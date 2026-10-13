@@ -206,7 +206,7 @@ impl ResourceWindow {
         }
         Ok(Self {
             opened: Instant::now(),
-            cpu_usec: replicas.iter().map(cpu_usec).collect(),
+            cpu_usec: replicas.iter().map(LocalServer::cpu_usec).collect(),
             peaks,
         })
     }
@@ -223,17 +223,12 @@ impl ResourceWindow {
             resources.push(Resources::between(
                 replica.ordinal(),
                 (self.opened, before),
-                (closed, cpu_usec(replica)),
+                (closed, replica.cpu_usec()),
                 peak.read()?,
             ));
         }
         Ok(resources)
     }
-}
-
-/// `replica`'s cgroup CPU time, microseconds.
-fn cpu_usec(replica: &LocalServer) -> u64 {
-    replica.cgroup_stat("cpu.stat", "usage_usec")
 }
 
 /// What one backlog read means for the drain.

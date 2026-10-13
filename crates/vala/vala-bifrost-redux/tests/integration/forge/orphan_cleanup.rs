@@ -37,13 +37,9 @@ fn forge_root(fixture: &PromotionIntegrationFixture) -> String {
 ///
 /// # Panics
 ///
-/// Panics when the staging operator rejects the write.
+/// Panics when the object store rejects the write.
 async fn seed_object(fixture: &PromotionIntegrationFixture, path: String) -> String {
-    fixture
-        .staging
-        .write(&path, b"lookalike".to_vec())
-        .await
-        .expect("the fixture object seeds");
+    fixture.write_object(&path, b"lookalike".to_vec()).await;
     path
 }
 
@@ -154,7 +150,7 @@ async fn assert_eligibility(
 #[tokio::test]
 async fn rowless_output_uses_canonical_identity_and_full_protection() {
     let promoted = PromotedRewriteFixture::start_unpromoted("orphan_rowless").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -481,7 +477,7 @@ async fn bounded_retry_resumes_after_cursor_without_starvation() {
     // One entry per page and one page per pass: every pass then classifies
     // exactly one key, which is what makes a leading protected run observable.
     promoted.fixture.config.orphan_gc_max_list_pages = 1;
-    let store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let store = CountingObjectStore::new(&promoted.fixture.storage);
     store.page_listing_by(1);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
@@ -679,25 +675,25 @@ async fn assert_recovered_pass_exhausts_the_prefix(
     );
 }
 
-/// A sibling table's Forge root is refused before any lease, catalog, or IO.
+/// A sibling table's Forge root is refused before any catalog load or IO.
 ///
 /// The plan input is a delete authority. A prefix that is well shaped — same
 /// tenant, same warehouse, same current Forge recipe root — but names a
 /// different table would still authorise deleting that table's objects, and the
 /// dispatch's catalog-derived comparison only catches it after the worker has
-/// already taken the table fence and loaded metadata. The binding derived from
-/// the task row already names the one table this task may touch, so the refusal
-/// belongs before all of that: no lease row, no catalog load, no listing, no
-/// stat, and no delete may exist when it returns.
+/// already loaded metadata. The binding derived from the task row already names
+/// the one table this task may touch, and the task's own claim is the only
+/// authority it holds, so the refusal belongs before all of that: no catalog
+/// load, no listing, no stat, and no delete may exist when it returns.
 ///
 /// # Panics
 ///
 /// Panics when the fixture cannot start, when the cross-table prefix is
 /// accepted, or when any effect was reached before the refusal.
 #[tokio::test]
-async fn cross_table_plan_refuses_before_lease_or_io() {
+async fn cross_table_plan_refuses_before_catalog_or_io() {
     let promoted = PromotedRewriteFixture::start_unpromoted("orphan_cross_table").await;
-    let store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         store.read_counter(),
@@ -770,11 +766,6 @@ async fn cross_table_plan_refuses_before_lease_or_io() {
         orphan_operations(fixture).await.is_empty(),
         "no orphan-GC batch was ever prepared"
     );
-    let leases: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.maintenance_leases")
-        .fetch_one(fixture.operator_pool.pool())
-        .await
-        .expect("maintenance leases are readable");
-    assert_eq!(leases, 0, "the refusal precedes table fence acquisition");
 }
 
 /// One durable authority whose loss must be independently observable.
@@ -1142,33 +1133,21 @@ async fn orphan_protection_sources_fail_closed_independently() {
         .await;
     }
 
-    assert_lease_and_fence_refuse_deletion(&batch).await;
+    assert_claim_loss_refuses_deletion(&batch).await;
 }
 
-/// Proves lease loss and fence loss each refuse a real claim without deleting.
+/// Proves a claim lapsed mid-batch refuses the deletion it would have made.
+///
+/// The orphan-cleanup task's claim is the table's only exclusive authority. It
+/// lapses while the first candidate is being stat'ed, and the per-candidate
+/// fence recheck sits between that stat and the delete, so the refusal lands
+/// with the object still intact.
 ///
 /// # Panics
 ///
-/// Panics when either refusal is not raised, or when the orphan is deleted.
-async fn assert_lease_and_fence_refuse_deletion(batch: &OrphanBatch) {
+/// Panics when the refusal is not raised, or when the orphan is deleted.
+async fn assert_claim_loss_refuses_deletion(batch: &OrphanBatch) {
     let fixture = &batch.promoted.fixture;
-    let lease_key = vala_bifrost_redux::forge::forge_lease_key(
-        fixture.tenant,
-        &fixture.binding.logical_namespace,
-        &fixture.binding.table_name,
-    );
-
-    // Lease loss: a live peer already owns this table's exclusive fence, so the
-    // claim is refused before it can classify or delete anything.
-    let peer = vala_bifrost_redux::forge::ForgeLease::acquire(
-        &fixture.operator_pool,
-        lease_key.clone(),
-        Uuid::now_v7(),
-        std::time::Duration::from_mins(5),
-    )
-    .await
-    .expect("the peer lease transaction runs")
-    .expect("an unheld table lease is acquirable");
     fixture.clear_task_backoff().await;
     let worker = ForgeWorker::new(
         Arc::clone(&batch.forge),
@@ -1181,74 +1160,33 @@ async fn assert_lease_and_fence_refuse_deletion(batch: &OrphanBatch) {
         .await
         .expect("claim transaction runs")
         .expect("the ready orphan task is claimable");
-    let refusal = worker
-        .execute_orphan_cleanup_claim_for_test(claim, &CancellationToken::new())
-        .await
-        .expect_err("a table whose fence a peer holds cannot be collected");
-    assert!(
-        matches!(
-            refusal,
-            vala_bifrost_redux::forge::ForgeError::FenceLost { .. }
-        ),
-        "lease loss refuses the claim: {refusal}"
-    );
-    assert_eq!(batch.store.deletes(), 0, "a refused lease deletes nothing");
-    peer.release(&fixture.operator_pool)
-        .await
-        .expect("the peer lease releases");
-
-    // Fence loss: this worker takes the lease, and a peer bumps its fencing
-    // token while the first candidate is being stat'ed. The per-candidate fence
-    // recheck sits between that stat and the delete, so the refusal lands with
-    // the object still intact.
-    //
-    // The refused attempt above still owns the row, so the production reclaim
-    // pass returns it to the pool rather than the test resetting durable state.
-    fixture.expire_claims().await;
-    worker
-        .reclaim_expired_attempts_for_test(16)
-        .await
-        .expect("the refused attempt is reclaimed");
-    fixture.clear_task_backoff().await;
-    let claim = worker
-        .claim_for_test()
-        .await
-        .expect("claim transaction runs")
-        .expect("the released task is claimable again");
     batch.store.pause_stat_at(1);
     let stop = CancellationToken::new();
     let (result, ()) = tokio::join!(
         worker.execute_orphan_cleanup_claim_for_test(claim, &stop),
         async {
             batch.store.stat_paused().await;
-            sqlx::query(
-                "UPDATE vala.maintenance_leases SET fencing_token = fencing_token + 1 \
-                 WHERE lease_key = $1",
-            )
-            .bind(&lease_key)
-            .execute(fixture.operator_pool.pool())
-            .await
-            .expect("a peer bumps the fence");
+            fixture.expire_claims().await;
             batch.store.release_stat();
         }
     );
-    // The batch was already prepared when the fence moved, so the attempt ends
+    // The batch was already prepared when the claim lapsed, so the attempt ends
     // in the retained shape an unresolved preparation always takes: its work is
-    // left for the successor that reclaims the lapsed lease. Nothing else about
-    // the pass changed between the paused stat and the release, so the bump is
+    // left for the successor that reclaims the lapsed claim. Nothing else about
+    // the pass changed between the paused stat and the release, so the lapse is
     // the only thing that could have stopped it.
-    let refusal = result.expect_err("a lost fence cannot complete a deletion");
+    let refusal = result.expect_err("a lapsed claim cannot complete a deletion");
     assert!(
         matches!(
             refusal,
             vala_bifrost_redux::forge::ForgeError::ShutdownRetained
         ),
-        "a fence lost mid-batch retains the attempt rather than settling it: {refusal}"
+        "a claim lost mid-batch retains the attempt rather than settling it: {refusal}"
     );
-    assert_eq!(batch.store.deletes(), 0, "a lost fence deletes nothing");
+    assert_eq!(batch.store.deletes(), 0, "a lapsed claim deletes nothing");
     assert!(
         object_exists(fixture, &batch.orphan).await,
-        "the orphan survives every refused authority"
+        "the orphan survives the refused authority"
     );
 }
 
@@ -1273,7 +1211,7 @@ struct OrphanBatch {
 /// Panics when the fixture cannot start or the clock cannot advance.
 async fn one_eligible_orphan(name: &str) -> OrphanBatch {
     let promoted = PromotedRewriteFixture::start_unpromoted(name).await;
-    let store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         store.read_counter(),
@@ -1522,10 +1460,14 @@ async fn assert_takeover_replays_the_same_batch(
     let fixture = &batch.promoted.fixture;
     fixture.expire_claims().await;
     let reclaimed = vala_sql::queries::forge_tasks::ForgeTasks::new(fixture.operator_pool.clone())
-        .reclaim_expired(8)
+        .reclaim_expired_attempts(8)
         .await
         .expect("expired claims reclaim");
-    assert_eq!(reclaimed, 1, "the lapsed lease returns exactly this task");
+    assert_eq!(
+        reclaimed.len(),
+        1,
+        "the lapsed claim returns exactly this task"
+    );
     fixture.clear_task_backoff().await;
 
     let taker = ForgeWorker::new(

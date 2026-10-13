@@ -1,27 +1,30 @@
 //! Redux catalog row and stored-schema projection onto public wire types.
 
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
+use arrow::datatypes::{Field, Schema};
 use vala_sql::row_types::olap_catalog::BifrostTableRow;
 use wyrd_spec::vala::api::{
-    BifrostTableEntry, DataTypeSpec, FieldSpec, PhysicalLayoutWire, TableStatus, TimeUnit,
+    BifrostTableEntry, DataTypeSpec, FieldSpec, PhysicalLayoutWire, TableStatus,
 };
-use wyrd_spec::vala::{CARD_UID, RUN_ID, WYRD_EVENT_TIME};
+use wyrd_spec::vala::{CARD_UID, RUN_ID};
+
+use wyrd_types::field_to_spec;
 
 use crate::catalog::BifrostCatalogError;
-use crate::tables::managed_columns::is_managed_column;
+use crate::tables::managed_columns::{is_managed_column, is_reserved_column};
 
 /// Reject user fields that collide with server-owned physical columns.
 ///
 /// Registration calls this before any schema is resolved, so a caller can
-/// never declare a column the server stamps or derives itself.
+/// never declare a column the server stamps or derives itself, nor any
+/// `wyrd_*` name.
 ///
 /// # Errors
 /// Returns [`BifrostCatalogError::ReservedColumn`] naming the first user field
-/// whose name is a managed column.
+/// whose name is reserved.
 pub fn reject_reserved_field_names(user_fields: &[Field]) -> Result<(), BifrostCatalogError> {
     for field in user_fields {
         let name = field.name();
-        if is_managed_column(name) {
+        if is_reserved_column(name) {
             return Err(BifrostCatalogError::ReservedColumn(name.clone()));
         }
     }
@@ -67,23 +70,20 @@ pub fn layout_wire_from_row(
     })
 }
 
-/// The three describe field classes projected from one stored physical schema.
+/// The two describe field classes projected from one stored physical schema.
 ///
 /// Splitting them is what lets a writer tell what it declares (`user_fields`)
-/// from the correlation inputs it may attach (`correlation_fields`) and the
-/// managed columns it may supply instead of letting the server stamp them
-/// (`managed_candidates`).
+/// from the correlation inputs it may attach (`correlation_fields`). No other
+/// managed column is writer-supplied, so none is described.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DescribedFields {
     /// The table's own declared columns, in stored order.
     pub user_fields: Vec<FieldSpec>,
     /// `card_uid` then `run_id`, the correlation inputs a writer supplies.
     pub correlation_fields: Vec<FieldSpec>,
-    /// `wyrd_event_time`, the one managed column a writer may supply itself.
-    pub managed_candidates: Vec<FieldSpec>,
 }
 
-/// Project a stored physical schema onto the three describe field classes.
+/// Project a stored physical schema onto the two describe field classes.
 ///
 /// Every declaration is taken from the stored schema, so its type,
 /// nullability, and registered field id are the table's actual ones rather
@@ -103,19 +103,21 @@ pub fn described_fields_from_stored_schema(
     let mut described = DescribedFields {
         user_fields: Vec::new(),
         correlation_fields: Vec::new(),
-        managed_candidates: Vec::new(),
     };
     let (mut card_uid, mut run_id) = (None, None);
     for field in schema.fields() {
         let name = field.name().as_str();
+        if name != CARD_UID && name != RUN_ID && is_managed_column(name) {
+            continue;
+        }
+        let spec = field_to_spec(field)
+            .map_err(|error| BifrostCatalogError::MetadataMismatch(error.to_string()))?;
         if name == CARD_UID {
-            card_uid = Some(field_to_spec(field)?);
+            card_uid = Some(spec);
         } else if name == RUN_ID {
-            run_id = Some(field_to_spec(field)?);
-        } else if name == WYRD_EVENT_TIME {
-            described.managed_candidates.push(field_to_spec(field)?);
-        } else if !is_managed_column(name) {
-            described.user_fields.push(field_to_spec(field)?);
+            run_id = Some(spec);
+        } else {
+            described.user_fields.push(spec);
         }
     }
     for (name, stored) in [(CARD_UID, card_uid), (RUN_ID, run_id)] {
@@ -142,88 +144,6 @@ fn status_from_db(status: &str) -> Result<TableStatus, BifrostCatalogError> {
     }
 }
 
-/// Project one stored Arrow field onto its wire declaration.
-///
-/// Arrow metadata is carried verbatim, which is what puts the stored
-/// `PARQUET:field_id` (and every nested child's) onto the wire.
-///
-/// # Errors
-///
-/// Returns [`BifrostCatalogError::MetadataMismatch`] when the stored type is
-/// not representable on the wire.
-fn field_to_spec(field: &Field) -> Result<FieldSpec, BifrostCatalogError> {
-    Ok(FieldSpec {
-        name: field.name().clone(),
-        data_type: data_type_from_arrow(field.data_type())?,
-        nullable: field.is_nullable(),
-        metadata: field
-            .metadata()
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-    })
-}
-
-fn data_type_from_arrow(data_type: &DataType) -> Result<DataTypeSpec, BifrostCatalogError> {
-    let spec = match data_type {
-        DataType::Boolean => DataTypeSpec::Bool,
-        DataType::Int8 => DataTypeSpec::Int8,
-        DataType::Int16 => DataTypeSpec::Int16,
-        DataType::Int32 => DataTypeSpec::Int32,
-        DataType::Int64 => DataTypeSpec::Int64,
-        DataType::UInt8 => DataTypeSpec::UInt8,
-        DataType::UInt16 => DataTypeSpec::UInt16,
-        DataType::UInt32 => DataTypeSpec::UInt32,
-        DataType::UInt64 => DataTypeSpec::UInt64,
-        DataType::Float32 => DataTypeSpec::Float32,
-        DataType::Float64 => DataTypeSpec::Float64,
-        DataType::Utf8 => DataTypeSpec::Utf8,
-        DataType::LargeUtf8 => DataTypeSpec::LargeUtf8,
-        DataType::Binary => DataTypeSpec::Binary,
-        DataType::LargeBinary => DataTypeSpec::LargeBinary,
-        DataType::FixedSizeBinary(len) => DataTypeSpec::FixedSizeBinary { len: *len },
-        DataType::Date32 => DataTypeSpec::Date32,
-        DataType::Date64 => DataTypeSpec::Date64,
-        DataType::Timestamp(unit, timezone) => DataTypeSpec::Timestamp {
-            unit: time_unit_from_arrow(*unit),
-            tz: timezone.as_ref().map(ToString::to_string),
-        },
-        DataType::Time32(unit) => DataTypeSpec::Time32 {
-            unit: time_unit_from_arrow(*unit),
-        },
-        DataType::Time64(unit) => DataTypeSpec::Time64 {
-            unit: time_unit_from_arrow(*unit),
-        },
-        DataType::Decimal128(precision, scale) => DataTypeSpec::Decimal128 {
-            precision: *precision,
-            scale: *scale,
-        },
-        DataType::List(element) => DataTypeSpec::List(Box::new(field_to_spec(element)?)),
-        DataType::Struct(fields) => {
-            let fields = fields
-                .iter()
-                .map(|field| field_to_spec(field))
-                .collect::<Result<Vec<_>, _>>()?;
-            DataTypeSpec::Struct(fields)
-        }
-        other => {
-            return Err(BifrostCatalogError::MetadataMismatch(format!(
-                "stored column type is not representable on the wire: {other:?}"
-            )));
-        }
-    };
-    Ok(spec)
-}
-
-const fn time_unit_from_arrow(unit: ArrowTimeUnit) -> TimeUnit {
-    match unit {
-        ArrowTimeUnit::Second => TimeUnit::Second,
-        ArrowTimeUnit::Millisecond => TimeUnit::Millisecond,
-        ArrowTimeUnit::Microsecond => TimeUnit::Microsecond,
-        ArrowTimeUnit::Nanosecond => TimeUnit::Nanosecond,
-    }
-}
-
 fn to_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
@@ -236,15 +156,18 @@ fn to_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::DataType;
+
     use crate::tables::managed_columns::MANAGED_COLUMNS;
 
     use super::*;
 
-    /// Every managed column name is refused as a user field.
+    /// Every managed column name, and any other `wyrd_*` name such as the
+    /// unmanaged `wyrd_custom`, is refused as a user field.
     ///
-    /// The names are iterated from the managed-column declaration rather than
-    /// spelled out here. A hand-written list silently stops covering a name the
-    /// moment one is added to the declaration.
+    /// The managed names are iterated from the managed-column declaration
+    /// rather than spelled out here. A hand-written list silently stops
+    /// covering a name the moment one is added to the declaration.
     ///
     /// # Panics
     ///
@@ -252,7 +175,8 @@ mod tests {
     /// than [`BifrostCatalogError::ReservedColumn`] for that name.
     #[test]
     fn every_managed_field_name_is_rejected() {
-        for name in MANAGED_COLUMNS.iter().map(|column| column.field.name) {
+        let managed = MANAGED_COLUMNS.iter().map(|column| column.field.name);
+        for name in managed.chain(["wyrd_custom"]) {
             let error = reject_reserved_field_names(&[Field::new(name, DataType::Int64, true)])
                 .expect_err("every reserved field must fail");
             assert!(
@@ -302,15 +226,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![CARD_UID, RUN_ID],
             "correlation is exactly the card uid and the run id"
-        );
-        assert_eq!(
-            described
-                .managed_candidates
-                .iter()
-                .map(|spec| spec.name.as_str())
-                .collect::<Vec<_>>(),
-            vec![WYRD_EVENT_TIME],
-            "event time is the one managed column a writer may supply"
         );
     }
 }

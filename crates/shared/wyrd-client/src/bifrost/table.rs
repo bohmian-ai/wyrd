@@ -70,9 +70,9 @@ pub struct TableConfig {
 impl TableConfig {
     /// Build a config from an explicit Arrow schema.
     ///
-    /// The precision path: a caller who needs `Int32`, a non-UTC timezone,
-    /// `Decimal128`, or `FixedSizeBinary` supplies Arrow directly, exactly as
-    /// [`wyrd_queue::arrow_schema_to_fieldspec`] documents.
+    /// The precision path: a caller who needs `Int32`, `Decimal128`, or
+    /// `FixedSizeBinary` supplies Arrow directly, exactly as
+    /// [`wyrd_types::arrow_schema_to_fieldspec`] documents.
     ///
     /// # Arguments
     /// * `fqn` - The table's `<namespace>.<name>`.
@@ -83,10 +83,14 @@ impl TableConfig {
     /// Returns [`BifrostClientError::Queue`] with code `WYRD_VALA_400_SCHEMA_PARSE`
     /// when `fqn` is not `<namespace>.<name>`, and
     /// `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` when a column uses a reserved
-    /// `wyrd_*`, `card_uid`, or `run_id` name.
+    /// `wyrd_*`, `card_uid`, or `run_id` name, and
+    /// `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE` naming the field and type when
+    /// a column's Arrow type has no wire form or no Iceberg column
+    /// ([`wyrd_types::schema::check_supported`]) — before any request is sent.
     pub fn from_arrow(fqn: &str, schema: SchemaRef) -> Result<Self, BifrostClientError> {
         let (namespace, name) = split_fqn(fqn)?;
         reject_reserved_columns(&schema)?;
+        wyrd_types::arrow_schema_to_fieldspec(&schema)?;
         Ok(Self {
             namespace,
             name,
@@ -102,7 +106,7 @@ impl TableConfig {
     ///
     /// This is the Pydantic (`model_json_schema()`) and Zod
     /// (`z.toJSONSchema()`) door. Mapping is delegated verbatim to
-    /// [`wyrd_queue::json_schema_to_arrow`], the single owner of the
+    /// [`wyrd_types::json_schema_to_arrow`], the single owner of the
     /// JSON-Schema-to-Arrow table, so all three languages agree on the columns
     /// one model produces.
     ///
@@ -113,13 +117,13 @@ impl TableConfig {
     /// # Errors
     ///
     /// As [`TableConfig::from_arrow`], plus a schema-parse failure for a
-    /// free-form object, an untyped array, an unsupported type, or an
-    /// unresolvable `$ref`.
+    /// model allowing undeclared keys beside its declared properties, an
+    /// unsupported JSON-Schema type, or an unresolvable `$ref`.
     pub fn from_json_schema(
         fqn: &str,
         schema: &serde_json::Value,
     ) -> Result<Self, BifrostClientError> {
-        let arrow = wyrd_queue::json_schema_to_arrow(schema)?;
+        let arrow = wyrd_types::json_schema_to_arrow(schema)?;
         Self::from_arrow(fqn, Arc::new(arrow))
     }
 
@@ -130,9 +134,9 @@ impl TableConfig {
     /// a Rust struct, a Pydantic model, and a Zod object that describe the same
     /// columns reach the same Arrow schema through the same single mapper.
     ///
-    /// The declared type must be a struct of supported scalar, list, or nested
-    /// struct fields; `schemars` emits a `$ref` for a nested type, which the
-    /// shared mapper resolves only from a `$defs` section.
+    /// The declared type must be a struct; a nested struct becomes a Struct
+    /// column, a `Vec<T>` a List, and `serde_json::Value` or
+    /// `HashMap<String, T>` a Variant.
     ///
     /// # Arguments
     /// * `fqn` - The table's `<namespace>.<name>`.
@@ -204,7 +208,7 @@ impl TableConfig {
     pub(crate) fn from_description(
         description: &BifrostTableDescription,
     ) -> Result<Self, BifrostClientError> {
-        let user_schema = wyrd_queue::fieldspec_to_arrow(&description.user_fields)?;
+        let user_schema = wyrd_types::fieldspec_to_arrow(&description.user_fields)?;
         Ok(Self {
             namespace: description.entry.namespace.clone(),
             name: description.entry.name.clone(),
@@ -221,8 +225,10 @@ impl TableConfig {
 
     /// Declare the physical layout the register call should request.
     ///
-    /// Omitted, the server resolves `hour(wyrd_event_time)`, `wyrd_event_time`
-    /// descending nulls-last, and the managed Bloom floor.
+    /// Omitted, the server resolves `hour(wyrd_ingested_at)`,
+    /// `wyrd_ingested_at` descending nulls-last, and the managed Bloom floor.
+    /// A layout's `time_column` names the non-null timestamp column that
+    /// partitions the table and leads its default sort order.
     ///
     /// # Arguments
     /// * `layout` - The partitioning, sort, and Bloom layout to request at register.
@@ -307,11 +313,17 @@ impl TableConfig {
     }
 
     /// The register-call body this config asks the server to create.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the schema is not wire-representable, which every
+    /// constructor refuses.
     pub(crate) fn register_request(&self) -> RegisterTableRequest {
         RegisterTableRequest {
             namespace: self.namespace.clone(),
             name: self.name.clone(),
-            fields: wyrd_queue::arrow_schema_to_fieldspec(&self.user_schema),
+            fields: wyrd_types::arrow_schema_to_fieldspec(&self.user_schema)
+                .expect("every TableConfig constructor admits only a wire-representable schema"),
             physical_layout: self.physical_layout.clone(),
             compaction_target_file_size_bytes: self.compaction_target_file_size_bytes,
             compaction_type: self.compaction_type,
@@ -357,11 +369,17 @@ struct TableConfigWire {
 
 impl From<TableConfig> for TableConfigWire {
     /// Project one config onto its wire form for a language boundary.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the schema is not wire-representable, which every
+    /// constructor refuses.
     fn from(config: TableConfig) -> Self {
         Self {
             namespace: config.namespace,
             name: config.name,
-            fields: wyrd_queue::arrow_schema_to_fieldspec(&config.user_schema),
+            fields: wyrd_types::arrow_schema_to_fieldspec(&config.user_schema)
+                .expect("every TableConfig constructor admits only a wire-representable schema"),
             physical_layout: config.physical_layout,
             compaction_target_file_size_bytes: config.compaction_target_file_size_bytes,
             compaction_type: config.compaction_type,
@@ -383,7 +401,7 @@ impl TryFrom<TableConfigWire> for TableConfig {
         Ok(Self {
             namespace: wire.namespace,
             name: wire.name,
-            user_schema: Arc::new(wyrd_queue::fieldspec_to_arrow(&wire.fields)?),
+            user_schema: Arc::new(wyrd_types::fieldspec_to_arrow(&wire.fields)?),
             physical_layout: wire.physical_layout,
             compaction_target_file_size_bytes: wire.compaction_target_file_size_bytes,
             compaction_type: wire.compaction_type,

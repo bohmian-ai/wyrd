@@ -33,8 +33,8 @@ use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
 use crate::scribe::assembly::{
-    AssemblyError, ClaimCause, OwnedMembers, ScribeAssemblyKey, StagingAssembler,
-    StagingAssemblerConfig, StagingBacklog, StagingClaim, StagingClaimId,
+    AssemblyError, ClaimCause, ScribeAssemblyKey, StagingAssembler, StagingAssemblerConfig,
+    StagingBacklog, StagingClaim, StagingClaimId,
 };
 use crate::scribe::claim_assembly::{
     AssembleClaimRequest, AssembledClaim, ClaimAssembler, ClaimRuns,
@@ -361,6 +361,7 @@ impl ScribeStagingRuntime {
             })
             .collect();
         let bytes = staged.staged_bytes();
+        let footers = staged.footers().clone();
         let wal = staged.wal();
         let ready = self.stager.publish_ready(staged, ready_at).await?;
         {
@@ -379,6 +380,7 @@ impl ScribeStagingRuntime {
                 member,
                 runs,
                 bytes,
+                footers,
                 wal: (
                     crate::scribe::wal::WalLsn::new(wal.min),
                     crate::scribe::wal::WalLsn::new(wal.max),
@@ -666,10 +668,16 @@ impl ScribeStagingRuntime {
 
     /// Installs the durable authority of every member recovery kept.
     ///
+    /// A member still served from its staged runs is offered with the runs'
+    /// footers, read by [`crate::scribe::member_stager::preflight_run`]
+    /// exactly as staging reads them, so its scans are sized like any other
+    /// staged member's.
+    ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the registry refuses a restored
-    /// authority, which means two durable records claim the same generation.
+    /// Returns [`ScribeError::Internal`] when a staged run fails its
+    /// preflight, or the registry refuses a restored authority, which means
+    /// two durable records claim the same generation.
     fn restore_authorities(
         &self,
         key: &ScribeAssemblyKey,
@@ -708,10 +716,16 @@ impl ScribeStagingRuntime {
                 StagedMemberState::Ready
                 | StagedMemberState::Claimed { .. }
                 | StagedMemberState::Publishing { .. } => {
+                    let runs = member.run_paths();
+                    let footers = runs
+                        .iter()
+                        .map(|run| crate::scribe::member_stager::preflight_run(run))
+                        .collect::<Result<Vec<_>, _>>()?;
                     crate::scribe::hot_source::HotAuthority::StagedRun {
                         member: id,
-                        runs: member.run_paths(),
+                        runs,
                         bytes: member.record().encoded_bytes(),
+                        footers: crate::scribe::hot_source::RunFooters::new(footers),
                         wal: (
                             crate::scribe::wal::WalLsn::new(wal.min),
                             crate::scribe::wal::WalLsn::new(wal.max),
@@ -762,7 +776,7 @@ impl ScribeStagingRuntime {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "a recovered staged key names no run to read its schema from".to_owned(),
             })?;
-        let schema = run_schema(&run)?;
+        let schema = Arc::clone(crate::scribe::member_stager::preflight_run(&run)?.schema());
         if crate::parquet::footer::schema_fingerprint(schema.as_ref()) != key.schema_fingerprint() {
             return Err(ScribeError::Internal {
                 detail: "a recovered staged run's schema is not the schema its key names"
@@ -813,28 +827,6 @@ impl ScribeStagingRuntime {
             .lock()
             .map_err(|_| poisoned("staged ready index"))?
             .ready_keys())
-    }
-
-    /// Snapshots every member this pod owns that has not yet published.
-    ///
-    /// Ready and claimed members are both included, whoever drives the claim,
-    /// so a flush can wait for exactly the rows that were durable when it
-    /// began. See [`StagingAssembler::owned_members`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when the ready index is unavailable.
-    pub fn owned_members(&self) -> Result<OwnedMembers, ScribeError> {
-        Ok(self.lock_assembly()?.owned_members())
-    }
-
-    /// Returns whether any member of `snapshot` is still unpublished.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when the ready index is unavailable.
-    pub fn owns_any(&self, snapshot: &OwnedMembers) -> Result<bool, ScribeError> {
-        Ok(self.lock_assembly()?.owns_any(snapshot))
     }
 
     /// Re-validates a claim's members and returns its runs in merge order.
@@ -1007,26 +999,6 @@ impl ScribeStagingRuntime {
     }
 }
 
-/// Reads the physical schema one staged run was encoded with.
-///
-/// The run's own footer is the authority: it describes the bytes that will be
-/// merged, which is exactly what the merge must be told about.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::Internal`] when the run cannot be opened or its
-/// Parquet metadata cannot be read.
-fn run_schema(run: &Path) -> Result<SchemaRef, ScribeError> {
-    let file = std::fs::File::open(run).map_err(|error| ScribeError::Internal {
-        detail: format!("open a recovered staged run: {error}"),
-    })?;
-    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|error| ScribeError::Internal {
-            detail: format!("read a recovered staged run's metadata: {error}"),
-        })?;
-    Ok(Arc::clone(builder.schema()))
-}
-
 impl std::fmt::Debug for ScribeStagingRuntime {
     /// Names the runtime without exposing its pooled or object-store owners.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1110,7 +1082,7 @@ mod tests {
     /// Physical schema the fixture member is staged and merged under.
     pub(super) fn runtime_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )]))
@@ -1131,6 +1103,7 @@ mod tests {
             ))],
         )
         .expect("fixture member batch");
+        let arrow_bytes = crate::scribe::memory::retained_arrow_bytes(&record);
         FrozenMemtable {
             seal_id: u64::from(shard),
             seal_key: SealKey::new(
@@ -1141,24 +1114,12 @@ mod tests {
             shard_id: usize::from(shard),
             schema,
             batches: vec![record],
+            statistics: Vec::new(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
-            arrow_bytes: 0,
+            arrow_bytes,
         }
-    }
-
-    /// Resolves the hourly layout the fixture member is encoded under.
-    pub(super) fn runtime_layout(schema: &Schema) -> PhysicalLayout {
-        PhysicalLayout::resolve(
-            "vala.bifrost.test",
-            schema,
-            Some(&crate::tables::hourly_layout(
-                vec![crate::tables::sort_asc("wyrd_event_time")],
-                &["wyrd_event_time"],
-            )),
-        )
-        .expect("fixture schema carries the built-in hourly layout")
     }
 
     /// Builds the publisher the runtime owns, over lazy and in-memory owners.
@@ -1171,9 +1132,7 @@ mod tests {
         wal_root: &Path,
         node: NodeId,
     ) -> ClaimPublisher {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .expect("memory operator")
-            .finish();
+        let operator = std::sync::Arc::new(object_store::memory::InMemory::new());
         ClaimPublisher::new(
             stage,
             ScribeStageMover::new(wal_root, operator),
@@ -1211,7 +1170,7 @@ mod tests {
 
         let tenant = DataTenantId::new_v7();
         let schema = runtime_schema();
-        let layout = runtime_layout(schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let frozen = frozen_member(tenant, 1_024, 1);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
@@ -1306,7 +1265,7 @@ mod tests {
 
         let tenant = DataTenantId::new_v7();
         let schema = runtime_schema();
-        let layout = runtime_layout(schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let frozen = frozen_member(tenant, 512, 3);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
@@ -1359,9 +1318,10 @@ mod tests {
             .into_iter()
             .next()
             .expect("the member names a run");
-        let on_disk = run_schema(&run).expect("the run carries its schema");
+        let on_disk =
+            crate::scribe::member_stager::preflight_run(&run).expect("the run carries its schema");
         assert_eq!(
-            crate::parquet::footer::schema_fingerprint(on_disk.as_ref()),
+            crate::parquet::footer::schema_fingerprint(on_disk.schema().as_ref()),
             key.schema_fingerprint(),
             "the schema restore reads back is the schema the key names"
         );
@@ -1389,7 +1349,7 @@ mod tests {
         );
 
         let schema = runtime_schema();
-        let layout = runtime_layout(schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let staged_at = chrono::Utc::now();
         let mut keys = Vec::new();
         for (shard, generation) in [(1_u8, 7_u64), (2, 8)] {
@@ -1487,7 +1447,7 @@ mod tests {
         .with_hot_sources(Arc::clone(&hot_sources));
 
         let schema = runtime_schema();
-        let layout = runtime_layout(schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let tenant = DataTenantId::new_v7();
         let frozen = frozen_member(tenant, 256, 1);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
@@ -1623,70 +1583,6 @@ mod tests {
         );
     }
 
-    /// A flush snapshot is still owned exactly while one of its members is
-    /// unpublished.
-    ///
-    /// A member durable at the snapshot keeps it owned while ready and while
-    /// claimed, and only its settlement releases it. A member staged after the
-    /// snapshot never makes it owned, whether ready or claimed, so a flush
-    /// waiting on the snapshot is not held open by newer data.
-    ///
-    /// # Panics
-    ///
-    /// Panics when staging, claiming, or settlement fails, or when
-    /// [`ScribeStagingRuntime::owns_any`] disagrees with the snapshot members
-    /// still unpublished.
-    #[tokio::test]
-    async fn owns_any_tracks_only_snapshot_members() {
-        let root = tempfile::tempdir().expect("runtime root");
-        let stage_root = root.path().join("stage");
-        let wal_root = root.path().join("member-wal");
-        for path in [&stage_root, &wal_root] {
-            std::fs::create_dir_all(path).expect("fixture directory");
-        }
-        let node_id = NodeId::new(uuid::Uuid::from_u128(0x5a75));
-        let stage = Arc::new(ScribeHotStage::new(stage_root));
-        let runtime = ScribeStagingRuntime::new(
-            Arc::clone(&stage),
-            publisher(stage, &wal_root, node_id),
-            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
-                .expect("assembler controls"),
-        );
-        let now = chrono::Utc::now();
-        let (durable, _) =
-            stage_durable_members(&runtime, DataTenantId::new_v7(), node_id, 1..=1, now).await;
-        let snapshot = runtime.owned_members().expect("owned snapshot");
-        assert_eq!(snapshot.len(), 1);
-        assert!(runtime.owns_any(&snapshot).expect("ready snapshot member"));
-
-        let (newer, _) =
-            stage_durable_members(&runtime, DataTenantId::new_v7(), node_id, 1..=1, now).await;
-        let claim = runtime
-            .take_residue(&durable, ClaimCause::Drain)
-            .expect("the durable key releases a residue claim")
-            .expect("a residue claim is due");
-        assert!(
-            runtime
-                .owns_any(&snapshot)
-                .expect("claimed snapshot member"),
-            "a claimed member stays owned until its claim settles"
-        );
-        runtime.settle(claim.id()).expect("the claim settles");
-        let newer_claim = runtime
-            .take_residue(&newer, ClaimCause::Drain)
-            .expect("the newer key releases a residue claim")
-            .expect("a residue claim is due");
-        assert!(
-            !runtime.owns_any(&snapshot).expect("settled snapshot"),
-            "members staged after the snapshot never hold it"
-        );
-        assert_eq!(
-            runtime.backlog(None).expect("backlog").outstanding_claims,
-            1
-        );
-        drop(newer_claim);
-    }
-
     /// Concurrent registration, claim, and settlement leave the published
     /// staged gauges equal to the assembler's final ownership.
     ///
@@ -1805,7 +1701,7 @@ mod tests {
         ready_at: DateTime<Utc>,
     ) -> (ScribeAssemblyKey, Vec<StagedMemberId>) {
         let schema = &runtime_schema();
-        let layout = &runtime_layout(schema.as_ref());
+        let layout = &crate::tables::hourly_test_layout(schema.as_ref());
         let mut key = None;
         let mut member_ids = Vec::new();
         for shard in shards {
@@ -2406,9 +2302,7 @@ mod tests {
 /// Postgres-backed recovery proofs for the staged backlog gauges.
 #[cfg(test)]
 mod pg_tests {
-    use super::tests::{
-        move_claim, publisher, runtime_layout, runtime_schema, stage_durable_members,
-    };
+    use super::tests::{move_claim, publisher, runtime_schema, stage_durable_members};
     use super::*;
     use crate::scribe::stream_identity::NodeId;
     use num_traits::ToPrimitive as _;
@@ -2431,7 +2325,7 @@ mod pg_tests {
             uuid::Uuid::now_v7().as_bytes(),
             &fqn,
             &[0_u8; 32],
-            &serde_json::to_value(runtime_layout(schema.as_ref()).to_wire())
+            &serde_json::to_value(crate::tables::hourly_test_layout(schema.as_ref()).to_wire())
                 .expect("fixture layout encodes"),
         )
         .await
@@ -2561,9 +2455,7 @@ mod pg_tests {
         node: NodeId,
         pool: OperatorPool,
     ) -> ClaimPublisher {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .expect("memory operator")
-            .finish();
+        let operator = std::sync::Arc::new(object_store::memory::InMemory::new());
         ClaimPublisher::new(
             stage,
             crate::scribe::persistence::ScribeStageMover::new(wal_root, operator),

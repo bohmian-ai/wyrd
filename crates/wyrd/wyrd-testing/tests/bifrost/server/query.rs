@@ -3,7 +3,9 @@ use futures_util::StreamExt as _;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
-use vala_bifrost_redux::oracle::{AuthorizedQueryContext, QueryIpcDecoder};
+use vala_bifrost_redux::oracle::{
+    AuthorizedQueryContext, OracleQueryStream, QueryIpcDecoder, failed_terminal,
+};
 use wyrd_client::bifrost::Correlation;
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
@@ -11,7 +13,8 @@ use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest, QueryClass};
+use wyrd_spec::vala::BifrostError;
+use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest, QueryClass, QueryStreamFrame};
 use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::wyrd::v1 as proto;
 use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
@@ -142,10 +145,6 @@ pub(super) async fn audit_rows(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn consumer_cancellation_requires_owner_terminal() -> Result<(), ServerJourneyError> {
-    use vala_bifrost_redux::oracle::{OracleQueryStream, failed_terminal};
-    use wyrd_spec::vala::BifrostError;
-    use wyrd_spec::vala::api::{QueryStreamFrame, QueryTerminalErrorCode};
-
     let server = WyrdTestServer::start_bound().await?;
     let tenant = server.data_tenant_id();
     let controls = server
@@ -179,7 +178,7 @@ async fn consumer_cancellation_requires_owner_terminal() -> Result<(), ServerJou
             OracleQueryStream::test_new("settlement-fixture".to_owned(), frames, token.clone());
         stream.deadline_ms =
             chrono::Utc::now().timestamp_millis() + if case == "deadline" { 200 } else { 5_000 };
-        let terminal = failed_terminal(QueryTerminalErrorCode::QueryExecutionFailed, 0);
+        let terminal = failed_terminal(BifrostError::QueryExecutionFailed, 0);
         let observed = (case == "consumed failed").then(|| terminal.clone());
         let controls = controls.clone();
         let settlement = tokio::spawn(async move {
@@ -571,7 +570,7 @@ fn value_row(value: i64) -> Vec<u8> {
     format!(r#"{{"value": {value}}}"#).into_bytes()
 }
 
-/// Bounded polls a scheduled journey waits on an Analytical lifecycle change.
+/// Bounded polls the peer-loss phase waits on an Analytical lifecycle change.
 const ANALYTICAL_POLLS: usize = 100;
 
 /// A scheduled Analytical query whose peer dies produces no outcome and no leak.
@@ -742,7 +741,7 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
         return Err("a failed query stage appended its own audit row".into());
     }
 
-    await_clean_analytical(&cluster).await?;
+    await_owners_released(&cluster).await?;
     cluster.shutdown().await?;
     Ok(())
 }
@@ -752,9 +751,11 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
 /// The Scribe-only pod of a role-separated cluster is held unbooted, so an
 /// Oracle's read decision is staged on its process Scribe outbox while the
 /// membership names no Scribe and every delivery attempt finds an empty
-/// roster. The Scribe then boots and the Oracle pod is drained gracefully.
-/// Membership must keep refreshing, so the outbox finds the late Scribe and
-/// the decision lands in retained history, read back through the other Oracle.
+/// roster. The Oracle pod then begins a graceful drain, and the Scribe boots
+/// only after that drain has withdrawn the Oracle's readiness. Membership
+/// must keep refreshing through the drain, so the outbox discovers the late
+/// Scribe and the decision lands in retained history, read back through the
+/// other Oracle.
 ///
 /// # Errors
 /// Returns cluster setup, catalog, query, shutdown, or retained-history errors,
@@ -805,8 +806,9 @@ async fn oracle_only_pod_retains_audit_staged_before_its_drain() -> Result<(), S
     while let Some(frame) = stream.frames.next().await {
         frame?;
     }
-    cluster.restart_node(scribe).await?;
-    cluster.stop_node(drained).await?;
+    cluster
+        .stop_node_restarting_another_during_drain(drained, scribe)
+        .await?;
 
     cluster
         .server_by_node(reader)
@@ -862,7 +864,7 @@ async fn prove_scheduled_analytical_completion(
     assert_eq!(outcome.terminal.query_class, QueryClass::Analytical);
     assert_eq!(outcome.rows, u64::try_from(FIXTURE_VALUES.len())?);
     assert_eq!(outcome.terminal.row_count, outcome.rows);
-    assert_scheduled_owners_released(cluster).await?;
+    await_owners_released(cluster).await?;
     assert_eq!(
         audit_rows(ingress, tenant, "bifrost.query.read_decision").await?,
         before + 1
@@ -922,7 +924,7 @@ async fn prove_scheduled_analytical_completion(
         .await?
         .expect_err("an actively cancelled schedule has no outcome");
     assert_eq!(error.code(), "WYRD_VALA_500_QUERY_EXECUTION_FAILED");
-    assert_scheduled_owners_released(cluster).await?;
+    await_owners_released(cluster).await?;
     assert_eq!(
         audit_rows(ingress, tenant, "bifrost.query.read_decision").await?,
         before + 2
@@ -930,76 +932,50 @@ async fn prove_scheduled_analytical_completion(
     Ok(())
 }
 
-/// Checks ownership after a scheduled query returns.
+/// Waits, bounded, until every node retains no query ownership.
 ///
-/// The leader retires its public running-query entry only after its own graph
-/// and admission owner are released, so an empty running-query list at return
-/// proves the leader settled. A follower frees its graph on its own once the
-/// leader closes the grant stream, so the graph check first waits for every
-/// node through [`await_clean_analytical`] before the strict checks run.
-///
-/// # Errors
-/// Returns inspection failure, a follower graph still held when the bounded
-/// wait ends, or retained query/admission/resource evidence.
-async fn assert_scheduled_owners_released(
-    cluster: &wyrd_testing::bifrost::WyrdTestCluster,
-) -> Result<(), ServerJourneyError> {
-    await_clean_analytical(cluster).await?;
-    for server in cluster.servers() {
-        let Some(query) = server.state().bifrost_query() else {
-            continue;
-        };
-        let engine = query.engine();
-        let live = engine
-            .analytical_execution()
-            .ok_or("missing analytical owner")?
-            .live()?;
-        let root = engine.role_resources().snapshot()?;
-        if !live.is_clean()
-            || !engine
-                .running_queries()
-                .list(cluster.data_tenant_id())
-                .is_empty()
-            || root.oracle_query_active
-            || root.oracle_query_memory_used_bytes != 0
-        {
-            return Err(format!("scheduled return retained ownership: {live:?}, {root:?}").into());
-        }
-    }
-    Ok(())
-}
-
-/// Waits until every running node retains no Analytical ownership.
+/// Graph release does not wait for dependency-owned teardown: children still
+/// being torn down return their bytes through the shared memory root as they
+/// free them. So release is proven as a bounded convergence to zero live
+/// Analytical ownership, running queries, active Oracle queries, and Oracle
+/// query memory; ownership that never returns within the bound is a leak.
 ///
 /// # Errors
-///
-/// Returns an inspection error, or a description of what a node still held.
-async fn await_clean_analytical(
+/// Returns an inspection failure, or what a node still held when the bound
+/// expired.
+async fn await_owners_released(
     cluster: &wyrd_testing::bifrost::WyrdTestCluster,
 ) -> Result<(), ServerJourneyError> {
     let mut last = String::new();
     for _ in 0..ANALYTICAL_POLLS {
-        let mut clean = true;
         last.clear();
         for server in cluster.servers() {
             let Some(query) = server.state().bifrost_query() else {
                 continue;
             };
-            let Some(handle) = query.engine().analytical_execution() else {
-                continue;
-            };
-            let live = handle.live()?;
-            if !AnalyticalLiveInspection::is_clean(&live) {
-                clean = false;
-                last = format!("{live:?}");
+            let engine = query.engine();
+            let live = engine
+                .analytical_execution()
+                .ok_or("missing analytical owner")?
+                .live()?;
+            let root = engine.role_resources().snapshot()?;
+            if !live.is_clean()
+                || !engine
+                    .running_queries()
+                    .list(cluster.data_tenant_id())
+                    .is_empty()
+                || root.oracle_query_active
+                || root.oracle_query_memory_used_bytes != 0
+            {
+                last = format!("{live:?}, {root:?}");
             }
         }
-        if clean {
+        if last.is_empty() {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    Err(format!("a node still retained Analytical ownership: {last}").into())
+    Err(format!("a node still retained query ownership: {last}").into())
 }
 
 /// Tenant-local roles reach exactly the Bifrost tables their scope names.
@@ -1501,13 +1477,23 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     let writes = server
         .retained_audit_records(
             tenant,
-            "outcome, audit_principal_id, detail",
+            "outcome, audit_principal_id, detail, credential_id",
             "operation = 'bifrost.record.write'",
         )
         .await?;
     let [
-        [Some(denied), Some(denied_principal), denied_detail],
-        [Some(allowed), Some(allowed_principal), allowed_detail],
+        [
+            Some(denied),
+            Some(denied_principal),
+            denied_detail,
+            denied_credential,
+        ],
+        [
+            Some(allowed),
+            Some(allowed_principal),
+            allowed_detail,
+            allowed_credential,
+        ],
     ] = writes
         .iter()
         .map(Vec::as_slice)
@@ -1532,6 +1518,15 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     assert!(
         allowed_detail.is_none(),
         "B's direct write carries no delegation attribution: {allowed_detail:?}"
+    );
+    assert_eq!(
+        *denied_credential, None,
+        "the delegated refusal names no credential"
+    );
+    assert_eq!(
+        *allowed_credential,
+        Some(b_credential.to_string()),
+        "B's direct write names the API key B authenticated with"
     );
 
     server.shutdown().await?;

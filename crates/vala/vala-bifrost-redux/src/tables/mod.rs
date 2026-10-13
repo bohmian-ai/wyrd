@@ -2,15 +2,24 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit};
+use arrow::array::{Array, AsArray};
+use arrow::datatypes::{
+    DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit,
+};
 use arrow::record_batch::RecordBatch;
+use arrow_schema::extension::ExtensionType;
 use iceberg::spec::{self, NestedField, Type};
+use parquet_variant_compute::VariantType;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use wyrd_queue::variant::EncodedVariant;
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
 };
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
+use wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT;
+use wyrd_types::is_extension_key;
+use wyrd_types::variant::is_variant;
 
 pub mod audit;
 pub mod drift;
@@ -104,49 +113,86 @@ pub fn sort_desc(column: &str) -> SortKeyWire {
     }
 }
 
-/// Builds one built-in physical-layout declaration on daily
-/// `wyrd_event_time`.
+/// Builds one built-in physical-layout declaration partitioned daily on
+/// `time_column`.
 ///
-/// The five verification tables partition by UTC day rather than by hour: one
-/// Verification Result and every one of its detail rows share one
-/// server-chosen event time, and a Drift analysis window is chosen by a
-/// schedule rather than by ingest rate, so an hourly partition would only
-/// fragment the objects a windowed scan reads. Like [`hourly_layout`], the
-/// declaration names only what is specific to the table; the catalog unions
-/// the managed Bloom floor when it resolves.
+/// The verification tables and the audit log partition by UTC day rather than
+/// by hour: a Drift analysis window is chosen by a schedule rather than by
+/// ingest rate, and a Verification Result's detail rows are read by
+/// `result_id`, so an hourly partition would only fragment the objects a
+/// windowed scan reads. Like [`hourly_layout`], the declaration names only
+/// what is specific to the table; the catalog unions the managed Bloom floor
+/// when it resolves.
 #[must_use]
-pub fn daily_layout(sort_keys: Vec<SortKeyWire>, bloom_columns: &[&str]) -> PhysicalLayoutWire {
+pub fn daily_layout(
+    time_column: &str,
+    sort_keys: Vec<SortKeyWire>,
+    bloom_columns: &[&str],
+) -> PhysicalLayoutWire {
     PhysicalLayoutWire {
         partition_granularity: TimeGranularityWire::Day,
+        time_column: Some(time_column.to_owned()),
         sort_keys,
         bloom_columns: bloom_columns.iter().map(|c| (*c).to_owned()).collect(),
     }
 }
 
-/// Builds one built-in physical-layout declaration on hourly
-/// `wyrd_event_time`.
+/// Builds one built-in physical-layout declaration partitioned hourly on
+/// `time_column`.
 ///
-/// Every built-in partitions hourly; only its sort keys and Bloom columns
-/// differ. The catalog resolves the result through the one
+/// The catalog resolves the result through the one
 /// [`crate::catalog::PhysicalLayout::resolve`] entry point a caller
 /// registration uses, which unions the managed Bloom floor, so a built-in
 /// declares only what is specific to it.
 #[must_use]
-pub fn hourly_layout(sort_keys: Vec<SortKeyWire>, bloom_columns: &[&str]) -> PhysicalLayoutWire {
+pub fn hourly_layout(
+    time_column: &str,
+    sort_keys: Vec<SortKeyWire>,
+    bloom_columns: &[&str],
+) -> PhysicalLayoutWire {
     PhysicalLayoutWire {
         partition_granularity: TimeGranularityWire::Hour,
+        time_column: Some(time_column.to_owned()),
         sort_keys,
         bloom_columns: bloom_columns.iter().map(|c| (*c).to_owned()).collect(),
     }
 }
 
-/// A table-owned canonical value validator.
+/// The one hourly layout Scribe's unit fixtures encode under.
 ///
-/// A canonical signal table supplies one of these so the registry can enforce
-/// the value-level rules its Arrow schema alone cannot express — canonical
-/// payload encoding, and for metrics the kind/column agreement — without any
-/// caller matching on a table name.
-pub type CanonicalBatchValidator = fn(&RecordBatch) -> Result<RecordBatch, String>;
+/// Fixture schemas carry a non-null `event_time` timestamp as their time
+/// column; the layout is resolved through [`PhysicalLayout::resolve`], the
+/// path every registered table takes, so the managed Bloom floor is unioned
+/// exactly as in production.
+///
+/// # Panics
+///
+/// Panics when `schema` has no non-null `event_time` timestamp column, which
+/// is a fixture bug.
+#[cfg(test)]
+pub(crate) fn hourly_test_layout(
+    schema: &arrow::datatypes::Schema,
+) -> crate::catalog::PhysicalLayout {
+    crate::catalog::PhysicalLayout::resolve(
+        "vala.bifrost.test",
+        schema,
+        Some(&hourly_layout(
+            "event_time",
+            vec![sort_asc("event_time")],
+            &["event_time"],
+        )),
+    )
+    .expect("fixture schema carries a non-null event_time time column")
+}
+
+/// A table-owned value validator: Scribe's one validation seam for built-ins.
+///
+/// Every built-in carries one, so the registry enforces the rules its storage
+/// fingerprint alone cannot express — the Variant contract, a canonical
+/// signal's exact ledger, and for metrics the kind/column agreement — without
+/// any caller matching on a table name. A refusal is the catalogued error the
+/// caller receives unchanged.
+pub type CanonicalBatchValidator = fn(&RecordBatch) -> Result<RecordBatch, BifrostError>;
 
 /// Canonical immutable definition for one built-in table.
 #[derive(Debug, Clone, Copy)]
@@ -161,8 +207,6 @@ pub struct BuiltinTableDefinition {
     pub payload_class: PayloadClass,
     /// Sensitive payload columns.
     pub sensitive_payload_columns: &'static [&'static str],
-    /// Whether a row may carry an event time older than the ordinary window.
-    pub past_event_time_exempt: bool,
     /// User schema constructor.
     pub arrow_fields: fn() -> Vec<Field>,
     /// User schema fingerprint constructor.
@@ -173,8 +217,8 @@ pub struct BuiltinTableDefinition {
     pub canonical_fields: fn() -> Option<&'static [fields::CanonicalField]>,
     /// Canonical physical fingerprint constructor, `None` when not canonical.
     pub canonical_physical_fingerprint: fn() -> Option<CanonicalPhysicalFingerprint>,
-    /// Canonical value validator, `None` for a pre-declared table.
-    pub canonical_validator: Option<CanonicalBatchValidator>,
+    /// Value validator Scribe runs over every supplied user block.
+    pub canonical_validator: CanonicalBatchValidator,
     /// Engine-owned physical-layout declaration.
     ///
     /// This is the built-in's single statement of partition granularity, sort
@@ -183,6 +227,231 @@ pub struct BuiltinTableDefinition {
     /// row, the Parquet Bloom recipe, and every partition identity — is derived
     /// from that one canonical layout.
     pub physical_layout: fn() -> PhysicalLayoutWire,
+}
+
+/// Enforce the Variant contract over one supplied batch at the trust boundary.
+///
+/// Clients prepare Variant values before sending, but a raw Arrow IPC writer
+/// can skip that. Variant identity — the `arrow.parquet.variant` extension
+/// that storage types drop — is enforced before this by Scribe, which
+/// conforms every batch to the table's registered Iceberg schema. `declared`
+/// is the trusted logical declaration — a built-in's own fields, or a dynamic
+/// table's registered Iceberg schema converted to Arrow — never the supplied
+/// schema. Every present value of a declared field that is or nests a Variant
+/// must pass [`EncodedVariant::from_bytes`], row by row in input order and
+/// field order, so the first failure follows the locked precedence. A
+/// declared field the batch does not supply is left to the fingerprint check.
+/// It reads the batch only and has no side effects.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::UnsupportedType`] naming the field when a declared
+/// Variant's stored column is not the canonical storage struct, and the
+/// catalogued Variant error (size, encoding or canonical form, numeric range,
+/// or depth, in that order) for the first stored value that fails.
+pub(crate) fn validate_declared_variants(
+    declared: &[Field],
+    batch: &RecordBatch,
+) -> Result<(), BifrostError> {
+    let schema = batch.schema();
+    let mut variant_columns = Vec::new();
+    for declared in declared.iter().filter(|declared| holds_variant(declared)) {
+        if let Ok(index) = schema.index_of(declared.name()) {
+            variant_columns.push((declared, Arc::clone(batch.column(index))));
+        }
+    }
+    for index in 0..batch.num_rows() {
+        let row = u64::try_from(index).unwrap_or(u64::MAX);
+        for (declared, column) in &variant_columns {
+            validate_variant_values(declared, declared.name(), column.as_ref(), index, row)?;
+        }
+    }
+    Ok(())
+}
+
+/// The value validator of a pre-declared built-in: its schema, then its
+/// Variant contract.
+///
+/// Checks run in the locked write order, so a request with several defects
+/// reports the earliest. An undeclared column is refused first. A user block
+/// that otherwise differs from the declaration — a missing, reordered, or
+/// differently nullable column, or a non-Variant storage type — is returned
+/// unwalked, so the later schema fingerprint refuses it before any Variant
+/// value is read. Only a block whose names, order, nullability, and storage
+/// types all match goes through [`validate_declared_variants`] and then
+/// [`refuse_partial_structs`] over the table's [`DomainTable::WHOLE_STRUCTS`].
+/// The batch is returned unchanged.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::UndeclaredField`] for an undeclared column and the
+/// refusals of [`validate_declared_variants`] and [`refuse_partial_structs`].
+fn validate_predeclared<T: DomainTable + ?Sized>(
+    batch: &RecordBatch,
+) -> Result<RecordBatch, BifrostError> {
+    let declared = T::arrow_fields();
+    let schema = batch.schema();
+    refuse_undeclared(&declared, &schema)?;
+    let shaped = schema.fields().len() == declared.len()
+        && schema
+            .fields()
+            .iter()
+            .zip(&declared)
+            .all(|(supplied, declared)| {
+                supplied.name() == declared.name()
+                    && supplied.is_nullable() == declared.is_nullable()
+                    && supplied.data_type().equals_datatype(declared.data_type())
+            });
+    if shaped {
+        validate_declared_variants(&declared, batch)?;
+        refuse_partial_structs(batch, T::WHOLE_STRUCTS)?;
+    }
+    Ok(batch.clone())
+}
+
+/// Refuse a row in which a nullable Struct is only partly present.
+///
+/// A nullable built-in Struct's children are physically nullable so a Parquet
+/// read keeps an absent parent's children null, yet the domain value it stores
+/// is wholly present or wholly absent. So in each named Struct column every
+/// child must be valid exactly where the parent is. Callers run this after the
+/// schema check, so a named column that is missing or not a Struct is left to
+/// the schema refusal.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] naming the first row, column, and
+/// child whose validity differs from its parent's.
+pub(crate) fn refuse_partial_structs(
+    batch: &RecordBatch,
+    columns: &[&str],
+) -> Result<(), BifrostError> {
+    for &name in columns {
+        let Some(parent) = batch.column_by_name(name).and_then(|c| c.as_struct_opt()) else {
+            continue;
+        };
+        for row in 0..parent.len() {
+            let present = parent.is_valid(row);
+            if let Some((child, _)) = parent
+                .fields()
+                .iter()
+                .zip(parent.columns())
+                .find(|(_, values)| values.is_valid(row) != present)
+            {
+                return Err(BifrostError::SchemaParse {
+                    detail: format!(
+                        "row {row}: {name}.{} must be null exactly when {name} is null",
+                        child.name()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse the first supplied column a built-in does not declare.
+///
+/// Every built-in validator runs this first, because an undeclared field
+/// outranks every other write refusal.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::UndeclaredField`] naming the first such column.
+pub(crate) fn refuse_undeclared(declared: &[Field], schema: &Schema) -> Result<(), BifrostError> {
+    match schema
+        .fields()
+        .iter()
+        .find(|supplied| !declared.iter().any(|field| field.name() == supplied.name()))
+    {
+        Some(undeclared) => Err(BifrostError::UndeclaredField {
+            field: undeclared.name().clone(),
+            row: 0,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Report whether a declared field is or nests a Variant.
+pub(crate) fn holds_variant(field: &Field) -> bool {
+    is_variant(field)
+        || match field.data_type() {
+            DataType::Struct(children) => children.iter().any(|child| holds_variant(child)),
+            DataType::List(element) => holds_variant(element),
+            _ => false,
+        }
+}
+
+/// The refusal for a declared Variant supplied in another wire type.
+fn unsupported_variant(field: &str, data_type: &DataType) -> BifrostError {
+    BifrostError::UnsupportedType {
+        field: field.to_owned(),
+        data_type: data_type.to_string(),
+    }
+}
+
+/// Validate every Variant value one input row holds under one declaration.
+///
+/// `index` is the position of the value inside `column`: a list descends into
+/// the element range the value owns and a struct into each child at the same
+/// position, so a nested Variant is checked with its own input row. A null at
+/// any level holds no value, which also skips the empty placeholder a Variant
+/// child keeps under a null parent. `label` is the top-level field a refusal
+/// names and `row` the input row.
+///
+/// # Errors
+///
+/// Returns the catalogued Variant error for the first value that cannot be
+/// stored, and [`BifrostError::UnsupportedType`] when a value's storage is not
+/// the declared layout.
+fn validate_variant_values(
+    declared: &Field,
+    label: &str,
+    column: &dyn Array,
+    index: usize,
+    row: u64,
+) -> Result<(), BifrostError> {
+    if column.is_null(index) {
+        return Ok(());
+    }
+    let malformed = || unsupported_variant(label, column.data_type());
+    if is_variant(declared) {
+        let storage = column.as_struct_opt().ok_or_else(malformed)?;
+        let child = |name: &str| {
+            storage
+                .column_by_name(name)
+                .and_then(|bytes| bytes.as_binary_opt::<i32>())
+                .map(|bytes| bytes.value(index))
+        };
+        let (Some(metadata), Some(value)) = (child("metadata"), child("value")) else {
+            return Err(malformed());
+        };
+        return EncodedVariant::from_bytes(metadata, value)
+            .map(drop)
+            .map_err(|violation| violation.into_error(label, row));
+    }
+    match declared.data_type() {
+        DataType::Struct(children) => {
+            let nested = column.as_struct_opt().ok_or_else(malformed)?;
+            children
+                .iter()
+                .zip(nested.columns())
+                .filter(|(child, _)| holds_variant(child))
+                .try_for_each(|(child, values)| {
+                    validate_variant_values(child, label, values.as_ref(), index, row)
+                })
+        }
+        DataType::List(element) => {
+            let list = column.as_list_opt::<i32>().ok_or_else(malformed)?;
+            let offsets = list.value_offsets();
+            let start = usize::try_from(offsets[index]).map_err(|_| malformed())?;
+            let end = usize::try_from(offsets[index + 1]).map_err(|_| malformed())?;
+            (start..end).try_for_each(|item| {
+                validate_variant_values(element, label, list.values().as_ref(), item, row)
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A table definition implemented by the canonical registry.
@@ -197,14 +466,6 @@ pub trait DomainTable: Send + Sync + 'static {
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Standard;
     /// Sensitive payload fields.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[];
-    /// Whether this table accepts event times below the ordinary past window.
-    ///
-    /// A caller-facing signal is refused a stale event time so a
-    /// misconfigured clock cannot backfill history. A server-owned backlog
-    /// that carries its own original decision time sets this instead, because
-    /// the alternative is a backlog that becomes permanently unpublishable
-    /// once it ages past the window.
-    const PAST_EVENT_TIME_EXEMPT: bool = false;
 
     /// The canonical signal ledger, when this table owns an `OTel` signal.
     ///
@@ -218,12 +479,18 @@ pub trait DomainTable: Send + Sync + 'static {
         None
     }
 
-    /// The table-owned canonical value validator, when this table is canonical.
+    /// The table-owned value validator Scribe runs over every user block.
     ///
     /// A canonical signal table sets this to the function that enforces its
-    /// value-level rules; a pre-declared table leaves it `None` and is value
-    /// validated by its declared Arrow schema alone.
-    const CANONICAL_VALIDATOR: Option<CanonicalBatchValidator> = None;
+    /// ledger and value-level rules; a pre-declared table keeps the Variant
+    /// contract over its declared Arrow fields.
+    const CANONICAL_VALIDATOR: CanonicalBatchValidator = validate_predeclared::<Self>;
+
+    /// Nullable Struct columns whose value is wholly present or wholly absent.
+    ///
+    /// The pre-declared validator refuses a row that sets only some children
+    /// of one of these columns; see [`refuse_partial_structs`].
+    const WHOLE_STRUCTS: &'static [&'static str] = &[];
 
     /// User-owned fields, excluding correlation and system fields.
     fn arrow_fields() -> Vec<Field>;
@@ -272,11 +539,11 @@ pub trait DomainTable: Send + Sync + 'static {
 
     /// Engine-owned physical-layout declaration.
     ///
-    /// Defaults to hourly `wyrd_event_time` with no additional Bloom intent,
-    /// which resolves to `wyrd_event_time DESC NULLS LAST` and the managed
+    /// Defaults to hourly `wyrd_ingested_at` with no additional Bloom intent,
+    /// which resolves to `wyrd_ingested_at DESC NULLS LAST` and the managed
     /// Bloom floor.
     fn physical_layout() -> PhysicalLayoutWire {
-        hourly_layout(vec![sort_desc(WYRD_EVENT_TIME)], &[])
+        hourly_layout(WYRD_INGESTED_AT, Vec::new(), &[])
     }
 }
 
@@ -379,6 +646,127 @@ pub fn iceberg_schema_for(schema: &Schema) -> Result<iceberg::spec::Schema, iceb
     }
 }
 
+/// Returns `field` as Bifrost stores it, or `None` when no column stores it.
+///
+/// Every zoned timestamp, nested ones included, is relabelled with the
+/// stored `+00:00` zone: Arrow stores a zoned timestamp as UTC epoch time
+/// whatever its label, so the label only says how to display it and the
+/// relabelled column holds the same instants. A naive timestamp keeps no
+/// zone; it is a different Iceberg type. A field naming the Variant
+/// extension with parameters is not the canonical Variant, which iceberg-rust
+/// would still accept by name, so it is refused here. Registration
+/// ([`iceberg_form`]) and Scribe's write-path type comparison both convert
+/// through this, so a declaration and a write agree on every zone label.
+pub(crate) fn as_stored(field: &Field) -> Option<Field> {
+    if field.extension_type_name() == Some(VariantType::NAME) && !is_variant(field) {
+        return None;
+    }
+    let child = |child: &FieldRef| as_stored(child).map(Arc::new);
+    let data_type = match field.data_type() {
+        DataType::Timestamp(unit, Some(_)) => {
+            DataType::Timestamp(*unit, Some(iceberg::arrow::UTC_TIME_ZONE.into()))
+        }
+        DataType::List(item) => DataType::List(child(item)?),
+        DataType::LargeList(item) => DataType::LargeList(child(item)?),
+        DataType::FixedSizeList(item, len) => DataType::FixedSizeList(child(item)?, *len),
+        DataType::Struct(children) => {
+            DataType::Struct(children.iter().map(child).collect::<Option<_>>()?)
+        }
+        DataType::Map(entries, sorted) => DataType::Map(child(entries)?, *sorted),
+        other => other.clone(),
+    };
+    Some(field.clone().with_data_type(data_type))
+}
+
+/// Reports whether two Arrow fields convert to the same Iceberg column type.
+///
+/// Each field is converted alone by iceberg-rust with fresh field ids, and
+/// only the column's Iceberg type is compared: nesting, nested nullability,
+/// and Variant identity count, while either side's ids, docs, and top-level
+/// nullability do not. The sent field first goes through [`as_stored`], so a
+/// writer's display zone never decides the column and a parameterized
+/// Variant marker matches nothing. A field Iceberg cannot represent matches
+/// nothing. Scribe's write path and the catalog's physical-table check both
+/// compare through this one function.
+pub(crate) fn same_iceberg_type(sent: &Field, registered: &Field) -> bool {
+    let iceberg = |field: Field| {
+        let schema =
+            iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&Schema::new(vec![field]))
+                .ok()?;
+        schema
+            .as_struct()
+            .fields()
+            .first()
+            .map(|column| column.field_type.clone())
+    };
+    match (
+        as_stored(sent).and_then(iceberg),
+        iceberg(registered.clone()),
+    ) {
+        (Some(sent), Some(registered)) => sent == registered,
+        _ => false,
+    }
+}
+
+/// Return the one Arrow form Bifrost stores for a declared column.
+///
+/// Iceberg is the schema authority: the declaration is converted to its
+/// Iceberg column and back with iceberg-rust's own conversions, so every
+/// spelling of one Iceberg type — `Int8` and `Int32`, any zone and `+00:00`,
+/// `LargeUtf8` and `Utf8`, a list element named `item` and `element` — leaves
+/// as the single Arrow type Iceberg reads it as. Registration stores, describes,
+/// and fingerprints only this form, so a table cannot carry a declared type
+/// that differs from its physical one. The ids the round trip assigns are
+/// dropped, because the registered table, not a declaration, owns field ids;
+/// every other metadata entry Iceberg keeps, such as a Variant's extension
+/// type, stays.
+///
+/// # Errors
+///
+/// Returns the Iceberg conversion error when the column has no Iceberg type,
+/// including a Variant extension marker with parameters.
+pub fn iceberg_form(declared: &Field) -> Result<Field, iceberg::Error> {
+    let declared = as_stored(declared).ok_or_else(|| {
+        iceberg::Error::new(
+            iceberg::ErrorKind::DataInvalid,
+            format!(
+                "`{}` names the Variant extension with parameters",
+                declared.name()
+            ),
+        )
+    })?;
+    let stored = iceberg::arrow::schema_to_arrow_schema(
+        &iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&Schema::new(vec![declared]))?,
+    )?;
+    Ok(without_field_id(&stored.fields()[0]))
+}
+
+/// Strip `PARQUET:field_id` from `field` and from every nested child.
+///
+/// Every other metadata entry and the field's name, type, and nullability are
+/// kept, so only the id assignment is removed.
+fn without_field_id(field: &Field) -> Field {
+    let data_type = match field.data_type() {
+        DataType::List(element) => DataType::List(Arc::new(without_field_id(element))),
+        DataType::Map(entries, sorted) => {
+            DataType::Map(Arc::new(without_field_id(entries)), *sorted)
+        }
+        DataType::Struct(children) => DataType::Struct(
+            children
+                .iter()
+                .map(|child| without_field_id(child))
+                .collect(),
+        ),
+        other => other.clone(),
+    };
+    let mut metadata = field.metadata().clone();
+    metadata.remove(fields::PARQUET_FIELD_ID);
+    field
+        .clone()
+        .with_data_type(data_type)
+        .with_metadata(metadata)
+}
+
 /// Report whether every top-level field carries a registered field id.
 ///
 /// An empty schema carries none, which keeps the automatic assignment for the
@@ -453,6 +841,9 @@ fn with_registered_id(field: &Field, registered: &NestedField) -> Result<Field, 
         ))
     };
     let data_type = match (field.data_type(), registered.field_type.as_ref()) {
+        // A Variant's `metadata`/`value` storage children carry no Iceberg
+        // field ids: the Variant is one logical Iceberg field.
+        (DataType::Struct(_), Type::Variant(_)) if is_variant(field) => field.data_type().clone(),
         (DataType::List(element), Type::List(list)) => {
             DataType::List(Arc::new(with_registered_id(element, &list.element_field)?))
         }
@@ -495,7 +886,9 @@ fn with_registered_id(field: &Field, registered: &NestedField) -> Result<Field, 
             DataType::List(_) | DataType::LargeList(_) | DataType::Struct(_) | DataType::Map(..),
             _,
         )
-        | (_, Type::List(_) | Type::Struct(_) | Type::Map(_)) => return Err(mismatch()),
+        | (_, Type::List(_) | Type::Struct(_) | Type::Map(_) | Type::Variant(_)) => {
+            return Err(mismatch());
+        }
         (scalar, _) => scalar.clone(),
     };
     let mut metadata = field.metadata().clone();
@@ -530,6 +923,14 @@ pub fn restamp_field_identity(
 }
 
 /// Recursively retype one array's data to `target`, children included.
+///
+/// A `List` element and a `Map`'s entries struct are each the single child, so
+/// both recurse through the same arm.
+///
+/// # Errors
+///
+/// Returns the Arrow validation error when the retyped data does not describe
+/// its own buffers.
 fn retype(
     data: arrow::array::ArrayData,
     target: &arrow::datatypes::DataType,
@@ -537,7 +938,7 @@ fn retype(
     use arrow::datatypes::DataType;
 
     let children = match target {
-        DataType::List(element) => data
+        DataType::List(element) | DataType::Map(element, _) => data
             .child_data()
             .iter()
             .map(|child| retype(child.clone(), element.data_type()))
@@ -556,63 +957,6 @@ fn retype(
         .build()
 }
 
-/// Report whether an actual Arrow type is the expected one after a storage
-/// round trip.
-///
-/// The installed Iceberg conversion normalizes some Arrow types on the way
-/// back — a binary or string column widens to its large variant, a list may
-/// return as a large list, and a zoned timestamp may return as `+00:00` — so a
-/// physical table's schema is compared by shape rather than by exact equality.
-/// Nested children are compared by name, never by position.
-#[must_use]
-pub fn arrow_type_shape_matches(
-    expected: &arrow::datatypes::DataType,
-    actual: &arrow::datatypes::DataType,
-) -> bool {
-    use arrow::datatypes::DataType as Arrow;
-    if expected.equals_datatype(actual) {
-        return true;
-    }
-    match (expected, actual) {
-        (Arrow::Binary, Arrow::LargeBinary)
-        | (Arrow::LargeBinary, Arrow::Binary)
-        | (Arrow::Utf8, Arrow::LargeUtf8)
-        | (Arrow::LargeUtf8, Arrow::Utf8) => true,
-        (
-            Arrow::List(expected) | Arrow::LargeList(expected),
-            Arrow::List(actual) | Arrow::LargeList(actual),
-        ) => {
-            expected.is_nullable() == actual.is_nullable()
-                && arrow_type_shape_matches(expected.data_type(), actual.data_type())
-        }
-        (Arrow::Struct(expected), Arrow::Struct(actual)) => {
-            expected.len() == actual.len()
-                && expected.iter().all(|field| {
-                    actual
-                        .iter()
-                        .find(|candidate| candidate.name() == field.name())
-                        .is_some_and(|candidate| {
-                            field.is_nullable() == candidate.is_nullable()
-                                && arrow_type_shape_matches(
-                                    field.data_type(),
-                                    candidate.data_type(),
-                                )
-                        })
-                })
-        }
-        (
-            arrow::datatypes::DataType::Timestamp(expected_unit, Some(expected_timezone)),
-            arrow::datatypes::DataType::Timestamp(actual_unit, Some(actual_timezone)),
-        ) => {
-            expected_unit == actual_unit
-                && ((expected_timezone.as_ref() == "UTC" && actual_timezone.as_ref() == "+00:00")
-                    || (expected_timezone.as_ref() == "+00:00"
-                        && actual_timezone.as_ref() == "UTC"))
-        }
-        _ => false,
-    }
-}
-
 /// Version byte prefixing every canonical physical fingerprint encoding.
 ///
 /// Any change to the encoding below must take the next unused version byte so
@@ -623,9 +967,11 @@ const CANONICAL_FINGERPRINT_VERSION: u8 = 2;
 ///
 /// The encoding is a version byte, the top-level field count, and then each
 /// field in declared order as: length-prefixed name, type bytes, nullability,
-/// sensitivity, its metadata entries other than `PARQUET:field_id` in
-/// ascending raw key-byte order, and finally its nested child count followed
-/// depth-first by the same record for each child. Every count and length is an
+/// sensitivity, its metadata entries other than `PARQUET:field_id` and the
+/// Arrow extension keys in ascending raw key-byte order, and finally its
+/// nested child count followed depth-first by the same record for each child.
+/// A Variant field writes the single tag `0x0d` and a zero child count, so
+/// only the logical schema is committed. Every count and length is an
 /// unsigned big-endian `u32`; fixed-binary widths are signed big-endian `i32`.
 /// Field ids are excluded because the registered Iceberg table, not the
 /// declaration, owns them.
@@ -663,15 +1009,20 @@ fn encode_field_sequence(fields: &Fields, out: &mut Vec<u8>) -> Result<(), Table
 /// Returns [`TableError::Internal`] when the field lacks a sensitivity marker
 /// or its type has no pinned tag.
 fn encode_field(field: &Field, out: &mut Vec<u8>) -> Result<(), TableError> {
+    let variant = is_variant(field);
     encode_len_prefixed(field.name().as_bytes(), out)?;
-    encode_data_type(field.data_type(), out)?;
+    if variant {
+        out.push(VARIANT_TYPE_TAG);
+    } else {
+        encode_data_type(field.data_type(), out)?;
+    }
     out.push(u8::from(field.is_nullable()));
     out.push(u8::from(sensitivity(field)?));
 
     let mut entries: Vec<(&String, &String)> = field
         .metadata()
         .iter()
-        .filter(|(key, _)| key.as_str() != fields::PARQUET_FIELD_ID)
+        .filter(|(key, _)| key.as_str() != fields::PARQUET_FIELD_ID && !is_extension_key(key))
         .collect();
     out.extend_from_slice(&count_u32(entries.len())?.to_be_bytes());
     entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
@@ -680,13 +1031,24 @@ fn encode_field(field: &Field, out: &mut Vec<u8>) -> Result<(), TableError> {
         encode_len_prefixed(value.as_bytes(), out)?;
     }
 
-    let children = child_fields(field.data_type());
+    let children = if variant {
+        None
+    } else {
+        child_fields(field.data_type())
+    };
     match children {
         Some(children) => encode_field_sequence(&children, out)?,
         None => out.extend_from_slice(&0_u32.to_be_bytes()),
     }
     Ok(())
 }
+
+/// Fingerprint tag of a Variant field.
+///
+/// A Variant commits only this byte: no storage children and no extension
+/// metadata, so per-file shredding layouts and the storage spelling of the
+/// `metadata`/`value` struct never change a table's fingerprint.
+const VARIANT_TYPE_TAG: u8 = 0x0d;
 
 /// Encode one pinned type tag and its inline parameters.
 ///
@@ -809,7 +1171,6 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
         correlation_policy: T::CORRELATION_POLICY,
         payload_class: T::PAYLOAD_CLASS,
         sensitive_payload_columns: T::SENSITIVE_PAYLOAD_COLUMNS,
-        past_event_time_exempt: T::PAST_EVENT_TIME_EXEMPT,
         arrow_fields: T::arrow_fields,
         schema_fingerprint: T::schema_fingerprint,
         schema: T::schema,
@@ -859,16 +1220,24 @@ pub fn builtin_fqns() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{
+        ArrayRef, BinaryArray, Int64Array, StringArray, StructArray, make_array, new_null_array,
+    };
+    use arrow::buffer::NullBuffer;
     use arrow::datatypes::{DataType, TimeUnit as ArrowTimeUnit};
     use arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use verification::{EVAL_SUMMARY, ResultsTable};
     use wyrd_tonic::otlp::common::v1::any_value::Value;
     use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue};
 
     use super::*;
     use fields::{boolean, float64, int32, int64, ts_us_utc, utf8};
+    use wyrd_queue::variant::VariantViolation;
+    use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
     use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
+    use wyrd_types::variant::variant_field;
 
     /// The registry owns three `OTel` signal tables and no removed physical name.
     ///
@@ -927,12 +1296,27 @@ mod tests {
         assert_eq!((spans.schema)(), SpansTable::schema());
     }
 
-    /// Every built-in keeps its managed columns, a stable fingerprint, and the
-    /// partition granularity pinned for its namespace and name.
+    /// The wire zone clients and the server spell stored timestamps with is
+    /// the one iceberg-rust reads a `timestamptz` back with.
     ///
     /// # Panics
     ///
-    /// Panics when a built-in declares no pinned granularity or drifts from it.
+    /// Panics when the two spellings differ.
+    #[test]
+    fn the_wire_utc_zone_is_icebergs() {
+        assert_eq!(
+            wyrd_spec::vala::api::UTC_TIME_ZONE,
+            iceberg::arrow::UTC_TIME_ZONE
+        );
+    }
+
+    /// Every built-in keeps its managed columns and a stable fingerprint, and
+    /// carries no tenant row column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a built-in's fingerprint is unset or unstable, or its
+    /// physical schema lacks `wyrd_ingested_at` or carries a tenant column.
     #[test]
     fn every_builtin_has_stable_schema_fingerprint_and_physical_columns() {
         for definition in builtin_tables() {
@@ -945,33 +1329,73 @@ mod tests {
             );
             assert_eq!(fingerprint, fingerprint_fields(&fields));
             let schema = (definition.schema)();
-            assert!(schema.field_with_name(WYRD_EVENT_TIME).is_ok());
+            assert!(schema.field_with_name(WYRD_INGESTED_AT).is_ok());
             assert!(schema.field_with_name("data_tenant_id").is_err());
-            // Continuous high-rate OTel signals and gateway calls partition hourly. Retained
-            // audit history and the five verification tables partition daily:
-            // both are low-rate, both are read over date ranges rather than a
-            // recent window, and a Verification Result plus all of its detail
-            // rows share one event time and must never split across partitions.
-            let expected = match (definition.namespace, definition.name) {
-                ("traces", "spans")
-                | ("metrics", "points")
-                | ("logs", "records")
-                | ("gateway", "calls") => TimeGranularityWire::Hour,
-                ("system", "audit_log")
-                | ("drift", "observations" | "result_features")
-                | ("eval", "observations" | "result_items")
-                | ("verification", "results") => TimeGranularityWire::Day,
-                (namespace, name) => {
-                    panic!("vala.{namespace}.{name} declares no pinned partition granularity")
+        }
+    }
+
+    /// Every built-in partitions and sorts on its pinned time column.
+    ///
+    /// Continuous high-rate `OTel` signals and gateway calls partition hourly;
+    /// retained audit history and the five verification tables are low-rate,
+    /// read over date ranges, and partition daily. Each
+    /// table's time column is a non-null timestamp in its own schema, OTLP
+    /// instants are nanosecond UTC, and the resolved layout leads its sort
+    /// order with that column descending.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a built-in declares no pinned time column, or drifts from
+    /// its pinned column, granularity, type, or leading sort key.
+    #[test]
+    fn every_builtin_partitions_and_sorts_on_its_time_column() {
+        let otlp_instant = DataType::Timestamp(ArrowTimeUnit::Nanosecond, Some("+00:00".into()));
+        for definition in builtin_tables() {
+            let fqn = format!("vala.{}.{}", definition.namespace, definition.name);
+            let (column, granularity) = match (definition.namespace, definition.name) {
+                ("traces", "spans") => ("start_time_unix_nano", TimeGranularityWire::Hour),
+                ("metrics", "points") | ("logs", "records") => {
+                    ("time_unix_nano", TimeGranularityWire::Hour)
                 }
+                ("gateway", "calls") => ("started_at", TimeGranularityWire::Hour),
+                ("drift" | "eval", "observations") | ("system", "audit_log") => {
+                    ("created_at", TimeGranularityWire::Day)
+                }
+                ("verification", "results") => ("ended_at", TimeGranularityWire::Day),
+                ("drift", "result_features") | ("eval", "result_items") => {
+                    (WYRD_INGESTED_AT, TimeGranularityWire::Day)
+                }
+                _ => panic!("{fqn} declares no pinned time column"),
             };
-            assert_eq!(
-                (definition.physical_layout)().partition_granularity,
-                expected,
-                "{}.{}",
-                definition.namespace,
-                definition.name
+            let declared = (definition.physical_layout)();
+            assert_eq!(declared.time_column.as_deref(), Some(column), "{fqn}");
+            assert_eq!(declared.partition_granularity, granularity, "{fqn}");
+            let schema = (definition.schema)();
+            let field = schema
+                .field_with_name(column)
+                .unwrap_or_else(|_| panic!("{fqn} has its time column {column}"));
+            assert!(!field.is_nullable(), "{fqn}.{column} is non-null");
+            assert!(
+                crate::catalog::TimePrecision::of(field.data_type()).is_some(),
+                "{fqn}.{column} is a µs or ns timestamp"
             );
+            if definition.namespace == "traces"
+                || definition.namespace == "metrics"
+                || definition.namespace == "logs"
+            {
+                assert_eq!(field.data_type(), &otlp_instant, "{fqn}.{column}");
+            }
+            let resolved =
+                crate::catalog::layout::PhysicalLayout::resolve(&fqn, &schema, Some(&declared))
+                    .unwrap_or_else(|error| panic!("{fqn} resolves: {error}"));
+            assert_eq!(resolved.time_column(), column, "{fqn}");
+            let first = resolved.sort_keys().first().expect("a leading sort key");
+            assert_eq!(
+                first.column(),
+                column,
+                "{fqn} sorts first on its time column"
+            );
+            assert!(first.is_descending(), "{fqn} sorts newest first");
         }
     }
 
@@ -1009,36 +1433,15 @@ mod tests {
                 columns: vec![
                     utf8("record_id", false),
                     utf8("session_id", true),
-                    utf8("context", false),
+                    variant_field("context", false),
                     fields::fixed_binary("trace_id", 16, true),
                     fields::fixed_binary("span_id", 8, true),
                     ts_us_utc("created_at", false),
-                    utf8("media", true),
+                    variant_field("media", true),
                 ],
                 blooms: &[],
             },
-            VerificationContract {
-                namespace: "verification",
-                name: "results",
-                columns: vec![
-                    utf8("result_id", false),
-                    utf8("implementation", false),
-                    utf8("execution_status", false),
-                    utf8("verdict", false),
-                    utf8("verifier_version", false),
-                    utf8("owner_card_uid", true),
-                    utf8("subject_card_uid", false),
-                    utf8("binding_id", true),
-                    utf8("trigger_identity", true),
-                    utf8("source_record_id", true),
-                    ts_us_utc("window_start", true),
-                    ts_us_utc("window_end", true),
-                    ts_us_utc("started_at", false),
-                    ts_us_utc("ended_at", false),
-                    utf8("details", true),
-                ],
-                blooms: &["result_id", "subject_card_uid", "binding_id"],
-            },
+            verification_results_contract(),
             VerificationContract {
                 namespace: "drift",
                 name: "result_features",
@@ -1069,8 +1472,8 @@ mod tests {
                     utf8("task_id", false),
                     utf8("outcome_kind", false),
                     boolean("passed", true),
-                    utf8("actual", true),
-                    utf8("expected", true),
+                    variant_field("actual", true),
+                    variant_field("expected", true),
                     utf8("operator", true),
                     utf8("message", true),
                     int32("stage", true),
@@ -1084,13 +1487,67 @@ mod tests {
         ]
     }
 
+    /// The approved contract for `verification.results`, whose typed
+    /// summaries are nullable Structs written exclusively per implementation,
+    /// and whose task result is one nullable `AssertionResult` Variant.
+    fn verification_results_contract() -> VerificationContract {
+        VerificationContract {
+            namespace: "verification",
+            name: "results",
+            columns: vec![
+                utf8("result_id", false),
+                utf8("implementation", false),
+                utf8("execution_status", false),
+                utf8("verdict", false),
+                utf8("verifier_version", false),
+                utf8("owner_card_uid", true),
+                utf8("subject_card_uid", false),
+                utf8("binding_id", true),
+                utf8("trigger_identity", true),
+                utf8("source_record_id", true),
+                ts_us_utc("window_start", true),
+                ts_us_utc("window_end", true),
+                ts_us_utc("started_at", false),
+                ts_us_utc("ended_at", false),
+                Field::new(
+                    "drift_report",
+                    DataType::Struct(
+                        vec![
+                            utf8("method", true),
+                            variant_field("features", true),
+                            utf8("verdict", true),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ),
+                Field::new(
+                    "eval_summary",
+                    DataType::Struct(
+                        vec![
+                            int32("total_tasks", true),
+                            int32("passed_tasks", true),
+                            int32("failed_tasks", true),
+                            float64("pass_rate", true),
+                            int64("duration_ms", true),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ),
+                variant_field("assertion_result", true),
+            ],
+            blooms: &["result_id", "subject_card_uid", "binding_id"],
+        }
+    }
+
     /// The managed envelope Bifrost appends after a verification table's
     /// authored columns, in physical order.
     ///
     /// This is the `CorrelationPolicy::Observation` envelope the Bifrost design
     /// fixes for every table: nullable `run_id` and `card_uid`, the required
-    /// publisher `principal_id`, and the required request, event-time, and
-    /// ingestion-time columns. The tenant is a property of
+    /// publisher `principal_id`, and the required request and ingestion-time
+    /// columns. The tenant is a property of
     /// the physical table and of each Parquet footer, never a row column, and
     /// Bifrost stamps no per-row position.
     fn verification_managed_envelope() -> Vec<Field> {
@@ -1099,7 +1556,6 @@ mod tests {
             utf8(CARD_UID, true),
             utf8(PRINCIPAL_ID, false),
             utf8(wyrd_spec::vala::WYRD_REQUEST_ID, false),
-            ts_us_utc(WYRD_EVENT_TIME, false),
             ts_us_utc(WYRD_INGESTED_AT, false),
         ]
     }
@@ -1113,7 +1569,7 @@ mod tests {
     /// them and dashboards query them — so a reordered, retyped, renamed, or
     /// newly nullable column is a breaking change rather than an
     /// implementation detail. Pinning the whole physical list here, including
-    /// nullable `owner_card_uid` and Drift `details`, is what makes that break
+    /// nullable `owner_card_uid` and the typed `drift_report`, is what makes that break
     /// fail in this crate instead of at a caller's insert.
     ///
     /// # Panics
@@ -1231,8 +1687,18 @@ mod tests {
     fn physical_layout_contract_all_builtins() {
         let dynamic_schema = Schema::new(vec![
             Field::new(
-                WYRD_EVENT_TIME,
+                "event_time",
+                DataType::Timestamp(ArrowTimeUnit::Nanosecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(
+                "updated_at",
                 DataType::Timestamp(ArrowTimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                WYRD_INGESTED_AT,
+                DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("+00:00".into())),
                 false,
             ),
             Field::new(RUN_ID, DataType::Utf8, true),
@@ -1329,10 +1795,11 @@ mod tests {
     /// built-ins use.
     ///
     /// Covers the three legal shapes: omission resolving to the hourly
-    /// event-time default with the managed floor, an explicit empty declaration
-    /// resolving to the same sort order as omission because the system injects
-    /// nothing, and a custom declaration keeping its own order while unioning
-    /// the managed floor.
+    /// `wyrd_ingested_at` default with the managed floor, an explicit empty
+    /// declaration resolving to the same time column and sort order as
+    /// omission because the system injects nothing, and a custom declaration
+    /// naming its own nanosecond time column and keeping its own order while
+    /// unioning the managed floor.
     ///
     /// # Panics
     ///
@@ -1341,8 +1808,8 @@ mod tests {
         // Dynamic declarations share the same resolution. The fixture schema
         // carries the full managed floor plus one user column.
 
-        // Omission resolves to the hourly event-time default with the managed
-        // floor and nothing else.
+        // Omission resolves to the hourly `wyrd_ingested_at` default, sorted
+        // newest first, with the managed floor and nothing else.
         let omitted = crate::catalog::layout::PhysicalLayout::resolve(table, dynamic_schema, None)
             .expect("omitted layout resolves to the default");
         assert_eq!(
@@ -1355,8 +1822,10 @@ mod tests {
                 .iter()
                 .map(|key| key.column().to_owned())
                 .collect::<Vec<_>>(),
-            vec![WYRD_EVENT_TIME.to_owned()]
+            vec![WYRD_INGESTED_AT.to_owned()]
         );
+        assert_eq!(omitted.time_column(), WYRD_INGESTED_AT);
+        assert!(omitted.sort_keys()[0].is_descending());
         assert_eq!(
             omitted.bloom_columns(),
             crate::catalog::layout::MANAGED_BLOOM_FLOOR
@@ -1370,6 +1839,7 @@ mod tests {
         // the sort order, because nothing is injected ahead of a declared key.
         let explicit_empty = PhysicalLayoutWire {
             partition_granularity: TimeGranularityWire::Day,
+            time_column: None,
             sort_keys: Vec::new(),
             bloom_columns: Vec::new(),
         };
@@ -1383,6 +1853,7 @@ mod tests {
             empty.granularity(),
             crate::catalog::layout::TimeGranularity::Day
         );
+        assert_eq!(empty.time_column(), omitted.time_column());
         assert_eq!(empty.sort_keys(), omitted.sort_keys());
         assert_eq!(empty.bloom_columns(), omitted.bloom_columns());
 
@@ -1390,7 +1861,8 @@ mod tests {
         // unions rather than replaces the managed Bloom floor.
         let custom = PhysicalLayoutWire {
             partition_granularity: TimeGranularityWire::Hour,
-            sort_keys: vec![sort_desc("customer"), sort_asc(WYRD_EVENT_TIME)],
+            time_column: Some("event_time".to_owned()),
+            sort_keys: vec![sort_desc("customer"), sort_asc("event_time")],
             bloom_columns: vec!["customer".to_owned()],
         };
         let resolved =
@@ -1403,8 +1875,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             sort_columns,
-            vec!["customer".to_owned(), WYRD_EVENT_TIME.to_owned()]
+            vec!["customer".to_owned(), "event_time".to_owned()]
         );
+        assert_eq!(resolved.time_column(), "event_time");
         assert!(resolved.bloom_columns().contains(&"customer".to_owned()));
         for column in crate::catalog::layout::MANAGED_BLOOM_FLOOR {
             assert!(resolved.bloom_columns().contains(&column.to_owned()));
@@ -1430,6 +1903,7 @@ mod tests {
                 "unknown sort column",
                 PhysicalLayoutWire {
                     partition_granularity: TimeGranularityWire::Hour,
+                    time_column: None,
                     sort_keys: vec![sort_asc("absent")],
                     bloom_columns: Vec::new(),
                 },
@@ -1438,6 +1912,7 @@ mod tests {
                 "duplicate sort column",
                 PhysicalLayoutWire {
                     partition_granularity: TimeGranularityWire::Hour,
+                    time_column: None,
                     sort_keys: vec![sort_asc("customer"), sort_desc("customer")],
                     bloom_columns: Vec::new(),
                 },
@@ -1446,8 +1921,9 @@ mod tests {
                 "a fifth declared sort key",
                 PhysicalLayoutWire {
                     partition_granularity: TimeGranularityWire::Hour,
+                    time_column: None,
                     sort_keys: vec![
-                        sort_asc(WYRD_EVENT_TIME),
+                        sort_asc("event_time"),
                         sort_asc(RUN_ID),
                         sort_asc("customer"),
                         sort_asc(CARD_UID),
@@ -1460,6 +1936,7 @@ mod tests {
                 "unknown bloom column",
                 PhysicalLayoutWire {
                     partition_granularity: TimeGranularityWire::Hour,
+                    time_column: None,
                     sort_keys: Vec::new(),
                     bloom_columns: vec!["absent".to_owned()],
                 },
@@ -1468,8 +1945,36 @@ mod tests {
                 "duplicate bloom column",
                 PhysicalLayoutWire {
                     partition_granularity: TimeGranularityWire::Hour,
+                    time_column: None,
                     sort_keys: Vec::new(),
                     bloom_columns: vec!["customer".to_owned(), "customer".to_owned()],
+                },
+            ),
+            (
+                "unknown time column",
+                PhysicalLayoutWire {
+                    partition_granularity: TimeGranularityWire::Hour,
+                    time_column: Some("absent".to_owned()),
+                    sort_keys: Vec::new(),
+                    bloom_columns: Vec::new(),
+                },
+            ),
+            (
+                "non-timestamp time column",
+                PhysicalLayoutWire {
+                    partition_granularity: TimeGranularityWire::Hour,
+                    time_column: Some("customer".to_owned()),
+                    sort_keys: Vec::new(),
+                    bloom_columns: Vec::new(),
+                },
+            ),
+            (
+                "nullable time column",
+                PhysicalLayoutWire {
+                    partition_granularity: TimeGranularityWire::Hour,
+                    time_column: Some("updated_at".to_owned()),
+                    sort_keys: Vec::new(),
+                    bloom_columns: Vec::new(),
                 },
             ),
         ];
@@ -1480,13 +1985,16 @@ mod tests {
                 Some(&declared),
             )
             .expect_err(label);
-            assert!(
-                matches!(
-                    error,
-                    wyrd_spec::vala::BifrostError::InvalidPhysicalLayout { .. }
-                ),
-                "{label} must fail as an invalid physical layout, got {error:?}"
-            );
+            let wyrd_spec::vala::BifrostError::InvalidPhysicalLayout { field, .. } = error else {
+                panic!("{label} must fail as an invalid physical layout, got {error:?}");
+            };
+            if label.ends_with("time column") {
+                assert_eq!(
+                    field,
+                    wyrd_spec::vala::PhysicalLayoutField::TimeColumn,
+                    "{label} must name the time_column field"
+                );
+            }
         }
     }
 
@@ -1605,62 +2113,23 @@ mod tests {
         }]
     }
 
-    /// Recursively assert two field sequences agree by declared identity.
+    /// Assert two field lists have one exact Arrow layout.
     ///
-    /// Binding is by name, never by position, so a reordering
-    /// storage layer cannot silently pass.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a declared field is missing from `actual`, or when its type
-    /// or nullability differs.
-    fn assert_identity_matches(expected: &Fields, actual: &Fields, context: &str) {
-        assert_eq!(
-            expected.len(),
-            actual.len(),
-            "{context} keeps its declared field count"
-        );
-        for field in expected {
-            let found = actual
-                .iter()
-                .find(|candidate| candidate.name() == field.name())
-                .unwrap_or_else(|| panic!("{context} keeps field {}", field.name()));
-            assert_field_pair(field, found, context);
-        }
-    }
-
-    /// Assert one declared field and its round-tripped counterpart agree.
-    ///
-    /// A list's single element is matched positionally because the Iceberg
-    /// projection renames it to `element`; everything else is matched by name.
+    /// Built-ins declare Iceberg's own Arrow form, so every storage leg must
+    /// return exactly the declared names, order, nullability, and types at
+    /// every depth. Metadata is ignored because it changes no buffer.
     ///
     /// # Panics
     ///
-    /// Panics when the nullability, type shape, or any nested child differs.
-    fn assert_field_pair(expected: &Field, actual: &Field, context: &str) {
+    /// Panics when any name, position, nullability, or type differs.
+    fn assert_same_layout(expected: &Fields, actual: &Fields, context: &str) {
         assert_eq!(
-            expected.is_nullable(),
-            actual.is_nullable(),
-            "{context} keeps the nullability of {}",
-            expected.name()
+            crate::schema::SchemaFingerprint::from_arrow_schema_exact(&Schema::new(
+                expected.clone()
+            )),
+            crate::schema::SchemaFingerprint::from_arrow_schema_exact(&Schema::new(actual.clone())),
+            "{context} keeps its exact layout: {expected:#?} became {actual:#?}"
         );
-        assert!(
-            arrow_type_shape_matches(expected.data_type(), actual.data_type()),
-            "{context} keeps the type of {}: {:?} became {:?}",
-            expected.name(),
-            expected.data_type(),
-            actual.data_type()
-        );
-        match (expected.data_type(), actual.data_type()) {
-            (
-                DataType::List(expected_child) | DataType::LargeList(expected_child),
-                DataType::List(actual_child) | DataType::LargeList(actual_child),
-            ) => assert_field_pair(expected_child, actual_child, context),
-            (DataType::Struct(expected_children), DataType::Struct(actual_children)) => {
-                assert_identity_matches(expected_children, actual_children, context);
-            }
-            _ => {}
-        }
     }
 
     /// Round-trip one canonical batch through Arrow IPC and read it back.
@@ -1775,11 +2244,11 @@ mod tests {
             assert!(batch.num_rows() > 0, "{label} fixture produces rows");
 
             let ipc = ipc_round_trip(&batch);
-            assert_identity_matches(&declared, ipc.schema().fields(), label);
+            assert_same_layout(&declared, ipc.schema().fields(), label);
             assert_eq!(ipc, batch, "{label} keeps every value through IPC");
 
             let parquet = parquet_round_trip(&batch);
-            assert_identity_matches(&declared, parquet.schema().fields(), label);
+            assert_same_layout(&declared, parquet.schema().fields(), label);
             assert_eq!(
                 parquet.columns(),
                 batch.columns(),
@@ -1790,7 +2259,7 @@ mod tests {
                 .expect("the canonical schema converts to Iceberg");
             let restored = iceberg::arrow::schema_to_arrow_schema(&iceberg)
                 .expect("the Iceberg schema converts back to Arrow");
-            assert_identity_matches(&declared, restored.fields(), label);
+            assert_same_layout(&declared, restored.fields(), label);
         }
     }
 
@@ -1848,8 +2317,10 @@ mod tests {
         let schema = Fields::from(vec![nested, naive, zoned]);
         let bytes = canonical_physical_fingerprint_bytes(&schema).expect("the schema encodes");
         assert_eq!(
-            canonical_physical_fingerprint_bytes(&without_field_ids(&schema))
-                .expect("the id-free schema encodes"),
+            canonical_physical_fingerprint_bytes(
+                &schema.iter().map(|field| without_field_id(field)).collect()
+            )
+            .expect("the id-free schema encodes"),
             bytes,
             "field ids contribute nothing to the encoding"
         );
@@ -1927,38 +2398,211 @@ mod tests {
         }
     }
 
-    /// Strip every `PARQUET:field_id` entry from `fields`, nested children included.
-    fn without_field_ids(fields: &Fields) -> Fields {
-        fields
-            .iter()
-            .map(|field| {
-                let data_type = match field.data_type() {
-                    DataType::List(child) => DataType::List(Arc::new(
-                        without_field_ids(&Fields::from(vec![child.as_ref().clone()]))[0]
-                            .as_ref()
-                            .clone(),
-                    )),
-                    DataType::Struct(children) => DataType::Struct(without_field_ids(children)),
-                    other => other.clone(),
-                };
-                let mut metadata = field.metadata().clone();
-                metadata.remove(fields::PARQUET_FIELD_ID);
-                Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata)
-            })
-            .collect()
-    }
-
-    /// The registry dispatches one canonical value validator per signal table.
+    /// Stamping a populated Map column re-types its entries in place.
+    ///
+    /// The key and value take their registered ids and the stamped column
+    /// keeps every entry, null map, and null value it arrived with.
     ///
     /// # Panics
     ///
-    /// Panics when a canonical built-in carries no validator, when a validator
-    /// admits a schema-valid but value-invalid batch, or when a pre-declared
-    /// built-in claims a canonical validator it cannot own.
+    /// Panics when stamping refuses the Map, a key or value lacks its
+    /// registered id, or a value changes.
+    #[test]
+    fn stamped_map_columns_carry_registered_entry_ids() {
+        use arrow::array::{
+            Array, ArrayRef, AsArray, Int64Array, MapArray, StringArray, StructArray,
+        };
+        use arrow::buffer::{NullBuffer, OffsetBuffer};
+
+        let entries = StructArray::new(
+            Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, true),
+            ]),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])),
+            ],
+            None,
+        );
+        let map = MapArray::new(
+            Arc::new(Field::new("key_value", entries.data_type().clone(), false)),
+            OffsetBuffer::from_lengths([2, 0, 1]),
+            entries,
+            Some(NullBuffer::from(vec![true, false, true])),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "attrs",
+            map.data_type().clone(),
+            true,
+        )]));
+        let registered = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&schema)
+            .expect("the map has an Iceberg projection");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(map) as ArrayRef]).expect("valid map batch");
+
+        let stamped =
+            stamp_registered_field_ids(&batch, &registered).expect("the map is registered");
+
+        let adopted = iceberg::arrow::arrow_schema_to_schema(&stamped.schema())
+            .expect("every stamped field carries an id");
+        assert_eq!(adopted.as_struct(), registered.as_struct());
+        let (before, after) = (batch.column(0).as_map(), stamped.column(0).as_map());
+        assert_eq!(after.offsets(), before.offsets());
+        assert_eq!(after.nulls(), before.nulls());
+        assert_eq!(after.keys(), before.keys());
+        assert_eq!(after.values(), before.values());
+    }
+
+    /// Every built-in declares exactly the Arrow form Iceberg stores for it.
+    ///
+    /// Iceberg is the one schema authority, so a built-in's physical schema
+    /// must already be a fixed point of [`iceberg_form`]: no timezone,
+    /// element-name, or width spelling may differ from what the registered
+    /// table reads back. The comparison is the exact-layout fingerprint, which
+    /// commits names, order, nullability, and exact types at every depth and
+    /// ignores metadata.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a built-in column has no Iceberg type or its declaration
+    /// differs from its Iceberg form.
+    #[test]
+    fn every_builtin_declares_its_iceberg_form() {
+        let exact = |field: &Field| {
+            crate::schema::SchemaFingerprint::from_arrow_schema_exact(&Schema::new(vec![
+                field.clone(),
+            ]))
+        };
+        let mut differing = Vec::new();
+        for definition in builtin_tables() {
+            for declared in (definition.schema)().fields() {
+                let stored =
+                    iceberg_form(declared).expect("every built-in column has an Iceberg type");
+                if exact(declared) != exact(&stored) {
+                    differing.push(format!(
+                        "{}.{}.{}: declared {} but Iceberg stores {}",
+                        definition.namespace,
+                        definition.name,
+                        declared.name(),
+                        declared.data_type(),
+                        stored.data_type(),
+                    ));
+                }
+            }
+        }
+        assert!(differing.is_empty(), "{}", differing.join("\n"));
+    }
+
+    /// Every spelling of one Iceberg type, a timestamp in any zone included,
+    /// registers as Iceberg's single Arrow form, and a type with no Iceberg
+    /// column is refused.
+    ///
+    /// The stored form carries no field id at any depth, keeps a Variant's
+    /// extension type, and is its own form, so registering a stored or described
+    /// schema again cannot change it. Each refused type is refused nested in a
+    /// struct and as a map value as well as top level.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a spelling stores as another type, an id survives, the form
+    /// is not a fixed point, or an unstorable type is accepted.
+    #[test]
+    fn declared_columns_register_as_their_one_iceberg_form() {
+        let map = |key_nullable: bool, value: DataType| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("k", DataType::Utf8, key_nullable),
+                        Field::new("v", value, true),
+                    ])),
+                    false,
+                )),
+                false,
+            )
+        };
+        let element = |data_type: DataType| Arc::new(Field::new("element", data_type, true));
+        for (declared, stored) in [
+            (DataType::Int8, DataType::Int32),
+            (DataType::UInt16, DataType::Int32),
+            (DataType::UInt32, DataType::Int64),
+            (
+                DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("+00:00".into())),
+            ),
+            (
+                DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("America/New_York".into())),
+                DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("+00:00".into())),
+            ),
+            (DataType::LargeUtf8, DataType::Utf8),
+            (DataType::Binary, DataType::LargeBinary),
+            (
+                DataType::List(Arc::new(Field::new("item", DataType::Int16, true))),
+                DataType::List(element(DataType::Int32)),
+            ),
+            (
+                map(true, DataType::Int8),
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "key_value",
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Int32, true),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+            ),
+        ] {
+            let form = iceberg_form(&Field::new("c", declared.clone(), true))
+                .unwrap_or_else(|error| panic!("{declared} is storable: {error}"));
+            assert_eq!(form, Field::new("c", stored, true), "{declared}");
+            assert_eq!(iceberg_form(&form).expect("the form is storable"), form);
+        }
+        let variant = variant_field("payload", true);
+        let form = iceberg_form(&variant).expect("a Variant is storable");
+        assert!(is_variant(&form), "the Variant keeps its extension type");
+        assert_eq!(iceberg_form(&form).expect("the form is storable"), form);
+
+        for unstorable in [
+            DataType::UInt64,
+            DataType::Date64,
+            DataType::Time32(ArrowTimeUnit::Second),
+            DataType::Time64(ArrowTimeUnit::Nanosecond),
+            DataType::Timestamp(ArrowTimeUnit::Second, None),
+            DataType::Timestamp(ArrowTimeUnit::Millisecond, Some("UTC".into())),
+        ] {
+            for declared in [
+                unstorable.clone(),
+                DataType::Struct(Fields::from(vec![Field::new(
+                    "inner",
+                    unstorable.clone(),
+                    true,
+                )])),
+                map(false, unstorable.clone()),
+            ] {
+                assert!(
+                    iceberg_form(&Field::new("c", declared.clone(), true)).is_err(),
+                    "{declared} must be refused"
+                );
+            }
+        }
+    }
+
+    /// The registry dispatches one canonical value validator per signal table,
+    /// and each signal definition refuses invalid Variant bytes with the
+    /// catalogued error through the shared Variant pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a canonical built-in carries no validator, when invalid
+    /// Variant bytes or a foreign metric kind column are admitted, or when a
+    /// pre-declared built-in claims a canonical validator it cannot own.
     #[test]
     fn builtin_registry_dispatches_canonical_value_validation() {
-        use arrow::array::{Array, BinaryArray, Int64Array};
-
         let (spans, _) =
             crate::tables::traces::project_resource_spans(&span_fixture(), None, usize::MAX)
                 .expect("the span fixture projects");
@@ -1975,9 +2619,7 @@ mod tests {
             ("metrics", "points", points),
         ] {
             let definition = builtin_table(namespace, name).expect("canonical built-in");
-            let validate = definition
-                .canonical_validator
-                .expect("a canonical signal table owns a value validator");
+            let validate = definition.canonical_validator;
             let batch = crate::tables::signal::without_correlation_columns(&projected)
                 .expect("the correlation columns split off cleanly");
             validate(&batch).expect("the table's own projection validates");
@@ -1991,10 +2633,19 @@ mod tests {
                     .zip(batch.columns())
                     .map(|(field, column)| {
                         if field.name() == "attributes" {
-                            Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
-                                [0xff_u8].as_slice(),
-                                batch.num_rows(),
-                            ))) as Arc<dyn Array>
+                            let invalid = || {
+                                Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
+                                    [0xff_u8].as_slice(),
+                                    batch.num_rows(),
+                                ))) as Arc<dyn Array>
+                            };
+                            let DataType::Struct(children) =
+                                wyrd_types::variant::variant_storage_type()
+                            else {
+                                panic!("Variant storage is a struct");
+                            };
+                            Arc::new(StructArray::new(children, vec![invalid(), invalid()], None))
+                                as Arc<dyn Array>
                         } else {
                             Arc::clone(column)
                         }
@@ -2002,9 +2653,11 @@ mod tests {
                     .collect(),
             )
             .expect("the corrupted batch still assembles");
-            assert!(
-                validate(&corrupted).is_err(),
-                "{namespace}.{name} rejects non-canonical payload bytes"
+            let refusal = validate(&corrupted).expect_err("invalid Variant bytes are refused");
+            assert_eq!(
+                refusal.code(),
+                "WYRD_VALA_400_VARIANT_INVALID_JSON",
+                "{namespace}.{name} refuses invalid Variant bytes with the catalogued code"
             );
         }
 
@@ -2035,27 +2688,27 @@ mod tests {
         .expect("the kind-violating batch still assembles");
         let validate = builtin_table("metrics", "points")
             .expect("points definition")
-            .canonical_validator
-            .expect("the points table owns a value validator");
+            .canonical_validator;
         assert!(
             validate(&kind_violation).is_err(),
             "a point may not populate a foreign kind's column"
         );
 
-        assert!(
-            builtin_table("drift", "observations")
-                .expect("drift observations definition")
-                .canonical_validator
-                .is_none(),
-            "a pre-declared built-in owns no canonical value validation"
+        let drift = builtin_table("drift", "observations").expect("drift observations definition");
+        let empty = RecordBatch::new_empty(Arc::new(Schema::new((drift.arrow_fields)())));
+        assert_eq!(
+            (drift.canonical_validator)(&empty).expect("a declared batch validates"),
+            empty,
+            "a pre-declared built-in's validator returns its batch unchanged"
         );
     }
 
     /// Assert every widened or re-spelled physical type drifts the identity.
     ///
-    /// `Utf8`/`LargeUtf8`, `Binary`/`LargeBinary`, and a re-spelled UTC offset
-    /// are the normalizations an Arrow-normalizing intermediary would silently
-    /// apply, so each one is walked over the real physical schema.
+    /// `Utf8`/`LargeUtf8`, `Binary`/`LargeBinary`, and Iceberg's `+00:00` zone
+    /// re-spelled as Arrow's `UTC` are the normalizations an Arrow-normalizing
+    /// intermediary would silently apply, so each one is walked over the real
+    /// physical schema.
     ///
     /// # Panics
     ///
@@ -2069,7 +2722,7 @@ mod tests {
             DataType::Utf8 => Some(DataType::LargeUtf8),
             DataType::Binary => Some(DataType::LargeBinary),
             DataType::Timestamp(unit, Some(_)) => {
-                Some(DataType::Timestamp(*unit, Some("+00:00".into())))
+                Some(DataType::Timestamp(*unit, Some("UTC".into())))
             }
             _ => None,
         };
@@ -2193,5 +2846,384 @@ mod tests {
             baseline,
             "a duplicated reserved field drifts the canonical physical identity"
         );
+    }
+
+    /// A nullable Struct is admitted only wholly present or wholly absent.
+    ///
+    /// The helper is driven through all four parent/child validity states,
+    /// then the Results and Calls validators are shown to refuse a partial
+    /// value in their declared Struct columns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a complete or absent value is refused, or a partial value
+    /// reaches a table's durable path.
+    #[test]
+    fn partial_nullable_structs_are_refused() {
+        let children = Fields::from(vec![utf8("provider", true), utf8("model", true)]);
+        let model = |parent: Vec<bool>, child: Vec<Option<&str>>| {
+            let child = Arc::new(StringArray::from(child)) as ArrayRef;
+            let column = StructArray::new(
+                children.clone(),
+                vec![Arc::clone(&child), child],
+                Some(NullBuffer::from(parent)),
+            );
+            RecordBatch::try_from_iter([("m", Arc::new(column) as ArrayRef)]).expect("batch")
+        };
+        refuse_partial_structs(&model(vec![true, false], vec![Some("a"), None]), &["m"])
+            .expect("complete-present and null-absent rows are admitted");
+        for (parent, child) in [(true, None), (false, Some("a"))] {
+            let refusal = refuse_partial_structs(&model(vec![parent], vec![child]), &["m"])
+                .expect_err("a partial value is refused");
+            assert_eq!(
+                refusal.code(),
+                "WYRD_VALA_400_SCHEMA_PARSE",
+                "{parent} {child:?}"
+            );
+        }
+
+        // One declared row: nullable columns null, required ones filled.
+        let filled = |data_type: &DataType| {
+            let data = new_null_array(data_type, 1).to_data();
+            make_array(data.into_builder().nulls(None).build().expect("unmasked"))
+        };
+        let refuses_partial = |namespace: &str, name: &str, column: &str, partial: ArrayRef| {
+            let definition = builtin_table(namespace, name).expect("built-in");
+            let fields = (definition.arrow_fields)();
+            let columns = fields
+                .iter()
+                .map(|field| match field.name() == column {
+                    true => Arc::clone(&partial),
+                    false if field.is_nullable() => new_null_array(field.data_type(), 1),
+                    false => match field.data_type() {
+                        DataType::Struct(nested) => Arc::new(StructArray::new(
+                            nested.clone(),
+                            nested.iter().map(|f| filled(f.data_type())).collect(),
+                            None,
+                        )) as ArrayRef,
+                        data_type => filled(data_type),
+                    },
+                })
+                .collect();
+            let batch =
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("declared row");
+            let refusal = (definition.canonical_validator)(&batch)
+                .expect_err("a partial Struct is refused before durable work");
+            assert_eq!(
+                refusal.code(),
+                "WYRD_VALA_400_SCHEMA_PARSE",
+                "{namespace}.{name}"
+            );
+        };
+        let summary = ResultsTable::eval_summary_fields();
+        let mut values: Vec<ArrayRef> = summary.iter().map(|f| filled(f.data_type())).collect();
+        values[0] = new_null_array(&DataType::Int32, 1);
+        refuses_partial(
+            "verification",
+            "results",
+            EVAL_SUMMARY,
+            Arc::new(StructArray::new(summary, values, None)),
+        );
+        refuses_partial(
+            "gateway",
+            "calls",
+            gateway::RESOLVED_MODEL,
+            Arc::new(model(vec![true], vec![None]).column(0).as_struct().clone()),
+        );
+    }
+
+    /// The metric points validator refuses a partly present bucket set.
+    ///
+    /// A projected point with no buckets gets its `offset` child set while the
+    /// collection stays null; the validator must refuse it before durable work.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture stops projecting, its first point gains buckets,
+    /// or the partial bucket set is admitted.
+    #[test]
+    fn partial_metric_buckets_are_refused() {
+        let filled = |data_type: &DataType| {
+            let data = new_null_array(data_type, 1).to_data();
+            make_array(data.into_builder().nulls(None).build().expect("unmasked"))
+        };
+        let (points, _) =
+            crate::tables::metrics::project_resource_metrics(&metric_fixture(), None, usize::MAX)
+                .expect("the metric fixture projects");
+        let points = crate::tables::signal::without_correlation_columns(&points)
+            .expect("the correlation columns split off cleanly");
+        let buckets = points
+            .column_by_name("positive_buckets")
+            .expect("bucket column")
+            .as_struct();
+        assert!(
+            buckets.is_null(0),
+            "the fixture's first point has no buckets"
+        );
+        let (bucket_fields, mut bucket_children, nulls) = buckets.clone().into_parts();
+        bucket_children[0] = filled(bucket_fields[0].data_type());
+        let bucket_children = bucket_children
+            .into_iter()
+            .map(|child| make_array(child.to_data().slice(0, 1)))
+            .collect();
+        let partial: ArrayRef = Arc::new(StructArray::new(
+            bucket_fields,
+            bucket_children,
+            nulls.map(|nulls| nulls.slice(0, 1)),
+        ));
+        let points = points.slice(0, 1);
+        let mut columns = points.columns().to_vec();
+        let index = points
+            .schema()
+            .index_of("positive_buckets")
+            .expect("bucket index");
+        columns[index] = partial;
+        let partial_points = RecordBatch::try_new(points.schema(), columns).expect("points");
+        let refusal = crate::tables::metrics::validate_metric_points(&partial_points)
+            .expect_err("a partial bucket set is refused");
+        assert_eq!(refusal.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+    }
+
+    /// Pins the revision-10 Variant contract and every built-in Variant/Struct layout.
+    ///
+    /// One test owns the persisted shapes a reader depends on: the `0x0d`
+    /// fingerprint tag with no storage children, the fixed depth and size
+    /// limits, each catalogued Variant error's code and detail fields, the
+    /// exact `drift_report`, `eval_summary`, and `resource_entity_refs`
+    /// layouts, and every built-in column revision 10 stores as Variant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any locked value, layout, code, or detail field drifts.
+    #[test]
+    fn variant_contract_and_builtin_schemas_are_stable() {
+        assert_variant_identity_and_errors();
+        assert_result_struct_layouts();
+        assert_builtin_variant_columns();
+    }
+
+    /// Pins the Variant tag, limits, fingerprint bytes, and each catalogued
+    /// Variant error's code and detail fields.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any of those locked values drifts.
+    fn assert_variant_identity_and_errors() {
+        assert_eq!(VARIANT_TYPE_TAG, 0x0d);
+        assert_eq!(VARIANT_MAX_DEPTH, 64);
+        assert_eq!(VARIANT_MAX_ENCODED_BYTES, 8_388_608);
+
+        // A Variant commits its name, tag, and zero children; neither the
+        // storage children nor the extension keys enter the identity.
+        let payload = variant_field("payload", true);
+        let mut metadata = payload.metadata().clone();
+        metadata.insert(fields::WYRD_SENSITIVE.to_owned(), "false".to_owned());
+        let bytes = canonical_physical_fingerprint_bytes(&Fields::from(vec![
+            payload.with_metadata(metadata),
+        ]))
+        .expect("a Variant schema encodes");
+        let hex = bytes.iter().fold(String::new(), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+        assert_eq!(
+            hex,
+            "0200000001000000077061796c6f61640d0100000000010000000e777972643a73656e7369746976650000000566616c736500000000"
+        );
+
+        for (violation, code, detail_keys) in [
+            (
+                VariantViolation::InvalidJson { path: "/a".into() },
+                "WYRD_VALA_400_VARIANT_INVALID_JSON",
+                &["field", "path", "row"][..],
+            ),
+            (
+                VariantViolation::NumericOutOfRange {
+                    path: "/n".into(),
+                    numeric_kind: "integer",
+                },
+                "WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE",
+                &["field", "numeric_kind", "path", "row"][..],
+            ),
+            (
+                VariantViolation::TooDeep {
+                    path: "/d".into(),
+                    depth: 65,
+                },
+                "WYRD_VALA_400_VARIANT_TOO_DEEP",
+                &["depth", "field", "limit", "path", "row"][..],
+            ),
+            (
+                VariantViolation::TooLarge { bytes: 9_000_000 },
+                "WYRD_VALA_413_VARIANT_TOO_LARGE",
+                &["bytes", "field", "limit", "row"][..],
+            ),
+        ] {
+            let error = violation.into_error("payload", 3);
+            assert_eq!(error.code(), code);
+            let wire = serde_json::to_value(&error).expect("the error serializes");
+            let mut keys: Vec<&str> = wire["data"]
+                .as_object()
+                .expect("the error carries detail fields")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, detail_keys, "{code} detail fields");
+        }
+    }
+
+    /// Pins the exact `drift_report` and `eval_summary` Struct layouts of
+    /// `vala.verification.results` and the absence of a `details` column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either layout drifts or `details` reappears.
+    fn assert_result_struct_layouts() {
+        let results = (builtin_table("verification", "results")
+            .expect("verification results")
+            .schema)();
+        let layout = |name: &str| -> Vec<(String, bool, bool)> {
+            let field = results.field_with_name(name).expect("the Struct column");
+            assert!(field.is_nullable(), "{name} is a nullable Struct");
+            let DataType::Struct(children) = field.data_type() else {
+                panic!("{name} is a Struct");
+            };
+            children
+                .iter()
+                .map(|child| (child.name().clone(), child.is_nullable(), is_variant(child)))
+                .collect()
+        };
+        let owned = |entries: &[(&str, bool)]| -> Vec<(String, bool, bool)> {
+            entries
+                .iter()
+                .map(|(name, variant)| ((*name).to_owned(), true, *variant))
+                .collect()
+        };
+        assert_eq!(
+            layout("drift_report"),
+            owned(&[("method", false), ("features", true), ("verdict", false)])
+        );
+        assert_eq!(
+            layout("eval_summary"),
+            owned(&[
+                ("total_tasks", false),
+                ("passed_tasks", false),
+                ("failed_tasks", false),
+                ("pass_rate", false),
+                ("duration_ms", false),
+            ])
+        );
+        assert!(results.field_with_name("details").is_err());
+    }
+
+    /// Pins every built-in column stored as Variant and the locked
+    /// `resource_entity_refs` Struct list of each signal table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a column is not Variant or an entity-reference shape drifts.
+    fn assert_builtin_variant_columns() {
+        let entity_ref = DataType::List(Arc::new(Field::new(
+            iceberg::spec::LIST_FIELD_NAME,
+            DataType::Struct(Fields::from(vec![
+                Field::new("type", DataType::Utf8, false),
+                Field::new(
+                    "id_keys",
+                    DataType::List(Arc::new(Field::new(
+                        iceberg::spec::LIST_FIELD_NAME,
+                        DataType::Utf8,
+                        false,
+                    ))),
+                    false,
+                ),
+                Field::new(
+                    "description_keys",
+                    DataType::List(Arc::new(Field::new(
+                        iceberg::spec::LIST_FIELD_NAME,
+                        DataType::Utf8,
+                        false,
+                    ))),
+                    false,
+                ),
+                Field::new("schema_url", DataType::Utf8, false),
+            ])),
+            false,
+        )));
+        for (namespace, name, variants) in [
+            (
+                "traces",
+                "spans",
+                &["attributes", "resource_attributes", "scope_attributes"][..],
+            ),
+            (
+                "logs",
+                "records",
+                &[
+                    "body",
+                    "attributes",
+                    "resource_attributes",
+                    "scope_attributes",
+                ][..],
+            ),
+            (
+                "metrics",
+                "points",
+                &[
+                    "metadata",
+                    "attributes",
+                    "resource_attributes",
+                    "scope_attributes",
+                ][..],
+            ),
+            ("eval", "observations", &["context", "media"][..]),
+            ("eval", "result_items", &["actual", "expected"][..]),
+            ("verification", "results", &["assertion_result"][..]),
+            (
+                "gateway",
+                "calls",
+                &["request_payload", "response_payload"][..],
+            ),
+            ("system", "audit_log", &["detail"][..]),
+        ] {
+            let schema = (builtin_table(namespace, name).expect("built-in").schema)();
+            for column in variants {
+                let field = schema
+                    .field_with_name(column)
+                    .unwrap_or_else(|_| panic!("vala.{namespace}.{name}.{column} exists"));
+                assert!(
+                    is_variant(field),
+                    "vala.{namespace}.{name}.{column} is Variant"
+                );
+            }
+            if matches!(namespace, "traces" | "logs" | "metrics") {
+                let refs = schema
+                    .field_with_name("resource_entity_refs")
+                    .expect("signal tables carry entity references");
+                assert!(!refs.is_nullable());
+                assert_same_layout(
+                    &Fields::from(vec![Field::new(
+                        "resource_entity_refs",
+                        entity_ref.clone(),
+                        false,
+                    )]),
+                    &Fields::from(vec![refs.clone()]),
+                    &format!("vala.{namespace}.{name}.resource_entity_refs"),
+                );
+                let DataType::List(element) = refs.data_type() else {
+                    panic!("resource_entity_refs is a list");
+                };
+                let DataType::Struct(children) = element.data_type() else {
+                    panic!("each entity reference is a Struct");
+                };
+                let order: Vec<&str> = children.iter().map(|child| child.name().as_str()).collect();
+                assert_eq!(
+                    order,
+                    ["type", "id_keys", "description_keys", "schema_url"],
+                    "entity reference field order"
+                );
+            }
+        }
     }
 }

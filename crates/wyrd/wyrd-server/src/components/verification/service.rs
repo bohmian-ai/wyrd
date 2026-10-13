@@ -563,7 +563,6 @@ impl<'a> VerificationControl<'a> {
             },
             verifier,
             result_id,
-            ended_at,
             started_at,
             ended_at,
         )

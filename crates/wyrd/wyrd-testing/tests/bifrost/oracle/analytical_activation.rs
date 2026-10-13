@@ -16,9 +16,7 @@ use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
 use vala_bifrost_redux::oracle::Oracle;
 use vala_bifrost_redux::oracle::QueryIpcDecoder;
-use vala_bifrost_redux::oracle::analytical::{
-    AnalyticalCleanupPause, AnalyticalLiveInspection, analytical_cleanup_pause_for_test,
-};
+use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
 use wyrd_client::Bifrost;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
@@ -70,12 +68,24 @@ fn request(sql: &str) -> BifrostQueryRequest {
     }
 }
 
-/// Writes and publishes one fixture table on the cluster's ingest node.
+/// Writes and publishes one fixture table on the cluster's ingest node as
+/// `objects` published objects.
+///
+/// Ids `0..FIXTURE_ROWS` are split evenly across `objects` writes, each
+/// flushed into its own object, and every object holds every `filter_key`
+/// group, so totals and group counts do not depend on `objects`. The class a
+/// statement settles follows this layout: a scan of two or more objects
+/// distributes, while one object is one file group and one partition with no
+/// repartition and so no stage boundary, which leaves its scan on the leader.
 ///
 /// # Errors
 /// Returns missing-ingest-node, registration, credential, append, flush, or
 /// Oracle membership-refresh failures while preparing the published fixture.
-async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, JourneyError> {
+async fn seed_table(
+    cluster: &WyrdTestCluster,
+    prefix: &str,
+    objects: i64,
+) -> Result<String, JourneyError> {
     let ingest = cluster
         .servers()
         .find(|server| server.bifrost_scribe().is_some())
@@ -84,15 +94,19 @@ async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, J
     let table = unique_table(prefix);
     register_table(ingest, tenant, &table).await?;
     let rows = writer(ingest, &format!("{prefix}-writer")).await?;
-    rows.write(
-        &format!("vala.bifrost.{table}"),
-        &journey_schema(),
-        (0..FIXTURE_ROWS)
-            .map(|id| journey_row(id, &format!("group_{}", id % FIXTURE_GROUPS)))
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-    ingest.flush_bifrost().await?;
+    let per_object = FIXTURE_ROWS / objects;
+    for object in 0..objects {
+        let start = object * per_object;
+        rows.write(
+            &format!("vala.bifrost.{table}"),
+            &journey_schema(),
+            (start..start + per_object)
+                .map(|id| journey_row(id, &format!("group_{}", id % FIXTURE_GROUPS)))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        ingest.flush_bifrost().await?;
+    }
     cluster.refresh_oracle_snapshots().await?;
     Ok(table)
 }
@@ -177,7 +191,7 @@ fn is_transport(error: &BifrostClientError) -> bool {
 ///
 /// The SDK owns exactly one public projection, so every assertion here reads
 /// the code through it rather than a second per-variant table.
-fn sdk_code(error: &BifrostClientError) -> &'static str {
+pub(crate) fn sdk_code(error: &BifrostClientError) -> &'static str {
     wyrd_spec::error::WyrdError::from(error).code()
 }
 
@@ -197,12 +211,12 @@ fn nodes_clean(cluster: &WyrdTestCluster) -> Result<bool, JourneyError> {
         .all(AnalyticalLiveInspection::is_clean))
 }
 
-/// Interactive streams are graphless and settle on their own; only a selected
-/// Analytical query keeps its running entry and graph ownership until the
-/// leader lifecycle's cleanup join completes.
+/// Interactive streams are graphless and settle on their own; a selected
+/// Analytical query whose consumer drops mid-stream retires its running entry
+/// and releases its graph ownership on every node without a terminal.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn transport_drop_retains_running_status_until_cleanup_joins() {
+async fn transport_drop_retires_and_releases_the_graph() {
     prove_cleanup_ownership()
         .await
         .expect("production analytical cleanup ownership journey");
@@ -217,7 +231,10 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
     let cluster =
         WyrdTestCluster::start_spec(BifrostClusterSpec::three_oracles_one_scribe()).await?;
     let tenant = cluster.data_tenant_id();
-    let table = seed_table(&cluster, "analytical_cleanup").await?;
+    let table = seed_table(&cluster, "analytical_cleanup", 2).await?;
+    // One object is one partition with no repartition and so no stage
+    // boundary: its scan is the graphless Interactive case.
+    let interactive_table = seed_table(&cluster, "analytical_cleanup_ui", 1).await?;
     let query_server = cluster.server(0).ok_or("missing query node")?;
     let engine = Arc::clone(
         query_server
@@ -229,7 +246,8 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
     let public = client(query_server, "analytical-cleanup-reader").await?;
     let query = wyrd_client::Bifrost::query_only(&public);
 
-    let plain = format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'");
+    let plain =
+        format!("SELECT id FROM vala.bifrost.{interactive_table} WHERE filter_key = 'group_0'");
     let grouped = format!(
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key"
     );
@@ -253,8 +271,8 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
         return Err(format!("{case}: Interactive retirement left graph ownership").into());
     }
 
-    prove_paused_cleanup(&cluster, &engine, tenant, query_server, &public, &grouped).await?;
-    prove_paused_cleanup_over_grpc(&cluster, &engine, tenant, query_server, &public, &grouped)
+    prove_dropped_cleanup(&cluster, &engine, tenant, &public, &grouped).await?;
+    prove_dropped_cleanup_over_grpc(&cluster, &engine, tenant, query_server, &public, &grouped)
         .await?;
 
     cluster.shutdown().await?;
@@ -285,28 +303,23 @@ async fn dispatch(
     }
 }
 
-/// Drops one selected Analytical HTTP consumer mid-stream and holds its release.
+/// Drops one selected Analytical HTTP consumer mid-stream.
 ///
 /// The consumer takes the schema and exactly one batch and then vanishes
 /// without `settle` and without reaching a terminal, which is what a real
-/// caller that closes its connection does. Every later observation is made on a
-/// freshly authenticated client, so the abandoned connection the dropped stream
-/// left in the pool cannot serve it.
+/// caller that closes its connection does.
 ///
 /// # Errors
 ///
-/// Returns a transport, pause, ownership, or assertion error.
-async fn prove_paused_cleanup(
+/// Returns a transport, ownership, or assertion error.
+async fn prove_dropped_cleanup(
     cluster: &WyrdTestCluster,
     engine: &Arc<Oracle>,
     tenant: DataTenantId,
-    server: &WyrdTestServer,
     public: &WyrdClient,
     sql: &str,
 ) -> Result<(), JourneyError> {
     let case = "http selected analytical";
-    let pause = analytical_cleanup_pause_for_test();
-    pause.arm();
     let mut stream = dispatch(&wyrd_client::Bifrost::query_only(public), sql, case).await?;
     let request_id = stream.request_id().clone();
     stream
@@ -317,15 +330,6 @@ async fn prove_paused_cleanup(
         return Err(format!("{case}: the abandoned consumer reached its terminal").into());
     }
     drop(stream);
-    let observer = client(server, "analytical-cleanup-http-observer").await?;
-    hold_and_release(
-        cluster,
-        &wyrd_client::Bifrost::query_only(&observer),
-        &request_id,
-        &pause,
-        case,
-    )
-    .await?;
     await_retired(engine, tenant, &request_id, case).await?;
     await_clean_nodes(cluster).await?;
     Ok(())
@@ -334,14 +338,12 @@ async fn prove_paused_cleanup(
 /// Drops one selected Analytical gRPC consumer and its channel mid-stream.
 ///
 /// Both the response stream and the channel that carried it are dropped after a
-/// single message, so nothing this consumer owns can drain to a terminal. The
-/// running-status observation opens its own channel for the same reason the
-/// HTTP case opens its own client.
+/// single message, so nothing this consumer owns can drain to a terminal.
 ///
 /// # Errors
 ///
-/// Returns a transport, pause, ownership, or assertion error.
-async fn prove_paused_cleanup_over_grpc(
+/// Returns a transport, ownership, or assertion error.
+async fn prove_dropped_cleanup_over_grpc(
     cluster: &WyrdTestCluster,
     engine: &Arc<Oracle>,
     tenant: DataTenantId,
@@ -364,8 +366,6 @@ async fn prove_paused_cleanup_over_grpc(
         format!("Bearer {}", bearer.expose()).parse()?,
     );
 
-    let pause = analytical_cleanup_pause_for_test();
-    pause.arm();
     let response = grpc.query(grpc_request).await?;
     let deadline_ms: i64 = response
         .metadata()
@@ -397,55 +397,19 @@ async fn prove_paused_cleanup_over_grpc(
     drop(frames);
     drop(grpc);
     drop(channel);
-
-    let observer = client(server, "analytical-cleanup-grpc-observer").await?;
-    hold_and_release(
-        cluster,
-        &wyrd_client::Bifrost::query_only(&observer),
-        &request_id,
-        &pause,
-        case,
-    )
-    .await?;
     await_retired(engine, tenant, &request_id, case).await?;
     await_clean_nodes(cluster).await?;
     Ok(())
 }
 
-/// Asserts running status and graph ownership survive the paused release.
-///
-/// # Errors
-///
-/// Returns a timeout, transport, ownership, or assertion error naming the case.
-async fn hold_and_release(
-    cluster: &WyrdTestCluster,
-    query: &Bifrost,
-    request_id: &RequestId,
-    pause: &AnalyticalCleanupPause,
-    case: &str,
-) -> Result<(), JourneyError> {
-    tokio::time::timeout(std::time::Duration::from_mins(2), pause.wait_entered())
-        .await
-        .map_err(|_| format!("{case}: cleanup never reached the graph release pause"))?;
-    query
-        .status(request_id)
-        .await
-        .map_err(|error| format!("{case}: running entry retired before cleanup joined: {error}"))?;
-    if nodes_clean(cluster)? {
-        return Err(format!("{case}: graph ownership was released before cleanup joined").into());
-    }
-    pause.release();
-    Ok(())
-}
-
 /// Index of the pod public queries are addressed to.
-const COORDINATOR: usize = 0;
+pub(crate) const COORDINATOR: usize = 0;
 
 /// Indices of the pods that follow the coordinator's distributed graph.
-const PEER_FOLLOWERS: [usize; 2] = [1, 2];
+pub(crate) const PEER_FOLLOWERS: [usize; 2] = [1, 2];
 
 /// Index of the pod that publishes the data every Oracle reads.
-const PEER_SCRIBE: usize = 3;
+pub(crate) const PEER_SCRIBE: usize = 3;
 
 /// Slot units one admitted Analytical graph charges at the resource root.
 ///
@@ -460,9 +424,9 @@ const ANALYTICAL_GRAPH_UNITS: u32 = 1;
 /// delta attributes remote stages to each follower. The private-plane
 /// body-poll counter is process-wide in the in-process topology, so its delta
 /// proves only that some admitted peer request reached a body.
-struct RemoteWork {
+pub(crate) struct RemoteWork {
     /// Graph-lease activations per follower, in [`PEER_FOLLOWERS`] order.
-    leases: Vec<u64>,
+    pub(crate) leases: Vec<u64>,
     /// Process-wide private-plane body polls.
     polls: u64,
 }
@@ -473,7 +437,7 @@ impl RemoteWork {
     /// # Errors
     ///
     /// Returns a message when a follower is not running.
-    fn observe(cluster: &PeerCluster) -> Result<Self, JourneyError> {
+    pub(crate) fn observe(cluster: &PeerCluster) -> Result<Self, JourneyError> {
         Ok(Self {
             leases: PEER_FOLLOWERS
                 .iter()
@@ -490,7 +454,11 @@ impl RemoteWork {
     ///
     /// Returns a message naming `case` and the follower or counter that did
     /// not advance.
-    fn expect_advanced(&self, cluster: &PeerCluster, case: &str) -> Result<(), JourneyError> {
+    pub(crate) fn expect_advanced(
+        &self,
+        cluster: &PeerCluster,
+        case: &str,
+    ) -> Result<(), JourneyError> {
         for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
             let activated = cluster.graph_leases(index)?.0;
             if activated <= self.leases[offset] {
@@ -718,10 +686,21 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     let api_key = cluster
         .provision_public_api_key("single-planner-caller")
         .await?;
+    // Class follows table layout: the two-object table distributes, while the
+    // one-object scan table is one partition with no repartition and so no
+    // stage boundary, the graphless Interactive case.
     let table = format!("single_planner_{}", uuid::Uuid::now_v7().simple());
     cluster.register_table(PEER_SCRIBE, &table).await?;
+    let half = FIXTURE_ROWS / 2;
+    for start_id in [0, half] {
+        cluster
+            .ingest_rows(PEER_SCRIBE, &table, start_id, half, FIXTURE_GROUPS)
+            .await?;
+    }
+    let scan_table = format!("single_planner_scan_{}", uuid::Uuid::now_v7().simple());
+    cluster.register_table(PEER_SCRIBE, &scan_table).await?;
     cluster
-        .ingest_rows(PEER_SCRIBE, &table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)
+        .ingest_rows(PEER_SCRIBE, &scan_table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)
         .await?;
     for index in [
         COORDINATOR,
@@ -739,7 +718,7 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     let remote_before = RemoteWork::observe(&cluster)?;
 
     let client = public_client(cluster.server(COORDINATOR)?, &api_key)?;
-    let scan_sql = format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'");
+    let scan_sql = format!("SELECT id FROM vala.bifrost.{scan_table} WHERE filter_key = 'group_0'");
     let grouped_sql = format!(
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
@@ -752,7 +731,8 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
         }
     }
 
-    // A normal root is entirely leader-executable and therefore Interactive.
+    // A one-object scan is one partition with no repartition and so no stage
+    // boundary, so its root is normal and the statement is Interactive.
     let scan = run_public(&client, &scan_sql).await?;
     expect_public(
         &scan,
@@ -761,7 +741,7 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
         "normal root",
     )?;
 
-    // The grouped statement is the only one whose root is `DistributedExec`.
+    // The two-object table spans two tasks, so its root is `DistributedExec`.
     let grouped = run_public(&client, &grouped_sql).await?;
     expect_public(
         &grouped,
@@ -820,9 +800,10 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     }
 
     // A pinned object that no longer exists is terminal on the ordinary
-    // normal-root scan: the pinned cut still names it, so the leader must
-    // fail its one attempt rather than repin, replan, or rebuild.
-    let object = pinned_parquet(&cluster, &table)?;
+    // normal-root scan: the pinned cut still names the one-object table's only
+    // object, so the leader must fail its one attempt rather than repin,
+    // replan, or rebuild.
+    let object = pinned_parquet(&cluster, &scan_table)?;
     cluster.remove_storage_object(&object)?;
     let stale_cut =
         expect_single_build_failure(&mut cluster, &client, &scan_sql, "missing pinned object")
@@ -1115,8 +1096,8 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     cluster.register_table(PEER_SCRIBE, &table).await?;
     cluster.ingest_rows(PEER_SCRIBE, &table, 0, 12, 3).await?;
     cluster.ingest_rows(PEER_SCRIBE, &table, 0, 12, 3).await?;
-    // The UI table publishes one object, so its scan is a single-partition
-    // leader-executable leaf and its root is normal. The Analytical table above
+    // The UI table publishes one object, one partition with no repartition
+    // and so no stage boundary, and its root is normal. The Analytical table above
     // publishes two, which is what gives its grouped statement real remote work
     // to distribute.
     let ui_table = format!("public_activation_ui_{suffix}");
@@ -1293,7 +1274,7 @@ async fn prove_under_privileged_refusal() -> Result<(), JourneyError> {
     let cluster =
         WyrdTestCluster::start_spec(BifrostClusterSpec::three_oracles_one_scribe()).await?;
     let tenant = cluster.data_tenant_id();
-    let table = seed_table(&cluster, "under_privileged").await?;
+    let table = seed_table(&cluster, "under_privileged", 2).await?;
     let query_server = cluster.server(0).ok_or("missing query node")?;
     let grouped = format!(
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key"
@@ -1582,8 +1563,9 @@ async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
     cluster
         .ingest_rows(BOUNDED_SCRIBE, &table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)
         .await?;
-    // The UI table publishes one object, so its scan stays a leader-executable
-    // leaf and its root stays Interactive while the Analytical graph is held.
+    // The UI table publishes one object, one partition with no repartition
+    // and so no stage boundary, so its root stays Interactive while the
+    // Analytical graph is held.
     let ui_table = format!("bounded_workers_ui_{suffix}");
     cluster.register_table(BOUNDED_SCRIBE, &ui_table).await?;
     cluster

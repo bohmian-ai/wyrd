@@ -9,7 +9,7 @@ use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray}
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::Utc;
-use opendal::Buffer;
+use object_store::ObjectStoreExt as _;
 use parquet::arrow::ArrowWriter;
 use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest};
+use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest, PhysicalLayoutWire};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::WyrdTestCluster;
 use wyrd_testing::bifrost::write::BifrostWriter;
@@ -99,11 +99,87 @@ pub(crate) async fn wait_for_spans(
     Err(format!("spans {names:?} never finished").into())
 }
 
-/// Register one tenant-owned Redux table through the server-owned catalog.
+/// Register one tenant-owned Redux table with the [`journey_schema`] fields.
+///
+/// # Errors
+///
+/// Returns the catalog error when registration is refused.
 pub(crate) async fn register_table(
     server: &wyrd_testing::WyrdTestServer,
     tenant: DataTenantId,
     table: &str,
+) -> Result<(), JourneyError> {
+    let fields = journey_schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    register_table_with(server, tenant, table, fields).await
+}
+
+/// Register one tenant-owned Redux table with `user_fields` through the
+/// server-owned catalog.
+///
+/// # Errors
+///
+/// Returns the catalog error when registration is refused.
+///
+/// # Panics
+///
+/// Panics when the server composes no Bifrost catalog.
+pub(crate) async fn register_table_with(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: DataTenantId,
+    table: &str,
+    user_fields: Vec<Field>,
+) -> Result<(), JourneyError> {
+    register(server, tenant, table, user_fields, None).await
+}
+
+/// Register one tenant-owned Redux table with the [`journey_schema`] fields
+/// plus [`EVENT_TIME`], partitioned hourly on that column.
+///
+/// A live row placed through [`timed_schema`] then lands in the hour
+/// partition its caller chose rather than the one its ingest instant names.
+///
+/// # Errors
+///
+/// Returns the catalog error when registration is refused.
+///
+/// # Panics
+///
+/// Panics when the server composes no Bifrost catalog.
+pub(crate) async fn register_timed_table(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: DataTenantId,
+    table: &str,
+) -> Result<(), JourneyError> {
+    let fields = timed_schema(&journey_schema())
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    register(server, tenant, table, fields, Some(timed_layout())).await
+}
+
+/// Register one tenant-owned Redux table through the server-owned catalog.
+///
+/// The one registration path every journey table shares; `physical_layout`
+/// is the caller's declaration, or `None` for the server default.
+///
+/// # Errors
+///
+/// Returns the catalog error when registration is refused.
+///
+/// # Panics
+///
+/// Panics when the server composes no Bifrost catalog.
+pub(crate) async fn register(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: DataTenantId,
+    table: &str,
+    user_fields: Vec<Field>,
+    physical_layout: Option<PhysicalLayoutWire>,
 ) -> Result<(), JourneyError> {
     server
         .state()
@@ -111,16 +187,53 @@ pub(crate) async fn register_table(
         .expect("Scribe composition retains the shared catalog")
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, table),
-            user_fields: vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("filter_key", DataType::Utf8, false),
-                Field::new("unused_payload", DataType::Utf8, false),
-            ],
+            user_fields,
             tenant,
-            physical_layout: None,
+            physical_layout,
         })
         .await?;
     Ok(())
+}
+
+/// The user time column every caller-placed journey table declares.
+pub(crate) const EVENT_TIME: &str = "event_time";
+
+/// Returns the non-null microsecond UTC [`EVENT_TIME`] field.
+pub(crate) fn event_time_field() -> Field {
+    Field::new(
+        EVENT_TIME,
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    )
+}
+
+/// Returns `schema` with [`event_time_field`] appended.
+///
+/// The registration and the batches of one caller-placed table both derive
+/// from this, so the declared and written schemas cannot drift apart.
+pub(crate) fn timed_schema(schema: &Schema) -> arrow::datatypes::SchemaRef {
+    let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+    fields.push(Arc::new(event_time_field()));
+    Arc::new(Schema::new(fields))
+}
+
+/// Returns the hourly layout that partitions on [`EVENT_TIME`] with
+/// `sort_keys` and `bloom_columns`.
+pub(crate) fn timed_layout_with(
+    sort_keys: Vec<wyrd_spec::vala::api::SortKeyWire>,
+    bloom_columns: Vec<String>,
+) -> PhysicalLayoutWire {
+    PhysicalLayoutWire {
+        partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Hour,
+        time_column: Some(EVENT_TIME.to_owned()),
+        sort_keys,
+        bloom_columns,
+    }
+}
+
+/// Returns the hourly layout that partitions on [`EVENT_TIME`] alone.
+pub(crate) fn timed_layout() -> PhysicalLayoutWire {
+    timed_layout_with(Vec::new(), Vec::new())
 }
 /// Build one authenticated public client for the fixture tenant.
 pub(crate) async fn client(
@@ -323,14 +436,16 @@ pub(crate) async fn seed_foreign_hot_row(
             Arc::new(StringArray::from(vec![None::<String>])),
             Arc::new(StringArray::from(vec![uuid::Uuid::now_v7().to_string()])),
             Arc::new(StringArray::from(vec![RequestId::now_v7().to_string()])),
-            Arc::new(TimestampMicrosecondArray::from(vec![1_000_000_i64]).with_timezone("UTC")),
-            Arc::new(TimestampMicrosecondArray::from(vec![1_000_001_i64]).with_timezone("UTC")),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![1_000_000_i64])
+                    .with_data_type(schema.field(7).data_type().clone()),
+            ),
         ],
     )?;
     let mut parquet = Vec::new();
     let properties = bifrost_writer_properties_with_metadata(
-        batch.num_rows(),
         vec![tenant_key_value(foreign)],
+        wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT,
         &[],
     );
     let mut writer = ArrowWriter::try_new(&mut parquet, schema, Some(properties))?;
@@ -338,8 +453,11 @@ pub(crate) async fn seed_foreign_hot_row(
     writer.close()?;
     let path = format!("{}/{path_tag}.parquet", binding.object_prefix);
     cluster
-        .storage_operator()
-        .write(&path, Buffer::from(parquet.clone()))
+        .storage_objects()
+        .put(
+            &object_store::path::Path::from(path.as_str()),
+            parquet.clone().into(),
+        )
         .await?;
     let mut conn = cluster.pg_fixture().tenant_conn_for(owner).await?;
     sqlx::query(
@@ -561,10 +679,10 @@ pub(crate) fn unused_payload(id: i64) -> String {
 /// failed with nothing compacted and no time elapsed. Generous, because a pass
 /// may claim nothing, retry, or lose a lease race; finite, because a stalled
 /// Forge must fail the journey rather than hang it.
-const COMPACTION_BUDGET: Duration = Duration::from_mins(3);
+pub(crate) const COMPACTION_BUDGET: Duration = Duration::from_mins(3);
 
 /// Longest one requested pass is waited on before the loop re-reads the truth.
-const COMPACTION_PASS_WAIT: Duration = Duration::from_secs(30);
+pub(crate) const COMPACTION_PASS_WAIT: Duration = Duration::from_secs(30);
 
 /// Floor on one loop iteration, so a fixture whose completions return instantly
 /// polls Postgres and nudges the scheduler at a bounded rate instead of
@@ -652,6 +770,114 @@ pub(crate) async fn compact_sealed_batch(
         tokio::time::sleep(COMPACTION_POLL_FLOOR).await;
     }
 }
+/// Path segment every Forge rewrite output carries beneath its table root.
+pub(crate) const FORGE_DATA_SEGMENT: &str = "/data/forge/";
+
+/// Advances every Forge clock past the compaction interval and waits,
+/// bounded, until each of `tables`' current snapshots plans only Forge
+/// outputs.
+///
+/// Each iteration releases retry backoff, requests a scheduler pass, and
+/// waits for a worker completion; the exit condition is the planned data
+/// files themselves, never a pass or completion count.
+///
+/// # Errors
+///
+/// Returns clock, catalog, scan-planning, or Postgres errors, or an error
+/// naming the tables still planning Scribe objects when
+/// [`COMPACTION_BUDGET`] elapses.
+pub(crate) async fn await_rewrite(
+    cluster: &WyrdTestCluster,
+    server: &wyrd_testing::WyrdTestServer,
+    tables: &[(BifrostNamespace, &str)],
+) -> Result<(), JourneyError> {
+    let observer = cluster
+        .forge_completion_observer()
+        .ok_or("cluster was started without a Forge completion observer")?;
+    for node in cluster.servers() {
+        node.forge_clock()
+            .advance(chrono::Duration::days(1))
+            .map_err(|error| format!("elapse the compaction interval: {error}"))?;
+    }
+    let tenant = cluster.data_tenant_id();
+    let deadline = std::time::Instant::now() + COMPACTION_BUDGET;
+    loop {
+        let mut pending = Vec::new();
+        for &(namespace, table) in tables {
+            let paths = planned_paths(server, tenant, namespace, table).await?;
+            if paths.is_empty() || !paths.iter().all(|path| path.contains(FORGE_DATA_SEGMENT)) {
+                pending.push(format!("{table}: {paths:?}"));
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("the rewrite did not publish: {pending:?}").into());
+        }
+        for &(_, table) in tables {
+            release_forge_retries(cluster, tenant, table).await?;
+        }
+        let target = observer.completed().saturating_add(1);
+        cluster.request_forge_scheduler_pass_for_test();
+        // A lapsed wait is not a verdict: the planned files checked at the
+        // top of the next iteration are.
+        let _ =
+            tokio::time::timeout(COMPACTION_PASS_WAIT, observer.wait_for_at_least(target)).await;
+    }
+}
+
+/// The data-file paths one table's current Iceberg snapshot plans.
+///
+/// # Errors
+///
+/// Returns catalog, binding, or scan-planning errors.
+pub(crate) async fn planned_paths(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: DataTenantId,
+    namespace: BifrostNamespace,
+    table: &str,
+) -> Result<Vec<String>, JourneyError> {
+    let catalog = server
+        .state()
+        .bifrost_catalog()
+        .ok_or("Scribe composition retains the shared catalog")?
+        .iceberg_catalog();
+    let binding = TenantTableBinding::resolve((tenant, TableRef::new(namespace, table)))?;
+    let loaded = catalog.load_table(&binding.table_ident()).await?;
+    if loaded.metadata().current_snapshot().is_none() {
+        return Ok(Vec::new());
+    }
+    let mut tasks = loaded.scan().select_all().build()?.plan_files().await?;
+    let mut paths = Vec::new();
+    while let Some(task) = futures_util::TryStreamExt::try_next(&mut tasks).await? {
+        paths.push(task.data_file_path);
+    }
+    Ok(paths)
+}
+
+/// Commits one table property through the shared catalog, outside Forge.
+///
+/// # Errors
+///
+/// Returns the catalog load, transaction, or commit error.
+pub(crate) async fn set_table_property(
+    catalog: &Arc<dyn iceberg::Catalog>,
+    binding: &TenantTableBinding,
+    key: &str,
+    value: &str,
+) -> Result<(), JourneyError> {
+    let loaded = catalog.load_table(&binding.table_ident()).await?;
+    let tx = iceberg::transaction::Transaction::new(&loaded);
+    let tx = iceberg::transaction::ApplyTransactionAction::apply(
+        tx.update_table_properties()
+            .set(key.to_owned(), value.to_owned()),
+        tx,
+    )?;
+    tx.commit_once(catalog.as_ref()).await?;
+    Ok(())
+}
+
 /// Makes every `retryable` Forge task for one table immediately eligible.
 ///
 /// Backoff between attempts is real production time, which a bounded journey

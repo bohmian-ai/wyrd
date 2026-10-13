@@ -1146,11 +1146,14 @@ export interface NativeTableConfig {
   resolvedJson?: string
 }
 
-/** Closed result of describing one table: its config or a catalog error. */
+/**
+ * Closed result of declaring or describing one table: its config or a
+ * catalog error.
+ */
 export interface NativeTableConfigResult {
-  /** Described table config when the server answered. */
+  /** The table config when it was declared or described. */
   config?: NativeTableConfig
-  /** Catalog failure when description failed. */
+  /** Catalog failure when declaration or description failed. */
   error?: NativeWyrdError
 }
 
@@ -1206,6 +1209,16 @@ export declare function openWyrdState(path: string): NativeWyrdState
 export declare function runWyrdCli(args: Array<string>): Promise<number>
 
 /**
+ * Renders one stored timestamp cell as its Bifrost timestamp type's text.
+ *
+ * `kind` is a [`TimestampKind::name`] and `stored` the column's microseconds;
+ * a `TIMESTAMP_TZ` cell also passes its `local` writer reading. The typed row
+ * terminal calls this for every timestamp cell, so reads render in Rust.
+ * Returns `None` for an unknown type or a value out of range.
+ */
+export declare function storedTimestampText(kind: string, stored: number, local?: number | undefined | null): string | null
+
+/**
  * Builds one table config from an explicit Arrow schema.
  *
  * This is the door for column types JSON Schema cannot express. The schema
@@ -1228,6 +1241,12 @@ export declare function tableConfigFromArrowIpc(table: string, schemaIpc: Buffer
  * `wyrd-queue` owner every language uses, so one model declares the same
  * columns from any SDK.
  *
+ * A catalogued refusal of the declaration itself — a table name that is not
+ * `namespace.name`, a document that does not map to columns, an open-extras
+ * object, or a server-owned column — returns in the result's structured
+ * `error`, which the TypeScript wrapper raises as a `WyrdError` carrying its
+ * code, status, details, and remediation.
+ *
  * # Errors
  *
  * Returns a napi error only when the declared config cannot be encoded. A
@@ -1245,6 +1264,55 @@ export declare function tableConfigFromJsonSchema(table: string, schemaJson: str
  * one Rust catalog.
  */
 export declare function telemetryProviderExists(): NativeWyrdError
+
+/**
+ * The JSON Schema `format` a Bifrost timestamp type declares itself with.
+ *
+ * `kind` is a [`TimestampKind::name`]; returns `None` for an unknown type. The
+ * TypeScript Wyrd timestamp types read their format here rather than restating
+ * the format table.
+ */
+export declare function timestampFormat(kind: string): string | null
+
+/**
+ * The Bifrost timestamp type of every top-level timestamp column in a
+ * schema-only Arrow IPC stream.
+ *
+ * Maps each column to `TIMESTAMP_NTZ`, `TIMESTAMP_LTZ`, or `TIMESTAMP_TZ` as
+ * [`TimestampKind::of`] decides it, so the typed row terminal renders each
+ * column's cells without restating that decision.
+ *
+ * # Errors
+ *
+ * Returns a napi error when the bytes are not an Arrow IPC stream.
+ */
+export declare function timestampKinds(schemaIpc: Buffer): Record<string, string>
+
+/**
+ * Checks one timestamp text against a Bifrost timestamp type and returns its
+ * canonical text.
+ *
+ * `kind` is a [`TimestampKind::name`]. The text is parsed exactly as the write
+ * path parses it, so a value the TypeScript Wyrd types accept is one an
+ * insert accepts. Returns `None` for an unknown type or refused text.
+ */
+export declare function timestampText(kind: string, text: string): string | null
+
+/**
+ * Decodes one Variant cell's `metadata`/`value` bytes into its native
+ * JavaScript value.
+ *
+ * The typed row terminal calls this for every Variant cell it finds while
+ * walking the result schema, so decoding stays in the shared `wyrd-queue`
+ * owner. napi's JSON projection makes objects plain objects, arrays arrays,
+ * and an integer outside the IEEE-754 safe range a `bigint`.
+ *
+ * # Errors
+ *
+ * Returns a napi error when the bytes are not a valid Variant, which only a
+ * faulty server result can produce.
+ */
+export declare function variantToValue(metadata: Uint8Array, value: Uint8Array): any
 
 /**
  * Parse a Workflow from its Card envelope YAML text, resolving inline

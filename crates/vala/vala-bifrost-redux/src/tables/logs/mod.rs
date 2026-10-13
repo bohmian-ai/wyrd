@@ -10,23 +10,27 @@ pub use records::RecordsTable;
 mod tests {
     use arrow::array::{
         Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray,
-        StringArray,
+        StringArray, StructArray, TimestampNanosecondArray,
     };
+    use arrow::datatypes::DataType;
     use arrow::record_batch::RecordBatch;
+    use serde_json::json;
     use std::sync::Arc;
+    use wyrd_queue::variant::variant_cell_to_json;
+    use wyrd_spec::vala::BifrostError;
     use wyrd_tonic::otlp::common::v1::any_value::Value;
     use wyrd_tonic::otlp::common::v1::{
         AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList,
     };
     use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use wyrd_tonic::otlp::resource::v1::Resource;
+    use wyrd_types::variant::{variant_field, variant_storage_type};
 
     use super::records::LOG_FIELDS;
     use super::{canonical_log_schema, project_resource_logs};
     use crate::tables::fields::{PARQUET_FIELD_ID, WYRD_SENSITIVE};
     use crate::tables::signal::{
-        encode_any_value, encode_attributes, validate_canonical_user_batch,
-        without_correlation_columns,
+        any_value_variant, validate_canonical_user_batch, without_correlation_columns,
     };
 
     /// Build one attribute entry with the supplied protocol value.
@@ -47,7 +51,7 @@ mod tests {
             Value::StringValue("body text".to_owned()),
             Value::BoolValue(true),
             Value::IntValue(-9_007_199_254_740_993),
-            Value::DoubleValue(f64::from_bits(0x7ff8_0000_0000_0001)),
+            Value::DoubleValue(-0.0),
             Value::BytesValue(vec![0x00, 0xff, 0x7f]),
             Value::ArrayValue(ArrayValue {
                 values: vec![
@@ -63,12 +67,17 @@ mod tests {
         ]
     }
 
+    /// The observed time of the fixture's uncorrelated record, whose OTLP
+    /// `time_unix_nano` is unset.
+    const UNSET_TIME_OBSERVED_AT: u64 = 1_700_000_000_555_000_000;
+
     /// Build the maximal supported resource-log fixture.
     ///
     /// The first scope carries one correlated, fully populated record per body
     /// form; the trailing scope carries an uncorrelated record with an absent
     /// body, an absent resource, and an absent scope so presence and
-    /// nullability distinctions are exercised in the same batch.
+    /// nullability distinctions are exercised in the same batch. That record
+    /// sets only its observed time, which its unset time falls back to.
     fn maximal_resource_logs() -> Vec<ResourceLogs> {
         let correlated: Vec<LogRecord> = body_forms()
             .into_iter()
@@ -80,7 +89,13 @@ mod tests {
                 severity_text: "INFO".to_owned(),
                 event_name: format!("wyrd.event.{index}"),
                 body: Some(AnyValue { value: Some(value) }),
-                attributes: vec![attribute("payload.bytes", Value::BytesValue(vec![0xab]))],
+                attributes: vec![
+                    attribute("payload.bytes", Value::BytesValue(vec![0xab])),
+                    attribute(
+                        "exception.type",
+                        Value::StringValue("ValueError".to_owned()),
+                    ),
+                ],
                 dropped_attributes_count: 3,
                 flags: 0xdead_beef,
                 trace_id: vec![0x11; 16],
@@ -91,10 +106,13 @@ mod tests {
         vec![
             ResourceLogs {
                 resource: Some(Resource {
-                    attributes: vec![attribute(
-                        "service.name",
-                        Value::StringValue("wyrd".to_owned()),
-                    )],
+                    attributes: vec![
+                        attribute("service.name", Value::StringValue("wyrd".to_owned())),
+                        attribute(
+                            "deployment.environment",
+                            Value::StringValue("staging".to_owned()),
+                        ),
+                    ],
                     dropped_attributes_count: 5,
                     entity_refs: vec![EntityRef {
                         schema_url: "https://wyrd.test/entity".to_owned(),
@@ -119,7 +137,10 @@ mod tests {
                 resource: None,
                 scope_logs: vec![ScopeLogs {
                     scope: None,
-                    log_records: vec![LogRecord::default()],
+                    log_records: vec![LogRecord {
+                        observed_time_unix_nano: UNSET_TIME_OBSERVED_AT,
+                        ..LogRecord::default()
+                    }],
                     schema_url: String::new(),
                 }],
                 schema_url: String::new(),
@@ -135,6 +156,61 @@ mod tests {
             .as_ref()
     }
 
+    /// Borrow the raw `metadata` and `value` bytes of one Variant cell.
+    ///
+    /// Comparing bytes rather than JSON keeps distinctions JSON equality
+    /// loses, such as `-0.0` versus `0.0`, exact.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the column is missing or is not Variant storage.
+    fn variant_bytes<'a>(batch: &'a RecordBatch, name: &str, row: usize) -> (&'a [u8], &'a [u8]) {
+        let storage = typed::<StructArray>(batch, name);
+        let child = |part: &str| {
+            storage
+                .column_by_name(part)
+                .and_then(|bytes| bytes.as_any().downcast_ref::<BinaryArray>())
+                .unwrap_or_else(|| panic!("{name} stores Variant {part} as Binary"))
+                .value(row)
+        };
+        (child("metadata"), child("value"))
+    }
+
+    /// A non-finite body is outside the Variant numeric domain, so its record
+    /// is rejected with the catalogued code while its siblings still land.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the NaN-bodied record is accepted, its sibling is lost, or
+    /// the rejection does not name `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE`.
+    #[test]
+    fn non_finite_log_body_rejects_only_its_record() {
+        let record = |body: f64| LogRecord {
+            body: Some(AnyValue {
+                value: Some(Value::DoubleValue(body)),
+            }),
+            ..LogRecord::default()
+        };
+        let request = vec![ResourceLogs {
+            resource: None,
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![record(f64::NAN), record(1.5)],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }];
+        let (batch, outcome) =
+            project_resource_logs(&request, None, usize::MAX).expect("logs project");
+        assert_eq!((outcome.accepted_records, outcome.rejected_records), (1, 1));
+        assert_eq!(batch.num_rows(), 1);
+        let reason = outcome.rejection_message.expect("a rejection is reported");
+        assert!(
+            reason.contains("WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE"),
+            "{reason}"
+        );
+    }
+
     /// Downcast one named column, panicking when its Arrow type differs.
     fn typed<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> &'a T {
         column(batch, name)
@@ -147,7 +223,7 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when any canonical body byte, event name, raw flag word,
+    /// Panics when any canonical body Variant byte, event name, raw flag word,
     /// nanosecond timestamp, optional correlation id, presence distinction,
     /// field-id absence, or sensitivity marker differs, when a malformed
     /// canonical payload is accepted, or when caller-supplied schema identity
@@ -173,15 +249,23 @@ mod tests {
             "the ledger columns plus the two appended correlation columns"
         );
 
-        let bodies = typed::<BinaryArray>(&batch, "body");
         for (row, value) in forms.into_iter().enumerate() {
-            let expected = encode_any_value(&AnyValue { value: Some(value) });
-            assert_eq!(bodies.value(row), expected.as_slice(), "body row {row}");
+            let expected = any_value_variant("body", &AnyValue { value: Some(value) })
+                .expect("every body form projects");
+            assert_eq!(
+                variant_bytes(&batch, "body", row),
+                (expected.metadata(), expected.value()),
+                "body row {row}"
+            );
         }
         assert!(
-            bodies.is_null(correlated),
+            column(&batch, "body").is_null(correlated),
             "an absent body projects to null"
         );
+        let body_text = typed::<StringArray>(&batch, "body_text");
+        assert_eq!(body_text.value(0), "body text");
+        assert!(body_text.is_null(1), "a non-string body promotes no text");
+        assert!(body_text.is_null(correlated));
 
         let names = typed::<StringArray>(&batch, "event_name");
         assert_eq!(names.value(0), "wyrd.event.0");
@@ -204,10 +288,20 @@ mod tests {
     fn assert_record_scalars(batch: &RecordBatch, correlated: usize) {
         let flags = typed::<Int64Array>(batch, "flags");
         assert_eq!(flags.value(0), 0xdead_beef, "raw flag word is not decoded");
-        let time = typed::<Int64Array>(batch, "time_unix_nano");
+        let time = typed::<TimestampNanosecondArray>(batch, "time_unix_nano");
         assert_eq!(time.value(0), 1_700_000_000_123_456_789);
-        let observed = typed::<Int64Array>(batch, "observed_time_unix_nano");
+        let observed = typed::<TimestampNanosecondArray>(batch, "observed_time_unix_nano");
         assert_eq!(observed.value(0), 1_700_000_000_987_654_321);
+        // An unset OTLP `time_unix_nano` stores the observed time, and the
+        // observed time keeps its own value.
+        assert_eq!(
+            time.value(correlated).cast_unsigned(),
+            UNSET_TIME_OBSERVED_AT
+        );
+        assert_eq!(
+            observed.value(correlated).cast_unsigned(),
+            UNSET_TIME_OBSERVED_AT
+        );
         assert_eq!(typed::<Int32Array>(batch, "severity_number").value(0), 9);
         assert_eq!(
             typed::<StringArray>(batch, "severity_text").value(0),
@@ -229,10 +323,14 @@ mod tests {
         assert!(span_ids.is_null(correlated), "uncorrelated span id is null");
 
         assert_eq!(
-            typed::<BinaryArray>(batch, "attributes").value(0),
-            encode_attributes(&[attribute("payload.bytes", Value::BytesValue(vec![0xab]))])
-                .as_slice()
+            variant_cell_to_json(column(batch, "attributes"), 0).expect("attributes decode"),
+            json!({"payload.bytes": "qw==", "exception.type": "ValueError"})
         );
+        let exception_type = typed::<StringArray>(batch, "exception_type");
+        assert_eq!(exception_type.value(0), "ValueError");
+        assert!(exception_type.is_null(correlated));
+        assert!(typed::<StringArray>(batch, "exception_message").is_null(0));
+        assert!(typed::<StringArray>(batch, "exception_stacktrace").is_null(0));
     }
 
     /// Assert resource and scope presence and context survive projection.
@@ -276,6 +374,22 @@ mod tests {
         let refs = typed::<ListArray>(batch, "resource_entity_refs");
         assert_eq!(refs.value_length(0), 1);
         assert_eq!(refs.value_length(correlated), 0);
+
+        let service_name = typed::<StringArray>(batch, "service_name");
+        assert_eq!(service_name.value(0), "wyrd");
+        assert!(service_name.is_null(correlated));
+        assert_eq!(
+            typed::<StringArray>(batch, "deployment_environment").value(0),
+            "staging",
+            "the legacy key promotes when the current one is absent"
+        );
+        assert!(typed::<StringArray>(batch, "service_version").is_null(0));
+        assert_eq!(
+            variant_cell_to_json(column(batch, "resource_attributes"), correlated)
+                .expect("absent resource attributes decode"),
+            json!({}),
+            "an absent resource stores an empty attribute object"
+        );
     }
 
     /// Assert the projected schema carries the ledger's declared identity.
@@ -313,7 +427,7 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when non-canonical attribute bytes validate successfully, or when
+    /// Panics when invalid attribute Variant bytes validate successfully, or when
     /// a caller-supplied field id survives validation or a caller-supplied
     /// sensitivity marker is not replaced by the ledger's.
     fn assert_non_canonical_inputs_are_rejected(batch: &RecordBatch) {
@@ -326,10 +440,17 @@ mod tests {
                 .zip(batch.columns())
                 .map(|(field, column)| {
                     if field.name() == "attributes" {
-                        Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
-                            [0xffu8].as_slice(),
-                            batch.num_rows(),
-                        ))) as Arc<dyn Array>
+                        let invalid = || {
+                            Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
+                                [0xffu8].as_slice(),
+                                batch.num_rows(),
+                            ))) as Arc<dyn Array>
+                        };
+                        let DataType::Struct(children) = variant_storage_type() else {
+                            panic!("Variant storage is a struct");
+                        };
+                        Arc::new(StructArray::new(children, vec![invalid(), invalid()], None))
+                            as Arc<dyn Array>
                     } else {
                         Arc::clone(column)
                     }
@@ -337,24 +458,32 @@ mod tests {
                 .collect(),
         )
         .expect("the malformed batch still assembles");
-        assert!(
-            validate_canonical_user_batch(LOG_FIELDS, &malformed).is_err(),
-            "non-canonical attribute bytes are rejected without a row"
+        let refusal = validate_canonical_user_batch(LOG_FIELDS, &malformed)
+            .expect_err("invalid attribute Variant bytes are rejected");
+        assert_eq!(
+            refusal,
+            BifrostError::VariantInvalidJson {
+                field: "attributes".to_owned(),
+                row: 0,
+                path: String::new(),
+            },
+            "the refusal is the catalogued Variant error"
         );
 
         let declared_body = LOG_FIELDS
             .iter()
             .find(|field| field.name == "body")
             .expect("the ledger declares the body column");
-        let drifted_field =
-            arrow::datatypes::Field::new("body", arrow::datatypes::DataType::Binary, true)
-                .with_metadata(std::collections::HashMap::from([
-                    (PARQUET_FIELD_ID.to_owned(), "999".to_owned()),
-                    (
-                        WYRD_SENSITIVE.to_owned(),
-                        (!declared_body.class.is_sensitive()).to_string(),
-                    ),
-                ]));
+        let body_variant = variant_field("body", true);
+        let mut drifted_metadata = body_variant.metadata().clone();
+        drifted_metadata.extend([
+            (PARQUET_FIELD_ID.to_owned(), "999".to_owned()),
+            (
+                WYRD_SENSITIVE.to_owned(),
+                (!declared_body.class.is_sensitive()).to_string(),
+            ),
+        ]);
+        let drifted_field = body_variant.with_metadata(drifted_metadata);
         let drifted_fields: Vec<_> = batch
             .schema()
             .fields()
@@ -509,13 +638,6 @@ mod tests {
         assert_eq!(run_ids.value(1), RUN);
         assert!(run_ids.is_null(2));
 
-        let attributes = typed::<BinaryArray>(&batch, "attributes");
-        for (row, source) in [missing, valid, duplicate].iter().enumerate() {
-            assert_eq!(
-                attributes.value(row),
-                encode_attributes(source).as_slice(),
-                "row {row} retains every ordered source attribute byte for byte"
-            );
-        }
+        correlation_fixture::assert_attribute_rows(&batch, &[&missing, &valid, &duplicate]);
     }
 }

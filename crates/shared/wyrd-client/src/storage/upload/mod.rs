@@ -1,10 +1,9 @@
 //! Upload plans, transfer hooks, and protocol dispatch.
 
 mod azure_block_blob;
-mod gcs_resumable;
 mod local_fs;
+mod multipart;
 mod reader;
-mod s3_multipart;
 mod single_put;
 
 use std::future::Future;
@@ -137,11 +136,11 @@ impl ArtifactSource for FileSource {
     }
 }
 
-/// Future returned by an on-demand S3 part URL minter.
+/// Future returned by an on-demand multipart part URL minter.
 pub(crate) type PartUrlFuture<'a> =
     Pin<Box<dyn Future<Output = Result<String, StorageClientError>> + Send + 'a>>;
 
-/// On-demand S3 part URL callback.
+/// On-demand multipart part URL callback.
 ///
 /// `Sync` so registration futures that borrow their upload hooks stay `Send`
 /// for async foreign-runtime boundaries such as the Node binding.
@@ -156,7 +155,7 @@ pub(crate) struct UploadHooks<'a> {
     pub idempotency_key: &'a str,
     /// Optional `(uploaded, total)` callback.
     pub progress: Option<ProgressCallback>,
-    /// On-demand S3 part URL minting callback.
+    /// On-demand multipart part URL minting callback.
     pub part_url_minter: Option<PartUrlMinter<'a>>,
 }
 
@@ -186,7 +185,7 @@ impl UploadOutcome {
 /// This is the single entry point [`crate::storage::WyrdStorageClient`] uses
 /// for byte transfer: it rejects degenerate plan geometry, wraps the source in
 /// a [`SourceReader`] with its size hint, and delegates to the LocalFs,
-/// single-PUT, S3 multipart, GCS resumable, or Azure block blob module. The
+/// single-PUT, multipart, or Azure block blob module. The
 /// returned outcome tells the caller whether a server completion call is
 /// still required.
 ///
@@ -215,11 +214,8 @@ pub(crate) async fn dispatch<S: ArtifactSource>(
         UploadPlan::SinglePut { .. } => {
             single_put::upload(client, plan, reader, total, &hooks).await
         }
-        UploadPlan::S3Multipart { .. } => {
-            s3_multipart::upload(client, plan, reader, total, &mut hooks).await
-        }
-        UploadPlan::GcsResumable { .. } => {
-            gcs_resumable::upload(client, plan, reader, total, &hooks).await
+        UploadPlan::Multipart { .. } => {
+            multipart::upload(client, plan, reader, total, &mut hooks).await
         }
         UploadPlan::AzureBlockBlob { .. } => {
             azure_block_blob::upload(client, plan, reader, total, &hooks).await
@@ -232,21 +228,16 @@ pub(crate) async fn dispatch<S: ArtifactSource>(
 ///
 /// # Errors
 ///
-/// Returns `PlanInvalid` when an S3 part count or size, GCS chunk size, or
-/// Azure block count or size is zero.
+/// Returns `PlanInvalid` when a multipart part count or size, or an Azure block
+/// count or size, is zero.
 fn validate_plan(plan: &UploadPlan) -> Result<(), StorageClientError> {
     match plan {
-        UploadPlan::S3Multipart {
+        UploadPlan::Multipart {
             part_count,
             part_size_bytes,
             ..
         } if *part_count == 0 || *part_size_bytes == 0 => Err(StorageClientError::PlanInvalid(
-            "S3 part count and size must be positive",
-        )),
-        UploadPlan::GcsResumable {
-            chunk_size_bytes, ..
-        } if *chunk_size_bytes == 0 => Err(StorageClientError::PlanInvalid(
-            "GCS chunk size must be positive",
+            "multipart part count and size must be positive",
         )),
         UploadPlan::AzureBlockBlob {
             block_size_bytes,
@@ -285,13 +276,13 @@ pub(crate) fn report(progress: Option<&ProgressCallback>, uploaded: u64, total: 
     }
 }
 
-/// Build the authenticated S3 part-URL callback for one server-owned upload.
-pub(crate) fn s3_part_url_minter<'a>(
+/// Build the authenticated multipart part-URL callback for one server-owned upload.
+pub(crate) fn part_url_minter<'a>(
     storage: &'a WyrdStorageClient,
     upload_id: &'a UploadId,
     plan: &UploadPlan,
 ) -> Option<PartUrlMinter<'a>> {
-    if !matches!(plan, UploadPlan::S3Multipart { .. }) {
+    if !matches!(plan, UploadPlan::Multipart { .. }) {
         return None;
     }
     let storage = storage.clone();
@@ -309,8 +300,7 @@ pub(crate) fn plan_variant(plan: &UploadPlan) -> &'static str {
     match plan {
         UploadPlan::LocalFs { .. } => "LocalFs",
         UploadPlan::SinglePut { .. } => "SinglePut",
-        UploadPlan::S3Multipart { .. } => "S3Multipart",
-        UploadPlan::GcsResumable { .. } => "GcsResumable",
+        UploadPlan::Multipart { .. } => "Multipart",
         UploadPlan::AzureBlockBlob { .. } => "AzureBlockBlob",
     }
 }

@@ -100,21 +100,20 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
-    #[allow(
-        clippy::unused_async,
-        reason = "signature parity with sibling cloud backends (S3/GCS/Azure); BackendSigner dispatch awaits the returned future uniformly across variants"
-    )]
-    pub async fn presign_single_put(
+    ///
+    /// The plan is ready immediately; the future keeps signature parity with
+    /// the cloud backends, whose dispatch awaits every variant uniformly.
+    pub fn presign_single_put(
         &self,
         path: &ValidatedPath,
         _size_bytes: u64,
         ttl: Duration,
-    ) -> Result<UploadPlan, StorageError> {
-        Ok(UploadPlan::SinglePut {
-            put_url: self.file_url(path)?,
+    ) -> std::future::Ready<Result<UploadPlan, StorageError>> {
+        std::future::ready(self.file_url(path).map(|put_url| UploadPlan::SinglePut {
+            put_url,
             ttl_secs: ttl_secs(ttl),
             required_headers: Vec::<HeaderPair>::new(),
-        })
+        }))
     }
 
     /// Return the local single PUT plan for multipart init.
@@ -160,16 +159,15 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
-    #[allow(
-        clippy::unused_async,
-        reason = "signature parity with sibling cloud backends (S3/GCS/Azure); BackendSigner dispatch awaits the returned future uniformly across variants"
-    )]
-    pub async fn presign_get(
+    ///
+    /// The URL is ready immediately; the future keeps signature parity with
+    /// the cloud backends, whose dispatch awaits every variant uniformly.
+    pub fn presign_get(
         &self,
         path: &ValidatedPath,
         _ttl: Duration,
-    ) -> Result<String, StorageError> {
-        self.file_url(path)
+    ) -> std::future::Ready<Result<String, StorageError>> {
+        std::future::ready(self.file_url(path))
     }
 
     /// Read local object metadata.
@@ -327,7 +325,7 @@ mod integration_tests {
         let path = storage_path(tenant);
 
         let input = UploadPlanReplayInput {
-            wire_protocol: WireProtocol::S3MultipartV1,
+            wire_protocol: WireProtocol::MultipartV1,
             backend_upload_id: None,
             part_count_planned: 1,
             part_size_bytes: 10,

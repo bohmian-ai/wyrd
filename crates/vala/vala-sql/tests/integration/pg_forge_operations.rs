@@ -1609,10 +1609,7 @@ mod pg_tests {
                     &mut conn,
                 )
                 .exclusive(identity)
-                .await?
-                .ok_or_else(|| SqlError::Conflict {
-                    detail: "an Oracle query is still reading this table".to_owned(),
-                })?;
+                .await?;
             let prepared = ops
                 .prepare_snapshot_expiration(operator, tenant, &exclusive, request)
                 .await;
@@ -1632,8 +1629,8 @@ mod pg_tests {
             }
         }
 
-        /// Seeds the registered table, its maintenance-authority row, one live
-        /// lease, and one running snapshot-expiry task owned by `authority`.
+        /// Seeds the registered table, its maintenance-authority row, and one
+        /// running snapshot-expiry task whose live claim `authority` holds.
         ///
         /// # Panics
         ///
@@ -1659,13 +1656,6 @@ mod pg_tests {
                 .execute(superuser)
                 .await
                 .expect("seed maintenance authority");
-            sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
-                .bind(&authority.lease_key)
-                .bind(authority.worker_id)
-                .bind(authority.lease_fencing_token)
-                .execute(superuser)
-                .await
-                .expect("seed lease");
             sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry',77,'{}'::jsonb,decode(repeat('00',32),'hex'),1,1,'running',$6,$7,now()+interval '10 minutes',77,1,now())")
                 .bind(authority.task_id)
                 .bind(tenant.as_uuid())
@@ -1792,8 +1782,6 @@ mod pg_tests {
                 ("task_id", "uuid", "NO"),
                 ("attempt_id", "uuid", "NO"),
                 ("worker_id", "uuid", "NO"),
-                ("lease_key", "text", "NO"),
-                ("lease_fencing_token", "bigint", "NO"),
                 ("table_uid", "bytea", "NO"),
                 ("catalog_name", "text", "NO"),
                 ("namespace_name", "text", "NO"),
@@ -1835,8 +1823,6 @@ mod pg_tests {
                 task_id: Uuid::now_v7(),
                 attempt_id: Uuid::now_v7(),
                 worker_id: Uuid::now_v7(),
-                lease_key: "forge:tenant_a:vala.bifrost:tbl".to_owned(),
-                lease_fencing_token: 9,
             };
             let table = claim_table(Uuid::now_v7());
             seed_expiration_arrangement(&superuser, tenant, &authority, &table).await;
@@ -1924,7 +1910,7 @@ mod pg_tests {
                 detail: &detail,
             };
             let reset = ops
-                .reset_snapshot_expiration(operator, tenant, None, &reset_request)
+                .reset_snapshot_expiration(operator, tenant, &reset_request)
                 .await
                 .expect("reset applies");
             assert_eq!(
@@ -1955,7 +1941,7 @@ mod pg_tests {
             );
 
             let reset_replay = ops
-                .reset_snapshot_expiration(operator, tenant, None, &reset_request)
+                .reset_snapshot_expiration(operator, tenant, &reset_request)
                 .await
                 .expect("reset replay");
             assert_eq!(
@@ -1969,16 +1955,7 @@ mod pg_tests {
                 task_id: Uuid::now_v7(),
                 attempt_id: Uuid::now_v7(),
                 worker_id: Uuid::now_v7(),
-                lease_key: "forge:tenant_a:vala.bifrost:tbl:settle".to_owned(),
-                lease_fencing_token: 10,
             };
-            sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
-                .bind(&settle_authority.lease_key)
-                .bind(settle_authority.worker_id)
-                .bind(settle_authority.lease_fencing_token)
-                .execute(&superuser)
-                .await
-                .expect("seed settle lease");
             sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry',78,'{}'::jsonb,decode(repeat('11',32),'hex'),1,1,'running',$6,$7,now()+interval '10 minutes',78,1,now())")
                 .bind(settle_authority.task_id)
                 .bind(tenant.as_uuid())
@@ -2160,26 +2137,6 @@ mod pg_tests {
                     ),
                 ),
                 (
-                    "lease key disagreement",
-                    format!(
-                        "UPDATE vala.forge_snapshot_expiration_claims SET lease_key='forge:tenant_a:other' {one_row}"
-                    ),
-                    format!(
-                        "UPDATE vala.forge_snapshot_expiration_claims SET lease_key='{}' {all_rows}",
-                        settle_authority.lease_key
-                    ),
-                ),
-                (
-                    "lease fence disagreement",
-                    format!(
-                        "UPDATE vala.forge_snapshot_expiration_claims SET lease_fencing_token=99 {one_row}"
-                    ),
-                    format!(
-                        "UPDATE vala.forge_snapshot_expiration_claims SET lease_fencing_token={} {all_rows}",
-                        settle_authority.lease_fencing_token
-                    ),
-                ),
-                (
                     "selected snapshot membership",
                     format!(
                         "UPDATE vala.forge_snapshot_expiration_claims SET snapshot_id=13 WHERE operation_id='{settle_operation}' AND snapshot_id=12"
@@ -2191,7 +2148,7 @@ mod pg_tests {
                 (
                     "selected snapshot cardinality",
                     format!(
-                        "INSERT INTO vala.forge_snapshot_expiration_claims SELECT data_tenant_id,resource,family,operation_id,13,task_id,attempt_id,worker_id,lease_key,lease_fencing_token,table_uid,catalog_name,namespace_name,table_name,table_uuid FROM vala.forge_snapshot_expiration_claims {one_row}"
+                        "INSERT INTO vala.forge_snapshot_expiration_claims SELECT data_tenant_id,resource,family,operation_id,13,task_id,attempt_id,worker_id,table_uid,catalog_name,namespace_name,table_name,table_uuid FROM vala.forge_snapshot_expiration_claims {one_row}"
                     ),
                     format!(
                         "DELETE FROM vala.forge_snapshot_expiration_claims WHERE operation_id='{settle_operation}' AND snapshot_id=13"
@@ -2227,13 +2184,13 @@ mod pg_tests {
                     "reconciliation input must refuse a corrupted {label}"
                 );
                 assert!(
-                    ops.reset_snapshot_expiration(operator, tenant, None, &settle_reset_request)
+                    ops.reset_snapshot_expiration(operator, tenant, &settle_reset_request)
                         .await
                         .is_err(),
                     "reset must refuse a corrupted {label}"
                 );
                 assert!(
-                    ops.settle_snapshot_expiration(operator, tenant, None, &settlement)
+                    ops.settle_snapshot_expiration(operator, tenant, &settlement)
                         .await
                         .is_err(),
                     "settlement must refuse a corrupted {label}"
@@ -2257,9 +2214,9 @@ mod pg_tests {
             }
 
             // A takeover's current authority is never compared with the
-            // historical worker, lease, and fence the rows agree on.
+            // historical worker the rows agree on.
             sqlx::query(AssertSqlSafe(format!(
-                "UPDATE vala.forge_snapshot_expiration_claims SET worker_id='{stranger}',lease_key='forge:tenant_a:historic',lease_fencing_token=3 {all_rows}"
+                "UPDATE vala.forge_snapshot_expiration_claims SET worker_id='{stranger}' {all_rows}"
             )))
             .execute(&superuser)
             .await
@@ -2277,17 +2234,15 @@ mod pg_tests {
             )
             .expect("a consistent historical authority is accepted under takeover");
             sqlx::query(AssertSqlSafe(format!(
-                "UPDATE vala.forge_snapshot_expiration_claims SET worker_id='{}',lease_key='{}',lease_fencing_token={} {all_rows}",
-                settle_authority.worker_id,
-                settle_authority.lease_key,
-                settle_authority.lease_fencing_token
+                "UPDATE vala.forge_snapshot_expiration_claims SET worker_id='{}' {all_rows}",
+                settle_authority.worker_id
             )))
             .execute(&superuser)
             .await
             .expect("restore historical authority");
 
             let settled = ops
-                .settle_snapshot_expiration(operator, tenant, None, &settlement)
+                .settle_snapshot_expiration(operator, tenant, &settlement)
                 .await
                 .expect("settlement applies");
             assert!(
@@ -2306,7 +2261,7 @@ mod pg_tests {
             );
 
             let settle_replay = ops
-                .settle_snapshot_expiration(operator, tenant, None, &settlement)
+                .settle_snapshot_expiration(operator, tenant, &settlement)
                 .await
                 .expect("settlement replay");
             assert!(

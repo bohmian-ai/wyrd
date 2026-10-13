@@ -16,7 +16,6 @@ use wyrd_tonic::prost::Message;
 
 /// Typed context for one worker attempt, checked against receiver state.
 #[derive(Clone, PartialEq, Message)]
-#[prost(prost_path = "::wyrd_tonic::prost")]
 pub struct PeerTicketClaims {
     /// Fixed private protocol version.
     #[prost(uint32, tag = "1")]
@@ -59,8 +58,8 @@ pub struct PeerTicketClaims {
     pub permission_digest: String,
     /// Canonical assignment-authority digest (see
     /// [`wyrd_spec::vala::assignment_authority`]) binding every dispatched
-    /// [`wyrd_spec::vala::api::FollowerScanAssignment`]'s identity, files,
-    /// schema fingerprint, and closed predicate/projection closure into one
+    /// [`wyrd_spec::vala::api::FollowerScanAssignment`]'s identity,
+    /// schema fingerprint, provider cut, and projection closure into one
     /// value. The follower recomputes this over its actual received
     /// assignments and rejects any mismatch before resolving a provider or
     /// issuing object I/O.
@@ -145,7 +144,6 @@ impl StageOperationV1 {
 /// lifecycles: a sibling distributed graph under the same public query, or a
 /// replayed graph identity under a different public query, must both fail.
 #[derive(Clone, PartialEq, Message)]
-#[prost(prost_path = "::wyrd_tonic::prost")]
 pub struct StageTicketClaims {
     /// Fixed private protocol version.
     #[prost(uint32, tag = "1")]
@@ -224,7 +222,6 @@ pub struct StageTicketClaims {
 /// is not in this attempt's cut, which is what makes a frozen destination fail
 /// rather than silently redirect to its replacement.
 #[derive(Clone, PartialEq, Message)]
-#[prost(prost_path = "::wyrd_tonic::prost")]
 pub struct StageParticipantV1 {
     /// Participant node UUID bytes.
     #[prost(bytes, tag = "1")]
@@ -313,11 +310,27 @@ pub const MAX_STAGE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Returns [`PeerSecurityError::Body`] when the body is empty or exceeds
 /// [`MAX_STAGE_BODY_BYTES`], before any hashing occurs.
 pub fn stage_body_digest(body: &[u8]) -> Result<String, PeerSecurityError> {
+    stage_body_digest_at(super::codec::ORACLE_DATAFUSION_REVISION, body)
+}
+
+/// Computes a stage body digest as a peer built from the `DataFusion`
+/// `revision` would.
+///
+/// [`stage_body_digest`] is this at
+/// [`super::codec::ORACLE_DATAFUSION_REVISION`]; tests use another revision
+/// to prove a mismatched build is refused.
+///
+/// # Errors
+///
+/// Returns [`PeerSecurityError::Body`] when the body is empty or exceeds
+/// [`MAX_STAGE_BODY_BYTES`], before any hashing occurs.
+fn stage_body_digest_at(revision: &str, body: &[u8]) -> Result<String, PeerSecurityError> {
     if body.is_empty() || body.len() > MAX_STAGE_BODY_BYTES {
         return Err(PeerSecurityError::Body);
     }
     let mut hash = Sha256::new();
     hash.update(b"wyrd.oracle.stage.body.v1\0");
+    super::codec::bind_datafusion_revision(&mut hash, revision);
     hash.update((body.len() as u64).to_be_bytes());
     hash.update(body);
     Ok(hex::encode(hash.finalize()))
@@ -491,7 +504,6 @@ impl ReservationOperationV1 {
 /// for a follower that has since restarted must not be honoured by its
 /// successor.
 #[derive(Clone, PartialEq, Message)]
-#[prost(prost_path = "::wyrd_tonic::prost")]
 pub struct ReservationTicketClaims {
     /// Fixed private protocol version.
     #[prost(uint32, tag = "1")]
@@ -738,7 +750,7 @@ pub trait PeerSecurityAudit: Send + Sync {
     /// Stages a rejection whose claims cannot select an audit tenant.
     fn stage_unverified_ticket_rejection(&self, violation: BifrostSecurityViolationKind);
 
-    /// Stages a violation on the context-named tenant's audit chain.
+    /// Stages a violation on the context-named tenant's audit history.
     fn stage_verified_ticket_violation(
         &self,
         tenant_id: DataTenantId,
@@ -785,8 +797,8 @@ pub fn projection_digest(projection: &[String]) -> String {
 ///
 /// Both the leader and the follower call this over the same list, in the same
 /// order, so a matching digest proves the follower's actual assignments are
-/// exactly the ones the leader described — including every file, schema
-/// fingerprint, and closed predicate.
+/// exactly the ones the leader described — including every schema
+/// fingerprint, provider cut, and projection.
 ///
 /// # Errors
 /// Returns [`PeerSecurityError::Encoding`] when a schema fingerprint is not
@@ -803,10 +815,8 @@ pub fn assignment_authority_digest_for(
                 namespace: assignment.binding.namespace.as_str(),
                 table: assignment.binding.table.as_str(),
                 schema_fingerprint_hex: assignment.schema_fingerprint.as_str(),
-                files: &assignment.persisted.files,
                 scribe_cut: assignment.scribe_provider_cut.as_ref(),
                 required_columns: &assignment.required_columns,
-                predicates: &assignment.predicates,
             },
         )
         .collect::<Vec<_>>();
@@ -1045,6 +1055,20 @@ mod tests {
         assert_eq!(
             claims.to_context(StageOperationV1::ExecuteTask),
             Err(PeerSecurityError::Operation)
+        );
+    }
+
+    /// A stage body digest commits to the `DataFusion` revision: the same body
+    /// digests differently under another engine build.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the two revisions produce the same digest.
+    #[test]
+    fn stage_body_digest_binds_the_datafusion_revision() {
+        assert_ne!(
+            stage_body_digest(b"plan").expect("a bounded body digests"),
+            stage_body_digest_at("another-revision", b"plan").expect("a bounded body digests")
         );
     }
 

@@ -1,0 +1,25 @@
+[package]
+name = "wyrd-types"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "Wyrd column types: the three timestamp types, Variant, and their JSON Schema and Arrow forms"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+wyrd-spec = { workspace = true }
+arrow-schema = { workspace = true }
+parquet-variant-compute = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+
+[dev-dependencies]
+workspace-hack.workspace = true

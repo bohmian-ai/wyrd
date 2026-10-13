@@ -11,15 +11,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use vala_bifrost_redux::resources::ResourcePlan;
 
-use async_trait::async_trait;
-use futures_util::{StreamExt, TryStreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::{
     Forge as ForgeCoordinator, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeError,
-    ForgeLeaderPeer, ForgeObjectPages, ForgeObjectStore, ForgeTelemetry, ForgeWorker,
+    ForgeLeaderPeer, ForgeObjectStore, ForgeObjects, ForgeTelemetry, ForgeWorker,
     ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
@@ -33,7 +31,7 @@ use vala_bifrost_redux::oracle::{
 use vala_bifrost_redux::resources::{
     BifrostRole, BifrostRoleResources, BifrostRuntimeResources, OracleClassSplit,
 };
-use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
+use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_bifrost_redux::scribe::{
@@ -80,187 +78,6 @@ const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_hours(1);
 const DEFAULT_HINT_CAPACITY: usize = 1_024;
 /// Longest boot waits for the Oracle to finish startup before failing.
 const ORACLE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Number of listing entries the production Forge object store groups into one
-/// orphan-GC page. The producer owns page granularity: this bounds how much of
-/// an OpenDAL recursive walk materializes before orphan GC can check its page
-/// cap and run budget at a page boundary. Sized so a steady-state prefix scans
-/// in a handful of pages while a pathological prefix still yields control
-/// promptly.
-const FORGE_OBJECT_LIST_PAGE_ENTRIES: usize = 1_000;
-
-/// Production Forge object-store capability backed by the server's OpenDAL operator.
-#[derive(Debug, Clone)]
-struct OpenDalForgeObjectStore {
-    /// Shared OpenDAL operator used for Forge reads and lifecycle operations.
-    operator: Arc<opendal::Operator>,
-}
-
-impl OpenDalForgeObjectStore {
-    /// Create a Forge capability over the process-owned storage operator.
-    #[must_use]
-    fn new(operator: Arc<opendal::Operator>) -> Self {
-        Self { operator }
-    }
-
-    /// Page a prefix in ascending key order on a backend without a native cursor.
-    ///
-    /// Each page is one full recursive walk that keeps only the
-    /// [`FORGE_OBJECT_LIST_PAGE_ENTRIES`] smallest file keys strictly after the
-    /// cursor, so memory stays bounded by the page size whatever the prefix
-    /// holds and the walk order the backend happens to use. The last key of a
-    /// page becomes the next cursor; a short page ends the stream. Pages are
-    /// produced lazily, so orphan GC stopping at its page cap stops the walks.
-    // ponytail: one full walk per page (O(pages × objects)); fine for local and
-    // Azure staging prefixes, native cursor backends never take this path.
-    fn emulated_pages(&self, prefix: &str, start_after: Option<&str>) -> ForgeObjectPages {
-        let state = Some((
-            self.clone(),
-            prefix.to_owned(),
-            start_after.map(str::to_owned),
-        ));
-        Box::pin(futures_util::stream::try_unfold(
-            state,
-            |state| async move {
-                let Some((store, prefix, cursor)) = state else {
-                    return Ok(None);
-                };
-                let page = store.smallest_after(&prefix, cursor.as_deref()).await?;
-                let Some(last) = page.last().map(|entry| entry.path().to_owned()) else {
-                    return Ok(None);
-                };
-                let next = (page.len() == FORGE_OBJECT_LIST_PAGE_ENTRIES).then_some((
-                    store,
-                    prefix,
-                    Some(last),
-                ));
-                Ok(Some((page, next)))
-            },
-        ))
-    }
-
-    /// Walk `prefix` once and return its smallest file keys after `cursor`, sorted.
-    ///
-    /// Directory keys are skipped for the same reason as on the native path:
-    /// they are not addressable objects and must not consume the page bound.
-    ///
-    /// # Errors
-    ///
-    /// Returns the underlying OpenDAL error when the walk cannot be opened or
-    /// fails part-way.
-    async fn smallest_after(
-        &self,
-        prefix: &str,
-        cursor: Option<&str>,
-    ) -> opendal::Result<Vec<opendal::Entry>> {
-        let mut lister = self.operator.lister_with(prefix).recursive(true).await?;
-        let mut smallest = std::collections::BTreeMap::new();
-        while let Some(entry) = lister.try_next().await? {
-            if !entry.metadata().is_file() || cursor.is_some_and(|cursor| entry.path() <= cursor) {
-                continue;
-            }
-            smallest.insert(entry.path().to_owned(), entry);
-            if smallest.len() > FORGE_OBJECT_LIST_PAGE_ENTRIES {
-                smallest.pop_last();
-            }
-        }
-        Ok(smallest.into_values().collect())
-    }
-}
-
-#[async_trait]
-impl ForgeObjectStore for OpenDalForgeObjectStore {
-    /// Read one staged or Iceberg-owned object through OpenDAL.
-    ///
-    /// # Errors
-    /// Returns the underlying OpenDAL error when the object cannot be read.
-    async fn read(&self, path: &str) -> opendal::Result<opendal::Buffer> {
-        self.operator.read(path).await
-    }
-
-    /// Read only the requested Parquet byte range through OpenDAL's ranged reader.
-    ///
-    /// # Errors
-    ///
-    /// Returns the underlying OpenDAL error when the reader cannot be opened or
-    /// the requested range cannot be fetched.
-    async fn read_range(
-        &self,
-        path: &str,
-        range: std::ops::Range<u64>,
-    ) -> opendal::Result<opendal::Buffer> {
-        self.operator.reader(path).await?.read(range).await
-    }
-
-    /// Recursively list objects below a Forge-owned prefix.
-    ///
-    /// # Errors
-    /// Returns the underlying OpenDAL error when listing cannot complete.
-    async fn list(&self, prefix: &str) -> opendal::Result<Vec<opendal::Entry>> {
-        self.operator.list_with(prefix).recursive(true).await
-    }
-
-    /// Recursively list objects below a Forge-owned prefix as bounded pages.
-    ///
-    /// Overrides the trait default with a true incremental OpenDAL lister so a
-    /// large orphan prefix never materializes at once. The returned stream owns
-    /// its lister and groups entries into fixed-size pages; orphan GC pulls one
-    /// page at a time and stops at a page boundary once its per-run page cap or
-    /// time budget is reached. Each page collects the lister's per-entry results
-    /// so a mid-walk backend error surfaces as a failed page rather than being
-    /// silently truncated.
-    ///
-    /// A backend with native `list_with_start_after` (S3, GCS) resumes on the
-    /// backend's own cursor. A backend without it (local fs, Azure) is served
-    /// by [`Self::emulated_pages`], which keeps the same ascending, exclusive
-    /// cursor contract and page bound at the cost of one walk per page.
-    ///
-    /// # Errors
-    ///
-    /// Returns the underlying OpenDAL error when the native lister cannot be
-    /// opened. Errors encountered after the walk begins, including every
-    /// emulated walk, surface as a failed page in the returned stream.
-    async fn list_pages(
-        &self,
-        prefix: &str,
-        start_after: Option<&str>,
-    ) -> opendal::Result<ForgeObjectPages> {
-        if !self.operator.info().full_capability().list_with_start_after {
-            return Ok(self.emulated_pages(prefix, start_after));
-        }
-        let mut listing = self.operator.lister_with(prefix).recursive(true);
-        if let Some(cursor) = start_after {
-            listing = listing.start_after(cursor);
-        }
-        let lister = listing.await?;
-        // A resumable scan advances its cursor over objects only: a directory
-        // key ends in a separator and is not an addressable object, so it must
-        // not consume the page bound either — a chunk of only directories would
-        // yield an empty page and leave the frontier standing still, starving
-        // the objects behind it.
-        let objects = lister.try_filter(|entry| std::future::ready(entry.metadata().is_file()));
-        let pages = objects
-            .chunks(FORGE_OBJECT_LIST_PAGE_ENTRIES)
-            .map(|chunk| chunk.into_iter().collect::<opendal::Result<Vec<_>>>());
-        Ok(Box::pin(pages))
-    }
-
-    /// Read object metadata before Forge makes a destructive decision.
-    ///
-    /// # Errors
-    /// Returns the underlying OpenDAL error when metadata cannot be read.
-    async fn stat(&self, path: &str) -> opendal::Result<opendal::Metadata> {
-        self.operator.stat(path).await
-    }
-
-    /// Delete one object after Forge's live-set and fence checks complete.
-    ///
-    /// # Errors
-    /// Returns the underlying OpenDAL error when deletion cannot complete.
-    async fn delete(&self, path: &str) -> opendal::Result<()> {
-        self.operator.delete(path).await
-    }
-}
-
 /// Caller-supplied overrides applied to core `AppState` before
 /// `production_validate`. Enterprise uses this to inject a real ABAC policy
 /// hook + audit writer through the same seam production hardening enforces.
@@ -461,6 +278,7 @@ fn resolve_forge_config(forge_runtime: &ForgeRuntimeConfig) -> (ForgeConfig, Dur
         orphan_gc_ttl: forge_runtime
             .orphan_gc_ttl_secs
             .map_or(base.orphan_gc_ttl, Duration::from_secs),
+        snapshot_retention: forge_runtime.snapshot_retention(),
         orphan_gc_max_list_pages: forge_runtime
             .orphan_gc_max_list_pages
             .unwrap_or(base.orphan_gc_max_list_pages),
@@ -592,16 +410,22 @@ async fn build_bifrost_external_dependencies(
     // an Oracle-serving target, so it cannot be resolved before the resource
     // plan exists, and the catalog cannot be built before the owner it must run
     // its Iceberg I/O through.
-    let bifrost_storage = Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
-        Arc::clone(&storage),
+    let mut bifrost_storage = vala_bifrost_redux::storage::BifrostStorage::new(
+        storage.backend_config(),
         vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
             config.storage.to_storage_config(),
             u64::try_from(resources.plan().managed_memory_bytes).unwrap_or(u64::MAX),
             resources.oracle().is_some(),
         )
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-        resources.oracle().map(|oracle| oracle.metadata()),
-    ));
+    )
+    .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    if let Some(oracle) = resources.oracle() {
+        bifrost_storage = bifrost_storage
+            .with_metadata_cache(&oracle.metadata())
+            .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    }
+    let bifrost_storage = Arc::new(bifrost_storage);
     let catalog = Arc::new(
         BifrostCatalog::new(
             dsns.catalog().expose_secret(),
@@ -643,7 +467,6 @@ pub async fn compose_bifrost(
         target,
         deployment_profile,
         postgres,
-        storage,
         bifrost_storage,
         catalog: bifrost,
         resources: bifrost_resources,
@@ -820,16 +643,6 @@ pub async fn compose_bifrost(
         // server. One initializer makes that divergence unrepresentable.
         let admission_defaults = AdmissionConfig {
             memory_limit_bytes: pod_memory_limit,
-            event_time_window: EventTimeWindow {
-                past: scribe_config.event_time_past_window_secs.map_or_else(
-                    || std::time::Duration::from_hours(720),
-                    std::time::Duration::from_secs,
-                ),
-                future: scribe_config.event_time_future_window_secs.map_or_else(
-                    || std::time::Duration::from_hours(24),
-                    std::time::Duration::from_secs,
-                ),
-            },
         };
         #[cfg(feature = "test-support")]
         let admission = test_controls
@@ -859,7 +672,7 @@ pub async fn compose_bifrost(
         );
         let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
             catalog: Some(Arc::clone(&bifrost)),
-            operator: Arc::new(storage.operator().clone()),
+            operator: Arc::clone(bifrost_storage.objects()),
             wal,
             stream,
             admission,
@@ -935,15 +748,13 @@ pub async fn compose_bifrost(
             .as_ref()
             .and_then(|controls| controls.forge_config.clone())
             .unwrap_or(forge_config);
-        let staging = Arc::new(storage.operator().clone());
         #[cfg(feature = "test-support")]
         let object_store: Arc<dyn ForgeObjectStore> = test_controls
             .as_ref()
             .and_then(|controls| controls.forge_object_store.clone())
-            .unwrap_or_else(|| Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging))));
+            .unwrap_or_else(|| Arc::new(ForgeObjects::new(&bifrost_storage)));
         #[cfg(not(feature = "test-support"))]
-        let object_store: Arc<dyn ForgeObjectStore> =
-            Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
+        let object_store: Arc<dyn ForgeObjectStore> = Arc::new(ForgeObjects::new(&bifrost_storage));
         let coordinator = ForgeCoordinator::new(ForgeBuildConfig {
             resources: bifrost_resources.forge().ok_or_else(|| {
                 ServerBootError::ForgeSchedulerRequired {
@@ -966,7 +777,7 @@ pub async fn compose_bifrost(
                     bifrost.iceberg_catalog()
                 }
             },
-            staging,
+            warehouse: vala_bifrost_redux::catalog::warehouse_uri(bifrost_storage.backend()),
             object_store,
             hints: staging_file_inbox,
             config: forge_config,
@@ -1148,6 +959,7 @@ pub async fn compose_bifrost(
             authority: forwarding_authority,
             config: OracleConfig {
                 default_deadline: bifrost_config.oracle.default_query_deadline(),
+                max_deadline: bifrost_config.oracle.max_query_deadline(),
                 ..OracleConfig::default()
             },
         },
@@ -1235,10 +1047,8 @@ fn forge_compaction_worker_config(
 /// same boot-resolved owner identity a process restart would, and its startup
 /// recovery reclaims lapsed claims and reconciles Prepared attempts exactly as
 /// after a restart. The failed instance cannot act again: its loop has
-/// returned only after joining its own plan runners and claim heartbeats, a
-/// same-owner table-lease acquisition bumps the fencing token so any lease it
-/// still held can no longer renew or commit, and a reclaimed claim settles
-/// only under its new attempt.
+/// returned only after joining its own plan runners and claim heartbeats, and
+/// a reclaimed claim renews and settles only under its new attempt.
 ///
 /// # Errors
 /// Returns [`ServerBootError::ForgeSchedulerRequired`] when Forge is absent or
@@ -1358,7 +1168,6 @@ pub async fn build_state(
         target: config.role,
         deployment_profile: config.deployment_profile,
         postgres: external.postgres.as_ref().clone(),
-        storage: Arc::clone(&external.storage),
         bifrost_storage: Arc::clone(&external.bifrost_storage),
         catalog: Arc::clone(&external.catalog),
         resources: external.resources,
@@ -1377,7 +1186,7 @@ pub async fn build_state(
     .await?;
     #[cfg(feature = "test-support")]
     if overrides.fail_after_scribe_activation {
-        bifrost.abort().await;
+        bifrost.abort();
         return Err(ServerBootError::Scribe(
             "test-injected failure after Scribe activation".to_owned(),
         ));
@@ -1430,7 +1239,7 @@ async fn rollback_state_roles(state: &AppState) {
     let deadline = std::time::Instant::now();
     state.bifrost.begin_shutdown();
     if state.bifrost.shutdown(deadline).await.is_err() {
-        state.bifrost.abort().await;
+        state.bifrost.abort();
     }
 }
 
@@ -1808,6 +1617,7 @@ impl OracleRoleBuilder<'_> {
         let default_split = OracleClassSplit::derive(raw_slots);
         let oracle_config = OracleConfig {
             max_workers_per_query: config.oracle.max_workers_per_query,
+            file_scan_bytes_per_task: config.oracle.file_scan_bytes_per_task,
             attempt_memory_bytes: config.oracle.max_frame_bytes.min(8 * 1024 * 1024),
             interactive_slots: calibrated
                 .as_ref()
@@ -1840,6 +1650,7 @@ impl OracleRoleBuilder<'_> {
                 |value| value.max_queue_wait,
             ),
             default_deadline: config.oracle.default_query_deadline(),
+            max_deadline: config.oracle.max_query_deadline(),
             ..OracleConfig::default()
         };
         let capabilities = OracleCapabilitiesV1 {
@@ -1901,13 +1712,6 @@ impl OracleRoleBuilder<'_> {
             node_id,
             tail_tls.clone(),
         ));
-        let reconciliation_limit_bytes = resource_plan
-            .managed_memory_bytes
-            .checked_div(4)
-            .filter(|limit| *limit > 0)
-            .ok_or_else(|| {
-                ServerBootError::OraclePeer("Oracle reconciliation budget is zero".to_owned())
-            })?;
         let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(
             tail_tls,
             local_scribe.as_ref().map(|scribe| scribe.tail_service()),
@@ -1947,10 +1751,7 @@ impl OracleRoleBuilder<'_> {
             vala: postgres.vala().clone(),
             cluster: Arc::clone(&cluster),
             local_role: role.clone(),
-            memory: OracleMemoryResources {
-                resources,
-                reconciliation_limit_bytes,
-            },
+            memory: OracleMemoryResources { resources },
             audit,
             reservations,
             stage_authority: Some(stage_authority),
@@ -2432,6 +2233,8 @@ mod tests {
             memory_limit_bytes: 4 * 1024 * 1024 * 1024,
             effective_cpu: 6,
             oracle_query_slot_limit: None,
+            oracle_partition_scan_bytes:
+                vala_bifrost_redux::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
             server_memory_min_bytes: 1024 * 1024 * 1024,
             managed_memory_bytes: 3 * 1024 * 1024 * 1024,
             scribe_enabled: false,
@@ -2483,125 +2286,6 @@ mod tests {
         );
     }
 
-    /// Orphan listing pages a backend without a native cursor in ascending order.
-    ///
-    /// The filesystem service advertises no `list_with_start_after` and walks
-    /// in directory order, so it takes the emulated path. Keys are written in
-    /// reverse so walk order and key order disagree; the pages must still be
-    /// bounded, globally ascending, and complete, and a resume from a mid-page
-    /// cursor must yield exactly the keys after it.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the operator cannot be built or written, when it starts
-    /// advertising cursor support, or when any page is oversized, out of order,
-    /// or skips or repeats a key.
-    #[tokio::test]
-    async fn open_dal_forge_listing_pages_backend_without_start_after() {
-        let root = tempfile::tempdir().expect("listing root");
-        let operator = opendal::Operator::new(
-            opendal::services::Fs::default().root(&root.path().to_string_lossy()),
-        )
-        .expect("filesystem operator builds")
-        .finish();
-        assert!(
-            !operator.info().full_capability().list_with_start_after,
-            "the filesystem service is the backend the emulated path exists for"
-        );
-        let prefix = "tenants/t/table/data/forge/v1/";
-        let total = FORGE_OBJECT_LIST_PAGE_ENTRIES * 2 + 3;
-        let mut keys = (0..total)
-            .map(|index| format!("{prefix}{index:06}.parquet"))
-            .collect::<Vec<_>>();
-        for key in keys.iter().rev() {
-            operator
-                .write(key, "orphan")
-                .await
-                .expect("object is written");
-        }
-        keys.sort();
-        let store = OpenDalForgeObjectStore::new(Arc::new(operator));
-
-        for (cursor, expected) in [(None, &keys[..]), (Some(keys[700].as_str()), &keys[701..])] {
-            let pages = store
-                .list_pages(prefix, cursor)
-                .await
-                .expect("an emulated listing opens")
-                .try_collect::<Vec<_>>()
-                .await
-                .expect("every emulated page lists");
-            assert!(
-                pages
-                    .iter()
-                    .all(|page| page.len() <= FORGE_OBJECT_LIST_PAGE_ENTRIES),
-                "every page stays within the page bound"
-            );
-            let listed = pages
-                .iter()
-                .flatten()
-                .map(|entry| entry.path().to_owned())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                listed, expected,
-                "pages are ascending, complete, and exclusive"
-            );
-        }
-    }
-
-    /// Directory entries never consume the page bound.
-    ///
-    /// The production page bound counts addressable objects, because the task
-    /// cursor advances over objects only. A chunk of leading directory markers
-    /// would otherwise yield an empty page and leave the frontier stationary,
-    /// starving the later object behind it. The filesystem service is the
-    /// installed backend that yields directory entries.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the operator cannot be built, when the single page is not
-    /// exactly the one object, or when the stream yields another page.
-    #[tokio::test]
-    async fn open_dal_forge_listing_filters_directories_before_page_boundary() {
-        let root = tempfile::tempdir().expect("listing root");
-        let operator = opendal::Operator::new(
-            opendal::services::Fs::default().root(&root.path().to_string_lossy()),
-        )
-        .expect("filesystem operator builds")
-        .finish();
-        let prefix = "tenants/t/table/data/forge/v1/";
-        for index in 0..FORGE_OBJECT_LIST_PAGE_ENTRIES {
-            operator
-                .create_dir(&format!("{prefix}{index:06}/"))
-                .await
-                .expect("leading directory marker is created");
-        }
-        let object = format!("{prefix}zzzzzz.parquet");
-        operator
-            .write(&object, "orphan")
-            .await
-            .expect("trailing object is written");
-
-        let store = OpenDalForgeObjectStore::new(Arc::new(operator));
-        let mut pages = store
-            .list_pages(prefix, None)
-            .await
-            .expect("the backend is listable");
-        let page = pages
-            .next()
-            .await
-            .expect("one object-only page is yielded")
-            .expect("the page lists successfully");
-        let paths = page
-            .iter()
-            .map(|entry| entry.path().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(paths, vec![object], "the page holds only the object");
-        assert!(
-            pages.next().await.is_none(),
-            "the object-only page is the whole listing"
-        );
-    }
-
     /// Boot rejects an expanded request above the cap while accepting its exact boundary.
     ///
     /// # Panics
@@ -2649,6 +2333,7 @@ mod tests {
     fn resolve_forge_config_applies_supplied_overrides() {
         let runtime = ForgeRuntimeConfig {
             orphan_gc_ttl_secs: Some(3_600),
+            snapshot_retention_secs: Some(43_200),
             orphan_gc_max_list_pages: Some(64),
             orphan_gc_run_budget_secs: Some(30),
             maintenance_interval_secs: Some(45),
@@ -2658,6 +2343,7 @@ mod tests {
         let (config, maintenance_interval) = resolve_forge_config(&runtime);
         assert_eq!(config.default_target_file_size_bytes, 2_147_483_648);
         assert_eq!(config.orphan_gc_ttl, Duration::from_hours(1));
+        assert_eq!(config.snapshot_retention, Duration::from_hours(12));
         assert_eq!(config.orphan_gc_max_list_pages, 64);
         assert_eq!(config.orphan_gc_run_budget, Duration::from_secs(30));
         assert_eq!(maintenance_interval, Duration::from_secs(45));
@@ -2797,7 +2483,7 @@ pub(crate) mod pg_tests {
         )
     }
 
-    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+    use wyrd_storage::{LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
 
@@ -2843,7 +2529,7 @@ pub(crate) mod pg_tests {
         let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
         let root = tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
+        let storage = Arc::new(StorageHandle::new(signer));
         let state = crate::test_support::test_app_state(
             postgres,
             storage,

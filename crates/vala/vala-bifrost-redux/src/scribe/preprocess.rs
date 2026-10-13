@@ -14,15 +14,15 @@ use wyrd_runtime::Principal;
 use wyrd_spec::request_id::RequestId;
 
 use crate::catalog::TableRef;
-use crate::catalog::TimeGranularity;
+use crate::catalog::TimeAxis;
 use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 use crate::resources::ScribeMemoryLease;
 use crate::schema::SchemaFingerprint;
-use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::admission::InflightFrameReservation;
 use crate::scribe::admission::REQUEST_OVERHEAD_BYTES;
 use crate::scribe::memory::MemoryCategory;
+use crate::scribe::profile::WriteProfile;
 use crate::scribe::seal_key::{
     SealKey, TimePartitionPlan, plan_time_partitions, split_batch_by_time_partition,
 };
@@ -57,19 +57,23 @@ pub(crate) struct AdmittedAppend {
     pub memory: ScribeMemoryLease,
     pub tenant: DataTenantId,
     pub table: TableRef,
-    /// Registered partition granularity every slice of this append is bucketed to.
-    pub partition_granularity: TimeGranularity,
+    /// Registered time axis every slice of this append is bucketed by.
+    pub time_axis: TimeAxis,
     pub queued_at: Instant,
     /// Completion channel answered once the append is durable in the WAL, or
     /// with the typed error that refused it; `None` for fire-and-forget appends.
     pub durable_ack: Option<oneshot::Sender<Result<DurableCompletion, ScribeError>>>,
+    /// The request's write profile, shared with its ingress waiter and
+    /// emitted once both have dropped it.
+    pub profile: Arc<WriteProfile>,
 }
 
 /// Root-owned row source entering current-only persistence preprocessing.
 #[derive(Debug)]
 pub(crate) enum AdmittedRows {
-    /// One already-stamped projected batch.
-    Projected(RecordBatch),
+    /// One already-stamped projected batch, with the logical identity Gate
+    /// computed when the batch still holds its inputs.
+    Projected(RecordBatch, Option<LogicalIdentity>),
     /// One native stream decoded a record batch at a time on the persistence lane.
     Native(Box<NativeAdmittedRows>),
 }
@@ -77,7 +81,7 @@ pub(crate) enum AdmittedRows {
 /// Retained native source and immutable stamping context.
 #[derive(Debug, Clone)]
 pub(crate) struct NativeAdmittedRows {
-    /// Transport bytes retained until the final planned source is decoded.
+    /// Transport-owned Arrow IPC stream, decoded zero-copy where aligned.
     pub(crate) bytes: Bytes,
     /// Authenticated principal used for managed correlation columns.
     pub(crate) principal: Principal,
@@ -90,19 +94,8 @@ pub(crate) struct NativeAdmittedRows {
     pub(crate) request_id: RequestId,
     /// Stable batch identity keying every produced slice.
     pub(crate) batch_id: Uuid,
-    /// Immutable event-time acceptance window.
-    pub(crate) event_time_window: EventTimeWindow,
     /// One receipt instant reused by planning, projection, and WAL identity.
     pub(crate) receipt_micros: i64,
-    /// Start of the preflighted schema frame in retained transport bytes.
-    pub(crate) schema_start: usize,
-    /// Exclusive end of the preflighted schema frame including padding.
-    pub(crate) schema_end: usize,
-    /// Fixed preflight descriptors for each record-batch message.
-    pub(crate) sources: [crate::scribe::material_plan::SourceMaterialPlan;
-        crate::scribe::material_plan::MAX_SOURCE_PLANS],
-    /// Live prefix length within `sources`.
-    pub(crate) source_count: usize,
     /// Canonical built-in whose physical identity every source must preserve.
     pub(crate) definition: Option<&'static crate::tables::BuiltinTableDefinition>,
     /// Registered Iceberg schema whose field ids every stamped batch carries.
@@ -110,11 +103,14 @@ pub(crate) struct NativeAdmittedRows {
     /// `None` only for the embedded engine seam, which has no catalog owner
     /// and writes objects that no registered table promotes.
     pub(crate) registered_schema: Option<Arc<Schema>>,
+    /// The ingress lane's remembered conform plans, shared so a native source
+    /// conforms each batch as the lane's decode does.
+    pub(crate) conform: Arc<crate::scribe::execution_lanes::ConformPlans>,
     /// Expanded-data ceiling the decoded, stamped output must fit before WAL.
     pub(crate) expanded_limit_bytes: usize,
 }
 
-/// A request after deterministic event-day splitting and serialization.
+/// A request after deterministic time-partition splitting and serialization.
 #[derive(Debug)]
 pub(crate) struct PreparedAppend {
     /// Stable batch identity keying every produced slice and the commit fence.
@@ -130,6 +126,12 @@ pub(crate) struct PreparedAppend {
     /// Completion channel carried from the queued append, answered once the
     /// prepared frame is durable or refused; `None` for fire-and-forget appends.
     pub durable_ack: Option<oneshot::Sender<Result<DurableCompletion, ScribeError>>>,
+    /// The request's write profile, charged its shard wait and group stages
+    /// by the shard that acknowledges it.
+    pub profile: Arc<WriteProfile>,
+    /// When preprocessing finished; the shard wait runs from here until the
+    /// append's group starts.
+    pub prepared_at: Instant,
 }
 
 /// Closed prepared-slice source used by the shard owner.
@@ -144,10 +146,13 @@ pub(crate) enum PreparedSliceSet {
 pub(crate) struct NativeSliceProducer {
     /// Deterministic retained source and stamping context.
     source: NativeAdmittedRows,
-    /// Push decoder retaining only its schema and current scratch.
+    /// Arrow's push decoder, which validates every batch it yields.
+    ///
+    /// Left at Arrow's default alignment policy, it aliases aligned buffers
+    /// and copies only an unaligned buffer into an aligned allocation.
     decoder: arrow::ipc::reader::StreamDecoder,
-    /// Index of the next preflighted source descriptor.
-    source_index: usize,
+    /// Undecoded remainder of the transport stream.
+    pending: Buffer,
     /// Current decoded source retained only across its partition slices.
     current: Option<NativeCurrentSource>,
     /// Request correlation stamped on every produced slice.
@@ -156,14 +161,15 @@ pub(crate) struct NativeSliceProducer {
     slice_index: u32,
     /// Exact count established by the non-retaining first pass.
     slice_count: u32,
-    /// Running decoded and stamped output checked against the expanded ceiling.
+    /// Running expanded bytes of the decoded batches, checked against the
+    /// expanded ceiling.
     output_bytes: usize,
     /// Authenticated tenant used by every produced seal key.
     tenant: DataTenantId,
     /// Logical table used by every produced seal key.
     table: TableRef,
-    /// Registered partition granularity used to bucket every produced slice.
-    partition_granularity: TimeGranularity,
+    /// Registered time axis used to bucket every produced slice.
+    time_axis: TimeAxis,
 }
 
 /// One decoded native source and its fixed time-partition cursor.
@@ -178,25 +184,22 @@ struct NativeCurrentSource {
 }
 
 impl NativeSliceProducer {
-    /// Builds a producer after a non-retaining pass fixes the total slice count.
+    /// Builds a producer positioned at the start of the native stream.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when native decoding, stamping, day planning, or
-    /// slice-count arithmetic fails during the first pass.
+    /// The stream bytes are shared with the decoder by reference count, so no
+    /// transport bytes are copied here.
     fn new(
         source: NativeAdmittedRows,
         request_id: Uuid,
         tenant: DataTenantId,
         table: TableRef,
-        partition_granularity: TimeGranularity,
-    ) -> Result<Self, ScribeError> {
-        let mut decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
-        feed_native_schema(&mut decoder, &source)?;
-        Ok(Self {
+        time_axis: TimeAxis,
+    ) -> Self {
+        let pending = Buffer::from(Bytes::clone(&source.bytes));
+        Self {
             source,
-            decoder,
-            source_index: 0,
+            decoder: arrow::ipc::reader::StreamDecoder::new(),
+            pending,
             current: None,
             request_id,
             slice_index: 0,
@@ -204,20 +207,53 @@ impl NativeSliceProducer {
             output_bytes: 0,
             tenant,
             table,
-            partition_granularity,
-        })
+            time_axis,
+        }
+    }
+
+    /// Decodes the next record batch from the remaining stream bytes.
+    ///
+    /// Arrow consumes the schema message on the first call and yields one
+    /// validated batch per call. Once every byte is consumed, Arrow's `finish`
+    /// refuses a stream that stopped inside a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::InvalidFrame`] when Arrow refuses the stream:
+    /// malformed framing or metadata, a batch that fails validation, bytes after
+    /// end-of-stream, or a truncated final message.
+    fn decode_next(&mut self) -> Result<Option<RecordBatch>, ScribeError> {
+        while !self.pending.is_empty() {
+            // ponytail: arrow-ipc 59 panics instead of erring on some malformed
+            // input (arrow-rs #10647, fixed in 60.0.0; #11044, unreleased). The
+            // panic is caller input, so it maps to the same refusal as an Arrow
+            // error. Delete the catch once the pinned arrow carries both fixes.
+            let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.decoder.decode(&mut self.pending)
+            }));
+            if let Some(rows) = decoded
+                .map_err(|_| ScribeError::InvalidFrame)?
+                .map_err(|_| ScribeError::InvalidFrame)?
+            {
+                return Ok(Some(rows));
+            }
+        }
+        self.decoder
+            .finish()
+            .map_err(|_| ScribeError::InvalidFrame)?;
+        Ok(None)
     }
 
     /// Produces one exact-capacity current slice and advances its owner state.
     ///
-    /// Each decoded source is stamped and its actual retained output added to
-    /// the running request total before any slice of it is produced, so output
-    /// above the expanded ceiling is refused before WAL.
+    /// Each decoded batch's expanded bytes are added to the running request
+    /// total before it is stamped or sliced, so a request above the expanded
+    /// ceiling is refused before WAL.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when decoding diverges from preflight, stamping
-    /// or day materialization fails, or fixed-capacity IPC encoding fails, and
+    /// Returns [`ScribeError`] when Arrow refuses the stream, stamping
+    /// or day materialization fails, or Arrow IPC encoding fails, and
     /// [`ScribeError::DecodedPayloadTooLarge`] when actual output exceeds the
     /// expanded ceiling.
     pub(crate) fn next_slice(&mut self) -> Result<Option<PreparedSlice>, ScribeError> {
@@ -253,16 +289,12 @@ impl NativeSliceProducer {
                 }
                 self.current = None;
             }
-            let Some(rows) =
-                decode_planned_native_source(&mut self.decoder, &self.source, self.source_index)?
-            else {
+            let Some(rows) = self.decode_next()? else {
                 return Ok(None);
             };
-            self.source_index += 1;
-            let rows = stamp_native_source(&rows, &self.source)?;
             self.output_bytes = self
                 .output_bytes
-                .checked_add(crate::scribe::material_plan::retained_slice_bytes(&rows)?)
+                .checked_add(crate::scribe::material_plan::expanded_bytes(&rows)?)
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,
                     limit: self.source.expanded_limit_bytes,
@@ -273,7 +305,8 @@ impl NativeSliceProducer {
                     limit: self.source.expanded_limit_bytes,
                 });
             }
-            let partitions = plan_time_partitions(&rows, self.partition_granularity)?;
+            let rows = stamp_native_source(&rows, &self.source)?;
+            let partitions = plan_time_partitions(&rows, &self.time_axis)?;
             self.current = Some(NativeCurrentSource {
                 rows,
                 partitions,
@@ -293,97 +326,6 @@ impl PreparedSliceSet {
     }
 }
 
-/// Counts native slices while retaining only one decoded source at a time.
-///
-/// # Errors
-///
-/// Returns [`ScribeError`] when decoding, stamping, day planning, or checked
-/// slice-count conversion fails.
-/// Decodes the next record batch from a preflighted native source.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::InvalidFrame`] when Arrow decoding or final stream
-/// completion diverges from the accepted metadata plan.
-fn feed_native_schema(
-    decoder: &mut arrow::ipc::reader::StreamDecoder,
-    source: &NativeAdmittedRows,
-) -> Result<(), ScribeError> {
-    source
-        .bytes
-        .get(source.schema_start..source.schema_end)
-        .ok_or(ScribeError::InvalidFrame)?;
-    let mut input = Buffer::from(source.bytes.slice(source.schema_start..source.schema_end));
-    if decoder
-        .decode(&mut input)
-        .map_err(|_| ScribeError::InvalidFrame)?
-        .is_some()
-        || !input.is_empty()
-    {
-        return Err(ScribeError::InvalidFrame);
-    }
-    Ok(())
-}
-
-/// Decodes one descriptor-selected native batch with an admitted current-body copy.
-///
-/// Aligned transport bodies alias the retained request bytes. An unaligned body
-/// is copied once into an exactly sized Arrow allocation while the retained raw
-/// owner remains live; the next source cannot begin until this batch is dropped.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::InvalidFrame`] when a descriptor range diverges from
-/// retained bytes or Arrow does not produce exactly one batch.
-fn decode_planned_native_source(
-    decoder: &mut arrow::ipc::reader::StreamDecoder,
-    source: &NativeAdmittedRows,
-    source_index: usize,
-) -> Result<Option<RecordBatch>, ScribeError> {
-    let Some(plan) = source
-        .sources
-        .get(source_index)
-        .filter(|_| source_index < source.source_count)
-    else {
-        return Ok(None);
-    };
-    source
-        .bytes
-        .get(plan.frame_start..plan.body_start)
-        .ok_or(ScribeError::InvalidFrame)?;
-    let mut metadata = Buffer::from(source.bytes.slice(plan.frame_start..plan.body_start));
-    if decoder
-        .decode(&mut metadata)
-        .map_err(|_| ScribeError::InvalidFrame)?
-        .is_some()
-        || !metadata.is_empty()
-    {
-        return Err(ScribeError::InvalidFrame);
-    }
-    let raw_body = source
-        .bytes
-        .get(plan.body_start..plan.body_end)
-        .ok_or(ScribeError::InvalidFrame)?;
-    let aligned = (source.bytes.as_ptr() as usize)
-        .checked_add(plan.body_start)
-        .is_some_and(|address| address.is_multiple_of(8));
-    let mut body = if aligned {
-        Buffer::from(source.bytes.slice(plan.body_start..plan.body_end))
-    } else {
-        let mut copied = arrow::buffer::MutableBuffer::new(raw_body.len());
-        copied.extend_from_slice(raw_body);
-        Buffer::from(copied)
-    };
-    let rows = decoder
-        .decode(&mut body)
-        .map_err(|_| ScribeError::InvalidFrame)?
-        .ok_or(ScribeError::InvalidFrame)?;
-    if !body.is_empty() {
-        return Err(ScribeError::InvalidFrame);
-    }
-    Ok(Some(rows))
-}
-
 /// Applies deterministic native contract validation and managed stamping.
 ///
 /// # Errors
@@ -401,10 +343,10 @@ fn stamp_native_source(
             card_scope: source.card_scope.as_deref(),
             expected_schema_fingerprint: source.expected_schema_fingerprint,
             request_id: &source.request_id,
-            window: source.event_time_window,
             receipt_micros: source.receipt_micros,
             definition: source.definition,
-            registered_schema: source.registered_schema.as_deref(),
+            registered_schema: source.registered_schema.as_ref(),
+            conform: Some(&source.conform),
         },
     )
 }
@@ -493,6 +435,111 @@ pub(crate) fn correlation_data_identity(rows: &RecordBatch) -> Result<[u8; 32], 
     Ok(digest.finalize().into())
 }
 
+/// A logical identity already computed over one batch, reusable for any rows
+/// that still hold that batch's exact identity inputs.
+///
+/// Gate derives the OTLP batch id from [`logical_data_identity`] over its
+/// projected batch, and Scribe needs the same digest for every WAL slice it
+/// cuts from the decoded rows. Decode re-types and stamps columns but, for a
+/// batch already in its registered layout, keeps every user column's buffers;
+/// an undivided slice then holds the same buffers again. [`Self::for_rows`]
+/// hands the digest back only when every input the digest reads is
+/// pointer-identical, so the reused value always equals a recomputation.
+#[derive(Debug, Clone)]
+pub(crate) struct LogicalIdentity {
+    /// SHA-256 digest from [`logical_data_identity`].
+    digest: [u8; 32],
+    /// Buffer length from [`logical_data_identity`].
+    len: u32,
+    /// The rows the digest was computed over, holding its inputs alive.
+    rows: RecordBatch,
+}
+
+impl LogicalIdentity {
+    /// Computes the logical identity of `rows` and keeps the rows it covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`logical_data_identity`] failure.
+    pub(crate) fn of(rows: &RecordBatch) -> Result<Self, ScribeError> {
+        let (digest, len) = logical_data_identity(rows)?;
+        Ok(Self {
+            digest,
+            len,
+            rows: rows.clone(),
+        })
+    }
+
+    /// The logical digest.
+    pub(crate) const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    /// The rows the identity covers.
+    pub(crate) const fn rows(&self) -> &RecordBatch {
+        &self.rows
+    }
+
+    /// Returns this identity for `rows` when `rows` hold exactly its inputs:
+    /// the same non-managed column names in the same order, each with the
+    /// same length, offset, validity bytes, data buffers, and children by
+    /// address. Any difference returns `None`, and the caller recomputes.
+    pub(crate) fn for_rows(&self, rows: &RecordBatch) -> Option<([u8; 32], u32)> {
+        let inputs = |batch: &RecordBatch| {
+            let schema = batch.schema();
+            schema
+                .fields()
+                .iter()
+                .zip(batch.columns())
+                .filter(|(field, _)| {
+                    !crate::tables::managed_columns::is_managed_column(field.name())
+                })
+                .map(|(field, column)| (field.name().clone(), column.to_data()))
+                .collect::<Vec<_>>()
+        };
+        let (known, offered) = (inputs(&self.rows), inputs(rows));
+        let same = known.len() == offered.len()
+            && known
+                .iter()
+                .zip(&offered)
+                .all(|((left_name, left), (right_name, right))| {
+                    left_name == right_name && same_identity_inputs(left, right)
+                });
+        same.then_some((self.digest, self.len))
+    }
+}
+
+/// Reports whether two arrays present [`digest_array_data`] the same bytes by
+/// address: length, offset, validity bytes, every data buffer, and every
+/// child, recursively.
+///
+/// Comparing slices with [`std::ptr::eq`] compares both their start and their
+/// length, so equal here means the digest reads the very same memory.
+fn same_identity_inputs(left: &ArrayData, right: &ArrayData) -> bool {
+    left.len() == right.len()
+        && left.offset() == right.offset()
+        && match (
+            left.nulls().map(|nulls| nulls.buffer().as_slice()),
+            right.nulls().map(|nulls| nulls.buffer().as_slice()),
+        ) {
+            (Some(left), Some(right)) => std::ptr::eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+        && left.buffers().len() == right.buffers().len()
+        && left
+            .buffers()
+            .iter()
+            .zip(right.buffers())
+            .all(|(left, right)| std::ptr::eq(left.as_slice(), right.as_slice()))
+        && left.child_data().len() == right.child_data().len()
+        && left
+            .child_data()
+            .iter()
+            .zip(right.child_data())
+            .all(|(left, right)| same_identity_inputs(left, right))
+}
+
 /// Computes the stable logical Arrow identity used only for retained retries.
 ///
 /// Server-generated request and time columns change across a legitimate client
@@ -559,8 +606,8 @@ struct PreparedRowsContext {
     tenant: DataTenantId,
     /// Logical table used by every seal key.
     table: TableRef,
-    /// Registered partition granularity used to bucket every slice.
-    partition_granularity: TimeGranularity,
+    /// Registered time axis used to bucket every slice.
+    time_axis: TimeAxis,
     /// Root bytes retained while the prepared source is live.
     memory_bytes: usize,
 }
@@ -583,11 +630,11 @@ fn prepare_rows(
         request_id,
         tenant,
         table,
-        partition_granularity,
+        time_axis,
         memory_bytes,
     } = context;
     match rows {
-        AdmittedRows::Projected(rows) => {
+        AdmittedRows::Projected(rows, known) => {
             let mut slices = Vec::new();
             append_prepared_slices(
                 &mut slices,
@@ -597,8 +644,9 @@ fn prepare_rows(
                     tenant,
                     table: &table,
                 },
-                partition_granularity,
+                &time_axis,
                 &rows,
+                known.as_ref(),
             )?;
             let slice_count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
                 detail: "Scribe batch exceeds the v6 WAL slice-count bound".to_owned(),
@@ -617,16 +665,14 @@ fn prepare_rows(
             Ok((PreparedSliceSet::Materialized(slices), prepared_bytes))
         }
         AdmittedRows::Native(native) => {
-            let mut producer = NativeSliceProducer::new(
-                *native,
-                request_id,
-                tenant,
-                table,
-                partition_granularity,
-            )?;
+            let mut producer =
+                NativeSliceProducer::new(*native, request_id, tenant, table, time_axis);
             let mut slices = Vec::new();
             while let Some(slice) = producer.next_slice()? {
                 slices.push(slice);
+            }
+            if slices.is_empty() {
+                return Err(ScribeError::InvalidFrame);
             }
             assign_slice_ordinals(&mut slices)?;
             let prepared_bytes = prepared_slice_bytes(&slices, memory_bytes)?;
@@ -674,9 +720,10 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         mut memory,
         tenant,
         table,
-        partition_granularity,
+        time_axis,
         queued_at,
         mut durable_ack,
+        profile,
     } = admitted;
 
     metrics::histogram!("bifrost_scribe_queue_wait_seconds")
@@ -689,7 +736,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
             request_id,
             tenant,
             table: table.clone(),
-            partition_granularity,
+            time_axis,
             memory_bytes: memory.bytes(),
         },
     );
@@ -715,6 +762,8 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         reservation,
         memory: Some(memory),
         durable_ack,
+        profile,
+        prepared_at: Instant::now(),
     })
 }
 
@@ -750,12 +799,13 @@ fn prepared_slice_bytes(slices: &[PreparedSlice], limit: usize) -> Result<usize,
 fn append_prepared_slices(
     slices: &mut Vec<PreparedSlice>,
     context: SliceContext<'_>,
-    partition_granularity: TimeGranularity,
+    time_axis: &TimeAxis,
     rows: &RecordBatch,
+    known: Option<&LogicalIdentity>,
 ) -> Result<(), ScribeError> {
-    for slice in split_batch_by_time_partition(rows, partition_granularity)? {
+    for slice in split_batch_by_time_partition(rows, time_axis)? {
         let (partition, partition_rows) = slice?;
-        slices.push(prepare_slice(context, partition, partition_rows, None)?);
+        slices.push(prepare_slice(context, partition, partition_rows, known)?);
     }
     Ok(())
 }
@@ -773,26 +823,34 @@ struct SliceContext<'a> {
     table: &'a TableRef,
 }
 
-/// Builds one fixed-capacity WAL slice from the current materialized day.
+/// Builds one exact-capacity WAL slice from the current materialized day.
+///
+/// The slice's logical identity is taken from `known` when the slice still
+/// holds its inputs ([`LogicalIdentity::for_rows`]), as an undivided canonical
+/// batch does, and is computed otherwise.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError`] when fixed IPC encoding fails.
+/// Returns [`ScribeError`] when Arrow IPC encoding fails or the logical
+/// identity cannot be represented.
 fn prepare_slice(
     context: SliceContext<'_>,
     partition: TimePartition,
     rows: RecordBatch,
-    ipc_plan: Option<crate::scribe::fixed_ipc::FixedIpcPlan>,
+    known: Option<&LogicalIdentity>,
 ) -> Result<PreparedSlice, ScribeError> {
     let seal_key = SealKey::new(context.tenant, context.table.clone(), partition);
-    let data_payload = encode_ipc_fixed(&rows, ipc_plan)?;
+    let data_payload = encode_ipc(&rows)?;
     let identity_span = tracing::debug_span!(
         "scribe_logical_batch_identity",
         batch_id = %context.batch_id,
         table = %context.table.fqn(),
     );
     let (logical_data_digest, logical_data_len) =
-        identity_span.in_scope(|| logical_data_identity(&rows))?;
+        match known.and_then(|known| known.for_rows(&rows)) {
+            Some(identity) => identity,
+            None => identity_span.in_scope(|| logical_data_identity(&rows))?,
+        };
     let wal_append = PreparedWalAppend::new(
         crate::scribe::wal::WalLsn::ZERO,
         *context.batch_id.as_bytes(),
@@ -818,30 +876,51 @@ fn prepare_slice(
     })
 }
 
-/// Encodes one current day into a capacity-frozen IPC payload.
+/// Encodes one current day as a ZSTD level-1 Arrow IPC stream.
 ///
-/// A fixed inline plan establishes the complete stream length before the sole
-/// output allocation and revalidates physical facts during encoding.
+/// The payload is written into one allocation sized to the bound admission
+/// reserved ([`crate::scribe::material_plan::wal_payload_bound`]), then shrunk
+/// to its compressed length so the WAL does not retain the uncompressed
+/// capacity. Every WAL reader decodes it with Arrow's standard `StreamReader`.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::Internal`] when either Arrow pass fails or the second
-/// pass diverges from its counted length or initial capacity.
-fn encode_ipc_fixed(
-    rows: &RecordBatch,
-    plan: Option<crate::scribe::fixed_ipc::FixedIpcPlan>,
-) -> Result<Bytes, ScribeError> {
-    let plan = match plan {
-        Some(plan) => plan,
-        None => crate::scribe::fixed_ipc::FixedIpcPlan::count(rows)?,
-    };
-    let encoded_bytes = plan.encoded_bytes();
-    let payload = plan.encode(rows)?;
-    if payload.len() != encoded_bytes || payload.capacity() != encoded_bytes {
+/// Returns [`ScribeError::Internal`] when the bound or either Arrow step fails,
+/// or the payload exceeds its reserved bound.
+fn encode_ipc(rows: &RecordBatch) -> Result<Bytes, ScribeError> {
+    let bound = crate::scribe::material_plan::wal_payload_bound(rows)?;
+    let options = arrow::ipc::writer::IpcWriteOptions::default()
+        .try_with_compression(Some(crate::scribe::material_plan::WAL_IPC_COMPRESSION))
+        .and_then(|options| {
+            options.try_with_compression_level(Some(
+                crate::scribe::material_plan::WAL_IPC_COMPRESSION_LEVEL,
+            ))
+        })
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("Arrow IPC compression unavailable: {error}"),
+        })?;
+    let mut payload = Vec::with_capacity(bound);
+    let mut writer = arrow::ipc::writer::StreamWriter::try_new_with_options(
+        &mut payload,
+        &rows.schema(),
+        options,
+    )
+    .map_err(|error| ScribeError::Internal {
+        detail: format!("Arrow IPC encode init failed: {error}"),
+    })?;
+    writer.write(rows).map_err(|error| ScribeError::Internal {
+        detail: format!("Arrow IPC encode failed: {error}"),
+    })?;
+    writer.finish().map_err(|error| ScribeError::Internal {
+        detail: format!("Arrow IPC encode finish failed: {error}"),
+    })?;
+    drop(writer);
+    if payload.len() > bound {
         return Err(ScribeError::Internal {
-            detail: "fixed IPC encoder diverged from its admitted capacity".to_owned(),
+            detail: "Arrow IPC encode exceeded its reserved bound".to_owned(),
         });
     }
+    payload.shrink_to_fit();
     Ok(Bytes::from(payload))
 }
 
@@ -930,7 +1009,9 @@ impl LogicalBatchDigest {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{
+        Array, ArrayRef, Decimal128Array, Int64Array, StringArray, Time64MicrosecondArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
@@ -939,14 +1020,14 @@ mod tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::managed_columns::{WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
+    use wyrd_spec::vala::managed_columns::{WYRD_INGESTED_AT, WYRD_REQUEST_ID};
 
-    use super::{
-        EventTimeWindow, NativeAdmittedRows, decode_planned_native_source, feed_native_schema,
-        logical_data_identity,
-    };
+    use super::{NativeAdmittedRows, NativeSliceProducer, encode_ipc, logical_data_identity};
+    use crate::catalog::TableRef;
+    use crate::catalog::{TimeAxis, TimeGranularity};
+    use crate::contracts::ScribeError;
+    use crate::namespaces::BifrostNamespace;
     use crate::schema::SchemaFingerprint;
-    use crate::scribe::material_plan::ScribeIngressPlanner;
 
     /// Encodes one scalar native stream whose body can be shifted off alignment.
     fn native_stream() -> (Bytes, SchemaFingerprint) {
@@ -968,20 +1049,18 @@ mod tests {
         (Bytes::from(bytes), fingerprint)
     }
 
-    /// Builds the retained owner required by the descriptor-driven decoder.
+    /// Builds a producer over `bytes` partitioning daily on `wyrd_ingested_at`.
     ///
     /// # Panics
     ///
-    /// Panics when the fixture bytes do not plan as a native payload.
-    fn planned_source(bytes: Bytes, fingerprint: SchemaFingerprint) -> NativeAdmittedRows {
-        let plan = ScribeIngressPlanner::default()
-            .plan_native(&bytes)
-            .expect("native plan");
+    /// Never panics; construction performs no IO or decoding.
+    fn producer(bytes: Bytes, fingerprint: SchemaFingerprint) -> NativeSliceProducer {
         let tenant = DataTenantId::new_v7();
-        NativeAdmittedRows {
+        let source = NativeAdmittedRows {
             definition: None,
             card_scope: None,
             registered_schema: None,
+            conform: Arc::default(),
             expanded_limit_bytes: crate::gate::limits::IngestLimits::default().expanded_bytes(),
             bytes,
             principal: Principal {
@@ -995,47 +1074,192 @@ mod tests {
             expected_schema_fingerprint: fingerprint,
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
-            event_time_window: EventTimeWindow::default(),
             receipt_micros: 0,
-            schema_start: plan.native_schema_start,
-            schema_end: plan.native_schema_end,
-            sources: plan.sources,
-            source_count: plan.source_count,
-        }
+        };
+        NativeSliceProducer::new(
+            source,
+            uuid::Uuid::now_v7(),
+            tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "events"),
+            TimeAxis::new(WYRD_INGESTED_AT, TimeGranularity::Day),
+        )
     }
 
-    /// Proves aligned bodies alias raw bytes while unaligned bodies copy one current body.
-    #[test]
-    fn native_descriptor_decoder_accepts_aligned_and_unaligned_transport() {
-        let (aligned, fingerprint) = native_stream();
-        let aligned_plan = ScribeIngressPlanner::default()
-            .plan_native(&aligned)
-            .expect("aligned plan");
-        assert_eq!(aligned_plan.aligned_copy_bytes, 0);
+    /// Decodes every batch of `bytes` through the native producer's decoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns the producer's refusal for the first batch Arrow rejects.
+    fn decode_all(bytes: Bytes) -> Result<Vec<RecordBatch>, ScribeError> {
+        let (_, fingerprint) = native_stream();
+        let mut producer = producer(bytes, fingerprint);
+        let mut batches = Vec::new();
+        while let Some(batch) = producer.decode_next()? {
+            batches.push(batch);
+        }
+        Ok(batches)
+    }
 
+    /// Encodes one single-column, one-batch stream for refusal fixtures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the field and array cannot form or encode a valid batch.
+    fn scalar_stream(field: Field, array: ArrayRef) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("scalar batch");
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("stream writer");
+        writer.write(&batch).expect("batch write");
+        writer.finish().expect("stream finish");
+        bytes
+    }
+
+    /// Returns the schema message's `FlatBuffer` range in one stream.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture lacks the continuation-framed schema prefix.
+    fn schema_metadata_bounds(bytes: &[u8]) -> (usize, usize) {
+        let len = u32::from_le_bytes(bytes[4..8].try_into().expect("schema length"));
+        (8, 8 + usize::try_from(len).expect("metadata length"))
+    }
+
+    /// Returns the schema's first field from one stream's schema message.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the metadata is not a schema message with a field.
+    fn first_field(metadata: &[u8]) -> arrow::ipc::Field<'_> {
+        arrow::ipc::root_as_message(metadata)
+            .expect("message")
+            .header_as_schema()
+            .and_then(|schema| schema.fields())
+            .map(|fields| fields.get(0))
+            .expect("schema field")
+    }
+
+    /// Aligned bodies decode zero-copy and unaligned bodies decode via Arrow's copy.
+    #[test]
+    fn native_decoder_accepts_aligned_and_unaligned_transport() {
+        let (aligned, _) = native_stream();
         let mut shifted = Vec::with_capacity(aligned.len() + 1);
         shifted.push(0);
         shifted.extend_from_slice(&aligned);
         let unaligned = Bytes::from(shifted).slice(1..);
-        let unaligned_plan = ScribeIngressPlanner::default()
-            .plan_native(&unaligned)
-            .expect("unaligned plan");
-        assert_eq!(
-            unaligned_plan.aligned_copy_bytes,
-            unaligned_plan.sources[0].body_end - unaligned_plan.sources[0].body_start
-        );
-
-        for source in [
-            planned_source(aligned, fingerprint),
-            planned_source(unaligned, fingerprint),
-        ] {
-            let mut decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
-            feed_native_schema(&mut decoder, &source).expect("schema");
-            let batch = decode_planned_native_source(&mut decoder, &source, 0)
-                .expect("decode")
-                .expect("batch");
-            assert_eq!(batch.num_rows(), 2);
+        for bytes in [aligned, unaligned] {
+            let batches = decode_all(bytes).expect("decodes");
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].num_rows(), 2);
         }
+    }
+
+    /// Arrow refuses a stream cut inside a message and bytes after end-of-stream.
+    #[test]
+    fn native_decoder_refuses_truncated_and_trailing_bytes() {
+        let (bytes, _) = native_stream();
+        let cut = bytes.slice(..bytes.len() - 12);
+        assert!(matches!(decode_all(cut), Err(ScribeError::InvalidFrame)));
+        let mut trailing = bytes.to_vec();
+        trailing.extend_from_slice(&[0_u8; 8]);
+        assert!(matches!(
+            decode_all(Bytes::from(trailing)),
+            Err(ScribeError::InvalidFrame)
+        ));
+    }
+
+    /// A null in a column the stream declares nonnullable fails Arrow validation.
+    #[test]
+    fn native_decoder_refuses_nonnullable_nulls() {
+        let mut bytes = scalar_stream(
+            Field::new("id", DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![Some(1_i64), None])),
+        );
+        let (start, end) = schema_metadata_bounds(&bytes);
+        let offset = {
+            let field = first_field(&bytes[start..end]);
+            field._tab.loc() + usize::from(field._tab.vtable().get(arrow::ipc::Field::VT_NULLABLE))
+        };
+        bytes[start + offset] = 0;
+        assert!(matches!(
+            decode_all(Bytes::from(bytes)),
+            Err(ScribeError::InvalidFrame)
+        ));
+    }
+
+    /// An illegal Time unit and bit-width pair is refused by Arrow's schema decode.
+    #[test]
+    fn native_decoder_refuses_illegal_time_width() {
+        let mut bytes = scalar_stream(
+            Field::new(
+                "time",
+                DataType::Time64(arrow::datatypes::TimeUnit::Microsecond),
+                false,
+            ),
+            Arc::new(Time64MicrosecondArray::from(vec![1_i64])),
+        );
+        let (start, end) = schema_metadata_bounds(&bytes);
+        let offset = {
+            let time = first_field(&bytes[start..end])
+                .type_as_time()
+                .expect("time metadata");
+            time._tab.loc() + usize::from(time._tab.vtable().get(arrow::ipc::Time::VT_BITWIDTH))
+        };
+        bytes[start + offset..start + offset + 4].copy_from_slice(&32_i32.to_le_bytes());
+        assert!(matches!(
+            decode_all(Bytes::from(bytes)),
+            Err(ScribeError::InvalidFrame)
+        ));
+    }
+
+    /// Decimal precision beyond Decimal128's width never reaches WAL.
+    ///
+    /// Arrow decodes the widened declaration, so the refusal comes from the
+    /// registered-schema fingerprint the producer checks on every batch.
+    #[test]
+    fn native_producer_refuses_decimal_precision_overflow() {
+        let array = Decimal128Array::from(vec![Some(123_i128)])
+            .with_precision_and_scale(10, 2)
+            .expect("decimal fixture");
+        let mut bytes = scalar_stream(
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+            Arc::new(array),
+        );
+        let (start, end) = schema_metadata_bounds(&bytes);
+        let offset = {
+            let decimal = first_field(&bytes[start..end])
+                .type_as_decimal()
+                .expect("decimal metadata");
+            decimal._tab.loc()
+                + usize::from(decimal._tab.vtable().get(arrow::ipc::Decimal::VT_PRECISION))
+        };
+        bytes[start + offset..start + offset + 4].copy_from_slice(&39_i32.to_le_bytes());
+        let registered = SchemaFingerprint::from_arrow_schema(&Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, 2),
+            true,
+        )]));
+        let refusal = producer(Bytes::from(bytes), registered).next_slice();
+        assert!(
+            matches!(refusal, Err(ScribeError::FingerprintMismatch { .. })),
+            "{refusal:?}"
+        );
+    }
+
+    /// Stamped output above the expanded ceiling is refused before any WAL slice.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stream fits a one-byte ceiling or the refusal differs.
+    #[test]
+    fn native_producer_refuses_output_above_expanded_ceiling() {
+        let (bytes, fingerprint) = native_stream();
+        let mut producer = producer(bytes, fingerprint);
+        producer.source.expanded_limit_bytes = 1;
+        assert!(matches!(
+            producer.next_slice(),
+            Err(ScribeError::DecodedPayloadTooLarge { limit: 1, .. })
+        ));
     }
 
     /// Volatile server columns do not alter retained logical payload identity.
@@ -1045,7 +1269,6 @@ mod tests {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("value", DataType::Int64, false),
                 Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
-                Field::new(WYRD_EVENT_TIME, DataType::Int64, false),
                 Field::new(WYRD_INGESTED_AT, DataType::Int64, false),
             ]));
             RecordBatch::try_new(
@@ -1053,7 +1276,6 @@ mod tests {
                 vec![
                     Arc::new(Int64Array::from(vec![value])),
                     Arc::new(StringArray::from(vec![request])),
-                    Arc::new(Int64Array::from(vec![receipt])),
                     Arc::new(Int64Array::from(vec![receipt])),
                 ],
             )
@@ -1065,5 +1287,156 @@ mod tests {
         let changed = logical_data_identity(&rows(8, "request-c", 30)).expect("changed identity");
         assert_eq!(first, fresh);
         assert_ne!(first, changed);
+    }
+
+    /// A known logical identity is reused only for rows holding its exact
+    /// inputs, and the reused value equals a recomputation.
+    ///
+    /// Restamping the managed columns, as decode does, keeps the identity;
+    /// the same values in fresh buffers and a partition `take` both fall back
+    /// to recomputation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture batch does not build, the restamped rows do not
+    /// reuse the identity or reuse a wrong one, or copied or taken rows do.
+    #[test]
+    fn known_identity_is_reused_only_for_its_exact_inputs() {
+        let batch = |values: ArrayRef, request: &str| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("value", DataType::Int64, true),
+                    Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
+                ])),
+                vec![values, Arc::new(StringArray::from(vec![request; 3]))],
+            )
+            .expect("identity batch")
+        };
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
+        let gate = batch(Arc::clone(&values), "gate");
+        let known = super::LogicalIdentity::of(&gate).expect("known identity");
+
+        let stamped = batch(Arc::clone(&values), "scribe");
+        assert_eq!(
+            known.for_rows(&stamped),
+            Some(logical_data_identity(&stamped).expect("recomputed identity")),
+            "restamped managed columns keep the known identity"
+        );
+
+        let copied = batch(
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])),
+            "gate",
+        );
+        assert_eq!(known.for_rows(&copied), None, "fresh buffers recompute");
+
+        let indices = arrow::array::UInt32Array::from(vec![0_u32, 1, 2]);
+        let taken = batch(
+            arrow::compute::take(values.as_ref(), &indices, None).expect("take"),
+            "gate",
+        );
+        assert_eq!(known.for_rows(&taken), None, "a partition take recomputes");
+    }
+
+    /// The WAL payload is an Arrow stream within its bound that Arrow reads back.
+    ///
+    /// Covers a nested Map column with a null map and a null value so the
+    /// encoder is proven on the shapes the removed hand-written encoder needed
+    /// per-type code for.
+    ///
+    /// # Panics
+    /// Panics when encoding fails, the payload exceeds its bound, or the
+    /// decoded batch differs.
+    #[test]
+    fn wal_payload_round_trips_within_its_bound() {
+        let mut builder = arrow::array::MapBuilder::new(
+            None,
+            arrow::array::StringBuilder::new(),
+            arrow::array::Int64Builder::new(),
+        );
+        builder.keys().append_value("a");
+        builder.values().append_value(1);
+        builder.keys().append_value("b");
+        builder.values().append_null();
+        builder.append(true).expect("first map");
+        builder.append(false).expect("null map");
+        let map = builder.finish();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "m",
+            map.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(map) as _]).expect("map batch");
+
+        let payload = encode_ipc(&batch).expect("encodes");
+
+        assert!(
+            payload.len()
+                <= crate::scribe::material_plan::wal_payload_bound(&batch).expect("bounds")
+        );
+        let mut reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(payload), None)
+                .expect("valid stream");
+        assert_eq!(reader.next().expect("one batch").expect("decodes"), batch);
+        assert!(reader.next().is_none());
+    }
+
+    /// Incompressible buffers stay within the reserved bound; compressible
+    /// ones shrink.
+    ///
+    /// Random binary values and random integers make Arrow fall back to
+    /// uncompressed buffers, the worst case the bound covers; a dictionary
+    /// column adds a second compressed message. A constant column must
+    /// compress below the uncompressed stream.
+    ///
+    /// # Panics
+    /// Panics when encoding fails, the payload exceeds its bound, the decoded
+    /// batch differs, or the constant column does not compress.
+    #[test]
+    fn wal_payload_bound_covers_incompressible_data() {
+        use arrow::array::{BinaryArray, DictionaryArray};
+        use arrow::datatypes::Int32Type;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let values = (0..4_096)
+            .map(|_| {
+                (0..rng.gen_range(1..96))
+                    .map(|_| rng.r#gen::<u8>())
+                    .collect::<Vec<u8>>()
+            })
+            .collect::<Vec<_>>();
+        let random = BinaryArray::from_iter_values(values.iter());
+        let integers = Int64Array::from_iter_values((0..4_096).map(|_| rng.r#gen::<i64>()));
+        let dictionary: DictionaryArray<Int32Type> =
+            (0..4_096).map(|index| ["x", "y", "z"][index % 3]).collect();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("random", Arc::new(random) as ArrayRef),
+            ("integers", Arc::new(integers) as ArrayRef),
+            ("dictionary", Arc::new(dictionary) as ArrayRef),
+        ])
+        .expect("incompressible batch");
+
+        let payload = encode_ipc(&batch).expect("encodes");
+        assert!(
+            payload.len()
+                <= crate::scribe::material_plan::wal_payload_bound(&batch).expect("bounds")
+        );
+        let mut reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(payload), None)
+                .expect("valid stream");
+        assert_eq!(reader.next().expect("one batch").expect("decodes"), batch);
+
+        let constant = RecordBatch::try_from_iter(vec![(
+            "constant",
+            Arc::new(Int64Array::from_iter_values(std::iter::repeat_n(42, 4_096))) as ArrayRef,
+        )])
+        .expect("constant batch");
+        let mut uncompressed = Vec::new();
+        let mut writer =
+            StreamWriter::try_new(&mut uncompressed, &constant.schema()).expect("writer");
+        writer.write(&constant).expect("writes");
+        writer.finish().expect("finishes");
+        drop(writer);
+        assert!(encode_ipc(&constant).expect("encodes").len() < uncompressed.len());
     }
 }

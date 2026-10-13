@@ -14,8 +14,11 @@
 //! declarations produce byte-identical canonical layouts.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
-use arrow::datatypes::Schema;
+use arrow::array::{Array, TimestampMicrosecondArray, TimestampNanosecondArray};
+use arrow::datatypes::{DataType, Schema, TimeUnit};
+use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Duration, DurationRound as _, Utc};
 use iceberg::spec::{
     NullOrder as IcebergNullOrder, Schema as IcebergSchema, SortDirection as IcebergSortDirection,
@@ -25,7 +28,7 @@ use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
     TimePartitionWire,
 };
-use wyrd_spec::vala::managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME};
+use wyrd_spec::vala::managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
 use wyrd_spec::vala::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
 
 /// Managed Bloom floor, in the stable order every writer must emit it.
@@ -63,8 +66,8 @@ pub const BIFROST_SORT_ORDER_ID: i32 = 1;
 
 /// Time-partition granularity owned by the engine.
 ///
-/// Bifrost v1 admits exactly these two Iceberg-native transforms on
-/// `wyrd_event_time`. Identity, bucket, truncate, month, year, and multi-column
+/// Bifrost v1 admits exactly these two Iceberg-native transforms on the
+/// table's one time column. Identity, bucket, truncate, month, year, and multi-column
 /// partitioning are deliberately unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TimeGranularity {
@@ -125,13 +128,22 @@ impl TimeGranularity {
     ///
     /// # Errors
     /// Returns [`TimePartitionError::StartOutOfRange`] when truncation to the
-    /// partition boundary is not representable, which no event time inside the
-    /// ingest acceptance window can reach.
-    pub fn bucket(self, event_time: DateTime<Utc>) -> Result<TimePartition, TimePartitionError> {
-        let start = event_time
+    /// partition boundary is not representable, or when the partition's end
+    /// boundary or Iceberg transform value is not, so every partition this
+    /// returns is total over [`TimePartition::end_utc`] and
+    /// [`TimePartition::iceberg_transform_value`].
+    pub fn bucket(self, instant: DateTime<Utc>) -> Result<TimePartition, TimePartitionError> {
+        let out_of_range = || TimePartitionError::StartOutOfRange(instant.timestamp_micros());
+        let start = instant
             .duration_trunc(self.span())
-            .map_err(|_| TimePartitionError::StartOutOfRange(event_time.timestamp_micros()))?;
-        TimePartition::new(self, start)
+            .map_err(|_| out_of_range())?;
+        let partition = TimePartition::new(self, start)?;
+        if start.checked_add_signed(self.span()).is_none()
+            || i32::try_from(start.timestamp().div_euclid(self.span().num_seconds())).is_err()
+        {
+            return Err(out_of_range());
+        }
+        Ok(partition)
     }
 
     /// Returns the span of one partition at this granularity.
@@ -162,33 +174,256 @@ impl TimeGranularity {
     }
 }
 
-/// The one time-partition declaration of a table.
+/// A table's one time axis: its time column and partition granularity.
 ///
-/// The partitioned column is the invariant [`WYRD_EVENT_TIME`] and is therefore
-/// not stored; only the granularity varies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TimePartitionSpec {
-    /// Partition granularity.
+/// Scribe receives this from the registered layout and uses it to bucket every
+/// admitted row into its partition and to bound every file it writes. Carrying
+/// the column with the granularity keeps both on one value, so no write path
+/// can partition one column and bound another.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TimeAxis {
+    /// Name of the time column in the table's physical schema.
+    column: Arc<str>,
+    /// Granularity of the one time partition.
     granularity: TimeGranularity,
 }
 
-impl TimePartitionSpec {
-    /// Constructs the partition spec for one granularity.
+impl TimeAxis {
+    /// Builds one time axis from a column name and granularity.
     #[must_use]
-    pub const fn new(granularity: TimeGranularity) -> Self {
-        Self { granularity }
+    pub fn new(column: &str, granularity: TimeGranularity) -> Self {
+        Self {
+            column: Arc::from(column),
+            granularity,
+        }
     }
 
-    /// Returns the granularity.
+    /// Derives the time axis a stored or built-in layout declaration names.
+    ///
+    /// A declaration without `time_column` partitions on `wyrd_ingested_at`,
+    /// the same default [`PhysicalLayout::resolve`] applies, so ingest and
+    /// publication agree on the axis without re-resolving the whole layout.
     #[must_use]
-    pub const fn granularity(self) -> TimeGranularity {
+    pub fn of_wire(layout: &PhysicalLayoutWire) -> Self {
+        Self::new(
+            layout.time_column.as_deref().unwrap_or(WYRD_INGESTED_AT),
+            TimeGranularity::from_wire(layout.partition_granularity),
+        )
+    }
+
+    /// Derives the time axis a published Iceberg table was partitioned on.
+    ///
+    /// The table's default partition spec has exactly one field, an `hour` or
+    /// `day` transform of the time column, so the column and granularity are
+    /// read from the table's own metadata rather than restated by a reader.
+    /// Returns `None` when the spec has no such field or its source column is
+    /// absent from the current schema, which a registered table never has.
+    #[must_use]
+    pub fn of_iceberg(metadata: &iceberg::spec::TableMetadata) -> Option<Self> {
+        let field = metadata.default_partition_spec().fields().first()?;
+        let granularity = match field.transform {
+            Transform::Hour => TimeGranularity::Hour,
+            Transform::Day => TimeGranularity::Day,
+            _ => return None,
+        };
+        let column = metadata
+            .current_schema()
+            .field_by_id(Self::iceberg_field_id(metadata.default_partition_spec())?)?;
+        Some(Self::new(&column.name, granularity))
+    }
+
+    /// Returns the field id of the time column a partition spec partitions on.
+    ///
+    /// Every Bifrost spec has exactly one field, the time transform, so its
+    /// source is the time column. Reading the id from the spec a file was
+    /// written under, rather than resolving a name against the current schema,
+    /// keeps a file's bounds attached to the column it was partitioned on.
+    /// Returns `None` for a spec with no field.
+    #[must_use]
+    pub fn iceberg_field_id(spec: &iceberg::spec::PartitionSpec) -> Option<i32> {
+        spec.fields().first().map(|field| field.source_id)
+    }
+
+    /// Borrows the time column name.
+    #[must_use]
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    /// Returns the partition granularity.
+    #[must_use]
+    pub const fn granularity(&self) -> TimeGranularity {
         self.granularity
     }
 
-    /// Returns the invariant partitioned column name.
+    /// Borrows the time column of `batch` as typed instants.
+    ///
+    /// Returns `None` when the batch has no such column or it is not a
+    /// microsecond or nanosecond timestamp, which a registered layout's
+    /// validated time column never is.
     #[must_use]
-    pub const fn column(self) -> &'static str {
-        WYRD_EVENT_TIME
+    pub fn values<'a>(&self, batch: &'a RecordBatch) -> Option<TimeColumnValues<'a>> {
+        TimeColumnValues::of(batch.column_by_name(&self.column)?.as_ref())
+    }
+}
+
+/// Stored precision of one time column.
+///
+/// Every catalog bound, partition bucket, and pruning interval is held in epoch
+/// microseconds. This is the one place a nanosecond instant is narrowed to that
+/// domain or a microsecond bound is widened back to it, so every reader derives
+/// the same conservative interval: a lower bound floors and an upper bound
+/// ceils, and the interval always contains every stored instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimePrecision {
+    /// Epoch microseconds.
+    Micros,
+    /// Epoch nanoseconds.
+    Nanos,
+}
+
+impl TimePrecision {
+    /// Returns the precision of an Arrow time-column type, or `None` for any
+    /// type a time column may not have.
+    #[must_use]
+    pub const fn of(data_type: &DataType) -> Option<Self> {
+        match data_type {
+            DataType::Timestamp(TimeUnit::Microsecond, _) => Some(Self::Micros),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => Some(Self::Nanos),
+            _ => None,
+        }
+    }
+
+    /// Narrows one stored instant to the greatest microsecond not after it.
+    #[must_use]
+    pub const fn floor_micros(self, value: i64) -> i64 {
+        match self {
+            Self::Micros => value,
+            Self::Nanos => value.div_euclid(1_000),
+        }
+    }
+
+    /// Narrows one stored instant to the least microsecond not before it.
+    #[must_use]
+    pub const fn ceil_micros(self, value: i64) -> i64 {
+        match self {
+            Self::Micros => value,
+            Self::Nanos => {
+                let floor = value.div_euclid(1_000);
+                if value.rem_euclid(1_000) == 0 {
+                    floor
+                } else {
+                    floor + 1
+                }
+            }
+        }
+    }
+
+    /// Widens a microsecond lower bound to the first stored instant it covers.
+    ///
+    /// Returns `None` when that instant is not representable at this precision.
+    #[must_use]
+    pub const fn lower_from_micros(self, micros: i64) -> Option<i64> {
+        match self {
+            Self::Micros => Some(micros),
+            Self::Nanos => micros.checked_mul(1_000),
+        }
+    }
+
+    /// Widens a microsecond upper bound to the last stored instant it covers.
+    ///
+    /// Returns `None` when that instant is not representable at this precision.
+    #[must_use]
+    pub const fn upper_from_micros(self, micros: i64) -> Option<i64> {
+        match self {
+            Self::Micros => Some(micros),
+            Self::Nanos => match micros.checked_mul(1_000) {
+                Some(nanos) => nanos.checked_add(999),
+                None => None,
+            },
+        }
+    }
+}
+
+/// The values of one time column at its stored precision.
+///
+/// Partition bucketing and catalog bounds work in microseconds; a nanosecond
+/// column is floored for a lower bound and ceiled for an upper bound, so every
+/// derived interval contains every stored instant.
+#[derive(Debug, Clone, Copy)]
+pub enum TimeColumnValues<'a> {
+    /// A microsecond timestamp column.
+    Micros(&'a TimestampMicrosecondArray),
+    /// A nanosecond timestamp column.
+    Nanos(&'a TimestampNanosecondArray),
+}
+
+impl<'a> TimeColumnValues<'a> {
+    /// Returns the column's stored precision.
+    #[must_use]
+    pub const fn precision(self) -> TimePrecision {
+        match self {
+            Self::Micros(_) => TimePrecision::Micros,
+            Self::Nanos(_) => TimePrecision::Nanos,
+        }
+    }
+
+    /// Borrows `array` as time-column values, or `None` for any other type.
+    #[must_use]
+    pub fn of(array: &'a dyn Array) -> Option<Self> {
+        let any = array.as_any();
+        any.downcast_ref::<TimestampMicrosecondArray>()
+            .map(Self::Micros)
+            .or_else(|| any.downcast_ref().map(Self::Nanos))
+    }
+
+    /// Returns the number of values, nulls included.
+    #[must_use]
+    pub fn len(self) -> usize {
+        match self {
+            Self::Micros(array) => array.len(),
+            Self::Nanos(array) => array.len(),
+        }
+    }
+
+    /// Reports whether the column holds no values.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Counts the null values.
+    #[must_use]
+    pub fn null_count(self) -> usize {
+        match self {
+            Self::Micros(array) => array.null_count(),
+            Self::Nanos(array) => array.null_count(),
+        }
+    }
+
+    /// Returns value `index` floored to epoch microseconds, or `None` when it
+    /// is null.
+    #[must_use]
+    pub fn floor_micros(self, index: usize) -> Option<i64> {
+        let value = match self {
+            Self::Micros(array) => array.is_valid(index).then(|| array.value(index)),
+            Self::Nanos(array) => array.is_valid(index).then(|| array.value(index)),
+        }?;
+        Some(self.precision().floor_micros(value))
+    }
+
+    /// Returns the inclusive microsecond interval covering every non-null
+    /// value, or `None` when there is none.
+    ///
+    /// A nanosecond maximum is ceiled so the interval still contains it.
+    #[must_use]
+    pub fn micros_bounds(self) -> Option<(i64, i64)> {
+        let (min, max) = match self {
+            Self::Micros(array) => (arrow::compute::min(array)?, arrow::compute::max(array)?),
+            Self::Nanos(array) => (arrow::compute::min(array)?, arrow::compute::max(array)?),
+        };
+        let precision = self.precision();
+        Some((precision.floor_micros(min), precision.ceil_micros(max)))
     }
 }
 
@@ -319,26 +554,31 @@ impl LayoutSortKey {
         matches!(self.null_order, NullOrder::First)
     }
 
-    /// Returns the sole key a layout resolves to when no sort key is declared.
+    /// Returns the sole key a layout resolves to when no sort key is declared:
+    /// the table's time column, descending with nulls last.
     ///
-    /// Ordering on `wyrd_event_time` is retained for encoding, not pruning:
-    /// `DELTA_BINARY_PACKED` is near-free on a sorted timestamp column and
-    /// expensive on an unsorted one.
+    /// Ordering on the time column clusters each file's rows by time, which
+    /// tightens the row-group bounds Oracle prunes on, and keeps
+    /// `DELTA_BINARY_PACKED` near-free on the sorted timestamp.
     #[must_use]
-    pub fn default_event_time() -> Self {
-        Self::new(WYRD_EVENT_TIME, SortDirection::Desc, NullOrder::Last)
+    pub fn default_for_time_column(time_column: &str) -> Self {
+        Self::new(time_column, SortDirection::Desc, NullOrder::Last)
     }
 }
 
 /// The canonical, fully resolved physical layout of one table.
 ///
 /// Construct it only through [`PhysicalLayout::resolve`] or
-/// [`PhysicalLayout::from_stored_wire`]; both guarantee a non-empty sort order,
-/// the managed Bloom floor, and schema-validated columns.
+/// [`PhysicalLayout::from_stored_wire`]; both guarantee a valid time column, a
+/// non-empty sort order, the managed Bloom floor, and schema-validated columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhysicalLayout {
-    /// Resolved time partition.
-    partition: TimePartitionSpec,
+    /// Granularity of the one time partition.
+    granularity: TimeGranularity,
+    /// The table's one time column: the source of its partition field, its
+    /// default first sort key, and every tier's time bounds. A non-null
+    /// microsecond or nanosecond timestamp column of the physical schema.
+    time_column: String,
     /// Canonical sort order, carrying at least one key.
     sort_keys: Vec<LayoutSortKey>,
     /// Canonical Bloom columns, always beginning with the schema-present managed
@@ -358,15 +598,16 @@ impl PhysicalLayout {
     /// as public error context. `schema` is the complete physical schema,
     /// including managed and correlation columns.
     ///
-    /// An omitted declaration resolves to hourly `wyrd_event_time`
-    /// partitioning, `wyrd_event_time` descending nulls-last as the sole sort
-    /// key, and the schema-present managed Bloom floor. An explicit declaration
-    /// whose `sort_keys` is empty resolves to the same sort order, because the
-    /// system injects nothing of its own.
+    /// An omitted declaration resolves to hourly partitioning on
+    /// `wyrd_ingested_at`, that column descending nulls-last as the sole sort
+    /// key, and the schema-present managed Bloom floor. An omitted
+    /// `time_column` resolves to `wyrd_ingested_at`, and an empty `sort_keys`
+    /// resolves to the time column descending nulls-last, because the system
+    /// injects nothing else of its own.
     ///
-    /// Validation precedence matches the public contract: the sort-key count,
-    /// then sort keys in request order, then Bloom columns in request order.
-    /// The first fault wins and nothing is mutated.
+    /// Validation precedence matches the public contract: the time column,
+    /// then the sort-key count, then sort keys in request order, then Bloom
+    /// columns in request order. The first fault wins and nothing is mutated.
     ///
     /// # Errors
     /// Returns [`BifrostError::InvalidPhysicalLayout`] naming the exact field,
@@ -378,19 +619,20 @@ impl PhysicalLayout {
     ) -> Result<Self, BifrostError> {
         let Some(declared) = declared else {
             return Ok(Self {
-                partition: TimePartitionSpec::new(TimeGranularity::Hour),
-                sort_keys: vec![LayoutSortKey::default_event_time()],
+                granularity: TimeGranularity::Hour,
+                time_column: WYRD_INGESTED_AT.to_owned(),
+                sort_keys: vec![LayoutSortKey::default_for_time_column(WYRD_INGESTED_AT)],
                 bloom_columns: managed_bloom_floor(schema),
             });
         };
 
-        let partition =
-            TimePartitionSpec::new(TimeGranularity::from_wire(declared.partition_granularity));
-        let sort_keys = canonical_sort_keys(table, schema, &declared.sort_keys)?;
+        let time_column = canonical_time_column(table, schema, declared.time_column.as_deref())?;
+        let sort_keys = canonical_sort_keys(table, schema, &time_column, &declared.sort_keys)?;
         let bloom_columns = canonical_bloom_columns(table, schema, &declared.bloom_columns)?;
 
         Ok(Self {
-            partition,
+            granularity: TimeGranularity::from_wire(declared.partition_granularity),
+            time_column,
             sort_keys,
             bloom_columns,
         })
@@ -451,16 +693,23 @@ impl PhysicalLayout {
         Ok(resolved)
     }
 
-    /// Returns the resolved partition spec.
-    #[must_use]
-    pub const fn partition(&self) -> TimePartitionSpec {
-        self.partition
-    }
-
     /// Returns the resolved partition granularity.
     #[must_use]
     pub const fn granularity(&self) -> TimeGranularity {
-        self.partition.granularity()
+        self.granularity
+    }
+
+    /// Borrows the table's one time column: the partition source, the default
+    /// first sort key, and the column every tier's time bounds describe.
+    #[must_use]
+    pub fn time_column(&self) -> &str {
+        &self.time_column
+    }
+
+    /// Returns the table's time axis for Scribe's partitioning and bounds.
+    #[must_use]
+    pub fn time_axis(&self) -> TimeAxis {
+        TimeAxis::new(&self.time_column, self.granularity)
     }
 
     /// Borrows the canonical sort order.
@@ -507,16 +756,16 @@ impl PhysicalLayout {
         &self.bloom_columns
     }
 
-    /// Buckets one `wyrd_event_time` value into its exact partition.
+    /// Buckets one time-column value into its exact partition.
     ///
     /// # Errors
-    /// Returns [`TimePartitionError::StartOutOfRange`] when the instant cannot be
-    /// truncated to a representable boundary.
+    /// Returns [`TimePartitionError::StartOutOfRange`] when the instant's
+    /// partition boundaries or Iceberg transform value are not representable.
     pub fn partition_of(
         &self,
-        event_time: DateTime<Utc>,
+        instant: DateTime<Utc>,
     ) -> Result<TimePartition, TimePartitionError> {
-        self.granularity().bucket(event_time)
+        self.granularity().bucket(instant)
     }
 
     /// Projects the canonical layout onto the public wire shape.
@@ -527,6 +776,7 @@ impl PhysicalLayout {
     pub fn to_wire(&self) -> PhysicalLayoutWire {
         PhysicalLayoutWire {
             partition_granularity: self.granularity().to_wire(),
+            time_column: Some(self.time_column.clone()),
             sort_keys: self
                 .sort_keys
                 .iter()
@@ -549,39 +799,31 @@ impl PhysicalLayout {
     /// Builds the Iceberg partition spec for this layout.
     ///
     /// # Errors
-    /// Returns a message when `wyrd_event_time` is absent from the Iceberg
+    /// Returns a message when the time column is absent from the Iceberg
     /// schema or when Iceberg rejects the partition field.
     pub fn iceberg_partition_spec(
         &self,
         iceberg_schema: &IcebergSchema,
     ) -> Result<UnboundPartitionSpec, String> {
         let field = iceberg_schema
-            .field_by_name(WYRD_EVENT_TIME)
-            .ok_or_else(|| format!("partition column not found: {WYRD_EVENT_TIME}"))?;
-        let (transform, name) = match self.granularity() {
-            TimeGranularity::Hour => (
-                iceberg::spec::Transform::Hour,
-                format!("{WYRD_EVENT_TIME}_hour"),
-            ),
-            TimeGranularity::Day => (
-                iceberg::spec::Transform::Day,
-                format!("{WYRD_EVENT_TIME}_day"),
-            ),
-        };
+            .field_by_name(&self.time_column)
+            .ok_or_else(|| format!("partition column not found: {}", self.time_column))?;
         Ok(UnboundPartitionSpec::builder()
-            .add_partition_field(field.id, &name, transform)
+            .add_partition_field(
+                field.id,
+                self.iceberg_partition_field_name(),
+                self.iceberg_transform(),
+            )
             .map_err(|error| error.to_string())?
             .build())
     }
 
-    /// Returns the Iceberg partition-field name this layout's granularity
-    /// produces, so validation can compare the recorded name exactly.
+    /// Returns the Iceberg partition-field name this layout produces,
+    /// `{time_column}_{hour|day}`, so validation can compare the recorded name
+    /// exactly.
     #[must_use]
     pub fn iceberg_partition_field_name(&self) -> String {
-        match self.granularity() {
-            TimeGranularity::Hour => format!("{WYRD_EVENT_TIME}_hour"),
-            TimeGranularity::Day => format!("{WYRD_EVENT_TIME}_day"),
-        }
+        format!("{}_{}", self.time_column, self.granularity.as_str())
     }
 
     /// Returns the Iceberg transform this layout's granularity uses.
@@ -597,7 +839,7 @@ impl PhysicalLayout {
     /// Iceberg schema.
     ///
     /// The order is exactly [`PhysicalLayout::sort_keys`] — the declared keys,
-    /// or the event-time default when none were declared — so Forge rewrites
+    /// or the time-column default when none were declared — so Forge rewrites
     /// reproduce the same physical order the writers emit.
     ///
     /// # Errors
@@ -647,18 +889,55 @@ fn invalid(
     }
 }
 
+/// Resolves the declared time column, or `wyrd_ingested_at` when none is named.
+///
+/// A time column must be a non-null column of the physical schema typed as a
+/// microsecond or nanosecond Arrow timestamp, naive (`TIMESTAMP_NTZ`) or zoned
+/// (`TIMESTAMP_LTZ`). `TIMESTAMP_TZ` is a struct and is therefore refused with
+/// every other non-timestamp type.
+///
+/// # Errors
+/// Returns [`BifrostError::InvalidPhysicalLayout`] on
+/// [`PhysicalLayoutField::TimeColumn`] with `UnknownColumn` for an absent
+/// column and `UnsupportedColumn` for a nullable or wrongly typed one.
+fn canonical_time_column(
+    table: &str,
+    schema: &Schema,
+    declared: Option<&str>,
+) -> Result<String, BifrostError> {
+    let Some(column) = declared else {
+        return Ok(WYRD_INGESTED_AT.to_owned());
+    };
+    let refuse = |violation| {
+        invalid(
+            table,
+            PhysicalLayoutField::TimeColumn,
+            violation,
+            Some(column.to_owned()),
+        )
+    };
+    let field = schema
+        .field_with_name(column)
+        .map_err(|_| refuse(PhysicalLayoutViolation::UnknownColumn))?;
+    if TimePrecision::of(field.data_type()).is_none() || field.is_nullable() {
+        return Err(refuse(PhysicalLayoutViolation::UnsupportedColumn));
+    }
+    Ok(column.to_owned())
+}
+
 /// Canonicalizes declared sort keys in request order.
 ///
 /// The sort order is entirely user-owned: nothing is injected ahead of a
 /// declared key, and any column present in the physical schema is legal,
-/// including `wyrd_event_time` and every other managed column. Naming
-/// `wyrd_event_time` therefore replaces the default rather than duplicating it.
+/// including the time column and every managed column. Naming the time column
+/// therefore replaces the default rather than duplicating it.
 ///
 /// The count cap is checked before per-key validation so a caller that declared
 /// too many keys learns the shape fault first rather than a fault in the fifth
 /// key. An unknown column is rejected and a repeated column is rejected. An
-/// empty declaration resolves to the event-time default, which is what makes an
-/// explicit empty `sort_keys` mean exactly what an omitted one means.
+/// empty declaration resolves to `time_column` descending nulls-last, which is
+/// what makes an explicit empty `sort_keys` mean exactly what an omitted one
+/// means.
 ///
 /// # Errors
 /// Returns [`BifrostError::InvalidPhysicalLayout`] with
@@ -666,6 +945,7 @@ fn invalid(
 fn canonical_sort_keys(
     table: &str,
     schema: &Schema,
+    time_column: &str,
     declared: &[SortKeyWire],
 ) -> Result<Vec<LayoutSortKey>, BifrostError> {
     if declared.len() > MAX_SORT_KEYS {
@@ -708,7 +988,7 @@ fn canonical_sort_keys(
         ));
     }
     if keys.is_empty() {
-        keys.push(LayoutSortKey::default_event_time());
+        keys.push(LayoutSortKey::default_for_time_column(time_column));
     }
     Ok(keys)
 }
@@ -847,12 +1127,13 @@ impl TimePartition {
     ///
     /// # Panics
     /// Panics only if the partition start is within one span of
-    /// `DateTime::<Utc>::MAX`, which no admitted event time can reach.
+    /// `DateTime::<Utc>::MAX`. [`TimeGranularity::bucket`] refuses such an
+    /// instant, so no written partition reaches it.
     #[must_use]
     pub fn end_utc(self) -> DateTime<Utc> {
         self.start_utc
             .checked_add_signed(self.granularity.span())
-            .expect("partition end is representable for every admitted event time")
+            .expect("TimeGranularity::bucket refuses partitions without a representable end")
     }
 
     /// Reports whether this partition is still open at `now`.
@@ -887,18 +1168,17 @@ impl TimePartition {
     ///
     /// # Panics
     ///
-    /// Panics when the transform value falls outside Iceberg's `i32` domain,
-    /// which is unreachable for any partition boundary the admission window
-    /// accepts.
+    /// Panics when the transform value falls outside Iceberg's `i32` domain.
+    /// [`TimeGranularity::bucket`] refuses such an instant, so no written
+    /// partition reaches it.
     #[must_use]
     pub fn iceberg_transform_value(self) -> i32 {
-        let seconds = self.start_utc.timestamp();
-        let divisor = match self.granularity {
-            TimeGranularity::Hour => 3_600,
-            TimeGranularity::Day => 86_400,
-        };
-        i32::try_from(seconds.div_euclid(divisor))
-            .expect("admitted partition boundaries fit the Iceberg i32 transform domain")
+        i32::try_from(
+            self.start_utc
+                .timestamp()
+                .div_euclid(self.granularity.span().num_seconds()),
+        )
+        .expect("TimeGranularity::bucket refuses partitions outside the Iceberg i32 domain")
     }
 
     /// Returns the typed Iceberg partition literal for this partition.
@@ -911,8 +1191,8 @@ impl TimePartition {
     /// # Panics
     ///
     /// Panics through [`Self::iceberg_transform_value`] when the partition
-    /// boundary falls outside the Iceberg `i32` transform domain, which no
-    /// admitted event time can reach.
+    /// boundary falls outside the Iceberg `i32` transform domain, which
+    /// [`TimeGranularity::bucket`] refuses.
     #[must_use]
     pub fn iceberg_partition_literal(self) -> iceberg::spec::Literal {
         let value = self.iceberg_transform_value();
@@ -1037,19 +1317,40 @@ mod tests {
     use wyrd_spec::vala::api::{
         NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
     };
-    use wyrd_spec::vala::managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME};
+    use wyrd_spec::vala::managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
     use wyrd_spec::vala::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
 
     /// Canonical fully-qualified name every case in this module resolves under.
     const TABLE: &str = "vala.datasets.layout";
 
-    /// Builds the fixture physical schema: the full managed floor and two
-    /// user columns to declare against.
+    /// Builds the fixture physical schema: the full managed floor, two user
+    /// columns to declare against, and one candidate time column per accepted
+    /// and refused shape.
     fn fixture_schema() -> Schema {
         Schema::new(vec![
             Field::new(
-                WYRD_EVENT_TIME,
+                WYRD_INGESTED_AT,
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(
+                "started_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(
+                "local_at",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new(
+                "maybe_at",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                "seconds_at",
+                DataType::Timestamp(TimeUnit::Second, None),
                 false,
             ),
             Field::new(RUN_ID, DataType::Utf8, true),
@@ -1073,6 +1374,7 @@ mod tests {
     fn declaration(sort_keys: Vec<SortKeyWire>, bloom_columns: Vec<String>) -> PhysicalLayoutWire {
         PhysicalLayoutWire {
             partition_granularity: TimeGranularityWire::Hour,
+            time_column: None,
             sort_keys,
             bloom_columns,
         }
@@ -1114,19 +1416,20 @@ mod tests {
     /// The declarations the single resolution entry point accepts.
     ///
     /// Covers an omitted declaration, an explicit-empty declaration,
-    /// `wyrd_event_time` declared explicitly, managed columns on both lists,
+    /// the time column declared explicitly, managed columns on both lists,
     /// floor-union dedupe, and the canonical form's fixed point through the
     /// stored wire.
     #[test]
     fn canonical_layout_accepts_declared_shapes() {
         let schema = fixture_schema();
 
-        // An omitted declaration resolves to hourly, one event-time key, and
-        // the schema-present managed floor.
+        // An omitted declaration resolves to hourly, one ingestion-time key,
+        // and the schema-present managed floor.
         let omitted =
             PhysicalLayout::resolve(TABLE, &schema, None).expect("an omitted declaration resolves");
         assert_eq!(omitted.granularity(), TimeGranularity::Hour);
-        assert_eq!(sort_columns(&omitted), vec![WYRD_EVENT_TIME.to_owned()]);
+        assert_eq!(omitted.time_column(), WYRD_INGESTED_AT);
+        assert_eq!(sort_columns(&omitted), vec![WYRD_INGESTED_AT.to_owned()]);
         assert!(omitted.sort_keys()[0].is_descending());
         assert!(!omitted.sort_keys()[0].nulls_first());
         assert_eq!(
@@ -1146,18 +1449,18 @@ mod tests {
         assert_eq!(explicit_empty.sort_keys(), omitted.sort_keys());
         assert_eq!(explicit_empty.bloom_columns(), omitted.bloom_columns());
 
-        // Naming wyrd_event_time is legal and replaces the default rather than
+        // Naming the time column is legal and replaces the default rather than
         // duplicating or erroring.
         let named = PhysicalLayout::resolve(
             TABLE,
             &schema,
-            Some(&declaration(vec![asc(WYRD_EVENT_TIME)], Vec::new())),
+            Some(&declaration(vec![asc(WYRD_INGESTED_AT)], Vec::new())),
         )
-        .expect("wyrd_event_time is a legal declared sort key");
-        assert_eq!(sort_columns(&named), vec![WYRD_EVENT_TIME.to_owned()]);
+        .expect("the time column is a legal declared sort key");
+        assert_eq!(sort_columns(&named), vec![WYRD_INGESTED_AT.to_owned()]);
         assert_eq!(
             named.sort_keys()[0],
-            LayoutSortKey::new(WYRD_EVENT_TIME, SortDirection::Asc, NullOrder::Last),
+            LayoutSortKey::new(WYRD_INGESTED_AT, SortDirection::Asc, NullOrder::Last),
             "the declaration replaces the descending default"
         );
 
@@ -1211,7 +1514,7 @@ mod tests {
         // The cap admits exactly MAX_SORT_KEYS and refuses the next one before
         // any per-key validation, so the shape fault wins over a column fault.
         let four = vec![
-            asc(WYRD_EVENT_TIME),
+            asc(WYRD_INGESTED_AT),
             asc(RUN_ID),
             asc(CARD_UID),
             asc("customer"),
@@ -1267,7 +1570,7 @@ mod tests {
     fn managed_bloom_floor_is_filtered_to_schema_present_columns() {
         let schema = Schema::new(vec![
             Field::new(
-                WYRD_EVENT_TIME,
+                WYRD_INGESTED_AT,
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
@@ -1276,5 +1579,115 @@ mod tests {
         let resolved = PhysicalLayout::resolve(TABLE, &schema, None)
             .expect("a narrow schema resolves under the default");
         assert_eq!(resolved.bloom_columns(), [PRINCIPAL_ID.to_owned()]);
+    }
+
+    /// A declared time column is the source of the one Iceberg partition field
+    /// and the default first sort key, at either timestamp precision and zone,
+    /// and the canonical wire names it so a repeat registration compares it.
+    #[test]
+    fn time_column_drives_partition_and_sort() {
+        let schema = fixture_schema();
+        for (column, granularity) in [
+            ("started_at", TimeGranularityWire::Hour),
+            ("local_at", TimeGranularityWire::Day),
+        ] {
+            let declared = PhysicalLayoutWire {
+                partition_granularity: granularity,
+                time_column: Some(column.to_owned()),
+                sort_keys: Vec::new(),
+                bloom_columns: Vec::new(),
+            };
+            let layout = PhysicalLayout::resolve(TABLE, &schema, Some(&declared))
+                .expect("a non-null timestamp column is a legal time column");
+            assert_eq!(layout.time_column(), column);
+            assert_eq!(
+                layout.sort_keys(),
+                [LayoutSortKey::new(
+                    column,
+                    SortDirection::Desc,
+                    NullOrder::Last
+                )]
+            );
+            assert_eq!(
+                layout.iceberg_partition_field_name(),
+                format!("{column}_{}", layout.granularity().as_str())
+            );
+            let stored = layout.to_wire();
+            assert_eq!(stored.time_column.as_deref(), Some(column));
+            assert_eq!(
+                PhysicalLayout::from_stored_wire(TABLE, &schema, &stored)
+                    .expect("a canonical layout re-resolves to itself"),
+                layout
+            );
+        }
+        let ingested =
+            PhysicalLayout::resolve(TABLE, &schema, Some(&declaration(Vec::new(), Vec::new())))
+                .expect("an omitted time column resolves");
+        assert_eq!(ingested.time_column(), WYRD_INGESTED_AT);
+        assert_eq!(
+            ingested.iceberg_partition_field_name(),
+            "wyrd_ingested_at_hour"
+        );
+    }
+
+    /// An absent, nullable, coarse, or non-timestamp time column is refused
+    /// naming the `time_column` field and the offending column.
+    #[test]
+    fn invalid_time_column_is_refused_naming_the_field() {
+        let schema = fixture_schema();
+        for (column, expected) in [
+            ("absent", PhysicalLayoutViolation::UnknownColumn),
+            ("maybe_at", PhysicalLayoutViolation::UnsupportedColumn),
+            ("seconds_at", PhysicalLayoutViolation::UnsupportedColumn),
+            ("customer", PhysicalLayoutViolation::UnsupportedColumn),
+        ] {
+            let declared = PhysicalLayoutWire {
+                time_column: Some(column.to_owned()),
+                ..declaration(Vec::new(), Vec::new())
+            };
+            let error = PhysicalLayout::resolve(TABLE, &schema, Some(&declared))
+                .expect_err("an invalid time column is refused");
+            assert_eq!(
+                error,
+                BifrostError::InvalidPhysicalLayout {
+                    table: TABLE.to_owned(),
+                    field: PhysicalLayoutField::TimeColumn,
+                    violation: expected,
+                    column: Some(column.to_owned()),
+                },
+                "{column}"
+            );
+        }
+    }
+
+    /// Nanosecond instants narrow to a microsecond interval that contains
+    /// them, and widen back to the full nanosecond span of that interval.
+    ///
+    /// A lower bound floors and an upper bound ceils on both sides of the
+    /// epoch, so no stored nanosecond falls outside the interval a reader
+    /// prunes with.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a nanosecond bound is narrowed or widened inexactly.
+    #[test]
+    fn nanosecond_bounds_contain_every_stored_instant() {
+        let nanos = super::TimePrecision::of(&DataType::Timestamp(
+            TimeUnit::Nanosecond,
+            Some("+00:00".into()),
+        ))
+        .expect("a nanosecond timestamp is a time column");
+        assert_eq!(nanos.floor_micros(1_500), 1);
+        assert_eq!(nanos.ceil_micros(1_500), 2);
+        assert_eq!(nanos.ceil_micros(2_000), 2);
+        assert_eq!(nanos.floor_micros(-1_500), -2);
+        assert_eq!(nanos.ceil_micros(-1_500), -1);
+        assert_eq!(nanos.lower_from_micros(1), Some(1_000));
+        assert_eq!(nanos.upper_from_micros(2), Some(2_999));
+        assert_eq!(nanos.upper_from_micros(i64::MAX / 1_000 + 1), None);
+        assert_eq!(
+            super::TimePrecision::of(&DataType::Timestamp(TimeUnit::Second, None)),
+            None
+        );
     }
 }

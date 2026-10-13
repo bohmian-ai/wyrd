@@ -20,7 +20,8 @@ pub(super) const fn admits_new_effect(strategy: ForgeTaskStrategy) -> bool {
         | ForgeTaskStrategy::SmallFiles
         | ForgeTaskStrategy::SnapshotExpiry
         | ForgeTaskStrategy::ExpiredCleanup
-        | ForgeTaskStrategy::OrphanCleanup => true,
+        | ForgeTaskStrategy::OrphanCleanup
+        | ForgeTaskStrategy::ManifestRewrite => true,
     }
 }
 
@@ -41,5 +42,6 @@ mod tests {
         assert!(admits_new_effect(ForgeTaskStrategy::SnapshotExpiry));
         assert!(admits_new_effect(ForgeTaskStrategy::ExpiredCleanup));
         assert!(admits_new_effect(ForgeTaskStrategy::OrphanCleanup));
+        assert!(admits_new_effect(ForgeTaskStrategy::ManifestRewrite));
     }
 }

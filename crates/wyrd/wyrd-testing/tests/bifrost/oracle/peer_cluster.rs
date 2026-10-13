@@ -19,7 +19,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
 use url::Url;
 use vala_bifrost_redux::oracle::OraclePreparationPause;
@@ -33,7 +32,7 @@ use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
-use crate::support::JourneyError;
+use crate::support::{JourneyError, seed_foreign_hot_row};
 
 /// Longest a membership change may take to become observable through
 /// [`PeerCluster::await_membership`].
@@ -78,12 +77,6 @@ pub(crate) struct PeerCluster {
     preparation_pauses: BTreeMap<usize, Arc<OraclePreparationPause>>,
     /// Statement a journey started and has not yet joined, per pod.
     active: BTreeMap<usize, QuerySlot>,
-    /// Managed event time, in UTC microseconds, stamped on every fixture row.
-    ///
-    /// Fixed once at launch so every row a journey ingests lands in one
-    /// hourly partition, and therefore behind one live route and one Scribe
-    /// producer, no matter when the journey runs relative to an hour boundary.
-    fixture_event_time_micros: i64,
 }
 
 impl PeerCluster {
@@ -177,7 +170,6 @@ impl PeerCluster {
             execute_pauses: BTreeMap::new(),
             preparation_pauses: BTreeMap::new(),
             active: BTreeMap::new(),
-            fixture_event_time_micros: chrono::Utc::now().timestamp_micros(),
         };
         let booted = peers.len() - usize::from(delay_last);
         for index in 0..booted {
@@ -494,6 +486,28 @@ impl PeerCluster {
         index: usize,
         table: &str,
     ) -> Result<(), JourneyError> {
+        self.register_table_with(
+            index,
+            table,
+            vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+                arrow::datatypes::Field::new("filter_key", arrow::datatypes::DataType::Utf8, false),
+            ],
+        )
+        .await
+    }
+
+    /// Registers `table` with `user_fields` through pod `index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the pod composes no catalog, or the refusal.
+    pub(crate) async fn register_table_with(
+        &self,
+        index: usize,
+        table: &str,
+        user_fields: Vec<arrow::datatypes::Field>,
+    ) -> Result<(), JourneyError> {
         let catalog = self
             .server(index)?
             .state()
@@ -502,14 +516,7 @@ impl PeerCluster {
         catalog
             .create_table(vala_bifrost_redux::catalog::CreateTableRequest {
                 table: table_ref(table),
-                user_fields: vec![
-                    arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-                    arrow::datatypes::Field::new(
-                        "filter_key",
-                        arrow::datatypes::DataType::Utf8,
-                        false,
-                    ),
-                ],
+                user_fields,
                 tenant: self.tenant(),
                 physical_layout: None,
             })
@@ -554,6 +561,33 @@ impl PeerCluster {
         rows: i64,
         groups: i64,
     ) -> Result<(), JourneyError> {
+        self.ingest_live_batch(index, table, &fixture_rows(start_id, rows, groups)?)
+            .await
+    }
+
+    /// Writes `batch` and leaves it live on pod `index`.
+    ///
+    /// The batch is admitted through the same logical ingress seam the public
+    /// write surface uses, under the schema fingerprint the catalog holds for
+    /// `table`. Nothing is frozen or published.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the pod composes no Scribe or catalog, the table
+    /// is unregistered, the batch cannot be encoded, or ingest fails.
+    pub(crate) async fn ingest_live_batch(
+        &self,
+        index: usize,
+        table: &str,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> Result<(), JourneyError> {
+        let mut payload = Vec::new();
+        {
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut payload, batch.schema().as_ref())?;
+            writer.write(batch)?;
+            writer.finish()?;
+        }
         let server = self.server(index)?;
         let scribe = server
             .bifrost_scribe()
@@ -581,7 +615,7 @@ impl PeerCluster {
                 expected_schema_fingerprint: fingerprint,
                 request_id: RequestId::now_v7(),
                 batch_id: uuid::Uuid::now_v7(),
-                payload: fixture_rows_ipc(start_id, rows, groups, self.fixture_event_time_micros)?,
+                payload: bytes::Bytes::from(payload),
             })
             .await?;
         Ok(())
@@ -1124,6 +1158,35 @@ impl PeerCluster {
             Bootstrap::Machine { api_key, .. } => Ok(api_key),
             Bootstrap::User { .. } => Err("machine bootstrap returned a user".into()),
         }
+    }
+
+    /// Seeds one hot file under `table` whose footer names a new foreign tenant.
+    ///
+    /// Delegates to [`seed_foreign_hot_row`] with this topology's private
+    /// cluster and fixture tenant, attributing the file-list row to pod
+    /// `index`. Every read of `table` that scans the file must then refuse
+    /// with the tenant invariant. `slug` names the foreign tenant and the
+    /// object, so it must be unique within one topology.
+    ///
+    /// # Errors
+    ///
+    /// Returns the tenant provisioning failure or any seeding error.
+    pub(crate) async fn seed_foreign_hot_row(
+        &self,
+        index: usize,
+        table: &str,
+        slug: &str,
+    ) -> Result<(), JourneyError> {
+        let foreign = self.cluster.add_tenant(slug).await?;
+        seed_foreign_hot_row(
+            &self.cluster,
+            self.tenant(),
+            table,
+            foreign,
+            slug,
+            self.node_id(index).as_uuid(),
+        )
+        .await
     }
 
     /// Deletes one object from the shared local object store.
@@ -1787,59 +1850,36 @@ fn scratch_usage(root: &Path) -> Result<ScratchUsage, JourneyError> {
     Ok(usage)
 }
 
-/// Encodes `rows` deterministic `(id, filter_key, wyrd_event_time)` rows as one
-/// Arrow IPC stream.
+/// Builds `rows` deterministic `(id, filter_key)` rows as one batch.
 ///
 /// Ids run `start_id..start_id + rows`, and keys cycle `group_{id % groups}`,
-/// so a grouped aggregate has more than one non-trivial group. Every row
-/// carries `event_time_micros` in the managed event-time column, which Scribe
-/// lifts verbatim, so the caller rather than wall clock picks the partition.
+/// so a grouped aggregate has more than one non-trivial group.
 ///
 /// # Errors
 ///
-/// Returns the batch or IPC encoding failure.
-fn fixture_rows_ipc(
+/// Returns the batch construction failure.
+fn fixture_rows(
     start_id: i64,
     rows: i64,
     groups: i64,
-    event_time_micros: i64,
-) -> Result<Bytes, JourneyError> {
+) -> Result<arrow::record_batch::RecordBatch, JourneyError> {
     let groups = groups.max(1);
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
         arrow::datatypes::Field::new("filter_key", arrow::datatypes::DataType::Utf8, false),
-        arrow::datatypes::Field::new(
-            wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
-            arrow::datatypes::DataType::Timestamp(
-                arrow::datatypes::TimeUnit::Microsecond,
-                Some("UTC".into()),
-            ),
-            false,
-        ),
     ]));
     let ids: Vec<i64> = (start_id..start_id.saturating_add(rows)).collect();
     let keys: Vec<String> = ids
         .iter()
         .map(|id| format!("group_{}", id % groups))
         .collect();
-    let event_times = vec![event_time_micros; ids.len()];
-    let batch = arrow::record_batch::RecordBatch::try_new(
-        Arc::clone(&schema),
+    Ok(arrow::record_batch::RecordBatch::try_new(
+        schema,
         vec![
             Arc::new(arrow::array::Int64Array::from(ids)),
             Arc::new(arrow::array::StringArray::from(keys)),
-            Arc::new(
-                arrow::array::TimestampMicrosecondArray::from(event_times).with_timezone("UTC"),
-            ),
         ],
-    )?;
-    let mut ipc = Vec::new();
-    {
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut ipc, schema.as_ref())?;
-        writer.write(&batch)?;
-        writer.finish()?;
-    }
-    Ok(Bytes::from(ipc))
+    )?)
 }
 
 /// Admits settled physical evidence only when the settlement counter advanced.
@@ -1884,8 +1924,8 @@ fn settled_analytical_evidence(
 #[test]
 fn sql_terminal_rejects_failed_output_after_rows() {
     use wyrd_spec::vala::api::{
-        QuerySource, QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame,
-        QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
+        QuerySource, QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion,
+        SourceCompletionOutcome,
     };
 
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
@@ -1926,10 +1966,12 @@ fn sql_terminal_rejects_failed_output_after_rows() {
             complete(QuerySource::HotSealed),
             complete(QuerySource::LiveTail),
         ],
-        error: Some(QueryTerminalError {
-            code: QueryTerminalErrorCode::QueryExecutionFailed,
-            detail: None,
-        }),
+        error: Some(Box::new(
+            wyrd_spec::error::WyrdError::from(
+                wyrd_spec::vala::error::BifrostError::QueryExecutionFailed,
+            )
+            .problem(),
+        )),
         arrow_ipc_eos: Vec::new(),
     };
     failed

@@ -6,13 +6,12 @@ use crate::contracts::{
 };
 use crate::namespaces::BifrostNamespace;
 use crate::scribe::ScribeImpl;
-use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::geometry::DEFAULT_SHARD_COUNT;
 use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::scribe::tail_rpc::FetchLiveTailRequest;
 use crate::scribe::wal::{WalConfig, WalWriter};
-use arrow::array::{Array, ArrayRef, Int64Array, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::array::{Array, ArrayRef, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -21,52 +20,61 @@ use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 
-/// Returns an event partition the production admission window still admits,
-/// `days_before_receipt` days below the current receipt instant.
+/// The fixed instant, in nanoseconds, every projected metric point carries.
 ///
-/// These fixtures must not pin an absolute date. A pinned instant silently ages
-/// out of `[receipt - past, receipt + future]` as wall-clock advances, so the
-/// append it feeds starts failing with `EventTimeOutOfRange` on some later
-/// date and the test stops covering the path it names. Deriving the day from
-/// the window keeps every case correct at any wall-clock time.
-///
-/// The partition is returned at hourly granularity because these fixtures drive
-/// Scribe without a catalog registration, and an unregistered table resolves to
-/// the hourly omission default. A seal key bucketed any other way would land in
-/// a partition no tail request in this file selects.
+/// `metrics.points` partitions hourly on `time_unix_nano`, so pinning the
+/// point time pins the one partition the tail request selects.
+const FIXTURE_POINT_TIME_NANOS: u64 = 1_784_016_000_000_000_000;
+
+/// Returns the hourly `metrics.points` partition the fixture points land in.
 ///
 /// # Panics
-/// Panics when the derived instant is not representable, or is not an exact
-/// hour boundary after truncation.
-fn fixture_event_day(days_before_receipt: i64) -> crate::catalog::layout::TimePartition {
-    let instant = chrono::DateTime::from_timestamp_micros(
-        EventTimeWindow::default().admitted_event_time_micros(days_before_receipt),
-    )
-    .expect("derived event time must be representable");
+/// Panics when the fixed instant is not representable.
+fn fixture_point_hour() -> crate::catalog::layout::TimePartition {
+    let instant = chrono::DateTime::from_timestamp_nanos(
+        i64::try_from(FIXTURE_POINT_TIME_NANOS).expect("the fixed instant fits i64"),
+    );
     crate::catalog::TimeGranularity::Hour
         .bucket(instant)
-        .expect("a truncated instant is an exact hourly boundary")
+        .expect("a fixed instant buckets into an hour")
 }
 
-/// Build the fixed one-row event-time batch for Scribe path tests.
+/// Returns the hourly receipt partitions between `since` and now.
+///
+/// These fixtures write unregistered tables without a catalog owner, so each
+/// row partitions on its hourly `wyrd_ingested_at` receipt. Bracketing the
+/// append with `since` and the read-time clock selects that receipt hour even
+/// when the append crosses an hour boundary.
 ///
 /// # Panics
-/// Panics when static time or Arrow fixture construction fails.
-fn batch(partition: crate::catalog::layout::TimePartition) -> RecordBatch {
-    let timestamp = partition.start_utc().timestamp_micros();
+/// Panics when either instant cannot be bucketed into an hour.
+fn receipt_hours(
+    since: chrono::DateTime<chrono::Utc>,
+    shift: chrono::Duration,
+) -> (
+    crate::catalog::layout::TimePartition,
+    crate::catalog::layout::TimePartition,
+) {
+    let hour = |at| {
+        crate::catalog::TimeGranularity::Hour
+            .bucket(at)
+            .expect("a receipt instant buckets into an hour")
+    };
+    (hour(since + shift), hour(chrono::Utc::now() + shift))
+}
+
+/// Build the one-row `value` batch for Scribe path tests.
+///
+/// # Panics
+/// Panics when the Arrow fixture cannot be built.
+fn batch(value: i64) -> RecordBatch {
     RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new(
-                "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                false,
-            ),
-            Field::new("value", DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(TimestampMicrosecondArray::from(vec![timestamp]).with_timezone("UTC")),
-            Arc::new(Int64Array::from(vec![42])),
-        ],
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![value]))],
     )
     .expect("scribe persistence batch")
 }
@@ -83,19 +91,18 @@ fn principal(tenant: DataTenantId) -> Principal {
     }
 }
 
-/// Build the projected metric batch this fixture drives, at a fixed partition.
+/// Build the projected metric batch this fixture drives.
 ///
 /// The rows come from the owning `OTLP` metrics projector, so the fixture
 /// carries exactly the nested, metadata-bearing, correlation-column shape a
-/// real signal write produces rather than a hand-built imitation. One
-/// caller-supplied `wyrd_event_time` column is prepended so every row lands in
-/// one deterministic partition the tail request can select.
+/// real signal write produces rather than a hand-built imitation. Every point
+/// carries a `time_unix_nano` in the hour [`fixture_point_hour`] names, so
+/// every row lands in one deterministic partition the tail request selects.
 ///
 /// # Panics
 ///
-/// Panics when the projection rejects a point or the event-time column cannot
-/// be attached.
-fn projected_metric_batch(partition: crate::catalog::layout::TimePartition) -> RecordBatch {
+/// Panics when the projection rejects a point.
+fn projected_metric_batch() -> RecordBatch {
     use wyrd_tonic::otlp::metrics::v1::{
         Metric, ResourceMetrics, ScopeMetrics, Summary, SummaryDataPoint, metric,
         summary_data_point::ValueAtQuantile,
@@ -104,7 +111,7 @@ fn projected_metric_batch(partition: crate::catalog::layout::TimePartition) -> R
     let point = |index: u64| SummaryDataPoint {
         attributes: Vec::new(),
         start_time_unix_nano: 0,
-        time_unix_nano: index + 1,
+        time_unix_nano: FIXTURE_POINT_TIME_NANOS + index,
         count: index + 1,
         sum: 1.5,
         quantile_values: vec![
@@ -140,26 +147,7 @@ fn projected_metric_batch(partition: crate::catalog::layout::TimePartition) -> R
         crate::tables::metrics::project_resource_metrics(&request, None, usize::MAX)
             .expect("the owning metrics projector accepts the fixture");
     assert_eq!(outcome.accepted_points, 4);
-
-    let timestamp = partition.start_utc().timestamp_micros();
-    let mut fields = vec![Field::new(
-        "wyrd_event_time",
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        false,
-    )];
-    fields.extend(
-        projected
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| field.as_ref().clone()),
-    );
-    let mut columns: Vec<ArrayRef> = vec![Arc::new(
-        TimestampMicrosecondArray::from(vec![timestamp; projected.num_rows()]).with_timezone("UTC"),
-    )];
-    columns.extend(projected.columns().iter().map(Arc::clone));
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .expect("the projected batch accepts one caller event time")
+    projected
 }
 
 /// Encode the supplied batches as one Arrow IPC stream.
@@ -257,7 +245,6 @@ const MANAGED_COLUMNS: &[&str] = &[
     "card_uid",
     "principal_id",
     "wyrd_request_id",
-    "wyrd_event_time",
     "wyrd_ingested_at",
 ];
 
@@ -321,17 +308,13 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
     // canonical path and its managed columns must come from the table's own
     // physical schema rather than from locally reconstructed fields.
     let table = TableRef::new(BifrostNamespace::Metrics, "points");
-    let day = fixture_event_day(1);
-    let rows = projected_metric_batch(day);
+    let day = fixture_point_hour();
+    let rows = projected_metric_batch();
     let total_rows = rows.num_rows();
     let canonical_request_id = RequestId::now_v7();
     let arrow_request_id = RequestId::now_v7();
     let temp_dir = TempDir::new().expect("WAL temp dir");
-    let operator = Arc::new(
-        opendal::Operator::new(opendal::services::Memory::default())
-            .expect("memory operator")
-            .finish(),
-    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
     let wal = Arc::new(
         WalWriter::new(
             temp_dir.path(),
@@ -426,15 +409,10 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
 async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let tenant = DataTenantId::new_v7();
     let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_tail");
-    let day = fixture_event_day(1);
-    let rows = batch(day);
+    let rows = batch(42);
     let batch_id = Uuid::now_v7();
     let temp_dir = TempDir::new().expect("WAL temp dir");
-    let operator = Arc::new(
-        opendal::Operator::new(opendal::services::Memory::default())
-            .expect("memory operator")
-            .finish(),
-    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
     let wal = Arc::new(
         WalWriter::new(
             temp_dir.path(),
@@ -448,6 +426,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
 
     let principal = principal(tenant);
     let request_id = RequestId::now_v7();
+    let since = chrono::Utc::now();
     let admission = Scribe::ingest_frame(
         &scribe,
         ScribeIngressFrame {
@@ -490,11 +469,12 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
 
     let binding = TenantTableBinding::resolve((tenant, table.clone())).expect("binding");
     let stream = StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1));
+    let (start_partition, end_partition) = receipt_hours(since, chrono::Duration::zero());
     let request = FetchLiveTailRequest {
         binding,
         target_stream: stream,
-        start_partition: day,
-        end_partition: day,
+        start_partition,
+        end_partition,
         required_columns: vec!["value".to_owned()],
     };
     let hot = live_rows(&scribe, &request, "hot snapshot");
@@ -508,21 +488,19 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
 }
 
 #[tokio::test]
-/// Oracle hot snapshots retain Arrow identity and isolate event days.
-async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
+/// Oracle hot snapshots retain Arrow identity and isolate receipt partitions.
+///
+/// Both tables are unregistered, so each row partitions on its hourly
+/// `wyrd_ingested_at` receipt. Shifting the receipt clock two days between the
+/// isolation appends places them in disjoint partitions.
+async fn oracle_hot_snapshot_preserves_pointer_identity_and_partition_isolation() {
     let tenant = DataTenantId::new_v7();
     let pointer_table = TableRef::new(BifrostNamespace::Bifrost, "scribe_pointer_identity");
-    let day_table = TableRef::new(BifrostNamespace::Bifrost, "scribe_day_isolation");
-    let day_one = fixture_event_day(2);
-    let day_two = fixture_event_day(1);
-    let source = batch(day_one);
-    let source_value = source.column(1).clone();
+    let isolation_table = TableRef::new(BifrostNamespace::Bifrost, "scribe_partition_isolation");
+    let source = batch(42);
+    let source_value = source.column(0).clone();
     let temp_dir = TempDir::new().expect("WAL temp dir");
-    let operator = Arc::new(
-        opendal::Operator::new(opendal::services::Memory::default())
-            .expect("memory operator")
-            .finish(),
-    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
     let wal = Arc::new(
         WalWriter::new(
             temp_dir.path(),
@@ -533,143 +511,141 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
         .expect("WAL writer"),
     );
     let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, &Uuid::nil().to_string(), 1);
-    let pointer_principal = principal(tenant);
-    let pointer_request_id = RequestId::now_v7();
-    let pointer_admission = Scribe::ingest_frame(
-        &scribe,
-        ScribeIngressFrame {
-            attributed_cards: None,
-            authenticated_tenant: tenant,
-            principal: pointer_principal,
-            table: pointer_table.clone(),
-            expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
-                source.schema().as_ref(),
-            )),
-            request_id: pointer_request_id,
-            batch_id: Uuid::now_v7(),
-            measured_wire_bytes: 0,
-            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(
-                vec![source.clone()],
-            )),
-        },
-    )
-    .await
-    .expect("pointer identity append");
-    assert_eq!(pointer_admission.rows_accepted, 1);
+    let since = chrono::Utc::now();
+    let shift = chrono::Duration::days(2);
+    append_one(&scribe, tenant, &pointer_table, source).await;
+    append_one(&scribe, tenant, &isolation_table, batch(101)).await;
+    scribe.shift_receipt_clock_for_test(shift.to_std().expect("a positive shift"));
+    append_one(&scribe, tenant, &isolation_table, batch(202)).await;
+
     let stream = StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1));
+    let current = receipt_hours(since, chrono::Duration::zero());
+    let shifted = receipt_hours(since, shift);
     assert_pointer_identity(
         &scribe,
         tenant,
         &pointer_table,
-        day_one,
+        current,
         &source_value,
         stream,
     );
-
-    let cross_day = cross_day_batch(source.schema(), day_one, day_two);
-    let cross_day_principal = principal(tenant);
-    let cross_day_request_id = RequestId::now_v7();
-    let cross_day_admission = Scribe::ingest_frame(
-        &scribe,
-        ScribeIngressFrame {
-            attributed_cards: None,
-            authenticated_tenant: tenant,
-            principal: cross_day_principal,
-            table: day_table.clone(),
-            expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
-                cross_day.schema().as_ref(),
-            )),
-            request_id: cross_day_request_id,
-            batch_id: Uuid::now_v7(),
-            measured_wire_bytes: 0,
-            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(
-                vec![cross_day],
-            )),
-        },
-    )
-    .await
-    .expect("cross-day append");
-    assert_eq!(cross_day_admission.rows_accepted, 2);
-    assert_cross_day_materialization(&scribe, tenant, &day_table, day_one, day_two, stream);
-    assert_other_tenant_isolated(&scribe, &pointer_table, day_one, stream);
+    let read = |hours| hot_values(&scribe, tenant, &isolation_table, hours, stream);
+    assert_eq!(read(current), vec![101]);
+    assert_eq!(read(shifted), vec![202]);
+    assert_other_tenant_isolated(&scribe, &pointer_table, current, stream);
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
         .await;
 }
 
+/// Durably appends one single-row `batch` to `table` for `tenant`.
+///
+/// # Panics
+/// Panics when Scribe refuses the append or accepts other than one row.
+async fn append_one(
+    scribe: &ScribeImpl,
+    tenant: DataTenantId,
+    table: &TableRef,
+    rows: RecordBatch,
+) {
+    let admission = Scribe::ingest_frame(
+        scribe,
+        ScribeIngressFrame {
+            attributed_cards: None,
+            authenticated_tenant: tenant,
+            principal: principal(tenant),
+            table: table.clone(),
+            expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
+                rows.schema().as_ref(),
+            )),
+            request_id: RequestId::now_v7(),
+            batch_id: Uuid::now_v7(),
+            measured_wire_bytes: 0,
+            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(
+                vec![rows],
+            )),
+        },
+    )
+    .await
+    .expect("durable append");
+    assert_eq!(admission.rows_accepted, 1);
+}
+
+/// Builds the `value` tail read of `table` over the inclusive partition range.
+///
+/// # Panics
+/// Panics when the tenant table binding cannot be resolved.
+fn value_read(
+    tenant: DataTenantId,
+    table: &TableRef,
+    (start_partition, end_partition): (
+        crate::catalog::layout::TimePartition,
+        crate::catalog::layout::TimePartition,
+    ),
+    stream: StreamIdentity,
+) -> FetchLiveTailRequest {
+    FetchLiveTailRequest {
+        binding: TenantTableBinding::resolve((tenant, table.clone())).expect("tail binding"),
+        target_stream: stream,
+        start_partition,
+        end_partition,
+        required_columns: vec!["value".to_owned()],
+    }
+}
+
 /// Assert a returned hot batch shares the expected Arrow allocation.
+///
+/// # Panics
+/// Panics when the read does not return exactly the source allocation.
 fn assert_pointer_identity(
     scribe: &ScribeImpl,
     tenant: DataTenantId,
     table: &TableRef,
-    day: crate::catalog::layout::TimePartition,
+    hours: (
+        crate::catalog::layout::TimePartition,
+        crate::catalog::layout::TimePartition,
+    ),
     source_value: &ArrayRef,
     stream: StreamIdentity,
 ) {
     let hot = live_rows(
         scribe,
-        &FetchLiveTailRequest {
-            binding: TenantTableBinding::resolve((tenant, table.clone())).expect("pointer binding"),
-            target_stream: stream,
-            start_partition: day,
-            end_partition: day,
-            required_columns: vec!["value".to_owned()],
-        },
+        &value_read(tenant, table, hours, stream),
         "pointer hot snapshot",
     );
     assert_eq!(hot.len(), 1);
     assert!(Arc::ptr_eq(source_value, hot[0].column(0)));
 }
 
-/// Build one batch spanning two event-day partitions.
+/// Reads every hot `value` of `table` in the partition range, in row order.
 ///
 /// # Panics
-/// Panics when the static cross-day Arrow fixture cannot be built.
-fn cross_day_batch(
-    schema: Arc<Schema>,
-    day_one: crate::catalog::layout::TimePartition,
-    day_two: crate::catalog::layout::TimePartition,
-) -> RecordBatch {
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(
-                TimestampMicrosecondArray::from(vec![
-                    day_one.start_utc().timestamp_micros(),
-                    day_two.start_utc().timestamp_micros(),
-                ])
-                .with_timezone("UTC"),
-            ),
-            Arc::new(Int64Array::from(vec![101_i64, 202_i64])),
-        ],
-    )
-    .expect("cross-day batch")
-}
-
-/// Assert cross-day materialization preserves row ownership and ordering.
-fn assert_cross_day_materialization(
+/// Panics when the read cannot open or a value column is not `Int64`.
+fn hot_values(
     scribe: &ScribeImpl,
     tenant: DataTenantId,
     table: &TableRef,
-    day_one: crate::catalog::layout::TimePartition,
-    day_two: crate::catalog::layout::TimePartition,
+    hours: (
+        crate::catalog::layout::TimePartition,
+        crate::catalog::layout::TimePartition,
+    ),
     stream: StreamIdentity,
-) {
-    let read_day = |day: crate::catalog::layout::TimePartition| FetchLiveTailRequest {
-        binding: TenantTableBinding::resolve((tenant, table.clone())).expect("day binding"),
-        target_stream: stream,
-        start_partition: day,
-        end_partition: day,
-        required_columns: vec!["value".to_owned()],
-    };
-    let day_one_hot = live_rows(scribe, &read_day(day_one), "day one snapshot");
-    let day_two_hot = live_rows(scribe, &read_day(day_two), "day two snapshot");
-    assert_eq!(day_one_hot.len(), 1);
-    assert_eq!(day_two_hot.len(), 1);
-    assert_eq!(day_one_hot[0].num_rows(), 1);
-    assert_eq!(day_two_hot[0].num_rows(), 1);
-    assert_eq!(hot_value(&day_one_hot[0]), 101);
-    assert_eq!(hot_value(&day_two_hot[0]), 202);
+) -> Vec<i64> {
+    live_rows(
+        scribe,
+        &value_read(tenant, table, hours, stream),
+        "isolation snapshot",
+    )
+    .iter()
+    .flat_map(|rows| {
+        rows.column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("hot values")
+            .values()
+            .to_vec()
+    })
+    .collect()
 }
 
 /// Opens one live read on `scribe` and returns its memtable rows.
@@ -691,38 +667,25 @@ fn live_rows(
         .expect(context)
         .into_parts();
     assert!(runs.is_empty(), "{context}: the fixture staged no run");
-    rows
-}
-
-/// Read the fixture's single hot value.
-///
-/// # Panics
-/// Panics when the fixture column is not the expected Int64 shape.
-fn hot_value(rows: &RecordBatch) -> i64 {
-    rows.column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("hot values")
-        .value(0)
+    rows.into_iter().map(|batch| batch.rows).collect()
 }
 
 /// Assert a distinct tenant cannot observe the retained hot batch.
+///
+/// # Panics
+/// Panics when another tenant's read returns any row.
 fn assert_other_tenant_isolated(
     scribe: &ScribeImpl,
     table: &TableRef,
-    day: crate::catalog::layout::TimePartition,
+    hours: (
+        crate::catalog::layout::TimePartition,
+        crate::catalog::layout::TimePartition,
+    ),
     stream: StreamIdentity,
 ) {
     let other = live_rows(
         scribe,
-        &FetchLiveTailRequest {
-            binding: TenantTableBinding::resolve((DataTenantId::new_v7(), table.clone()))
-                .expect("other tenant binding"),
-            target_stream: stream,
-            start_partition: day,
-            end_partition: day,
-            required_columns: vec!["value".to_owned()],
-        },
+        &value_read(DataTenantId::new_v7(), table, hours, stream),
         "other tenant snapshot",
     );
     assert!(other.is_empty(), "hot snapshots must be tenant isolated");
@@ -733,13 +696,8 @@ fn assert_other_tenant_isolated(
 async fn shard_wal_failure_reaches_the_durable_completion() {
     let tenant = DataTenantId::new_v7();
     let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_wal_failure");
-    let day = fixture_event_day(1);
     let temp_dir = TempDir::new().expect("WAL temp dir");
-    let operator = Arc::new(
-        opendal::Operator::new(opendal::services::Memory::default())
-            .expect("memory operator")
-            .finish(),
-    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
     let wal = Arc::new(
         WalWriter::new(
             temp_dir.path(),
@@ -756,7 +714,7 @@ async fn shard_wal_failure_reaches_the_durable_completion() {
         &Uuid::nil().to_string(),
         1,
     );
-    let rows = batch(day);
+    let rows = batch(42);
     let principal = principal(tenant);
     let request_id = RequestId::now_v7();
     let error = Scribe::ingest_frame(

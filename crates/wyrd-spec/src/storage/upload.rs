@@ -82,8 +82,8 @@ pub enum UploadPlan {
         /// URL time-to-live in seconds.
         ttl_secs: u32,
     },
-    /// AWS S3 multipart upload.
-    S3Multipart {
+    /// Multipart upload over the multipart protocol, served by AWS S3 and the GCS XML API.
+    Multipart {
         /// Number of parts planned.
         part_count: u32,
         /// Size of each non-final part.
@@ -93,13 +93,6 @@ pub enum UploadPlan {
         /// Headers the client must include on each part PUT.
         #[serde(default)]
         required_headers: Vec<HeaderPair>,
-    },
-    /// Google Cloud Storage resumable upload.
-    GcsResumable {
-        /// Resumable session URI returned once to the client.
-        session_uri: String,
-        /// Recommended chunk size in bytes.
-        chunk_size_bytes: u64,
     },
     /// Azure block blob upload.
     AzureBlockBlob {
@@ -162,10 +155,8 @@ pub struct HeaderPair {
 pub enum UploadCompleteRequest {
     /// Single PUT completion.
     SinglePut(SinglePutComplete),
-    /// S3 multipart completion.
-    S3Multipart(S3MultipartComplete),
-    /// GCS resumable completion.
-    GcsResumable(GcsResumableComplete),
+    /// multipart completion.
+    Multipart(MultipartComplete),
     /// Azure block blob completion.
     AzureBlockBlob(AzureBlockBlobComplete),
 }
@@ -176,31 +167,25 @@ pub enum UploadCompleteRequest {
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct SinglePutComplete {}
 
-/// S3 multipart completion payload.
+/// multipart completion payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub struct S3MultipartComplete {
+pub struct MultipartComplete {
     /// Parts uploaded by the client.
-    pub parts: Vec<S3CompletedPart>,
+    pub parts: Vec<CompletedPart>,
 }
 
-/// Completed S3 part descriptor.
+/// Completed part descriptor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub struct S3CompletedPart {
+pub struct CompletedPart {
     /// One-based part number.
     pub part_number: u32,
-    /// S3 ETag returned by the part upload.
+    /// ETag the backend returned for the part upload.
     pub e_tag: String,
 }
-
-/// GCS resumable completion payload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub struct GcsResumableComplete {}
 
 /// Azure block blob completion payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

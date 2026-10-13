@@ -2,6 +2,7 @@
 """Select CI verification lanes and release packages for a set of changed files.
 
 Usage: select-ci.py <changed-files>
+       select-ci.py --gate    (only the complete gate's ci_jobs)
 
 Each changed path is owned by a workspace package (longest manifest-directory
 prefix) or classified by path. Changed packages expand to their consumer
@@ -15,6 +16,13 @@ every selection is printed (and appended to $GITHUB_STEP_SUMMARY when set). Any
 path or package the selector cannot place, or any failure to read the
 workspace graph, selects the complete gate rather than a smaller plan.
 WYRD_CARGO_METADATA names a prepared `cargo metadata` document for self-tests.
+
+`ci_jobs` is the JSON matrix of the Linux `ci` job: one entry per parallel job,
+each running its space-separated `lanes` and restoring the Rust cache named by
+`cache`. The complete gate runs one job per `gate:*` shard listed in mise.toml,
+so every lane runs exactly once. The `deps` job builds the workspace tests and
+saves their dependencies as the shared `test` cache before any shard starts; `save` marks the one shard that refreshes
+each other cache from main.
 """
 
 import json
@@ -22,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from collections import deque
 
 # Global paths configure every lane at once.
@@ -40,8 +49,8 @@ PYTHON = re.compile(r"^(sdks/wyrd-sdk-python/|examples/python/)")
 TYPESCRIPT = re.compile(r"^sdks/wyrd-sdk-ts/")
 # Non-package inputs of the environment-owning journeys; package changes reach
 # them through the closure.
-STORAGE = re.compile(r"^(crates/wyrd/wyrd-storage/docker/|\.github/workflows/storage-integration)")
-IDENTITY = re.compile(r"^(docker-compose\.yml|tests/fixtures/identity/|\.github/workflows/identity-e2e\.yml)")
+STORAGE = re.compile(r"^crates/wyrd/wyrd-storage/docker/")
+IDENTITY = re.compile(r"^(docker-compose\.yml|tests/fixtures/identity/)")
 # Paths owned by the Bifrost capability gate. A change made only of these runs
 # verify:bifrost; Bifrost plus other Rust takes the complete gate.
 BIFROST_ONLY = re.compile(
@@ -69,9 +78,11 @@ BIFROST_JOURNEY = {"vala-bifrost-redux", "wyrd-client", "wyrd-testing", "wyrd-mc
 # Packages whose ignored gateway journeys test:gateway:gate runs.
 GATEWAY_JOURNEY = {"wyrd-testing", "wyrd-cli", "wyrd-mcp", "wyrd-sdk-rust"}
 STORAGE_PACKAGES = {"wyrd-storage", "wyrd-server", "wyrd-sql"}
+# The identity journeys drive the server, the CLI, and every SDK's saved login.
 IDENTITY_PACKAGES = {
     "wyrd-auth", "wyrd-auth-check", "wyrd-auth-issue", "wyrd-auth-oidc",
-    "wyrd-auth-verify", "wyrd-client", "wyrd-server", "wyrd-testing",
+    "wyrd-auth-verify", "wyrd-client", "wyrd-server", "wyrd-testing", "wyrd-cli",
+    "wyrd-sdk-rust", "wyrd-sdk-python", "wyrd-sdk-ts", "wyrd-sdk-ts-testing",
 }
 CODEGEN_PACKAGES = {"wyrd-spec", "wyrd-client", "wyrd-sdk-python"}
 RUST_CLIENT_PACKAGES = {"wyrd-client", "wyrd-sdk-rust"}
@@ -98,6 +109,35 @@ def read_families(workspace):
         for prefix, family in FAMILY_DIRS
         if directory.startswith(prefix)
     }
+
+
+# Gate shards whose builds differ from the shared Rust test graph keep their own
+# cache: Clippy's check-only artifacts and the napi addons' --target tree.
+SHARD_CACHE = {"gate:checks": "clippy", "gate:typescript": "napi"}
+
+
+def gate_jobs(root):
+    """Return one ci job per `gate:*` shard, in mise.toml's gate order."""
+    with open(os.path.join(root, "mise.toml"), "rb") as manifest:
+        shards = tomllib.load(manifest)["tasks"]["gate"]["depends"]
+    jobs = [{"name": shard, "lanes": shard, "cache": SHARD_CACHE.get(shard, "test")} for shard in shards]
+    for cache in {job["cache"] for job in jobs} - {"test"}:
+        next(job for job in jobs if job["cache"] == cache)["save"] = True
+    return jobs
+
+
+def ci_jobs(sel, outputs):
+    """Return the ci matrix for a change that does not take the complete gate."""
+    if outputs.get("bifrost_only"):
+        return [{"name": "bifrost", "lanes": "verify:bifrost", "cache": "test"}]
+    jobs = []
+    if sel.lanes:
+        jobs.append({"name": "lanes", "lanes": " ".join(["check", "check:deps", *sel.lanes]), "cache": "test"})
+    if sel.flags.get("identity"):
+        jobs.append({"name": "identity", "lanes": "test:identity:journey", "cache": "test"})
+    if sel.flags.get("storage"):
+        jobs.append({"name": "storage", "lanes": "test:storage:matrix", "cache": "test"})
+    return jobs
 
 
 def read_metadata(root):
@@ -258,6 +298,7 @@ def select(paths, root):
         sel.flag("typescript", why)
         sel.lane("ts:napi:check", why)
         sel.lane("ts:test:integration", why)
+        sel.flag("identity", why)
     if hits := sorted(shipped & CODEGEN_PACKAGES) or typescript:
         sel.lane("codegen:check", f"generated contracts derive from {hits[0]}")
     if hits := sorted(affected.keys() & BIFROST_JOURNEY):
@@ -284,10 +325,19 @@ def select(paths, root):
     return sel, outputs
 
 
+def write_outputs(result):
+    with open(os.environ.get("GITHUB_OUTPUT", "/dev/stdout"), "a", encoding="utf-8") as out:
+        for name, value in result.items():
+            out.write(f"{name}={value}\n")
+
+
 def main():
     root = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True,
     ).stdout.strip()
+    if sys.argv[1] == "--gate":
+        write_outputs({"ci_jobs": json.dumps(gate_jobs(root), separators=(",", ":"))})
+        return
     paths = [line.strip() for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
     sel, outputs = select(paths, root)
 
@@ -304,15 +354,14 @@ def main():
         # filter would make its family lanes test only the affected closure.
         "rust_packages": "" if full_gate else outputs["rust_packages"],
         "ci_lanes": "" if full_gate else " ".join(sel.lanes),
+        "ci_jobs": json.dumps(gate_jobs(root) if full_gate else ci_jobs(sel, outputs), separators=(",", ":")),
     }
     for name in flags:
         # Unknown impact selects every platform job and the complete package matrix.
         unknown = full_gate and (name.startswith("package_") or name in ("python", "typescript", "rust_client"))
         result[name] = str(unknown or bool(sel.flags.get(name))).lower()
 
-    with open(os.environ.get("GITHUB_OUTPUT", "/dev/stdout"), "a", encoding="utf-8") as out:
-        for name, value in result.items():
-            out.write(f"{name}={value}\n")
+    write_outputs(result)
 
     report = ["Changed files:", *(f"- {p}" for p in paths), "", "Selection:",
               *(f"- {note}" for note in sel.notes),

@@ -199,12 +199,13 @@ impl ServerHandler for WyrdMcpHandler {
     /// Return the complete bounded catalog after public-edge authentication.
     ///
     /// # Errors
-    /// This hook is infallible; authentication failures are handled by the edge.
-    async fn list_tools(
+    /// This hook is infallible; authentication failures are handled by the
+    /// edge. The catalog is built before the returned future is polled.
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
         // The advertised catalog is per caller, not per process: a write tool
         // appears only to a caller whose verified token already carries the
         // permission it needs. An agent therefore never discovers a capability
@@ -222,7 +223,7 @@ impl ServerHandler for WyrdMcpHandler {
             }
         }
         catalog.extend(self.probe_descriptors());
-        Ok(ListToolsResult::with_all_items(catalog))
+        std::future::ready(Ok(ListToolsResult::with_all_items(catalog)))
     }
 
     /// Dispatch tools with verified request context and retain the shutdown

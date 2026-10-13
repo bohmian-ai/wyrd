@@ -48,6 +48,11 @@ name = "gateway"
 path = "tests/gateway/main.rs"
 
 [dependencies]
+# A normal edge, unlike every other member's dev-only one: the Python
+# `testing` extension and the TypeScript testing addon reach the hack only
+# through this harness, so their builds reuse the Rust test builds' third-party
+# artifacts. The harness never ships, so its test-only features never do.
+workspace-hack.workspace = true
 async-trait = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
@@ -67,7 +72,7 @@ iceberg = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = "0.1"
-opendal = { workspace = true }
+object_store = { workspace = true }
 parquet = { workspace = true }
 rand = { workspace = true }
 # The capacity benchmark serves its judge mock over trusted TLS.
@@ -105,6 +110,7 @@ wyrd-auth-verify = { workspace = true }
 wyrd-crypt = { workspace = true }
 wyrd-client = { workspace = true, features = ["internal", "test-support"] }
 wyrd-queue = { workspace = true }
+wyrd-types = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
@@ -119,13 +125,21 @@ wyrd-tls = { workspace = true }
 
 wiremock = { workspace = true }
 
+# The release-server launcher reads host and process usage on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = { workspace = true }
+sysinfo = { workspace = true }
+
 [dev-dependencies]
-workspace-hack.workspace = true
 # The peer-context journey encodes a Scribe fragment exactly as a leader does.
 datafusion-proto = { workspace = true }
+# The leaf-predicate peer journey plans its filter as a leader's session does.
+datafusion = { workspace = true }
 # The analytical-layout journey maps an Eval report through the production
 # result payload builder, whose Eval input is this crate's report type.
 vala-eval = { workspace = true }
+# The Variant recovery journey builds Variant ingest batches from JSON.
+parquet-variant-compute = { workspace = true }
 metrics = { workspace = true }
 # Local provider upstream of the native gateway ingress journey.
 wiremock = { workspace = true }

@@ -1,19 +1,12 @@
 //! Attempt-scoped supervision for Oracle's Analytical execution path.
 //!
-//! The leader query stream owns the complete lifetime of a distributed graph.
-//! Its [`super::analytical`] graph lifecycle revokes every follower grant,
-//! closes the graph's exchanges, and aborts local drivers synchronously when
-//! the stream ends. The stream releases the query's active-read claim only
-//! after that revocation.
-//! Remote IO that has already lost its consumer may finish after that
-//! revocation; it can no longer deliver a result or extend the claim.
-//!
-//! This module does not own query lifetime. It indexes and routes the state a
-//! follower needs between separate stage operations: it registers the
-//! attempt's query-owned runtime, splits the attempt's exchange children from
-//! the query admission already charged, hands out a cancellation child, and
-//! settles each attempt exactly once. A graph whose cleanup cannot be confirmed
-//! stays here as charged capacity residue rather than as a free slot.
+//! A distributed graph fans work out across followers, so nothing about its
+//! cleanup is implied by a leader stream ending. This module owns the one place
+//! that knows an attempt exists: it registers the attempt's query-owned runtime,
+//! splits the attempt's exchange children from the query admission already
+//! charged, hands out a cancellation child, retains every driver future
+//! started under that attempt, and releases all of it exactly once on every
+//! terminal path — success, retry, cancellation, deadline, error, or shutdown.
 //!
 //! Two properties are structural rather than conventional:
 //!
@@ -37,7 +30,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::vala::BifrostError;
 
@@ -208,11 +200,6 @@ struct AnalyticalGraphState {
     running_query: Option<super::query_stream::RunningQueryTerminalOwner>,
     /// The query-owned runtime every follower of this graph installs.
     runtime: OracleExecution,
-    /// Every outbound exchange stream this graph opened, owned by the graph.
-    ///
-    /// Shared by the leader session that opens them and the lease that settles
-    /// the graph, so one graph has exactly one place its exchanges live.
-    exchanges: Arc<super::analytical_transport::AnalyticalGraphExchanges>,
     /// Cancellation child covering every descendant of this graph.
     ///
     /// Owned by the graph rather than by each attempt because a graph's
@@ -269,8 +256,6 @@ impl AnalyticalGraphEntry {
 struct AnalyticalAttemptState {
     /// Cancellation child covering every descendant started under the attempt.
     cancel: CancellationToken,
-    /// Driver futures retained so settlement can join rather than orphan them.
-    drivers: Vec<JoinHandle<()>>,
     /// In-flight gauge and duration accounting released on the terminal path.
     telemetry: AnalyticalAttemptTelemetry,
     /// Whether result data produced under this attempt already left the node.
@@ -279,20 +264,6 @@ struct AnalyticalAttemptState {
     /// evidence: a retry admitted after egress would re-emit rows a client has
     /// already seen, so the successor is refused rather than merely discouraged.
     egressed: Arc<AtomicBool>,
-}
-
-impl Drop for AnalyticalAttemptState {
-    /// Aborts every driver this attempt still retains.
-    ///
-    /// A joined driver has already been removed, so this reaches only drivers
-    /// nothing will join: an abandoned attempt, or a settlement whose join was
-    /// itself dropped. A detached `JoinHandle` would otherwise let the driver
-    /// run on with no owner.
-    fn drop(&mut self) {
-        for driver in &self.drivers {
-            driver.abort();
-        }
-    }
 }
 
 /// Proof that one attempt released every resource it held.
@@ -306,8 +277,6 @@ pub struct AnalyticalAttemptRelease {
     pub key: AnalyticalAttemptKey,
     /// The terminal outcome recorded for the attempt.
     pub outcome: AnalyticalAttemptOutcome,
-    /// Driver futures joined before the attempt's resources were returned.
-    pub drivers_joined: usize,
     /// Whether result data left the node under this attempt.
     pub egressed: bool,
 }
@@ -489,7 +458,6 @@ impl AnalyticalSupervisor {
                 retained_admission: None,
                 running_query: None,
                 runtime,
-                exchanges: Arc::default(),
                 cancel: self.root_cancel.child_token(),
                 metric_fold: None,
             }),
@@ -505,25 +473,6 @@ impl AnalyticalSupervisor {
             graph,
             released: false,
         })
-    }
-
-    /// Returns one registered graph's own exchange registry.
-    ///
-    /// `None` when the graph is not registered here, which is the correct
-    /// answer: an unregistered graph opens no exchange.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
-    pub fn graph_exchanges(
-        &self,
-        graph: AnalyticalGraphKey,
-    ) -> Result<Option<Arc<super::analytical_transport::AnalyticalGraphExchanges>>, BifrostError>
-    {
-        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-        Ok(graphs
-            .get(&graph)
-            .map(|entry| Arc::clone(&entry.state().exchanges)))
     }
 
     /// Returns one registered graph's own cancellation child.
@@ -841,6 +790,10 @@ impl AnalyticalSupervisor {
 
     /// Releases one graph's runtime and admitted envelope.
     ///
+    /// The graph's removal and the return of its envelope and permit are one
+    /// step under the graph lock, so `live_graphs` reaching zero implies every
+    /// released envelope is already back with the resource root.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when an attempt of the graph is
@@ -858,17 +811,31 @@ impl AnalyticalSupervisor {
                 });
             }
         }
-        let removed = {
+        // The graph leaves the map, its runtime leaves the registry, and its
+        // envelope and permit drop, all under the graph lock, so no observer of
+        // `live_graphs` sees the graph gone while its envelope is still
+        // charged. The registry lock is a leaf, so nesting it here is safe.
+        let (running_query, attempt) = {
             let mut graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-            graphs.remove(&graph)
+            let Some(mut removed) = graphs.remove(&graph) else {
+                return Err(BifrostError::QueryExecutionFailed);
+            };
+            let state = removed.state_mut();
+            // Handed back rather than dropped here: dropping the owner would
+            // retire the entry as failed, and only the caller knows this
+            // graph's terminal.
+            let running_query = state.running_query.take();
+            // An attempt ownership left on the permit would re-enter this
+            // supervisor when dropped, so it is dropped after the lock.
+            let attempt = state
+                .retained_admission
+                .as_mut()
+                .and_then(super::admission::AdmittedQueryGuard::take_analytical);
+            self.registry.invalidate(graph)?;
+            drop(removed);
+            (running_query, attempt)
         };
-        let Some(mut removed) = removed else {
-            return Err(BifrostError::QueryExecutionFailed);
-        };
-        // Handed back rather than dropped here: dropping the owner would retire
-        // the entry as failed, and only the caller knows this graph's terminal.
-        let running_query = removed.state_mut().running_query.take();
-        self.registry.invalidate(graph)?;
+        drop(attempt);
         tracing::debug!(
             public_query_id = %graph.public_query_id,
             datafusion_query_id = %graph.datafusion_query_id,
@@ -974,7 +941,6 @@ impl AnalyticalSupervisor {
             key,
             AnalyticalAttemptState {
                 cancel: cancel.clone(),
-                drivers: Vec::new(),
                 telemetry,
                 egressed: Arc::clone(&egressed),
             },
@@ -990,31 +956,10 @@ impl AnalyticalSupervisor {
         })
     }
 
-    /// Retains one driver future so settlement joins it instead of orphaning it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the attempt lock is poisoned, and
-    /// [`BifrostError::QueryExecutionFailed`] when the attempt is no longer
-    /// supervised — a stale or sibling graph — which fails the caller closed
-    /// rather than letting an unowned future run on.
-    pub fn retain_driver(
-        &self,
-        key: AnalyticalAttemptKey,
-        driver: JoinHandle<()>,
-    ) -> Result<(), BifrostError> {
-        let mut attempts = self.attempts.lock().map_err(|_| poisoned_supervisor())?;
-        let Some(state) = attempts.get_mut(&key) else {
-            return Err(BifrostError::QueryExecutionFailed);
-        };
-        state.drivers.push(driver);
-        Ok(())
-    }
-
-    /// Cancels one attempt, joins its drivers, and returns everything it held.
+    /// Cancels one attempt and returns everything it held.
     ///
     /// The state is removed from the map under the lock before anything is
-    /// awaited or dropped, so a concurrent or repeated settlement of the same
+    /// dropped, so a concurrent or repeated settlement of the same
     /// key observes an absent attempt and refuses. This is what makes release
     /// exactly-once rather than merely usually-once.
     ///
@@ -1024,11 +969,7 @@ impl AnalyticalSupervisor {
     /// attempt, and [`BifrostError::Internal`] when the attempt or registry lock
     /// is poisoned.
     ///
-    /// # Panics
-    ///
-    /// Does not panic. A driver that panicked is reported through its join
-    /// result and logged; it does not propagate into settlement.
-    pub async fn finish_attempt(
+    pub fn finish_attempt(
         &self,
         key: AnalyticalAttemptKey,
         outcome: AnalyticalAttemptOutcome,
@@ -1037,32 +978,9 @@ impl AnalyticalSupervisor {
             return Err(BifrostError::QueryExecutionFailed);
         };
         state.cancel.cancel();
-        let mut drivers_joined = 0;
-        // Joined in place and removed only once joined: if this future is
-        // dropped mid-join, the drivers still held are aborted by the state's
-        // own `Drop` rather than detached.
-        while let Some(driver) = state.drivers.last_mut() {
-            let joined = driver.await;
-            state.drivers.pop();
-            match joined {
-                Ok(()) => drivers_joined += 1,
-                Err(error) if error.is_cancelled() => drivers_joined += 1,
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        public_query_id = %key.public_query_id,
-                        datafusion_query_id = %key.datafusion_query_id,
-                        stage = %key.stage,
-                        attempt = key.attempt.as_u8(),
-                        "Oracle analytical driver failed to settle cleanly"
-                    );
-                }
-            }
-        }
         let release = AnalyticalAttemptRelease {
             key,
             outcome,
-            drivers_joined,
             egressed: state.egressed.load(Ordering::Acquire),
         };
         state.telemetry.finish(outcome);
@@ -1077,7 +995,6 @@ impl AnalyticalSupervisor {
             task = key.task.map(TaskId::as_usize),
             attempt = key.attempt.as_u8(),
             outcome = outcome.as_str(),
-            drivers_joined,
             "Oracle analytical attempt settled"
         );
         Ok(release)
@@ -1087,7 +1004,7 @@ impl AnalyticalSupervisor {
     /// releases every registered graph's runtime and admitted envelope.
     ///
     /// Every graph is moved to `Draining` first so nothing new is admitted to
-    /// it. A leader graph's participants and drivers belong to its stream-owned
+    /// it. A leader graph's participants belong to its stream-owned
     /// lifecycle, which revokes them when that stream settles or drops; the
     /// root cancellation above is what makes every such stream end.
     ///
@@ -1095,7 +1012,7 @@ impl AnalyticalSupervisor {
     ///
     /// Returns [`BifrostError::Internal`] when the attempt or registry lock is
     /// poisoned, leaving the supervisor closed to new work.
-    pub async fn shutdown(&self) -> Result<AnalyticalSupervisorInspection, BifrostError> {
+    pub fn shutdown(&self) -> Result<AnalyticalSupervisorInspection, BifrostError> {
         self.accepting.store(false, Ordering::Release);
         self.root_cancel.cancel();
         let signalled: Vec<AnalyticalGraphKey> = {
@@ -1113,7 +1030,6 @@ impl AnalyticalSupervisor {
         for key in live {
             if self
                 .finish_attempt(key, AnalyticalAttemptOutcome::Cancelled)
-                .await
                 .is_ok()
             {
                 attempts_settled += 1;
@@ -1157,11 +1073,9 @@ impl AnalyticalSupervisor {
         Ok(attempts.remove(&key))
     }
 
-    /// Cancels and releases one attempt without awaiting its drivers.
+    /// Cancels and releases one attempt whose owner vanished without a terminal.
     ///
-    /// This is the drop path. It aborts rather than joins, because a `Drop`
-    /// implementation cannot await; callers that need the join guarantee must
-    /// use [`AnalyticalSupervisor::finish_attempt`].
+    /// This is the drop path; it records the attempt as cancelled.
     fn abandon_attempt(&self, key: AnalyticalAttemptKey) {
         let taken = match self.take_attempt(key) {
             Ok(taken) => taken,
@@ -1174,9 +1088,6 @@ impl AnalyticalSupervisor {
             return;
         };
         state.cancel.cancel();
-        for driver in &state.drivers {
-            driver.abort();
-        }
         state.telemetry.finish(AnalyticalAttemptOutcome::Cancelled);
         tracing::warn!(
             public_query_id = %key.public_query_id,
@@ -1274,8 +1185,8 @@ impl Drop for AnalyticalGraphGuard {
 ///
 /// Holding the guard is what keeps the attempt's runtime resolvable and its
 /// child grants charged. Dropping it without an explicit terminal cancels and
-/// releases the attempt rather than leaking it, but only
-/// [`AnalyticalAttemptGuard::finish`] joins the attempt's drivers.
+/// releases the attempt rather than leaking it, recorded as cancelled;
+/// [`AnalyticalAttemptGuard::finish`] records its real outcome.
 pub struct AnalyticalAttemptGuard {
     /// The supervisor that owns the attempt's state.
     supervisor: Arc<AnalyticalSupervisor>,
@@ -1339,28 +1250,18 @@ impl AnalyticalAttemptGuard {
         self.egressed.load(Ordering::Acquire)
     }
 
-    /// Retains one driver future under this exact attempt.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error reported by
-    /// [`AnalyticalSupervisor::retain_driver`].
-    pub fn retain_driver(&self, driver: JoinHandle<()>) -> Result<(), BifrostError> {
-        self.supervisor.retain_driver(self.key, driver)
-    }
-
-    /// Settles the attempt, joining its drivers and returning its grants.
+    /// Settles the attempt and returns its grants.
     ///
     /// # Errors
     ///
     /// Returns the error reported by
     /// [`AnalyticalSupervisor::finish_attempt`].
-    pub async fn finish(
+    pub fn finish(
         mut self,
         outcome: AnalyticalAttemptOutcome,
     ) -> Result<AnalyticalAttemptRelease, BifrostError> {
         self.settled = true;
-        self.supervisor.finish_attempt(self.key, outcome).await
+        self.supervisor.finish_attempt(self.key, outcome)
     }
 }
 
@@ -1434,6 +1335,7 @@ mod tests {
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
+            oracle_partition_scan_bytes: None,
             scratch_root: None,
             volume_roots: None,
         };
@@ -1562,10 +1464,7 @@ mod tests {
             datafusion_query_id: DataFusionQueryId::allocate(),
         };
         let failing_resources = failing_oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits the rewrite-failure query");
         let failing_runtime = failing_resources.execution().clone();
         let mut failing = lifecycle_over_fold(
@@ -1607,7 +1506,6 @@ mod tests {
         );
         let failing_inspection = failing_supervisor
             .shutdown()
-            .await
             .expect("shutdown reaches the isolated retained graph");
         assert_eq!(
             failing_inspection.graphs_retained, 1,
@@ -1652,10 +1550,7 @@ mod tests {
             datafusion_query_id: DataFusionQueryId::allocate(),
         };
         let expired_resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits the held query");
         let expired_runtime = expired_resources.execution().clone();
         let never = Arc::clone(&held);
@@ -1699,10 +1594,7 @@ mod tests {
             datafusion_query_id: DataFusionQueryId::allocate(),
         };
         let settled_resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits the released query");
         let settled_runtime = settled_resources.execution().clone();
         let mut settled = lifecycle_over_fold(
@@ -1736,7 +1628,6 @@ mod tests {
 
         let inspection = supervisor
             .shutdown()
-            .await
             .expect("shutdown reaches every remaining graph");
         assert_eq!(
             inspection.graphs_retained, 1,
@@ -1765,16 +1656,10 @@ mod tests {
     async fn analytical_stage_identity_separates_public_and_datafusion_queries() {
         let oracle = oracle_role();
         let resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits one analytical query");
         let resources_b = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits a second analytical query");
         let runtime_a = resources.execution().clone();
         let runtime_b = resources_b.execution().clone();
@@ -1816,7 +1701,6 @@ mod tests {
 
         let release_b = guard_b
             .finish(AnalyticalAttemptOutcome::Success)
-            .await
             .expect("graph B settles its own attempt");
         assert_eq!(release_b.key, key_b);
         graph_guard_b
@@ -1842,20 +1726,15 @@ mod tests {
         assert!(
             supervisor
                 .finish_attempt(key_b, AnalyticalAttemptOutcome::Cancelled)
-                .await
                 .is_err(),
             "a settled sibling attempt cannot be settled again through graph A's supervisor"
         );
 
         guard_a
             .finish(AnalyticalAttemptOutcome::Success)
-            .await
             .expect("graph A settles its own attempt");
         drop(graph_guard_a);
-        let inspection = supervisor
-            .shutdown()
-            .await
-            .expect("shutdown inspects cleanly");
+        let inspection = supervisor.shutdown().expect("shutdown inspects cleanly");
         assert_eq!(inspection.attempts_retained, 0);
         assert_eq!(inspection.graphs_retained, 0);
     }
@@ -1914,10 +1793,7 @@ mod tests {
         let metrics_guard = metrics::set_default_local_recorder(&recorder);
         let oracle = oracle_role();
         let resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits one analytical query");
         let pool = Arc::clone(resources.execution().memory_pool());
         let runtime = resources.execution().clone();
@@ -1949,11 +1825,9 @@ mod tests {
         );
         assert_exchange_allocates_from_installed_pool(resolved.runtime(), &pool);
 
-        let release = guard
+        guard
             .finish(AnalyticalAttemptOutcome::Success)
-            .await
             .expect("the attempt settles once");
-        assert_eq!(release.drivers_joined, 0);
         assert_eq!(
             pool.reserved(),
             0,
@@ -1963,7 +1837,6 @@ mod tests {
         assert!(
             supervisor
                 .finish_attempt(key, AnalyticalAttemptOutcome::Cancelled)
-                .await
                 .is_err(),
             "a settled attempt cannot release its resources a second time"
         );

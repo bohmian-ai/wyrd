@@ -47,7 +47,7 @@ pub enum StorageClientError {
         operation: &'static str,
     },
     /// A multipart response omitted the required ETag.
-    #[error("S3 part {part_number} response did not include an ETag")]
+    #[error("multipart part {part_number} response did not include an ETag")]
     MissingETag {
         /// One-based part number.
         part_number: u32,
@@ -164,7 +164,7 @@ impl From<StorageClientError> for WyrdError {
                 .into()
             }
             StorageClientError::MissingETag { part_number } => WyrdStorageError::Backend {
-                detail: format!("S3 part {part_number} response omitted ETag"),
+                detail: format!("multipart part {part_number} response omitted ETag"),
             }
             .into(),
         }

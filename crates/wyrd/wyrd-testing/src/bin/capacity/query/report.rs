@@ -1,0 +1,630 @@
+//! Judges each measured step against its target and renders the report.
+//!
+//! Every row is PASS, FAIL, or `-` (a sweep point that only locates
+//! saturation) with a one-line reason. Every row fails on any error, on peak
+//! server memory within [`MEMORY_HEADROOM_BYTES`] of the server's memory
+//! limit, or on an OOM kill.
+
+use std::fmt::Write as _;
+use std::path::Path;
+
+use crate::query::Result;
+use crate::query::run::{Measured, Overload, QUEUE_FULL, QUEUE_PLACES, Usage};
+use crate::query::workload::{Case, Fixture, Target};
+
+/// The server's 1-GiB default headroom: every step's peak server memory must
+/// stay below the server's memory limit less this.
+const MEMORY_HEADROOM_BYTES: u64 = 1 << 30;
+
+/// Durable acknowledged rows per second every write step must reach.
+const MIN_WRITE_ROWS_PER_SECOND: f64 = 200_000.0;
+
+/// OTLP wire MiB per second per server core an export sweep's peak step must
+/// reach: the upper end of published per-core OTLP ingest figures.
+const MIN_EXPORT_WIRE_MIB_PER_CORE: f64 = 30.0;
+
+/// The report table's header.
+const HEADER: &str = "| step | clients | rate | p50/p95/p99 ms | errors | server CPU | peak memory | driver CPU | verdict | reason |\n|---|---|---|---|---|---|---|---|---|---|";
+
+/// A row's judgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Met every target.
+    Pass,
+    /// Missed a target or saw an error.
+    Fail,
+    /// A sweep point: reported, judged by its sweep's summary row.
+    Measured,
+}
+
+/// One report line.
+struct Row {
+    /// Step name.
+    step: String,
+    /// Clients, writers, or `-`.
+    clients: String,
+    /// Successful queries (or acknowledged rows) per second.
+    rate: String,
+    /// p50/p95/p99 in milliseconds.
+    latency: String,
+    /// Error count and codes.
+    errors: String,
+    /// Server usage over the window.
+    usage: Option<(f64, u64, f64)>,
+    /// Judgement.
+    verdict: Verdict,
+    /// Why.
+    reason: String,
+}
+
+impl Row {
+    /// Renders the row as one Markdown table line.
+    fn render(&self) -> String {
+        let usage = self
+            .usage
+            .map_or("- | - | -".to_owned(), |(cpu, peak, driver)| {
+                format!(
+                    "{cpu:.2} cores | {:.2} GiB | {driver:.2} cores",
+                    peak as f64 / f64::from(1 << 30)
+                )
+            });
+        let verdict = match self.verdict {
+            Verdict::Pass => "PASS",
+            Verdict::Fail => "FAIL",
+            Verdict::Measured => "-",
+        };
+        format!(
+            "| {} | {} | {} | {} | {} | {usage} | {verdict} | {} |",
+            self.step, self.clients, self.rate, self.latency, self.errors, self.reason
+        )
+    }
+}
+
+/// Every judged row, in the order the journey ran them.
+pub struct Report {
+    /// Fixture the report describes.
+    fixture: Fixture,
+    /// Which tier the reads hit and where the server ran.
+    label: String,
+    /// The server's memory limit, which sets the peak-memory ceiling.
+    memory_limit_bytes: u64,
+    /// Rows so far.
+    rows: Vec<Row>,
+    /// One JSON line per judged step: its name, clients, and every latency.
+    samples: String,
+}
+
+impl Report {
+    /// Starts an empty report for `fixture` titled with `label` (the tier
+    /// and host) on a server whose memory limit is `memory_limit_bytes`, and
+    /// prints the title and table header; each row prints as it is judged.
+    pub fn new(fixture: Fixture, label: String, memory_limit_bytes: u64) -> Self {
+        let report = Self {
+            fixture,
+            label,
+            memory_limit_bytes,
+            rows: Vec::new(),
+            samples: String::new(),
+        };
+        println!("{}\n\n{HEADER}", report.title());
+        report
+    }
+
+    /// Adds a write step: it must durably acknowledge at least
+    /// [`MIN_WRITE_ROWS_PER_SECOND`]. `files` and `bytes` are the Parquet
+    /// objects the table holds afterwards.
+    pub fn write(&mut self, step: &str, measured: &Measured, files: u64, bytes: u64) {
+        let rate = rows_per_second(measured);
+        let missed = (rate < MIN_WRITE_ROWS_PER_SECOND)
+            .then(|| format!("{rate:.0} rows/s < {MIN_WRITE_ROWS_PER_SECOND:.0}"));
+        let shape = write_shape(measured, files, bytes);
+        let row = self.judge(step, measured, format!("{rate:.0} rows/s"), missed, shape);
+        self.add(row);
+    }
+
+    /// Adds one OTLP export sweep point: reported, failed only on an error,
+    /// and judged with the rest by [`Self::export_target`].
+    pub fn export(&mut self, step: &str, measured: &Measured, files: u64, bytes: u64) {
+        let rate = format!("{:.0} rows/s", rows_per_second(measured));
+        let shape = write_shape(measured, files, bytes);
+        let mut row = self.judge(step, measured, rate, None, shape);
+        if row.verdict == Verdict::Pass {
+            row.verdict = Verdict::Measured;
+        }
+        self.add(row);
+    }
+
+    /// Adds the export sweep's summary: its fastest point must durably
+    /// acknowledge [`MIN_WRITE_ROWS_PER_SECOND`] and carry
+    /// [`MIN_EXPORT_WIRE_MIB_PER_CORE`] of OTLP wire per server core. Lower
+    /// concurrency points only locate saturation.
+    pub fn export_target(&mut self, step: &str, points: &[Measured]) {
+        let peak = points
+            .iter()
+            .max_by(|left, right| rows_per_second(left).total_cmp(&rows_per_second(right)));
+        let summary = peak.map_or(Err("no points".to_owned()), |peak| {
+            let rate = rows_per_second(peak);
+            let per_core = peak.wire_bytes as f64
+                / f64::from(1 << 20)
+                / peak.usage.server_cpu_seconds.max(f64::EPSILON);
+            let shape = format!(
+                "peak x{}: {rate:.0} rows/s, {per_core:.1} MiB/s OTLP wire per server core",
+                peak.clients
+            );
+            if rate < MIN_WRITE_ROWS_PER_SECOND {
+                Err(format!("{shape}; < {MIN_WRITE_ROWS_PER_SECOND:.0} rows/s"))
+            } else if per_core < MIN_EXPORT_WIRE_MIB_PER_CORE {
+                Err(format!(
+                    "{shape}; < {MIN_EXPORT_WIRE_MIB_PER_CORE:.0} MiB/s per core"
+                ))
+            } else {
+                Ok(shape)
+            }
+        });
+        self.add(Row {
+            step: step.to_owned(),
+            clients: "-".to_owned(),
+            rate: "-".to_owned(),
+            latency: "-".to_owned(),
+            errors: "-".to_owned(),
+            usage: None,
+            verdict: if summary.is_ok() {
+                Verdict::Pass
+            } else {
+                Verdict::Fail
+            },
+            reason: summary.unwrap_or_else(|missed| missed),
+        });
+    }
+
+    /// Adds the exact-answer check.
+    pub fn answers(&mut self, measured: &Measured) {
+        let row = self.judge(
+            "exact answers",
+            measured,
+            "-".to_owned(),
+            None,
+            format!("{} statements", measured.latencies_us.len()),
+        );
+        self.add(row);
+    }
+
+    /// Adds one query step judged against `case`'s target.
+    pub fn query(&mut self, case: Case, measured: &Measured) {
+        let target = case.target(self.fixture);
+        let missed = missed(&target, measured);
+        let reason = if target == Target::default() {
+            "no target on this fixture".to_owned()
+        } else {
+            "meets target".to_owned()
+        };
+        let row = self.judge(case.name(), measured, qps(measured), missed, reason);
+        self.add(row);
+    }
+
+    /// Adds a concurrency sweep of `case`: one `-` row per point, then a
+    /// summary judged by [`peak_summary`] when the target has a peak rate,
+    /// else by [`concurrency_summary`].
+    pub fn sweep(&mut self, case: Case, points: &[Measured]) {
+        let target = case.target(self.fixture);
+        for point in points {
+            let step = format!("{} sweep", case.name());
+            let mut row = self.judge(&step, point, qps(point), None, String::new());
+            if row.verdict == Verdict::Pass {
+                row.verdict = Verdict::Measured;
+                row.reason = missed(&target, point).unwrap_or_else(|| "meets target".to_owned());
+            }
+            self.add(row);
+        }
+        let summary = match target.peak_qps {
+            Some(floor) => peak_summary(&target, points, floor),
+            None => concurrency_summary(&target, points),
+        };
+        self.add(Row {
+            step: format!("{} target", case.name()),
+            clients: "-".to_owned(),
+            rate: "-".to_owned(),
+            latency: "-".to_owned(),
+            errors: "-".to_owned(),
+            usage: None,
+            verdict: if summary.is_ok() {
+                Verdict::Pass
+            } else {
+                Verdict::Fail
+            },
+            reason: summary.unwrap_or_else(|missed| missed),
+        });
+    }
+
+    /// Adds `case` read while writes run: it must meet its own target, and its
+    /// p95 read alone is reported beside it because reads and writes share the
+    /// node's CPU.
+    pub fn loaded(&mut self, case: Case, alone: &Measured, loaded: &Measured) {
+        let missed = missed(&case.target(self.fixture), loaded);
+        let step = format!("{} while writing", case.name());
+        let reason = format!(
+            "p95 alone {:.1} ms",
+            alone.percentile_ms(95.0).unwrap_or(f64::INFINITY)
+        );
+        let row = self.judge(&step, loaded, qps(loaded), missed, reason);
+        self.add(row);
+    }
+
+    /// Adds the full-queue step: [`QUEUE_PLACES`] wait, the next query is
+    /// refused as queue-full, and the queue empties once waiters leave.
+    pub fn overload(&mut self, overload: Overload) {
+        let missed = if overload.queued < QUEUE_PLACES {
+            Some(format!(
+                "queue reached {} of {QUEUE_PLACES}",
+                overload.queued
+            ))
+        } else if overload.overflow != QUEUE_FULL {
+            Some(format!("query into full queue: {}", overload.overflow))
+        } else if overload.drained_seconds.is_none() {
+            Some("queue did not empty after waiters left".to_owned())
+        } else {
+            None
+        };
+        let reason = format!(
+            "{} queued, overflow {}, emptied in {:.1}s",
+            overload.queued,
+            overload.overflow,
+            overload.drained_seconds.unwrap_or(f64::NAN)
+        );
+        let measured = Measured {
+            clients: QUEUE_PLACES + 1,
+            usage: overload.usage,
+            ..Measured::default()
+        };
+        let row = self.judge("full queue", &measured, "-".to_owned(), missed, reason);
+        self.add(row);
+    }
+
+    /// Whether every judged row passed.
+    pub fn passed(&self) -> bool {
+        self.rows.iter().all(|row| row.verdict != Verdict::Fail)
+    }
+
+    /// Adds a tier check: `outcome` says where the table's rows were, or why
+    /// they were not in the tier the phase reads.
+    pub fn tier(&mut self, step: &str, outcome: std::result::Result<String, String>) {
+        let (verdict, reason) = match outcome {
+            Ok(reason) => (Verdict::Pass, reason),
+            Err(reason) => (Verdict::Fail, reason),
+        };
+        self.add(Row {
+            step: step.to_owned(),
+            clients: "-".to_owned(),
+            rate: "-".to_owned(),
+            latency: "-".to_owned(),
+            errors: "-".to_owned(),
+            usage: None,
+            verdict,
+            reason,
+        });
+    }
+
+    /// Adds the shutdown step: after `SIGTERM` the server must exit cleanly
+    /// within its grace period; `stopped` is its exit time or the failure.
+    pub fn shutdown(&mut self, stopped: &Result<f64>) {
+        let (verdict, reason) = match stopped {
+            Ok(seconds) => (Verdict::Pass, format!("exited cleanly in {seconds:.1}s")),
+            Err(error) => (Verdict::Fail, error.to_string()),
+        };
+        self.add(Row {
+            step: "shutdown".to_owned(),
+            clients: "-".to_owned(),
+            rate: "-".to_owned(),
+            latency: "-".to_owned(),
+            errors: "-".to_owned(),
+            usage: None,
+            verdict,
+            reason,
+        });
+    }
+
+    /// Writes every row, as printed, into `output/report.md` and the raw
+    /// latencies into `output/samples.jsonl`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the file write failure.
+    pub fn write_to(&self, output: &Path) -> Result<()> {
+        let mut text = format!("{}\n\n{HEADER}\n", self.title());
+        for row in &self.rows {
+            let _ = writeln!(text, "{}", row.render());
+        }
+        std::fs::write(output.join("report.md"), text)?;
+        std::fs::write(output.join("samples.jsonl"), &self.samples)?;
+        Ok(())
+    }
+
+    /// The report's title line: the fixture's rows, the tier, and where the
+    /// server ran, so only reports from matching hosts are compared.
+    fn title(&self) -> String {
+        format!(
+            "# Bifrost query capacity: {} rows, {}",
+            self.fixture.rows, self.label
+        )
+    }
+
+    /// Appends `row` and prints it.
+    fn add(&mut self, row: Row) {
+        println!("{}", row.render());
+        self.rows.push(row);
+    }
+
+    /// Judges one row: errors, memory, and OOM fail it first, then `missed`
+    /// (a target miss) does. A window whose scan sizing diverged from its
+    /// scans (see [`Usage::sizing_divergence`]) is noted in the reason
+    /// without changing the verdict. Records the step's raw latencies.
+    fn judge(
+        &mut self,
+        step: &str,
+        measured: &Measured,
+        rate: String,
+        missed: Option<String>,
+        reason: String,
+    ) -> Row {
+        let _ = writeln!(
+            self.samples,
+            "{}",
+            serde_json::json!({
+                "step": step,
+                "clients": measured.clients,
+                "latencies_us": measured.latencies_us,
+                "completed_unix_ms": measured.completed_unix_ms,
+            })
+        );
+        let usage_ = &measured.usage;
+        let failure = if measured.error_count() > 0 {
+            Some(format!("{} errors", measured.error_count()))
+        } else if usage_.oom_kills > 0 {
+            Some(format!("{} OOM kills", usage_.oom_kills))
+        } else if usage_.peak_memory_bytes + MEMORY_HEADROOM_BYTES >= self.memory_limit_bytes {
+            Some(format!(
+                "peak memory >= {} GiB",
+                self.memory_limit_bytes
+                    .saturating_sub(MEMORY_HEADROOM_BYTES)
+                    >> 30
+            ))
+        } else {
+            missed
+        };
+        let latency = match (
+            measured.percentile_ms(50.0),
+            measured.percentile_ms(95.0),
+            measured.percentile_ms(99.0),
+        ) {
+            (Some(p50), Some(p95), Some(p99)) => format!("{p50:.1}/{p95:.1}/{p99:.1}"),
+            _ => "-".to_owned(),
+        };
+        let errors = if measured.errors.is_empty() {
+            "0".to_owned()
+        } else {
+            measured
+                .errors
+                .iter()
+                .map(|(code, count)| format!("{count}× {code}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        Row {
+            step: step.to_owned(),
+            clients: measured.clients.to_string(),
+            rate,
+            latency,
+            errors,
+            usage: usage(usage_),
+            verdict: if failure.is_some() {
+                Verdict::Fail
+            } else {
+                Verdict::Pass
+            },
+            reason: match usage_.sizing_divergence() {
+                Some(divergence) => format!("{}; {divergence}", failure.unwrap_or(reason)),
+                None => failure.unwrap_or(reason),
+            },
+        }
+    }
+}
+
+/// Server CPU cores, peak memory, and driver CPU cores of a window;
+/// `None` for a window that never opened.
+fn usage(usage: &Usage) -> Option<(f64, u64, f64)> {
+    let seconds = usage.seconds;
+    (seconds > 0.0).then(|| {
+        (
+            usage.server_cpu_seconds / seconds,
+            usage.peak_memory_bytes,
+            usage.driver_cpu_seconds / seconds,
+        )
+    })
+}
+
+/// Judges a sweep whose whole target must hold at one concurrency: `Ok`
+/// names every error-free point meeting it, `Err` says none did.
+fn concurrency_summary(
+    target: &Target,
+    points: &[Measured],
+) -> std::result::Result<String, String> {
+    let meeting: Vec<String> = points
+        .iter()
+        .filter(|point| missed(target, point).is_none() && point.error_count() == 0)
+        .map(|point| point.clients.to_string())
+        .collect();
+    if meeting.is_empty() {
+        Err("no concurrency meets the target".to_owned())
+    } else {
+        Ok(format!("met at {} clients", meeting.join(", ")))
+    }
+}
+
+/// Judges a sweep whose latency ceilings hold at one client and whose rate
+/// must reach `floor` at its busiest error-free point.
+///
+/// # Errors
+///
+/// Returns the first miss: no error-free one-client point, a latency
+/// ceiling missed there, or a peak rate below `floor`.
+fn peak_summary(
+    target: &Target,
+    points: &[Measured],
+    floor: f64,
+) -> std::result::Result<String, String> {
+    let clean = || points.iter().filter(|point| point.error_count() == 0);
+    let single = clean()
+        .find(|point| point.clients == 1)
+        .ok_or_else(|| "no error-free point at 1 client".to_owned())?;
+    if let Some(miss) = missed(target, single) {
+        return Err(format!("1 client: {miss}"));
+    }
+    let peak = clean()
+        .max_by(|a, b| a.rate().total_cmp(&b.rate()))
+        .ok_or_else(|| "no error-free point".to_owned())?;
+    if peak.rate() < floor {
+        return Err(format!("peak {:.1} qps < {floor}", peak.rate()));
+    }
+    Ok(format!(
+        "latency met at 1 client; peak {:.1} qps at {} clients",
+        peak.rate(),
+        peak.clients
+    ))
+}
+
+/// Successful queries per second, formatted.
+fn qps(measured: &Measured) -> String {
+    format!("{:.1} qps", measured.rate())
+}
+
+/// The first target `measured` misses, or `None`.
+fn missed(target: &Target, measured: &Measured) -> Option<String> {
+    let ceilings = [
+        ("p50", 50.0, target.p50_ms),
+        ("p95", 95.0, target.p95_ms),
+        ("p99", 99.0, target.p99_ms),
+    ];
+    for (name, percentile, ceiling) in ceilings {
+        if let Some(ceiling) = ceiling {
+            let actual = measured.percentile_ms(percentile).unwrap_or(f64::INFINITY);
+            if actual >= ceiling {
+                return Some(format!("{name} {actual:.1} ms >= {ceiling} ms"));
+            }
+        }
+    }
+    if let Some(floor) = target.min_qps
+        && measured.rate() < floor
+    {
+        return Some(format!("{:.1} qps < {floor}", measured.rate()));
+    }
+    if let Some(floor) = target.min_scan_bytes_per_second {
+        let scanned = measured.usage.scanned_bytes / measured.usage.seconds.max(f64::EPSILON);
+        if scanned < floor {
+            return Some(format!(
+                "scan {:.0} MB/s < {:.0} MB/s",
+                scanned / 1e6,
+                floor / 1e6
+            ));
+        }
+    }
+    None
+}
+
+/// Durable acknowledged rows per second of a write or export step.
+fn rows_per_second(measured: &Measured) -> f64 {
+    measured.rows as f64 / measured.usage.seconds.max(f64::EPSILON)
+}
+
+/// A write or export step's shape: retained Arrow MB/s overall and per
+/// server core, the Parquet files the table holds afterwards, and, for an
+/// OTLP export, its wire MB/s and rows/s per server core.
+fn write_shape(measured: &Measured, files: u64, bytes: u64) -> String {
+    let megabytes = measured
+        .usage
+        .write
+        .get(crate::query::run::MEMTABLE_BYTES)
+        .copied()
+        .unwrap_or(0.0)
+        / 1e6;
+    let mut shape = format!(
+        "{} rows in {:.1}s, {:.1} MB/s, {:.1} MB/s per server core; {files} files, avg {:.1} MiB",
+        measured.rows,
+        measured.usage.seconds,
+        megabytes / measured.usage.seconds.max(f64::EPSILON),
+        megabytes / measured.usage.server_cpu_seconds.max(f64::EPSILON),
+        bytes as f64 / files.max(1) as f64 / f64::from(1 << 20),
+    );
+    if measured.wire_bytes > 0 {
+        let wire = measured.wire_bytes as f64 / f64::from(1 << 20);
+        let _ = write!(
+            shape,
+            "; OTLP wire {:.1} MiB/s, {:.1} MiB/s and {:.0} rows/s per server core",
+            wire / measured.usage.seconds.max(f64::EPSILON),
+            wire / measured.usage.server_cpu_seconds.max(f64::EPSILON),
+            measured.rows as f64 / measured.usage.server_cpu_seconds.max(f64::EPSILON),
+        );
+    }
+    shape
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Report, Verdict};
+    use crate::query::run::{Measured, Usage};
+    use crate::query::workload::{Case, Fixture};
+    use num_traits::ToPrimitive;
+
+    /// A point with the selective latencies and rate.
+    fn point(clients: usize, latency_ms: u64, queries: u64) -> Measured {
+        Measured {
+            clients,
+            latencies_us: vec![latency_ms * 1_000; queries.to_usize().unwrap_or(0)],
+            usage: Usage {
+                seconds: 1.0,
+                ..Usage::default()
+            },
+            ..Measured::default()
+        }
+    }
+
+    /// A selective sweep passes on one-client latency plus its busiest
+    /// point's rate, a small-aggregate sweep when one point meets the whole
+    /// target, and an error fails a row whatever its latency.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a verdict is wrong.
+    #[test]
+    fn sweep_and_errors_are_judged() {
+        let mut report = Report::new(Fixture::standard(), "test host".to_owned(), 16 << 30);
+        report.sweep(
+            Case::Selective,
+            &[point(1, 5, 150), point(16, 12, 1_300), point(64, 90, 1_280)],
+        );
+        assert_eq!(report.rows[3].verdict, Verdict::Pass);
+        assert_eq!(
+            report.rows[3].reason,
+            "latency met at 1 client; peak 1300.0 qps at 16 clients"
+        );
+        report.sweep(Case::Selective, &[point(1, 8, 150), point(16, 12, 1_300)]);
+        assert_eq!(report.rows[6].reason, "1 client: p50 8.0 ms >= 7 ms");
+        report.sweep(Case::Selective, &[point(1, 5, 150), point(16, 12, 1_000)]);
+        assert_eq!(report.rows[9].reason, "peak 1000.0 qps < 1200");
+        report.sweep(
+            Case::SmallAggregate,
+            &[point(1, 10, 90), point(4, 15, 270), point(64, 180, 370)],
+        );
+        assert_eq!(report.rows[13].reason, "met at 4 clients");
+        report.rows.retain(|row| row.verdict != Verdict::Fail);
+        assert!(report.passed());
+
+        let mut failing = point(1, 100, 10);
+        failing.errors.insert("wrong-result".to_owned(), 1);
+        report.query(Case::TableAggregate, &failing);
+        assert_eq!(
+            report.rows.last().map(|row| row.verdict),
+            Some(Verdict::Fail)
+        );
+        assert!(!report.passed());
+    }
+}

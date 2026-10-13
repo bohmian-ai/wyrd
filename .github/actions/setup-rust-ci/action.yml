@@ -1,8 +1,9 @@
 name: Setup Rust CI
 description: >-
-  Shared CI bring-up for Rust jobs: free disk space, install mise, cache the
-  cargo build, and select the GNU BFD linker on Linux. Assumes the repo is
-  already checked out.
+  Shared CI bring-up for Rust jobs: free disk space, install mise, restore the
+  shared cargo build cache, and select the GNU BFD linker on Linux. Assumes the
+  repo is already checked out. Every Rust job goes through this action so all
+  of them build with the same RUSTFLAGS and can reuse one another's caches.
 
 inputs:
   free-disk:
@@ -14,12 +15,28 @@ inputs:
   tool-cache:
     description: Let free-disk-space remove the hosted-tool cache.
     default: "true"
-  rust-cache-key:
-    description: Optional extra key passed to Swatinem/rust-cache to isolate a cache slot.
-    default: ""
+  cache-key:
+    description: >-
+      The shared Rust cache this job restores. Jobs that build the same graph
+      share one: `test` (cargo test builds and the Python extension, which
+      share third-party artifacts through workspace-hack), `clippy`
+      (check-only artifacts), and `napi` (the TypeScript addons' --target tree).
+    default: test
+  save-cache:
+    description: >-
+      Save the cache after the job: "true" saves on main only, so pull
+      requests restore main's cache instead of evicting it with their own;
+      "always" also saves on pull requests, for the one deps job whose cache
+      the run's shards restore. One job per cache-key saves.
+    default: "false"
   bfd-linker:
     description: Force the GNU BFD linker on Linux (workaround for lld issues).
     default: "true"
+
+outputs:
+  cache-hit:
+    description: "true when the Rust cache restored an exact key match."
+    value: ${{ steps.rust-cache.outputs.cache-hit }}
 
 runs:
   using: composite
@@ -36,6 +53,20 @@ runs:
         docker-images: ${{ inputs.docker-images }}
         swap-storage: true
 
+    # Linking several server-sized test binaries at once exceeds the runner's
+    # RAM; without enough swap the runner is killed mid-link.
+    - name: Add swap
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo swapoff -a
+        sudo rm -f /mnt/swapfile
+        sudo fallocate -l 16G /mnt/swapfile
+        sudo chmod 600 /mnt/swapfile
+        sudo mkswap /mnt/swapfile
+        sudo swapon /mnt/swapfile
+        free -h
+
     - name: Set up mise
       uses: jdx/mise-action@v3
       with:
@@ -43,9 +74,11 @@ runs:
         cache: true
 
     - name: Cache Rust
+      id: rust-cache
       uses: Swatinem/rust-cache@v2
       with:
-        key: ${{ inputs.rust-cache-key }}
+        shared-key: ${{ inputs.cache-key }}
+        save-if: ${{ inputs.save-cache == 'always' || (inputs.save-cache == 'true' && github.ref == 'refs/heads/main') }}
         # A red run still compiled the dependency set; saving it keeps the next
         # run from starting cold.
         cache-on-failure: true

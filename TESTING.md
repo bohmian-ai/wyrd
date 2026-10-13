@@ -65,7 +65,9 @@ Keep a module under roughly 40 KB. Splitting costs one file and one `mod` line.
 ## Which lane do I run?
 
 Run the narrowest complete capability lane covering what you changed. `mise run
-gate` is the nightly, release, and conservative fallback aggregate.
+gate` is the nightly, release, and conservative fallback aggregate: every lane,
+each exactly once, grouped into `gate:*` shards that CI runs as parallel jobs.
+Only the scheduled production-geometry and live-credential lanes sit outside it.
 When using `gate` for final verification, do not also run its component lanes
 as a checklist. Use focused tests while iterating; add a separate final lane
 only if `mise.toml` shows that required proof is outside `gate`.
@@ -82,17 +84,23 @@ mise run test:bifrost:journey:scribe:production-geometry  # scheduled 512 MiB ob
 #                     :sdk :forge :scribe :oracle :otlp :server :mcp :python :typescript
 ```
 
+`gate` runs every Bifrost test except the two production-geometry
+qualifications: `gate:rust` runs the ignored journeys with the family lanes, and
+the Python and TypeScript shards run the SDK files. `test:bifrost` is the same proof as
+one standalone lane, so `gate` does not run it again.
+
 ### SDKs
 
 ```bash
-mise run verify:python-sdk               # checks + unit, TensorFlow, harness, every integration journey, identity
-mise run verify:rust-sdk                 # checks + wyrd-sdk-rust unit and every story journey, identity
-mise run verify:typescript-sdk           # checks + napi/package/types, unit, every integration journey, identity
+mise run verify:python-sdk               # checks + unit, TensorFlow, harness, every integration journey
+mise run verify:rust-sdk                 # checks + wyrd-sdk-rust unit and every story journey
+mise run verify:typescript-sdk           # checks + napi/package/types, unit, every integration journey
+mise run test:identity:journey           # every identity journey against Keycloak and Dex (needs Docker)
 ```
 
-Each also runs `test:identity:journey` against Keycloak and Dex, so Docker must
-be available. One run owns those containers at a time, so the three tasks share
-that one dependency and `gate`, which runs all three, runs it once.
+The identity journeys need Keycloak and Dex, so they run only in
+`test:identity:journey`, not in the `verify:*-sdk` tasks; `gate` runs it once in
+its `gate:rust` shard.
 
 ### Everything else
 
@@ -111,14 +119,15 @@ lane instead; Bifrost-only pull requests run `verify:bifrost`.
 
 ### What CI selects
 
-`.github/scripts/select-ci.py` maps each changed file to its workspace package
+`.github/scripts/select-ci.py` plans the `ci` jobs. It maps each changed file to its workspace package
 and expands it to that package's consumers via `cargo metadata`. A pull request
 runs `check`, the boundary checks, and the owning lanes of the affected
 packages. Those lanes cover the family lanes, filtered by `WYRD_TEST_PACKAGES`,
 along with codegen, the SDK platform jobs, and the Python, TypeScript,
 Bifrost, gateway, identity, and storage journeys that consume them. The selector writes
 every reason to the job summary. Any global, mixed, or unknown change, or a
-package it cannot place, takes `gate`. Main pushes build only the affected
+package it cannot place, takes `gate`, run as one job per `gate:*` shard, and
+the SDK platform jobs then run on macOS only because the shards cover Linux. Main pushes build only the affected
 release packages; releases build every package.
 `mise run check:ci-selection` pins every route.
 

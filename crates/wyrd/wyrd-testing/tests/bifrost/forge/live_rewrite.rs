@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use vala_bifrost_redux::catalog::TenantTableBinding;
+use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_sql::row_types::forge_tasks::{ForgeClaimStrategy, ForgeTaskStrategy};
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::CompactionTypeWire;
@@ -1257,7 +1258,6 @@ const APPROVED_FORGE_FAMILIES: &[&str] = &[
     "bifrost_forge_worker_restarts_total",
     "bifrost_forge_worker_restart_backoff_seconds",
     "bifrost_forge_scheduler_restarts_total",
-    "bifrost_forge_expired_cleanup_refusals_total",
 ];
 
 /// Promoted rows survive a rewrite whose acceptance the committer never learned.
@@ -2455,7 +2455,10 @@ async fn write_two_commits(
 
 /// A failed Forge worker is rebuilt on the same pod while the API keeps serving.
 ///
-/// A one-shot lease-release fault makes the worker's first rewrite fatal. While
+/// The worker's first rewrite fails before any effect and the settlement of
+/// that failure is faulted once, which is the worker's runtime fatal path; the
+/// tenant's `audit_log` is opted out of compaction so no sibling attempt is
+/// left unsettled by that fatal exit for the rebuilt worker to wait out. While
 /// the failing worker is held at that fatal point the pod reports Forge not
 /// ready and the public read still serves. Once released, the supervisor
 /// rebuilds the worker after its backoff, readiness returns, and a second
@@ -2471,10 +2474,6 @@ async fn write_two_commits(
 /// or the leader and worker metrics disagree with that story.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
-#[expect(
-    clippy::float_cmp,
-    reason = "Prometheus renders these counters and gauges as whole numbers, so f64 equality is exact"
-)]
 async fn failed_worker_restarts_while_the_api_serves() {
     let (_telemetry_guard, telemetry) =
         shared_process_telemetry_for_test().expect("process production telemetry");
@@ -2493,6 +2492,20 @@ async fn failed_worker_restarts_while_the_api_serves() {
     let client = tenant_client(server, tenant).await;
     await_worker_readiness(&cluster, true, "first worker").await;
 
+    // Every audited request writes the tenant's `audit_log`, which Forge would
+    // compact beside the journey's table in the faulted pass. A fatal exit
+    // leaves that sibling attempt to the next owner once its claim lapses, so
+    // the journey opts the audit table out and the fault meets only its own
+    // rewrite.
+    let audit_log =
+        TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Audit, "audit_log")))
+            .expect("the tenant audit table resolves to its physical binding");
+    set_table_properties(
+        server,
+        &audit_log,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
     let failing = register_table(server, tenant, &unique_table("restart_failing")).await;
     let failing_rows = write_two_commits(&cluster, &client, &failing).await;
     server
@@ -2502,7 +2515,10 @@ async fn failed_worker_restarts_while_the_api_serves() {
     drain_forge_backlog(&cluster, &observer, &[tenant]).await;
 
     observer.hold_before_fatal_observation_for_test();
-    observer.fail_next_lease_release();
+    server
+        .fail_next_forge_prepared_audit_for_test()
+        .expect("the embedded pod composes a Forge coordinator");
+    observer.fail_next_failure_settlement();
     server
         .forge_clock()
         .advance(chrono::Duration::hours(1))
@@ -2515,17 +2531,20 @@ async fn failed_worker_restarts_while_the_api_serves() {
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "the rewrite release fault never fired: {:?}",
+            "the rewrite settlement fault never fired: {:?}",
             observer.returned_errors()
         )
     });
     assert!(
-        !observer.lease_release_failure_armed(),
-        "the rewrite consumed the release fault"
+        !observer.failure_settlement_failure_armed(),
+        "the rewrite consumed the settlement fault"
     );
     await_worker_readiness(&cluster, false, "failing worker").await;
     assert_public_rows(&client, &failing, &failing_rows, "while the worker fails").await;
 
+    // The unsettled claim is left to lapse on its production TTL before a
+    // successor can reclaim it; the journey proves the recovery, not the wait.
+    expire_running_claims(&cluster, tenant).await;
     observer.release_fatal_observation_for_test();
     await_worker_readiness(&cluster, true, "rebuilt worker").await;
     assert_public_rows(&client, &failing, &failing_rows, "after the restart").await;
@@ -2567,9 +2586,9 @@ async fn failed_worker_restarts_while_the_api_serves() {
             "bifrost_forge_leader_held",
         ])
     );
-    assert_eq!(
-        counter_delta(&running, "bifrost_forge_leader_acquisitions_total", &[]),
-        1.0
+    assert!(
+        (counter_delta(&running, "bifrost_forge_leader_acquisitions_total", &[]) - 1.0).abs()
+            < f64::EPSILON
     );
     assert!(
         counter_delta(
@@ -2578,17 +2597,17 @@ async fn failed_worker_restarts_while_the_api_serves() {
             &[("outcome", "ok")]
         ) >= 1.0
     );
-    assert_eq!(
-        counter_delta(&running, "bifrost_forge_worker_restarts_total", &[]),
-        1.0,
+    assert!(
+        (counter_delta(&running, "bifrost_forge_worker_restarts_total", &[]) - 1.0).abs()
+            < f64::EPSILON,
         "the injected failure restarted the worker exactly once"
     );
-    assert_eq!(
-        gauge_final(&running, "bifrost_forge_worker_restart_backoff_seconds"),
-        1.0
+    assert!(
+        (gauge_final(&running, "bifrost_forge_worker_restart_backoff_seconds") - 1.0).abs()
+            < f64::EPSILON
     );
-    assert_eq!(gauge_final(&running, "bifrost_forge_worker_ready"), 1.0);
-    assert_eq!(gauge_final(&running, "bifrost_forge_leader_held"), 1.0);
+    assert!((gauge_final(&running, "bifrost_forge_worker_ready") - 1.0).abs() < f64::EPSILON);
+    assert!((gauge_final(&running, "bifrost_forge_leader_held") - 1.0).abs() < f64::EPSILON);
 
     let running_end = telemetry
         .checkpoint()
@@ -2597,17 +2616,18 @@ async fn failed_worker_restarts_while_the_api_serves() {
     let stopped = telemetry
         .delta_since(&running_end)
         .expect("production telemetry shutdown window");
-    assert_eq!(
-        counter_delta(
+    assert!(
+        (counter_delta(
             &stopped,
             "bifrost_forge_leader_revocations_total",
             &[("reason", "shutdown")]
-        ),
-        1.0,
+        ) - 1.0)
+            .abs()
+            < f64::EPSILON,
         "shutdown resigned the one held term"
     );
-    assert_eq!(gauge_final(&stopped, "bifrost_forge_leader_held"), 0.0);
-    assert_eq!(gauge_final(&stopped, "bifrost_forge_worker_ready"), 0.0);
+    assert!(gauge_final(&stopped, "bifrost_forge_leader_held").abs() < f64::EPSILON);
+    assert!(gauge_final(&stopped, "bifrost_forge_worker_ready").abs() < f64::EPSILON);
 }
 
 /// Reads one unlabelled gauge's value at the close of a telemetry window.

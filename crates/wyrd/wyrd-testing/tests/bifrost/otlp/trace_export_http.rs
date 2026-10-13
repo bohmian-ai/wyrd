@@ -199,7 +199,7 @@ mod pg_tests {
 
         let stored = journey
             .query(&format!(
-                "SELECT * FROM {SPANS_TABLE} WHERE start_time_unix_nano = {anchor}"
+                "SELECT * FROM {SPANS_TABLE} WHERE start_time_unix_nano = to_timestamp_nanos({anchor})"
             ))
             .await;
         let rows: Vec<_> = sent

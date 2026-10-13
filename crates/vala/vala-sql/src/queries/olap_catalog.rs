@@ -21,8 +21,8 @@ use crate::row_types::oracle_reader_authority::TableAuthorityIdentity;
 ///
 /// Registration also writes the table's
 /// `vala.bifrost_table_maintenance_authority` row in the same transaction, so
-/// the one serialization boundary reader protection and snapshot expiration
-/// both lock exists from the moment the table does. That is what lets every
+/// the one serialization boundary Forge's destructive protocols lock exists
+/// from the moment the table does. That is what lets every
 /// later consumer treat a missing authority row as an identity failure rather
 /// than falling back to an advisory lock.
 ///

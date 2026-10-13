@@ -10,6 +10,12 @@
 //! Scribe journeys in `wyrd-testing`; lifecycle and describe audit evidence is
 //! asserted by the `wyrd-testing` server journeys.
 
+mod every_iceberg_column_type;
+mod register_a_table_from_a_model;
+mod table_time_column;
+mod three_timestamp_types;
+mod variant_tables;
+
 mod pg_tests {
     use std::sync::Arc;
 
@@ -50,7 +56,11 @@ mod pg_tests {
     /// # Panics
     ///
     /// Panics when the service cannot be bootstrapped or the client assembled.
-    async fn service_client(srv: &WyrdTestServer, service: &str, roles: &[&str]) -> WyrdClient {
+    pub(super) async fn service_client(
+        srv: &WyrdTestServer,
+        service: &str,
+        roles: &[&str],
+    ) -> WyrdClient {
         let bootstrap = srv
             .bootstrap_service(service, roles)
             .await
@@ -1151,22 +1161,21 @@ mod pg_tests {
             .expect("a query-only caller reads the structured GenAI messages");
         let batches = messages.batches();
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
-        let stored = arrow::compute::cast(
-            batches[0]
-                .column_by_name("attributes")
-                .expect("column `attributes`"),
-            &DataType::Binary,
-        )
-        .expect("the canonical attribute payload reads back as bytes");
-        let payload = stored
-            .as_any()
-            .downcast_ref::<arrow::array::BinaryArray>()
-            .expect("the cast payload is Binary")
-            .value(0)
-            .to_vec();
-        let payload = String::from_utf8_lossy(&payload);
-        assert!(payload.contains(fixture::INPUT_MESSAGES));
-        assert!(payload.contains(fixture::OUTPUT_MESSAGES));
+        let stored = batches[0]
+            .column_by_name("attributes")
+            .expect("column `attributes`");
+        let payload = wyrd_queue::variant::variant_cell_to_json(stored.as_ref(), 0)
+            .expect("the Variant attribute payload decodes");
+        assert_eq!(
+            payload["gen_ai.input.messages"],
+            fixture::INPUT_MESSAGES,
+            "the structured GenAI input messages survive the round trip verbatim"
+        );
+        assert_eq!(
+            payload["gen_ai.output.messages"],
+            fixture::OUTPUT_MESSAGES,
+            "the structured GenAI output messages survive the round trip verbatim"
+        );
 
         signals.server.shutdown().await.expect("server shutdown");
     }

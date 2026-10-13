@@ -9,7 +9,8 @@ use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
 use wyrd_tonic::tonic::Code;
 use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
-use wyrd_tonic::wyrd::v1::{AnalyticalGraphRef, ReserveNodeSlotsRequest};
+use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
+use wyrd_tonic::wyrd::v1::{AnalyticalGraphRef, IngestCaptureRequest, ReserveNodeSlotsRequest};
 
 use super::support::{
     DialIdentity, PeerDial, PeerJourneyError, probe_oracle_lifecycle, probe_oracle_peer,
@@ -17,6 +18,10 @@ use super::support::{
 };
 use crate::peer_cluster::{PeerCluster, PeerProbePlan};
 use crate::support::public_client;
+
+/// tonic's default per-message decode limit, which a peer capture frame must
+/// be able to exceed when the configured ingest ceiling is larger.
+const TONIC_DEFAULT_DECODE_BYTES: usize = 4 * 1024 * 1024;
 
 /// File a Scribe's runtime node identity is persisted into beside its WAL.
 ///
@@ -63,6 +68,7 @@ async fn prove_peer_listener_isolation() -> Result<(), PeerJourneyError> {
     only_a_member_certificate_completes_the_handshake(&cluster).await?;
     a_trusted_certificate_alone_authorizes_nothing(&cluster).await?;
     every_target_mounts_exactly_its_services(&cluster).await?;
+    a_frame_above_the_tonic_default_is_acknowledged_and_retained(&cluster).await?;
     a_restarted_scribe_advances_its_fence(&mut cluster, 1).await?;
     cluster.shutdown().await?;
 
@@ -497,6 +503,102 @@ async fn every_target_mounts_exactly_its_services(
             }
         }
     }
+    Ok(())
+}
+
+/// A valid capture frame above tonic's default decode limit, below the
+/// configured ingest ceiling, is acknowledged by the Scribe peer plane and
+/// lands whole in retained history.
+///
+/// One `vala.system.audit_log` row whose `resource` alone is six MiB is
+/// projected through the production audit projection, encoded as Arrow IPC,
+/// and submitted as a cluster member to the Scribe pod's capture peer RPC.
+/// The ACK proves the listener decodes at the configured ceiling rather than
+/// tonic's default; the retained read through an Oracle pod, matching the
+/// exact resource length, proves the frame was neither truncated nor dropped.
+///
+/// # Errors
+///
+/// Returns a failure when the frame is not above the tonic default and below
+/// the configured ceiling, the Scribe refuses it, or retained history does not
+/// hold exactly that one row.
+async fn a_frame_above_the_tonic_default_is_acknowledged_and_retained(
+    cluster: &PeerCluster,
+) -> Result<(), PeerJourneyError> {
+    let index_of = |target: BifrostTarget| {
+        (0..cluster.len())
+            .find(|index| cluster.target(*index) == target)
+            .ok_or_else(|| format!("the cluster runs no {target:?} pod"))
+    };
+    let scribe = cluster.server(index_of(BifrostTarget::Scribe)?)?;
+    let oracle = cluster.server(index_of(BifrostTarget::Oracle)?)?;
+    let operation = format!("journey.large_frame.{}", uuid::Uuid::now_v7().simple());
+    let resource_bytes = 6 * 1024 * 1024;
+    let event = wyrd_spec::vala::api::AuditEvent::new(
+        wyrd_spec::request_id::RequestId::now_v7(),
+        None,
+        operation.clone(),
+        "r".repeat(resource_bytes),
+        None,
+        wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+        wyrd_spec::auth::PrincipalKindTag::Service,
+        operation.clone(),
+        wyrd_spec::vala::api::AuditOutcome::Allowed,
+    );
+    let batch = vala_bifrost_redux::tables::audit::projection::project_audit_event(
+        &event,
+        chrono::Utc::now(),
+    )?;
+    let mut writer = arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &batch.schema())?;
+    writer.write(&batch)?;
+    writer.finish()?;
+    let request = IngestCaptureRequest {
+        tenant_id: cluster.tenant().to_string(),
+        table: "vala.system.audit_log".to_owned(),
+        batch_id: uuid::Uuid::now_v7().to_string(),
+        request_id: event.request_id.as_str().to_owned(),
+        arrow_ipc: writer.into_inner()?.into(),
+        verifier: None,
+    };
+    let encoded = wyrd_tonic::prost::Message::encoded_len(&request);
+    let ceiling = vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES;
+    if encoded <= TONIC_DEFAULT_DECODE_BYTES || encoded >= ceiling {
+        return Err(format!(
+            "a {encoded}-byte frame does not sit above tonic's default and below the \
+             {ceiling}-byte configured ceiling"
+        )
+        .into());
+    }
+    let authority = cluster.peer_ca();
+    let member = authority.issue_leaf("large-frame-member")?;
+    let channel = wyrd_tonic::transport::mutually_authenticated_tls_endpoint(
+        scribe
+            .peer_url()
+            .ok_or("the Scribe pod has no peer listener")?,
+        authority.ca_certificate_pem().as_bytes(),
+        authority.server_name().to_owned(),
+        member.certificate_pem().as_bytes(),
+        member.private_key_pem().as_bytes(),
+    )?
+    .connect()
+    .await?;
+    ScribeCapturePeerServiceClient::new(channel)
+        .ingest_capture(request)
+        .await
+        .map_err(|status| {
+            format!(
+                "the Scribe refused a valid {encoded}-byte frame: {:?} {}",
+                status.code(),
+                status.message()
+            )
+        })?;
+    oracle
+        .await_retained_audit_count(
+            cluster.tenant(),
+            &format!("operation = '{operation}' AND length(resource) = {resource_bytes}"),
+            1,
+        )
+        .await?;
     Ok(())
 }
 

@@ -10,8 +10,11 @@ use crate::public_support::{
 };
 use arrow::array::{BinaryBuilder, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use iceberg::spec::DataFile;
+use futures_util::TryStreamExt as _;
+use iceberg::spec::{DataFile, Operation, SnapshotRef};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use object_store::ObjectStoreExt as _;
+use object_store::path::Path as ObjectPath;
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
@@ -22,13 +25,13 @@ use vala_bifrost_redux::forge::{
 };
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
-use vala_bifrost_redux::storage::{StorageOperation, StorageOperationBarrier};
 use vala_sql::row_types::forge_tasks::{ForgeTaskStrategy, evidence_from_json};
 use wyrd_client::WyrdClient;
 use wyrd_server::config::BifrostRuntimeRole;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::NodeId;
+use wyrd_spec::vala::api::{NodeId, PhysicalLayoutWire, TimeGranularityWire};
 use wyrd_testing::WyrdTestServer;
+use wyrd_testing::bifrost::object_reads::ReadStall;
 use wyrd_testing::bifrost::write::RawIngest;
 use wyrd_testing::bifrost::{
     BifrostClusterSpec, CommitUncertaintyCatalog, TestOracleResources, WyrdTestCluster,
@@ -36,32 +39,26 @@ use wyrd_testing::bifrost::{
 
 /// Every Oracle-serving node's ranged-read pause, armed before a lazy public read.
 ///
-/// The query's leader commits its active table read before any object IO, so
-/// stalling the production storage owner at the first ranged read holds the
-/// query at a point where that read is already durable and observable,
-/// without adding any production seam.
+/// Stalling the production storage owner at the first ranged read holds the
+/// query mid-read, after its cut is pinned, without adding any production
+/// seam.
 struct OracleReadBarriers {
     /// One barrier per Oracle-serving node, paired with that node's identity.
-    entries: Vec<(NodeId, Arc<StorageOperationBarrier>)>,
+    entries: Vec<(NodeId, Arc<ReadStall>)>,
 }
 
 impl OracleReadBarriers {
-    /// Installs one `ReadRange` barrier on every Oracle-serving node.
+    /// Arms one ranged-read stall on every Oracle-serving node.
     ///
     /// # Panics
-    /// Panics if no composed node owns both an Oracle and a storage owner.
+    /// Panics if no composed node serves an Oracle.
     fn arm(cluster: &WyrdTestCluster) -> Self {
         let mut entries = Vec::new();
         for server in cluster.servers() {
             if server.state().bifrost.oracle().is_none() {
                 continue;
             }
-            let Some(storage) = server.state().bifrost_storage() else {
-                continue;
-            };
-            let barrier = StorageOperationBarrier::new(StorageOperation::ReadRange);
-            storage.install_operation_barrier_for_test(Arc::clone(&barrier));
-            entries.push((server.node_id(), barrier));
+            entries.push((server.node_id(), server.object_reads_for_test().arm_stall()));
         }
         assert!(
             !entries.is_empty(),
@@ -213,8 +210,6 @@ impl CloseoutJourney {
     /// Panics if the real role graph cannot start or its observer is absent.
     async fn start_with_config(config: ForgeConfig) -> Self {
         let profile = GeometryProfile::selected();
-        // The one worker drains only the journey's tables, so the tenant's audit
-        // table cannot take a slot a geometry or competing-table plan is owed.
         let mut spec = BifrostClusterSpec::dedicated_forge_workers().with_scribe_geometry_for_test(
             vala_bifrost_redux::scribe::geometry::ScribeGeometry::default()
                 .with_staging_target_file_size_bytes(profile.scribe_target_bytes)
@@ -296,24 +291,26 @@ impl CloseoutJourney {
         }
     }
 
-    /// Promotes owed debt, then waits for a pulled rewrite of this table's head.
+    /// Promotes owed debt, then waits until this table's head is all Forge output.
     ///
     /// One scheduler pass promotes owed Scribe debt; its commit makes the table
-    /// due on the leader, and a worker pulls it on its own interval. Progress
-    /// is observed through settled attempts, never sleeps, until a snapshot
-    /// newer than the one on entry names only Forge outputs.
+    /// due on the leader, and a worker pulls it on its own interval. That pull
+    /// may already have rewritten debt an earlier pass promoted, so completion
+    /// is judged on state, not against the head on entry: progress is observed
+    /// through settled attempts, never sleeps, until the live head names only
+    /// Forge outputs.
     ///
     /// # Panics
     /// Panics if no such rewrite publishes within the rewrite bound, or on any
     /// worker or SQL failure observed while draining.
     async fn compact(&self, binding: &TenantTableBinding) -> (i64, BTreeMap<String, DataFile>) {
-        let (entry, _) = self.live_files(binding).await;
         self.scheduler_pass().await;
         let current = tokio::time::timeout(REWRITE_BOUND, async {
             loop {
                 let next = self.observer.attempts() + 1;
                 let current = self.live_files(binding).await;
-                if current.0 != entry && current.1.keys().all(|path| path.contains("/data/forge/"))
+                if !current.1.is_empty()
+                    && current.1.keys().all(|path| path.contains("/data/forge/"))
                 {
                     return current;
                 }
@@ -348,9 +345,14 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics on a storage error other than absence.
     async fn object_missing(&self, path: &str) -> bool {
-        match self.cluster.storage_operator().stat(path).await {
+        match self
+            .cluster
+            .storage_objects()
+            .head(&ObjectPath::from(path))
+            .await
+        {
             Ok(_) => false,
-            Err(error) if error.kind() == opendal::ErrorKind::NotFound => true,
+            Err(object_store::Error::NotFound { .. }) => true,
             Err(error) => panic!("object inspection failed: {error}"),
         }
     }
@@ -459,15 +461,12 @@ impl CloseoutJourney {
     async fn forge_objects(&self, binding: &TenantTableBinding) -> BTreeSet<String> {
         let prefix = format!("{}/data/forge/", binding.object_prefix.as_str());
         self.cluster
-            .storage_operator()
-            .list_with(&prefix)
-            .recursive(true)
+            .storage_objects()
+            .list(Some(&ObjectPath::from(prefix)))
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect()
             .await
             .expect("Forge output listing")
-            .into_iter()
-            .filter(|entry| entry.metadata().is_file())
-            .map(|entry| entry.path().to_owned())
-            .collect()
     }
 
     /// Asserts the coordinator's production orphan predicate for each object.
@@ -555,6 +554,10 @@ impl CloseoutJourney {
 
     /// Registers the payload schema through the retained server catalog harness.
     ///
+    /// The table partitions hourly on its [`EVENT_TIME`] column, so a
+    /// [`GeometryWorkload`]'s pinned event time keeps every request in one
+    /// physical partition.
+    ///
     /// # Panics
     /// Panics if registration or tenant-qualified identity validation fails.
     async fn register_payload_table(&self, tenant: DataTenantId, name: String) -> JourneyTable {
@@ -563,11 +566,17 @@ impl CloseoutJourney {
             .create_bifrost_table_for_test(CreateTableRequest {
                 table: table_ref.clone(),
                 tenant,
-                user_fields: vec![
-                    Field::new("value", DataType::Int64, false),
-                    Field::new("payload", DataType::Binary, false),
-                ],
-                physical_layout: None,
+                user_fields: payload_schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect(),
+                physical_layout: Some(PhysicalLayoutWire {
+                    partition_granularity: TimeGranularityWire::Hour,
+                    time_column: Some(EVENT_TIME.to_owned()),
+                    sort_keys: Vec::new(),
+                    bloom_columns: Vec::new(),
+                }),
             })
             .await
             .expect("payload table registration");
@@ -898,17 +907,59 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics on missing catalog authority, unreadable manifests, or duplicate files.
     async fn live_files(&self, binding: &TenantTableBinding) -> (i64, BTreeMap<String, DataFile>) {
-        let table = self
-            .coordinator()
-            .bifrost_catalog()
-            .iceberg_catalog()
-            .load_table(&binding.table_ident())
-            .await
-            .expect("catalog table");
+        let table = self.load_table(binding).await;
         let snapshot = table
             .metadata()
             .current_snapshot()
             .expect("published snapshot");
+        Self::snapshot_files(binding, &table, snapshot).await
+    }
+
+    /// Reads the live files of the table's latest Scribe promotion.
+    ///
+    /// A worker may pull the table as soon as the promotion commits, so the
+    /// current head can already be a rewrite of it. The promotion is the
+    /// table's latest append, which no rewrite replaces in history.
+    ///
+    /// # Panics
+    /// Panics when the table has no append snapshot, or as [`Self::live_files`].
+    async fn promoted_files(
+        &self,
+        binding: &TenantTableBinding,
+    ) -> (i64, BTreeMap<String, DataFile>) {
+        let table = self.load_table(binding).await;
+        let snapshot = table
+            .metadata()
+            .snapshots()
+            .filter(|snapshot| snapshot.summary().operation == Operation::Append)
+            .max_by_key(|snapshot| snapshot.sequence_number())
+            .expect("promotion snapshot");
+        Self::snapshot_files(binding, &table, snapshot).await
+    }
+
+    /// Loads the table from the coordinator's catalog.
+    ///
+    /// # Panics
+    /// Panics when the catalog cannot load the table.
+    async fn load_table(&self, binding: &TenantTableBinding) -> iceberg::table::Table {
+        self.coordinator()
+            .bifrost_catalog()
+            .iceberg_catalog()
+            .load_table(&binding.table_ident())
+            .await
+            .expect("catalog table")
+    }
+
+    /// Reads exact live files from one snapshot's manifests, keyed by object path.
+    ///
+    /// # Panics
+    /// Panics on unreadable manifests, a file outside the table prefix, or
+    /// duplicate files.
+    async fn snapshot_files(
+        binding: &TenantTableBinding,
+        table: &iceberg::table::Table,
+        snapshot: &SnapshotRef,
+    ) -> (i64, BTreeMap<String, DataFile>) {
         let manifests = table
             .manifest_list_reader(snapshot)
             .load()
@@ -936,22 +987,20 @@ impl CloseoutJourney {
         (snapshot.snapshot_id(), files)
     }
 
-    /// Counts the snapshots the table currently retains.
+    /// Counts the rewrite snapshots the table currently retains.
     ///
-    /// Publication is per plan, so the retained snapshot count — not the task
-    /// count — is what an attempt's operations have to line up against.
+    /// Publication is per plan, so the retained rewrite snapshot count — not
+    /// the task count — is what an attempt's operations have to line up
+    /// against.
     ///
     /// # Panics
     /// Panics when the catalog cannot load the table.
-    async fn snapshot_count(&self, binding: &TenantTableBinding) -> usize {
-        self.coordinator()
-            .bifrost_catalog()
-            .iceberg_catalog()
-            .load_table(&binding.table_ident())
+    async fn rewrite_snapshot_count(&self, binding: &TenantTableBinding) -> usize {
+        self.load_table(binding)
             .await
-            .expect("catalog table")
             .metadata()
             .snapshots()
+            .filter(|snapshot| snapshot.summary().operation == Operation::Replace)
             .count()
     }
 
@@ -1046,13 +1095,30 @@ impl CloseoutJourney {
         for (path, file) in files {
             let metadata = self
                 .cluster
-                .storage_operator()
-                .stat(path)
+                .storage_objects()
+                .head(&ObjectPath::from(path.as_str()))
                 .await
                 .expect("retained object");
-            assert_eq!(metadata.content_length(), file.file_size_in_bytes());
+            assert_eq!(metadata.size, file.file_size_in_bytes());
         }
     }
+}
+
+/// The user time column every payload table declares.
+const EVENT_TIME: &str = "event_time";
+
+/// The payload table's user schema: the asserted `value`, an incompressible
+/// `payload`, and the non-null microsecond UTC [`EVENT_TIME`] it partitions on.
+fn payload_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new("payload", DataType::Binary, false),
+        Field::new(
+            EVENT_TIME,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]))
 }
 
 /// Owns bounded, deterministic incompressible data and its acknowledged row set.
@@ -1130,15 +1196,7 @@ impl GeometryWorkload {
             payload.append_value(block);
         }
         RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new("payload", DataType::Binary, false),
-                Field::new(
-                    "wyrd_event_time",
-                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                    false,
-                ),
-            ])),
+            payload_schema(),
             vec![
                 Arc::new(Int64Array::from(values.to_vec())),
                 Arc::new(payload.finish()),
@@ -1199,10 +1257,6 @@ fn assert_output_geometry(outputs: &BTreeMap<String, DataFile>, rows: usize, tar
 /// Panics on any route, geometry, exactness, tenancy, or convergence violation.
 #[tokio::test]
 #[ignore = "requires Postgres and production-sized object storage"]
-#[expect(
-    clippy::float_cmp,
-    reason = "Prometheus renders this gauge as whole numbers, so f64 equality is exact"
-)]
 async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     let mut journey = CloseoutJourney::start().await;
     let tenant = journey.cluster.data_tenant_id();
@@ -1286,17 +1340,20 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         .restart_node(journey.coordinator_node)
         .await
         .expect("coordinator starts after complete ingestion");
-    // The new leader promotes all owed debt inside its boot pass, so the
-    // promoted cut is read before any driven pass can rewrite it.
+    // The new leader promotes all owed debt inside its boot pass. A promotion
+    // that makes a table due may be dispatched at once, so the promoted cut is
+    // read from the promotion snapshot, whatever a rewrite already did to it.
     journey.await_boot_pass().await;
-    let (promoted_snapshot, inputs) = journey.live_files(&table.binding).await;
+    let (promoted_snapshot, inputs) = journey.promoted_files(&table.binding).await;
     assert_eq!(
         inputs.len(),
         hot.len(),
         "promotion retains every physical Scribe object"
     );
-    let (neighbour_promoted, _) = journey.live_files(&neighbour_table.binding).await;
-    let published_before = journey.snapshot_count(&table.binding).await;
+    let (neighbour_promoted, _) = journey.promoted_files(&neighbour_table.binding).await;
+    // A rewrite's publication deadline is an instant on the Forge clock, so the
+    // clock moves only once no rewrite started before the jump is in flight.
+    journey.drain_tasks().await;
     for server in journey.cluster.servers().iter() {
         server
             .forge_clock()
@@ -1306,7 +1363,9 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     // One dispatched full rewrite covers the closed partition's whole head.
     let (replacement_snapshot, outputs) = journey.compact(&table.binding).await;
     assert_ne!(replacement_snapshot, promoted_snapshot);
-    let (neighbour_snapshot, neighbour_files) = journey.live_files(&neighbour_table.binding).await;
+    // Settled task rows do not prove the neighbour was pulled: the leader holds
+    // its demand until a worker's next pull, so its own rewrite is awaited.
+    let (neighbour_snapshot, neighbour_files) = journey.compact(&neighbour_table.binding).await;
     assert_ne!(
         neighbour_snapshot, neighbour_promoted,
         "the competing table's own maintenance drained through the same worker \
@@ -1319,27 +1378,10 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     assert_output_geometry(&outputs, workload.expected.len(), target);
     journey.assert_objects(&inputs).await;
     journey.assert_objects(&outputs).await;
-    // Pause the follower at its first ranged read: the query's active table
-    // read must already be durable there, because acquisition commits it
-    // before any object IO.
-    let barriers = OracleReadBarriers::arm(&journey.cluster);
-    let paused_read = read_managed_rows(&reader, &table.qualified);
-    let inspect_protection = async {
-        let reader_node = tokio::time::timeout(PASS_BOUND, barriers.first_reached())
-            .await
-            .expect("lazy query reaches its first ranged read");
-        let active = journey
-            .cluster
-            .server_by_node(reader_node)
-            .expect("the stalled reader is a composed node")
-            .oracle_active_table_reads_for_test(&table.binding)
-            .await
-            .expect("active read inspection");
-        assert_eq!(active, 1, "the held query owns one active table read");
-        barriers.release();
-    };
-    let (actual, ()) = tokio::join!(paused_read, inspect_protection);
-    assert_eq!(actual, workload.expected);
+    assert_eq!(
+        read_managed_rows(&reader, &table.qualified).await,
+        workload.expected
+    );
     let rewrites = journey
         .observer
         .completed_strategies()
@@ -1378,10 +1420,12 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     let operations = journey.assert_rewrite_evidence(&table.binding).await;
     assert_eq!(
         operations,
-        journey.snapshot_count(&table.binding).await - published_before,
+        journey.rewrite_snapshot_count(&table.binding).await,
         "every snapshot the rewrite passes published carries its own operation"
     );
-    // Ownership is judged once every role has drained, when every attempt
+    // Audited reads above keep publishing retained audit, so the coordinator
+    // can plan and start audit-log maintenance after the last drain. Ownership
+    // is therefore judged once every role has drained, when every attempt
     // guard must have returned its increment.
     let telemetry = journey.cluster.telemetry().clone();
     journey.cluster.shutdown().await.expect("all roles drain");
@@ -1391,7 +1435,10 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         .iter()
         .filter(|sample| sample.family == "bifrost_forge_active_tasks")
     {
-        assert_eq!(sample.value, 0.0, "settled ownership: {sample:?}");
+        assert!(
+            sample.value.abs() < f64::EPSILON,
+            "settled ownership: {sample:?}"
+        );
     }
 }
 
@@ -1417,7 +1464,7 @@ struct ReaderCleanupJourney {
     old_snapshot: i64,
     /// Exact data files the paused query must retain.
     old_files: BTreeMap<String, DataFile>,
-    /// Earlier replaced data object collected only after the reader releases.
+    /// Earlier replaced data object collected only after the retention window.
     earlier_object: String,
 }
 
@@ -1469,11 +1516,14 @@ impl ReaderCleanupJourney {
             .restart_node(roles.coordinator_node)
             .await
             .expect("coordinator starts");
-        // The boot pass promotes the owed debt, so the promoted inputs are
-        // read before any driven pass can rewrite them.
+        // The boot pass promotes the owed debt, and a rewrite it makes due may
+        // already be dispatched, so the inputs are read from the promotion
+        // snapshot; the Forge clock moves only once no rewrite is in flight,
+        // since a rewrite's publication deadline is an instant on that clock.
         roles.await_boot_pass().await;
-        let (_, earlier_files) = roles.live_files(&table.binding).await;
+        let (_, earlier_files) = roles.promoted_files(&table.binding).await;
         assert!(earlier_files.len() >= 2, "two real promoted inputs");
+        roles.drain_tasks().await;
         roles.advance_maintenance(chrono::Duration::hours(2));
         let earlier_object = earlier_files.keys().next().expect("earlier object").clone();
         let (old_snapshot, old_files) = roles.compact_small_table(&table.binding).await;
@@ -1498,40 +1548,34 @@ impl ReaderCleanupJourney {
         }
     }
 
-    /// Waits for the terminal query to release its active table read.
+    /// Moves the table's recorded snapshot supersessions past the retention
+    /// window, as if the window had elapsed since Forge observed them.
     ///
     /// # Panics
-    /// Panics if the read survives the pass bound or inspection fails.
-    async fn wait_for_reader_release(&self) {
-        tokio::time::timeout(PASS_BOUND, async {
-            loop {
-                let active = self
-                    .roles
-                    .coordinator()
-                    .oracle_active_table_reads_for_test(&self.table.binding)
-                    .await
-                    .expect("active read inspection");
-                if active == 0 {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("terminal query releases its active table read");
+    /// Panics if the backdate fails.
+    async fn outlive_retention(&self) {
+        self.roles
+            .coordinator()
+            .age_snapshot_supersessions_for_test(
+                self.table.binding.tenant,
+                ForgeConfig::default().snapshot_retention + std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("supersessions backdate");
     }
 
     /// Holds a public reader across a rewrite and destructive passes, then
-    /// collects the earlier replaced object once the reader releases.
+    /// collects the earlier replaced object once the retention window passes.
     ///
-    /// While the query owns its active table read, another pod still rewrites
-    /// the table, but every maintenance pass defers expiry and cleanup, so the
-    /// earlier object, the reader's files, and its snapshot all survive.
+    /// While the query runs, another pod still rewrites the table, but inside
+    /// the retention window every maintenance pass keeps the replaced
+    /// snapshots, so the earlier object, the reader's files, and its snapshot
+    /// all survive. The query records nothing.
     ///
     /// # Panics
     /// Panics if the query was not protected, a held pass deletes anything, its
     /// terminal rows change, or the earlier object is not collected after
-    /// release.
+    /// the window.
     async fn protect_during_cleanup(&mut self) {
         let expected = canonical_order(self.workload.expected.clone());
         let barriers = OracleReadBarriers::arm(&self.roles.cluster);
@@ -1541,15 +1585,6 @@ impl ReaderCleanupJourney {
                 .await
                 .expect("lazy query reaches its first ranged read");
             assert_ne!(reader_node, self.roles.worker_node);
-            let active = self
-                .roles
-                .cluster
-                .server_by_node(reader_node)
-                .expect("the stalled reader is a composed node")
-                .oracle_active_table_reads_for_test(&self.table.binding)
-                .await
-                .expect("active read inspection");
-            assert_eq!(active, 1, "the held query owns one active table read");
             self.workload
                 .append_batch(&self.transport, &self.table.qualified, &[5, 6])
                 .await;
@@ -1566,7 +1601,7 @@ impl ReaderCleanupJourney {
             }
             assert!(
                 !self.roles.object_missing(&self.earlier_object).await,
-                "an active table read defers every destructive pass"
+                "the retention window defers every destructive pass"
             );
             self.roles.assert_objects(&self.old_files).await;
             let metadata = self
@@ -1590,10 +1625,10 @@ impl ReaderCleanupJourney {
             actual, expected,
             "old reader returns exactly its protected cut"
         );
-        self.wait_for_reader_release().await;
-        // With the last reader gone the earlier object is collected without an
-        // age wait; the reader's own files stay live through the head's
-        // rewrite lineage until `finish` moves the head on.
+        self.outlive_retention().await;
+        // Past the window the earlier object is collected; the reader's own
+        // files stay live through the head's rewrite lineage until `finish`
+        // moves the head on.
         self.roles
             .collect_exact(&self.table.binding, &self.earlier_object, &self.old_files)
             .await;
@@ -1615,6 +1650,7 @@ impl ReaderCleanupJourney {
             .expect("later rows flush");
         let (_, current) = self.roles.compact_small_table(&self.table.binding).await;
         self.roles.advance_maintenance(chrono::Duration::days(2));
+        self.outlive_retention().await;
         let old_path = self.old_files.keys().next().expect("old compacted object");
         self.roles
             .collect_exact(&self.table.binding, old_path, &current)
@@ -1642,7 +1678,8 @@ impl ReaderCleanupJourney {
     }
 }
 
-/// An old public reader defers cross-pod expiration and physical cleanup.
+/// The retention window keeps an old public reader's snapshot through
+/// cross-pod expiration and physical cleanup.
 ///
 /// # Panics
 /// Panics when durable protection, exact deletion ownership, or tenant rows fail.
@@ -2107,7 +2144,12 @@ struct LeaderJourney {
 }
 
 impl LeaderJourney {
-    /// Starts `spec` with the default Forge policy and a completion observer.
+    /// Starts `spec` with the default Forge policy, no snapshot retention
+    /// window, and a completion observer.
+    ///
+    /// Retention is measured by Postgres time, which `advance` cannot move,
+    /// so a zero window is what lets a replaced snapshot expire on the pass
+    /// a scenario requests.
     ///
     /// `inject_uncertainty` routes every node's Forge catalog through the
     /// cluster's shared [`CommitUncertaintyCatalog`], which passes commits
@@ -2118,7 +2160,10 @@ impl LeaderJourney {
     async fn start(spec: BifrostClusterSpec, inject_uncertainty: bool) -> Self {
         let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
             spec,
-            ForgeConfig::default(),
+            ForgeConfig {
+                snapshot_retention: Duration::ZERO,
+                ..ForgeConfig::default()
+            },
             false,
             inject_uncertainty,
         )
@@ -2230,9 +2275,14 @@ impl LeaderJourney {
     /// # Panics
     /// Panics on a storage error other than absence.
     async fn exists(&self, path: &str) -> bool {
-        match self.cluster.storage_operator().stat(path).await {
+        match self
+            .cluster
+            .storage_objects()
+            .head(&ObjectPath::from(path))
+            .await
+        {
             Ok(_) => true,
-            Err(error) if error.kind() == opendal::ErrorKind::NotFound => false,
+            Err(object_store::Error::NotFound { .. }) => false,
             Err(error) => panic!("object inspection failed: {error}"),
         }
     }
@@ -2651,8 +2701,11 @@ async fn revoked_term_stops_promotion_dispatch_and_maintenance() {
     );
     journey
         .cluster
-        .storage_operator()
-        .write(&orphan, b"never published".to_vec())
+        .storage_objects()
+        .put(
+            &ObjectPath::from(orphan.as_str()),
+            b"never published".to_vec().into(),
+        )
         .await
         .expect("rowless output");
     journey.advance(chrono::Duration::days(2));
@@ -2887,8 +2940,11 @@ async fn empty_maintenance_restart_protects_orphans() {
     );
     journey
         .cluster
-        .storage_operator()
-        .write(&orphan, b"never published".to_vec())
+        .storage_objects()
+        .put(
+            &ObjectPath::from(orphan.as_str()),
+            b"never published".to_vec().into(),
+        )
         .await
         .expect("rowless output");
 

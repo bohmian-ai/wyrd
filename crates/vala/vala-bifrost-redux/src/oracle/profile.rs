@@ -1,0 +1,194 @@
+//! Per-query execution profile: the Oracle's analog of `ClickHouse`
+//! `ProfileEvents`.
+//!
+//! One [`QueryProfile`] follows one SQL attempt from its catalog pin to its
+//! stream's terminal. The Oracle's own steps are timed into `DataFusion`
+//! [`Time`] metrics registered on an [`ExecutionPlanMetricsSet`], with the
+//! same scoped-guard pattern every `DataFusion` operator uses, and the executed
+//! physical root's operator metrics are folded in once the query's admission
+//! guard releases that root (see [`QueryProfile::fold_root`]). The profile is
+//! emitted exactly once, when its last owner drops, as
+//! [`ProfileFamily::ORACLE_QUERY`].
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::metrics::{
+    ExecutionPlanMetricsSet, MetricBuilder, MetricValue, Time,
+};
+
+use crate::profile::{ProfileFamily, ProfileValue};
+
+/// Prefix naming the Oracle's own steps among the operator events.
+const ORACLE_EVENT: &str = "Oracle";
+
+/// Accumulated time and counts for one query, emitted when the last owner drops.
+///
+/// Shared by the attempt's planned cut and its returned stream. The stream is
+/// the last owner on every successful path, and drops it only after every
+/// descendant of the query has settled, so the emitted profile includes every
+/// operator's final metrics.
+///
+/// Times are `DataFusion` nanosecond totals summed across partitions, so an
+/// operator's time may exceed the query's wall time when partitions overlap.
+/// Only the leader's operators are folded; work a distributed stage ran on a
+/// follower is reported only as far as the distributed metrics rewrite
+/// returns it to the leader's plan.
+#[derive(Debug)]
+pub(crate) struct QueryProfile {
+    /// Owner of every Oracle step metric below, read back once on drop.
+    metrics: ExecutionPlanMetricsSet,
+    /// The read-only tenant-scoped statement that returns every pointer.
+    pub(crate) cut_read: Time,
+    /// Reading every acquired table's metadata and manifests.
+    pub(crate) cut_materialize: Time,
+    /// Listing live Scribe streams on the frozen roster.
+    pub(crate) scribe_listing: Time,
+    /// Registering the pinned cut's table providers.
+    pub(crate) provider_setup: Time,
+    /// Planning the one physical root from SQL.
+    pub(crate) physical_planning: Time,
+    /// Estimating the bytes the plan scans and sizing its partitions.
+    pub(crate) scan_sizing: Time,
+    /// Acquiring query admission, queueing included.
+    pub(crate) admission: Time,
+    /// Staging the read decision and binding sources to the retained root.
+    pub(crate) audit_bind: Time,
+    /// Operator metrics folded from the executed root when its owner released
+    /// it.
+    ///
+    /// The profile holds values, never the plan: an operator such as a
+    /// `CollectLeft` hash join keeps memory reserved on its plan node, so a
+    /// profile that held the root would keep that memory alive past the
+    /// query's admission envelope.
+    operators: Mutex<BTreeMap<String, ProfileValue>>,
+}
+
+impl QueryProfile {
+    /// Registers every Oracle step metric on a fresh metrics set.
+    pub(crate) fn new() -> Self {
+        let metrics = ExecutionPlanMetricsSet::new();
+        let step = |name: &'static str| {
+            let time = Time::new();
+            MetricBuilder::new(&metrics).build(MetricValue::Time {
+                name: name.into(),
+                time: time.clone(),
+            });
+            time
+        };
+        Self {
+            cut_read: step("cut_read"),
+            cut_materialize: step("cut_materialize"),
+            scribe_listing: step("scribe_listing"),
+            provider_setup: step("provider_setup"),
+            physical_planning: step("physical_planning"),
+            scan_sizing: step("scan_sizing"),
+            admission: step("admission"),
+            audit_bind: step("audit_bind"),
+            operators: Mutex::default(),
+            metrics,
+        }
+    }
+
+    /// Folds the executed root's operator metrics into this profile.
+    ///
+    /// The root's owner calls it while releasing the root, once the values
+    /// are final: the admission guard for an Interactive root, after the
+    /// query is cancelled, and an Analytical graph's metric fold for the
+    /// metric-carrier plan its follower metrics were folded into. Either
+    /// owner then drops the root before the query's envelope is released. An
+    /// attempt executes one root, so this runs at most once per profile.
+    pub(crate) fn fold_root(&self, root: &dyn ExecutionPlan) {
+        let mut operators = self
+            .operators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::fold_plan(root, &mut operators);
+    }
+
+    /// Collects every event: the Oracle's steps, then each operator's metrics.
+    ///
+    /// Events are keyed `<operator>.<metric>`, summed across partitions and
+    /// across operators of the same name. Only time and count metrics are
+    /// kept; gauges, timestamps, ratios, and pruning summaries do not sum
+    /// meaningfully across queries.
+    fn events(&self) -> BTreeMap<String, ProfileValue> {
+        let mut events = BTreeMap::new();
+        ProfileValue::fold(ORACLE_EVENT, &self.metrics.clone_inner(), &mut events);
+        events.extend(
+            self.operators
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(event, value)| (event.clone(), *value)),
+        );
+        events
+    }
+
+    /// Folds one operator's metrics and then its children's.
+    fn fold_plan(plan: &dyn ExecutionPlan, events: &mut BTreeMap<String, ProfileValue>) {
+        if let Some(metrics) = plan.metrics() {
+            ProfileValue::fold(plan.name(), &metrics.aggregate_by_name(), events);
+        }
+        for child in plan.children() {
+            Self::fold_plan(child.as_ref(), events);
+        }
+    }
+}
+
+impl Drop for QueryProfile {
+    /// Emits the profile once as [`ProfileFamily::ORACLE_QUERY`]: global
+    /// counters, divided by the profile count for the mean per query, and
+    /// one DEBUG event.
+    fn drop(&mut self) {
+        ProfileFamily::ORACLE_QUERY.emit(&self.events());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_expr::expressions::lit;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::filter::FilterExec;
+    use datafusion::physical_plan::{ExecutionPlan, collect};
+
+    use super::QueryProfile;
+    use crate::profile::ProfileValue;
+
+    /// A timed Oracle step and the executed root's operators both appear,
+    /// keyed by operator and metric name.
+    #[tokio::test]
+    async fn profile_folds_oracle_steps_and_operator_metrics() {
+        let profile = QueryProfile::new();
+        profile
+            .cut_read
+            .add_duration(std::time::Duration::from_micros(5));
+        let empty = Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]))));
+        let root: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(lit(true), empty).expect("filter over an empty input"));
+        collect(Arc::clone(&root), Arc::new(TaskContext::default()))
+            .await
+            .expect("execute the empty root");
+        profile.fold_root(root.as_ref());
+
+        let events = profile.events();
+
+        assert_eq!(
+            events.get("Oracle.cut_read"),
+            Some(&ProfileValue::Nanoseconds(5_000))
+        );
+        assert_eq!(
+            events.get("FilterExec.output_rows"),
+            Some(&ProfileValue::Count(0))
+        );
+    }
+}

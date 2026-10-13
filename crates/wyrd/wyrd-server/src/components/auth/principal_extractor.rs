@@ -69,21 +69,28 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
     /// Returns `401` when the access-token header is missing or verification
     /// fails, `400` when the token is malformed, and `503` when no token
     /// verifier is configured.
-    async fn from_request_parts(
+    /// Resolution completes before the returned future is polled.
+    fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         // Fast path: require_authenticated (post-verify) is the sole trusted producer
         // of this extension. Any future insertion site must verify before inserting;
         // reading an unverified principal here would be a silent auth bypass.
-        if let Some(principal) = parts.extensions.get::<AuthenticatedPrincipal>() {
-            return Ok(principal.clone());
-        }
-        verify_authenticated_principal(
-            state.auth.token_verifier.as_deref(),
-            &parts.headers,
-            wyrd_auth_verify::TokenAudience::Wyrd,
-        )
+        let resolved = parts
+            .extensions
+            .get::<AuthenticatedPrincipal>()
+            .map_or_else(
+                || {
+                    verify_authenticated_principal(
+                        state.auth.token_verifier.as_deref(),
+                        &parts.headers,
+                        wyrd_auth_verify::TokenAudience::Wyrd,
+                    )
+                },
+                |principal| Ok(principal.clone()),
+            );
+        std::future::ready(resolved)
     }
 }
 
@@ -211,7 +218,7 @@ mod pg_tests {
     async fn test_state(_tenant: DataTenantId) -> crate::state::AppState {
         use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
         use std::collections::HashMap;
-        use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+        use wyrd_storage::{LocalSigner, StorageHandle};
 
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let root = tempfile::tempdir().expect("temp dir");
@@ -241,7 +248,7 @@ mod pg_tests {
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
         crate::test_support::test_app_state(
             postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            Arc::new(StorageHandle::new(signer)),
             crate::test_support::test_catalog().await,
         )
         .with_auth(crate::components::auth::ServerAuth {

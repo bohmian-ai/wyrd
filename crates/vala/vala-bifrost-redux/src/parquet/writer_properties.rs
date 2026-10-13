@@ -1,13 +1,11 @@
 //! Uniform Parquet writer properties for Bifrost data files.
 
+use iceberg::writer::file_writer::variant_shredding::VariantShreddingPolicy;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::KeyValue;
-use parquet::file::properties::{
-    DEFAULT_MAX_ROW_GROUP_ROW_COUNT, EnabledStatistics, WriterProperties,
-};
+use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// Estimated encoded bytes at which a Bifrost writer closes a row group.
 ///
@@ -31,21 +29,6 @@ const BIFROST_DICTIONARY_PAGE_BYTES: usize = 256 * 1024;
 /// Target false-positive probability of every Bifrost Bloom filter.
 const BLOOM_FPP: f64 = 0.01;
 
-/// Derives a row group's Bloom-filter distinct-value hint from its row count.
-///
-/// # Panics
-/// Never panics: the row count is first bounded by parquet-rs's row-group row
-/// maximum, which fits in `u64`.
-fn bloom_filter_ndv(row_count: usize) -> u64 {
-    let ndv = u64::try_from(row_count.min(DEFAULT_MAX_ROW_GROUP_ROW_COUNT))
-        .expect("bounded row count fits in u64");
-    if ndv > 1_000 {
-        (ndv / 100).max(1_000)
-    } else {
-        ndv
-    }
-}
-
 /// Parquet [`WriterProperties`] for every Bifrost data file.
 ///
 /// ZSTD level 3 (writes are once-per-frame after bounded admission; reads are
@@ -57,9 +40,10 @@ fn bloom_filter_ndv(row_count: usize) -> u64 {
 /// Dictionary encoding is on by default so low-cardinality string and
 /// identifier columns encode as `RLE_DICTIONARY`; parquet-rs owns dictionary
 /// page overflow at [`BIFROST_DICTIONARY_PAGE_BYTES`] and the fallback to
-/// `PLAIN`, so no sampler or cardinality estimate is computed here. `wyrd_event_time` is the one column that opts
-/// out: it is monotonic microsecond data that `DELTA_BINARY_PACKED` encodes
-/// strictly better than a dictionary would.
+/// `PLAIN`, so no sampler or cardinality estimate is computed here. The table's
+/// `time_column` is the one column that opts out: it is near-monotonic
+/// timestamp data that `DELTA_BINARY_PACKED` encodes strictly better than a
+/// dictionary would.
 ///
 /// Bloom filters are enabled only for `bloom_columns`, the canonical union the
 /// registered physical layout resolved from the managed floor and the table's
@@ -68,14 +52,14 @@ fn bloom_filter_ndv(row_count: usize) -> u64 {
 ///
 /// # Panics
 /// Never panics — ZSTD level 3 is always valid.
-pub fn bifrost_writer_properties(row_count: usize, bloom_columns: &[String]) -> WriterProperties {
-    bifrost_writer_properties_with_metadata(row_count, Vec::new(), bloom_columns)
+pub fn bifrost_writer_properties(time_column: &str, bloom_columns: &[String]) -> WriterProperties {
+    bifrost_writer_properties_with_metadata(Vec::new(), time_column, bloom_columns)
 }
 
 /// Parquet properties carrying caller-supplied footer metadata.
 ///
-/// Dictionary encoding is enabled globally and disabled for
-/// [`WYRD_EVENT_TIME`], which keeps `DELTA_BINARY_PACKED` as its actual
+/// Dictionary encoding is enabled globally and disabled for the table's
+/// `time_column`, which keeps `DELTA_BINARY_PACKED` as its actual
 /// encoding. Both calls are required: parquet-rs treats a per-column encoding
 /// request as a *fallback* used only after a dictionary overflows, so
 /// `set_column_encoding` alone would leave the column dictionary-encoded.
@@ -90,16 +74,36 @@ pub fn bifrost_writer_properties(row_count: usize, bloom_columns: &[String]) -> 
 /// Panics only if the compile-time constant Zstandard level `3` becomes invalid.
 #[must_use]
 pub fn bifrost_writer_properties_with_metadata(
-    row_count: usize,
     metadata: Vec<KeyValue>,
+    time_column: &str,
     bloom_columns: &[String],
 ) -> WriterProperties {
-    let mut builder = recipe_builder(row_count, bloom_columns);
+    let mut builder = recipe_builder(time_column, bloom_columns);
     if !metadata.is_empty() {
         builder = builder.set_key_value_metadata(Some(metadata));
     }
     builder.build()
 }
+
+/// How every final Bifrost object chooses its shredded Variant layout.
+///
+/// Scribe samples each claim stratified by `principal_id`: Cochran's sample
+/// size at 99% confidence (`z = 2.5758`) and a ±0.02 margin, 4,147 rows per
+/// large stratum with the finite-population correction, writers under 30 rows
+/// merged into one stratum. A field is eligible at 10% minus the margin in any
+/// stratum. Forge combines source footers and keeps fields covering 10% of the
+/// rewrite's rows. Both track 1,000 and keep 300 children per object node to
+/// depth 50. These are internal policy constants, never table, wire, or user
+/// configuration. Scribe recovery-stage runs are never shredded.
+pub const BIFROST_VARIANT_SHREDDING: VariantShreddingPolicy = VariantShreddingPolicy {
+    confidence_z: 2.5758,
+    margin: 0.02,
+    min_stratum_rows: 30,
+    min_frequency: 0.10,
+    max_tracked_children: 1_000,
+    max_emitted_children: 300,
+    max_depth: 50,
+};
 
 /// Parquet properties for a Forge rewrite output at a table's row-group target.
 ///
@@ -118,10 +122,11 @@ pub fn bifrost_writer_properties_with_metadata(
 #[must_use]
 pub fn bifrost_rewrite_writer_properties(
     row_group_target_bytes: u64,
+    time_column: &str,
     bloom_columns: &[String],
     tenant: DataTenantId,
 ) -> WriterProperties {
-    recipe_builder(DEFAULT_MAX_ROW_GROUP_ROW_COUNT, bloom_columns)
+    recipe_builder(time_column, bloom_columns)
         .set_max_row_group_bytes(Some(
             usize::try_from(row_group_target_bytes).unwrap_or(usize::MAX),
         ))
@@ -134,11 +139,15 @@ pub fn bifrost_rewrite_writer_properties(
 /// Extracted so the rewrite writer cannot drift from the ingest writer: a
 /// producer that encoded differently would make an otherwise-identical file
 /// obsolete on the next selection pass for no semantic reason.
-fn recipe_builder(
-    row_count: usize,
-    bloom_columns: &[String],
-) -> parquet::file::properties::WriterPropertiesBuilder {
-    let bloom_ndv = bloom_filter_ndv(row_count);
+///
+/// Bloom columns set only enablement and [`BLOOM_FPP`]; parquet-rs sizes each
+/// filter's distinct-value capacity from the writer's row-group row maximum
+/// and folds it down to the values a group actually holds when it writes it.
+///
+/// # Panics
+///
+/// Panics only if the compile-time constant Zstandard level `3` becomes invalid.
+fn recipe_builder(time_column: &str, bloom_columns: &[String]) -> WriterPropertiesBuilder {
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(
             ZstdLevel::try_new(3).expect("zstd level 3 is valid"),
@@ -146,11 +155,8 @@ fn recipe_builder(
         .set_max_row_group_bytes(Some(BIFROST_ROW_GROUP_TARGET_BYTES))
         .set_dictionary_enabled(true)
         .set_dictionary_page_size_limit(BIFROST_DICTIONARY_PAGE_BYTES)
-        .set_column_dictionary_enabled(ColumnPath::from(WYRD_EVENT_TIME), false)
-        .set_column_encoding(
-            ColumnPath::from(WYRD_EVENT_TIME),
-            Encoding::DELTA_BINARY_PACKED,
-        )
+        .set_column_dictionary_enabled(ColumnPath::from(time_column), false)
+        .set_column_encoding(ColumnPath::from(time_column), Encoding::DELTA_BINARY_PACKED)
         .set_statistics_enabled(EnabledStatistics::Page)
         .set_offset_index_disabled(false);
 
@@ -158,8 +164,7 @@ fn recipe_builder(
         let path = ColumnPath::from(column.as_str());
         builder = builder
             .set_column_bloom_filter_enabled(path.clone(), true)
-            .set_column_bloom_filter_fpp(path.clone(), BLOOM_FPP)
-            .set_column_bloom_filter_max_ndv(path, bloom_ndv);
+            .set_column_bloom_filter_fpp(path, BLOOM_FPP);
     }
 
     builder
@@ -167,7 +172,12 @@ fn recipe_builder(
 
 #[cfg(test)]
 mod tests {
+    use parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT;
+
     use super::*;
+
+    /// The time column every recipe fixture declares.
+    const TIME_COLUMN: &str = "event_time";
 
     /// The canonical union a traces table resolves: managed floor plus the
     /// declaration-only correlation columns.
@@ -180,13 +190,13 @@ mod tests {
 
     /// The one writer recipe every Bifrost producer builds: dictionary
     /// encoding on by default so low-cardinality columns compress, bounded at
-    /// the per-lookup dictionary decode size, and off for `wyrd_event_time` so
+    /// the per-lookup dictionary decode size, and off for the time column so
     /// `DELTA_BINARY_PACKED` is its real encoding rather than a post-overflow
     /// fallback.
     #[test]
     fn writer_recipe_encoding_contract() {
         let bloom_columns = declared_recipe();
-        let properties = bifrost_writer_properties(50_000, &bloom_columns);
+        let properties = bifrost_writer_properties(TIME_COLUMN, &bloom_columns);
 
         for column in ["service_name", "run_id", "message", "card_uid"] {
             let path = ColumnPath::from(column);
@@ -207,10 +217,10 @@ mod tests {
             "dictionary pages overflow at the bounded per-lookup decode size"
         );
 
-        let event_time = ColumnPath::from(WYRD_EVENT_TIME);
+        let event_time = ColumnPath::from(TIME_COLUMN);
         assert!(
             !properties.dictionary_enabled(&event_time),
-            "wyrd_event_time must opt out of dictionary encoding"
+            "the time column must opt out of dictionary encoding"
         );
         assert_eq!(
             properties.encoding(&event_time),
@@ -218,11 +228,18 @@ mod tests {
         );
     }
 
+    /// Every recipe setting resolves to its fixed value, including Bloom
+    /// filters sized natively from the row-group row maximum.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a compression, sizing, encoding, statistics, or Bloom
+    /// setting drifts.
     #[test]
     fn writer_recipe_metadata_is_deterministic() {
         let bloom_columns = declared_recipe();
-        let properties = bifrost_writer_properties(50_000, &bloom_columns);
-        let timestamp = ColumnPath::from("wyrd_event_time");
+        let properties = bifrost_writer_properties(TIME_COLUMN, &bloom_columns);
+        let timestamp = ColumnPath::from(TIME_COLUMN);
 
         assert_eq!(
             properties.compression(&timestamp),
@@ -265,7 +282,10 @@ mod tests {
                 .bloom_filter_properties(&ColumnPath::from(column.as_str()))
                 .expect("allowlisted column has a bloom filter");
             assert!((properties_for_column.fpp() - BLOOM_FPP).abs() < f64::EPSILON);
-            assert_eq!(properties_for_column.ndv(), 1_000);
+            assert_eq!(
+                properties_for_column.ndv(),
+                DEFAULT_MAX_ROW_GROUP_ROW_COUNT as u64
+            );
         }
 
         for column in ["message", "payload", "value"] {
@@ -284,7 +304,7 @@ mod tests {
     #[test]
     fn writer_recipe_blooms_exactly_the_resolved_union() {
         let floor = ["card_uid".to_owned(), "run_id".to_owned()];
-        let properties = bifrost_writer_properties(50_000, &floor);
+        let properties = bifrost_writer_properties(TIME_COLUMN, &floor);
         for column in &floor {
             assert!(
                 properties
@@ -293,7 +313,7 @@ mod tests {
                 "resolved column {column} must have a bloom filter"
             );
         }
-        for column in ["trace_id", "span_id", "wyrd_event_time"] {
+        for column in ["trace_id", "span_id", TIME_COLUMN] {
             assert!(
                 properties
                     .bloom_filter_properties(&ColumnPath::from(column))
@@ -303,14 +323,37 @@ mod tests {
         }
     }
 
-    /// The Bloom distinct-value hint scales with rows and is bounded by the
-    /// row-group row maximum.
+    /// Scribe and Forge size every Bloom filter for a full row group.
+    ///
+    /// The Scribe recipe takes no batch input at all, so the size of the batch
+    /// that opens a file cannot change the capacity; the Forge rewrite recipe
+    /// lands on the same capacity at any row-group byte target. Both keep the
+    /// row-group row maximum the capacity is derived from and the fixed
+    /// false-positive rate.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either writer's Bloom capacity, row maximum, or
+    /// false-positive rate drifts.
     #[test]
-    fn writer_recipe_bloom_ndv_is_bounded() {
-        assert_eq!(bloom_filter_ndv(1_000), 1_000);
-        assert_eq!(bloom_filter_ndv(50_000), 1_000);
-        assert_eq!(bloom_filter_ndv(200_000), 2_000);
-        assert_eq!(bloom_filter_ndv(usize::MAX), 10_485);
+    fn bloom_capacity_uses_row_group_limit_for_scribe_and_forge() {
+        let columns = declared_recipe();
+        let scribe = bifrost_writer_properties_with_metadata(Vec::new(), TIME_COLUMN, &columns);
+        let forge =
+            bifrost_rewrite_writer_properties(1_024, TIME_COLUMN, &columns, DataTenantId::new_v7());
+        for properties in [&scribe, &forge] {
+            assert_eq!(
+                properties.max_row_group_row_count(),
+                Some(DEFAULT_MAX_ROW_GROUP_ROW_COUNT)
+            );
+            for column in &columns {
+                let bloom = properties
+                    .bloom_filter_properties(&ColumnPath::from(column.as_str()))
+                    .expect("a Bloom column has a filter");
+                assert_eq!(bloom.ndv(), DEFAULT_MAX_ROW_GROUP_ROW_COUNT as u64);
+                assert!((bloom.fpp() - BLOOM_FPP).abs() < f64::EPSILON);
+            }
+        }
     }
 
     /// The row-group target is soft: a row larger than the target is written
@@ -353,6 +396,7 @@ mod tests {
             schema,
             Some(bifrost_rewrite_writer_properties(
                 target,
+                TIME_COLUMN,
                 &[],
                 wyrd_spec::DataTenantId::new_v7(),
             )),

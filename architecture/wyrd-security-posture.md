@@ -492,7 +492,7 @@ Audit frames are submitted under the platform audit principal, the one
 principal Scribe admits for the reserved system owner's audit history. A row
 carries only decision content (request, trace, operation, resource, audit Card,
 principal, permission, outcome, detail, and credential id) with
-`wyrd_event_time` set to the decision time; there is no chain, sequence, or
+`created_at` set to the decision time; there is no chain, sequence, or
 publication progress, and readers order by decision time. Because the outbox
 writer evaluates no new permission, it appends no audit event and retained
 history cannot feed itself. A legacy direct-Iceberg relay and

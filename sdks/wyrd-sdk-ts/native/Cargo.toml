@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 arrow = { workspace = true }
 chrono = { workspace = true }
 wyrd-queue = { workspace = true }
-napi = { workspace = true }
+napi = { workspace = true, features = ["serde-json"] }
 napi-derive = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
@@ -25,6 +25,7 @@ wyrd-cli = { workspace = true }
 wyrd-client = { workspace = true, features = ["internal"] }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
+wyrd-types = { workspace = true }
 
 [build-dependencies]
 napi-build = { workspace = true }

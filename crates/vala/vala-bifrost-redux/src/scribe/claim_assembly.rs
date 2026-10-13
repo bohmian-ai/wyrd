@@ -22,6 +22,7 @@ use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
 use crate::scribe::assembly::{StagingClaim, StagingClaimId};
 use crate::scribe::claim_merge::StagedRunMerge;
+use crate::scribe::claim_sample::ClaimVariantSample;
 use crate::scribe::hot_stage::{ScribeHotStage, StagedLsnRange, StagedMemberState};
 use crate::scribe::parquet_writer::{
     ArtifactPlan, BoundedParquetArtifactSet, RowGroupStats, encode_ordered_claim,
@@ -246,10 +247,13 @@ impl ClaimAssembler {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the merge cannot open or decode a
-    /// run, encoding refuses a batch or cannot seal an object, or the written
+    /// Returns [`ScribeError::Internal`] when the Variant sample or the merge
+    /// cannot open or decode a run, encoding refuses a batch or cannot seal an object, or the written
     /// rows are not exactly the rows the claim promised.
     pub fn encode(&self, request: AssembleClaimRequest<'_>) -> Result<AssembledClaim, ScribeError> {
+        let variant_layout =
+            ClaimVariantSample::new(request.runs.claim, request.runs.runs(), &request.schema)
+                .layout()?;
         let merge = StagedRunMerge::open(
             request.runs.runs(),
             request.schema,
@@ -266,6 +270,7 @@ impl ClaimAssembler {
                 tenant: request.tenant,
             },
             &request.memory,
+            variant_layout,
             merge,
         )?;
         let rows = artifacts.iter().try_fold(0_u64, |sum, artifact| {
@@ -314,7 +319,7 @@ mod tests {
     /// Physical schema the fixtures stage, merge, and assemble under.
     fn assembly_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )]))
@@ -336,6 +341,7 @@ mod tests {
             TimestampMicrosecondArray::from_iter_values((0..rows).map(|row| row * 2 + offset));
         let record = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(times)])
             .expect("fixture member batch");
+        let arrow_bytes = crate::scribe::memory::retained_arrow_bytes(&record);
         FrozenMemtable {
             seal_id: u64::from(batch),
             seal_key: SealKey::new(
@@ -346,24 +352,12 @@ mod tests {
             shard_id: usize::from(batch),
             schema,
             batches: vec![record],
+            statistics: Vec::new(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
-            arrow_bytes: 0,
+            arrow_bytes,
         }
-    }
-
-    /// Resolves the hourly layout every fixture member is encoded under.
-    fn assembly_layout(schema: &Schema) -> PhysicalLayout {
-        PhysicalLayout::resolve(
-            "vala.bifrost.test",
-            schema,
-            Some(&crate::tables::hourly_layout(
-                vec![crate::tables::sort_asc("wyrd_event_time")],
-                &["wyrd_event_time"],
-            )),
-        )
-        .expect("fixture schema carries the built-in hourly layout")
     }
 
     /// Stages two interleaving members of one key and claims them together.
@@ -449,7 +443,7 @@ mod tests {
         let stager = ScribeMemberStager::new(Arc::clone(&stage));
         let tenant = DataTenantId::new_v7();
         let schema = assembly_schema();
-        let layout = assembly_layout(schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let ready_at = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("fixture instant");
 
         let claim = stage_two_members(&stager, tenant, &layout, ready_at).await;
@@ -526,7 +520,7 @@ mod tests {
         );
     }
 
-    /// Reads `wyrd_event_time` from sealed objects in publication order after
+    /// Reads `event_time` from sealed objects in publication order after
     /// proving each object's footer records `tenant`.
     ///
     /// # Panics
@@ -549,7 +543,7 @@ mod tests {
             for batch in reader {
                 let batch = batch.expect("sealed object batch");
                 let column = batch
-                    .column_by_name("wyrd_event_time")
+                    .column_by_name("event_time")
                     .expect("event time column")
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()

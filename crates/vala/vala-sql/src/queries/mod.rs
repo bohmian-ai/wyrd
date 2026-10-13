@@ -14,7 +14,6 @@ pub mod forge_catalog_operator;
 pub mod forge_leader;
 pub mod forge_operations;
 pub mod forge_tasks;
-pub mod maintenance_leases;
 pub mod monitor;
 pub mod olap_catalog;
 pub mod oracle_reader_authority;

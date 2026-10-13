@@ -55,6 +55,7 @@ wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.0.1" }
 wyrd-cards = { path = "crates/wyrd/wyrd-cards", version = "0.0.1" }
 wyrd-runtime = { path = "crates/shared/wyrd-runtime", version = "0.0.1" }
 wyrd-queue = { path = "crates/shared/wyrd-queue", version = "0.0.1" }
+wyrd-types = { path = "crates/shared/wyrd-types", version = "0.0.1" }
 wyrd-auth-issue = { path = "crates/shared/wyrd-auth-issue", version = "0.0.1" }
 wyrd-auth-oidc = { path = "crates/shared/wyrd-auth-oidc", version = "0.0.1" }
 wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify", version = "0.0.1" }
@@ -74,6 +75,7 @@ wyrd-semver = { path = "crates/shared/wyrd-semver", version = "0.0.1" }
 workspace-hack = { path = "crates/shared/workspace-hack" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
+pin-project = "1"
 async-trait = "0.1"
 async-stream = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
@@ -180,9 +182,9 @@ opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
 opentelemetry-http = { version = "0.31", default-features = false }
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "gen-tonic-messages", "trace", "metrics", "logs", "with-serde"] }
-arrow = "59.2"
-arrow-array = "59.2"
-arrow-schema = "59.2"
+arrow = "60.0"
+arrow-array = "60.0"
+arrow-schema = "60.0"
 statrs = "0.18"
 jsonpath-rust = "0.7"
 tracing-opentelemetry = "0.32"
@@ -208,54 +210,87 @@ napi = { version = "3", default-features = false, features = ["napi8", "tokio_rt
 napi-derive = "3"
 napi-build = "2"
 
-# Cloud SDKs are server-tier only.
-aws-sdk-s3 = { version = "=1.75.0", default-features = false, features = ["sigv4a", "rt-tokio", "behavior-version-latest"] }
-aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "behavior-version-latest"] }
-aws-types = "1"
-gcloud-storage = { version = "1", features = ["auth"] }
-gcloud-auth = "1"
-azure_core = "0.21.0"
-azure_identity = "0.21.0"
-azure_storage = "0.21.0"
-azure_storage_blobs = "0.21.0"
-# opendal 0.57 pinned as the wyrd-storage substrate (stage0) and the future
-# iceberg substrate (stage1). reqwest-rustls-tls is mandatory:
-# default-features=false drops it, leaving an HTTP-only client that fails all
-# cloud HTTPS requests.
 typetag = "0.2.23"
-opendal = { version = "0.57", default-features = false, features = [
-  "services-fs", "services-s3", "services-gcs", "services-azblob",
-  "reqwest-rustls-tls",
-] }
 
 # Bounded least-recently-used map behind the Bifrost decoded-metadata cache's
 # byte ceiling. Pinned: the cache manages its own byte accounting against this
 # map's ordering, so a silent ordering or capacity change would alter eviction.
 lru = "=0.12.5"
-# =55.0.0 matches the managed iceberg-rust arrow-59.2 line. The four iceberg
+# Safe macOS host and process readings for the release-server benchmark harness.
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+# Safe `proc_pid_rusage` wrapper: lifetime peak footprint of a macOS process.
+libproc = "0.14.11"
+# =55.1.0 matches the managed iceberg-rust arrow-60 line. The four iceberg
 # crates share one immutable SCRIBE_ICEBERG_SHA so the analytical graph stays a
-# single native universe (no moving branch, no duplicate Arrow/Parquet package).
-datafusion = "=55.0.0"
-datafusion-proto = "=55.0.0"
-parquet = "59.2"
-iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "97c32f6377cbdfe51dbeb69e77a2a726669de93a" }
+# single native universe (no moving branch, no duplicate Arrow/Parquet package);
+# `[patch.crates-io]` below pins the DataFusion crates to the Wyrd fork.
+datafusion = "=55.1.0"
+# Wyrd's one object store for artifact and Bifrost storage; the same release
+# DataFusion 55 uses.
+object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
+datafusion-proto = "=55.1.0"
+datafusion-datasource = "=55.1.0"
+parquet = "60.0"
+# Arrow-rs Variant model, kernels, and JSON conversion; same release line as `parquet`.
+parquet-variant = "60.0"
+parquet-variant-compute = "60.0"
+parquet-variant-json = "60.0"
+iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "0991fef0af3f86336b52d7c56b7f35cf4b2da222" }
 # sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
-iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "97c32f6377cbdfe51dbeb69e77a2a726669de93a" }
-iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "97c32f6377cbdfe51dbeb69e77a2a726669de93a" }
-# Non-blocking local-filesystem Iceberg storage for Scribe staged-run reads;
-# already in the graph through the managed compaction core.
-iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "97c32f6377cbdfe51dbeb69e77a2a726669de93a", default-features = false, features = ["opendal-fs"] }
+iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "0991fef0af3f86336b52d7c56b7f35cf4b2da222" }
+iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "0991fef0af3f86336b52d7c56b7f35cf4b2da222" }
 # FINAL_CORE_SHA. The managed compaction core Forge plans and rewrites through.
 # It resolves the same SCRIBE_ICEBERG_SHA iceberg crates and the same DataFusion
-# 55 / Arrow 59 line as the workspace, so embedding it adds no second native
+# 55 / Arrow 60 line as the workspace, so embedding it adds no second native
 # universe. The revision is literal and must never be a branch: the branch it was
 # published on can move, and a moved core would silently change selection,
 # grouping, delete application, and output identity underneath Forge.
-iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "4e9f325d993d900bcdec2fa74239c6a6173f49cd" }
+iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "5f4010291869ed4fb71357aa3dec96746010319a" }
 # Test-only. Pinned to an immutable revision so the Bifrost integration target can
 # prove that Wyrd's Oracle SessionState composes with the distributed planner over
 # one shared native DataFusion 55 universe. Wyrd ships no distributed query path.
-datafusion-distributed = { git = "https://github.com/datafusion-contrib/datafusion-distributed", rev = "4cfa166d233207ee188a277a7849bee7d9dfd2de" }
+# The Wyrd fork carries the Arrow 60 port; upstream is still on Arrow 59.
+datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distributed", rev = "8fac2a978bdcf8e06457238ebfe9c7f35023c123" }
+
+# One tested revision of the Wyrd DataFusion fork (v55.1.0 rebased onto apache
+# main with Arrow 60, plus nested-field
+# access, UDF input requirements, nested statistics pruning, and the per-file
+# Parquet read planner) replaces these crates for every consumer, including the
+# iceberg, compaction, and distributed git dependencies.
+[patch.crates-io]
+datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "2183432dd327d19041f9514250ed151798a08d9c" }
+datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "2183432dd327d19041f9514250ed151798a08d9c" }
+datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "2183432dd327d19041f9514250ed151798a08d9c" }
+datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "2183432dd327d19041f9514250ed151798a08d9c" }
+datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "2183432dd327d19041f9514250ed151798a08d9c" }
+datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "2183432dd327d19041f9514250ed151798a08d9c" }
+datafusion-functions-variant = { git = "https://github.com/bohmian-ai/datafusion", rev = "2183432dd327d19041f9514250ed151798a08d9c" }
+datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "2183432dd327d19041f9514250ed151798a08d9c" }
+datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "2183432dd327d19041f9514250ed151798a08d9c" }
+datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "2183432dd327d19041f9514250ed151798a08d9c" }
+datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "2183432dd327d19041f9514250ed151798a08d9c" }
+# Arrow-rs 60.0.0 with the unshred_variant buffer pre-size fix, the same
+# revision the DataFusion fork pins.
+arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-arith = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-buffer = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-cmp = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-csv = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-data = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-flight = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-ipc = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-json = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-ord = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-row = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-schema = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-select = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-string = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+parquet = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+parquet-variant = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+parquet-variant-compute = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+parquet-variant-json = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -291,6 +326,13 @@ allow_attributes_without_reason = "warn"
 # debug info. Every test binary statically links the whole dependency cone, so
 # full debug info costs gigabytes of linker memory and target/ per binary.
 [profile.dev]
+debug = "line-tables-only"
+
+# Pin build scripts and proc-macros to the same debug info. Left unset, Cargo
+# gives a build-time crate debug info only when the same build also uses it as
+# a normal dependency, so a workspace build and a per-package build hash
+# quote/syn/serde_derive differently and rebuild everything downstream of them.
+[profile.dev.build-override]
 debug = "line-tables-only"
 
 # Local image builds, test lanes, and benchmarks. Four codegen units recover

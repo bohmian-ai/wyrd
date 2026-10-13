@@ -1,8 +1,8 @@
 -- vala.cluster_nodes: unified Scribe/Oracle node registry.
 --
 -- Each Bifrost role (Scribe, Oracle) INSERTs a row on boot and UPDATEs
--- heartbeat_at every 5s. Gate is stateless (no row). Forge uses
--- vala.maintenance_leases instead.
+-- heartbeat_at every 5s. Gate is stateless (no row). Forge coordinates
+-- through its task rows instead.
 --
 -- fencing_token is the writer_epoch source: Scribe bumps it on every boot to
 -- obtain a fresh LSN stream. Each (node_id, writer_epoch) pair identifies one

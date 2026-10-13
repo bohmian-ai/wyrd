@@ -6,7 +6,7 @@
 //! error). Reuses the same key/verifier setup as `router_smoke.rs`.
 
 use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use std::net::SocketAddr;
@@ -17,13 +17,15 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use bytes::Bytes;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, Utc};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{CompactionRegistration, TableRef};
 use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::scan_sizing::ScanScope;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint as ReduxSchemaFingerprint;
 use vala_bifrost_redux::scribe::{replay::replay_wal_directory, tail_rpc::TonicTailReadTransport};
+use vala_bifrost_redux::tables::{DomainTable, verification::ResultsTable};
 use vala_sql::TenantConn;
 use wyrd_auth_verify::TokenPrincipalRef;
 use wyrd_runtime::{
@@ -113,35 +115,19 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> Stri
         .expect("test jwt mints")
 }
 
-/// The instant the private-tail fixture writes its rows at.
+/// Builds two logical rows of the private-tail fixture.
 ///
-/// Production Scribe admission bounds event time to a window around now, so a
-/// frozen literal would age out of the accepted range and start failing.
-fn fixture_event_time() -> DateTime<Utc> {
-    Utc::now()
-}
-
-/// Builds two logical rows on the private-tail fixture's UTC event day.
+/// The fixture table declares no time column, so both rows partition on the
+/// one `wyrd_ingested_at` Scribe stamps on their request and share one live
+/// partition.
 fn non_empty_tail_batch() -> RecordBatch {
-    let timestamp = fixture_event_time().timestamp_micros();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(
-            wyrd_spec::vala::WYRD_EVENT_TIME,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
-        Field::new("value", DataType::Int64, false),
-    ]));
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(
-                TimestampMicrosecondArray::from(vec![timestamp, timestamp]).with_timezone("UTC"),
-            ),
-            Arc::new(Int64Array::from(vec![11, 22])),
-        ],
-    )
-    .expect("private-tail fixture batch is valid")
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![11, 22]))])
+        .expect("private-tail fixture batch is valid")
 }
 
 /// The caller-owned logical table the private-tail fixtures read.
@@ -166,6 +152,7 @@ fn tail_binding(tenant: DataTenantId) -> TenantTableBinding {
 fn list_request(binding: TenantTableBinding) -> Request<ListActiveStreamsRequest> {
     Request::new(ListActiveStreamsRequest {
         binding: Some(binding.into()),
+        ..Default::default()
     })
 }
 
@@ -183,9 +170,8 @@ fn test_principal(tenant: DataTenantId) -> Principal {
 /// Seeds two logical rows through the production embedded Scribe boundary.
 ///
 /// The frame is the one a transport request would carry: an authenticated
-/// tenant, the Gate-owned allow/success audit event, the projected `value`-only
-/// source fingerprint (`wyrd_event_time` is server-managed and never part of
-/// schema identity), and the measured wire size.
+/// tenant, the Gate-owned allow/success audit event, the `value`-only source
+/// fingerprint, and the measured wire size.
 ///
 /// # Panics
 ///
@@ -701,7 +687,7 @@ async fn scribe_tail_tonic_lists_seeded_partition() {
         connect_peer_channel(bind, &authority).await,
     ));
     let streams = remote
-        .list_active_streams(tail_binding(tenant))
+        .list_active_streams(tail_binding(tenant), &ScanScope::default())
         .await
         .expect("authorized discovery lists the seeded partition");
     assert_eq!(streams.len(), 1, "one live partition holds the seeded rows");
@@ -782,58 +768,36 @@ async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
 
 /// Encodes one complete `vala.verification.results` row with `card_uid`.
 ///
-/// Carries every authored column of the built-in result table, with
-/// `card_uid` in the correlation column.
+/// Carries every authored column of the built-in result table, taken from
+/// [`ResultsTable::arrow_fields`] so the row tracks the canonical declaration:
+/// a completed passing drift result with every implementation summary null,
+/// and `card_uid` in the correlation column.
 ///
 /// # Panics
 ///
 /// Panics when the fixed Arrow batch or IPC stream cannot be constructed.
 fn verification_result_ipc(card_uid: &str) -> Vec<u8> {
-    let utc = || DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-    let text = |name: &str, nullable: bool| Field::new(name, DataType::Utf8, nullable);
-    let fields = vec![
-        text("result_id", false),
-        text("implementation", false),
-        text("execution_status", false),
-        text("verdict", false),
-        text("verifier_version", false),
-        text("owner_card_uid", true),
-        text("subject_card_uid", false),
-        text("binding_id", true),
-        text("trigger_identity", true),
-        text("source_record_id", true),
-        Field::new("window_start", utc(), true),
-        Field::new("window_end", utc(), true),
-        Field::new("started_at", utc(), false),
-        Field::new("ended_at", utc(), false),
-        text("details", true),
-        text("card_uid", true),
-    ];
-    let schema = Arc::new(Schema::new(fields));
+    let mut fields = ResultsTable::arrow_fields();
+    fields.push(Field::new("card_uid", DataType::Utf8, true));
     let now = Utc::now().timestamp_micros();
-    let value = |value: &str| -> ArrayRef { Arc::new(StringArray::from(vec![Some(value)])) };
-    let null = || -> ArrayRef { Arc::new(StringArray::from(vec![None::<&str>])) };
-    let at = |micros: Option<i64>| -> ArrayRef {
-        Arc::new(TimestampMicrosecondArray::from(vec![micros]).with_timezone("UTC"))
-    };
-    let columns = vec![
-        value(&uuid::Uuid::now_v7().to_string()),
-        value("drift"),
-        value("completed"),
-        value("pass"),
-        value("1.0.0"),
-        null(),
-        value(&uuid::Uuid::now_v7().to_string()),
-        null(),
-        null(),
-        null(),
-        at(None),
-        at(None),
-        at(Some(now)),
-        at(Some(now)),
-        null(),
-        value(card_uid),
-    ];
+    let columns: Vec<ArrayRef> = fields
+        .iter()
+        .map(|field| match (field.name().as_str(), field.data_type()) {
+            ("result_id" | "subject_card_uid", _) => {
+                Arc::new(StringArray::from(vec![uuid::Uuid::now_v7().to_string()])) as ArrayRef
+            }
+            ("implementation", _) => Arc::new(StringArray::from(vec!["drift"])),
+            ("execution_status", _) => Arc::new(StringArray::from(vec!["completed"])),
+            ("verdict", _) => Arc::new(StringArray::from(vec!["pass"])),
+            ("verifier_version", _) => Arc::new(StringArray::from(vec!["1.0.0"])),
+            ("started_at" | "ended_at", data_type) => Arc::new(
+                TimestampMicrosecondArray::from(vec![now]).with_data_type(data_type.clone()),
+            ),
+            ("card_uid", _) => Arc::new(StringArray::from(vec![card_uid])),
+            (_, data_type) => arrow::array::new_null_array(data_type, 1),
+        })
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
         .expect("valid verification result batch");
     let mut bytes = Vec::new();

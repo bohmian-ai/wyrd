@@ -57,7 +57,7 @@ use wyrd_sql::queries::gateway::{
     gateway_call_accounting_entries, lock_gateway_admission, record_gateway_batch,
 };
 use wyrd_sql::row_types::gateway::GatewayBatchRow;
-use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+use wyrd_storage::{LocalSigner, StorageHandle};
 
 use super::capture::object_path;
 use super::capture::recording::RecordingScribe;
@@ -3250,19 +3250,21 @@ async fn replica_with_fixture_catalog(
         .keep()
         .join("gateway-storage");
     std::fs::create_dir_all(&root).expect("storage root creates");
-    let storage = Arc::new(StorageHandle::new(BackendSigner::Local(
+    let storage = Arc::new(StorageHandle::new(
         LocalSigner::new(root).expect("local signer creates"),
-    )));
-    let bifrost_storage = Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
-        Arc::clone(&storage),
-        vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
-            vala_bifrost_redux::storage::BifrostStorageConfig::default(),
-            u64::from(u32::MAX),
-            false,
-        )
-        .expect("the default storage policy is valid"),
-        None,
     ));
+    let bifrost_storage = Arc::new(
+        vala_bifrost_redux::storage::BifrostStorage::new(
+            storage.backend_config(),
+            vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
+                vala_bifrost_redux::storage::BifrostStorageConfig::default(),
+                u64::from(u32::MAX),
+                false,
+            )
+            .expect("the default storage policy is valid"),
+        )
+        .expect("the local Bifrost store builds"),
+    );
     let catalog = Arc::new(
         vala_bifrost_redux::catalog::BifrostCatalog::new(
             secrecy::ExposeSecret::expose_secret(fixture.catalog_dsn()),

@@ -330,6 +330,7 @@ def local_deployment() -> Iterator[tuple[Path, dict[str, str]]]:
         home = Path(working)
         config = home / "wyrd"
         release = config / "server/versions" / version
+        config.mkdir(mode=0o700)
         release.mkdir(parents=True)
         shutil.copy2(root / "target/debug/wyrd-server", release / "wyrd-server")
         (config / "server/current").symlink_to(Path("versions") / version)
@@ -410,6 +411,7 @@ def installed_local_cli(
                     os.close(master)
 
 
+@pytest.mark.local_dev
 @pytest.mark.parametrize("runtime", ["rust", "python", "typescript", "interrupt", "exit"])
 def test_installed_cli_bootstrap(runtime: str) -> None:
     """Run fresh SDK processes through real installed startup and shutdown.

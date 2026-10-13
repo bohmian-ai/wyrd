@@ -152,11 +152,6 @@ impl VerifierEngines {
     /// records its input-read, preparation, and wait intervals on
     /// `telemetry`. Every failure is carried in the returned
     /// [`EngineOutcome`], not raised.
-    ///
-    /// Each arm's future is boxed. The arms embed the Bifrost query stream
-    /// futures, and every wrapper above this call (phase timing, timeout,
-    /// lease select, claim task) holds its child inline, so an unboxed arm
-    /// multiplies into a claim task that overflows a worker thread's stack.
     async fn execute(
         &self,
         tenant: DataTenantId,
@@ -164,14 +159,12 @@ impl VerifierEngines {
         implementation: &VerifierImplementation,
         telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
-        // Boxed: each engine's query chain is large, and inlining it into
-        // every runner frame overflows a worker stack in unoptimized builds.
         match implementation {
             VerifierImplementation::Drift(spec) => {
-                Box::pin(self.drift.verify(tenant, run, spec, telemetry)).await
+                self.drift.verify(tenant, run, spec, telemetry).await
             }
             VerifierImplementation::Eval(spec) => {
-                Box::pin(self.eval.execute(tenant, run, spec, telemetry)).await
+                self.eval.execute(tenant, run, spec, telemetry).await
             }
             // A task Verifier is invoked directly, never through a queued run.
             VerifierImplementation::Task(_) => EngineOutcome::implementation_unavailable("task"),
@@ -731,9 +724,9 @@ impl VerifierRunner {
 
 /// Build `report`'s result payload once into the write that completes `run`.
 ///
-/// Mints one result ID and one producer event time shared by every row — a
-/// result fact this process observes, not a coordination instant — attributed
-/// to the tenant SYSTEM principal and the exact `verifier`. The write is
+/// Mints one result ID and the execution `ended_at`, the results table's time
+/// column — a result fact this process observes, not a coordination instant —
+/// attributed to the tenant SYSTEM principal and the exact `verifier`. The write is
 /// returned rather than staged: only a settlement that still holds the lease
 /// may stage it, so a holder that lost its lease writes no result.
 ///
@@ -750,7 +743,7 @@ fn result(
         Err(transition) => return (transition, None),
     };
     let result_id = VerificationResultId::new_v7();
-    let event_time = Utc::now();
+    let ended_at = Utc::now();
     let invalid = || {
         Transition::Terminate(
             TerminalStatus::Errored,
@@ -761,9 +754,8 @@ fn result(
         ResultRun::claimed(run, report.run_id()),
         &run.verifier_uid,
         result_id,
-        event_time,
         started_at,
-        event_time,
+        ended_at,
     )
     .build(report)
     {

@@ -10,7 +10,6 @@ use std::time::Duration;
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use wyrd_client::bifrost::TableConfig;
 use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode};
 use wyrd_client::observe::{EvalObservationOptions, Run};
 use wyrd_client::state::WyrdState;
@@ -18,13 +17,10 @@ use wyrd_client::{Bifrost, QueueConfig, WyrdClient};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::WyrdTestServer;
 
-/// The dataset the emit-time test records into.
-const DATASET: &str = "vala.datasets.event_times";
-
-/// One stored `wyrd_event_time`, as microseconds since the Unix epoch.
+/// One stored `created_at`, as microseconds since the Unix epoch.
 #[derive(Debug, Deserialize)]
 struct EventTime {
-    /// `CAST(wyrd_event_time AS BIGINT)` of one row.
+    /// `CAST(created_at AS BIGINT)` of one row.
     event_time: i64,
 }
 
@@ -218,9 +214,9 @@ fn assert_exactly_once(groups: &[RecordCount], observations: u16, features: u16)
     );
 }
 
-/// Every observation stores the client clock reading of its emit call as
-/// `wyrd_event_time`, not Scribe's receipt instant, and a caller-supplied
-/// `wyrd_event_time` in a record row is stored unchanged.
+/// Every Drift and Eval observation stores the client clock reading of its
+/// emit call as its declared `created_at` time axis, not Scribe's receipt
+/// instant.
 ///
 /// Scribe's receipt clock runs one day ahead for the whole emit-to-ingest
 /// window, so a receipt stamp could never fall between the client readings
@@ -232,20 +228,6 @@ fn assert_exactly_once(groups: &[RecordCount], observations: u16, features: u16)
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn observations_store_the_client_emit_time() {
     let observed = Observed::start(QueueConfig::default()).await;
-    let table = TableConfig::from_json_schema(
-        DATASET,
-        &json!({
-            "type": "object",
-            "properties": { "value": { "type": "integer" } },
-            "required": ["value"],
-        }),
-    )
-    .expect("dataset declares");
-    let registrar = Bifrost::connect_with_table(&observed.admin, table)
-        .await
-        .expect("registrar connects");
-    registrar.register().await.expect("dataset registers");
-    registrar.shutdown().await.expect("registrar stops");
     let scribe = observed
         .server
         .bifrost_scribe()
@@ -265,46 +247,22 @@ async fn observations_store_the_client_emit_time() {
             EvalObservationOptions::default(),
         )
         .expect("eval emits");
-    model
-        .observe()
-        .record(DATASET, &json!({ "value": 1 }))
-        .await
-        .expect("record emits");
     let after = chrono::Utc::now().timestamp_micros();
-    let supplied = chrono::DateTime::from_timestamp_micros(before - 3_600_000_000)
-        .expect("an hour ago is representable");
-    model
-        .observe()
-        .record(
-            DATASET,
-            &json!({
-                "value": 2,
-                "wyrd_event_time": supplied.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
-            }),
-        )
-        .await
-        .expect("a caller event time emits");
     let mut emitted: Vec<EventTime> = observed
         .drain_and_read(
-            "SELECT CAST(wyrd_event_time AS BIGINT) AS event_time FROM vala.drift.observations",
+            "SELECT CAST(created_at AS BIGINT) AS event_time FROM vala.drift.observations",
         )
         .await;
     scribe.shift_receipt_clock_for_test(Duration::ZERO);
-    for sql in [
-        "SELECT CAST(wyrd_event_time AS BIGINT) AS event_time FROM vala.eval.observations",
-        "SELECT CAST(wyrd_event_time AS BIGINT) AS event_time \
-         FROM vala.datasets.event_times WHERE value = 1",
-    ] {
-        emitted.extend(observed.read::<EventTime>(sql).await);
-    }
-    let kept: Vec<EventTime> = observed
-        .read(
-            "SELECT CAST(wyrd_event_time AS BIGINT) AS event_time \
-             FROM vala.datasets.event_times WHERE value = 2",
-        )
-        .await;
+    emitted.extend(
+        observed
+            .read::<EventTime>(
+                "SELECT CAST(created_at AS BIGINT) AS event_time FROM vala.eval.observations",
+            )
+            .await,
+    );
 
-    assert_eq!(emitted.len(), 4, "two drift rows, one eval, one record");
+    assert_eq!(emitted.len(), 3, "two drift rows, one eval");
     for row in &emitted {
         assert!(
             (before..=after).contains(&row.event_time),
@@ -312,10 +270,6 @@ async fn observations_store_the_client_emit_time() {
             row.event_time
         );
     }
-    assert_eq!(
-        kept.iter().map(|row| row.event_time).collect::<Vec<_>>(),
-        [supplied.timestamp_micros()]
-    );
     observed.server.shutdown().await.expect("server stops");
 }
 

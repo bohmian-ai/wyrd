@@ -6,9 +6,9 @@
 //! failure is logged and never stops the rest. A new leader starts with empty
 //! sets, so a cold table rejoins only on its next commit notice.
 //!
-//! Expiry and cleanup run inline on the leader's own executor as recorded
-//! attempts, so their durable evidence, table lease and recovery stay the
-//! worker's. Wyrd's never-published orphan sweep runs last, only for tables
+//! Manifest rewrite, expiry and cleanup run inline on the leader's own
+//! executor as recorded attempts, so the active task row is their table
+//! authority and their durable evidence and recovery stay the worker's. Wyrd's never-published orphan sweep runs last, only for tables
 //! that owe no compaction, because hot Scribe objects and uncertain outputs
 //! have no `RisingWave` equivalent.
 
@@ -16,7 +16,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use iceberg::spec::{FormatVersion, ManifestContentType, ManifestFile};
+use iceberg::spec::{ManifestContentType, ManifestFile};
 use iceberg::table::Table;
 use iceberg::transaction::{
     ApplyTransactionAction, MANIFEST_MIN_MERGE_COUNT, MANIFEST_MIN_MERGE_COUNT_DEFAULT,
@@ -37,7 +37,6 @@ use super::compact::ForgeGroupKey;
 use super::error::ForgeError;
 use super::identity::task_table_binding;
 use super::leader::{ForgeSchedule, ForgeTableKey};
-use super::lease::{ForgeLease, forge_lease_key};
 use super::path::catalog_path_to_object_key;
 use super::planner::{ForgePlanCandidate, ForgeTableSnapshot, plan_hash, plan_table};
 use super::scribe_promotion::PROMOTION_BRANCH;
@@ -50,6 +49,9 @@ use crate::catalog::{TableRef, TenantTableBinding};
 ///
 /// Output manifests are still split by partition spec inside the action.
 const MANIFEST_CLUSTER: &str = "wyrd-forge-maintenance";
+
+/// The `kind` parameter of a manifest-rewrite task plan, its only parameter.
+pub(super) const MANIFEST_REWRITE_PARAMETER_KIND: &str = "manifest_rewrite";
 
 /// Manifests one rewrite replaces, grouped by partition spec.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -175,7 +177,7 @@ impl Forge {
             if stop.is_cancelled() {
                 return;
             }
-            if let Err(error) = self.rewrite_manifests(schedule, key, stop).await {
+            if let Err(error) = self.rewrite_manifests(schedule, executor, key, stop).await {
                 let error = term.attribute(error, shutdown);
                 tracing::error!(error = %error, table = %key.table.table, "Forge manifest rewrite failed");
             }
@@ -220,32 +222,26 @@ impl Forge {
         Ok((binding, table, settings))
     }
 
-    /// Rewrites one table's fragmented data manifests under its table lease.
+    /// Plans one table's manifest rewrite and runs it as a recorded attempt.
     ///
     /// Current settings are re-read first, as `RisingWave` does: a disabled
-    /// table leaves the set. A format v3 table is skipped because row lineage
-    /// forbids this rewrite. The target size and minimum merge count are the
-    /// standard Iceberg commit properties.
-    ///
-    /// `stop` is checked under the lease, immediately before the commit.
+    /// table leaves the set. The selected manifests become the task's exact
+    /// inputs, and the attempt commits them under the task's claim, so a
+    /// rewrite is admitted only when no other Forge task holds the table.
     ///
     /// # Errors
     ///
-    /// Returns catalog, lease, property and commit errors, and
-    /// [`ForgeError::Shutdown`] when `stop` is cancelled before the commit.
+    /// Returns catalog, property, plan and attempt errors.
     async fn rewrite_manifests(
         &self,
         schedule: &ForgeSchedule,
+        executor: &ForgeWorker,
         key: &ForgeTableKey,
         stop: &CancellationToken,
     ) -> Result<(), ForgeError> {
-        let (binding, table, settings) = self.load_member(key).await?;
+        let (_, table, settings) = self.load_member(key).await?;
         if !settings.manifest_rewrite_enabled {
             schedule.refresh_membership(key, &settings);
-            return Ok(());
-        }
-        if table.metadata().format_version() >= FormatVersion::V3 {
-            tracing::warn!(table = %key.table.table, "Forge manifest rewrite skipped for format v3");
             return Ok(());
         }
         let Some(snapshot) = table.metadata().snapshot_for_ref(PROMOTION_BRANCH) else {
@@ -274,54 +270,40 @@ impl Forge {
         if plan.rewrite_paths.is_empty() {
             return Ok(());
         }
-        let lease_key = forge_lease_key(
-            key.tenant,
-            binding.logical_namespace.as_str(),
-            &binding.table_ref.name,
-        );
-        let Some(lease) = ForgeLease::acquire(
-            &self.core.operator_pool,
-            lease_key,
-            Uuid::now_v7(),
-            self.core.config.lease_ttl,
-        )
-        .await?
-        else {
-            tracing::debug!(table = %key.table.table, "Forge manifest rewrite deferred behind a table lease");
-            return Ok(());
-        };
-        let committed = if stop.is_cancelled() {
-            Err(ForgeError::Shutdown)
-        } else {
-            self.commit_manifest_rewrite(&binding, plan).await
-        };
-        if let Err(error) = lease.release(&self.core.operator_pool).await {
-            tracing::warn!(error = %error, table = %key.table.table, "Forge manifest rewrite lease was not released; it will expire");
-        }
-        let selected = committed?;
-        tracing::info!(table = %key.table.table, selected, "Forge manifest rewrite committed");
+        let bytes = manifests
+            .entries()
+            .iter()
+            .filter(|manifest| plan.rewrite_paths.contains(&manifest.manifest_path))
+            .map(|manifest| u64::try_from(manifest.manifest_length).unwrap_or(0))
+            .sum::<u64>();
+        let task = manifest_rewrite_task(key, snapshot.snapshot_id(), plan, bytes)?;
+        executor
+            .execute_accepted(Uuid::now_v7(), &task, stop)
+            .await?;
         Ok(())
     }
 
-    /// Commits one planned manifest rewrite against the freshly loaded table.
+    /// Commits one claimed manifest rewrite against the freshly loaded table.
     ///
-    /// The table is reloaded under the lease so the commit starts from the
-    /// head no Forge attempt can move meanwhile; the transaction keeps only the
-    /// planned paths that are still in that head.
+    /// The table is reloaded under the attempt's claim, so the commit starts
+    /// from a head no other Forge task can move meanwhile; the transaction
+    /// keeps only the selected paths that are still in that head. Bifrost
+    /// tables are format v3: every rewritten entry keeps its explicit
+    /// `first_row_id`, so row lineage is unchanged and only the new manifest
+    /// consumes fresh row-id space.
     ///
     /// Returns the number of manifests the plan selected.
     ///
     /// # Errors
     ///
     /// Returns catalog load, action and commit errors, or a timeout.
-    async fn commit_manifest_rewrite(
+    pub(super) async fn commit_manifest_rewrite(
         &self,
         binding: &TenantTableBinding,
-        plan: ManifestRewritePlan,
+        paths: HashSet<String>,
     ) -> Result<usize, ForgeError> {
         let table = self.load_table(&binding.table_ident()).await?;
-        let selected = plan.rewrite_paths.len();
-        let paths = plan.rewrite_paths;
+        let selected = paths.len();
         let transaction = Transaction::new(&table);
         let transaction = transaction
             .rewrite_manifests()
@@ -348,12 +330,10 @@ impl Forge {
     ///
     /// The pre-checks run on the leader: a processing compaction without an
     /// observed snapshot skips the table, one with a snapshot holds the chain
-    /// from the current snapshot down to it, and a table with no other
-    /// replaced snapshot skips, as does a table an Oracle query is reading.
-    /// The recorded expiry attempt then re-derives
-    /// its selection from durable roots — running attempts, claims, and
-    /// unresolved operations — and preparation refuses while an Oracle query
-    /// still reads the table. An unconsumed handoff from an earlier
+    /// from the current snapshot down to it, and a table with no unheld
+    /// replaced snapshot past the retention window skips. The recorded expiry
+    /// attempt then re-derives its selection from durable roots — running
+    /// attempts, claims, unresolved operations, and the retention window. An unconsumed handoff from an earlier
     /// failed cleanup is drained first, so a retry deletes only what is still
     /// proven unreachable.
     ///
@@ -380,8 +360,11 @@ impl Forge {
                 false
             }
             watermark => {
-                expiry_due(&table, watermark.flatten())
-                    && !self.table_is_read(key.tenant, &binding.table_ref).await?
+                let unheld = unheld_snapshots(&table, watermark.flatten());
+                !unheld.is_empty()
+                    && self
+                        .any_past_retention(key.tenant, &binding.table_ref, &table, &unheld)
+                        .await?
             }
         };
         let Some(task) = self
@@ -396,38 +379,50 @@ impl Forge {
         self.clean_expired(executor, key, stop).await
     }
 
-    /// Reports whether an Oracle query is reading one table, so the leader
-    /// records no expiry attempt that preparation would only refuse.
+    /// Reports whether any of `unheld` has been replaced for longer than the
+    /// retention window.
     ///
-    /// Advisory only: a refused attempt would stay the table's active attempt
-    /// until its retry, delaying the first pass after the last reader. The
-    /// authoritative check is preparation's own refusal under the table's
-    /// maintenance authority. Commits so abandoned reads it discards stay
-    /// discarded.
+    /// Records first observations of every replaced snapshot exactly as the
+    /// expiry pass does, so a snapshot's window starts at the first pass that
+    /// sees it replaced even when no task is planned. Planning a task only
+    /// when something is past the window keeps every planned task one that
+    /// changes the table, so the next plan is never an idempotent duplicate
+    /// of one that retained everything. The expiry pass rechecks the window
+    /// under the table's exclusive authority before deleting anything.
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Sql`] when the transaction or statements fail and
-    /// [`ForgeError::Invariant`] when the table is unregistered.
-    async fn table_is_read(
+    /// Returns SQL errors from the tenant connection or the statement.
+    async fn any_past_retention(
         &self,
         tenant: DataTenantId,
         table_ref: &TableRef,
+        table: &Table,
+        unheld: &[i64],
     ) -> Result<bool, ForgeError> {
+        let current = table.metadata().current_snapshot_id();
+        let replaced = table
+            .metadata()
+            .snapshots()
+            .map(|snapshot| snapshot.snapshot_id())
+            .filter(|id| Some(*id) != current)
+            .collect::<Vec<_>>();
         let mut conn = self
             .core
             .vala
             .tenant_conn(tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let active = super::table_authority::TableAuthority::new(&mut conn)
-            .has_active_reads(tenant, table_ref)
+        let retained = super::table_authority::TableAuthority::new(&mut conn)
+            .retained_supersessions(
+                tenant,
+                table_ref,
+                &replaced,
+                self.core.config.snapshot_retention,
+            )
             .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
-        if active {
-            tracing::info!(table = %table_ref.fqn(), "Forge expiry deferred: an Oracle query is reading the table");
-        }
-        Ok(active)
+        Ok(unheld.iter().any(|id| !retained.contains(id)))
     }
 
     /// Builds the recorded expiry attempt for one table, when one is due.
@@ -580,7 +575,7 @@ impl Forge {
         let scan_prefix = catalog_path_to_object_key(
             &location,
             &binding,
-            &self.core.staging,
+            &self.core.warehouse,
             &forge_data_location(&location),
         )?;
         let base_snapshot_id = table
@@ -609,15 +604,15 @@ impl Forge {
 /// table no longer retains skips the table. This is only the leader's
 /// pre-check: the recorded attempt re-derives its selection from every
 /// durable root before preparing anything.
-fn expiry_due(table: &Table, watermark: Option<i64>) -> bool {
+fn unheld_snapshots(table: &Table, watermark: Option<i64>) -> Vec<i64> {
     let metadata = table.metadata();
     let Some(current) = metadata.current_snapshot_id() else {
-        return false;
+        return Vec::new();
     };
     let mut held = HashSet::from([current]);
     if let Some(snapshot_id) = watermark {
         if metadata.snapshot_by_id(snapshot_id).is_none() {
-            return false;
+            return Vec::new();
         }
         let mut cursor = metadata
             .snapshot_by_id(current)
@@ -633,7 +628,53 @@ fn expiry_due(table: &Table, watermark: Option<i64>) -> bool {
     }
     metadata
         .snapshots()
-        .any(|snapshot| !held.contains(&snapshot.snapshot_id()))
+        .map(|snapshot| snapshot.snapshot_id())
+        .filter(|id| !held.contains(id))
+        .collect()
+}
+
+/// Builds the manifest-rewrite attempt for one planned set of manifests.
+///
+/// The selected manifest paths are the plan's exact inputs, sorted so the
+/// same selection always hashes to the same plan.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when the selection exceeds `u32` files or
+/// the plan cannot be hashed.
+fn manifest_rewrite_task(
+    key: &ForgeTableKey,
+    base_snapshot_id: i64,
+    plan: ManifestRewritePlan,
+    bytes: u64,
+) -> Result<NewForgeTask, ForgeError> {
+    let files = u32::try_from(plan.rewrite_paths.len()).map_err(|_| ForgeError::Invariant {
+        detail: "manifest rewrite selection exceeds u32 manifests".to_owned(),
+    })?;
+    let plan = ForgeTaskPlan {
+        version: FORGE_TASK_PAYLOAD_VERSION,
+        inputs: plan
+            .rewrite_paths
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        parameters: serde_json::json!({ "kind": MANIFEST_REWRITE_PARAMETER_KIND }),
+    };
+    let plan_hash = plan_hash(&plan)?;
+    Ok(NewForgeTask {
+        data_tenant_id: key.tenant,
+        table_ref: key.table.clone(),
+        strategy: ForgeTaskStrategy::ManifestRewrite,
+        base_snapshot_id,
+        plan,
+        plan_hash,
+        estimates: ForgeTaskEstimates {
+            files,
+            bytes: bytes.max(1),
+        },
+        ready_at: None,
+    })
 }
 
 /// Builds the orphan-cleanup attempt for one table at one fixed cut.
@@ -641,7 +682,7 @@ fn expiry_due(table: &Table, watermark: Option<i64>) -> bool {
 /// # Errors
 ///
 /// Returns [`ForgeError::Invariant`] when the TTL or cutoff is unrepresentable.
-fn orphan_cleanup_task(
+pub(super) fn orphan_cleanup_task(
     key: &ForgeTableKey,
     base_snapshot_id: i64,
     scan_prefix: String,

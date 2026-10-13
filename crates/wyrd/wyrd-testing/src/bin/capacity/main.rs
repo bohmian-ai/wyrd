@@ -31,12 +31,20 @@
 //! Run through `mise run bench:capacity`; `-- --profile` adds per-step,
 //! per-replica `perf` captures of a frame-pointer build, as diagnostic
 //! evidence. Exits nonzero when the verdict fails.
+//!
+//! The same binary carries the named Bifrost workloads, selected by the first
+//! argument: `query-capacity` ([`query`], `mise run
+//! bench:bifrost:query-capacity` and `bench:bifrost:write-capacity`) and
+//! `client-queue` ([`client_queue`], `mise run bench:bifrost:client-queue`).
+//! Each keeps its own flags, report, and output directory.
 
+mod client_queue;
 mod evidence;
 mod fixture;
 mod judge;
 mod load;
 mod profile;
+mod query;
 mod report;
 mod step;
 
@@ -50,7 +58,9 @@ use clap::Parser;
 use secrecy::ExposeSecret as _;
 use tokio::time::{Instant, Interval};
 use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
-use wyrd_testing::release_server::{CPUS, Envelope, LocalServer, MEMORY_BYTES, STOP_GRACE};
+use wyrd_testing::release_server::{
+    CPUS, Envelope, LocalServer, MEMORY_BYTES, Placement, STOP_GRACE,
+};
 
 use evidence::Queue;
 use fixture::Tenant;
@@ -494,7 +504,13 @@ impl Benchmark {
     /// seeded observations already written stay in the database and store;
     /// a retry starts a fresh database through the Postgres wrapper.
     async fn provision(&mut self) -> Result<()> {
-        let first = LocalServer::start(&self.binary, &TENANTS, &self.env(0), Envelope::POD).await?;
+        let first = LocalServer::start(
+            &self.binary,
+            &TENANTS,
+            &self.env(0),
+            Placement::Scoped(Envelope::POD),
+        )
+        .await?;
         let mut tenants = Vec::new();
         for setup in first.tenants() {
             self.auth_pace.tick().await;
@@ -695,9 +711,29 @@ fn install_tracing() {
     );
 }
 
-/// Runs the benchmark and exits nonzero on a failed verdict or error.
+/// Runs the Bifrost workload the first argument names, or the capacity mix
+/// when it names none, and exits nonzero on a failed verdict or error.
+///
+/// A named workload receives the command line without its name, so its flags
+/// parse exactly as they did on its standalone binary.
 #[tokio::main]
 async fn main() -> ExitCode {
+    let mut arguments: Vec<String> = std::env::args().collect();
+    match arguments.get(1).map(String::as_str) {
+        Some("query-capacity") => {
+            arguments.remove(1);
+            Box::pin(query::main(arguments)).await
+        }
+        Some("client-queue") => {
+            arguments.remove(1);
+            Box::pin(client_queue::main(arguments)).await
+        }
+        _ => Box::pin(capacity()).await,
+    }
+}
+
+/// Runs the capacity mix and exits nonzero on a failed verdict or error.
+async fn capacity() -> ExitCode {
     install_tracing();
     let cli = Cli::parse();
     let result = match Lifetime::from_command() {
@@ -736,7 +772,7 @@ mod tests {
     use clap::Parser as _;
     use tokio::time::Instant;
 
-    use super::{Benchmark, Cli, Envelope, Lifetime, LocalServer};
+    use super::{Benchmark, Cli, Envelope, Lifetime, LocalServer, Placement};
 
     /// A benchmark that cannot finish fails when its measuring share ends,
     /// and a cleanup that cannot finish stops at its own reserve, so both
@@ -947,7 +983,7 @@ esac
         let mut benchmark = Benchmark::prepare(cli, lifetime).await.expect("prepare");
         benchmark.output = scratch.path().join("capacity");
         std::fs::create_dir_all(&benchmark.output).expect("output directory");
-        let replica = LocalServer::start(&server, &[], &[], Envelope::POD)
+        let replica = LocalServer::start(&server, &[], &[], Placement::Scoped(Envelope::POD))
             .await
             .expect("the stand-in serves");
         benchmark.deployment = Some(super::Deployment {

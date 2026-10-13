@@ -50,6 +50,17 @@ pub struct ValidatedPath {
     pub relative_path: String,
 }
 
+impl ValidatedPath {
+    /// Return the `object_store` location of this path.
+    ///
+    /// Validation admits only ASCII letters, digits, `.`, `_`, and `-` in
+    /// non-empty segments, so every segment maps to the location unchanged.
+    #[must_use]
+    pub fn location(&self) -> object_store::path::Path {
+        object_store::path::Path::from(self.full.as_str())
+    }
+}
+
 /// Parse a tenant prefix segment.
 ///
 /// # Errors

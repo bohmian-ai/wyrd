@@ -21,11 +21,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
 use crate::scribe::assembly::{ReadyMember, ScribeAssemblyKey, StagedMemberId};
+use crate::scribe::hot_source::RunFooters;
 use crate::scribe::hot_stage::{
     RECORD_FILE_NAME, ScribeHotStage, StagedHotSourceRecordV1, StagedLsnRange, StagedRunFile,
 };
@@ -82,8 +84,13 @@ pub struct StagedRuns {
     wal: StagedLsnRange,
     /// Sorted runs in sort order, named relative to the member directory.
     runs: Vec<StagedRunFile>,
+    /// The runs' footers in run order, read by their preflight.
+    footers: RunFooters,
     /// Durable staged bytes committed to the staging volume for these runs.
     staged_bytes: u64,
+    /// Uncompressed Arrow bytes the frozen bucket held, recorded so the
+    /// assembler's size target counts raw data rather than encoded bytes.
+    raw_bytes: u64,
 }
 
 impl StagedRuns {
@@ -109,6 +116,20 @@ impl StagedRuns {
     /// that may already be partially removed.
     pub const fn staged_bytes(&self) -> u64 {
         self.staged_bytes
+    }
+
+    /// Returns the uncompressed Arrow bytes the frozen bucket held.
+    ///
+    /// This is the size the assembler's target counts and the numerator of
+    /// the staging compression ratio.
+    pub const fn raw_bytes(&self) -> u64 {
+        self.raw_bytes
+    }
+
+    /// Returns the runs' footers, which size a scan of the runs once they are
+    /// a query source.
+    pub fn footers(&self) -> &RunFooters {
+        &self.footers
     }
 
     /// Returns the inclusive WAL bounds the member's rows cover.
@@ -206,6 +227,7 @@ impl ScribeMemberStager {
             request.memory,
         )?;
         let mut runs = Vec::with_capacity(encoded.artifacts.len());
+        let mut footers = Vec::with_capacity(encoded.artifacts.len());
         let mut staged_bytes = 0_u64;
         for artifact in &encoded.artifacts {
             let file_name = file_name_of(&artifact.scratch_path)?;
@@ -215,7 +237,7 @@ impl ScribeMemberStager {
                     detail: "staged member size exceeds u64".to_owned(),
                 })?;
             fsync_file(&artifact.scratch_path)?;
-            preflight_run(&artifact.scratch_path)?;
+            footers.push(preflight_run(&artifact.scratch_path)?);
             runs.push(StagedRunFile::new(
                 file_name,
                 artifact.file_size,
@@ -232,7 +254,13 @@ impl ScribeMemberStager {
             member,
             wal: request.origin.wal,
             runs,
+            footers: RunFooters::new(footers),
             staged_bytes,
+            raw_bytes: u64::try_from(request.frozen.arrow_bytes).map_err(|_| {
+                ScribeError::Internal {
+                    detail: "staged member raw size exceeds u64".to_owned(),
+                }
+            })?,
         })
     }
 
@@ -255,6 +283,7 @@ impl ScribeMemberStager {
             staged.member,
             staged.wal,
             staged.runs,
+            staged.raw_bytes,
             ready_at,
         );
         self.stage
@@ -324,23 +353,34 @@ fn run_digest(checksum: &str) -> Result<[u8; 32], ScribeError> {
     })
 }
 
-/// Proves one fsynced run decodes before it is offered as a query source.
+/// Proves one fsynced run decodes before it is offered as a query source,
+/// and returns the footer the proof read.
 ///
 /// The preflight is bounded to one small batch: it exists to catch a run that
-/// is structurally sealed but undecodable, not to re-read the member.
+/// is structurally sealed but undecodable, not to re-read the member. The
+/// footer, with its Arrow schema, is kept in [`RunFooters`] so the Scribe
+/// listing sizes the run's scans without reading it again. Staging runs it on
+/// every new run and boot recovery on every recovered one, so every staged
+/// run is offered with its footer.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::Internal`] when the run cannot be opened, its reader
-/// cannot be built, decoding fails, or it yields no rows.
-fn preflight_run(path: &Path) -> Result<(), ScribeError> {
+/// Returns [`ScribeError::Internal`] when the run cannot be opened, its footer
+/// cannot be read, decoding fails, or it yields no rows.
+pub(crate) fn preflight_run(path: &Path) -> Result<ArrowReaderMetadata, ScribeError> {
     let file = std::fs::File::open(path).map_err(|error| ScribeError::Internal {
         detail: format!("open the staged run for preflight: {error}"),
     })?;
-    let mut reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|error| ScribeError::Internal {
-            detail: format!("build the staged run preflight reader: {error}"),
-        })?
+    let footer = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).map_err(|error| {
+        ScribeError::Internal {
+            detail: format!("read the staged run footer: {error}"),
+        }
+    })?;
+    let mut reader =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::new_with_metadata(
+            file,
+            footer.clone(),
+        )
         .with_batch_size(PREFLIGHT_BATCH_ROWS)
         .build()
         .map_err(|error| ScribeError::Internal {
@@ -360,7 +400,7 @@ fn preflight_run(path: &Path) -> Result<(), ScribeError> {
             detail: "staged run decoded an empty batch".to_owned(),
         });
     }
-    Ok(())
+    Ok(footer)
 }
 
 /// Flushes one sealed run to stable storage.
@@ -405,7 +445,7 @@ mod tests {
     fn frozen_member(tenant: DataTenantId, rows: usize) -> FrozenMemtable {
         let row_count = i64::try_from(rows).expect("test row count fits i64");
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )]));
@@ -416,6 +456,7 @@ mod tests {
             ))],
         )
         .expect("frozen member fixture");
+        let arrow_bytes = crate::scribe::memory::retained_arrow_bytes(&batch);
         FrozenMemtable {
             seal_id: 11,
             seal_key: SealKey::new(
@@ -426,24 +467,12 @@ mod tests {
             shard_id: 5,
             schema,
             batches: vec![batch],
+            statistics: Vec::new(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
-            arrow_bytes: 0,
+            arrow_bytes,
         }
-    }
-
-    /// Resolves the registered hourly layout every fixture is encoded under.
-    fn member_layout(schema: &Schema) -> PhysicalLayout {
-        PhysicalLayout::resolve(
-            "vala.bifrost.test",
-            schema,
-            Some(&crate::tables::hourly_layout(
-                vec![crate::tables::sort_asc("wyrd_event_time")],
-                &["wyrd_event_time"],
-            )),
-        )
-        .expect("test schema carries the built-in hourly layout")
     }
 
     /// Builds the origin facts a rotating shard contributes to one member.
@@ -478,7 +507,7 @@ mod tests {
         let frozen = frozen_member(tenant, 512);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
-        let layout = member_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         let member = stager
             .encode_runs(StageMemberRequest {
                 frozen: &frozen,
@@ -503,6 +532,11 @@ mod tests {
             .expect("staged member publishes ready");
         assert_eq!(ready.id(), StagedMemberId::new(5, 9));
         assert_eq!(ready.rows(), 512);
+        assert_eq!(
+            ready.raw_bytes(),
+            u64::try_from(frozen.arrow_bytes).expect("fixture size fits u64"),
+            "the size target counts the frozen bucket's raw Arrow bytes"
+        );
 
         let recovered = stage.recover().await.expect("scan after publication");
         let members = recovered
@@ -534,7 +568,7 @@ mod tests {
         let frozen = frozen_member(tenant, 64);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
-        let layout = member_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         let request = || StageMemberRequest {
             frozen: &frozen,
             binding: &binding,
@@ -573,7 +607,7 @@ mod tests {
         let frozen = frozen_member(tenant, 64);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
-        let layout = member_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         let request = || StageMemberRequest {
             frozen: &frozen,
             binding: &binding,

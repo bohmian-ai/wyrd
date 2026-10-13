@@ -4,56 +4,27 @@ use crate::catalog::TenantTableBinding;
 
 use super::error::ForgeError;
 
-/// Verify that an Iceberg table location belongs to this exact binding and store.
+/// Verify that an Iceberg table location is exactly this binding's table root
+/// in this node's warehouse.
+///
+/// The catalog places every table at `{warehouse}/{object_prefix}`, so any
+/// other location belongs to another binding or another store.
 ///
 /// # Errors
 ///
-/// Returns [`ForgeError::Invariant`] when the location is empty, the binding
-/// prefix is empty, the location uses the prefix as anything other than its
-/// final path segment, or its scheme/authority differs from `store`.
+/// Returns [`ForgeError::Invariant`] when the binding prefix is empty or the
+/// location is not exactly `{warehouse}/{object_prefix}`.
 pub(super) fn validate_table_location(
     binding: &TenantTableBinding,
     table_location: &str,
-    store: &opendal::Operator,
+    warehouse: &str,
 ) -> Result<(), ForgeError> {
-    let location = table_location.trim_end_matches('/');
     let prefix = binding.object_prefix.trim_matches('/');
-    let marker = format!("/{prefix}");
-    if !location.ends_with(&marker) {
+    let expected = format!("{}/{prefix}", warehouse.trim_end_matches('/'));
+    if prefix.is_empty() || table_location.trim_end_matches('/') != expected {
         return Err(ForgeError::Invariant {
             detail: format!(
-                "catalog table location does not match tenant binding: location={table_location}"
-            ),
-        });
-    }
-    if location.is_empty() || prefix.is_empty() {
-        return Err(ForgeError::Invariant {
-            detail: format!(
-                "catalog table location does not match tenant binding: location={table_location}"
-            ),
-        });
-    }
-    let info = store.info();
-    let expected_scheme = match info.scheme() {
-        "fs" => "file",
-        scheme => scheme,
-    };
-    let expected_location = if expected_scheme == "file" {
-        String::new()
-    } else {
-        format!("{expected_scheme}://{}/{prefix}", info.name())
-    };
-    let location_matches_store = if expected_scheme == "file" {
-        location
-            .strip_prefix("file://")
-            .is_some_and(|path| !path.ends_with(&format!("//{prefix}")))
-    } else {
-        location == expected_location
-    };
-    if !location_matches_store {
-        return Err(ForgeError::Invariant {
-            detail: format!(
-                "catalog table location does not exactly match the binding and staging store: {table_location}"
+                "catalog table location does not exactly match the binding and warehouse: {table_location}"
             ),
         });
     }
@@ -69,10 +40,10 @@ pub(super) fn validate_table_location(
 pub(super) fn catalog_path_to_object_key(
     table_location: &str,
     binding: &TenantTableBinding,
-    store: &opendal::Operator,
+    warehouse: &str,
     path: &str,
 ) -> Result<String, ForgeError> {
-    validate_table_location(binding, table_location, store)?;
+    validate_table_location(binding, table_location, warehouse)?;
     if let Some(path) = binding.validate_object_path(path) {
         return Ok(path);
     }
@@ -106,100 +77,77 @@ mod tests {
         .expect("test binding resolves")
     }
 
-    /// Create an in-memory store so scheme and authority checks use live metadata.
-    fn memory_store() -> opendal::Operator {
-        opendal::Operator::new(opendal::services::Memory::default())
-            .expect("memory backend initializes")
-            .finish()
-    }
-
-    /// Create a filesystem store to cover the authority-free `file:///` form.
-    fn filesystem_store(root: &std::path::Path) -> opendal::Operator {
-        let service = opendal::services::Fs::default()
-            .root(root.to_str().expect("temporary path is valid UTF-8"));
-        opendal::Operator::new(service)
-            .expect("filesystem backend initializes")
-            .finish()
-    }
+    /// Warehouse URI the path contract tests place tables under.
+    const WAREHOUSE: &str = "s3://tables";
 
     /// Proves URI and relative forms map to one validated key while confusing
-    /// prefixes, traversal, and a foreign store authority fail closed.
+    /// prefixes, traversal, and a foreign warehouse fail closed.
     #[test]
     fn manifest_candidate_rejects_cross_binding_path() {
         let binding = binding();
-        let store = memory_store();
-        let authority = store.info().name();
-        let location = format!("memory://{authority}/{}", binding.object_prefix);
+        let location = format!("{WAREHOUSE}/{}", binding.object_prefix);
         let catalog_path = format!("{location}/data/part-000.parquet");
         let expected = format!("{}/data/part-000.parquet", binding.object_prefix);
+        let map = |location: &str, path: &str| {
+            catalog_path_to_object_key(location, &binding, WAREHOUSE, path)
+        };
 
         assert_eq!(
-            catalog_path_to_object_key(&location, &binding, &store, &catalog_path)
-                .expect("catalog URI maps"),
+            map(&location, &catalog_path).expect("catalog URI maps"),
             expected
         );
         assert_eq!(
-            catalog_path_to_object_key(&location, &binding, &store, &expected)
-                .expect("relative key maps"),
+            map(&location, &expected).expect("relative key maps"),
             expected
         );
         assert!(
-            catalog_path_to_object_key(
+            map(
                 &location,
-                &binding,
-                &store,
                 &format!(
-                    "memory://{authority}/{}-other/data/part.parquet",
+                    "{WAREHOUSE}/{}-other/data/part.parquet",
                     binding.object_prefix
-                ),
+                )
             )
             .is_err()
         );
         assert!(
-            catalog_path_to_object_key(
+            map(
                 &location,
-                &binding,
-                &store,
                 &format!(
-                    "memory://{authority}/{}/../other/part.parquet",
+                    "{WAREHOUSE}/{}/../other/part.parquet",
                     binding.object_prefix
-                ),
+                )
             )
             .is_err()
         );
         assert!(
-            catalog_path_to_object_key(
-                &format!("memory://foreign/{}", binding.object_prefix),
-                &binding,
-                &store,
-                &catalog_path,
+            map(
+                &format!("s3://foreign/{}", binding.object_prefix),
+                &catalog_path
             )
             .is_err()
         );
         assert!(
-            catalog_path_to_object_key(
-                &format!("memory://{authority}//{}", binding.object_prefix),
-                &binding,
-                &store,
-                &catalog_path,
+            map(
+                &format!("{WAREHOUSE}//{}", binding.object_prefix),
+                &catalog_path
             )
             .is_err(),
             "an extra separator changes the exact table root"
         );
     }
 
-    /// Proves the authority-free filesystem URI maps through the same contract.
+    /// Proves a local warehouse's `file://` table root maps through the same contract.
     #[test]
     fn shared_path_contract_accepts_file_scheme_round_trip() {
         let binding = binding();
-        let root = tempfile::tempdir().expect("temporary root initializes");
-        let store = filesystem_store(root.path());
-        let location = format!("file:///{}", binding.object_prefix);
+        let warehouse = "file:///var/lib/wyrd/warehouse";
+        let location = format!("{warehouse}/{}", binding.object_prefix);
         let catalog_path = format!("{location}/data/part-000.parquet");
         let expected = format!("{}/data/part-000.parquet", binding.object_prefix);
 
         assert_eq!(
-            catalog_path_to_object_key(&location, &binding, &store, &catalog_path)
+            catalog_path_to_object_key(&location, &binding, warehouse, &catalog_path)
                 .expect("file catalog URI maps"),
             expected
         );

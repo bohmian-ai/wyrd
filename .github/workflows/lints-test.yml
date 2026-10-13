@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request supersedes the running checks.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   MISE_LOCKED: "true"
 
@@ -22,10 +27,9 @@ jobs:
       rust_client: ${{ steps.filter.outputs.rust_client }}
       docs: ${{ steps.filter.outputs.docs }}
       ui: ${{ steps.filter.outputs.ui }}
-      bifrost_only: ${{ steps.filter.outputs.bifrost_only }}
       full_gate: ${{ steps.filter.outputs.full_gate }}
       rust_packages: ${{ steps.filter.outputs.rust_packages }}
-      ci_lanes: ${{ steps.filter.outputs.ci_lanes }}
+      ci_jobs: ${{ steps.filter.outputs.ci_jobs }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,6 +43,9 @@ jobs:
           WYRD_CHANGE_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: .github/scripts/detect-changes.sh
 
+  # The full gate's shards already run every Linux lane, so a full-gate change
+  # runs the SDK platform jobs on macOS only; a selected change runs them on
+  # both. Main pushes add the older supported Python versions on Linux.
   matrix-plan:
     name: matrix plan
     needs: changes
@@ -51,60 +58,79 @@ jobs:
       - id: plan
         shell: bash
         run: |
-          echo 'os=["ubuntu-24.04","macos-15"]' >> "$GITHUB_OUTPUT"
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo 'python=["3.12"]' >> "$GITHUB_OUTPUT"
+          if [[ "${{ needs.changes.outputs.full_gate }}" == "true" ]]; then
+            echo 'os=["macos-15"]' >> "$GITHUB_OUTPUT"
+            python='[{"os":"macos-15","python-version":"3.12"}'
           else
-            echo 'python=["3.10","3.11","3.12"]' >> "$GITHUB_OUTPUT"
+            echo 'os=["ubuntu-24.04","macos-15"]' >> "$GITHUB_OUTPUT"
+            python='[{"os":"ubuntu-24.04","python-version":"3.12"},{"os":"macos-15","python-version":"3.12"}'
           fi
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            python+=',{"os":"ubuntu-24.04","python-version":"3.10"},{"os":"ubuntu-24.04","python-version":"3.11"}'
+          fi
+          echo "python=$python]" >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
 
-  # Mixed, global, unclassified, and unresolvable changes take the complete
-  # repository gate. Any other change with selected lanes runs format, lint, the
-  # live boundary checks, and exactly the lanes select-ci.py chose for its
-  # affected packages and journeys, all on Linux; the SDK jobs below cover
-  # Linux and macOS.
-  ci:
-    name: ci
+  # select-ci.py plans the Linux jobs. Mixed, global, unclassified, and
+  # unresolvable changes take the complete gate as one parallel job per
+  # `gate:*` shard in mise.toml, so every lane runs exactly once. Any other
+  # change runs format, lint, the boundary checks, and exactly the lanes
+  # selected for its affected packages, with the identity and storage journeys
+  # as their own jobs when selected.
+  # Compiles the third-party dependency set once, before any shard starts:
+  # building the workspace's tests compiles every dependency with the features
+  # the shards' test builds use, and the cache keeps only those dependencies.
+  # Each shard restores it from the `test` cache instead of compiling it. An
+  # exact cache hit already holds the set, so the build is skipped.
+  deps:
+    name: deps
     needs: changes
-    if: needs.changes.outputs.full_gate == 'true' || needs.changes.outputs.ci_lanes != ''
+    if: needs.changes.outputs.ci_jobs != '[]'
     runs-on: ubuntu-24.04
-    # The full gate needs more than an hour on a cold hosted runner; selected
-    # lanes keep the tighter bound.
-    timeout-minutes: ${{ needs.changes.outputs.full_gate == 'true' && 120 || 60 }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+      - id: setup
+        uses: ./.github/actions/setup-rust-ci
         with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
+          save-cache: always
 
-      - name: Set up mise
-        uses: jdx/mise-action@v3
+      - name: Build the shared dependencies
+        if: steps.setup.outputs.cache-hit != 'true'
+        run: >-
+          mise exec -- cargo build --locked --workspace --tests
+          --exclude wyrd-sdk-python --exclude wyrd-sdk-ts --exclude wyrd-sdk-ts-testing
+
+  ci:
+    name: ci (${{ matrix.job.name }})
+    needs: [changes, deps]
+    if: needs.changes.outputs.ci_jobs != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.changes.outputs.ci_jobs) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          install: true
-          cache: true
+          docker-images: "false"
+          cache-key: ${{ matrix.job.cache }}
+          save-cache: ${{ matrix.job.save && 'true' || 'false' }}
 
       - name: Install uv and Python
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          # Shards that never run uv have nothing to cache.
+          ignore-nothing-to-cache: true
           python-version: "3.12"
 
       - name: Install Rust components
         run: rustup component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt clippy
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
 
       - name: Install system tools
         run: sudo apt-get update && sudo apt-get install -y ripgrep libcurl4-openssl-dev pkg-config
@@ -112,75 +138,20 @@ jobs:
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Run selected CI lanes
+      - name: Run lanes
         env:
           RUST_LOG: info,vala_bifrost_redux::oracle=debug,wyrd_server::http::router=debug
           WYRD_TEST_PACKAGES: ${{ needs.changes.outputs.rust_packages }}
-          CI_LANES: ${{ needs.changes.outputs.ci_lanes }}
+          CI_LANES: ${{ matrix.job.lanes }}
         run: |
-          timed() {
-            local started=$SECONDS
-            echo "::group::mise run $1"
-            mise run "$1"
-            echo "::endgroup::"
-            echo "| \`$1\` | $((SECONDS - started))s |" >> "$GITHUB_STEP_SUMMARY"
-          }
           printf '### Lane timings\n\n| lane | duration |\n| --- | --- |\n' >> "$GITHUB_STEP_SUMMARY"
-          if [[ "${{ needs.changes.outputs.full_gate }}" == "true" ]]; then
-            timed gate
-          else
-            timed check
-            timed check:deps
-            for lane in $CI_LANES; do
-              timed "$lane"
-            done
-          fi
-
-  bifrost:
-    name: bifrost
-    needs: changes
-    if: needs.changes.outputs.bifrost_only == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: Set up mise
-        uses: jdx/mise-action@v3
-        with:
-          install: true
-          cache: true
-
-      - name: Install uv and Python
-        uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
-          python-version: "3.12"
-
-      - name: Install Rust components
-        run: rustup component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt clippy
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      - name: Install system tools
-        run: sudo apt-get update && sudo apt-get install -y ripgrep libcurl4-openssl-dev pkg-config
-
-      - name: Run Bifrost gate
-        run: mise run verify:bifrost
+          for lane in $CI_LANES; do
+            started=$SECONDS
+            echo "::group::mise run $lane"
+            mise run "$lane"
+            echo "::endgroup::"
+            echo "| \`$lane\` | $((SECONDS - started))s |" >> "$GITHUB_STEP_SUMMARY"
+          done
 
   rust-client:
     name: rust client (${{ matrix.os }})
@@ -196,6 +167,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/setup-rust-ci
+        with:
+          save-cache: ${{ runner.os == 'macOS' && 'true' || 'false' }}
 
       - name: Run Rust client and SDK tests
         run: |
@@ -216,6 +189,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/setup-rust-ci
+        with:
+          cache-key: napi
+          save-cache: ${{ runner.os == 'macOS' && 'true' || 'false' }}
 
       - name: Run TypeScript SDK tests
         run: |
@@ -231,27 +207,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(needs.matrix-plan.outputs.os) }}
-        python-version: ${{ fromJSON(needs.matrix-plan.outputs.python) }}
+        include: ${{ fromJSON(needs.matrix-plan.outputs.python) }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space
-        if: runner.os == 'Linux'
-        uses: jlumbroso/free-disk-space@main
-        with:
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: Set up mise
-        uses: jdx/mise-action@v3
-        with:
-          install: true
-          cache: true
+      - uses: ./.github/actions/setup-rust-ci
 
       - name: Install build dependencies (Ubuntu)
         if: runner.os == 'Linux'
@@ -262,14 +222,6 @@ jobs:
       - name: Install libomp on macOS
         if: runner.os == 'macOS'
         run: brew install libomp curl openssl pkg-config
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.os }}-${{ matrix.python-version }}
 
       - name: Install uv and Python
         uses: astral-sh/setup-uv@v6
@@ -305,7 +257,8 @@ jobs:
   docs:
     name: docs
     needs: changes
-    if: needs.changes.outputs.full_gate == 'true' || needs.changes.outputs.docs == 'true'
+    # The full gate's gate:checks shard already runs docs:check.
+    if: needs.changes.outputs.full_gate != 'true' && needs.changes.outputs.docs == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -323,11 +276,8 @@ jobs:
           enable-cache: true
           python-version: "3.12"
 
-      - name: Check docs
+      - name: Check docs (includes docs:a11y)
         run: mise run docs:check
-
-      - name: docs:a11y — landmarks, heading order, contrast, keyboard controls
-        run: mise run docs:a11y
 
   ui:
     name: ui
@@ -357,8 +307,10 @@ jobs:
 
   ci-complete:
     name: ci complete
-    needs: [changes, matrix-plan, ci, bifrost, rust-client, typescript, python, docs, ui]
-    if: always()
+    needs: [changes, matrix-plan, deps, ci, rust-client, typescript, python, docs, ui]
+    # Not always(): a superseded run must stop here, or the next push's run
+    # waits for this job before the concurrency group lets it start.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -370,8 +322,8 @@ jobs:
           .github/scripts/verify-required-jobs.sh
           "${{ needs.changes.result }}"
           "${{ needs.matrix-plan.result }}"
+          "${{ needs.deps.result }}"
           "${{ needs.ci.result }}"
-          "${{ needs.bifrost.result }}"
           "${{ needs.rust-client.result }}"
           "${{ needs.typescript.result }}"
           "${{ needs.python.result }}"

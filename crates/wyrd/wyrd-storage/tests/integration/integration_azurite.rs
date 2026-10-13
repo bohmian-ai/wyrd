@@ -2,21 +2,16 @@
 //!
 //! Run by `test:storage:azurite` (part of `test:storage:matrix`), which selects
 //! the emulator through `WYRD_STORAGE_URL` and `WYRD_STORAGE_ENDPOINT_URL`.
-
-//! Azure Blob signer-layer integration tests against Azurite.
-//!
 //! The client-to-server transfer journey owns block upload and download
-//! coverage. These tests retain Azure-specific planning, cleanup, head, and
-//! capability behavior.
+//! coverage; these tests retain Azure planning, cleanup, head, and capability
+//! behavior.
 
 use std::time::Duration;
 
 use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::{StorageBackendKind, UploadPlan, WireProtocol};
-use wyrd_storage::azure::AzureSigner;
-use wyrd_storage::cloud::CloudSigner;
 use wyrd_storage::error::{AzureError, StorageError};
-use wyrd_storage::settings::{self, BackendConfig};
+use wyrd_storage::settings;
 use wyrd_storage::{BackendSigner, UploadPlanReplayInput, ValidatedPath, factory};
 
 /// Block size used for multipart init and replay plans.
@@ -24,18 +19,18 @@ const BLOCK_SIZE: u64 = 256 * 1024;
 /// Planned block count used for replay plans.
 const BLOCK_COUNT: u32 = 3;
 
-/// Build the Azure signer for the location and endpoint in `WYRD_STORAGE_URL`.
+/// Build the signer for the Azure location and endpoint in `WYRD_STORAGE_URL`.
 ///
 /// # Panics
 /// Panics when the environment does not select Azure or signer construction fails.
-async fn build_signer() -> AzureSigner {
-    let BackendConfig::Azure(config) = settings::from_env().expect("storage settings").backend
-    else {
-        panic!("WYRD_STORAGE_URL must select az://");
-    };
-    factory::azure::build_signer(&config)
-        .await
-        .expect("Azure signer")
+async fn build_signer() -> BackendSigner {
+    let backend = settings::from_env().expect("storage settings").backend;
+    assert_eq!(
+        backend.kind(),
+        StorageBackendKind::Azure,
+        "WYRD_STORAGE_URL must select az://"
+    );
+    factory::build_signer(&backend).await.expect("Azure signer")
 }
 
 /// Tenant- and Card-unique validated path, so concurrent runs against a shared bucket never collide.
@@ -65,19 +60,19 @@ async fn azure_abort_lifecycle() {
         .init_multipart(&path, 1, BLOCK_SIZE, Duration::from_mins(5))
         .await
         .expect("init multipart");
-    match signer.abort_multipart(&path).await {
+    match signer.abort_multipart(&path, "").await {
         Ok(()) => {}
         Err(StorageError::Azure(boxed)) if matches!(*boxed, AzureError::BlobNotFound { .. }) => {}
         Err(error) => panic!("abort multipart: {error}"),
     }
     assert!(matches!(
-        signer.head(&path).await,
+        signer.head_for_verification(&path).await,
         Err(StorageError::Azure(boxed)) if matches!(*boxed, AzureError::BlobNotFound { .. })
     ));
 }
 
-/// Aborting a never-written blob through [`BackendSigner`] must reach
-/// [`AzureSigner`] and fail, not dispatch to a capability mismatch or report
+/// Aborting a never-written blob through [`BackendSigner`] must reach the
+/// Azure delete and fail, not dispatch to a capability mismatch or report
 /// silent success.
 ///
 /// # Panics
@@ -85,14 +80,14 @@ async fn azure_abort_lifecycle() {
 /// dispatch returns `BackendCapabilityMismatch`.
 #[tokio::test]
 async fn azure_abort_on_nonexistent_blob_returns_error() {
-    let backend = BackendSigner::Cloud(Box::new(CloudSigner::Azure(build_signer().await)));
+    let backend = build_signer().await;
     let error = backend
         .abort_multipart(&fresh_path("never-written.bin"), "unused")
         .await
         .expect_err("Azure abort must return Err when no blob exists, not Ok(())");
     assert!(
         !matches!(error, StorageError::BackendCapabilityMismatch { .. }),
-        "Azure abort must dispatch to AzureSigner, not return capability mismatch: {error}"
+        "Azure abort must dispatch to the Azure delete, not return capability mismatch: {error}"
     );
 }
 
@@ -130,7 +125,10 @@ async fn azure_remint_plan_produces_valid_plan() {
 #[tokio::test]
 async fn azure_head_on_missing_returns_blob_not_found() {
     assert!(matches!(
-        build_signer().await.head(&fresh_path("never-written.bin")).await,
+        build_signer()
+            .await
+            .head_for_verification(&fresh_path("never-written.bin"))
+            .await,
         Err(StorageError::Azure(boxed)) if matches!(*boxed, AzureError::BlobNotFound { .. })
     ));
 }
@@ -141,7 +139,7 @@ async fn azure_head_on_missing_returns_blob_not_found() {
 /// Panics when the environment does not select Azure or dispatch returns anything else.
 #[tokio::test]
 async fn azure_capability_mismatch_is_typed_for_presign_part() {
-    let backend = BackendSigner::Cloud(Box::new(CloudSigner::Azure(build_signer().await)));
+    let backend = build_signer().await;
     let result = backend
         .presign_part(
             &fresh_path("capability/object.bin"),

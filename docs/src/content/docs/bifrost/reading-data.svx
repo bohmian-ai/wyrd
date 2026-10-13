@@ -65,7 +65,7 @@ curl --fail-with-body -X POST "$WYRD_SERVER_URL/v1/query" \
   -H "x-wyrd-access-token: Bearer $WYRD_ACCESS_TOKEN" \
   -H "content-type: application/json" \
   -d '{
-    "sql": "SELECT metric_name, time, value, service_name FROM vala.metrics.points WHERE wyrd_event_time >= now() - interval '\''7 days'\''"
+    "sql": "SELECT metric_name, time_unix_nano, value, service_name FROM vala.metrics.points WHERE time_unix_nano >= now() - interval '\''7 days'\''"
   }'
 ```
 
@@ -86,7 +86,7 @@ from wyrd.client import WyrdClient
 
 bifrost = AsyncBifrost(client=WyrdClient(server_url="https://wyrd.example", credential=token))
 stream = await bifrost.stream(
-    'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval \'7 days\'',
+    'SELECT metric_name, time_unix_nano, value, service_name FROM "vala.metrics.points" WHERE time_unix_nano >= now() - interval \'7 days\'',
 )
 rows = []
 async for batch in stream:
@@ -110,7 +110,7 @@ import { Bifrost, WyrdClient } from "@wyrd/sdk";
 const client = WyrdClient.connect({ serverUrl, credential: accessToken });
 const bifrost = await Bifrost.connect({ client });
 const stream = await bifrost.stream(
-  'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval \'7 days\'',
+  'SELECT metric_name, time_unix_nano, value, service_name FROM "vala.metrics.points" WHERE time_unix_nano >= now() - interval \'7 days\'',
 );
 const rows = [];
 for await (const batch of stream) rows.push(...batch.toArray());
@@ -134,7 +134,7 @@ other source in the normal ambient credential chain, before running the query.
 ```bash
 wyrd query \
   --server "$WYRD_SERVER_URL" \
-  --sql 'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval '\''7 days'\''' \
+  --sql 'SELECT metric_name, time_unix_nano, value, service_name FROM "vala.metrics.points" WHERE time_unix_nano >= now() - interval '\''7 days'\''' \
   --format jsonl
 ```
 

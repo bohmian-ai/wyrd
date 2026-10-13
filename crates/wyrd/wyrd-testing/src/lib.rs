@@ -2,6 +2,7 @@
 
 pub mod bifrost;
 pub mod capacity;
+pub mod gateway_capture;
 pub mod human_login;
 pub mod interleaving;
 pub mod keys;
@@ -9,6 +10,7 @@ pub mod load;
 pub mod logs;
 pub mod oidc_fixture;
 pub mod principal;
+pub mod profile;
 pub mod release_server;
 pub mod server;
 pub mod time;

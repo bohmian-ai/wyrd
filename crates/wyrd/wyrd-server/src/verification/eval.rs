@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, ArrayRef, AsArray as _};
-use arrow::datatypes::{DataType, Int32Type, Int64Type, TimestampMicrosecondType};
+use arrow::datatypes::{
+    DataType, Int32Type, Int64Type, TimestampMicrosecondType, TimestampNanosecondType,
+};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -32,10 +34,10 @@ use vala_eval::sampling::RecordSample;
 use vala_eval::{
     EvalExecError, EvalReport, InMemoryTraceSource, JudgeError, JudgeInvoker, MediaBindings,
 };
+use wyrd_queue::variant::variant_cell_to_json;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::agent::AgentSpec;
-
 use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
@@ -57,8 +59,6 @@ use wyrd_sql::queries::cards::{get_card_by_ref, get_card_by_uid};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput, TerminalStatus};
 use wyrd_storage::tenant_path;
 use wyrd_storage::{StorageError, StorageHandle};
-use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValueList, any_value};
-use wyrd_tonic::prost::Message as _;
 
 use super::authority::{SystemReadAuthority, SystemReadAuthorityError, writer_caller};
 use super::engines::{EngineOutcome, VerifierReport};
@@ -156,13 +156,10 @@ impl EvalEngine {
                 )
                 .await
                 .map_err(ReadStart::Authority)?;
-                let record = Box::pin(reader.record(
-                    &run.subject_card_uid.to_string(),
-                    record_id,
-                    *event_time,
-                ))
-                .await
-                .map_err(ReadStart::Record)?;
+                let record = reader
+                    .record(&run.subject_card_uid.to_string(), record_id, *event_time)
+                    .await
+                    .map_err(ReadStart::Record)?;
                 Ok::<_, ReadStart>((reader, record))
             })
             .await;
@@ -222,11 +219,12 @@ impl EvalEngine {
         };
         let traces = InMemoryTraceSource::new();
         if let Some(trace_id) = record.trace_id.filter(|_| needs_trace(spec)) {
-            match Box::pin(telemetry.phase(
-                Phase::InputRead,
-                reader.spans(trace_id, *event_time, self.trace_window),
-            ))
-            .await
+            match telemetry
+                .phase(
+                    Phase::InputRead,
+                    reader.spans(trace_id, *event_time, self.trace_window),
+                )
+                .await
             {
                 Ok(spans) if spans.is_empty() => {
                     return EngineOutcome::AwaitingTrace(failure(
@@ -596,25 +594,27 @@ impl BifrostReader {
     #[tracing::instrument(name = "verification.evidence_read", skip_all)]
     async fn query(&self, sql: String) -> Result<Vec<RecordBatch>, WyrdError> {
         let mut batches = Vec::new();
-        Box::pin(self.waits.wait(self.caller.run_with(
-            BifrostQueryRequest {
-                params: Vec::new(),
-                sql,
-                deadline_ms: i64::try_from(READ_DEADLINE_MS).ok(),
-            },
-            |batch| {
-                batches.push(batch);
-                Ok(())
-            },
-        )))
-        .await?;
+        self.waits
+            .wait(self.caller.run_with(
+                BifrostQueryRequest {
+                    params: Vec::new(),
+                    sql,
+                    deadline_ms: i64::try_from(READ_DEADLINE_MS).ok(),
+                },
+                |batch| {
+                    batches.push(batch);
+                    Ok(())
+                },
+            ))
+            .await?;
         Ok(batches)
     }
 
     /// Read one committed observation of `subject` by its record ID, pruned
-    /// to the UTC day of its frozen server `event_time`, with the managed
-    /// application `run_id` that wrote it (`None` when the row names none)
-    /// and its managed writer `principal_id`.
+    /// to the UTC day of its `created_at`, the table's time column, which the
+    /// run froze as `event_time`, with the managed application `run_id` that
+    /// wrote it (`None` when the row names none) and its managed writer
+    /// `principal_id`.
     ///
     /// # Errors
     /// Returns [`ReadError::Admission`] when Bifrost refuses the read at
@@ -627,16 +627,16 @@ impl BifrostReader {
         event_time: DateTime<Utc>,
     ) -> Result<(EvalRecordObservation, Option<RunId>, Option<String>), ReadError> {
         let (start, end) = utc_day(event_time);
-        let batches = Box::pin(self.query(format!(
+        let batches = self.query(format!(
             "SELECT record_id, session_id, context, trace_id, span_id, created_at, media, run_id, principal_id \
                  FROM vala.eval.observations \
                  WHERE card_uid = '{}' AND record_id = '{}' \
-                   AND wyrd_event_time >= TIMESTAMP '{start}' \
-                   AND wyrd_event_time < TIMESTAMP '{end}' \
+                   AND created_at >= TIMESTAMP '{start}' \
+                   AND created_at < TIMESTAMP '{end}' \
                  LIMIT 1",
             quoted(subject),
             quoted(record_id),
-        )))
+        ))
         .await?;
         let batch = batches
             .iter()
@@ -666,29 +666,32 @@ impl BifrostReader {
             .map(|at| at.is_valid(0).then(|| at.value(0)))?
             .and_then(DateTime::<Utc>::from_timestamp_micros)
             .ok_or("created_at is missing")?;
-        let json_text = |name| -> Result<Value, String> {
-            text(batch, name, 0)?
-                .map(|raw| serde_json::from_str(&raw).map_err(|error| error.to_string()))
-                .transpose()
-                .map(Option::unwrap_or_default)
+        let variant = |name: &str| -> Result<Value, String> {
+            let column = batch
+                .column_by_name(name)
+                .ok_or_else(|| format!("{name} is missing"))?;
+            variant_cell_to_json(column.as_ref(), 0).map_err(|_| format!("{name} does not decode"))
         };
         let run_id = text(batch, "run_id", 0)?.map(RunId::from_string);
         let record = serde_json::from_value(json!({
             "record_id": text(batch, "record_id", 0)?,
             "session_id": text(batch, "session_id", 0)?,
-            "context": json_text("context")?,
+            "context": variant("context")?,
             "trace_id": trace_id.map(|id| id.to_hex()),
             "span_id": span_id.map(|id| id.to_hex()),
             "created_at": created_at,
-            "media": json_text("media")?,
+            "media": variant("media")?,
         }))
         .map_err(|error| format!("record {record_id} does not decode: {error}"))?;
         Ok((record, run_id, text(batch, "principal_id", 0)?))
     }
 
-    /// Read the visible spans of `trace_id` received from the start of the
-    /// day before the record's day to the end of the day containing
+    /// Read the visible spans of `trace_id` that started from the start of
+    /// the day before the record's day to the end of the day containing
     /// `event_time + window`, in start-time then span-ID order.
+    ///
+    /// The range is on `start_time_unix_nano`, the span table's time column,
+    /// so it prunes to the partitions and files the range covers.
     ///
     /// The one total order makes positional selectors such as `$.spans[0]`
     /// reproducible across retries and restarts. At most
@@ -712,21 +715,22 @@ impl BifrostReader {
                 .checked_add_signed(window)
                 .ok_or("the trace window is out of range")?,
         );
-        let batches = match Box::pin(self.query(format!(
-            "SELECT span_id, parent_span_id, trace_state, flags, name, kind, \
+        let batches = match self
+            .query(format!(
+                "SELECT span_id, parent_span_id, trace_state, flags, name, kind, \
                         start_time_unix_nano, end_time_unix_nano, status_code, status_message, \
                         attributes, dropped_attributes_count, events, dropped_events_count, \
                         links, dropped_links_count, scope_name, service_name \
                  FROM vala.traces.spans \
                  WHERE trace_id = X'{}' \
-                   AND wyrd_event_time >= TIMESTAMP '{start}' \
-                   AND wyrd_event_time < TIMESTAMP '{end}' \
+                   AND start_time_unix_nano >= TIMESTAMP '{start}' \
+                   AND start_time_unix_nano < TIMESTAMP '{end}' \
                  ORDER BY start_time_unix_nano, span_id \
                  LIMIT {}",
-            trace_id.to_hex(),
-            TRACE_SPAN_LIMIT + 1,
-        )))
-        .await
+                trace_id.to_hex(),
+                TRACE_SPAN_LIMIT + 1,
+            ))
+            .await
         {
             Ok(batches) => batches,
             // A tenant's span table is created by its first export, so its
@@ -766,8 +770,7 @@ fn span(batch: &RecordBatch, row: usize, trace_id: TraceId) -> Result<SpanRecord
             .transpose()
     };
     let nanos = |name| -> Result<DateTime<Utc>, String> {
-        let value = int64(batch, name, row)?.ok_or_else(|| format!("{name} is missing"))?;
-        Ok(DateTime::<Utc>::from_timestamp_nanos(value))
+        instant(batch, name, row)?.ok_or_else(|| format!("{name} is missing"))
     };
     let (start_time, end_time) = (nanos("start_time_unix_nano")?, nanos("end_time_unix_nano")?);
     let status = match int32(batch, "status_code", row)? {
@@ -823,9 +826,8 @@ fn span(batch: &RecordBatch, row: usize, trace_id: TraceId) -> Result<SpanRecord
 /// Returns a description of a missing or malformed field.
 fn event(items: &RecordBatch, row: usize) -> Result<SpanEvent, String> {
     Ok(SpanEvent {
-        timestamp: DateTime::<Utc>::from_timestamp_nanos(
-            int64(items, "time_unix_nano", row)?.ok_or("event time_unix_nano is missing")?,
-        ),
+        timestamp: instant(items, "time_unix_nano", row)?
+            .ok_or("event time_unix_nano is missing")?,
         name: text(items, "name", row)?.unwrap_or_default(),
         attributes: attribute_column(items, "attributes", row)?,
         dropped_attributes_count: count(items, "dropped_attributes_count", row)?,
@@ -887,17 +889,30 @@ fn nested<T>(
         .collect()
 }
 
-/// The canonical attribute payload in column `name` at `row` as JSON; a null
-/// payload is empty.
+/// The Variant attribute object in column `name` at `row` as JSON; a null
+/// value is empty.
+///
+/// Bytes values render as base64 text and integers keep their exact value.
 ///
 /// # Errors
-/// Returns the column or protobuf decode failure.
+/// Returns a description when the column is absent, is not Variant storage,
+/// the value does not decode, or the value is not an object.
 fn attribute_column(
     batch: &RecordBatch,
     name: &str,
     row: usize,
 ) -> Result<Map<String, Value>, String> {
-    bytes(batch, name, row)?.map_or_else(|| Ok(Map::new()), |raw| attributes(&raw))
+    let column = batch
+        .column_by_name(name)
+        .ok_or_else(|| format!("column {name} is missing"))?;
+    let ordinal = u64::try_from(row).unwrap_or(u64::MAX);
+    match variant_cell_to_json(column.as_ref(), row)
+        .map_err(|violation| violation.into_error(name, ordinal).to_string())?
+    {
+        Value::Null => Ok(Map::new()),
+        Value::Object(attributes) => Ok(attributes),
+        _ => Err(format!("column {name} does not hold an attribute object")),
+    }
 }
 
 /// Non-negative 32-bit count in 64-bit column `name` at `row`; null is zero.
@@ -907,46 +922,6 @@ fn attribute_column(
 fn count(batch: &RecordBatch, name: &str, row: usize) -> Result<u32, String> {
     u32::try_from(int64(batch, name, row)?.unwrap_or_default())
         .map_err(|_| format!("column {name} is not a 32-bit count"))
-}
-
-/// Decode a canonical `KeyValueList` attribute payload into JSON.
-///
-/// # Errors
-/// Returns the protobuf decode failure.
-fn attributes(raw: &[u8]) -> Result<Map<String, Value>, String> {
-    Ok(KeyValueList::decode(raw)
-        .map_err(|error| error.to_string())?
-        .values
-        .into_iter()
-        .map(|entry| (entry.key, any_json(entry.value)))
-        .collect())
-}
-
-/// One OTLP `AnyValue` as JSON; bytes become base64 text.
-fn any_json(value: Option<AnyValue>) -> Value {
-    match value.and_then(|value| value.value) {
-        None => Value::Null,
-        Some(any_value::Value::StringValue(text)) => Value::String(text),
-        Some(any_value::Value::BoolValue(flag)) => Value::Bool(flag),
-        Some(any_value::Value::IntValue(number)) => Value::from(number),
-        Some(any_value::Value::DoubleValue(number)) => Value::from(number),
-        Some(any_value::Value::BytesValue(raw)) => {
-            Value::String(base64::engine::general_purpose::STANDARD.encode(raw))
-        }
-        Some(any_value::Value::ArrayValue(array)) => Value::Array(
-            array
-                .values
-                .into_iter()
-                .map(|item| any_json(Some(item)))
-                .collect(),
-        ),
-        Some(any_value::Value::KvlistValue(list)) => Value::Object(
-            list.values
-                .into_iter()
-                .map(|entry| (entry.key, any_json(entry.value)))
-                .collect(),
-        ),
-    }
 }
 
 /// The UTC day containing `at`, as `[start, end)` SQL timestamp literals.
@@ -1024,6 +999,23 @@ fn int64(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<i64>, Str
         .as_primitive_opt::<Int64Type>()
         .ok_or_else(|| format!("column {name} is not a 64-bit integer"))?;
     Ok(column.is_valid(row).then(|| column.value(row)))
+}
+
+/// UTC instant of the nanosecond timestamp column `name` at `row`, `None`
+/// when null.
+///
+/// Span start, end and event times are stored as OTLP instants
+/// (`Timestamp(Nanosecond, "UTC")`), not as raw integers.
+///
+/// # Errors
+/// Returns the column failure or a column that is not a nanosecond timestamp.
+fn instant(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<DateTime<Utc>>, String> {
+    let column = column(batch, name)?
+        .as_primitive_opt::<TimestampNanosecondType>()
+        .ok_or_else(|| format!("column {name} is not a nanosecond timestamp"))?;
+    Ok(column
+        .is_valid(row)
+        .then(|| DateTime::<Utc>::from_timestamp_nanos(column.value(row))))
 }
 
 /// 32-bit integer value of column `name` at `row`, `None` when null.
@@ -1274,17 +1266,17 @@ fn supported(kind: skald_spec::MediaKind, mime: &str) -> bool {
 mod tests {
     use std::sync::Arc;
 
-    use opendal::raw::{
-        Access, Layer, LayeredAccess, OpList, OpRead, OpStat, OpWrite, RpDelete, RpList, RpRead,
-        RpStat, RpWrite,
+    use futures_util::stream::BoxStream;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
     use vala_eval::JudgeError;
     use vala_eval::orchestrator::MediaResolver;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::vala::eval::media::MediaRef as EvalMediaRef;
-    use wyrd_storage::{
-        BackendConfig, BackendSigner, LocalSigner, StorageHandle, StorageSettings, tenant_path,
-    };
+    use wyrd_storage::{BackendConfig, LocalSigner, StorageHandle, StorageSettings, tenant_path};
 
     use wyrd_spec::ids::VerificationRunId;
 
@@ -1349,9 +1341,9 @@ mod tests {
     #[tokio::test]
     async fn media_resolves_only_authorized_bounded_supported_objects() {
         let root = tempfile::tempdir().expect("temp dir");
-        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(
+        let storage = Arc::new(StorageHandle::new(
             LocalSigner::new(root.path().to_path_buf()).expect("local signer"),
-        )));
+        ));
         let tenant = DataTenantId::new_v7();
         let card = uuid::Uuid::now_v7();
         let object = |name: &str| format!("{tenant}/cards/{card}/{name}");
@@ -1405,20 +1397,22 @@ mod tests {
 
     /// A media URI's private object key reaches neither the judge error nor
     /// the log: an absent object, a foreign tenant's object, and a storage
-    /// read failure (the key names a directory) each yield only the binding
+    /// read failure (the key's parent is a regular file) each yield only the binding
     /// ID and a fixed category, and a read failure stays retryable.
     #[tokio::test]
     async fn media_failures_name_only_the_binding_and_a_category() {
         let logs = Logs::default();
         let _capture = logs.capture();
         let root = tempfile::tempdir().expect("temp dir");
-        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(
+        let storage = Arc::new(StorageHandle::new(
             LocalSigner::new(root.path().to_path_buf()).expect("local signer"),
-        )));
+        ));
         let tenant = DataTenantId::new_v7();
         let card = uuid::Uuid::now_v7();
-        let directory = format!("{tenant}/cards/{card}/{LOCATOR_SENTINEL}-dir.png");
-        std::fs::create_dir_all(root.path().join(&directory)).expect("the directory exists");
+        let parent = format!("{tenant}/cards/{card}/{LOCATOR_SENTINEL}-file");
+        std::fs::create_dir_all(root.path().join(format!("{tenant}/cards/{card}")))
+            .expect("the card directory exists");
+        std::fs::write(root.path().join(&parent), b"x").expect("the parent file exists");
         let media = TenantMedia { storage, tenant };
 
         let mut reasons = Vec::new();
@@ -1434,7 +1428,7 @@ mod tests {
                 ),
                 false,
             ),
-            (format!("file:///{directory}"), true),
+            (format!("file:///{parent}/x.png"), true),
         ] {
             let reason = match media.resolve(&descriptor(&uri, "image/png")).await {
                 Err(JudgeError::Terminal { reason }) if !retryable => reason,
@@ -1484,66 +1478,106 @@ mod tests {
         );
     }
 
-    /// Test layer whose `stat` reports every object as one byte long while
+    /// Test store whose `HEAD` reports every object as one byte long while
     /// reads return the real body: the metadata a replaced or stale object
     /// presents between a size check and the read that follows it.
-    #[derive(Debug, Clone, Copy)]
-    struct UndersizedStat;
+    #[derive(Debug)]
+    struct UndersizedHead(Arc<dyn ObjectStore>);
 
-    impl<A: Access> Layer<A> for UndersizedStat {
-        type LayeredAccess = UndersizedStatAccess<A>;
-
-        /// Wrap `inner` so only its metadata lies.
-        fn layer(&self, inner: A) -> Self::LayeredAccess {
-            UndersizedStatAccess(inner)
+    impl std::fmt::Display for UndersizedHead {
+        /// Names the wrapper and the store it wraps.
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "UndersizedHead({})", self.0)
         }
     }
 
-    /// Accessor of [`UndersizedStat`]: forwards everything except `stat`.
-    #[derive(Debug)]
-    struct UndersizedStatAccess<A>(A);
-
-    impl<A: Access> LayeredAccess for UndersizedStatAccess<A> {
-        type Inner = A;
-        type Reader = A::Reader;
-        type Writer = A::Writer;
-        type Lister = A::Lister;
-        type Deleter = A::Deleter;
-        type Copier = A::Copier;
-
-        /// The wrapped accessor.
-        fn inner(&self) -> &A {
-            &self.0
+    #[async_trait::async_trait]
+    impl ObjectStore for UndersizedHead {
+        /// Forward the put unchanged.
+        ///
+        /// # Errors
+        /// Returns the wrapped store's error.
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.0.put_opts(location, payload, opts).await
         }
 
-        /// Forward the read unchanged, so the real body is returned.
-        async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, A::Reader)> {
-            self.0.read(path, args).await
+        /// Forward the multipart upload unchanged.
+        ///
+        /// # Errors
+        /// Returns the wrapped store's error.
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.0.put_multipart_opts(location, opts).await
         }
 
-        /// Forward the write unchanged.
-        async fn write(&self, path: &str, args: OpWrite) -> opendal::Result<(RpWrite, A::Writer)> {
-            self.0.write(path, args).await
+        /// Forward the get, reporting a one-byte size on a `HEAD` while a
+        /// body read returns the real bytes.
+        ///
+        /// # Errors
+        /// Returns the wrapped store's error.
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let head = options.head;
+            let mut result = self.0.get_opts(location, options).await?;
+            if head {
+                result.meta.size = 1;
+            }
+            Ok(result)
         }
 
-        /// Forward the delete unchanged.
-        async fn delete(&self) -> opendal::Result<(RpDelete, A::Deleter)> {
-            self.0.delete().await
+        /// Forward deletes unchanged.
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.0.delete_stream(locations)
         }
 
         /// Forward the listing unchanged.
-        async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, A::Lister)> {
-            self.0.list(path, args).await
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.0.list(prefix)
         }
 
-        /// Report the real metadata with a one-byte content length.
-        async fn stat(&self, path: &str, args: OpStat) -> opendal::Result<RpStat> {
-            let metadata = self.0.stat(path, args).await?.into_metadata();
-            Ok(RpStat::new(metadata.with_content_length(1)))
+        /// Forward the delimited listing unchanged.
+        ///
+        /// # Errors
+        /// Returns the wrapped store's error.
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.0.list_with_delimiter(prefix).await
+        }
+
+        /// Forward the copy unchanged.
+        ///
+        /// # Errors
+        /// Returns the wrapped store's error.
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.0.copy_opts(from, to, options).await
         }
     }
 
-    /// Metadata is not the authority for media size: an object whose `stat`
+    /// Metadata is not the authority for media size: an object whose `HEAD`
     /// reports one byte while its body exceeds [`MEDIA_LIMIT_BYTES`] is
     /// refused as a terminal input error from a body read that stops at the
     /// limit plus one byte, so no provider call can receive it.
@@ -1553,10 +1587,9 @@ mod tests {
         let backend = BackendConfig::Local {
             root: root.path().to_path_buf(),
         };
-        let operator = wyrd_storage::factory::build_operator(&backend)
-            .expect("the local operator builds")
-            .layer(UndersizedStat);
-        let storage = StorageHandle::from_settings_with_operator(
+        let local = object_store::local::LocalFileSystem::new_with_prefix(root.path())
+            .expect("the local store builds");
+        let storage = StorageHandle::from_settings_with_store(
             StorageSettings {
                 backend,
                 require_encryption: false,
@@ -1564,7 +1597,7 @@ mod tests {
                 part_size_bytes: 16 * 1024 * 1024,
                 multipart_threshold_bytes: 100 * 1024 * 1024,
             },
-            operator,
+            Arc::new(UndersizedHead(Arc::new(local))),
         )
         .await
         .expect("the storage handle builds");

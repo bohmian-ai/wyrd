@@ -103,7 +103,24 @@ const FIXTURE_ROWS: i64 = 12;
 /// Number of distinct `filter_key` groups the fixture rows fall into.
 const FIXTURE_GROUPS: i64 = 3;
 
+/// Number of published objects every fixture table is written as.
+///
+/// One published object is one file group and one partition; with an inexact
+/// row count and trusted row estimates no repartition is added, so its scan
+/// has no stage boundary and stays Interactive. Every journey here therefore
+/// needs at least two objects to run Analytical.
+const FIXTURE_OBJECTS: i64 = 2;
+
 /// Writes and publishes one fixture table on the cluster's ingest node.
+///
+/// Ids `0..FIXTURE_ROWS` are split evenly across [`FIXTURE_OBJECTS`] writes,
+/// each flushed into its own published object; every object holds every
+/// `filter_key` group, so totals and group counts match a single write.
+///
+/// # Errors
+///
+/// Returns missing-ingest-node, registration, credential, append, flush, or
+/// Oracle membership-refresh failures while preparing the published fixture.
 async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, JourneyError> {
     let ingest = cluster
         .servers()
@@ -113,15 +130,19 @@ async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, J
     let table = unique_table(prefix);
     register_table(ingest, tenant, &table).await?;
     let rows = writer(ingest, &format!("{prefix}-writer")).await?;
-    rows.write(
-        &format!("vala.bifrost.{table}"),
-        &journey_schema(),
-        (0..FIXTURE_ROWS)
-            .map(|id| journey_row(id, &format!("group_{}", id % FIXTURE_GROUPS)))
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-    ingest.flush_bifrost().await?;
+    let per_object = FIXTURE_ROWS / FIXTURE_OBJECTS;
+    for object in 0..FIXTURE_OBJECTS {
+        let start = object * per_object;
+        rows.write(
+            &format!("vala.bifrost.{table}"),
+            &journey_schema(),
+            (start..start + per_object)
+                .map(|id| journey_row(id, &format!("group_{}", id % FIXTURE_GROUPS)))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        ingest.flush_bifrost().await?;
+    }
     cluster.refresh_oracle_snapshots().await?;
     Ok(table)
 }
@@ -241,8 +262,9 @@ async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
             .ok_or("Oracle composed no Analytical handle")?,
     );
     let supervisor = Arc::clone(handle.supervisor());
-    // Only a statement carrying a shuffle classifies Analytical; a projection
-    // scan of one cut settles Interactive and has no attempt to lease.
+    // The seeded table spans two published objects, so the distributed
+    // planner splits its scan across tasks and the statement has an
+    // Analytical attempt to lease.
     let sql = format!("SELECT filter_key, count(*) FROM vala.bifrost.{table} GROUP BY filter_key");
 
     let (_session, ownership) = engine
@@ -262,16 +284,9 @@ async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
     );
     if supervisor
         .finish_attempt(stale, AnalyticalAttemptOutcome::Cancelled)
-        .await
         .is_ok()
     {
         return Err("a stale attempt settled work it never owned".into());
-    }
-    if supervisor
-        .retain_driver(stale, tokio::spawn(async {}))
-        .is_ok()
-    {
-        return Err("a stale attempt attached a driver".into());
     }
 
     // A sibling graph under the same public query: a different private plan
@@ -288,16 +303,9 @@ async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
     }
     if supervisor
         .finish_attempt(sibling, AnalyticalAttemptOutcome::Cancelled)
-        .await
         .is_ok()
     {
         return Err("a sibling graph settled this graph's attempt".into());
-    }
-    if supervisor
-        .retain_driver(sibling, tokio::spawn(async {}))
-        .is_ok()
-    {
-        return Err("a sibling graph attached a driver to this graph".into());
     }
 
     // The refusals changed nothing: the real attempt is still live and still
@@ -406,12 +414,10 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
         )
         .into());
     }
-    // The exchange is read from a grouped statement of its own rather than from
-    // either scan above. A projection scan of one cut is entirely
-    // leader-executable, so the single planner returns a normal root for it and
-    // the query settles Interactive; only a statement carrying a shuffle
-    // produces the follower stages whose result data this claim is about. The
-    // same seeded cut is read either way, so this is the same physical source.
+    // The exchange is read from a grouped statement of its own, whose
+    // follower stages return partial aggregates over the network boundary.
+    // The same seeded cut is read either way, so this is the same physical
+    // source.
     let exchange_checkpoint = cluster
         .telemetry()
         .checkpoint()
@@ -445,9 +451,8 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
         .into());
     }
 
-    // Qualified spill: the attempt's own runtime, not a process default.
-    // Only a statement carrying a shuffle classifies Analytical; a projection
-    // scan of one cut settles Interactive and has no attempt to lease.
+    // Qualified spill: the attempt's own runtime, not a process default. The
+    // two-object table distributes, so the statement has an attempt to lease.
     let sql = format!("SELECT filter_key, count(*) FROM vala.bifrost.{table} GROUP BY filter_key");
     let (session, ownership) = engine
         .lease_analytical_attempt(query_context(tenant)?, request(&sql))

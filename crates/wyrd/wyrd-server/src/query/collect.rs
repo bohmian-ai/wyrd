@@ -10,7 +10,7 @@
 //! Oracle controls it calls; each surface keeps only its own argument parsing
 //! and error projection.
 
-#[cfg(feature = "test-support")]
+use std::pin::pin;
 use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{OracleQueryStream, QueryIpcDecoder};
+use wyrd_queue::variant::WyrdJsonEncoderFactory;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -299,17 +300,23 @@ impl BoundedQuery {
             .clone();
         let tenant = caller.data_tenant_id;
         let request_id = caller.request_id.clone();
-        let open =
-            super::service::stream_query(self.state.clone(), caller, arguments.to_request(), None);
-        let stream = controls
-            .open_cancellable(
-                open,
-                tenant,
-                &request_id,
-                arguments.deadline_ms.map(i64::from),
-                cancel,
-            )
-            .await?;
+        let stream = {
+            let open = pin!(super::service::stream_query(
+                self.state.clone(),
+                caller,
+                arguments.to_request(),
+                None,
+            ));
+            controls
+                .open_cancellable(
+                    open,
+                    tenant,
+                    &request_id,
+                    arguments.deadline_ms.map(i64::from),
+                    cancel,
+                )
+                .await?
+        };
         #[cfg(feature = "test-support")]
         let mut stream = stream;
         let settlement = Some((controls, tenant, request_id));
@@ -490,14 +497,7 @@ impl ResultCollector {
                     }
                     if frame.outcome == QueryTerminalOutcome::Failed {
                         *observed = Some(frame.clone());
-                        return Err(frame.error.as_ref().map_or(
-                            WyrdError::from(ValaError::QueryExecutionFailed),
-                            |error| {
-                                WyrdError::from(super::service::terminal_error_to_bifrost(
-                                    error.code,
-                                ))
-                            },
-                        ));
+                        return Err(super::service::terminal_error(frame.error.as_deref()));
                     }
                     if let Err(error) = ipc.accept_eos(&frame.arrow_ipc_eos) {
                         stream.request_cancel();
@@ -540,7 +540,8 @@ impl ResultCollector {
             return Err(ValaError::QueryResultTooLarge.into());
         }
         let schema = batch.schema();
-        let options = EncoderOptions::default();
+        let options =
+            EncoderOptions::default().with_encoder_factory(Arc::new(WyrdJsonEncoderFactory));
         let mut encoders = Vec::with_capacity(batch.num_columns());
         for (field, array) in schema.fields().iter().zip(batch.columns()) {
             encoders.push(
@@ -667,8 +668,7 @@ mod tests {
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::api::{
         QueryBatchFrame, QueryClass, QuerySchemaFrame, QuerySource, QueryStreamFrame,
-        QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
-        SourceCompletion, SourceCompletionOutcome,
+        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
     };
 
     /// One synthetic batch carrying every shape the projection must survive.
@@ -808,10 +808,9 @@ mod tests {
                     "EOS" => terminal.arrow_ipc_eos = vec![1],
                     "failed" => {
                         terminal.outcome = QueryTerminalOutcome::Failed;
-                        terminal.error = Some(QueryTerminalError {
-                            code: QueryTerminalErrorCode::QueryTimeout,
-                            detail: None,
-                        });
+                        terminal.error = Some(Box::new(
+                            WyrdError::from(BifrostError::QueryTimeout).problem(),
+                        ));
                         terminal.arrow_ipc_eos.clear();
                     }
                     "duplicate" => frames.push(frames[2].clone()),

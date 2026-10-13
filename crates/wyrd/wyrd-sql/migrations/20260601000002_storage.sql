@@ -10,8 +10,7 @@ CREATE TABLE wyrd.storage_multipart_uploads (
     backend                TEXT        NOT NULL CHECK (backend IN ('local', 's3', 'gcs', 'azure')),
     wire_protocol          TEXT        NOT NULL CHECK (wire_protocol IN (
                                       'single_put_v1',
-                                      's3_multipart_v1',
-                                      'gcs_resumable_v1',
+                                      'multipart_v1',
                                       'azure_block_blob_v1',
                                       'local_fs_v1'
                                   )),

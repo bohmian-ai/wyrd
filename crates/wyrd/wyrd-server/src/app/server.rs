@@ -614,6 +614,19 @@ impl BoundServer {
                 },
             ));
         }
+        // Oracle's cut cache serves only while this listener hears every
+        // `vala.file_list` change, so it runs wherever Oracle plans queries.
+        if self.state.bifrost.oracle_peer_service().is_some()
+            && let Some(catalog) = self.state.bifrost.catalog().map(Arc::clone)
+        {
+            let shutdown = shutdown.clone();
+            set.spawn(worker_task(
+                TaskId::Worker("oracle_cut_cache"),
+                async move {
+                    catalog.watch_cuts(shutdown).await;
+                },
+            ));
+        }
         if let Some(handle) = spawn_storage_sweeper(&self.state, shutdown.clone())
             .map_err(|e| BootExit::Other(Box::new(e)))?
         {
@@ -903,17 +916,17 @@ impl BoundServer {
                 Ok(report) => (report, None),
                 Err(error) => {
                     tracing::warn!(%error, "Bifrost shutdown did not complete cleanly");
-                    bifrost.abort().await;
+                    bifrost.abort();
                     (BifrostShutdownReport::none_drained(), Some(error))
                 }
             }
         } else {
             // The supervisor drain consumed the whole budget. That is a process
             // lifecycle failure, not a clean teardown: nothing drained and the
-            // storage owner is only settled by the awaited abort below, so
-            // reporting success here would let a pod exit claiming a drain it
-            // never ran.
-            bifrost.abort().await;
+            // roles are only cancelled by the abort below, so reporting
+            // success here would let a pod exit claiming a drain it never
+            // ran.
+            bifrost.abort();
             (
                 BifrostShutdownReport::none_drained(),
                 Some(wyrd_spec::vala::error::BifrostError::Internal {
@@ -967,7 +980,7 @@ mod pg_tests {
     use tempfile::tempdir;
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
-    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+    use wyrd_storage::{LocalSigner, StorageHandle};
 
     use super::*;
     use crate::components::auth::ServerAuth;
@@ -1000,7 +1013,7 @@ mod pg_tests {
             "wyrd",
             WyrdAuthVerifySettings::default(),
         ));
-        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
+        let storage = Arc::new(StorageHandle::new(signer));
         let shutdown = tokio_util::sync::CancellationToken::new();
         let bifrost = crate::state::Bifrost::test_shell(Arc::clone(&verifier));
         AppState::new(postgres, storage, bifrost, shutdown).with_auth(ServerAuth {

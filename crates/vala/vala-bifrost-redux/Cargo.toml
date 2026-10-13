@@ -23,11 +23,16 @@ required-features = ["test-support"]
 default = []
 bench-support = []
 test-support = []
+# Cloud object stores, enabled with `wyrd-storage/cloud` by the server.
+cloud = ["wyrd-storage/cloud"]
 
 [dependencies]
 metrics.workspace = true
+mini-moka = { workspace = true }
 num-traits = { workspace = true }
 wyrd-spec = { workspace = true }
+wyrd-queue = { workspace = true }
+wyrd-types = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-sql = { workspace = true }
 wyrd-storage = { workspace = true }
@@ -39,17 +44,17 @@ arc-swap = { workspace = true }
 futures-util = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-opentelemetry = { workspace = true }
-tracing-opentelemetry = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 arrow = { workspace = true }
+arrow-schema = { workspace = true }
 parquet = { workspace = true, features = ["async"] }
+parquet-variant = { workspace = true }
+parquet-variant-compute = { workspace = true }
 iceberg = { workspace = true }
 iceberg-datafusion = { workspace = true }
-iceberg-storage-opendal = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
 iceberg-compaction-core = { workspace = true }
 typetag = { workspace = true }
@@ -59,9 +64,10 @@ http = { workspace = true }
 http-body = { workspace = true }
 tower = { workspace = true }
 url = { workspace = true }
-datafusion = { workspace = true }
+datafusion = { workspace = true, features = ["variant"] }
+datafusion-datasource = { workspace = true }
 datafusion-proto = { workspace = true }
-opendal = { workspace = true }
+object_store = { workspace = true }
 crc32c = { workspace = true }
 rustix = { workspace = true }
 blake3 = { workspace = true }
@@ -70,6 +76,7 @@ base64 = { workspace = true }
 secrecy = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["server", "client"] }
+prost = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
 # The Iceberg SQL catalog opens its own Postgres pool on this sqlx; without a
@@ -81,6 +88,7 @@ rayon = { workspace = true }
 rand = "0.8"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+pin-project = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]

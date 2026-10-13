@@ -70,6 +70,7 @@ markers = [
     "tensorflow: marks TensorFlow tests that run in the dedicated TensorFlow task",
     "integration: marks tests that require a live WyrdTestServer and run in the gated integration lane",
     "identity: marks integration journeys that need the identity lane's Keycloak; only test:identity:journey runs them",
+    "local_dev: marks integration journeys that run the built wyrd and wyrd-server binaries; only test:local-dev:journey builds and runs them",
     "smoke: marks opt-in live provider smoke tests that need operator credentials and real upstreams",
 ]
 
@@ -100,3 +101,13 @@ unused-ignore-comment = "error"
 
 [tool.uv]
 package = false
+
+# Linux takes the CPU-only torch build: no test uses a GPU, and the default
+# Linux wheel pulls about 3 GB of CUDA libraries into every environment.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

@@ -18,27 +18,35 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    StructArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use arrow::ipc::writer::StreamWriter;
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::TryStreamExt as _;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{
     Catalog, Error as IcebergError, ErrorKind as IcebergErrorKind, Namespace, NamespaceIdent,
     TableCommit, TableCreation, TableIdent,
 };
-use opendal::{Buffer, Entry, Metadata, Operator};
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectMeta, ObjectStoreExt as _};
 use secrecy::ExposeSecret as _;
+use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{
-    BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
+    BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding, warehouse_uri,
 };
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeError,
-    ForgeObjectStore, ForgeRoleReadiness, ForgeSchedulerTrigger, ForgeTelemetry, ForgeWorker,
-    ForgeWorkerCompletionObserver, ForgeWorkerConfig,
+    ForgeObjectPages, ForgeObjectStore, ForgeObjects, ForgeRoleReadiness, ForgeSchedulerTrigger,
+    ForgeTelemetry, ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -53,14 +61,17 @@ use vala_bifrost_redux::scribe::{
     ScribeIngressCpuPool, ScribePersistenceConfig, ScribePersistenceCpuPool, ScribePressureConfig,
     ScribeWalIoPool,
 };
+use vala_bifrost_redux::storage::BifrostStorage;
 use vala_sql::OperatorPool;
 use vala_sql::queries::forge_tasks::ForgeTasks;
-use vala_sql::queries::oracle_reader_authority::{AcquiredTableCut, ActiveReadOwner};
+use vala_sql::queries::oracle_reader_authority::TableCut;
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use wyrd_bench::BenchmarkRecorder;
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::DataTenantId;
 use wyrd_telemetry::{TelemetryGuard, TestTraceCapture};
+use wyrd_types::variant::is_variant;
 
 /// Bounded wait every fixture handshake uses instead of a sleep.
 const FIXTURE_BOUND: Duration = Duration::from_secs(30);
@@ -68,15 +79,13 @@ const FIXTURE_BOUND: Duration = Duration::from_secs(30);
 /// Object-store seam that delegates every call and counts what promotion did.
 ///
 /// The promotion route is defined by what it does *not* do to the object
-/// store: it reads footers and never writes or deletes a data object. Counting
-/// the delegated calls is therefore the direct proof, and it stays honest
-/// because every call still reaches the real operator.
+/// store: it reads footers and never deletes a data object. Counting the
+/// delegated calls is therefore the direct proof, and it stays honest because
+/// every call still reaches the production implementation.
 #[derive(Debug)]
 pub(crate) struct CountingObjectStore {
-    /// Real operator every delegated call runs against.
-    inner: Arc<Operator>,
-    /// Number of rewrite output writers opened, which promotion must leave at zero.
-    output_writers: AtomicUsize,
+    /// Production Forge object operations every delegated call runs against.
+    inner: ForgeObjects,
     /// Number of delegated deletes, which promotion must leave at zero.
     deletes: AtomicUsize,
     /// Number of delegated object reads, shared so a seam can snapshot it.
@@ -93,7 +102,7 @@ pub(crate) struct CountingObjectStore {
     delete_errors: AtomicUsize,
     /// Remaining delegated deletes to submit and then report as already absent.
     delete_absences: AtomicUsize,
-    /// Entries per orphan-listing page; `0` keeps the single-page default.
+    /// Entries per orphan-listing page; `0` keeps the production page size.
     list_page_entries: AtomicUsize,
     /// Every `start_after` cursor orphan listing has been given, in order.
     list_cursors: Mutex<Vec<Option<String>>>,
@@ -121,11 +130,10 @@ struct CallPause {
 }
 
 impl CountingObjectStore {
-    /// Wrap the fixture operator in a counting seam.
-    pub(crate) fn new(inner: Arc<Operator>) -> Arc<Self> {
+    /// Wrap production Forge object operations over `storage` in a counting seam.
+    pub(crate) fn new(storage: &BifrostStorage) -> Arc<Self> {
         Arc::new(Self {
-            inner,
-            output_writers: AtomicUsize::new(0),
+            inner: ForgeObjects::new(storage),
             deletes: AtomicUsize::new(0),
             reads: Arc::new(AtomicUsize::new(0)),
             stats: AtomicUsize::new(0),
@@ -184,7 +192,7 @@ impl CountingObjectStore {
 
     /// Fail the next `count` delegated stats with an injected transient error.
     ///
-    /// The error is an `Unexpected` opendal failure rather than `NotFound`, so
+    /// The error is a generic object-store failure rather than `NotFound`, so
     /// it exercises the branch where the object's existence stays unknown.
     pub(crate) fn fail_next_stats(&self, count: usize) {
         self.stat_errors.store(count, Ordering::Release);
@@ -234,11 +242,6 @@ impl CountingObjectStore {
         Arc::clone(&self.reads)
     }
 
-    /// Return how many rewrite outputs were opened.
-    pub(crate) fn output_writers(&self) -> usize {
-        self.output_writers.load(Ordering::Acquire)
-    }
-
     /// Return how many objects were deleted.
     pub(crate) fn deletes(&self) -> usize {
         self.deletes.load(Ordering::Acquire)
@@ -250,66 +253,50 @@ impl CountingObjectStore {
     }
 }
 
+/// Builds one injected object-store failure for the fault seams below.
+fn injected(message: &'static str) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "fixture",
+        source: message.into(),
+    }
+}
+
 #[async_trait]
 impl ForgeObjectStore for CountingObjectStore {
-    async fn output_writer(
-        &self,
-        operator: &Operator,
-        path: &str,
-        chunk_bytes: usize,
-    ) -> opendal::Result<opendal::Writer> {
-        self.output_writers.fetch_add(1, Ordering::AcqRel);
-        operator.writer_with(path).chunk(chunk_bytes).await
-    }
-
-    async fn read(&self, path: &str) -> opendal::Result<Buffer> {
+    async fn read(&self, path: &str) -> object_store::Result<Bytes> {
         self.reads.fetch_add(1, Ordering::AcqRel);
         self.inner.read(path).await
     }
 
-    async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer> {
-        self.reads.fetch_add(1, Ordering::AcqRel);
-        self.inner.read_with(path).range(range).await
-    }
-
-    async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>> {
-        self.inner.list_with(prefix).recursive(true).await
-    }
-
-    /// Page the real listing while preserving exclusive, lexicographic cursors.
+    /// Page the production listing, optionally into smaller pages.
     ///
-    /// The production adapter delegates the cursor to the backend; the
-    /// filesystem operator behind this fixture cannot, so the same semantics
-    /// are applied here over a real recursive listing. Recording each cursor is
-    /// what lets a resume proof assert that earlier pages are never relisted.
-    async fn list_pages(
-        &self,
-        prefix: &str,
-        start_after: Option<&str>,
-    ) -> opendal::Result<vala_bifrost_redux::forge::ForgeObjectPages> {
+    /// Recording each cursor is what lets a resume proof assert that earlier
+    /// pages are never relisted; re-chunking each production page keeps its
+    /// order and cursor semantics while letting the page cap bite.
+    fn list_pages(&self, prefix: &str, start_after: Option<&str>) -> ForgeObjectPages {
         self.list_cursors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(start_after.map(ToOwned::to_owned));
-        let mut entries = self.list(prefix).await?;
-        entries.retain(|entry| entry.metadata().is_file());
-        if let Some(cursor) = start_after {
-            entries.retain(|entry| entry.path() > cursor);
-        }
-        entries.sort_unstable_by(|left, right| left.path().cmp(right.path()));
+        let pages = self.inner.list_pages(prefix, start_after);
         let per_page = self.list_page_entries.load(Ordering::Acquire);
-        let pages: Vec<opendal::Result<Vec<Entry>>> = if per_page == 0 {
-            vec![Ok(entries)]
-        } else {
-            entries
-                .chunks(per_page)
-                .map(|chunk| Ok(chunk.to_vec()))
-                .collect()
-        };
-        Ok(Box::pin(futures_util::stream::iter(pages)))
+        if per_page == 0 {
+            return pages;
+        }
+        Box::pin(
+            pages
+                .map_ok(move |page| {
+                    futures_util::stream::iter(
+                        page.chunks(per_page)
+                            .map(|chunk| Ok(chunk.to_vec()))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .try_flatten(),
+        )
     }
 
-    async fn stat(&self, path: &str) -> opendal::Result<Metadata> {
+    async fn stat(&self, path: &str) -> object_store::Result<ObjectMeta> {
         let ordinal = self.stats.fetch_add(1, Ordering::AcqRel) + 1;
         if self.stat_pause.at.load(Ordering::Acquire) == ordinal {
             self.stat_pause.at.store(0, Ordering::Release);
@@ -323,15 +310,12 @@ impl ForgeObjectStore for CountingObjectStore {
             })
             .is_ok()
         {
-            return Err(opendal::Error::new(
-                opendal::ErrorKind::Unexpected,
-                "injected expired-cleanup stat failure",
-            ));
+            return Err(injected("injected expired-cleanup stat failure"));
         }
         self.inner.stat(path).await
     }
 
-    async fn delete(&self, path: &str) -> opendal::Result<()> {
+    async fn delete(&self, path: &str) -> object_store::Result<()> {
         let ordinal = self.deletes.fetch_add(1, Ordering::AcqRel) + 1;
         if self.delete_pause.at.load(Ordering::Acquire) == ordinal {
             self.delete_pause.at.store(0, Ordering::Release);
@@ -347,8 +331,7 @@ impl ForgeObjectStore for CountingObjectStore {
             .is_ok()
         {
             submitted?;
-            return Err(opendal::Error::new(
-                opendal::ErrorKind::Unexpected,
+            return Err(injected(
                 "injected expired-cleanup delete acknowledgement failure",
             ));
         }
@@ -360,10 +343,10 @@ impl ForgeObjectStore for CountingObjectStore {
             .is_ok()
         {
             submitted?;
-            return Err(opendal::Error::new(
-                opendal::ErrorKind::NotFound,
-                "injected expired-cleanup delete absence",
-            ));
+            return Err(object_store::Error::NotFound {
+                path: path.to_owned(),
+                source: "injected expired-cleanup delete absence".into(),
+            });
         }
         submitted
     }
@@ -543,11 +526,26 @@ impl PromotionCatalogSeam {
         }
     }
 
-    /// Wait until cancellation or the request timeout dropped the parked commit.
+    /// Wait until cancellation dropped the parked commit.
     pub(crate) async fn wait_for_parked_commit_drop(&self) {
         while !self.parked_dropped.load(Ordering::Acquire) {
             self.parked_drop_ready.notified().await;
         }
+    }
+
+    /// Release the parked commit as a definite conflict and park the next one.
+    ///
+    /// Arming the follow-up park before the release is what makes the retry
+    /// observable: the conflicted call returns, production re-derives and
+    /// submits once more, and that second call stops here instead of racing the
+    /// test to the real catalog. The parked second call is never released, so
+    /// only the production budget can end it.
+    pub(crate) fn reject_parked_commit_and_park_next(&self) {
+        self.parked.store(false, Ordering::Release);
+        self.parked_dropped.store(false, Ordering::Release);
+        self.park_next.store(true, Ordering::Release);
+        self.reject_parked.store(true, Ordering::Release);
+        self.parked_release.notify_waiters();
     }
 
     /// Arm or disarm losing every accepted commit's response.
@@ -569,7 +567,7 @@ impl PromotionCatalogSeam {
     /// call is refused by the real catalog because the first one landed, so the
     /// caller ends up with a *definite* conflict rather than an unknown
     /// acceptance. Withholding the answer instead leaves the call in flight
-    /// until the catalog request timeout ends it, which is the one shape that
+    /// until the publication budget ends it, which is the one shape that
     /// delivers a landed replacement and an unknowable outcome together.
     pub(crate) fn stall_next_commit_responses(&self, count: usize) {
         self.stall_response_budget.store(count, Ordering::Release);
@@ -724,7 +722,7 @@ impl Catalog for PromotionCatalogSeam {
             // The call is handed to a task the caller cannot cancel, so the
             // replacement lands exactly as it would have while this call never
             // answers. Awaiting the commit here instead would let the caller's
-            // catalog request timeout cancel the commit itself, which is a different
+            // publication budget cancel the commit itself, which is a different
             // fault entirely: nothing landed.
             let inner = Arc::clone(&self.inner);
             tokio::spawn(async move {
@@ -789,8 +787,8 @@ pub(crate) struct PromotionIntegrationFixture {
     pub(crate) operator_pool: OperatorPool,
     /// Tenant-scoped SQL handle Forge transitions run through.
     pub(crate) vala: vala_sql::ValaPostgres,
-    /// Raw staging operator shared by Scribe, the catalog, and Forge.
-    pub(crate) staging: Arc<Operator>,
+    /// Storage owner whose one object store Scribe, the catalog, and Forge share.
+    pub(crate) storage: Arc<BifrostStorage>,
     /// Tenant that owns the table and every sealed row.
     pub(crate) tenant: DataTenantId,
     /// Physical and logical identity of the seeded table.
@@ -818,104 +816,45 @@ pub(crate) struct PromotionIntegrationFixture {
 }
 
 impl PromotionIntegrationFixture {
-    /// Records one live Oracle query's active read on the fixture table.
-    ///
-    /// Goes through the production catalog acquisition, so the row is the
-    /// exact durable state a held query leaves and serializes with Forge on
-    /// the same table maintenance authority. The one-hour query deadline
-    /// keeps the row protective for the whole test.
+    /// Reads the fixture table's current cut through the production
+    /// statement a query runs.
     ///
     /// # Panics
-    /// Panics when the acquisition fails.
-    pub(crate) async fn hold_active_read(&self) -> Uuid {
-        let (query_id, acquisition) = self.spawn_active_read();
-        acquisition.await.expect("the active read task joins");
-        query_id
+    /// Panics when the cut read fails.
+    pub(crate) async fn read_cut(&self) -> TableCut {
+        self.catalog
+            .read_cut(self.tenant, std::slice::from_ref(&self.binding.table_ref))
+            .await
+            .expect("the registered table's cut reads")
+            .pop()
+            .expect("one table cut")
     }
 
-    /// Starts one Oracle query's production cut acquisition on its own task.
+    /// Backdates every recorded snapshot supersession of the fixture table by
+    /// `age`, so the next expiry pass sees them as that much older.
     ///
-    /// Returns the query id at once and the acquisition as a join handle, so
-    /// a scenario can race the acquisition against a live destructive Forge
-    /// owner: the statement waits on the table's maintenance authority until
-    /// that owner yields, then returns the pointer it read.
-    ///
-    /// # Panics
-    /// The spawned task panics when the acquisition fails or the one-hour
-    /// deadline has already passed; awaiting the handle surfaces that panic.
-    pub(crate) fn spawn_active_read(&self) -> (Uuid, JoinHandle<AcquiredTableCut>) {
-        let query_id = Uuid::now_v7();
-        let catalog = Arc::clone(&self.catalog);
-        let tenant = self.tenant;
-        let table = self.binding.table_ref.clone();
-        let acquisition = tokio::spawn(async move {
-            catalog
-                .acquire_active_cut(
-                    tenant,
-                    ActiveReadOwner {
-                        query_id,
-                        node_id: Uuid::now_v7(),
-                        fencing_token: 1,
-                    },
-                    std::time::Instant::now() + std::time::Duration::from_hours(1),
-                    std::slice::from_ref(&table),
-                )
-                .await
-                .expect("the registered table's active read commits")
-                .expect("an hour remains before the deadline")
-                .pop()
-                .expect("one acquired table")
-        });
-        (query_id, acquisition)
-    }
-
-    /// Waits until exactly one Oracle cut acquisition is blocked on a row lock.
-    ///
-    /// Observes `pg_stat_activity` rather than elapsed time, so a returning
-    /// call proves the acquisition statement reached `PostgreSQL` and is waiting
-    /// on the table's maintenance authority rather than merely not yet run.
-    /// The probe runs as the fixture superuser because `PostgreSQL` hides other
-    /// roles' wait state and statement text from the operator role.
+    /// Retention is measured in `PostgreSQL` time, which a test cannot advance;
+    /// moving the recorded observation is the equivalent. Runs as the fixture
+    /// superuser because only Forge's tenant role holds the table.
     ///
     /// # Panics
-    /// Panics when the superuser pool or the activity read fails, or no
-    /// acquisition blocks within thirty seconds.
-    pub(crate) async fn await_blocked_cut_acquisition(&self) {
-        let observer = self
+    /// Panics when the superuser pool or the update fails.
+    pub(crate) async fn age_supersessions(&self, age: Duration) {
+        let pool = self
             .database
             .superuser_pool()
             .expect("fixture superuser pool");
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let blocked: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM pg_stat_activity \
-                      WHERE datname = current_database() AND wait_event_type = 'Lock' \
-                        AND query LIKE '%oracle_acquire_table_cut%'",
-                )
-                .fetch_one(&observer)
-                .await
-                .expect("lock waits read");
-                if blocked == 1 {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        let millis = i64::try_from(age.as_millis()).expect("age fits in i64 milliseconds");
+        sqlx::query(
+            "UPDATE vala.forge_snapshot_supersessions \
+                SET observed_at = observed_at - $2 * interval '1 millisecond' \
+              WHERE data_tenant_id = $1",
+        )
+        .bind(self.tenant.as_uuid())
+        .bind(millis)
+        .execute(&pool)
         .await
-        .expect("the cut acquisition blocks on the table authority");
-    }
-
-    /// Releases one query's active reads through the production statement.
-    ///
-    /// # Panics
-    /// Panics when the release fails or removes no row.
-    pub(crate) async fn release_active_read(&self, query_id: Uuid) {
-        let released = self
-            .catalog
-            .release_active_reads(self.tenant, query_id)
-            .await
-            .expect("the active read releases");
-        assert_eq!(released, 1, "the query held exactly one table read");
+        .expect("supersessions backdate");
     }
 
     /// Reads the fixture table's maintenance-authority identity.
@@ -948,7 +887,7 @@ impl PromotionIntegrationFixture {
         &self,
         observer: ForgeWorkerCompletionObserver,
     ) -> ForgeWorker {
-        let store = CountingObjectStore::new(Arc::clone(&self.staging));
+        let store = CountingObjectStore::new(&self.storage);
         let forge = self.build_forge_for_test(
             self.catalog.iceberg_catalog(),
             store,
@@ -1024,12 +963,39 @@ impl PromotionIntegrationFixture {
 
     /// Start Postgres, compose the production graph, and seal two hot objects.
     ///
+    /// The table carries one `value` column and each object lands in its own
+    /// closed day; see [`Self::start_with`].
+    ///
     /// # Panics
     ///
     /// Panics when any fixture dependency cannot start, when the table cannot
     /// be registered, or when a real Scribe seal publishes fewer than the two
     /// `vala.file_list` rows a promotion group needs.
     pub(crate) async fn start(table_name: &str) -> Self {
+        let schema = ingress_schema();
+        Self::start_with(
+            table_name,
+            value_fields(),
+            &[ingress_batch(&schema, 0), ingress_batch(&schema, 1)],
+        )
+        .await
+    }
+
+    /// Start Postgres, compose the production graph, register `user_fields`,
+    /// and seal one hot object per batch.
+    ///
+    /// Each batch carries its own [`FIXTURE_TIME_COLUMN`], so the caller decides
+    /// which closed day, and therefore which Forge plan, every object joins.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any fixture dependency cannot start, when the table cannot
+    /// be registered, or when a seal publishes no `vala.file_list` row.
+    pub(crate) async fn start_with(
+        table_name: &str,
+        user_fields: Vec<Field>,
+        batches: &[RecordBatch],
+    ) -> Self {
         ProcessTelemetry::shared();
         let database = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
@@ -1039,8 +1005,7 @@ impl PromotionIntegrationFixture {
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let scratch_root = tempfile::tempdir().expect("scratch directory");
 
-        let storage = local_storage_owner(warehouse.path());
-        let staging = Arc::new(storage.operator().clone());
+        let storage = BifrostStorage::for_test(warehouse.path(), false);
         let catalog = Arc::new(
             BifrostCatalog::new(
                 database.catalog_dsn().expose_secret(),
@@ -1060,39 +1025,29 @@ impl PromotionIntegrationFixture {
         let scribe = start_scribe(
             &database,
             Arc::clone(&catalog),
-            Arc::clone(&staging),
+            Arc::clone(storage.objects()),
             wal_root.path(),
             scribe_resources,
         )
         .await;
 
-        let binding = create_table(&catalog, tenant, table_name).await;
+        let binding = create_table(&catalog, tenant, table_name, user_fields).await;
         let operator_pool = database.operator_pool().clone();
-        let seeded_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
-            .fetch_one(operator_pool.pool())
-            .await
-            .expect("fixture seed marker");
-        let ingress_schema = ingress_schema();
-        for file_number in 0..2_i64 {
-            append_and_seal(
-                &scribe,
-                &catalog,
-                tenant,
-                &binding,
-                &ingress_batch(&ingress_schema, file_number),
-            )
-            .await;
-        }
-        age_files(&operator_pool, tenant, &binding, seeded_at).await;
 
         let fixture = Self {
             catalog,
             operator_pool,
             vala: database.vala_postgres().clone(),
-            staging,
+            storage,
             tenant,
             binding,
-            config: ForgeConfig::default(),
+            // No retention window: a replaced snapshot expires on the first
+            // pass, as every maintenance scenario expects. The retention
+            // scenarios restore the production window.
+            config: ForgeConfig {
+                snapshot_retention: Duration::ZERO,
+                ..ForgeConfig::default()
+            },
             forge_resources,
             forge_spill,
             scribe,
@@ -1101,12 +1056,7 @@ impl PromotionIntegrationFixture {
             _wal_root: wal_root,
             _scratch_root: scratch_root,
         };
-        let sealed = fixture.file_rows().await;
-        assert_eq!(
-            sealed.len(),
-            2,
-            "a real Scribe seal must publish two hot objects, saw {sealed:?}"
-        );
+        fixture.seal(batches).await;
         fixture
     }
 
@@ -1158,7 +1108,7 @@ impl PromotionIntegrationFixture {
                 vala: self.vala.clone(),
                 operator_pool: self.operator_pool.clone(),
                 catalog,
-                staging: Arc::clone(&self.staging),
+                warehouse: warehouse_uri(self.storage.backend()),
                 object_store,
                 hints,
                 config: self.config.clone(),
@@ -1195,8 +1145,8 @@ impl PromotionIntegrationFixture {
                 vala: self.vala.clone(),
                 operator_pool,
                 catalog: self.catalog.iceberg_catalog(),
-                staging: Arc::clone(&self.staging),
-                object_store: CountingObjectStore::new(Arc::clone(&self.staging)),
+                warehouse: warehouse_uri(self.storage.backend()),
+                object_store: CountingObjectStore::new(&self.storage),
                 hints,
                 config: self.config.clone(),
                 maintenance_interval: Duration::from_hours(1),
@@ -1294,28 +1244,45 @@ impl PromotionIntegrationFixture {
     ///
     /// Panics when a seal publishes no new `vala.file_list` row.
     pub(crate) async fn seal_more(&self, count: usize) {
+        let first = i64::try_from(self.file_rows().await.len())
+            .expect("fixture row counts stay representable");
+        let count = i64::try_from(count).expect("fixture seal counts stay representable");
+        let schema = ingress_schema();
+        let batches: Vec<RecordBatch> = (first..first + count)
+            .map(|file_number| ingress_batch(&schema, file_number))
+            .collect();
+        self.seal(&batches).await;
+    }
+
+    /// Seals one hot object per batch into the fixture table and ages them.
+    ///
+    /// Each batch is appended and sealed through the real Scribe on its own,
+    /// so every batch becomes exactly one `vala.file_list` row. The new rows
+    /// are then backdated past Forge's settle floor so the next pass sees them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a seal publishes no new `vala.file_list` row.
+    pub(crate) async fn seal(&self, batches: &[RecordBatch]) {
         let before = self.file_rows().await.len();
-        let first = i64::try_from(before).expect("fixture row counts stay representable");
         let seeded_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
             .fetch_one(self.operator_pool.pool())
             .await
             .expect("fixture seed marker");
-        let schema = ingress_schema();
-        for file_number in 0..i64::try_from(count).expect("fixture seal counts stay representable")
-        {
+        for batch in batches {
             append_and_seal(
                 &self.scribe,
                 &self.catalog,
                 self.tenant,
                 &self.binding,
-                &ingress_batch(&schema, first + file_number),
+                batch,
             )
             .await;
         }
         age_files(&self.operator_pool, self.tenant, &self.binding, seeded_at).await;
         assert_eq!(
             self.file_rows().await.len(),
-            before + count,
+            before + batches.len(),
             "a real Scribe seal publishes one row per batch"
         );
     }
@@ -1422,7 +1389,7 @@ impl PromotionIntegrationFixture {
         name: &str,
         count: usize,
     ) {
-        let binding = create_table(&self.catalog, tenant, name).await;
+        let binding = create_table(&self.catalog, tenant, name, value_fields()).await;
         let seeded_at = Utc::now();
         let schema = ingress_schema();
         for number in 0..count {
@@ -1446,7 +1413,7 @@ impl PromotionIntegrationFixture {
     /// # Panics
     /// Panics when registration, sealing, or eligibility aging fails.
     pub(crate) async fn register_and_seal_table(&self, name: &str, count: usize) {
-        let binding = create_table(&self.catalog, self.tenant, name).await;
+        let binding = create_table(&self.catalog, self.tenant, name, value_fields()).await;
         let seeded_at = Utc::now();
         let schema = ingress_schema();
         for number in 0..count {
@@ -1463,6 +1430,58 @@ impl PromotionIntegrationFixture {
             .await;
         }
         age_files(&self.operator_pool, self.tenant, &binding, seeded_at).await;
+    }
+
+    /// Provisions one flat built-in table and seals generated rows into it.
+    ///
+    /// The table is created through the production lazy-provisioning owner, so
+    /// its schema, layout, and format are exactly what a tenant's first write
+    /// would get, and provisioning again is a no-op. Each sealed object carries
+    /// `rows_per_file` rows generated from the built-in's own authored fields
+    /// and lands in its own closed day, `first_file` onwards counted back from
+    /// the fixture day, so every object is one Forge plan and repeated calls
+    /// stay disjoint. The table is declared compaction-enabled as the fixture
+    /// table is.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the built-in is unknown, when an authored field is not a
+    /// type the fixture generator supports, or when
+    /// provisioning, sealing, or eligibility aging fails.
+    pub(crate) async fn seal_builtin_table(
+        &self,
+        namespace: BifrostNamespace,
+        name: &str,
+        first_file: usize,
+        files: usize,
+        rows_per_file: usize,
+    ) -> TenantTableBinding {
+        let segment = namespace
+            .as_str()
+            .strip_prefix("vala.")
+            .expect("built-in namespaces are vala-qualified");
+        let definition = vala_bifrost_redux::tables::builtin_table(segment, name)
+            .expect("the built-in definition resolves");
+        self.catalog
+            .ensure_builtin(self.tenant, definition)
+            .await
+            .expect("the built-in provisions");
+        let binding = TenantTableBinding::resolve((self.tenant, TableRef::new(namespace, name)))
+            .expect("built-in table binding");
+        enable_compaction(&self.catalog, &binding).await;
+        let seeded_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+            .fetch_one(self.operator_pool.pool())
+            .await
+            .expect("fixture seed marker");
+        let fields = (definition.arrow_fields)();
+        let first = i64::try_from(first_file).expect("bounded fixture count");
+        let count = i64::try_from(files).expect("bounded fixture count");
+        for file_number in first..first + count {
+            let batch = flat_builtin_batch(&fields, file_number, rows_per_file);
+            append_and_seal(&self.scribe, &self.catalog, self.tenant, &binding, &batch).await;
+        }
+        age_files(&self.operator_pool, self.tenant, &binding, seeded_at).await;
+        binding
     }
 
     /// Reads every durable Forge task of this fixture's table, in durable order.
@@ -1597,35 +1616,34 @@ impl PromotionIntegrationFixture {
         .expect("fixture claim aging");
     }
 
-    /// Expires the durable table lease this fixture's Forge owner holds.
+    /// Lapses the claim of the fixture table's one active Forge task.
     ///
-    /// The lease row is the real fence owner, and every renewal is conditional
-    /// on it still being unexpired, so aging it here is exactly what a lost
-    /// fence looks like to production code: the next `renew` matches no row and
-    /// reports the lease as lost. Nothing about the claim, the attempt, or the
-    /// table is touched.
+    /// The active task's claim is the table's only exclusive authority, and
+    /// every renewal and fenced commit requires it unexpired, so aging it here
+    /// is exactly what a lost fence looks like to production code: the next
+    /// renewal matches no row and reports the fence as lost. The task's state,
+    /// attempt, and owner are untouched.
     ///
     /// # Panics
     ///
-    /// Panics when the update fails.
-    pub(crate) async fn expire_table_lease(&self) {
-        let lease_key = vala_bifrost_redux::forge::forge_lease_key(
-            self.tenant,
-            &self.binding.logical_namespace,
-            &self.binding.table_name,
-        );
-        let expired = sqlx::query(
-            "UPDATE vala.maintenance_leases \
-             SET expires_at = statement_timestamp() - interval '1 minute' WHERE lease_key = $1",
+    /// Panics when the update fails or the table has no single active task.
+    pub(crate) async fn lapse_table_claim(&self) {
+        let lapsed = sqlx::query(
+            "UPDATE vala.forge_tasks \
+             SET claim_expires_at = statement_timestamp() - interval '1 minute' \
+             WHERE data_tenant_id = $1 AND namespace_name = $2 AND table_name = $3 \
+             AND state IN ('claimed', 'running', 'prepared')",
         )
-        .bind(&lease_key)
+        .bind(self.tenant.as_uuid())
+        .bind(self.binding.table_ref.namespace.as_str())
+        .bind(&self.binding.table_ref.name)
         .execute(self.operator_pool.pool())
         .await
-        .expect("fixture lease aging");
+        .expect("fixture claim lapse");
         assert_eq!(
-            expired.rows_affected(),
+            lapsed.rows_affected(),
             1,
-            "the publication under test holds exactly one table lease"
+            "the publication under test holds exactly one table claim"
         );
     }
 
@@ -1731,28 +1749,28 @@ impl PromotionIntegrationFixture {
         .expect("fixture operation-state inspection")
     }
 
-    /// Counts unexpired Forge leases still held over the fixture table.
+    /// Counts live Forge claims still held over the fixture table.
     ///
-    /// The key is derived through the production builder, so a re-scoped lease
-    /// identity fails this read rather than silently counting zero.
+    /// A claim is live while its task is active and its deadline has not
+    /// passed; the terminal transition clears it, so zero proves the table is
+    /// released.
     ///
     /// # Panics
     ///
     /// Panics when the read-only diagnostic query fails.
-    pub(crate) async fn live_leases(&self) -> i64 {
-        let lease_key = vala_bifrost_redux::forge::forge_lease_key(
-            self.tenant,
-            &self.binding.logical_namespace,
-            &self.binding.table_name,
-        );
+    pub(crate) async fn live_claims(&self) -> i64 {
         sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.maintenance_leases \
-             WHERE lease_key = $1 AND expires_at > statement_timestamp()",
+            "SELECT count(*) FROM vala.forge_tasks \
+             WHERE data_tenant_id = $1 AND namespace_name = $2 AND table_name = $3 \
+             AND state IN ('claimed', 'running', 'prepared') \
+             AND claim_expires_at > statement_timestamp()",
         )
-        .bind(&lease_key)
+        .bind(self.tenant.as_uuid())
+        .bind(self.binding.table_ref.namespace.as_str())
+        .bind(&self.binding.table_ref.name)
         .fetch_one(self.operator_pool.pool())
         .await
-        .expect("fixture lease inspection")
+        .expect("fixture claim inspection")
     }
 
     /// Collects the live data-file paths of the table's current snapshot.
@@ -1797,6 +1815,61 @@ impl PromotionIntegrationFixture {
         paths
     }
 
+    /// Reads one object's bytes from the fixture's object store.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the object cannot be read.
+    pub(crate) async fn read_object(&self, key: &str) -> Bytes {
+        self.storage
+            .objects()
+            .get(&ObjectPath::from(key))
+            .await
+            .expect("fixture object read")
+            .bytes()
+            .await
+            .expect("fixture object bytes")
+    }
+
+    /// Writes one object directly into the fixture's object store.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the write fails.
+    pub(crate) async fn write_object(&self, key: &str, bytes: impl Into<Bytes>) {
+        self.storage
+            .objects()
+            .put(&ObjectPath::from(key), bytes.into().into())
+            .await
+            .expect("fixture object write");
+    }
+
+    /// Deletes one object from the fixture's object store.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the delete fails.
+    pub(crate) async fn delete_object(&self, key: &str) {
+        self.storage
+            .objects()
+            .delete(&ObjectPath::from(key))
+            .await
+            .expect("fixture object delete");
+    }
+
+    /// Reports whether one object exists in the fixture's object store.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the store fails for a reason other than absence.
+    pub(crate) async fn object_exists(&self, key: &str) -> bool {
+        match self.storage.objects().head(&ObjectPath::from(key)).await {
+            Ok(_) => true,
+            Err(object_store::Error::NotFound { .. }) => false,
+            Err(error) => panic!("fixture object stat failed: {error}"),
+        }
+    }
+
     /// Snapshots every object under the table prefix with its exact content hash.
     ///
     /// Comparing the map across a promotion is the direct proof that no data
@@ -1805,28 +1878,26 @@ impl PromotionIntegrationFixture {
     ///
     /// # Panics
     ///
-    /// Panics when the staging operator cannot be listed or read.
+    /// Panics when the object store cannot be listed or read.
     pub(crate) async fn object_digests(&self) -> BTreeMap<String, String> {
-        let prefix = format!("{}/", self.binding.object_prefix);
-        let entries = self
-            .staging
-            .list_with(&prefix)
-            .recursive(true)
+        let objects = self.storage.objects();
+        let prefix = ObjectPath::from(self.binding.object_prefix.as_str());
+        let entries = objects
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
             .await
             .expect("fixture object listing");
         let mut digests = BTreeMap::new();
         for entry in entries {
-            if entry.metadata().is_dir() {
-                continue;
-            }
-            let bytes = self
-                .staging
-                .read(entry.path())
+            let bytes = objects
+                .get(&entry.location)
                 .await
-                .expect("fixture object read");
-            digests.insert(entry.path().to_owned(), {
-                use sha2::Digest as _;
-                hex::encode(sha2::Sha256::digest(bytes.to_bytes()))
+                .expect("fixture object read")
+                .bytes()
+                .await
+                .expect("fixture object bytes");
+            digests.insert(entry.location.to_string(), {
+                hex::encode(Sha256::digest(&bytes))
             });
         }
         digests
@@ -2238,10 +2309,15 @@ impl SupervisedPromotion {
             self.worker_observer.returned_errors()
         );
         self.stop_worker().await;
-        assert!(
-            self.worker_observer.completed() > before,
-            "the worker settled no attempt"
-        );
+        // A promotion the scheduler pass executes records its completion after
+        // the held attempt is released, independently of the worker join.
+        tokio::time::timeout(
+            FIXTURE_BOUND,
+            self.worker_observer
+                .wait_for_at_least(before.saturating_add(1)),
+        )
+        .await
+        .expect("the worker settled no attempt");
     }
 
     /// Schedule one pass and await exactly one returned worker error while
@@ -2370,16 +2446,45 @@ impl SupervisedPromotion {
     ///
     /// Panics when a deterministic bound is missed or the attempt succeeded.
     pub(crate) async fn run_one_failure(&mut self) -> String {
+        self.run_one_failure_progressing(|| 0).await
+    }
+
+    /// Schedule one pass and await exactly one returned worker error, bounding
+    /// the attempt by stalls rather than by its total length.
+    ///
+    /// An attempt whose plans each spend the production conflict-retry
+    /// schedule sleeps for that schedule once per plan, so its total length
+    /// grows with the plan count while no single step does. The attempt bound
+    /// therefore restarts whenever `progress` — a monotonic counter such as
+    /// the catalog seam's commit attempts — has advanced since the last
+    /// window. A window of [`FIXTURE_BOUND`] with no progress is a stuck
+    /// worker. [`Self::run_one_failure`] passes a constant counter, so its
+    /// attempt keeps the single fixed bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a window passes without progress, another deterministic
+    /// bound is missed, or the attempt succeeded.
+    pub(crate) async fn run_one_failure_progressing(
+        &mut self,
+        progress: impl Fn() -> usize,
+    ) -> String {
         let before = self.worker_observer.returned_errors();
         self.worker_observer.hold_after_next_attempt_for_test();
         self.start_armed_worker();
         let pass = self.request_pass();
-        tokio::time::timeout(
+        let mut seen = progress();
+        while tokio::time::timeout(
             FIXTURE_BOUND,
             self.worker_observer.wait_for_held_attempt_for_test(),
         )
         .await
-        .expect("production Forge worker attempt bound");
+        .is_err()
+        {
+            let now = progress();
+            assert!(now > seen, "production Forge worker attempt bound");
+            seen = now;
+        }
         self.stop_worker().await;
         self.await_pass(pass).await;
         let after = self.worker_observer.returned_errors();
@@ -2549,27 +2654,6 @@ impl SupervisedPromotion {
     }
 }
 
-/// Builds the local-filesystem storage owner both Scribe and the catalog use.
-///
-/// One owner backs both, so the object Scribe writes is at the path the
-/// catalog resolves and the path Forge reads — which is the whole point of an
-/// append-in-place promotion.
-fn local_storage_owner(root: &std::path::Path) -> Arc<vala_bifrost_redux::storage::BifrostStorage> {
-    let signer = wyrd_storage::signer::BackendSigner::Local(
-        wyrd_storage::local::LocalSigner::new(root.to_path_buf()).expect("fixture local signer"),
-    );
-    Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
-        Arc::new(wyrd_storage::handle::StorageHandle::new(signer)),
-        vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
-            vala_bifrost_redux::storage::BifrostStorageConfig::default(),
-            2 * 1024 * 1024 * 1024,
-            false,
-        )
-        .expect("fixture storage policy"),
-        None,
-    ))
-}
-
 /// Composes Scribe and Forge capabilities over the fixture's real volume roots.
 ///
 /// The snapshot is injected rather than probed so capacity is deterministic
@@ -2607,6 +2691,7 @@ fn fixture_roles(
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
+            oracle_partition_scan_bytes: None,
             scratch_root: Some(scratch_root.to_owned()),
             volume_roots: Some(BifrostVolumeRoots {
                 wal: wal_root.to_owned(),
@@ -2636,7 +2721,7 @@ fn fixture_roles(
 async fn start_scribe(
     database: &wyrd_dev_fixtures::pg::PgFixture,
     catalog: Arc<BifrostCatalog>,
-    staging: Arc<Operator>,
+    objects: Arc<dyn object_store::ObjectStore>,
     wal_root: &std::path::Path,
     resources: vala_bifrost_redux::resources::ScribeResources,
 ) -> Arc<ScribeImpl> {
@@ -2656,7 +2741,7 @@ async fn start_scribe(
     );
     Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
         catalog: Some(catalog),
-        operator: staging,
+        operator: objects,
         wal,
         stream: vala_bifrost_redux::scribe::stream_identity::StreamIdentity::new(
             node_id,
@@ -2727,19 +2812,33 @@ pub(crate) fn fixture_day() -> chrono::NaiveDate {
     Utc::now().date_naive() - chrono::Duration::days(1)
 }
 
-/// User-visible ingress schema for the fixture table.
+/// The time column every dynamic fixture table declares.
 ///
-/// `wyrd_event_time` is carried explicitly so the fixture selects its own event
-/// day; Scribe lifts that column into the managed slot verbatim.
+/// It partitions the table by day, so the value a batch carries selects the
+/// closed day, and therefore the Forge plan, that batch joins.
+pub(crate) const FIXTURE_TIME_COLUMN: &str = "event_time";
+
+/// The non-null UTC microsecond [`FIXTURE_TIME_COLUMN`] field that
+/// [`create_table`] appends to every dynamic fixture table's user fields.
+pub(crate) fn fixture_time_field() -> Field {
+    Field::new(
+        FIXTURE_TIME_COLUMN,
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    )
+}
+
+/// User-visible ingress schema for the fixture table: its `value` column and
+/// the time column [`create_table`] declares.
 fn ingress_schema() -> Arc<ArrowSchema> {
-    Arc::new(ArrowSchema::new(vec![
-        Field::new("value", DataType::Int64, false),
-        Field::new(
-            wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
-    ]))
+    let mut fields = value_fields();
+    fields.push(fixture_time_field());
+    Arc::new(ArrowSchema::new(fields))
+}
+
+/// User fields of the default fixture table: one non-null `value` column.
+fn value_fields() -> Vec<Field> {
+    vec![Field::new("value", DataType::Int64, false)]
 }
 
 /// Builds one two-row ingress batch whose event times land in its own closed day.
@@ -2747,8 +2846,7 @@ fn ingress_schema() -> Arc<ArrowSchema> {
 /// `file_number` separates the batches so each sealed object carries a distinct
 /// value and lands `file_number` days before the fixture day. One file per
 /// partition gives Forge's per-partition planner one plan per sealed file, so
-/// multi-plan scenarios stay multi-plan; Scribe's 30-day acceptance window
-/// bounds a fixture table to 29 files.
+/// multi-plan scenarios stay multi-plan.
 ///
 /// # Panics
 ///
@@ -2771,6 +2869,101 @@ fn ingress_batch(schema: &Arc<ArrowSchema>, file_number: i64) -> RecordBatch {
     .expect("fixture ingress batch")
 }
 
+/// Generates one batch of distinct rows for a built-in's authored fields.
+///
+/// Every authored column is populated, including nullable ones, so a rewrite
+/// that mixed rows up would be visible in any column. Struct columns recurse
+/// into their children and Variant columns hold one distinct JSON object per
+/// row. Every timestamp column, the built-in's time column among them, places
+/// the whole batch at noon of the day `file_number` days before the fixture
+/// day, as [`ingress_batch`] does.
+///
+/// # Panics
+///
+/// Panics when a field is not a string, integer, float, boolean, UTC
+/// microsecond or nanosecond timestamp, Variant, or Struct of those, or when
+/// the batch
+/// cannot be assembled.
+fn flat_builtin_batch(fields: &[Field], file_number: i64, rows: usize) -> RecordBatch {
+    let noon = (fixture_day() - chrono::Duration::days(file_number))
+        .and_hms_opt(12, 0, 0)
+        .expect("fixture timestamp")
+        .and_utc()
+        .timestamp_micros();
+    let offsets: Vec<i64> = (0..i64::try_from(rows).expect("bounded fixture rows")).collect();
+    let columns: Vec<ArrayRef> = fields
+        .iter()
+        .map(|field| fixture_column(field, file_number, noon, &offsets))
+        .collect();
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields.to_vec())), columns)
+        .expect("fixture built-in batch")
+}
+
+/// Generates one fixture column of distinct non-null values for `field`.
+///
+/// Values derive from the field name, `file_number`, and each row offset, so
+/// every cell of every file is distinct; timestamps are `noon` plus the row
+/// offset in microseconds, at the column's own precision.
+///
+/// # Panics
+///
+/// Panics when the field type is not one [`flat_builtin_batch`] supports or a
+/// Variant value cannot be encoded.
+fn fixture_column(field: &Field, file_number: i64, noon: i64, offsets: &[i64]) -> ArrayRef {
+    if is_variant(field) {
+        let mut builder = VariantColumnBuilder::with_capacity(offsets.len());
+        for row in offsets {
+            let value = serde_json::json!({ field.name().as_str(): [file_number, row] });
+            builder.append(&EncodedVariant::from_json(&value).expect("fixture Variant encodes"));
+        }
+        return builder.finish();
+    }
+    match field.data_type() {
+        DataType::Utf8 => Arc::new(StringArray::from_iter_values(
+            offsets
+                .iter()
+                .map(|row| format!("{}-{file_number}-{row}", field.name())),
+        )),
+        DataType::Int64 => Arc::new(Int64Array::from_iter_values(
+            offsets.iter().map(|row| file_number * 1_000 + row),
+        )),
+        DataType::Int32 => Arc::new(Int32Array::from_iter_values(offsets.iter().map(|row| {
+            i32::try_from(file_number * 1_000 + row).expect("bounded fixture value")
+        }))),
+        DataType::Float64 => Arc::new(Float64Array::from_iter_values(offsets.iter().map(|row| {
+            f64::from(i32::try_from(file_number * 1_000 + row).expect("bounded fixture value"))
+        }))),
+        DataType::Boolean => Arc::new(
+            offsets
+                .iter()
+                .map(|row| Some(row % 2 == 0))
+                .collect::<BooleanArray>(),
+        ),
+        DataType::Timestamp(TimeUnit::Microsecond, Some(zone)) => Arc::new(
+            TimestampMicrosecondArray::from_iter_values(offsets.iter().map(|row| noon + row))
+                .with_timezone(Arc::clone(zone)),
+        ),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(zone)) => Arc::new(
+            TimestampNanosecondArray::from_iter_values(
+                offsets.iter().map(|row| (noon + row) * 1_000),
+            )
+            .with_timezone(Arc::clone(zone)),
+        ),
+        DataType::Struct(children) => Arc::new(StructArray::new(
+            children.clone(),
+            children
+                .iter()
+                .map(|child| fixture_column(child, file_number, noon, offsets))
+                .collect(),
+            None,
+        )),
+        other => panic!(
+            "a built-in fixture cannot generate {}: {other}",
+            field.name()
+        ),
+    }
+}
+
 /// Encodes one batch as the native Arrow IPC stream Scribe ingress accepts.
 ///
 /// # Panics
@@ -2780,15 +2973,16 @@ fn ingress_ipc(batch: &RecordBatch) -> bytes::Bytes {
     let mut ipc = Vec::new();
     {
         let mut writer =
-            arrow::ipc::writer::StreamWriter::try_new(&mut ipc, batch.schema().as_ref())
-                .expect("fixture IPC writer");
+            StreamWriter::try_new(&mut ipc, batch.schema().as_ref()).expect("fixture IPC writer");
         writer.write(batch).expect("fixture IPC batch");
         writer.finish().expect("fixture IPC finish");
     }
     bytes::Bytes::from(ipc)
 }
 
-/// Registers the fixture table through the real catalog and returns its binding.
+/// Registers the fixture table with `user_fields` plus [`fixture_time_field`]
+/// through the real catalog, declaring that field its daily time column, and
+/// returns its binding.
 ///
 /// # Panics
 ///
@@ -2797,17 +2991,20 @@ async fn create_table(
     catalog: &BifrostCatalog,
     tenant: DataTenantId,
     table_name: &str,
+    mut user_fields: Vec<Field>,
 ) -> TenantTableBinding {
+    user_fields.push(fixture_time_field());
     let binding =
         TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, table_name)))
             .expect("fixture table binding");
     catalog
         .create_table(CreateTableRequest {
             table: binding.table_ref.clone(),
-            user_fields: vec![Field::new("value", DataType::Int64, false)],
+            user_fields,
             tenant,
             physical_layout: Some(wyrd_spec::vala::api::PhysicalLayoutWire {
                 partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
+                time_column: Some(FIXTURE_TIME_COLUMN.to_owned()),
                 sort_keys: Vec::new(),
                 bloom_columns: Vec::new(),
             }),
@@ -3006,7 +3203,7 @@ pub(crate) fn manual_clock() -> (ForgeClock, ForgeClockControl) {
 /// The metrics recorder and the tracing subscriber are process-global and can
 /// be set only once, so this binary has exactly one owner for both. Every
 /// fixture entry point initialises it, which is what makes `WYRD_LOG` (else
-/// `RUST_LOG`) trace any test that starts a fixture, and
+/// `RUST_LOG`) print the logs of any test that starts a fixture, and
 /// [`ForgeTelemetryCheckpoint`] reads from it instead of installing its own.
 /// The subscriber is the production pipeline with an in-memory exporter, so
 /// what a checkpoint asserts on is production emission.
@@ -3025,8 +3222,9 @@ static PROCESS_TELEMETRY: std::sync::OnceLock<ProcessTelemetry> = std::sync::Onc
 impl ProcessTelemetry {
     /// Returns the process telemetry, installing it on first use.
     ///
-    /// The filter is `WYRD_LOG`, else `RUST_LOG`, else `info`. Concurrent
-    /// first callers block until the one installation finishes.
+    /// Log output is filtered by `WYRD_LOG`, else `RUST_LOG`, else `info`;
+    /// span capture is unfiltered. Concurrent first callers block until the
+    /// one installation finishes.
     ///
     /// # Panics
     ///

@@ -128,7 +128,6 @@ const BIFROST_P99_DURATION_FAMILIES: &[&str] = &[
     "oracle_admission_queue_duration_seconds",
     "oracle_query_duration_seconds",
     "oracle_query_time_to_first_batch_seconds",
-    "oracle_query_phase_seconds",
     WYRD_POSTGRES_POOL_ACQUIRE_SECONDS,
     VALA_POSTGRES_POOL_ACQUIRE_SECONDS,
     WYRD_STORAGE_OPERATION_DURATION_SECONDS,
@@ -206,7 +205,7 @@ pub fn install_capture_runtime(
     config: TelemetryConfig,
 ) -> Result<(WyrdTelemetryRuntime, wyrd_telemetry::TestTraceCapture), TelemetryRuntimeError> {
     let (guard, traces) =
-        wyrd_telemetry::init_capture(config).map_err(TelemetryRuntimeError::Tracing)?;
+        wyrd_telemetry::init_test_capture(config).map_err(TelemetryRuntimeError::Tracing)?;
     let prometheus = install_recorder().map_err(TelemetryRuntimeError::Metrics)?;
     Ok((
         WyrdTelemetryRuntime {

@@ -58,12 +58,12 @@ check_selection() {
 
 # --- Scenario 1: classified Rust changes select their consumer closure -------
 
-check_selection "leaf crate selects its owner and journey lanes" \
-  "full_gate=false changed_packages=wyrd-mcp rust_packages=wyrd-mcp ci_lanes~test:wyrd ci_lanes~test:bifrost:gate ci_lanes~test:gateway:gate" \
+check_selection "MCP client selects its consumers and journey lanes" \
+  "full_gate=false changed_packages=wyrd-mcp rust_packages~wyrd-mcp rust_packages~wyrd-cli ci_lanes~test:wyrd ci_lanes~test:bifrost:gate ci_lanes~test:gateway:gate package_python=true" \
   "crates/wyrd/wyrd-mcp/src/lib.rs"
 check_selection "leaf crate omits unrelated families" \
-  "full_gate=false changed_packages=wyrd-mcp ci_lanes~test:wyrd ci_lanes!test:skald ci_lanes!test:vala ci_lanes!test:shared ci_lanes!test:rust" \
-  "crates/wyrd/wyrd-mcp/src/lib.rs"
+  "full_gate=false changed_packages=wyrd ci_lanes~test:wyrd ci_lanes!test:skald ci_lanes!test:vala ci_lanes!test:shared ci_lanes!test:rust" \
+  "crates/wyrd/wyrd/src/lib.rs"
 check_selection "shared crate includes transitive consumers" \
   "full_gate=false rust_packages~skald-runtime rust_packages~skald-agent rust_packages~skald-workflow rust_packages~wyrd rust_packages~wyrd-server ci_lanes~test:skald ci_lanes~test:wyrd ci_lanes~test:vala" \
   "crates/skald/skald-cache/src/lib.rs"
@@ -71,8 +71,8 @@ check_selection "dev-dependency consumers are tested but not propagated" \
   "full_gate=false rust_packages~wyrd-sdk-rust rust_packages~wyrd-server rust_packages!wyrd-rust-examples" \
   "crates/wyrd/wyrd-testing/src/lib.rs"
 check_selection "rename inside one crate keeps its closure" \
-  "full_gate=false changed_packages=wyrd-mcp rust_packages=wyrd-mcp ci_lanes~test:wyrd ci_lanes~test:bifrost:gate ci_lanes~test:gateway:gate" \
-  "crates/wyrd/wyrd-mcp/src/old_name.rs" "crates/wyrd/wyrd-mcp/src/new_name.rs"
+  "full_gate=false changed_packages=wyrd rust_packages~wyrd rust_packages~wyrd-rust-examples rust_packages!wyrd-cli ci_lanes~test:wyrd" \
+  "crates/wyrd/wyrd/src/old_name.rs" "crates/wyrd/wyrd/src/new_name.rs"
 check_selection "deleted crate path takes the full gate" \
   "full_gate=true" \
   "crates/wyrd/wyrd-retired/src/lib.rs"
@@ -131,7 +131,7 @@ check_selection "client storage selects storage" "storage=true" \
   "crates/shared/wyrd-client/src/storage/mod.rs"
 check_selection "Rust-only leaf skips SDK platforms and unrelated journeys" \
   "rust_client=false typescript=false python=false identity=false storage=false ci_lanes!py:test:integration" \
-  "crates/wyrd/wyrd-mcp/src/lib.rs"
+  "crates/wyrd/wyrd/src/lib.rs"
 check_selection "Bifrost-only runs the capability gate" \
   "bifrost_only=true full_gate=false ci_lanes=" \
   "crates/vala/vala-bifrost-redux/src/forge/worker.rs"
@@ -165,6 +165,40 @@ check_selection "Python example runs Python checks" "full_gate=false python=true
 check_selection "identity fixture selects the identity journey" "full_gate=false identity=true" \
   "tests/fixtures/identity/dex-config.yaml"
 
+# check_jobs <label> <job-names> <changed-file>...: the ci matrix runs exactly
+# these jobs, in order.
+check_jobs() {
+  local label="$1" want="$2" files outputs got
+  shift 2
+  files="$(mktemp)"
+  outputs="$(mktemp)"
+  printf '%s\n' "$@" > "$files"
+  WYRD_CHANGED_FILES="$files" GITHUB_OUTPUT="$outputs" bash "$DETECT" > /dev/null
+  got="$(grep -m1 '^ci_jobs=' "$outputs" | cut -d= -f2- \
+    | python3 -c 'import json,sys; print(" ".join(j["name"] for j in json.load(sys.stdin)))')"
+  rm -f "$files" "$outputs"
+  if [[ "$got" == "$want" ]]; then ok "$label"; else fail "$label: got '$got', want '$want'"; fi
+}
+
+gate_shards="$(python3 -c 'import tomllib; print(" ".join(tomllib.load(open("'"$SCRIPT_DIR/../../../mise.toml"'","rb"))["tasks"]["gate"]["depends"]))')"
+check_jobs "full gate runs one job per gate shard" "$gate_shards" "Cargo.lock"
+check_jobs "server change runs its lanes, identity, and storage" "lanes identity storage" \
+  "crates/wyrd/wyrd-server/src/state.rs"
+check_jobs "Rust-only leaf runs only its lanes" "lanes" "crates/wyrd/wyrd/src/lib.rs"
+check_jobs "Bifrost-only runs the Bifrost gate" "bifrost" \
+  "crates/vala/vala-bifrost-redux/src/forge/worker.rs"
+check_jobs "docs-only change runs no ci job" "" "docs/src/index.mdx"
+check_jobs "identity fixture runs only the identity journey" "identity" \
+  "tests/fixtures/identity/dex-config.yaml"
+check_jobs "TypeScript SDK change runs its lanes and identity" "lanes identity" \
+  "sdks/wyrd-sdk-ts/wyrd/src/index.ts"
+if [[ "$(cd "$SCRIPT_DIR/../../.." && GITHUB_OUTPUT=/dev/stdout python3 .github/scripts/select-ci.py --gate \
+  | cut -d= -f2- | python3 -c 'import json,sys; print(" ".join(j["name"] for j in json.load(sys.stdin)))')" == "$gate_shards" ]]; then
+  ok "nightly runs the same gate shards"
+else
+  fail "select-ci.py --gate must list every gate shard"
+fi
+
 zero_outputs="$(mktemp)"
 GITHUB_OUTPUT="$zero_outputs" bash "$DETECT" "$(printf '%040d' 0)" "$(git rev-parse HEAD)" > /dev/null
 if grep -qx 'full_gate=true' "$zero_outputs" && grep -qx 'any=true' "$zero_outputs"; then
@@ -183,22 +217,19 @@ job() {
 # check, boundary checks, and exactly the selected lanes; SDK platform jobs run
 # on Linux and macOS, and the full gate also selects them.
 ci_job="$(job lints-test.yml ci)"
-if grep -q 'timed gate$' <<< "$ci_job" \
-  && grep -q 'timed check$' <<< "$ci_job" \
-  && grep -q 'timed check:deps$' <<< "$ci_job" \
+if grep -q 'fromJSON(needs.changes.outputs.ci_jobs)' <<< "$ci_job" \
   && grep -q 'for lane in $CI_LANES' <<< "$ci_job" \
-  && ! grep -q 'test:rust' <<< "$ci_job" \
   && grep -q 'WYRD_TEST_PACKAGES' <<< "$ci_job"; then
-  ok "ci runs the gate or check plus the selected lanes"
+  ok "ci runs each selected job's lanes in parallel"
 else
-  fail "ci must run the gate or check, boundary checks, and the selected lanes"
+  fail "ci must run the ci_jobs matrix and each job's lanes"
 fi
 for sdk_job in rust-client typescript python; do
   block="$(job lints-test.yml "$sdk_job")"
-  if grep -q 'matrix-plan.outputs.os' <<< "$block" && grep -q 'outputs.full_gate' <<< "$block"; then
-    ok "$sdk_job runs on both platforms and on the full gate"
+  if grep -q 'matrix-plan.outputs.\(os\|python\)' <<< "$block" && grep -q 'outputs.full_gate' <<< "$block"; then
+    ok "$sdk_job runs on the planned platforms and on the full gate"
   else
-    fail "$sdk_job must run on both platforms and on the full gate"
+    fail "$sdk_job must run on the planned platforms and on the full gate"
   fi
 done
 if grep -q '"macos-15"' <<< "$(job lints-test.yml matrix-plan)"; then
@@ -206,7 +237,7 @@ if grep -q '"macos-15"' <<< "$(job lints-test.yml matrix-plan)"; then
 else
   fail "SDK platform matrix must include macOS"
 fi
-for workflow in lints-test.yml storage-integration-emulator.yml identity-e2e.yml; do
+for workflow in lints-test.yml; do
   if ! grep -q '\${{ *secrets\.' "$WORKFLOWS/$workflow"; then
     ok "$workflow uses no secrets"
   else
@@ -224,7 +255,7 @@ fi
 
 check_selection "leaf crate packages nothing" \
   "package_python=false package_typescript=false package_server=false package_crates=false" \
-  "crates/wyrd/wyrd-mcp/src/lib.rs"
+  "crates/wyrd/wyrd/src/lib.rs"
 check_selection "shared Skald change packages every SDK and server" \
   "package_python=true package_server=true package_typescript=true package_crates=false" \
   "crates/skald/skald-cache/src/lib.rs"

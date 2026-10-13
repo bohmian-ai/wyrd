@@ -68,13 +68,11 @@ pub struct BifrostBuildInputs {
     pub deployment_profile: DeploymentProfile,
     /// Shared production PostgreSQL handles.
     pub postgres: ServerPostgres,
-    /// Shared object-storage handle used by Scribe and Forge construction.
-    pub storage: Arc<StorageHandle>,
     /// This node's one Bifrost storage owner.
     ///
-    /// Retained so every co-located role shares one pointer-identical owner,
-    /// one request ceiling, and one shutdown, rather than each role composing
-    /// its own view of the same backend.
+    /// Retained so every co-located role shares one pointer-identical object
+    /// store and one request ceiling, rather than each role composing its own
+    /// view of the same backend.
     pub bifrost_storage: Arc<vala_bifrost_redux::storage::BifrostStorage>,
     /// Shared tenant-qualified Bifrost catalog.
     pub catalog: Arc<BifrostCatalog>,
@@ -598,9 +596,22 @@ impl Oracle {
     }
 
     /// Reports startup reconciliation and lifecycle readiness, excluding saturation.
+    ///
+    /// Ready also requires this role's own fenced lease in the live membership
+    /// snapshot, so a peer-mode Oracle restarted beside a live one is not ready
+    /// until its activation publishes the lease peers route by.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.lifecycle.is_serving() && self.engine.is_ready()
+        self.lifecycle.is_serving()
+            && self.engine.is_ready()
+            && self
+                .cluster
+                .snapshot()
+                .live_oracle_at_fence(
+                    self.registered_role.key.node_id,
+                    self.registered_role.fencing_token,
+                )
+                .is_some()
     }
 
     /// Synchronously closes local Oracle readiness before transport cancellation.
@@ -835,6 +846,7 @@ impl Scribe {
         let fragment_follower = Arc::new(PhysicalPlanFollower::new(ScribeTailResolver::new(
             Arc::clone(&tail_service),
             Arc::clone(&catalog),
+            resources.oracle_partitioning(),
         )));
         // A WAL that faulted during boot replay never advertises ready.
         let advertise_ready = Arc::new(AtomicBool::new(
@@ -947,9 +959,22 @@ impl Scribe {
     }
 
     /// Reports whether the ingest writer has completed recovery and can accept work.
+    ///
+    /// Ready also requires this role's own fenced lease in the live membership
+    /// snapshot, so a peer-mode Scribe is not ready until its activation
+    /// publishes the lease peers dial its tail by.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.lifecycle.is_serving() && self.ingest.is_ready()
+        self.lifecycle.is_serving()
+            && self.ingest.is_ready()
+            && self
+                .cluster
+                .snapshot()
+                .live_scribe_at_fence(
+                    self.registered_role.key.node_id,
+                    self.registered_role.fencing_token,
+                )
+                .is_some()
     }
 
     /// Reports whether this role's WAL faulted and withdrew it until restart.
@@ -1819,9 +1844,9 @@ impl Bifrost {
     /// Borrows this node's one Bifrost storage owner.
     ///
     /// `None` only for the ownerless unit-test shell. Every co-located role in a
-    /// composed process observes the identical pointer, which is what makes the
-    /// node-wide request ceiling and the single shutdown real rather than
-    /// per-role.
+    /// composed process observes the identical pointer, so the node-wide
+    /// request ceiling is shared rather than per-role. Storage has no shutdown
+    /// step of its own: the shared owner drops with its last role.
     #[must_use]
     pub fn bifrost_storage(&self) -> Option<&Arc<vala_bifrost_redux::storage::BifrostStorage>> {
         self.storage.as_ref()
@@ -1920,31 +1945,24 @@ impl Bifrost {
         }
     }
 
-    /// Drains every selected subsystem and this node's storage owner against
-    /// one absolute deadline.
+    /// Drains every selected subsystem against one absolute deadline.
     ///
     /// The order is fixed and load-bearing: readiness and public admission
-    /// close first, Forge supervision must already be quiesced, the Oracle and
-    /// then the Scribe owner and registry drain, the membership poller stops,
-    /// and only then is the storage owner closed. The poller outlives every
-    /// role because draining roles and the earlier Scribe outbox drain read
-    /// membership. Storage is last because work a role already admitted may
-    /// still need object I/O to finish; closing it first would fail that work
-    /// rather than let it complete.
+    /// close first, Forge supervision must already be quiesced, then the
+    /// Oracle and then the Scribe owner and registry drain, and the membership
+    /// poller stops last because draining roles and the earlier Scribe outbox
+    /// drain read membership. Storage has no drain step: the shared storage
+    /// owner simply drops once its last role does, so work a role already
+    /// admitted keeps its object I/O until it finishes.
     ///
-    /// Any failure along the way — unquiesced Forge supervision, a role drain
-    /// error, or a storage owner that does not settle by the deadline — runs
-    /// the abort path for both roles *and* storage before returning, so a
-    /// failed shutdown never leaves the metadata cache open, decoded entries
-    /// retained, or object I/O admissible. A successful report is therefore
-    /// only ever produced when storage is closed and settled.
+    /// Any failure along the way — unquiesced Forge supervision or a role
+    /// drain error — runs the abort path for every selected role before
+    /// returning, so a failed shutdown never leaves admission open.
     ///
     /// # Errors
     /// Returns a stable lifecycle failure when a selected role cannot remove
-    /// readiness, when Forge supervision has not joined, or
-    /// [`BifrostError::Internal`](wyrd_spec::vala::error::BifrostError::Internal)
-    /// with detail `"Bifrost storage did not settle before shutdown deadline"`
-    /// when the storage owner does not settle.
+    /// readiness or drain by the deadline, or when Forge supervision has not
+    /// joined, or when the membership poller does not stop by the deadline.
     pub async fn shutdown(
         &self,
         deadline: Instant,
@@ -1953,7 +1971,7 @@ impl Bifrost {
         match self.drain_selected_owners(deadline).await {
             Ok(report) => Ok(report),
             Err(error) => {
-                self.abort_selected_owners().await;
+                self.abort_selected_owners();
                 Err(error)
             }
         }
@@ -2006,13 +2024,6 @@ impl Bifrost {
         if let Some(poller) = &self.membership_poller {
             stop_role_task(poller, deadline, "membership poller").await?;
         }
-        if let Some(storage) = &self.storage
-            && !storage.close(deadline).await
-        {
-            return Err(wyrd_spec::vala::error::BifrostError::Internal {
-                detail: "Bifrost storage did not settle before shutdown deadline".to_owned(),
-            });
-        }
         Ok(BifrostShutdownReport {
             scribe_drained,
             forge_drained,
@@ -2022,19 +2033,17 @@ impl Bifrost {
 
     /// Closes public admission and aborts selected role owners without claiming a flush.
     ///
-    /// Awaits the storage owner's abort, so once this returns no retained
-    /// loader and no governed operation is still running against the node's
-    /// backend. Repeated calls remain safe.
-    pub async fn abort(&self) {
-        self.abort_selected_owners().await;
+    /// Signals cancellation and returns without waiting for any owner to
+    /// settle. Repeated calls remain safe.
+    pub fn abort(&self) {
+        self.abort_selected_owners();
     }
 
-    /// Cancels every selected owner and settles the storage owner.
+    /// Closes the gate and cancels every selected owner.
     ///
     /// The one abort path, shared by the public seam and by every failed
-    /// shutdown, so a failure can never take a cleanup route that skips
-    /// storage.
-    async fn abort_selected_owners(&self) {
+    /// shutdown, so both cancel the same set of owners.
+    fn abort_selected_owners(&self) {
         self.gate.close();
         if let Some(query) = &self.oracle {
             query.abort_shutdown();
@@ -2047,9 +2056,6 @@ impl Bifrost {
         }
         if let Some(poller) = &self.membership_poller {
             poller.abort();
-        }
-        if let Some(storage) = &self.storage {
-            storage.abort().await;
         }
     }
 }
@@ -2568,7 +2574,7 @@ mod tests {
     use super::{AppState, LimitsConfig};
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+    use wyrd_storage::{LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
 
@@ -2753,7 +2759,7 @@ mod tests {
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         crate::test_support::test_app_state(
             postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            Arc::new(StorageHandle::new(signer)),
             crate::test_support::test_catalog().await,
         )
     }

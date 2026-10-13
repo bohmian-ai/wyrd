@@ -37,7 +37,10 @@ services:
     restart: "no"
 
   fake-gcs-server:
-    image: fsouza/fake-gcs-server:1.50.2@sha256:23996047676fe5312001b828d800670519181c57a5943c2270e7421f3ab3f477
+    # object_store writes through the GCS XML API (`PUT /{bucket}/{object}`);
+    # upstream fake-gcs-server accepts that only for signed URLs, so this is the
+    # fork object_store's own CI runs against.
+    image: tustvold/fake-gcs-server@sha256:dcd3aeacc07c731f1336e90c2889be2af8626ae993ee1fe2c0ba042ebbeb5a04
     container_name: wyrd-storage-gcs
     command:
       - "-scheme"

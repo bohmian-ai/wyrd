@@ -16,100 +16,6 @@ pub const REQUEST_OVERHEAD_BYTES: usize = 4 * 1024;
 /// Fixed pod-global in-flight item ceiling from the Scribe contract.
 pub const GLOBAL_INFLIGHT_ITEMS: usize = 4_096;
 
-/// Bounded acceptance window for caller-supplied `wyrd_event_time`.
-///
-/// Both the native Arrow IPC path and the projected OTLP path evaluate a
-/// present `wyrd_event_time` column against this window at admission time.
-/// Values that fall outside the window are rejected with
-/// [`ScribeError::EventTimeOutOfRange`]; values within the window (inclusive
-/// at both edges) are preserved verbatim. When the column is absent the
-/// server stamps receipt time and no check runs.
-///
-/// A single per-batch receipt instant governs all rows so an in-flight clock
-/// tick cannot split a batch verdict.
-#[derive(Debug, Clone, Copy)]
-pub struct EventTimeWindow {
-    /// Maximum age below the per-batch server receipt time.
-    ///
-    /// Default: 30 days, accommodating backfill workloads.
-    pub past: std::time::Duration,
-    /// Maximum lead above receipt time for clock-skew tolerance.
-    ///
-    /// Default: 24 hours.
-    pub future: std::time::Duration,
-}
-
-impl EventTimeWindow {
-    /// Returns `true` when `event_micros` lies within the inclusive window
-    /// `[receipt_micros - past, receipt_micros + future]`.
-    ///
-    /// Duration-to-micros conversions saturate at `i64::MAX`/`i64::MIN` rather
-    /// than panicking so a pathologically large window cannot overflow.
-    #[must_use]
-    pub fn contains(&self, event_micros: i64, receipt_micros: i64) -> bool {
-        // Saturating cast: past_micros fits an i64 for any sane Duration.
-        let past_micros = i64::try_from(self.past.as_micros()).unwrap_or(i64::MAX);
-        let future_micros = i64::try_from(self.future.as_micros()).unwrap_or(i64::MAX);
-        let lo = receipt_micros.saturating_sub(past_micros);
-        let hi = receipt_micros.saturating_add(future_micros);
-        event_micros >= lo && event_micros <= hi
-    }
-
-    /// Returns the UTC-noon instant `days_before_receipt` days below the
-    /// production receipt instant, in the microsecond unit
-    /// [`Self::contains`] itself compares against.
-    ///
-    /// Scribe fixtures must never pin an absolute event-time literal. A pinned
-    /// instant silently ages out of `[receipt - past, receipt + future]` as
-    /// wall-clock advances, so a fixture that passes today becomes a permanent
-    /// failure on some later date and stops proving anything about the path it
-    /// covers. Deriving the instant here -- from this window, against the same
-    /// [`crate::scribe::execution_lanes::current_receipt_micros`] clock the
-    /// enforcement path reads -- keeps a fixture correct at any wall-clock
-    /// time without restating the bound arithmetic outside this type.
-    ///
-    /// Noon is chosen so the returned instant sits at least twelve hours from
-    /// either surrounding day boundary. A caller that derives an `EventDay`
-    /// from this value therefore lands on the same calendar day as the value
-    /// itself no matter when the test runs.
-    ///
-    /// # Panics
-    /// Panics when the receipt clock is unavailable, when `days_before_receipt`
-    /// does not land on a representable instant, or when the derived instant
-    /// falls outside this window. Each case would leave a fixture asserting
-    /// against an event time the production admission path would refuse, which
-    /// is precisely the condition this accessor exists to prevent.
-    #[cfg(any(test, feature = "test-support"))]
-    #[must_use]
-    pub fn admitted_event_time_micros(&self, days_before_receipt: i64) -> i64 {
-        let receipt_micros = crate::scribe::execution_lanes::current_receipt_micros()
-            .expect("receipt clock must be readable to derive an admitted event time");
-        let receipt = chrono::DateTime::from_timestamp_micros(receipt_micros)
-            .expect("receipt instant must be representable");
-        let event_micros = (receipt - chrono::Duration::days(days_before_receipt))
-            .date_naive()
-            .and_hms_opt(12, 0, 0)
-            .expect("noon must be a valid time on any date")
-            .and_utc()
-            .timestamp_micros();
-        assert!(
-            self.contains(event_micros, receipt_micros),
-            "derived event time {event_micros} must lie inside the admission window"
-        );
-        event_micros
-    }
-}
-
-impl Default for EventTimeWindow {
-    fn default() -> Self {
-        const SECS_PER_DAY: u64 = 86_400;
-        Self {
-            past: std::time::Duration::from_secs(30 * SECS_PER_DAY),
-            future: std::time::Duration::from_secs(SECS_PER_DAY),
-        }
-    }
-}
-
 /// Fixed pod-wide admission settings.
 #[derive(Debug, Clone, Copy)]
 pub struct AdmissionConfig {
@@ -118,13 +24,6 @@ pub struct AdmissionConfig {
     /// Server deployments pass the resolved shared Bifrost cap; admission
     /// itself enforces no byte ceiling against it.
     pub memory_limit_bytes: usize,
-    /// Acceptance window for caller-supplied `wyrd_event_time` values.
-    ///
-    /// Applied uniformly to both the native Arrow IPC and projected OTLP
-    /// ingest surfaces. Values outside the window are rejected with
-    /// `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`; the absent-column server-stamp
-    /// path is unaffected. Defaults to 30 days past / 24 hours future per D85.
-    pub event_time_window: EventTimeWindow,
 }
 
 /// Default pod memory budget for embedded and test Scribe construction.
@@ -134,7 +33,6 @@ impl Default for AdmissionConfig {
     fn default() -> Self {
         Self {
             memory_limit_bytes: DEFAULT_POD_MEMORY_LIMIT_BYTES,
-            event_time_window: EventTimeWindow::default(),
         }
     }
 }
@@ -172,7 +70,7 @@ impl AdmissionController {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn with_config(config: AdmissionConfig) -> Self {
-        let memory = super::embedded_scribe_resources(&config);
+        let memory = super::embedded_scribe_resources(config);
         Self::with_config_and_memory(config, memory)
     }
 

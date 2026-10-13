@@ -70,7 +70,7 @@ pub struct ObservationRun {
     pub verifier_uid: Uuid,
     /// The frozen `record_id` of the observation that created the run.
     pub record_id: String,
-    /// The frozen server-managed `wyrd_event_time` of that observation.
+    /// The frozen `created_at`, the table's time column, of that observation.
     pub event_time: chrono::DateTime<chrono::Utc>,
     /// The run's durable control-plane state.
     pub state: RunRow,

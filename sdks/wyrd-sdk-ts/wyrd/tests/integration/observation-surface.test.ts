@@ -24,9 +24,9 @@ const VALUE_ROW = { type: "object", properties: { value: { type: "integer" } }, 
 const HexId = z.instanceof(Uint8Array).transform((bytes) => Buffer.from(bytes).toString("hex"));
 
 const SpannedEvalRow = z.object({
-  context: z.string(),
+  context: z.record(z.string(), z.unknown()),
   session_id: z.string().nullable(),
-  media: z.string().nullable(),
+  media: z.array(z.record(z.string(), z.unknown())).nullable(),
   trace_id: HexId,
   span_id: HexId,
   card_uid: z.string(),
@@ -63,9 +63,9 @@ test("eval observation carries its session, media, and active span", async ({ se
   );
   expect(rows).toEqual([
     {
-      context: '{"answer":"yes"}',
+      context: { answer: "yes" },
       session_id: SESSION,
-      media: '[{"id":"screenshot","kind":"image","uri":"s3://bucket/shot.png","media_type":"image/png"}]',
+      media: [{ id: "screenshot", kind: "image", uri: "s3://bucket/shot.png", media_type: "image/png" }],
       trace_id: span.spanContext().traceId,
       span_id: span.spanContext().spanId,
       card_uid: state.cardRef("agent").uid,

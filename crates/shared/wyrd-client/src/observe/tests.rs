@@ -18,6 +18,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     BifrostTableDescription, BifrostTableEntry, FieldSpec, PARQUET_FIELD_ID_KEY,
 };
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::eval::media::{MediaKind, MediaRef};
 use wyrd_spec::vala::ids::{SessionId, SpanId, TraceId};
 
@@ -148,7 +149,11 @@ fn ok_json(body: &str) -> String {
 
 /// One stable problem-JSON 404 for an unknown table.
 fn not_found() -> String {
-    let body = r#"{"type":"about:blank","title":"Not Found","status":404,"code":"WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND","detail":"no such table"}"#;
+    let body = WyrdError::from(BifrostError::TableNotFound {
+        table: "no.such_table".to_owned(),
+    })
+    .as_problem_json()
+    .to_string();
     format!(
         "HTTP/1.1 404 Not Found\r\ncontent-type: application/problem+json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
@@ -172,7 +177,8 @@ fn description(fqn: &str, fields: Vec<Field>) -> BifrostTableDescription {
             registered_at: "2026-07-01T00:00:00Z".parse().expect("fixture timestamp"),
             updated_at: "2026-07-01T00:00:00Z".parse().expect("fixture timestamp"),
         },
-        user_fields: wyrd_queue::arrow_schema_to_fieldspec(&schema),
+        user_fields: wyrd_types::arrow_schema_to_fieldspec(&schema)
+            .expect("the fixture schema is representable"),
         correlation_fields: vec![
             FieldSpec {
                 name: "card_uid".to_owned(),
@@ -187,10 +193,10 @@ fn description(fqn: &str, fields: Vec<Field>) -> BifrostTableDescription {
                 metadata: [(PARQUET_FIELD_ID_KEY.to_owned(), "1000".to_owned())].into(),
             },
         ],
-        managed_candidates: Vec::new(),
         canonical_physical_fingerprint: None,
         physical_layout: wyrd_spec::vala::api::PhysicalLayoutWire {
             partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
+            time_column: None,
             sort_keys: Vec::new(),
             bloom_columns: Vec::new(),
         },
@@ -1126,11 +1132,12 @@ fn eval_projects_context_media_and_trace_identity() {
     assert_eq!(row["trace_id"], json!("0102030405060708090a0b0c0d0e0f10"));
     assert_eq!(row["span_id"], json!("1112131415161718"));
     assert_eq!(row["session_id"], json!(uuid::Uuid::nil().to_string()));
-    let context: Value = serde_json::from_str(row["context"].as_str().expect("context text"))
-        .expect("context is canonical JSON text");
-    assert_eq!(context, json!({ "question": "why?", "answer": "because" }));
-    let media: Value = serde_json::from_str(row["media"].as_str().expect("media text"))
-        .expect("media is canonical JSON text");
+    assert_eq!(
+        row["context"],
+        json!({ "question": "why?", "answer": "because" }),
+        "context stays a JSON value for its Variant column"
+    );
+    let media = &row["media"];
     assert_eq!(media[0]["id"], json!("screenshot"));
     assert_eq!(media[0]["uri"], json!("s3://bucket/shot.png"));
     assert_eq!(
@@ -1173,7 +1180,7 @@ fn eval_refuses_a_span_without_its_trace() {
     assert_eq!(error.code(), "WYRD_SPEC_400_VALIDATION");
 }
 
-// ── Scenario 6: the generic record path ────────────────────────────────────
+// ── Scenario 5: the generic record path ────────────────────────────────────
 
 /// The first call describes the table once; later calls reuse its schema.
 #[tokio::test]
@@ -1305,185 +1312,6 @@ async fn record_refuses_an_unknown_dataset_table() {
         .await
         .expect_err("an unregistered table must refuse");
     assert_eq!(error.status(), 404);
-}
-
-// ── Scenario 5: the client owns observation event time ──────────────────────
-
-/// Every `wyrd_event_time` in the batches `sink` settled for `table`, decoded
-/// from the sent IPC as the exact `Timestamp(Microsecond, "UTC")` wire column.
-///
-/// # Panics
-/// Panics when a batch is not valid IPC or does not carry that column.
-fn sent_event_times(sink: &MockSink, table: &str) -> Vec<i64> {
-    use arrow::array::{Array, TimestampMicrosecondArray};
-    let mut times = Vec::new();
-    for receipt in sink.received().iter().filter(|r| r.table == table) {
-        let reader = arrow::ipc::reader::StreamReader::try_new(receipt.bytes.as_slice(), None)
-            .expect("the settled frame is IPC");
-        for batch in reader {
-            let batch = batch.expect("the settled frame decodes");
-            let column = batch
-                .column_by_name(wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME)
-                .expect("every emitted row carries wyrd_event_time");
-            assert_eq!(
-                column.data_type(),
-                &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
-                "the wire column is the managed candidate type"
-            );
-            assert_eq!(column.null_count(), 0, "event time is never null");
-            let column = column
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .expect("timestamp column");
-            times.extend(column.values().iter().copied());
-        }
-    }
-    times
-}
-
-/// Drift, Eval, and record rows carry the client clock reading of their emit
-/// call, not of the later flush; a caller's own `wyrd_event_time` is kept.
-///
-/// The queue lingers for a minute, so nothing seals until `shutdown`; every
-/// stamp must still lie between clock readings taken around the emits and
-/// before that shutdown.
-#[tokio::test]
-async fn emits_stamp_their_own_event_time_and_keep_a_callers() {
-    let server = DescribeServer::start(fixed_table_bodies());
-    let table = "vala.datasets.app_events";
-    server.publish(
-        table,
-        &description(table, vec![Field::new("event", DataType::Utf8, false)]),
-    );
-    let (_bundle, state) = state_fixture();
-    let sink = Arc::new(MockSink::new());
-    state
-        .adopt_started_bifrost_for_test(bifrost_over(
-            &server,
-            Arc::clone(&sink),
-            QueueConfig {
-                linger_ms: 60_000,
-                ..QueueConfig::default()
-            },
-        ))
-        .await
-        .expect("startup");
-    let run = state.run();
-    let observe = run.observe();
-    let supplied = "2026-01-02T03:04:05.678901Z";
-
-    let before = chrono::Utc::now().timestamp_micros();
-    observe
-        .drift(&json!({ "age": 42, "tier": "gold" }), None)
-        .expect("drift enqueues");
-    observe
-        .eval(
-            &json!({ "answer": "yes" }),
-            EvalObservationOptions::default(),
-        )
-        .expect("eval enqueues");
-    observe
-        .record(table, &json!({ "event": "stamped" }))
-        .await
-        .expect("record enqueues");
-    let after = chrono::Utc::now().timestamp_micros();
-    observe
-        .record(
-            table,
-            &json!({ "event": "supplied", "wyrd_event_time": supplied }),
-        )
-        .await
-        .expect("a caller event time is admitted");
-    state.shutdown().await.expect("shutdown drains");
-
-    let drift = sent_event_times(&sink, DRIFT_OBSERVATIONS_TABLE);
-    let eval = sent_event_times(&sink, EVAL_OBSERVATIONS_TABLE);
-    let records = sent_event_times(&sink, table);
-    assert_eq!((drift.len(), eval.len(), records.len()), (2, 1, 2));
-    assert_eq!(
-        drift[0], drift[1],
-        "one Drift record is stamped once for all its rows"
-    );
-    for time in [drift[0], eval[0], records[0]] {
-        assert!(
-            (before..=after).contains(&time),
-            "{time} is the emit-time reading in [{before}, {after}]"
-        );
-    }
-    assert_eq!(
-        records[1],
-        chrono::DateTime::parse_from_rfc3339(supplied)
-            .expect("fixture timestamp")
-            .timestamp_micros(),
-        "the caller's wyrd_event_time is kept, not overwritten"
-    );
-}
-
-/// A plain Bifrost write is not an observation, so the client leaves its event
-/// time to the server's receipt instant: interleaved with a stamped
-/// `observe.record` on the same table, it seals into its own batch without a
-/// `wyrd_event_time` column while the observation keeps its stamp.
-#[tokio::test]
-async fn plain_inserts_leave_event_time_to_the_server() {
-    let server = DescribeServer::start(fixed_table_bodies());
-    let table = "vala.datasets.app_events";
-    server.publish(
-        table,
-        &description(table, vec![Field::new("event", DataType::Utf8, false)]),
-    );
-    let (_bundle, state) = state_fixture();
-    let sink = Arc::new(MockSink::new());
-    state
-        .adopt_started_bifrost_for_test(bifrost_over(
-            &server,
-            Arc::clone(&sink),
-            QueueConfig {
-                linger_ms: 60_000,
-                ..QueueConfig::default()
-            },
-        ))
-        .await
-        .expect("startup");
-    let run = state.run();
-    let started = state.started_bifrost().expect("Bifrost is started");
-    let destination = started
-        .bifrost
-        .writer_table(table)
-        .await
-        .expect("the table is described");
-
-    run.observe()
-        .record(table, &json!({ "event": "observed" }))
-        .await
-        .expect("record enqueues");
-    started
-        .bifrost
-        .insert_into(
-            &destination,
-            json!({ "event": "plain" }).to_string().into_bytes(),
-            run.correlation(),
-        )
-        .expect("a plain row enqueues");
-    drop(started);
-    state.shutdown().await.expect("shutdown drains");
-
-    let carries_event_time: Vec<bool> = sink
-        .received()
-        .iter()
-        .filter(|receipt| receipt.table == table)
-        .map(|receipt| {
-            arrow::ipc::reader::StreamReader::try_new(receipt.bytes.as_slice(), None)
-                .expect("the settled frame is IPC")
-                .schema()
-                .field_with_name(wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME)
-                .is_ok()
-        })
-        .collect();
-    assert_eq!(
-        carries_event_time,
-        vec![true, false],
-        "the observation is stamped and the plain write is not"
-    );
 }
 
 /// A state created with a client keeps it for every server call: its clones

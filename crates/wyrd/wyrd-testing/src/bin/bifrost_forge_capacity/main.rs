@@ -50,7 +50,7 @@ use std::time::Duration;
 use clap::Parser;
 use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
 use wyrd_testing::capacity::{binary_identity, install_tracing, release_binary};
-use wyrd_testing::release_server::{Envelope, LocalServer};
+use wyrd_testing::release_server::{Envelope, LocalServer, Placement};
 
 use dependencies::Dependencies;
 use deployment::{Deployment, LogCursor, keep_log};
@@ -233,7 +233,13 @@ async fn benchmark(cli: Cli) -> Result<Outcome> {
         ("WYRD_TARGET", "server"),
         ("WYRD_MAX_FILE_RETENTION_TIME", seal.as_str()),
     ]);
-    let leader = LocalServer::start(&binary, &["forge"], &leader_env, leader_envelope).await?;
+    let leader = LocalServer::start(
+        &binary,
+        &["forge"],
+        &leader_env,
+        Placement::Scoped(leader_envelope),
+    )
+    .await?;
     let dependencies = Dependencies::connect().await?;
     let probe = LeaderProbe::new(dependencies.owner(), &probe_identity)?;
     let mut deployment = Deployment {

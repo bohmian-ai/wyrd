@@ -30,11 +30,22 @@ engine and its three cohesive subsystems:
   retention, and garbage collection.
 
 Apache Iceberg-managed Parquet in object storage is the analytical system of
-record. Postgres is the tenant-isolated catalog and durable control plane.
+record. Each node reaches it through one `object_store` client for the
+configured backend behind one node-wide request limit; Scribe, Oracle, Forge,
+and the Iceberg catalog all use it, and timeouts and retries are the cloud
+client's own. `wyrd-storage` keeps its separate client for card and artifact
+storage. Postgres is the tenant-isolated catalog and durable control plane.
 DataFusion is the vectorized execution engine. Managed compaction and Iceberg
 components perform bounded computation behind Vala-owned contracts; they do not
 authenticate callers, serve the network, own tenant authority, or commit
 durable Wyrd state independently.
+
+Each role on a pod renews its own `vala.cluster_nodes` heartbeat, and one
+process-wide membership poller reads the live set for every role. Internal
+Scribe writes route to a peer by its Scribe capability alone, so a pod without
+Oracle still reaches Scribe. At the entrance, Gate admits only a verified
+principal, OTLP authenticates its API key before decoding a body, and every
+Bifrost SQL path takes a `TenantConn` or an `OperatorPool`, never a bare pool.
 
 ## Table and row identity
 
@@ -43,20 +54,30 @@ non-null columns:
 
 - `wyrd_request_id`: server-minted or validated request correlation, the
   join key to audit and to the batch-commit fence;
-- `wyrd_event_time`: when the observed thing happened — the caller's value,
-  validated against the acceptance window, or `wyrd_ingested_at` when the
-  caller supplies none;
-- `wyrd_ingested_at`: when Wyrd accepted the batch. Scribe reads it once per
-  batch from PostgreSQL (`statement_timestamp()`) at admission, stamps the same
-  value on every row, and stores it on the batch's
+- `wyrd_ingested_at`: when Wyrd accepted the batch. Scribe takes it once per
+  batch at admission from a PostgreSQL-anchored clock: each node reads
+  `statement_timestamp()` once, carries it forward on its local monotonic
+  clock, and re-reads it every minute, never consulting its wall clock. Scribe
+  stamps the same value on every row and stores it on the batch's
   `vala.scribe_batch_commits` fence. A caller can never supply it.
 
 The column names, types, stable ids, and order are declared once, in
 `vala_bifrost_redux::tables::managed_columns::MANAGED_COLUMNS`; every physical
 schema and every reserved-name check derives from that declaration.
 `wyrd_ingested_at` comes from the database clock, so it is comparable across
-replicas, but it is the admission instant, not a commit order, and is not an
+replicas to within one anchor's monotonic drift, but it is the admission instant, not a commit order, and is not an
 incremental-read checkpoint.
+
+Every table has exactly one time column: a non-null `Timestamp` in
+microseconds or nanoseconds, with or without a zone. A registration declares
+it as `time_column` on its physical layout, and omitting it selects
+`wyrd_ingested_at`. The time column alone drives the hour or day partition
+transform, the default first sort key (descending), hot and published time
+bounds, and `COUNT(*)`. Built-in tables declare their own: OTLP spans
+`start_time_unix_nano`, OTLP logs and metrics `time_unix_nano`, gateway and
+agent traces `started_at`, Drift and Eval observations and
+`vala.system.audit_log` `created_at`, and `vala.verification.results`
+`ended_at`. Every caller-supplied `wyrd_*` column is reserved and refused.
 
 The tenant is not a row column. It is a property of the physical table, of
 each Parquet file, and of each in-memory Scribe bucket, all bound from the
@@ -67,10 +88,13 @@ Required, non-null `principal_id` identifies the authenticated publisher. None
 participates in row identity.
 
 For OTLP records, table-owned projection reads correlation only from the final
-record-level `wyrd.card_uid` and `wyrd.run_id` attributes, retaining all source
-attributes losslessly. The values use the `CardUid` and `RunId` text grammars.
-Scribe stores a client Card UID only when the verified principal scope, or for
-a principal bound to no Card the tenant registry, confirms it.
+record-level `wyrd.card_uid` and `wyrd.run_id` attributes. Every source
+attribute is retained in the record's Variant attribute column; when a
+collection repeats a key, the final occurrence is the one stored, matching the
+OTel data model and the correlation rule. The values use the `CardUid` and
+`RunId` text grammars. Scribe stores a client Card UID only when the verified
+principal scope, or for a principal bound to no Card the tenant registry,
+confirms it.
 
 Identity is batch-level. The batch identity is the client-generated UUIDv7
 `wyrd_batch_id` request field; it is not stored on rows. Within a
@@ -120,27 +144,172 @@ failure fails provisioning or startup rather than exposing a partially ready
 tenant or server. An unwritten built-in is therefore queryable and empty, and
 neither first write nor describe owns its creation.
 
+## Storage format and Variant
+
+Every Bifrost table, built-in and user-defined, is created as Iceberg format
+v3, and physical-table validation refuses a table that is not v3. There is no
+other format and no mixed-version state. Appends assign row ids through the v3
+first-row-id mechanism. The hidden lineage columns `_row_id` and
+`_last_updated_sequence_number` are Iceberg metadata, never logical columns:
+they are absent from the table schema, its fingerprints, and every query
+result, and a Forge rewrite preserves both for every surviving row.
+
+Variant is a canonical column type (`DataTypeSpec::Variant`) for open,
+self-describing values. On the Arrow wire a Variant column is the
+`arrow.parquet.variant` extension over the unshredded `metadata`/`value`
+binary Struct; Iceberg and Parquet store it as the v3 Variant type. A field
+declared Variant must carry that extension at every nesting level: missing or
+foreign extension metadata is `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`, even
+when the storage Struct matches. Extension metadata is not part of a
+fingerprint, so files with different shredding layouts share one table and one
+fingerprint.
+
+A Variant value reads back with the type, nesting, and value it was written
+with. Integers stay integers and never pass through floating point; doubles
+keep their IEEE meaning; strings, booleans, bytes, arrays, and objects keep
+their type; and an absent object key stays distinct from a key whose value is
+null. Object keys are unique: when an OTel attribute collection repeats a key,
+the final occurrence is stored. JSON input converts an integer in the signed
+64-bit (`i64`) range to an integer, an integer from `i64::MAX + 1` through
+`u64::MAX` to a scale-zero Variant decimal, and a non-integer number to a
+double; every other integer is refused with
+`WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE`, so every accepted integer reads
+back exactly without `serde_json` `arbitrary_precision`. A value
+nested beyond 64 containers is `WYRD_VALA_400_VARIANT_TOO_DEEP`, one whose
+encoded metadata plus value exceeds 8,388,608 bytes is
+`WYRD_VALA_413_VARIANT_TOO_LARGE`, and undecodable bytes are
+`WYRD_VALA_400_VARIANT_INVALID_JSON`.
+
+Raw Variant bytes are held to the same domain. A raw number must be one JSON
+input could produce: an integer, a finite Float or Double, or a scale-zero
+Decimal16 in `i64::MAX + 1..=u64::MAX`. Decimal4, Decimal8, any other
+Decimal16 (`numeric_kind: "decimal"`), and a NaN or infinite Float or Double
+(`numeric_kind: "double"`) are `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE`;
+exact fractional or wider numbers travel as strings. A raw object is canonical
+or `WYRD_VALA_400_VARIANT_INVALID_JSON`: its resolved field names strictly
+increase whether or not the metadata dictionary is sorted, and every field
+value owns its own bytes, never shared with or overlapping another field's.
+Bifrost enforces size, encoding, numeric range, and depth when writing.
+Validation of raw bytes is iterative and bounded by the fixed size limit, and
+because no two fields may share or overlap bytes a value cannot describe more
+nodes than its bytes hold. Reads apply no Bifrost limit: arrow-rs decodes
+stored Variant and refuses malformed or over-deep bytes with an error rather
+than a panic or unbounded work.
+
+When writing, one value reports one failure in a fixed order: size, then invalid JSON or
+encoding, then numeric range, then depth, wherever each sits in the value.
+JSON size counts the bytes actually built from accepted members; a refused
+number or an over-depth container adds none. JSON syntax is decided at any
+nesting depth, so valid JSON past the limit is too deep, never invalid, and
+`try_parse_json` maps only invalid JSON to null.
+
+Scribe repeats the extension, size, encoding, numeric, and depth checks over
+every declared Variant of a built-in table at its admission boundary, before
+the batch is acknowledged, because a raw Arrow writer can skip client
+preparation and the fingerprint compares storage types only. Extension
+identity is checked across all fields first, then each value in row and field
+order in the order above; the first failure names the field, row, and path.
+
+Built-in tables store open caller content as Variant and closed shapes as
+typed columns:
+
+- `vala.traces.spans`, `vala.logs.records`, and `vala.metrics.points` store
+  their attribute collections (record, resource, scope, span event and link,
+  and exemplar filtered attributes), the log `body`, and the metric `metadata`
+  as Variant. `resource_entity_refs` is a list of Structs with `type`,
+  `id_keys`, `description_keys`, and `schema_url`. Well-known
+  semantic-convention values are copied into nullable promoted columns, each
+  null when its source is absent or has another type: `service_name`,
+  `service_version`, and `deployment_environment` on all three signals;
+  `gen_ai_*`, `http_request_method`, `http_route`,
+  `http_response_status_code`, `url_full`, and the `exception_*` columns of the
+  span's last `exception` event on spans; the record's own `exception_*`
+  attributes and `body_text` (the body when it is a string) on logs.
+- `vala.verification.results` replaces its JSON `details` text with two
+  nullable Structs: `drift_report` (`method`, Variant `features`, `verdict`) and
+  `eval_summary` (task counts, `pass_rate`, `duration_ms`). A scored result sets
+  exactly the one its implementation owns.
+- Every nullable built-in Struct — `drift_report`, `eval_summary`, the
+  `vala.metrics.points` bucket sets, and `vala.gateway.calls`
+  `resolved_model` — has nullable children, because a required Parquet leaf
+  under a null parent reads back as another row's value through a field
+  query. The Struct is whole or absent: a present one sets every child its
+  shape requires and an absent one nulls every child, so `s['child']` reads
+  SQL null for an absent Struct on hot and published data alike. Admission
+  refuses a batch with a partial Struct before ACK with
+  `WYRD_VALA_400_SCHEMA_PARSE` naming the row and child.
+- `vala.eval.observations` `context` and `media`, `vala.eval.result_items`
+  `actual` and `expected`, `vala.verification.results` `assertion_result`,
+  `vala.gateway.calls` `request_payload` and `response_payload`, and
+  `vala.system.audit_log` `detail` are Variant.
+
+### Variant shredding
+
+Every Variant field — a table column, a Struct child, or a child of a List
+element's Struct — is stored in the standard Parquet shredded layout:
+`metadata`, a residual `value`, and `typed_value` leaves for the keys the file
+chose. The footer is the only record of a file's layout; Wyrd writes no layout
+metadata, and files with different layouts share one table and one
+fingerprint. Values that do not fit the layout stay in the residual `value`,
+so the layout changes performance only, never a result. Both readers unshred
+at any depth before rows leave the scan.
+
+- **Scribe** recovery-stage runs stay unshredded. Each final hot object's
+  layout is chosen before its writer opens, from one seeded, stratified sample
+  of the claim: strata are `principal_id` values, writers with fewer than 30
+  rows share one stratum, and each stratum samples Cochran's size for 99%
+  confidence and a ±0.02 margin. A key is shredded when at least 8% of a
+  stratum's sampled non-null values hold it with one compatible type. The seed
+  is the claim, so a re-run claim writes the same objects. Each element of a
+  Variant inside a List counts as one observation, and one layout covers every
+  element. The sample holds counters, never rows.
+- **Forge** samples nothing. It sums each source footer's shredded-leaf
+  non-null counts, keeps keys covering at least 10% of the combined rows,
+  gives a type conflict to the type covering more rows, and writes every output
+  of one rewrite with that layout. Forge only keeps or drops keys; Scribe
+  discovers them.
+
+The sampling parameters and the per-node child and depth caps are internal
+writer constants, not public, wire, table, or persisted contracts.
+
+## Declared types and the registered schema
+
+`wyrd-types` owns the one mapping from a declared model or Arrow schema to
+wire columns, and `wyrd_types::schema::check_supported` is the one decision of
+which declared types Bifrost can store. The SDK declaration and server
+registration both call it, so an unstorable type (`UInt64`, `Date64`,
+`Time32`, a `Time64` or `Timestamp` unit Iceberg has no column for, at any
+depth) is `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE` before any request or
+table exists.
+
+A table's registered Iceberg schema is its one schema. Registration stores
+each declared column in its Iceberg form, and a repeat declaration that spells
+the same Iceberg types repeats rather than conflicts. On every write Scribe
+matches the batch to that schema before acknowledging: columns match by name
+in any order; a column whose Arrow type is another spelling of the registered
+Iceberg type (`Int8` for `int`, `LargeUtf8` for `string`, a timestamp in any
+zone) is cast once with Arrow's `cast`; a column whose storage matches but
+whose Variant identity does not is `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`;
+and any other difference is `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
+
+Bifrost has three timestamp types, named as Snowflake names them:
+
+- `TIMESTAMP_NTZ`: a wall-clock reading with no instant, stored as a naive
+  Arrow timestamp. A naive declared timestamp is `TIMESTAMP_NTZ`.
+- `TIMESTAMP_LTZ`: one instant, stored as an Arrow timestamp zoned `+00:00`
+  and read back in UTC. A declared timestamp in any zone is `TIMESTAMP_LTZ`; the zone
+  label is not stored.
+- `TIMESTAMP_TZ`: one instant plus the writer's wall-clock reading, stored as
+  the Struct of required microsecond `utc` (`TIMESTAMP_LTZ`) and `local`
+  (`TIMESTAMP_NTZ`) children, so a reader
+  can group by the writer's local hour and the writer's offset is
+  `local - utc`.
+
+`wyrd_types::TimestampKind` owns each type's JSON Schema format and its
+RFC 3339 rendering; the Python and TypeScript SDKs read both from the native
+binding rather than restating them.
+
 ## Durability and visibility
-
-### Consistency principle
-
-Wyrd's high-throughput paths are eventually consistent within a few seconds,
-and their tradeoffs are known and accepted:
-
-- An acknowledgement on a high-throughput path means the server has received
-  the work. It does not guarantee the work is durable, and the caller never
-  waits for derived work. Examples of derived work are Eval run creation,
-  audit decisions, result publication, and Forge planning.
-- Derived work is batched through server-owned outboxes and becomes visible
-  within seconds. An outbox retries rather than dropping work because a
-  dependency is slow or unavailable, and graceful shutdown flushes it.
-- A hard process kill may lose work that was received but not yet flushed.
-  This loss is accepted, and every loss the process can observe is counted and
-  logged.
-- Reviews and designs MUST NOT treat these windows as defects, and MUST NOT
-  close them by making callers wait. A path that needs a stronger guarantee
-  states it explicitly in its own contract. Scribe's append acknowledgement,
-  described below, is one such path.
 
 Bifrost uses explicit authority transitions:
 
@@ -246,7 +415,7 @@ The principal size boundaries are independent:
 | Ingest request | one `scribe.ingest_request_bytes` wire ceiling, 16 MiB default |
 | Ingest expanded data | derived 4x the wire ceiling (64 MiB default), enforced before WAL; no row cap |
 | Parquet row group | soft 128 MiB encoded target; a single large accepted row fits a group of its own |
-| Scribe hot object | `min(WYRD_MAX_FILE_SIZE_ON_DISK, Forge target)` encoded whole-file target, drained by size or dwell, with bounded residue |
+| Scribe hot object | `min(WYRD_MAX_FILE_SIZE_ON_DISK, Forge target)`: a key's ready members drain once their summed raw (uncompressed Arrow) bytes reach it, or at dwell, with bounded residue; output objects roll at the same value in encoded bytes |
 | Forge rewrite output | the table's optional registered compaction target, else the deployment default of approximately 1 GiB (`WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES`) |
 
 Ingest has exactly one size setting. The wire ceiling bounds encoded request
@@ -275,11 +444,24 @@ validate and split by canonical physical partition
   -> acknowledgement
 ```
 
-Caller-supplied `wyrd_event_time` is accepted only within the server window,
-defaulting to 30 days before through 24 hours after the batch's
-`wyrd_ingested_at`. An out-of-window value fails with
-`WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`; Scribe never clamps or normalizes it.
-When the column is absent, the server stamps `wyrd_ingested_at` into it.
+A shard commits admitted requests in groups. One group cycle writes every
+SLICE record, appends each complete batch's COMMIT record, and makes both
+durable with one sync over every segment the cycle touched before it records
+the batch fences. No request is acknowledged before that sync and its fence
+commit.
+
+Each write request carries one profile in the Oracle query-profile pattern,
+emitted once when the request settles as
+`scribe_write_profile_nanoseconds_total{event}` and
+`scribe_write_profiles_total`. Its own steps are `Scribe.admission`,
+`Scribe.decode`, `Scribe.preprocess`, and `Scribe.shard_wait`; each group
+stage, `Scribe.group_write`, `group_commit`, `group_sync`, `group_fence`, and
+`group_insert`, is timed once per cycle and charged to every request the cycle
+acknowledged.
+
+Every time-column value is accepted; no acceptance window exists. One request
+may touch at most 32 time partitions of its table; a request touching more is
+refused whole with the existing invalid-frame error and stores nothing.
 
 Each shard projects WAL bytes, Arrow and metadata ownership, age, and resource
 pressure before append. Rotation closes the shard generation when any validated
@@ -325,7 +507,11 @@ be split across claims and a later member cannot join an existing claim.
 `PhysicalLayout` order; rows that tie on every layout key keep claim-member
 order, then their position within the staged run, so the merged order is
 deterministic without a per-row tie-breaker column. It writes Parquet row groups toward a soft 128 MiB target and
-closes immutable hot objects around the 512 MiB whole-file target. A completed row group is
+closes immutable hot objects around the 512 MiB whole-file target. The claim
+trigger counts raw bytes: each staged member records the uncompressed Arrow
+bytes its frozen bucket held, and a key is claimed once those sum to the target,
+matching how memtable rotation measures size. Counting encoded bytes instead
+would hold a well-compressing table until dwell. A completed row group is
 indivisible, and a smaller object is valid for dwell, partition close,
 pressure, drain, or final residue. The 512 MiB target is independent of WAL,
 active-memory, row-group, and Forge output geometry.
@@ -354,6 +540,12 @@ Startup replays WAL using the recorded shard ID, validates staged files and
 manifests, rebuilds source and claim indexes, and reconciles publishing
 operation IDs against `file_list` before opening admission. Unknown versions,
 checksum mismatch, contradictory lineage, or ambiguous authority fail closed.
+Because SLICE and COMMIT records share one sync, a crash may leave a complete
+but invalid record in a shard's unsynced tail. Replay ends that shard's chain
+at the first such record in its last segment, as it does a torn tail, only
+when the shard stream's newest durable batch fence lies before it; a bad
+record preceding an acknowledged COMMIT, in an earlier segment, or with no
+fence authority available fails closed.
 
 Shutdown closes admission and mailboxes, rotates nonempty generations, stages
 immutable ownership, and drains admitted work within the server deadline. It
@@ -391,6 +583,55 @@ return a stable structured failure. Representative end-to-end queries prove
 scan/filter/projection, grouped aggregation, join, sort/limit, exchange, and
 spill behavior without claiming exhaustive operator coverage.
 
+### Variant SQL
+
+Every Oracle session — leader planning, admission execution, follower,
+analytical leader, analytical planning, and distributed worker — is built with
+`DataFusion`'s default features, which include the fork's `variant` feature:
+
+- `v -> 'key'` and `v -> n` return the Variant at an object key or array index,
+  or null when absent; chains such as `attributes -> 'http' ->> 'route'` follow
+  nested keys.
+- `v ->> 'key'` and `v ->> n` return the same value as text: a string as
+  itself, any other non-null value as its JSON text, and SQL null when absent or
+  JSON null. Its result casts to numeric, boolean, and timestamp types with
+  ordinary SQL cast semantics.
+- `parse_json(text)` returns the Variant for JSON text and fails the query on
+  invalid input; `try_parse_json(text)` returns null instead. `to_json(v)`
+  returns a Variant's JSON text.
+
+`->` and `->>` apply only to Variant operands; a JSON text column is queried as
+`parse_json(column) ->> 'key'`. `->` plans as `variant_get` and `->>` as
+`variant_get_text`. Struct access stays DataFusion's exact `s['field']`
+`get_field`. Every Variant result keeps the `arrow.parquet.variant` extension
+on the wire. Wyrd adds no Variant function, planner, or file adapter: queries
+use the fork's Variant feature as-is, so a Variant evaluation failure is the
+generic `WYRD_VALA_500_QUERY_EXECUTION_FAILED`, and peers agree on function
+semantics through the pinned fork revision.
+
+### Nested-field reads
+
+When every use of a Struct or Variant column in a query's projection and
+filter is a literal path — `s['a']['b']`, `v -> 'a' ->> 'k'`,
+`l[i]['f'] ->> 'k'`, or such a path on an `unnest(l)` output — each Oracle
+reader decodes only that path's leaves. A Struct path reads its field's
+leaves; a shredded Variant path reads its `typed_value` subtree, its
+path-local residual `value`, and the top-level `metadata`; a List element path
+reads those leaves of every element. Sibling leaves are not decoded. A query
+that uses the whole column, or a path a file did not shred, reads the whole
+root, with the same result.
+
+Hot objects and published files read through one per-file read plan built on
+the `DataFusion` fork's nested projection, decoder filter, and statistics
+pruning, so leader, follower, interactive, and analytical scans cannot drift.
+Struct access stays exact `get_field` and Variant access stays semantic
+`variant_get`. A literal comparison, `IN`, or null test on such a path filters
+while decoding. It skips row groups or pages only when a Variant path's
+residual is all-null and its type matches, or a Struct field's statistics are
+complete; otherwise the predicate is evaluated on the decoded values.
+Unshredded against shredded Variant reads are DataFusion's behavior, timed by
+DataFusion's `parquet_variant_query` benchmark.
+
 ### Distributed analytical execution
 
 The analytical path uses streamed exchanges parameterized by DataFusion
@@ -422,8 +663,10 @@ accepts the leader's stream, beneath its own local capacity root, or refuses
 at once with retry timing when full. No pending reservation, reservation
 expiry, or reclaim-by-timeout exists. When the leader stream completes, fails,
 is cancelled, or is dropped, or the deadline passes, the follower cancels the
-graph immediately and releases every owner once its structured tasks have
-joined; nothing waits for a later request or timer to reclaim it.
+graph immediately and releases every owner inline, without waiting for nested
+children still being torn down; a late child returns its bytes through the
+shared memory root as it frees them. Nothing waits for a later request or
+timer to reclaim it.
 
 Exchange buffers draw from the same finite query-owned memory pool as the
 operators; they are not precharged into a predicted child allocation. Before
@@ -517,8 +760,13 @@ root, never an independently sized pool: the view refuses growth past that
 query's own ceiling, and the root's single tracked spill-fair pool, bounded by
 the shared Bifrost memory cap that Scribe, Forge, and in-flight transport also
 charge, arbitrates what all live queries hold together. No role holds a fixed
-share or a precharge: an idle role holds nothing, and every charge returns
-when its owner ends. Aggregate governed reservations therefore cannot sum above
+share or a precharge, with one exception: when an Oracle-serving node sets up
+`DataFusion`'s Parquet footer cache at composition, it charges the cache's
+whole `metadata_cache_bytes` budget to the Oracle memory root and holds it for
+the storage owner's life, because that cache reports no per-entry charge; a
+zero budget sets up no cache and charges nothing. Apart from that standing
+charge an idle role holds nothing, and every charge returns when its owner
+ends. Aggregate governed reservations therefore cannot sum above
 the Bifrost cap.
 
 The cap comes from the detected process or pod memory limit. `wyrd-server`
@@ -539,12 +787,36 @@ allocations outside cooperative reservation fall in the server minimum; the
 pool is the Bifrost safety boundary, not a guarantee against operating-system
 or cgroup OOM.
 
-Query parallelism comes from CPU, not memory. Before
-physical planning, every Oracle leader, Oracle peer, and distributed stage
-session sets its target partitions from the node's effective CPU and the pinned input's
-locality: `cpu + (4 * cpu - cpu) * (1 - local_ratio)`, never below two, where
-`local_ratio` is the pinned bytes held in the local hot tier. Neither the grant
-nor the pinned file count changes it. Batch size and join preference are the
+Query parallelism comes from CPU and scanned bytes, not memory. The node's
+effective CPU and the pinned input's locality cap it:
+`cpu + (4 * cpu - cpu) * (1 - local_ratio)`, never below two, where
+`local_ratio` is the pinned bytes held in the local hot tier. Before physical
+planning, the Oracle leader narrows that cap to the bytes the query scans: one
+partition per started `WYRD_BIFROST_ORACLE_PARTITION_SCAN_BYTES` (24 MiB by
+default), at least one. Scanned bytes are measured by one owner,
+`scan_sizing::ScanSizer`, on every tier: the query's projected columns in the
+units its filters cannot rule out by their recorded bounds, counted in decoded
+bytes. A Parquet unit is a row group of a published file, hot file, or staged
+run, counted by its uncompressed column chunks from the footer (a file whose
+footer cannot be read counts its size on disk); a memtable unit is an append
+batch, counted by each column's Arrow data, recorded once at append so sizing
+adds stored numbers. Oracle sizes published and hot
+files; each Scribe reports its memtable batches and staged runs for the same
+columns and filters, and its follower sizes its memtable leaf from the batches
+it actually keeps. Neither the grant nor the pinned file count changes it.
+Where the rule cannot apply (a filter conjunct that does not plan, a footer
+not read, a batch column without a recorded size) sizing counts it in
+`bifrost_scan_sizing_fallback_total{reason}`; Oracle counts the row groups it
+sized in `oracle_query_row_groups_sized_total`, read beside
+`oracle_query_row_groups_scanned_total`, and the query capacity benchmark
+flags a window where either diverges.
+
+Because the class is read from the physical root, it follows from this count:
+a single-partition plan has no exchange for the distributed planner to cut, so
+a point lookup or small scan runs Interactive, and only a scan large enough to
+earn several partitions can plan Analytical. Distributed-path journeys set the
+partition bytes to one, so their kilobyte tables plan the shape a
+production-sized table does. Batch size and join preference are the
 `DataFusion` defaults. Oracle retains the planning `SessionConfig` with the
 single physical root. The actual grant supplies only the query-owned
 `RuntimeEnv`, its `MemoryPool` ceiling, and a per-partition sort-merge
@@ -598,22 +870,42 @@ HTTP queries bypass the server's global load-shed and request-concurrency
 layers so they reach this queue; gRPC reaches it directly.
 
 Snapshot preparation has no admission gate of its own. One tenant-scoped
-statement on the bounded runtime PostgreSQL pool resolves every referenced
-table, registers one active read per table under the table's maintenance
-authority, and returns each catalog metadata pointer with its hot rows. Oracle
+autocommit statement on the bounded runtime PostgreSQL pool, binding its own
+tenant, resolves every referenced table and returns each catalog metadata
+pointer with its hot rows. The statement is read-only: it takes no lock,
+writes no row, and nothing is released at the query's terminal. Each Oracle
+node caches the returned cuts per table and serves them only while it is
+listening on the `bifrost_cut` channel, which a `vala.file_list` trigger
+notifies in every committing transaction that changes a table's hot
+candidates; a lost listener clears the cache. A Forge rewrite's terminal
+transition sends the same notification in its transaction, so warm nodes stop
+reading the files it replaced. Expiry and manifest rewrites send nothing,
+because the older pointer returns the same rows from the same files. A cached cut serves a query only when it was read no earlier than the
+query deadline minus `max_query_deadline_ms`, so snapshot retention still
+covers it. Delivery follows commit, so the cache adds its notification
+latency to the publication race below. Oracle
 then reads the selected metadata documents directly and concurrently; a
 document missing after a catalog move reacquires the whole cut once, and a
-second `NotFound` is terminal. The active reads live until the leader settles
-every descendant fragment, and all of this waits within the leader deadline. `oracle_query_phase_seconds` times the
-leader's sequential, non-overlapping steps — `snapshot_pin` (covering every
-preparation substep above), `scribe_listing`, `provider_setup`,
-`physical_planning`, and `admission` — so they may be read as additive; total
-Oracle time is `oracle_query_duration_seconds`, not a phase.
+second `NotFound` is terminal. All of this waits within the leader deadline,
+which is capped at `max_query_deadline_ms` (default 6 h); Forge's snapshot
+retention, never a per-query record, keeps the pinned objects readable.
+
+Every query carries one execution profile, the analog of `ClickHouse`
+`ProfileEvents`. The leader's own steps — `cut_read`, `cut_materialize`,
+`scribe_listing`, `provider_setup`, `physical_planning`, `admission`, and
+`audit_bind` — are `DataFusion` `Time` metrics timed with
+the same scoped guards operators use, and every operator of the executed root
+contributes its own `DataFusion` metrics. The profile is emitted once, after
+the leader settles every descendant fragment, as `oracle_query_profile_nanoseconds_total{event}`,
+`oracle_query_profile_count_total{event}`, and `oracle_query_profiles_total`,
+with events named `Oracle.<step>` or `<operator>.<metric>`, plus one DEBUG
+event per query. Operator times sum across partitions, so they are not wall
+time; total Oracle time is `oracle_query_duration_seconds`.
 Remote peer work reuses one authenticated channel per ready peer incarnation and
 endpoint; a changed fence or endpoint connects anew and never inherits the
-prior peer's channel. Connect, fragment open, first remote frame, and terminal
-are timed as separate `peer_*` phases; they are per-fragment latencies that can
-overlap one another and the leader steps, so they are never summed with them.
+prior peer's channel. A live leaf profiles `fragment_open_time`, connect
+included, and `fragment_wait_time` spent awaiting remote frames; both sum
+across its partitions.
 
 An Analytical leader selects at most `max_workers_per_query` remote workers from
 the pinned eligible cut, rotating the starting position by the attempt identity
@@ -647,6 +939,17 @@ framing is `QueryQueueFull`; any other admission refusal before framing is
 exchange exhaustion after framing is `QueryResourcesExhausted`. Cancellation,
 deadline, peer loss, and execution failure have typed terminal outcomes. A
 stream never represents partial rows as success.
+
+A query failure carries the same complete derive-backed catalog problem, code
+and details, whether it occurs before the first frame or after rows were sent,
+in Interactive and Analytical execution over HTTP and gRPC. The failure
+terminal holds that problem, every SDK raises it unchanged, and collecting a
+result returns no partial rows. Distributed workers forward an execution error
+only as text, so a catalogued Oracle error crosses as its tagged serde form
+inside the existing external `DataFusion` error, and the coordinator
+reconstructs it in one place before mapping the failure; no failure is
+classified from its human message. Only a failure with no catalog identity
+becomes `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
 
 A public distributed-plan or execution-path `EXPLAIN` surface is deferred and
 is not part of this delivery. Selected-path evidence reaches callers only
@@ -688,10 +991,10 @@ rather than days.
 The five verification tables — `vala.drift.observations`,
 `vala.eval.observations`, `vala.verification.results`,
 `vala.drift.result_features`, and `vala.eval.result_items` — also partition by
-UTC day on `wyrd_event_time`, never by Verifier, subject, binding, or tenant
-ID. Every row of one Verification Result carries the same server-chosen event
-time, so a result and its detail rows never split across day partitions. A
-Drift schedule window does not determine partition size.
+UTC day on each table's time column — `created_at` for observations,
+`ended_at` for results, and `wyrd_ingested_at` for result features and items —
+never by Verifier, subject, binding, or tenant ID. A Drift schedule window does
+not determine partition size.
 
 ## Maintenance: Forge
 
@@ -720,7 +1023,13 @@ one table is logged and the pass continues. Durable task rows record attempt
 evidence and recovery; retryable rows are reclaimed with tenant-fair
 admission, but no durable queue decides what runs next.
 
-At most one durable task attempt owns the lease and fence for a
+A table's one `claimed`, `running`, or `prepared` task row is its exclusive
+lease: claiming the row acquires the table, contention is a refused claim at
+admission, the attempt's heartbeat renews the claim, and the attempt's single
+terminal transition, committed only after that heartbeat has stopped, releases
+it. A strategy that decides its own outcome returns that decision for the
+settlement seam to commit; it never releases the claim itself. At most one
+durable task attempt therefore owns the lease and fence for a
 tenant-qualified table. Within that attempt, admitted ordinary compaction plans are independent child
 operations: fitting siblings may rewrite and publish concurrently, while
 bounded per-tenant and per-worker admission also permits independent tables to
@@ -745,11 +1054,12 @@ branch. It then performs one fenced duplicate-checking fast-append
 On a definite compare-and-swap conflict, Forge refreshes the branch head and
 revalidates the exact `file_list` rows, object/footer evidence, absence of an
 equivalent promoted entry, branch, lease, and fence. When all assumptions hold,
-the same attempt and operation ID may make at most one additional `commit_once`.
-Another conflict or changed assumption settles the attempt as definitely
-uncommitted and leaves the rows as `file_list` promotion debt that a later
-leader sweep retries under a new attempt. No retry rewrites or reuploads the
-Scribe object.
+the same attempt and operation ID may make at most one additional `commit_once`
+within the original deadline. Another conflict, changed assumption, or expired
+deadline settles the attempt as definitely uncommitted and leaves the rows as
+`file_list` promotion debt that a later leader sweep retries under a new
+attempt. No retry rewrites or reuploads
+the Scribe object.
 
 An ambiguous catalog result keeps the same attempt and operation ID. Forge
 refreshes metadata and reconciles exact snapshot properties and manifest
@@ -812,6 +1122,12 @@ deduplicate by their complete canonical identity. Reading a delete file does
 not make it removable because it may still apply to unselected live data.
 Forge does not reselect, regroup, reconstruct, edit, or rewrite handoff files.
 
+Forge reads the hidden `_row_id` and `_last_updated_sequence_number` beside
+the logical projection, carries them in its internal physical batch, and
+writes those exact values for every surviving row, so a row keeps its lineage
+identity across any number of rewrites. Lineage evidence stays in the output
+`DataFile`s; the five-field handoff is unchanged.
+
 The commit adapter derives delete-file disposition from the immutable base
 snapshot and the applied-delete evidence; the handoff remains exactly five
 fields. A position-delete file is removed only when every referenced live data
@@ -851,11 +1167,11 @@ conflict, Forge refreshes the branch head and revalidates the retained planning
 snapshot, current schema identity, selected-input existence, lease, and fence.
 When those assumptions remain true, the same plan operation, output generation,
 and objects may make at most three further `commit_once` calls after fixed
-1s/2s/4s delays. Each call is bounded by the catalog request timeout; a call it
-ends is ambiguous, never a refusal. Exhausted retries or a changed assumption
-settles only that plan as definitely uncommitted. Successful sibling snapshots
-remain visible; the task succeeds when any admitted plan publishes, and later
-discovery replans remaining debt from the current head. No conflict retry creates new output objects.
+1s/2s/4s delays within the original deadline. Exhausted retries, an expired
+deadline, or a changed assumption settles only that plan as definitely
+uncommitted. Successful sibling snapshots remain visible; the task succeeds
+when any admitted plan publishes, and later discovery replans remaining debt
+from the current head. No conflict retry creates new output objects.
 
 An uncertain attempt protects its outputs and reconciles under the same
 identity; it never retries the catalog call, starts a fresh attempt, or reports
@@ -875,36 +1191,33 @@ or contradictory lineage evidence fails closed.
 Data-file compaction, manifest rewriting, snapshot expiration, expired-object
 cleanup, and never-published orphan cleanup are separate protocols. The leader
 timer orders them per pass as manifest rewrite, snapshot expiry, then cleanup.
-Expiry has no age or retain-last window: a replaced snapshot is eligible as
-soon as no active Oracle read, in-flight compaction, unsettled promotion, or
-other authoritative root retains it. A table with an active read is skipped;
-snapshot expiration preserves active refs, unresolved attempts, reconciliation
+Expiry protects readers with a time window, as Iceberg, Trino, Delta, Paimon,
+and Snowflake do, and tracks no query. Forge records in Postgres when it first
+observes each retained snapshot as no longer current; a replaced snapshot is
+eligible once that observation is `snapshot_retention_secs` (default 6 h, never
+below the maximum query deadline) old and no in-flight compaction, unsettled
+promotion, or other authoritative root retains it. A query pins a snapshot
+while it is current, so the snapshot cannot expire before the query's deadline.
+The leader plans an expiry task only when some replaced snapshot is already
+past the window, so a quiet table is rechecked every pass and every planned
+task changes the table.
+Snapshot expiration preserves active refs, unresolved attempts, reconciliation
 evidence, and the lineage snapshot referenced by the branch head. Orphan GC deletes only
 objects proven unreferenced and outside every active or uncertain attempt.
-Committed Scribe hot objects in `file_list` that lack exact promotion evidence,
-and objects of a table with an active Oracle read, are hard GC roots even
-when no Iceberg snapshot references them. Once the last reader releases,
-expired-object cleanup deletes without an age floor and removes the matching
+Committed Scribe hot objects in `file_list` that lack exact promotion evidence
+are hard GC roots even when no Iceberg snapshot references them. Once its
+snapshots expire, expired-object cleanup deletes without a further age floor and removes the matching
 terminal `file_list` row in the same completion transaction.
 Every destructive effect holds the table's exclusive maintenance authority
 through its known outcome, and the Forge lease TTL bounds that hold: an
 object-store call still running at the bound is an uncertain effect left for
-idempotent replay, so a hung store never blocks the table's readers
-indefinitely. An Oracle cut that waits on the authority waits at most until
-its query deadline and then fails with the query timeout.
-Snapshot expiry uses the existing prepared expiration claims when its catalog
-commit remains acceptance-unknown at that bound. After the authority lock is
-released, those claims block a new Oracle cut for the table with
-`WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` until reconciliation establishes
-the stable old or new pointer and removes them. This is not a reader claim or a
-second coordination protocol; the same prepared operation already required for
-expiry recovery is the barrier. Acceptance-unknown object deletion needs no
-such barrier because its candidate was proved unreachable before submission
-and cannot be named by a new cut.
+idempotent replay. Oracle never takes the authority, so maintenance never
+waits on a query and a query never waits on maintenance.
 An open Scribe fragment retains its local Arrow batches and staged resources
 until its stream completes or drops. It names no Forge-collectable object and
 contributes no independent Forge GC root.
-No cleanup infers safety from age or path shape alone.
+No cleanup infers safety from path shape; only snapshot expiry and orphan GC
+use age.
 
 ## Resource and failure invariants
 
@@ -918,8 +1231,10 @@ No cleanup infers safety from age or path shape alone.
   does not have.
 - Global resource owners account tenant and table attribution without creating
   an independent root pool per tenant.
-- Cancellation is structured: stop admission, cancel descendants, join work,
-  reconcile uncertain effects, and release ownership exactly once.
+- Cancellation is structured: stop admission, cancel descendants, reconcile
+  uncertain effects, and release ownership exactly once. Query graph release
+  does not join dependency-owned teardown; memory those children still hold
+  stays charged to the shared root until they free it.
 - Durable operations separate definite failure from uncertain completion.
   Uncertainty retains identity and evidence until reconciliation.
 - Catalog compare-and-swap and lease fences own publication authority. An
@@ -983,7 +1298,10 @@ across a restart; durable batch, file, and task rows answer that question.
 - **Scribe.** `bifrost_scribe_ack_seconds` measures each ACK attempt.
   `bifrost_scribe_memtable_rows_inserted_total` counts rows the shard inserted
   into the live memtable in this process; an idempotent same-process retry adds
-  zero, and replay after restart counts again in the new process. Receipt
+  zero, and replay after restart counts again in the new process.
+  `bifrost_scribe_memtable_bytes_inserted_total` counts the same rows'
+  retained Arrow bytes, the in-memory size ingest throughput is measured in.
+  Receipt
   `accepted_rows` is a client contract, not a newly-stored-row measure.
   `bifrost_scribe_staging_live_members`, `_live_bytes`,
   `_oldest_member_timestamp_seconds`, and `_outstanding_claims` are published
@@ -1001,21 +1319,17 @@ across a restart; durable batch, file, and task rows answer that question.
   pre-registers only the decisions an admission branch can make, and
   `oracle_admission_queue_duration_seconds` records each waiter once. Scan
   counters report the executed plan's files, bytes, partitions, and row
-  groups. `bifrost_oracle_file_pruning_total{outcome}` counts hot-object
-  exclusions decided from declared bounds; Iceberg pruning happens inside its
-  own scan planning and is not re-walked for telemetry.
-- **Storage.** `bifrost_storage_metadata_cache_effects_total{effect,reason}`
-  counts cache decisions (hit, miss, join, bypass, evict) — logical lookups,
-  not backend I/O. `bifrost_storage_metadata_cache_loads_total{outcome}`,
-  `bifrost_storage_metadata_load_seconds`, and
-  `bifrost_storage_metadata_wait_seconds` measure footer decodes and the time
-  callers waited on them. `bifrost_storage_requests_total{operation}`,
-  `bifrost_storage_request_terminals_total{operation,outcome}`,
-  `bifrost_storage_request_seconds`, and
-  `bifrost_storage_request_retries_total` measure governed backend requests; a
-  cache hit adds none. Resident entries/bytes and in-flight loads are set from
-  the cache's own state, and `bifrost_storage_active_requests` moves at request
-  admission and settlement. No telemetry copy of cache or request state exists.
+  groups.
+- **Variant layout.** `bifrost_variant_residual_share{writer}` records, for
+  each final Scribe object and Forge output, the uncompressed bytes of its
+  Variants' root residual `value` leaves as a share of all their
+  non-`metadata` leaves, read from the file's footer; `writer` is `scribe` or
+  `forge`. A file with no Variant bytes records nothing. A rising share means layouts are missing keys. Forge
+  reads each output footer once after the rewrite and logs, never fails on, a
+  footer it cannot read. Recovery-stage runs are not measured.
+- **Storage.** Bifrost emits no storage metrics of its own. Parquet footers
+  are cached in `DataFusion`'s node-wide metadata cache, whose whole budget is
+  charged to the Oracle memory root at composition.
 - **Traces.** A query is one trace: `bifrost.gate.query.stream` spans the
   client-facing stream through terminal or drop, with `bifrost.gate.query`
   dispatch as its child; `bifrost.oracle.stream` spans Oracle execution through
@@ -1059,7 +1373,8 @@ The surface includes:
 - `AppendReceipt { batch_id, accepted_rows, durability }`, where `durability`
   is the closed `AppendDurability::Acknowledged` value; the synchronous append
   response never reports staged, published, promoted, or rewritten state;
-- terminal-safe query streaming at `POST /v1/query`;
+- terminal-safe query streaming at `POST /v1/query`, with ordered typed bind
+  values (`params`) for the `$1..$n` placeholders in its SQL;
 - canonical SQL observation reads through the ordinary Bifrost query contract;
 - gRPC ingestion through `wyrd.v1.BifrostIngestService`;
 - gRPC query projection through `wyrd.v1.BifrostQueryService`;
@@ -1083,9 +1398,10 @@ attribution (run, exact Verifier Card, tenant `System` principal) that Scribe
 stamps as `principal_id` and `card_uid`. A pod without Scribe submits through
 `ScribeCapturePeerService.IngestCapture` on the peer listener, which the same
 `wyrd-peer` mTLS admits; the request names its tenant and one of those five
-tables explicitly, carries no token, carries an attribution exactly when the
-table is a result table, and is refused for the reserved system tenant or any
-other table. Sensitive-column metadata remains descriptive; table query
+tables or `vala.system.audit_log` explicitly, carries no token, and carries an
+attribution exactly when the table is a result table. It is refused for any
+other table, and for the reserved system tenant unless the table is
+`vala.system.audit_log`. Sensitive-column metadata remains descriptive; table query
 permission governs every column, including GenAI fields stored on trace spans,
 except that a projection reaching the `vala.gateway.calls` request or response
 payload columns also requires the tenant-wide gateway payload-read permission.

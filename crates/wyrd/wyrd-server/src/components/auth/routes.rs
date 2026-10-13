@@ -677,7 +677,7 @@ mod pg_tests {
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
-    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+    use wyrd_storage::{LocalSigner, StorageHandle};
 
     use crate::components::auth::AuthenticatedPrincipal;
     use crate::components::gateway::recording::RecordingScribe;
@@ -792,7 +792,7 @@ mod pg_tests {
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         crate::test_support::test_app_state(
             postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            Arc::new(StorageHandle::new(signer)),
             crate::test_support::test_catalog().await,
         )
     }

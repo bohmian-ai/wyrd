@@ -192,7 +192,7 @@ impl PyTableConfig {
 
     /// Builds one config from a `pyarrow.Schema` serialized as Arrow IPC.
     ///
-    /// The precision door: `int32`, a non-UTC timestamp, or `decimal128` has no
+    /// The precision door: `int32` or `decimal128` has no
     /// JSON Schema spelling, so the caller hands over Arrow directly rather
     /// than a document the mapper would have to widen.
     ///
@@ -334,6 +334,95 @@ impl PyQueryResult {
     fn __len__(&self) -> usize {
         self.inner.num_rows()
     }
+
+    /// The Bifrost timestamp type of every top-level timestamp column.
+    ///
+    /// Returns `(column, type name)` pairs, the name being `TIMESTAMP_NTZ`,
+    /// `TIMESTAMP_LTZ`, or `TIMESTAMP_TZ` as [`wyrd_types::TimestampKind`]
+    /// decides it, so the typed row terminal turns each column's values into
+    /// the matching Wyrd timestamp type without restating that decision.
+    fn timestamp_kinds(&self) -> Vec<(String, &'static str)> {
+        self.inner
+            .schema()
+            .fields()
+            .iter()
+            .filter_map(|field| {
+                wyrd_types::TimestampKind::of(field.data_type())
+                    .map(|kind| (field.name().clone(), kind.name()))
+            })
+            .collect()
+    }
+
+    /// Renders every cell of one top-level `TIMESTAMP_TZ` column as its text.
+    ///
+    /// Each stored `{utc, local}` cell is rendered by
+    /// [`wyrd_types::TimestampKind::render`], the one owner of the writer's
+    /// offset, as RFC 3339 text in that offset; a null cell is `None`. The
+    /// typed row terminal parses the text with the standard library, so
+    /// Python restates no timestamp rule.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` carrying `WYRD_SPEC_500_INTERNAL` when the column is
+    /// absent, is not the `TIMESTAMP_TZ` struct, or holds a value out of
+    /// range, which only a faulty server result can produce.
+    fn timestamp_tz_texts(&self, column: &str) -> WyrdPyResult<Vec<Option<String>>> {
+        use arrow::array::{Array, AsArray};
+        use arrow::datatypes::TimestampMicrosecondType;
+
+        let malformed = || boundary_internal(format!("`{column}` is not a TIMESTAMP_TZ column"));
+        let mut texts = Vec::with_capacity(self.inner.num_rows());
+        for batch in self.inner.batches() {
+            let cells = batch
+                .column_by_name(column)
+                .and_then(|cells| cells.as_struct_opt())
+                .ok_or_else(malformed)?;
+            let part = |name: &str| {
+                cells
+                    .column_by_name(name)
+                    .and_then(|part| part.as_primitive_opt::<TimestampMicrosecondType>())
+                    .ok_or_else(malformed)
+            };
+            let (utc, local) = (
+                part(wyrd_types::timestamp::TIMESTAMP_TZ_UTC)?,
+                part(wyrd_types::timestamp::TIMESTAMP_TZ_LOCAL)?,
+            );
+            for row in 0..cells.len() {
+                texts.push(if cells.is_null(row) {
+                    None
+                } else {
+                    Some(
+                        wyrd_types::TimestampKind::Tz
+                            .render(utc.value(row), Some(local.value(row)))
+                            .ok_or_else(malformed)?,
+                    )
+                });
+            }
+        }
+        Ok(texts)
+    }
+
+    /// Decodes one Variant cell's `metadata`/`value` bytes into its native
+    /// Python value.
+    ///
+    /// The typed row terminal calls this for every Variant cell it finds while
+    /// walking the result schema, so decoding stays in the shared `wyrd-queue`
+    /// owner: objects become `dict`, arrays `list`, and integers exact `int`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` carrying `WYRD_SPEC_500_INTERNAL` when the bytes are not a
+    /// valid Variant, which only a faulty server result can produce.
+    #[staticmethod]
+    fn variant_to_python(py: Python<'_>, metadata: &[u8], value: &[u8]) -> WyrdPyResult<Py<PyAny>> {
+        let json =
+            wyrd_queue::variant::variant_bytes_to_json(metadata, value).map_err(|violation| {
+                boundary_internal(format!(
+                    "query result Variant does not decode: {violation:?}"
+                ))
+            })?;
+        Ok(json_to_pyobject(py, &json)?)
+    }
 }
 
 /// Python-facing typed view of one validated query terminal frame.
@@ -409,28 +498,16 @@ impl PyQueryTerminal {
             .collect()
     }
 
-    /// Stable failure code for a failed terminal, otherwise `None`.
-    ///
-    /// # Errors
-    ///
-    /// Raises `WyrdError` when the code has no wire name.
+    /// Stable `WyrdError` code of a failed terminal's problem, otherwise `None`.
     #[getter]
-    fn error_code(&self) -> WyrdPyResult<Option<String>> {
-        self.0
-            .error
-            .as_ref()
-            .map(|error| wire_name(&error.code))
-            .transpose()
+    fn error_code(&self) -> Option<&str> {
+        self.0.error.as_ref().map(|error| error.code.as_str())
     }
 
-    /// Scrubbed failure diagnostic for a failed terminal, when the server sent one.
+    /// Scrubbed problem detail of a failed terminal, otherwise `None`.
     #[getter]
     fn error_detail(&self) -> Option<&str> {
-        self.0
-            .error
-            .as_ref()
-            .and_then(|error| error.detail.as_ref())
-            .map(wyrd_spec::vala::api::QueryErrorDetail::as_str)
+        self.0.error.as_ref().map(|error| error.detail.as_str())
     }
 
     /// Compact debugging representation naming outcome, class, and rows.
@@ -1161,7 +1238,7 @@ fn record(
 ) -> WyrdPyResult<()> {
     let schema_value: Value =
         serde_json::from_str(schema).map_err(|error| invalid_argument("schema", error))?;
-    let schema = wyrd_queue::json_schema_to_arrow(&schema_value)
+    let schema = wyrd_types::json_schema_to_arrow(&schema_value)
         .map_err(|error| client_error(error.into()))?;
     wyrd_client::bifrost::observe::record(
         &bifrost.borrow().handle,
@@ -1171,6 +1248,16 @@ fn record(
         correlation(card_uid, run_id)?,
     );
     Ok(())
+}
+
+/// The JSON Schema `format` a Wyrd timestamp type declares itself with.
+///
+/// `kind` is a [`wyrd_types::TimestampKind`] name; returns `None` for an
+/// unknown type. The Python Wyrd timestamp types read their format here
+/// rather than restating the format table.
+#[pyfunction]
+fn timestamp_format(kind: &str) -> Option<&'static str> {
+    wyrd_types::TimestampKind::from_name(kind).map(wyrd_types::TimestampKind::json_format)
 }
 
 /// Register the one Bifrost client and its result types on the supplied module.
@@ -1184,6 +1271,17 @@ pub fn register_bifrost(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyQueryTerminal>()?;
     module.add_class::<PyBifrostQueryStream>()?;
     Ok(())
+}
+
+/// Register [`timestamp_format`] on the root native module.
+///
+/// The Python timestamp types live outside the `bifrost` package and import
+/// from the root module, whose stub declares this function.
+///
+/// # Errors
+/// Returns `PyO3` registration errors.
+pub fn register_timestamp_format(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(timestamp_format, module)?)
 }
 
 /// Register the `observe` fire-and-forget telemetry function on the module.

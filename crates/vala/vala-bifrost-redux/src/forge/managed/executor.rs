@@ -14,6 +14,7 @@
 //! resource error, and the attempt's durable task stays unsettled so a retry
 //! replans without publishing anything partial.
 
+use crate::parquet::variant_residual::{VariantWriter, variant_residual_share};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -269,9 +270,16 @@ impl ForgeManagedRewrite {
                 .get(crate::catalog::layout::BLOOM_COLUMNS_PROPERTY),
         )
         .map_err(|detail| ForgeError::InvalidConfig { detail })?;
+        let time_axis =
+            crate::catalog::TimeAxis::of_iceberg(table.metadata()).ok_or_else(|| {
+                ForgeError::InvalidConfig {
+                    detail: "table partition spec has no time partition field".to_owned(),
+                }
+            })?;
         let config = policy.to_core_config(
             CompactionPlanningConfig::default(),
             self.attempt_id.to_string(),
+            time_axis.column(),
             &bloom_columns,
             self.core.config.max_concurrent_reads,
             self.binding.tenant,
@@ -325,6 +333,7 @@ impl ForgeManagedRewrite {
             }
             output_data_files.push(file);
         }
+        record_variant_residual_shares(table, &output_data_files).await;
         RewriteHandoff::try_new(
             base_snapshot_id,
             rewritten_data_files,
@@ -386,6 +395,52 @@ impl ForgeManagedRewrite {
         ForgeError::RewriteUnsettled {
             source: Box::new(failure),
             possible_outputs,
+        }
+    }
+}
+
+/// Records the Variant residual-share metric for each Forge output.
+///
+/// Reads each output's footer once after the rewrite, only when the table has
+/// a Variant column. A footer that cannot be read is logged and skipped: the
+/// metric is not evidence and never fails a rewrite.
+async fn record_variant_residual_shares(table: &Table, outputs: &[iceberg::spec::DataFile]) {
+    let Ok(logical) = iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
+    else {
+        return;
+    };
+    if !logical
+        .fields()
+        .iter()
+        .any(|field| wyrd_types::variant::is_variant(field))
+    {
+        return;
+    }
+    for file in outputs {
+        let footer = async {
+            let input = table
+                .file_io()
+                .new_input(file.file_path())
+                .map_err(|error| error.to_string())?;
+            let mut reader = iceberg::arrow::ArrowFileReader::new(
+                iceberg::io::FileMetadata {
+                    size: file.file_size_in_bytes(),
+                },
+                input.reader().await.map_err(|error| error.to_string())?,
+            );
+            parquet::arrow::async_reader::AsyncFileReader::get_metadata(&mut reader, None)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        match footer.await {
+            Ok(metadata) => {
+                VariantWriter::Forge.record(variant_residual_share(&metadata, &logical));
+            }
+            Err(error) => tracing::warn!(
+                path = file.file_path(),
+                error,
+                "Forge cannot read an output footer to measure its Variant residual share"
+            ),
         }
     }
 }

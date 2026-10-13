@@ -217,11 +217,121 @@ pub enum BifrostError {
         code = "WYRD_VALA_400_SCHEMA_PARSE",
         status = 400,
         title = "Bifrost schema parse failed",
-        remediation = "Correct the column type or the row value so it satisfies the table's declared DataTypeSpec."
+        remediation = "Correct the column type or the row value so it satisfies the table's declared DataTypeSpec; declare a Variant field for open data."
     )]
     SchemaParse {
         /// Human-readable schema or value validation detail.
         detail: String,
+    },
+
+    /// A Variant input value, or `parse_json` query text, is not valid JSON or
+    /// not a valid Variant encoding.
+    #[error("invalid Variant JSON in field {field} row {row} at {path}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_VARIANT_INVALID_JSON",
+        status = 400,
+        title = "Invalid Variant JSON",
+        remediation = "Supply valid JSON text or a valid arrow.parquet.variant value for the Variant field; use try_parse_json in SQL to map invalid text to null."
+    )]
+    VariantInvalidJson {
+        /// Logical field (or SQL function) whose value failed to convert.
+        field: String,
+        /// Zero-based input row of the failing value.
+        row: u64,
+        /// RFC 6901 JSON Pointer to the failing value inside the row value.
+        path: String,
+    },
+
+    /// A JSON number fits no Variant numeric type.
+    #[error("Variant {numeric_kind} value out of range in field {field} row {row} at {path}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE",
+        status = 400,
+        title = "Variant numeric value out of range",
+        remediation = "Send integers within the signed 64-bit or Variant decimal range, or send the number as a string."
+    )]
+    VariantNumericOutOfRange {
+        /// Logical field whose value failed to convert.
+        field: String,
+        /// Zero-based input row of the failing value.
+        row: u64,
+        /// RFC 6901 JSON Pointer to the failing number inside the row value.
+        path: String,
+        /// Numeric family that could not hold the value, such as `integer`.
+        numeric_kind: String,
+    },
+
+    /// A Variant value nests deeper than the fixed Variant depth limit.
+    #[error(
+        "Variant value in field {field} row {row} nests {depth} levels, limit {limit} at {path}"
+    )]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_VARIANT_TOO_DEEP",
+        status = 400,
+        title = "Variant value too deep",
+        remediation = "Flatten the value so it nests at most 64 levels, counting the root container as one."
+    )]
+    VariantTooDeep {
+        /// Logical field whose value is too deep.
+        field: String,
+        /// Zero-based input row of the failing value.
+        row: u64,
+        /// RFC 6901 JSON Pointer to the first container past the limit.
+        path: String,
+        /// Depth reached at `path`, counting the root container as one.
+        depth: u32,
+        /// Fixed maximum Variant depth.
+        limit: u32,
+    },
+
+    /// A Variant value encodes to more bytes than the fixed Variant size limit.
+    #[error("Variant value in field {field} row {row} encodes {bytes} bytes, limit {limit}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_413_VARIANT_TOO_LARGE",
+        status = 413,
+        title = "Variant value too large",
+        remediation = "Keep each Variant value at most 8388608 encoded bytes (metadata plus value); split large payloads across rows."
+    )]
+    VariantTooLarge {
+        /// Logical field whose value is too large.
+        field: String,
+        /// Zero-based input row of the failing value.
+        row: u64,
+        /// Canonical encoded Variant bytes, metadata plus value.
+        bytes: u64,
+        /// Fixed maximum encoded Variant bytes.
+        limit: u64,
+    },
+
+    /// A write row names a key the table does not declare.
+    #[error("undeclared field {field} in row {row}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_BIFROST_UNDECLARED_FIELD",
+        status = 400,
+        title = "Undeclared Bifrost field",
+        remediation = "Remove the key or declare it on the table; store open data in a Variant field."
+    )]
+    UndeclaredField {
+        /// Key the table does not declare.
+        field: String,
+        /// Zero-based input row that carried the key.
+        row: u64,
+    },
+
+    /// A table field uses a type Bifrost cannot store, or a write supplies a
+    /// type that does not match the declared field.
+    #[error("unsupported type {data_type} for field {field}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE",
+        status = 400,
+        title = "Unsupported Bifrost type",
+        remediation = "Use a supported Bifrost column type; store open data in a Variant field."
+    )]
+    UnsupportedType {
+        /// Field whose type is unsupported.
+        field: String,
+        /// Rendered Arrow or declared type that was refused.
+        data_type: String,
     },
 
     /// A user-supplied schema field uses a reserved system column name.
@@ -230,7 +340,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
         status = 400,
         title = "Reserved system column name",
-        remediation = "Rename the column — run_id, card_uid, principal_id, wyrd_request_id, wyrd_event_time, and wyrd_ingested_at are reserved."
+        remediation = "Rename the column — run_id, card_uid, principal_id, wyrd_request_id, and wyrd_ingested_at are reserved."
     )]
     ReservedColumn {
         /// The reserved column name that was supplied.
@@ -442,20 +552,6 @@ pub enum BifrostError {
         /// Human-readable parse/validation detail.
         detail: String,
     },
-
-    /// The query request's `deadline_ms` is outside `1..=u32::MAX`
-    /// milliseconds.
-    ///
-    /// Clients refuse it before IO and the server refuses it in Oracle
-    /// validation, so every surface reports this one code.
-    #[error("deadline_ms must be an integer between 1 and 4294967295")]
-    #[wyrd_error(
-        code = "WYRD_VALA_400_QUERY_INVALID_DEADLINE",
-        status = 400,
-        title = "Invalid query deadline",
-        remediation = "Omit deadline_ms or pass a whole number of milliseconds between 1 and 4294967295."
-    )]
-    QueryInvalidDeadline,
 
     /// The query exceeded the configured execution time budget.
     #[error("query execution timed out")]
@@ -700,31 +796,6 @@ pub enum BifrostError {
         detail: String,
     },
 
-    /// A caller-supplied `wyrd_event_time` value falls outside the server
-    /// acceptance window evaluated against per-batch receipt time.
-    ///
-    /// The entire batch is rejected pre-admission; no rows are written. Either
-    /// supply a `wyrd_event_time` within the configured window (default: 30 days
-    /// past to 24 hours future of server receipt time) or omit the column to let
-    /// the server stamp receipt time. The window cannot be overridden per-tenant.
-    #[error("event time out of acceptance window: {value} not in [{past_bound}, {future_bound}]")]
-    #[wyrd_error(
-        code = "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE",
-        status = 400,
-        title = "Event time outside acceptance window",
-        remediation = "Supply a wyrd_event_time within the server acceptance window \
-(default 30 days past to 24 hours future of server receipt time), or omit the \
-column to let the server stamp receipt time."
-    )]
-    EventTimeOutOfRange {
-        /// The offending `wyrd_event_time` value (epoch-microseconds rendered as a string).
-        value: String,
-        /// The inclusive past bound used for this batch (epoch-microseconds rendered as a string).
-        past_bound: String,
-        /// The inclusive future bound used for this batch (epoch-microseconds rendered as a string).
-        future_bound: String,
-    },
-
     /// A register request declared a physical layout Bifrost cannot canonicalize.
     ///
     /// The fault is reported before any SQL transaction, Iceberg call, or audit
@@ -735,7 +806,7 @@ column to let the server stamp receipt time."
         code = "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT",
         status = 400,
         title = "Invalid Bifrost physical layout",
-        remediation = "Declare hour or day granularity, at most four unique schema columns as sort keys, and supported sort/null values."
+        remediation = "Declare hour or day granularity, an optional non-null timestamp time column, at most four unique schema columns as sort keys, and supported sort/null values."
     )]
     InvalidPhysicalLayout {
         /// Canonical `<namespace>.<name>` of the table being registered.
@@ -838,6 +909,8 @@ pub enum PhysicalLayoutField {
     NullOrder,
     /// An entry of `bloom_columns`.
     BloomColumn,
+    /// The `time_column` the table partitions and sorts on.
+    TimeColumn,
 }
 
 /// Why the declaration named by [`PhysicalLayoutField`] was rejected.
@@ -867,9 +940,10 @@ mod tests {
     use super::*;
 
     /// Every declaration slot in the public layout contract, in declaration order.
-    const ALL_FIELDS: [PhysicalLayoutField; 6] = [
+    const ALL_FIELDS: [PhysicalLayoutField; 7] = [
         PhysicalLayoutField::Partition,
         PhysicalLayoutField::Granularity,
+        PhysicalLayoutField::TimeColumn,
         PhysicalLayoutField::SortKey,
         PhysicalLayoutField::SortDirection,
         PhysicalLayoutField::NullOrder,
@@ -899,7 +973,7 @@ mod tests {
 
         for field in ALL_FIELDS {
             for violation in ALL_VIOLATIONS {
-                for column in [None, Some("wyrd_event_time".to_owned())] {
+                for column in [None, Some("start_time_unix_nano".to_owned())] {
                     let error = BifrostError::InvalidPhysicalLayout {
                         table: "obs.events".to_owned(),
                         field,

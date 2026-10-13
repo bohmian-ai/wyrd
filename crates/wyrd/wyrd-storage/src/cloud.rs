@@ -74,6 +74,10 @@ impl CloudStore {
     /// A configured endpoint names a GCS emulator, accepted only in builds
     /// with the `emulator` feature. Without a service-account key the
     /// emulator receives unsigned requests; presigning always needs a key.
+    /// `object_store` still fetches a credential for uploads when signing
+    /// is skipped, so a keyless emulator store also carries an empty static
+    /// bearer token; without it the upload walks the default credential
+    /// chain to the cloud metadata server.
     ///
     /// # Errors
     /// Returns [`StorageError::Backend`] when an endpoint is set without the
@@ -96,6 +100,9 @@ impl CloudStore {
             builder = builder
                 .with_base_url(endpoint)
                 .with_skip_signature(key.is_none());
+            if key.is_none() {
+                builder = builder.with_bearer_token("");
+            }
         }
         builder
             .build()

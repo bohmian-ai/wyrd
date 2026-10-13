@@ -331,7 +331,6 @@ cargo nextest run --locked \
   -p wyrd-testing --test forge --test scribe --test oracle --test otlp --test server \
   -p wyrd-mcp --test mcp \
   -p vala-bifrost-redux --test integration \
-  --features wyrd-client/test-support \
   -P journey --run-ignored=only \
   -E "not test(=qualification::scribe_512_mib_physical_object_qualifies) and (not package(wyrd-client) or test(/^pg_bifrost_e2e::/))"'
 """
@@ -1561,10 +1560,7 @@ exactly one shard. The only tests outside gate are the scheduled production-geom
 depends = [
   "gate:checks",
   "gate:rust",
-  "gate:bifrost",
   "gate:storage",
-  "gate:identity",
-  "gate:sdk-journeys",
   "gate:python",
   "gate:typescript",
 ]
@@ -1576,28 +1572,13 @@ depends = ["check", "check:deps", "check:tenant-isolation", "check:storage:drift
 
 [tasks."gate:rust"]
 hide = true
-description = "Gate shard: every Rust family lane and the ignored gateway journeys"
-depends = ["test:wyrd", "test:skald", "test:vala", "test:shared", "test:gateway:gate"]
-
-[tasks."gate:bifrost"]
-hide = true
-description = "Gate shard: the ignored Bifrost journeys; the family and SDK shards run every other Bifrost test"
-depends = ["test:bifrost:gate"]
+description = "Gate shard: every Rust family lane and every Rust-built journey (gateway, Bifrost, identity, SDK stories, installed CLI), sharing one compile"
+depends = ["test:wyrd", "test:skald", "test:vala", "test:shared", "test:gateway:gate", "test:bifrost:gate", "test:identity:journey", "test:rust-sdk:journey", "test:local-dev:journey"]
 
 [tasks."gate:storage"]
 hide = true
 description = "Gate shard: the object-store emulator matrix"
 depends = ["test:storage:matrix"]
-
-[tasks."gate:identity"]
-hide = true
-description = "Gate shard: every identity journey against Keycloak and Dex"
-depends = ["test:identity:journey"]
-
-[tasks."gate:sdk-journeys"]
-hide = true
-description = "Gate shard: the Rust SDK story journeys and the installed-CLI bootstrap journeys"
-depends = ["test:rust-sdk:journey", "test:local-dev:journey"]
 
 [tasks."gate:python"]
 hide = true

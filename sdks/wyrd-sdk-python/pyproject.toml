@@ -70,6 +70,7 @@ markers = [
     "tensorflow: marks TensorFlow tests that run in the dedicated TensorFlow task",
     "integration: marks tests that require a live WyrdTestServer and run in the gated integration lane",
     "identity: marks integration journeys that need the identity lane's Keycloak; only test:identity:journey runs them",
+    "local_dev: marks integration journeys that run the built wyrd and wyrd-server binaries; only test:local-dev:journey builds and runs them",
     "smoke: marks opt-in live provider smoke tests that need operator credentials and real upstreams",
 ]
 

@@ -47,6 +47,20 @@ runs:
         docker-images: ${{ inputs.docker-images }}
         swap-storage: true
 
+    # Linking several server-sized test binaries at once exceeds the runner's
+    # RAM; without enough swap the runner is killed mid-link.
+    - name: Add swap
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo swapoff -a
+        sudo rm -f /mnt/swapfile
+        sudo fallocate -l 16G /mnt/swapfile
+        sudo chmod 600 /mnt/swapfile
+        sudo mkswap /mnt/swapfile
+        sudo swapon /mnt/swapfile
+        free -h
+
     - name: Set up mise
       uses: jdx/mise-action@v3
       with:

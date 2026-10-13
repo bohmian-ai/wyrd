@@ -741,7 +741,7 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
         return Err("a failed query stage appended its own audit row".into());
     }
 
-    await_clean_analytical(&cluster).await?;
+    await_owners_released(&cluster).await?;
     cluster.shutdown().await?;
     Ok(())
 }
@@ -864,7 +864,7 @@ async fn prove_scheduled_analytical_completion(
     assert_eq!(outcome.terminal.query_class, QueryClass::Analytical);
     assert_eq!(outcome.rows, u64::try_from(FIXTURE_VALUES.len())?);
     assert_eq!(outcome.terminal.row_count, outcome.rows);
-    assert_scheduled_owners_released(cluster)?;
+    await_owners_released(cluster).await?;
     assert_eq!(
         audit_rows(ingress, tenant, "bifrost.query.read_decision").await?,
         before + 1
@@ -924,7 +924,7 @@ async fn prove_scheduled_analytical_completion(
         .await?
         .expect_err("an actively cancelled schedule has no outcome");
     assert_eq!(error.code(), "WYRD_VALA_500_QUERY_EXECUTION_FAILED");
-    assert_scheduled_owners_released(cluster)?;
+    await_owners_released(cluster).await?;
     assert_eq!(
         audit_rows(ingress, tenant, "bifrost.query.read_decision").await?,
         before + 2
@@ -932,68 +932,50 @@ async fn prove_scheduled_analytical_completion(
     Ok(())
 }
 
-/// Checks ownership at the scheduled return boundary, without a later polling grace period.
+/// Waits, bounded, until every node retains no query ownership.
+///
+/// Graph release does not wait for dependency-owned teardown: children still
+/// being torn down return their bytes through the shared memory root as they
+/// free them. So release is proven as a bounded convergence to zero live
+/// Analytical ownership, running queries, active Oracle queries, and Oracle
+/// query memory; ownership that never returns within the bound is a leak.
 ///
 /// # Errors
-/// Returns inspection failure or retained query/graph/admission/resource evidence.
-fn assert_scheduled_owners_released(
-    cluster: &wyrd_testing::bifrost::WyrdTestCluster,
-) -> Result<(), ServerJourneyError> {
-    for server in cluster.servers() {
-        let Some(query) = server.state().bifrost_query() else {
-            continue;
-        };
-        let engine = query.engine();
-        let live = engine
-            .analytical_execution()
-            .ok_or("missing analytical owner")?
-            .live()?;
-        let root = engine.role_resources().snapshot()?;
-        if !live.is_clean()
-            || !engine
-                .running_queries()
-                .list(cluster.data_tenant_id())
-                .is_empty()
-            || root.oracle_query_active
-            || root.oracle_query_memory_used_bytes != 0
-        {
-            return Err(format!("scheduled return retained ownership: {live:?}, {root:?}").into());
-        }
-    }
-    Ok(())
-}
-
-/// Waits until every running node retains no Analytical ownership.
-///
-/// # Errors
-///
-/// Returns an inspection error, or a description of what a node still held.
-async fn await_clean_analytical(
+/// Returns an inspection failure, or what a node still held when the bound
+/// expired.
+async fn await_owners_released(
     cluster: &wyrd_testing::bifrost::WyrdTestCluster,
 ) -> Result<(), ServerJourneyError> {
     let mut last = String::new();
     for _ in 0..ANALYTICAL_POLLS {
-        let mut clean = true;
         last.clear();
         for server in cluster.servers() {
             let Some(query) = server.state().bifrost_query() else {
                 continue;
             };
-            let Some(handle) = query.engine().analytical_execution() else {
-                continue;
-            };
-            let live = handle.live()?;
-            if !AnalyticalLiveInspection::is_clean(&live) {
-                clean = false;
-                last = format!("{live:?}");
+            let engine = query.engine();
+            let live = engine
+                .analytical_execution()
+                .ok_or("missing analytical owner")?
+                .live()?;
+            let root = engine.role_resources().snapshot()?;
+            if !live.is_clean()
+                || !engine
+                    .running_queries()
+                    .list(cluster.data_tenant_id())
+                    .is_empty()
+                || root.oracle_query_active
+                || root.oracle_query_memory_used_bytes != 0
+            {
+                last = format!("{live:?}, {root:?}");
             }
         }
-        if clean {
+        if last.is_empty() {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    Err(format!("a node still retained Analytical ownership: {last}").into())
+    Err(format!("a node still retained query ownership: {last}").into())
 }
 
 /// Tenant-local roles reach exactly the Bifrost tables their scope names.

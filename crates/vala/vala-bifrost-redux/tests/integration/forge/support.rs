@@ -3174,7 +3174,7 @@ pub(crate) fn manual_clock() -> (ForgeClock, ForgeClockControl) {
 /// The metrics recorder and the tracing subscriber are process-global and can
 /// be set only once, so this binary has exactly one owner for both. Every
 /// fixture entry point initialises it, which is what makes `WYRD_LOG` (else
-/// `RUST_LOG`) trace any test that starts a fixture, and
+/// `RUST_LOG`) print the logs of any test that starts a fixture, and
 /// [`ForgeTelemetryCheckpoint`] reads from it instead of installing its own.
 /// The subscriber is the production pipeline with an in-memory exporter, so
 /// what a checkpoint asserts on is production emission.
@@ -3193,8 +3193,9 @@ static PROCESS_TELEMETRY: std::sync::OnceLock<ProcessTelemetry> = std::sync::Onc
 impl ProcessTelemetry {
     /// Returns the process telemetry, installing it on first use.
     ///
-    /// The filter is `WYRD_LOG`, else `RUST_LOG`, else `info`. Concurrent
-    /// first callers block until the one installation finishes.
+    /// Log output is filtered by `WYRD_LOG`, else `RUST_LOG`, else `info`;
+    /// span capture is unfiltered. Concurrent first callers block until the
+    /// one installation finishes.
     ///
     /// # Panics
     ///

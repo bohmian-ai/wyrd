@@ -399,13 +399,15 @@ impl LocalServer {
     /// On the host, `binary` is spawned directly and metered by PID. Scoped,
     /// it is spawned through `systemd-run --scope`, which execs it in place,
     /// and metered by the scope's cgroup once that is confirmed to enforce
-    /// the envelope.
+    /// the envelope. The process-wide rustls provider is installed first,
+    /// because the readiness and metrics probes build reqwest clients, which
+    /// carry no provider of their own.
     ///
     /// # Errors
     ///
-    /// Returns an error when the host cannot be read, the process cannot
-    /// spawn, exits, or never becomes ready, or a scoped cgroup does not
-    /// enforce its envelope.
+    /// Returns an error when the rustls provider cannot be installed, the
+    /// host cannot be read, the process cannot spawn, exits, or never becomes
+    /// ready, or a scoped cgroup does not enforce its envelope.
     async fn serve(
         binary: &Path,
         root: TempDir,
@@ -415,6 +417,7 @@ impl LocalServer {
         env: &[(&str, &str)],
         placement: Placement,
     ) -> Result<Self> {
+        wyrd_tls::install_crypto_provider().map_err(|error| error.to_string())?;
         let host = Host::detect()?;
         let log = File::create(root.path().join("server.log"))?;
         let mut command = match placement {

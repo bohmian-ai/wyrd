@@ -4,6 +4,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use base64::Engine;
+use bytes::Bytes;
+use futures_util::stream::BoxStream;
 use sha2::{Digest, Sha256};
 use sqlx::types::Uuid;
 use tracing::instrument;
@@ -534,27 +536,32 @@ pub async fn download_init(
 }
 
 /// Open a local-mode blob for streaming through the authenticated server route.
+///
+/// The body is read through the handle's one object store, so it classifies a
+/// missing object, including a key that names a directory, exactly as every
+/// other storage read does.
+///
+/// # Errors
+/// Returns the tenant-path refusal for a path outside the caller's tenant, an
+/// internal error when the route is reached on a non-local backend, and the
+/// mapped storage error when the object is absent or cannot be opened.
 #[instrument(skip(storage), fields(tenant = %data_tenant_id))]
 pub async fn download_local_blob(
     storage: &StorageHandle,
     data_tenant_id: DataTenantId,
     path: String,
-) -> Result<(tokio::fs::File, u64), WyrdError> {
+) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), WyrdError> {
     let validated = tenant_path::validate(&path, data_tenant_id).map_err(map_tenant_path)?;
-    #[cfg_attr(
-        not(feature = "cloud"),
-        expect(
-            irrefutable_let_patterns,
-            reason = "without `cloud` the local signer is the only backend"
-        )
-    )]
-    let crate::BackendSigner::Local(local) = storage.signer() else {
+    if storage.backend() != StorageBackendKind::Local {
         return Err(internal_error(
             "local download route mounted for non-local backend",
             serde_json::json!({ "backend": storage.backend() }),
         ));
-    };
-    open_local_blob(local, &validated).await
+    }
+    storage
+        .get_object_stream(&validated)
+        .await
+        .map_err(map_storage_error)
 }
 
 async fn try_replay_idempotent_init(
@@ -740,31 +747,6 @@ async fn download_url(
 fn local_download_url(validated: &ValidatedPath) -> String {
     let path: String = byte_serialize(validated.full.as_bytes()).collect();
     format!("/v1/cards/download/local?path={path}")
-}
-
-async fn open_local_blob(
-    local: &crate::LocalSigner,
-    validated: &ValidatedPath,
-) -> Result<(tokio::fs::File, u64), WyrdError> {
-    let fs_path = local.root().join(&validated.full);
-    let file = tokio::fs::File::open(&fs_path)
-        .await
-        .map_err(|error| map_local_read_error(error, validated))?;
-    let len = file
-        .metadata()
-        .await
-        .map_err(|error| map_storage_error(StorageError::Io(error)))?
-        .len();
-    Ok((file, len))
-}
-
-fn map_local_read_error(error: std::io::Error, validated: &ValidatedPath) -> WyrdError {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        return map_storage_error(StorageError::ObjectNotFound {
-            storage_path: validated.full.clone(),
-        });
-    }
-    map_storage_error(StorageError::Io(error))
 }
 
 fn validate_sha256_b64(value: &str) -> Result<(), WyrdError> {
@@ -1403,7 +1385,7 @@ pub(crate) fn internal_error(message: impl Into<String>, details: serde_json::Va
 mod tests {
     use super::*;
     use crate::{BackendConfig, StorageSettings};
-    use tokio::io::AsyncReadExt;
+    use futures_util::TryStreamExt as _;
     use wyrd_spec::storage::SinglePutComplete;
 
     #[test]
@@ -1604,18 +1586,15 @@ mod tests {
             .await
             .expect("write blob");
 
-        let (mut file, len) = download_local_blob(&storage, tenant, path)
+        let (stream, len) = download_local_blob(&storage, tenant, path)
             .await
             .expect("download file");
         assert_eq!(
             len,
             u64::try_from(b"download me".len()).expect("test bytes length fits u64")
         );
-        let mut body = String::new();
-        file.read_to_string(&mut body)
-            .await
-            .expect("read opened file");
-        assert_eq!(body, "download me");
+        let body: Vec<Bytes> = stream.try_collect().await.expect("read opened body");
+        assert_eq!(body.concat(), b"download me");
     }
 
     #[test]

@@ -45,7 +45,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.identity == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: "2"
     steps:

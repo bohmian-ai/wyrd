@@ -1,7 +1,7 @@
 ---
 id: TASK-020
 kind: implementation
-status: proposed
+status: implemented
 spec: SPEC-wyrd-ui-live-data
 spec_revision: 5
 requirements: [REQ-001, REQ-003, REQ-016, REQ-027]
@@ -62,6 +62,18 @@ Prohibited: a generated or persisted UI key, an image-generated secret, another 
 - `mise run test:identity:journey` with `WYRD_IDENTITY_TARGET=ui` (SSO and API-key browser login without a secret)
 - `WYRD_STARTUP_FILTER=authenticated_analytical_bff scripts/server/test-startup-prod.sh`
 - `pnpm run check` and `vitest run src/lib/server/auth/browser-sessions.test.ts`
+
+### Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `wyrd-ui` identifies by `client_id`; a Basic header is `invalid_client` | `wyrd-server/src/auth/oauth.rs` `identify_client`/`require_client` | `clients_identify_by_client_id`; `identity_e2e.rs` Basic-header 401 step | PASS |
+| The callback comes from the request origin; an off-origin redirect is refused | `wyrd-server/src/auth/mod.rs` `RequestOrigin`; `authorize.rs`, `cli_login.rs`, admin identity routes; `wyrd-auth` origin arguments | `origin_is_the_host_with_the_forwarded_scheme`; pg tests `authorize_derives_the_callback_from_the_request_origin`, `a_redirect_off_the_request_origin_is_refused` (25 wyrd-server pg tests, 121 wyrd-auth lib tests) | PASS |
+| BFF signs in with no secret or discovery; cookie `Secure` only over https | `wyrd-ui/src/lib/server/auth/browser-sessions.ts` | `browser-sessions.test.ts` 3/3; `pnpm run check` 0 errors; `WYRD_IDENTITY_TARGET=ui mise run test:identity:journey` 12/12 | PASS |
+| Image signs in with nothing configured, at localhost over http and behind a TLS proxy at another host | `docker/official/extras/entrypoint.sh`, `nginx.conf.template` | `WYRD_STARTUP_FILTER=authenticated_analytical_bff scripts/server/test-startup-prod.sh` PASS (proxied sign-in asserts a 303 and a `Secure` session cookie) | PASS |
+| No surface regressed | test harness `human_sso` option removed; spec rev 5, docs, `wyrd-http.d.ts` regenerated | `WYRD_IDENTITY_TARGET` = server, cli, rust, client, python, typescript `mise run test:identity:journey` all exit 0; `mise run test:principals:integration` (served OpenAPI) exit 0 | PASS |
+
+Non-goals held: no generated or persisted UI key, no image secret, no session store, no compatibility for the removed settings. Commits 094ce948b, 00919cf15, a1a9e1977, c3e70455b, 4f93bdaa0, 49f76f17e, 6f859c0ea.
 
 ## Authority Links
 

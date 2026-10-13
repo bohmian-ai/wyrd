@@ -148,3 +148,31 @@ Report a concrete blocker if repository-managed setup cannot supply the required
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
 
+
+## Implementation Evidence
+
+This is a verification-only page gate. The TASK-005 shared exact read (`WyrdClient.card`, `liveCard`, `specSections`) renders real Data declarations without any Data-specific change. RED was not manufactured, per the task.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-005 declaration and schema fidelity | Shared `specSections`/`flatten`: every schema column renders under `columns[i].*`, plus interface, stats and `card_refs` ("Declared empty.") | `live UI Data detail projection`; browser `live UI Data detail`: 2 real Data versions with the parquet artifact via `wyrd apply`. 1.0.0 declares column `det-clicked`, Snappy and label `owner=r.okafor`; 2.0.0 declares `det-converted` and Zstd. The pinned 1.0.0 HTML has `columns[0].name`, `feature`, `columns[1].dtype`, `int64`, `Parquet`, `Snappy`, `row_count` and `owner=r.okafor`, and no `Zstd` or `det-converted` | PASS |
+| AC-005 versions | Shared by-ref and versions reads | Browser: inventory opens 2.0.0; the version click shows 1.0.0 only; refresh and Back hold | PASS |
+| AC-005 relationships | Shared `edges` | Browser: the inbound `Verifier default/det-data-drift@1.0.0` (a drift Verifier whose `baseline_ref` is det-data 1.0.0) opens the Verifier UID page | PASS |
+| AC-005 missing and denied | Shared | Browser: unknown version/UID and `not-a-uid` are 404; the other tenant's reader gets 404; no-role gets 403 | PASS |
+| AC-018 SSR, nav, no browser `/v1` | Shared server load | Browser: initial HTML, `__data.json` on version click, no `/v1/`, no `__data.json` on reload | PASS |
+
+Commands (all passed):
+```bash
+WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER='live UI Data detail' mise run test:identity:journey   # 1 passed, 10 skipped
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/features/cards/core/CardDetail.test.ts   # 11 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui run check   # 0 errors
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui run build   # run by the journey lane
+```
+- Generated types are as in TASK-005.
+- No analytical query or row browser was added, per the non-goal.
+
+Usability pass (`target/debug/wyrd-ui-live-login/data-*.png`, local only):
+- The schema reads as one indexed key list per column field. It is legible at 2 columns; a wide schema would be long but complete.
+- A columnar schema table would be a Data-specific workspace, which was declined because the generic shell renders every declared field.
+
+Non-goals stayed excluded: there is no production change in this task; the browser case and `mise.toml` selector landed in the TASK-005 commit.

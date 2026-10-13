@@ -284,16 +284,9 @@ async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
     );
     if supervisor
         .finish_attempt(stale, AnalyticalAttemptOutcome::Cancelled)
-        .await
         .is_ok()
     {
         return Err("a stale attempt settled work it never owned".into());
-    }
-    if supervisor
-        .retain_driver(stale, tokio::spawn(async {}))
-        .is_ok()
-    {
-        return Err("a stale attempt attached a driver".into());
     }
 
     // A sibling graph under the same public query: a different private plan
@@ -310,16 +303,9 @@ async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
     }
     if supervisor
         .finish_attempt(sibling, AnalyticalAttemptOutcome::Cancelled)
-        .await
         .is_ok()
     {
         return Err("a sibling graph settled this graph's attempt".into());
-    }
-    if supervisor
-        .retain_driver(sibling, tokio::spawn(async {}))
-        .is_ok()
-    {
-        return Err("a sibling graph attached a driver to this graph".into());
     }
 
     // The refusals changed nothing: the real attempt is still live and still

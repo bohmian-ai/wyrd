@@ -148,3 +148,33 @@ Report a concrete blocker if repository-managed setup cannot supply the required
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
 
+
+## Implementation Evidence
+
+This is a verification-only page gate. The TASK-005 shared exact read and the existing relationship rendering show the real server-derived Agent→Prompt edges without any Agent-specific change. RED was not manufactured, per the task.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-006 Agent metadata and declaration | Shared `liveCard`/`specSections`: the `prompt` section shows the server-resolved ref (`kind`/`name`/`version`/`space`/`uid`) and `run_config` | `live UI Agent detail projection`; browser `live UI Agent detail`: the Prompt `det-agent-prompt` plus Agent `det-agent` 1.0.0 (`timeout_ms: 43210`) and 2.0.0 (`98765`) via `wyrd apply`, each declaring `prompt: {kind: Prompt, name: det-agent-prompt, version: 1.0.0}`. The pinned 1.0.0 shows 43210 only | PASS |
+| AC-006 exact Prompt relationship | Shared `edges` over `relationships.outbound_refs` | Browser: the outbound `Prompt default/det-agent-prompt@1.0.0` link (exact UID) opens the Prompt. The 2.0.0 HTML links the same Prompt UID. The Prompt page lists inbound `Agent default/det-agent@1.0.0` and `@2.0.0` | PASS |
+| AC-006 versions, missing and denied | Shared | Browser: inventory opens 2.0.0, version click, refresh and Back. Unknown version/UID and `not-a-uid` are 404; the other tenant's reader gets 404; no-role gets 403 | PASS |
+| AC-006 contextual links; no invented runtime | `actions: []`, no presentation | Browser: no `Run agent`, `last run` or `Open traces`. Unit: `actions` empty and `presentation` undefined | PASS |
+| AC-018 SSR, nav, no browser `/v1` | Shared server load | Browser: as in TASK-005 | PASS |
+
+Commands (all passed):
+```bash
+WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER='live UI Agent detail' mise run test:identity:journey   # 1 passed, 10 skipped
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/features/cards/core/CardDetail.test.ts   # 11 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui run check   # 0 errors
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui run build   # run by the journey lane
+```
+
+Usability pass (`target/debug/wyrd-ui-live-login/agent-*.png`, local only):
+- The Prompt edge sits in the Relationships panel as a link, and the declared ref is visible in the `prompt` section.
+- The `prompt.uid` value is plain text; the link lives in Relationships, so it is not duplicated.
+
+Contextual investigation links are deliberately absent:
+- The Observe pages are still mock-only in live mode (TASK-010+), so any trace or log link would land on an unavailable page.
+- There is no applicable valid investigation yet; add one when Observe goes live.
+
+Non-goals stayed excluded: no Agent execution, graph store, workspace or production change.

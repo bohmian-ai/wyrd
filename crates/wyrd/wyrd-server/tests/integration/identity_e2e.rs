@@ -946,9 +946,13 @@ async fn service_account_issuer_full_chain() {
 
 // ─── Human OIDC login journey (Keycloak) ──────────────────────────────────────
 
-/// Deployment public origin every human journey configures; the tenant
-/// connection callback URL is `{origin}/auth/callback`, which the Keycloak
-/// fixture clients register.
+/// Host every human journey's requests arrive at, sent as
+/// `X-Forwarded-Host` as a proxy in front of the server would.
+const PUBLIC_HOST: &str = "test-tenant-1.wyrd.test";
+
+/// Origin of [`PUBLIC_HOST`]; the server derives the tenant connection
+/// callback `{origin}/auth/callback` from it, which the Keycloak fixture
+/// clients register.
 const PUBLIC_ORIGIN: &str = "http://test-tenant-1.wyrd.test";
 
 /// The public PKCE Keycloak client human journeys sign in through.
@@ -959,14 +963,6 @@ const PUBLIC_HUMAN_CLIENT: &str = "wyrd-human";
 const CONFIDENTIAL_HUMAN_CLIENT: &str = "wyrd-human-confidential";
 /// The fixture secret Keycloak registers for [`CONFIDENTIAL_HUMAN_CLIENT`].
 const CONFIDENTIAL_HUMAN_SECRET: &str = "wyrd-human-confidential-secret";
-
-/// A server builder with the deployment public origin every human journey
-/// needs to stage a tenant connection.
-fn human_server_builder() -> WyrdTestServerBuilder {
-    WyrdTestServerBuilder::default()
-        .with_public_origin(PUBLIC_ORIGIN.parse().expect("public origin parses"))
-        .with_ui_client_secret(UI_CLIENT_SECRET)
-}
 
 /// The group map every human journey grants through: the realm's
 /// `wyrd-admins` group confers `writer`, so alice can be a delegation subject.
@@ -1001,7 +997,8 @@ async fn tenant_admin(srv: &WyrdTestServer, tenant: DataTenantId, name: &str) ->
     TenantAdmin { token, api_key }
 }
 
-/// Call one authenticated JSON route and read its status and body.
+/// Call one authenticated JSON route at [`PUBLIC_HOST`] and read its status
+/// and body.
 ///
 /// # Panics
 /// Panics when the request cannot be built or the router fails.
@@ -1012,7 +1009,26 @@ async fn call_json(
     uri: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
-    let mut request = Request::builder().method(method).uri(uri);
+    call_json_at(srv, PUBLIC_HOST, token, method, uri, body).await
+}
+
+/// Call one authenticated JSON route as reached at `host` and read its
+/// status and body.
+///
+/// # Panics
+/// Panics when the request cannot be built or the router fails.
+async fn call_json_at(
+    srv: &WyrdTestServer,
+    host: &str,
+    token: &str,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-forwarded-host", host);
     let body = match body {
         Some(body) => {
             request = request.header(header::CONTENT_TYPE, "application/json");
@@ -1195,7 +1211,7 @@ const ACTIVE_DEACTIVATE: &str = "/v1/identity/oidc/active/deactivate";
 /// # Panics
 /// Panics when the server or the connection setup fails.
 async fn human_server() -> WyrdTestServer {
-    let srv = human_server_builder()
+    let srv = WyrdTestServerBuilder::default()
         .start_in_process()
         .await
         .expect("test server starts");
@@ -1203,10 +1219,6 @@ async fn human_server() -> WyrdTestServer {
     activate_keycloak_connection(&srv, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
     srv
 }
-
-/// The `wyrd-ui` client secret every human journey server registers; the
-/// journey plays that confidential client at the token endpoint.
-const UI_CLIENT_SECRET: &str = "identity-journey-ui-secret";
 
 /// The opaque `state` the journey's `wyrd-ui` client sends to
 /// `GET /auth/authorize` and expects echoed on every redirect back.
@@ -1227,8 +1239,8 @@ fn pkce_pair() -> (String, String) {
 }
 
 /// `GET /auth/authorize` as the `wyrd-ui` client for `tenant_slug` with the
-/// S256 `challenge`, under hostile `Host` and forwarded headers that must play
-/// no part; returns the status and `Location`.
+/// S256 `challenge`, reached at [`PUBLIC_HOST`]; returns the status and
+/// `Location`.
 ///
 /// # Panics
 /// Panics when the request cannot be built, the router fails, or the
@@ -1252,9 +1264,7 @@ async fn authorize(
             Request::builder()
                 .method(Method::GET)
                 .uri(format!("/auth/authorize?{query}"))
-                .header(header::HOST, "attacker.example.net")
-                .header("x-forwarded-host", "attacker.example.net")
-                .header("x-forwarded-proto", "https")
+                .header("x-forwarded-host", PUBLIC_HOST)
                 .body(Body::empty())
                 .expect("authorize request builds"),
         )
@@ -1552,7 +1562,7 @@ async fn refused_login(srv: &WyrdTestServer, code: &str, state: &str, iss: Optio
     callback_refusal(&callback_reply(srv, code, state, iss, "test-tenant-1.wyrd.test").await)
 }
 
-/// Redeem `code` at `POST /auth/token` as the confidential `wyrd-ui` client
+/// Redeem `code` at `POST /auth/token` as the public `wyrd-ui` client
 /// with `verifier`, returning the status and RFC 6749 JSON body.
 ///
 /// # Panics
@@ -1571,44 +1581,35 @@ async fn redeem(srv: &WyrdTestServer, code: &str, verifier: &str) -> (StatusCode
     .await
 }
 
-/// `POST /auth/token` with the form `params`, authenticated as the
-/// confidential `wyrd-ui` client (`client_secret_basic`), returning the
-/// status and RFC 6749 JSON body.
+/// `POST /auth/token` with the form `params` as the public `wyrd-ui` client
+/// (`client_id` alone), returning the status and RFC 6749 JSON body.
 ///
 /// # Panics
 /// Panics when the request cannot be built or the router fails.
 async fn token_call(srv: &WyrdTestServer, params: &[(&str, &str)]) -> (StatusCode, Value) {
     let form = url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(params)
+        .append_pair("client_id", "wyrd-ui")
         .finish();
-    let (status, _, body) = token_request(
-        srv,
-        UI_CLIENT_SECRET,
-        "application/x-www-form-urlencoded",
-        form,
-    )
-    .await;
+    let (status, _, body) = token_request(srv, "application/x-www-form-urlencoded", form).await;
     (status, body)
 }
 
-/// `POST /auth/token` with `body` of `content_type`, authenticated as
-/// `wyrd-ui` with `secret`, returning the status, headers, and JSON body.
+/// `POST /auth/token` with `body` of `content_type`, returning the status,
+/// headers, and JSON body.
 ///
 /// # Panics
 /// Panics when the request cannot be built or the router fails.
 async fn token_request(
     srv: &WyrdTestServer,
-    secret: &str,
     content_type: &str,
     body: String,
 ) -> (StatusCode, header::HeaderMap, Value) {
-    let basic = base64::engine::general_purpose::STANDARD.encode(format!("wyrd-ui:{secret}"));
     let response = srv
         .oneshot(
             Request::builder()
                 .method(Method::POST)
                 .uri("/auth/token")
-                .header(header::AUTHORIZATION, format!("Basic {basic}"))
                 .header(header::CONTENT_TYPE, content_type)
                 .body(Body::from(body.clone()))
                 .expect("token request builds"),
@@ -1828,6 +1829,7 @@ async fn decide_device(
         Request::builder()
             .method(Method::POST)
             .uri("/auth/device")
+            .header("x-forwarded-host", PUBLIC_HOST)
             .header(header::ORIGIN, PUBLIC_ORIGIN)
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(Body::from(form.clone()))
@@ -2020,6 +2022,7 @@ async fn device_grant_refusal_journey() {
         .oneshot(
             Request::builder()
                 .uri("/.well-known/oauth-authorization-server")
+                .header("x-forwarded-host", PUBLIC_HOST)
                 .body(Body::empty())
                 .expect("metadata request builds"),
         )
@@ -2453,7 +2456,7 @@ fn assert_refused(status: StatusCode, body: &Value, expected: StatusCode, code: 
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn tenant_connection_admin_journey() {
-    let srv = human_server_builder()
+    let srv = WyrdTestServerBuilder::default()
         .start_bound()
         .await
         .expect("bound server starts");
@@ -2791,7 +2794,7 @@ async fn tenant_connection_rotation_journey() {
                 .with_retained(SecretKey::from_bytes(retained)),
         )
     };
-    let replica_a = human_server_builder()
+    let replica_a = WyrdTestServerBuilder::default()
         .with_sealing_keyring(keyring(k1, k2))
         .start_in_process()
         .await
@@ -3038,7 +3041,7 @@ async fn tenant_connection_rotation_journey() {
         "K1 sealed the first secret"
     );
     let replica_b = replica_a
-        .start_replica(human_server_builder().with_sealing_keyring(keyring(k2, k1)))
+        .start_replica(WyrdTestServerBuilder::default().with_sealing_keyring(keyring(k2, k1)))
         .await
         .expect("replica B starts");
     let under_k2 = replica_a
@@ -3104,7 +3107,7 @@ async fn tenant_connection_rotation_journey() {
         .await
         .expect("replica A, the last K1 writer, shuts down");
     let replica_c = replica_b
-        .start_replica(human_server_builder().with_sealing_keyring(keyring(k2, k1)))
+        .start_replica(WyrdTestServerBuilder::default().with_sealing_keyring(keyring(k2, k1)))
         .await
         .expect("final-pass replica C starts");
     for state in ["Active", "Candidate"] {
@@ -3124,7 +3127,7 @@ async fn tenant_connection_rotation_journey() {
     replica_c.shutdown().await.expect("replica C shuts down");
     let replica_k2 = replica_b
         .start_replica(
-            human_server_builder().with_sealing_keyring(std::sync::Arc::new(SealingKeyring::new(
+            WyrdTestServerBuilder::default().with_sealing_keyring(std::sync::Arc::new(SealingKeyring::new(
                 SecretKey::from_bytes(k2),
             ))),
         )
@@ -3334,12 +3337,12 @@ async fn assert_refresh_cut_off(srv: &WyrdTestServer, session: &Value, label: &s
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn tenant_connection_session_cutoff_journey() {
-    let replica_a = human_server_builder()
+    let replica_a = WyrdTestServerBuilder::default()
         .start_in_process()
         .await
         .expect("replica A starts");
     let replica_b = replica_a
-        .start_replica(human_server_builder())
+        .start_replica(WyrdTestServerBuilder::default())
         .await
         .expect("replica B starts");
     let tenant = replica_a.data_tenant_id();
@@ -3958,28 +3961,28 @@ async fn tenant_callback_refusal_journey() {
         ("code", code.as_str()),
         ("redirect_uri", redirect_uri.as_str()),
         ("code_verifier", verifier.as_str()),
+        ("client_id", "wyrd-ui"),
     ];
-    let (status, headers, body) = token_request(
-        &srv,
-        "not-the-ui-secret",
-        "application/x-www-form-urlencoded",
-        url::form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(&grant)
-            .finish(),
-    )
-    .await;
-    assert_oauth_refusal(
-        &(status, body),
-        StatusCode::UNAUTHORIZED,
-        "invalid_client",
-        "wrong client secret",
-    );
+    let basic = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/token")
+                .header(header::AUTHORIZATION, "Basic d3lyZC11aTpzM2NyZXQ=")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    url::form_urlencoded::Serializer::new(String::new())
+                        .extend_pairs(&grant)
+                        .finish(),
+                ))
+                .expect("token request builds"),
+        )
+        .await
+        .expect("auth call completes");
     assert_eq!(
-        headers
-            .get(header::WWW_AUTHENTICATE)
-            .and_then(|value| value.to_str().ok()),
-        Some("Basic realm=\"wyrd\""),
-        "invalid_client names the authentication scheme"
+        basic.status(),
+        StatusCode::UNAUTHORIZED,
+        "a client secret is invalid_client: wyrd-ui is a public client"
     );
     let wrong_redirect = format!("{PUBLIC_ORIGIN}/elsewhere");
     for (label, redirect, wrong_verifier) in [
@@ -4026,7 +4029,6 @@ async fn tenant_callback_refusal_journey() {
     let (code, verifier) = issued_code(&srv, &keycloak).await;
     let (status, _, body) = token_request(
         &srv,
-        UI_CLIENT_SECRET,
         "application/json",
         serde_json::json!({
             "grant_type": "authorization_code",
@@ -4048,14 +4050,10 @@ async fn tenant_callback_refusal_journey() {
         .append_pair("code", &code)
         .append_pair("redirect_uri", &ui_redirect())
         .append_pair("code_verifier", &verifier)
+        .append_pair("client_id", "wyrd-ui")
         .finish();
-    let (status, headers, session) = token_request(
-        &srv,
-        UI_CLIENT_SECRET,
-        "application/x-www-form-urlencoded",
-        form,
-    )
-    .await;
+    let (status, headers, session) =
+        token_request(&srv, "application/x-www-form-urlencoded", form).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -4364,7 +4362,7 @@ type IssuerCase<'a> = (
 #[tokio::test]
 #[ignore = "runs in the identity journey lane"]
 async fn tenant_callback_issuer_binding_journey() {
-    let srv = human_server_builder()
+    let srv = WyrdTestServerBuilder::default()
         .start_in_process()
         .await
         .expect("test server starts");
@@ -4656,7 +4654,7 @@ async fn candidate_tested(srv: &WyrdTestServer, admin: &TenantAdmin) -> bool {
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn tenant_connection_test_sign_in_journey() {
-    let srv = human_server_builder()
+    let srv = WyrdTestServerBuilder::default()
         .start_in_process()
         .await
         .expect("test server starts");
@@ -4753,18 +4751,24 @@ async fn tenant_connection_test_sign_in_journey() {
     );
     srv.shutdown().await.expect("server shuts down");
 
-    // 5. Wrong callback: the provider refuses an unregistered redirect.
+    // 5. Wrong callback: a test begun at a host the provider does not
+    // register sends an unregistered redirect, which the provider refuses.
     let unregistered = WyrdTestServerBuilder::default()
-        .with_public_origin(
-            "http://unregistered.wyrd.test"
-                .parse()
-                .expect("public origin parses"),
-        )
         .start_in_process()
         .await
         .expect("unregistered server starts");
     let admin = tenant_admin(&unregistered, unregistered.data_tenant_id(), "unregistered").await;
-    let (revision, begun) = begin_keycloak_test(&unregistered, &admin).await;
+    let (revision, _) = begin_keycloak_test(&unregistered, &admin).await;
+    let (status, begun) = call_json_at(
+        &unregistered,
+        "unregistered.wyrd.test",
+        &admin.token,
+        Method::POST,
+        CANDIDATE_TEST,
+        Some(serde_json::json!({ "expected_revision": revision })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the test begins: {begun}");
     let refused = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -4816,7 +4820,7 @@ async fn tenant_connection_test_sign_in_journey() {
 async fn tenant_provider_switch_journey() {
     let first = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let second = OidcIssuerFixture::connect(&keycloak_second_issuer()).await;
-    let srv = human_server_builder()
+    let srv = WyrdTestServerBuilder::default()
         .start_in_process()
         .await
         .expect("test server starts");
@@ -4973,7 +4977,7 @@ async fn tenant_machine_independence_journey() {
             .expect("workload token carries a subject")
             .to_owned()
     };
-    let srv = human_server_builder()
+    let srv = WyrdTestServerBuilder::default()
         .with_trusted_issuer_configs(vec![keycloak_workload_issuer()])
         .with_workload_binding_configs(vec![
             machine_binding(&subject_of(&bound), Some("wyrd-workload"), "machine-sa"),
@@ -5424,7 +5428,7 @@ async fn conformance_untrusted_issuer_rejected() {
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn conformance_login_rejects_bare_localhost_host() {
-    let srv = human_server_builder()
+    let srv = WyrdTestServerBuilder::default()
         .start_in_process()
         .await
         .expect("test server starts");

@@ -41,9 +41,6 @@ pub struct ServerAuth {
     /// platform plane and a signing key exist. The begin and callback routes
     /// share it, and with it one relying-party provider cache.
     pub platform_login: Option<PlatformLogin>,
-    /// The registered OAuth clients the authorization-server endpoints
-    /// identify requests against.
-    pub oauth_clients: crate::auth::oauth::OAuthClients,
     /// TTL and delegation settings for token exchange responses.
     pub token_exchange_settings: TokenExchangeSettings,
 }

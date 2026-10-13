@@ -28,11 +28,8 @@ const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 /// Name the contract gives the one Wyrd authentication scheme.
 const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 
-/// The served contract's name for confidential OAuth client HTTP Basic.
-const OAUTH_CLIENT_BASIC_SCHEME: &str = "oauthClientBasic";
-
 /// The OAuth client endpoints: each identifies its client by the public
-/// form's `client_id` or by confidential HTTP Basic.
+/// form's `client_id`.
 const OAUTH_CLIENT_OPERATIONS: [&str; 3] =
     ["/auth/token", "/auth/device_authorization", "/auth/revoke"];
 
@@ -406,15 +403,16 @@ async fn tenant_login_operations_publish_their_contract() {
         "the token endpoint offers the authorization-code grant"
     );
 
-    let basic = &document["components"]["securitySchemes"][OAUTH_CLIENT_BASIC_SCHEME];
-    assert_eq!(basic["type"], "http", "{basic}");
-    assert_eq!(basic["scheme"], "basic", "{basic}");
+    assert!(
+        document["components"]["securitySchemes"]["oauthClientBasic"].is_null(),
+        "no OAuth client authenticates with a secret"
+    );
     for path in OAUTH_CLIENT_OPERATIONS {
         let operation = &document["paths"][path]["post"];
         assert_eq!(
             operation["security"],
-            serde_json::json!([{}, { OAUTH_CLIENT_BASIC_SCHEME: [] }]),
-            "{path} accepts the public form or confidential Basic"
+            serde_json::json!([{}]),
+            "{path} is reached by a public client naming itself with client_id"
         );
         let form = resolve_schema(
             &document,
@@ -644,11 +642,8 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
             };
             // utoipa renders `security(())` as one empty requirement object,
             // which is OpenAPI's way of saying the operation needs nothing.
-            let oauth_client = OAUTH_CLIENT_OPERATIONS.contains(&path.as_str())
-                && overridden == &serde_json::json!([{}, { OAUTH_CLIENT_BASIC_SCHEME: [] }]);
             assert!(
-                oauth_client
-                    || overridden == &serde_json::json!([])
+                overridden == &serde_json::json!([])
                     || overridden == &serde_json::json!([{}]),
                 "{method} {path} overrides the document requirement with a second scheme"
             );

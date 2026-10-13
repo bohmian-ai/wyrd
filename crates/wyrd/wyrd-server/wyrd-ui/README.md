@@ -33,9 +33,9 @@ Both local sign-in and the mock switch are unavailable in production builds,
 even if their environment flags or cookies are present.
 
 Production builds sign in through the Wyrd server, which is the OAuth 2.0
-authorization server. The web app is its confidential client `wyrd-ui` and uses
-`openid-client` for the authorization code flow with PKCE. It keeps the session
-in a `jose`-encrypted HttpOnly cookie, so Wyrd and provider tokens never reach
-the browser. Set `WYRD_UI_CLIENT_SECRET`, `WYRD_SERVER_URL`, and `ORIGIN`; see
-the self-hosting SSO and OIDC guide. Only Home is currently
+authorization server. The web app is its public client `wyrd-ui` and uses
+`openid-client` for the authorization code flow with PKCE. It keeps the
+server-validated refresh token (or API key) in an HttpOnly cookie that page
+scripts cannot read, and holds access tokens only in memory. It needs only
+`WYRD_SERVER_URL`; its public origin is whatever address the browser used. Only Home is currently
 implemented; linked workspaces arrive with their owning tasks.

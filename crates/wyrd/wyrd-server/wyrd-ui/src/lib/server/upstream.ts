@@ -6,8 +6,8 @@ export const loopback = (hostname: string) =>
 
 /**
  * Internal Wyrd server origin; the application image points it at the
- * co-located Rust listener. This one origin carries the `wyrd-ui` client secret
- * and session credentials, so it must be `https:`; plaintext `http:` is allowed
+ * co-located Rust listener. This one origin carries session credentials, so
+ * it must be `https:`; plaintext `http:` is allowed
  * only for `localhost` and literal loopback addresses. Only an absent value
  * takes the loopback default; an explicit empty value is refused like any
  * other invalid one. Throws on any other value, before a caller can send a

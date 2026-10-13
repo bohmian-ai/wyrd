@@ -130,6 +130,7 @@ async fn start_bff(
         .env("HOST", "127.0.0.1")
         .env("PORT", port.to_string())
         .env("PROTOCOL_HEADER", "x-forwarded-proto")
+        .env("HOST_HEADER", "x-forwarded-host")
         .env("WYRD_SERVER_URL", server_url)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

@@ -477,11 +477,6 @@ pub struct WyrdTestServerBuilder {
     workload_binding_configs: Vec<WorkloadBindingEntry>,
     /// Provider-secret sealing keyring; `None` uses the deterministic test key.
     sealing_keyring: Option<Arc<SealingKeyring>>,
-    /// Deployment public origin the human-connection callback URL derives from.
-    public_origin: Option<Url>,
-    /// SHA-256 of the `wyrd-ui` client secret; `None` leaves `wyrd-ui`
-    /// unable to authenticate.
-    ui_client_secret_hash: Option<wyrd_spec::auth::Sha256Hex>,
     forge_interval: Duration,
     /// Executor slots composed into the production Forge worker.
     wal_sync_delay: Duration,
@@ -657,8 +652,6 @@ impl Default for WyrdTestServerBuilder {
             trusted_issuer_configs: Vec::new(),
             workload_binding_configs: Vec::new(),
             sealing_keyring: None,
-            public_origin: None,
-            ui_client_secret_hash: None,
             forge_interval: Duration::from_mins(1),
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
@@ -4391,21 +4384,6 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Configure the deployment public origin; the tenant human-connection
-    /// callback URL is `{origin}/auth/callback`.
-    #[must_use]
-    pub fn with_public_origin(mut self, origin: Url) -> Self {
-        self.public_origin = Some(origin);
-        self
-    }
-
-    /// Register the `wyrd-ui` confidential client with `secret`, exactly as
-    /// `WYRD_UI_CLIENT_SECRET_SHA256` does in production.
-    #[must_use]
-    pub fn with_ui_client_secret(mut self, secret: &str) -> Self {
-        self.ui_client_secret_hash = Some(wyrd_spec::auth::Sha256Hex::digest(secret.as_bytes()));
-        self
-    }
 
     /// Boot workload bindings from `[[workload_bindings]]` config DTOs.
     ///
@@ -5024,9 +5002,6 @@ impl WyrdTestServerBuilder {
                 sealing_key: Some(sealing_key),
                 human_connections: None,
                 platform_login: None,
-                oauth_clients: wyrd_server::auth::oauth::OAuthClients::new(
-                    self.ui_client_secret_hash.into_iter().collect(),
-                ),
             })
             .with_gateway(test_gateway_config(
                 fixture.data_tenant_id(),
@@ -5040,7 +5015,6 @@ impl WyrdTestServerBuilder {
             state.postgres.wyrd().clone(),
             state.auth.sealing_key.clone(),
             DeploymentProfile::Development.screened_http(),
-            self.public_origin.as_ref(),
             Arc::clone(&state.scribe_outbox) as _,
         ));
         state.auth.platform_login = Some(wyrd_auth::platform_login::PlatformLogin::new(

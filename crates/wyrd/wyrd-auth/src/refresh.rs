@@ -1412,7 +1412,6 @@ mod pg_tests {
             fixture.wyrd_postgres().clone(),
             None,
             ScreenedHttp::allowing_internal(),
-            None,
             Arc::clone(&audit) as _,
         );
 

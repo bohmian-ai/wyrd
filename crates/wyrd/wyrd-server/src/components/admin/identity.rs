@@ -26,7 +26,7 @@ use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::vala::api::AuditEvent;
 
 use crate::audit;
-use crate::auth::auth_not_configured;
+use crate::auth::{RequestOrigin, auth_not_configured};
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -121,11 +121,12 @@ fn refuse_after_decision<T>(
 #[tracing::instrument(skip_all, fields(operation = "identity.oidc.connections.list"))]
 async fn list_connections(
     State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
     caller: Caller,
 ) -> Result<Json<HumanConnectionsResponse>, WyrdErrorResponse> {
     let decision = decide(&state, &caller, "identity.oidc.connections.list")?;
     connections(&state)?
-        .list(caller.data_tenant_id, &decision)
+        .list(caller.data_tenant_id, &decision, &origin)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -142,7 +143,7 @@ async fn list_connections(
 /// body was valid.
 ///
 /// # Errors
-/// Returns `400` for invalid input, a missing public origin, or an unsupported
+/// Returns `400` for invalid input or an unsupported
 /// client authentication method, `403` without `identity_connections:write`,
 /// `409` for a stale `expected_revision`, and `503` when the store is
 /// unavailable.
@@ -153,7 +154,7 @@ async fn list_connections(
     responses(
         (status = 200, description = "Candidate staged; the secret is never returned",
          body = HumanConnectionView),
-        (status = 400, description = "Invalid input or no public origin configured \
+        (status = 400, description = "Invalid input \
           (WYRD_SPEC_400_VALIDATION), or an unsupported client authentication method \
           (WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
@@ -174,6 +175,7 @@ async fn list_connections(
 #[tracing::instrument(skip_all, fields(operation = "identity.oidc.candidate.put"))]
 async fn put_candidate(
     State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
     caller: Caller,
     body: Bytes,
 ) -> Result<Json<HumanConnectionView>, WyrdErrorResponse> {
@@ -184,7 +186,7 @@ async fn put_candidate(
         Err(refusal) => return refuse_after_decision(&state, &caller, decision, refusal),
     };
     owner
-        .put_candidate(caller.data_tenant_id, staged, &decision)
+        .put_candidate(caller.data_tenant_id, staged, &decision, &origin)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -205,7 +207,7 @@ async fn put_candidate(
 /// credential, or User.
 ///
 /// # Errors
-/// Returns `400` when no public origin or sealing key is configured, `403`
+/// Returns `400` when no sealing key is configured, `403`
 /// without `identity_connections:write`, `409` for a stale revision
 /// (`CONNECTION_CONFLICT`) or a failed check (`CONNECTION_NOT_TESTED`), and
 /// `503` when the provider is refused by address screening or unavailable, the
@@ -217,7 +219,7 @@ async fn put_candidate(
     responses(
         (status = 200, description = "The provider checks passed; complete the sign-in at \
           authorization_url to mark this candidate revision tested", body = ConnectionTestResponse),
-        (status = 400, description = "No public origin or sealing key is configured \
+        (status = 400, description = "No sealing key is configured \
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
@@ -240,6 +242,7 @@ async fn put_candidate(
 #[tracing::instrument(skip_all, fields(operation = "identity.oidc.candidate.test"))]
 async fn test_candidate(
     State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
     caller: Caller,
     Json(request): Json<ConnectionTestRequest>,
 ) -> Result<Json<ConnectionTestResponse>, WyrdErrorResponse> {
@@ -250,7 +253,7 @@ async fn test_candidate(
         principal_kind: caller.principal.kind.tag(),
     };
     connections(&state)?
-        .begin_test(caller.data_tenant_id, request.expected_revision, tester)
+        .begin_test(caller.data_tenant_id, request.expected_revision, tester, &origin)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -295,12 +298,13 @@ async fn test_candidate(
 #[tracing::instrument(skip_all, fields(operation = "identity.oidc.candidate.activate"))]
 async fn activate_candidate(
     State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
     caller: Caller,
     Json(request): Json<ConnectionActivate>,
 ) -> Result<Json<HumanConnectionView>, WyrdErrorResponse> {
     let decision = decide(&state, &caller, "identity.oidc.candidate.activate")?;
     connections(&state)?
-        .activate(caller.data_tenant_id, request, &decision)
+        .activate(caller.data_tenant_id, request, &decision, &origin)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -417,8 +421,17 @@ mod pg_tests {
     /// Public x coordinate of the Ed25519 key the mock provider publishes.
     const ED_X: &str = "WhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ-DZ8Vw";
 
-    /// Deployment origin whose `/auth/callback` a test sign-in returns to.
+    /// Origin the test requests arrive at; a sign-in returns to its
+    /// `/auth/callback`.
     const PUBLIC_ORIGIN: &str = "https://wyrd.test";
+
+    /// [`PUBLIC_ORIGIN`] parsed, as the request-origin extractor yields it.
+    ///
+    /// # Panics
+    /// Panics when the constant is not a URL.
+    fn origin() -> Url {
+        Url::parse(PUBLIC_ORIGIN).expect("origin parses")
+    }
 
     /// A permission check that allows its first `allowed` evaluations and
     /// denies every later one.
@@ -497,7 +510,6 @@ mod pg_tests {
             .join("identity-storage");
         std::fs::create_dir_all(&root).expect("storage root creates");
         let signer = LocalSigner::new(root).expect("local signer creates");
-        let origin = Url::parse(PUBLIC_ORIGIN).expect("origin parses");
         let state = scribe.record(test_app_state(
             postgres,
             Arc::new(StorageHandle::new(signer)),
@@ -512,7 +524,6 @@ mod pg_tests {
                         [7_u8; 32],
                     )))),
                     ScreenedHttp::allowing_internal(),
-                    Some(&origin),
                     audit,
                 )),
                 ..ServerAuth::default()
@@ -568,7 +579,7 @@ mod pg_tests {
             wyrd_spec::vala::api::AuditOutcome::Allowed,
         );
         owner
-            .put_candidate(tenant, staged, &decision)
+            .put_candidate(tenant, staged, &decision, &origin())
             .await
             .expect("candidate is staged");
     }
@@ -636,6 +647,7 @@ mod pg_tests {
 
         let Json(begun) = test_candidate(
             State(state.clone()),
+            RequestOrigin(origin()),
             caller(tenant),
             Json(ConnectionTestRequest {
                 expected_revision: 1,
@@ -704,6 +716,7 @@ mod pg_tests {
         .await;
         let refused = put_candidate(
             State(denied.clone()),
+            RequestOrigin(origin()),
             caller(tenant),
             Bytes::from_static(b"{not json"),
         )
@@ -726,6 +739,7 @@ mod pg_tests {
         .await;
         let malformed = put_candidate(
             State(state.clone()),
+            RequestOrigin(origin()),
             caller(tenant),
             Bytes::from_static(b"{not json"),
         )
@@ -735,6 +749,7 @@ mod pg_tests {
 
         let unsupported = put_candidate(
             State(state.clone()),
+            RequestOrigin(origin()),
             caller(tenant),
             candidate_body("https://idp.example.com", "PrivateKeyJwt"),
         )
@@ -747,6 +762,7 @@ mod pg_tests {
 
         let Json(staged) = put_candidate(
             State(state.clone()),
+            RequestOrigin(origin()),
             caller(tenant),
             candidate_body("https://idp.example.com", "Public"),
         )

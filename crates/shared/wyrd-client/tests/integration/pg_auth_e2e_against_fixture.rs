@@ -34,7 +34,7 @@ use secrecy::ExposeSecret;
 use wyrd_client::saved_login::canonical_origin;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_testing::human_login::{
-    FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso, expire_saved_access, saved_login,
+    FIXTURE_TENANT_SLUG, HumanSso, expire_saved_access, saved_login,
     saved_logins,
 };
 
@@ -216,7 +216,6 @@ async fn mint_in_children(count: usize, config: &std::path::Path, server: &str) 
 #[ignore = "requires the Keycloak identity lane; run via `mise run test:identity:journey`"]
 async fn concurrent_saved_renewal() {
     let srv = wyrd_testing::WyrdTestServerBuilder::default()
-        .with_public_origin(HUMAN_PUBLIC_ORIGIN.parse().expect("origin parses"))
         .start_bound()
         .await
         .expect("server starts");

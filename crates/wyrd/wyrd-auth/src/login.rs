@@ -17,12 +17,13 @@
 use std::time::Duration;
 
 use serde_json::json;
+use url::Url;
 use wyrd_spec::auth::{AbsoluteUrl, ClientAuthorization, LoginInitiation, Sha256Hex};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::queries::auth::{LoginState, insert_login_state};
 
-use crate::connections::HumanConnections;
+use crate::connections::{HumanConnections, provider_callback};
 use crate::error::{relying_party_error, store_error};
 
 /// Lifetime of a persisted login-state row: the browser must complete the `IdP`
@@ -46,25 +47,28 @@ impl HumanConnections {
         &self,
         tenant_route_key: &TenantSlug,
         authorization: ClientAuthorization,
+        origin: &Url,
     ) -> Result<AbsoluteUrl, WyrdError> {
-        self.begin_bound(tenant_route_key, LoginInitiation::Authorize(authorization))
-            .await
+        self.begin_bound(
+            tenant_route_key,
+            LoginInitiation::Authorize(authorization),
+            origin,
+        )
+        .await
     }
 
     /// Begin a tenant human SSO login bound to `initiation` and return the
     /// provider authorization URL.
     ///
-    /// Everything that can refuse without the network runs first, before any
-    /// provider IO or state write: a configured public origin. The route key then resolves the
-    /// tenant, and the tenant must have an Active connection; an unknown
+    /// The route key resolves the tenant, and the tenant must have an Active connection; an unknown
     /// tenant and a tenant without one fail with the same generic refusal, so
     /// the endpoint cannot enumerate tenants or their login configuration.
     ///
     /// The provider comes from the relying party's per-issuer cache, which
     /// discovers through the screened HTTP capability on a miss, and the
     /// relying party screens the authorization endpoint by scheme and
-    /// generates the state, nonce, and PKCE verifier. The redirect URI is
-    /// always the deployment's configured callback. The state row binds the
+    /// generates the state, nonce, and PKCE verifier. The redirect URI is the
+    /// callback on `origin`, the address the request arrived at. The state row binds the
     /// exact connection revision, issuer, and client id, the PKCE verifier,
     /// the nonce, and the initiation binding; only the SHA-256 of the state is
     /// stored, and the raw state is returned only inside the URL. The
@@ -72,7 +76,7 @@ impl HumanConnections {
     /// login.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] when no public origin is configured;
+    /// Returns [`WyrdError::Validation`] when `origin` cannot form a callback;
     /// [`WyrdError::InvalidState`] for a binding
     /// already recorded for another login; [`WyrdError::InvalidToken`] when
     /// the route key names no active tenant or the tenant has no Active
@@ -85,8 +89,9 @@ impl HumanConnections {
         &self,
         tenant_route_key: &TenantSlug,
         initiation: LoginInitiation,
+        origin: &Url,
     ) -> Result<AbsoluteUrl, WyrdError> {
-        let redirect_uri = self.require_callback()?.clone();
+        let redirect_uri = provider_callback(origin)?;
         let tenant = self
             .postgres()
             .resolve_tenant_slug(tenant_route_key)
@@ -166,20 +171,23 @@ mod pg_tests {
     use crate::audit::test_audit::RecordedAudit;
     use crate::connections::HumanConnections;
 
-    /// A connection owner over `fixture` with a public origin, no keyring, and
-    /// an audit stage nothing in these tests stages on.
-    ///
-    /// # Panics
-    /// Panics when the fixed origin does not parse.
+    /// A connection owner over `fixture` with no keyring and an audit stage
+    /// nothing in these tests stages on.
     fn connections(fixture: &PgFixture) -> HumanConnections {
-        let origin = Url::parse("https://wyrd.example.com").expect("origin parses");
         HumanConnections::new(
             fixture.wyrd_postgres().clone(),
             None,
             ScreenedHttp::allowing_internal(),
-            Some(&origin),
             RecordedAudit::new(),
         )
+    }
+
+    /// The origin these tests' sign-in requests arrive at.
+    ///
+    /// # Panics
+    /// Panics when the fixed origin does not parse.
+    fn origin() -> Url {
+        Url::parse("https://wyrd.example.com").expect("origin parses")
     }
 
     /// A `wyrd-ui` authorization request with a fixed S256 challenge.
@@ -219,6 +227,7 @@ mod pg_tests {
             .authorize(
                 &TenantSlug::new("no-such-tenant").expect("slug is valid"),
                 authorization(),
+                &origin(),
             )
             .await
             .expect_err("unknown tenant refuses");
@@ -226,6 +235,7 @@ mod pg_tests {
             .authorize(
                 &TenantSlug::new(fixture.tenant_slug()).expect("slug is valid"),
                 authorization(),
+                &origin(),
             )
             .await
             .expect_err("tenant without a connection refuses");

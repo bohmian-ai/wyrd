@@ -23,8 +23,13 @@ use wyrd_client::saved_login::{SavedLogin, SavedLogins, canonical_origin};
 use wyrd_spec::auth::{SecretBearer, TokenResponse};
 use wyrd_spec::ids::TenantSlug;
 
-/// Public origin every human journey server is configured with; the Keycloak
-/// fixture clients register `{origin}/auth/callback`.
+/// Host the human journeys reach the server at, sent as `X-Forwarded-Host`
+/// as a proxy in front of it would; the server derives every sign-in
+/// callback from it.
+pub const HUMAN_PUBLIC_HOST: &str = "test-tenant-1.wyrd.test";
+
+/// Origin of [`HUMAN_PUBLIC_HOST`]; the Keycloak fixture clients register
+/// `{origin}/auth/callback`.
 pub const HUMAN_PUBLIC_ORIGIN: &str = "http://test-tenant-1.wyrd.test";
 
 /// Route key of the harness's fixture tenant.
@@ -38,13 +43,24 @@ pub fn keycloak_issuer() -> String {
         .unwrap_or_else(|_| "http://localhost:8180/realms/wyrd-test".to_owned())
 }
 
+/// Headers that make a request reach the server at [`HUMAN_PUBLIC_HOST`].
+fn forwarded_host() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-forwarded-host",
+        reqwest::header::HeaderValue::from_static(HUMAN_PUBLIC_HOST),
+    );
+    headers
+}
+
 /// Served human-login steps against one bound server.
 pub struct HumanSso {
     /// The server's bound base URL.
     server: String,
     /// The server's unauthenticated `/auth` surface.
     exchange: TokenExchange,
-    /// Plain client for administration calls and the provider callback.
+    /// Client for administration calls and the provider callback that
+    /// reaches the server at [`HUMAN_PUBLIC_HOST`].
     http: reqwest::Client,
 }
 
@@ -58,7 +74,10 @@ impl HumanSso {
         Self {
             server: server.trim_end_matches('/').to_owned(),
             exchange: TokenExchange::new(server, 30_000).expect("token exchange builds"),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .default_headers(forwarded_host())
+                .build()
+                .expect("client builds"),
         }
     }
 
@@ -182,6 +201,7 @@ impl HumanSso {
     pub async fn approve(&self, tenant: &TenantSlug, user_code: &str) -> Url {
         let page = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .default_headers(forwarded_host())
             .build()
             .expect("client builds");
         let reply = page

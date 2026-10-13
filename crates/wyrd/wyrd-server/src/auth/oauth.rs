@@ -4,9 +4,9 @@
 //! `POST /auth/device_authorization`, and `POST /auth/revoke` take
 //! `application/x-www-form-urlencoded` parameters ([`OAuthForm`]) and answer
 //! with `Cache-Control: no-store`. Device authorization and revocation
-//! require a registered OAuth client ([`OAuthClients::require`]). The tenant
+//! require a registered OAuth client ([`require_client`]). The tenant
 //! token endpoint identifies a client when one is supplied
-//! ([`OAuthClients::identify`]) and requires one only for the
+//! ([`identify_client`]) and requires one only for the
 //! authorization-code, refresh, and device-code grants; RFC 8693 token
 //! exchange and RFC 7523 JWT bearer are clientless. The platform token
 //! endpoint is clientless and authenticates only its presented platform
@@ -25,12 +25,9 @@ use axum::body::Bytes;
 use axum::extract::{FromRequest, Request};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
-use base64::Engine;
 use serde::de::DeserializeOwned;
 use url::form_urlencoded;
-use wyrd_spec::auth::{
-    OAuthClientId, OAuthErrorCode, OAuthErrorResponse, Sha256Hex, TokenAudience, TokenRequest,
-};
+use wyrd_spec::auth::{OAuthClientId, OAuthErrorCode, OAuthErrorResponse, TokenAudience, TokenRequest};
 use wyrd_spec::error::WyrdError;
 
 /// The RFC 8693 token-exchange `grant_type`.
@@ -49,16 +46,13 @@ pub const GRANT_TYPES: [&str; 5] = [
 /// parameters plus the public client's `client_id` (RFC 6749 §2.3.1, §3.2.1).
 ///
 /// It exists for the served contract only. Requests are read by
-/// [`OAuthForm`] and the client is identified by [`OAuthClients`]; a
-/// confidential client sends HTTP Basic (RFC 7617) instead of `client_id`,
-/// which the operation declares as its alternative security requirement.
+/// [`OAuthForm`] and the client is identified by [`identify_client`].
 #[derive(utoipa::ToSchema)]
 pub struct ClientForm<T> {
     /// The endpoint's own parameters.
     #[serde(flatten)]
     pub params: T,
-    /// The public client's identifier. A confidential client omits it and
-    /// authenticates with HTTP Basic instead.
+    /// The public client's identifier.
     pub client_id: Option<OAuthClientId>,
 }
 
@@ -138,23 +132,15 @@ impl From<WyrdError> for OAuthError {
 }
 
 impl IntoResponse for OAuthError {
-    /// Render the RFC 6749 §5.2 JSON body with `no-store` caching, adding the
-    /// `Basic` challenge to an `invalid_client` refusal.
+    /// Render the RFC 6749 §5.2 JSON body with `no-store` caching.
     fn into_response(self) -> Response {
-        let mut response = no_store(
+        no_store(
             self.status(),
             Json(OAuthErrorResponse {
                 error: self.0,
                 error_description: None,
             }),
-        );
-        if self.0 == OAuthErrorCode::InvalidClient {
-            response.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                HeaderValue::from_static("Basic realm=\"wyrd\""),
-            );
-        }
-        response
+        )
     }
 }
 
@@ -273,169 +259,45 @@ impl<S: Send + Sync> FromRequest<S> for OAuthForm {
     }
 }
 
-/// The deployment's OAuth client registrations.
+/// The client a request identifies, if any.
 ///
-/// `wyrd-cli` is public and identifies itself with `client_id` alone.
-/// `wyrd-ui` is confidential and authenticates with `client_secret_basic`
-/// (RFC 6749 §2.3.1) against the configured SHA-256 digests of its secret:
-/// one, or two during a rotation overlap. With no digest configured
-/// `wyrd-ui` cannot authenticate.
-#[derive(Debug, Clone, Default)]
-pub struct OAuthClients {
-    /// SHA-256 of each accepted `wyrd-ui` client secret.
-    ui_secret_hashes: Vec<Sha256Hex>,
+/// Both registered clients are public (RFC 6749 §2.1): `wyrd-cli` and the
+/// `wyrd-ui` BFF each name themselves with the `client_id` parameter alone
+/// and hold no secret. A request that also presents an `Authorization`
+/// header is attempting client authentication no client is registered for.
+///
+/// # Errors
+/// Returns `invalid_client` for an `Authorization` header or an unknown
+/// `client_id`.
+pub fn identify_client(
+    headers: &HeaderMap,
+    form: &OAuthForm,
+) -> Result<Option<OAuthClientId>, OAuthError> {
+    let invalid_client = OAuthError(OAuthErrorCode::InvalidClient);
+    if headers.contains_key(header::AUTHORIZATION) {
+        return Err(invalid_client);
+    }
+    form.get("client_id")
+        .map(|id| OAuthClientId::parse(id).ok_or(invalid_client))
+        .transpose()
 }
 
-impl OAuthClients {
-    /// Register `wyrd-ui` with these secret digests.
-    #[must_use]
-    pub fn new(ui_secret_hashes: Vec<Sha256Hex>) -> Self {
-        Self { ui_secret_hashes }
-    }
-
-    /// The client a request identifies, if any.
-    ///
-    /// An `Authorization: Basic` header must carry `wyrd-ui` and an accepted
-    /// secret, both form-urlencoded (RFC 6749 §2.3.1); a `client_id`
-    /// parameter beside it must name the same client. Without the header the
-    /// `client_id` parameter must name the public `wyrd-cli`.
-    ///
-    /// # Errors
-    /// Returns `invalid_client` for a malformed or refused header, an unknown
-    /// client, or `wyrd-ui` without its secret, and `invalid_request` for a
-    /// `client_id` parameter that contradicts the header.
-    pub fn identify(
-        &self,
-        headers: &HeaderMap,
-        form: &OAuthForm,
-    ) -> Result<Option<OAuthClientId>, OAuthError> {
-        let invalid_client = OAuthError(OAuthErrorCode::InvalidClient);
-        let Some(authorization) = headers.get(header::AUTHORIZATION) else {
-            return match form.get("client_id").map(OAuthClientId::parse) {
-                None => Ok(None),
-                Some(Some(OAuthClientId::WyrdCli)) => Ok(Some(OAuthClientId::WyrdCli)),
-                Some(_) => Err(invalid_client),
-            };
-        };
-        let (client_id, secret) = authorization
-            .to_str()
-            .ok()
-            .and_then(|value| value.split_once(' '))
-            .and_then(|(scheme, credentials)| {
-                scheme.eq_ignore_ascii_case("basic").then_some(credentials)
-            })
-            .and_then(|encoded| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(encoded.trim())
-                    .ok()
-            })
-            .and_then(|decoded| String::from_utf8(decoded).ok())
-            .and_then(|decoded| {
-                let (id, secret) = decoded.split_once(':')?;
-                Some((form_decoded(id), form_decoded(secret)))
-            })
-            .ok_or(invalid_client)?;
-        if OAuthClientId::parse(&client_id) != Some(OAuthClientId::WyrdUi)
-            || !self
-                .ui_secret_hashes
-                .contains(&Sha256Hex::digest(secret.as_bytes()))
-        {
-            return Err(invalid_client);
-        }
-        if form
-            .get("client_id")
-            .is_some_and(|param| param != client_id)
-        {
-            return Err(OAuthError(OAuthErrorCode::InvalidRequest));
-        }
-        Ok(Some(OAuthClientId::WyrdUi))
-    }
-
-    /// The client a request that must identify one names.
-    ///
-    /// # Errors
-    /// The errors of [`Self::identify`], and `invalid_client` when the
-    /// request identifies no client.
-    pub fn require(
-        &self,
-        headers: &HeaderMap,
-        form: &OAuthForm,
-    ) -> Result<OAuthClientId, OAuthError> {
-        self.identify(headers, form)?
-            .ok_or(OAuthError(OAuthErrorCode::InvalidClient))
-    }
-}
-
-/// Decode one form-urlencoded component, as RFC 6749 §2.3.1 encodes the
-/// Basic credentials.
-fn form_decoded(component: &str) -> String {
-    form_urlencoded::parse(component.as_bytes())
-        .next()
-        .map(|(decoded, _)| decoded.into_owned())
-        .unwrap_or_default()
+/// The client a request that must identify one names.
+///
+/// # Errors
+/// The errors of [`identify_client`], and `invalid_client` when the request
+/// identifies no client.
+pub fn require_client(headers: &HeaderMap, form: &OAuthForm) -> Result<OAuthClientId, OAuthError> {
+    identify_client(headers, form)?.ok_or(OAuthError(OAuthErrorCode::InvalidClient))
 }
 
 #[cfg(test)]
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
-    use base64::Engine;
-    use wyrd_spec::auth::{OAuthClientId, OAuthErrorCode, Sha256Hex, TokenAudience, TokenRequest};
+    use wyrd_spec::auth::{OAuthClientId, OAuthErrorCode, TokenAudience, TokenRequest};
     use wyrd_spec::error::WyrdError;
 
-    use super::{OAuthClients, OAuthError, OAuthForm};
-
-    /// Headers carrying `Authorization: Basic` for `id` and `secret`.
-    fn basic(id: &str, secret: &str) -> HeaderMap {
-        basic_with_scheme("Basic", id, secret)
-    }
-
-    /// Headers carrying `Authorization: <scheme>` with the Base64 of
-    /// `id:secret`.
-    ///
-    /// # Panics
-    /// Panics when the header value is not valid.
-    fn basic_with_scheme(scheme: &str, id: &str, secret: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{id}:{secret}"));
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("{scheme} {encoded}")).expect("header value"),
-        );
-        headers
-    }
-
-    /// The `Basic` scheme token matches in any case (RFC 9110 §11.1); another
-    /// scheme, a missing separator, or a wrong secret stays `invalid_client`.
-    ///
-    /// # Panics
-    /// Panics when a header authenticates differently.
-    #[test]
-    fn basic_scheme_matches_case_insensitively() {
-        let clients = OAuthClients::new(vec![Sha256Hex::digest(b"s3cret")]);
-        let empty = OAuthForm::parse(b"").expect("form parses");
-        for scheme in ["Basic", "basic", "BASIC", "bAsIc"] {
-            assert_eq!(
-                clients.identify(&basic_with_scheme(scheme, "wyrd-ui", "s3cret"), &empty),
-                Ok(Some(OAuthClientId::WyrdUi)),
-                "{scheme}"
-            );
-        }
-        let invalid = Err(OAuthError(OAuthErrorCode::InvalidClient));
-        assert_eq!(
-            clients.identify(&basic_with_scheme("basic", "wyrd-ui", "wrong"), &empty),
-            invalid
-        );
-        assert_eq!(
-            clients.identify(&basic_with_scheme("Bearer", "wyrd-ui", "s3cret"), &empty),
-            invalid
-        );
-        let mut joined = HeaderMap::new();
-        joined.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Basicd3lyZC11aTpzM2NyZXQ="),
-        );
-        assert_eq!(clients.identify(&joined, &empty), invalid);
-    }
+    use super::{OAuthError, OAuthForm, identify_client, require_client};
 
     /// A repeated parameter is refused, an empty one is omitted.
     ///
@@ -494,42 +356,37 @@ mod tests {
         ));
     }
 
-    /// `wyrd-ui` authenticates only with an accepted, form-urlencoded Basic
-    /// secret; `wyrd-cli` identifies itself by `client_id`.
+    /// Both clients identify by `client_id` alone; an unknown client or any
+    /// `Authorization` header is `invalid_client`, and only a request that
+    /// must name a client refuses naming none.
     ///
     /// # Panics
     /// Panics when a client is identified differently.
     #[test]
-    fn clients_authenticate_by_registration() {
-        let clients = OAuthClients::new(vec![Sha256Hex::digest(b"s3cret/+")]);
-        let empty = OAuthForm::parse(b"").expect("form parses");
+    fn clients_identify_by_client_id() {
+        let none = HeaderMap::new();
+        let form = |raw: &[u8]| OAuthForm::parse(raw).expect("form parses");
+        let invalid = OAuthError(OAuthErrorCode::InvalidClient);
         assert_eq!(
-            clients.identify(&basic("wyrd-ui", "s3cret%2F%2B"), &empty),
+            identify_client(&none, &form(b"client_id=wyrd-ui")),
             Ok(Some(OAuthClientId::WyrdUi))
         );
         assert_eq!(
-            clients.identify(&basic("wyrd-ui", "wrong"), &empty),
-            Err(OAuthError(OAuthErrorCode::InvalidClient))
-        );
-        assert_eq!(
-            clients.identify(&basic("wyrd-cli", "s3cret%2F%2B"), &empty),
-            Err(OAuthError(OAuthErrorCode::InvalidClient))
-        );
-        let cli = OAuthForm::parse(b"client_id=wyrd-cli").expect("form parses");
-        assert_eq!(
-            clients.identify(&HeaderMap::new(), &cli),
+            identify_client(&none, &form(b"client_id=wyrd-cli")),
             Ok(Some(OAuthClientId::WyrdCli))
         );
-        assert_eq!(
-            clients.identify(&basic("wyrd-ui", "s3cret%2F%2B"), &cli),
-            Err(OAuthError(OAuthErrorCode::InvalidRequest))
+        assert_eq!(identify_client(&none, &form(b"client_id=other")), Err(invalid));
+        assert_eq!(identify_client(&none, &form(b"")), Ok(None));
+        assert_eq!(require_client(&none, &form(b"")), Err(invalid));
+        let mut basic = HeaderMap::new();
+        basic.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic d3lyZC11aTpzM2NyZXQ="),
         );
-        let ui = OAuthForm::parse(b"client_id=wyrd-ui").expect("form parses");
         assert_eq!(
-            clients.identify(&HeaderMap::new(), &ui),
-            Err(OAuthError(OAuthErrorCode::InvalidClient))
+            identify_client(&basic, &form(b"client_id=wyrd-ui")),
+            Err(invalid)
         );
-        assert_eq!(clients.identify(&HeaderMap::new(), &empty), Ok(None));
     }
 
     /// Catalog refusals map to their RFC codes; a token exchange reports an

@@ -6,7 +6,9 @@
 //! common callback later redirects back with a single-use code or an RFC 6749
 //! §4.1.2.1 error ([`client_redirect`]). The one extension parameter,
 //! `tenant`, is pre-login routing context only. RFC 8414 metadata describes
-//! these endpoints at `/.well-known/oauth-authorization-server`.
+//! these endpoints at `/.well-known/oauth-authorization-server`. Every URL
+//! here is on the origin the request arrived at ([`RequestOrigin`]): the
+//! UI and the server share it, so nothing is configured.
 
 use axum::Json;
 use axum::extract::{RawQuery, State};
@@ -19,21 +21,22 @@ use wyrd_spec::auth::{
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 
-use crate::auth::auth_not_configured;
 use crate::auth::cli_login::page;
+use crate::auth::{RequestOrigin, auth_not_configured};
 use crate::auth::oauth::{GRANT_TYPES, OAuthError, OAuthForm};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
-/// Path of `wyrd-ui`'s registered redirect URI under the public origin.
+/// Path of `wyrd-ui`'s redirect URI on the request origin.
 const UI_REDIRECT_PATH: &str = "/login/callback";
 
 /// `GET /auth/authorize` — begin a sign-in for an OAuth client (RFC 6749
 /// §4.1.1, RFC 7636 §4.3).
 ///
 /// Only `wyrd-ui` uses the authorization code grant, so `client_id` must
-/// name it once and `redirect_uri` must appear once and equal its registered
-/// `{public_origin}/login/callback` exactly (RFC 6749 §3.1.2); otherwise the
+/// name it once and `redirect_uri` must appear once and equal
+/// `{origin}/login/callback` exactly (RFC 6749 §3.1.2), on the origin this
+/// request arrived at; otherwise the
 /// browser is shown an error page and never redirected. After that, any
 /// other repeated parameter, a missing `response_type`, `code_challenge`, or
 /// `tenant`, a challenge method other than `S256`, or a refused sign-in
@@ -41,11 +44,12 @@ const UI_REDIRECT_PATH: &str = "/login/callback";
 /// when the request sent exactly one. A valid request
 /// redirects (`303`) to the tenant's provider sign-in, bound to the client,
 /// redirect URI, challenge, and `state`. No request header selects the
-/// tenant, connection, or redirect, and initiation appends no audit event:
-/// it evaluates no principal permission.
+/// tenant or connection, and initiation appends no audit event: it
+/// evaluates no principal permission.
 ///
 /// # Errors
-/// Returns problem JSON when auth or the public origin is not configured.
+/// Returns problem JSON when auth is not configured or the request names no
+/// usable host.
 #[utoipa::path(
     get,
     path = "/auth/authorize",
@@ -62,8 +66,8 @@ const UI_REDIRECT_PATH: &str = "/login/callback";
         (status = 303, description = "Sign in at the tenant's provider, or return to the \
           client's redirect URI with an RFC 6749 §4.1.2.1 `error`",
           headers(("Location" = String, description = "Provider or client redirect URI"))),
-        (status = 400, description = "An unknown client or unregistered redirect URI is \
-          shown an HTML page; a deployment without a public origin answers \
+        (status = 400, description = "An unknown client or a redirect URI off the request \
+          origin is shown an HTML page; a request without a usable host answers \
           WYRD_SPEC_400_VALIDATION",
           content((String = "text/html"), (WyrdProblem = "application/problem+json"))),
         (status = 500, description = "Auth is not configured (WYRD_SPEC_500_INTERNAL)",
@@ -75,6 +79,7 @@ const UI_REDIRECT_PATH: &str = "/login/callback";
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn authorize(
     State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
     RawQuery(query): RawQuery,
 ) -> Result<Response, WyrdErrorResponse> {
     let connections = state
@@ -82,15 +87,15 @@ pub async fn authorize(
         .human_connections
         .as_ref()
         .ok_or_else(auth_not_configured)?;
-    let registered = ui_redirect_uri(connections.require_callback()?);
+    let registered = ui_redirect_uri(&origin);
     let query = query.unwrap_or_default();
     if unique_param(&query, "client_id").as_deref() != Some(OAuthClientId::WyrdUi.as_str())
         || unique_param(&query, "redirect_uri").as_deref() != Some(registered.as_str())
     {
         return Ok(page(
             StatusCode::BAD_REQUEST,
-            "<h1>Sign-in request refused</h1><p>The application or its return address is not \
-             registered with this Wyrd deployment.</p>",
+            "<h1>Sign-in request refused</h1><p>The application or its return address does not \
+             belong to this Wyrd deployment.</p>",
         ));
     }
     let mut authorization = ClientAuthorization {
@@ -130,23 +135,28 @@ pub async fn authorize(
     {
         return refused(OAuthErrorCode::InvalidRequest);
     }
-    match connections.authorize(&tenant, authorization.clone()).await {
+    match connections
+        .authorize(&tenant, authorization.clone(), &origin)
+        .await
+    {
         Ok(url) => Ok(Redirect::to(url.as_str()).into_response()),
         Err(error) => refused(OAuthError::authorization(error)),
     }
 }
 
-/// `GET /.well-known/oauth-authorization-server` — RFC 8414 §3 metadata.
+/// `GET /.well-known/oauth-authorization-server` — RFC 8414 §3 metadata,
+/// with every endpoint on the origin the request arrived at.
 ///
 /// # Errors
-/// Returns problem JSON when auth or the public origin is not configured.
+/// Returns problem JSON when auth is not configured or the request names no
+/// usable host.
 #[utoipa::path(
     get,
     path = "/.well-known/oauth-authorization-server",
     responses(
         (status = 200, description = "Authorization server metadata",
           body = AuthorizationServerMetadata),
-        (status = 400, description = "No public origin is configured \
+        (status = 400, description = "The request names no usable host \
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 500, description = "Auth is not configured (WYRD_SPEC_500_INTERNAL)",
           body = WyrdProblem)
@@ -156,24 +166,24 @@ pub async fn authorize(
 )]
 pub async fn metadata(
     State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
 ) -> Result<Json<AuthorizationServerMetadata>, WyrdErrorResponse> {
-    let callback = state
+    state
         .auth
         .human_connections
         .as_ref()
-        .ok_or_else(auth_not_configured)?
-        .require_callback()?;
-    let origin = callback.origin().ascii_serialization();
+        .ok_or_else(auth_not_configured)?;
+    let origin = origin.origin().ascii_serialization();
     let url = |path: &str| {
         AbsoluteUrl::new(format!("{origin}{path}")).map_err(|error| {
             WyrdErrorResponse::from(WyrdError::Internal {
-                message: format!("the public origin does not form an endpoint URL: {error}"),
+                message: format!("the request origin does not form an endpoint URL: {error}"),
                 details: serde_json::json!({}),
             })
         })
     };
     let strings = |values: &[&str]| values.iter().map(|value| (*value).to_owned()).collect();
-    let auth_methods = strings(&["client_secret_basic", "none"]);
+    let auth_methods = strings(&["none"]);
     Ok(Json(AuthorizationServerMetadata {
         issuer: url("")?,
         authorization_endpoint: url("/auth/authorize")?,
@@ -199,13 +209,9 @@ fn unique_param(query: &str, name: &str) -> Option<String> {
     values.next().is_none().then_some(value)
 }
 
-/// `wyrd-ui`'s registered redirect URI under the origin of the deployment's
-/// configured provider callback.
-pub(crate) fn ui_redirect_uri(callback: &Url) -> String {
-    format!(
-        "{}{UI_REDIRECT_PATH}",
-        callback.origin().ascii_serialization()
-    )
+/// `wyrd-ui`'s redirect URI on `origin`.
+fn ui_redirect_uri(origin: &Url) -> String {
+    format!("{}{UI_REDIRECT_PATH}", origin.origin().ascii_serialization())
 }
 
 /// Redirect (`303`) to `authorization`'s redirect URI with `params` and the
@@ -284,7 +290,7 @@ mod pg_tests {
     const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
     /// App state over `fixture` whose tenant's Active connection points at a
-    /// mock provider, with a fixed public origin.
+    /// mock provider.
     ///
     /// # Panics
     /// Panics when the fixture cannot be seeded or the state cannot be built.
@@ -323,7 +329,6 @@ mod pg_tests {
         .execute(&fixture.superuser_pool().expect("superuser pool opens"))
         .await
         .expect("connection points at the mock provider");
-        let origin = Url::parse("https://wyrd.example.com").expect("origin parses");
         let tempdir = tempfile::tempdir().expect("authorize storage tempdir");
         let signer = LocalSigner::new(tempdir.keep()).expect("local signer creates");
         let state = crate::test_support::test_app_state(
@@ -340,27 +345,35 @@ mod pg_tests {
                 fixture.wyrd_postgres().clone(),
                 None,
                 ScreenedHttp::allowing_internal(),
-                Some(&origin),
                 audit,
             )),
             ..ServerAuth::default()
         })
     }
 
-    /// GET `/auth/authorize?{query}` with hostile `Host` and forwarded
-    /// headers through the handler alone; returns the status and `Location`.
+    /// GET `/auth/authorize?{query}` arriving at `https://wyrd.example.com`
+    /// through a TLS proxy, through the handler alone; returns the status and
+    /// `Location`.
     ///
     /// # Panics
     /// Panics when the request cannot be built or answered.
     async fn get_authorize(state: AppState, query: &str) -> (StatusCode, Option<Url>) {
+        get_authorize_at(state, query, "wyrd.example.com").await
+    }
+
+    /// GET `/auth/authorize?{query}` with `Host: host` behind a proxy that
+    /// forwards `https`; returns the status and `Location`.
+    ///
+    /// # Panics
+    /// Panics when the request cannot be built or answered.
+    async fn get_authorize_at(state: AppState, query: &str, host: &str) -> (StatusCode, Option<Url>) {
         let response = axum::Router::new()
             .route("/auth/authorize", axum::routing::get(super::authorize))
             .with_state(state)
             .oneshot(
                 Request::get(format!("/auth/authorize?{query}"))
-                    .header(header::HOST, "attacker.example.net")
-                    .header("x-forwarded-host", "evil.example.org")
-                    .header("x-forwarded-proto", "http")
+                    .header(header::HOST, host)
+                    .header("x-forwarded-proto", "https")
                     .body(Body::empty())
                     .expect("request builds"),
             )
@@ -392,14 +405,13 @@ mod pg_tests {
     }
 
     /// A valid request sends the browser to the tenant's provider with the
-    /// deployment's configured callback, whatever `Host` or forwarded headers
-    /// it carried.
+    /// callback on the origin the request arrived at.
     ///
     /// # Panics
     /// Panics when the request is refused or the provider URL carries another
     /// `redirect_uri`.
     #[tokio::test]
-    async fn authorize_ignores_request_headers() {
+    async fn authorize_derives_the_callback_from_the_request_origin() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let provider = MockServer::start().await;
         let state = authorize_state(&fixture, &provider).await;
@@ -480,6 +492,28 @@ mod pg_tests {
             );
             assert_eq!(param(&location, "state").as_deref(), echoed, "{query}");
         }
+    }
+
+    /// A request that arrives at another origin than its redirect URI names
+    /// — a forged `Host` — is refused and never redirected.
+    ///
+    /// # Panics
+    /// Panics when the request redirects.
+    #[tokio::test]
+    async fn a_redirect_off_the_request_origin_is_refused() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let provider = MockServer::start().await;
+        let state = authorize_state(&fixture, &provider).await;
+
+        let (status, location) = get_authorize_at(
+            state,
+            &request(fixture.tenant_slug(), ""),
+            "attacker.example.net",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(location.is_none());
     }
 
     /// An unregistered, missing, or repeated redirect URI or client is never

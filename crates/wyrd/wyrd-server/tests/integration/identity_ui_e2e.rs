@@ -1,14 +1,13 @@
 //! Production UI identity journey host.
 //!
 //! Starts two real Wyrd server replicas over one Postgres on bound sockets,
-//! both registering the `wyrd-ui` confidential client secret and the shared
-//! public origin, seeds an SSO tenant (Active Keycloak
+//! with nothing configured for sign-in, seeds an SSO tenant (Active Keycloak
 //! connection), an OIDC-off tenant (API keys only), three switch tenants (two
 //! on the same Keycloak issuer, one on Dex, a different provider), and a
 //! provider-replacement tenant (Active first realm, replaced by the second
 //! Keycloak realm through the settings page), starts two production
-//! BFF processes (`node build`) with the same public origin and client secret
-//! — the first in front of replica A over loopback HTTP, the second in front of
+//! BFF processes (`node build`) configured as the official image configures
+//! them — the first in front of replica A over loopback HTTP, the second in front of
 //! replica B only through a Node TLS terminator whose certificate the
 //! repository's test CA issues and the BFF trusts — and runs the Vitest HTTP journey
 //! `src/lib/server/auth/production-auth.integration.test.ts` against them. The
@@ -103,17 +102,16 @@ fn ui_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("wyrd-ui")
 }
 
-/// Start one production BFF replica against `server_url`, as the `wyrd-ui`
-/// OAuth client holding `client_secret`, and wait until it answers. `extra_ca` is the PEM file Node adds to its trust store, so a
-/// replica given the TLS terminator's `https:` origin verifies it through the
-/// ordinary native `fetch` path.
+/// Start one production BFF replica against `server_url`, configured as the
+/// official image configures it, and wait until it answers. `extra_ca` is the
+/// PEM file Node adds to its trust store, so a replica given the TLS
+/// terminator's `https:` origin verifies it through the ordinary native
+/// `fetch` path.
 ///
 /// # Panics
 /// Panics when the build output is missing or the process never answers.
 async fn start_bff(
-    origin: &str,
     server_url: &str,
-    client_secret: &str,
     extra_ca: Option<&std::path::Path>,
 ) -> Bff {
     let ui = ui_dir();
@@ -131,9 +129,8 @@ async fn start_bff(
         .current_dir(&ui)
         .env("HOST", "127.0.0.1")
         .env("PORT", port.to_string())
-        .env("ORIGIN", origin)
+        .env("PROTOCOL_HEADER", "x-forwarded-proto")
         .env("WYRD_SERVER_URL", server_url)
-        .env("WYRD_UI_CLIENT_SECRET", client_secret)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -211,12 +208,14 @@ async fn start_tls_terminator(server_url: &str, material: &std::path::Path) -> (
     panic!("TLS terminator on port {port} never accepted");
 }
 
-/// Call one authenticated JSON route on the bound server.
+/// Call one authenticated JSON route on the bound server as reached at the
+/// public `host`, as the gateway forwards it.
 ///
 /// # Panics
 /// Panics when the request fails or does not return `200`.
 async fn call(
     server: &str,
+    host: &str,
     token: &str,
     method: reqwest::Method,
     path: &str,
@@ -224,6 +223,7 @@ async fn call(
 ) -> Value {
     let response = reqwest::Client::new()
         .request(method, format!("{server}{path}"))
+        .header("x-forwarded-host", host)
         .header("x-wyrd-access-token", format!("Bearer {token}"))
         .json(&body)
         .send()
@@ -298,10 +298,17 @@ fn dex_connection() -> Value {
 ///
 /// # Panics
 /// Panics when any step fails.
-async fn activate_connection(server: &str, admin_key: &str, connection: Value, user: ProviderUser) {
+async fn activate_connection(
+    server: &str,
+    host: &str,
+    admin_key: &str,
+    connection: Value,
+    user: ProviderUser,
+) {
     let token = access_token(server, admin_key).await;
     let candidate = call(
         server,
+        host,
         &token,
         reqwest::Method::PUT,
         "/v1/identity/oidc/candidate",
@@ -311,6 +318,7 @@ async fn activate_connection(server: &str, admin_key: &str, connection: Value, u
     let revision = candidate["revision"].clone();
     let begun = call(
         server,
+        host,
         &token,
         reqwest::Method::POST,
         "/v1/identity/oidc/candidate/test",
@@ -343,6 +351,7 @@ async fn activate_connection(server: &str, admin_key: &str, connection: Value, u
     );
     call(
         server,
+        host,
         &token,
         reqwest::Method::POST,
         "/v1/identity/oidc/candidate/activate",
@@ -360,6 +369,7 @@ async fn activate_connection(server: &str, admin_key: &str, connection: Value, u
 async fn sso_tenant(
     srv: &WyrdTestServer,
     server: &str,
+    host: &str,
     slug: &str,
     connection: Value,
     user: ProviderUser,
@@ -374,7 +384,7 @@ async fn sso_tenant(
         .expect("owner key")
         .expose_secret()
         .to_owned();
-    activate_connection(server, &key, connection, user).await;
+    activate_connection(server, host, &key, connection, user).await;
     key
 }
 
@@ -392,14 +402,9 @@ async fn sso_tenant(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Keycloak and a built UI; run via `mise run test:identity:journey`"]
 async fn production_ui_bff_journey() {
-    let origin = format!("http://localhost:{}", free_port());
-    let client_secret = uuid::Uuid::new_v4().simple().to_string();
-    let builder = || {
-        WyrdTestServerBuilder::default()
-            .with_public_origin(origin.parse().expect("origin parses"))
-            .with_ui_client_secret(&client_secret)
-            .with_access_ttl(chrono::Duration::seconds(30))
-    };
+    let host = format!("localhost:{}", free_port());
+    let origin = format!("http://{host}");
+    let builder = || WyrdTestServerBuilder::default().with_access_ttl(chrono::Duration::seconds(30));
     let srv = builder().start_bound().await.expect("server starts");
     let server = srv.base_url().expect("bound server has a URL").to_owned();
     let replica = Box::pin(srv.start_bound_replica(builder()))
@@ -421,6 +426,7 @@ async fn production_ui_bff_journey() {
         .to_owned();
     activate_connection(
         &server,
+        &host,
         &sso_admin_key,
         keycloak_connection(),
         KEYCLOAK_ALICE,
@@ -440,6 +446,7 @@ async fn production_ui_bff_journey() {
     sso_tenant(
         &srv,
         &server,
+        &host,
         SWITCH_KEYCLOAK_TENANT,
         keycloak_connection(),
         KEYCLOAK_ALICE,
@@ -448,6 +455,7 @@ async fn production_ui_bff_journey() {
     sso_tenant(
         &srv,
         &server,
+        &host,
         SWITCH_SECOND_TENANT,
         dex_connection(),
         DEX_ALICE,
@@ -456,6 +464,7 @@ async fn production_ui_bff_journey() {
     sso_tenant(
         &srv,
         &server,
+        &host,
         SWITCH_PEER_TENANT,
         keycloak_connection(),
         KEYCLOAK_ALICE,
@@ -464,6 +473,7 @@ async fn production_ui_bff_journey() {
     let replacement_owner_key = sso_tenant(
         &srv,
         &server,
+        &host,
         REPLACEMENT_TENANT,
         keycloak_connection(),
         KEYCLOAK_ALICE,
@@ -475,8 +485,8 @@ async fn production_ui_bff_journey() {
     // serves crosses a real TLS hop to the other server replica.
     let material = std::env::temp_dir().join(format!("wyrd-ui-tls-{}", uuid::Uuid::new_v4()));
     let (terminator, ca) = start_tls_terminator(&replica_url, &material).await;
-    let first = start_bff(&origin, &server, &client_secret, None).await;
-    let second = start_bff(&origin, &terminator.url, &client_secret, Some(&ca)).await;
+    let first = start_bff(&server, None).await;
+    let second = start_bff(&terminator.url, Some(&ca)).await;
     let fixture = json!({
         "origin": origin,
         "servers": [server, replica_url],

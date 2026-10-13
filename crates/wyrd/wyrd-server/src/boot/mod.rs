@@ -57,7 +57,6 @@ use wyrd_sql::OperatorPool;
 use wyrd_sql::dsn::{DsnError, ResolvedDsns};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
-use crate::auth::oauth::OAuthClients;
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::boot::data_root::{BifrostDataRoot, BifrostDataRootError};
 use crate::components::auth::{ServerAuth, ServerAuthz};
@@ -1446,7 +1445,6 @@ fn install_auth(
         workload_binding_resolver: Some(binding_resolver),
         human_connections: None,
         platform_login: None,
-        oauth_clients: OAuthClients::new(config.auth.ui_client_secret_hashes.clone()),
         sealing_key: sealing_key.clone(),
         token_exchange_settings,
     })
@@ -1469,7 +1467,6 @@ fn attach_human_logins(
         state.postgres.wyrd().clone(),
         sealing_key.clone(),
         config.deployment_profile.screened_http(),
-        config.auth.public_origin.as_ref(),
         Arc::clone(&state.scribe_outbox) as _,
     ));
     state.auth.platform_login = state

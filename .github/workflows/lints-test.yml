@@ -302,7 +302,9 @@ jobs:
   ci-complete:
     name: ci complete
     needs: [changes, matrix-plan, deps, ci, rust-client, typescript, python, docs, ui]
-    if: always()
+    # Not always(): a superseded run must stop here, or the next push's run
+    # waits for this job before the concurrency group lets it start.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

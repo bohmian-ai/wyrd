@@ -1,6 +1,6 @@
 ---
 id: SPEC-wyrd-ui-live-data
-revision: 4
+revision: 5
 status: approved
 ---
 
@@ -127,6 +127,16 @@ If a record lacks optional Card correlation, the UI must not invent it.
   A revoked login cannot renew; already-issued access tokens retain the
   protocol's existing expiry semantics. Invalid authentication state never
   grants a session or releases protected content.
+- **REQ-027:** The official image signs in with no UI- or origin-specific
+  deployment settings. Run with only its database and storage settings and
+  reached at any address — `http://localhost:8080` in development, or an
+  `https://` host behind a TLS-terminating proxy — a person signs in through
+  the UI with an API key, and through SSO once the tenant's connection is
+  active. Neither the BFF nor the server requires a client secret, a public
+  origin, or a UI `ORIGIN`: the deployment's public origin is the origin each
+  request arrived at (its `Host`, with the scheme the image's proxy forwards),
+  and an operator may still pin `WYRD_PUBLIC_ORIGIN` when a proxy rewrites
+  `Host`.
 
 ### Home and Cards
 
@@ -342,7 +352,12 @@ rendering and navigation preloading do not replace Wyrd server authorization.
   not elevate the signed-in person's data authority.
 - **INV-004 — Secrets and permissions:** OAuth credentials remain in the
   established server/session boundary, absent from page data, browser storage,
-  URLs, logs and checked-in test artifacts. Local HTTPS/trust setup preserves
+  URLs, logs and checked-in test artifacts. The BFF is the public OAuth client
+  `wyrd-ui` and holds no secret of its own: each tenant session cookie
+  (HttpOnly, SameSite=Lax, Secure whenever the request is `https`) carries
+  only the credential the server validates on every renewal — the Wyrd
+  refresh token, or the API key the person entered — and the server, not the
+  cookie, is the authority that ends a session. Local HTTPS/trust setup preserves
   production cookie behavior. Server RBAC, query object scope, token audience,
   CSRF controls and any additional payload permissions remain enforced.
   Actual Bifrost column permissions govern; mock permission labels do not
@@ -410,6 +425,7 @@ integration changes its behavior.
 | **AC-016 — Combined journey and isolation** | In one user story, login → register → inspect Cards → execute → investigate telemetry → inspect verification → return home. Repeat targeted access checks with a restricted user and another tenant containing overlapping names; attempted scope/URL manipulation leaks no protected rows or details. | REQ-001–019, INV-001–009 |
 | **AC-017 — Generated contract gate** | Before accepting live page integrations, regenerate from the locally served composed contract and type-check the consumers. Repeating regeneration yields identical artifacts. Demonstrate that stale/missing output fails the check, and that a representative consumed field/parameter or operation change leaves an unchanged adapter failing type-check after regeneration. Actual JSON/error serialization agrees with the served schema; analytical schema mismatches fail truthfully. Every page's acceptance record identifies its generated wire contract and typed projection. | REQ-020–022, INV-010 |
 | **AC-018 — SvelteKit loading gate** | For each included page, verify primary content in the initial server-rendered response before hydration, then operate client navigation, supported preloading, URL filters and refresh/invalidation. Network evidence shows protected upstream access remains in the BFF and hydration does not redundantly fetch the same initial dataset. Navigation after session expiry and tenant changes revalidates authority; preloads perform no writes or cross-session reuse. | REQ-023–025, INV-011 |
+| **AC-020 — Zero-configuration image login** | Build the official image and run it with only its database and storage settings: no `WYRD_PUBLIC_ORIGIN`, client secret or UI `ORIGIN`. Reach it over plain `http` at a non-`localhost` host and through an `https`-forwarding proxy; sign in with an API key and load an authenticated page each way. On the server, an authorization request is redirected back only to `{request origin}/login/callback`, a redirect URI on another origin is refused, a pinned `WYRD_PUBLIC_ORIGIN` wins over the request, and `wyrd-ui` redeems, refreshes and revokes with `client_id` alone. The SSO browser journey passes with no secret or pinned origin. | REQ-001, REQ-003, REQ-016, REQ-027, INV-003–004 |
 | **AC-019 — Full-scale simulation** | After the page gates and the combined journey, run the shared setup at twenty Services through public pathways and settle it with bounded readiness. In a real browser, every included page (Home, Cards inventory and details, Service workspaces, Observe overview, traces and trace detail, logs, metrics, evaluations and task detail, drift) shows each Service's evidence; paging covers each authoritative population without overlap; filters, counts and Home summaries agree with authoritative reads under equivalent scope; another tenant and a restricted user still see nothing protected. Record per-page server-render and navigation timings and the dataset sizes they were measured on. | REQ-004–019, REQ-023–024, REQ-026, INV-006–008 |
 
 ## Acceptance evidence and verification
@@ -468,6 +484,19 @@ No broad gate is required merely because this draft exists.
    navigation/preloading and targeted invalidation maintain it. Server actions
    and handlers cover applicable interactions. Client-only initial fetching
    is not an alternative implementation of these requirements.
+
+9. Login derives the deployment's public origin from each request: `Host`,
+   and the scheme from the image proxy's `X-Forwarded-Proto` (`http` when
+   absent). Wyrd's own redirect to `wyrd-ui` must stay on the origin the
+   authorization request arrived at, and the identity provider's registered
+   redirect URIs remain the trust anchor for its callback, so a forged `Host`
+   only redirects its own sender. `WYRD_PUBLIC_ORIGIN` is an optional pin that
+   wins when set. `wyrd-ui` becomes a public client; its refresh token still
+   does not rotate, because concurrent page requests renew one session, and
+   it keeps its bounded absolute lifetime. This supersedes the confidential
+   `wyrd-ui` client, its `WYRD_UI_CLIENT_SECRET`/`WYRD_UI_CLIENT_SECRET_SHA256`
+   settings and RFC 8414 discovery by the BFF. No compatibility path keeps the
+   secret; a Basic-authenticated `wyrd-ui` request is refused.
 
 ## Open material decisions
 
@@ -542,3 +571,4 @@ by this specification edit.
 | 2 | 2026-10-12 | draft | Add the requested canonical server-to-UI TypeScript generation path, source/output drift and consumer compilation gates, and runtime/analytical schema limits. Awaiting explicit human approval. |
 | 3 | 2026-10-12 | approved | Record the user's OpenAPI decision and add hard SvelteKit server-load, SSR, navigation/preloading and invalidation requirements with page-level acceptance evidence. Explicitly approved by the user on 2026-10-12 for task decomposition. |
 | 4 | 2026-10-12 | approved | Add the user's original full-scale load requirement, previously missing: REQ-026 and AC-019 (twenty Services with observations, evaluations, drift and records, all visible and correct in the UI). Timings are recorded evidence, not a gating SLO, so INV-008 is clarified rather than replaced. Additive: revision-3 requirements and accepted tasks 001–008 stand unchanged. Approved by the user on 2026-10-12 ("agree"), choosing correctness at scale plus recorded timings. |
+| 5 | 2026-10-12 | approved | Zero-configuration image login: REQ-027, AC-020 and decision 9, with INV-004 restated for a secretless BFF. The confidential `wyrd-ui` client, its secret settings, BFF discovery and the required public origin are removed: the image could not sign in as shipped. Revision 4 requirements and tasks stand; TASK-020 implements this. Approved by the user on 2026-10-12 ("write it up in a spec revision and make the changes"). |

@@ -38,9 +38,6 @@ startup_journey=prod
 source "$(dirname "${BASH_SOURCE[0]}")/startup-common.sh"
 readonly app_pw=app_pw_startup platform_pw=platform_pw_startup
 readonly ui_dir="$root/crates/wyrd/wyrd-server/wyrd-ui"
-# The production BFF's confidential OAuth client secret; the server holds only its digest.
-ui_secret="$(openssl rand -hex 32)"
-readonly ui_secret
 
 serving_env=(
   -e "WYRD_DATABASE_URL=postgres://wyrd_tenant:${app_pw}@${pg}:5432/wyrd"
@@ -50,8 +47,6 @@ serving_env=(
   -e WYRD_SERVER_TENANT_SLUG=acme
   -e WYRD_OPERATOR_KEK_SOURCE=file
   -e WYRD_OPERATOR_KEK_DIR=/run/wyrd/kek
-  -e "WYRD_UI_CLIENT_SECRET=$ui_secret"
-  -e "WYRD_UI_CLIENT_SECRET_SHA256=$(printf %s "$ui_secret" | sha256sum | cut -d' ' -f1)"
   ${WYRD_LOG:+-e "WYRD_LOG=$WYRD_LOG"}
 )
 
@@ -187,14 +182,15 @@ passed+=(startup_image_journey:verify)
 fi
 
 # Sign in through the BFF's API-key recovery form into the cookie jar `$jar`.
-# `localhost` is a secure context to curl, so it keeps the Secure session cookie over HTTP.
 bff_signin() {
   public="${http/127.0.0.1/localhost}"
   jar="$work/bff-cookies"
   local signin
-  signin="$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' -c "$jar" -H "origin: $public" \
+  signin="$(curl -sS -o "$work/signin.html" -w '%{http_code} %{redirect_url}' -c "$jar" \
+    -H "origin: $public" -H 'accept: text/html' \
     --data-urlencode "apiKey=$api_key" "$public/t/acme/login/api-key")"
-  [[ $signin == "303 $public/t/acme" ]] || fail "API-key sign-in through the BFF did not redirect home: $signin"
+  [[ $signin == "303 $public/t/acme" ]] \
+    || fail "API-key sign-in through the BFF did not redirect home: $signin $(grep -oE 'WYRD_[A-Z0-9_]+' "$work/signin.html" | sort -u | tr '\n' ' ')"
   grep -q wyrd_session_acme "$jar" || fail "the BFF issued no session cookie"
 }
 # The BFF's Service page for `$1` (a UID plus query), as the signed-in browser in `$jar`.

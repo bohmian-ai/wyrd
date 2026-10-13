@@ -22,7 +22,6 @@ const FIXTURE_TENANT = "test-tenant-1";
 const test = serverTest({
   provider: () => ({ status: 200, body: COMPLETION }),
   verificationRuntime: true,
-  humanSso: true,
   accessTtlSeconds: ACCESS_TTL_SECONDS,
 });
 

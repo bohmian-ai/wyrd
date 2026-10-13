@@ -16,7 +16,7 @@ use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_spec::error::WyrdError;
 use wyrd_testing::Bootstrap;
-use wyrd_testing::human_login::{HUMAN_PUBLIC_ORIGIN, HumanSso};
+use wyrd_testing::human_login::HumanSso;
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerError};
 
 pub mod cli;
@@ -410,8 +410,7 @@ impl NativeWyrdTestServer {
     /// return its id: the fixture tenant when `tenantSlug` is absent, else a
     /// newly seeded tenant of that slug with its own administrator.
     ///
-    /// Needs `startTestServer({ humanSso: true })` and the identity lane's
-    /// Keycloak.
+    /// Needs the identity lane's Keycloak.
     ///
     /// # Errors
     ///
@@ -544,9 +543,6 @@ pub struct NativeTestServerOptions {
     pub provider_base_url: Option<String>,
     /// `true` runs Drift baseline fitting and Verifier runs.
     pub verification_runtime: Option<bool>,
-    /// `true` serves the public origin the identity lane's Keycloak clients
-    /// register, for saved user login journeys.
-    pub human_sso: Option<bool>,
     /// Access-token lifetime in seconds, verified with no clock-skew
     /// allowance, so a journey can outlive one token; omitted keeps the
     /// production lifetime.
@@ -568,7 +564,6 @@ pub fn start_test_server(
     let options = options.unwrap_or(NativeTestServerOptions {
         provider_base_url: None,
         verification_runtime: None,
-        human_sso: None,
         access_ttl_seconds: None,
     });
     let provider_root = options
@@ -583,7 +578,6 @@ pub fn start_test_server(
     wyrd_runtime::runtime().block_on(Box::pin(start_test_server_async(
         provider_root,
         options.verification_runtime.unwrap_or(false),
-        options.human_sso.unwrap_or(false),
         options.access_ttl_seconds,
     )))
 }
@@ -596,7 +590,6 @@ pub fn start_test_server(
 async fn start_test_server_async(
     provider_root: Option<url::Url>,
     verification_runtime: bool,
-    human_sso: bool,
     access_ttl_seconds: Option<u32>,
 ) -> napi::Result<NativeWyrdTestServer> {
     let mut builder = WyrdTestServer::builder();
@@ -606,9 +599,6 @@ async fn start_test_server_async(
             .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
                 allowed_clock_skew: Duration::ZERO,
             });
-    }
-    if human_sso {
-        builder = builder.with_public_origin(url::Url::parse(HUMAN_PUBLIC_ORIGIN).map_err(reason)?);
     }
     if verification_runtime {
         builder = builder.with_verification_runtime_for_test();

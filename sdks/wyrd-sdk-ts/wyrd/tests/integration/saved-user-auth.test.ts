@@ -26,7 +26,7 @@ function cards(tenant?: string, credential?: string): Cards {
  * Human single sign-on enabled once for both tenants, then per test a fresh
  * configuration home holding bob's saved reader login and no API key.
  */
-const test = serverTest({ humanSso: true }).extend<{ sso: void; config: string }>({
+const test = serverTest().extend<{ sso: void; config: string }>({
   sso: [
     async ({ server }, use) => {
       server.activateHumanSso();

@@ -61,9 +61,7 @@ class Worked:
     agent_uid: str
 
 
-def local_server(
-    human_sso: bool = False, access_ttl_seconds: int | None = None
-) -> Iterator[WyrdTestServer]:
+def local_server(access_ttl_seconds: int | None = None) -> Iterator[WyrdTestServer]:
     """A server that verifies in real time and routes the Gateway to a local upstream answering ``hi``."""
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
     recorded = Receiver(url=f"http://127.0.0.1:{upstream.server_address[1]}")
@@ -74,7 +72,6 @@ def local_server(
             mutate_env=False,
             verification_runtime=True,
             provider_base_url=recorded.url,
-            human_sso=human_sso,
             access_ttl_seconds=access_ttl_seconds,
         ) as server:
             yield server

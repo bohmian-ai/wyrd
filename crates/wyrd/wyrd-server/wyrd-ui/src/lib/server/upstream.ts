@@ -72,15 +72,29 @@ export const loopback = (hostname: string) =>
  * request.
  */
 export function serverUrl(): string {
-  const configured = env.WYRD_SERVER_URL ?? 'http://127.0.0.1:8080';
+  return secured('WYRD_SERVER_URL', env.WYRD_SERVER_URL ?? 'http://127.0.0.1:8080');
+}
+
+/**
+ * Bifrost gRPC endpoint the BFF's analytical reads use, under the same
+ * transport rule as {@link serverUrl}. Absent, the SDK derives it from the
+ * server URL's host on the public gRPC port, which the application image serves.
+ */
+export function grpcUrl(): string | undefined {
+  const configured = env.WYRD_GRPC_URL;
+  return configured === undefined ? undefined : secured('WYRD_GRPC_URL', configured);
+}
+
+/** `configured` when it is `https:` or loopback `http:`; throws naming `name` otherwise. */
+function secured(name: string, configured: string): string {
   let url: URL;
   try {
     url = new URL(configured);
   } catch {
-    throw new Error('WYRD_SERVER_URL is not a valid URL');
+    throw new Error(`${name} is not a valid URL`);
   }
   if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback(url.hostname)))
-    throw new Error('WYRD_SERVER_URL must use https unless it is a loopback address');
+    throw new Error(`${name} must use https unless it is a loopback address`);
   return configured;
 }
 

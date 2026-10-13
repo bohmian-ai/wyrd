@@ -12,7 +12,20 @@ import { mockHome } from './mock/home';
 import type { HomeView } from '$lib/views';
 import { reject, type TenantContext } from './auth/session';
 import type { BrowserSession } from './auth/browser-sessions';
-import { problemKind } from './problem';
+import { problem, problemKind, safeProblem } from './problem';
+import {
+  RESULTS_SQL,
+  RESULT_COLUMNS,
+  SIGNAL_WINDOW_S,
+  TRACES_SQL,
+  TRACE_COLUMNS,
+  bucketWindow,
+  declaredBindings,
+  liveService,
+  readSection,
+  resultRow,
+  traceRow
+} from './service-live';
 import type { components, operations } from './generated/wyrd-http';
 import type {
   DashboardDetail,
@@ -27,7 +40,14 @@ import type {
   TracesView,
   GenAiView
 } from '$lib/features/observe/core/types';
-import { CARD_KINDS, type CardDetail, type CardKind, type CardsView, type KV } from '$lib/features/cards/core/types';
+import {
+  CARD_KINDS,
+  type CardDetail,
+  type CardKind,
+  type CardsView,
+  type KV,
+  type ServicePresentation
+} from '$lib/features/cards/core/types';
 import { projectCard, projectCards } from './mock/cards/project';
 import {
   projectDashboard,
@@ -428,8 +448,9 @@ export class WyrdClient {
    * One Card at an exact version. The URL's UID pins a registered version and
    * names its identity line; `version` selects another version of that line
    * through the exact by-reference read. Unknown UIDs and versions are 404s.
+   * A Service also projects its live workspace over `range`.
    */
-  async card(uid: string, version?: string): Promise<CardDetail> {
+  async card(uid: string, version?: string, range = '1h'): Promise<CardDetail> {
     if (this.mockData) {
       const detail = this.cardsAccess() ? projectCard(uid, version) : null;
       if (!detail) reject('notFound');
@@ -453,10 +474,56 @@ export class WyrdClient {
     ]);
     if (!versions.ok) reject(await problemKind(versions));
     if (selected instanceof Response && !selected.ok) reject(await problemKind(selected));
-    return liveCard(
-      selected instanceof Response ? await selected.json() : selected,
-      (await versions.json()).versions
-    );
+    const response: GetCardResponse = selected instanceof Response ? await selected.json() : selected;
+    const detail = liveCard(response, (await versions.json()).versions);
+    if (response.card.kind === 'Service') detail.presentation = await this.service(response.card, range);
+    return detail;
+  }
+
+  /**
+   * Read one exact Service version's binding statuses and its two bounded
+   * analytical sections concurrently. Each section keeps its own refusal; a
+   * failed section never fails the page or borrows another's values.
+   */
+  private async service(card: GetCardResponse['card'], range: string): Promise<ServicePresentation> {
+    const session = this.session!;
+    const now = new Date();
+    const { from, end, step } = bucketWindow(range, now);
+    const owner = card.metadata.uid ?? '';
+    const ids = card.status?.verification?.binding_ids ?? [];
+    const signalEnd = Math.ceil(now.getTime() / 1000);
+    const [statuses, traces, results] = await Promise.all([
+      Promise.all(
+        ids.map(async (binding_id) => {
+          const response = await session.api('get', '/verification/bindings/{binding_id}', {
+            path: { binding_id }
+          });
+          if (!response.ok) throw problem(await problemKind(response));
+          return response.json();
+        })
+      ).then(
+        (list) => ({ list, error: undefined }),
+        (cause: unknown) => ({ list: [], error: safeProblem(cause).code })
+      ),
+      readSection(
+        () => session.query(TRACES_SQL, [card.metadata.name, card.metadata.version ?? '', from, end, step]),
+        TRACE_COLUMNS,
+        traceRow
+      ),
+      readSection(
+        () => session.query(RESULTS_SQL, [owner, signalEnd - SIGNAL_WINDOW_S, signalEnd]),
+        RESULT_COLUMNS,
+        resultRow
+      )
+    ]);
+    const bindings = declaredBindings(card).bindings.map((declared) => ({
+      declared,
+      status:
+        statuses.list.find(
+          (s) => s.subject_card_uid === declared.subject.uid && s.verifier_uid === declared.verifier.uid
+        ) ?? null
+    }));
+    return liveService({ card, range, now, bindings, bindingError: statuses.error, traces, results });
   }
 
   async home(): Promise<HomeView> {

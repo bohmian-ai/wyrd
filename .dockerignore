@@ -6,11 +6,13 @@ node_modules/
 *.pem
 **/*.pem
 
-# Local SDK environments and native builds; no image copies them.
+# Local SDK environments and native builds; no image copies them except the UI's SDK addon.
 .venv/
 **/.venv/
 **/*.so
 **/*.node
+# The UI BFF installs the staged @wyrd/sdk platform addon (`mise run ui:sdk`).
+!sdks/wyrd-sdk-ts/wyrd-linux-x64-gnu/wyrd.linux-x64-gnu.node
 
 # Local secrets and credentials
 .env

@@ -1,0 +1,2 @@
+overrides:
+  '@wyrd/sdk-linux-x64-gnu': file:../../../../sdks/wyrd-sdk-ts/wyrd-linux-x64-gnu

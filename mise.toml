@@ -710,7 +710,7 @@ admin REST API, export env gates, run the identity e2e suite against both issuer
 Its tests are #[ignore]d so the family lanes, which start no identity providers, skip them visibly.
 """
 env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8180/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
-
+depends = ["ui:sdk"]
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:identity:journey:inner'"
 [tasks."test:identity:journey:inner"]
 hide = true
@@ -972,10 +972,12 @@ run = ["mise run test:server:startup:dev", "mise run test:server:startup:prod"]
 
 [tasks."test:server:startup:dev"]
 description = "Official image, development setup: one ordinary login that owns its database, migrate, serve, setup"
+depends = ["ui:sdk"]
 run = "bash scripts/server/test-startup-dev.sh"
 
 [tasks."test:server:startup:prod"]
-description = "Official image, team deployment: platform and tenant logins, migrate, setup, nginx HTTP and gRPC, restart, migration refusal and retry"
+description = "Official image, team deployment: platform and tenant logins, migrate, setup, nginx HTTP and gRPC, restart, migration refusal and retry, authenticated analytical BFF"
+depends = ["ui:sdk"]
 run = "bash scripts/server/test-startup-prod.sh"
 
 [tasks."test:server:peer"]
@@ -989,6 +991,7 @@ run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --tes
 [tasks."docker:build"]
 hide = true
 description = "Build the wyrd-server Docker image"
+depends = ["ui:sdk"]
 run = """
 set -eu
 cargo build --locked --release -p wyrd-server --features cloud
@@ -1646,6 +1649,13 @@ description = "Build the public @wyrd/sdk napi addon (sdks/wyrd-sdk-ts/native) +
 depends = ["ts:install"]
 dir = "sdks/wyrd-sdk-ts/wyrd"
 run = "pnpm exec napi build --platform --manifest-path ../native/Cargo.toml --output-dir . --package-json-path package.json && test ! -f index.js || mv index.js index.generated.cjs && cp index.d.ts index.d.cts && pnpm exec tsc -p tsconfig.build.json && node -e 'require(\"node:fs\").rmSync(\"index.generated.cjs\", { force: true })'"
+
+[tasks."ui:sdk"]
+hide = true
+description = "Stage the built @wyrd/sdk addon in its linux-x64-gnu platform package, which the UI BFF and the official image install"
+depends = ["ts:build"]
+# ponytail: linux-x64-gnu only, the official image's platform; stage other platforms when the BFF runs elsewhere.
+run = "cp sdks/wyrd-sdk-ts/wyrd/wyrd.linux-x64-gnu.node sdks/wyrd-sdk-ts/wyrd-linux-x64-gnu/"
 
 [tasks."ts:build:testing"]
 description = "Build the private @wyrd/testing napi harness addon (sdks/wyrd-sdk-ts/native-testing) into sdks/wyrd-sdk-ts/testing; feeds the integration lane only (slice 13a)"

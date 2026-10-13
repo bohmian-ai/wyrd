@@ -14,7 +14,11 @@
 FROM node:26.2.0-slim AS ui
 RUN npm install --global pnpm@11.4.0
 WORKDIR /src/crates/wyrd/wyrd-server/wyrd-ui
-COPY crates/wyrd/wyrd-server/wyrd-ui/package.json crates/wyrd/wyrd-server/wyrd-ui/pnpm-lock.yaml ./
+# The BFF's analytical reads use the TypeScript SDK built from this checkout.
+COPY sdks/wyrd-sdk-ts/wyrd/package.json sdks/wyrd-sdk-ts/wyrd/index.cjs sdks/wyrd-sdk-ts/wyrd/index.d.ts sdks/wyrd-sdk-ts/wyrd/index.d.cts /src/sdks/wyrd-sdk-ts/wyrd/
+COPY sdks/wyrd-sdk-ts/wyrd/dist /src/sdks/wyrd-sdk-ts/wyrd/dist
+COPY sdks/wyrd-sdk-ts/wyrd-linux-x64-gnu /src/sdks/wyrd-sdk-ts/wyrd-linux-x64-gnu
+COPY crates/wyrd/wyrd-server/wyrd-ui/package.json crates/wyrd/wyrd-server/wyrd-ui/pnpm-lock.yaml crates/wyrd/wyrd-server/wyrd-ui/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY crates/wyrd-spec/schemas /src/crates/wyrd-spec/schemas
 COPY crates/wyrd/wyrd-server/wyrd-ui ./

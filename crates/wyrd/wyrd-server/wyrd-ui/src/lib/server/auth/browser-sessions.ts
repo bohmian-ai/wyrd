@@ -5,6 +5,7 @@ import * as client from 'openid-client';
 import { EncryptJWT, decodeJwt, jwtDecrypt } from 'jose';
 import type { SessionMetadata } from '$lib/views';
 import {
+  grpcUrl,
   loopback,
   serverUrl,
   v1Path,
@@ -107,7 +108,40 @@ export class BrowserSession {
       reject('upstream');
     }
   }
+
+  /**
+   * Run one bound SELECT through Bifrost as this session's principal. The SDK
+   * owns transport, terminal validation and Arrow decoding; its `WyrdError`
+   * (refusal, transport or failed terminal) propagates for the caller to
+   * project. The SDK loads lazily so mock-only runtimes never need its addon.
+   */
+  async query(sql: string, params: readonly (string | number)[]): Promise<Analytical> {
+    const { Bifrost, WyrdClient } = await import('@wyrd/sdk');
+    const client = WyrdClient.connect({
+      serverUrl: serverUrl(),
+      credential: this.#token,
+      grpcUrl: grpcUrl()
+    });
+    const bifrost = await Bifrost.connect({ client });
+    try {
+      const result = await bifrost.sql(sql, params);
+      return {
+        outcome: result.terminal.outcome === 'degraded' ? 'degraded' : 'success',
+        fields: result.schema.fields.map((field) => ({ name: field.name, type: String(field.type) })),
+        rows: result.toArrow().toArray().map((row) => row.toJSON())
+      };
+    } finally {
+      await bifrost.shutdown();
+    }
+  }
 }
+
+/** One completed analytical read: terminal outcome, result schema and plain rows. */
+export type Analytical = {
+  outcome: 'success' | 'degraded';
+  fields: { name: string; type: string }[];
+  rows: Record<string, unknown>[];
+};
 
 /**
  * The BFF as the confidential OAuth client `wyrd-ui` of Wyrd's authorization

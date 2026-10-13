@@ -3622,11 +3622,11 @@ impl AttemptSettlement {
 /// The first batch is the decision point for the whole attempt. A typed stale
 /// object error means a data file the pinned cut referenced was already deleted
 /// when the scan reached it; there is no second attempt to move to, so the
-/// attempt is cancelled, its distributed children are joined, and the query
-/// fails. Any other first-batch failure, a missing telemetry guard, or a
-/// schema-frame failure settles the distributed children and releases the
-/// admitted owner before returning, so no child outlives its parent on a
-/// failure path.
+/// attempt is cancelled and the query fails. Any other first-batch failure, a
+/// missing telemetry guard, or a schema-frame failure breaks to one tail that
+/// cancels the attempt and request, drops the batches (releasing the graph
+/// inline), and releases the admitted owner before returning. Children still
+/// being torn down return their bytes through the shared memory root.
 ///
 /// # Errors
 ///
@@ -3656,96 +3656,79 @@ async fn settle_attempt_output(
     } = settle;
     // A cancel before the first batch ends the wait, exactly as a cancel of
     // an open stream ends its next read; the distributed children are then
-    // cancelled and joined like any other first-batch failure. It is marked
+    // cancelled like any other first-batch failure. It is marked
     // on the query's telemetry as `request_cancel` marks an open stream, so
     // an owner cancelled before its stream opens is recorded as cancelled.
-    let cancellation = admitted.cancellation.clone();
-    let next = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), batches.next());
-    let Ok(first) = (tokio::select! {
-        first = next => first,
-        () = cancellation.cancelled() => {
-            if let Some(telemetry) = query_telemetry.as_ref() {
-                telemetry.cancellation_marker().store(true, Ordering::Release);
+    let (error, phase) = 'failed: {
+        let cancellation = admitted.cancellation.clone();
+        let next =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), batches.next());
+        let Ok(first) = (tokio::select! {
+            first = next => first,
+            () = cancellation.cancelled() => {
+                if let Some(telemetry) = query_telemetry.as_ref() {
+                    telemetry.cancellation_marker().store(true, Ordering::Release);
+                }
+                break 'failed (BifrostError::QueryExecutionFailed, "first-batch cancellation");
             }
-            return settle_distributed_failure(
+        }) else {
+            break 'failed (BifrostError::QueryTimeout, "first-batch timeout");
+        };
+        if first
+            .as_ref()
+            .is_some_and(|result| result.as_ref().is_err_and(is_stale_iceberg_object_error))
+        {
+            admitted.cancellation.cancel();
+            drop(batches);
+            return release_error(
                 deadline,
-                batches,
                 admitted,
                 BifrostError::QueryExecutionFailed,
-                "first-batch cancellation",
-            )
-            .await;
+                "stale first batch",
+            );
         }
-    }) else {
-        return settle_distributed_failure(
-            deadline,
-            batches,
-            admitted,
-            BifrostError::QueryTimeout,
-            "first-batch timeout",
-        )
-        .await;
-    };
-    if first
-        .as_ref()
-        .is_some_and(|result| result.as_ref().is_err_and(is_stale_iceberg_object_error))
-    {
-        admitted.cancellation.cancel();
-        drop(batches);
-        admitted.distributed_settlement.join().await;
-        return release_error(
-            deadline,
-            admitted,
-            BifrostError::QueryExecutionFailed,
-            "stale first batch",
-        );
-    }
-    if let Some(error) = map_first_batch_failure(first.as_ref()) {
-        return settle_distributed_failure(
-            deadline,
-            batches,
-            admitted,
-            error,
-            "first-batch rejection",
-        )
-        .await;
-    }
-    let Some(query_telemetry) = query_telemetry.take() else {
-        let error = BifrostError::QueryExecutionFailed;
-        return settle_distributed_failure(deadline, batches, admitted, error, "missing telemetry")
-            .await;
-    };
-    let (ipc, schema_frame) = match QueryIpcEncoder::new(&schema) {
-        Ok(opened) => opened,
-        Err(error) => {
-            return settle_distributed_failure(
-                deadline,
-                batches,
-                admitted,
-                error,
-                "schema preparation",
-            )
-            .await;
+        if let Some(error) = map_first_batch_failure(first.as_ref()) {
+            break 'failed (error, "first-batch rejection");
         }
+        let Some(query_telemetry) = query_telemetry.take() else {
+            let error = BifrostError::QueryExecutionFailed;
+            break 'failed (error, "missing telemetry");
+        };
+        let (ipc, schema_frame) = match QueryIpcEncoder::new(&schema) {
+            Ok(opened) => opened,
+            Err(error) => {
+                break 'failed (error, "schema preparation");
+            }
+        };
+        return Ok(OracleQueryStream::new(QueryStreamInput {
+            query_class,
+            schema_frame,
+            ipc,
+            batches,
+            first,
+            admitted,
+            deadline,
+            deadline_ms,
+            degraded_sources,
+            query_telemetry,
+            scan_stats,
+            // Gate attaches its own lifecycle to the returned stream through
+            // `with_gate_lifecycle`; nothing on the attempt path owns one.
+            gate_lifecycle: None,
+            running_query,
+            profile: Some(profile),
+        }));
     };
-    Ok(OracleQueryStream::new(QueryStreamInput {
-        query_class,
-        schema_frame,
-        ipc,
-        batches,
-        first,
-        admitted,
-        deadline,
-        deadline_ms,
-        degraded_sources,
-        query_telemetry,
-        scan_stats,
-        // Gate attaches its own lifecycle to the returned stream through
-        // `with_gate_lifecycle`; nothing on the attempt path owns one.
-        gate_lifecycle: None,
-        running_query,
-        profile: Some(profile),
-    }))
+    // Every failure before the stream opens cancels the attempt and drops the
+    // batches, which releases the graph inline; children still being torn
+    // down return their bytes through the shared memory root as they free
+    // them. Admission is released before the error reaches the caller.
+    admitted.cancellation.cancel();
+    admitted.request_cancellation.cancel();
+    drop(batches);
+    #[cfg(feature = "test-support")]
+    analytical::analytical_cleanup_pause_for_test().hold().await;
+    release_error(deadline, admitted, error, phase)
 }
 
 /// Classifies typed planning refusals through context/diagnostic wrappers.
@@ -3917,32 +3900,6 @@ fn release_error<T>(
     tracing::error!(phase, error = ?original, "Oracle query released after failure");
     admitted.release();
     Err(original)
-}
-
-/// Cancels and joins every distributed child before releasing query admission.
-///
-/// Dropping the batches drops the graph's stream-owned lifecycle, which
-/// releases the graph inline; the error returns to the caller only after the
-/// children are joined and admission is released, so no caller observes a
-/// terminal while the query still owns anything.
-///
-/// # Errors
-///
-/// Always returns `original`, after cleanup.
-async fn settle_distributed_failure<T>(
-    deadline: Instant,
-    batches: SendableRecordBatchStream,
-    admitted: AdmittedQueryGuard,
-    original: BifrostError,
-    phase: &'static str,
-) -> Result<T, BifrostError> {
-    admitted.cancellation.cancel();
-    admitted.request_cancellation.cancel();
-    drop(batches);
-    admitted.distributed_settlement.join().await;
-    #[cfg(feature = "test-support")]
-    analytical::analytical_cleanup_pause_for_test().hold().await;
-    release_error(deadline, admitted, original, phase)
 }
 
 /// Awaits the actual first physical batch while retaining admission ownership.

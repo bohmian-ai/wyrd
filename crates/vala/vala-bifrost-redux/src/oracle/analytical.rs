@@ -1052,7 +1052,7 @@ impl GraphLease {
     /// Returns [`BifrostError::Internal`] on a poisoned lock,
     /// [`BifrostError::QueryExecutionFailed`] when `key` names no live attempt
     /// of this graph, and the supervisor's refusal when settlement fails.
-    async fn finish_attempt(
+    fn finish_attempt(
         &self,
         key: AnalyticalAttemptKey,
         outcome: AnalyticalAttemptOutcome,
@@ -1062,7 +1062,7 @@ impl GraphLease {
             attempts.remove(&key)
         };
         match guard {
-            Some(guard) => guard.finish(outcome).await.map(|_| ()),
+            Some(guard) => guard.finish(outcome).map(|_| ()),
             None => Err(BifrostError::QueryExecutionFailed),
         }
     }
@@ -1070,7 +1070,7 @@ impl GraphLease {
     /// Returns everything this graph owns, in one order, exactly once.
     ///
     /// The order is the invariant: stop admitting, cancel unless the graph
-    /// succeeded, join every attempt and the descendants they own, drop the
+    /// succeeded, settle every attempt, drop the
     /// graph's worker cache and exchanges, and only then release the supervisor
     /// guard that returns the envelope, the egress record, and, when the last
     /// holder of this lease goes away, the reservation's running permit.
@@ -1082,10 +1082,7 @@ impl GraphLease {
     ///
     /// Returns [`BifrostError::Internal`] when a lock is poisoned, and the
     /// supervisor's or egress owner's refusal when a release fails.
-    pub(crate) async fn settle(
-        &self,
-        outcome: AnalyticalAttemptOutcome,
-    ) -> Result<(), BifrostError> {
+    pub(crate) fn settle(&self, outcome: AnalyticalAttemptOutcome) -> Result<(), BifrostError> {
         if self.settled.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -1107,7 +1104,7 @@ impl GraphLease {
             attempts.keys().copied().collect::<Vec<_>>()
         };
         for key in live {
-            self.finish_attempt(key, outcome).await?;
+            self.finish_attempt(key, outcome)?;
         }
         // Before the release, never after. Upstream's cached stage plans own
         // the worker connections that hold this envelope's reservations, so
@@ -1167,15 +1164,23 @@ struct GraphSettlement {
 }
 
 impl GraphSettlement {
-    /// Drain this graph's lease and retain its identity with the outcome so the
-    /// ingress driver can update the matching entry without a second inventory.
+    /// Settles this graph's lease inline and records the result on the
+    /// matching ingress entry, when the ingress still exists.
     ///
-    /// # Errors
-    /// The returned outcome contains the lease's task-drain or cleanup failure;
-    /// failed cleanup remains owned and observable by the lease supervisor.
-    async fn settle(self) -> (AnalyticalGraphKey, Result<(), BifrostError>) {
-        let settled = self.lease.settle(self.outcome).await;
-        (self.graph, settled)
+    /// A cleanup failure is logged and recorded; the failed graph stays owned
+    /// and observable by the lease supervisor.
+    fn settle(self, ingress: &Weak<AnalyticalStageIngress>) {
+        let settled = self.lease.settle(self.outcome);
+        if let Err(error) = &settled {
+            tracing::warn!(
+                error = %error,
+                public_query_id = %self.graph.public_query_id,
+                "Oracle analytical follower could not settle a closed graph"
+            );
+        }
+        if let Some(node) = ingress.upgrade() {
+            node.record_settlement(self.graph, &settled);
+        }
     }
 }
 
@@ -1365,14 +1370,12 @@ impl AnalyticalStageIngress {
     /// Settles every graph this node must release, and cancels each at its
     /// deadline or when its leader's grant stream ends.
     ///
-    /// The single asynchronous owner of follower settlement. It has four reasons
+    /// The single asynchronous owner of follower settlement. It has three reasons
     /// to wake — a command on its bounded queue, the earliest signed graph deadline
-    /// coming due, a leader grant stream ending, and the completion of a
-    /// settlement it already owns — and it serves all four from one task. The settlements it owns run concurrently in
-    /// one driver-local `FuturesUnordered`, so a graph whose cleanup drains slowly
-    /// cannot stop the driver from cancelling a different graph on time; they are
-    /// still this task's own futures, so nothing is detached and shutdown's join is
-    /// still complete.
+    /// coming due, and a leader grant stream ending — and it serves all three from
+    /// one task. Settlement itself is synchronous and runs inline: graph release
+    /// does not wait for dependency-owned teardown, so no settlement can hold the
+    /// driver past another graph's deadline.
     ///
     /// It holds only a [`Weak`] back-reference, so the ingress's own join handle
     /// cannot keep the ingress alive; a settlement that completes after the node is
@@ -1383,7 +1386,6 @@ impl AnalyticalStageIngress {
         ingress: Weak<Self>,
         grant_closed: Arc<tokio::sync::Notify>,
     ) {
-        let mut settling = futures_util::stream::FuturesUnordered::new();
         let mut queue_closed = false;
         loop {
             // Every deadline is rescanned from the graph map on every wake rather
@@ -1394,7 +1396,7 @@ impl AnalyticalStageIngress {
                 Some(node) => match node.expire_due_graphs(Utc::now()) {
                     Ok((due, next)) => {
                         for settlement in due {
-                            settling.push(settlement.settle());
+                            settlement.settle(&ingress);
                         }
                         next
                     }
@@ -1408,7 +1410,7 @@ impl AnalyticalStageIngress {
                 },
                 None => None,
             };
-            if queue_closed && settling.is_empty() {
+            if queue_closed {
                 return;
             }
             let timer = next_deadline.map(|deadline_ms| {
@@ -1419,22 +1421,10 @@ impl AnalyticalStageIngress {
                 command = commands.recv(), if !queue_closed => match command {
                     Some(GraphSettlementCommand::Wake) => {}
                     Some(GraphSettlementCommand::Settle(settlement)) => {
-                        settling.push(settlement.settle());
+                        settlement.settle(&ingress);
                     }
                     None => queue_closed = true,
                 },
-                Some((graph, settled)) = futures_util::StreamExt::next(&mut settling) => {
-                    if let Err(error) = &settled {
-                        tracing::warn!(
-                            error = %error,
-                            public_query_id = %graph.public_query_id,
-                            "Oracle analytical follower could not settle a closed graph"
-                        );
-                    }
-                    if let Some(node) = ingress.upgrade() {
-                        node.record_settlement(graph, &settled);
-                    }
-                }
                 () = async {
                     timer
                         .expect("the timer branch is enabled only when a deadline exists")
@@ -1794,7 +1784,7 @@ impl AnalyticalStageIngress {
     /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned,
     /// [`BifrostError::QueryExecutionFailed`] when `key` names no live graph or
     /// attempt, and the settlement failure when the graph could not be released.
-    pub async fn finish_attempt(
+    pub fn finish_attempt(
         &self,
         key: AnalyticalAttemptKey,
         outcome: AnalyticalAttemptOutcome,
@@ -1809,8 +1799,8 @@ impl AnalyticalStageIngress {
                 None => return Err(BifrostError::QueryExecutionFailed),
             }
         };
-        lease.finish_attempt(key, outcome).await?;
-        self.settle_if_idle(key.graph(), outcome).await
+        lease.finish_attempt(key, outcome)?;
+        self.settle_if_idle(key.graph(), outcome)
     }
 
     /// Settles one graph inline when no attempt and no connection holds it.
@@ -1823,7 +1813,7 @@ impl AnalyticalStageIngress {
     ///
     /// Returns [`BifrostError::Internal`] on a poisoned lock and the settlement
     /// failure when cleanup did not complete.
-    async fn settle_if_idle(
+    fn settle_if_idle(
         &self,
         graph: AnalyticalGraphKey,
         outcome: AnalyticalAttemptOutcome,
@@ -1850,7 +1840,7 @@ impl AnalyticalStageIngress {
             );
             lease
         };
-        let settled = lease.settle(outcome).await;
+        let settled = lease.settle(outcome);
         self.record_settlement(graph, &settled);
         settled
     }
@@ -2188,7 +2178,7 @@ impl AnalyticalStageIngress {
                 "Oracle analytical follower shutdown retains unsettled graph ownership"
             );
         }
-        self.supervisor.shutdown().await
+        self.supervisor.shutdown()
     }
 }
 
@@ -2498,7 +2488,7 @@ impl AnalyticalGraphLifecycle {
         };
         let mut release = None;
         if let Some(attempt) = self.attempt.take() {
-            match attempt.finish(outcome).await {
+            match attempt.finish(outcome) {
                 Ok(settled) => release = Some(settled),
                 Err(error) => {
                     if failure.is_none() {
@@ -4225,10 +4215,10 @@ mod tests {
         );
     }
 
-    /// Dropping the owner revokes every follower and local driver before it returns.
+    /// Dropping the owner revokes every follower before it returns.
     ///
     /// The raw drop path: no settle and no await. Every follower grant must be
-    /// closed, the attempt abandoned with its drivers aborted, the graph
+    /// closed, the attempt abandoned, the graph
     /// cancelled and refusing new work, all observable the instant `drop`
     /// returns — which is what lets the leader stream release its active-read
     /// claim right after. Only the envelope is returned afterwards.
@@ -4236,8 +4226,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when anything revocable is still live after the drop returns,
-    /// when the aborted driver keeps running, or when the envelope and its
-    /// admission are not returned.
+    /// or when the envelope and its admission are not returned.
     async fn assert_owner_drop_revokes_before_returning() {
         let fixture = GraphFixture::new(Utc::now());
         let oracle = fixture_oracle_role();
@@ -4249,17 +4238,6 @@ mod tests {
             .expect("every addressed follower accepted its reservation");
         let graph = ownership.key().graph();
         let cancel = ownership.cancellation().clone();
-        let (driver_alive, driver_ended) = tokio::sync::oneshot::channel::<()>();
-        fixture
-            .supervisor
-            .retain_driver(
-                ownership.key(),
-                tokio::spawn(async move {
-                    let _alive = driver_alive;
-                    std::future::pending::<()>().await;
-                }),
-            )
-            .expect("the live attempt retains one local driver");
         assert!(
             ownership.retain_admission(admitted).is_ok(),
             "the live graph takes this query's admission permit"
@@ -4287,11 +4265,6 @@ mod tests {
             fixture.supervisor.ensure_graph_active(graph).is_err(),
             "the dropped graph admits no new work"
         );
-        tokio::time::timeout(Duration::from_secs(10), driver_ended)
-            .await
-            .expect("the aborted driver ends promptly")
-            .expect_err("the driver was aborted, never completed");
-
         assert_eq!(
             fixture
                 .supervisor
@@ -4386,7 +4359,6 @@ mod tests {
         let inspection = fixture
             .supervisor
             .shutdown()
-            .await
             .expect("shutdown reaches the retained residue");
         assert_eq!(
             (inspection.graphs_released, inspection.graphs_retained),
@@ -4666,7 +4638,6 @@ mod tests {
         fixture
             .ingress
             .finish_attempt(attempt, AnalyticalAttemptOutcome::Success)
-            .await
             .expect("the graph's only attempt settles");
         assert!(
             fixture.ingress.published(fixture.graph).is_ok(),
@@ -4769,7 +4740,6 @@ mod tests {
         fixture
             .ingress
             .finish_attempt(attempt, AnalyticalAttemptOutcome::Success)
-            .await
             .expect("the graph's only attempt settles");
         assert!(
             fixture
@@ -4792,7 +4762,6 @@ mod tests {
         sibling
             .ingress
             .finish_attempt(sibling_attempt, AnalyticalAttemptOutcome::Success)
-            .await
             .expect("the sibling graph's only attempt settles");
     }
 
@@ -4805,19 +4774,15 @@ mod tests {
     /// stays owned. Its bound is therefore the one the leader already signed:
     /// the absolute deadline in the retained binding. The single ingress-owned
     /// driver observes it, moves the graph to draining, cancels it, and runs
-    /// the same joined settlement every other terminal path runs.
-    ///
-    /// A sibling graph whose attempt retains a driver that never observes
-    /// cancellation holds its own settlement open across the target's whole
-    /// deadline, which is what proves the driver settles concurrently rather
-    /// than serially: a slow cleanup may not stop the driver from cancelling
-    /// another graph on time.
+    /// the same settlement every other terminal path runs. A sibling graph whose
+    /// last connection closed settles inline at once, while its grant stays held
+    /// until its leader's stream closes.
     ///
     /// # Panics
     ///
     /// Panics when a live `ExecuteTask`-first graph is released by the end of
-    /// its unary request, when it outlives its signed deadline, when a blocked
-    /// sibling settlement delays it, or when the bounded settlement queue
+    /// its unary request, when it outlives its signed deadline, when a grant
+    /// outlives or precedes its leader's stream, or when the bounded settlement queue
     /// cannot hold one wake plus one settlement per admitted graph.
     #[tokio::test]
     async fn execute_task_first_without_set_plan_settles_at_signed_deadline() {
@@ -4833,27 +4798,16 @@ mod tests {
             "the settlement queue must hold one wake plus one settlement per admitted graph"
         );
 
-        // The sibling activates first and is handed to the driver immediately,
-        // with one retained driver that keeps its settlement join from
-        // completing until the gate opens.
+        // The sibling activates first, with a deadline far past the target's;
+        // dropping its only connection settles it inline.
         let (sibling_graph, mut sibling_message, sibling_grant) =
             fixture.sibling(now, now + chrono::Duration::seconds(60));
         sibling_message.operation = StageOperationV1::SetPlan;
         sibling_message.task_id = None;
-        let sibling_attempt = fixture
+        fixture
             .send(&sibling_message, now)
             .await
             .expect("the reserving leader activates the sibling graph");
-        let (gate, gate_closed) = tokio::sync::oneshot::channel::<()>();
-        fixture
-            .supervisor
-            .retain_driver(
-                sibling_attempt,
-                tokio::spawn(async move {
-                    let _ = gate_closed.await;
-                }),
-            )
-            .expect("the sibling's live attempt retains one driver");
         drop(
             fixture
                 .ingress
@@ -4876,8 +4830,7 @@ mod tests {
             "a completed unary ExecuteTask must not release valid work"
         );
 
-        // Past the signed deadline the target settles and releases everything,
-        // while the sibling's blocked settlement is still in flight.
+        // Past the signed deadline the target settles and releases everything.
         tokio::time::timeout(Duration::from_secs(3), async {
             while fixture.ingress.published(fixture.graph).is_ok() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4897,14 +4850,8 @@ mod tests {
             fixture.supervisor.graph_runtime(fixture.graph).is_err(),
             "a settled graph released its supervisor registration and query runtime"
         );
-        assert!(
-            fixture.ingress.published(sibling_graph).is_ok(),
-            "the blocked sibling is still owned by the same driver"
-        );
-
-        // Opening the gate lets the sibling's own settlement complete, and
-        // shutdown joins the one driver rather than a detached cleanup task.
-        drop(gate);
+        // Shutdown joins the one settlement driver rather than a detached
+        // cleanup task.
         let inspection = tokio::time::timeout(Duration::from_secs(10), fixture.ingress.shutdown())
             .await
             .expect("the one settlement driver joins within the bound")
@@ -4973,7 +4920,6 @@ mod tests {
         fixture
             .ingress
             .finish_attempt(attempt, AnalyticalAttemptOutcome::Success)
-            .await
             .expect_err("a graph with a live stray attempt cannot be settled");
 
         let retained = fixture.ingress.live().expect("ownership is readable");
@@ -5027,7 +4973,6 @@ mod tests {
         fixture
             .ingress
             .finish_attempt(attempt, AnalyticalAttemptOutcome::Success)
-            .await
             .expect_err("a graph with a live stray attempt cannot be settled");
         assert!(
             matches!(
@@ -6755,7 +6700,7 @@ impl AnalyticalExecutionHandle {
     /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned.
     pub async fn shutdown(self) -> Result<AnalyticalShutdownInspection, BifrostError> {
         let follower = self.worker.shutdown().await?;
-        let leader = self.supervisor.shutdown().await?;
+        let leader = self.supervisor.shutdown()?;
         Ok(AnalyticalShutdownInspection { leader, follower })
     }
 
@@ -7047,11 +6992,11 @@ impl AnalyticalAttemptOwnership {
     /// Settles the attempt and then releases its graph, in that order.
     ///
     /// Runs the graph's one cleanup sequence inline on the caller. Dropping
-    /// this value instead revokes every follower and aborts every local driver
-    /// at once, but only settling joins the attempt's drivers and confirms the
-    /// envelope idle before it is returned. A leader stream that ended — for
-    /// any reason — calls this so follower work is cancelled and joined before
-    /// the query envelope is returned.
+    /// this value instead revokes every follower at once, but only settling
+    /// records the attempt's real outcome and confirms the envelope idle
+    /// before it is returned. A leader stream that ended — for any reason —
+    /// calls this so follower work is cancelled before the query envelope is
+    /// returned.
     ///
     /// # Errors
     ///

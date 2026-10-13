@@ -14,7 +14,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use tokio_util::io::ReaderStream;
 use wyrd_runtime::Permission;
 use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::error::{WyrdError, WyrdProblem};
@@ -492,10 +491,9 @@ async fn download_local_blob(
         "storage.download.local_blob",
         &format!("object:{path}"),
     )?;
-    let (file, len) = service::download_local_blob(&state.storage, caller.data_tenant_id, path)
+    let (stream, len) = service::download_local_blob(&state.storage, caller.data_tenant_id, path)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let stream = ReaderStream::new(file);
 
     Ok((
         StatusCode::OK,

@@ -19,11 +19,15 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { chromium, type Browser as Chromium, type BrowserContext, type Page } from 'playwright';
 import { expect, test } from 'vitest';
+import { WyrdClient } from '@wyrd/sdk';
+import { serviceWorkload } from './service-workload';
 
 type Journey = {
   origin: string;
   /** The Wyrd replicas, in BFF order: the server routes the gateway sends `/auth/*` to. */
   servers: [string, string];
+  /** Each replica's public gRPC listener, in the same order. */
+  grpcs: [string, string];
   bffs: [string, string];
   ssoTenant: string;
   apiKeyTenant: string;
@@ -1498,3 +1502,78 @@ test('live UI Prompt detail', async () => {
     await browser.close();
   }
 }, 180_000);
+
+test('live UI Service workspace', async () => {
+  await mkdir(journey.evidence, { recursive: true });
+  const admin = WyrdClient.connect({ serverUrl: journey.servers[0], credential: journey.ssoAdminKey, grpcUrl: journey.grpcs[0] });
+  const [passing, failing] = await serviceWorkload(admin);
+  const sso = journey.ssoTenant;
+  const base = `${journey.origin}/t/${sso}`;
+  const browser = await chromium.launch();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await browserLogin(page, sso, journey.users.admin);
+    const html = async (uid: string, query = '') => {
+      const response = await context.request.get(`${base}/cards/${uid}${query}`);
+      expect(response.status()).toBe(200);
+      return response.text();
+    };
+
+    // Initial HTML carries each Service's own retained evidence and nothing of the other's.
+    const pass1h = await html(passing.uid, '?range=1h');
+    for (const text of ['✓ VERIFICATION PASSING', '2/2 ready', `${passing.recentSpans} root spans · 1h`, 'WL-ANSWER 1.0.0 → agent', 'REQUESTS', 'LATENCY'])
+      expect(pass1h).toContain(text);
+    for (const text of ['▲ VERIFICATION FAILING', failing.name, failing.agentUid, ...cardFixtures]) expect(pass1h).not.toContain(text);
+    const fail1h = await html(failing.uid, '?range=1h');
+    for (const text of ['▲ VERIFICATION FAILING', `${failing.recentSpans} root spans · 1h`, 'wl-answer → agent failed'])
+      expect(fail1h).toContain(text);
+    for (const text of ['✓ VERIFICATION PASSING', passing.name, passing.agentUid]) expect(fail1h).not.toContain(text);
+    // The older root span is outside 1h and inside 6h.
+    expect(await html(passing.uid, '?range=6h')).toContain(`${passing.recentSpans + 1} root spans · 6h`);
+
+    // Composition names the exact versioned components and measurement; definition the declaration.
+    const composition = await html(passing.uid, '?view=composition');
+    for (const text of ['RUNTIME COMPOSITION', 'MEASUREMENT', passing.agentUid, passing.evalUid, passing.driftUid, 'verified by'])
+      expect(composition).toContain(text);
+    expect(composition).not.toContain(failing.agentUid);
+    expect(await html(passing.uid, '?view=definition')).toContain('wl-score-drift@1.0.0');
+
+    // Changing the range is a server load; the browser never calls the API, and refresh does not refetch.
+    await page.goto(`${base}/cards/${passing.uid}?range=1h`);
+    await page.screenshot({ path: join(journey.evidence, 'service-1h.png'), fullPage: true });
+    const browserRequests: string[] = [];
+    page.on('request', (request) => browserRequests.push(new URL(request.url()).pathname));
+    await page.getByRole('link', { name: '6h', exact: true }).click();
+    await page.waitForURL(/range=6h/);
+    await expect.poll(() => page.locator('main').textContent()).toContain(`${passing.recentSpans + 1} root spans · 6h`);
+    expect(browserRequests).toContain(`/t/${sso}/cards/${passing.uid}/__data.json`);
+    expect(browserRequests.filter((path) => path.startsWith('/v1/'))).toEqual([]);
+    await page.screenshot({ path: join(journey.evidence, 'service-6h.png'), fullPage: true });
+    browserRequests.length = 0;
+    expect(await (await page.reload())!.text()).toContain(`${passing.recentSpans + 1} root spans · 6h`);
+    expect(browserRequests.filter((path) => path.endsWith('__data.json'))).toEqual([]);
+    await page.goto(`${base}/cards/${failing.uid}?range=1h`);
+    await page.screenshot({ path: join(journey.evidence, 'service-failing.png'), fullPage: true });
+    await page.goto(`${base}/cards/${passing.uid}?view=composition`);
+    await page.screenshot({ path: join(journey.evidence, 'service-composition.png'), fullPage: true });
+    await context.close();
+
+    // Another tenant's reader cannot see the Service; a principal refused Card reads is denied.
+    const other = `${journey.origin}/t/${journey.apiKeyTenant}/cards/${passing.uid}`;
+    const reader = await browser.newContext();
+    await apiKeyLogin(await reader.newPage(), journey.apiKeyTenant, journey.offReaderKey);
+    const hidden = await reader.request.get(other);
+    expect(hidden.status()).toBe(404);
+    expect(await hidden.text()).not.toContain('root spans');
+    await reader.close();
+    const denied = await browser.newContext();
+    await apiKeyLogin(await denied.newPage(), journey.apiKeyTenant, journey.offNoRoleKey);
+    const refusal = await denied.request.get(other);
+    expect(refusal.status()).toBe(403);
+    expect(await refusal.text()).toContain('WYRD_PERMISSION_403');
+    await denied.close();
+  } finally {
+    await browser.close();
+  }
+}, 420_000);

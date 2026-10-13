@@ -911,7 +911,7 @@ run_ui() {
   pnpm --dir "$ui_dir" install --frozen-lockfile
   pnpm --dir "$ui_dir" build
   pnpm --dir "$ui_dir" exec playwright install chromium-headless-shell
-  for required in "production SSO crosses replicas" "OIDC-off credential UI" "production multi-provider tenant switch" "production provider replacement settings" "live UI login and CLI" "live UI initial Home" "live UI Card inventory" "live UI Model detail" "live UI Data detail" "live UI Agent detail" "live UI Prompt detail"; do
+  for required in "production SSO crosses replicas" "OIDC-off credential UI" "production multi-provider tenant switch" "production provider replacement settings" "live UI login and CLI" "live UI initial Home" "live UI Card inventory" "live UI Model detail" "live UI Data detail" "live UI Agent detail" "live UI Prompt detail" "live UI Service workspace"; do
     count="$(ui_selected_count "$required")"
     if [ "$count" != 1 ]; then
       echo "UI identity journey '$required' selects $count tests; expected exactly 1" >&2

@@ -106,8 +106,9 @@ fn ui_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("wyrd-ui")
 }
 
-/// Start one production BFF replica against `server_url`, as the `wyrd-ui`
-/// OAuth client holding `client_secret`, and wait until it answers. `extra_ca` is the PEM file Node adds to its trust store, so a
+/// Start one production BFF replica against `server_url` and its analytical
+/// gRPC listener `grpc_url`, as the `wyrd-ui` OAuth client holding
+/// `client_secret`, and wait until it answers. `extra_ca` is the PEM file Node adds to its trust store, so a
 /// replica given the TLS terminator's `https:` origin verifies it through the
 /// ordinary native `fetch` path.
 ///
@@ -116,6 +117,7 @@ fn ui_dir() -> PathBuf {
 async fn start_bff(
     origin: &str,
     server_url: &str,
+    grpc_url: &str,
     client_secret: &str,
     extra_ca: Option<&std::path::Path>,
 ) -> Bff {
@@ -136,6 +138,7 @@ async fn start_bff(
         .env("PORT", port.to_string())
         .env("ORIGIN", origin)
         .env("WYRD_SERVER_URL", server_url)
+        .env("WYRD_GRPC_URL", grpc_url)
         .env("WYRD_UI_CLIENT_SECRET", client_secret)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -464,6 +467,7 @@ async fn production_ui_bff_journey() {
             .with_public_origin(origin.parse().expect("origin parses"))
             .with_ui_client_secret(&client_secret)
             .with_access_ttl(chrono::Duration::seconds(30))
+            .with_verification_runtime_for_test()
     };
     let srv = builder().start_bound().await.expect("server starts");
     let server = srv.base_url().expect("bound server has a URL").to_owned();
@@ -474,6 +478,8 @@ async fn production_ui_bff_journey() {
         .base_url()
         .expect("bound replica has a URL")
         .to_owned();
+    let grpc = srv.grpc_url().expect("bound server has a gRPC URL");
+    let replica_grpc = replica.grpc_url().expect("bound replica has a gRPC URL");
 
     let sso_admin = srv
         .bootstrap_service_in_tenant(srv.data_tenant_id(), "ui-sso-admin", &["admin"])
@@ -544,8 +550,15 @@ async fn production_ui_bff_journey() {
     // serves crosses a real TLS hop to the other server replica.
     let material = std::env::temp_dir().join(format!("wyrd-ui-tls-{}", uuid::Uuid::new_v4()));
     let (terminator, ca) = start_tls_terminator(&replica_url, &material).await;
-    let first = start_bff(&origin, &server, &client_secret, None).await;
-    let second = start_bff(&origin, &terminator.url, &client_secret, Some(&ca)).await;
+    let first = start_bff(&origin, &server, &grpc, &client_secret, None).await;
+    let second = start_bff(
+        &origin,
+        &terminator.url,
+        &replica_grpc,
+        &client_secret,
+        Some(&ca),
+    )
+    .await;
     let gateway = start_gateway(origin_port, &server, &first.url).await;
     // The identity lane builds the `wyrd` CLI into the target directory that
     // holds this test binary's `deps/` directory.
@@ -559,6 +572,7 @@ async fn production_ui_bff_journey() {
     let fixture = json!({
         "origin": origin,
         "servers": [server, replica_url],
+        "grpcs": [grpc, replica_grpc],
         "bffs": [first.url, second.url],
         "ssoTenant": SSO_TENANT,
         "apiKeyTenant": API_KEY_TENANT,

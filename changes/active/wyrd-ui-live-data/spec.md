@@ -1,6 +1,6 @@
 ---
 id: SPEC-wyrd-ui-live-data
-revision: 3
+revision: 4
 status: approved
 ---
 
@@ -36,6 +36,9 @@ In scope:
 - SvelteKit server loading, rendering, navigation preloading and invalidation
   as hard requirements for the live BFF.
 - Targeted usability corrections required to complete these journeys.
+- A full-scale simulation of Wyrd and its UI: twenty Services with their
+  composed Cards, observations, evaluations, drift and records, all visible
+  and correct in the UI (REQ-026, AC-019).
 
 The current mock UI already implements meaningful filters, search, pagination
 on several surfaces, detail views, and scoped navigation. For example,
@@ -227,6 +230,22 @@ If a record lacks optional Card correlation, the UI must not invent it.
   discoverability and interpretation rather than inferring usability from
   HTTP HTML assertions alone.
 
+- **REQ-026:** The shared disposable setup can run at full simulation scale:
+  twenty Services, each with its composed Cards, repeated actual executions
+  producing traces, logs and metrics, real-time and continuous Eval results
+  (passing and failing), and Drift bindings with fitted baselines and
+  healthy and shifted observations. All of it is registered, emitted and
+  evaluated through the same public pathways as the page gates; nothing is
+  inserted directly. At that scale every included page shows every Service's
+  authorized evidence: pagination covers the whole matching population
+  without overlap, filters and counts agree with authoritative reads, and no
+  page times out, truncates silently or falls back to fixtures. Per-page work
+  stays bounded independently of the tenant's Service count, except where the
+  displayed rows are themselves per-Service and limited by page size. Page
+  server-render and navigation timings are recorded as evidence; they are not
+  a pass/fail threshold in this revision. Page gates keep their small
+  deterministic datasets; the simulation is one additional journey.
+
 ### Generated server-to-UI contracts
 
 - **REQ-020:** The one canonical generation path is Rust wire types and mounted
@@ -344,7 +363,8 @@ rendering and navigation preloading do not replace Wyrd server authorization.
 - **INV-008 — Bounded work:** Page loads and BFF queries do not perform
   unbounded scans/collection, fan-out or automatic retries. Supported server
   resource limits remain authoritative; cancellation and failures release
-  resources. A new response-time SLO or benchmark suite is not implied.
+  resources. A new response-time SLO or benchmark suite is not implied;
+  REQ-026 records full-scale timings as evidence, not as a gating threshold.
 - **INV-009 — Compatibility:** Preserve the existing contextual URL contract
   where it expresses valid Wyrd behavior. Necessary private data projections
   can change; unsupported mock assumptions must be corrected without public
@@ -390,6 +410,7 @@ integration changes its behavior.
 | **AC-016 — Combined journey and isolation** | In one user story, login → register → inspect Cards → execute → investigate telemetry → inspect verification → return home. Repeat targeted access checks with a restricted user and another tenant containing overlapping names; attempted scope/URL manipulation leaks no protected rows or details. | REQ-001–019, INV-001–009 |
 | **AC-017 — Generated contract gate** | Before accepting live page integrations, regenerate from the locally served composed contract and type-check the consumers. Repeating regeneration yields identical artifacts. Demonstrate that stale/missing output fails the check, and that a representative consumed field/parameter or operation change leaves an unchanged adapter failing type-check after regeneration. Actual JSON/error serialization agrees with the served schema; analytical schema mismatches fail truthfully. Every page's acceptance record identifies its generated wire contract and typed projection. | REQ-020–022, INV-010 |
 | **AC-018 — SvelteKit loading gate** | For each included page, verify primary content in the initial server-rendered response before hydration, then operate client navigation, supported preloading, URL filters and refresh/invalidation. Network evidence shows protected upstream access remains in the BFF and hydration does not redundantly fetch the same initial dataset. Navigation after session expiry and tenant changes revalidates authority; preloads perform no writes or cross-session reuse. | REQ-023–025, INV-011 |
+| **AC-019 — Full-scale simulation** | After the page gates and the combined journey, run the shared setup at twenty Services through public pathways and settle it with bounded readiness. In a real browser, every included page (Home, Cards inventory and details, Service workspaces, Observe overview, traces and trace detail, logs, metrics, evaluations and task detail, drift) shows each Service's evidence; paging covers each authoritative population without overlap; filters, counts and Home summaries agree with authoritative reads under equivalent scope; another tenant and a restricted user still see nothing protected. Record per-page server-render and navigation timings and the dataset sizes they were measured on. | REQ-004–019, REQ-023–024, REQ-026, INV-006–008 |
 
 ## Acceptance evidence and verification
 
@@ -520,3 +541,4 @@ by this specification edit.
 | 1 | 2026-10-12 | draft | New live-data integration spec incorporating the agreed reuse of frontend behavior and contextual navigation, disposable local journeys, and page-by-page acceptance. Awaiting explicit human approval. |
 | 2 | 2026-10-12 | draft | Add the requested canonical server-to-UI TypeScript generation path, source/output drift and consumer compilation gates, and runtime/analytical schema limits. Awaiting explicit human approval. |
 | 3 | 2026-10-12 | approved | Record the user's OpenAPI decision and add hard SvelteKit server-load, SSR, navigation/preloading and invalidation requirements with page-level acceptance evidence. Explicitly approved by the user on 2026-10-12 for task decomposition. |
+| 4 | 2026-10-12 | approved | Add the user's original full-scale load requirement, previously missing: REQ-026 and AC-019 (twenty Services with observations, evaluations, drift and records, all visible and correct in the UI). Timings are recorded evidence, not a gating SLO, so INV-008 is clarified rather than replaced. Additive: revision-3 requirements and accepted tasks 001–008 stand unchanged. Approved by the user on 2026-10-12 ("agree"), choosing correctness at scale plus recorded timings. |

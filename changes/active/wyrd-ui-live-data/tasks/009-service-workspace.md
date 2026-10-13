@@ -3,8 +3,8 @@ id: TASK-009
 kind: implementation
 status: proposed
 spec: SPEC-wyrd-ui-live-data
-spec_revision: 3
-requirements: [REQ-003, REQ-007, REQ-008, REQ-009, REQ-016, REQ-017, REQ-018, REQ-019, REQ-021, REQ-023, REQ-024, REQ-025]
+spec_revision: 4
+requirements: [REQ-003, REQ-007, REQ-008, REQ-009, REQ-016, REQ-017, REQ-018, REQ-019, REQ-021, REQ-023, REQ-024, REQ-025, REQ-026]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008, INV-009, INV-010, INV-011]
 acceptance: [AC-008, AC-017, AC-018]
 depends_on: [TASK-008]
@@ -52,7 +52,7 @@ Use generated HTTP operation types and SvelteKit-generated route data types. Pro
 1. Connect server-only analytical access through the current session and existing SDK; preserve actual token audience/object/column permissions and bounded cancellation/deadlines.
 2. Validate analytical schemas before mapping values; handle terminal success/degraded/failure and serialize supported large integers/timestamps safely.
 3. Close package/lock, native SDK availability and production Node/image runtime consumers together.
-4. Extend shared workload setup with distinct actual executions for two Services, normal export/shutdown and bounded visibility checks; reuse existing deterministic provider/verification support.
+4. Extend shared workload setup with distinct actual executions for two Services, normal export/shutdown and bounded visibility checks; reuse existing deterministic provider/verification support. Revision 4 (REQ-026): the setup takes the number of Services as an input. It defaults to the two this page gate needs; TASK-019 drives the same setup at twenty. Service identities, names and evidence derive from that count rather than being hard-coded to two, and its readiness checks wait for the whole requested population.
 5. Resolve selected Service version/composition and truthful operational sections; preserve service-state URL links.
 6. Extend the existing official-image production startup proof with a focused authenticated analytical BFF case, preserving the default startup cases and their assertions.
 
@@ -117,6 +117,7 @@ Expect failure from the missing live BFF/native packaging/connection behavior, n
 - The focused official-image case proves the production BFF's native SDK loads, uses the configured real endpoints, returns known retained analytical evidence in initial HTML, and exposes analytical dependency failure without fixture fallback. Record immutable image provenance and the actual production runtime/dependency layout; host check/build or host browser success cannot substitute for this proof.
 - The startup selector selects exactly the planned case and rejects unknown/missing/skipped selections. Default production startup behavior still retains all existing assertions. The smoke runs against the official image without host SDK/module mounts and without exposing credentials in output or captures.
 - Record a human usability pass or concrete corrected issues with scrubbed local screenshots; review control discoverability, scope clarity, back/refresh behavior, accessible interaction and error recovery.
+- Revision 4 (REQ-026): the shared workload setup accepts a Service count, with this gate running the default of two. Larger counts reuse the same public registration, execution, flush and readiness path; no second setup or seeding shortcut exists. Proving twenty Services is TASK-019's obligation, not this gate's.
 
 ## Expected Write Set and Consumer Closure
 
@@ -171,7 +172,7 @@ Report a concrete blocker if repository-managed setup cannot supply the required
 - [Independent plan review, PR-001](../plan-readiness-review.md)
 - [Server/BFF route audit](../route-audit.md)
 
-- [Approved specification, revision 3](../spec.md)
+- [Approved specification, revision 4](../spec.md)
 - [Repository standards](../../../../AGENTS.md)
 - [Agent rules](../../../../architecture/agent-rules.md)
 - [Wyrd design](../../../../architecture/wyrd-design.md)

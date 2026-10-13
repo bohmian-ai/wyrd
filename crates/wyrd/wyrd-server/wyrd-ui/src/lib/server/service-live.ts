@@ -344,9 +344,11 @@ function charts(
   const latency = filled.flatMap((r) => (r ? [Math.round(r.meanMs * 10) / 10] : []));
   const state = traces.degraded ? ('gap' as const) : ('ok' as const);
   const note = traces.degraded ? 'degraded read — some sources incomplete' : undefined;
+  // Counts headline the range total: the newest bucket is still filling, so it understates live traffic.
+  const total = (points: number[]) => `${points.reduce((n, p) => n + p, 0)} in ${range}`;
   return [
-    { ...specs[0], series: [{ label: 'spans', points: spans }], latest: `${spans.at(-1)} last bucket`, state, note },
-    { ...specs[1], series: [{ label: 'errors', points: errors }], latest: `${errors.at(-1)} last bucket`, state, note },
+    { ...specs[0], series: [{ label: 'spans', points: spans }], latest: total(spans), state, note },
+    { ...specs[1], series: [{ label: 'errors', points: errors }], latest: total(errors), state, note },
     {
       ...specs[2],
       series: [{ label: 'mean ms', points: latency }],

@@ -1522,7 +1522,7 @@ test('live UI Service workspace', async () => {
 
     // Initial HTML carries each Service's own retained evidence and nothing of the other's.
     const pass1h = await html(passing.uid, '?range=1h');
-    for (const text of ['✓ VERIFICATION PASSING', '2/2 ready', `${passing.recentSpans} root spans · 1h`, 'WL-ANSWER 1.0.0 → agent', 'REQUESTS', 'LATENCY'])
+    for (const text of ['✓ VERIFICATION PASSING', '2/2 ready', `${passing.recentSpans} root spans · 1h`, `${passing.recentSpans} in 1h`, 'WL-ANSWER 1.0.0 → agent', 'REQUESTS', 'LATENCY'])
       expect(pass1h).toContain(text);
     for (const text of ['▲ VERIFICATION FAILING', failing.name, failing.agentUid, ...cardFixtures]) expect(pass1h).not.toContain(text);
     const fail1h = await html(failing.uid, '?range=1h');

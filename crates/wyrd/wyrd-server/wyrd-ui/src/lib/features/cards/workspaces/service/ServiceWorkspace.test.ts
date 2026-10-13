@@ -377,7 +377,8 @@ test('live UI Service workspace projection', async () => {
 
   // Charts draw the read buckets; missing buckets are zero spans, latency only where spans exist.
   const [requests, errors, latency] = view.overview.default.charts;
-  expect(requests).toMatchObject({ state: 'ok', latest: '6 last bucket' });
+  expect(requests).toMatchObject({ state: 'ok', latest: '10 in 6h' });
+  expect(errors).toMatchObject({ latest: '1 in 6h' });
   expect(requests.series[0].points).toHaveLength(30);
   expect(requests.series[0].points.slice(-2)).toEqual([4, 6]);
   expect(errors.series[0].points.slice(-2)).toEqual([1, 0]);

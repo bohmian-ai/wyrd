@@ -1,7 +1,7 @@
 ---
 id: TASK-009
 kind: implementation
-status: proposed
+status: implemented
 spec: SPEC-wyrd-ui-live-data
 spec_revision: 4
 requirements: [REQ-003, REQ-007, REQ-008, REQ-009, REQ-016, REQ-017, REQ-018, REQ-019, REQ-021, REQ-023, REQ-024, REQ-025, REQ-026]
@@ -161,6 +161,21 @@ Run `mise run codegen:check` when HTTP generation/consumption changes, and recor
 For actual Rust changes, run `mise run fmt` and `mise run lints`; for changed dependency/owner boundaries run `mise run check:deps`. Add only the narrow owning format/lint/test checks justified by the actual write set.
 Do not run full identity/SDK journey suites or a broad aggregate as this task’s gate. Integrated verification belongs once to change review. Existing authentication/audit behavior needs regression proof, not manufactured RED.
 Retain initial-response/network evidence, expected data identities and exclusions, readiness bounds and a scrubbed usability review. Record page pass/fail and mapped obligations; do not claim an isolated page proves the whole change.
+
+### Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Composition and scoped operational reads (scenario 1) | `7e87aaf7d`, `0563d3fed`: Service load/workspace projection over exact declaration, binding status and scoped Bifrost reads | `vitest run .../ServiceWorkspace.test.ts` 13/13; `WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER='live UI Service workspace' mise run test:identity:journey` 1 passed, 11 skipped | PASS |
+| Schema, authority and query failures without fixture fallback (scenario 2) | Service projection error branches | Same focused vitest and journey case | PASS |
+| Public two-Service workload, count parameterised (REQ-026) | `fea1b3316` shared workload setup | Focused journey case drives `wl-svc-0` passing and `wl-svc-1` failing | PASS |
+| Official image: native SDK loads, live analytical read in initial HTML, unreachable endpoint fails without fallback (scenario 3) | `75f248188` startup case; TASK-020 removed the sign-in blocker | `WYRD_STARTUP_FILTER=authenticated_analytical_bff scripts/server/test-startup-prod.sh` PASS. Image `sha256:8f794eec79935b5f48b81c6b11622e5613a74cf3672817a2f696fbcbb4a9e570`; Node v26.2.0; native `/app/ui/node_modules/.pnpm/@wyrd+sdk-linux-x64-gnu@.../wyrd.linux-x64-gnu.node` | PASS |
+| Generated contracts | — | `mise run codegen:check` exit 0; `pnpm run check` 0 errors; UI build passes inside the journey lane | PASS |
+| Usability pass | Screenshots in `target/debug/wyrd-ui-live-login/service-{1h,6h,composition,failing}.png` (local, no credentials) | Reviewed below | PASS with notes |
+
+Usability review (`service-1h.png`, `service-failing.png`): verification state, binding readiness, telemetry and latest result read as separate facts; range controls and the version selector are visible in the tab bar; investigate links name the Service and range they carry; the failing Service highlights its failing binding with an Investigate link. Notes, not blockers: in Needs attention only the first failing binding gets the highlighted card and link, and the second (`wl-score-drift`) is plain text; the Components row ends in a bare `→`.
+
+Not run per standing instruction: `mise run fmt`, `mise run lints`.
 
 ## Material Stop Conditions
 

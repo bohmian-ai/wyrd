@@ -5,7 +5,9 @@
 //! renders refusals in that protocol's error envelope. The `OpenAI`-compatible
 //! handlers live in [`super::routes`]; the Anthropic Messages and Gemini
 //! `GenerateContent` handlers here take each provider's native body and
-//! answer with its native response or stream. All of them run through the one
+//! answer with its native response or stream, and the Jev `systemone` handler
+//! takes Jev's question body and answers with Jev's answer, authenticating and
+//! refusing like the `OpenAI`-compatible routes. All of them run through the one
 //! governed [`GatewayInvocation`], which never forwards caller headers to a
 //! provider.
 
@@ -22,8 +24,10 @@ use wyrd_gateway::IngressDialect;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::native::{
     AnthropicErrorEnvelope, GatewayAnthropicMessage, GatewayAnthropicMessagesRequest,
-    GatewayGeminiGenerateContentRequest, GatewayGeminiGenerateContentResponse, GoogleErrorEnvelope,
+    GatewayGeminiGenerateContentRequest, GatewayGeminiGenerateContentResponse, GatewayJevRequest,
+    GatewayJevResponse, GoogleErrorEnvelope,
 };
+use wyrd_spec::gateway::openai::OpenAiErrorEnvelope;
 use wyrd_spec::gateway::{
     CARD_UID_HEADER, FALLBACK_HEADER, GatewayContractError, GatewayFallbackOverride,
     GatewayOperation, GatewayUsageAmount, MAX_RUN_HEADER_BYTES, ModelRef, RUN_HEADER,
@@ -164,7 +168,8 @@ pub fn gateway_ingress_router(state: &AppState) -> OpenApiRouter<AppState> {
         .routes(routes!(routes::file_content))
         .routes(routes!(routes::create_batch, routes::list_batches))
         .routes(routes!(routes::get_batch))
-        .routes(routes!(routes::cancel_batch));
+        .routes(routes!(routes::cancel_batch))
+        .routes(routes!(jev_systemone));
     let anthropic = OpenApiRouter::new().routes(routes!(anthropic_messages));
     let gemini = OpenApiRouter::new().routes(routes!(gemini_generate_content));
     GatewayIngress::OpenAi
@@ -372,6 +377,94 @@ pub(crate) async fn anthropic_messages(
         Ok(answer) => relay(answer.status, answer.body),
         Err(error) => GatewayIngress::AnthropicMessages.error(&error),
     }
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/systemone",
+    params(
+        ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
+        ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+    ),
+    request_body(content = GatewayJevRequest, description = "Jev systemone request whose `model` is an exact Jev model id, such as `jev-latest`, with keyed `noul`, `choice`, or `score` questions about `state`"),
+    responses(
+        (status = 200, description = "Jev answer: the resolved model, intact keyed answers, and usage", body = GatewayJevResponse),
+        (status = 400, description = "Invalid request or a broken question bound, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 401, description = "Authentication required, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 403, description = "Invoke permission required for the model, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 404, description = "No authorized Jev deployment serves the model, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 422, description = "Call cost cannot be bounded: Jev answers carry no output bound, so a token limit or budget refuses them, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 429, description = "Limit or budget exhausted, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 502, description = "No provider attempt completed, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 503, description = "The server is draining, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 504, description = "Deadline exceeded, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = "default", description = "Other gateway refusal as an OpenAI error envelope, or the refusing provider's status with its error body", body = OpenAiErrorEnvelope)
+    ),
+    tag = "Gateway"
+)]
+/// `POST /v1/systemone`: one governed Jev question call.
+///
+/// The body's `model` names an exact model of provider `jev`, and only
+/// deployments declaring `system_one` serve it, so fallback never leaves the
+/// protocol. A body that does not match [`GatewayJevRequest`], or breaks a
+/// documented question bound, is refused before dispatch; an accepted body
+/// reaches Jev with only its model rewritten and the answer returns
+/// unchanged. Jev never streams. Gateway-originated failures render as the
+/// `OpenAI` error envelope with a stable Wyrd code; a provider refusal relays
+/// its status and body through the shared refusal path, credential removed.
+#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+pub(crate) async fn jev_systemone(
+    State(state): State<AppState>,
+    caller: Result<Caller, WyrdErrorResponse>,
+    headers: HeaderMap,
+    request: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let answer = match caller {
+        Err(WyrdErrorResponse(error)) => Err(error),
+        Ok(caller) => match jev_call(&headers, request) {
+            Ok(call) => GatewayInvocation::new(&state).invoke(&caller, call).await,
+            Err(error) => Err(error),
+        },
+    };
+    match answer {
+        Ok(answer) => relay(answer.status, answer.body),
+        Err(error) => GatewayIngress::OpenAi.error(&error),
+    }
+}
+
+/// Builds the governed call of a Jev `systemone` body.
+///
+/// The call has no usage bound: no Jev request member bounds its answer.
+///
+/// # Errors
+/// Returns `GatewayInvalidRequest` naming `body` or the missing member for a
+/// body that is not a Jev request, `model` for an invalid model id, and every
+/// error of [`requested_fallback`] and [`requested_subject`].
+fn jev_call(
+    headers: &HeaderMap,
+    request: Result<Json<Value>, JsonRejection>,
+) -> Result<GatewayCallRequest, WyrdError> {
+    let body = typed_body::<GatewayJevRequest>(request)?;
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_request(GatewayContractError::new("model", "is required")))
+        .and_then(|model| native_model("jev", model))?;
+    Ok(GatewayCallRequest {
+        operation: GatewayOperation::SystemOne,
+        ingress: IngressDialect::Jev,
+        fallback: requested_fallback(headers, &model)?,
+        model,
+        stream: false,
+        usage_bound: None,
+        body,
+        media: None,
+        batch: None,
+        deployment: None,
+        timeout: PUBLIC_CALL_TIMEOUT,
+        subject: requested_subject(headers)?,
+    })
 }
 
 #[utoipa::path(

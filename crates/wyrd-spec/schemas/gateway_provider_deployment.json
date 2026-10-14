@@ -111,6 +111,13 @@
           "enum": [
             "batches"
           ]
+        },
+        {
+          "description": "Jev `systemone` keyed questions, served only by the Jev adapter.",
+          "type": "string",
+          "enum": [
+            "system_one"
+          ]
         }
       ]
     },
@@ -195,6 +202,13 @@
             }
           },
           "additionalProperties": false
+        },
+        {
+          "description": "TypeSafe Jev `systemone` question protocol.",
+          "type": "string",
+          "enum": [
+            "jev"
+          ]
         },
         {
           "description": "Standard OpenAI-compatible routes under a tenant base URL.",

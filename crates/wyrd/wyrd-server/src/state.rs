@@ -27,7 +27,7 @@ use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailService;
 
 use crate::scribe_outbox::{ScribeOutbox, ScribeSink};
 use wyrd_auth_verify::TokenVerifier;
-use wyrd_gateway::{GatewayEngine, ManagedSecretKeys};
+use wyrd_gateway::GatewayEngine;
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
 use wyrd_tonic::tonic_health::server::HealthReporter;
@@ -2192,12 +2192,6 @@ pub struct AppState {
     pub limits: LimitsConfig,
     /// Operator-declared gateway credential bindings and secret backends.
     pub gateway: Arc<GatewayConfig>,
-    /// Independently configured tenant keyrings protecting managed secrets.
-    ///
-    /// Administration seals through this handle and the credential resolver
-    /// opens through the same one, so key selection and envelope protection
-    /// have a single owner. Key material lives only here, never in Postgres.
-    pub gateway_secret_keys: Arc<ManagedSecretKeys>,
     /// Shared gateway execution engine behind every governed invocation entry.
     pub gateway_engine: Arc<GatewayEngine>,
     /// The process's one non-blocking outbox for audit decisions, gateway
@@ -2271,7 +2265,6 @@ impl AppState {
             )),
             limits: LimitsConfig::default(),
             gateway: Arc::default(),
-            gateway_secret_keys: Arc::default(),
             gateway_engine: Arc::new(crate::components::gateway::unconnected_engine()),
             scribe_outbox,
             grpc_health: reporter,
@@ -2356,13 +2349,6 @@ impl AppState {
     #[must_use]
     pub fn with_gateway(mut self, gateway: GatewayConfig) -> Self {
         self.gateway = Arc::new(gateway);
-        self
-    }
-
-    /// Attach the loaded per-tenant managed-secret keyrings.
-    #[must_use]
-    pub fn with_gateway_secret_keys(mut self, keys: Arc<ManagedSecretKeys>) -> Self {
-        self.gateway_secret_keys = keys;
         self
     }
 

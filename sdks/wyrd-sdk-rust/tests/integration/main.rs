@@ -7,6 +7,8 @@
 
 mod gateway_admin;
 mod gateway_inference;
+/// TypeSafe Jev through the Gateway, natively and as a Verifier's judge.
+mod gateway_jev;
 /// The admin-key local workflow, start to finish, without a publication flush.
 mod local_development;
 mod observe_a_run;

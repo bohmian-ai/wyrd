@@ -10,17 +10,17 @@
 //!
 //! The production catalog exposes three read-only Bifrost tools for table
 //! discovery, schema/layout description, and bounded terminal-safe queries,
-//! the Card read, Verification status, and Operator connection read tools,
-//! per-caller write tools for credential revocation, manual Verifier runs,
-//! and Operator connection management, plus the seventeen tenant gateway
-//! administration tools.
+//! the Card read, Verification status, Operator connection, and tenant
+//! gateway read tools, and per-caller write tools for credential revocation,
+//! manual Verifier runs, Operator connection management, and tenant gateway
+//! administration.
 //! A test-support context probe is available only through explicit fixture opt-in.
 
 use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ErrorCode, ErrorData,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ErrorCode, ErrorData,
     InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
     ServerInfo, Tool,
 };
@@ -145,13 +145,13 @@ impl WyrdMcpHandler {
     /// operations require explicit gateway write or delete scopes at dispatch.
     /// Principal write tools are per caller and the test-support probe is
     /// opt-in, so neither belongs here.
-    fn catalog(&self) -> Vec<Tool> {
+    fn catalog() -> Vec<Tool> {
         let mut catalog = bifrost::descriptors();
         catalog.extend(principals::descriptors_unscoped());
         catalog.extend(cards::descriptors());
         catalog.extend(verification::descriptors_unscoped());
         catalog.extend(operators::descriptors_unscoped());
-        catalog.extend(gateway::descriptors());
+        catalog.extend(gateway::descriptors_unscoped());
         catalog.push(guide::descriptor());
         catalog
     }
@@ -187,11 +187,12 @@ impl ServerHandler for WyrdMcpHandler {
 
     /// Resolve only tools in this process's configured Wyrd catalog.
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        self.catalog()
+        Self::catalog()
             .into_iter()
             .chain(principals::write_descriptors())
             .chain(verification::write_descriptors())
             .chain(operators::write_descriptors())
+            .chain(gateway::descriptors())
             .chain(self.probe_descriptors())
             .find(|tool| tool.name == name)
     }
@@ -210,7 +211,7 @@ impl ServerHandler for WyrdMcpHandler {
         // appears only to a caller whose verified token already carries the
         // permission it needs. An agent therefore never discovers a capability
         // it cannot use, and naming one anyway is still refused at dispatch.
-        let mut catalog = self.catalog();
+        let mut catalog = Self::catalog();
         if let Ok(caller) = Self::caller(&context) {
             if principals::may_administer(&caller) {
                 catalog.extend(principals::write_descriptors());
@@ -221,9 +222,15 @@ impl ServerHandler for WyrdMcpHandler {
             if operators::may_manage(&caller) {
                 catalog.extend(operators::write_descriptors());
             }
+            catalog.extend(gateway::write_descriptors(&caller));
         }
         catalog.extend(self.probe_descriptors());
-        std::future::ready(Ok(ListToolsResult::with_all_items(catalog)))
+        // Protocol 2026-07-28 requires cache metadata on list results. The
+        // catalog depends on the caller's permissions, which can change at
+        // any time, so it is private to the caller and immediately stale.
+        std::future::ready(Ok(ListToolsResult::with_all_items(catalog)
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private)))
     }
 
     /// Dispatch tools with verified request context and retain the shutdown
@@ -420,4 +427,50 @@ pub(crate) fn wyrd_error_to_mcp(error: WyrdError) -> ErrorData {
     };
     let message = error.to_string();
     ErrorData::new(code, message, Some(error.as_problem_json()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WyrdMcpHandler, gateway, operators, principals, verification};
+
+    /// Top-level input keywords OpenAI function tools refuse, rejecting the
+    /// whole tool list when any advertised tool carries one.
+    const ROOT_COMBINATORS: [&str; 6] = ["oneOf", "anyOf", "allOf", "enum", "const", "not"];
+
+    /// Proves every tool a caller holding every scope can be shown has a plain
+    /// object input root and an object output root, so common MCP clients and
+    /// model tool-calling accept the complete catalog.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the operator connection create tool is missing from the
+    /// catalog, or when any tool's input or output root is not a plain object.
+    #[test]
+    fn every_tool_schema_is_accepted_by_common_tool_callers() {
+        let catalog: Vec<_> = WyrdMcpHandler::catalog()
+            .into_iter()
+            .chain(principals::write_descriptors())
+            .chain(verification::write_descriptors())
+            .chain(operators::write_descriptors())
+            .chain(gateway::descriptors())
+            .collect();
+        assert!(catalog.iter().any(|tool| tool.name == operators::CREATE));
+        for tool in &catalog {
+            let name = tool.name.as_ref();
+            assert_eq!(
+                tool.input_schema.get("type"),
+                Some(&"object".into()),
+                "{name}"
+            );
+            for keyword in ROOT_COMBINATORS {
+                assert!(
+                    !tool.input_schema.contains_key(keyword),
+                    "{name} input root carries {keyword}"
+                );
+            }
+            if let Some(output) = &tool.output_schema {
+                assert_eq!(output.get("type"), Some(&"object".into()), "{name}");
+            }
+        }
+    }
 }

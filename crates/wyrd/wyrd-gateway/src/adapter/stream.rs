@@ -228,7 +228,8 @@ enum Ended {
 }
 
 /// Terminal error frame of the stream's ingress protocol, or `None` when the
-/// protocol has no in-band error (Google `GenerateContent`).
+/// protocol has no in-band error (Google `GenerateContent`, and Jev, which
+/// never streams).
 ///
 /// Chat Completions append an `OpenAI` error envelope and `[DONE]`; Responses
 /// an `error` event; Anthropic an `error` event.
@@ -257,7 +258,7 @@ fn error_frame(wire: Wire, frames: &Frames, stop: Stop) -> Option<Vec<u8>> {
                 json!({"type": "error", "error": {"type": kind, "message": message}}),
             )
         }
-        (Frames::Native { .. }, Wire::Google) => return None,
+        (Frames::Native { .. }, Wire::Google | Wire::Jev) => return None,
     };
     Some(format!("event: {event}\ndata: {data}\n\n").into_bytes())
 }
@@ -267,9 +268,11 @@ fn error_frame(wire: Wire, frames: &Frames, stop: Stop) -> Option<Vec<u8>> {
 /// `OpenAI` Chat Completions end with `[DONE]`; Responses with a
 /// `response.completed`, `response.incomplete`, or `response.failed` event;
 /// Anthropic with `message_stop`; Google with a response whose every
-/// candidate carries a finish reason.
+/// candidate carries a finish reason. Jev never streams, so no event of it
+/// terminates a stream.
 fn terminates(wire: Wire, responses: bool, data: &str, event: Option<&Value>) -> bool {
     match wire {
+        Wire::Jev => false,
         Wire::OpenAi if !responses => data == "[DONE]",
         Wire::OpenAi => event
             .and_then(|event| event.get("type"))
@@ -371,7 +374,7 @@ impl ChatChunks {
         match wire {
             Wire::Anthropic => self.anthropic(event),
             Wire::Google => self.google(event),
-            Wire::OpenAi => None,
+            Wire::OpenAi | Wire::Jev => None,
         }
     }
 
@@ -456,7 +459,7 @@ impl ChatChunks {
         let usage = match wire {
             Wire::Anthropic => anthropic::chat_usage(&serde_json::from_value(merged).ok()?),
             Wire::Google => google::chat_usage(&serde_json::from_value(merged).ok()?),
-            Wire::OpenAi => return None,
+            Wire::OpenAi | Wire::Jev => return None,
         };
         Some(self.envelope(Vec::new(), Some(usage)))
     }
@@ -898,9 +901,11 @@ impl Relay {
 
 /// Overlays the usage object `event` carries onto `merged`: `OpenAI` `usage`
 /// or a Responses event's `response.usage`, Anthropic `message.usage` then
-/// each later `usage`, or Google `usageMetadata`.
+/// each later `usage`, Google `usageMetadata`, or Jev `usage`, though Jev
+/// never streams.
 fn merge_usage(wire: Wire, event: &Value, merged: &mut Map<String, Value>) {
     let found = match wire {
+        Wire::Jev => event.get("usage"),
         Wire::OpenAi => event
             .get("usage")
             .or_else(|| event.pointer("/response/usage")),

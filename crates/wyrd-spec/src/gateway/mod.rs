@@ -50,7 +50,7 @@ use crate::ids::{ModelId, ProviderId};
 const MAX_TEXT_LEN: usize = 128;
 
 /// Provider identifiers reserved for the built-in adapters.
-pub const BUILTIN_PROVIDER_IDS: [&str; 4] = ["openai", "anthropic", "gemini", "vertex"];
+pub const BUILTIN_PROVIDER_IDS: [&str; 5] = ["openai", "anthropic", "gemini", "vertex", "jev"];
 
 /// Request header naming the application Run a gateway call belongs to.
 ///
@@ -179,6 +179,8 @@ pub enum GatewayOperation {
     Audio,
     /// Batches, including the file operations batches require.
     Batches,
+    /// Jev `systemone` keyed questions, served only by the Jev adapter.
+    SystemOne,
 }
 
 impl GatewayOperation {
@@ -325,6 +327,11 @@ mod tests {
             serde_json::to_value(GatewayOperation::ChatCompletions).expect("serializes"),
             json!("chat_completions")
         );
+        assert_eq!(
+            serde_json::to_value(GatewayOperation::SystemOne).expect("serializes"),
+            json!("system_one")
+        );
+        assert!(!GatewayOperation::SystemOne.streams());
         assert!(serde_json::from_value::<GatewayOperation>(json!("rerank")).is_err());
     }
 

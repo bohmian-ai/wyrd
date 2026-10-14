@@ -7,7 +7,8 @@
 //! generated JSON Schema; named reads, revocation, and deletions take the
 //! resource `name`. Reads require `gateway:read`, replacements and revocation
 //! `gateway:write`, and deletions `gateway:delete` or `gateway:write` exactly
-//! as the HTTP routes do.
+//! as the HTTP routes do. Read tools are always advertised; a write tool is
+//! advertised only to a caller already holding the permission it enforces.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use rmcp::model::{CallToolResult, ErrorData, Tool, ToolAnnotations};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value as JsonValue};
+use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::GatewayContractError;
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName};
@@ -133,17 +135,19 @@ impl Effect {
     }
 }
 
-/// The gateway administration tools in [`TOOLS`] order.
+/// The gateway administration tools in [`TOOLS`] order, each paired with the
+/// permission its operation enforces.
 ///
-/// Replacement inputs are the generated contract schemas that
-/// `codegen:check` keeps in step with `wyrd_spec::gateway`.
+/// The permission decides who is shown a write tool; dispatch still authorizes
+/// every call through [`GatewayAdministration`]. Replacement inputs are the
+/// generated contract schemas that `codegen:check` keeps in step with
+/// `wyrd_spec::gateway`.
 ///
 /// # Panics
 ///
 /// Panics if an embedded input schema is not a JSON object, which the static
 /// literals and generated contract schemas never are.
-#[must_use]
-pub(super) fn descriptors() -> Vec<Tool> {
+fn gated() -> Vec<(Tool, Permission)> {
     [
         (
             LIST_CREDENTIALS,
@@ -153,6 +157,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              Requires gateway read permission.",
             NO_INPUT,
             Effect::Read,
+            Permission::gateway_read(),
         ),
         (
             LIST_DEPLOYMENTS,
@@ -161,6 +166,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              name, declared capabilities, and routing weight. Requires gateway read permission.",
             NO_INPUT,
             Effect::Read,
+            Permission::gateway_read(),
         ),
         (
             GET_FALLBACK,
@@ -169,6 +175,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              permission.",
             NO_INPUT,
             Effect::Read,
+            Permission::gateway_read(),
         ),
         (
             GET_GOVERNANCE,
@@ -177,6 +184,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              policy. Requires gateway read permission.",
             NO_INPUT,
             Effect::Read,
+            Permission::gateway_read(),
         ),
         (
             GET_CAPTURE,
@@ -185,6 +193,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              Requires gateway read permission.",
             NO_INPUT,
             Effect::Read,
+            Permission::gateway_read(),
         ),
         (
             GET_CREDENTIAL,
@@ -193,6 +202,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              Requires gateway read permission.",
             NAME_INPUT,
             Effect::Read,
+            Permission::gateway_read(),
         ),
         (
             GET_DEPLOYMENT,
@@ -200,6 +210,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
             "Read one provider deployment by name. Requires gateway read permission.",
             NAME_INPUT,
             Effect::Read,
+            Permission::gateway_read(),
         ),
         (
             PUT_CREDENTIAL,
@@ -213,6 +224,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              only the redacted source. Requires gateway write permission.",
             include_str!("../../../../wyrd-spec/schemas/gateway_provider_credential_write.json"),
             Effect::Replace,
+            Permission::gateway_write(),
         ),
         (
             PUT_DEPLOYMENT,
@@ -221,6 +233,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              Requires gateway write permission.",
             include_str!("../../../../wyrd-spec/schemas/gateway_provider_deployment.json"),
             Effect::Replace,
+            Permission::gateway_write(),
         ),
         (
             PUT_FALLBACK,
@@ -228,6 +241,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
             "Replace this tenant's gateway fallback policy. Requires gateway write permission.",
             include_str!("../../../../wyrd-spec/schemas/gateway_fallback_policy.json"),
             Effect::Replace,
+            Permission::gateway_write(),
         ),
         (
             PUT_GOVERNANCE,
@@ -236,6 +250,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              Requires gateway write permission.",
             include_str!("../../../../wyrd-spec/schemas/gateway_governance_policy.json"),
             Effect::Replace,
+            Permission::gateway_write(),
         ),
         (
             PUT_CAPTURE,
@@ -244,6 +259,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              Requires gateway write permission.",
             include_str!("../../../../wyrd-spec/schemas/gateway_capture_policy_write.json"),
             Effect::Replace,
+            Permission::gateway_write(),
         ),
         (
             REVOKE_CREDENTIAL,
@@ -252,6 +268,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              returns the same revocation. Requires gateway write permission.",
             NAME_INPUT,
             Effect::Destroy,
+            Permission::gateway_write(),
         ),
         (
             DELETE_CREDENTIAL,
@@ -260,6 +277,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              Requires gateway delete permission.",
             NAME_INPUT,
             Effect::Destroy,
+            Permission::gateway_delete(),
         ),
         (
             DELETE_DEPLOYMENT,
@@ -268,6 +286,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              permission.",
             NAME_INPUT,
             Effect::Destroy,
+            Permission::gateway_delete(),
         ),
         (
             DELETE_FALLBACK,
@@ -276,6 +295,7 @@ pub(super) fn descriptors() -> Vec<Tool> {
              permission.",
             NO_INPUT,
             Effect::Destroy,
+            Permission::gateway_write(),
         ),
         (
             DELETE_GOVERNANCE,
@@ -284,18 +304,71 @@ pub(super) fn descriptors() -> Vec<Tool> {
              permission.",
             NO_INPUT,
             Effect::Destroy,
+            Permission::gateway_write(),
         ),
     ]
     .into_iter()
-    .map(|(name, title, description, schema, effect)| {
+    .map(|(name, title, description, schema, effect, permission)| {
         let Ok(schema) = serde_json::from_str::<Map<String, JsonValue>>(schema) else {
             unreachable!("every gateway tool input schema is a JSON object")
         };
-        Tool::new(name, description, Arc::new(schema))
+        let tool = Tool::new(name, description, Arc::new(schema))
             .with_title(title)
-            .annotate(effect.annotations())
+            .annotate(effect.annotations());
+        (tool, permission)
     })
     .collect()
+}
+
+/// Every gateway tool in [`TOOLS`] order, for name resolution and catalog checks.
+///
+/// # Panics
+///
+/// Panics, through [`gated`], if an embedded gateway input schema is not a
+/// JSON object, which the static literals and generated contract schemas never
+/// are.
+#[must_use]
+pub(super) fn descriptors() -> Vec<Tool> {
+    gated().into_iter().map(|(tool, _)| tool).collect()
+}
+
+/// The gateway read tools every authenticated caller may be shown.
+///
+/// # Panics
+///
+/// Panics, through [`gated`], if an embedded gateway input schema is not a
+/// JSON object, which the static literals and generated contract schemas never
+/// are.
+#[must_use]
+pub(super) fn descriptors_unscoped() -> Vec<Tool> {
+    gated()
+        .into_iter()
+        .filter(|(_, permission)| *permission == Permission::gateway_read())
+        .map(|(tool, _)| tool)
+        .collect()
+}
+
+/// The gateway write, revoke, reset, and delete tools shown to `caller`.
+///
+/// A tool is listed only when the caller's verified permissions already grant
+/// what its operation enforces, so an agent is never offered a change it
+/// cannot make.
+///
+/// # Panics
+///
+/// Panics, through [`gated`], if an embedded gateway input schema is not a
+/// JSON object, which the static literals and generated contract schemas never
+/// are.
+#[must_use]
+pub(super) fn write_descriptors(caller: &Caller) -> Vec<Tool> {
+    gated()
+        .into_iter()
+        .filter(|(_, permission)| {
+            *permission != Permission::gateway_read()
+                && caller.principal.effective_permissions.contains(permission)
+        })
+        .map(|(tool, _)| tool)
+        .collect()
 }
 
 impl WyrdMcpHandler {

@@ -1,0 +1,39 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: reply-quality
+  version: 1.0.0
+  space: default
+spec:
+  description: >-
+    Jev judges the agent's reply to the customer's question; the reply passes
+    when Jev finds it helpful with probability at least 0.5 and its tone polite.
+  implementation:
+    kind: eval
+    spec:
+      pass_gate: {kind: all_pass}
+      tasks:
+        judge:
+          kind: llm_judge
+          id: judge
+          judge_ref:
+            prompt: ./jev-judge-prompt.yaml
+            tool_names: []
+            run_config: {max_iterations: 1}
+          operator: is_object
+          expected: true
+          max_retries: 2
+        helpful:
+          kind: assertion
+          id: helpful
+          depends_on: [judge]
+          context_path: $.task.judge.parsed.answers.helpful.noul
+          operator: greater_than_or_equals
+          expected: 0.5
+        polite:
+          kind: assertion
+          id: polite
+          depends_on: [judge]
+          context_path: $.task.judge.parsed.answers.tone.choice
+          operator: equals
+          expected: polite

@@ -269,7 +269,6 @@ fn trusted_context(
             .collect::<Vec<_>>(),
         "request_id": request_id.as_str(),
         "cancelled": cancelled,
-        "trace_id": crate::http::middleware::trace_context::active()
-            .map(|context| context.trace_id),
+        "trace_id": wyrd_telemetry::continued_context().map(|context| context.trace_id),
     })
 }

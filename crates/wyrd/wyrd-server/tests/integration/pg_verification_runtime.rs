@@ -2739,8 +2739,9 @@ const JUDGE_CHAIN: [&str; 8] = [
 /// carrying the caller's `traceparent`, produces one subtree under its
 /// request span: the gateway execution of the judge's model call descends,
 /// span by span, through the gateway call, the judge, the score, and the
-/// verification execute span to the request span the caller parents. The
-/// Eval case crosses the Eval executor's per-task fan-out.
+/// verification execute span to the request span the caller parents, and its
+/// one captured attempt row sits in the caller's trace under that gateway
+/// call. The Eval case crosses the Eval executor's per-task fan-out.
 ///
 /// # Panics
 /// Panics when telemetry, the mock provider, the server, or a fixture fails
@@ -2801,6 +2802,28 @@ async fn eval_judge_gateway_call_descends_from_the_request_span() {
         .deploy_gateway_model_for_test("gpt-test", "traced_judge_invoker")
         .await
         .expect("judge model deploys");
+    let wyrd_testing::Bootstrap::User { jwt: admin, .. } = server
+        .bootstrap_user("traced-judge-admin", &["admin"])
+        .await
+        .expect("admin bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let captured = server
+        .oneshot_authenticated(
+            &admin,
+            axum::http::Request::builder()
+                .method(axum::http::Method::PUT)
+                .uri("/v1/admin/gateway/capture-policy")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "mode": "metadata", "payload_fields": [] }).to_string(),
+                ))
+                .expect("capture policy request builds"),
+        )
+        .await
+        .expect("capture policy request responds");
+    assert!(captured.status().is_success(), "{}", captured.status());
     let wyrd_testing::Bootstrap::User { jwt, .. } = server
         .bootstrap_user("traced-judge-writer", &["editor", "traced_judge_invoker"])
         .await
@@ -2842,6 +2865,18 @@ async fn eval_judge_gateway_call_descends_from_the_request_span() {
             serde_json::from_slice(&bytes).expect("execute body is JSON");
         assert_eq!(judged["verdict"], "passed", "{kind}: {judged}");
     }
+    server.flush_bifrost().await.expect("Scribe flushes");
+    let attempt_parents: Vec<String> = server
+        .retained_span_records(
+            seed.tenant(),
+            "encode(parent_span_id, 'hex')",
+            &format!("trace_id = X'{JUDGE_CALLER_TRACE}' AND scope_name = 'wyrd.gateway'"),
+        )
+        .await
+        .expect("captured attempts read")
+        .into_iter()
+        .map(|row| row.into_iter().flatten().collect())
+        .collect();
     server.shutdown().await.expect("test server shuts down");
 
     let spans: Vec<_> = traces
@@ -2883,6 +2918,18 @@ async fn eval_judge_gateway_call_descends_from_the_request_span() {
             "{kind}: {names:?} contains {JUDGE_CHAIN:?} in order"
         );
         assert_eq!(names.last(), Some(&"request"), "{kind}: {names:?}");
+        let call = chain
+            .iter()
+            .find(|span| span.name == "gateway.call")
+            .expect("the chain holds the gateway call");
+        assert_eq!(
+            attempt_parents
+                .iter()
+                .filter(|parent| **parent == call.span_id)
+                .count(),
+            1,
+            "{kind}: one captured attempt under the gateway call: {attempt_parents:?}"
+        );
     }
 }
 

@@ -54,7 +54,6 @@ use super::service::{GatewayAdministration, unavailable};
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
-use crate::http::middleware::trace_context;
 use crate::state::AppState;
 
 /// Audited operation name of every invocation decision.
@@ -488,7 +487,7 @@ impl<'a> GatewayInvocation<'a> {
         };
         // A call continuing a caller's trace parents its captured attempts on
         // this `gateway.call` span; an untraced call keeps its own trace.
-        let trace = trace_context::active().and_then(|_| wyrd_telemetry::current_context());
+        let trace = wyrd_telemetry::continued_context();
 
         let tenant = caller.data_tenant_id;
         let snapshot = GatewayAdministration::new(self.state)

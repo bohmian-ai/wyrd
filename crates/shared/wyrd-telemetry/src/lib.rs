@@ -5,7 +5,7 @@
 mod context;
 mod export;
 
-pub use context::{continue_remote, current_context, inbound_context};
+pub use context::{continue_remote, continued_context, current_context, inbound_context};
 pub use export::{TenantSpanRoute, TenantSpanSink, bind_tenant_route, set_tenant_span_sink};
 
 #[cfg(feature = "test-support")]

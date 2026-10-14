@@ -228,11 +228,11 @@ impl ServerHandler for WyrdMcpHandler {
         std::future::ready(Ok(ListToolsResult::with_all_items(catalog)))
     }
 
-    /// Dispatch tools inside the HTTP request's span and inbound trace context.
+    /// Dispatch tools inside the HTTP request's span.
     ///
-    /// The transport serves each request on a task of its own, so neither the
-    /// request span nor the context the HTTP edge made active is visible here;
-    /// both are read again from the original request, so every span a tool
+    /// The transport serves each request on a task of its own, so the request
+    /// span is not current here; it is read again from the original request,
+    /// so every span a tool
     /// opens — a `verification.execute` and the judge and gateway calls inside
     /// it — descends from the request span, which continues the agent's trace
     /// like an HTTP verification does.
@@ -245,13 +245,10 @@ impl ServerHandler for WyrdMcpHandler {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let parts = context.extensions.get::<axum::http::request::Parts>();
-        let inbound = parts.and_then(|parts| wyrd_telemetry::inbound_context(&parts.headers));
         let span = parts
             .and_then(|parts| parts.extensions.get::<trace_context::RequestSpan>())
             .map_or_else(tracing::Span::current, |span| span.0.clone());
-        trace_context::within(inbound, self.dispatch(request, context))
-            .instrument(span)
-            .await
+        self.dispatch(request, context).instrument(span).await
     }
 }
 

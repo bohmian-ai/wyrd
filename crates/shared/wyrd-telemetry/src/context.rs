@@ -5,7 +5,8 @@
 //! parses it once for every transport, [`continue_remote`] makes it the parent
 //! of the server's request span so everything the request does descends from
 //! the caller, and [`current_context`] reads back the context of whatever span
-//! is current, for work that forwards it. Deferred work never adopts a cause as
+//! is current, for work that forwards it. [`continued_context`] reads it only
+//! inside a request that continued a caller's trace. Deferred work never adopts a cause as
 //! its parent; [`crate::link_remote_span`] records it as a span link instead.
 
 use http::HeaderMap;
@@ -13,6 +14,7 @@ use opentelemetry::trace::{
     SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId, TraceState,
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+use tracing_subscriber::registry::{LookupSpan as _, Registry};
 use wyrd_spec::trace::TraceContext;
 
 /// W3C header carrying the caller's trace and parent span.
@@ -48,20 +50,64 @@ pub fn inbound_context(headers: &HeaderMap) -> Option<TraceContext> {
     TraceContext::parse_traceparent(parent, state).ok()
 }
 
+/// Extension on a request span that continued a caller's trace.
+///
+/// It lives in the `tracing` span tree, so every span opened inside the
+/// request finds it among its ancestors, including spans on tasks the
+/// request spawned inside its span.
+struct Continued;
+
 /// Make the caller's span `context` the OpenTelemetry parent of `span`.
 ///
 /// `span` then joins the caller's trace as a child of its span, and every span
 /// opened inside it descends from the caller. The parent is marked remote,
 /// which the process sampler reads to keep the operator's decision independent
-/// of the caller's flags. This must run before `span` is first entered; on a
+/// of the caller's flags, and `span` is marked as continued for
+/// [`continued_context`]. This must run before `span` is first entered; on a
 /// started or disabled span, or without an OpenTelemetry layer, it does
 /// nothing.
 pub fn continue_remote(span: &tracing::Span, context: &TraceContext) {
-    if let Some(remote) = remote_span_context(context) {
-        // A span already started keeps its own trace; continuing is
-        // best-effort observability and never fails the request.
-        let _ = span.set_parent(opentelemetry::Context::new().with_remote_span_context(remote));
+    let Some(remote) = remote_span_context(context) else {
+        return;
+    };
+    // A span already started keeps its own trace; continuing is best-effort
+    // observability and never fails the request.
+    if span
+        .set_parent(opentelemetry::Context::new().with_remote_span_context(remote))
+        .is_ok()
+    {
+        span.with_subscriber(|(id, dispatch)| {
+            if let Some(span) = dispatch
+                .downcast_ref::<Registry>()
+                .and_then(|registry| registry.span(id))
+            {
+                span.extensions_mut().insert(Continued);
+            }
+        });
     }
+}
+
+/// The current span's trace context, only inside a request that continued a
+/// caller's trace.
+///
+/// A span continues the caller's trace when it or an ancestor was passed to
+/// [`continue_remote`], whatever the caller's sampled flag. Work that names
+/// the caller's position only for a continued trace (a captured gateway
+/// attempt's parent) reads it here; elsewhere it is `None`.
+#[must_use]
+pub fn continued_context() -> Option<TraceContext> {
+    let continued = tracing::Span::current()
+        .with_subscriber(|(id, dispatch)| {
+            dispatch
+                .downcast_ref::<Registry>()
+                .and_then(|registry| registry.span(id))
+                .is_some_and(|span| {
+                    span.scope()
+                        .any(|ancestor| ancestor.extensions().get::<Continued>().is_some())
+                })
+        })
+        .unwrap_or(false);
+    continued.then(current_context).flatten()
 }
 
 /// The trace context of the current `tracing` span, when it has a valid one.
@@ -105,7 +151,11 @@ fn remote_span_context(context: &TraceContext) -> Option<SpanContext> {
 mod tests {
     use http::{HeaderMap, HeaderValue};
 
-    use super::inbound_context;
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use wyrd_spec::trace::TraceContext;
+
+    use super::{continue_remote, continued_context, inbound_context};
 
     /// A valid caller `traceparent`.
     const PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
@@ -170,5 +220,39 @@ mod tests {
         ] {
             assert!(inbound_context(&headers(&pairs)).is_none(), "{pairs:?}");
         }
+    }
+
+    /// Spans inside a continued request, at any depth and whatever the
+    /// caller's sampled flag, read the current context; spans of a request
+    /// that did not continue a caller's trace read none.
+    #[test]
+    fn only_spans_of_a_continued_request_read_a_continued_context() {
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("context")));
+        tracing::subscriber::with_default(subscriber, || {
+            for flags in ["00", "01"] {
+                let caller = TraceContext::parse_traceparent(
+                    &format!("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-{flags}"),
+                    String::new(),
+                )
+                .expect("valid traceparent");
+                let request = tracing::info_span!("request");
+                continue_remote(&request, &caller);
+                let work = tracing::info_span!(parent: &request, "work");
+                let continued =
+                    work.in_scope(|| tracing::info_span!("call").in_scope(continued_context));
+                assert_eq!(
+                    continued.map(|context| context.trace_id),
+                    Some(caller.trace_id),
+                    "flags {flags}"
+                );
+            }
+            let untraced = tracing::info_span!("request");
+            assert!(
+                untraced.in_scope(continued_context).is_none(),
+                "an uncontinued request reads no continued context"
+            );
+        });
     }
 }

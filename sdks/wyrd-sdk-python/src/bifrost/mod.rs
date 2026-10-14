@@ -35,7 +35,7 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, CompactionTypeWire, PhysicalLayoutWire, QueryParam, QueryTerminalFrame,
 };
-use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::ids::{RunId, TraceId};
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
 
 use wyrd_client::bifrost::Correlation;
@@ -777,6 +777,23 @@ impl Bifrost {
         let response =
             crate::trace::block_on(py, self.handle.cancel(&request_id)).map_err(client_error)?;
         to_python_json(py, serde_json::to_value(response))
+    }
+
+    /// Reads one trace's span tree, plus each trace linking directly to it,
+    /// as canonical span records in JSON form.
+    ///
+    /// The id is parsed before any request, so a malformed one never reaches
+    /// the server; the read itself is [`NativeBifrost::trace_timeline`].
+    ///
+    /// # Errors
+    ///
+    /// Raises `WYRD_SPEC_400_VALIDATION` for a malformed or all-zero
+    /// `trace_id`, and `WyrdError` for query, transport, or decode failures.
+    fn trace_timeline(&self, py: Python<'_>, trace_id: &str) -> WyrdPyResult<Py<PyAny>> {
+        let trace_id = TraceId::from_hex(trace_id).map_err(WyrdPyError::from)?;
+        let spans = crate::trace::block_on(py, self.handle.trace_timeline(trace_id))
+            .map_err(client_error)?;
+        to_python_json(py, serde_json::to_value(spans))
     }
 
     /// Describes one registered table's stored physical schema.

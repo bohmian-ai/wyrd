@@ -5,6 +5,7 @@ from typing import Any, Literal, Protocol, TypedDict, TypeVar, overload
 
 import pyarrow
 
+from .._card_types import SpanRecord
 from ..client import WyrdClient
 
 class DataTypeSpecVariants(TypedDict, total=False):
@@ -728,6 +729,24 @@ class Bifrost(_BifrostBase):
             WyrdError: As for ``status()``.
         """
         ...
+    def trace_timeline(self, trace_id: str) -> list[SpanRecord]:
+        """Read one trace's span tree plus each trace linking directly to it.
+
+        Spans come back deduplicated, ordered by start time, then trace id,
+        then span id. A trace no span names reads as an empty list.
+
+        Args:
+            trace_id: the 32-character lowercase hex W3C trace id.
+
+        Returns:
+            The canonical span records.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a malformed or
+                all-zero ``trace_id``, before any request; otherwise a query,
+                authorization, or transport failure.
+        """
+        ...
     def describe_table(self, namespace: str, name: str) -> TableDescription:
         """Describe the registered ``namespace.name`` table's stored schema and layout.
 
@@ -876,6 +895,19 @@ class AsyncBifrost(_BifrostBase):
             WyrdError: As for ``Bifrost.status()``.
         """
         ...
+    async def trace_timeline(self, trace_id: str) -> list[SpanRecord]:
+        """Read one trace's span tree; as ``Bifrost.trace_timeline()``.
+
+        Args:
+            trace_id: the 32-character lowercase hex W3C trace id.
+
+        Returns:
+            The canonical span records.
+
+        Raises:
+            WyrdError: As for ``Bifrost.trace_timeline()``.
+        """
+        ...
     async def describe_table(self, namespace: str, name: str) -> TableDescription:
         """Describe the registered ``namespace.name`` table's stored schema and layout.
 
@@ -910,6 +942,7 @@ __all__ = [
     "RunningQuery",
     "RunningQueryProgress",
     "SortKey",
+    "SpanRecord",
     "TableConfig",
     "TableDescription",
     "TableEntry",

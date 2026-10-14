@@ -1,0 +1,422 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SpanRecord",
+  "description": "One OTel-compliant span.",
+  "type": "object",
+  "required": [
+    "duration_ms",
+    "end_time",
+    "kind",
+    "name",
+    "resource",
+    "scope",
+    "span_id",
+    "start_time",
+    "status",
+    "trace_id"
+  ],
+  "properties": {
+    "attributes": {
+      "description": "Span attribute bag. (Proto: `Span.attributes`.)",
+      "default": {},
+      "type": "object",
+      "additionalProperties": true
+    },
+    "dropped_attributes_count": {
+      "description": "Count of span-level attributes the SDK dropped before sending.",
+      "default": 0,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "dropped_events_count": {
+      "description": "Count of span events the SDK dropped before sending.",
+      "default": 0,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "dropped_links_count": {
+      "description": "Count of span links the SDK dropped before sending.",
+      "default": 0,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "duration_ms": {
+      "description": "Query convenience field equal to `(end_time - start_time)` in milliseconds.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "end_time": {
+      "description": "Span end time. (Proto: `Span.end_time_unix_nano`.)",
+      "type": "string",
+      "format": "date-time"
+    },
+    "events": {
+      "description": "Span events. (Proto: `Span.events`.)",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SpanEvent"
+      }
+    },
+    "flags": {
+      "description": "OTel proto `Span.flags` fixed32 bitfield.",
+      "default": 0,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "kind": {
+      "description": "Span kind. (Proto: `Span.kind`.)",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SpanKind"
+        }
+      ]
+    },
+    "links": {
+      "description": "Span links. (Proto: `Span.links`.)",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SpanLink"
+      }
+    },
+    "name": {
+      "description": "Span name. Non-empty and no longer than 256 bytes.",
+      "type": "string"
+    },
+    "parent_span_id": {
+      "description": "Parent span id. `None` for root spans.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SpanId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "resource": {
+      "description": "Resource of the producer.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Resource"
+        }
+      ]
+    },
+    "scope": {
+      "description": "Instrumentation scope of the producer.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/InstrumentationScope"
+        }
+      ]
+    },
+    "span_id": {
+      "description": "8-byte span id. (Proto: `Span.span_id`.)",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SpanId"
+        }
+      ]
+    },
+    "start_time": {
+      "description": "Span start time. (Proto: `Span.start_time_unix_nano`.)",
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "description": "Span status. (Proto: `Span.status`.)",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SpanStatus"
+        }
+      ]
+    },
+    "trace_id": {
+      "description": "16-byte trace id. (Proto: `Span.trace_id`.)",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TraceId"
+        }
+      ]
+    },
+    "trace_state": {
+      "description": "W3C tracestate header. (Proto: `Span.trace_state`.)",
+      "default": "",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "InstrumentationScope": {
+      "description": "OTel-canonical instrumentation scope.\n\nFields:\n\n- `name` -- instrumentation library name, such as `wyrd-tracing` or `opentelemetry-instrumentation-requests`. - `version` -- optional library version string. - `attributes` -- rare scope-level attributes.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "attributes": {
+          "description": "Scope-level attribute bag.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": true
+        },
+        "name": {
+          "description": "Instrumentation library name.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Instrumentation library version, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Resource": {
+      "description": "OTel-canonical resource projection.\n\nFields:\n\n- `service_name` -- required OTel `service.name` semantic-convention attribute. Empty values are rejected; non-empty values are capped at 256 characters. - `service_namespace` -- optional OTel `service.namespace`. - `service_version` -- optional OTel `service.version`. - `service_instance_id` -- optional OTel `service.instance.id`. - `attributes` -- every other OTel resource attribute the producer emitted, such as `host.name`, `k8s.pod.uid`, `telemetry.sdk.name`, or `process.pid`.",
+      "type": "object",
+      "required": [
+        "service_name"
+      ],
+      "properties": {
+        "attributes": {
+          "description": "Remaining OTel resource attributes, such as `host.*`, `k8s.*`, and `cloud.*`.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": true
+        },
+        "service_instance_id": {
+          "description": "`service.instance.id`, when emitted by the producer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service_name": {
+          "description": "`service.name`, required by OTel semantic conventions.",
+          "type": "string"
+        },
+        "service_namespace": {
+          "description": "`service.namespace`, when emitted by the producer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service_version": {
+          "description": "`service.version`, when emitted by the producer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "SpanEvent": {
+      "description": "OTel-canonical span event.\n\nFields:\n\n- `timestamp` — wall-clock time the event occurred. Must lie within the span's `[start_time, end_time]` window; that check is enforced by [`crate::vala::trace::SpanRecord::validate`], not here, because the event itself has no knowledge of its parent span. - `name` — event name. Free-form but non-empty; OTel conventions suggest namespaced names (`exception`, `log`, `gen_ai.evaluation.result`). - `attributes` — typed key/value bag stored as flat JSON. Use the constants in [`crate::vala::trace::attributes`] for known keys. - `dropped_attributes_count` — count of attributes the SDK dropped before sending (OTel default 0 means \"none dropped\"). Carried for parity with the OTLP proto.",
+      "type": "object",
+      "required": [
+        "name",
+        "timestamp"
+      ],
+      "properties": {
+        "attributes": {
+          "description": "Event attribute bag.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": true
+        },
+        "dropped_attributes_count": {
+          "description": "Count of attributes the SDK dropped before sending.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "name": {
+          "description": "Event name; non-empty.",
+          "type": "string"
+        },
+        "timestamp": {
+          "description": "Wall-clock time the event occurred.",
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SpanId": {
+      "type": "string",
+      "maxLength": 16,
+      "minLength": 16,
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "SpanKind": {
+      "description": "OTel canonical span kind. (Proto: `Span.SpanKind`.)",
+      "oneOf": [
+        {
+          "description": "Default internal operation inside the service.",
+          "type": "string",
+          "enum": [
+            "internal"
+          ]
+        },
+        {
+          "description": "Inbound RPC or HTTP handler.",
+          "type": "string",
+          "enum": [
+            "server"
+          ]
+        },
+        {
+          "description": "Outbound RPC or HTTP call.",
+          "type": "string",
+          "enum": [
+            "client"
+          ]
+        },
+        {
+          "description": "Asynchronous message producer.",
+          "type": "string",
+          "enum": [
+            "producer"
+          ]
+        },
+        {
+          "description": "Asynchronous message consumer.",
+          "type": "string",
+          "enum": [
+            "consumer"
+          ]
+        }
+      ]
+    },
+    "SpanLink": {
+      "description": "OTel-canonical span link.\n\nFields:\n\n- `trace_id` / `span_id` — linked span identity. Both are typed (commit 02); the wire shape is hex strings. - `trace_state` — W3C TraceContext `tracestate` of the linked span (vendor list, comma-separated). Defaults to empty. - `flags` — full OTel proto `Link.flags` fixed32 bitfield. The low byte carries W3C trace flags (bit 0 = `sampled`); the upper bits are reserved by the OTel spec for SDK-internal signaling. Stored as `u32` so we don't truncate non-W3C bits at the contract layer. - `attributes` — typed key/value bag, same shape as [`super::SpanEvent::attributes`]. - `dropped_attributes_count` — count of attributes the SDK dropped before sending.",
+      "type": "object",
+      "required": [
+        "span_id",
+        "trace_id"
+      ],
+      "properties": {
+        "attributes": {
+          "description": "Link attribute bag.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": true
+        },
+        "dropped_attributes_count": {
+          "description": "Count of attributes the SDK dropped before sending.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "flags": {
+          "description": "OTel proto `Link.flags` fixed32 bitfield. Bit 0 = `sampled`; upper bits reserved.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "span_id": {
+          "description": "Linked span id.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SpanId"
+            }
+          ]
+        },
+        "trace_id": {
+          "description": "Linked trace id.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TraceId"
+            }
+          ]
+        },
+        "trace_state": {
+          "description": "W3C tracestate header value for the linked span.",
+          "default": "",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SpanStatus": {
+      "description": "OTel canonical span status. (Proto: `Span.Status`.)",
+      "oneOf": [
+        {
+          "description": "No status set; OTel default.",
+          "type": "object",
+          "required": [
+            "code"
+          ],
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "unset"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Operation completed successfully.",
+          "type": "object",
+          "required": [
+            "code"
+          ],
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "ok"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Operation failed with an optional human-readable description.",
+          "type": "object",
+          "required": [
+            "code"
+          ],
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "error"
+              ]
+            },
+            "description": {
+              "description": "Optional status description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TraceId": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 32,
+      "pattern": "^[0-9a-f]{32}$"
+    }
+  }
+}

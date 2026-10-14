@@ -269,6 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<CreateOperatorConnectionRequest>(out, "create_operator_connection_request")?;
     write::<UpdateOperatorConnectionRequest>(out, "update_operator_connection_request")?;
     write::<OperatorConnectionView>(out, "operator_connection_view")?;
+    write::<SpanRecord>(out, "span_record")?;
     let eval_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/eval/schemas");
     fs::create_dir_all(eval_fixtures)?;
     write_fixture::<EvalSpec>(eval_fixtures, "eval_spec")?;

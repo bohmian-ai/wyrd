@@ -41,7 +41,7 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryParam};
 use wyrd_spec::vala::api::{CompactionTypeWire, PhysicalLayoutWire};
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::ids::{RunId, TraceId};
 use wyrd_types::TimestampKind;
 
 /// JavaScript query request projected onto the pure Wyrd contract.
@@ -1122,6 +1122,36 @@ impl NativeBifrost {
                 ),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
+        })
+    }
+
+    /// Reads one trace's span tree, plus each trace linking directly to it,
+    /// as canonical span records.
+    ///
+    /// The id is parsed before any request, so a malformed one never reaches
+    /// the server; the read itself is `Bifrost::trace_timeline`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the spans cannot be projected; an
+    /// invalid id and query or transport failures are returned in
+    /// [`NativeLifecycleResult`].
+    #[napi]
+    pub fn trace_timeline<'env>(
+        &self,
+        env: &'env Env,
+        trace_id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            let spans = match TraceId::from_hex(&trace_id) {
+                Ok(trace_id) => client
+                    .trace_timeline(trace_id)
+                    .await
+                    .map_err(|error| WyrdError::from(&error)),
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(spans)
         })
     }
 

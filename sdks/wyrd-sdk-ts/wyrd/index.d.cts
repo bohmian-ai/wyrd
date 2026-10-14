@@ -170,6 +170,20 @@ export declare class NativeBifrost {
    */
   cancel(requestId: string): Promise<NativeLifecycleResult>
   /**
+   * Reads one trace's span tree, plus each trace linking directly to it,
+   * as canonical span records.
+   *
+   * The id is parsed before any request, so a malformed one never reaches
+   * the server; the read itself is `Bifrost::trace_timeline`.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the spans cannot be projected; an
+   * invalid id and query or transport failures are returned in
+   * [`NativeLifecycleResult`].
+   */
+  traceTimeline(traceId: string): Promise<NativeLifecycleResult>
+  /**
    * Describes one registered table's stored physical schema.
    *
    * The description is the server's own projection: the user fields a caller

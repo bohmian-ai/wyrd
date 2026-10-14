@@ -12,6 +12,7 @@ from typing import Any, Protocol, TypedDict, TypeVar, cast, overload
 import pyarrow
 
 from .. import _wyrd as _native
+from .._card_types import SpanRecord, span_record_from_wire
 from ..client import WyrdClient
 from ..types import TIMESTAMP_TYPES, TimestampLTZ, TimestampNTZ, TimestampTZ
 
@@ -789,6 +790,21 @@ class Bifrost(_BifrostBase):
 
         return cast("CancelRunningQueryResult", self._native.cancel(request_id))
 
+    def trace_timeline(self, trace_id: str) -> list[SpanRecord]:
+        """Read one trace's span tree plus each trace linking directly to it.
+
+        Spans come back deduplicated, ordered by start time, then trace id,
+        then span id. A trace no span names reads as an empty list.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a malformed or
+                all-zero ``trace_id``, before any request; otherwise a query,
+                authorization, or transport failure.
+
+        """
+
+        return [span_record_from_wire(span) for span in self._native.trace_timeline(trace_id)]
+
     def describe_table(self, namespace: str, name: str) -> TableDescription:
         """Describe the registered ``namespace.name`` table's stored schema and layout.
 
@@ -914,6 +930,12 @@ class AsyncBifrost(_BifrostBase):
             "CancelRunningQueryResult",
             await asyncio.to_thread(self._native.cancel, request_id),
         )
+
+    async def trace_timeline(self, trace_id: str) -> list[SpanRecord]:
+        """Read one trace's span tree; as ``Bifrost.trace_timeline()``."""
+
+        spans = await asyncio.to_thread(self._native.trace_timeline, trace_id)
+        return [span_record_from_wire(span) for span in spans]
 
     async def describe_table(self, namespace: str, name: str) -> TableDescription:
         """Describe the registered ``namespace.name`` table; as ``Bifrost.describe_table()``."""
@@ -1162,6 +1184,7 @@ __all__ = [
     "RunningQuery",
     "RunningQueryProgress",
     "SortKey",
+    "SpanRecord",
     "TableConfig",
     "TableDescription",
     "TableEntry",

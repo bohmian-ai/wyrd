@@ -12,6 +12,7 @@ import type {
   RegisteredServiceCard,
   RegisteredVerifierCard,
   RegisteredWorkflowCard,
+  SpanRecord,
 } from "./card-types.js";
 
 import type { NativeBifrostQueryStream, NativeLifecycleResult, NativeQueryStep } from "../index.cjs";
@@ -219,6 +220,7 @@ export type {
   RegisteredWorkflowCard,
   Relationships as CardRelationships,
   ServiceSpec,
+  SpanRecord,
   Status as CardStatus,
   TriggerSpec,
   TypedCardKind,
@@ -1322,6 +1324,22 @@ export class Bifrost {
       requestId: wire.request_id,
       cancellationStarted: wire.cancellation_started,
     };
+  }
+
+  /**
+   * Read one trace's span tree plus each trace linking directly to it.
+   *
+   * Spans come back deduplicated, ordered by start time, then trace id, then
+   * span id. A trace no span names reads as an empty array.
+   *
+   * @param traceId - The 32-character lowercase hex W3C trace id.
+   * @returns The canonical span records.
+   * @throws {@link WyrdError} `WYRD_SPEC_400_VALIDATION` for a malformed or
+   * all-zero id, before any request; otherwise a query, authorization, or
+   * transport failure.
+   */
+  async traceTimeline(traceId: string): Promise<SpanRecord[]> {
+    return lifecycleValue<SpanRecord[]>(await this.#native.traceTimeline(traceId));
   }
 
   /**

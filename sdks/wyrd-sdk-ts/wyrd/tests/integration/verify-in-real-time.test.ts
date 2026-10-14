@@ -4,11 +4,11 @@ import { join } from "node:path";
 
 import { expect, vi } from "vitest";
 
-import { Bifrost, Cards, WyrdClient, WyrdState } from "wyrd-ai";
+import { Bifrost, Cards, Gateway, WyrdClient, WyrdState } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { configureGateway } from "../support/local-development.js";
-import { type RegisteredRef, fixture, registered, serverTest } from "../support/server.js";
+import { type RegisteredRef, columnValues, fixture, registered, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 120_000 });
 
@@ -64,6 +64,7 @@ const test = serverTest({ provider: () => ({ status: 200, body: JUDGE_PASSES }),
   assistant: [
     async ({ server: _ }, use) => {
       await configureGateway(WyrdClient.connect());
+      await Gateway.connect().putCapturePolicy({ mode: "metadata", payload_fields: [] });
       const cards = Cards.connect();
       await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
       await cards.registerFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
@@ -153,6 +154,22 @@ test("judged answer passes the llm judge", async ({ provider, state }) => {
   const [graded] = await provider.requests(1);
   expect(graded?.path).toBe("/v1/chat/completions");
   expect(graded?.body).toContain("Grade the answer yes.");
+});
+
+test("judge call is attributed to the run and card", async ({ server, state }) => {
+  const run = state.run("agent");
+
+  const judgment = await run.observe.verify("answer-graded", { answer: "yes" });
+  server.flushBifrost();
+
+  const calls = (
+    await (
+      await Bifrost.connect()
+    ).sql("SELECT caller_principal_id, card_uid FROM vala.gateway.calls WHERE run_id = $1", [run.runId])
+  ).toArrow();
+  const issued = await cli.issueKey({ kind: "Service", name: "assistant", version: "1.0.0", space: "default" });
+  expect(columnValues(calls.getChild("caller_principal_id"))).toEqual([issued.principal_id]);
+  expect(columnValues(calls.getChild("card_uid"))).toEqual([judgment.subject.uid]);
 });
 
 test("model latency like the baseline passes its verifier", async ({ server, assistant, state }) => {

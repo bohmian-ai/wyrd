@@ -17,9 +17,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::cards::{CardKind, CardSelector, RegistrationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::gateway::{
-    GatewayOperation, ModelId, ModelRef, ProviderAdapter, ProviderAuth, ProviderCredentialName,
-    ProviderCredentialWrite, ProviderCredentialWriteSource, ProviderDeployment,
-    ProviderDeploymentName, ProviderId,
+    GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation, ModelId, ModelRef,
+    ProviderAdapter, ProviderAuth, ProviderCredentialName, ProviderCredentialWrite,
+    ProviderCredentialWriteSource, ProviderDeployment, ProviderDeploymentName, ProviderId,
 };
 use wyrd_ai::operator_connections::SecretBearer;
 use wyrd_ai::{Gateway, Workflow, WorkflowRunStatus, WyrdClient};
@@ -27,7 +27,7 @@ use wyrd_testing::server::WyrdTestServer;
 
 use wyrd_ai::state::WyrdState;
 
-use crate::support::{Deployment, hydrate, register};
+use crate::support::{Deployment, hydrate, register, registered};
 
 /// The provider key the operator submits; only the upstream may see it.
 const PROVIDER_KEY: &str = "sk-native-upstream";
@@ -65,7 +65,7 @@ struct Inference {
 impl Inference {
     /// Start the upstream and the server, write the `openai-key` credential
     /// with the CLI as the administrator, deploy `gpt-4o` and `gpt-5-5` on
-    /// it, and register `ask`.
+    /// it, capture call metadata, and register `ask`.
     ///
     /// # Panics
     /// Panics when a setup step fails.
@@ -113,6 +113,13 @@ impl Inference {
                 .await
                 .expect("deployment puts");
         }
+        gateway
+            .put_capture_policy(&GatewayCapturePolicyWrite {
+                mode: GatewayCaptureMode::Metadata,
+                payload_fields: BTreeSet::new(),
+            })
+            .await
+            .expect("the capture policy puts");
         let ask = register(&deployment.cards(), "cards/gateway_inference/ask.yaml").await;
         Self {
             deployment,
@@ -148,8 +155,30 @@ impl Inference {
     /// # Panics
     /// Panics when no token mints or the Gateway does not answer with JSON.
     async fn ask_openai(&self, client: &WyrdClient) -> (u16, Value) {
+        self.ask_openai_with(client, &[]).await
+    }
+
+    /// [`Self::ask_openai`], sending `traceparent` with [`CALLER_STATE`] as
+    /// the caller's W3C trace context, the way an instrumented HTTP client
+    /// does.
+    ///
+    /// # Panics
+    /// Panics when no token mints or the Gateway does not answer with JSON.
+    async fn ask_openai_traced(&self, client: &WyrdClient, traceparent: &str) -> (u16, Value) {
+        self.ask_openai_with(
+            client,
+            &[("traceparent", traceparent), ("tracestate", CALLER_STATE)],
+        )
+        .await
+    }
+
+    /// [`Self::ask_openai`], sending each of `headers` with the request.
+    ///
+    /// # Panics
+    /// Panics when no token mints or the Gateway does not answer with JSON.
+    async fn ask_openai_with(&self, client: &WyrdClient, headers: &[(&str, &str)]) -> (u16, Value) {
         let token = client.access_token().await.expect("access token mints");
-        let response = reqwest::Client::new()
+        let mut request = reqwest::Client::new()
             .post(format!(
                 "{}/v1/chat/completions",
                 self.deployment
@@ -157,7 +186,11 @@ impl Inference {
                     .base_url()
                     .expect("bound server has a URL")
             ))
-            .bearer_auth(token.expose())
+            .bearer_auth(token.expose());
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = request
             .json(&json!({
                 "model": "openai/gpt-4o",
                 "max_completion_tokens": 16,
@@ -169,6 +202,47 @@ impl Inference {
         let status = response.status().as_u16();
         (status, response.json().await.expect("the reply is JSON"))
     }
+}
+
+/// The trace identity of a caller's W3C `traceparent`.
+const CALLER_TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+/// The caller's span identity within [`CALLER_TRACE`].
+const CALLER_SPAN: &str = "00f067aa0ba902b7";
+/// The vendor trace state the caller sends with its `traceparent`.
+const CALLER_STATE: &str = "wyrd=journey";
+
+/// One gateway span's trace identity and parent, as hex.
+#[derive(Debug, PartialEq, serde::Deserialize)]
+struct GatewaySpan {
+    /// The span's trace identity.
+    trace_id: String,
+    /// The span's parent span identity; `None` for a root span.
+    parent_span_id: Option<String>,
+    /// The vendor trace state.
+    trace_state: String,
+}
+
+/// Publish every captured row, then read the gateway's model-call spans.
+///
+/// # Panics
+/// Panics when the flush or the read fails.
+async fn gateway_spans(deployment: &Deployment) -> Vec<GatewaySpan> {
+    deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+    wyrd_ai::Bifrost::connect(&deployment.admin())
+        .await
+        .expect("Bifrost connects")
+        .sql_as(
+            "SELECT encode(trace_id, 'hex') AS trace_id, \
+                    encode(parent_span_id, 'hex') AS parent_span_id, trace_state \
+               FROM vala.traces.spans WHERE scope_name = 'wyrd.gateway'",
+            &[],
+        )
+        .await
+        .expect("gateway spans read back")
 }
 
 /// Write the managed provider credential `name` holding `secret` with the
@@ -234,6 +308,144 @@ async fn openai_client_calls_the_gateway_with_an_access_token() {
             "the access token reached upstream in {name}"
         );
     }
+    inference.deployment.shutdown().await;
+}
+
+/// A caller's `traceparent` makes the gateway's model-call span a child of
+/// the caller's span, so the application span and the call share one trace.
+///
+/// # Panics
+/// Panics when the call, flush, or read fails or the span is not the
+/// caller's child.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn gateway_span_joins_the_callers_trace() {
+    let inference = Inference::start().await;
+
+    let (status, reply) = inference
+        .ask_openai_traced(
+            &inference.deployment.admin(),
+            &format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01"),
+        )
+        .await;
+
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        gateway_spans(&inference.deployment).await,
+        [GatewaySpan {
+            trace_id: CALLER_TRACE.to_owned(),
+            parent_span_id: Some(CALLER_SPAN.to_owned()),
+            trace_state: CALLER_STATE.to_owned(),
+        }]
+    );
+    inference.deployment.shutdown().await;
+}
+
+/// A malformed `traceparent` is ignored: the call succeeds and its span
+/// starts a trace of its own.
+///
+/// # Panics
+/// Panics when the call, flush, or read fails or the span joined a trace.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn malformed_traceparent_is_ignored_by_the_gateway() {
+    let inference = Inference::start().await;
+
+    let (status, reply) = inference
+        .ask_openai_traced(
+            &inference.deployment.admin(),
+            &format!("00-{CALLER_TRACE}-{CALLER_SPAN}-zz"),
+        )
+        .await;
+
+    assert_eq!(status, 200, "{reply}");
+    let spans = gateway_spans(&inference.deployment).await;
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert_ne!(spans[0].trace_id, CALLER_TRACE);
+    assert_eq!(spans[0].parent_span_id, None);
+    inference.deployment.shutdown().await;
+}
+
+/// One `vala.gateway.calls` row's requesting principal and attribution.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+struct CallAttribution {
+    /// The principal that made the call.
+    caller_principal_id: String,
+    /// The application Run the call is attributed to.
+    run_id: Option<String>,
+    /// The Card UID the call is attributed to.
+    card_uid: Option<String>,
+}
+
+/// Every call records its principal plus whichever of `wyrd-run-id` and
+/// `wyrd-card-uid` it carried: neither, the Card alone, the Run alone, or
+/// both, each absent one as null. The caller holds `ask-agent`'s own
+/// card-scoped key, whose scope admits that Card.
+///
+/// # Panics
+/// Panics when a call, flush, or read fails or a row's attribution differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn gateway_call_records_whichever_attribution_it_carries() {
+    let inference = Inference::start().await;
+    let agent = registered(&inference.ask, "ask-agent");
+    let issued = cli::issue_key(
+        "Agent",
+        "ask-agent",
+        "1.0.0",
+        "default",
+        None,
+        None,
+        Some(inference.deployment.admin()),
+    )
+    .await
+    .expect("the CLI issues the agent's key");
+    let id = issued.principal_id;
+    let caller = inference.deployment.client(issued.key.expose());
+    let card = agent.uid.expect("a registered Card has a UID").to_string();
+
+    for headers in [
+        vec![],
+        vec![("wyrd-card-uid", card.as_str())],
+        vec![("wyrd-run-id", "run-alone")],
+        vec![
+            ("wyrd-run-id", "run-with-card"),
+            ("wyrd-card-uid", card.as_str()),
+        ],
+    ] {
+        let (status, reply) = inference.ask_openai_with(&caller, &headers).await;
+        assert_eq!(status, 200, "{headers:?}: {reply}");
+    }
+
+    inference
+        .deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+    let mut calls: Vec<CallAttribution> = wyrd_ai::Bifrost::connect(&inference.deployment.admin())
+        .await
+        .expect("Bifrost connects")
+        .sql_as(
+            "SELECT caller_principal_id, run_id, card_uid FROM vala.gateway.calls",
+            &[],
+        )
+        .await
+        .expect("calls read back");
+    calls.sort();
+    let call = |run_id: Option<&str>, card_uid: Option<&str>| CallAttribution {
+        caller_principal_id: id.to_string(),
+        run_id: run_id.map(str::to_owned),
+        card_uid: card_uid.map(str::to_owned),
+    };
+    let mut expected = vec![
+        call(None, None),
+        call(None, Some(&card)),
+        call(Some("run-alone"), None),
+        call(Some("run-with-card"), Some(&card)),
+    ];
+    expected.sort();
+    assert_eq!(calls, expected);
     inference.deployment.shutdown().await;
 }
 

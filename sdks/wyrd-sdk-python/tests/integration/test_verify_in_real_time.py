@@ -12,10 +12,11 @@ from wyrd import WyrdError
 from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
+from wyrd.gateway import Gateway
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer
+from wyrd.testing import WyrdTestServer, cli
 
-from .support import Count, Receiver, hydrated, register
+from .support import Count, Receiver, client_of, hydrated, register
 
 pytestmark = pytest.mark.integration
 
@@ -70,6 +71,26 @@ def test_judged_answer_passes_the_llm_judge(assistant: WyrdState, receiver: Rece
     judgment = assistant.run("agent").observe.verify("answer-is-judged", {"answer": "yes"})
     assert judgment.verdict == "passed"
     assert len(receiver.to("/v1/chat/completions")) == asked + 1
+
+
+def test_judge_call_is_attributed_to_the_run_and_card(
+    assistant: WyrdState, wyrd_server: WyrdTestServer, bifrost: Bifrost
+) -> None:
+    Gateway(client_of(wyrd_server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
+    run = assistant.run("agent")
+    judgment = run.observe.verify("answer-graded", {"answer": "yes"})
+    wyrd_server.flush_bifrost()
+
+    calls = bifrost.sql(
+        "SELECT caller_principal_id, card_uid FROM vala.gateway.calls WHERE run_id = $1",
+        [run.run_id],
+    ).to_arrow()
+    principal = cli.issue_key(
+        kind="Service", name="assistant", version="1.0.0", space="default"
+    ).principal_id
+    assert calls.to_pylist() == [
+        {"caller_principal_id": principal, "card_uid": str(judgment.subject.uid)}
+    ]
 
 
 def test_model_latency_like_the_baseline_passes_its_verifier(assistant: WyrdState) -> None:

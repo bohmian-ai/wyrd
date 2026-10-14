@@ -39,6 +39,7 @@ use wyrd_spec::gateway::{
 };
 use wyrd_spec::ids::{CardUid, ProviderDeploymentName};
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::trace::TraceContext;
 use wyrd_spec::vala::api::AuditOutcome;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::RunId;
@@ -53,6 +54,7 @@ use super::service::{GatewayAdministration, unavailable};
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
+use crate::http::middleware::trace_context;
 use crate::state::AppState;
 
 /// Audited operation name of every invocation decision.
@@ -91,21 +93,44 @@ pub struct GatewayCallRequest {
     pub timeout: Duration,
     /// Application Run and Card the call is attributed to; `None` records an
     /// uncorrelated call.
-    pub subject: Option<GatewayCallSubject>,
+    pub subject: Option<GatewayCallAttribution>,
 }
 
-/// Application Run and Card one governed call is attributed to.
+/// How a governed call's Run and Card attribution reached the gateway.
 ///
-/// Ingress builds it from the paired `wyrd-run-id` and `wyrd-card-uid`
-/// headers. Admission authorizes the UID against the caller before any
-/// provider sees the call, and the captured `vala.gateway.calls` row records
-/// the authorized UID.
+/// The provenance decides whether admission must authorize the Card: a
+/// caller's assertion is checked against its Card attribution scope, while a
+/// server-derived attribution names a Card the originating operation already
+/// resolved and authorized.
+#[derive(Debug, Clone)]
+pub enum GatewayCallAttribution {
+    /// Asserted by the caller through the `wyrd-run-id` and `wyrd-card-uid`
+    /// headers; admission authorizes the Card against the caller.
+    Requested(GatewayCallSubject),
+    /// Derived by the server from an operation that already resolved the
+    /// Card in the caller's tenant, such as the subject and optional Run of a
+    /// direct verification whose judge calls a model. Admission records it
+    /// as is.
+    Resolved(GatewayCallSubject),
+}
+
+/// Application Run and Card one governed call is attributed to, each
+/// independently optional.
+///
+/// Ingress builds it from the independent `wyrd-run-id` and `wyrd-card-uid`
+/// headers; a Verifier execution builds it from its subject Card and the Run
+/// it executes for, if any. Admission authorizes a requested UID against the
+/// caller before any provider sees the call, and the captured
+/// `vala.gateway.calls` row records whichever is present, an absent one as
+/// null.
 #[derive(Debug, Clone)]
 pub struct GatewayCallSubject {
-    /// Application Run the call belongs to.
-    pub run_id: RunId,
-    /// UID of the Card the call is attributed to.
-    pub card_uid: CardUid,
+    /// Application Run the call belongs to; `None` when the originating
+    /// request carried no Run.
+    pub run_id: Option<RunId>,
+    /// UID of the Card the call is attributed to; `None` when the
+    /// originating request named no Card.
+    pub card_uid: Option<CardUid>,
 }
 
 /// Provider answer of a governed call: a completion, or the refusal that
@@ -201,6 +226,9 @@ struct AdmittedCall {
     requested: ModelRef,
     /// Authorized Run and Card attribution, carrying the Card's UID.
     subject: Option<GatewayCallSubject>,
+    /// Caller trace context active when the call was admitted; the call's
+    /// spans join that trace as children of its span.
+    trace: Option<TraceContext>,
 }
 
 impl AdmittedCall {
@@ -452,9 +480,13 @@ impl<'a> GatewayInvocation<'a> {
                 .map_err(permission_deny_reason_to_wyrd)?;
         }
         let subject = match request.subject.take() {
-            Some(subject) => Some(self.attribute(caller, subject).await?),
+            Some(GatewayCallAttribution::Requested(subject)) => {
+                Some(self.attribute(caller, subject).await?)
+            }
+            Some(GatewayCallAttribution::Resolved(subject)) => Some(subject),
             None => None,
         };
+        let trace = trace_context::active();
 
         let tenant = caller.data_tenant_id;
         let snapshot = GatewayAdministration::new(self.state)
@@ -478,6 +510,7 @@ impl<'a> GatewayInvocation<'a> {
             deadline: Instant::now() + request.timeout,
             requested: request.model,
             subject,
+            trace,
         };
         let admission = self.admit(&call, &mut plan).await?;
         Ok((call, plan, admission))
@@ -686,7 +719,8 @@ impl<'a> GatewayInvocation<'a> {
         verdict
     }
 
-    /// Authorizes the Card UID `subject` attributes a call to.
+    /// Authorizes the Card UID `subject` attributes a call to, when it names
+    /// one; a Run alone needs no authorization.
     ///
     /// A Card-bound caller attributes only to a UID its signed scope carries;
     /// a caller bound to no Card may attribute to any registered
@@ -702,10 +736,13 @@ impl<'a> GatewayInvocation<'a> {
         caller: &Caller,
         subject: GatewayCallSubject,
     ) -> Result<GatewayCallSubject, WyrdError> {
+        let Some(card_uid) = &subject.card_uid else {
+            return Ok(subject);
+        };
         let authorized = match caller.principal.card_attribution() {
-            CardAttribution::Scoped(scope) => scope.uids().contains(&subject.card_uid),
+            CardAttribution::Scoped(scope) => scope.uids().contains(card_uid),
             CardAttribution::AnyRegistered => {
-                self.is_observation_target(caller.data_tenant_id, &subject.card_uid)
+                self.is_observation_target(caller.data_tenant_id, card_uid)
                     .await?
             }
         };
@@ -867,6 +904,7 @@ impl<'a> GatewayInvocation<'a> {
             entries: entries.map(<[_]>::to_vec).unwrap_or_default(),
             policy: policy.clone(),
             subject: call.subject.clone(),
+            trace: call.trace.clone(),
             request: None,
             response,
             objects,

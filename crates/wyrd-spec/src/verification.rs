@@ -366,8 +366,10 @@ pub struct VerificationRunStatus {
     pub run_id: VerificationRunId,
     /// Execution state.
     pub status: VerificationExecutionStatus,
-    /// Authenticated caller of a manual run; null for scheduled and
-    /// observation-created runs.
+    /// The principal the run was requested by and executes as: the
+    /// authenticated caller of a manual run, the writer of an observation
+    /// run's record, or the tenant SYSTEM principal of a scheduled run; null
+    /// only for a run created before every origin recorded one.
     pub requested_by_principal_id: Option<PrincipalId>,
     /// Canonical result of a completed run.
     pub result_id: Option<VerificationResultId>,

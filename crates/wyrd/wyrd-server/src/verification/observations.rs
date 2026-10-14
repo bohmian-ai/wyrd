@@ -118,8 +118,8 @@ impl ObservationEnqueue {
 impl ObservationAck for ObservationEnqueue {
     /// Decodes the acknowledged frame's records, keyed by the `card_uid`
     /// Scribe authorized and stored, and stages one run request per record,
-    /// tagged with the Card `auth`'s principal is bound to as its writer,
-    /// without waiting.
+    /// tagged with `auth`'s principal as its requester and the Card that
+    /// principal is bound to as its writer, without waiting.
     ///
     /// A writer bound to no Card is staged without a writer, so its records
     /// activate every matching binding of their subject. A frame that does
@@ -135,6 +135,7 @@ impl ObservationAck for ObservationEnqueue {
                         ObservationRecord {
                             subject: key.card_uid,
                             writer: writer.clone(),
+                            principal: auth.principal.id,
                             record_id: key.record_id,
                             event_time: key.created_at,
                         },

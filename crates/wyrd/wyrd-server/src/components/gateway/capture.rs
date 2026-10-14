@@ -37,7 +37,10 @@ use wyrd_spec::gateway::{
     GatewayCallOutcome, GatewayCallPayloadV1, GatewayCaptureMode, GatewayCapturePolicy,
     GatewayOperation, GatewayPayloadField, GatewayPayloadObjectRefV1, ModelRef,
 };
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::trace::TraceContext;
+use wyrd_spec::vala::ids::RunId;
 use wyrd_storage::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 use wyrd_tonic::otlp::common::v1::any_value::Value as AnyValueKind;
@@ -147,6 +150,8 @@ pub(crate) struct CallFacts {
     pub(crate) policy: GatewayCapturePolicy,
     /// Authorized Run and Card attribution, its Card carrying the UID.
     pub(crate) subject: Option<GatewayCallSubject>,
+    /// Caller trace context the call was admitted under, if any.
+    pub(crate) trace: Option<TraceContext>,
     /// Unredacted request content, present only when the policy selects it.
     pub(crate) request: Option<Value>,
     /// Response content, present only when the policy selects it: a
@@ -177,6 +182,8 @@ pub struct CallCapture {
     request_id: RequestId,
     /// Authorized Run and Card the row is correlated to.
     subject: Option<GatewayCallSubject>,
+    /// Caller trace context the attempt spans join, if any.
+    trace: Option<TraceContext>,
 }
 
 impl CallCapture {
@@ -270,6 +277,7 @@ impl CallCapture {
             spans,
             request_id: facts.request_id,
             subject: facts.subject,
+            trace: facts.trace,
         })
     }
 
@@ -277,8 +285,9 @@ impl CallCapture {
     /// fields followed by its `card_uid` and `run_id` correlation inputs.
     ///
     /// The correlation inputs carry the authorized subject's Card UID, which
-    /// Scribe confirms against the frame's attributed UIDs, or are null for an
-    /// uncorrelated call.
+    /// Scribe confirms against the frame's attributed UIDs, and its Run, each
+    /// null when the subject names none; both are null for an uncorrelated
+    /// call.
     ///
     /// The scalar columns decode from the serialized payload; the
     /// `request_payload` and `response_payload` Variant columns encode the
@@ -327,16 +336,24 @@ impl CallCapture {
         if let Some(subject) = &self.subject {
             let user = columns.len() - 2;
             columns.truncate(user);
-            columns.push(Arc::new(StringArray::from(vec![subject.card_uid.as_str()])));
-            columns.push(Arc::new(StringArray::from(vec![subject.run_id.as_str()])));
+            columns.push(Arc::new(StringArray::from(vec![
+                subject.card_uid.as_ref().map(CardUid::as_str),
+            ])));
+            columns.push(Arc::new(StringArray::from(vec![
+                subject.run_id.as_ref().map(RunId::as_str),
+            ])));
         }
         RecordBatch::try_new(schema, columns).map_err(|_| CaptureDrop::Projection)
     }
 
     /// Builds the canonical `vala.traces.spans` batch of the attempt spans.
     ///
-    /// Every span shares the call's trace id, so they link to each other and
-    /// to the row by `gateway_call_id`. Each carries exactly the
+    /// Every span shares one trace, so they link to each other and to the row
+    /// by `gateway_call_id`: the caller's trace, each span a child of the
+    /// caller's span carrying its trace state, when the call was admitted
+    /// under a caller trace context, and otherwise a trace whose id is the
+    /// call id. Span ids derive from the call id and attempt ordinal, so they
+    /// stay distinct when many calls share a caller's trace. Each carries exactly the
     /// [`GatewayAttemptSpanFieldsV1`] attributes, nulls omitted, plus the
     /// standard GenAI operation, provider, and request-model attributes.
     /// Returns `None` for a call with no attempt.
@@ -349,13 +366,22 @@ impl CallCapture {
         if self.spans.is_empty() {
             return Ok(None);
         }
-        let trace_id = self.payload.call_id.as_uuid().as_bytes().to_vec();
+        let call_id = *self.payload.call_id.as_uuid().as_bytes();
+        let parent = self.trace.as_ref().map(caller_parent).transpose()?;
         let operation = gen_ai_operation(self.operation);
         let spans = self
             .spans
             .iter()
-            .map(|fields| otlp_span(&trace_id, operation, fields))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|fields| {
+                let mut span = otlp_span(&call_id, operation, fields)?;
+                if let Some((trace_id, span_id, state)) = &parent {
+                    span.trace_id = trace_id.to_vec();
+                    span.parent_span_id = span_id.to_vec();
+                    span.trace_state.clone_from(state);
+                }
+                Ok(span)
+            })
+            .collect::<Result<Vec<_>, CaptureDrop>>()?;
         let resource = ResourceSpans {
             resource: Some(Resource {
                 attributes: vec![attribute(
@@ -830,13 +856,35 @@ fn attempt_span(
     }
 }
 
-/// One OTLP client span carrying `fields` under the call's `trace_id`.
+/// The caller's trace id, parent span id, and trace state as OTLP bytes.
+///
+/// # Errors
+///
+/// Returns [`CaptureDrop::Projection`] when an id is not hex, which the
+/// validated W3C parse that produced `trace` precludes.
+fn caller_parent(trace: &TraceContext) -> Result<([u8; 16], [u8; 8], String), CaptureDrop> {
+    let trace_id =
+        u128::from_str_radix(&trace.trace_id, 16).map_err(|_| CaptureDrop::Projection)?;
+    let span_id = u64::from_str_radix(&trace.span_id, 16).map_err(|_| CaptureDrop::Projection)?;
+    Ok((
+        trace_id.to_be_bytes(),
+        span_id.to_be_bytes(),
+        trace.trace_state.clone(),
+    ))
+}
+
+/// One OTLP client span carrying `fields` in the trace whose id is the
+/// 16-byte `call_id`.
+///
+/// The span id is the call id's random low eight bytes XOR the attempt
+/// ordinal: distinct across one call's attempts, and, through the call id's
+/// randomness, across calls that join one caller trace.
 ///
 /// # Errors
 ///
 /// Returns [`CaptureDrop::Projection`] when the fields cannot be encoded.
 fn otlp_span(
-    trace_id: &[u8],
+    call_id: &[u8; 16],
     operation: &str,
     fields: &GatewayAttemptSpanFieldsV1,
 ) -> Result<Span, CaptureDrop> {
@@ -873,9 +921,11 @@ fn otlp_span(
             .and_then(|nanos| u64::try_from(nanos).ok())
             .unwrap_or_default()
     };
+    let mut low = [0; 8];
+    low.copy_from_slice(&call_id[8..]);
     Ok(Span {
-        trace_id: trace_id.to_vec(),
-        span_id: u64::from(fields.attempt_ordinal.get())
+        trace_id: call_id.to_vec(),
+        span_id: (u64::from_be_bytes(low) ^ u64::from(fields.attempt_ordinal.get()))
             .to_be_bytes()
             .to_vec(),
         name: operation.to_owned(),
@@ -980,6 +1030,7 @@ pub(crate) mod tests {
             entries: Vec::new(),
             policy,
             subject: None,
+            trace: None,
             request: Some(json!({
                 "model": "acme/a",
                 "api_key": CANARY,

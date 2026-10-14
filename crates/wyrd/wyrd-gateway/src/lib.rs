@@ -33,7 +33,7 @@ pub use engine::{
     ResponseCapture, StreamAborted, StreamEnd, outcome_error_code, outcome_name,
 };
 pub use health::DeploymentHealth;
-pub use managed::{ManagedSecretBinding, ManagedSecretEnvelope, ManagedSecretKeys, TenantKeyring};
+pub use managed::ManagedSecretBinding;
 pub use pricing::{GatewayCost, PricedModel};
 pub use routing::{CallPlan, PlannedCandidate};
 pub use skald_providers::{MediaAnswer, OpenAiMediaRoute, UploadContent, UploadFile};

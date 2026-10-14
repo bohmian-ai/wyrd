@@ -1320,18 +1320,15 @@ fn apply_overrides(state: AppState, overrides: StateOverrides) -> AppState {
 
 /// Attach config-derived fields to core state: shutdown token, telemetry,
 /// limits, gateway configuration, and the gateway engine whose HTTP provider
-/// dispatch screens endpoints under the deployment profile. Pure/sync (no I/O).
+/// dispatch screens endpoints under the deployment profile. The engine opens
+/// managed secrets with the deployment sealing keyring already attached by
+/// [`AppState::with_auth`]. Pure/sync (no I/O).
 fn attach_config_fields(
     state: AppState,
     config: &WyrdServerConfig,
     telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
 ) -> Result<AppState, ServerBootError> {
-    let gateway_secret_keys = Arc::new(
-        config
-            .gateway
-            .managed_secret_keys()
-            .map_err(|error| ServerBootError::GatewayTransport(error.to_string()))?,
-    );
+    let sealing_key = state.auth.sealing_key.clone();
     Ok(state
         .with_deployment_profile(config.deployment_profile)
         .with_operator_keys(OperatorKeys::for_role(
@@ -1342,11 +1339,10 @@ fn attach_config_fields(
         .with_limits(config.limits.into_state())
         .with_workflow_config(config.workflow.clone())
         .with_gateway(config.gateway.clone())
-        .with_gateway_secret_keys(Arc::clone(&gateway_secret_keys))
         .with_gateway_engine(wyrd_gateway::GatewayEngine::new(
             config
                 .gateway
-                .credential_resolver(gateway_secret_keys)
+                .credential_resolver(sealing_key)
                 .map_err(|error| ServerBootError::GatewayTransport(error.to_string()))?,
             wyrd_gateway::DeploymentHealth::default(),
             Arc::new(
@@ -1359,8 +1355,9 @@ fn attach_config_fields(
         )))
 }
 
-/// Reseal every stored provider and workload-issuer client secret under the current
-/// sealing write key, or prove a keyless deployment stores none.
+/// Reseal every stored provider and workload-issuer client secret and gateway
+/// managed secret under the current sealing write key, or prove a keyless
+/// deployment stores none.
 ///
 /// This is the rewrap step of sealing-key rotation: with the new key configured
 /// as the write key and the old one retained, every boot converges stored
@@ -1389,8 +1386,8 @@ pub async fn rewrap_sealed_secrets(
     match SealedSecretRewrap::new(operator, keyring).run().await {
         Ok(report) if keyless && report.remaining > 0 => Err(ServerBootError::SealingKey(format!(
             "{} stored sealed secret(s) (provider or workload-issuer client \
-                 secrets) exist but no sealing key is configured; configure the key \
-                 they were sealed under",
+                 secrets or gateway managed secrets) exist but no sealing key is \
+                 configured; configure the key they were sealed under",
             report.remaining
         ))),
         Ok(_) => Ok(()),

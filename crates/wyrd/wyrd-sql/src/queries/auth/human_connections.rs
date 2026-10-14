@@ -160,7 +160,8 @@ pub struct HumanConnectionWrite {
 pub struct SealedSecretRow {
     /// Owning tenant, used only for operator diagnostics.
     pub data_tenant_id: Uuid,
-    /// Row key as text: the connection id or the trusted issuer URL.
+    /// Row key as text: the connection id, the trusted issuer URL, or the
+    /// gateway credential name.
     pub row_key: String,
     /// The sealed bytes of the table's sealed column exactly as stored.
     pub client_secret_enc: Vec<u8>,
@@ -427,11 +428,18 @@ pub enum SealedSecretTable {
     HumanConnections,
     /// `wyrd.auth_trusted_issuers.client_secret_enc`, keyed by issuer URL.
     TrustedIssuers,
+    /// `wyrd.gateway_provider_credentials.secret_ciphertext`, the sealed
+    /// managed-secret provider keys, keyed by credential name.
+    GatewayProviderCredentials,
 }
 
 impl SealedSecretTable {
     /// Every column rewrap walks, in a stable order.
-    pub const ALL: [Self; 2] = [Self::HumanConnections, Self::TrustedIssuers];
+    pub const ALL: [Self; 3] = [
+        Self::HumanConnections,
+        Self::TrustedIssuers,
+        Self::GatewayProviderCredentials,
+    ];
 
     /// Stable label for operator logs.
     #[must_use]
@@ -439,6 +447,7 @@ impl SealedSecretTable {
         match self {
             Self::HumanConnections => "wyrd.auth_human_connections",
             Self::TrustedIssuers => "wyrd.auth_trusted_issuers",
+            Self::GatewayProviderCredentials => "wyrd.gateway_provider_credentials",
         }
     }
 
@@ -455,6 +464,10 @@ impl SealedSecretTable {
                 "SELECT data_tenant_id, issuer_url AS row_key, client_secret_enc
                    FROM wyrd.auth_trusted_issuers WHERE client_secret_enc IS NOT NULL"
             }
+            Self::GatewayProviderCredentials => {
+                "SELECT data_tenant_id, name AS row_key, secret_ciphertext AS client_secret_enc
+                   FROM wyrd.gateway_provider_credentials WHERE secret_ciphertext IS NOT NULL"
+            }
         }
     }
 
@@ -470,6 +483,10 @@ impl SealedSecretTable {
             Self::TrustedIssuers => {
                 "UPDATE wyrd.auth_trusted_issuers SET client_secret_enc = $4
                   WHERE data_tenant_id = $1 AND issuer_url = $2 AND client_secret_enc = $3"
+            }
+            Self::GatewayProviderCredentials => {
+                "UPDATE wyrd.gateway_provider_credentials SET secret_ciphertext = $4
+                  WHERE data_tenant_id = $1 AND name = $2 AND secret_ciphertext = $3"
             }
         }
     }

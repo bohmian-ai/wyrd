@@ -2,10 +2,12 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { trace } from "@opentelemetry/api";
+import { type ProxyTracerProvider, context, propagation, trace } from "@opentelemetry/api";
+import OpenAI from "openai";
 import { expect, vi } from "vitest";
+import { z } from "zod";
 
-import { Bifrost, Cards, Gateway, WyrdClient, WyrdState } from "wyrd-ai";
+import { Bifrost, Cards, Gateway, type SpanRecord, TableConfig, WyrdClient, WyrdState } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { configureGateway } from "../support/local-development.js";
@@ -50,6 +52,45 @@ let telemetry: Promise<unknown> | undefined;
 function startTelemetry(state: WyrdState): Promise<unknown> {
   telemetry ??= state.startTelemetry();
   return telemetry;
+}
+
+/** Export every ended span the process-global tracer provider still holds. */
+async function flushTelemetry(): Promise<void> {
+  const provider = (trace.getTracerProvider() as ProxyTracerProvider).getDelegate();
+  await (provider as unknown as { forceFlush(): Promise<void> }).forceFlush();
+}
+
+/** `span` and each ancestor its parent ids reach within `timeline`, nearest first. */
+function ancestry(timeline: readonly SpanRecord[], span: SpanRecord): SpanRecord[] {
+  const byId = new Map(timeline.map((each) => [each.span_id, each]));
+  const chain = [span];
+  for (let next = byId.get(span.parent_span_id ?? ""); next !== undefined; next = byId.get(next.parent_span_id ?? "")) {
+    chain.push(next);
+  }
+  return chain;
+}
+
+/** One `scope kind name` line per span, for a readable assertion message. */
+function outline(timeline: readonly SpanRecord[]): string {
+  return timeline.map((span) => `${span.scope.name} ${span.kind} ${span.name}`).join("\n");
+}
+
+/** Whether `names` holds every one of `steps` in order, gaps allowed. */
+function holdsInOrder(names: readonly string[], steps: readonly ((name: string) => boolean)[]): boolean {
+  let at = 0;
+  return steps.every((step) => {
+    while (at < names.length && !step(names[at])) {
+      at += 1;
+    }
+    at += 1;
+    return at <= names.length;
+  });
+}
+
+/** The span tree of `traceId` as the administrator reads it after a flush. */
+async function timeline(server: { flushBifrost(): void }, traceId: string): Promise<SpanRecord[]> {
+  server.flushBifrost();
+  return (await Bifrost.connect()).traceTimeline(traceId);
 }
 
 /**
@@ -190,27 +231,11 @@ test("traced verify joins the caller's trace", async ({ server, state }) => {
     span.end();
     return span.spanContext();
   });
-  server.flushBifrost();
 
-  const rows = (
-    await (
-      await Bifrost.connect()
-    ).sql(
-      "SELECT encode(span_id, 'hex') AS span_id, encode(parent_span_id, 'hex') AS parent, scope_name " +
-        "FROM vala.traces.spans WHERE encode(trace_id, 'hex') = $1",
-      [caller.traceId],
-    )
-  ).toArrow();
-  const spans = new Map<string, { parent: string | null; scope_name: string }>(
-    rows.toArray().map((row) => [row.span_id, { parent: row.parent, scope_name: row.scope_name }]),
-  );
-  const attempts = [...spans.values()].filter((span) => span.scope_name === "wyrd.gateway");
+  const spans = await timeline(server, caller.traceId);
+  const attempts = spans.filter((span) => span.scope.name === "wyrd.gateway");
   expect(attempts).toHaveLength(1);
-  let ancestor = attempts[0];
-  for (let next = spans.get(ancestor.parent ?? ""); next !== undefined; next = spans.get(ancestor.parent ?? "")) {
-    ancestor = next;
-  }
-  expect(ancestor.parent).toBe(caller.spanId);
+  expect(ancestry(spans, attempts[0]).map((span) => span.parent_span_id)).toContain(caller.spanId);
 });
 
 test("sdk requests carry the active trace", async ({ server, state }) => {
@@ -221,18 +246,86 @@ test("sdk requests carry the active trace", async ({ server, state }) => {
     span.end();
     return span.spanContext();
   });
-  server.flushBifrost();
 
-  const spans = (
-    await (
-      await Bifrost.connect()
-    ).sql(
-      "SELECT name FROM vala.traces.spans " +
-        "WHERE encode(trace_id, 'hex') = $1 AND encode(parent_span_id, 'hex') = $2",
-      [caller.traceId, caller.spanId],
-    )
-  ).toArrow();
-  expect(columnValues(spans.getChild("name"))).toEqual(["request"]);
+  const spans = await timeline(server, caller.traceId);
+  expect(spans.filter((span) => span.parent_span_id === caller.spanId).map((span) => span.name)).toEqual(["request"]);
+});
+
+test("service action timeline is one connected tree", async ({ server, state, assistantKey }) => {
+  await startTelemetry(state);
+  await state.startBifrost();
+  const actions = "vala.datasets.actions";
+  const admin = await Bifrost.connect({ table: TableConfig.fromJsonSchema(actions, z.object({ action: z.string() })) });
+  await admin.register();
+  await admin.shutdown();
+  const service = WyrdClient.connect({ credential: assistantKey });
+  const writer = await Bifrost.connect({ client: service });
+  await writer.useTableByName(actions);
+  const tracer = trace.getTracer("journey.service");
+
+  const action = await tracer.startActiveSpan("service.action", async (span) => {
+    tracer.startSpan("answer").end();
+    state.run("model").observe.drift({ latency: 12.5 });
+    writer.insert({ action: "answered" });
+    await tracer.startActiveSpan("model.ask", async (ask) => {
+      const headers: Record<string, string> = {};
+      propagation.inject(context.active(), headers);
+      await new OpenAI({
+        baseURL: `${service.serverUrl}/v1`,
+        apiKey: await service.accessToken(),
+        maxRetries: 0,
+      }).chat.completions.create({ model: "openai/gpt-4o", messages: [{ role: "user", content: "hi" }] }, { headers });
+      ask.end();
+    });
+    const judgment = await state.run("agent").observe.verify("answer-is-judged", { answer: "yes" });
+    expect(judgment.passed).toBe(true);
+    span.end();
+    return span.spanContext();
+  });
+  await writer.shutdown();
+  await state.shutdown();
+  await flushTelemetry();
+
+  const spans = await timeline(server, action.traceId);
+  const starts = spans.map((span) => span.start_time);
+  expect(starts).toEqual([...starts].sort());
+  const roots = spans.filter((span) => span.parent_span_id == null);
+  expect(
+    roots.map((root) => [root.name, root.scope.name]),
+    outline(spans),
+  ).toEqual([["service.action", "journey.service"]]);
+  for (const span of spans) {
+    expect(span.trace_id, span.name).toBe(action.traceId);
+    expect(ancestry(spans, span).at(-1), span.name).toBe(roots[0]);
+  }
+  expect(spans.some((span) => span.name === "answer")).toBe(true);
+  const producers = spans.filter((span) => span.kind === "producer" && span.name === "bifrost.enqueue");
+  expect(producers.length, outline(spans)).toBeGreaterThanOrEqual(2);
+  const attempts = spans
+    .filter((span) => span.scope.name === "wyrd.gateway")
+    .map((span) => ancestry(spans, span).map((each) => each.name));
+  expect(attempts).toHaveLength(2);
+  expect(
+    attempts.some((names) =>
+      holdsInOrder(names, [
+        (name) => name === "gateway.call",
+        (name) => name === "request",
+        (name) => name === "model.ask",
+      ]),
+    ),
+    JSON.stringify(attempts),
+  ).toBe(true);
+  expect(
+    attempts.some((names) =>
+      holdsInOrder(names, [
+        (name) => name === "gateway.call",
+        (name) => name.startsWith("verification."),
+        (name) => name === "request",
+        (name) => name === "service.action",
+      ]),
+    ),
+    JSON.stringify(attempts),
+  ).toBe(true);
 });
 
 test("model latency like the baseline passes its verifier", async ({ server, assistant, state }) => {

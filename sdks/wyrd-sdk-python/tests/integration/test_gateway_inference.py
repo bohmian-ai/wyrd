@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import secrets
-from typing import Any
 
 import openai
 import pytest
@@ -15,7 +14,7 @@ from wyrd.gateway import Gateway
 from wyrd.testing import WyrdTestServer, cli
 
 from .gateway.support import PROVIDER_KEY, deploy
-from .support import FIXTURES, Receiver, client_of, register
+from .support import FIXTURES, Receiver, ancestry, client_of, register, timeline
 
 pytestmark = pytest.mark.integration
 
@@ -80,16 +79,6 @@ def test_openai_client_calls_the_gateway_with_an_access_token(
     assert upstream.deliveries[0].headers["authorization"] == f"Bearer {PROVIDER_KEY}"
 
 
-def gateway_spans(server: WyrdTestServer, trace_id: str) -> list[dict[str, Any]]:
-    """Publish every captured row, then read the gateway's model-call spans in trace ``trace_id``."""
-    server.flush_bifrost()
-    query = (
-        "SELECT encode(parent_span_id, 'hex') AS parent_span_id, trace_state "
-        "FROM vala.traces.spans WHERE scope_name = 'wyrd.gateway' AND encode(trace_id, 'hex') = $1"
-    )
-    return Bifrost(client=client_of(server)).sql(query, [trace_id]).to_arrow().to_pylist()
-
-
 def test_gateway_span_joins_the_callers_trace(server: WyrdTestServer, admin: WyrdClient) -> None:
     trace_id, span_id = secrets.token_hex(16), secrets.token_hex(8)
     completion = openai_client(admin).chat.completions.create(
@@ -99,9 +88,11 @@ def test_gateway_span_joins_the_callers_trace(server: WyrdTestServer, admin: Wyr
     )
 
     assert completion.choices[0].message.content == "hi"
-    assert gateway_spans(server, trace_id) == [
-        {"parent_span_id": span_id, "trace_state": "wyrd=journey"}
-    ]
+    spans = timeline(server, trace_id)
+    attempts = [span for span in spans if span.scope.name == "wyrd.gateway"]
+    assert len(attempts) == 1, spans
+    assert ancestry(spans, attempts[0])[-1].parent_span_id == span_id
+    assert attempts[0].trace_state == "wyrd=journey"
 
 
 def test_malformed_traceparent_is_ignored_by_the_gateway(
@@ -115,7 +106,7 @@ def test_malformed_traceparent_is_ignored_by_the_gateway(
     )
 
     assert completion.choices[0].message.content == "hi"
-    assert gateway_spans(server, trace_id) == []
+    assert timeline(server, trace_id) == []
 
 
 def test_gateway_call_records_a_lone_run_or_card(server: WyrdTestServer, admin: WyrdClient) -> None:

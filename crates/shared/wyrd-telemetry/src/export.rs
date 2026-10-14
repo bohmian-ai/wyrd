@@ -12,12 +12,14 @@
 //!
 //! [`TenantExport`] stages the tenant copy:
 //! - A span starting under a sampled remote parent opens a route for its
-//!   request, and each descendant joins its parent's route.
+//!   request, and each descendant the behavior-span catalog names joins its
+//!   parent's route. A span outside the catalog has no route, so neither it
+//!   nor any span below it is copied, and the copied spans form one tree.
 //! - Once authentication succeeds, the server binds the tenant and principal
 //!   to that route with [`bind_tenant_route`].
-//! - When a span on a bound route ends and the behavior-span catalog names it,
-//!   it is filtered to its safe attributes and staged on the
-//!   [`TenantSpanSink`] the server set with [`set_tenant_span_sink`].
+//! - When a span on a bound route ends, it is filtered to its safe
+//!   attributes and staged on the [`TenantSpanSink`] the server set with
+//!   [`set_tenant_span_sink`].
 //!
 //! The route is never a span attribute and is never exported.
 
@@ -249,9 +251,9 @@ type RouteSlot = Arc<OnceLock<TenantSpanRoute>>;
 
 /// The process routing registry and the sink tenant copies are staged on.
 struct TenantRoutes {
-    /// The route of every live span on a request that continued a sampled
-    /// client trace, keyed by the span's own ids, which the server
-    /// generated.
+    /// The route of every live catalog span whose ancestors up to a sampled
+    /// remote parent are all catalog spans, keyed by the span's own ids,
+    /// which the server generated.
     // ponytail: one process lock per routed span start and end; shard by span id if it contends.
     live: Mutex<HashMap<(TraceId, SpanId), RouteSlot>>,
     /// The bound sink; until the server binds one, nothing is staged.
@@ -263,8 +265,11 @@ impl TenantRoutes {
     ///
     /// A span with a sampled remote parent opens a new route for its request.
     /// A span with a local parent joins the parent's route if the parent has
-    /// one. Any other span has no route.
-    fn start(&self, parent: &SpanContext, span: &SpanContext) {
+    /// one. Either way the span joins only if `in_catalog` says the catalog
+    /// names it, so a span outside the catalog takes its whole subtree out of
+    /// the tenant copy and every staged span's parent is the caller's span or
+    /// another staged span. Any other span has no route.
+    fn start(&self, parent: &SpanContext, span: &SpanContext, in_catalog: impl FnOnce() -> bool) {
         if !parent.is_valid() || (parent.is_remote() && !parent.is_sampled()) {
             return;
         }
@@ -277,7 +282,9 @@ impl TenantRoutes {
                 None => return,
             }
         };
-        live.insert((span.trace_id(), span.span_id()), route);
+        if in_catalog() {
+            live.insert((span.trace_id(), span.span_id()), route);
+        }
     }
 
     /// Forget the ended `span` and return its bound route, if it has one.
@@ -349,13 +356,16 @@ pub(crate) struct TenantExport {
 }
 
 impl SpanProcessor for TenantExport {
-    /// Record the route the starting span joins.
+    /// Record the route the starting span joins, reading its name only when
+    /// its parent is routed.
     fn on_start(&self, span: &mut Span, cx: &Context) {
-        ROUTES.start(cx.span().span_context(), span.span_context());
+        ROUTES.start(cx.span().span_context(), span.span_context(), || {
+            span.exported_data()
+                .is_some_and(|data| in_catalog(&data.name))
+        });
     }
 
-    /// Stage the tenant copy of an ended span if its route is bound and the
-    /// catalog names it.
+    /// Stage the tenant copy of an ended span if its route is bound.
     ///
     /// The span leaves the registry first, so the registry holds only live
     /// spans.
@@ -363,9 +373,6 @@ impl SpanProcessor for TenantExport {
         let Some(route) = ROUTES.end(&span.span_context) else {
             return;
         };
-        if !in_catalog(&span.name) {
-            return;
-        }
         if let Some(sink) = ROUTES.sink() {
             sink.stage(route, ResourceSpans::new(tenant_copy(span), &self.resource));
         }
@@ -406,7 +413,8 @@ impl SpanProcessor for TenantExport {
 ///
 /// The catalog is the request span, `verification.*`, `dispatch`,
 /// `workflow.gateway.call`, `gateway.*` except `gateway.attempt` (the gateway
-/// captures attempts as their own rows), `bifrost.gate.*`,
+/// captures attempts as their own rows, so nothing below an attempt is
+/// copied either), `bifrost.gate.*`,
 /// `bifrost.oracle.query`, and the OTLP ingest spans.
 fn in_catalog(name: &str) -> bool {
     matches!(
@@ -765,7 +773,8 @@ mod tests {
     }
 
     /// One continued request: a bound root with a catalog child and a
-    /// non-catalog child, under `policy`, with or without an operator.
+    /// non-catalog `gateway.attempt` child whose own child the catalog names,
+    /// under `policy`, with or without an operator.
     ///
     /// Returns the trace id, the operator's span names, and the staged copies.
     fn continued_request(
@@ -826,14 +835,19 @@ mod tests {
         );
         child.set_status(Status::error("secret detail"));
         child.end();
-        tracer.start_with_context("storage.get", &request).end();
+        let attempt = request.with_span(tracer.start_with_context("gateway.attempt", &request));
+        tracer
+            .start_with_context("gateway.translate", &attempt)
+            .end();
+        attempt.span().end();
         request.span().end();
         (trace_id, recorder.names(trace_id), staged.of(trace_id))
     }
 
     /// The four sampling rows, with and without an operator: the operator
     /// receives every span exactly when it accepts, and the tenant receives
-    /// the catalog spans exactly when the client sampled.
+    /// the catalog spans exactly when the client sampled, never one below a
+    /// span outside the catalog.
     #[test]
     fn sampling_matrix_holds_with_and_without_an_operator() {
         for operator in [true, false] {
@@ -846,7 +860,12 @@ mod tests {
                 let row = format!("{policy:?} sampled={sampled} operator={operator}");
                 let (_, exported, staged) = continued_request(policy, sampled, operator, true);
                 let expected: &[&str] = if operator && operator_sees {
-                    &["verification.execute", "storage.get", "request"]
+                    &[
+                        "verification.execute",
+                        "gateway.translate",
+                        "gateway.attempt",
+                        "request",
+                    ]
                 } else {
                     &[]
                 };
@@ -889,7 +908,7 @@ mod tests {
     #[test]
     fn unbound_request_is_operator_only() {
         let (_, exported, staged) = continued_request(Sampler::AlwaysOn, true, true, false);
-        assert_eq!(exported.len(), 3);
+        assert_eq!(exported.len(), 4);
         assert!(staged.is_empty(), "{staged:?}");
     }
 

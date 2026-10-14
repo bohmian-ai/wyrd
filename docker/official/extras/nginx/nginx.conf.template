@@ -32,21 +32,37 @@ http {
         '' '';
     }
 
+    # A TLS proxy in front states the browser's scheme and host; without one,
+    # this listener's own scheme and the request Host are the public origin
+    # the server derives sign-in and OAuth URLs from.
+    map $http_x_forwarded_proto $forwarded_proto {
+        default $http_x_forwarded_proto;
+        '' $scheme;
+    }
+
+    map $http_x_forwarded_host $forwarded_host {
+        default $http_x_forwarded_host;
+        '' $http_host;
+    }
+
     server {
         listen 8080;
         server_name _;
 
         proxy_http_version 1.1;
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
 
         # Rust owns every path verbatim; nothing is rewritten. Bodies stream
         # through unbuffered so artifact uploads and MCP streams are not held
-        # or size-capped here; the server enforces its own limits.
+        # or size-capped here; the server enforces its own limits. Every
+        # header is set here because a location's own proxy_set_header drops
+        # all inherited ones.
         location / {
             proxy_pass http://wyrd_http;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $forwarded_proto;
+            proxy_set_header X-Forwarded-Host $forwarded_host;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection $connection_upgrade;
             client_max_body_size 0;

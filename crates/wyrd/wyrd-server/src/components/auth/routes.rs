@@ -475,8 +475,7 @@ Wyrd settings to activate the connection.</p></body></html>";
         (status = 400, description = "The query carries both or neither of `code` and \
           `error` (WYRD_SPEC_400_VALIDATION), the login state is unknown, expired, or replayed \
           (WYRD_AUTH_400_INVALID_STATE), the ID token nonce does not match \
-          (WYRD_AUTH_400_INVALID_NONCE), or the deployment has no public origin \
-          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+          (WYRD_AUTH_400_INVALID_NONCE)", body = WyrdProblem),
         (status = 401, description = "The code or ID token is not usable, the response `iss` \
           does not match the login's issuer or is missing while the provider advertises it, or \
           the login's connection changed (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),

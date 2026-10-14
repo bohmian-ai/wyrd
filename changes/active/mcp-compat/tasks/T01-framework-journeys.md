@@ -1,12 +1,25 @@
 ---
 task: T01-framework-journeys
-spec: SPEC-mcp-compat r2
-obligations: [REQ-003, INV-001, INV-002, INV-003, AC-001, AC-002, AC-003]
+spec: SPEC-mcp-compat r3
+obligations: [REQ-003, INV-001, INV-002, INV-003, INV-004, AC-001, AC-002, AC-003, AC-004]
 depends_on: []
 skills: [$wyrd-implement]
 ---
 
 # T01 Prove Wyrd MCP with the reference client and three Python agent frameworks
+
+## Revision 3 authority and remediation
+
+The owner directed revision 3 after the immutable r2 review of `6fbd60f19`.
+The original task remains available at `84c2af51b`; its historical execution
+evidence below does not close the validated findings. The current completion
+contract includes r3's bounded model-facing aliases and actual Wyrd refusal
+proof. Execute
+`changes/active/mcp-compat/review/T01-6fbd60f19/T01-R1-close-framework-findings.md`
+under `$wyrd-implement`, then review the cumulative candidate. That remediation
+task supplies the current execution and exact verification commands; it
+supersedes the older command recipes and private implementation suggestions
+below. The historical review remains unchanged.
 
 ## Outcome and Value
 
@@ -39,7 +52,8 @@ object-rooted schemas). What remains is proof from real clients:
   it at the shared tool builder in `crates/wyrd/wyrd-server/src/mcp/`, never
   per tool and never in a client.
 - **Prohibited:**
-  - renaming any tool (spec non-goal);
+  - renaming a Wyrd MCP wire tool or adding a server alias; model-facing aliases
+    are permitted within r3's presentation-only boundary;
   - adding a framework package to `wyrd-ai` runtime dependencies or to the
     `dev` group;
   - re-adding hand-written schema-root assertions in client journeys
@@ -174,8 +188,10 @@ provider matches `^[a-zA-Z0-9_-]{1,64}$`.
 **RED.** Command:
 `... python -m pytest -q -m mcp_frameworks "tests/integration/test_mcp_agent_frameworks.py::test_forwarded_tool_names_are_provider_valid"`
 
-**GREEN.** If every framework sanitizes the names, pass. If one forwards
-dotted names, stop (see Material Stop Conditions); do not rename tools.
+**GREEN.** Use built-in framework naming facilities first. If the framework
+has no mapping option, retain the smallest local model-name override allowed
+by r3. Prove unique provider-valid names and invocation of the original wire
+tool. Do not rename server tools or replace framework MCP machinery.
 
 **REFACTOR.** None beyond Scenario 2.
 
@@ -222,8 +238,10 @@ dotted names, stop (see Material Stop Conditions); do not rename tools.
 
 ## Material Stop Conditions
 
-- A covered framework forwards dotted tool names to providers. Tool naming is
-  a public contract and needs a spec revision.
+- A covered framework cannot meet the provider-name rule using built-in naming
+  or r3's bounded local presentation override while preserving the original
+  wire call. A new transport, schema converter, public SDK adapter, or server
+  tool rename still requires a specification decision.
 - A framework rejects a Wyrd schema because of a framework bug that Wyrd can
   only work around by changing a public tool contract.
 - A framework cannot run without model credentials or a live provider.
@@ -233,7 +251,7 @@ dotted names, stop (see Material Stop Conditions); do not rename tools.
 
 ## Authority Links
 
-- `changes/active/mcp-compat/spec.md` (r2)
+- `changes/active/mcp-compat/spec.md` (r3)
 - `AGENTS.md` §2, §11, §12, §16
 - `architecture/agent-rules.md`
 - `TESTING.md`

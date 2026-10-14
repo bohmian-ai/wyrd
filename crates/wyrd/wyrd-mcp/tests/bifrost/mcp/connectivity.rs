@@ -327,10 +327,11 @@ mod pg_tests {
             "the chain names the one actor that exchanged the subject token"
         );
         assert_eq!(context["cancelled"], serde_json::Value::Bool(false));
-        assert_eq!(
-            context["trace_id"],
-            serde_json::Value::Null,
-            "a request without traceparent runs untraced"
+        assert!(
+            context["trace_id"]
+                .as_str()
+                .is_some_and(|trace| trace.len() == 32),
+            "the client's ambient session trace reaches the handler: {context}"
         );
         assert!(
             context["request_id"]

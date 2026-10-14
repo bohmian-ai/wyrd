@@ -249,7 +249,9 @@ impl HttpTransport {
     /// a `401` *means* is decided here.
     ///
     /// A caller-supplied `wyrd-request-id` is preserved; otherwise one is
-    /// minted through the same path every other request uses. Headers the
+    /// minted through the same path every other request uses. A
+    /// caller-supplied `traceparent` likewise wins over the ambient trace
+    /// context, with whatever `tracestate` the caller sent beside it. Headers the
     /// caller's own protocol needs are passed through untouched.
     ///
     /// # Arguments
@@ -281,12 +283,14 @@ impl HttpTransport {
                     .map_err(|error| AuthenticatedReplayError::header(&error))?,
             );
         }
-        for (name, value) in trace::headers() {
-            custom_headers.insert(
-                HeaderName::from_static(name),
-                HeaderValue::from_str(&value)
-                    .map_err(|error| AuthenticatedReplayError::header(&error))?,
-            );
+        if !custom_headers.contains_key(&HeaderName::from_static(trace::TRACEPARENT)) {
+            for (name, value) in trace::headers() {
+                custom_headers.insert(
+                    HeaderName::from_static(name),
+                    HeaderValue::from_str(&value)
+                        .map_err(|error| AuthenticatedReplayError::header(&error))?,
+                );
+            }
         }
 
         let first = operation(custom_headers.clone()).await;

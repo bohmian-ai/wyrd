@@ -2374,6 +2374,13 @@ export interface OpenAiFunction {
   readonly strict?: boolean | null;
 }
 
+/**
+ * A Responses tool result: text, or content parts such as `input_text`.
+ *
+ * `OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.
+ */
+export type OpenAiFunctionCallOutput = string | readonly OpenAiResponseContentPart[];
+
 export interface OpenAiFunctionChoice {
   readonly name: string;
 }
@@ -2529,7 +2536,10 @@ export interface OpenAiResponseItemFunctionCall {
 
 export interface OpenAiResponseItemFunctionCallOutput {
   readonly call_id: string;
-  readonly output: string;
+  /**
+   * Tool result, as text or as content parts.
+   */
+  readonly output: OpenAiFunctionCallOutput;
   readonly type: "function_call_output";
 }
 

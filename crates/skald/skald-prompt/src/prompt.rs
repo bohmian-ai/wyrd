@@ -146,7 +146,7 @@ impl Prompt {
                     .items_mut()
                     .push(OpenAiResponseItem::FunctionCallOutput {
                         call_id: tool_use_id,
-                        output: content,
+                        output: content.into(),
                     });
             }
             ProviderRequest::AnthropicMessage(request) => {

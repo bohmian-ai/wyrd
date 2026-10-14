@@ -6748,6 +6748,22 @@
       },
       "additionalProperties": false
     },
+    "OpenAiFunctionCallOutput": {
+      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.",
+      "anyOf": [
+        {
+          "description": "Plain text result.",
+          "type": "string"
+        },
+        {
+          "description": "Content parts.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseContentPart"
+          }
+        }
+      ]
+    },
     "OpenAiFunctionChoice": {
       "type": "object",
       "required": [
@@ -7297,7 +7313,12 @@
               "type": "string"
             },
             "output": {
-              "type": "string"
+              "description": "Tool result, as text or as content parts.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
+                }
+              ]
             },
             "type": {
               "type": "string",
@@ -7587,7 +7608,7 @@
           "type": "string"
         },
         {
-          "description": "Ordered input items.",
+          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/OpenAiResponseItem"

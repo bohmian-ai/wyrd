@@ -570,7 +570,7 @@ impl PyOpenAiResponseItem {
     }
     fn as_function_call_output(&self) -> WyrdPyResult<String> {
         match self.i() {
-            OpenAiResponseItem::FunctionCallOutput { output, .. } => Ok(output.clone()),
+            OpenAiResponseItem::FunctionCallOutput { output, .. } => Ok(output.text().into_owned()),
             _ => Err(wrong_variant("function_call_output", self.kind()).into()),
         }
     }

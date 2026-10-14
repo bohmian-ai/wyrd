@@ -1568,7 +1568,10 @@ exactly one shard. The only tests outside gate are the scheduled production-geom
 (performance.yml) and the live-credential lanes (storage-integration-cloud.yml, the *:smoke:live tasks)."""
 depends = [
   "gate:checks",
-  "gate:rust",
+  "gate:rust:families",
+  "gate:rust:gateway",
+  "gate:rust:bifrost",
+  "gate:rust:journeys",
   "gate:storage",
   "gate:python",
   "gate:typescript",
@@ -1579,10 +1582,27 @@ hide = true
 description = "Gate shard: format, Clippy, workspace-hack, boundary, codegen, docs, example, and CI-selection checks"
 depends = ["check", "check:deps", "check:tenant-isolation", "check:storage:drift", "check:ci-selection", "check:docs", "check:examples", "codegen:check", "docs:check"]
 
-[tasks."gate:rust"]
+# The Rust lanes are four shards so CI runs them in parallel; one sequential
+# shard took about two hours on a hosted runner.
+[tasks."gate:rust:families"]
 hide = true
-description = "Gate shard: every Rust family lane and every Rust-built journey (gateway, Bifrost, identity, SDK stories, installed CLI), sharing one compile"
-depends = ["test:wyrd", "test:skald", "test:vala", "test:shared", "test:gateway:gate", "test:bifrost:gate", "test:identity:journey", "test:rust-sdk:journey", "test:local-dev:journey"]
+description = "Gate shard: every Rust family lane"
+depends = ["test:wyrd", "test:skald", "test:vala", "test:shared"]
+
+[tasks."gate:rust:gateway"]
+hide = true
+description = "Gate shard: the gateway journeys"
+depends = ["test:gateway:gate"]
+
+[tasks."gate:rust:bifrost"]
+hide = true
+description = "Gate shard: the Bifrost journeys"
+depends = ["test:bifrost:gate"]
+
+[tasks."gate:rust:journeys"]
+hide = true
+description = "Gate shard: the identity, Rust SDK, and installed-CLI local development journeys"
+depends = ["test:identity:journey", "test:rust-sdk:journey", "test:local-dev:journey"]
 
 [tasks."gate:storage"]
 hide = true

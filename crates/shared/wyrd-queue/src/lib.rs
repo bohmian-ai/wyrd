@@ -39,7 +39,7 @@ pub use error::WyrdQueueError;
 pub use producer::{
     ClientByteBudget, ClientByteGuard, ClientByteMetrics, Producer, ProducerMetrics,
 };
-pub use queue::{Flushable, RecordQueue, Row};
+pub use queue::{Flushable, MAX_PRODUCER_TRACES, RecordQueue, Row};
 pub use sealed_sender::SealedBatchSender;
 pub use sink::{
     BatchSink, DurableBatchAck, MockSink, OwnedIpcBytes, SealedBatch, SharedIpcBytes, SinkError,

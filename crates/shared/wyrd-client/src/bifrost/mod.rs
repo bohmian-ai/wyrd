@@ -660,6 +660,7 @@ mod sdk {
             ),
             rows: 1,
             request_id: None,
+            producer_traces: Vec::new(),
         };
 
         let rt = wyrd_runtime::runtime();

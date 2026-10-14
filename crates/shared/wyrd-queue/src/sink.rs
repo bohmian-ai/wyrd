@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::trace::TraceContext;
 
 /// The server acknowledgement that settles one durable batch identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +107,11 @@ pub struct SealedBatch<G> {
     /// `None` for a frame coalesced from unrelated rows, which mints one per
     /// attempt.
     pub request_id: Option<RequestId>,
+    /// The PRODUCER spans whose rows this frame carries: the first
+    /// [`crate::MAX_PRODUCER_TRACES`] distinct contexts in row-admission
+    /// order. Fixed at seal, so every attempt of the batch sends the same
+    /// contexts; empty when no row was admitted under one.
+    pub producer_traces: Vec<TraceContext>,
 }
 
 impl<G> SealedBatch<G> {
@@ -170,6 +176,8 @@ pub struct BatchReceipt {
     pub rows: u64,
     /// Originating request the settled frame carried.
     pub request_id: Option<RequestId>,
+    /// Producer contexts the settled frame carried.
+    pub producer_traces: Vec<TraceContext>,
 }
 
 /// In-memory loopback sink for queue tests.
@@ -177,6 +185,7 @@ pub struct BatchReceipt {
 pub struct MockSink {
     received: Mutex<Vec<BatchReceipt>>,
     attempted: Mutex<Vec<[u8; 16]>>,
+    attempted_traces: Mutex<Vec<Vec<TraceContext>>>,
     fail_next: AtomicUsize,
     terminal_next: AtomicUsize,
 }
@@ -212,6 +221,20 @@ impl MockSink {
             .clone()
     }
 
+    /// Returns every attempt's producer contexts, in attempt order, including
+    /// retained ambiguous attempts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a thread panicked while holding the attempt lock.
+    #[must_use]
+    pub fn attempted_traces(&self) -> Vec<Vec<TraceContext>> {
+        self.attempted_traces
+            .lock()
+            .expect("mock sink is not poisoned")
+            .clone()
+    }
+
     /// Returns every attempted identity, including retained ambiguous attempts.
     ///
     /// # Panics
@@ -240,6 +263,10 @@ impl<G: Send + Sync + 'static> BatchSink<G> for MockSink {
             .lock()
             .expect("mock sink is not poisoned")
             .push(batch.batch_id);
+        self.attempted_traces
+            .lock()
+            .expect("mock sink is not poisoned")
+            .push(batch.producer_traces.clone());
         loop {
             let remaining = self.fail_next.load(Ordering::SeqCst);
             if remaining == 0 {
@@ -272,6 +299,7 @@ impl<G: Send + Sync + 'static> BatchSink<G> for MockSink {
             bytes: batch.bytes().to_vec(),
             rows: batch.rows,
             request_id: batch.request_id.clone(),
+            producer_traces: batch.producer_traces.clone(),
         };
         let ack = DurableBatchAck {
             batch_id: receipt.batch_id,

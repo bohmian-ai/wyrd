@@ -232,6 +232,19 @@ message InsertBatchRequest {
   string table          = 1;   // fqn "namespace.name"
   bytes  arrow_ipc      = 2;   // one sealed Arrow IPC payload
   bytes  wyrd_batch_id  = 3;   // exactly 16 bytes; UUIDv7
+  // The client PRODUCER spans whose rows this frame carries: at most 32
+  // distinct contexts in row-admission order, identical on every retry of
+  // the batch. The ingest span links each valid one; malformed or excess
+  // entries are ignored and never refuse the batch.
+  repeated ProducerTraceContext producer_trace_contexts = 4;
+}
+
+// One W3C trace context of a client PRODUCER span.
+message ProducerTraceContext {
+  bytes  trace_id    = 1;   // exactly 16 bytes, not all zero
+  bytes  span_id     = 2;   // exactly 8 bytes, not all zero
+  uint32 trace_flags = 3;   // W3C trace flags
+  string trace_state = 4;   // W3C tracestate list; empty when none
 }
 // NOTE: the proto deliberately carries only frame-grain transport metadata.
 // `card_ref` and `run_id` are PER-ROW correlation COLUMNS inside `arrow_ipc`,

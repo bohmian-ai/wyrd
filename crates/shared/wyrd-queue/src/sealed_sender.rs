@@ -96,6 +96,7 @@ impl SealedBatchSender {
             frame: OwnedIpcBytes::new(frame, guard),
             rows,
             request_id: None,
+            producer_traces: Vec::new(),
         };
         self.settle(&sealed).await
     }

@@ -11,9 +11,10 @@ use bytes::Bytes;
 use uuid::{Uuid, Version};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::trace::TraceContext;
 use wyrd_tonic::tonic::{Code, Request, Status, metadata::MetadataValue};
-use wyrd_tonic::wyrd::v1::InsertBatchRequest;
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_client::BifrostIngestServiceClient;
+use wyrd_tonic::wyrd::v1::{InsertBatchRequest, ProducerTraceContext};
 
 use crate::bifrost::sink::IngestTransport;
 use wyrd_queue::{ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
@@ -198,7 +199,7 @@ impl BifrostGrpcTransport {
     /// shared [`crate::auth::AuthMiddleware`] and resends the same batch once,
     /// so an expired or revoked cached token recovers without a second refresh
     /// owner; a repeated refusal is terminal. Every attempt carries the same
-    /// `request_id` when one is supplied.
+    /// `request_id` and producer trace contexts when supplied.
     ///
     /// # Errors
     ///
@@ -213,6 +214,7 @@ impl BifrostGrpcTransport {
         batch_id: [u8; 16],
         request_id: Option<&RequestId>,
         arrow_ipc: Bytes,
+        producer_trace_contexts: &[ProducerTraceContext],
     ) -> Result<(), SinkError> {
         let mut retry_number = 0_u32;
         let mut refreshed = false;
@@ -229,6 +231,7 @@ impl BifrostGrpcTransport {
                 table: table.to_owned(),
                 arrow_ipc: arrow_ipc.clone(),
                 wyrd_batch_id: Bytes::copy_from_slice(&batch_id),
+                producer_trace_contexts: producer_trace_contexts.to_vec(),
             };
             match self.send_once(request, request_id).await {
                 Ok(()) => return Ok(()),
@@ -335,11 +338,17 @@ impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
             return Err(SinkError::Terminal(error));
         }
         let bytes = Bytes::from_owner(batch.frame.shared_bytes());
+        let producers: Vec<_> = batch
+            .producer_traces
+            .iter()
+            .filter_map(producer_trace_context)
+            .collect();
         let send = self.send_owned_bytes(
             &batch.table,
             batch.batch_id,
             batch.request_id.as_ref(),
             bytes,
+            &producers,
         );
         tokio::time::timeout(self.attempt_budget(), send)
             .await
@@ -471,6 +480,17 @@ fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
     }
 }
 
+/// Encode one producer's span context as the binary ids the ingest wire
+/// carries, or `None` when either hex id does not decode.
+fn producer_trace_context(trace: &TraceContext) -> Option<ProducerTraceContext> {
+    Some(ProducerTraceContext {
+        trace_id: hex::decode(&trace.trace_id).ok()?,
+        span_id: hex::decode(&trace.span_id).ok()?,
+        trace_flags: u32::from(trace.trace_flags),
+        trace_state: trace.trace_state.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +560,8 @@ mod tests {
         batch_ids: Arc<Mutex<Vec<Vec<u8>>>>,
         /// Ordered `wyrd-request-id` metadata observed at the RPC boundary.
         request_ids: Arc<Mutex<Vec<String>>>,
+        /// Ordered producer trace contexts each attempt carried.
+        producers: Arc<Mutex<Vec<Vec<ProducerTraceContext>>>>,
         /// Selects the next scripted response without serializing request recording.
         attempts: Arc<AtomicUsize>,
         /// Answers every attempt with stable busy, standing in for a sink that
@@ -567,6 +589,10 @@ mod tests {
                 .to_owned();
             self.request_ids.lock().await.push(request_id);
             let request = request.into_inner();
+            self.producers
+                .lock()
+                .await
+                .push(request.producer_trace_contexts.clone());
             self.batch_ids
                 .lock()
                 .await
@@ -609,6 +635,7 @@ mod tests {
             frame: OwnedIpcBytes::new(bytes, guard),
             rows: 1,
             request_id: None,
+            producer_traces: Vec::new(),
         }
     }
 
@@ -629,7 +656,7 @@ mod tests {
 
     /// Stable busy retries while every other capacity status terminalizes, and
     /// a sink that stays busy settles terminally after exactly the configured
-    /// attempts under one UUID and request ID.
+    /// attempts under one UUID, request ID, and set of producer contexts.
     #[tokio::test]
     async fn ingest_busy_retries_same_batch_and_permanent_capacity_is_terminal() {
         let service = ScriptedIngest::default();
@@ -658,8 +685,15 @@ mod tests {
         .expect("real test gRPC transport connects");
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let request_id = RequestId::now_v7();
+        let producer = TraceContext {
+            trace_id: "0af7651916cd43dd8448eb211c80319c".to_owned(),
+            span_id: "b7ad6b7169203331".to_owned(),
+            trace_flags: 1,
+            trace_state: "wyrd=producer".to_owned(),
+        };
         let retried = SealedBatch {
             request_id: Some(request_id.clone()),
+            producer_traces: vec![producer],
             ..sealed_batch(&budget, vec![1, 2, 3])
         };
         let batch_id = retried.batch_id;
@@ -673,6 +707,17 @@ mod tests {
             *service.request_ids.lock().await,
             vec![request_id.to_string(), request_id.to_string()],
             "every retry carries the batch's originating request"
+        );
+        let sent = ProducerTraceContext {
+            trace_id: hex::decode("0af7651916cd43dd8448eb211c80319c").expect("hex"),
+            span_id: hex::decode("b7ad6b7169203331").expect("hex"),
+            trace_flags: 1,
+            trace_state: "wyrd=producer".to_owned(),
+        };
+        assert_eq!(
+            *service.producers.lock().await,
+            vec![vec![sent.clone()], vec![sent]],
+            "every retry carries the batch's sealed producer contexts"
         );
 
         let terminal = transport

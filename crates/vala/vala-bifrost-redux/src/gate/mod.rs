@@ -26,7 +26,7 @@ use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
     BifrostIngestService, BifrostIngestServiceServer,
 };
-use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};
+use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse, ProducerTraceContext};
 
 use crate::catalog::TableRef;
 use crate::contracts::{
@@ -49,6 +49,7 @@ use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome, BifrostQueryRequest};
 use wyrd_spec::vala::error::BifrostError;
+use wyrd_spec::vala::ids::{SpanId, TraceId};
 
 /// Maps a canonical OTLP projection failure to its ingest refusal.
 ///
@@ -1129,7 +1130,13 @@ impl<A: GateAudit + 'static> BifrostIngestService for Gate<A> {
     #[tracing::instrument(
         name = "bifrost.gate.write",
         skip_all,
-        fields(operation = "write", outcome = tracing::field::Empty)
+        fields(
+            otel.kind = "consumer",
+            messaging.system = "bifrost",
+            messaging.operation.type = "process",
+            operation = "write",
+            outcome = tracing::field::Empty,
+        )
     )]
     async fn insert_batch(
         &self,
@@ -1145,6 +1152,9 @@ impl<A: GateAudit + 'static> BifrostIngestService for Gate<A> {
             validate_batch(&frame, &self.limits)
                 .inspect_err(record_write_rejection)
                 .map_err(Status::from)?;
+            for (trace_id, span_id) in producer_links(&frame.producer_trace_contexts) {
+                wyrd_telemetry::link_remote_span(&tracing::Span::current(), &trace_id, &span_id);
+            }
             self.dispatch_native_frame(&self.limits, &auth, frame.clone())
                 .await
                 .inspect_err(|error| {
@@ -1233,6 +1243,27 @@ pub fn validate_batch(
         });
     }
     Ok(())
+}
+
+/// The producer spans one ingest batch links to, in the frame's order.
+///
+/// Only the first [`wyrd_queue::MAX_PRODUCER_TRACES`] entries are read. An
+/// entry whose ids are not a nonzero 16-byte trace id and 8-byte span id, or
+/// whose flags exceed one byte, is skipped: producer contexts describe the
+/// batch's causes and never decide whether its rows are accepted.
+fn producer_links(contexts: &[ProducerTraceContext]) -> Vec<(TraceId, SpanId)> {
+    contexts
+        .iter()
+        .take(wyrd_queue::MAX_PRODUCER_TRACES)
+        .filter_map(|context| {
+            u8::try_from(context.trace_flags).ok()?;
+            let trace_id =
+                TraceId::from_bytes(<[u8; 16]>::try_from(&context.trace_id[..]).ok()?).ok()?;
+            let span_id =
+                SpanId::from_bytes(<[u8; 8]>::try_from(&context.span_id[..]).ok()?).ok()?;
+            Some((trace_id, span_id))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1717,12 +1748,52 @@ mod tests {
         }
     }
 
+    /// One producer context on the wire with `trace` and `span` filling its
+    /// ids and the sampled flag set.
+    fn producer(trace: &[u8], span: &[u8]) -> wyrd_tonic::wyrd::v1::ProducerTraceContext {
+        wyrd_tonic::wyrd::v1::ProducerTraceContext {
+            trace_id: trace.to_vec(),
+            span_id: span.to_vec(),
+            trace_flags: 1,
+            trace_state: String::new(),
+        }
+    }
+
+    /// Malformed producer contexts and those past the bound are skipped, and
+    /// the valid ones link in the frame's order.
+    #[test]
+    fn producer_links_skip_malformed_and_excess_contexts() {
+        let mut wide_flags = producer(&[2; 16], &[2; 8]);
+        wide_flags.trace_flags = 256;
+        let mut contexts = vec![
+            producer(&[1; 16], &[1; 8]),
+            producer(&[0; 16], &[1; 8]),
+            producer(&[1; 16], &[0; 8]),
+            producer(&[1; 15], &[1; 8]),
+            producer(&[1; 16], &[1; 9]),
+            wide_flags,
+            producer(&[3; 16], &[3; 8]),
+        ];
+        contexts.extend((0..wyrd_queue::MAX_PRODUCER_TRACES).map(|_| producer(&[4; 16], &[4; 8])));
+
+        let links = super::producer_links(&contexts);
+
+        let ids: Vec<_> = links
+            .iter()
+            .map(|(trace, span)| (trace.as_bytes()[0], span.as_bytes()[0]))
+            .collect();
+        let mut expected = vec![(1, 1), (3, 3)];
+        expected.resize(wyrd_queue::MAX_PRODUCER_TRACES - 5, (4, 4));
+        assert_eq!(ids, expected);
+    }
+
     /// One native frame for `table` carrying a fresh `UUIDv7` batch identity.
     fn native_frame(table: &str) -> wyrd_tonic::wyrd::v1::InsertBatchRequest {
         wyrd_tonic::wyrd::v1::InsertBatchRequest {
             table: table.to_owned(),
             wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
             arrow_ipc: Vec::new().into(),
+            producer_trace_contexts: Vec::new(),
         }
     }
 
@@ -2598,6 +2669,7 @@ mod tests {
                     table: table.to_owned(),
                     wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
                     arrow_ipc: Vec::new().into(),
+                    producer_trace_contexts: Vec::new(),
                 };
 
                 let result = gate
@@ -2682,6 +2754,7 @@ mod tests {
             table: "vala.traces.spans".to_owned(),
             wyrd_batch_id: batch_id.into(),
             arrow_ipc: Vec::new().into(),
+            producer_trace_contexts: Vec::new(),
         };
 
         let uuid_v4 = uuid::Uuid::new_v4();

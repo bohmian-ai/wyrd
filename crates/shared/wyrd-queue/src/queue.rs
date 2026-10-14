@@ -14,6 +14,7 @@ use arrow_schema::SchemaRef;
 use tokio::time::Instant;
 use uuid::Uuid;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::trace::TraceContext;
 
 use crate::config::QueueConfig;
 use crate::error::WyrdQueueError;
@@ -25,6 +26,9 @@ use crate::sink::{BatchSink, DurableBatchAck, OwnedIpcBytes, SealedBatch, SinkEr
 const RETRY_BACKOFF_INITIAL_MS: u64 = 10;
 /// Maximum ceiling for one retained ambiguity backoff.
 const RETRY_BACKOFF_MAX_MS: u64 = 1_000;
+/// The most producer contexts one sealed frame carries; later distinct
+/// contexts are not linked.
+pub const MAX_PRODUCER_TRACES: usize = 32;
 
 /// One staged prepared row and the record reservation that pays for it.
 ///
@@ -39,6 +43,8 @@ pub struct Row {
     pub(crate) bytes: usize,
     /// The record's one handle-wide reservation.
     pub(crate) _guard: Arc<ClientByteGuard>,
+    /// The PRODUCER span the record was admitted under, shared by its rows.
+    pub(crate) trace: Option<Arc<TraceContext>>,
 }
 
 /// One caller-built Arrow batch and the reservation that pays for its arrays.
@@ -354,6 +360,7 @@ impl RecordQueue {
                     frame: OwnedIpcBytes::new(frame, guard),
                     rows,
                     request_id,
+                    producer_traces: Vec::new(),
                 })
             });
         match sealed {
@@ -582,6 +589,7 @@ impl RecordQueue {
                 frame: OwnedIpcBytes::new(frame, frame_guard),
                 rows: chunk.len() as u64,
                 request_id: None,
+                producer_traces: producer_traces(&chunk),
             };
             drop(chunk);
             self.outbox().push_back(batch);
@@ -654,6 +662,27 @@ pub(crate) fn retry_backoff(batch_id: [u8; 16], attempt: u32) -> Duration {
     Duration::from_millis(floor + mixed % (ceiling - floor + 1))
 }
 
+/// The first [`MAX_PRODUCER_TRACES`] distinct producer contexts of `rows`,
+/// by `(trace_id, span_id)`, in row-admission order.
+///
+/// Rows without a context add nothing, and contexts past the bound are
+/// ignored.
+fn producer_traces(rows: &[Row]) -> Vec<TraceContext> {
+    let mut traces: Vec<TraceContext> = Vec::new();
+    for trace in rows.iter().filter_map(|row| row.trace.as_deref()) {
+        if traces.len() == MAX_PRODUCER_TRACES {
+            break;
+        }
+        if !traces
+            .iter()
+            .any(|seen| seen.trace_id == trace.trace_id && seen.span_id == trace.span_id)
+        {
+            traces.push(trace.clone());
+        }
+    }
+    traces
+}
+
 #[cfg(test)]
 mod tests {
     //! Settlement tests for sealing, splitting, and restoration.
@@ -697,6 +726,7 @@ mod tests {
             _guard: Arc::new(budget.reserve(bytes).expect("row bytes fit")),
             bytes,
             batch,
+            trace: None,
         }
     }
 
@@ -882,6 +912,7 @@ mod tests {
             _guard: Arc::new(poison_budget.reserve(bytes).expect("row bytes fit")),
             bytes,
             batch,
+            trace: None,
         });
         poison_queue.push(row(&poison_budget, 3));
         assert!(matches!(
@@ -993,5 +1024,85 @@ mod tests {
             .expect("a later pass retries the batch");
         queue.settle(resend.await, &mut FlushOutcome::default());
         assert_eq!(sink.attempted().len(), 3);
+    }
+
+    /// A producer context with distinct trace and span ids for `n`.
+    fn trace(n: u8) -> TraceContext {
+        TraceContext {
+            trace_id: format!("{:032x}", u128::from(n) + 1),
+            span_id: format!("{:016x}", u64::from(n) + 1),
+            trace_flags: 1,
+            trace_state: String::new(),
+        }
+    }
+
+    /// A queue row admitted under `context`, or under none.
+    fn traced_row(budget: &ClientByteBudget, id: i64, context: Option<TraceContext>) -> Row {
+        Row {
+            trace: context.map(Arc::new),
+            ..row(budget, id)
+        }
+    }
+
+    /// A seal keeps the first 32 distinct producer contexts in row-admission
+    /// order: a repeated context and a context-free row add nothing, and
+    /// contexts past the bound are ignored.
+    #[test]
+    fn seal_keeps_the_first_distinct_producer_contexts_in_order() {
+        let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
+        let mut rows = vec![
+            traced_row(&budget, 1, Some(trace(0))),
+            traced_row(&budget, 2, None),
+            traced_row(&budget, 3, Some(trace(1))),
+            traced_row(&budget, 4, Some(trace(0))),
+        ];
+        rows.extend((2..40).map(|n| traced_row(&budget, i64::from(n), Some(trace(n)))));
+        let kept = producer_traces(&rows);
+        assert_eq!(kept.len(), MAX_PRODUCER_TRACES);
+        assert_eq!(kept, (0..32).map(trace).collect::<Vec<_>>());
+        assert!(
+            producer_traces(&[traced_row(&budget, 1, None)]).is_empty(),
+            "a context-free row adds nothing"
+        );
+    }
+
+    /// Every attempt of one sealed batch, including the resend after an
+    /// ambiguous settlement, carries byte-identical producer contexts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch is not retained after the ambiguity or an
+    /// attempt's contexts differ.
+    #[tokio::test(start_paused = true)]
+    async fn an_ambiguous_retry_resends_the_same_producer_contexts() {
+        let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
+        let sink = Arc::new(MockSink::new());
+        let queue = RecordQueue::new(
+            "events".to_owned(),
+            output_schema(),
+            sink.clone(),
+            QueueConfig::default(),
+            budget.clone(),
+            Arc::new(Counters::default()),
+        );
+        queue
+            .place(Entry::Rows(vec![
+                traced_row(&budget, 1, Some(trace(7))),
+                traced_row(&budget, 2, Some(trace(3))),
+            ]))
+            .expect("rows staged");
+        queue.seal().expect("rows sealed");
+        sink.fail_next(1);
+
+        let first = queue.start(Instant::now()).expect("the fresh batch starts");
+        queue.settle(first.await, &mut FlushOutcome::default());
+        let due = queue.next_retry_due().expect("the ambiguity is retained");
+        tokio::time::advance(due - Instant::now()).await;
+        let retry = queue.start(Instant::now()).expect("the due batch starts");
+        queue.settle(retry.await, &mut FlushOutcome::default());
+
+        let attempts = sink.attempted_traces();
+        assert_eq!(attempts, vec![vec![trace(7), trace(3)]; 2]);
+        assert_eq!(sink.received()[0].producer_traces, attempts[0]);
     }
 }

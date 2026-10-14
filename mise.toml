@@ -867,13 +867,8 @@ run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --tes
 
 [tasks."docker:build"]
 hide = true
-description = "Build the wyrd-server Docker image"
-run = """
-set -eu
-cargo build --locked --release -p wyrd-server --features cloud
-mkdir -p binary && cp target/release/wyrd-server binary/
-docker build -f docker/official/Dockerfile -t wyrd .
-"""
+description = "Build the official ubuntu image as wyrd on Linux"
+run = "scripts/build.sh image ubuntu wyrd"
 
 [tasks."check:deps"]
 hide = true

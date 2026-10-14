@@ -266,7 +266,6 @@ def select(paths, root):
             sel.flag("docs", f"docs input {path}")
         if UI.match(path):
             sel.flag("ui", f"UI input {path}")
-            sel.flag("package_server", f"UI bundle input {path}")
         if STORAGE.match(path):
             sel.flag("storage", f"storage environment input {path}")
         if IDENTITY.match(path):

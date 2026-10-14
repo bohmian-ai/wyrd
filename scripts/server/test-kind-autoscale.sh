@@ -44,7 +44,7 @@ cleanup() {
     echo "--- cluster state and pod logs: target/wyrd-kind-failure.log"
   fi
   kind delete cluster --name "$cluster" >/dev/null 2>&1 || true
-  rm -rf "$work" "$root/binary"
+  rm -rf "$work"
   exit "$status"
 }
 trap cleanup EXIT
@@ -108,14 +108,9 @@ oracle_pods() { k get pods -l app=wyrd-oracle -o jsonpath='{range .items[*]}{.me
 hpa_desires() { [[ "$(hpa_field .status.desiredReplicas)" == "$1" ]]; }
 
 echo "== build: server binary and the official image"
-cargo build --locked -p wyrd-server --features cloud
-mkdir -p "$root/binary"
-cp "$root/target/debug/wyrd-server" "$root/binary/"
-source_commit="$(git -C "$root" rev-parse HEAD)"
-[[ -z "$(git -C "$root" status --porcelain --untracked-files=no)" ]] || source_commit+="+dirty"
-image_id="$(docker build -q -f "$root/docker/official/Dockerfile" \
-  --label "org.opencontainers.image.revision=$source_commit" -t wyrd:kind "$root")"
+image_id="$("$root/scripts/build.sh" image ubuntu wyrd:kind)"
 [[ $image_id == sha256:* ]] || fail "the official build reported no immutable image ID: $image_id"
+source_commit="$(docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_id")"
 # The config digest is the image ID containerd reports inside kind, whichever
 # image store the host Docker uses.
 config_id="sha256:$(docker save wyrd:kind | tar -xO manifest.json | python3 -c \

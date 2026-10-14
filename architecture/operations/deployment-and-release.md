@@ -218,9 +218,20 @@ declared compatibility interval before surge starts. Overlap is permitted only
 when both manifests mutually accept the other version for every shared
 contract. Missing or one-sided compatibility fails closed.
 
+The official images (`docker/official/{ubuntu,debian,rocky}/Dockerfile`) run
+`wyrd-server` behind nginx, which proxies HTTP on 8080 and gRPC on 50051 to
+the server's loopback listeners. Each copies a Linux server bundle and
+compiles nothing. Release publishes `wyrdai/wyrd:<distro>-<arch>-<version>`
+for ubuntu, debian, and rocky on amd64 and ubuntu and debian on arm64, each
+built on a native runner from the bundle its build job recorded, then the
+multi-arch tags `<distro>-<version>` and `<distro>-latest`, with ubuntu also
+as `<version>` and `latest`. The ubuntu and debian images carry the bundle
+built on ubuntu-22.04; rocky carries the one built on rockylinux:9, so each
+runs on its image's glibc.
+
 No Wyrd image has been published yet. Until the first release, image
-acceptance builds the official recipe (`docker/official/Dockerfile`) from the
-reviewed commit and pins that exact build by its immutable local image ID,
+acceptance builds the ubuntu image on Linux with `scripts/build.sh image` from
+the reviewed commit and pins that exact build by its immutable local image ID,
 recording the ID and source commit. The first release repeats the same image
 journeys against the published registry digest named in its manifest.
 
@@ -245,8 +256,9 @@ journeys against the published registry digest named in its manifest.
 ## Local server bundles
 
 Each release publishes `wyrd-server-<target>.tar.gz` for
-`aarch64-apple-darwin`, `x86_64-apple-darwin`,
-`x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`, plus
+`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
+`x86_64-unknown-linux-gnu-rocky`, and `aarch64-unknown-linux-gnu`, each built
+by `scripts/build.sh bundle` and holding `wyrd-server`, plus
 `checksums.txt` and `checksums.txt.sig`: a raw Ed25519 signature over the
 checksums made with the `WYRD_RELEASE_SIGNING_KEY` release secret.
 Publication refuses a secret whose public half differs from the key the CLI

@@ -11,7 +11,8 @@
 #                                exits nonzero, serve stays unready, and the
 #                                retry succeeds without losing tenant data.
 #   startup_image_journey        migrate, serve, idempotent setup, nginx routes
-#                                (API, BFF, health, MCP stream, no authz check),
+#                                (API, OAuth metadata, health, MCP stream, no
+#                                authz check),
 #                                public Rust SDK over HTTP and derived gRPC,
 #                                restart into APP_ENV=production, persistence.
 #
@@ -100,9 +101,8 @@ docker exec "$app" wyrd-server setup --tenant acme | grep -q "already set up" \
 [[ "$(curl -fsS "$http/healthz")" == ok ]] || fail "healthz through nginx"
 curl -fsS "$http/openapi.json" | grep -q '"/v1/cards"' || fail "openapi through nginx"
 curl -fsS "$http/openapi.json" | grep -q 'authz/check' && fail "authz check still in OpenAPI"
-bff="$(curl -fsS "$http/")"
-grep -qi '<html' <<<"$bff" || fail "BFF did not serve the UI"
-grep -q WYRD_SPEC_502_UPSTREAM_FAILURE <<<"$bff" && fail "BFF could not reach the Rust server"
+curl -fsS "$http/.well-known/oauth-authorization-server" | grep -q '"issuer"' \
+  || fail "OAuth metadata through nginx"
 token="$(curl -fsS -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
   --data-urlencode "subject_token=$api_key" \
   -d subject_token_type=urn:wyrd:oauth:token-type:api_key "$http/auth/token" \

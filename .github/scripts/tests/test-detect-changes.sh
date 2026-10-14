@@ -262,8 +262,8 @@ check_selection "shared Skald change packages every SDK, server, and crate" \
 check_selection "wire contract packages every deliverable" \
   "package_python=true package_typescript=true package_server=true package_crates=true" \
   "crates/wyrd-spec/src/lib.rs"
-check_selection "UI change packages the server bundle only" \
-  "package_server=true package_python=false package_typescript=false" \
+check_selection "UI change packages nothing" \
+  "package_python=false package_typescript=false package_server=false package_crates=false" \
   "crates/wyrd/wyrd-server/wyrd-ui/src/routes/+page.svelte"
 check_selection "TypeScript SDK change packages TypeScript only" \
   "package_typescript=true package_python=false package_server=false" \
@@ -277,7 +277,7 @@ check_selection "unknown impact packages the complete matrix" \
 
 release="$WORKFLOWS/release.yml"
 release_builds_ok=true
-for build in build-sdist build-linux build-macos build-typescript build-ui build-server package-crates; do
+for build in build-sdist build-linux build-macos build-typescript build-server package-crates; do
   block="$(job release.yml "$build")"
   grep -q "github.event_name == 'release'" <<< "$block" || release_builds_ok=false
   grep -q 'needs.changes.outputs.package_' <<< "$block" || release_builds_ok=false

@@ -27,7 +27,7 @@ cleanup() {
   docker volume rm -f "$volume" "$keys" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
   docker image rm -f "$tag" >/dev/null 2>&1 || true
-  rm -rf "$work" "$root/binary"
+  rm -rf "$work"
   exit "$status"
 }
 trap cleanup EXIT
@@ -52,14 +52,9 @@ start_app() {
 }
 
 echo "== build: server binary and the official image"
-cargo build --locked -p wyrd-server --features cloud
-mkdir -p "$root/binary"
-cp "$root/target/debug/wyrd-server" "$root/binary/"
-source_commit="$(git -C "$root" rev-parse HEAD)"
-[[ -z "$(git -C "$root" status --porcelain --untracked-files=no)" ]] || source_commit+="+dirty"
-image="$(docker build -q -f "$root/docker/official/Dockerfile" \
-  --label "org.opencontainers.image.revision=$source_commit" -t "$tag" "$root")"
+image="$("$root/scripts/build.sh" image ubuntu "$tag")"
 [[ $image == sha256:* ]] || fail "the official build reported no immutable image ID: $image"
+source_commit="$(docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")"
 echo "image: $image source: $source_commit" | tee "$root/target/startup-$startup_journey-image-provenance.txt"
 # The server reads only owner-only key files, so the signing key and the
 # single-tenant deployment's file operator KEK are written into a volume as

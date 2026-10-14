@@ -27,6 +27,7 @@ jobs:
       rust_client: ${{ steps.filter.outputs.rust_client }}
       docs: ${{ steps.filter.outputs.docs }}
       ui: ${{ steps.filter.outputs.ui }}
+      package_server: ${{ steps.filter.outputs.package_server }}
       full_gate: ${{ steps.filter.outputs.full_gate }}
       rust_packages: ${{ steps.filter.outputs.rust_packages }}
       ci_jobs: ${{ steps.filter.outputs.ci_jobs }}
@@ -305,9 +306,36 @@ jobs:
         working-directory: crates/wyrd/wyrd-server/wyrd-ui
         run: node brand/gen-theme.mjs --check
 
+  # The official ubuntu image built the way the startup lanes and kind build
+  # it, then both startup journeys against it, on Linux x86 and arm.
+  image:
+    name: image (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.full_gate == 'true' || needs.changes.outputs.package_server == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          docker-images: "false"
+          cache-key: image-${{ matrix.os }}
+          save-cache: "true"
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev pkg-config
+
+      - name: Startup journeys
+        run: mise run test:server:startup
+
   ci-complete:
     name: ci complete
-    needs: [changes, matrix-plan, deps, ci, rust-client, typescript, python, docs, ui]
+    needs: [changes, matrix-plan, deps, ci, rust-client, typescript, python, docs, ui, image]
     # Not always(): a superseded run must stop here, or the next push's run
     # waits for this job before the concurrency group lets it start.
     if: ${{ !cancelled() }}
@@ -329,3 +357,4 @@ jobs:
           "${{ needs.python.result }}"
           "${{ needs.docs.result }}"
           "${{ needs.ui.result }}"
+          "${{ needs.image.result }}"

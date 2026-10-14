@@ -321,12 +321,24 @@ fn gated() -> Vec<(Tool, Permission)> {
 }
 
 /// Every gateway tool in [`TOOLS`] order, for name resolution and catalog checks.
+///
+/// # Panics
+///
+/// Panics, through [`gated`], if an embedded gateway input schema is not a
+/// JSON object, which the static literals and generated contract schemas never
+/// are.
 #[must_use]
 pub(super) fn descriptors() -> Vec<Tool> {
     gated().into_iter().map(|(tool, _)| tool).collect()
 }
 
 /// The gateway read tools every authenticated caller may be shown.
+///
+/// # Panics
+///
+/// Panics, through [`gated`], if an embedded gateway input schema is not a
+/// JSON object, which the static literals and generated contract schemas never
+/// are.
 #[must_use]
 pub(super) fn descriptors_unscoped() -> Vec<Tool> {
     gated()
@@ -341,6 +353,12 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
 /// A tool is listed only when the caller's verified permissions already grant
 /// what its operation enforces, so an agent is never offered a change it
 /// cannot make.
+///
+/// # Panics
+///
+/// Panics, through [`gated`], if an embedded gateway input schema is not a
+/// JSON object, which the static literals and generated contract schemas never
+/// are.
 #[must_use]
 pub(super) fn write_descriptors(caller: &Caller) -> Vec<Tool> {
     gated()

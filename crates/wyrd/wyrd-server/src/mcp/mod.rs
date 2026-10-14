@@ -440,6 +440,11 @@ mod tests {
     /// Proves every tool a caller holding every scope can be shown has a plain
     /// object input root and an object output root, so common MCP clients and
     /// model tool-calling accept the complete catalog.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the operator connection create tool is missing from the
+    /// catalog, or when any tool's input or output root is not a plain object.
     #[test]
     fn every_tool_schema_is_accepted_by_common_tool_callers() {
         let catalog: Vec<_> = WyrdMcpHandler::catalog()

@@ -2,7 +2,7 @@
   "name": "wyrd-ai-linux-x64-gnu",
   "version": "0.0.1",
   "description": "Native napi addon for wyrd-ai-linux-x64-gnu.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "os": [
     "linux"
   ],

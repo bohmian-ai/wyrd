@@ -2,7 +2,7 @@
   "name": "wyrd-ai-darwin-arm64",
   "version": "0.0.1",
   "description": "Native napi addon for wyrd-ai-darwin-arm64.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "os": [
     "darwin"
   ],

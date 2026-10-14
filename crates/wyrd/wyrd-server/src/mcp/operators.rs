@@ -53,6 +53,19 @@ struct IdArgs {
     connection_id: OperatorConnectionId,
 }
 
+/// Advertised arguments of `operator_connections.create`: the HTTP POST body
+/// under `request`.
+///
+/// The body is a provider-tagged union. Nesting it keeps the argument root a
+/// plain object, which tool-calling consumers such as OpenAI function tools
+/// require, while the union still validates every provider's fields.
+#[derive(Debug, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CreateArgs {
+    /// Provider-tagged Slack, PagerDuty, or HTTP connection to create.
+    request: CreateOperatorConnectionRequest,
+}
+
 /// Advertised arguments of `operator_connections.update`: the connection ID
 /// plus the HTTP PATCH body under `request`.
 #[derive(Debug, serde::Deserialize, JsonSchema)]
@@ -96,11 +109,12 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
 #[must_use]
 pub(super) fn write_descriptors() -> Vec<Tool> {
     vec![
-        tool::<CreateOperatorConnectionRequest, OperatorConnectionView>(
+        tool::<CreateArgs, OperatorConnectionView>(
             CREATE,
             "Create an Operator connection",
-            "Create one provider-tagged Slack, PagerDuty, or HTTP connection. The secret is \
-             encrypted at rest and never returned. Requires operators:write.",
+            "Create one provider-tagged Slack, PagerDuty, or HTTP connection from the HTTP \
+             create body under `request`. The secret is encrypted at rest and never returned. \
+             Requires operators:write.",
             false,
         ),
         tool::<UpdateArgs, OperatorConnectionView>(
@@ -167,11 +181,10 @@ impl WyrdMcpHandler {
                 let args: IdArgs = parse_args(arguments, GET)?;
                 structured(&control.get(&caller, args.connection_id).await?)
             }
-            CREATE => structured(
-                &control
-                    .create(&caller, decode_secret_args(arguments)?)
-                    .await?,
-            ),
+            CREATE => {
+                let args: CreateArgs = decode_secret_args(arguments)?;
+                structured(&control.create(&caller, args.request).await?)
+            }
             UPDATE => {
                 let args: UpdateArgs = decode_secret_args(arguments)?;
                 structured(

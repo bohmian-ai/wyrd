@@ -145,7 +145,7 @@ impl WyrdMcpHandler {
     /// operations require explicit gateway write or delete scopes at dispatch.
     /// Principal write tools are per caller and the test-support probe is
     /// opt-in, so neither belongs here.
-    fn catalog(&self) -> Vec<Tool> {
+    fn catalog() -> Vec<Tool> {
         let mut catalog = bifrost::descriptors();
         catalog.extend(principals::descriptors_unscoped());
         catalog.extend(cards::descriptors());
@@ -187,7 +187,7 @@ impl ServerHandler for WyrdMcpHandler {
 
     /// Resolve only tools in this process's configured Wyrd catalog.
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        self.catalog()
+        Self::catalog()
             .into_iter()
             .chain(principals::write_descriptors())
             .chain(verification::write_descriptors())
@@ -210,7 +210,7 @@ impl ServerHandler for WyrdMcpHandler {
         // appears only to a caller whose verified token already carries the
         // permission it needs. An agent therefore never discovers a capability
         // it cannot use, and naming one anyway is still refused at dispatch.
-        let mut catalog = self.catalog();
+        let mut catalog = Self::catalog();
         if let Ok(caller) = Self::caller(&context) {
             if principals::may_administer(&caller) {
                 catalog.extend(principals::write_descriptors());
@@ -425,4 +425,44 @@ pub(crate) fn wyrd_error_to_mcp(error: WyrdError) -> ErrorData {
     };
     let message = error.to_string();
     ErrorData::new(code, message, Some(error.as_problem_json()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WyrdMcpHandler, operators, principals, verification};
+
+    /// Top-level input keywords OpenAI function tools refuse, rejecting the
+    /// whole tool list when any advertised tool carries one.
+    const ROOT_COMBINATORS: [&str; 6] = ["oneOf", "anyOf", "allOf", "enum", "const", "not"];
+
+    /// Proves every tool a caller holding every scope can be shown has a plain
+    /// object input root and an object output root, so common MCP clients and
+    /// model tool-calling accept the complete catalog.
+    #[test]
+    fn every_tool_schema_is_accepted_by_common_tool_callers() {
+        let catalog: Vec<_> = WyrdMcpHandler::catalog()
+            .into_iter()
+            .chain(principals::write_descriptors())
+            .chain(verification::write_descriptors())
+            .chain(operators::write_descriptors())
+            .collect();
+        assert!(catalog.iter().any(|tool| tool.name == operators::CREATE));
+        for tool in &catalog {
+            let name = tool.name.as_ref();
+            assert_eq!(
+                tool.input_schema.get("type"),
+                Some(&"object".into()),
+                "{name}"
+            );
+            for keyword in ROOT_COMBINATORS {
+                assert!(
+                    !tool.input_schema.contains_key(keyword),
+                    "{name} input root carries {keyword}"
+                );
+            }
+            if let Some(output) = &tool.output_schema {
+                assert_eq!(output.get("type"), Some(&"object".into()), "{name}");
+            }
+        }
+    }
 }

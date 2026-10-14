@@ -9,10 +9,13 @@
 use async_trait::async_trait;
 use reqwest::header::HeaderName;
 use serde_json::value::{RawValue, to_raw_value};
-use skald_providers::auth::{AnthropicAuth, GoogleApiKeyAuth, GoogleOAuth, OpenAiAuth, VertexAuth};
+use skald_providers::auth::{
+    AnthropicAuth, GoogleApiKeyAuth, GoogleOAuth, JevAuth, OpenAiAuth, VertexAuth,
+};
 use skald_providers::{
-    AnthropicClient, GoogleClient, HttpTransport, MediaAnswer, OpenAiClient, OpenAiMediaRoute,
-    OpenAiRoute, ProviderByteStream, ProviderError, ProviderResult, RetryPolicy, VertexClient,
+    AnthropicClient, GoogleClient, HttpTransport, JevClient, MediaAnswer, OpenAiClient,
+    OpenAiMediaRoute, OpenAiRoute, ProviderByteStream, ProviderError, ProviderResult, RetryPolicy,
+    VertexClient,
 };
 use skald_spec::{ProviderRequest, ProviderResponse};
 use url::Url;
@@ -20,7 +23,8 @@ use wyrd_spec::gateway::{GatewayOperation, ProviderAdapter, ProviderAuth, Provid
 
 use super::stream::{ChatChunks, Frames, MediaCapture, StreamCapture, relay, relay_media};
 use super::{
-    BatchAction, MediaRequest, Prepared, Wire, complete, faithful_embeddings, prepare, refusal,
+    BatchAction, IngressDialect, MediaRequest, Prepared, Wire, complete, faithful_embeddings,
+    prepare, refusal,
 };
 use crate::credential::ProviderSecret;
 use crate::engine::{
@@ -45,6 +49,8 @@ pub struct BuiltinEndpoints {
     /// Vertex AI base; `None` selects the regional endpoint of each
     /// deployment's location.
     pub vertex: Option<Url>,
+    /// TypeSafe API base, without the `/v1` segment.
+    pub jev: Option<Url>,
 }
 
 /// Provider dispatch through Skald provider clients under an endpoint policy.
@@ -84,7 +90,8 @@ impl HttpProviderDispatch {
     ///
     /// `OpenAI` takes bearer authentication; compatible endpoints take any
     /// style; Anthropic takes its `x-api-key` header; Gemini its
-    /// `x-goog-api-key` header; Vertex a bearer access token. Returns `None`
+    /// `x-goog-api-key` header; Vertex a bearer access token; Jev a bearer API
+    /// key. Returns `None`
     /// for any other combination, a base URL the policy does not admit, a
     /// missing credential, or a credential or header name that is not a valid
     /// header.
@@ -98,6 +105,7 @@ impl HttpProviderDispatch {
             ProviderAdapter::Anthropic => self.endpoints.anthropic.clone(),
             ProviderAdapter::Gemini => self.endpoints.gemini.clone(),
             ProviderAdapter::Vertex { .. } => self.endpoints.vertex.clone(),
+            ProviderAdapter::Jev => self.endpoints.jev.clone(),
             ProviderAdapter::OpenAiCompatible { base_url } => {
                 Some(Url::parse(base_url.as_str()).ok()?)
             }
@@ -183,6 +191,18 @@ impl HttpProviderDispatch {
                     retry,
                 ))
             }
+            (ProviderAdapter::Jev, ProviderAuth::Bearer { .. }) => {
+                let auth = JevAuth::new(key()?);
+                let auth = match base {
+                    Some(base) => auth.with_base_url(base),
+                    None => auth,
+                };
+                Client::Jev(JevClient::with_transport(
+                    auth,
+                    self.transport.clone(),
+                    retry,
+                ))
+            }
             _ => return None,
         };
         Some(client)
@@ -199,6 +219,8 @@ enum Client {
     Google(GoogleClient),
     /// Vertex `GenerateContent`.
     Vertex(VertexClient),
+    /// Jev `systemone`.
+    Jev(JevClient),
 }
 
 impl Client {
@@ -222,6 +244,7 @@ impl Client {
             Prepared::Native(body) => to_raw_value(body),
             Prepared::Anthropic(request) => to_raw_value(request),
             Prepared::Google(request) => to_raw_value(request),
+            Prepared::Jev(request) => to_raw_value(request),
         }
         .map_err(|error| ProviderError::decode("gateway", error))?;
         match (self, prepared) {
@@ -347,6 +370,11 @@ impl Client {
             (Self::Vertex(client), Prepared::Google(request)) => {
                 client
                     .send_native(ProviderRequest::GeminiGenerateContent(*request))
+                    .await?
+            }
+            (Self::Jev(client), Prepared::Jev(request)) => {
+                client
+                    .send_native(ProviderRequest::JevSystemOne(*request))
                     .await?
             }
             (_, _) => return Err(mismatch()),
@@ -639,7 +667,10 @@ impl ProviderDispatch for HttpProviderDispatch {
             );
             return failed(FailureClass::BeforeDispatch);
         };
-        let translated = !matches!(prepared, Prepared::Native(_));
+        // A Jev request is translated only on the Chat Completions
+        // pass-through; on its native route it answers in its own dialect.
+        let translated =
+            !matches!(prepared, Prepared::Native(_)) && attempt.ingress == IngressDialect::OpenAi;
         let wire = Wire::of(&deployment.adapter);
         let id = format!("chatcmpl-{}", attempt.call_id.as_uuid().simple());
         let model = deployment.model.model.as_str();
@@ -692,7 +723,7 @@ impl ProviderDispatch for HttpProviderDispatch {
             }
         };
         let mapped = tracing::info_span!("gateway.translate", direction = "response")
-            .in_scope(|| complete(response, wire, &id, model));
+            .in_scope(|| complete(response, wire, translated, &id, model));
         match mapped {
             Ok((body, usage))
                 if attempt.operation != GatewayOperation::Embeddings

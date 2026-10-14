@@ -2236,6 +2236,147 @@
         }
       ]
     },
+    "JevNoulCriteria": {
+      "description": "Outcome descriptions of a `noul` question.",
+      "type": "object",
+      "required": [
+        "false",
+        "true"
+      ],
+      "properties": {
+        "false": {
+          "description": "When the answer is false.",
+          "type": "string"
+        },
+        "true": {
+          "description": "When the answer is true.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "JevQuestion": {
+      "description": "One keyed Jev question, tagged by its answer form.",
+      "oneOf": [
+        {
+          "description": "Yes/no question answered with a probability that it holds.",
+          "type": "object",
+          "required": [
+            "instructions",
+            "type"
+          ],
+          "properties": {
+            "criteria": {
+              "description": "Optional descriptions of the true and false outcomes.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JevNoulCriteria"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "instructions": {
+              "description": "What to decide about the state.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "noul"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Pick exactly one of the keyed options.",
+          "type": "object",
+          "required": [
+            "criteria",
+            "instructions",
+            "type"
+          ],
+          "properties": {
+            "criteria": {
+              "description": "Option name to its description.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "instructions": {
+              "description": "What to choose about the state.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "choice"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Grade on an ordered scale whose levels are indexed from zero.",
+          "type": "object",
+          "required": [
+            "criteria",
+            "instructions",
+            "type"
+          ],
+          "properties": {
+            "criteria": {
+              "description": "Level descriptions, lowest first.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "instructions": {
+              "description": "What to grade about the state.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "score"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "JevRequest": {
+      "description": "`POST /v1/systemone` request body.",
+      "type": "object",
+      "required": [
+        "model",
+        "questions",
+        "state"
+      ],
+      "properties": {
+        "model": {
+          "description": "Native Jev model, such as `jev-latest`.",
+          "type": "string"
+        },
+        "questions": {
+          "description": "Questions keyed by the name their answer returns under.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/JevQuestion"
+          }
+        },
+        "state": {
+          "description": "Text the questions are about, such as an agent reply.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "LlmRoute": {
       "description": "Workflow model-call route.\n\nResolution is `step.llm_route -> workflow.llm_route -> Native`. The Prompt remains the sole owner of provider, model, request fields, and response shape; the route only selects the execution boundary.",
       "oneOf": [
@@ -5181,6 +5322,13 @@
           ]
         },
         {
+          "description": "TypeSafe Jev provider.",
+          "type": "string",
+          "enum": [
+            "jev"
+          ]
+        },
+        {
           "description": "Provider not modeled by skald-spec.",
           "type": "object",
           "required": [
@@ -5327,6 +5475,25 @@
               "type": "string",
               "enum": [
                 "vertex_predict"
+              ]
+            }
+          }
+        },
+        {
+          "description": "TypeSafe Jev `systemone` keyed questions about a state.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/JevRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "jev_system_one"
               ]
             }
           }

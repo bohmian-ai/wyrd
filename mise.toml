@@ -223,7 +223,7 @@ run = """scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate
   && mise run test:gateway:native:inner \
   && mise run test:gateway:vault:inner \
   && mise run test:gateway:journey:surfaces:inner \
-  && cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E \"test(/^(gateway_admin|gateway_inference)::/)\" \
+  && cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E \"test(/^(gateway_admin|gateway_inference|gateway_jev)::/)\" \
   && mise run py:test:gateway:journey:inner \
   && mise run ts:test:gateway:journey:inner'"""
 
@@ -257,12 +257,12 @@ run = [
 hide = true
 description = "Run every Python gateway journey — administration, native clients, and the official OpenAI client over all four provider backends — with their lifecycle already provisioned"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run python -m pytest -q -m integration tests/integration/gateway tests/integration/test_gateway_admin.py tests/integration/test_gateway_inference.py"
+run = "uv run python -m pytest -q -m integration tests/integration/gateway tests/integration/test_gateway_admin.py tests/integration/test_gateway_inference.py tests/integration/test_gateway_jev.py"
 
 [tasks."test:gateway:smoke:live"]
-description = """Opt-in live provider smoke lane: real OpenAI, Anthropic, and Gemini upstreams through the gateway.
+description = """Opt-in live provider smoke lane: real OpenAI, Anthropic, Gemini, and Jev upstreams through the gateway.
 Operator credentials come from the environment, normally an untracked mise.local.toml: the
-conventional OPENAI_API_KEY, ANTHROPIC_API_KEY, and GOOGLE_API_KEY are read directly and submitted
+conventional OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, and TYPESAFE_API_KEY are read directly and submitted
 as managed secrets through the CLI. A provider whose credential is absent is skipped explicitly.
 Vertex is excluded: its credential is a short-lived OAuth token, which never enters managed-secret
 storage. Deliberately outside test:gateway:journey and the CI gate.
@@ -280,7 +280,7 @@ run = "uv run python -m pytest -q -rs -m smoke tests/smoke"
 hide = true
 description = "Run the TypeScript gateway administration and inference journeys with their lifecycle already provisioned"
 dir = "sdks/wyrd-sdk-ts/wyrd"
-run = "pnpm exec vitest run tests/integration/gateway-admin.test.ts tests/integration/gateway-inference.test.ts tests/integration/gateway-streaming.test.ts"
+run = "pnpm exec vitest run tests/integration/gateway-admin.test.ts tests/integration/gateway-inference.test.ts tests/integration/gateway-streaming.test.ts tests/integration/gateway-jev.test.ts"
 
 [tasks."test:skald"]
 hide = true

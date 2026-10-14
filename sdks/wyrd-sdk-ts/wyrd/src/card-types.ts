@@ -1726,6 +1726,88 @@ export interface InlineableRef_for_TriggerSpecSibling {
   readonly sibling: CardRef;
 }
 
+/**
+ * Outcome descriptions of a `noul` question.
+ */
+export interface JevNoulCriteria {
+  /**
+   * When the answer is false.
+   */
+  readonly false: string;
+  /**
+   * When the answer is true.
+   */
+  readonly true: string;
+}
+
+/**
+ * One keyed Jev question, tagged by its answer form.
+ */
+export type JevQuestion = JevQuestionNoul | JevQuestionChoice | JevQuestionScore;
+
+/**
+ * Pick exactly one of the keyed options.
+ */
+export interface JevQuestionChoice {
+  /**
+   * Option name to its description.
+   */
+  readonly criteria: Readonly<Record<string, string>>;
+  /**
+   * What to choose about the state.
+   */
+  readonly instructions: string;
+  readonly type: "choice";
+}
+
+/**
+ * Yes/no question answered with a probability that it holds.
+ */
+export interface JevQuestionNoul {
+  /**
+   * Optional descriptions of the true and false outcomes.
+   */
+  readonly criteria?: JevNoulCriteria | null;
+  /**
+   * What to decide about the state.
+   */
+  readonly instructions: string;
+  readonly type: "noul";
+}
+
+/**
+ * Grade on an ordered scale whose levels are indexed from zero.
+ */
+export interface JevQuestionScore {
+  /**
+   * Level descriptions, lowest first.
+   */
+  readonly criteria: readonly string[];
+  /**
+   * What to grade about the state.
+   */
+  readonly instructions: string;
+  readonly type: "score";
+}
+
+/**
+ * `POST /v1/systemone` request body.
+ */
+export interface JevRequest {
+  /**
+   * Native Jev model, such as `jev-latest`.
+   */
+  readonly model: string;
+  /**
+   * Questions keyed by the name their answer returns under.
+   */
+  readonly questions: Readonly<Record<string, JevQuestion>>;
+  /**
+   * Text the questions are about, such as an agent reply.
+   */
+  readonly state: string;
+}
+
 export type JsonPath = string;
 
 /**
@@ -3070,7 +3152,7 @@ export interface PromptSpec {
 /**
  * Which provider a request targets.
  */
-export type ProviderName = "open_ai" | "anthropic" | "google" | "vertex" | ProviderNameCustom;
+export type ProviderName = "open_ai" | "anthropic" | "google" | "vertex" | "jev" | ProviderNameCustom;
 
 /**
  * Provider not modeled by skald-spec.
@@ -3084,7 +3166,7 @@ export interface ProviderNameCustom {
  *
  * Serialized as `{"provider": "<variant>", "body": <native provider JSON>}`. The tag selects the variant, so a body that does not match its named dialect fails to deserialize. The tag names a wire schema, not a destination: one schema served by several providers is one variant.
  */
-export type ProviderRequest = ProviderRequestOpenAiChatCompletion | ProviderRequestOpenAiResponses | ProviderRequestOpenAiEmbeddings | ProviderRequestAnthropicMessage | ProviderRequestGeminiGenerateContent | ProviderRequestGoogleBatchEmbed | ProviderRequestVertexPredict | ProviderRequestRawV1;
+export type ProviderRequest = ProviderRequestOpenAiChatCompletion | ProviderRequestOpenAiResponses | ProviderRequestOpenAiEmbeddings | ProviderRequestAnthropicMessage | ProviderRequestGeminiGenerateContent | ProviderRequestGoogleBatchEmbed | ProviderRequestVertexPredict | ProviderRequestJevSystemOne | ProviderRequestRawV1;
 
 /**
  * Anthropic Messages request.
@@ -3108,6 +3190,14 @@ export interface ProviderRequestGeminiGenerateContent {
 export interface ProviderRequestGoogleBatchEmbed {
   readonly body: GoogleBatchEmbedRequest;
   readonly provider: "google_batch_embed";
+}
+
+/**
+ * TypeSafe Jev `systemone` keyed questions about a state.
+ */
+export interface ProviderRequestJevSystemOne {
+  readonly body: JevRequest;
+  readonly provider: "jev_system_one";
 }
 
 /**

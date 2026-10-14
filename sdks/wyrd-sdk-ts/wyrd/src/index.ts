@@ -2996,8 +2996,18 @@ export interface ModelRef {
   readonly model: string;
 }
 
-/** Gateway operation a deployment may serve. */
-export type GatewayOperation = "chat_completions" | "responses" | "embeddings" | "images" | "audio" | "batches";
+/**
+ * Gateway operation a deployment may serve. `system_one` is Jev's
+ * `POST /v1/systemone` question answering, served only by the `jev` adapter.
+ */
+export type GatewayOperation =
+  | "chat_completions"
+  | "responses"
+  | "embeddings"
+  | "images"
+  | "audio"
+  | "batches"
+  | "system_one";
 
 /**
  * Redacted credential source. A tenant-submitted managed secret projects to
@@ -3029,11 +3039,18 @@ export interface ProviderCredentialView {
   readonly revoked_at: string | null;
 }
 
-/** Provider wire adapter; built-in adapters require their reserved provider. */
+/**
+ * Provider wire adapter; built-in adapters require their reserved provider.
+ * `jev` serves `system_one`, typed `{model, state, questions}` requests
+ * answered by typed `answers`, and a `chat_completions` pass-through whose last
+ * user message is the JSON text of `{state, questions}` and whose answer
+ * content is Jev's answer as JSON.
+ */
 export type ProviderAdapter =
   | "openai"
   | "anthropic"
   | "gemini"
+  | "jev"
   | {
       readonly vertex: { readonly project: string; readonly location: string };
     }

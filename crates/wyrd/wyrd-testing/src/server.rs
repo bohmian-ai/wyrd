@@ -4141,8 +4141,9 @@ impl WyrdTestServerBuilder {
     /// Dispatch gateway calls over HTTP with every built-in adapter rooted at
     /// one local mock upstream `root`.
     ///
-    /// `OpenAI` is served under `root`'s `/v1` segment; Anthropic, Gemini, and
-    /// Vertex at `root` itself, where each provider's native paths begin.
+    /// `OpenAI` is served under `root`'s `/v1` segment; Anthropic, Gemini,
+    /// Vertex, and Jev at `root` itself, where each provider's native paths
+    /// begin.
     /// Delegates to [`Self::with_gateway_endpoints_for_test`]. Eval judges
     /// call the gateway too, so a language journey roots every model path at
     /// one local mock.
@@ -4154,7 +4155,8 @@ impl WyrdTestServerBuilder {
             openai: Some(openai),
             anthropic: Some(root.clone()),
             gemini: Some(root.clone()),
-            vertex: Some(root),
+            vertex: Some(root.clone()),
+            jev: Some(root),
         })
     }
 
@@ -5188,6 +5190,10 @@ pub const TEST_GATEWAY_GEMINI_BINDING: &str = "test-gemini-key";
 /// gateway credentials, used as a static bearer access token.
 pub const TEST_GATEWAY_VERTEX_BINDING: &str = "test-vertex-key";
 
+/// Operator binding every test server declares for Jev `Environment`
+/// gateway credentials, presented as a bearer API key.
+pub const TEST_GATEWAY_JEV_BINDING: &str = "test-jev-key";
+
 /// Environment variable every test server's operator bindings read, per
 /// resolution, as the provider key.
 pub const TEST_GATEWAY_PROVIDER_KEY_VARIABLE: &str = "WYRD_TEST_GATEWAY_PROVIDER_KEY";
@@ -5311,6 +5317,7 @@ fn test_gateway_config(
             binding(TEST_GATEWAY_ANTHROPIC_BINDING, "anthropic")?,
             binding(TEST_GATEWAY_GEMINI_BINDING, "gemini")?,
             binding(TEST_GATEWAY_VERTEX_BINDING, "vertex")?,
+            binding(TEST_GATEWAY_JEV_BINDING, "jev")?,
         ]
         .into_iter()
         .collect(),

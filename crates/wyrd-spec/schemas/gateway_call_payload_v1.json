@@ -261,6 +261,13 @@
           "enum": [
             "batches"
           ]
+        },
+        {
+          "description": "Jev `systemone` keyed questions, served only by the Jev adapter.",
+          "type": "string",
+          "enum": [
+            "system_one"
+          ]
         }
       ]
     },

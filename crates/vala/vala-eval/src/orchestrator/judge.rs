@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use skald_agent::{Agent, AgentError, run_config_from_agent_run_config_spec};
 use skald_prompt::Prompt;
 use skald_providers::ProviderError;
@@ -174,10 +174,7 @@ impl SkaldJudgeInvoker {
                 });
             }
         };
-        if !matches!(
-            prompt.native().response_type,
-            skald_spec::ResponseType::JsonSchema { .. }
-        ) {
+        if !prompt.native().yields_structured_output() {
             return Err(JudgeError::Terminal {
                 reason: "judge Agent prompt must require structured JSON output".to_owned(),
             });
@@ -212,6 +209,22 @@ impl SkaldJudgeInvoker {
 
 #[async_trait]
 impl JudgeInvoker for SkaldJudgeInvoker {
+    /// Ask the judge Agent's Prompt once and return its structured answer.
+    ///
+    /// A judge is constrained to one iteration, no tools, and no session, so
+    /// it is one model call for every provider: the Prompt renders with the
+    /// context variables (media bound on a per-call copy), dispatches once to
+    /// the Agent's providers (the gateway registry when one is configured)
+    /// under [`Self::call_deadline`], and the provider-neutral
+    /// [`skald_spec::ResponseAdapter::structured_output`] becomes the
+    /// judgment.
+    ///
+    /// # Errors
+    /// Returns [`JudgeError::Terminal`] for an invalid judge or a Prompt that
+    /// does not render, [`JudgeError::Timeout`] past the deadline, the
+    /// provider failure classified by [`map_provider_error`], and
+    /// [`JudgeError::InvalidStructuredOutput`] when the answer is not a JSON
+    /// object.
     async fn invoke(
         &self,
         judge: &InlineableRef<AgentSpec>,
@@ -229,22 +242,33 @@ impl JudgeInvoker for SkaldJudgeInvoker {
         let vars = context_variables(prompt, &context);
         let borrowed = borrowed_pairs(&vars);
 
-        let run = tokio::time::timeout(
-            self.call_deadline,
-            agent.run_prompt(self.providers.as_ref(), prompt, &borrowed),
-        )
-        .await
-        .map_err(|_| JudgeError::Timeout {
-            elapsed_ms: elapsed_millis(self.call_deadline),
-        })?
-        .map_err(map_agent_error)?;
-
-        let map = run
-            .structured_output
-            .ok_or_else(|| JudgeError::InvalidStructuredOutput {
-                reason: "judge Agent produced no structured output".to_owned(),
+        let request = prompt
+            .render_native(&borrowed)
+            .map_err(|error| JudgeError::Terminal {
+                reason: format!("judge Prompt does not render: {error}"),
             })?;
-        Ok(Value::Object(map))
+        let call = skald_runtime::dispatch(
+            agent.effective_providers(&self.providers),
+            prompt.native().provider(),
+            request,
+        );
+        let response = tokio::time::timeout(self.call_deadline, call)
+            .await
+            .map_err(|_| JudgeError::Timeout {
+                elapsed_ms: elapsed_millis(self.call_deadline),
+            })?
+            .map_err(map_provider_error)?;
+
+        let answer = response.adapter().structured_output().ok_or_else(|| {
+            JudgeError::InvalidStructuredOutput {
+                reason: "judge answer carries no structured JSON output".to_owned(),
+            }
+        })?;
+        serde_json::from_str::<Map<String, Value>>(answer.get())
+            .map(Value::Object)
+            .map_err(|error| JudgeError::InvalidStructuredOutput {
+                reason: error.to_string(),
+            })
     }
 }
 
@@ -267,41 +291,35 @@ fn validate_judge_agent(spec: &AgentSpec) -> Result<(), JudgeError> {
     Ok(())
 }
 
-/// Classify an Agent failure for the judge retry loop.
+/// Classify a judge model-call failure for the judge retry loop.
 ///
-/// A gateway problem the Workflow classification deems terminal — such as a
-/// permission denial or an unknown model — stays terminal with its stable
-/// code leading the reason; every other provider failure is retryable.
-fn map_agent_error(error: AgentError) -> JudgeError {
-    if let AgentError::Provider(SkaldRuntimeError::Provider {
-        source: ProviderError::RemoteProblem(problem),
-        ..
-    }) = &error
-        && !agent_error_retryable(&error)
-    {
-        return JudgeError::Terminal {
-            reason: format!("{}: {}", problem.code, problem.message),
-        };
-    }
-    match error {
-        AgentError::Timeout { duration } => JudgeError::Timeout {
-            elapsed_ms: elapsed_millis(duration),
-        },
-        AgentError::StructuredOutputDecode { detail, .. } => {
-            JudgeError::InvalidStructuredOutput { reason: detail }
+/// A provider answer follows the shared Workflow classification for every
+/// provider: transport failures, timeouts, throttling, server errors, and
+/// retryable gateway problems retry; validation and credential refusals and
+/// terminal gateway problems do not. A runtime failure with no provider
+/// answer, such as an unregistered provider, stays retryable. A gateway
+/// problem keeps its stable code and message; any other provider failure
+/// names only its stable provider code, never the provider body.
+fn map_provider_error(error: SkaldRuntimeError) -> JudgeError {
+    let error = AgentError::Provider(error);
+    let reason = match &error {
+        AgentError::Provider(SkaldRuntimeError::Provider {
+            source: ProviderError::RemoteProblem(problem),
+            ..
+        }) => format!("{}: {}", problem.code, problem.message),
+        AgentError::Provider(SkaldRuntimeError::Provider { source, .. }) => {
+            format!("provider failure {}", source.code())
         }
-        AgentError::Provider(source) => JudgeError::Retryable {
-            reason: source.to_string(),
-        },
-        AgentError::Prompt { detail, .. } | AgentError::InvalidArgument { detail, .. } => {
-            JudgeError::Terminal { reason: detail }
-        }
-        AgentError::ProviderMismatch { .. } => JudgeError::Terminal {
-            reason: error.to_string(),
-        },
-        other => JudgeError::Terminal {
-            reason: other.to_string(),
-        },
+        other => other.to_string(),
+    };
+    let retryable = match &error {
+        AgentError::Provider(SkaldRuntimeError::Provider { .. }) => agent_error_retryable(&error),
+        _ => true,
+    };
+    if retryable {
+        JudgeError::Retryable { reason }
+    } else {
+        JudgeError::Terminal { reason }
     }
 }
 

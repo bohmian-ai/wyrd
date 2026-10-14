@@ -12,6 +12,7 @@ pub fn provider_name_from_str(value: &str) -> ProviderName {
         "anthropic" => ProviderName::Anthropic,
         "google" | "gemini" => ProviderName::Google,
         "vertex" | "vertex_ai" => ProviderName::Vertex,
+        "jev" => ProviderName::Jev,
         _ => ProviderName::Custom(value.to_owned()),
     }
 }

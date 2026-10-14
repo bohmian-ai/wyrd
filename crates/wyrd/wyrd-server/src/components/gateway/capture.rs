@@ -784,6 +784,7 @@ fn ingress_dialect(ingress: IngressDialect, operation: GatewayOperation) -> Stri
         IngressDialect::AnthropicMessages => "anthropic_messages".to_owned(),
         IngressDialect::GeminiGenerateContent => "gemini_generate_content".to_owned(),
         IngressDialect::VertexGenerateContent => "vertex_generate_content".to_owned(),
+        IngressDialect::Jev => "jev_systemone".to_owned(),
     }
 }
 
@@ -796,6 +797,7 @@ pub(crate) const fn operation_name(operation: GatewayOperation) -> &'static str 
         GatewayOperation::Images => "images",
         GatewayOperation::Audio => "audio",
         GatewayOperation::Batches => "batches",
+        GatewayOperation::SystemOne => "system_one",
     }
 }
 

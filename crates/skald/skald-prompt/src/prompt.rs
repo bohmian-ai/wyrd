@@ -271,6 +271,7 @@ pub(crate) fn provider_name_to_string(provider: &skald_spec::ProviderName) -> St
         skald_spec::ProviderName::Anthropic => "anthropic".to_owned(),
         skald_spec::ProviderName::Google => "google".to_owned(),
         skald_spec::ProviderName::Vertex => "vertex".to_owned(),
+        skald_spec::ProviderName::Jev => "jev".to_owned(),
         skald_spec::ProviderName::Custom(value) => value.clone(),
     }
 }
@@ -412,6 +413,12 @@ impl Prompt {
                     ..GeminiOptions::default()
                 };
                 crate::builder::vertex(model, options)?
+            }
+            skald_spec::ProviderName::Jev => {
+                return Err(PromptBuilderError::Validation(
+                    "a jev Prompt declares its native `request`, not messages".to_owned(),
+                )
+                .into());
             }
             skald_spec::ProviderName::Custom(custom) => {
                 let prompt = crate::builder::openai_chat(

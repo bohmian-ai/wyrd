@@ -9681,12 +9681,14 @@ dependencies = [
  "uuid",
  "vala-bifrost-redux",
  "vala-eval",
+ "wiremock",
  "workspace-hack",
  "wyrd-client",
  "wyrd-runtime",
  "wyrd-server",
  "wyrd-spec",
  "wyrd-sql",
+ "wyrd-telemetry",
  "wyrd-testing",
 ]
 
@@ -10343,6 +10345,7 @@ dependencies = [
  "uuid",
  "workspace-hack",
  "wyrd-spec",
+ "wyrd-telemetry",
  "wyrd-tls",
  "wyrd-tonic",
 ]

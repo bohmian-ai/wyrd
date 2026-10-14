@@ -114,18 +114,38 @@ pub(crate) fn transport(
     credential: ResolvedCredential,
     request_id: Option<&RequestId>,
 ) -> Result<StreamableHttpClientTransport<WyrdMcpHttpClient>, McpJourneyError> {
+    let headers = request_id
+        .map(|request_id| {
+            HeaderValue::from_str(request_id.as_str())
+                .map(|value| (HeaderName::from_static("wyrd-request-id"), value))
+        })
+        .transpose()?;
+    transport_with_headers(server, credential, headers)
+}
+
+/// Build the first-party MCP client transport for `server` using `credential`,
+/// sending every `headers` pair on each request.
+///
+/// [`transport`] is this with at most a `wyrd-request-id`; a journey that
+/// must control another request header, such as the caller's `traceparent`,
+/// names it here.
+///
+/// # Errors
+///
+/// Returns an error when the server is not bound to a listener or when the
+/// client cannot be constructed for `credential`.
+pub(crate) fn transport_with_headers(
+    server: &WyrdTestServer,
+    credential: ResolvedCredential,
+    headers: impl IntoIterator<Item = (HeaderName, HeaderValue)>,
+) -> Result<StreamableHttpClientTransport<WyrdMcpHttpClient>, McpJourneyError> {
     let base_url = server
         .base_url()
         .ok_or("journey requires a bound test server")?
         .to_owned();
     let mut transport_config =
         StreamableHttpClientTransportConfig::with_uri(format!("{base_url}/mcp"));
-    if let Some(request_id) = request_id {
-        transport_config.custom_headers.insert(
-            HeaderName::from_static("wyrd-request-id"),
-            HeaderValue::from_str(request_id.as_str())?,
-        );
-    }
+    transport_config.custom_headers.extend(headers);
     Ok(StreamableHttpClientTransport::with_client(
         WyrdMcpHttpClient::new(&client(server, credential)?),
         transport_config,

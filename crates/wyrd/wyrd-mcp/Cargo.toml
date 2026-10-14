@@ -56,6 +56,9 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 jsonschema = { workspace = true }
 sqlx = { workspace = true }
+# The local judge provider the trace-continuity journey's Eval calls.
+wiremock = { workspace = true }
+wyrd-telemetry = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

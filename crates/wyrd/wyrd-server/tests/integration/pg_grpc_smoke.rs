@@ -251,3 +251,167 @@ mod grpc_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), consumer_handle).await;
     }
 }
+
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+use tokio_util::sync::CancellationToken;
+use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, serve_grpc};
+use wyrd_testing::WyrdTestServer;
+use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
+use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
+use wyrd_tonic::tonic::Request;
+use wyrd_tonic::tonic::transport::Channel;
+use wyrd_tonic::tonic_health::server::health_reporter;
+use wyrd_tonic::wyrd::v1::bifrost_ingest_service_client::BifrostIngestServiceClient;
+use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
+use wyrd_tonic::wyrd::v1::{InsertBatchRequest, ListRunningQueriesRequest};
+
+/// Trace id of the caller span the continuity case sends.
+const CALLER_TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+/// Span id of the caller span the continuity case sends.
+const CALLER_SPAN: &str = "00f067aa0ba902b7";
+
+/// Serve this server's public gRPC router on a free loopback port and return
+/// a connected channel with the listener's shutdown token.
+///
+/// # Panics
+/// Panics when the router does not build or the channel does not connect
+/// within five seconds.
+async fn serve_public_grpc(server: &WyrdTestServer) -> (Channel, CancellationToken) {
+    let (_, health_service) = health_reporter();
+    let router = build_app_grpc(
+        server.state(),
+        health_service,
+        GrpcRouterConfig {
+            reflection_enabled: false,
+            tls_identity: None,
+        },
+    )
+    .expect("gRPC router builds");
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind probe listener");
+    let bind: SocketAddr = probe.local_addr().expect("probe local addr");
+    drop(probe);
+    let shutdown = CancellationToken::new();
+    let token = shutdown.clone();
+    tokio::spawn(async move { serve_grpc(router, bind, token).await });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Channel::from_shared(format!("http://{bind}"))
+            .expect("endpoint parses")
+            .connect()
+            .await
+        {
+            Ok(channel) => return (channel, shutdown),
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "gRPC channel never connected: {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Wrap `message` in a request carrying `traceparent` metadata.
+fn traced<T>(message: T, traceparent: &str) -> Request<T> {
+    let mut request = Request::new(message);
+    request.metadata_mut().insert(
+        "traceparent",
+        traceparent.parse().expect("traceparent metadata value"),
+    );
+    request
+}
+
+/// Every public gRPC service continues a valid inbound `traceparent`: the
+/// ingest, OTLP, and query requests each open a SERVER `request` span that is
+/// a child of the caller's span and names its RPC, while malformed metadata
+/// starts a new trace without failing differently.
+///
+/// The requests carry no credential, so each is refused after its span opens;
+/// continuity is a property of the shared router, not of a service's
+/// authentication outcome.
+///
+/// # Panics
+/// Panics when a service's request span is missing, is not a SERVER child of
+/// the caller's span, or the malformed request joins the caller's trace.
+#[tokio::test]
+async fn grpc_traceparent_parents_the_server_span() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let (channel, shutdown) = serve_public_grpc(&server).await;
+    let parent = format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01");
+    let checkpoint = traces.checkpoint();
+
+    let ingest = BifrostIngestServiceClient::new(channel.clone())
+        .insert_batch(traced(InsertBatchRequest::default(), &parent))
+        .await
+        .expect_err("an uncredentialed insert is refused");
+    let export = TraceServiceClient::new(channel.clone())
+        .export(traced(ExportTraceServiceRequest::default(), &parent))
+        .await
+        .expect_err("an uncredentialed export is refused");
+    let query = BifrostQueryServiceClient::new(channel.clone())
+        .list_running_queries(traced(ListRunningQueriesRequest::default(), &parent))
+        .await
+        .expect_err("an uncredentialed listing is refused");
+    let malformed = BifrostQueryServiceClient::new(channel)
+        .list_running_queries(traced(
+            ListRunningQueriesRequest::default(),
+            "00-not-a-trace-01",
+        ))
+        .await
+        .expect_err("an uncredentialed listing is refused");
+    assert_eq!(malformed.code(), query.code(), "{ingest:?} {export:?}");
+    shutdown.cancel();
+    server.shutdown().await.expect("server shuts down");
+
+    let spans: Vec<_> = traces
+        .finished_since(checkpoint)
+        .into_iter()
+        .filter(|span| span.name == "request")
+        .collect();
+    for (service, method) in [
+        ("wyrd.v1.BifrostIngestService", "InsertBatch"),
+        (
+            "opentelemetry.proto.collector.trace.v1.TraceService",
+            "Export",
+        ),
+        ("wyrd.v1.BifrostQueryService", "ListRunningQueries"),
+    ] {
+        let span = spans
+            .iter()
+            .find(|span| {
+                span.trace_id == CALLER_TRACE
+                    && span.attributes.get("rpc.service").map(String::as_str) == Some(service)
+            })
+            .unwrap_or_else(|| panic!("{service} continues the caller: {spans:#?}"));
+        assert_eq!(span.parent_span_id, CALLER_SPAN, "{span:?}");
+        assert_eq!(span.kind, "Server", "{span:?}");
+        assert_eq!(
+            span.attributes.get("rpc.method").map(String::as_str),
+            Some(method),
+            "{span:?}"
+        );
+    }
+    let listings: Vec<_> = spans
+        .iter()
+        .filter(|span| {
+            span.attributes.get("rpc.method").map(String::as_str) == Some("ListRunningQueries")
+        })
+        .collect();
+    assert_eq!(listings.len(), 2, "{listings:#?}");
+    assert!(
+        listings
+            .iter()
+            .any(|span| span.trace_id != CALLER_TRACE && span.parent_span_id == "0000000000000000"),
+        "malformed metadata starts a new trace: {listings:#?}"
+    );
+}

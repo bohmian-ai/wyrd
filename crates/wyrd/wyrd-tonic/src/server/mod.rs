@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::StreamExt as _;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
+use tonic::codegen::http::Request as HttpRequest;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::server::{Connected, Router as TonicRouter, TcpConnectInfo};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
@@ -175,7 +176,7 @@ where
     I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
 {
     wyrd_tls::install_crypto_provider()?;
-    let mut server = Server::builder();
+    let mut server = Server::builder().trace_fn(request_span);
     if let Some(identity) = cfg.tls_identity {
         server = server
             .tls_config(ServerTlsConfig::new().identity(identity))
@@ -207,6 +208,33 @@ where
     };
 
     Ok(router)
+}
+
+/// Opens the SERVER span of one public gRPC request.
+///
+/// A valid `traceparent` metadata entry (an HTTP/2 header on the wire) makes
+/// the caller's span its parent, so every service mounted on the public
+/// router continues the caller's trace; a missing, malformed, or repeated one
+/// leaves the span the root of a new trace. The span carries the RPC service
+/// and method from the request path, never metadata values.
+fn request_span(request: &HttpRequest<()>) -> tracing::Span {
+    let (service, method) = request
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .split_once('/')
+        .unwrap_or_default();
+    let span = tracing::info_span!(
+        "request",
+        otel.kind = "server",
+        rpc.system = "grpc",
+        rpc.service = service,
+        rpc.method = method,
+    );
+    if let Some(caller) = wyrd_telemetry::inbound_context(request.headers()) {
+        wyrd_telemetry::continue_remote(&span, &caller);
+    }
+    span
 }
 
 /// Drive the tonic server to completion.

@@ -43,6 +43,15 @@ async function serviceKey(name: string): Promise<string> {
   return issued.key;
 }
 
+/** The process-global tracer provider, installed once by the first traced test. */
+let telemetry: Promise<unknown> | undefined;
+
+/** Install `state`'s telemetry unless an earlier test in this file already did. */
+function startTelemetry(state: WyrdState): Promise<unknown> {
+  telemetry ??= state.startTelemetry();
+  return telemetry;
+}
+
 /**
  * The assistant Service, registered after its latency baseline and Model,
  * and the unfitted assistant whose `tier-drift` baseline never fits, after the
@@ -174,9 +183,41 @@ test("judge call is attributed to the run and card", async ({ server, state }) =
 });
 
 test("traced verify joins the caller's trace", async ({ server, state }) => {
-  await state.startTelemetry();
+  await startTelemetry(state);
+  await Gateway.connect().putCapturePolicy({ mode: "metadata", payload_fields: [] });
   const caller = await trace.getTracer("journey").startActiveSpan("caller", async (span) => {
     await state.run("agent").observe.verify("answer-graded", { answer: "yes" });
+    span.end();
+    return span.spanContext();
+  });
+  server.flushBifrost();
+
+  const rows = (
+    await (
+      await Bifrost.connect()
+    ).sql(
+      "SELECT encode(span_id, 'hex') AS span_id, encode(parent_span_id, 'hex') AS parent, scope_name " +
+        "FROM vala.traces.spans WHERE encode(trace_id, 'hex') = $1",
+      [caller.traceId],
+    )
+  ).toArrow();
+  const spans = new Map<string, { parent: string | null; scope_name: string }>(
+    rows.toArray().map((row) => [row.span_id, { parent: row.parent, scope_name: row.scope_name }]),
+  );
+  const attempts = [...spans.values()].filter((span) => span.scope_name === "wyrd.gateway");
+  expect(attempts).toHaveLength(1);
+  let ancestor = attempts[0];
+  for (let next = spans.get(ancestor.parent ?? ""); next !== undefined; next = spans.get(ancestor.parent ?? "")) {
+    ancestor = next;
+  }
+  expect(ancestor.parent).toBe(caller.spanId);
+});
+
+test("sdk requests carry the active trace", async ({ server, state }) => {
+  await startTelemetry(state);
+  const gateway = Gateway.connect();
+  const caller = await trace.getTracer("journey").startActiveSpan("caller", async (span) => {
+    await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });
     span.end();
     return span.spanContext();
   });
@@ -186,12 +227,12 @@ test("traced verify joins the caller's trace", async ({ server, state }) => {
     await (
       await Bifrost.connect()
     ).sql(
-      "SELECT encode(parent_span_id, 'hex') AS parent_span_id FROM vala.traces.spans " +
-        "WHERE scope_name = 'wyrd.gateway' AND encode(trace_id, 'hex') = $1",
-      [caller.traceId],
+      "SELECT name FROM vala.traces.spans " +
+        "WHERE encode(trace_id, 'hex') = $1 AND encode(parent_span_id, 'hex') = $2",
+      [caller.traceId, caller.spanId],
     )
   ).toArrow();
-  expect(columnValues(spans.getChild("parent_span_id"))).toEqual([caller.spanId]);
+  expect(columnValues(spans.getChild("name"))).toEqual(["request"]);
 });
 
 test("model latency like the baseline passes its verifier", async ({ server, assistant, state }) => {

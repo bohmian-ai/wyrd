@@ -13,9 +13,7 @@ use pyo3::types::{PyDict, PyList, PyMapping, PyModule, PyString, PyType};
 use wyrd_cards::card_ref::CardRefPy;
 use wyrd_client::observe::eval::parse_session_id;
 use wyrd_client::observe::{EvalObservationOptions, Observe, Run};
-use wyrd_client::transport::trace::with_caller_trace;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::trace::TraceContext;
 use wyrd_spec::verification::Judgment;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
 
@@ -131,40 +129,11 @@ fn json_array_text(py: Python<'_>, field: &str, value: &Bound<'_, PyAny>) -> Wyr
 /// Python's OpenTelemetry context never becomes Rust's current `tracing` span across
 /// `PyO3`, so the shared Rust fallback cannot see it; this boundary reads it
 /// instead and hands the IDs to the ordinary explicit-options path. Both IDs
-/// or neither, as [`active_trace_context`] supplies them.
+/// or neither, as [`crate::trace::active_trace_context`] supplies them.
 fn active_span_ids(py: Python<'_>) -> (Option<String>, Option<String>) {
-    active_trace_context(py).map_or((None, None), |context| {
+    crate::trace::active_trace_context(py).map_or((None, None), |context| {
         (Some(context.trace_id), Some(context.span_id))
     })
-}
-
-/// Read Python's active OpenTelemetry span context as W3C trace context.
-///
-/// A missing `opentelemetry` package (the optional `otel` extra), no active
-/// span, an invalid context, or any lookup failure supplies nothing, because
-/// correlation is best-effort and must never fail the call it rides on.
-fn active_trace_context(py: Python<'_>) -> Option<TraceContext> {
-    let lookup = || -> PyResult<Option<TraceContext>> {
-        let context = py
-            .import("opentelemetry.trace")?
-            .call_method0("get_current_span")?
-            .call_method0("get_span_context")?;
-        if !context.getattr("is_valid")?.extract::<bool>()? {
-            return Ok(None);
-        }
-        let trace_id: u128 = context.getattr("trace_id")?.extract()?;
-        let span_id: u64 = context.getattr("span_id")?.extract()?;
-        Ok(Some(TraceContext {
-            trace_id: format!("{trace_id:032x}"),
-            span_id: format!("{span_id:016x}"),
-            trace_flags: context.getattr("trace_flags")?.extract()?,
-            trace_state: context
-                .getattr("trace_state")?
-                .call_method0("to_header")?
-                .extract()?,
-        }))
-    };
-    lookup().ok().flatten()
 }
 
 /// Python wrapper for one invocation or one Card-scoped view of it.
@@ -285,8 +254,7 @@ impl PyRun {
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
-        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.invoke(&pairs)))
-            .map_err(WyrdPyError::from)
+        crate::trace::block_on(py, self.inner.invoke(&pairs)).map_err(WyrdPyError::from)
     }
 
     /// The emit surface for this view.
@@ -330,8 +298,7 @@ impl PyObserveHandle {
     ) -> WyrdPyResult<()> {
         let json = json_text(py, "features", features)?;
         let session = parse_session_id(session_id).map_err(WyrdPyError::from)?;
-        self.observe()
-            .drift_json(&json, session)
+        crate::trace::traced(py, || self.observe().drift_json(&json, session))
             .map_err(WyrdPyError::from)
     }
 
@@ -370,8 +337,7 @@ impl PyObserveHandle {
             span_id.or(active_span.as_deref()),
         )
         .map_err(WyrdPyError::from)?;
-        self.observe()
-            .eval_json(&json, options)
+        crate::trace::traced(py, || self.observe().eval_json(&json, options))
             .map_err(WyrdPyError::from)
     }
 
@@ -386,7 +352,7 @@ impl PyObserveHandle {
     /// outside `vala.datasets`.
     fn record(&self, py: Python<'_>, table: &str, row: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
         let json = json_text(py, "row", row)?;
-        py.detach(|| wyrd_runtime::runtime().block_on(self.observe().record_json(table, &json)))
+        crate::trace::block_on(py, self.observe().record_json(table, &json))
             .map_err(WyrdPyError::from)
     }
 
@@ -426,15 +392,9 @@ impl PyObserveHandle {
             .map_err(|error| invalid_argument("media", error))?
             .unwrap_or_default();
         let observe = self.observe();
-        let caller = active_trace_context(py);
-        py.detach(|| {
-            wyrd_runtime::runtime().block_on(with_caller_trace(
-                caller,
-                observe.verify_json(verifier, &json, media),
-            ))
-        })
-        .map(|inner| PyJudgment { inner })
-        .map_err(WyrdPyError::from)
+        crate::trace::block_on(py, observe.verify_json(verifier, &json, media))
+            .map(|inner| PyJudgment { inner })
+            .map_err(WyrdPyError::from)
     }
 }
 

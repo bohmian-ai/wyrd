@@ -130,13 +130,11 @@ impl PyWorkflow {
         client: Option<&Bound<'_, PyWyrdClient>>,
     ) -> WyrdPyResult<Self> {
         let client = client.map(|client| client.get().inner().clone());
-        let workflow = py.detach(|| {
-            wyrd_runtime::runtime().block_on(async move {
-                match client {
-                    Some(client) => ClientWorkflow::from_path_with_client(path, client).await,
-                    None => ClientWorkflow::from_path(path).await,
-                }
-            })
+        let workflow = crate::trace::block_on(py, async move {
+            match client {
+                Some(client) => ClientWorkflow::from_path_with_client(path, client).await,
+                None => ClientWorkflow::from_path(path).await,
+            }
         })?;
         Ok(Self::from(workflow))
     }
@@ -184,7 +182,7 @@ impl PyWorkflow {
     #[pyo3(signature = (input = None))]
     fn run(&self, py: Python<'_>, input: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<PyWorkflowRun> {
         let input = workflow_input_from_py(input)?;
-        let run = py.detach(|| wyrd_runtime::runtime().block_on(self.inner.run(input)))?;
+        let run = crate::trace::block_on(py, self.inner.run(input))?;
         Ok(PyWorkflowRun { run })
     }
 }

@@ -40,6 +40,18 @@ pub async fn with_caller_trace<F: Future>(context: Option<TraceContext>, future:
     }
 }
 
+/// Run the synchronous `call` with `context` as the caller's trace context,
+/// as [`with_caller_trace`] does for a future.
+///
+/// A foreign-runtime SDK uses it for a call that sends nothing itself but
+/// records the caller's context, such as a queued write's PRODUCER span.
+pub fn with_caller_trace_sync<R>(context: Option<TraceContext>, call: impl FnOnce() -> R) -> R {
+    match context {
+        Some(context) => CALLER.sync_scope(context, call),
+        None => call(),
+    }
+}
+
 /// The trace context the current request is sent under, if any.
 ///
 /// A context scoped by [`with_caller_trace`] wins; otherwise the current

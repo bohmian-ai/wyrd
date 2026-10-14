@@ -2482,14 +2482,16 @@ function activeSpanIds(): { readonly traceId?: string; readonly spanId?: string 
 }
 
 /**
- * Node's active OpenTelemetry span as W3C `traceparent`/`tracestate`; empty
+ * Node's active OpenTelemetry span as W3C `traceparent`/`tracestate`; `null`
  * when no API is installed, no span is active, or its context is invalid.
+ * Every native call reads it on entry, so the Wyrd requests it sends join the
+ * caller's trace.
  */
-function activeTraceContext(): { readonly traceparent?: string; readonly tracestate?: string } {
+function activeTraceContext(): { traceparent: string; tracestate?: string } | null {
   const api = otel();
   const spanContext = api?.trace.getActiveSpan()?.spanContext();
   if (spanContext === undefined || !api?.isSpanContextValid(spanContext)) {
-    return {};
+    return null;
   }
   const flags = spanContext.traceFlags.toString(16).padStart(2, "0");
   return {
@@ -2497,6 +2499,8 @@ function activeTraceContext(): { readonly traceparent?: string; readonly tracest
     tracestate: spanContext.traceState?.serialize(),
   };
 }
+
+nativeBinding.setTraceSource(activeTraceContext);
 
 /** The application's `@opentelemetry/api`, or `null` when it is not installed. */
 function otel(): typeof import("@opentelemetry/api") | null {
@@ -2642,15 +2646,8 @@ export class Observe {
     input: unknown,
     options: { readonly media?: readonly EvalMediaRef[] } = {},
   ): Promise<Judgment> {
-    const caller = activeTraceContext();
     const judgment = lifecycleValue<Omit<Judgment, "passed">>(
-      await this.#native.verify(
-        verifier,
-        strictJson("input", input),
-        mediaJson(options.media),
-        caller.traceparent,
-        caller.tracestate,
-      ),
+      await this.#native.verify(verifier, strictJson("input", input), mediaJson(options.media)),
     );
     return { ...judgment, passed: judgment.verdict === "passed" };
   }

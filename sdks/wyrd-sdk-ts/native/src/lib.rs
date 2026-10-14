@@ -12,6 +12,7 @@ pub mod gateway;
 pub mod operators;
 /// The napi projection of the tenant principal handle.
 pub mod principals;
+pub mod trace;
 pub mod workflow;
 
 use std::collections::HashMap;
@@ -20,8 +21,10 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use napi::Env;
 use napi::Error;
 use napi::Result;
+use napi::bindgen_prelude::PromiseRaw;
 use napi::bindgen_prelude::{Buffer, Uint8Array};
 use napi_derive::napi;
 use serde::Serialize;
@@ -766,13 +769,19 @@ impl NativeBifrost {
     /// no-active-table, fingerprint-conflict, and transport failures are
     /// returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn register(&self) -> Result<NativeLifecycleResult> {
-        match self.client.register().await {
-            Ok(outcome) => NativeLifecycleResult::success(&serde_json::Value::String(
-                wyrd_client::bifrost::register_outcome_name(outcome).to_owned(),
-            )),
-            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
-        }
+    pub fn register<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            match client.register().await {
+                Ok(outcome) => NativeLifecycleResult::success(&serde_json::Value::String(
+                    wyrd_client::bifrost::register_outcome_name(outcome).to_owned(),
+                )),
+                Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+            }
+        })
     }
 
     /// Binds `table` as the write target, returning the previous binding.
@@ -801,11 +810,18 @@ impl NativeBifrost {
     /// not-found, authorization, and transport failures are returned in
     /// [`NativeLifecycleResult`].
     #[napi]
-    pub async fn use_table_by_name(&self, table: String) -> Result<NativeLifecycleResult> {
-        match self.client.use_table_by_name(&table).await {
-            Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
-            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
-        }
+    pub fn use_table_by_name<'env>(
+        &self,
+        env: &'env Env,
+        table: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            match client.use_table_by_name(&table).await {
+                Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
+                Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+            }
+        })
     }
 
     /// The active write binding, if any.
@@ -836,12 +852,14 @@ impl NativeBifrost {
     #[napi]
     pub fn insert(
         &self,
+        env: Env,
         row: String,
         card_uid: Option<String>,
         run_id: Option<String>,
     ) -> Result<NativeLifecycleResult> {
-        let inserted = correlation(card_uid.as_deref(), run_id)
-            .and_then(|correlation| self.client.insert(row.into_bytes(), correlation));
+        let inserted = correlation(card_uid.as_deref(), run_id).and_then(|correlation| {
+            crate::trace::traced(env, || self.client.insert(row.into_bytes(), correlation))
+        });
         match inserted {
             Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
             Err(error) => Ok(NativeLifecycleResult::failure(&error)),
@@ -861,16 +879,20 @@ impl NativeBifrost {
     /// stream; server and envelope refusals are returned in
     /// [`NativeLifecycleResult`].
     #[napi]
-    pub async fn write_batch(
+    pub fn write_batch<'env>(
         &self,
+        env: &'env Env,
         table: String,
         batch_ipc: Buffer,
-    ) -> Result<NativeLifecycleResult> {
-        let batch = decode_batch_ipc(&batch_ipc)?;
-        match self.client.write_batch(&table, &batch).await {
-            Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
-            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
-        }
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            let batch = decode_batch_ipc(&batch_ipc)?;
+            match client.write_batch(&table, &batch).await {
+                Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
+                Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+            }
+        })
     }
 
     /// Flushes every pooled producer and awaits each durable acknowledgement.
@@ -880,11 +902,17 @@ impl NativeBifrost {
     /// Returns a napi error only when the native result cannot be projected;
     /// producer and sink failures are returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn flush(&self) -> Result<NativeLifecycleResult> {
-        match self.client.flush().await {
-            Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
-            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
-        }
+    pub fn flush<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            match client.flush().await {
+                Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
+                Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+            }
+        })
     }
 
     /// Drains every producer and stops its background task.
@@ -893,11 +921,17 @@ impl NativeBifrost {
     ///
     /// As [`NativeBifrost::flush`].
     #[napi]
-    pub async fn shutdown(&self) -> Result<NativeLifecycleResult> {
-        match self.client.shutdown().await {
-            Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
-            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
-        }
+    pub fn shutdown<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            match client.shutdown().await {
+                Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
+                Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+            }
+        })
     }
 
     /// Number of distinct table producers currently pooled.
@@ -932,6 +966,7 @@ impl NativeBifrost {
     #[napi]
     pub fn record(
         &self,
+        env: Env,
         table: String,
         schema_json: String,
         row: String,
@@ -940,13 +975,15 @@ impl NativeBifrost {
     ) -> Result<NativeLifecycleResult> {
         let recorded = telemetry_schema(&schema_json).and_then(|schema| {
             let correlation = correlation(card_uid.as_deref(), run_id)?;
-            wyrd_client::bifrost::observe::record(
-                &self.client,
-                &table,
-                &schema,
-                row.into_bytes(),
-                correlation,
-            );
+            crate::trace::traced(env, || {
+                wyrd_client::bifrost::observe::record(
+                    &self.client,
+                    &table,
+                    &schema,
+                    row.into_bytes(),
+                    correlation,
+                );
+            });
             Ok(())
         });
         match recorded {
@@ -966,29 +1003,36 @@ impl NativeBifrost {
     /// Returns a napi error only when napi cannot project the structured
     /// startup result itself.
     #[napi]
-    pub async fn query(&self, request: NativeQueryRequest) -> Result<NativeQueryStart> {
-        let params = request
-            .params
-            .unwrap_or_default()
-            .into_iter()
-            .enumerate()
-            .map(|(index, param)| param.into_param(index))
-            .collect::<StdResult<Vec<_>, _>>();
-        let params = match params {
-            Ok(params) => params,
-            Err(error) => return Ok(NativeQueryStart::failure(&error)),
-        };
-        let request = BifrostQueryRequest {
-            params,
-            sql: request.sql,
-            deadline_ms: match request.deadline_ms.map(parse_deadline_ms).transpose() {
-                Ok(deadline_ms) => deadline_ms,
+    pub fn query<'env>(
+        &self,
+        env: &'env Env,
+        request: NativeQueryRequest,
+    ) -> napi::Result<PromiseRaw<'env, NativeQueryStart>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            let params = request
+                .params
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(|(index, param)| param.into_param(index))
+                .collect::<StdResult<Vec<_>, _>>();
+            let params = match params {
+                Ok(params) => params,
                 Err(error) => return Ok(NativeQueryStart::failure(&error)),
-            },
-        };
-        Ok(match self.client.query(&request).await {
-            Ok(stream) => NativeQueryStart::success(stream),
-            Err(error) => NativeQueryStart::failure(&error),
+            };
+            let request = BifrostQueryRequest {
+                params,
+                sql: request.sql,
+                deadline_ms: match request.deadline_ms.map(parse_deadline_ms).transpose() {
+                    Ok(deadline_ms) => deadline_ms,
+                    Err(error) => return Ok(NativeQueryStart::failure(&error)),
+                },
+            };
+            Ok(match client.query(&request).await {
+                Ok(stream) => NativeQueryStart::success(stream),
+                Err(error) => NativeQueryStart::failure(&error),
+            })
         })
     }
 
@@ -1002,13 +1046,19 @@ impl NativeBifrost {
     /// Returns a napi error only when the native result cannot be projected;
     /// Wyrd control failures are returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn running(&self) -> Result<NativeLifecycleResult> {
-        match self.client.running().await {
-            Ok(queries) => {
-                NativeLifecycleResult::success(&serde_json::to_value(queries).map_err(napi_error)?)
+    pub fn running<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            match client.running().await {
+                Ok(queries) => NativeLifecycleResult::success(
+                    &serde_json::to_value(queries).map_err(napi_error)?,
+                ),
+                Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
-            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
-        }
+        })
     }
 
     /// Gets one active query by canonical request ID.
@@ -1021,19 +1071,26 @@ impl NativeBifrost {
     /// Returns a napi error only when the native result cannot be projected;
     /// validation and Wyrd control failures are returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn status(&self, request_id: String) -> Result<NativeLifecycleResult> {
-        let request_id = match parse_request_id(&request_id) {
-            Ok(request_id) => request_id,
-            Err(error) => {
-                return Ok(NativeLifecycleResult::failure(&error));
+    pub fn status<'env>(
+        &self,
+        env: &'env Env,
+        request_id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            let request_id = match parse_request_id(&request_id) {
+                Ok(request_id) => request_id,
+                Err(error) => {
+                    return Ok(NativeLifecycleResult::failure(&error));
+                }
+            };
+            match client.status(&request_id).await {
+                Ok(summary) => NativeLifecycleResult::success(
+                    &serde_json::to_value(summary).map_err(napi_error)?,
+                ),
+                Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
-        };
-        match self.client.status(&request_id).await {
-            Ok(summary) => {
-                NativeLifecycleResult::success(&serde_json::to_value(summary).map_err(napi_error)?)
-            }
-            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
-        }
+        })
     }
 
     /// Requests server-side cancellation without closing a local stream.
@@ -1046,19 +1103,26 @@ impl NativeBifrost {
     /// Returns a napi error only when the native result cannot be projected;
     /// validation and Wyrd control failures are returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn cancel(&self, request_id: String) -> Result<NativeLifecycleResult> {
-        let request_id = match parse_request_id(&request_id) {
-            Ok(request_id) => request_id,
-            Err(error) => {
-                return Ok(NativeLifecycleResult::failure(&error));
+    pub fn cancel<'env>(
+        &self,
+        env: &'env Env,
+        request_id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            let request_id = match parse_request_id(&request_id) {
+                Ok(request_id) => request_id,
+                Err(error) => {
+                    return Ok(NativeLifecycleResult::failure(&error));
+                }
+            };
+            match client.cancel(&request_id).await {
+                Ok(response) => NativeLifecycleResult::success(
+                    &serde_json::to_value(response).map_err(napi_error)?,
+                ),
+                Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
-        };
-        match self.client.cancel(&request_id).await {
-            Ok(response) => {
-                NativeLifecycleResult::success(&serde_json::to_value(response).map_err(napi_error)?)
-            }
-            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
-        }
+        })
     }
 
     /// Describes one registered table's stored physical schema.
@@ -1074,17 +1138,21 @@ impl NativeBifrost {
     /// Returns a napi error only when the native result cannot be projected;
     /// Wyrd control failures are returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn describe_table(
+    pub fn describe_table<'env>(
         &self,
+        env: &'env Env,
         namespace: String,
         name: String,
-    ) -> Result<NativeLifecycleResult> {
-        match self.client.describe_table(&namespace, &name).await {
-            Ok(description) => NativeLifecycleResult::success(
-                &serde_json::to_value(description).map_err(napi_error)?,
-            ),
-            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
-        }
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            match client.describe_table(&namespace, &name).await {
+                Ok(description) => NativeLifecycleResult::success(
+                    &serde_json::to_value(description).map_err(napi_error)?,
+                ),
+                Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+            }
+        })
     }
 }
 

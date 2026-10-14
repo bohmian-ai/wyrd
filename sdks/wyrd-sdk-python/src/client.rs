@@ -116,7 +116,7 @@ impl PyWyrdClient {
     /// Raises the server's stable error when it refuses the credential, or a
     /// transport error when the token endpoint cannot be reached.
     fn access_token(&self, py: Python<'_>) -> WyrdPyResult<String> {
-        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.access_token()))
+        crate::trace::block_on(py, self.inner.access_token())
             .map(|bearer| bearer.expose().to_owned())
             .map_err(WyrdPyError::from)
     }
@@ -147,11 +147,9 @@ impl PyWyrdClient {
             })
         })?;
         let subject_token = SecretString::from(subject_token);
-        py.detach(|| {
-            wyrd_runtime::runtime().block_on(self.inner.on_behalf_of(subject_token, audience))
-        })
-        .map(|inner| Self { inner })
-        .map_err(WyrdPyError::from)
+        crate::trace::block_on(py, self.inner.on_behalf_of(subject_token, audience))
+            .map(|inner| Self { inner })
+            .map_err(WyrdPyError::from)
     }
 }
 

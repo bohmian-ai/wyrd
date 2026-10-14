@@ -7,17 +7,17 @@
 use std::path::Path;
 use std::result::Result as StdResult;
 
+use napi::Env;
 use napi::Result;
+use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
 use wyrd_client::cards::{CardKind, CardSelector, Cards, HydrationMode, ListCardsRequest};
 use wyrd_client::observe::eval::parse_session_id;
 use wyrd_client::observe::{EvalObservationOptions, Run};
 use wyrd_client::state::WyrdState;
-use wyrd_client::transport::trace::with_caller_trace;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefParseError};
-use wyrd_spec::trace::TraceContext;
 
 use crate::client::{NativeWyrdClient, NativeWyrdClientResult};
 use crate::workflow::{NativeWorkflowLoad, parse_workflow_selector};
@@ -69,10 +69,17 @@ impl NativeCards {
     /// Returns a napi error only when the receipt cannot be serialized; load,
     /// validation, and registry failures are returned in the result.
     #[napi]
-    pub async fn register_from_path(&self, path: String) -> Result<NativeLifecycleResult> {
-        NativeLifecycleResult::outcome(
-            Box::pin(self.cards.register_from_path(Path::new(&path))).await,
-        )
+    pub fn register_from_path<'env>(
+        &self,
+        env: &'env Env,
+        path: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let cards = self.cards.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(
+                Box::pin(cards.register_from_path(Path::new(&path))).await,
+            )
+        })
     }
 
     /// Fetches one Card envelope by exact reference.
@@ -82,12 +89,19 @@ impl NativeCards {
     /// Returns a napi error only when the envelope cannot be serialized; an
     /// invalid reference or registry failure is returned in the result.
     #[napi]
-    pub async fn get(&self, card_ref: String) -> Result<NativeLifecycleResult> {
-        let result = match parse_card_ref(&card_ref) {
-            Ok(card_ref) => self.cards.get(CardSelector::exact(card_ref)).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn get<'env>(
+        &self,
+        env: &'env Env,
+        card_ref: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let cards = self.cards.clone();
+        crate::trace::spawn(env, async move {
+            let result = match parse_card_ref(&card_ref) {
+                Ok(card_ref) => cards.get(CardSelector::exact(card_ref)).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Lists metadata-only Card summaries for one serialized list request.
@@ -97,15 +111,22 @@ impl NativeCards {
     /// Returns a napi error only when the page cannot be serialized; a
     /// malformed request or registry failure is returned in the result.
     #[napi]
-    pub async fn list(&self, request_json: String) -> Result<NativeLifecycleResult> {
-        let result = match serde_json::from_str::<ListCardsRequest>(&request_json) {
-            Ok(request) => self.cards.list(request).await,
-            Err(error) => Err(WyrdError::Validation {
-                message: error.to_string(),
-                details: serde_json::json!({ "field": "request" }),
-            }),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn list<'env>(
+        &self,
+        env: &'env Env,
+        request_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let cards = self.cards.clone();
+        crate::trace::spawn(env, async move {
+            let result = match serde_json::from_str::<ListCardsRequest>(&request_json) {
+                Ok(request) => cards.list(request).await,
+                Err(error) => Err(WyrdError::Validation {
+                    message: error.to_string(),
+                    details: serde_json::json!({ "field": "request" }),
+                }),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Resolves the latest Active version of one named Card to its exact
@@ -123,27 +144,31 @@ impl NativeCards {
     /// malformed kind, space, or name (`WYRD_SPEC_400_VALIDATION`), no Active
     /// version, and registry failures are returned in the result.
     #[napi]
-    pub async fn resolve_latest(
+    pub fn resolve_latest<'env>(
         &self,
+        env: &'env Env,
         kind: String,
         space: String,
         name: String,
-    ) -> Result<NativeLifecycleResult> {
-        let invalid = |field: &str, error: &dyn std::fmt::Display| WyrdError::Validation {
-            message: format!("{field} is invalid: {error}"),
-            details: serde_json::json!({ "field": field }),
-        };
-        let parsed = (
-            serde_json::from_value::<CardKind>(serde_json::Value::String(kind))
-                .map_err(|error| invalid("kind", &error)),
-            SpaceName::new(space).map_err(|error| invalid("space", &error)),
-            CardName::new(name).map_err(|error| invalid("name", &error)),
-        );
-        let result = match parsed {
-            (Ok(kind), Ok(space), Ok(name)) => self.cards.resolve_latest(kind, space, name).await,
-            (Err(error), ..) | (_, Err(error), _) | (.., Err(error)) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let cards = self.cards.clone();
+        crate::trace::spawn(env, async move {
+            let invalid = |field: &str, error: &dyn std::fmt::Display| WyrdError::Validation {
+                message: format!("{field} is invalid: {error}"),
+                details: serde_json::json!({ "field": field }),
+            };
+            let parsed = (
+                serde_json::from_value::<CardKind>(serde_json::Value::String(kind))
+                    .map_err(|error| invalid("kind", &error)),
+                SpaceName::new(space).map_err(|error| invalid("space", &error)),
+                CardName::new(name).map_err(|error| invalid("name", &error)),
+            );
+            let result = match parsed {
+                (Ok(kind), Ok(space), Ok(name)) => cards.resolve_latest(kind, space, name).await,
+                (Err(error), ..) | (_, Err(error), _) | (.., Err(error)) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Hydrates one Card graph into a published local bundle.
@@ -156,28 +181,28 @@ impl NativeCards {
     /// Returns a napi error only when the summary cannot be serialized; graph,
     /// destination, and transfer failures are returned in the result.
     #[napi]
-    pub async fn hydrate(
+    pub fn hydrate<'env>(
         &self,
+        env: &'env Env,
         card_ref: String,
         destination: String,
         metadata_only: bool,
-    ) -> Result<NativeLifecycleResult> {
-        let mode = if metadata_only {
-            HydrationMode::MetadataOnly
-        } else {
-            HydrationMode::Complete
-        };
-        let result = match parse_card_ref(&card_ref) {
-            Ok(card_ref) => {
-                Box::pin(
-                    self.cards
-                        .hydrate(CardSelector::exact(card_ref), &destination, mode),
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let cards = self.cards.clone();
+        crate::trace::spawn(env, async move {
+            let mode = if metadata_only {
+                HydrationMode::MetadataOnly
+            } else {
+                HydrationMode::Complete
+            };
+            let result = match parse_card_ref(&card_ref) {
+                Ok(card_ref) => {
+                    Box::pin(cards.hydrate(CardSelector::exact(card_ref), &destination, mode)).await
+                }
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Loads one registered Workflow and its locked Agents and Prompts.
@@ -194,12 +219,21 @@ impl NativeCards {
     /// promise is abandoned, completed reads may already have happened, but
     /// no partial Workflow is returned and nothing durable is written.
     #[napi]
-    pub async fn load_workflow(&self, selector_json: String) -> NativeWorkflowLoad {
-        let outcome = match parse_workflow_selector(&selector_json) {
-            Ok(selector) => self.cards.workflow().load(&selector).await,
-            Err(error) => Err(error),
-        };
-        NativeWorkflowLoad::from_outcome(outcome)
+    pub fn load_workflow<'env>(
+        &self,
+        env: &'env Env,
+        selector_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeWorkflowLoad>> {
+        let cards = self.cards.clone();
+        crate::trace::spawn(env, async move {
+            Ok({
+                let outcome = match parse_workflow_selector(&selector_json) {
+                    Ok(selector) => cards.workflow().load(&selector).await,
+                    Err(error) => Err(error),
+                };
+                NativeWorkflowLoad::from_outcome(outcome)
+            })
+        })
     }
 
     /// Soft-deletes one Card by exact reference.
@@ -209,12 +243,19 @@ impl NativeCards {
     /// Returns a napi error only when the result cannot be projected; an
     /// invalid reference or registry failure is returned in the result.
     #[napi]
-    pub async fn delete(&self, card_ref: String) -> Result<NativeLifecycleResult> {
-        let result = match parse_card_ref(&card_ref) {
-            Ok(card_ref) => self.cards.delete(CardSelector::exact(card_ref)).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn delete<'env>(
+        &self,
+        env: &'env Env,
+        card_ref: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let cards = self.cards.clone();
+        crate::trace::spawn(env, async move {
+            let result = match parse_card_ref(&card_ref) {
+                Ok(card_ref) => cards.delete(CardSelector::exact(card_ref)).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 }
 
@@ -439,23 +480,27 @@ impl NativeWyrdState {
     /// a second start, a closed state, and credential, byte-budget, dial, and
     /// fixed-table failures are returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn start_bifrost(
+    pub fn start_bifrost<'env>(
         &self,
+        env: &'env Env,
         table: Option<NativeTableConfig>,
         client_byte_limit_bytes: Option<i64>,
-    ) -> Result<NativeLifecycleResult> {
-        let state = match &self.state {
-            Ok(state) => state,
-            Err(error) => return Ok(NativeLifecycleResult::from_wyrd(error)),
-        };
-        let table = table.map(|table| table.parse()).transpose()?;
-        NativeLifecycleResult::outcome(
-            Box::pin(
-                state
-                    .start_bifrost_with_config(table, crate::queue_config(client_byte_limit_bytes)),
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let state = self.state.clone();
+        crate::trace::spawn(env, async move {
+            let state = match &state {
+                Ok(state) => state,
+                Err(error) => return Ok(NativeLifecycleResult::from_wyrd(error)),
+            };
+            let table = table.map(|table| table.parse()).transpose()?;
+            NativeLifecycleResult::outcome(
+                Box::pin(state.start_bifrost_with_config(
+                    table,
+                    crate::queue_config(client_byte_limit_bytes),
+                ))
+                .await,
             )
-            .await,
-        )
+        })
     }
 
     /// Opens one invocation over this state, targeting `alias` or the root Service.
@@ -481,11 +526,17 @@ impl NativeWyrdState {
     /// lifecycle refusals and the first producer or sink failure are returned in
     /// [`NativeLifecycleResult`].
     #[napi]
-    pub async fn flush(&self) -> Result<NativeLifecycleResult> {
-        match &self.state {
-            Ok(state) => NativeLifecycleResult::outcome(Box::pin(state.flush()).await),
-            Err(error) => Ok(NativeLifecycleResult::from_wyrd(error)),
-        }
+    pub fn flush<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let state = self.state.clone();
+        crate::trace::spawn(env, async move {
+            match &state {
+                Ok(state) => NativeLifecycleResult::outcome(Box::pin(state.flush()).await),
+                Err(error) => Ok(NativeLifecycleResult::from_wyrd(error)),
+            }
+        })
     }
 
     /// Drains every producer of this state's writer and closes it to writes.
@@ -499,11 +550,17 @@ impl NativeWyrdState {
     /// Returns a napi error only when the outcome cannot be projected; the first
     /// producer or sink failure is returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn shutdown(&self) -> Result<NativeLifecycleResult> {
-        match &self.state {
-            Ok(state) => NativeLifecycleResult::outcome(Box::pin(state.shutdown()).await),
-            Err(error) => Ok(NativeLifecycleResult::from_wyrd(error)),
-        }
+    pub fn shutdown<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let state = self.state.clone();
+        crate::trace::spawn(env, async move {
+            match &state {
+                Ok(state) => NativeLifecycleResult::outcome(Box::pin(state.shutdown()).await),
+                Err(error) => Ok(NativeLifecycleResult::from_wyrd(error)),
+            }
+        })
     }
 }
 
@@ -620,6 +677,7 @@ impl NativeRun {
     #[napi]
     pub fn drift(
         &self,
+        env: Env,
         features_json: String,
         session_id: Option<String>,
     ) -> Result<NativeLifecycleResult> {
@@ -627,7 +685,9 @@ impl NativeRun {
             Ok(session) => session,
             Err(error) => return Ok(NativeLifecycleResult::from_wyrd(&error)),
         };
-        NativeLifecycleResult::outcome(self.run.observe().drift_json(&features_json, session))
+        NativeLifecycleResult::outcome(crate::trace::traced(env, || {
+            self.run.observe().drift_json(&features_json, session)
+        }))
     }
 
     /// Emits one Eval observation from its JSON context and options.
@@ -644,6 +704,7 @@ impl NativeRun {
     #[napi]
     pub fn eval(
         &self,
+        env: Env,
         context_json: String,
         session_id: Option<String>,
         media_json: Option<String>,
@@ -660,7 +721,9 @@ impl NativeRun {
             Ok(options) => options,
             Err(error) => return Ok(NativeLifecycleResult::from_wyrd(&error)),
         };
-        NativeLifecycleResult::outcome(self.run.observe().eval_json(&context_json, options))
+        NativeLifecycleResult::outcome(crate::trace::traced(env, || {
+            self.run.observe().eval_json(&context_json, options)
+        }))
     }
 
     /// Judges this view's subject with a bound Verifier from JSON input.
@@ -668,9 +731,6 @@ impl NativeRun {
     /// `input_json` is one Eval context object or one array of Drift feature
     /// rows; `media_json` is one JSON array of media descriptors. One server
     /// call, never replayed; nothing is observed, recorded, or dispatched.
-    /// `traceparent` and `tracestate` are Node's active OpenTelemetry span,
-    /// which the call carries as its W3C trace context so the server's work
-    /// joins the caller's trace; a malformed `traceparent` is ignored.
     ///
     /// # Errors
     ///
@@ -679,35 +739,28 @@ impl NativeRun {
     /// server's verification refusals are returned in
     /// [`NativeLifecycleResult`].
     #[napi]
-    pub async fn verify(
+    pub fn verify<'env>(
         &self,
+        env: &'env Env,
         verifier: String,
         input_json: String,
         media_json: Option<String>,
-        traceparent: Option<String>,
-        tracestate: Option<String>,
-    ) -> Result<NativeLifecycleResult> {
-        let caller = traceparent.and_then(|parent| {
-            TraceContext::parse_traceparent(&parent, tracestate.unwrap_or_default()).ok()
-        });
-        let media = match media_json.as_deref().map(serde_json::from_str).transpose() {
-            Ok(media) => media.unwrap_or_default(),
-            Err(error) => {
-                return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::Validation {
-                    message: format!("media is invalid: {error}"),
-                    details: serde_json::json!({ "field": "media", "reason": error.to_string() }),
-                }));
-            }
-        };
-        NativeLifecycleResult::outcome(
-            Box::pin(with_caller_trace(
-                caller,
-                self.run
-                    .observe()
-                    .verify_json(&verifier, &input_json, media),
-            ))
-            .await,
-        )
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let run = self.run.clone();
+        crate::trace::spawn(env, async move {
+            let media = match media_json.as_deref().map(serde_json::from_str).transpose() {
+                Ok(media) => media.unwrap_or_default(),
+                Err(error) => {
+                    return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::Validation {
+                        message: format!("media is invalid: {error}"),
+                        details: serde_json::json!({ "field": "media", "reason": error.to_string() }),
+                    }));
+                }
+            };
+            NativeLifecycleResult::outcome(
+                Box::pin(run.observe().verify_json(&verifier, &input_json, media)).await,
+            )
+        })
     }
 
     /// Invokes this view's tool-free Agent once through the Wyrd gateway with
@@ -719,28 +772,35 @@ impl NativeRun {
     /// non-Agent view, an Agent with tools, malformed variables, and the
     /// gateway's refusals are returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn invoke(&self, variables_json: Option<String>) -> Result<NativeLifecycleResult> {
-        let variables: std::collections::BTreeMap<String, String> = match variables_json
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-        {
-            Ok(variables) => variables.unwrap_or_default(),
-            Err(error) => {
-                return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::Validation {
-                    message: format!("variables are invalid: {error}"),
-                    details: serde_json::json!({
-                        "field": "variables",
-                        "reason": error.to_string(),
-                    }),
-                }));
-            }
-        };
-        let pairs: Vec<(&str, &str)> = variables
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect();
-        NativeLifecycleResult::outcome(Box::pin(self.run.invoke(&pairs)).await)
+    pub fn invoke<'env>(
+        &self,
+        env: &'env Env,
+        variables_json: Option<String>,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let run = self.run.clone();
+        crate::trace::spawn(env, async move {
+            let variables: std::collections::BTreeMap<String, String> = match variables_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+            {
+                Ok(variables) => variables.unwrap_or_default(),
+                Err(error) => {
+                    return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::Validation {
+                        message: format!("variables are invalid: {error}"),
+                        details: serde_json::json!({
+                            "field": "variables",
+                            "reason": error.to_string(),
+                        }),
+                    }));
+                }
+            };
+            let pairs: Vec<(&str, &str)> = variables
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            NativeLifecycleResult::outcome(Box::pin(run.invoke(&pairs)).await)
+        })
     }
 
     /// Emits one row into a registered `vala.datasets` table.
@@ -754,9 +814,17 @@ impl NativeRun {
     /// reserved, unknown, or unauthorized table and the lifecycle refusals are
     /// returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn record(&self, table: String, row_json: String) -> Result<NativeLifecycleResult> {
-        NativeLifecycleResult::outcome(
-            Box::pin(self.run.observe().record_json(&table, &row_json)).await,
-        )
+    pub fn record<'env>(
+        &self,
+        env: &'env Env,
+        table: String,
+        row_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let run = self.run.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(
+                Box::pin(run.observe().record_json(&table, &row_json)).await,
+            )
+        })
     }
 }

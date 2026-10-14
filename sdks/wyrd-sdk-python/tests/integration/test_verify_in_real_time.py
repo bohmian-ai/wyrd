@@ -104,12 +104,34 @@ def test_traced_verify_joins_the_callers_trace(
     wyrd_server.flush_bifrost()
 
     context = caller.get_span_context()
-    spans = bifrost.sql(
-        "SELECT encode(parent_span_id, 'hex') AS parent_span_id FROM vala.traces.spans "
-        "WHERE scope_name = 'wyrd.gateway' AND encode(trace_id, 'hex') = $1",
+    rows = bifrost.sql(
+        "SELECT encode(span_id, 'hex') AS span_id, encode(parent_span_id, 'hex') AS parent, "
+        "scope_name, name FROM vala.traces.spans WHERE encode(trace_id, 'hex') = $1",
         [format(context.trace_id, "032x")],
     ).to_arrow()
-    assert spans.to_pylist() == [{"parent_span_id": format(context.span_id, "016x")}]
+    spans = {row["span_id"]: row for row in rows.to_pylist()}
+    attempts = [row for row in spans.values() if row["scope_name"] == "wyrd.gateway"]
+    assert len(attempts) == 1, spans
+    ancestor = attempts[0]
+    while ancestor["parent"] in spans:
+        ancestor = spans[ancestor["parent"]]
+    assert ancestor["parent"] == format(context.span_id, "016x"), spans
+
+
+def test_sdk_requests_carry_the_active_trace(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:
+    gateway = Gateway(client_of(wyrd_server))
+    tracer = TracerProvider().get_tracer("journey")
+    with tracer.start_as_current_span("caller") as caller:
+        gateway.put_capture_policy({"mode": "metadata", "payload_fields": []})
+    wyrd_server.flush_bifrost()
+
+    context = caller.get_span_context()
+    spans = bifrost.sql(
+        "SELECT name FROM vala.traces.spans "
+        "WHERE encode(trace_id, 'hex') = $1 AND encode(parent_span_id, 'hex') = $2",
+        [format(context.trace_id, "032x"), format(context.span_id, "016x")],
+    ).to_arrow()
+    assert spans.to_pylist() == [{"name": "request"}]
 
 
 def test_model_latency_like_the_baseline_passes_its_verifier(assistant: WyrdState) -> None:

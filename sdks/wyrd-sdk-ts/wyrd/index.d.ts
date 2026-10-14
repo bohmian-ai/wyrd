@@ -650,9 +650,6 @@ export declare class NativeRun {
    * `input_json` is one Eval context object or one array of Drift feature
    * rows; `media_json` is one JSON array of media descriptors. One server
    * call, never replayed; nothing is observed, recorded, or dispatched.
-   * `traceparent` and `tracestate` are Node's active OpenTelemetry span,
-   * which the call carries as its W3C trace context so the server's work
-   * joins the caller's trace; a malformed `traceparent` is ignored.
    *
    * # Errors
    *
@@ -661,7 +658,7 @@ export declare class NativeRun {
    * server's verification refusals are returned in
    * [`NativeLifecycleResult`].
    */
-  verify(verifier: string, inputJson: string, mediaJson?: string | undefined | null, traceparent?: string | undefined | null, tracestate?: string | undefined | null): Promise<NativeLifecycleResult>
+  verify(verifier: string, inputJson: string, mediaJson?: string | undefined | null): Promise<NativeLifecycleResult>
   /**
    * Invokes this view's tool-free Agent once through the Wyrd gateway with
    * the string variables of `variables_json` and returns its final text.
@@ -1042,6 +1039,14 @@ export interface NativeBifrostConnection {
   error?: NativeWyrdError
 }
 
+/** Node's active span as W3C `traceparent` and optional `tracestate`. */
+export interface NativeCallerTrace {
+  /** The W3C `traceparent` header value. */
+  traceparent: string
+  /** The W3C `tracestate` header value, when the span carries one. */
+  tracestate?: string
+}
+
 /** Structured native result for one live-query lifecycle control. */
 export interface NativeLifecycleResult {
   /** Canonical JSON payload when the control succeeded. */
@@ -1210,6 +1215,16 @@ export declare function openWyrdState(path: string): NativeWyrdState
  * and resolves its process exit code.
  */
 export declare function runWyrdCli(args: Array<string>): Promise<number>
+
+/**
+ * Register the callback each native call reads Node's active span through;
+ * a later registration replaces the earlier one.
+ *
+ * # Errors
+ *
+ * Returns a napi error when the callback reference cannot be created.
+ */
+export declare function setTraceSource(source: () => NativeCallerTrace | null): void
 
 /**
  * Renders one stored timestamp cell as its Bifrost timestamp type's text.

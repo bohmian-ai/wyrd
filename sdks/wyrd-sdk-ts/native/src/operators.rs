@@ -8,7 +8,8 @@
 
 use std::result::Result as StdResult;
 
-use napi::Result;
+use napi::Env;
+use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
 use serde::de::DeserializeOwned;
 use wyrd_client::operator_connections::{
@@ -73,12 +74,19 @@ impl NativeOperatorConnections {
     /// Returns a napi error only when the view cannot be serialized; a
     /// malformed request or server refusal is returned in the result.
     #[napi]
-    pub async fn create(&self, request_json: String) -> Result<NativeLifecycleResult> {
-        let result = match decode::<CreateOperatorConnectionRequest>("request", &request_json) {
-            Ok(request) => self.connections.create(&request).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn create<'env>(
+        &self,
+        env: &'env Env,
+        request_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let connections = self.connections.clone();
+        crate::trace::spawn(env, async move {
+            let result = match decode::<CreateOperatorConnectionRequest>("request", &request_json) {
+                Ok(request) => connections.create(&request).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Lists the caller tenant's redacted connections.
@@ -87,8 +95,14 @@ impl NativeOperatorConnections {
     ///
     /// Returns a napi error only when the views cannot be serialized.
     #[napi]
-    pub async fn list(&self) -> Result<NativeLifecycleResult> {
-        NativeLifecycleResult::outcome(self.connections.list().await)
+    pub fn list<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let connections = self.connections.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(connections.list().await)
+        })
     }
 
     /// Reads one connection's redacted view.
@@ -98,12 +112,19 @@ impl NativeOperatorConnections {
     /// Returns a napi error only when the view cannot be serialized; a
     /// malformed ID or server refusal is returned in the result.
     #[napi]
-    pub async fn get(&self, id: String) -> Result<NativeLifecycleResult> {
-        let result = match connection_id(id) {
-            Ok(id) => self.connections.get(&id).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn get<'env>(
+        &self,
+        env: &'env Env,
+        id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let connections = self.connections.clone();
+        crate::trace::spawn(env, async move {
+            let result = match connection_id(id) {
+                Ok(id) => connections.get(&id).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Updates or rotates one connection from a serialized
@@ -114,15 +135,23 @@ impl NativeOperatorConnections {
     /// Returns a napi error only when the view cannot be serialized; a
     /// malformed argument or server refusal is returned in the result.
     #[napi]
-    pub async fn update(&self, id: String, request_json: String) -> Result<NativeLifecycleResult> {
-        let result = match (
-            connection_id(id),
-            decode::<UpdateOperatorConnectionRequest>("request", &request_json),
-        ) {
-            (Ok(id), Ok(request)) => self.connections.update(&id, &request).await,
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn update<'env>(
+        &self,
+        env: &'env Env,
+        id: String,
+        request_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let connections = self.connections.clone();
+        crate::trace::spawn(env, async move {
+            let result = match (
+                connection_id(id),
+                decode::<UpdateOperatorConnectionRequest>("request", &request_json),
+            ) {
+                (Ok(id), Ok(request)) => connections.update(&id, &request).await,
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Disables one connection; Operators naming it fail closed.
@@ -132,11 +161,18 @@ impl NativeOperatorConnections {
     /// Returns a napi error only when the view cannot be serialized; a
     /// malformed ID or server refusal is returned in the result.
     #[napi]
-    pub async fn disable(&self, id: String) -> Result<NativeLifecycleResult> {
-        let result = match connection_id(id) {
-            Ok(id) => self.connections.disable(&id).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn disable<'env>(
+        &self,
+        env: &'env Env,
+        id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let connections = self.connections.clone();
+        crate::trace::spawn(env, async move {
+            let result = match connection_id(id) {
+                Ok(id) => connections.disable(&id).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 }

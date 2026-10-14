@@ -6,7 +6,8 @@
 
 use std::result::Result as StdResult;
 
-use napi::Result;
+use napi::Env;
+use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
 use wyrd_client::principals::{
     CreateServicePrincipalRequest, PrincipalId, PrincipalQuery, Principals, RevokePrincipalRequest,
@@ -56,15 +57,19 @@ impl NativePrincipals {
     /// Returns a napi error only when the response cannot be serialized; a
     /// malformed request or server refusal is returned in the result.
     #[napi]
-    pub async fn create_service_principal(
+    pub fn create_service_principal<'env>(
         &self,
+        env: &'env Env,
         request_json: String,
-    ) -> Result<NativeLifecycleResult> {
-        let result = match decode::<CreateServicePrincipalRequest>("request", &request_json) {
-            Ok(request) => self.principals.create_service_principal(&request).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = match decode::<CreateServicePrincipalRequest>("request", &request_json) {
+                Ok(request) => principals.create_service_principal(&request).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Issues one more credential for a Service or Agent principal.
@@ -74,12 +79,19 @@ impl NativePrincipals {
     /// Returns a napi error only when the credential cannot be serialized; a
     /// malformed id or server refusal is returned in the result.
     #[napi]
-    pub async fn issue_credential(&self, principal_id: String) -> Result<NativeLifecycleResult> {
-        let result = match self::principal_id(principal_id) {
-            Ok(id) => self.principals.issue_credential(&id).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn issue_credential<'env>(
+        &self,
+        env: &'env Env,
+        principal_id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = match self::principal_id(principal_id) {
+                Ok(id) => principals.issue_credential(&id).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Lists a principal's credential metadata.
@@ -89,12 +101,19 @@ impl NativePrincipals {
     /// Returns a napi error only when the list cannot be serialized; a
     /// malformed id or server refusal is returned in the result.
     #[napi]
-    pub async fn list_credentials(&self, principal_id: String) -> Result<NativeLifecycleResult> {
-        let result = match self::principal_id(principal_id) {
-            Ok(id) => self.principals.list_credentials(&id).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn list_credentials<'env>(
+        &self,
+        env: &'env Env,
+        principal_id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = match self::principal_id(principal_id) {
+                Ok(id) => principals.list_credentials(&id).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Revokes one credential of a principal.
@@ -104,20 +123,24 @@ impl NativePrincipals {
     /// Returns a napi error only when the outcome cannot be serialized; a
     /// malformed id or server refusal is returned in the result.
     #[napi]
-    pub async fn revoke_credential(
+    pub fn revoke_credential<'env>(
         &self,
+        env: &'env Env,
         principal_id: String,
         credential_id: String,
-    ) -> Result<NativeLifecycleResult> {
-        let credential = decode(
-            "credential_id",
-            &serde_json::Value::String(credential_id).to_string(),
-        );
-        let result = match (self::principal_id(principal_id), credential) {
-            (Ok(id), Ok(credential)) => self.principals.revoke_credential(&id, credential).await,
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let credential = decode(
+                "credential_id",
+                &serde_json::Value::String(credential_id).to_string(),
+            );
+            let result = match (self::principal_id(principal_id), credential) {
+                (Ok(id), Ok(credential)) => principals.revoke_credential(&id, credential).await,
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Revokes a principal and every credential it holds.
@@ -127,19 +150,23 @@ impl NativePrincipals {
     /// Returns a napi error only when the outcome cannot be serialized; a
     /// malformed argument or server refusal is returned in the result.
     #[napi]
-    pub async fn revoke_principal(
+    pub fn revoke_principal<'env>(
         &self,
+        env: &'env Env,
         principal_id: String,
         request_json: String,
-    ) -> Result<NativeLifecycleResult> {
-        let result = match (
-            self::principal_id(principal_id),
-            decode::<RevokePrincipalRequest>("request", &request_json),
-        ) {
-            (Ok(id), Ok(request)) => self.principals.revoke_principal(&id, &request).await,
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = match (
+                self::principal_id(principal_id),
+                decode::<RevokePrincipalRequest>("request", &request_json),
+            ) {
+                (Ok(id), Ok(request)) => principals.revoke_principal(&id, &request).await,
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Lists one page of assignable principals from a serialized
@@ -150,12 +177,19 @@ impl NativePrincipals {
     /// Returns a napi error only when the page cannot be serialized; a
     /// malformed query or server refusal is returned in the result.
     #[napi]
-    pub async fn list(&self, query_json: String) -> Result<NativeLifecycleResult> {
-        let result = match decode::<PrincipalQuery>("query", &query_json) {
-            Ok(query) => self.principals.list(&query).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn list<'env>(
+        &self,
+        env: &'env Env,
+        query_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = match decode::<PrincipalQuery>("query", &query_json) {
+                Ok(query) => principals.list(&query).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Reads a principal's Role assignments.
@@ -165,12 +199,19 @@ impl NativePrincipals {
     /// Returns a napi error only when the assignments cannot be serialized; a
     /// malformed id or server refusal is returned in the result.
     #[napi]
-    pub async fn roles(&self, principal_id: String) -> Result<NativeLifecycleResult> {
-        let result = match self::principal_id(principal_id) {
-            Ok(id) => self.principals.roles(&id).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn roles<'env>(
+        &self,
+        env: &'env Env,
+        principal_id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = match self::principal_id(principal_id) {
+                Ok(id) => principals.roles(&id).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Idempotently grants a direct Role.
@@ -180,16 +221,20 @@ impl NativePrincipals {
     /// Returns a napi error only when the change cannot be serialized; a
     /// malformed id or server refusal is returned in the result.
     #[napi]
-    pub async fn grant_role(
+    pub fn grant_role<'env>(
         &self,
+        env: &'env Env,
         principal_id: String,
         role: String,
-    ) -> Result<NativeLifecycleResult> {
-        let result = match self::principal_id(principal_id) {
-            Ok(id) => self.principals.grant_role(&id, &role).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = match self::principal_id(principal_id) {
+                Ok(id) => principals.grant_role(&id, &role).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Idempotently revokes a direct Role; identity-provider assignments stay.
@@ -199,15 +244,19 @@ impl NativePrincipals {
     /// Returns a napi error only when the change cannot be serialized; a
     /// malformed id or server refusal is returned in the result.
     #[napi]
-    pub async fn revoke_role(
+    pub fn revoke_role<'env>(
         &self,
+        env: &'env Env,
         principal_id: String,
         role: String,
-    ) -> Result<NativeLifecycleResult> {
-        let result = match self::principal_id(principal_id) {
-            Ok(id) => self.principals.revoke_role(&id, &role).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = match self::principal_id(principal_id) {
+                Ok(id) => principals.revoke_role(&id, &role).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 }

@@ -17,11 +17,17 @@ class GatewayAuth(httpx.Auth, httpx2.Auth):
     token expires. Needs the ``gateway`` extra (``pip install 'wyrd[gateway]'``).
     """
 
-    def __init__(self, client: WyrdClient) -> None:
-        """Authenticate as ``client``.
+    def __init__(self, client: WyrdClient | None = None) -> None:
+        """Authenticate as ``client``, or as the ambient client.
 
         Args:
             client: The client whose access token every request carries.
+                Omitted, the ambient ``WyrdClient()`` is resolved once, here,
+                from the environment or saved ``wyrd auth login``.
+
+        Raises:
+            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when ``client`` is
+                omitted and no ambient credential resolves.
         """
         ...
 

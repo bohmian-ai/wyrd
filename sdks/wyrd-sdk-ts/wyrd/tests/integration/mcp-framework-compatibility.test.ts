@@ -2,7 +2,9 @@ import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/cli
 import { type FunctionTool, getAllMcpTools, MCPServerStreamableHttp, RunContext } from "@openai/agents-core";
 import { expect, vi } from "vitest";
 
-import { serverTest } from "../support/server.js";
+import { wyrdFetch } from "wyrd-ai";
+
+import { revokedApiKey, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -84,4 +86,31 @@ test("the OpenAI Agents SDK converts every tool and calls a read tool", async ({
   } finally {
     await mcp.close();
   }
+});
+
+/** The official MCP SDK connected to `/mcp` with only the environment and {@link wyrdFetch}. */
+async function ambientMcpClient(): Promise<Client> {
+  const client = new Client({ name: "wyrd-ts-ambient", version: "1.0.0" }, { versionNegotiation: { mode: "auto" } });
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL("/mcp", process.env.WYRD_SERVER_URL), { fetch: wyrdFetch() }),
+  );
+  return client;
+}
+
+test("the official MCP SDK lists tools over wyrdFetch from the environment alone", async () => {
+  const client = await ambientMcpClient();
+  try {
+    const { tools } = await client.listTools();
+    expect(tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(WRITE_TOOLS));
+  } finally {
+    await client.close();
+  }
+});
+
+test("a revoked api key is refused by the token exchange, not by /mcp", async () => {
+  vi.stubEnv("WYRD_API_KEY", await revokedApiKey("revoked-mcp-caller"));
+
+  await expect(ambientMcpClient()).rejects.toMatchObject({
+    cause: { code: "WYRD_SPEC_400_VALIDATION", details: { error: "invalid_request" } },
+  });
 });

@@ -13,11 +13,11 @@ import {
   type RegistrationReceipt,
   Workflow,
   WyrdClient,
-  gatewayFetch,
+  accessTokenSource,
 } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
-import { columnValues, fixture, registered, serverTest } from "../support/server.js";
+import { columnValues, fixture, registered, revokedApiKey, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -104,6 +104,26 @@ test("openai client calls the gateway with an access token", async ({ provider, 
   expect(Object.keys(upstream?.headers ?? {}).filter((name) => name.startsWith("x-wyrd"))).toEqual([]);
 });
 
+test("stock openai client authenticates from the environment alone", async ({ ask: _ }) => {
+  const client = new OpenAI({ baseURL: `${process.env.WYRD_SERVER_URL}/v1`, apiKey: accessTokenSource() });
+
+  for (let turn = 0; turn < 2; turn++) {
+    const reply = await client.chat.completions.create(ASK);
+    expect(reply.choices[0]?.message.content).toBe("hi");
+  }
+});
+
+test("revoked api key is refused by the token exchange, before the gateway", async ({ provider, ask: _ }) => {
+  vi.stubEnv("WYRD_API_KEY", await revokedApiKey("revoked-gateway-caller"));
+  const client = new OpenAI({ baseURL: `${process.env.WYRD_SERVER_URL}/v1`, apiKey: accessTokenSource() });
+  const before = provider.received.length;
+
+  await expect(client.chat.completions.create(ASK)).rejects.toMatchObject({
+    cause: { code: "WYRD_SPEC_400_VALIDATION", details: { error: "invalid_request" } },
+  });
+  expect(provider.received.length).toBe(before);
+});
+
 /** The gateway's model-call spans in the trace `traceId`, after publishing every captured row. */
 async function gatewaySpans(
   server: { flushBifrost(): void },
@@ -165,7 +185,7 @@ test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {
 test("gateway call records a lone run or card", async ({ server, ask }) => {
   const issued = await cli.issueKey({ kind: "Agent", name: "ask-agent", version: "1.0.0", space: "default" });
   const caller = WyrdClient.connect({ credential: issued.key });
-  const client = new OpenAI({ baseURL: `${caller.serverUrl}/v1`, apiKey: "wyrd", fetch: gatewayFetch(caller) });
+  const client = new OpenAI({ baseURL: `${caller.serverUrl}/v1`, apiKey: accessTokenSource({ client: caller }) });
   const cardUid = registered(ask, "ask-agent").uid;
 
   for (const headers of [{ "wyrd-run-id": "run-alone" }, { "wyrd-card-uid": cardUid }]) {

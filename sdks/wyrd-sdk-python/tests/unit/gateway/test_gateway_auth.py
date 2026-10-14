@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING, cast
 
 import httpx
 import httpx2
-from wyrd.gateway import GatewayAuth
+import pytest
+from wyrd.gateway import GatewayAuth, _auth
 
 if TYPE_CHECKING:
     from wyrd.client import WyrdClient
@@ -53,3 +54,17 @@ def test_async_requests_carry_a_fresh_token() -> None:
             return [(await client.get("http://gateway/v1/models")).text for _ in range(2)]
 
     assert asyncio.run(send_twice()) == ["Bearer token-1", "Bearer token-2"]
+
+
+def test_omitted_client_resolves_the_ambient_client_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolved: list[Minting] = []
+
+    def ambient() -> Minting:
+        resolved.append(Minting())
+        return resolved[-1]
+
+    monkeypatch.setattr(_auth, "WyrdClient", ambient)
+    auth = GatewayAuth()
+    with httpx2.Client(auth=auth, transport=httpx2.MockTransport(bearer2)) as client:
+        sent = [client.get("http://gateway/v1/models").text for _ in range(2)]
+    assert (len(resolved), sent) == (1, ["Bearer token-1", "Bearer token-2"])

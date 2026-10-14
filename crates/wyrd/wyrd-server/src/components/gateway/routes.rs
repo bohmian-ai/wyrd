@@ -1841,7 +1841,8 @@ pub(super) fn openai_error(error: &WyrdError) -> Response {
 /// `max_completion_tokens` (or legacy `max_tokens`) times the choice count
 /// `n`, Responses by `max_output_tokens`, and a request without that maximum
 /// is unbounded; Embeddings produce no output tokens. Other operations have no
-/// token bound here.
+/// token bound here, including Jev `systemone`, whose answers no request
+/// member bounds.
 pub(super) fn usage_bound(
     operation: GatewayOperation,
     body: &Value,
@@ -1855,7 +1856,10 @@ pub(super) fn usage_bound(
         ),
         GatewayOperation::Responses => Some(field("max_output_tokens")?),
         GatewayOperation::Embeddings => None,
-        GatewayOperation::Images | GatewayOperation::Audio | GatewayOperation::Batches => {
+        GatewayOperation::Images
+        | GatewayOperation::Audio
+        | GatewayOperation::Batches
+        | GatewayOperation::SystemOne => {
             return None;
         }
     };

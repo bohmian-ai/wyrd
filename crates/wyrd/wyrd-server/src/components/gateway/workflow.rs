@@ -93,7 +93,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             operation,
             ingress,
             usage_bound: match ingress {
-                IngressDialect::OpenAi => usage_bound(operation, &body),
+                IngressDialect::OpenAi | IngressDialect::Jev => usage_bound(operation, &body),
                 IngressDialect::AnthropicMessages => anthropic_usage_bound(&body),
                 IngressDialect::GeminiGenerateContent | IngressDialect::VertexGenerateContent => {
                     google_usage_bound(&body)

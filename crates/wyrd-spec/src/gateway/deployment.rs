@@ -64,6 +64,9 @@ pub enum ProviderAdapter {
         /// Google Cloud location, such as `us-central1`.
         location: VertexLocation,
     },
+    /// TypeSafe Jev `systemone` question protocol.
+    #[serde(rename = "jev")]
+    Jev,
     /// Standard OpenAI-compatible routes under a tenant base URL.
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible {
@@ -82,6 +85,7 @@ impl ProviderAdapter {
             Self::Anthropic => Some("anthropic"),
             Self::Gemini => Some("gemini"),
             Self::Vertex { .. } => Some("vertex"),
+            Self::Jev => Some("jev"),
             Self::OpenAiCompatible { .. } => None,
         }
     }
@@ -90,15 +94,24 @@ impl ProviderAdapter {
     ///
     /// This is the typed capability source: deployment validation, request
     /// preparation, and the published operation-support table all agree with
-    /// it. `OpenAI`-protocol adapters carry every operation natively; Anthropic
-    /// and Google adapters carry Chat Completions only.
+    /// it. `OpenAI`-protocol adapters carry every `OpenAI` operation natively;
+    /// Anthropic and Google adapters carry Chat Completions only. Jev alone
+    /// carries [`GatewayOperation::SystemOne`], plus Chat Completions in its
+    /// constrained single-message question form; it never streams, embeds,
+    /// or calls tools.
     #[must_use]
     pub const fn serves(&self, operation: GatewayOperation) -> bool {
         match self {
-            Self::OpenAi | Self::OpenAiCompatible { .. } => true,
+            Self::OpenAi | Self::OpenAiCompatible { .. } => {
+                !matches!(operation, GatewayOperation::SystemOne)
+            }
             Self::Anthropic | Self::Gemini | Self::Vertex { .. } => {
                 matches!(operation, GatewayOperation::ChatCompletions)
             }
+            Self::Jev => matches!(
+                operation,
+                GatewayOperation::SystemOne | GatewayOperation::ChatCompletions
+            ),
         }
     }
 }
@@ -431,6 +444,36 @@ mod tests {
             "batches"
         ]);
         let served: ProviderDeployment = serde_json::from_value(served).expect("decodes");
-        served.validate().expect("openai serves every operation");
+        served
+            .validate()
+            .expect("openai serves every OpenAI operation");
+        let mut systemone = deployment("openai", json!("openai"));
+        systemone["capabilities"] = json!(["system_one"]);
+        let systemone: ProviderDeployment = serde_json::from_value(systemone).expect("decodes");
+        assert!(
+            systemone.validate().is_err(),
+            "only Jev serves systemone questions"
+        );
+        let mut jev = deployment("jev", json!("jev"));
+        jev["auth"] = json!({"bearer": {"credential": "jev-key"}});
+        jev["capabilities"] = json!(["system_one", "chat_completions"]);
+        let jev_valid: ProviderDeployment = serde_json::from_value(jev.clone()).expect("decodes");
+        jev_valid
+            .validate()
+            .expect("jev serves systemone and adapted chat");
+        for unserved in ["embeddings", "responses", "batches"] {
+            jev["capabilities"] = json!(["system_one", unserved]);
+            let jev: ProviderDeployment = serde_json::from_value(jev.clone()).expect("decodes");
+            assert!(jev.validate().is_err(), "jev does not serve {unserved}");
+        }
+        let jev_compatible: ProviderDeployment = serde_json::from_value(deployment(
+            "jev",
+            json!({"openai_compatible": {"base_url": "https://api.typesafe.ai"}}),
+        ))
+        .expect("decodes");
+        assert!(
+            jev_compatible.validate().is_err(),
+            "the jev provider is reserved for the Jev adapter"
+        );
     }
 }

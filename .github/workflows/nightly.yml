@@ -77,7 +77,7 @@ jobs:
           enable-cache: true
           # Shards that never run uv have nothing to cache.
           ignore-nothing-to-cache: true
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install Rust components
         run: rustup component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt clippy

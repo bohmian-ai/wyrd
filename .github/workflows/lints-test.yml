@@ -61,10 +61,10 @@ jobs:
         run: |
           if [[ "${{ needs.changes.outputs.full_gate }}" == "true" ]]; then
             echo 'os=["macos-15"]' >> "$GITHUB_OUTPUT"
-            python='[{"os":"macos-15","python-version":"3.12"}'
+            python='[{"os":"macos-15","python-version":"3.13"}'
           else
             echo 'os=["ubuntu-24.04","macos-15"]' >> "$GITHUB_OUTPUT"
-            python='[{"os":"ubuntu-24.04","python-version":"3.12"},{"os":"macos-15","python-version":"3.12"}'
+            python='[{"os":"ubuntu-24.04","python-version":"3.13"},{"os":"macos-15","python-version":"3.13"}'
           fi
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             python+=',{"os":"ubuntu-24.04","python-version":"3.10"},{"os":"ubuntu-24.04","python-version":"3.11"}'
@@ -128,7 +128,7 @@ jobs:
           enable-cache: true
           # Shards that never run uv have nothing to cache.
           ignore-nothing-to-cache: true
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install Rust components
         run: rustup component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt clippy
@@ -244,13 +244,13 @@ jobs:
           UV_PYTHON: ${{ matrix.python-version }}
 
       - name: TensorFlow Python tests
-        if: matrix.python-version == '3.12'
+        if: matrix.python-version == '3.13'
         run: mise run py:test:tensorflow
         env:
           UV_PYTHON: ${{ matrix.python-version }}
 
       - name: Python examples
-        if: matrix.os == 'ubuntu-24.04' && matrix.python-version == '3.12'
+        if: matrix.os == 'ubuntu-24.04' && matrix.python-version == '3.13'
         run: mise run examples:python:datacard
         env:
           UV_PYTHON: ${{ matrix.python-version }}
@@ -275,7 +275,7 @@ jobs:
         uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Check docs (includes docs:a11y)
         run: mise run docs:check

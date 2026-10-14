@@ -9,18 +9,11 @@
 use async_trait::async_trait;
 use skald_spec::{ProviderRequest, ProviderResponse};
 
-use crate::auth::OpenAiAuth;
+use crate::auth::JevAuth;
 use crate::error::{ProviderError, ProviderResult};
 use crate::retry::RetryPolicy;
 use crate::trait_::{ProviderClient, ProviderStream};
 use crate::transport::{HttpTransport, TransportConfig};
-
-/// Production TypeSafe API base URL.
-pub const JEV_BASE_URL: &str = "https://api.typesafe.ai";
-
-/// Environment variable holding the TypeSafe API key [`JevClient::from_env`]
-/// reads.
-pub const JEV_API_KEY_VARIABLE: &str = "TYPESAFE_API_KEY";
 
 /// Provider label on every error this client raises.
 const PROVIDER: &str = "jev";
@@ -29,7 +22,7 @@ const PROVIDER: &str = "jev";
 #[derive(Debug, Clone)]
 pub struct JevClient {
     /// Bearer credential and base URL.
-    auth: OpenAiAuth,
+    auth: JevAuth,
     /// Policy-enforcing HTTP transport.
     transport: HttpTransport,
     /// Retry policy of each exchange.
@@ -37,20 +30,13 @@ pub struct JevClient {
 }
 
 impl JevClient {
-    /// Bearer auth presenting `api_key` to `base_url`, or to
-    /// [`JEV_BASE_URL`] when `base_url` is `None`.
-    #[must_use]
-    pub fn auth(api_key: impl Into<String>, base_url: Option<&str>) -> OpenAiAuth {
-        OpenAiAuth::new(api_key).with_base_url(base_url.unwrap_or(JEV_BASE_URL))
-    }
-
     /// Creates a client from explicit auth with the default transport and
     /// retry policy.
     ///
     /// # Errors
     ///
     /// Returns the transport construction error.
-    pub fn new(auth: OpenAiAuth) -> ProviderResult<Self> {
+    pub fn new(auth: JevAuth) -> ProviderResult<Self> {
         Ok(Self::with_transport(
             auth,
             HttpTransport::new(TransportConfig::default())?,
@@ -58,27 +44,21 @@ impl JevClient {
         ))
     }
 
-    /// Creates a production client keyed by [`JEV_API_KEY_VARIABLE`].
+    /// Creates a production client from [`JevAuth::from_env`].
     ///
     /// # Errors
     ///
-    /// Returns [`ProviderError::Auth`] when the variable is unset or empty,
-    /// and the transport construction error.
+    /// Returns the [`JevAuth::from_env`] error and the transport construction
+    /// error.
     pub fn from_env() -> ProviderResult<Self> {
-        let key = std::env::var(JEV_API_KEY_VARIABLE)
-            .ok()
-            .filter(|key| !key.is_empty())
-            .ok_or_else(|| {
-                ProviderError::auth(PROVIDER, format!("{JEV_API_KEY_VARIABLE} is not set"))
-            })?;
-        Self::new(Self::auth(key, None))
+        Self::new(JevAuth::from_env()?)
     }
 
     /// Creates a client over a shared transport and retry policy; `auth`
-    /// carries the bearer key and base URL, usually built by [`Self::auth`].
+    /// carries the bearer key and base URL.
     #[must_use]
     pub const fn with_transport(
-        auth: OpenAiAuth,
+        auth: JevAuth,
         transport: HttpTransport,
         retry: RetryPolicy,
     ) -> Self {
@@ -173,7 +153,7 @@ mod tests {
     /// Builds a client of `server` with the test key.
     fn client(server: &MockServer) -> JevClient {
         JevClient::with_transport(
-            JevClient::auth("jev-test", Some(&server.uri())),
+            JevAuth::new("jev-test").with_base_url(server.uri()),
             common::transport(),
             common::retry_policy(),
         )

@@ -9,7 +9,9 @@
 use async_trait::async_trait;
 use reqwest::header::HeaderName;
 use serde_json::value::{RawValue, to_raw_value};
-use skald_providers::auth::{AnthropicAuth, GoogleApiKeyAuth, GoogleOAuth, OpenAiAuth, VertexAuth};
+use skald_providers::auth::{
+    AnthropicAuth, GoogleApiKeyAuth, GoogleOAuth, JevAuth, OpenAiAuth, VertexAuth,
+};
 use skald_providers::{
     AnthropicClient, GoogleClient, HttpTransport, JevClient, MediaAnswer, OpenAiClient,
     OpenAiMediaRoute, OpenAiRoute, ProviderByteStream, ProviderError, ProviderResult, RetryPolicy,
@@ -17,13 +19,12 @@ use skald_providers::{
 };
 use skald_spec::{ProviderRequest, ProviderResponse};
 use url::Url;
-use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{GatewayOperation, ProviderAdapter, ProviderAuth, ProviderDeployment};
 
 use super::stream::{ChatChunks, Frames, MediaCapture, StreamCapture, relay, relay_media};
 use super::{
     BatchAction, IngressDialect, MediaRequest, Prepared, Wire, complete, faithful_embeddings,
-    openai_error_body, prepare, refusal,
+    prepare, refusal,
 };
 use crate::credential::ProviderSecret;
 use crate::engine::{
@@ -191,8 +192,13 @@ impl HttpProviderDispatch {
                 ))
             }
             (ProviderAdapter::Jev, ProviderAuth::Bearer { .. }) => {
+                let auth = JevAuth::new(key()?);
+                let auth = match base {
+                    Some(base) => auth.with_base_url(base),
+                    None => auth,
+                };
                 Client::Jev(JevClient::with_transport(
-                    JevClient::auth(key()?, base.as_deref()),
+                    auth,
                     self.transport.clone(),
                     retry,
                 ))
@@ -455,62 +461,6 @@ fn failure(
     }
 }
 
-/// Attempt evidence of a failed Jev exchange.
-///
-/// A rejected credential (401, 403) maps exactly as for every other provider:
-/// [`failure`] relays the upstream status and body, `translated` for the
-/// Chat Completions pass-through, with `credential` removed, and never
-/// retries it. Every other non-redirect status becomes a gateway-originated
-/// `OpenAI` error envelope with a stable Wyrd code and a fixed message, so
-/// Jev's own body is not relayed: validation refusals (400, 422) are invalid
-/// requests; rate limiting (429) is upstream throttling; overload (529) and
-/// every other status are upstream unavailability. Retry follows the provider
-/// status: throttling and server errors may succeed on another deployment,
-/// validation refusals are never retried. Other failures map as [`failure`]
-/// maps them.
-fn jev_failure(
-    error: ProviderError,
-    translated: bool,
-    credential: Option<&ProviderSecret>,
-) -> AttemptResult {
-    let ProviderError::Status { status, .. } = error else {
-        return failure(error, translated, credential);
-    };
-    if matches!(status, 300..=399 | 401 | 403) {
-        return failure(error, translated, credential);
-    }
-    let (wyrd, message) = match status {
-        400 | 422 => (
-            WyrdError::GatewayInvalidRequest {
-                message: String::new(),
-                details: serde_json::Value::Null,
-            },
-            "the Jev provider rejected the request as invalid",
-        ),
-        429 => (
-            WyrdError::GatewayUpstreamThrottled {
-                message: String::new(),
-                details: serde_json::Value::Null,
-            },
-            "the Jev provider is rate limiting this deployment",
-        ),
-        _ => (
-            WyrdError::GatewayUpstreamUnavailable {
-                message: String::new(),
-                details: serde_json::Value::Null,
-            },
-            "the Jev provider is overloaded or unavailable",
-        ),
-    };
-    let answered = wyrd.status();
-    AttemptResult::Refused {
-        class: refusal_class(status),
-        status: answered,
-        body: openai_error_body(answered, message, Some(wyrd.code()), None),
-        usage: AttemptUsage::default(),
-    }
-}
-
 /// Capture projection of a successful JSON answer `raw`, only when `attempt`
 /// selected capture: the decoded answer with every exact occurrence of the
 /// attempt's credential removed, so a provider echoing its credential never
@@ -769,10 +719,7 @@ impl ProviderDispatch for HttpProviderDispatch {
                     code = error.code(),
                     "gateway provider call failed"
                 );
-                return match wire {
-                    Wire::Jev => jev_failure(error, translated, attempt.credential),
-                    _ => failure(error, translated, attempt.credential),
-                };
+                return failure(error, translated, attempt.credential);
             }
         };
         let mapped = tracing::info_span!("gateway.translate", direction = "response")

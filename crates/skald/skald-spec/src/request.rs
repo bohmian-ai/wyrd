@@ -130,6 +130,27 @@ impl ProviderRequest {
         }
     }
 
+    /// Whether the dialect answers with a typed object by protocol, so
+    /// [`crate::adapter::ResponseAdapter::structured_output`] reads every
+    /// answer without a declared JSON schema.
+    ///
+    /// Conversational and embedding dialects answer with text or vectors and
+    /// return `false`; their structured output needs a schema-constrained
+    /// Prompt.
+    pub const fn answers_structured(&self) -> bool {
+        match self {
+            Self::JevSystemOne(_) => true,
+            Self::OpenAiChatCompletion(_)
+            | Self::OpenAiResponses(_)
+            | Self::OpenAiEmbeddings(_)
+            | Self::AnthropicMessage(_)
+            | Self::GeminiGenerateContent(_)
+            | Self::GoogleBatchEmbed(_)
+            | Self::VertexPredict(_)
+            | Self::RawV1 { .. } => false,
+        }
+    }
+
     /// Return a copy of the native request with provider-specific tool fields populated.
     #[must_use]
     pub fn with_tools(mut self, tools: Vec<ToolDescriptor>) -> Self {

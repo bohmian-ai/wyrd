@@ -45,8 +45,6 @@ const JUDGE_QUESTIONS = {
 const REFUSALS: Record<string, number> = {
   "refused-form": 400,
   "rate-limited": 429,
-  "server-error": 500,
-  overloaded: 529,
   "bad-key": 401,
 };
 
@@ -222,6 +220,23 @@ test("jev judge fails an unhelpful rude reply", async ({ reviewer }) => {
 
 test("jev judge judges a reply with quotes and newlines", async ({ server, provider, reviewer }) => {
   const before = provider.received.length;
+  // The file shares one server, so the judge's call is the one `system_one`
+  // call this verify adds. Correlating it to the judgment's Run is owned by
+  // the verify-attribution change, not by the Jev provider.
+  const systemOneCalls = async (): Promise<Array<Record<string, unknown>>> => {
+    server.flushBifrost();
+    return (
+      await (
+        await Bifrost.connect()
+      ).sql(
+        "SELECT call_id, outcome, CAST(attempt_count AS INT) AS attempt_count FROM vala.gateway.calls WHERE operation = 'system_one'",
+      )
+    )
+      .toArrow()
+      .toArray()
+      .map((row) => row.toJSON());
+  };
+  const earlier = new Set((await systemOneCalls()).map((call) => call.call_id));
   const question = 'Is my "refund" done?\nOrder 7';
   const reply = 'He said "your refund is on its way".\nAnything else?';
 
@@ -236,23 +251,19 @@ test("jev judge judges a reply with quotes and newlines", async ({ server, provi
     state: `Question: ${question}\nAnswer: ${reply}`,
     questions: JUDGE_QUESTIONS,
   });
-  server.flushBifrost();
+  const judged = (await systemOneCalls()).filter((call) => !earlier.has(call.call_id));
+  expect(judged.map(({ outcome, attempt_count }) => ({ outcome, attempt_count }))).toEqual([
+    { outcome: "succeeded", attempt_count: 1 },
+  ]);
   const recorded = (
     await (
       await Bifrost.connect()
-    ).sql(
-      "SELECT r.implementation, r.verdict, c.operation, c.outcome, CAST(c.attempt_count AS INT) AS attempt_count " +
-        "FROM vala.verification.results r JOIN vala.gateway.calls c ON c.run_id = r.run_id " +
-        "WHERE r.result_id = $1",
-      [judgment.execution_id],
-    )
+    ).sql("SELECT implementation, verdict FROM vala.verification.results WHERE result_id = $1", [judgment.execution_id])
   )
     .toArrow()
     .toArray()
     .map((row) => row.toJSON());
-  expect(recorded).toEqual([
-    { implementation: "eval", verdict: "passed", operation: "system_one", outcome: "succeeded", attempt_count: 1 },
-  ]);
+  expect(recorded).toEqual([{ implementation: "eval", verdict: "passed" }]);
 });
 
 test("jev judge refusal is a typed error without retry", async ({ provider, reviewer }) => {
@@ -263,7 +274,7 @@ test("jev judge refusal is a typed error without retry", async ({ provider, revi
     .observe.verify("reply-quality", { question: "Where is my refund?", answer: "refused-form" });
 
   await expect(refused).rejects.toMatchObject({ code: "WYRD_VERIFICATION_502_DEPENDENCY_FAILED" });
-  await expect(refused).rejects.not.toThrow(/key cred/);
+  await expect(refused).rejects.not.toThrow(JEV_KEY);
   expect(provider.received.length).toBe(before + 1);
 });
 
@@ -275,52 +286,35 @@ async function chatRefusal(openai: OpenAI, state: string): Promise<InstanceType<
   );
 }
 
-// Last in the file: an upstream throttle or server error cools the shared
-// deployment down for 30 seconds. A validation refusal and a refused key do
-// not, so both routes prove them first; throttling is then proven on the
-// Chat Completions route, and the server error and overload that follow
-// answer the same stable error whether Jev or the cooldown refuses them. The
-// gateway adapter's unit tests pin every mapping per route.
-test("jev refusals map to stable errors", async ({ provider, reviewer: _ }) => {
+// Last in the file: an upstream throttle cools the shared deployment down
+// for 30 seconds. A validation refusal and a refused key do not, so both
+// routes prove them first; throttling is proven last. The 5xx statuses share
+// throttling's retry class and are pinned by the gateway adapter's unit tests.
+// Every refusal relays exactly like every other provider's: the upstream
+// status with Jev's body natively and an OpenAI error envelope on Chat
+// Completions, the operator key removed, and no Wyrd code invented.
+test("jev refusals relay like other providers", async ({ provider, reviewer: _ }) => {
   const openai = await openaiClient();
   const native = (state: string) => post("/v1/systemone", { model: "jev-latest", state, questions: QUESTIONS });
 
-  const invalid = await native("refused-form");
-  expect({ status: invalid.status, code: invalid.reply.error?.code }).toEqual({
-    status: 400,
-    code: "WYRD_GATEWAY_400_INVALID_REQUEST",
-  });
-  expect(JSON.stringify(invalid.reply)).not.toContain("key cred");
-  const invalidChat = await chatRefusal(openai, "refused-form");
-  expect({ status: invalidChat?.status, code: invalidChat?.code }).toEqual({
-    status: 400,
-    code: "WYRD_GATEWAY_400_INVALID_REQUEST",
-  });
-  expect(JSON.stringify(invalidChat?.error)).not.toContain("key cred");
-
-  // A refused key relays like every other provider's: the upstream 401
-  // without the operator key, no Wyrd code, and no retry.
-  const before = provider.received.length;
-  const refused = await native("bad-key");
-  expect({ status: refused.status, reply: refused.reply }).toEqual({ status: 401, reply: { detail: "key cred " } });
-  const refusedChat = await chatRefusal(openai, "bad-key");
-  expect(refusedChat).toBeInstanceOf(OpenAI.AuthenticationError);
-  expect(refusedChat?.code ?? null).toBeNull();
-  expect(JSON.stringify(refusedChat?.error)).not.toContain(JEV_KEY);
-  expect(provider.received.length).toBe(before + 2);
+  for (const [state, status] of [
+    ["refused-form", 400],
+    ["bad-key", 401],
+  ] as const) {
+    const before = provider.received.length;
+    const refused = await native(state);
+    expect({ status: refused.status, reply: refused.reply }).toEqual({ status, reply: { detail: "key cred " } });
+    const refusedChat = await chatRefusal(openai, state);
+    expect({ state, status: refusedChat?.status, code: refusedChat?.code ?? null }).toEqual({
+      state,
+      status,
+      code: null,
+    });
+    expect(JSON.stringify(refusedChat?.error)).not.toContain(JEV_KEY);
+    expect(provider.received.length).toBe(before + 2);
+  }
 
   const throttled = await chatRefusal(openai, "rate-limited");
-  expect({ status: throttled?.status, code: throttled?.code }).toEqual({
-    status: 429,
-    code: "WYRD_GATEWAY_429_UPSTREAM_THROTTLED",
-  });
-  for (const state of ["server-error", "overloaded"]) {
-    const { status, reply } = await native(state);
-    expect({ state, status, code: reply.error?.code }).toEqual({
-      state,
-      status: 502,
-      code: "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE",
-    });
-    expect(JSON.stringify(reply)).not.toContain("key cred");
-  }
+  expect({ status: throttled?.status, code: throttled?.code ?? null }).toEqual({ status: 429, code: null });
+  expect(JSON.stringify(throttled?.error)).not.toContain(JEV_KEY);
 });

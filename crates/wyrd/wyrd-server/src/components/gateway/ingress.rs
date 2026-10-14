@@ -390,29 +390,29 @@ pub(crate) async fn anthropic_messages(
     request_body(content = GatewayJevRequest, description = "Jev systemone request whose `model` is an exact Jev model id, such as `jev-latest`, with keyed `noul`, `choice`, or `score` questions about `state`"),
     responses(
         (status = 200, description = "Jev answer: the resolved model, intact keyed answers, and usage", body = GatewayJevResponse),
-        (status = 400, description = "Invalid request, a broken question bound, or a provider validation refusal (WYRD_GATEWAY_400_INVALID_REQUEST), as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 400, description = "Invalid request or a broken question bound, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 401, description = "Authentication required, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 403, description = "Invoke permission required for the model, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 404, description = "No authorized Jev deployment serves the model, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 422, description = "Call cost cannot be bounded: Jev answers carry no output bound, so a token limit or budget refuses them, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
-        (status = 429, description = "Limit or budget exhausted, or the provider is rate limiting (WYRD_GATEWAY_429_UPSTREAM_THROTTLED), as an OpenAI error envelope", body = OpenAiErrorEnvelope),
-        (status = 502, description = "No provider attempt completed, including a rejected deployment credential or provider overload, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 429, description = "Limit or budget exhausted, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 502, description = "No provider attempt completed, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 503, description = "The server is draining, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 504, description = "Deadline exceeded, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
-        (status = "default", description = "Other gateway refusal as an OpenAI error envelope", body = OpenAiErrorEnvelope)
+        (status = "default", description = "Other gateway refusal as an OpenAI error envelope, or the refusing provider's status with its error body", body = OpenAiErrorEnvelope)
     ),
     tag = "Gateway"
 )]
 /// `POST /v1/systemone`: one governed Jev question call.
 ///
 /// The body's `model` names an exact model of provider `jev`, and only
-/// built-in Jev deployments serve it, so fallback never leaves the protocol.
-/// A body that does not match [`GatewayJevRequest`], or breaks a documented
-/// question bound, is refused before dispatch; an accepted body reaches Jev
-/// with only its model rewritten and the answer returns unchanged. Jev never
-/// streams. Gateway-originated failures and provider refusals render as the
-/// `OpenAI` error envelope with a stable Wyrd code; Jev's own error body is
-/// never relayed.
+/// deployments declaring `system_one` serve it, so fallback never leaves the
+/// protocol. A body that does not match [`GatewayJevRequest`], or breaks a
+/// documented question bound, is refused before dispatch; an accepted body
+/// reaches Jev with only its model rewritten and the answer returns
+/// unchanged. Jev never streams. Gateway-originated failures render as the
+/// `OpenAI` error envelope with a stable Wyrd code; a provider refusal relays
+/// its status and body through the shared refusal path, credential removed.
 #[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
 pub(crate) async fn jev_systemone(
     State(state): State<AppState>,

@@ -3558,42 +3558,51 @@ async fn jev_omitted_usage_stays_unknown() {
     assert_eq!(usage, AttemptUsage::default());
 }
 
-/// Every documented non-credential Jev refusal becomes a fixed `OpenAI`
-/// envelope with a stable Wyrd code on both the native and the Chat
-/// Completions route, never relaying Jev's body or the credential; validation
-/// refusals are not retryable, throttling and overload are.
+/// Every Jev refusal relays through the shared refusal path exactly as for
+/// other providers, on both routes: the upstream status relays, the native
+/// route carries Jev's own body and the Chat Completions route an `OpenAI`
+/// error envelope, neither carries the credential, no Wyrd code is invented,
+/// and the retry class follows the status (throttling and server errors may
+/// succeed elsewhere; validation and credential refusals never retry).
 ///
 /// # Panics
 ///
-/// Panics when a refusal maps to another code, status, or retry class, or
-/// leaks the provider body.
+/// Panics when a refusal is remapped, mis-classified, or leaks the credential.
 #[tokio::test]
-async fn jev_refusals_map_to_stable_wyrd_errors() {
-    for (status, code, answered, retryable) in [
-        (400, "WYRD_GATEWAY_400_INVALID_REQUEST", 400, false),
-        (422, "WYRD_GATEWAY_400_INVALID_REQUEST", 400, false),
-        (429, "WYRD_GATEWAY_429_UPSTREAM_THROTTLED", 429, true),
-        (500, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE", 502, true),
-        (529, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE", 502, true),
+async fn jev_refusals_relay_like_other_providers() {
+    for (status, retryable) in [
+        (400_u16, false),
+        (401, false),
+        (403, false),
+        (422, false),
+        (429, true),
+        (500, true),
+        (529, true),
     ] {
         let server = MockServer::start().await;
         let detail = json!({"detail": {"error_type": "api_usage_error",
-            "message": "key cred is secret-detail"}});
+            "message": "Invalid request for key cred"}});
         Mock::given(method("POST"))
             .and(path("/v1/systemone"))
             .respond_with(ResponseTemplate::new(status).set_body_json(detail))
             .mount(&server)
             .await;
         let dispatch = dispatch(&server);
-        for (operation, ingress, body) in [
-            (GatewayOperation::SystemOne, IngressDialect::Jev, jev_body()),
+        for (operation, ingress, request, native) in [
+            (
+                GatewayOperation::SystemOne,
+                IngressDialect::Jev,
+                jev_body(),
+                true,
+            ),
             (
                 GatewayOperation::ChatCompletions,
                 IngressDialect::OpenAi,
                 jev_chat(),
+                false,
             ),
         ] {
-            let result = jev_attempt(&dispatch, operation, ingress, &body).await;
+            let result = jev_attempt(&dispatch, operation, ingress, &request).await;
             let AttemptResult::Refused {
                 class,
                 status: relayed,
@@ -3603,14 +3612,17 @@ async fn jev_refusals_map_to_stable_wyrd_errors() {
             else {
                 panic!("{status} refuses: {result:?}");
             };
-            assert_eq!(relayed, answered, "{status}");
-            assert_eq!(body["error"]["code"], code, "{status}");
-            let text = body.to_string();
-            assert!(
-                !text.contains("key cred") && !text.contains("api_usage_error"),
-                "Jev's body never relays: {text}"
-            );
+            assert_eq!(relayed, status, "{status}: the upstream status relays");
             assert_eq!(class == FailureClass::Upstream, retryable, "{status}");
+            if native {
+                assert_eq!(
+                    body["detail"]["error_type"], "api_usage_error",
+                    "the native route relays Jev's body"
+                );
+            } else {
+                assert_eq!(body["error"]["code"], Value::Null, "no Wyrd code: {body}");
+            }
+            assert!(!body.to_string().contains("cred"), "{status}: {body}");
         }
         let requests = server.received_requests().await.expect("recording");
         assert_eq!(
@@ -3618,76 +3630,6 @@ async fn jev_refusals_map_to_stable_wyrd_errors() {
             2,
             "{status}: one provider request per route"
         );
-    }
-}
-
-/// A rejected Jev credential (401, 403) maps as for every other provider on
-/// both routes: the upstream status relays, the body never carries the
-/// credential (Jev's own body natively, the shared `OpenAI` authentication
-/// error envelope on Chat Completions), no Wyrd code is invented, and it is
-/// never retried.
-///
-/// # Panics
-///
-/// Panics when a credential refusal is remapped, retried, or leaks the
-/// credential.
-#[tokio::test]
-async fn jev_credential_refusals_relay_like_other_providers() {
-    for (status, kind) in [(401_u16, "authentication_error"), (403, "permission_error")] {
-        let server = MockServer::start().await;
-        let detail = json!({"detail": {"error_type": "authentication_error",
-            "message": "Invalid API key cred"}});
-        Mock::given(method("POST"))
-            .and(path("/v1/systemone"))
-            .respond_with(ResponseTemplate::new(status).set_body_json(detail))
-            .mount(&server)
-            .await;
-        let dispatch = dispatch(&server);
-        let native = jev_attempt(
-            &dispatch,
-            GatewayOperation::SystemOne,
-            IngressDialect::Jev,
-            &jev_body(),
-        )
-        .await;
-        let AttemptResult::Refused {
-            class,
-            status: relayed,
-            body,
-            ..
-        } = native
-        else {
-            panic!("{status} refuses natively: {native:?}");
-        };
-        assert_eq!((relayed, class), (status, FailureClass::Rejected));
-        assert_eq!(
-            body["detail"]["error_type"], "authentication_error",
-            "the native route relays Jev's body"
-        );
-        assert!(!body.to_string().contains("cred"), "{body}");
-
-        let chat = jev_attempt(
-            &dispatch,
-            GatewayOperation::ChatCompletions,
-            IngressDialect::OpenAi,
-            &jev_chat(),
-        )
-        .await;
-        let AttemptResult::Refused {
-            class,
-            status: relayed,
-            body,
-            ..
-        } = chat
-        else {
-            panic!("{status} refuses on chat: {chat:?}");
-        };
-        assert_eq!((relayed, class), (status, FailureClass::Rejected));
-        assert_eq!(body["error"]["type"], kind, "{body}");
-        assert_eq!(body["error"]["code"], Value::Null, "no Wyrd code: {body}");
-        assert!(!body.to_string().contains("cred"), "{body}");
-        let requests = server.received_requests().await.expect("recording");
-        assert_eq!(requests.len(), 2, "{status}: never retried");
     }
 }
 

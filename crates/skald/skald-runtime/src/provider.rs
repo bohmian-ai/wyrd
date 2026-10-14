@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use skald_providers::{
     AnthropicClient, GoogleClient, JevClient, OpenAiClient, ProviderClient, ProviderError,
     ProviderStream, VertexClient,
-    auth::{AnthropicAuth, OpenAiAuth},
+    auth::{AnthropicAuth, JevAuth, OpenAiAuth},
 };
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 
@@ -166,19 +166,11 @@ impl ProviderRegistry {
                 Ok(Self::new().with(Arc::new(AnthropicClient::new(auth)?)))
             }
             skald_spec::ProviderName::Jev => {
-                let key = match api_key {
-                    Some(key) => key,
-                    None => std::env::var(skald_providers::JEV_API_KEY_VARIABLE).map_err(|_| {
-                        ProviderError::auth(
-                            "jev",
-                            format!("{} is not set", skald_providers::JEV_API_KEY_VARIABLE),
-                        )
-                    })?,
+                let auth = match api_key {
+                    Some(key) => JevAuth::new(key).with_base_url(base_url),
+                    None => JevAuth::from_env()?.with_base_url(base_url),
                 };
-                Ok(Self::new().with(Arc::new(JevClient::new(JevClient::auth(
-                    key,
-                    Some(&base_url),
-                ))?)))
+                Ok(Self::new().with(Arc::new(JevClient::new(auth)?)))
             }
             skald_spec::ProviderName::Google | skald_spec::ProviderName::Vertex => {
                 Err(ProviderError::auth(

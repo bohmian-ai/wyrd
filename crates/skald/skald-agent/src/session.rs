@@ -10,7 +10,6 @@ use skald_spec::{
 };
 
 use crate::conversation::ConversationTurn;
-use crate::error::{AgentError, AgentResult};
 
 /// Durable identifier for a session memory stream.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -130,20 +129,11 @@ pub enum SessionError {
 /// Use this in preference to the `From` impl inside `seed_session_recent`.
 /// The `From` impl falls back to the OpenAI Chat wire format for
 /// `Role::Assistant` and is only safe for OpenAI Chat agents.
-///
-/// # Errors
-///
-/// Returns [`AgentError::LoopMessageType`] when `request` is a Jev question
-/// request: Jev is not a chat dialect, so no session turn has a Jev shape and
-/// none is ever re-encoded as another dialect.
 pub(crate) fn session_turn_to_conversation_turn(
     turn: SessionTurn,
     request: &ProviderRequest,
-) -> AgentResult<ConversationTurn> {
-    if matches!(request, ProviderRequest::JevSystemOne(_)) {
-        return Err(jev_is_not_a_chat_dialect());
-    }
-    Ok(match turn.role {
+) -> ConversationTurn {
+    match turn.role {
         Role::System => ConversationTurn::System {
             content: turn.content,
         },
@@ -172,8 +162,10 @@ pub(crate) fn session_turn_to_conversation_turn(
                     role: "model".to_owned(),
                     parts: vec![GooglePart::Text { text: turn.content }],
                 }),
-                ProviderName::Jev => return Err(jev_is_not_a_chat_dialect()),
-                ProviderName::OpenAi | ProviderName::Custom(_) => {
+                // `run_with` refuses a request that cannot drive the loop
+                // before seeding, so a non-chat dialect never reaches here;
+                // the OpenAI Chat fallback only keeps the match total.
+                ProviderName::OpenAi | ProviderName::Jev | ProviderName::Custom(_) => {
                     MessageNum::OpenAi(Box::new(OpenAiChatMessage {
                         role: "assistant".to_owned(),
                         content: Some(OpenAiMessageContent::Text(turn.content)),
@@ -188,15 +180,6 @@ pub(crate) fn session_turn_to_conversation_turn(
             ok: true,
             content: serde_json::Value::String(turn.content),
         },
-    })
-}
-
-/// Refusal of a Jev request in the Agent loop: Jev answers keyed questions
-/// and has no conversation turns, so it is never treated as `OpenAI` chat.
-fn jev_is_not_a_chat_dialect() -> AgentError {
-    AgentError::LoopMessageType {
-        provider: ProviderName::Jev,
-        detail: "jev is not a chat dialect; a Jev request never enters the Agent loop".to_owned(),
     }
 }
 
@@ -226,50 +209,6 @@ impl From<SessionTurn> for ConversationTurn {
                 ok: true,
                 content: serde_json::Value::String(turn.content),
             },
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-    use skald_spec::{ProviderName, ProviderRequest};
-
-    use super::{Role, SessionTurn, session_turn_to_conversation_turn};
-    use crate::error::AgentError;
-
-    /// Every session turn of a Jev request is refused with a typed loop
-    /// error naming Jev, never re-encoded as an `OpenAI` chat message.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a turn converts or the error is not the Jev refusal.
-    #[test]
-    fn jev_session_turns_are_refused_as_not_a_chat_dialect() {
-        let request = ProviderRequest::JevSystemOne(
-            serde_json::from_value(json!({
-                "model": "jev-latest",
-                "state": "s",
-                "questions": {"q": {"type": "noul", "instructions": "x"}}
-            }))
-            .expect("typed Jev request"),
-        );
-        for role in [Role::System, Role::User, Role::Assistant, Role::Tool] {
-            let turn = SessionTurn {
-                role,
-                content: "hi".to_owned(),
-                call_id: None,
-            };
-            let error = session_turn_to_conversation_turn(turn, &request)
-                .expect_err("a Jev request has no chat turns");
-            assert!(
-                matches!(
-                    &error,
-                    AgentError::LoopMessageType { provider: ProviderName::Jev, detail }
-                        if detail.contains("not a chat dialect")
-                ),
-                "{error}"
-            );
         }
     }
 }

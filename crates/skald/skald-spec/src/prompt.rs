@@ -192,6 +192,17 @@ impl Prompt {
             .unwrap_or_else(|| self.request.provider())
     }
 
+    /// Whether every answer to this Prompt is a structured JSON object.
+    ///
+    /// True when the Prompt declares a JSON-schema response, or when its
+    /// request dialect answers with a typed object by protocol
+    /// ([`ProviderRequest::answers_structured`]). Callers that require a
+    /// structured judgment check this instead of naming a provider.
+    pub const fn yields_structured_output(&self) -> bool {
+        matches!(self.response_type, ResponseType::JsonSchema { .. })
+            || self.request.answers_structured()
+    }
+
     /// Borrow native generation settings for the request's active provider.
     pub fn settings_ref(&self) -> Option<ProviderSettingsRef<'_>> {
         match &self.request {

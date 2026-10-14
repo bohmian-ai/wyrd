@@ -4,16 +4,15 @@
 //! defined fallback source — request override, exact `Model` rule,
 //! `Operation` rule, then `Global` — without merging rules. Candidates equal
 //! to the requested model or already listed are skipped, and a candidate with
-//! no deployment declaring the operation is dropped. A candidate on the other
-//! side of the Jev protocol boundary is dropped too: a Jev question never
-//! falls back to an ordinary chat model, nor ordinary chat to Jev. Each remaining
-//! candidate's deployments are ordered by weighted selection keyed by the
+//! no deployment declaring the operation is dropped; a deployment whose
+//! adapter cannot represent the request body is dropped later by
+//! [`CallPlan::retain_representable`]. Each remaining candidate's deployments are ordered by weighted selection keyed by the
 //! logical call id, so every replica picks the same first deployment.
 
 use serde_json::Value;
 use wyrd_spec::gateway::{
     FallbackScope, GatewayCallId, GatewayFallbackOverride, GatewayOperation, ModelRef,
-    ProviderAdapter, ProviderDeployment,
+    ProviderDeployment,
 };
 use wyrd_spec::ids::ProviderDeploymentName;
 
@@ -69,12 +68,9 @@ impl CallPlan {
             .or_else(|| rule(&|scope| matches!(scope, FallbackScope::Global)))
             .unwrap_or_default();
 
-        let jev = |model: &ModelRef| {
-            ProviderAdapter::Jev.builtin_provider() == Some(model.provider.as_str())
-        };
         let mut models: Vec<&ModelRef> = vec![&requested];
         for model in fallback {
-            if !models.contains(&model) && jev(model) == jev(&requested) {
+            if !models.contains(&model) {
                 models.push(model);
             }
         }
@@ -398,15 +394,16 @@ mod tests {
         );
     }
 
-    /// Fallback never crosses the Jev protocol boundary: a Jev question keeps
-    /// only Jev candidates and ordinary chat drops every Jev candidate, even
-    /// when both declare Chat Completions.
+    /// Fallback stays within the protocol by capability and representability
+    /// alone: a `systemone` question keeps only deployments declaring that
+    /// operation, and an ordinary chat body drops every Jev deployment because
+    /// the Jev adapter cannot represent it.
     ///
     /// # Panics
     ///
-    /// Panics when a plan keeps a candidate across the boundary.
+    /// Panics when a plan keeps a candidate that cannot carry the request.
     #[test]
-    fn fallback_never_crosses_the_jev_protocol_boundary() {
+    fn fallback_keeps_only_capable_and_representable_candidates() {
         let jev = |name: &str, model: &str| -> ProviderDeployment {
             serde_json::from_value(json!({
                 "name": name,
@@ -429,23 +426,6 @@ mod tests {
             ]}]}),
         );
         let call = GatewayCallId::new_v7();
-        let chat = GatewayOperation::ChatCompletions;
-        assert_eq!(
-            models(&CallPlan::new(
-                &snap,
-                call,
-                chat,
-                model("jev/jev-latest"),
-                None
-            )),
-            ["jev/jev-latest", "jev/jev-preview"],
-            "a Jev question never falls back to ordinary chat"
-        );
-        assert_eq!(
-            models(&CallPlan::new(&snap, call, chat, model("acme/chat"), None)),
-            ["acme/chat"],
-            "ordinary chat never falls back to Jev"
-        );
         assert_eq!(
             models(&CallPlan::new(
                 &snap,
@@ -455,6 +435,26 @@ mod tests {
                 None
             )),
             ["jev/jev-preview", "jev/jev-latest"],
+            "only systemone-capable deployments answer a Jev question"
+        );
+        let mut chat = CallPlan::new(
+            &snap,
+            call,
+            GatewayOperation::ChatCompletions,
+            model("acme/chat"),
+            None,
+        );
+        chat.retain_representable(
+            IngressDialect::OpenAi,
+            false,
+            &json!({"model": "acme/chat", "messages": [{"role": "user", "content": "hi"}]}),
+            None,
+        )
+        .expect("ordinary chat is representable");
+        assert_eq!(
+            models(&chat),
+            ["acme/chat"],
+            "an ordinary chat body is not a Jev request"
         );
     }
 }

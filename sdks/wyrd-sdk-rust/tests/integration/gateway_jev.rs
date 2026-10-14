@@ -91,8 +91,10 @@ fn judge_questions() -> Value {
     })
 }
 
-/// A judgment's verification result beside the Jev call its judge made,
-/// joined on their Run.
+/// A judgment's verification result beside the deployment's one Jev
+/// `system_one` call: each journey owns its deployment, so the judge's call
+/// is the only one. Correlating the call to the judgment's Run is owned by
+/// the verify-attribution change, not by the Jev provider.
 #[derive(Debug, PartialEq, Deserialize)]
 struct JudgedCall {
     /// The result's Verifier implementation.
@@ -111,9 +113,8 @@ struct JudgedCall {
 ///
 /// The upstream answers a helpful, polite verdict unless the state names a
 /// scripted case: `Go away` is judged unhelpful and rude, `refused-form` is
-/// refused with 400, `rate-limited` is throttled with 429, `server-error`
-/// answers 500, `overloaded` answers 529, and `bad-key` answers 401. Every
-/// refusal body echoes the operator key after `key cred`.
+/// refused with 400, `rate-limited` is throttled with 429, and `bad-key`
+/// answers 401. Every refusal body echoes the operator key after `key cred`.
 struct Jev {
     /// The deployment.
     deployment: Deployment,
@@ -135,8 +136,6 @@ impl Jev {
         for (needle, status) in [
             ("refused-form", 400),
             ("rate-limited", 429),
-            ("server-error", 500),
-            ("overloaded", 529),
             ("bad-key", 401),
         ] {
             Mock::given(method("POST"))
@@ -269,7 +268,8 @@ impl Jev {
     }
 
     /// Publish every captured row, then read the verification result
-    /// `execution_id` wrote beside each Gateway call made in its Run.
+    /// `execution_id` wrote beside each `system_one` Gateway call this
+    /// deployment made.
     ///
     /// # Panics
     /// Panics when the flush or the read fails.
@@ -286,12 +286,12 @@ impl Jev {
                 "SELECT r.implementation, r.verdict, c.operation, c.outcome, \
                         CAST(c.attempt_count AS BIGINT) AS attempt_count \
                    FROM vala.verification.results r \
-                   JOIN vala.gateway.calls c ON c.run_id = r.run_id \
-                  WHERE r.result_id = $1",
+                  CROSS JOIN vala.gateway.calls c \
+                  WHERE r.result_id = $1 AND c.operation = 'system_one'",
                 &[QueryParam::String(execution_id.to_owned())],
             )
             .await
-            .expect("the result joins its Jev call")
+            .expect("the result and the Jev calls read")
     }
 
     /// Register and hydrate the `reviewer` Service, and load it acting as
@@ -429,85 +429,50 @@ async fn chat_completions_pass_typed_jev_requests_through() {
     jev.deployment.shutdown().await;
 }
 
-/// Jev refusals on both routes. A validation refusal maps to the stable
-/// invalid-request error and never relays Jev's body; a refused key relays
-/// like every other provider's: the upstream 401 with the operator key
-/// removed, no Wyrd code, and no retry. Neither cools the deployment down.
-/// Throttling is then proven on the Chat Completions route; it cools the one
-/// deployment down for 30 seconds, so the server error and overload that
-/// follow on the native route answer the same stable unavailable error
-/// whether Jev or the cooldown refuses them. Each mapping is pinned per route
-/// by the gateway adapter's unit tests.
+/// Jev refusals relay on both routes exactly like every other provider's:
+/// the upstream status returns with Jev's body natively and an `OpenAI` error
+/// envelope on Chat Completions, the operator key removed and no Wyrd code
+/// invented. A validation refusal (400) and a refused key (401) are never
+/// retried and do not cool the deployment down. Throttling (429) is proven
+/// last on the Chat Completions route because it cools the one deployment
+/// down; the 5xx statuses share its retry class and are pinned by the gateway
+/// adapter's unit tests.
 ///
 /// # Panics
-/// Panics when a refusal maps to another status or code, leaks the body or
-/// the key, or a refused key is retried.
+/// Panics when a refusal is remapped, leaks the key, or a non-retryable
+/// refusal is retried.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn jev_refusals_map_to_stable_errors() {
+async fn jev_refusals_relay_like_other_providers() {
     let jev = Jev::start().await;
     let native =
         |state: &str| json!({"model": "jev-latest", "state": state, "questions": questions()});
 
-    for (route, body) in [
-        ("/v1/systemone", native("refused-form")),
-        ("/v1/chat/completions", chat("refused-form")),
-    ] {
-        let (answered, reply) = jev.post(route, &body).await;
+    for (state, status) in [("refused-form", 400_u16), ("bad-key", 401)] {
+        let before = jev.received().await.len();
+        let (answered, reply) = jev.post("/v1/systemone", &native(state)).await;
+        assert_eq!(answered, status, "{reply}");
         assert_eq!(
-            (answered, reply["error"]["code"].as_str()),
-            (400, Some("WYRD_GATEWAY_400_INVALID_REQUEST")),
-            "{route}: {reply}"
+            reply["detail"], "key cred ",
+            "Jev's body relays without the key"
         );
-        assert!(!reply.to_string().contains("key cred"), "{reply}");
+        let (answered, reply) = jev.post("/v1/chat/completions", &chat(state)).await;
+        assert_eq!(answered, status, "{reply}");
+        assert_eq!(reply["error"]["code"], Value::Null, "no Wyrd code: {reply}");
+        assert!(!reply.to_string().contains(JEV_KEY), "{reply}");
+        assert_eq!(
+            jev.received().await.len(),
+            before + 2,
+            "{status}: a non-retryable refusal is never retried"
+        );
     }
 
-    let before = jev.received().await.len();
-    let (answered, reply) = jev.post("/v1/systemone", &native("bad-key")).await;
-    assert_eq!(answered, 401, "{reply}");
-    assert_eq!(
-        reply["detail"], "key cred ",
-        "Jev's body relays without the key"
-    );
-    let (answered, reply) = jev.post("/v1/chat/completions", &chat("bad-key")).await;
-    assert_eq!(answered, 401, "{reply}");
-    assert_eq!(reply["error"]["type"], "authentication_error", "{reply}");
+    let (answered, reply) = jev
+        .post("/v1/chat/completions", &chat("rate-limited"))
+        .await;
+    assert_eq!(answered, 429, "{reply}");
     assert_eq!(reply["error"]["code"], Value::Null, "no Wyrd code: {reply}");
     assert!(!reply.to_string().contains(JEV_KEY), "{reply}");
-    assert_eq!(
-        jev.received().await.len(),
-        before + 2,
-        "a refused key is never retried"
-    );
-
-    for (route, body, status, code) in [
-        (
-            "/v1/chat/completions",
-            chat("rate-limited"),
-            429,
-            "WYRD_GATEWAY_429_UPSTREAM_THROTTLED",
-        ),
-        (
-            "/v1/systemone",
-            native("server-error"),
-            502,
-            "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE",
-        ),
-        (
-            "/v1/systemone",
-            native("overloaded"),
-            502,
-            "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE",
-        ),
-    ] {
-        let (answered, reply) = jev.post(route, &body).await;
-        assert_eq!(
-            (answered, reply["error"]["code"].as_str()),
-            (status, Some(code)),
-            "{route}: {reply}"
-        );
-        assert!(!reply.to_string().contains("key cred"), "{reply}");
-    }
     jev.deployment.shutdown().await;
 }
 

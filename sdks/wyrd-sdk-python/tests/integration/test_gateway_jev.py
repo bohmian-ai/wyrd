@@ -46,8 +46,6 @@ QUESTIONS = {
 REFUSALS = {
     "refused-form": 400,
     "rate-limited": 429,
-    "server-error": 500,
-    "overloaded": 529,
     "bad-key": 401,
 }
 """State text → the status the upstream refuses it with."""
@@ -277,15 +275,15 @@ def test_chat_completions_pass_typed_jev_requests_through(
     assert len(upstream.deliveries) == asked + 1, "ordinary chat never reaches Jev"
 
 
-def test_jev_refusals_map_to_stable_errors(jev: tuple[WyrdTestServer, Receiver]) -> None:
-    """Jev refusals on both routes.
+def test_jev_refusals_relay_like_other_providers(jev: tuple[WyrdTestServer, Receiver]) -> None:
+    """Jev refusals relay on both routes exactly like every other provider's.
 
-    A validation refusal and a refused key never cool the deployment down, so
-    both routes prove them. Throttling, proven on the Chat Completions route,
-    cools the one deployment down for 30 seconds: the server error and
-    overload that follow answer the same stable error whether Jev or the
-    cooldown refuses them. The gateway adapter's unit tests pin every mapping
-    per route.
+    The upstream status returns with Jev's body natively and an OpenAI error
+    envelope on Chat Completions, the operator key removed and no Wyrd code
+    invented. A validation refusal and a refused key are never retried and do
+    not cool the deployment down. Throttling cools the one deployment down, so
+    it is proven last; the 5xx statuses share its retry class and are pinned by
+    the gateway adapter's unit tests.
     """
     server, upstream = jev
     client = openai_client(server)
@@ -295,36 +293,24 @@ def test_jev_refusals_map_to_stable_errors(jev: tuple[WyrdTestServer, Receiver])
             server, "/v1/systemone", {"model": "jev-latest", "state": state, "questions": QUESTIONS}
         )
 
-    reply = native("refused-form")
-    assert (reply.status_code, reply.json()["error"]["code"]) == (
-        400,
-        "WYRD_GATEWAY_400_INVALID_REQUEST",
-    )
-    assert "key cred" not in reply.text
-    with pytest.raises(openai.BadRequestError) as invalid:
-        client.chat.completions.create(model="jev/jev-latest", messages=chat("refused-form"))
-    assert invalid.value.code == "WYRD_GATEWAY_400_INVALID_REQUEST"
-    assert "key cred" not in invalid.value.response.text
-
-    asked = len(upstream.deliveries)
-    reply = native("bad-key")
-    assert (reply.status_code, reply.json()) == (401, {"detail": "key cred "})
-    with pytest.raises(openai.AuthenticationError) as refused:
-        client.chat.completions.create(model="jev/jev-latest", messages=chat("bad-key"))
-    assert refused.value.code is None
-    assert JEV_KEY not in refused.value.response.text
-    assert len(upstream.deliveries) == asked + 2, "a refused key is never retried"
+    for state, status, error in [
+        ("refused-form", 400, openai.BadRequestError),
+        ("bad-key", 401, openai.AuthenticationError),
+    ]:
+        asked = len(upstream.deliveries)
+        reply = native(state)
+        assert (reply.status_code, reply.json()) == (status, {"detail": "key cred "})
+        with pytest.raises(error) as refused:
+            client.chat.completions.create(model="jev/jev-latest", messages=chat(state))
+        assert refused.value.status_code == status
+        assert refused.value.code is None
+        assert JEV_KEY not in refused.value.response.text
+        assert len(upstream.deliveries) == asked + 2, f"{status} is never retried"
 
     with pytest.raises(openai.RateLimitError) as throttled:
         client.chat.completions.create(model="jev/jev-latest", messages=chat("rate-limited"))
-    assert throttled.value.code == "WYRD_GATEWAY_429_UPSTREAM_THROTTLED"
-    for state in ["server-error", "overloaded"]:
-        reply = native(state)
-        assert (reply.status_code, reply.json()["error"]["code"]) == (
-            502,
-            "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE",
-        ), state
-        assert "key cred" not in reply.text
+    assert throttled.value.code is None
+    assert JEV_KEY not in throttled.value.response.text
 
 
 def test_jev_judge_passes_a_helpful_polite_reply(
@@ -403,9 +389,8 @@ def test_jev_judge_judges_a_reply_with_quotes_and_newlines(
         .sql(
             "SELECT r.implementation, r.verdict, c.operation, c.outcome, "
             "CAST(c.attempt_count AS BIGINT) AS attempt_count "
-            "FROM vala.verification.results r "
-            "JOIN vala.gateway.calls c ON c.run_id = r.run_id "
-            "WHERE r.result_id = $1",
+            "FROM vala.verification.results r CROSS JOIN vala.gateway.calls c "
+            "WHERE r.result_id = $1 AND c.operation = 'system_one'",
             [judgment.execution_id],
         )
         .to_arrow()
@@ -435,5 +420,5 @@ def test_jev_judge_refusal_is_a_typed_error_without_retry(
         )
 
     assert raised.value.code == "WYRD_VERIFICATION_502_DEPENDENCY_FAILED"
-    assert "key cred" not in str(raised.value)
+    assert JEV_KEY not in str(raised.value)
     assert len(upstream.deliveries[asked:]) == 1

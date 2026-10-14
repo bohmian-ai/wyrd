@@ -11,7 +11,7 @@ pub mod vertex;
 pub use anthropic::AnthropicClient;
 pub use external::ExternalGatewayClient;
 pub use google::GoogleClient;
-pub use jev::{JEV_API_KEY_VARIABLE, JEV_BASE_URL, JevClient};
+pub use jev::JevClient;
 pub use openai::{
     MediaAnswer, OpenAiBatchRoute, OpenAiClient, OpenAiMediaRoute, OpenAiRoute, UploadContent,
     UploadFile,

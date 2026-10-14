@@ -535,3 +535,61 @@ async fn jev_judge_answers_typed_questions_with_quoted_state() {
     };
     assert_eq!(sent.state, reply);
 }
+
+/// OpenAI provider that refuses every call with `status` and a body echoing a
+/// secret, as a gateway relays a provider refusal.
+struct RefusingProvider {
+    /// Upstream status of every refusal.
+    status: u16,
+}
+
+#[async_trait]
+impl Provider for RefusingProvider {
+    /// Refuse with the configured status.
+    async fn send(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        Err(ProviderError::Status {
+            provider: "openai".to_owned(),
+            status: self.status,
+            body: "secret-provider-body".to_owned(),
+            retry_after_ms: None,
+        })
+    }
+
+    /// Streaming is not used by the judge.
+    async fn stream(&self, _request: ProviderRequest) -> Result<ProviderStream, ProviderError> {
+        Err(ProviderError::timeout("openai"))
+    }
+
+    /// Serves the OpenAI provider slot.
+    fn name(&self) -> ProviderName {
+        ProviderName::OpenAi
+    }
+}
+
+/// A relayed provider refusal is classified by the shared Workflow rule for
+/// every provider: a validation or credential refusal is terminal, throttling
+/// and server errors retry, and neither reason carries the provider body.
+///
+/// # Panics
+///
+/// Panics when a refusal is mis-classified or its reason leaks the body.
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_refusals_follow_the_shared_retry_classification() {
+    for (status, retryable) in [(400_u16, false), (401, false), (429, true), (503, true)] {
+        let providers =
+            Arc::new(ProviderRegistry::new().with(Arc::new(RefusingProvider { status })));
+        let error = invoker_with_registry(providers)
+            .invoke(
+                &judge_agent_ref(),
+                json!({"response": "DONE"}),
+                &MediaBindings::new(),
+            )
+            .await
+            .expect_err("a refusal fails the judgment");
+        assert_eq!(error.is_retryable(), retryable, "{status}: {error:?}");
+        assert!(
+            !format!("{error:?}").contains("secret-provider-body"),
+            "{status}: {error:?}"
+        );
+    }
+}

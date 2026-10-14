@@ -238,3 +238,93 @@ dotted names, stop (see Material Stop Conditions); do not rename tools.
 - `architecture/agent-rules.md`
 - `TESTING.md`
 - `docs/src/content/docs/reference/mcp-tools.md`
+
+## Implementation Evidence
+
+Status: `SPEC_REVISION_REQUIRED` for Google ADK and for provider names on
+Pydantic AI. Everything else is implemented in `a87c1cb4b`, `c6f53481f`,
+`4386a3ede`, and `06750ca55`.
+
+### Stop conditions reached
+
+1. **Google ADK cannot connect.** `google-adk` 2.12.0 opens every session
+   with the legacy `ClientSession.initialize()`
+   (`google/adk/tools/mcp_tool/session_context.py:62`). Wyrd serves only
+   2026-07-28, which is reached through `server/discover`, so ADK fails with
+   `MCPError: Unsupported protocol version` and runs with no Wyrd tools.
+   Serving the older lifecycle is a SPEC non-goal. ADK was removed from the
+   dependency group because no journey can use it.
+2. **Dotted names reach providers.** Pydantic AI 2.56 offers the model the
+   raw MCP names (`bifrost.list_tables`, `wyrd.guide`), which OpenAI rejects.
+   The OpenAI Agents SDK does the same by default and sanitizes names only
+   with `mcp_config={"include_server_in_tool_names": True}`
+   (`mcp_wyrd__wyrd_guide`). The journeys use that option. Tool naming is a
+   public contract, so no rename was made.
+
+### Findings fixed at the server
+
+- **Gateway writes were advertised to readers** (REQ-003, read-only caller).
+  Found by the reader journey: a viewer was shown all ten gateway
+  put/revoke/reset/delete tools, each with `readOnlyHint: false`. Root fix in
+  `crates/wyrd/wyrd-server/src/mcp/gateway.rs`: each tool carries the
+  permission its operation enforces. Reads stay in the always-advertised
+  catalog, and `write_descriptors(caller)` lists a write only when the
+  caller's permissions contain it. This is the rule principals, verification,
+  and operators already follow. Docs updated in `mcp-tools.md`.
+  - Diagnosis of the follow-on failure in
+    `connectivity::pg_tests::streamable_http_client_reaches_authenticated_server_context`:
+    - Symptom: catalog order mismatch.
+    - Cause: the test pins list order, and gateway writes now follow the
+      caller's other write tools.
+    - Fix site: that test's expectation. The `discovery.rs` constant was
+      reordered to match.
+
+### Recorded, not changed
+
+- **Strict conversion falls back for 8 of 35 tools.** The OpenAI Agents SDK
+  converts every tool (none dropped) but keeps 8 non-strict:
+  - `verification.execute` has free-form `context` maps, which strict mode
+    cannot represent.
+  - `cards.list`, `cards.get_by_ref`, four `gateway.put_*` tools, and
+    `operator_connections.update` keep bare `$ref`s. The SDK refuses those
+    under MCP (`_UNVALIDATED_REF_ERROR`). Inlining definitions at the shared
+    builder would make the seven strict. The spec requires conversion with
+    strict enabled, not strictness for each tool, so this is left as a
+    recommendation.
+- **Refusal shape.** A hidden write is refused before the call does anything
+  (`WYRD_PERMISSION_403_DENIED_RBAC`) and comes back as a JSON-RPC error.
+  - Pydantic AI hands it to the model as `ModelRetry`.
+  - The OpenAI Agents SDK's generic `call_tool` raises `MCPError` carrying the
+    code, and the connection stays usable for the next call.
+  - The arguments must be valid UUIDv7 ids. With malformed ids, input
+    validation answers first.
+
+### Deviations from task text
+
+- One Python file, at `tests/integration/mcp_frameworks/test_agent_frameworks.py`.
+  The lane is isolated by `norecursedirs` plus an explicit path rather than a
+  pytest marker: a marker deselects tests only after the module is imported,
+  and importing it needs the framework group. The directory is excluded from
+  `ty` for the same reason.
+- The TS journey proves the full catalog without a hard-coded list. The SDK
+  rejects the whole list if any tool or the result is malformed, and the test
+  asserts the administrator's list has both read-only and write tools.
+- The provider-name check is part of the OpenAI Agents journey.
+  `test_forwarded_tool_names_are_provider_valid` was not written because two
+  of the three frameworks are blocked above.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| TS reference journey trimmed, renamed; `@openai/agents-core` removed | `sdks/wyrd-sdk-ts/wyrd/tests/integration/mcp-reference-client.test.ts`, `package.json`, `pnpm-lock.yaml` | RED with `ttlMs` removed: `SdkError: Invalid result for tools/list: ["ttlMs"]`. GREEN after restore: 1 passed. | PASS |
+| OpenAI Agents SDK converts every tool (strict on), invokes `wyrd.guide`, names provider-valid | `test_openai_agents_converts_every_tool` | `mise run py:test:mcp-frameworks` (4 passed) | PASS |
+| Pydantic AI converts every tool and an agent loop calls `wyrd.guide` | `test_pydantic_ai_agent_calls_wyrd_guide` | same lane | PASS |
+| Reader sees no write tool; hidden write refused with Wyrd code, not success or crash | `test_openai_agents_reader_sees_and_reaches_no_write_tool`, `test_pydantic_ai_reader_sees_and_reaches_no_write_tool`, `mcp/gateway.rs` | RED before the gateway fix (viewer listed `gateway.put_*`). GREEN after. | PASS |
+| Google ADK journeys | none | ADK cannot connect (stop condition 1) | BLOCKED |
+| Forwarded names provider-valid for every framework | OpenAI Agents with `include_server_in_tool_names` | Pydantic AI forwards dotted names (stop condition 2) | BLOCKED |
+| Default lanes neither collect nor need the frameworks | `pyproject.toml` `norecursedirs`, `ty` exclude, `[tool.uv.dependency-groups]` | `pytest --collect-only` collects 0 framework tests; the explicit path collects 4 | PASS |
+| Rust catalog test and discovery journey pass | `mcp/mod.rs` test also covers every gateway tool | `cargo nextest ... -E 'test(/^mcp::/)'` (3 passed); `mise run test:bifrost:journey:mcp` (19 passed) | PASS |
+| No credentials or live provider calls | scripted `FunctionModel`, direct tool invocation | journeys run offline | PASS |
+| Format, lints, codegen | — | `mise run fmt`, `mise run lints`, `mise run codegen:check`, `py:format`, `py:lints`, `py:typecheck`, `ts:format:check`, `ts:lints`, `ts:typecheck`, `git diff --check` all pass | PASS |
+
+Non-goals stayed excluded: no tool renamed, no older protocol, no resources or
+prompts, no framework in runtime or `dev` dependencies.

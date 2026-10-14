@@ -24,7 +24,9 @@ use wyrd_client::auth::{AuthError, TokenExchange};
 use wyrd_client::saved_login::{SavedLogin, canonical_origin};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_testing::WyrdTestServerBuilder;
-use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso, saved_logins};
+use wyrd_testing::human_login::{
+    FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_HOST, HUMAN_PUBLIC_ORIGIN, HumanSso, saved_logins,
+};
 
 /// The shipped CLI with every ambient `WYRD_*` source cleared and its
 /// configuration directory at `config_home`.
@@ -97,11 +99,14 @@ async fn decide(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("client builds");
-    let mut request = client.post(format!("{server}/auth/device")).form(&[
-        ("tenant", tenant),
-        ("user_code", user_code),
-        ("decision", decision),
-    ]);
+    let mut request = client
+        .post(format!("{server}/auth/device"))
+        .header("x-forwarded-host", HUMAN_PUBLIC_HOST)
+        .form(&[
+            ("tenant", tenant),
+            ("user_code", user_code),
+            ("decision", decision),
+        ]);
     if let Some(origin) = origin {
         request = request.header(reqwest::header::ORIGIN, origin);
     }
@@ -122,7 +127,6 @@ async fn decide(
 /// Panics when any step of the journey differs.
 pub(crate) async fn cli_device_login_journey() {
     let srv = WyrdTestServerBuilder::default()
-        .with_public_origin(HUMAN_PUBLIC_ORIGIN.parse().expect("origin parses"))
         .start_bound()
         .await
         .expect("server starts");

@@ -22,8 +22,8 @@ use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
 
-use crate::auth::auth_not_configured;
 use crate::auth::oauth::{ClientForm, OAuthError, OAuthForm, no_store};
+use crate::auth::{RequestOrigin, auth_not_configured};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -70,24 +70,25 @@ pub(crate) fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdError> {
         (status = 500, description = "`server_error`", body = OAuthErrorResponse),
         (status = 503, description = "`temporarily_unavailable`", body = OAuthErrorResponse)
     ),
-    // No session exists yet at this operation: a public client names itself
-    // with `client_id` and needs nothing, a confidential client uses Basic.
-    security((), ("oauthClientBasic" = [])),
+    // No session exists yet at this operation: a client names itself with
+    // `client_id` and needs nothing.
+    security(()),
     tag = "Auth"
 )]
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn device_authorization(
     State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
     form: OAuthForm,
 ) -> Result<Response, OAuthError> {
-    match state.auth.oauth_clients.require(&headers, &form)? {
+    match crate::auth::oauth::require_client(&headers, &form)? {
         OAuthClientId::WyrdCli => {}
         OAuthClientId::WyrdUi => return Err(OAuthError(OAuthErrorCode::UnauthorizedClient)),
     }
     let request: DeviceAuthorizationRequest = form.decode()?;
     let device = cli_logins(&state)?
-        .authorize(&request.tenant)
+        .authorize(&request.tenant, &origin)
         .await
         .map_err(OAuthError::request)?;
     Ok(no_store(StatusCode::OK, Json(device)))
@@ -167,7 +168,7 @@ pub async fn device_page(Query(query): Query<DeviceQuery>) -> Response {
 
 /// `POST /auth/device` — approve or deny a user code (RFC 8628 §3.3).
 ///
-/// Only a form posted from the deployment's own origin is accepted, so
+/// Only a form posted from the origin the request arrived at is accepted, so
 /// another site cannot approve its own code in the person's browser. Approve
 /// redirects (`303`) to the tenant's provider sign-in, bound to the code's
 /// device authorization; Deny ends the CLI's login.
@@ -201,22 +202,15 @@ pub async fn device_page(Query(query): Query<DeviceQuery>) -> Response {
 #[tracing::instrument(level = "debug", skip_all, fields(tenant_route_key = %form.tenant))]
 pub async fn device_decision(
     State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
     Form(form): Form<DeviceForm>,
 ) -> Result<Response, WyrdErrorResponse> {
     let logins = cli_logins(&state)?;
-    let origin = state
-        .auth
-        .human_connections
-        .as_ref()
-        .ok_or_else(auth_not_configured)?
-        .require_callback()?
-        .origin()
-        .ascii_serialization();
     if headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
-        != Some(&*origin)
+        != Some(&*origin.origin().ascii_serialization())
     {
         return Ok(page(
             StatusCode::FORBIDDEN,
@@ -225,7 +219,7 @@ pub async fn device_decision(
     }
     let result = match form.decision {
         DeviceDecision::Approve => logins
-            .approve(&form.tenant, &form.user_code)
+            .approve(&form.tenant, &form.user_code, &origin)
             .await
             .map(|url| Redirect::to(url.as_str()).into_response()),
         DeviceDecision::Deny => logins.deny(&form.tenant, &form.user_code).await.map(|()| {
@@ -267,8 +261,8 @@ pub(crate) fn page(status: StatusCode, body: &str) -> Response {
 
 /// `POST /auth/revoke` — revoke a refresh token (RFC 7009 §2).
 ///
-/// The client identifies itself as for the token endpoint: `wyrd-ui` with
-/// its Basic secret, `wyrd-cli` with `client_id`. Revoking a token revokes
+/// The client identifies itself as for the token endpoint, with
+/// `client_id`. Revoking a token revokes
 /// its whole login; the User's other logins continue. An unknown, malformed,
 /// or already revoked token also answers `200` (RFC 7009 §2.2), and
 /// `token_type_hint` is ignored: only refresh tokens are revocable. The
@@ -291,7 +285,7 @@ pub(crate) fn page(status: StatusCode, body: &str) -> Response {
         (status = 500, description = "`server_error`", body = OAuthErrorResponse),
         (status = 503, description = "`temporarily_unavailable`", body = OAuthErrorResponse)
     ),
-    security((), ("oauthClientBasic" = [])),
+    security(()),
     tag = "Auth"
 )]
 #[tracing::instrument(level = "debug", skip_all)]
@@ -301,7 +295,7 @@ pub async fn revoke(
     headers: HeaderMap,
     form: OAuthForm,
 ) -> Result<Response, OAuthError> {
-    let client = state.auth.oauth_clients.require(&headers, &form)?;
+    let client = crate::auth::oauth::require_client(&headers, &form)?;
     let request: TokenRevocationRequest = form.decode()?;
     let request_id = request_id.map_or_else(RequestId::now_v7, |Extension(id)| id);
     cli_logins(&state)?

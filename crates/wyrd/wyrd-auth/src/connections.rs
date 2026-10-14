@@ -71,7 +71,7 @@ pub const CONNECTION_TEST_VALIDITY: Duration = Duration::from_mins(15);
 /// JWKS key-cache lifetime for a connection that inherits none.
 const DEFAULT_JWKS_TTL_SECS: i64 = 300;
 
-/// Path of the deployment's common provider callback on the public origin.
+/// Path of the deployment's common provider callback on its public origin.
 const CALLBACK_PATH: &str = "/auth/callback";
 
 /// Audit operation of the decision a completed test sign-in records when it
@@ -86,8 +86,7 @@ const CONNECTION_RESOURCE: &str = "identity:oidc_connection";
 ///
 /// Holds the role-separated runtime store (every statement runs on an RLS
 /// [`TenantConn`] acquired through [`WyrdPostgres`]), the deployment sealing
-/// keyring, the human-login relying party, and the callback URL derived from
-/// the configured public origin. Built once per server and cheap to clone;
+/// keyring, and the human-login relying party. Built once per server and cheap to clone;
 /// clones share the relying party's provider cache.
 #[derive(Clone)]
 pub struct HumanConnections {
@@ -99,17 +98,13 @@ pub struct HumanConnections {
     /// The human-login relying party; every provider request it makes goes
     /// through the screened, redirect-disabled, proxy-free HTTP capability.
     relying_party: RelyingParty,
-    /// `{public_origin}/auth/callback`, or `None` without a public origin.
-    callback_url: Option<Url>,
     /// Process audit stage every connection decision is staged on.
     audit: Arc<dyn AuditStage>,
 }
 
 impl Debug for HumanConnections {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HumanConnections")
-            .field("callback_url", &self.callback_url)
-            .finish_non_exhaustive()
+        f.debug_struct("HumanConnections").finish_non_exhaustive()
     }
 }
 
@@ -147,25 +142,19 @@ pub struct ActiveHumanConnection {
 }
 
 impl HumanConnections {
-    /// Build the owner over the runtime store, keyring, screened HTTP, public
-    /// origin, and the process audit stage its decisions are staged on.
-    ///
-    /// The callback URL is `{public_origin}/auth/callback`; it is `None` when
-    /// the deployment configures no public origin, in which case staging,
-    /// testing, and login refuse.
+    /// Build the owner over the runtime store, keyring, screened HTTP, and
+    /// the process audit stage its decisions are staged on.
     #[must_use]
     pub fn new(
         postgres: WyrdPostgres,
         keyring: Option<Arc<SealingKeyring>>,
         http: ScreenedHttp,
-        public_origin: Option<&Url>,
         audit: Arc<dyn AuditStage>,
     ) -> Self {
         Self {
             postgres,
             keyring,
             relying_party: RelyingParty::new(http),
-            callback_url: public_origin.and_then(|origin| origin.join(CALLBACK_PATH).ok()),
             audit,
         }
     }
@@ -195,7 +184,9 @@ impl HumanConnections {
         &self,
         tenant: DataTenantId,
         decision: &AuditEvent,
+        origin: &Url,
     ) -> Result<HumanConnectionsResponse, WyrdError> {
+        let callback = provider_callback(origin)?;
         self.audit.stage(tenant, decision.clone());
         let mut conn = self.begin(tenant).await?;
         let rows = live_human_connections(&mut conn)
@@ -206,10 +197,10 @@ impl HumanConnections {
         let mut response = HumanConnectionsResponse {
             active: None,
             candidate: None,
-            callback_url: self.callback_url.as_ref().map(Url::to_string),
+            callback_url: Some(callback.to_string()),
         };
         for row in rows {
-            let view = self.view(row)?;
+            let view = view(row, &callback)?;
             match view.state {
                 HumanConnectionState::Active => response.active = Some(view),
                 HumanConnectionState::Candidate => response.candidate = Some(view),
@@ -219,8 +210,8 @@ impl HumanConnections {
         Ok(response)
     }
 
-    /// Prepare a candidate write without IO: require a public origin and seal
-    /// the secret under the keyring's write key.
+    /// Prepare a candidate write without IO: seal the secret under the
+    /// keyring's write key.
     ///
     /// `input` must come from [`ConnectionInput::from_slice`], which is the one
     /// place its cross-field rules are checked; the durable table re-asserts
@@ -229,11 +220,10 @@ impl HumanConnections {
     /// fact rather than an unaudited decision.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] when no public origin is configured or
-    /// a secret must be sealed without a keyring, and [`WyrdError::Internal`]
-    /// when sealing or JSON encoding fails.
+    /// Returns [`WyrdError::Validation`] when a secret must be sealed without
+    /// a keyring, and [`WyrdError::Internal`] when sealing or JSON encoding
+    /// fails.
     pub fn stage(&self, input: ConnectionInput) -> Result<StagedCandidate, WyrdError> {
-        self.require_callback()?;
         let client_secret_enc = match &input.client_secret {
             Some(secret) => {
                 let keyring = self.require_keyring()?;
@@ -269,7 +259,9 @@ impl HumanConnections {
         tenant: DataTenantId,
         staged: StagedCandidate,
         decision: &AuditEvent,
+        origin: &Url,
     ) -> Result<HumanConnectionView, WyrdError> {
+        let callback = provider_callback(origin)?;
         let StagedCandidate {
             expected_revision,
             mut write,
@@ -308,14 +300,13 @@ impl HumanConnections {
                 .map_err(store_error)?,
         };
         conn.commit().await.map_err(store_error)?;
-        self.view(row)
+        view(row, &callback)
     }
 
     /// Begin a real test sign-in for the exact candidate revision and return
     /// the provider authorization URL that completes it.
     ///
-    /// Everything that can refuse without the network runs first: a public
-    /// origin (the callback the sign-in returns to). The candidate must exist at `expected_revision`. Holding no
+    /// The sign-in returns to the callback on `origin`. The candidate must exist at `expected_revision`. Holding no
     /// transaction or lock, screened discovery must then name exactly the
     /// candidate's issuer, its JWKS must decode to at least one key the
     /// verifier can use, and the authorization endpoint must pass the
@@ -328,8 +319,7 @@ impl HumanConnections {
     /// its state row is durable.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] when no public origin is configured,
-    /// [`WyrdError::ConnectionConflict`] when no candidate exists at
+    /// Returns [`WyrdError::ConnectionConflict`] when no candidate exists at
     /// `expected_revision`,
     /// [`WyrdError::ConnectionNotTested`] with `details.reason`
     /// `issuer_mismatch` or `jwks_unusable`, [`WyrdError::DiscoveryUnavailable`]
@@ -342,8 +332,9 @@ impl HumanConnections {
         tenant: DataTenantId,
         expected_revision: u64,
         tester: ConnectionTester,
+        origin: &Url,
     ) -> Result<ConnectionTestResponse, WyrdError> {
-        let redirect_uri = self.require_callback()?.clone();
+        let redirect_uri = provider_callback(origin)?;
         let target = self.test_target(tenant, expected_revision).await?;
         let provider = self
             .relying_party
@@ -533,7 +524,9 @@ impl HumanConnections {
         tenant: DataTenantId,
         request: ConnectionActivate,
         decision: &AuditEvent,
+        origin: &Url,
     ) -> Result<HumanConnectionView, WyrdError> {
+        let callback = provider_callback(origin)?;
         let mut conn = self.begin_locked(tenant, decision).await?;
         let recovery_key = request.recovery_api_key.into_secret_string();
         let candidate =
@@ -582,7 +575,7 @@ impl HumanConnections {
             revision = row.revision,
             "tenant human connection activated"
         );
-        self.view(row)
+        view(row, &callback)
     }
 
     /// Retire the Active connection; human login and every session bound to
@@ -684,14 +677,6 @@ impl HumanConnections {
         })
     }
 
-    /// Refuse when no public origin is configured.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] naming the missing public origin.
-    pub fn require_callback(&self) -> Result<&Url, WyrdError> {
-        self.callback_url.as_ref().ok_or_else(public_origin_missing)
-    }
-
     /// Open one RLS tenant transaction through the runtime store.
     ///
     /// # Errors
@@ -747,38 +732,56 @@ impl HumanConnections {
             client_id: row.client_id,
         })
     }
+}
 
-    /// Project a stored row to its redacted view.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Internal`] when a stored column does not decode.
-    fn view(&self, row: HumanConnectionRow) -> Result<HumanConnectionView, WyrdError> {
-        let claim_mapping: ClaimMappingPayload =
-            serde_json::from_value(row.claim_mapping).map_err(internal)?;
-        let group_role_map: HashMap<String, Vec<String>> =
-            serde_json::from_value(row.group_role_map).map_err(internal)?;
-        Ok(HumanConnectionView {
-            id: row.connection_id,
-            tenant_id: DataTenantId::new(row.data_tenant_id).map_err(internal)?,
-            revision: u64::try_from(row.revision).map_err(internal)?,
-            state: HumanConnectionState::parse(&row.state)?,
-            issuer: row.issuer_url,
-            client_id: row.client_id,
-            client_auth: HumanClientAuth::parse(&row.client_auth)?,
-            claim_mapping,
-            group_role_map,
-            jwks_ttl_secs: u64::try_from(row.jwks_ttl_secs).map_err(internal)?,
-            tested_revision: row
-                .tested_revision
-                .map(u64::try_from)
-                .transpose()
-                .map_err(internal)?,
-            tested_until: row.tested_until,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            callback_url: self.callback_url.as_ref().map(Url::to_string),
+/// Project a stored row to its redacted view, naming `callback` as the
+/// redirect URI to register at the provider.
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when a stored column does not decode.
+fn view(row: HumanConnectionRow, callback: &Url) -> Result<HumanConnectionView, WyrdError> {
+    let claim_mapping: ClaimMappingPayload =
+        serde_json::from_value(row.claim_mapping).map_err(internal)?;
+    let group_role_map: HashMap<String, Vec<String>> =
+        serde_json::from_value(row.group_role_map).map_err(internal)?;
+    Ok(HumanConnectionView {
+        id: row.connection_id,
+        tenant_id: DataTenantId::new(row.data_tenant_id).map_err(internal)?,
+        revision: u64::try_from(row.revision).map_err(internal)?,
+        state: HumanConnectionState::parse(&row.state)?,
+        issuer: row.issuer_url,
+        client_id: row.client_id,
+        client_auth: HumanClientAuth::parse(&row.client_auth)?,
+        claim_mapping,
+        group_role_map,
+        jwks_ttl_secs: u64::try_from(row.jwks_ttl_secs).map_err(internal)?,
+        tested_revision: row
+            .tested_revision
+            .map(u64::try_from)
+            .transpose()
+            .map_err(internal)?,
+        tested_until: row.tested_until,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        callback_url: Some(callback.to_string()),
+    })
+}
+
+/// The provider callback for a request that arrived at `origin`:
+/// `{origin}/auth/callback`, the address the browser itself used.
+///
+/// A forged request origin only redirects its own sender, and the
+/// provider accepts only the redirect URIs registered with it.
+///
+/// # Errors
+/// Returns [`WyrdError::Validation`] when `origin` cannot carry a path.
+pub fn provider_callback(origin: &Url) -> Result<Url, WyrdError> {
+    origin
+        .join(CALLBACK_PATH)
+        .map_err(|error| WyrdError::Validation {
+            message: format!("the request origin cannot form a callback URL: {error}"),
+            details: json!({ "reason": "request_origin_invalid" }),
         })
-    }
 }
 
 /// Whether a test sign-in's tester is still authorized to mark a candidate
@@ -941,16 +944,6 @@ fn conflict(message: &str) -> WyrdError {
     WyrdError::ConnectionConflict {
         message: message.to_owned(),
         details: json!({}),
-    }
-}
-
-/// The deployment configures no public origin, so it has no callback URL.
-fn public_origin_missing() -> WyrdError {
-    WyrdError::Validation {
-        message: "the deployment has no public origin configured (WYRD_PUBLIC_ORIGIN), so no \
-                  callback URL can be registered"
-            .to_owned(),
-        details: json!({ "reason": "public_origin_missing" }),
     }
 }
 

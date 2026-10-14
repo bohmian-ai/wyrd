@@ -12,7 +12,7 @@ use wyrd_ai::cards::{CardKind, Cards, ListCardsRequest};
 use wyrd_ai::config::ClientConfig;
 use wyrd_ai::environment::Environment;
 use wyrd_ai::{GlobalConfig, WyrdClient, WyrdError};
-use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso};
+use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HumanSso};
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::support::{Deployment, fixture};
@@ -41,11 +41,7 @@ impl SavedLogins {
     /// # Panics
     /// Panics when a setup step fails.
     async fn start() -> Self {
-        let deployment = Deployment::start_with(
-            WyrdTestServer::builder()
-                .with_public_origin(HUMAN_PUBLIC_ORIGIN.parse().expect("origin parses")),
-        )
-        .await;
+        let deployment = Deployment::start_with(WyrdTestServer::builder()).await;
         let sso = HumanSso::new(
             deployment
                 .server()

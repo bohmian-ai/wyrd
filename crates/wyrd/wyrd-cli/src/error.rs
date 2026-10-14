@@ -312,7 +312,7 @@ pub enum WyrdCliError {
         code = "WYRD_CLI_400_SERVER_HOST_UNSUPPORTED",
         status = 400,
         title = "Server host unsupported",
-        remediation = "Run the server on macOS or Linux (glibc) on x86_64 or aarch64, or use the official container image."
+        remediation = "Run the server on macOS on aarch64 or Linux (glibc) on x86_64 or aarch64, or use the official container image."
     )]
     ServerHostUnsupported {
         /// Detected operating system.

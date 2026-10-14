@@ -39,6 +39,9 @@ max-threads = 1
 # occasionally exceeds the 100ms default under load without anything actually
 # leaking.
 leak-timeout = "2s"
+# A test still running after 15 minutes is hung: fail it rather than let it
+# hold its CI job until the job timeout.
+slow-timeout = { period = "300s", terminate-after = 3 }
 # Match the old lanes' `--no-fail-fast`: one broken test must not hide the rest
 # of a binary.
 fail-fast = false

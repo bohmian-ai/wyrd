@@ -12,8 +12,11 @@ inputs:
   docker-images:
     description: Let free-disk-space remove preinstalled Docker images. Set false when the job needs Docker (emulators, OIDC providers).
     default: "true"
-  tool-cache:
-    description: Let free-disk-space remove the hosted-tool cache.
+  preinstalled-runtimes:
+    description: Let free-disk-space remove preinstalled language runtimes (the hosted-tool cache).
+    default: "true"
+  large-packages:
+    description: Let free-disk-space remove large apt packages, including azure-cli. Set false when the job needs `az`.
     default: "true"
   cache-key:
     description: >-
@@ -43,13 +46,13 @@ runs:
   steps:
     - name: Free disk space
       if: inputs.free-disk == 'true' && runner.os == 'Linux'
-      uses: jlumbroso/free-disk-space@main
+      uses: jlumbroso/free-disk-space@v2
       with:
-        tool-cache: ${{ inputs.tool-cache }}
+        preinstalled-runtimes: ${{ inputs.preinstalled-runtimes }}
         android: true
         dotnet: true
         haskell: true
-        large-packages: true
+        large-packages: ${{ inputs.large-packages }}
         docker-images: ${{ inputs.docker-images }}
         swap-storage: true
 
@@ -68,7 +71,7 @@ runs:
         free -h
 
     - name: Set up mise
-      uses: jdx/mise-action@v3
+      uses: jdx/mise-action@v5
       with:
         install: true
         cache: true
@@ -84,7 +87,7 @@ runs:
         cache-on-failure: true
 
     - name: Use GNU BFD linker on Linux
-      if: inputs.bfd-linker == 'true' && runner.os == 'Linux'
+      if: inputs.bfd-linker == 'true' && runner.os == 'Linux' && runner.arch == 'X64'
       shell: bash
       run: |
         command -v cc

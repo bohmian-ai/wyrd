@@ -1,6 +1,6 @@
 [package]
 name = "wyrd-tls"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 description = "Process-wide TLS crypto-provider ownership for Wyrd transports."
 license = { workspace = true }

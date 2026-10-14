@@ -21,6 +21,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use rand::{Rng as _, RngCore as _};
 use serde_json::json;
+use url::Url;
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
@@ -73,7 +74,7 @@ const USER_CODE_LEN: usize = 8;
 /// approval, denial, redemption, and refresh-chain revocation.
 ///
 /// Composed per request from the server's human-connection owner, which
-/// carries the runtime store and public origin, and the tenant issuance owner
+/// carries the runtime store, and the tenant issuance owner
 /// that mints a redeemed device login's session.
 #[derive(Clone)]
 pub struct CliLogins {
@@ -115,20 +116,16 @@ impl CliLogins {
     /// stored.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] without a public origin,
-    /// [`WyrdError::InvalidToken`] when the route key names no active
+    /// Returns [`WyrdError::InvalidToken`] when the route key names no active
     /// tenant or the tenant has no Active connection, and
     /// [`WyrdError::AuthVerifyUnavailable`] when the store fails, including
     /// the negligible chance of a user code already live in the tenant.
     pub async fn authorize(
         &self,
         tenant_route_key: &TenantSlug,
+        origin: &Url,
     ) -> Result<DeviceAuthorization, WyrdError> {
-        let origin = self
-            .connections
-            .require_callback()?
-            .origin()
-            .ascii_serialization();
+        let origin = origin.origin().ascii_serialization();
         let tenant = self
             .tenant(tenant_route_key)
             .await?
@@ -190,6 +187,7 @@ impl CliLogins {
         &self,
         tenant_route_key: &TenantSlug,
         user_code: &str,
+        origin: &Url,
     ) -> Result<AbsoluteUrl, WyrdError> {
         let user_code = normalize_user_code(user_code).ok_or_else(user_code_unavailable)?;
         let tenant = self
@@ -208,7 +206,7 @@ impl CliLogins {
             .ok_or_else(user_code_unavailable)?;
         conn.commit().await.map_err(store_error)?;
         self.connections
-            .begin_bound(tenant_route_key, LoginInitiation::Device(device_id))
+            .begin_bound(tenant_route_key, LoginInitiation::Device(device_id), origin)
             .await
     }
 
@@ -521,7 +519,7 @@ fn user_code_unavailable() -> WyrdError {
     }
 }
 
-/// A verification URL built from the configured public origin.
+/// A verification URL on the origin the device authorization arrived at.
 ///
 /// # Errors
 /// Returns [`WyrdError::Internal`] when it is not an absolute URL.
@@ -572,6 +570,14 @@ mod pg_tests {
     use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
     use wyrd_auth_issue::hash_secret;
 
+    /// The origin these tests' device requests arrive at.
+    ///
+    /// # Panics
+    /// Panics when the fixed origin does not parse.
+    fn origin() -> Url {
+        Url::parse("https://wyrd.example.com").expect("origin parses")
+    }
+
     /// A CLI login owner over `fixture` whose tenant's Active connection
     /// points at `provider`, a mock discovery document, staging its audit on
     /// `audit`.
@@ -617,7 +623,6 @@ mod pg_tests {
         .execute(&fixture.superuser_pool().expect("superuser pool"))
         .await
         .expect("connection points at the mock provider");
-        let origin = Url::parse("https://wyrd.example.com").expect("origin parses");
         CliLogins::new(
             HumanConnections::new(
                 fixture.wyrd_postgres().clone(),
@@ -625,7 +630,6 @@ mod pg_tests {
                     [5_u8; 32],
                 )))),
                 ScreenedHttp::allowing_internal(),
-                Some(&origin),
                 Arc::clone(audit) as _,
             ),
             TenantTokenIssuer::new(
@@ -712,7 +716,10 @@ mod pg_tests {
         let logins = owner(&fixture, &provider, &audit).await;
         let slug = TenantSlug::new(fixture.tenant_slug()).expect("slug");
 
-        let device = logins.authorize(&slug).await.expect("authorizes");
+        let device = logins
+            .authorize(&slug, &origin())
+            .await
+            .expect("authorizes");
         let code = device.device_code.expose();
         assert!(!device.verification_uri_complete.as_str().contains(code));
         assert!(
@@ -745,16 +752,19 @@ mod pg_tests {
             (&other, &*device.user_code),
         ] {
             let error = logins
-                .approve(tenant, user_code)
+                .approve(tenant, user_code, &origin())
                 .await
                 .expect_err("refused");
             assert_eq!(reason(&error), Some("user_code_unavailable"));
         }
         let typed = device.user_code.replace('-', " ").to_lowercase();
-        let url = logins.approve(&slug, &typed).await.expect("approves");
+        let url = logins
+            .approve(&slug, &typed, &origin())
+            .await
+            .expect("approves");
         assert!(url.as_str().starts_with(&provider.uri()));
         let error = logins
-            .approve(&slug, &device.user_code)
+            .approve(&slug, &device.user_code, &origin())
             .await
             .expect_err("one login per device code");
         assert_eq!(reason(&error), Some("login_binding_reused"));
@@ -771,7 +781,10 @@ mod pg_tests {
             "invalid_grant"
         );
 
-        let expiring = logins.authorize(&slug).await.expect("authorizes");
+        let expiring = logins
+            .authorize(&slug, &origin())
+            .await
+            .expect("authorizes");
         sqlx::query(
             "UPDATE wyrd.auth_device_authorizations
                 SET created_at = statement_timestamp() - interval '11 minutes',
@@ -812,8 +825,14 @@ mod pg_tests {
         let logins = owner(&fixture, &provider, &audit).await;
         let slug = TenantSlug::new(fixture.tenant_slug()).expect("slug");
         let tenant = fixture.data_tenant_id();
-        let approved = logins.authorize(&slug).await.expect("authorizes");
-        let denied = logins.authorize(&slug).await.expect("authorizes");
+        let approved = logins
+            .authorize(&slug, &origin())
+            .await
+            .expect("authorizes");
+        let denied = logins
+            .authorize(&slug, &origin())
+            .await
+            .expect("authorizes");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user = Uuid::now_v7();
@@ -924,7 +943,10 @@ mod pg_tests {
         termination: Termination,
     ) -> (DeviceAuthorization, Result<LoginCompletion, WyrdError>) {
         let slug = TenantSlug::new(fixture.tenant_slug()).expect("slug");
-        let device = logins.authorize(&slug).await.expect("authorizes");
+        let device = logins
+            .authorize(&slug, &origin())
+            .await
+            .expect("authorizes");
         let active = logins
             .connections
             .active_connection(fixture.data_tenant_id())
@@ -959,29 +981,33 @@ mod pg_tests {
             .await
             .expect("gate pid reads");
 
-        let (approval, ()) = tokio::join!(logins.approve(&slug, &device.user_code), async {
-            wait_for_blocked_by(fixture, gate_pid).await;
-            match termination {
-                Termination::Deny => logins.deny(&slug, &device.user_code).await.expect("denies"),
-                Termination::ExpireAndPoll => {
-                    sqlx::query(
-                        "UPDATE wyrd.auth_device_authorizations
+        let origin = origin();
+        let (approval, ()) =
+            tokio::join!(logins.approve(&slug, &device.user_code, &origin), async {
+                wait_for_blocked_by(fixture, gate_pid).await;
+                match termination {
+                    Termination::Deny => {
+                        logins.deny(&slug, &device.user_code).await.expect("denies");
+                    }
+                    Termination::ExpireAndPoll => {
+                        sqlx::query(
+                            "UPDATE wyrd.auth_device_authorizations
                             SET created_at = statement_timestamp() - interval '11 minutes',
                                 expires_at = statement_timestamp() - interval '1 minute'
                           WHERE device_id = $1",
-                    )
-                    .bind(device_id)
-                    .execute(&fixture.superuser_pool().expect("superuser pool"))
-                    .await
-                    .expect("expires the code");
-                    assert_eq!(
-                        device_error(logins.redeem(&device.device_code, "req-expire").await),
-                        "expired_token"
-                    );
+                        )
+                        .bind(device_id)
+                        .execute(&fixture.superuser_pool().expect("superuser pool"))
+                        .await
+                        .expect("expires the code");
+                        assert_eq!(
+                            device_error(logins.redeem(&device.device_code, "req-expire").await),
+                            "expired_token"
+                        );
+                    }
                 }
-            }
-            gate.rollback().await.expect("the gate releases");
-        });
+                gate.rollback().await.expect("the gate releases");
+            });
         let url = approval.expect("the parked approval begins its login");
         let state = Url::parse(url.as_str())
             .expect("provider URL parses")

@@ -63,4 +63,4 @@ mise.local.toml
 .mise.local.toml
 mise.*.local.toml
 openapi.yaml.tmp
-/binary/
+/release/

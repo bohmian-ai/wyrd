@@ -37,9 +37,6 @@ class WyrdTestServer:
     provider endpoint, which only the opt-in live smoke lane asks for. It
     cannot be combined with ``provider_base_url``.
 
-    ``human_sso=True`` serves the public origin the identity lane's Keycloak
-    clients register, so saved user login journeys can sign in against it.
-
     ``access_ttl_seconds`` mints access tokens of that lifetime, verified with
     no clock-skew allowance, so a journey can outlive its first token.
     """
@@ -50,7 +47,6 @@ class WyrdTestServer:
         verification_runtime: bool = False,
         provider_base_url: str | None = None,
         live_providers: bool = False,
-        human_sso: bool = False,
         access_ttl_seconds: int | None = None,
     ) -> None:
         """Create an unstarted server; entering the ``with`` block boots it.
@@ -72,9 +68,6 @@ class WyrdTestServer:
                 provider unless ``live_providers`` is set.
             live_providers: true points every built-in adapter at its real
                 provider endpoint, for the opt-in live smoke lane only.
-            human_sso: true serves the public origin the identity lane's
-                Keycloak clients register, so saved user login journeys can
-                sign in against it.
             access_ttl_seconds: the access-token lifetime in seconds, verified
                 with no clock-skew allowance; omitted keeps the production
                 lifetime.
@@ -316,7 +309,7 @@ class WyrdTestServer:
         """Activate the identity lane's Keycloak sign-in for ``admin_key``'s tenant.
 
         Maps ``wyrd-admins`` to ``admin`` and ``wyrd-viewers`` to ``reader``.
-        Needs ``human_sso=True`` and the identity lane's Keycloak.
+        Needs the identity lane's Keycloak.
 
         Args:
             admin_key: an API key of the tenant's administrator.

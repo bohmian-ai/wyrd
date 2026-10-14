@@ -34,12 +34,8 @@
 {:else if connections}
   <div class="grid">
     <Panel title="Callback URL">
-      {#if connections.callback_url}
-        <p>Register this exact redirect URI with your identity provider's Web application.</p>
-        <code>{connections.callback_url}</code>
-      {:else}
-        <StateBlock state="absent" title="No public origin is configured" detail="The deployment must set its public origin before SSO can be configured." />
-      {/if}
+      <p>Register this exact redirect URI with your identity provider's Web application.</p>
+      <code>{connections.callback_url}</code>
     </Panel>
 
     <Panel title="Active connection">

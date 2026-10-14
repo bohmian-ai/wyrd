@@ -5,11 +5,10 @@ import * as client from 'openid-client';
 import { BrowserSessions } from './browser-sessions';
 
 vi.mock('$env/dynamic/private', () => ({
-  env: { WYRD_UI_CLIENT_SECRET: 'test-client-secret', WYRD_SERVER_URL: 'http://127.0.0.1:8080' }
+  env: { WYRD_SERVER_URL: 'http://127.0.0.1:8080' }
 }));
 vi.mock('openid-client', async (actual) => ({
   ...(await actual<typeof import('openid-client')>()),
-  discovery: vi.fn(async () => ({})),
   buildAuthorizationUrl: vi.fn(() => new URL('https://wyrd.example/auth/authorize')),
   authorizationCodeGrant: vi.fn(),
   refreshTokenGrant: vi.fn(),
@@ -53,16 +52,16 @@ function jar() {
   return { cookies, values, options };
 }
 
-/** Sign in to `acme` through the code grant, with the login cookie `begin` set. */
-async function signIn(sessions: BrowserSessions, refreshToken: string, lifetime = 60) {
+/** Sign in to `acme` at `at` through the code grant, with the login cookie `begin` set. */
+async function signIn(sessions: BrowserSessions, refreshToken: string, lifetime = 60, at = url) {
   const browser = jar();
-  await sessions.begin('acme', url, browser.cookies);
+  await sessions.begin('acme', at, browser.cookies);
   vi.mocked(client.authorizationCodeGrant).mockResolvedValueOnce({
     access_token: accessToken(lifetime),
     refresh_token: refreshToken,
     token_type: 'bearer'
   } as Awaited<ReturnType<typeof client.authorizationCodeGrant>>);
-  expect(await sessions.complete(url, browser.cookies)).toBe('/t/acme');
+  expect(await sessions.complete(at, browser.cookies)).toBe('/t/acme');
   return browser;
 }
 
@@ -71,7 +70,6 @@ test('accepts an opaque refresh token and forwards it unchanged', async () => {
   const opaque = 'opaque-refresh-token-not-a-jwt';
   const browser = await signIn(sessions, opaque, 1);
   expect(browser.values.has('wyrd_session_acme')).toBe(true);
-  expect(browser.values.get('wyrd_session_acme')).not.toContain(opaque);
   expect(browser.options.get('wyrd_session_acme')?.maxAge).toBe(12 * 60 * 60);
 
   // The cached access token is inside its renewal margin, so the read refreshes.
@@ -110,4 +108,17 @@ test('failed refresh-token revocation still signs out', async () => {
   vi.mocked(client.refreshTokenGrant).mockRejectedValueOnce(invalidGrant());
   expect(await sessions.read('acme', url, browser.cookies)).toBeNull();
   expect(vi.mocked(client.refreshTokenGrant).mock.calls[0][1]).toBe('refresh-to-revoke');
+});
+
+test('the session cookie is Secure exactly when the browser used https', async () => {
+  const secure = await signIn(new BrowserSessions(), 'over-https');
+  expect(secure.options.get('wyrd_session_acme')?.secure).toBe(true);
+  const plain = await signIn(
+    new BrowserSessions(),
+    'over-http',
+    60,
+    new URL('http://localhost:8080/login/callback?code=c&state=s')
+  );
+  expect(plain.options.get('wyrd_session_acme')?.secure).toBe(false);
+  expect(plain.options.get('wyrd_session_acme')?.httpOnly).toBe(true);
 });

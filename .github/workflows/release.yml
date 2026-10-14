@@ -13,6 +13,11 @@ on:
   release:
     types: [published]
 
+# A newer push to main supersedes the previous push's run; release runs never cancel.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
 permissions:
   contents: read
 
@@ -21,7 +26,7 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: "10"
   CARGO_TERM_COLOR: always
-  PYTHON_VERSION: "3.12"
+  PYTHON_VERSION: "3.13"
   MISE_LOCKED: "true"
 
 jobs:
@@ -36,7 +41,7 @@ jobs:
       package_server: ${{ steps.filter.outputs.package_server }}
       package_crates: ${{ steps.filter.outputs.package_crates }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -61,7 +66,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -83,19 +88,20 @@ jobs:
     if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_python == 'true') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           ignore-nothing-to-cache: true
 
       - run: pip install "twine>=6.1.0" "packaging>=24.2"
 
-      - uses: arduino/setup-protoc@v3
+      # protoc at the version mise.toml pins.
+      - uses: jdx/mise-action@v5
         with:
-          version: "33.2"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          install_args: protoc
+          cache: true
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
@@ -112,7 +118,7 @@ jobs:
           twine check --strict ./*
           shasum -a 256 ./* | sed 's|  \./|  |' | sudo tee SHA256SUMS.pypi_sdist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pypi_sdist
           path: sdks/wyrd-sdk-python/dist
@@ -134,9 +140,9 @@ jobs:
             docker-options: "-e CI"
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           ignore-nothing-to-cache: true
@@ -180,7 +186,7 @@ jobs:
         working-directory: sdks/wyrd-sdk-python/dist
         run: shasum -a 256 ./*.whl | sed 's|  \./|  |' | sudo tee SHA256SUMS.pypi_ubuntu_${{ matrix.target }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pypi_ubuntu_${{ matrix.target }}
           path: sdks/wyrd-sdk-python/dist
@@ -194,25 +200,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
           - os: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           ignore-nothing-to-cache: true
 
       - run: pip install "twine>=6.1.0" "packaging>=24.2"
 
-      - uses: arduino/setup-protoc@v3
+      # protoc at the version mise.toml pins.
+      - uses: jdx/mise-action@v5
         with:
-          version: "33.2"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          install_args: protoc
+          cache: true
 
       - run: brew install libomp curl openssl pkg-config
 
@@ -231,7 +236,7 @@ jobs:
         working-directory: sdks/wyrd-sdk-python/dist
         run: shasum -a 256 ./*.whl | sed 's|  \./|  |' > SHA256SUMS.pypi_macos_${{ matrix.target }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pypi_macos_${{ matrix.target }}
           path: sdks/wyrd-sdk-python/dist
@@ -242,7 +247,7 @@ jobs:
     needs: [build-sdist, build-linux, build-macos]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: pypi_*
           merge-multiple: true
@@ -258,13 +263,13 @@ jobs:
         os: [ubuntu, macos]
     runs-on: ${{ matrix.os }}-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: pypi_${{ matrix.os }}_*
           merge-multiple: true
@@ -291,7 +296,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -302,13 +307,13 @@ jobs:
           echo "crate version: v$VERSION  tag: ${{ github.ref_name }}"
           test "v$VERSION" = "${{ github.ref_name }}"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - run: pip install "twine>=6.1.0" "packaging>=24.2"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: pypi_*
           merge-multiple: true
@@ -317,7 +322,7 @@ jobs:
       - name: Verify the tested package bytes
         run: bash .github/scripts/verify-release-artifacts.sh dist
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*.whl, dist/*.tar.gz
 
@@ -347,30 +352,28 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             package: linux-arm64-gnu
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            package: darwin-x64
           - os: macos-15
             target: aarch64-apple-darwin
             package: darwin-arm64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 11.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: sdks/wyrd-sdk-ts/pnpm-lock.yaml
 
-      - uses: arduino/setup-protoc@v3
+      # protoc at the version mise.toml pins.
+      - uses: jdx/mise-action@v5
         with:
-          version: "33.2"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          install_args: protoc
+          cache: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -426,7 +429,7 @@ jobs:
         shell: bash
         run: (cd dist && shasum -a 256 ./*.tgz | sed 's|  \./|  |' > SHA256SUMS.typescript_${{ matrix.package }})
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: typescript-${{ matrix.package }}
           path: |
@@ -447,9 +450,9 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
@@ -457,7 +460,7 @@ jobs:
       - name: Verify version matches release tag
         run: test "v$(node -p 'require("./sdks/wyrd-sdk-ts/wyrd/package.json").version')" = "${{ github.ref_name }}"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: typescript-*
           path: dist
@@ -465,7 +468,7 @@ jobs:
       - name: Verify the tested package bytes
         run: for dir in dist/typescript-*; do bash .github/scripts/verify-release-artifacts.sh "$dir"; done
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/typescript-*/*.tgz
 
@@ -481,102 +484,80 @@ jobs:
           done
           npm publish dist/typescript-linux-x64-gnu/wyrd-ai-0.0.1.tgz --access public
 
-  # ── Server binary + Docker ─────────────────────────────────────────────────
-
-  build-ui:
-    name: ui build
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_server == 'true') }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: jdx/mise-action@v3
-        with:
-          install: true
-          cache: true
-
-      - name: Build UI
-        run: |
-          pnpm --dir crates/wyrd/wyrd-server/wyrd-ui install --frozen-lockfile
-          pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wyrd-ui-build
-          path: crates/wyrd/wyrd-server/wyrd-ui/build
-          retention-days: 1
+  # ── Server bundles + Docker ────────────────────────────────────────────────
 
   # One bundle per local-server target `wyrd server install` selects by
-  # `wyrd-server-<target>.tar.gz`; Linux bundles also feed the images.
+  # `wyrd-server-<target>.tar.gz`; the Linux bundles also feed the images.
+  # Linux bundles build on the oldest glibc their images run: ubuntu-22.04
+  # for the ubuntu and debian images, rockylinux:9 for rocky.
   build-server:
-    name: server - ${{ matrix.target }}
-    needs: [changes, build-ui]
-    if: ${{ !cancelled() && needs.build-ui.result == 'success' && (github.event_name == 'release' || needs.changes.outputs.package_server == 'true') }}
+    name: server - ${{ matrix.bundle }}
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_server == 'true') }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-22.04
+            bundle: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04
+            container: rockylinux:9
+            bundle: x86_64-unknown-linux-gnu-rocky
+          - os: ubuntu-22.04-arm
+            bundle: aarch64-unknown-linux-gnu
           - os: macos-15
-            target: aarch64-apple-darwin
+            bundle: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    env:
+      BUNDLE: wyrd-server-${{ matrix.bundle }}.tar.gz
+      WYRD_PROFILE: dist
     steps:
-      - uses: actions/checkout@v4
+      - name: Install system deps
+        if: matrix.container
+        run: |
+          dnf install -y --setopt=install_weak_deps=False gcc gcc-c++ make perl perl-Digest-SHA \
+            git tar gzip xz pkgconf-pkg-config openssl-devel libcurl-devel
 
-      - uses: jdx/mise-action@v3
+      - name: Install system deps
+        if: runner.os == 'Linux' && !matrix.container
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev pkg-config
+
+      - uses: actions/checkout@v7
+
+      - uses: jdx/mise-action@v5
         with:
-          install: true
+          install_args: rust protoc cmake
           cache: true
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install system deps
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev pkg-config
-
-      - uses: actions/download-artifact@v4
         with:
-          name: wyrd-ui-build
-          path: crates/wyrd/wyrd-server/wyrd-ui/build
+          key: ${{ matrix.bundle }}
 
-      - name: Build server
-        run: cargo build -p wyrd-server --profile dist --locked --features cloud
+      - name: Build bundle
+        run: scripts/build.sh bundle
 
-      - name: Package binary + UI
+      - name: Package and record the server bundle
         run: |
-          mkdir -p release/ui
-          cp target/dist/wyrd-server release/
-          chmod +x release/wyrd-server
-          cp -r crates/wyrd/wyrd-server/wyrd-ui/build release/ui/build
-          cp crates/wyrd/wyrd-server/wyrd-ui/package.json release/ui/package.json
-          tar -czf wyrd-server-${{ matrix.target }}.tar.gz -C release .
-
-      - name: Smoke-test and record the server bundle
-        env:
-          BUNDLE: wyrd-server-${{ matrix.target }}.tar.gz
-        run: |
-          release/wyrd-server --version
+          tar -czf "$BUNDLE" -C release .
           tar -tzf "$BUNDLE" | grep -qx './wyrd-server'
-          tar -tzf "$BUNDLE" | grep -qx './ui/build/'
-          shasum -a 256 "$BUNDLE" > SHA256SUMS.wyrd-server-${{ matrix.target }}
+          shasum -a 256 "$BUNDLE" > SHA256SUMS.wyrd-server-${{ matrix.bundle }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: wyrd-server-${{ matrix.target }}
+          name: wyrd-server-${{ matrix.bundle }}
           path: |
-            wyrd-server-${{ matrix.target }}.tar.gz
-            SHA256SUMS.wyrd-server-${{ matrix.target }}
+            ${{ env.BUNDLE }}
+            SHA256SUMS.wyrd-server-${{ matrix.bundle }}
           retention-days: 1
 
+  # Each image copies a tested Linux bundle and compiles nothing; arm64 builds
+  # on an arm runner, not under emulation.
   publish-docker:
-    name: docker - ${{ matrix.arch }}
+    name: docker - ${{ matrix.distro }}-${{ matrix.arch }}
     if: github.event_name == 'release'
     needs: [qualify, release-commit, build-server]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     environment: release
     permissions:
       contents: read
@@ -586,32 +567,47 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
-            artifact: wyrd-server-x86_64-unknown-linux-gnu
-          - arch: arm64
-            artifact: wyrd-server-aarch64-unknown-linux-gnu
+          - distro: ubuntu
+            arch: amd64
+            runner: ubuntu-24.04
+            bundle: x86_64-unknown-linux-gnu
+          - distro: debian
+            arch: amd64
+            runner: ubuntu-24.04
+            bundle: x86_64-unknown-linux-gnu
+          - distro: rocky
+            arch: amd64
+            runner: ubuntu-24.04
+            bundle: x86_64-unknown-linux-gnu-rocky
+          - distro: ubuntu
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            bundle: aarch64-unknown-linux-gnu
+          - distro: debian
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            bundle: aarch64-unknown-linux-gnu
+    env:
+      IMAGE: bohmian/wyrd:${{ matrix.distro }}-${{ matrix.arch }}-${{ github.event.release.tag_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: docker/setup-qemu-action@v3
-        if: matrix.arch == 'arm64'
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
-          name: ${{ matrix.artifact }}
+          name: wyrd-server-${{ matrix.bundle }}
           path: ./artifacts
 
       - name: Verify the tested server bundle
         run: bash .github/scripts/verify-release-artifacts.sh artifacts
 
-      - name: Extract server artifact
+      - name: Extract the server bundle
         run: |
-          mkdir -p binary
-          tar -xzf ./artifacts/${{ matrix.artifact }}.tar.gz -C binary
+          mkdir -p release
+          tar -xzf ./artifacts/wyrd-server-${{ matrix.bundle }}.tar.gz -C release
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
@@ -619,37 +615,64 @@ jobs:
       # The image is new bytes built from the verified bundle, so it is
       # smoke-tested locally and published as that exact digest.
       - name: Build image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
-          file: docker/official/Dockerfile
+          file: docker/official/${{ matrix.distro }}/Dockerfile
           load: true
           platforms: linux/${{ matrix.arch }}
-          tags: |
-            wyrdai/wyrd:${{ matrix.arch }}-${{ github.event.release.tag_name }}
-            wyrdai/wyrd:${{ matrix.arch }}-latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha,scope=${{ matrix.distro }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.distro }}-${{ matrix.arch }}
 
       - name: Smoke-test and push the image
         id: push
-        env:
-          IMAGE: wyrdai/wyrd:${{ matrix.arch }}-${{ github.event.release.tag_name }}
-          LATEST: wyrdai/wyrd:${{ matrix.arch }}-latest
         run: |
-          docker run --rm --platform linux/${{ matrix.arch }} --entrypoint /usr/local/bin/wyrd-server "$IMAGE" --version
+          docker run --rm --entrypoint /usr/local/bin/wyrd-server "$IMAGE" --version
           docker push "$IMAGE"
-          docker push "$LATEST"
           digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE" | cut -d@ -f2)"
           test -n "$digest"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "$IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
-          subject-name: index.docker.io/wyrdai/wyrd
+          subject-name: index.docker.io/bohmian/wyrd
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+  # `docker pull bohmian/wyrd` resolves through these multi-arch tags: one per
+  # distro, and the ubuntu image as the bare version and latest.
+  publish-docker-manifests:
+    name: docker manifests
+    if: github.event_name == 'release'
+    needs: publish-docker
+    runs-on: ubuntu-24.04
+    environment: release
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Publish the multi-arch tags
+        run: |
+          repo=bohmian/wyrd
+          docker buildx imagetools create -t "$repo:$TAG" -t "$repo:latest" \
+            -t "$repo:ubuntu-$TAG" -t "$repo:ubuntu-latest" \
+            "$repo:ubuntu-amd64-$TAG" "$repo:ubuntu-arm64-$TAG"
+          docker buildx imagetools create -t "$repo:debian-$TAG" -t "$repo:debian-latest" \
+            "$repo:debian-amd64-$TAG" "$repo:debian-arm64-$TAG"
+          docker buildx imagetools create -t "$repo:rocky-$TAG" -t "$repo:rocky-latest" \
+            "$repo:rocky-amd64-$TAG"
+          for t in "$TAG" debian-"$TAG" rocky-"$TAG"; do
+            docker buildx imagetools inspect "$repo:$t" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
 
   publish-binaries:
     name: publish binaries
@@ -662,9 +685,9 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: wyrd-server-*
           merge-multiple: true
@@ -691,7 +714,7 @@ jobs:
           openssl pkeyutl -sign -inkey "$key" -rawin -in checksums.txt -out checksums.txt.sig
           openssl pkeyutl -verify -pubin -inkey "$PUBLIC_KEY" -rawin -in checksums.txt -sigfile checksums.txt.sig
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*.tar.gz
 
@@ -711,9 +734,9 @@ jobs:
     if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_crates == 'true') }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: jdx/mise-action@v3
+      - uses: jdx/mise-action@v5
         with:
           install: true
           cache: true
@@ -726,7 +749,7 @@ jobs:
           cp target/package/*.crate dist/
           (cd dist && shasum -a 256 ./*.crate | sed 's|  \./|  |' > SHA256SUMS.rust-crates)
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rust-crates
           path: dist
@@ -743,7 +766,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -754,12 +777,12 @@ jobs:
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev pkg-config
 
-      - uses: jdx/mise-action@v3
+      - uses: jdx/mise-action@v5
         with:
           install: true
           cache: true
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: rust-crates
           path: dist
@@ -772,7 +795,7 @@ jobs:
           cargo package --locked --no-verify $(python3 -c 'import tomllib; print(" ".join("-p " + p["name"] for p in tomllib.load(open("release-plz.toml", "rb"))["package"] if p.get("publish")))')
           (cd target/package && sha256sum --check --strict ../../dist/SHA256SUMS.rust-crates)
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*.crate
 

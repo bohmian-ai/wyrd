@@ -1,6 +1,6 @@
 {
   "name": "wyrd-ai-linux-arm64-gnu",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Native napi addon for wyrd-ai-linux-arm64-gnu.",
   "license": "Apache-2.0",
   "os": [

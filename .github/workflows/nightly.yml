@@ -21,7 +21,7 @@ jobs:
     outputs:
       ci_jobs: ${{ steps.plan.outputs.ci_jobs }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: plan
         run: python3 .github/scripts/select-ci.py --gate
 
@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - id: setup
         uses: ./.github/actions/setup-rust-ci
@@ -63,7 +63,7 @@ jobs:
       matrix:
         job: ${{ fromJSON(needs.plan.outputs.ci_jobs) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -72,12 +72,12 @@ jobs:
           save-cache: ${{ matrix.job.save && 'true' || 'false' }}
 
       - name: Install uv and Python
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           # Shards that never run uv have nothing to cache.
           ignore-nothing-to-cache: true
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install Rust components
         run: rustup component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt clippy
@@ -96,7 +96,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
         with:

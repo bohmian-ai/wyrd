@@ -17,8 +17,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
-wyrd-auth-oidc = { path = "../wyrd-auth-oidc", version = "0.0.1" }
-wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
+wyrd-auth-oidc = { path = "../wyrd-auth-oidc", version = "0.1.0" }
+wyrd-spec = { path = "../../wyrd-spec", version = "0.1.0" }
 wyrd-runtime = { workspace = true }
 
 [dev-dependencies]
@@ -27,7 +27,7 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wiremock = { workspace = true }
-wyrd-semver = { path = "../wyrd-semver", version = "0.0.1" }
+wyrd-semver = { path = "../wyrd-semver", version = "0.1.0" }
 wyrd-tls = { workspace = true }
 
 [lints]

@@ -8,7 +8,7 @@ use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::config::ClientConfig;
 use wyrd_ai::environment::Environment;
 use wyrd_ai::{Bifrost, GlobalConfig, WyrdClient};
-use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso};
+use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HumanSso};
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::local_development::{Local, export, invoke, work};
@@ -35,7 +35,6 @@ async fn saved_login_completes_the_workflow_past_token_expiry() {
     let local = Box::pin(Local::start(
         WyrdTestServer::builder()
             .without_process_telemetry_for_test()
-            .with_public_origin(HUMAN_PUBLIC_ORIGIN.parse().expect("origin parses"))
             .with_access_ttl(ACCESS_TTL)
             .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
                 allowed_clock_skew: Duration::ZERO,

@@ -18,7 +18,6 @@ const target = (() => {
     if (process.arch === "arm64") return "linux-arm64-gnu";
   }
   if (process.platform === "darwin") {
-    if (process.arch === "x64") return "darwin-x64";
     if (process.arch === "arm64") return "darwin-arm64";
   }
   return undefined;

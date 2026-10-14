@@ -23,7 +23,7 @@ use wyrd_crypt::SecretKey;
 use wyrd_gateway::{
     CredentialAssignment, CredentialResolver, ManagedSecretKeys, TenantKeyring, VaultBackend,
 };
-use wyrd_spec::auth::{IssuerTokenPolicy, Sha256Hex};
+use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_spec::card::workflow::ExternalGatewayBindingConfig;
 use wyrd_spec::gateway::{ExternalSecretReference, ProviderCredentialSourceView};
 use wyrd_spec::ids::{CredentialBindingName, SecretBackendName};
@@ -2361,27 +2361,6 @@ pub struct AuthConfig {
     /// Empty when unset.
     #[serde(skip)]
     pub sealing_retained_keys: Vec<SecretString>,
-    /// Deployment-controlled public origin (scheme, host, optional port) that
-    /// browsers and identity providers reach Wyrd on.
-    ///
-    /// Loaded from `WYRD_PUBLIC_ORIGIN` or `[auth] public_origin`. The tenant
-    /// human-connection callback URL shown to administrators is this origin
-    /// plus `/auth/callback`; it is never assembled from request headers.
-    /// `None` leaves OIDC administration unable to stage a connection while
-    /// every non-OIDC path keeps working.
-    #[serde(default)]
-    pub public_origin: Option<url::Url>,
-    /// SHA-256 hashes of the client secret the production UI's confidential
-    /// OAuth client `wyrd-ui` authenticates with (RFC 6749 §2.3.1).
-    ///
-    /// Env-injected only. Loaded from `WYRD_UI_CLIENT_SECRET_SHA256`: one or,
-    /// during a rotation overlap, two comma-separated lowercase-hex SHA-256
-    /// digests of the raw secret. Empty leaves `wyrd-ui` unable to
-    /// authenticate, so a deployment without the production UI accepts no
-    /// authorization-code grant. The secret authenticates only the client,
-    /// never tenant API authority.
-    #[serde(skip)]
-    pub ui_client_secret_hashes: Vec<Sha256Hex>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -3302,18 +3281,6 @@ impl WyrdServerConfig {
         if !retained.is_empty() {
             self.auth.sealing_retained_keys = retained;
         }
-        if let Some(hashes) = env_opt("WYRD_UI_CLIENT_SECRET_SHA256")? {
-            self.auth.ui_client_secret_hashes = parse_ui_client_secret_hashes(&hashes)?;
-        }
-        if let Some(origin) = env_opt("WYRD_PUBLIC_ORIGIN")? {
-            self.auth.public_origin =
-                Some(
-                    url::Url::parse(&origin).map_err(|e| ConfigError::BadEnvVar {
-                        key: "WYRD_PUBLIC_ORIGIN".to_string(),
-                        message: e.to_string(),
-                    })?,
-                );
-        }
 
         Ok(())
     }
@@ -3711,30 +3678,6 @@ impl WyrdServerConfig {
 // Internal helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Parse `WYRD_UI_CLIENT_SECRET_SHA256`: one or two comma-separated
-/// lowercase-hex SHA-256 digests, the second accepted only for a bounded
-/// rotation overlap.
-///
-/// # Errors
-/// Returns [`ConfigError::BadEnvVar`] for an empty entry, a value that is not a
-/// SHA-256 digest, or more than two entries.
-fn parse_ui_client_secret_hashes(value: &str) -> Result<Vec<Sha256Hex>, ConfigError> {
-    let bad = |message: String| ConfigError::BadEnvVar {
-        key: "WYRD_UI_CLIENT_SECRET_SHA256".to_string(),
-        message,
-    };
-    let hashes = value
-        .split(',')
-        .map(|entry| Sha256Hex::new(entry.trim()).map_err(|error| bad(error.to_string())))
-        .collect::<Result<Vec<_>, _>>()?;
-    if hashes.len() > 2 {
-        return Err(bad(
-            "at most two secret hashes (current and rotating) are accepted".to_string(),
-        ));
-    }
-    Ok(hashes)
-}
-
 /// Read an environment variable, returning `None` if unset and
 /// `Err(EmptyEnvVar)` if set but empty.
 ///
@@ -3936,33 +3879,6 @@ mod tests {
 
     /// Serialize env-var tests so concurrent test threads cannot interfere.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// The `wyrd-ui` client-secret hash list accepts one secret or a
-    /// two-secret rotation overlap and refuses malformed digests and a third.
-    #[test]
-    fn ui_client_secret_hashes_accept_at_most_two_digests() {
-        let one = "a".repeat(64);
-        let two = format!("{one}, {}", "b".repeat(64));
-        assert_eq!(
-            parse_ui_client_secret_hashes(&one).expect("one key").len(),
-            1
-        );
-        assert_eq!(
-            parse_ui_client_secret_hashes(&two).expect("two keys").len(),
-            2
-        );
-        for bad in [
-            format!("{two},{}", "c".repeat(64)),
-            "A".repeat(64),
-            "abc".to_owned(),
-            format!("{one},"),
-        ] {
-            assert!(
-                parse_ui_client_secret_hashes(&bad).is_err(),
-                "{bad} is refused"
-            );
-        }
-    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

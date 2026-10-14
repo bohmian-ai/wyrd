@@ -37,6 +37,11 @@ on:
 # (build:postgres → db:setup-roles → db:migrate), so no database secret is
 # required.
 
+# A newer push to main supersedes the previous push's run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   id-token: write   # Required for S3 and Azure OIDC credential federation
@@ -51,14 +56,14 @@ jobs:
     environment: storage-integration
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
         with:
           docker-images: "false"
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_CLOUD_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_CLOUD_REGION }}
@@ -74,7 +79,7 @@ jobs:
     environment: storage-integration
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -92,14 +97,16 @@ jobs:
     environment: storage-integration
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
         with:
           docker-images: "false"
+          # azure/login and the tests' credential both shell out to `az`.
+          large-packages: "false"
 
       - name: Authenticate to Azure (OIDC)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLOUD_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_CLOUD_TENANT_ID }}
@@ -108,4 +115,6 @@ jobs:
       - name: Run Azure cloud tests
         env:
           WYRD_STORAGE_URL: az://${{ secrets.AZURE_CLOUD_ACCOUNT_NAME }}/${{ secrets.AZURE_CLOUD_CONTAINER_NAME }}
+          # object_store reads this and takes its token from the azure/login session.
+          AZURE_USE_AZURE_CLI: "true"
         run: mise run test:storage:azure:cloud

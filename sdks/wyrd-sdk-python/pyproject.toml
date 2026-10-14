@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "wyrd-ai"
-version = "0.0.1"
+version = "0.1.0"
 description = "Python bindings for Wyrd"
 readme = { text = "Python SDK for Wyrd verification and assurance.", content-type = "text/markdown" }
 requires-python = ">=3.10"
@@ -46,7 +46,8 @@ dev = [
     "ruff>=0.1.0,<1.0.0",
     "safetensors>=0.4.0",
     "scikit-learn>=1.5.0",
-    "tensorflow>=2.18.0",
+    # TensorFlow publishes no wheels past Python 3.13.
+    "tensorflow>=2.18.0; python_version < '3.14'",
     "torch>=2.4.0",
     "transformers>=4.44.0",
     "ty>=0.0.35,<0.1.0",

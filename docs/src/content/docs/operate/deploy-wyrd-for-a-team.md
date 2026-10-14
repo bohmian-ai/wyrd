@@ -17,7 +17,7 @@ This page covers the database, the server's persistent settings, and the first t
 ## Prerequisites
 
 - PostgreSQL 16, and an administrator login that can create logins and databases.
-- The `wyrd-server` binary for the release you are deploying, or the `wyrdai/wyrd` container image from Docker Hub.
+- The `wyrd-server` binary for the release you are deploying, or the `bohmian/wyrd` container image from Docker Hub.
 - An object store every server replica can reach: S3, Google Cloud Storage, or Azure Blob Storage.
 
 ## 1. Create the logins and the database

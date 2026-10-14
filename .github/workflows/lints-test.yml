@@ -27,11 +27,12 @@ jobs:
       rust_client: ${{ steps.filter.outputs.rust_client }}
       docs: ${{ steps.filter.outputs.docs }}
       ui: ${{ steps.filter.outputs.ui }}
+      package_server: ${{ steps.filter.outputs.package_server }}
       full_gate: ${{ steps.filter.outputs.full_gate }}
       rust_packages: ${{ steps.filter.outputs.rust_packages }}
       ci_jobs: ${{ steps.filter.outputs.ci_jobs }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -60,13 +61,13 @@ jobs:
         run: |
           if [[ "${{ needs.changes.outputs.full_gate }}" == "true" ]]; then
             echo 'os=["macos-15"]' >> "$GITHUB_OUTPUT"
-            python='[{"os":"macos-15","python-version":"3.12"}'
+            python='[{"os":"macos-15","python-version":"3.13"}'
           else
             echo 'os=["ubuntu-24.04","macos-15"]' >> "$GITHUB_OUTPUT"
-            python='[{"os":"ubuntu-24.04","python-version":"3.12"},{"os":"macos-15","python-version":"3.12"}'
+            python='[{"os":"ubuntu-24.04","python-version":"3.13"},{"os":"macos-15","python-version":"3.13"}'
           fi
-          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
-            python+=',{"os":"ubuntu-24.04","python-version":"3.10"},{"os":"ubuntu-24.04","python-version":"3.11"}'
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            python+=',{"os":"ubuntu-24.04","python-version":"3.14"}'
           fi
           echo "python=$python]" >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
@@ -89,7 +90,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - id: setup
         uses: ./.github/actions/setup-rust-ci
@@ -113,7 +114,7 @@ jobs:
       matrix:
         job: ${{ fromJSON(needs.changes.outputs.ci_jobs) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -122,12 +123,12 @@ jobs:
           save-cache: ${{ matrix.job.save && 'true' || 'false' }}
 
       - name: Install uv and Python
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           # Shards that never run uv have nothing to cache.
           ignore-nothing-to-cache: true
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install Rust components
         run: rustup component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt clippy
@@ -164,7 +165,7 @@ jobs:
       matrix:
         os: ${{ fromJSON(needs.matrix-plan.outputs.os) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -186,7 +187,7 @@ jobs:
       matrix:
         os: ${{ fromJSON(needs.matrix-plan.outputs.os) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -209,7 +210,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.matrix-plan.outputs.python) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
 
@@ -224,7 +225,7 @@ jobs:
         run: brew install libomp curl openssl pkg-config
 
       - name: Install uv and Python
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -243,13 +244,13 @@ jobs:
           UV_PYTHON: ${{ matrix.python-version }}
 
       - name: TensorFlow Python tests
-        if: matrix.python-version == '3.12'
+        if: matrix.python-version == '3.13'
         run: mise run py:test:tensorflow
         env:
           UV_PYTHON: ${{ matrix.python-version }}
 
       - name: Python examples
-        if: matrix.os == 'ubuntu-24.04' && matrix.python-version == '3.12'
+        if: matrix.os == 'ubuntu-24.04' && matrix.python-version == '3.13'
         run: mise run examples:python:datacard
         env:
           UV_PYTHON: ${{ matrix.python-version }}
@@ -262,19 +263,19 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up mise
-        uses: jdx/mise-action@v3
+        uses: jdx/mise-action@v5
         with:
           install: true
           cache: true
 
       - name: Install uv and Python
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Check docs (includes docs:a11y)
         run: mise run docs:check
@@ -286,10 +287,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up mise
-        uses: jdx/mise-action@v3
+        uses: jdx/mise-action@v5
         with:
           install: true
           cache: true
@@ -305,16 +306,43 @@ jobs:
         working-directory: crates/wyrd/wyrd-server/wyrd-ui
         run: node brand/gen-theme.mjs --check
 
+  # The official ubuntu image built the way the startup lanes and kind build
+  # it, then both startup journeys against it, on Linux x86 and arm.
+  image:
+    name: image (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.full_gate == 'true' || needs.changes.outputs.package_server == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          docker-images: "false"
+          cache-key: image-${{ matrix.os }}
+          save-cache: "true"
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev pkg-config
+
+      - name: Startup journeys
+        run: mise run test:server:startup
+
   ci-complete:
     name: ci complete
-    needs: [changes, matrix-plan, deps, ci, rust-client, typescript, python, docs, ui]
+    needs: [changes, matrix-plan, deps, ci, rust-client, typescript, python, docs, ui, image]
     # Not always(): a superseded run must stop here, or the next push's run
     # waits for this job before the concurrency group lets it start.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Verify required jobs
         shell: bash
@@ -329,3 +357,4 @@ jobs:
           "${{ needs.python.result }}"
           "${{ needs.docs.result }}"
           "${{ needs.ui.result }}"
+          "${{ needs.image.result }}"

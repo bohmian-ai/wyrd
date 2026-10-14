@@ -1374,7 +1374,6 @@ mod pg_tests {
                 fixture.wyrd_postgres().clone(),
                 Some(Arc::clone(&sealing_key)),
                 ScreenedHttp::allowing_internal(),
-                None,
                 audit,
             )),
             sealing_key: Some(sealing_key),

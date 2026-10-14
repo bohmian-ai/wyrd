@@ -3,7 +3,6 @@ packages:
   - wyrd
   - wyrd-linux-x64-gnu
   - wyrd-linux-arm64-gnu
-  - wyrd-darwin-x64
   - wyrd-darwin-arm64
   - ../../examples/support-desk/typescript
 allowBuilds:

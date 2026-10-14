@@ -30,7 +30,7 @@ FIXTURE_TENANT = "test-tenant-1"
 @pytest.fixture(scope="module")
 def server() -> Iterator[WyrdTestServer]:
     """The local deployment, accepting human sign-in with short-lived access tokens."""
-    for server in local_server(human_sso=True, access_ttl_seconds=ACCESS_TTL_SECONDS):
+    for server in local_server(access_ttl_seconds=ACCESS_TTL_SECONDS):
         server.activate_human_sso(server.api_key)
         yield server
 

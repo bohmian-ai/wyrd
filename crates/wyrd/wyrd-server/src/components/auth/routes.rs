@@ -73,8 +73,7 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
 /// §4.1.3, `wyrd-ui`), a refresh token (§6), an RFC 8628 device code
 /// (`wyrd-cli`), an RFC 8693 token exchange — a Wyrd API key as subject, or
 /// a delegation — and an RFC 7523 workload assertion. The human grants
-/// require their client: `wyrd-ui` authenticates with its Basic secret and
-/// `wyrd-cli` names itself with `client_id`. Tenant and principal are derived
+/// require their client, which names itself with `client_id`. Tenant and principal are derived
 /// from the verified credential, never from a client-supplied header.
 ///
 /// # Errors
@@ -103,9 +102,9 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
         (status = 500, description = "`server_error`", body = OAuthErrorResponse),
         (status = 503, description = "`temporarily_unavailable`", body = OAuthErrorResponse)
     ),
-    // No session exists yet at this operation: a public client names itself
-    // with `client_id` and needs nothing, a confidential client uses Basic.
-    security((), ("oauthClientBasic" = [])),
+    // No session exists yet at this operation: a client names itself with
+    // `client_id` and needs nothing.
+    security(()),
     tag = "Auth"
 )]
 #[tracing::instrument(level = "debug", skip_all)]
@@ -115,7 +114,7 @@ async fn token(
     request_id: Option<Extension<RequestId>>,
     form: OAuthForm,
 ) -> Result<Response, OAuthError> {
-    let client = state.auth.oauth_clients.identify(&headers, &form)?;
+    let client = crate::auth::oauth::identify_client(&headers, &form)?;
     match form.get("grant_type") {
         None => return Err(OAuthError(OAuthErrorCode::InvalidRequest)),
         Some(grant) if !GRANT_TYPES.contains(&grant) => {
@@ -476,8 +475,7 @@ Wyrd settings to activate the connection.</p></body></html>";
         (status = 400, description = "The query carries both or neither of `code` and \
           `error` (WYRD_SPEC_400_VALIDATION), the login state is unknown, expired, or replayed \
           (WYRD_AUTH_400_INVALID_STATE), the ID token nonce does not match \
-          (WYRD_AUTH_400_INVALID_NONCE), or the deployment has no public origin \
-          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+          (WYRD_AUTH_400_INVALID_NONCE)", body = WyrdProblem),
         (status = 401, description = "The code or ID token is not usable, the response `iss` \
           does not match the login's issuer or is missing while the provider advertises it, or \
           the login's connection changed (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),

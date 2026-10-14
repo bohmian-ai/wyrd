@@ -1,6 +1,6 @@
 {
   "name": "wyrd-ai",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "license": "Apache-2.0",
   "private": false,
   "type": "module",
@@ -32,15 +32,13 @@
     "targets": [
       "x86_64-unknown-linux-gnu",
       "aarch64-unknown-linux-gnu",
-      "x86_64-apple-darwin",
       "aarch64-apple-darwin"
     ]
   },
   "optionalDependencies": {
-    "wyrd-ai-darwin-arm64": "0.0.1",
-    "wyrd-ai-darwin-x64": "0.0.1",
-    "wyrd-ai-linux-arm64-gnu": "0.0.1",
-    "wyrd-ai-linux-x64-gnu": "0.0.1"
+    "wyrd-ai-darwin-arm64": "0.1.0",
+    "wyrd-ai-linux-arm64-gnu": "0.1.0",
+    "wyrd-ai-linux-x64-gnu": "0.1.0"
   },
   "dependencies": {
     "apache-arrow": "21.1.0"

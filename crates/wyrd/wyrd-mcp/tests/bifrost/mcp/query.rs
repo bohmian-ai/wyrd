@@ -335,6 +335,18 @@ mod pg_tests {
                 serde_json::json!({"sql": format!("SELECT evil_udf(value) FROM {table}")}),
                 "WYRD_VALA_400_QUERY_INVALID_SQL",
             ),
+            (
+                "type mismatch",
+                serde_json::json!({"sql": format!("SELECT value + 1 AS n FROM {table}")}),
+                "WYRD_VALA_400_QUERY_INVALID_SQL",
+            ),
+            (
+                "ambiguous reference",
+                serde_json::json!({"sql": format!(
+                    "SELECT id FROM {table} a JOIN {table} b ON a.id = b.id"
+                )}),
+                "WYRD_VALA_400_QUERY_INVALID_SQL",
+            ),
         ];
         for (case, arguments, code) in cases {
             let refusal = problem(client.call_tool(query(arguments)).await?)?;
@@ -348,6 +360,18 @@ mod pg_tests {
                 assert!(
                     detail.contains("No field named t.valeu. Did you mean 't.value'?"),
                     "{case} carries the planner's suggestion: {refusal}"
+                );
+            }
+            if case == "type mismatch" {
+                assert!(
+                    detail.contains("Cannot coerce arithmetic expression Utf8 + Int64"),
+                    "{case} carries the planner's detail: {refusal}"
+                );
+            }
+            if case == "ambiguous reference" {
+                assert!(
+                    detail.contains("Ambiguous reference to unqualified field id"),
+                    "{case} carries the planner's detail: {refusal}"
                 );
             }
             if case == "unsupported shape" {
@@ -381,7 +405,8 @@ mod pg_tests {
     }
 
     /// An agent's scalar, `IN`, and correlated `EXISTS` subqueries over a live
-    /// table answer exactly like their equivalent joins.
+    /// table, including one correlated on the managed `run_id`, answer exactly
+    /// like their equivalent joins.
     ///
     /// Every row of the fixture is still unsealed in Scribe, so each query
     /// reads the live tail; the scalar subquery's filter must stay on the
@@ -437,6 +462,18 @@ mod pg_tests {
                 format!(
                     "SELECT a.id FROM {table} a JOIN {table} b ON b.id = a.id + 1 \
                      ORDER BY a.id"
+                ),
+                serde_json::json!([[1], [2]]),
+            ),
+            (
+                format!(
+                    "SELECT a.id FROM {table} a WHERE EXISTS \
+                     (SELECT 1 FROM {table} b WHERE b.run_id = a.run_id AND b.id <> a.id) \
+                     ORDER BY a.id"
+                ),
+                format!(
+                    "SELECT DISTINCT a.id FROM {table} a JOIN {table} b \
+                     ON b.run_id = a.run_id AND b.id <> a.id ORDER BY a.id"
                 ),
                 serde_json::json!([[1], [2]]),
             ),

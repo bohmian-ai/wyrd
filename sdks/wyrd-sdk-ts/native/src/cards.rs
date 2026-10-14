@@ -13,7 +13,6 @@ use wyrd_client::cards::{CardKind, CardSelector, Cards, HydrationMode, ListCards
 use wyrd_client::observe::eval::parse_session_id;
 use wyrd_client::observe::{EvalObservationOptions, Run};
 use wyrd_client::state::WyrdState;
-use wyrd_client::transport::trace::with_caller_trace;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefParseError};
@@ -700,12 +699,11 @@ impl NativeRun {
             }
         };
         NativeLifecycleResult::outcome(
-            Box::pin(with_caller_trace(
-                caller,
+            Box::pin(
                 self.run
                     .observe()
-                    .verify_json(&verifier, &input_json, media),
-            ))
+                    .verify_json(&verifier, &input_json, media, caller),
+            )
             .await,
         )
     }

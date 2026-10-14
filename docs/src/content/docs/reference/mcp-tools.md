@@ -20,13 +20,13 @@ The tables below summarize wire shapes. Named shapes such as `ExecuteVerificatio
 
 ## Agent frameworks
 
-Wyrd serves MCP protocol revision 2026-07-28 only, and its tool names contain dots. Some model providers accept only `^[a-zA-Z0-9_-]{1,64}$` as a tool name, so configure each framework to forward provider-valid names; calls still reach the dotted Wyrd tool.
+Wyrd serves MCP protocol revision 2026-07-28 only. Its MCP tool names contain dots and do not change. Model providers commonly accept only `^[a-zA-Z0-9_-]{1,64}$` as a function-tool name, so each framework below forwards a model-facing alias instead; its own MCP client still calls the dotted Wyrd tool and surfaces Wyrd's refusals as tool errors. These are the configurations Wyrd's framework journeys test.
 
-| Framework | Settings |
+| Framework | Tested configuration |
 | --- | --- |
-| OpenAI Agents SDK (Python) | `mcp_config={"include_server_in_tool_names": True}` forwards names such as `mcp_wyrd__wyrd_guide`. |
-| Pydantic AI | `MCPToolset(url, headers=...).renamed({"wyrd_guide": "wyrd.guide", ...})`. |
-| Google ADK | Set `ADK_ENABLE_MCP_MODERN_PROTOCOL=1` (experimental in ADK) to negotiate 2026-07-28, and `GOOGLE_API_USE_CLIENT_CERTIFICATE=false` to skip ADK's Google Cloud mTLS probe. Gemini accepts dotted names; for other providers, override `McpToolset.get_tools` to return copies with renamed `name`. |
+| OpenAI Agents SDK (Python) | `mcp_config={"convert_schemas_to_strict": True, "include_server_in_tool_names": True}` forwards aliases such as `mcp_wyrd__wyrd_guide`. |
+| Pydantic AI | `MCPToolset(url, headers=...).renamed({"wyrd_guide": "wyrd.guide", ...})`, one entry per discovered tool. |
+| Google ADK | Set `ADK_ENABLE_MCP_MODERN_PROTOCOL=1` (experimental in ADK) to negotiate 2026-07-28, and `GOOGLE_API_USE_CLIENT_CERTIFICATE=false` to skip ADK's Google Cloud mTLS probe. ADK has no renaming option and declares the dotted names as they are, so override `McpToolset.get_tools` to return shallow copies whose `name` is the alias; ADK still calls each copy's original MCP tool. |
 
 ## Investigation guide
 

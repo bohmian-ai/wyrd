@@ -134,7 +134,7 @@ def test_unknown_column_carries_the_planners_suggestion(
 def test_unauthorized_table_refusal_reveals_no_columns(
     wyrd_server: WyrdTestServer, live_table: str
 ) -> None:
-    datasets_only = {
+    datasets_only: dict[str, object] = {
         "resource": "bifrost_query",
         "action": "read",
         "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "datasets"}}},

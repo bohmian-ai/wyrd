@@ -107,6 +107,9 @@ importers:
 
   wyrd:
     dependencies:
+      '@openai/agents-core':
+        specifier: ^0.20.0
+        version: 0.20.0(zod@4.5.4)
       '@opentelemetry/api':
         specifier: ^1.9.1
         version: 1.9.1

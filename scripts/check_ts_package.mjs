@@ -142,9 +142,11 @@ try {
   const { stdout: importOutput } = await exec(
     process.execPath,
     ["--input-type=module", "-e", `
-      import { Bifrost, TableConfig } from "wyrd-ai";
+      import { Bifrost, TableConfig, WyrdAgentsTraceProcessor } from "wyrd-ai";
       if (typeof Bifrost.connect !== "function") throw new Error("Bifrost facade missing");
       if (typeof TableConfig !== "function") throw new Error("TableConfig missing");
+      // The clean project installs no optional peer, so this proves the Agents SDK is optional.
+      await new WyrdAgentsTraceProcessor().onTraceStart({ traceId: "trace_1", name: "workflow" });
       const resolved = import.meta.resolve("wyrd-ai");
       if (resolved.includes(".ts")) throw new Error("published export resolves to TypeScript: " + resolved);
       console.log(resolved);

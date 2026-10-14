@@ -484,6 +484,17 @@ def test_missing_opentelemetry_is_a_no_op(state: WyrdState) -> None:
         assert run.alias == "model"
 
 
+def test_otel_imports_without_the_agents_sdk() -> None:
+    """Without the optional Agents SDK, ``wyrd.otel`` still imports and builds its processor."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(sys.modules, "agents", None)
+        patch.setitem(sys.modules, "agents.tracing", None)
+        importlib.reload(wyrd.otel)
+        assert wyrd.otel.WyrdAgentsTraceProcessor.__bases__ == (object,)
+        wyrd.otel.WyrdAgentsTraceProcessor().shutdown()
+    importlib.reload(wyrd.otel)
+
+
 def _drift_reaches_the_ordinary_boundary(run: Run) -> None:
     """Emit one explicit Drift observation and assert its ordinary offline error."""
     with pytest.raises(wyrd.WyrdError) as raised:

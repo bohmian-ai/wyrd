@@ -13,7 +13,6 @@ use pyo3::types::{PyDict, PyList, PyMapping, PyModule, PyString, PyType};
 use wyrd_cards::card_ref::CardRefPy;
 use wyrd_client::observe::eval::parse_session_id;
 use wyrd_client::observe::{EvalObservationOptions, Observe, Run};
-use wyrd_client::transport::trace::with_caller_trace;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::trace::TraceContext;
 use wyrd_spec::verification::Judgment;
@@ -428,10 +427,7 @@ impl PyObserveHandle {
         let observe = self.observe();
         let caller = active_trace_context(py);
         py.detach(|| {
-            wyrd_runtime::runtime().block_on(with_caller_trace(
-                caller,
-                observe.verify_json(verifier, &json, media),
-            ))
+            wyrd_runtime::runtime().block_on(observe.verify_json(verifier, &json, media, caller))
         })
         .map(|inner| PyJudgment { inner })
         .map_err(WyrdPyError::from)

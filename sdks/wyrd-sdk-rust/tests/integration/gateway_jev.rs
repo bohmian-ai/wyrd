@@ -12,19 +12,20 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::cli;
 use wyrd_ai::gateway::{
-    GatewayOperation, ModelId, ModelRef, ProviderAdapter, ProviderAuth, ProviderCredentialName,
-    ProviderCredentialWrite, ProviderCredentialWriteSource, ProviderDeployment,
-    ProviderDeploymentName, ProviderId,
+    GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation, ModelId, ModelRef,
+    ProviderAdapter, ProviderAuth, ProviderCredentialName, ProviderCredentialWrite,
+    ProviderCredentialWriteSource, ProviderDeployment, ProviderDeploymentName, ProviderId,
 };
 use wyrd_ai::operator_connections::SecretBearer;
 use wyrd_ai::state::WyrdState;
-use wyrd_ai::{Gateway, VerificationVerdict, VerifierCounts, VerifierKind};
+use wyrd_ai::{Bifrost, Gateway, VerificationVerdict, VerifierCounts, VerifierKind, WyrdError};
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::support::{Deployment, hydrate, register};
@@ -63,11 +64,47 @@ fn chat(state: &str) -> Value {
     ]})
 }
 
-/// One agent reply, the input `reply-quality` judges.
+/// One customer question and the agent's reply, the input `reply-quality`
+/// judges.
 #[derive(Serialize)]
 struct Reply {
+    /// The customer's question.
+    question: &'static str,
     /// The reply text.
     answer: &'static str,
+}
+
+/// The `state` the native Jev Prompt renders from a [`Reply`].
+fn rendered(reply: &Reply) -> String {
+    format!("Question: {}\nAnswer: {}", reply.question, reply.answer)
+}
+
+/// The typed questions the native Jev Prompt asks about every reply.
+fn judge_questions() -> Value {
+    json!({
+        "helpful": {"type": "noul", "instructions": "Does the reply help the customer?",
+                    "criteria": {"true": "it resolves or advances the request",
+                                 "false": "it ignores or deflects the request"}},
+        "tone": {"type": "choice", "instructions": "What is the tone of the reply?",
+                 "criteria": {"polite": "courteous and respectful",
+                              "rude": "curt or dismissive"}},
+    })
+}
+
+/// A judgment's verification result beside the Jev call its judge made,
+/// joined on their Run.
+#[derive(Debug, PartialEq, Deserialize)]
+struct JudgedCall {
+    /// The result's Verifier implementation.
+    implementation: String,
+    /// The result's verdict.
+    verdict: String,
+    /// The Gateway operation the judge called.
+    operation: String,
+    /// The Gateway call's outcome.
+    outcome: String,
+    /// How many upstream attempts the Gateway call made.
+    attempt_count: i64,
 }
 
 /// A Gateway with one Jev deployment in front of a local Jev upstream.
@@ -86,9 +123,10 @@ struct Jev {
 
 impl Jev {
     /// Start the upstream and a verification-capable server, write the
-    /// `jev-key` credential with the CLI as the administrator, and deploy
+    /// `jev-key` credential with the CLI as the administrator, deploy
     /// `jev/jev-latest` serving `system_one` and the `chat_completions`
-    /// pass-through.
+    /// pass-through, and capture call metadata so every Gateway call lands
+    /// in Bifrost.
     ///
     /// # Panics
     /// Panics when a setup step fails.
@@ -163,6 +201,13 @@ impl Jev {
             })
             .await
             .expect("deployment puts");
+        Gateway::with_client(deployment.admin())
+            .put_capture_policy(&GatewayCapturePolicyWrite {
+                mode: GatewayCaptureMode::Metadata,
+                payload_fields: BTreeSet::new(),
+            })
+            .await
+            .expect("the capture policy puts");
         Self {
             deployment,
             upstream,
@@ -221,6 +266,32 @@ impl Jev {
                 )
             })
             .collect()
+    }
+
+    /// Publish every captured row, then read the verification result
+    /// `execution_id` wrote beside each Gateway call made in its Run.
+    ///
+    /// # Panics
+    /// Panics when the flush or the read fails.
+    async fn judged_calls(&self, execution_id: &str) -> Vec<JudgedCall> {
+        self.deployment
+            .server()
+            .flush_bifrost()
+            .await
+            .expect("rows publish");
+        Bifrost::connect(&self.deployment.admin())
+            .await
+            .expect("Bifrost connects")
+            .sql_as(
+                "SELECT r.implementation, r.verdict, c.operation, c.outcome, \
+                        CAST(c.attempt_count AS BIGINT) AS attempt_count \
+                   FROM vala.verification.results r \
+                   JOIN vala.gateway.calls c ON c.run_id = r.run_id \
+                  WHERE r.result_id = $1",
+                &[QueryParam::String(execution_id.to_owned())],
+            )
+            .await
+            .expect("the result joins its Jev call")
     }
 
     /// Register and hydrate the `reviewer` Service, and load it acting as
@@ -459,6 +530,7 @@ async fn jev_judge_passes_a_helpful_polite_reply() {
         .verify(
             "reply-quality",
             &Reply {
+                question: "Where is my refund?",
                 answer: "Your refund is on its way.",
             },
         )
@@ -472,7 +544,10 @@ async fn jev_judge_passes_a_helpful_polite_reply() {
     let received = jev.received().await;
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].1["model"], "jev-latest");
-    assert_eq!(received[0].1["state"], "Your refund is on its way.");
+    assert_eq!(
+        received[0].1["state"],
+        "Question: Where is my refund?\nAnswer: Your refund is on its way."
+    );
     assert_eq!(
         received[0].1["questions"]["tone"]["criteria"]["polite"],
         "courteous and respectful"
@@ -495,7 +570,13 @@ async fn jev_judge_fails_an_unhelpful_rude_reply() {
         .run_for_card("agent")
         .expect("agent run opens")
         .observe()
-        .verify("reply-quality", &Reply { answer: "Go away." })
+        .verify(
+            "reply-quality",
+            &Reply {
+                question: "Where is my refund?",
+                answer: "Go away.",
+            },
+        )
         .await
         .expect("the reply is judged");
 
@@ -515,29 +596,91 @@ async fn jev_judge_fails_an_unhelpful_rude_reply() {
     jev.deployment.shutdown().await;
 }
 
-/// A reply holding quotes and a newline is judged: the native Jev Prompt
-/// renders it into the typed `state` as text, so Jev receives it verbatim.
+/// A question and reply holding quotes and newlines are judged: the native
+/// Jev Prompt renders both into the typed `state` as escaped JSON text, so
+/// Jev receives exactly the typed request the Prompt declares, with the
+/// operator key. The judgment's verification result and the judge's one
+/// `system_one` Gateway call are both recorded.
 ///
 /// # Panics
-/// Panics when the reply is not judged or Jev receives a different state.
+/// Panics when the reply is not judged, Jev receives a different request,
+/// or either row is missing.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn jev_judge_judges_a_reply_with_quotes_and_newlines() {
     let jev = Jev::start().await;
     let (state, _bundle) = jev.reviewer().await;
-    let answer = "He said \"your refund is on its way\".\nAnything else?";
+    let reply = Reply {
+        question: "Is my \"refund\" done?\nOrder 7",
+        answer: "He said \"your refund is on its way\".\nAnything else?",
+    };
 
     let judgment = state
         .run_for_card("agent")
         .expect("agent run opens")
         .observe()
-        .verify("reply-quality", &Reply { answer })
+        .verify("reply-quality", &reply)
         .await
         .expect("a reply with quotes and newlines is judged");
+    state.shutdown().await.expect("the reviewer stops");
 
     assert_eq!(judgment.verdict, VerificationVerdict::Passed);
     let received = jev.received().await;
     assert_eq!(received.len(), 1);
-    assert_eq!(received[0].1["state"], answer);
+    assert_eq!(received[0].0.as_deref(), Some("Bearer jev-operator-key"));
+    assert_eq!(
+        received[0].1,
+        json!({"model": "jev-latest", "state": rendered(&reply), "questions": judge_questions()})
+    );
+    assert_eq!(
+        jev.judged_calls(&judgment.execution_id.to_string()).await,
+        [JudgedCall {
+            implementation: "eval".to_owned(),
+            verdict: "passed".to_owned(),
+            operation: "system_one".to_owned(),
+            outcome: "succeeded".to_owned(),
+            attempt_count: 1,
+        }]
+    );
+    jev.deployment.shutdown().await;
+}
+
+/// Jev refusing the judge's request with 400 fails the verify with the
+/// typed verification dependency failure, without relaying Jev's body, and
+/// the judge does not retry the terminal refusal although `reply-quality`
+/// allows two retries: Jev is asked exactly once.
+///
+/// # Panics
+/// Panics when the verify succeeds, the error is untyped, or Jev is asked
+/// again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn jev_judge_refusal_is_a_typed_error_without_retry() {
+    let jev = Jev::start().await;
+    let (state, _bundle) = jev.reviewer().await;
+
+    let refused = state
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .verify(
+            "reply-quality",
+            &Reply {
+                question: "Where is my refund?",
+                answer: "refused-form",
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(&refused, Err(WyrdError::VerificationDependencyFailed { message, .. })
+            if !message.contains("key cred")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        jev.received().await.len(),
+        1,
+        "a refused judge is never retried"
+    );
     jev.deployment.shutdown().await;
 }

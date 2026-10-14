@@ -99,9 +99,10 @@ impl JevClient {
 
     /// Sends a typed Jev request and decodes the typed answer.
     ///
-    /// The request is sent as given; callers validate it first with
-    /// [`skald_spec::JevRequest::validate`]. Retries follow the client's
-    /// policy.
+    /// The request is sent as given and is not validated here: a native
+    /// `systemone` caller checks it with [`skald_spec::JevRequest::validate`]
+    /// first, while the unified chat pass-through forwards it unvalidated.
+    /// Retries follow the client's policy.
     ///
     /// # Errors
     ///
@@ -133,7 +134,18 @@ impl JevClient {
 
 #[async_trait]
 impl ProviderClient for JevClient {
-    /// Sends one Jev request; see [`JevClient::send_native`].
+    /// Sends one Jev request through [`JevClient::send_native`], the single
+    /// owner of the Jev exchange.
+    ///
+    /// # Errors
+    ///
+    /// Forwards every [`JevClient::send_native`] failure unchanged:
+    /// [`ProviderError::VariantMismatch`] for a non-Jev request,
+    /// [`ProviderError::Status`] for a non-success answer,
+    /// [`ProviderError::Decode`] for an undecodable answer or invalid
+    /// credential header, and [`ProviderError::Connect`],
+    /// [`ProviderError::Timeout`], or [`ProviderError::Upstream`] when the
+    /// exchange fails.
     async fn send(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
         self.send_native(request).await
     }

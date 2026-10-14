@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
@@ -19,16 +21,20 @@ const QueryRow = z.object({ id: z.bigint(), value: z.string() });
 /** A table holding the same rows that Scribe acknowledged and nothing published. */
 const LIVE_ROWS = "vala.datasets.live_query_rows";
 
-/** Writes rows 1 to 3 of `table` through the SDK and waits for Scribe's acknowledgement. */
+/**
+ * Writes rows 1 to 3 of `table` through the SDK and waits for Scribe's
+ * acknowledgement; rows 1 and 2 share one managed `run_id`, row 3 another.
+ */
 async function writeRows(table: string): Promise<void> {
   const writer = await Bifrost.connect({ table: TableConfig.fromJsonSchema(table, QueryRowColumns) });
   await writer.register();
-  for (const [id, value] of [
-    [1, "one"],
-    [2, "two"],
-    [3, "three"],
+  const [shared, other] = [randomUUID(), randomUUID()];
+  for (const [id, value, runId] of [
+    [1, "one", shared],
+    [2, "two", shared],
+    [3, "three", other],
   ] as const) {
-    writer.insert({ id, value });
+    writer.insert({ id, value }, { runId });
   }
   await writer.flush();
   await writer.shutdown();
@@ -130,6 +136,12 @@ test.for([
     join: `SELECT a.id FROM ${LIVE_ROWS} a JOIN ${LIVE_ROWS} b ON b.id = a.id + 1 ORDER BY a.id`,
     expected: [1n, 2n],
   },
+  {
+    shape: "managed run_id",
+    subquery: `SELECT a.id FROM ${LIVE_ROWS} a WHERE EXISTS (SELECT 1 FROM ${LIVE_ROWS} b WHERE b.run_id = a.run_id AND b.id <> a.id) ORDER BY a.id`,
+    join: `SELECT DISTINCT a.id FROM ${LIVE_ROWS} a JOIN ${LIVE_ROWS} b ON b.run_id = a.run_id AND b.id <> a.id ORDER BY a.id`,
+    expected: [1n, 2n],
+  },
 ])("live table $shape subquery matches its join", async ({ subquery, join, expected }, { bifrost, live }) => {
   void live;
   expect(await ids(bifrost, subquery)).toEqual(expected);
@@ -148,6 +160,25 @@ test.for([
   await expect(bifrost.sql(sql)).rejects.toMatchObject({
     code: "WYRD_VALA_400_QUERY_INVALID_SQL",
     detail: expect.stringContaining("No field named r.valeu. Did you mean 'r.value'?"),
+  });
+});
+
+test.for([
+  {
+    fault: "type mismatch",
+    sql: `SELECT value + 1 AS n FROM ${LIVE_ROWS}`,
+    detail: "Cannot coerce arithmetic expression Utf8 + Int64",
+  },
+  {
+    fault: "ambiguous reference",
+    sql: `SELECT id FROM ${LIVE_ROWS} a JOIN ${LIVE_ROWS} b ON a.id = b.id`,
+    detail: "Ambiguous reference to unqualified field id",
+  },
+])("$fault carries the planners detail", async ({ sql, detail }, { bifrost, live }) => {
+  void live;
+  await expect(bifrost.sql(sql)).rejects.toMatchObject({
+    code: "WYRD_VALA_400_QUERY_INVALID_SQL",
+    detail: expect.stringContaining(detail),
   });
 });
 

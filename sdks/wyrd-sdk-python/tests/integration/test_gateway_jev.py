@@ -21,6 +21,8 @@ import httpx
 import openai
 import pytest
 from openai.types.chat import ChatCompletionMessageParam
+from wyrd import WyrdError
+from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 from wyrd.gateway import Gateway
 from wyrd.state import WyrdState
@@ -49,6 +51,24 @@ REFUSALS = {
     "bad-key": 401,
 }
 """State text → the status the upstream refuses it with."""
+
+
+JUDGE_QUESTIONS = {
+    "helpful": {
+        "type": "noul",
+        "instructions": "Does the reply help the customer?",
+        "criteria": {
+            "true": "it resolves or advances the request",
+            "false": "it ignores or deflects the request",
+        },
+    },
+    "tone": {
+        "type": "choice",
+        "instructions": "What is the tone of the reply?",
+        "criteria": {"polite": "courteous and respectful", "rude": "curt or dismissive"},
+    },
+}
+"""The typed questions the native Jev judge Prompt asks about every reply."""
 
 
 def answer(noul: float, tone: str) -> dict[str, Any]:
@@ -104,6 +124,8 @@ class JevUpstream(BaseHTTPRequestHandler):
 def jev() -> Iterator[tuple[WyrdTestServer, Receiver]]:
     """A verification-capable server with one Jev deployment on a local upstream.
 
+    The Gateway captures call metadata, so every judge call lands in Bifrost.
+
     Each test gets its own server: an upstream refusal cools the deployment
     down, which must not leak into the next story.
     """
@@ -136,6 +158,7 @@ def jev() -> Iterator[tuple[WyrdTestServer, Receiver]]:
                         "routing_weight": 1,
                     }
                 )
+                Gateway(admin).put_capture_policy({"mode": "metadata", "payload_fields": []})
                 yield server, recorded
     finally:
         upstream.shutdown()
@@ -313,14 +336,17 @@ def test_jev_judge_passes_a_helpful_polite_reply(
     judgment = (
         reviewer(server, reviewer_bundle)
         .run("agent")
-        .observe.verify("reply-quality", {"answer": "Your refund is on its way."})
+        .observe.verify(
+            "reply-quality",
+            {"question": "Where is my refund?", "answer": "Your refund is on its way."},
+        )
     )
 
     assert (judgment.verdict, judgment.kind) == ("passed", "eval_llm_judge")
     (delivery,) = upstream.deliveries[asked:]
     assert (delivery.body["model"], delivery.body["state"]) == (
         "jev-latest",
-        "Your refund is on its way.",
+        "Question: Where is my refund?\nAnswer: Your refund is on its way.",
     )
 
 
@@ -332,7 +358,7 @@ def test_jev_judge_fails_an_unhelpful_rude_reply(
     judgment = (
         reviewer(server, reviewer_bundle)
         .run("agent")
-        .observe.verify("reply-quality", {"answer": "Go away."})
+        .observe.verify("reply-quality", {"question": "Where is my refund?", "answer": "Go away."})
     )
 
     # The judge task itself passes; both threshold assertions fail.
@@ -351,16 +377,63 @@ def test_jev_judge_fails_an_unhelpful_rude_reply(
 def test_jev_judge_judges_a_reply_with_quotes_and_newlines(
     jev: tuple[WyrdTestServer, Receiver], reviewer_bundle: Path
 ) -> None:
+    """Quotes and newlines reach Jev as one escaped, typed request, and both rows record."""
     server, upstream = jev
     asked = len(upstream.deliveries)
+    question = 'Is my "refund" done?\nOrder 7'
     reply = 'He said "your refund is on its way".\nAnything else?'
 
     judgment = (
         reviewer(server, reviewer_bundle)
         .run("agent")
-        .observe.verify("reply-quality", {"answer": reply})
+        .observe.verify("reply-quality", {"question": question, "answer": reply})
     )
 
     assert judgment.verdict == "passed"
     (delivery,) = upstream.deliveries[asked:]
-    assert delivery.body["state"] == reply
+    assert delivery.headers["authorization"] == f"Bearer {JEV_KEY}"
+    assert delivery.body == {
+        "model": "jev-latest",
+        "state": f"Question: {question}\nAnswer: {reply}",
+        "questions": JUDGE_QUESTIONS,
+    }
+    server.flush_bifrost()
+    recorded = (
+        Bifrost(client=client_of(server))
+        .sql(
+            "SELECT r.implementation, r.verdict, c.operation, c.outcome, "
+            "CAST(c.attempt_count AS BIGINT) AS attempt_count "
+            "FROM vala.verification.results r "
+            "JOIN vala.gateway.calls c ON c.run_id = r.run_id "
+            "WHERE r.result_id = $1",
+            [judgment.execution_id],
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    assert recorded == [
+        {
+            "implementation": "eval",
+            "verdict": "passed",
+            "operation": "system_one",
+            "outcome": "succeeded",
+            "attempt_count": 1,
+        }
+    ]
+
+
+def test_jev_judge_refusal_is_a_typed_error_without_retry(
+    jev: tuple[WyrdTestServer, Receiver], reviewer_bundle: Path
+) -> None:
+    """A Jev 400 fails the verify with a typed error, and the judge never retries it."""
+    server, upstream = jev
+    asked = len(upstream.deliveries)
+
+    with pytest.raises(WyrdError) as raised:
+        reviewer(server, reviewer_bundle).run("agent").observe.verify(
+            "reply-quality", {"question": "Where is my refund?", "answer": "refused-form"}
+        )
+
+    assert raised.value.code == "WYRD_VERIFICATION_502_DEPENDENCY_FAILED"
+    assert "key cred" not in str(raised.value)
+    assert len(upstream.deliveries[asked:]) == 1

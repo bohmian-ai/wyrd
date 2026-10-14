@@ -5,11 +5,12 @@ metadata:
   version: 1.0.0
   space: default
 spec:
+  provider: jev
   request:
     provider: jev_system_one
     body:
       model: jev-latest
-      state: ${answer}
+      state: "Question: ${question}\nAnswer: ${answer}"
       questions:
         helpful:
           type: noul
@@ -24,5 +25,5 @@ spec:
             polite: courteous and respectful
             rude: curt or dismissive
   model: jev-latest
-  variables: [answer]
+  variables: [question, answer]
   media_variables: []

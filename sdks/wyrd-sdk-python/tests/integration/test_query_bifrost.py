@@ -1,8 +1,11 @@
 """A caller queries Bifrost with bound parameters, as model rows or as an Arrow stream.
 
 ``query_table`` holds rows 1-3 written through the SDK and published;
-``live_table`` holds the same rows acknowledged by Scribe and never published.
+``live_table`` holds the same rows acknowledged by Scribe and never published,
+rows 1 and 2 under one managed ``run_id`` and row 3 under another.
 """
+
+import uuid
 
 import pytest
 from wyrd import WyrdError
@@ -19,11 +22,15 @@ LIVE_ROWS = "vala.datasets.live_query_rows"
 
 @pytest.fixture(scope="module")
 def live_table(wyrd_server: WyrdTestServer) -> str:
-    """A ``vala.datasets`` table holding rows 1-3 that only Scribe's live tail serves."""
+    """A ``vala.datasets`` table holding rows 1-3 that only Scribe's live tail serves.
+
+    Rows 1 and 2 share one managed ``run_id`` and row 3 carries another.
+    """
     writer = Bifrost(TableConfig(QueryRow, LIVE_ROWS))
     writer.register()
-    for row_id, value in ((1, "one"), (2, "two"), (3, "three")):
-        writer.insert({"id": row_id, "value": value})
+    shared, other = str(uuid.uuid4()), str(uuid.uuid4())
+    for row_id, value, run_id in ((1, "one", shared), (2, "two", shared), (3, "three", other)):
+        writer.insert({"id": row_id, "value": value}, {"run_id": run_id})
     writer.flush()
     writer.shutdown()
     return LIVE_ROWS
@@ -102,8 +109,16 @@ def ids(bifrost: Bifrost, sql: str) -> list[int]:
             f"SELECT a.id FROM {LIVE_ROWS} a JOIN {LIVE_ROWS} b ON b.id = a.id + 1 ORDER BY a.id",
             [1, 2],
         ),
+        (
+            f"SELECT a.id FROM {LIVE_ROWS} a WHERE EXISTS "
+            f"(SELECT 1 FROM {LIVE_ROWS} b WHERE b.run_id = a.run_id AND b.id <> a.id) "
+            "ORDER BY a.id",
+            f"SELECT DISTINCT a.id FROM {LIVE_ROWS} a JOIN {LIVE_ROWS} b "
+            "ON b.run_id = a.run_id AND b.id <> a.id ORDER BY a.id",
+            [1, 2],
+        ),
     ],
-    ids=["scalar", "in", "exists"],
+    ids=["scalar", "in", "exists", "managed_run_id"],
 )
 def test_live_table_subqueries_match_their_joins(
     bifrost: Bifrost, live_table: str, subquery: str, join: str, expected: list[int]
@@ -131,10 +146,33 @@ def test_unknown_column_carries_the_planners_suggestion(
     assert "No field named r.valeu. Did you mean 'r.value'?" in refused.value.detail
 
 
+@pytest.mark.parametrize(
+    ("sql", "detail"),
+    [
+        (
+            f"SELECT value + 1 AS n FROM {LIVE_ROWS}",
+            "Cannot coerce arithmetic expression Utf8 + Int64",
+        ),
+        (
+            f"SELECT id FROM {LIVE_ROWS} a JOIN {LIVE_ROWS} b ON a.id = b.id",
+            "Ambiguous reference to unqualified field id",
+        ),
+    ],
+    ids=["type_mismatch", "ambiguous_reference"],
+)
+def test_type_mismatch_and_ambiguous_reference_carry_the_planners_detail(
+    bifrost: Bifrost, live_table: str, sql: str, detail: str
+) -> None:
+    with pytest.raises(WyrdError) as refused:
+        bifrost.sql(sql)
+    assert refused.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL"
+    assert detail in refused.value.detail
+
+
 def test_unauthorized_table_refusal_reveals_no_columns(
     wyrd_server: WyrdTestServer, live_table: str
 ) -> None:
-    datasets_only = {
+    datasets_only: dict[str, object] = {
         "resource": "bifrost_query",
         "action": "read",
         "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "datasets"}}},

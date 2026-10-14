@@ -615,6 +615,63 @@ async fn public_gateway_call_carries_run_and_card_uid() {
     );
 }
 
+/// A gateway call made inside a `tracing` span carrying a valid
+/// OpenTelemetry context sends no `traceparent` or `tracestate`: only a
+/// verify request carries the caller's trace context.
+///
+/// # Panics
+/// Panics when the call fails, the ambient span is not valid, or a trace
+/// header is sent.
+#[tokio::test]
+async fn public_gateway_call_does_not_inject_ambient_trace_context() {
+    use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+    use tracing::Instrument as _;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        ResponseTemplate::new(200).set_body_json(chat_answer()),
+        1,
+    )
+    .await;
+    let traced = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(
+                opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                    .build()
+                    .tracer("workflow-transport"),
+            ),
+        ),
+    );
+    let ambient = tracing::dispatcher::with_default(&traced, || tracing::info_span!("caller"));
+    let valid = tracing::dispatcher::with_default(&traced, || {
+        ambient.context().span().span_context().is_valid()
+    });
+    assert!(
+        valid,
+        "the ambient span carries a valid OpenTelemetry context"
+    );
+    let token = CancellationToken::new();
+    PublicWyrdGatewayCaller::new(client(&server.uri()))
+        .call(
+            gateway_call(chat_request(), "openai/gpt-a", None, Duration::from_secs(5)),
+            &token,
+        )
+        .instrument(ambient)
+        .with_subscriber(traced)
+        .await
+        .expect("the call answers");
+    let requests = received(&server).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].headers.get("traceparent"), None);
+    assert_eq!(requests[0].headers.get("tracestate"), None);
+}
+
 /// Concurrent public gateway calls keep their own fallback, deadline, and
 /// model; each dialect reaches its ingress with the call's model; Vertex,
 /// cancellation, and timeouts stop locally; native error envelopes become

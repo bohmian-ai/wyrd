@@ -34,6 +34,7 @@ execution is connected back to its originating state where possible.
   as SYSTEM instead of the observation writer (`writer_caller`). The authority
   stays unchanged until the owner decides, based on evidence about
   permissions and spend.
+- Superseded by the approved `sub-act-attribution` change (2026-10-14): FIND-1 and FIND-6 of the integrated review are closed by it, not fixed here.
 
 ## OD-2 Gateway attribution is optional context
 

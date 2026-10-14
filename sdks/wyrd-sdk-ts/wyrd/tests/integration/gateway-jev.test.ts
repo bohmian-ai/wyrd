@@ -5,7 +5,7 @@ import { join } from "node:path";
 import OpenAI from "openai";
 import { expect, vi } from "vitest";
 
-import { Cards, Gateway, WyrdClient, WyrdState } from "wyrd-ai";
+import { Bifrost, Cards, Gateway, WyrdClient, WyrdState } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
@@ -24,6 +24,20 @@ const QUESTIONS = {
     type: "choice",
     instructions: "What is the tone of the reply?",
     criteria: { polite: "courteous", rude: "curt" },
+  },
+};
+
+/** The typed questions the native Jev judge Prompt asks about every reply. */
+const JUDGE_QUESTIONS = {
+  helpful: {
+    type: "noul",
+    instructions: "Does the reply help the customer?",
+    criteria: { true: "it resolves or advances the request", false: "it ignores or deflects the request" },
+  },
+  tone: {
+    type: "choice",
+    instructions: "What is the tone of the reply?",
+    criteria: { polite: "courteous and respectful", rude: "curt or dismissive" },
   },
 };
 
@@ -92,7 +106,8 @@ function chat(state: string): OpenAI.Chat.ChatCompletionMessageParam[] {
 
 /**
  * A verification-capable server with one Jev deployment serving
- * `system_one` and the `chat_completions` pass-through, and the hydrated
+ * `system_one` and the `chat_completions` pass-through, call metadata
+ * captured so every judge call lands in Bifrost, and the hydrated
  * `reviewer` Service acting as its own Card-scoped key.
  */
 const test = serverTest({ provider: jev, verificationRuntime: true }).extend<{ reviewer: WyrdState }>({
@@ -111,6 +126,7 @@ const test = serverTest({ provider: jev, verificationRuntime: true }).extend<{ r
         capabilities: ["system_one", "chat_completions"],
         routing_weight: 1,
       });
+      await Gateway.connect().putCapturePolicy({ mode: "metadata", payload_fields: [] });
       const cards = Cards.connect();
       const receipt = await cards.registerFromPath(fixture("cards/gateway_jev/reviewer.yaml"));
       const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-reviewer-"));
@@ -181,15 +197,20 @@ test("jev judge passes a helpful polite reply", async ({ provider, reviewer }) =
 
   const judgment = await reviewer
     .run("agent")
-    .observe.verify("reply-quality", { answer: "Your refund is on its way." });
+    .observe.verify("reply-quality", { question: "Where is my refund?", answer: "Your refund is on its way." });
 
   expect(judgment).toMatchObject({ passed: true, verdict: "passed", kind: "eval_llm_judge" });
   const [upstream] = provider.received.slice(before);
-  expect(JSON.parse(upstream?.body ?? "")).toMatchObject({ model: "jev-latest", state: "Your refund is on its way." });
+  expect(JSON.parse(upstream?.body ?? "")).toMatchObject({
+    model: "jev-latest",
+    state: "Question: Where is my refund?\nAnswer: Your refund is on its way.",
+  });
 });
 
 test("jev judge fails an unhelpful rude reply", async ({ reviewer }) => {
-  const judgment = await reviewer.run("agent").observe.verify("reply-quality", { answer: "Go away." });
+  const judgment = await reviewer
+    .run("agent")
+    .observe.verify("reply-quality", { question: "Where is my refund?", answer: "Go away." });
 
   // The judge task itself passes; both threshold assertions fail.
   expect(judgment).toMatchObject({
@@ -199,16 +220,51 @@ test("jev judge fails an unhelpful rude reply", async ({ reviewer }) => {
   });
 });
 
-test("jev judge judges a reply with quotes and newlines", async ({ provider, reviewer }) => {
+test("jev judge judges a reply with quotes and newlines", async ({ server, provider, reviewer }) => {
   const before = provider.received.length;
+  const question = 'Is my "refund" done?\nOrder 7';
   const reply = 'He said "your refund is on its way".\nAnything else?';
 
-  const judgment = await reviewer.run("agent").observe.verify("reply-quality", { answer: reply });
+  const judgment = await reviewer.run("agent").observe.verify("reply-quality", { question, answer: reply });
 
   expect(judgment).toMatchObject({ passed: true, verdict: "passed" });
   const [upstream, ...rest] = provider.received.slice(before);
   expect(rest).toEqual([]);
-  expect(JSON.parse(upstream?.body ?? "")).toMatchObject({ state: reply });
+  expect(upstream?.headers.authorization).toBe(`Bearer ${JEV_KEY}`);
+  expect(JSON.parse(upstream?.body ?? "")).toEqual({
+    model: "jev-latest",
+    state: `Question: ${question}\nAnswer: ${reply}`,
+    questions: JUDGE_QUESTIONS,
+  });
+  server.flushBifrost();
+  const recorded = (
+    await (
+      await Bifrost.connect()
+    ).sql(
+      "SELECT r.implementation, r.verdict, c.operation, c.outcome, CAST(c.attempt_count AS INT) AS attempt_count " +
+        "FROM vala.verification.results r JOIN vala.gateway.calls c ON c.run_id = r.run_id " +
+        "WHERE r.result_id = $1",
+      [judgment.execution_id],
+    )
+  )
+    .toArrow()
+    .toArray()
+    .map((row) => row.toJSON());
+  expect(recorded).toEqual([
+    { implementation: "eval", verdict: "passed", operation: "system_one", outcome: "succeeded", attempt_count: 1 },
+  ]);
+});
+
+test("jev judge refusal is a typed error without retry", async ({ provider, reviewer }) => {
+  const before = provider.received.length;
+
+  const refused = reviewer
+    .run("agent")
+    .observe.verify("reply-quality", { question: "Where is my refund?", answer: "refused-form" });
+
+  await expect(refused).rejects.toMatchObject({ code: "WYRD_VERIFICATION_502_DEPENDENCY_FAILED" });
+  await expect(refused).rejects.not.toThrow(/key cred/);
+  expect(provider.received.length).toBe(before + 1);
 });
 
 /** The OpenAI client error a Chat Completions call to the Jev model about `state` rejects with. */

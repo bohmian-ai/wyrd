@@ -110,10 +110,16 @@ execution's context, not from whether a Run exists.
   `llm_judge` call through `ServerWyrdGatewayCaller`) records the
   execution's subject Card as `card_uid` and its `run_id` when present, for
   direct, observation, and scheduled executions alike.
-- Every Verifier execution records its requesting principal: the
-  verification result carries `requested_by_principal_id`, and
-  `wyrd.verifier_runs` records the principal a scheduled or observation run
-  executes as. The result joins its judge calls on
+- Every Verifier execution records its actor as
+  `requested_by_principal_id` on the verification result and on
+  `wyrd.verifier_runs`. Actor = the authenticated caller for a manual run or
+  a direct execution; actor = the tenant SYSTEM principal for work Wyrd
+  starts internally (a scheduled or observation-triggered run). Origin =
+  references only: `run_id`, subject `card_uid`, `source_record_id`, and the
+  binding, owner, and Trigger; no second principal (such as the observation
+  writer) is copied onto runs or results. An observation-triggered
+  execution's span links to the observation's stored trace and span when the
+  record has them. The result joins its judge calls on
   `subject_card_uid` = `card_uid`.
 - No binding enforcement or new authorization is added; direct-execution
   authorization is unchanged.

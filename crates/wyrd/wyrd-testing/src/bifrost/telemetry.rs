@@ -2747,6 +2747,7 @@ mod tests {
             duration_nanos: 1,
             status: wyrd_telemetry::CapturedSpanStatus::Unset,
             events: Vec::new(),
+            links: Vec::new(),
         }
     }
 

@@ -719,6 +719,9 @@ async fn observation_runs_are_unique_per_input_record() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
+    let system = provision_system_principal(&mut conn)
+        .await
+        .expect("the tenant SYSTEM principal provisions");
     let (owner, _) = register_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "eval", eval()).await;
     let binding = bind(
@@ -731,7 +734,6 @@ async fn observation_runs_are_unique_per_input_record() {
     .await;
     let event_time = at(22, 11, 59);
     let observation = |record: &str| RunRequest::Observation {
-        requested_by: actor.id,
         binding_id: binding,
         record_id: record.to_owned(),
         event_time,
@@ -761,7 +763,11 @@ async fn observation_runs_are_unique_per_input_record() {
     let claimed = claim(&queue, &mut conn).await;
     assert_eq!(claimed.lease.run_id, run);
     assert_eq!(claimed.origin, RunOrigin::Observation);
-    assert_eq!(claimed.requested_by, Some(actor.id));
+    assert_eq!(
+        claimed.requested_by,
+        Some(PrincipalId::new(system)),
+        "an observation-triggered run records the SYSTEM actor"
+    );
     assert_eq!(
         claimed.input,
         RunInput::EvalRecord {
@@ -836,7 +842,6 @@ async fn observation_ordinal_is_fixed_at_serialized_enqueue() {
     setup.commit().await.expect("setup commits");
     let event_time = at(22, 11, 59);
     let observation = |record: &str| RunRequest::Observation {
-        requested_by: actor.id,
         binding_id: binding,
         record_id: record.to_owned(),
         event_time,
@@ -1728,13 +1733,11 @@ async fn claim_reports_postgres_measured_queue_wait_and_age() {
 }
 
 /// One committed record of `subject` written by a principal bound to
-/// `writer`, whose id stands in as the writer's UUID; the requester column
-/// carries no foreign key.
+/// `writer`.
 fn record(subject: &CardUid, writer: &CardUid, record_id: &str) -> ObservationRecord {
     ObservationRecord {
         subject: subject.clone(),
         writer: Some(writer.clone()),
-        principal: PrincipalId::new(writer.as_uuid()),
         record_id: record_id.to_owned(),
         event_time: at(22, 11, 59),
     }
@@ -1774,6 +1777,9 @@ async fn observation_batches_insert_once_per_binding_and_record() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
+    let system = provision_system_principal(&mut conn)
+        .await
+        .expect("the tenant SYSTEM principal provisions");
     let assertion = register_verifier(&mut conn, &actor, "assertion", eval()).await;
     let judge = register_verifier(&mut conn, &actor, "judge", eval()).await;
     let drift = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
@@ -1873,8 +1879,8 @@ async fn observation_batches_insert_once_per_binding_and_record() {
     .expect("requesters read");
     assert_eq!(
         requesters,
-        [Some(live.as_uuid())],
-        "every run records its record's writing principal"
+        [Some(system)],
+        "every observation-triggered run records the SYSTEM actor, not the writer"
     );
 }
 
@@ -2104,7 +2110,6 @@ async fn trace_wait_requeues_until_deadline_then_times_out() {
             .enqueue(
                 &mut conn,
                 &RunRequest::Observation {
-                    requested_by: actor.id,
                     binding_id: binding,
                     record_id: "record-1".to_owned(),
                     event_time: at(22, 11, 59),

@@ -147,10 +147,10 @@ pub struct ResultRun<'a> {
     pub verifier_version: &'a str,
     /// Verified subject Card.
     pub subject_card_uid: &'a CardUid,
-    /// The principal that requested the execution and that it ran as,
-    /// stored as `requested_by_principal_id`: a direct execution's caller,
-    /// or a claimed run's frozen requester; `None` only for a run enqueued
-    /// before every origin recorded one.
+    /// The execution's actor, stored as `requested_by_principal_id`: a
+    /// direct execution's caller, or a claimed run's frozen actor (a manual
+    /// run's caller, or the tenant SYSTEM principal of internal work);
+    /// `None` when an internal run's tenant had no SYSTEM principal.
     pub requested_by: Option<PrincipalId>,
     /// Binding owner; `None` for a direct run.
     pub owner_card_uid: Option<&'a CardUid>,

@@ -224,7 +224,8 @@ fn api_key(bootstrap: Bootstrap) -> String {
     }
 }
 
-/// Emit one Eval record from `view` with optional media JSON and trace.
+/// Emit one Eval record from `view` with optional media JSON and trace; a
+/// traced record names [`OBSERVED_SPAN`] as its span within that trace.
 ///
 /// # Panics
 /// Panics when the options or the emit are refused.
@@ -232,7 +233,7 @@ fn emit(view: &Run, context: &Value, media: Option<&str>, trace: Option<&str>) {
     view.observe()
         .eval(
             context,
-            EvalObservationOptions::from_parts(None, media, trace, None)
+            EvalObservationOptions::from_parts(None, media, trace, trace.map(|_| OBSERVED_SPAN))
                 .expect("journey options parse"),
         )
         .expect("eval emits");
@@ -1404,6 +1405,8 @@ const EVIDENCE_TRACE: &str = "7d0a111920253035a5b5c5d5e5f50515";
 const LINKED_TRACE: &str = "8e1b222a31364146b6c6d6e6f6061626";
 /// Span the evidence trace's first span links to.
 const LINKED_SPAN: &str = "2b3c4d5e6f708192";
+/// Span every traced emitted record names as the one it was observed in.
+const OBSERVED_SPAN: &str = "3c4d5e6f70819203";
 /// Trace holding exactly the server's span ceiling.
 const CEILING_TRACE: &str = "9f2c333b42475257c7d7e7f707172737";
 /// Trace holding one span more than the server's span ceiling.
@@ -1687,7 +1690,10 @@ async fn system_reads(
 /// time out awaiting their trace. A second
 /// in-window record over the same trace, scored by a restarted runtime,
 /// produces identical canonical items. Every input read before and after the
-/// restart is audited as the tenant's one stored System principal.
+/// restart is audited as the tenant's one stored System principal. The
+/// emitted record's execution span links to the observation's trace and span
+/// without joining that trace, and the raw records, which carry no span,
+/// link nothing.
 ///
 /// # Errors
 /// Returns server, registration, query, or fixture errors, or a description of
@@ -1696,6 +1702,8 @@ async fn system_reads(
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), ServerJourneyError> {
     let journey = TraceJourney::start().await?;
+    let (_telemetry, capture) = wyrd_testing::bifrost::shared_process_telemetry_for_test()?;
+    let traced = capture.checkpoint()?;
     let mut first = span_at(EVIDENCE_TRACE, "first-span", 1, 0);
     first.events = vec![wyrd_tonic::otlp::trace::v1::span::Event {
         time_unix_nano: *EVIDENCE_START + 500,
@@ -1755,6 +1763,27 @@ async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), Se
     }
     let run = run_of(&runs, "eval-trace-evidence", &evidence)?;
     assert_completed(&journey.server, journey.tenant, run, "passed", (6, 0), 0).await?;
+    let observed = (EVIDENCE_TRACE.to_owned(), OBSERVED_SPAN.to_owned());
+    let engines = capture
+        .spans_since(&traced)
+        .into_iter()
+        .filter(|span| span.name == "verification.engine")
+        .collect::<Vec<_>>();
+    let (linked, unlinked): (Vec<_>, Vec<_>) =
+        engines.iter().partition(|span| !span.links.is_empty());
+    if linked.is_empty()
+        || unlinked.is_empty()
+        || linked.iter().any(|span| {
+            span.links.as_slice() != std::slice::from_ref(&observed)
+                || span.trace_id == EVIDENCE_TRACE
+        })
+    {
+        return Err(format!(
+            "the emitted record's execution must link, not join, its observation \
+             span {observed:?}, and spanless records link nothing: {engines:#?}"
+        )
+        .into());
+    }
     let items = journey.items(run.state.result_id).await?;
     let expected = [
         "event=\"retrieval\"".to_owned(),

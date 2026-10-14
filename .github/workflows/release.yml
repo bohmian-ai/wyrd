@@ -36,7 +36,7 @@ jobs:
       package_server: ${{ steps.filter.outputs.package_server }}
       package_crates: ${{ steps.filter.outputs.package_crates }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -83,19 +83,20 @@ jobs:
     if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_python == 'true') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           ignore-nothing-to-cache: true
 
       - run: pip install "twine>=6.1.0" "packaging>=24.2"
 
-      - uses: arduino/setup-protoc@v3
+      # protoc at the version mise.toml pins.
+      - uses: jdx/mise-action@v5
         with:
-          version: "33.2"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          install_args: protoc
+          cache: true
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
@@ -112,7 +113,7 @@ jobs:
           twine check --strict ./*
           shasum -a 256 ./* | sed 's|  \./|  |' | sudo tee SHA256SUMS.pypi_sdist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pypi_sdist
           path: sdks/wyrd-sdk-python/dist
@@ -134,9 +135,9 @@ jobs:
             docker-options: "-e CI"
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           ignore-nothing-to-cache: true
@@ -180,7 +181,7 @@ jobs:
         working-directory: sdks/wyrd-sdk-python/dist
         run: shasum -a 256 ./*.whl | sed 's|  \./|  |' | sudo tee SHA256SUMS.pypi_ubuntu_${{ matrix.target }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pypi_ubuntu_${{ matrix.target }}
           path: sdks/wyrd-sdk-python/dist
@@ -198,19 +199,20 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           ignore-nothing-to-cache: true
 
       - run: pip install "twine>=6.1.0" "packaging>=24.2"
 
-      - uses: arduino/setup-protoc@v3
+      # protoc at the version mise.toml pins.
+      - uses: jdx/mise-action@v5
         with:
-          version: "33.2"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          install_args: protoc
+          cache: true
 
       - run: brew install libomp curl openssl pkg-config
 
@@ -229,7 +231,7 @@ jobs:
         working-directory: sdks/wyrd-sdk-python/dist
         run: shasum -a 256 ./*.whl | sed 's|  \./|  |' > SHA256SUMS.pypi_macos_${{ matrix.target }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pypi_macos_${{ matrix.target }}
           path: sdks/wyrd-sdk-python/dist
@@ -240,7 +242,7 @@ jobs:
     needs: [build-sdist, build-linux, build-macos]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: pypi_*
           merge-multiple: true
@@ -256,13 +258,13 @@ jobs:
         os: [ubuntu, macos]
     runs-on: ${{ matrix.os }}-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: pypi_${{ matrix.os }}_*
           merge-multiple: true
@@ -289,7 +291,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -300,13 +302,13 @@ jobs:
           echo "crate version: v$VERSION  tag: ${{ github.ref_name }}"
           test "v$VERSION" = "${{ github.ref_name }}"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - run: pip install "twine>=6.1.0" "packaging>=24.2"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: pypi_*
           merge-multiple: true
@@ -315,7 +317,7 @@ jobs:
       - name: Verify the tested package bytes
         run: bash .github/scripts/verify-release-artifacts.sh dist
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*.whl, dist/*.tar.gz
 
@@ -350,22 +352,23 @@ jobs:
             package: darwin-arm64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 11.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: sdks/wyrd-sdk-ts/pnpm-lock.yaml
 
-      - uses: arduino/setup-protoc@v3
+      # protoc at the version mise.toml pins.
+      - uses: jdx/mise-action@v5
         with:
-          version: "33.2"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          install_args: protoc
+          cache: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -421,7 +424,7 @@ jobs:
         shell: bash
         run: (cd dist && shasum -a 256 ./*.tgz | sed 's|  \./|  |' > SHA256SUMS.typescript_${{ matrix.package }})
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: typescript-${{ matrix.package }}
           path: |
@@ -442,9 +445,9 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
@@ -452,7 +455,7 @@ jobs:
       - name: Verify version matches release tag
         run: test "v$(node -p 'require("./sdks/wyrd-sdk-ts/wyrd/package.json").version')" = "${{ github.ref_name }}"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: typescript-*
           path: dist
@@ -460,7 +463,7 @@ jobs:
       - name: Verify the tested package bytes
         run: for dir in dist/typescript-*; do bash .github/scripts/verify-release-artifacts.sh "$dir"; done
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/typescript-*/*.tgz
 
@@ -515,9 +518,9 @@ jobs:
         if: runner.os == 'Linux' && !matrix.container
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev pkg-config
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: jdx/mise-action@v3
+      - uses: jdx/mise-action@v5
         with:
           install_args: rust protoc cmake
           cache: true
@@ -535,7 +538,7 @@ jobs:
           tar -tzf "$BUNDLE" | grep -qx './wyrd-server'
           shasum -a 256 "$BUNDLE" > SHA256SUMS.wyrd-server-${{ matrix.bundle }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wyrd-server-${{ matrix.bundle }}
           path: |
@@ -582,11 +585,11 @@ jobs:
     env:
       IMAGE: wyrdai/wyrd:${{ matrix.distro }}-${{ matrix.arch }}-${{ github.event.release.tag_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: wyrd-server-${{ matrix.bundle }}
           path: ./artifacts
@@ -599,7 +602,7 @@ jobs:
           mkdir -p release
           tar -xzf ./artifacts/wyrd-server-${{ matrix.bundle }}.tar.gz -C release
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
@@ -607,7 +610,7 @@ jobs:
       # The image is new bytes built from the verified bundle, so it is
       # smoke-tested locally and published as that exact digest.
       - name: Build image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/official/${{ matrix.distro }}/Dockerfile
@@ -628,7 +631,7 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "$IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-name: index.docker.io/wyrdai/wyrd
           subject-digest: ${{ steps.push.outputs.digest }}
@@ -645,9 +648,9 @@ jobs:
     env:
       TAG: ${{ github.event.release.tag_name }}
     steps:
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
@@ -677,9 +680,9 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: wyrd-server-*
           merge-multiple: true
@@ -706,7 +709,7 @@ jobs:
           openssl pkeyutl -sign -inkey "$key" -rawin -in checksums.txt -out checksums.txt.sig
           openssl pkeyutl -verify -pubin -inkey "$PUBLIC_KEY" -rawin -in checksums.txt -sigfile checksums.txt.sig
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*.tar.gz
 
@@ -726,9 +729,9 @@ jobs:
     if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_crates == 'true') }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: jdx/mise-action@v3
+      - uses: jdx/mise-action@v5
         with:
           install: true
           cache: true
@@ -741,7 +744,7 @@ jobs:
           cp target/package/*.crate dist/
           (cd dist && shasum -a 256 ./*.crate | sed 's|  \./|  |' > SHA256SUMS.rust-crates)
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rust-crates
           path: dist
@@ -758,7 +761,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -769,12 +772,12 @@ jobs:
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev pkg-config
 
-      - uses: jdx/mise-action@v3
+      - uses: jdx/mise-action@v5
         with:
           install: true
           cache: true
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: rust-crates
           path: dist
@@ -787,7 +790,7 @@ jobs:
           cargo package --locked --no-verify $(python3 -c 'import tomllib; print(" ".join("-p " + p["name"] for p in tomllib.load(open("release-plz.toml", "rb"))["package"] if p.get("publish")))')
           (cd target/package && sha256sum --check --strict ../../dist/SHA256SUMS.rust-crates)
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*.crate
 

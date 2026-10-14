@@ -40,25 +40,25 @@ jobs:
     steps:
       # Full history: page update dates come from each page's last commit, and a
       # shallow clone would date every page to the tip commit.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       # Toolchain (node, pnpm) comes from mise.toml — do not pin here.
       - name: Set up mise
-        uses: jdx/mise-action@v3
+        uses: jdx/mise-action@v5
         with:
           install: true
           cache: true
 
       - name: Install uv and Python
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v10
         with:
           enable-cache: true
           python-version: "3.12"
 
       - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Install docs dependencies
         run: mise run docs:install
@@ -72,7 +72,7 @@ jobs:
         run: mise run docs:build
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: docs/build
 
@@ -87,4 +87,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

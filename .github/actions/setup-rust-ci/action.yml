@@ -43,7 +43,7 @@ runs:
   steps:
     - name: Free disk space
       if: inputs.free-disk == 'true' && runner.os == 'Linux'
-      uses: jlumbroso/free-disk-space@main
+      uses: jlumbroso/free-disk-space@v2
       with:
         tool-cache: ${{ inputs.tool-cache }}
         android: true
@@ -68,7 +68,7 @@ runs:
         free -h
 
     - name: Set up mise
-      uses: jdx/mise-action@v3
+      uses: jdx/mise-action@v5
       with:
         install: true
         cache: true

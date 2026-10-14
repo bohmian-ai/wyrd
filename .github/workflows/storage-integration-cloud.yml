@@ -51,14 +51,14 @@ jobs:
     environment: storage-integration
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
         with:
           docker-images: "false"
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_CLOUD_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_CLOUD_REGION }}
@@ -74,7 +74,7 @@ jobs:
     environment: storage-integration
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -92,14 +92,14 @@ jobs:
     environment: storage-integration
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-rust-ci
         with:
           docker-images: "false"
 
       - name: Authenticate to Azure (OIDC)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLOUD_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_CLOUD_TENANT_ID }}

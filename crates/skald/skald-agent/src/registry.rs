@@ -35,6 +35,10 @@ pub fn system_messages(prompt: &str, provider: &ProviderName) -> AgentResult<Vec
                 }],
             })])
         }
+        ProviderName::Jev => Err(AgentError::Prompt {
+            agent: "jev".to_owned(),
+            detail: "jev answers keyed questions and takes no system messages".to_owned(),
+        }),
         ProviderName::Custom(provider) => Err(AgentError::Prompt {
             agent: provider.clone(),
             detail: "custom providers must author the system content into the prompt directly"

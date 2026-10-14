@@ -3016,8 +3016,8 @@ export interface ProviderCredentialView {
 
 /**
  * Provider wire adapter; built-in adapters require their reserved provider.
- * `jev` serves `system_one` and a `chat_completions` projection whose single
- * user message is the JSON text of `{state, questions}`.
+ * `jev` serves `system_one` only: typed `{model, state, questions}` requests
+ * answered by typed `answers`.
  */
 export type ProviderAdapter =
   | "openai"

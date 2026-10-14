@@ -7,6 +7,7 @@ use crate::wire::google_embeddings::GoogleBatchEmbedRequest;
 use crate::wire::google_generate::{
     GoogleFunctionDeclaration, GoogleGenerateContentRequest, GoogleTool,
 };
+use crate::wire::jev::JevRequest;
 use crate::wire::openai_chat::OpenAiChatRequest;
 use crate::wire::openai_chat::{OpenAiFunction, OpenAiTool};
 use crate::wire::openai_embeddings::OpenAiEmbeddingsRequest;
@@ -42,6 +43,8 @@ pub enum ProviderRequest {
     GoogleBatchEmbed(GoogleBatchEmbedRequest),
     /// Vertex Predict request.
     VertexPredict(VertexPredictRequest),
+    /// TypeSafe Jev `systemone` keyed questions about a state.
+    JevSystemOne(JevRequest),
     /// Raw provider request body that no typed variant models.
     RawV1 {
         /// Provider dispatch target for the raw body.
@@ -64,6 +67,8 @@ pub enum ProviderName {
     Google,
     /// Google Vertex AI provider.
     Vertex,
+    /// TypeSafe Jev provider.
+    Jev,
     /// Provider not modeled by skald-spec.
     Custom(String),
 }
@@ -85,6 +90,7 @@ impl Serialize for ProviderName {
             Self::Anthropic => serializer.serialize_unit_variant("ProviderName", 1, "anthropic"),
             Self::Google => serializer.serialize_unit_variant("ProviderName", 2, "google"),
             Self::Vertex => serializer.serialize_unit_variant("ProviderName", 3, "vertex"),
+            Self::Jev => serializer.serialize_unit_variant("ProviderName", 4, "jev"),
             Self::Custom(name) => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("custom", name)?;
@@ -119,6 +125,7 @@ impl ProviderRequest {
             Self::AnthropicMessage(_) => ProviderName::Anthropic,
             Self::GeminiGenerateContent(_) | Self::GoogleBatchEmbed(_) => ProviderName::Google,
             Self::VertexPredict(_) => ProviderName::Vertex,
+            Self::JevSystemOne(_) => ProviderName::Jev,
             Self::RawV1 { provider, .. } => provider.clone(),
         }
     }
@@ -146,6 +153,7 @@ impl ProviderRequest {
             Self::OpenAiEmbeddings(_)
             | Self::GoogleBatchEmbed(_)
             | Self::VertexPredict(_)
+            | Self::JevSystemOne(_)
             | Self::RawV1 { .. } => {}
         }
 
@@ -287,6 +295,7 @@ mod round_trip {
             ProviderName::Anthropic,
             ProviderName::Google,
             ProviderName::Vertex,
+            ProviderName::Jev,
             ProviderName::Custom("mock".to_owned()),
         ] {
             let yaml = serde_yaml::to_string(&provider).unwrap();
@@ -354,6 +363,10 @@ mod round_trip {
             (
                 "google_batch_embed",
                 serde_json::to_value(common::anthropic_request()),
+            ),
+            (
+                "jev_system_one",
+                serde_json::to_value(common::openai_chat_request()),
             ),
         ];
         for (provider, body) in mismatches {
@@ -592,6 +605,13 @@ mod untagged_dispatch {
             )
             .unwrap(),
             ProviderResponse::GeminiGenerateContent(_)
+        ));
+        assert!(matches!(
+            serde_json::from_value::<ProviderResponse>(
+                serde_json::to_value(common::jev_response()).unwrap()
+            )
+            .unwrap(),
+            ProviderResponse::JevSystemOne(_)
         ));
     }
 }

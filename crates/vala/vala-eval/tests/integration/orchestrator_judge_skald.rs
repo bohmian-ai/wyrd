@@ -429,3 +429,93 @@ impl Provider for SlowProvider {
 }
 
 fn _assert_json_value(_: &Value) {}
+
+/// Jev provider that records every typed question request and answers with a
+/// typed `noul` judgment.
+struct JevProvider {
+    /// Requests received, in order.
+    seen: std::sync::Mutex<Vec<ProviderRequest>>,
+}
+
+#[async_trait]
+impl Provider for JevProvider {
+    /// Record `request` and answer `helpful` with `noul` 0.9.
+    async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        self.seen.lock().expect("capture lock").push(request);
+        Ok(ProviderResponse::JevSystemOne(
+            serde_json::from_value(json!({
+                "model": "jev-1.13.0",
+                "answers": {"helpful": {"type": "noul", "noul": 0.9}},
+                "usage": {"input_tokens": 12, "output_tokens": 3}
+            }))
+            .expect("typed Jev answer"),
+        ))
+    }
+
+    /// Jev never streams.
+    async fn stream(&self, _request: ProviderRequest) -> Result<ProviderStream, ProviderError> {
+        Err(ProviderError::timeout("jev"))
+    }
+
+    /// Serves the Jev provider slot.
+    fn name(&self) -> ProviderName {
+        ProviderName::Jev
+    }
+}
+
+/// A judge whose Prompt is a native Jev question request needs no JSON
+/// schema: the record renders into the typed `state` verbatim, quotes and
+/// newlines included, and Jev's whole typed answer becomes the judgment an
+/// assertion thresholds at `answers.<question>.noul`.
+///
+/// # Panics
+///
+/// Panics when the judgment, the rendered state, or the call count diverge.
+#[tokio::test(flavor = "multi_thread")]
+async fn jev_judge_answers_typed_questions_with_quoted_state() {
+    let provider = Arc::new(JevProvider {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::clone(&provider) as Arc<dyn Provider>);
+    let request = ProviderRequest::JevSystemOne(
+        serde_json::from_value(json!({
+            "model": "jev-latest",
+            "state": "${response}",
+            "questions": {"helpful": {"type": "noul", "instructions": "Is it helpful?"}}
+        }))
+        .expect("typed Jev request"),
+    );
+    let prompt = skald_prompt::Prompt::from_native(
+        skald_spec::Prompt::new(request, "jev-latest", None, skald_spec::ResponseType::Text)
+            .expect("Jev prompt"),
+    );
+    let invoker = SkaldJudgeInvoker::new(
+        Arc::new(registry),
+        Arc::new(StaticAgentResolver {
+            prompt: prompt.clone(),
+            calls: None,
+        }),
+        Arc::new(StaticResolver {
+            prompt: prompt.clone(),
+        }),
+    );
+    let reply = "Sure, \"happy\" to help!\nAnything else?";
+
+    let value = invoker
+        .invoke(
+            &inline_agent_ref(prompt),
+            json!({"response": reply}),
+            &MediaBindings::new(),
+        )
+        .await
+        .expect("Jev judge answers");
+
+    assert_eq!(value["answers"]["helpful"]["noul"], json!(0.9));
+    let seen = provider.seen.lock().expect("capture lock");
+    assert_eq!(seen.len(), 1, "one Jev call per judgment");
+    let ProviderRequest::JevSystemOne(sent) = &seen[0] else {
+        panic!("the judge sends a Jev request: {:?}", seen[0]);
+    };
+    assert_eq!(sent.state, reply);
+}

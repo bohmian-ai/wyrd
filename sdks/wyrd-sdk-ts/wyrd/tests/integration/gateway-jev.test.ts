@@ -28,7 +28,13 @@ const QUESTIONS = {
 };
 
 /** State text → the status the upstream refuses it with. */
-const REFUSALS: Record<string, number> = { "rate-limited": 429, overloaded: 529, "bad-key": 401 };
+const REFUSALS: Record<string, number> = {
+  "refused-form": 400,
+  "rate-limited": 429,
+  "server-error": 500,
+  overloaded: 529,
+  "bad-key": 401,
+};
 
 /** Jev's answer: `helpful` with probability `noul`, tone `tone`. */
 function answer(noul: number, tone: string) {
@@ -72,7 +78,7 @@ async function post(route: string, body: unknown): Promise<{ status: number; rep
 
 /**
  * A verification-capable server with one Jev deployment serving
- * `system_one` and `chat_completions`, and the hydrated `reviewer` Service
+ * `system_one`, the only operation Jev serves, and the hydrated `reviewer` Service
  * acting as its own Card-scoped key.
  */
 const test = serverTest({ provider: jev, verificationRuntime: true }).extend<{ reviewer: WyrdState }>({
@@ -88,7 +94,7 @@ const test = serverTest({ provider: jev, verificationRuntime: true }).extend<{ r
         model: { provider: "jev", model: "jev-latest" },
         adapter: "jev",
         auth: { bearer: { credential: "jev-key" } },
-        capabilities: ["system_one", "chat_completions"],
+        capabilities: ["system_one"],
         routing_weight: 1,
       });
       const cards = Cards.connect();
@@ -115,44 +121,35 @@ test("native systemone answers relay intact", async ({ provider, reviewer: _ }) 
   expect(JSON.parse(upstream?.body ?? "")).toEqual(body);
 });
 
-test("chat completions reach jev as questions", async ({ provider, reviewer: _ }) => {
+test("invalid jev questions are refused before jev", async ({ provider, reviewer: _ }) => {
   const before = provider.received.length;
-  const client = WyrdClient.connect();
-  const openai = new OpenAI({ baseURL: `${client.serverUrl}/v1`, apiKey: await client.accessToken(), maxRetries: 0 });
 
-  const completion = await openai.chat.completions.create({
-    model: "jev/jev-latest",
-    messages: [{ role: "user", content: JSON.stringify({ state: "Thanks!", questions: QUESTIONS }) }],
-  });
-
-  expect(JSON.parse(completion.choices[0]?.message.content ?? "")).toEqual({
-    model: "jev-1.13.0",
-    answers: answer(0.93, "polite").answers,
-  });
-  expect(completion).toMatchObject({ model: "jev-1.13.0", usage: { prompt_tokens: 378, total_tokens: 443 } });
-  const [upstream] = provider.received.slice(before);
-  expect(JSON.parse(upstream?.body ?? "")).toEqual({ model: "jev-latest", state: "Thanks!", questions: QUESTIONS });
-});
-
-test("ordinary chat is refused before jev", async ({ provider, reviewer: _ }) => {
-  const before = provider.received.length;
-  const questions = JSON.stringify({ state: "Thanks!", questions: QUESTIONS });
-
-  for (const [route, body] of [
-    ["/v1/chat/completions", { model: "jev/jev-latest", messages: [{ role: "user", content: "hi" }] }],
-    [
-      "/v1/chat/completions",
-      { model: "jev/jev-latest", stream: true, messages: [{ role: "user", content: questions }] },
-    ],
-    ["/v1/systemone", { model: "jev-latest", state: "s", questions: { q: { type: "essay", instructions: "x" } } }],
-  ] as const) {
-    const { status, reply } = await post(route, body);
-    expect({ route, status, code: reply.error?.code }).toEqual({
-      route,
+  for (const body of [
+    { model: "jev-latest", state: "s", questions: { q: { type: "essay", instructions: "x" } } },
+    { model: "jev-latest", state: { answer: "s" }, questions: QUESTIONS },
+    { model: "jev-latest", state: "s", questions: QUESTIONS, temperature: 0 },
+  ]) {
+    const { status, reply } = await post("/v1/systemone", body);
+    expect({ body, status, code: reply.error?.code }).toEqual({
+      body,
       status: 400,
       code: "WYRD_GATEWAY_400_INVALID_REQUEST",
     });
   }
+  expect(provider.received.slice(before)).toEqual([]);
+});
+
+test("chat completions never reach jev", async ({ provider, reviewer: _ }) => {
+  const before = provider.received.length;
+  const client = WyrdClient.connect();
+  const openai = new OpenAI({ baseURL: `${client.serverUrl}/v1`, apiKey: await client.accessToken(), maxRetries: 0 });
+
+  await expect(
+    openai.chat.completions.create({
+      model: "jev/jev-latest",
+      messages: [{ role: "user", content: JSON.stringify({ state: "Thanks!", questions: QUESTIONS }) }],
+    }),
+  ).rejects.toMatchObject({ status: 404, code: "WYRD_GATEWAY_404_MODEL_UNAVAILABLE" });
   expect(provider.received.slice(before)).toEqual([]);
 });
 
@@ -179,19 +176,24 @@ test("jev judge fails an unhelpful rude reply", async ({ reviewer }) => {
   });
 });
 
-test("jev judge refuses a reply that breaks the question json", async ({ provider, reviewer }) => {
+test("jev judge judges a reply with quotes and newlines", async ({ provider, reviewer }) => {
   const before = provider.received.length;
+  const reply = 'He said "your refund is on its way".\nAnything else?';
 
-  await expect(
-    reviewer.run("agent").observe.verify("reply-quality", { answer: 'He said "no".' }),
-  ).rejects.toMatchObject({ code: "WYRD_VERIFICATION_502_DEPENDENCY_FAILED" });
-  expect(provider.received.slice(before)).toEqual([]);
+  const judgment = await reviewer.run("agent").observe.verify("reply-quality", { answer: reply });
+
+  expect(judgment).toMatchObject({ passed: true, verdict: "passed" });
+  const [upstream, ...rest] = provider.received.slice(before);
+  expect(rest).toEqual([]);
+  expect(JSON.parse(upstream?.body ?? "")).toMatchObject({ state: reply });
 });
 
 // Last in the file: an upstream refusal cools the shared deployment down.
 test("jev refusals map to stable errors", async ({ reviewer: _ }) => {
   for (const [state, status, code] of [
+    ["refused-form", 400, "WYRD_GATEWAY_400_INVALID_REQUEST"],
     ["rate-limited", 429, "WYRD_GATEWAY_429_UPSTREAM_THROTTLED"],
+    ["server-error", 502, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE"],
     ["overloaded", 502, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE"],
     ["bad-key", 502, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE"],
   ] as const) {

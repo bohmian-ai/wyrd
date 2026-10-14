@@ -162,7 +162,9 @@ pub(crate) fn session_turn_to_conversation_turn(
                     role: "model".to_owned(),
                     parts: vec![GooglePart::Text { text: turn.content }],
                 }),
-                ProviderName::OpenAi | ProviderName::Custom(_) => {
+                // Jev never converses, so the loop never seeds a session for
+                // it; the OpenAI Chat fallback only keeps the match total.
+                ProviderName::OpenAi | ProviderName::Jev | ProviderName::Custom(_) => {
                     MessageNum::OpenAi(Box::new(OpenAiChatMessage {
                         role: "assistant".to_owned(),
                         content: Some(OpenAiMessageContent::Text(turn.content)),

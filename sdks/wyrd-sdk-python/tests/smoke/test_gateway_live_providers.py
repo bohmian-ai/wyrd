@@ -289,20 +289,30 @@ def test_google_client_reaches_live_gemini() -> None:
 
 
 @pytest.mark.smoke
-def test_jev_answers_live_questions_natively_and_through_chat() -> None:
-    """Real Jev answers one question natively and through the Chat projection.
+def test_jev_answers_live_typed_questions() -> None:
+    """Real Jev answers one typed question of each form through ``system_one``.
 
-    The native body is what a Jev client sends to ``POST /v1/systemone``; the
-    Chat call carries the same question set as its one user message. Both
-    must come back as Jev's typed answers, which proves the request bounds and
-    the answer translation against the real provider.
+    The native body is what a Jev client sends to ``POST /v1/systemone``; its
+    state carries quotes and a newline as text. Every answer must come back in
+    Jev's typed form, which proves the request bounds and the typed answer
+    decoding against the real provider.
     """
     secret = credential("jev")
-    questions = {"polite": {"type": "noul", "instructions": "Is the reply polite?"}}
-    state = "Thank you for waiting; your refund has been issued."
-    with live_server(
-        "jev", secret, deployments=[("jev-latest", ["system_one", "chat_completions"])]
-    ) as (
+    questions = {
+        "polite": {"type": "noul", "instructions": "Is the reply polite?"},
+        "tone": {
+            "type": "choice",
+            "instructions": "What is the tone of the reply?",
+            "criteria": {"polite": "courteous", "rude": "curt"},
+        },
+        "quality": {
+            "type": "score",
+            "instructions": "How good is the reply?",
+            "criteria": ["poor", "ok", "great"],
+        },
+    }
+    state = 'Thank you for waiting; "your refund" has been issued.\nAnything else?'
+    with live_server("jev", secret, deployments=[("jev-latest", ["system_one"])]) as (
         server,
         token,
     ):
@@ -313,18 +323,10 @@ def test_jev_answers_live_questions_natively_and_through_chat() -> None:
             timeout=60,
         )
         assert native.status_code == 200, f"jev native call answered {native.status_code}"
-        assert native.json()["answers"]["polite"]["type"] == "noul"
-
-        client = openai.OpenAI(base_url=f"{server.base_url}/v1", api_key=token, max_retries=0)
-        completion = client.chat.completions.create(
-            model="jev/jev-latest",
-            messages=[
-                {"role": "user", "content": json.dumps({"state": state, "questions": questions})}
-            ],
-        )
-        content = completion.choices[0].message.content
-        assert content is not None, "jev chat returned no content"
-        assert 0.0 <= json.loads(content)["answers"]["polite"]["noul"] <= 1.0
+        answers = native.json()["answers"]
+        assert 0.0 <= answers["polite"]["noul"] <= 1.0
+        assert answers["tone"]["choice"] in {"polite", "rude"}
+        assert answers["quality"]["type"] == "score"
 
 
 @contextlib.contextmanager

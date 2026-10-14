@@ -3237,11 +3237,12 @@ async fn a_truncated_gemini_candidate_becomes_a_length_choice() {
     assert_eq!(usage.normalized, Some(tokens(8, 13)));
 }
 
-/// Native Jev `systemone` body holding one question of each form.
+/// Native Jev `systemone` body holding one question of each form; the state
+/// carries quotes and a newline, which typed text carries verbatim.
 fn jev_body() -> Value {
     json!({
         "model": "jev-latest",
-        "state": {"answer": "Thanks, happy to help!"},
+        "state": "Thanks, \"happy\" to help!\nAnything else?",
         "questions": jev_questions(),
     })
 }
@@ -3254,16 +3255,6 @@ fn jev_questions() -> Value {
                  "criteria": {"polite": "courteous", "rude": "curt"}},
         "quality": {"type": "score", "instructions": "Quality?",
                     "criteria": ["poor", "ok", "great"]},
-    })
-}
-
-/// Chat Completions body carrying the Jev questions in its one user message.
-fn jev_chat_body() -> Value {
-    let content =
-        json!({"state": {"answer": "Thanks, happy to help!"}, "questions": jev_questions()});
-    json!({
-        "model": "jev/jev-latest",
-        "messages": [{"role": "user", "content": content.to_string()}],
     })
 }
 
@@ -3290,7 +3281,7 @@ fn jev_deployment() -> ProviderDeployment {
         "model": ModelRef::from_projection("jev/jev-latest").expect("model"),
         "adapter": "jev",
         "auth": bearer(),
-        "capabilities": ["system_one", "chat_completions"],
+        "capabilities": ["system_one"],
         "routing_weight": 1,
     }))
     .expect("jev deployment")
@@ -3325,21 +3316,16 @@ async fn jev_attempt(
         .await
 }
 
-/// Chat body for `jev/jev-latest` whose one user message is `content`'s JSON.
-fn jev_content(content: &Value) -> Value {
-    json!({"model": "jev/jev-latest", "messages": [{"role": "user", "content": content.to_string()}]})
-}
-
-/// [`jev_chat_body`] with `member` set to `value`.
-fn jev_chat_with(member: &str, value: Value) -> Value {
-    let mut body = jev_chat_body();
-    body[member] = value;
+/// [`jev_body`] with the question `helpful` replaced by `question`.
+fn jev_with_question(question: Value) -> Value {
+    let mut body = jev_body();
+    body["questions"]["helpful"] = question;
     body
 }
 
-/// Bad Jev forms, ordinary chat, and chat features Jev cannot honor are all
-/// refused by preparation, so they never reach the provider; Jev bodies never
-/// reach `OpenAI` adapters either.
+/// Bad Jev forms, broken bounds, and every other dialect are refused by
+/// preparation, so they never reach the provider; Jev bodies never reach
+/// `OpenAI` adapters either.
 ///
 /// # Panics
 ///
@@ -3347,108 +3333,46 @@ fn jev_chat_with(member: &str, value: Value) -> Value {
 #[tokio::test]
 async fn jev_bad_forms_are_rejected_before_provider_io() {
     let jev = jev_deployment();
-    let chat = GatewayOperation::ChatCompletions;
     let one = GatewayOperation::SystemOne;
-    let openai_in = IngressDialect::OpenAi;
-    let mut two_turns = jev_chat_body();
-    two_turns["messages"]
-        .as_array_mut()
-        .expect("messages")
-        .push(json!({"role": "user", "content": "and?"}));
-    let mut native_extra = jev_body();
-    native_extra["temperature"] = json!(0.2);
-    let mut native_form = jev_body();
-    native_form["questions"]["helpful"]["type"] = json!("essay");
-    let ordinary = json!({"model": "jev/jev-latest", "messages": [{"role": "user", "content": "Is this helpful?"}]});
-    let system = json!({"model": "jev/jev-latest",
-        "messages": [{"role": "system", "content": jev_body().to_string()}]});
-    let image = json!({"model": "jev/jev-latest", "messages": [{"role": "user",
-        "content": [{"type": "image_url", "image_url": {"url": "https://x"}}]}]});
-    let named = json!({"model": "jev/jev-latest",
-        "messages": [{"role": "user", "name": "n", "content": "{}"}]});
-    let tools = json!([{"type": "function", "function": {"name": "f"}}]);
+    let mut extra = jev_body();
+    extra["temperature"] = json!(0.2);
+    let mut structured_state = jev_body();
+    structured_state["state"] = json!({"answer": "hi"});
+    let ordinary = json!({"model": "jev/jev-latest",
+        "messages": [{"role": "user", "content": jev_body().to_string()}]});
     let cases = [
+        (IngressDialect::Jev, one, extra, false, "body"),
+        (IngressDialect::Jev, one, structured_state, false, "body"),
         (
-            openai_in,
-            chat,
+            IngressDialect::Jev,
+            one,
+            jev_with_question(json!({"type": "essay", "instructions": "x"})),
+            false,
+            "body",
+        ),
+        (
+            IngressDialect::Jev,
+            one,
+            jev_with_question(json!({"type": "score", "instructions": "x", "criteria": ["one"]})),
+            false,
+            "questions.helpful.criteria",
+        ),
+        (
+            IngressDialect::Jev,
+            one,
+            jev_with_question(json!({"type": "noul", "instructions": " "})),
+            false,
+            "questions.helpful.instructions",
+        ),
+        (IngressDialect::Jev, one, jev_body(), true, "stream"),
+        (
+            IngressDialect::OpenAi,
+            GatewayOperation::ChatCompletions,
             ordinary.clone(),
             false,
-            "messages[0].content",
+            "operation",
         ),
-        (openai_in, chat, two_turns, false, "messages"),
-        (openai_in, chat, system, false, "messages[0].role"),
-        (openai_in, chat, image, false, "messages[0].content[0]"),
-        (openai_in, chat, named, false, "messages[0].name"),
-        (
-            openai_in,
-            chat,
-            jev_chat_with("tools", tools),
-            false,
-            "tools",
-        ),
-        (
-            openai_in,
-            chat,
-            jev_chat_with("max_tokens", json!(16)),
-            false,
-            "max_tokens",
-        ),
-        (
-            openai_in,
-            chat,
-            jev_chat_with("response_format", json!({"type": "json_object"})),
-            false,
-            "response_format",
-        ),
-        (
-            openai_in,
-            chat,
-            jev_chat_with("stream", json!(true)),
-            true,
-            "stream",
-        ),
-        (
-            openai_in,
-            chat,
-            jev_content(
-                &json!({"model": "jev-preview", "state": "s", "questions": jev_questions()}),
-            ),
-            false,
-            "messages[0].content.model",
-        ),
-        (
-            openai_in,
-            chat,
-            jev_content(&json!({"state": "s", "questions": {}})),
-            false,
-            "questions",
-        ),
-        (
-            openai_in,
-            chat,
-            jev_content(&json!({"state": "s", "questions": {"q": {"type": "score",
-                "instructions": "x", "criteria": ["one"]}}})),
-            false,
-            "questions.q.criteria",
-        ),
-        (
-            openai_in,
-            chat,
-            jev_content(&json!({"state": 7, "questions": jev_questions()})),
-            false,
-            "state",
-        ),
-        (
-            openai_in,
-            chat,
-            jev_content(&json!({"state": "s", "questions": jev_questions(), "extra": 1})),
-            false,
-            "messages[0].content",
-        ),
-        (IngressDialect::Jev, one, native_extra, false, "body"),
-        (IngressDialect::Jev, one, native_form, false, "body"),
-        (IngressDialect::Jev, one, jev_body(), true, "stream"),
-        (openai_in, one, jev_body(), false, "operation"),
+        (IngressDialect::OpenAi, one, jev_body(), false, "operation"),
     ];
     for (ingress, operation, body, stream, field) in cases {
         let error = prepare(ingress, operation, stream, &body, &jev, None).expect_err(field);
@@ -3461,12 +3385,6 @@ async fn jev_bad_forms_are_rejected_before_provider_io() {
             .field,
         "body"
     );
-    assert_eq!(
-        prepare(openai_in, one, false, &jev_body(), &openai, None)
-            .expect_err("OpenAI never serves systemone")
-            .field,
-        "operation"
-    );
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -3474,7 +3392,13 @@ async fn jev_bad_forms_are_rejected_before_provider_io() {
         .expect(0)
         .mount(&server)
         .await;
-    let result = jev_attempt(&dispatch(&server), chat, openai_in, &ordinary).await;
+    let result = jev_attempt(
+        &dispatch(&server),
+        GatewayOperation::ChatCompletions,
+        IngressDialect::OpenAi,
+        &ordinary,
+    )
+    .await;
     assert!(
         matches!(
             result,
@@ -3503,15 +3427,15 @@ fn jev_usage() -> AttemptUsage {
     }
 }
 
-/// Native and adapted Jev calls send the same question request with the
-/// deployment's model and bearer credential, return equivalent intact
-/// answers, and account identical normalized usage from Jev's own usage.
+/// A Jev call sends the typed question request with the deployment's model
+/// and bearer credential, returns Jev's typed answer, and accounts usage from
+/// Jev's own usage.
 ///
 /// # Panics
 ///
-/// Panics when the request, answers, or usage diverge.
+/// Panics when the request, answer, or usage diverge.
 #[tokio::test]
-async fn jev_native_and_adapted_answers_are_equivalent() {
+async fn jev_answers_return_typed_with_usage() {
     let server = MockServer::start().await;
     answer(
         &server,
@@ -3521,71 +3445,33 @@ async fn jev_native_and_adapted_answers_are_equivalent() {
         jev_answer(),
     )
     .await;
-    let dispatch = dispatch(&server);
 
-    let native = jev_attempt(
-        &dispatch,
+    let mut asked = jev_body();
+    asked["model"] = json!("jev-preview");
+    let result = jev_attempt(
+        &dispatch(&server),
         GatewayOperation::SystemOne,
         IngressDialect::Jev,
-        &jev_body(),
+        &asked,
     )
     .await;
-    let AttemptResult::Completed { body, usage, .. } = native else {
-        panic!("native completes: {native:?}");
+    let AttemptResult::Completed { body, usage, .. } = result else {
+        panic!("completes: {result:?}");
     };
-    assert_eq!(
-        parsed(&body),
-        jev_answer(),
-        "the native answer relays intact"
-    );
+    assert_eq!(parsed(&body), jev_answer());
     assert_eq!(usage, jev_usage());
 
-    let adapted = jev_attempt(
-        &dispatch,
-        GatewayOperation::ChatCompletions,
-        IngressDialect::OpenAi,
-        &jev_chat_body(),
-    )
-    .await;
-    let AttemptResult::Completed { body, usage, .. } = adapted else {
-        panic!("adapted completes: {adapted:?}");
-    };
-    let chat = parsed(&body);
-    assert_eq!(chat["object"], "chat.completion");
-    assert_eq!(chat["model"], "jev-1.13.0");
-    assert_eq!(chat["choices"].as_array().map(Vec::len), Some(1));
-    assert_eq!(chat["choices"][0]["message"]["role"], "assistant");
-    assert_eq!(chat["choices"][0]["finish_reason"], "stop");
-    let content: Value = serde_json::from_str(
-        chat["choices"][0]["message"]["content"]
-            .as_str()
-            .expect("text content"),
-    )
-    .expect("content is JSON");
-    assert_eq!(
-        content,
-        json!({"model": "jev-1.13.0", "answers": jev_answer()["answers"]}),
-        "adapted content is the resolved model and intact answers"
-    );
-    for (member, tokens) in [
-        ("prompt_tokens", 378),
-        ("completion_tokens", 65),
-        ("total_tokens", 443),
-    ] {
-        assert_eq!(chat["usage"][member], tokens, "{member}");
-    }
-    assert_eq!(usage, jev_usage(), "both forms account the same usage");
-
     let requests = server.received_requests().await.expect("recording");
-    assert_eq!(requests.len(), 2);
-    for request in &requests {
-        let sent: Value = serde_json::from_slice(&request.body).expect("json body");
-        assert_eq!(sent, jev_body(), "both forms send the same Jev request");
-    }
+    assert_eq!(requests.len(), 1);
+    let sent: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        sent,
+        jev_body(),
+        "the deployment's model replaces the caller's"
+    );
 }
 
-/// An answer without usage relays intact with usage unknown, and its
-/// translation carries no fabricated usage.
+/// An answer without usage returns with usage unknown, never fabricated.
 ///
 /// # Panics
 ///
@@ -3603,39 +3489,25 @@ async fn jev_omitted_usage_stays_unknown() {
         bare.clone(),
     )
     .await;
-    let dispatch = dispatch(&server);
 
-    let native = jev_attempt(
-        &dispatch,
+    let result = jev_attempt(
+        &dispatch(&server),
         GatewayOperation::SystemOne,
         IngressDialect::Jev,
         &jev_body(),
     )
     .await;
-    let AttemptResult::Completed { body, usage, .. } = native else {
-        panic!("native completes: {native:?}");
+    let AttemptResult::Completed { body, usage, .. } = result else {
+        panic!("completes: {result:?}");
     };
     assert_eq!(parsed(&body), bare);
-    assert_eq!(usage, AttemptUsage::default());
-
-    let adapted = jev_attempt(
-        &dispatch,
-        GatewayOperation::ChatCompletions,
-        IngressDialect::OpenAi,
-        &jev_chat_body(),
-    )
-    .await;
-    let AttemptResult::Completed { body, usage, .. } = adapted else {
-        panic!("adapted completes: {adapted:?}");
-    };
-    assert!(parsed(&body)["usage"].is_null(), "no usage is fabricated");
     assert_eq!(usage, AttemptUsage::default());
 }
 
 /// Every documented Jev refusal becomes a fixed `OpenAI` envelope with a
-/// stable Wyrd code on both forms, never relaying Jev's body or the
-/// credential; validation and authentication refusals are not retryable,
-/// throttling and overload are.
+/// stable Wyrd code, never relaying Jev's body or the credential; validation
+/// and authentication refusals are not retryable, throttling and overload
+/// are.
 ///
 /// # Panics
 ///
@@ -3648,6 +3520,7 @@ async fn jev_refusals_map_to_stable_wyrd_errors() {
         (400, "WYRD_GATEWAY_400_INVALID_REQUEST", 400, false),
         (422, "WYRD_GATEWAY_400_INVALID_REQUEST", 400, false),
         (429, "WYRD_GATEWAY_429_UPSTREAM_THROTTLED", 429, true),
+        (500, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE", 502, true),
         (529, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE", 502, true),
     ] {
         let server = MockServer::start().await;
@@ -3658,39 +3531,31 @@ async fn jev_refusals_map_to_stable_wyrd_errors() {
             .respond_with(ResponseTemplate::new(status).set_body_json(detail))
             .mount(&server)
             .await;
-        let dispatch = dispatch(&server);
-        for (operation, ingress, body) in [
-            (GatewayOperation::SystemOne, IngressDialect::Jev, jev_body()),
-            (
-                GatewayOperation::ChatCompletions,
-                IngressDialect::OpenAi,
-                jev_chat_body(),
-            ),
-        ] {
-            let result = jev_attempt(&dispatch, operation, ingress, &body).await;
-            let AttemptResult::Refused {
-                class,
-                status: relayed,
-                body,
-                ..
-            } = result
-            else {
-                panic!("{status} refuses: {result:?}");
-            };
-            assert_eq!(relayed, answered, "{status}");
-            assert_eq!(body["error"]["code"], code, "{status}");
-            let text = body.to_string();
-            assert!(
-                !text.contains("key cred") && !text.contains("api_usage_error"),
-                "Jev's body never relays: {text}"
-            );
-            assert_eq!(class == FailureClass::Upstream, retryable, "{status}");
-        }
-        let requests = server.received_requests().await.expect("recording");
-        assert_eq!(
-            requests.len(),
-            2,
-            "{status}: one provider request per attempt"
+        let result = jev_attempt(
+            &dispatch(&server),
+            GatewayOperation::SystemOne,
+            IngressDialect::Jev,
+            &jev_body(),
+        )
+        .await;
+        let AttemptResult::Refused {
+            class,
+            status: relayed,
+            body,
+            ..
+        } = result
+        else {
+            panic!("{status} refuses: {result:?}");
+        };
+        assert_eq!(relayed, answered, "{status}");
+        assert_eq!(body["error"]["code"], code, "{status}");
+        let text = body.to_string();
+        assert!(
+            !text.contains("key cred") && !text.contains("api_usage_error"),
+            "Jev's body never relays: {text}"
         );
+        assert_eq!(class == FailureClass::Upstream, retryable, "{status}");
+        let requests = server.received_requests().await.expect("recording");
+        assert_eq!(requests.len(), 1, "{status}: one provider request");
     }
 }

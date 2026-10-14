@@ -8,10 +8,10 @@
 
 use secrecy::SecretString;
 use tempfile::TempDir;
-use wyrd_sdk::cards::{CardKind, Cards, ListCardsRequest};
-use wyrd_sdk::config::ClientConfig;
-use wyrd_sdk::environment::Environment;
-use wyrd_sdk::{GlobalConfig, WyrdClient, WyrdError};
+use wyrd_ai::cards::{CardKind, Cards, ListCardsRequest};
+use wyrd_ai::config::ClientConfig;
+use wyrd_ai::environment::Environment;
+use wyrd_ai::{GlobalConfig, WyrdClient, WyrdError};
 use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso};
 use wyrd_testing::server::WyrdTestServer;
 

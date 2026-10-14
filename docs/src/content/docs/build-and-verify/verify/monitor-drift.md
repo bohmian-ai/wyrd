@@ -114,7 +114,7 @@ print(verifier.status.verification.baseline.state)  # pending, building, ready, 
 <LangTab lang="rust">
 
 ```rust
-use wyrd_sdk::cards::{CardKind, CardSelector, Cards};
+use wyrd_ai::cards::{CardKind, CardSelector, Cards};
 
 let selector = CardSelector::named(CardKind::Verifier, "default".parse()?, "churn-input-drift".parse()?)
     .with_version("1.0.0".parse()?);
@@ -211,7 +211,7 @@ print(rows.to_pandas())
 <LangTab lang="rust">
 
 ```rust
-use wyrd_sdk::{Bifrost, bifrost::QueryParam};
+use wyrd_ai::{Bifrost, bifrost::QueryParam};
 
 let rows = Bifrost::from_env()
     .await?

@@ -84,7 +84,7 @@ pub struct Run {
 
 impl Run {
     /// Run `future` inside this view's scope, so spans its task starts carry
-    /// this run and Card once `wyrd_sdk::otel::start_telemetry` installed
+    /// this run and Card once `wyrd_ai::otel::start_telemetry` installed
     /// telemetry.
     ///
     /// The scope is a Tokio task-local: it follows `future` across awaits but

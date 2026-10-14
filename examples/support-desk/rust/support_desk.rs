@@ -14,13 +14,13 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::Instrument as _;
-use wyrd_sdk::bifrost::QueryParam;
-use wyrd_sdk::cards::{CardSelector, Cards, HydrationMode, RegistrationReceipt};
-use wyrd_sdk::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
-use wyrd_sdk::observe::EvalObservationOptions;
-use wyrd_sdk::otel::start_telemetry;
-use wyrd_sdk::state::WyrdState;
-use wyrd_sdk::{Bifrost, Gateway, Spec, WyrdClient, WyrdError};
+use wyrd_ai::bifrost::QueryParam;
+use wyrd_ai::cards::{CardSelector, Cards, HydrationMode, RegistrationReceipt};
+use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
+use wyrd_ai::observe::EvalObservationOptions;
+use wyrd_ai::otel::start_telemetry;
+use wyrd_ai::state::WyrdState;
+use wyrd_ai::{Bifrost, Gateway, Spec, WyrdClient, WyrdError};
 
 /// The failure any support-desk step returns.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

@@ -129,7 +129,7 @@ mod tests {
     }
 
     /// A Rust SDK user names every compaction type and declares it on a
-    /// table config through `wyrd_sdk::bifrost` alone, with no direct
+    /// table config through `wyrd_ai::bifrost` alone, with no direct
     /// `wyrd-spec` dependency.
     ///
     /// # Panics

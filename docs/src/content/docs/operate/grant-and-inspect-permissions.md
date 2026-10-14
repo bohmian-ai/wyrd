@@ -52,7 +52,7 @@ print(result["changed"], result["roles"])
 <LangTab lang="rust">
 
 ```rust
-use wyrd_sdk::{Principals, WyrdClient};
+use wyrd_ai::{Principals, WyrdClient};
 
 let principals = Principals::with_client(WyrdClient::from_global()?);
 let result = principals.grant_role(&principal_id, "editor").await?;

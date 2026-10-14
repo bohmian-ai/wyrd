@@ -45,7 +45,7 @@ print(bifrost.register())  # "created" or "already_exists"
 <LangTab lang="rust">
 
 ```rust
-use wyrd_sdk::{Bifrost, bifrost::TableConfig};
+use wyrd_ai::{Bifrost, bifrost::TableConfig};
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 struct TicketOutcome {
@@ -97,7 +97,7 @@ TableConfig(TicketOutcome, "vala.datasets.ticket_outcomes", time_column="closed_
 <LangTab lang="rust">
 
 ```rust
-// The layout type is not re-exported from wyrd_sdk yet; add wyrd-spec as a dependency.
+// The layout type is not re-exported from wyrd_ai yet; add wyrd-spec as a dependency.
 use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire};
 
 let table = TableConfig::from_model::<TicketOutcome>("vala.datasets.ticket_outcomes")?
@@ -140,7 +140,7 @@ bifrost.flush()
 <LangTab lang="rust">
 
 ```rust
-use wyrd_sdk::bifrost::Correlation;
+use wyrd_ai::bifrost::Correlation;
 
 for outcome in &outcomes {
     let row = TicketOutcome { ticket_id: outcome.id.clone(), resolved: outcome.resolved, handle_time_s: outcome.seconds };
@@ -192,7 +192,7 @@ Pass `model=` to get validated rows back instead: `bifrost.sql(query, params, mo
 <LangTab lang="rust">
 
 ```rust
-use wyrd_sdk::bifrost::QueryParam;
+use wyrd_ai::bifrost::QueryParam;
 
 #[derive(serde::Deserialize)]
 struct Summary {

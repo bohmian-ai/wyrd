@@ -6,12 +6,12 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
-use wyrd_sdk::cards::CardSelector;
-use wyrd_sdk::operator_connections::{
+use wyrd_ai::cards::CardSelector;
+use wyrd_ai::operator_connections::{
     ConnectionName, CreateOperatorConnectionRequest, HttpConnectionAuth, HttpsOrigin,
     OperatorConnections, SecretBearer,
 };
-use wyrd_sdk::state::WyrdState;
+use wyrd_ai::state::WyrdState;
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::support::{Deployment, fixture, hydrate, register, registered};

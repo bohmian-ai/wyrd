@@ -11,10 +11,10 @@ use serde_json::json;
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_sdk::bifrost::QueryParam;
-use wyrd_sdk::cards::CardRef;
-use wyrd_sdk::state::WyrdState;
-use wyrd_sdk::{Bifrost, VerificationVerdict, VerifierCounts, VerifierKind, WyrdClient};
+use wyrd_ai::bifrost::QueryParam;
+use wyrd_ai::cards::CardRef;
+use wyrd_ai::state::WyrdState;
+use wyrd_ai::{Bifrost, VerificationVerdict, VerifierCounts, VerifierKind, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::local_development::configure_gateway;

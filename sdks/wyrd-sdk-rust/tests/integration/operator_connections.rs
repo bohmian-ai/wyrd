@@ -3,7 +3,7 @@
 
 use std::fmt::Debug;
 
-use wyrd_sdk::operator_connections::{
+use wyrd_ai::operator_connections::{
     ConnectionName, CreateOperatorConnectionRequest, HttpAuthScheme, HttpConnectionAuth,
     HttpsOrigin, OperatorConnectionConfig, OperatorConnectionId, OperatorConnectionStatus,
     OperatorConnections, SecretBearer, UpdateOperatorConnectionRequest,

@@ -4580,7 +4580,7 @@ impl WyrdTestServerBuilder {
 
     /// Leave the process-global `tracing` subscriber unowned, so a journey
     /// can install the application's own telemetry pipeline, such as
-    /// `wyrd_sdk::otel::start_telemetry`, after the server starts.
+    /// `wyrd_ai::otel::start_telemetry`, after the server starts.
     ///
     /// The server keeps a telemetry guard that installs nothing, so a failing
     /// test prints no captured spans or metrics.

@@ -14,19 +14,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_sdk::bifrost::QueryParam;
-use wyrd_sdk::cards::Cards;
-use wyrd_sdk::cli;
-use wyrd_sdk::gateway::{
+use wyrd_ai::bifrost::QueryParam;
+use wyrd_ai::cards::Cards;
+use wyrd_ai::cli;
+use wyrd_ai::gateway::{
     GatewayOperation, ModelId, ModelRef, ProviderAdapter, ProviderAuth, ProviderCredentialName,
     ProviderCredentialWrite, ProviderCredentialWriteSource, ProviderDeployment,
     ProviderDeploymentName, ProviderId,
 };
-use wyrd_sdk::observe::Run;
-use wyrd_sdk::operator_connections::SecretBearer;
-use wyrd_sdk::otel::{Telemetry, start_telemetry};
-use wyrd_sdk::state::WyrdState;
-use wyrd_sdk::{Bifrost, Gateway, VerifierKind, WyrdClient};
+use wyrd_ai::observe::Run;
+use wyrd_ai::operator_connections::SecretBearer;
+use wyrd_ai::otel::{Telemetry, start_telemetry};
+use wyrd_ai::state::WyrdState;
+use wyrd_ai::{Bifrost, Gateway, VerifierKind, WyrdClient};
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
 use crate::support::{Deployment, hydrate, register};
@@ -336,7 +336,7 @@ async fn cli_bootstrap_saved_config_connects() {
     let cards = Cards::with_client(client);
     let receipt = register(&cards, "cards/gateway_inference/ask-prompt.yaml").await;
     let card = cards
-        .get(wyrd_sdk::cards::CardSelector::exact(receipt.root))
+        .get(wyrd_ai::cards::CardSelector::exact(receipt.root))
         .await
         .expect("saved-config client reads its write");
     assert_eq!(card.metadata.name.as_str(), "ask-prompt");

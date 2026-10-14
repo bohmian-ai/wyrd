@@ -52,7 +52,7 @@ state.start_bifrost()
 <LangTab lang="rust">
 
 ```rust
-use wyrd_sdk::state::WyrdState;
+use wyrd_ai::state::WyrdState;
 
 let state = WyrdState::from_path("./support-desk")?;
 state.start_bifrost().await?;
@@ -97,7 +97,7 @@ def answer_question(ticket_id: str, question: str) -> str:
 
 ```rust
 use serde_json::json;
-use wyrd_sdk::observe::EvalObservationOptions;
+use wyrd_ai::observe::EvalObservationOptions;
 
 async fn answer_question(state: &WyrdState, ticket_id: &str, question: &str) -> Result<String, WyrdError> {
     let run = state.run_for_card("agent")?;
@@ -205,7 +205,7 @@ print(rows.to_pandas())
 <LangTab lang="rust">
 
 ```rust
-use wyrd_sdk::{Bifrost, bifrost::QueryParam};
+use wyrd_ai::{Bifrost, bifrost::QueryParam};
 
 let rows = Bifrost::from_env()
     .await?

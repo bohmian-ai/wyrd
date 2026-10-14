@@ -7,8 +7,8 @@
 //! Run with:
 //!     cargo run -p wyrd-rust-examples --bin transport_grpc
 
-use wyrd_sdk::config::ClientConfig;
-use wyrd_sdk::transport::GrpcConfig;
+use wyrd_ai::config::ClientConfig;
+use wyrd_ai::transport::GrpcConfig;
 
 fn main() -> anyhow::Result<()> {
     let grpc = GrpcConfig {

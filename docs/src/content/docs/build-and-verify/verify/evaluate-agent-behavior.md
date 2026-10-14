@@ -157,7 +157,7 @@ print(rows.to_pandas())
 <LangTab lang="rust">
 
 ```rust
-use wyrd_sdk::{Bifrost, bifrost::QueryParam};
+use wyrd_ai::{Bifrost, bifrost::QueryParam};
 
 let bifrost = Bifrost::from_env().await?;
 let rows = bifrost

@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde_json::{Map, Value, json};
-use wyrd_sdk::cards::{CardKind, CardRef, CardSelector, Cards};
-use wyrd_sdk::{Card, Workflow, WorkflowRun, WorkflowRunStatus, WyrdClient};
+use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards};
+use wyrd_ai::{Card, Workflow, WorkflowRun, WorkflowRunStatus, WyrdClient};
 
 use crate::support::{Deployment, fixture, register};
 

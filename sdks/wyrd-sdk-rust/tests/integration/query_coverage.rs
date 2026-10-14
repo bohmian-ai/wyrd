@@ -185,6 +185,31 @@ fn cases() -> Vec<Case> {
             expected: json!([{"order_id": 12}]),
         },
         Case {
+            name: "single-row scalar subquery",
+            sql: format!(
+                "SELECT order_id FROM {ORDERS} \
+                 WHERE amount = (SELECT amount FROM {ORDERS} WHERE order_id = 11) \
+                 ORDER BY order_id"
+            ),
+            expected: json!([{"order_id": 11}, {"order_id": 15}]),
+        },
+        Case {
+            name: "scalar subquery over no rows",
+            sql: format!(
+                "SELECT order_id FROM {ORDERS} \
+                 WHERE amount = (SELECT amount FROM {ORDERS} WHERE order_id = 99)"
+            ),
+            expected: json!([]),
+        },
+        Case {
+            name: "scalar subquery yielding NULL",
+            sql: format!(
+                "SELECT order_id FROM {ORDERS} \
+                 WHERE customer_id = (SELECT customer_id FROM {ORDERS} WHERE order_id = 13)"
+            ),
+            expected: json!([]),
+        },
+        Case {
             name: "correlated scalar subquery",
             sql: format!(
                 "SELECT c.name, (SELECT SUM(o.amount) FROM {ORDERS} o \

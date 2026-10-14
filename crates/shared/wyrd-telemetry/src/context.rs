@@ -27,11 +27,10 @@ const TRACESTATE: &str = "tracestate";
 /// W3C trace context treats a repeated `traceparent` as invalid, so only a
 /// single parseable value is accepted; a missing, malformed, or repeated one
 /// yields `None`, which a request treats as "start a new trace", never as an
-/// error. Repeated `tracestate` headers are combined into one list in order.
-/// The combined list must parse as W3C `tracestate` (OpenTelemetry's
-/// [`TraceState`] parser); otherwise the state is dropped and the valid parent
-/// is kept with empty state, as W3C requires a vendor list that fails to parse
-/// to be discarded independently.
+/// error. Repeated `tracestate` headers are combined into one list in order;
+/// [`trace_state`] validates it, and a list that fails is dropped while the
+/// valid parent is kept with empty state, as W3C requires a vendor list that
+/// fails to parse to be discarded independently.
 #[must_use]
 pub fn inbound_context(headers: &HeaderMap) -> Option<TraceContext> {
     let mut parents = headers.get_all(TRACEPARENT).iter();
@@ -44,10 +43,37 @@ pub fn inbound_context(headers: &HeaderMap) -> Option<TraceContext> {
         .iter()
         .map(|value| value.to_str().ok())
         .collect::<Option<Vec<_>>>()
-        .map(|values| values.join(","))
-        .filter(|state| state.parse::<TraceState>().is_ok())
+        .and_then(|values| trace_state(&values))
         .unwrap_or_default();
     TraceContext::parse_traceparent(parent, state).ok()
+}
+
+/// The most list members a W3C `tracestate` may carry.
+const TRACESTATE_MEMBERS: usize = 32;
+
+/// Validate the combined W3C `tracestate` list in `values` and return it in
+/// canonical form.
+///
+/// Members are comma-separated with optional spaces or tabs around each, and
+/// empty members are skipped, as the W3C grammar allows. Each member's key
+/// and value must be valid by OpenTelemetry's [`TraceState`] rules, keys must
+/// be unique, and there may be at most 32 members. `None` when any rule
+/// fails; an empty list is valid and yields an empty state.
+fn trace_state(values: &[&str]) -> Option<String> {
+    let members = values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(|member| member.trim_matches([' ', '\t']))
+        .filter(|member| !member.is_empty())
+        .map(|member| member.split_once('='))
+        .collect::<Option<Vec<_>>>()?;
+    let mut keys = std::collections::HashSet::new();
+    if members.len() > TRACESTATE_MEMBERS || !members.iter().all(|(key, _)| keys.insert(*key)) {
+        return None;
+    }
+    TraceState::from_key_value(members)
+        .ok()
+        .map(|state| state.header())
 }
 
 /// Extension on a request span that continued a caller's trace.
@@ -193,16 +219,62 @@ mod tests {
         );
     }
 
+    /// Spaces and tabs around members and empty members are W3C-valid and
+    /// normalize away.
+    #[test]
+    fn tracestate_whitespace_and_empty_members_normalize() {
+        let context = inbound_context(&headers(&[
+            ("traceparent", PARENT),
+            ("tracestate", "a=1 ,\t b=2,,"),
+            ("tracestate", " c=3"),
+        ]))
+        .expect("the parent parses");
+        assert_eq!(context.trace_state, "a=1,b=2,c=3");
+    }
+
     /// A malformed `tracestate`, whether in one header or one of several, is
     /// dropped while the valid parent is kept.
     #[test]
     fn malformed_tracestate_is_dropped_keeping_the_parent() {
-        for state in [vec!["not a list member"], vec!["a=1", "B=2"], vec!["a=1,b"]] {
+        let crowded = (0..=32)
+            .map(|i| format!("k{i}=v"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for state in [
+            vec!["not a list member"],
+            vec!["a=1", "B=2"],
+            vec!["a=1,b"],
+            vec!["a=1", "a=2"],
+            vec!["a==1"],
+            vec![crowded.as_str()],
+        ] {
             let mut pairs = vec![("traceparent", PARENT)];
             pairs.extend(state.iter().map(|value| ("tracestate", *value)));
             let context = inbound_context(&headers(&pairs)).expect("the parent survives");
             assert_eq!(context.span_id, "b7ad6b7169203331", "{pairs:?}");
             assert_eq!(context.trace_state, "", "{pairs:?}");
+        }
+    }
+
+    /// A later-version `traceparent` continues the trace from its first four
+    /// fields, extra fields included.
+    #[test]
+    fn future_version_traceparent_is_read_forward_compatibly() {
+        for parent in [
+            "01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "cc-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01-what-the-future-holds",
+        ] {
+            let context =
+                inbound_context(&headers(&[("traceparent", parent)])).expect("future version");
+            assert_eq!(
+                (
+                    context.trace_id.as_str(),
+                    context.span_id.as_str(),
+                    context.trace_flags
+                ),
+                ("0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331", 1),
+                "{parent}"
+            );
         }
     }
 
@@ -216,6 +288,18 @@ mod tests {
                 "00-00000000000000000000000000000000-b7ad6b7169203331-01",
             )],
             vec![("traceparent", PARENT), ("traceparent", PARENT)],
+            vec![(
+                "traceparent",
+                "ff-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            )],
+            vec![(
+                "traceparent",
+                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01-extra",
+            )],
+            vec![(
+                "traceparent",
+                "01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01x",
+            )],
             vec![("tracestate", "a=1")],
         ] {
             assert!(inbound_context(&headers(&pairs)).is_none(), "{pairs:?}");

@@ -1322,7 +1322,17 @@ fn apply_overrides(state: AppState, overrides: StateOverrides) -> AppState {
 /// limits, gateway configuration, and the gateway engine whose HTTP provider
 /// dispatch screens endpoints under the deployment profile. The engine opens
 /// managed secrets with the deployment sealing keyring already attached by
-/// [`AppState::with_auth`]. Pure/sync (no I/O).
+/// [`AppState::with_auth`]. Synchronous, but not IO-free: building the
+/// credential resolver reads each configured secret backend's CA bundle from
+/// its file or environment variable once.
+///
+/// # Errors
+/// Returns [`ServerBootError::OperatorKeys`] when an API-bearing role's
+/// Operator key owner cannot be built (see [`OperatorKeys::for_role`]), and
+/// [`ServerBootError::GatewayTransport`] when a secret backend's CA bundle is
+/// unreadable or does not parse, a backend client cannot be built, or the
+/// HTTP provider dispatch transport cannot be built. Boot aborts before
+/// readiness on any of these.
 fn attach_config_fields(
     state: AppState,
     config: &WyrdServerConfig,

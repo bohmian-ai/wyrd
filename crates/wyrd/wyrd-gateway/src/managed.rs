@@ -160,6 +160,12 @@ mod tests {
 
     /// Opens `sealed` for `binding`, exposing the plaintext so a result can be
     /// compared directly against the expected value or failure.
+    ///
+    /// # Errors
+    /// Returns [`CredentialError::Unavailable`], as
+    /// [`ManagedSecretBinding::open`] does, when no key in `keyring` opens the
+    /// envelope, the payload does not decode, or the payload is bound to
+    /// another tenant, name, or provider.
     fn open(
         binding: ManagedSecretBinding<'_>,
         keyring: &SealingKeyring,

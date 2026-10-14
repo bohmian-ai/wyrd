@@ -27,7 +27,7 @@ use wyrd_testing::server::WyrdTestServer;
 
 use wyrd_ai::state::WyrdState;
 
-use crate::support::{Deployment, hydrate, register, registered};
+use crate::support::{Deployment, ancestry, hydrate, register, registered};
 
 /// The provider key the operator submits; only the upstream may see it.
 const PROVIDER_KEY: &str = "sk-native-upstream";
@@ -214,47 +214,6 @@ const CALLER_STATE: &str = "wyrd=journey";
 /// Scope of the gateway's captured model-call attempt spans.
 const GATEWAY_SCOPE: &str = "wyrd.gateway";
 
-/// One retained span's identity, parent, and name, ids as hex.
-#[derive(Debug, PartialEq, serde::Deserialize)]
-struct TenantSpan {
-    /// Instrumentation scope; [`GATEWAY_SCOPE`] for a captured attempt.
-    scope_name: String,
-    /// Span name.
-    name: String,
-    /// The span's trace identity.
-    trace_id: String,
-    /// The span's own identity.
-    span_id: String,
-    /// The span's parent span identity; `None` for a root span.
-    parent_span_id: Option<String>,
-    /// The W3C vendor trace state the span carried.
-    trace_state: String,
-}
-
-/// Publish every captured row, then read every span the tenant retains.
-///
-/// # Panics
-/// Panics when the flush or the read fails.
-async fn tenant_spans(deployment: &Deployment) -> Vec<TenantSpan> {
-    deployment
-        .server()
-        .flush_bifrost()
-        .await
-        .expect("rows publish");
-    wyrd_ai::Bifrost::connect(&deployment.admin())
-        .await
-        .expect("Bifrost connects")
-        .sql_as(
-            "SELECT scope_name, name, encode(trace_id, 'hex') AS trace_id, \
-                    encode(span_id, 'hex') AS span_id, \
-                    encode(parent_span_id, 'hex') AS parent_span_id, trace_state \
-               FROM vala.traces.spans",
-            &[],
-        )
-        .await
-        .expect("tenant spans read back")
-}
-
 /// Write the managed provider credential `name` holding `secret` with the
 /// CLI as `client`, and return its redacted view as JSON.
 ///
@@ -342,39 +301,32 @@ async fn gateway_span_joins_the_callers_trace() {
         .await;
 
     assert_eq!(status, 200, "{reply}");
-    let spans = tenant_spans(&inference.deployment).await;
-    let traced: Vec<&TenantSpan> = spans
+    let timeline = inference.deployment.timeline(CALLER_TRACE).await;
+    let [attempt] = timeline
         .iter()
-        .filter(|span| span.trace_id == CALLER_TRACE)
-        .collect();
-    let [attempt] = traced
-        .iter()
-        .filter(|span| span.scope_name == GATEWAY_SCOPE)
+        .filter(|span| span.trace_id.to_hex() == CALLER_TRACE && span.scope.name == GATEWAY_SCOPE)
         .collect::<Vec<_>>()[..]
     else {
-        panic!("exactly one attempt row joins the caller: {spans:#?}");
+        panic!("exactly one attempt row joins the caller: {timeline:#?}");
     };
     assert_eq!(
         attempt.trace_state, CALLER_STATE,
         "the caller's state propagates"
     );
     assert!(
-        traced.iter().all(|span| span.name != "gateway.attempt"),
-        "{spans:#?}"
+        timeline.iter().all(|span| span.name != "gateway.attempt"),
+        "{timeline:#?}"
     );
-    let mut chain = vec![*attempt];
-    while let Some(parent) = chain.last().and_then(|span| {
-        traced
-            .iter()
-            .find(|parent| Some(&parent.span_id) == span.parent_span_id.as_ref())
-    }) {
-        chain.push(parent);
-    }
+    let chain = ancestry(&timeline, attempt);
     let names: Vec<&str> = chain.iter().map(|span| span.name.as_str()).collect();
     assert_eq!(names.get(1), Some(&"gateway.call"), "{names:?}");
-    assert_eq!(names.last(), Some(&"request"), "{names:?} in {traced:#?}");
+    assert_eq!(names.last(), Some(&"request"), "{names:?} in {timeline:#?}");
     assert_eq!(
-        chain.last().and_then(|span| span.parent_span_id.as_deref()),
+        chain
+            .last()
+            .and_then(|span| span.parent_span_id)
+            .map(|span| span.to_hex())
+            .as_deref(),
         Some(CALLER_SPAN),
         "{names:?}"
     );
@@ -399,15 +351,39 @@ async fn malformed_traceparent_is_ignored_by_the_gateway() {
         .await;
 
     assert_eq!(status, 200, "{reply}");
-    let spans: Vec<TenantSpan> = tenant_spans(&inference.deployment)
+    assert!(
+        inference.deployment.timeline(CALLER_TRACE).await.is_empty(),
+        "nothing joined the caller's trace"
+    );
+    let calls = wyrd_ai::Bifrost::connect(&inference.deployment.admin())
         .await
-        .into_iter()
-        .filter(|span| span.scope_name == GATEWAY_SCOPE)
-        .collect();
-    assert_eq!(spans.len(), 1, "{spans:?}");
-    assert_ne!(spans[0].trace_id, CALLER_TRACE);
-    assert_eq!(spans[0].parent_span_id, None);
+        .expect("Bifrost connects")
+        .sql_as::<CallId>("SELECT call_id FROM vala.gateway.calls", &[])
+        .await
+        .expect("calls read back");
+    let [call] = &calls[..] else {
+        panic!("exactly one call is recorded: {calls:?}");
+    };
+    let own_trace = inference
+        .deployment
+        .timeline(&call.call_id.replace('-', ""))
+        .await;
+    let [attempt] = &own_trace[..] else {
+        panic!("the call's own trace holds its one attempt: {own_trace:#?}");
+    };
+    assert_eq!(
+        (attempt.scope.name.as_str(), attempt.parent_span_id),
+        (GATEWAY_SCOPE, None)
+    );
     inference.deployment.shutdown().await;
+}
+
+/// One `vala.gateway.calls` row's identity.
+#[derive(Debug, serde::Deserialize)]
+struct CallId {
+    /// The call's UUID, whose bytes are its trace id when no caller's trace
+    /// was continued.
+    call_id: String,
 }
 
 /// One `vala.gateway.calls` row's requesting principal and attribution.

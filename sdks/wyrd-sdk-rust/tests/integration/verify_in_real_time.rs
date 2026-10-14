@@ -17,21 +17,22 @@ use wyrd_ai::cards::CardRef;
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::{
-    Bifrost, Gateway, VerificationVerdict, VerifierCounts, VerifierKind, WyrdClient, cli,
+    Bifrost, Gateway, SpanRecord, VerificationVerdict, VerifierCounts, VerifierKind, WyrdClient,
+    cli,
 };
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::local_development::configure_gateway;
-use crate::support::{Deployment, coordinates, hydrate, register, registered};
+use crate::support::{Deployment, ancestry, coordinates, hydrate, register, registered};
 
 /// How long a test waits for the latency baseline to fit.
 const BASELINE_FIT: Duration = Duration::from_secs(90);
 
 /// One agent answer, the input the Eval Verifiers judge.
 #[derive(Serialize)]
-struct Answer {
+pub(crate) struct Answer {
     /// The answer text.
-    answer: &'static str,
+    pub(crate) answer: &'static str,
 }
 
 /// One observed request latency, the input `latency-drift` judges.
@@ -45,15 +46,15 @@ struct Latency {
 /// gateway deploys `gpt-4o` on a local judge that passes every answer, with
 /// the assistant Service registered and hydrated. The gateway captures call
 /// metadata, so every judge call lands in Bifrost.
-struct Assistant {
+pub(crate) struct Assistant {
     /// The deployment.
-    deployment: Deployment,
+    pub(crate) deployment: Deployment,
     /// The local judge the server's Eval judge calls.
     judge: MockServer,
     /// The hydrated assistant bundle.
     bundle: TempDir,
     /// The registered assistant Service.
-    service: CardRef,
+    pub(crate) service: CardRef,
     /// The registered `latency-drift` Verifier.
     latency_drift: CardRef,
     /// The registered `answer-is-yes` Eval Verifier.
@@ -73,7 +74,7 @@ impl Assistant {
     ///
     /// # Panics
     /// Panics when a setup step fails.
-    async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let judge = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -136,7 +137,7 @@ impl Assistant {
     /// # Panics
     /// Panics when the key is not issued, the bundle does not load, or
     /// Bifrost does not start.
-    async fn state(&self) -> WyrdState {
+    pub(crate) async fn state(&self) -> WyrdState {
         let key = self.deployment.service_key(&self.service).await;
         let state = self.state_as(self.deployment.client(&key));
         state.start_bifrost().await.expect("Bifrost starts");
@@ -175,9 +176,8 @@ impl Assistant {
         .to_string()
     }
 
-    /// Publish every captured row, then read the requesting principal and
-    /// the Run and Card attribution of each `vala.gateway.calls` row with the
-    /// hex trace of its span.
+    /// Publish every captured row, then read each `vala.gateway.calls` row's
+    /// id, requesting principal, and Run and Card attribution.
     ///
     /// # Panics
     /// Panics when the flush or the read fails.
@@ -191,11 +191,7 @@ impl Assistant {
             .await
             .expect("Bifrost connects")
             .sql_as(
-                "SELECT c.caller_principal_id, c.run_id, c.card_uid, \
-                        encode(s.trace_id, 'hex') AS trace_id, \
-                        encode(s.parent_span_id, 'hex') AS parent_span_id \
-                   FROM vala.gateway.calls c \
-                   JOIN vala.traces.spans s ON s.scope_name = 'wyrd.gateway'",
+                "SELECT call_id, caller_principal_id, run_id, card_uid FROM vala.gateway.calls",
                 &[],
             )
             .await
@@ -285,19 +281,29 @@ impl Assistant {
     }
 }
 
-/// One judge call's `vala.gateway.calls` attribution and its span's trace.
+/// One judge call's `vala.gateway.calls` identity and attribution.
 #[derive(Debug, PartialEq, Deserialize)]
 struct JudgeCall {
+    /// The call's UUID, which its gateway spans carry as `gateway_call_id`.
+    call_id: String,
     /// The principal that requested the judgment.
     caller_principal_id: String,
     /// The application Run the call is attributed to.
     run_id: Option<String>,
     /// The Card UID the call is attributed to.
     card_uid: Option<String>,
-    /// The span's trace identity as hex.
-    trace_id: String,
-    /// The span's parent span identity as hex.
-    parent_span_id: Option<String>,
+}
+
+impl JudgeCall {
+    /// This call's gateway span in `timeline`, joined on its call id.
+    fn span<'a>(&self, timeline: &'a [SpanRecord]) -> Option<&'a SpanRecord> {
+        timeline.iter().find(|span| {
+            span.attributes
+                .get("gateway_call_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(self.call_id.as_str())
+        })
+    }
 }
 
 /// One verification result beside one judge call joined to it on the
@@ -528,9 +534,10 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
 }
 
 /// A judgment requested over HTTP with a caller `traceparent` and no Run
-/// judges in process within the caller's trace: the judge's gateway span is a
-/// child of the caller's span, and the call records the requesting principal
-/// and the subject Card with a null Run rather than an invented one. The
+/// judges in process within the caller's trace: the judge call's gateway span,
+/// joined on its call id, descends from the caller's span, and the call
+/// records the requesting principal and the subject Card with a null Run
+/// rather than an invented one. The
 /// result records the same principal and joins the call on that Card.
 ///
 /// # Panics
@@ -545,15 +552,35 @@ async fn judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
         .await;
 
     let principal = assistant.principal().await;
+    let calls = assistant.judge_calls().await;
+    let [call] = &calls[..] else {
+        panic!("exactly one judge call: {calls:?}");
+    };
     assert_eq!(
-        assistant.judge_calls().await,
-        [JudgeCall {
-            caller_principal_id: principal.clone(),
-            run_id: None,
-            card_uid: assistant.agent.uid.as_ref().map(ToString::to_string),
-            trace_id: CALLER_TRACE.to_owned(),
-            parent_span_id: Some(CALLER_SPAN.to_owned()),
-        }]
+        (
+            call.caller_principal_id.as_str(),
+            call.run_id.as_deref(),
+            call.card_uid.clone()
+        ),
+        (
+            principal.as_str(),
+            None,
+            assistant.agent.uid.as_ref().map(ToString::to_string)
+        )
+    );
+    let timeline = assistant.deployment.timeline(CALLER_TRACE).await;
+    let span = call
+        .span(&timeline)
+        .expect("the judge call joins the caller's trace");
+    let chain = ancestry(&timeline, span);
+    assert_eq!(
+        chain
+            .last()
+            .and_then(|root| root.parent_span_id)
+            .map(|parent| parent.to_hex())
+            .as_deref(),
+        Some(CALLER_SPAN),
+        "{chain:#?}"
     );
     assert_eq!(
         assistant.result_with_its_judge_calls(&execution).await,
@@ -622,13 +649,10 @@ async fn traced_sdk_verify_joins_the_callers_trace() {
     state.shutdown().await.expect("Bifrost stops");
 
     let calls = assistant.judge_calls().await;
-    assert_eq!(
-        calls
-            .iter()
-            .map(|call| call.trace_id.as_str())
-            .collect::<Vec<_>>(),
-        [CALLER_TRACE],
-        "{calls:?}"
+    let timeline = assistant.deployment.timeline(CALLER_TRACE).await;
+    assert!(
+        calls.len() == 1 && calls[0].span(&timeline).is_some(),
+        "{calls:?} in {timeline:#?}"
     );
     assistant.deployment.shutdown().await;
 }
@@ -649,8 +673,10 @@ async fn malformed_traceparent_is_ignored_by_the_judge_call() {
 
     let calls = assistant.judge_calls().await;
     assert_eq!(calls.len(), 1, "{calls:?}");
-    assert_ne!(calls[0].trace_id, CALLER_TRACE);
-    assert_eq!(calls[0].parent_span_id, None);
+    assert!(
+        assistant.deployment.timeline(CALLER_TRACE).await.is_empty(),
+        "nothing joined the caller's trace"
+    );
     assistant.deployment.shutdown().await;
 }
 

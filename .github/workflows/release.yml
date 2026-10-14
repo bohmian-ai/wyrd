@@ -323,10 +323,13 @@ jobs:
 
       - run: twine check --strict dist/*.whl dist/*.tar.gz
 
-      - run: twine upload dist/*.whl dist/*.tar.gz
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+      # PyPI trusted publishing: the action exchanges this job's OIDC token,
+      # so wyrd-ai names release.yml and the release environment on pypi.org.
+      - run: mkdir upload && cp dist/*.whl dist/*.tar.gz upload/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: upload/
 
   # ── TypeScript SDK + napi platform addons ────────────────────────────────
 

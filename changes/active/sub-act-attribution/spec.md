@@ -1,6 +1,6 @@
 ---
 id: SPEC-sub-act-attribution
-revision: 1
+revision: 3
 status: approved
 ---
 
@@ -28,6 +28,16 @@ plainly whether a principal or Wyrd itself did the work.
 
 Approved by the human owner on 2026-10-14: "I approve the design. there is no
 need for migrations. nothing has shipped".
+
+Revision 2 follows owner direction on 2026-10-14 that this change lands after
+SPEC-verify-attribution r2 ("sub-act lands after this, so you will need to
+update the sub-act spec"). It changes only what that ordering requires; see
+"Relationship to verify-attribution".
+
+Revision 3 settles the open Workflow-step decision and states that work a
+request causes inside Wyrd keeps that request's originating `sub` and
+authority. Approved by the human owner on 2026-10-14: "delegation should always
+retain the originating sub … i agree and settle the spec".
 
 ## Definitions
 
@@ -58,13 +68,21 @@ a client can never supply either one.
 | Scheduled binding run | binding owner's principal | SYSTEM |
 | Observation-triggered binding run | binding owner's principal | SYSTEM |
 | Judge model call inside any Verifier run | the run's `sub` | SYSTEM |
+| Model call made by a Workflow step | the run's captured caller (A under delegation) | the run's captured caller (B under delegation) |
 | A client writes observations, spans, logs, metrics, or table rows | writer, or A under delegation | writer, or B under delegation |
+| Server span copied to the tenant's `vala.traces.spans` (verify-attribution REQ-007) | the `sub` of the request the span continues | the `act` of that request |
 | Card, service account, API key, operator connection, or Bifrost table registration | caller | caller, or B under delegation |
 
 - The binding owner's principal is the principal projected for the binding's
   `owner_card_uid` Service or Agent Card.
 - The observation writer is never the `sub` of an observation-triggered run.
   It stays reachable through `source_record_id`.
+- `sub` is carried, never re-derived. Work a request causes inside Wyrd, such
+  as a Verifier's judge call or a Workflow step's model call, keeps the
+  originating request's `sub` at every hop. A principal that calls verify is
+  the `sub` of the judge's gateway call.
+- A Workflow step's model call is the caller's own requested work, so its
+  `act` is the captured caller, not SYSTEM.
 
 ### REQ-003 Authorization and cost follow sub
 
@@ -73,8 +91,13 @@ a client can never supply either one.
   or was started inside Wyrd.
 - A delegated external call keeps today's rule: its permissions are the
   intersection of the subject's and the actor's.
-- SYSTEM as `act` adds no restriction and grants nothing. An internal call is
-  authorized exactly as its `sub` would be.
+- Work a request causes inside Wyrd carries that request's authority. Each
+  downstream call is checked against the originating `sub`'s permissions,
+  intersected with the originating actor's when the request was delegated. A
+  delegated request can never widen to `sub`'s full permissions on a later hop.
+- SYSTEM as `act` adds no restriction and grants nothing. Work with no
+  originating request (scheduled and observation-triggered runs) is authorized
+  exactly as its `sub` would be.
 - Gateway spend and admission accounting are charged to `sub`.
 - SYSTEM is never a `sub`.
 
@@ -87,6 +110,10 @@ a client can never supply either one.
   - `verifier_card_uid`, which replaces `verifier_uid` and also replaces
     today's use of the managed `card_uid` for the Verifier on result tables.
 - `subject_card_uid` no longer exists.
+- A Workflow step's model call records `card_uid` = the Workflow Card and a
+  null `run_id`. A Workflow run id is not an application Run; the step call
+  correlates to its Workflow run through the trace and the
+  `wyrd.workflow.run_id` span attribute.
 
 ### REQ-005 Schemas
 
@@ -109,6 +136,7 @@ Bifrost system tables:
 |---|---|
 | gateway calls | drop `caller_principal_id`; attribution is the managed pair |
 | verification results | drop `requested_by_principal_id` and `subject_card_uid`; managed `card_uid` = Card verified; add `verifier_card_uid` |
+| `vala.traces.spans` server-span rows | the managed pair replaces verify-attribution D6's single requesting-principal stamp |
 | eval result items, drift result features | drop `subject_card_uid`; managed `card_uid` = Card verified; add `verifier_card_uid` |
 | audit log | `audit_principal_id` → `sub_principal_id`; `principal_kind` → `sub_principal_kind`; add `act_principal_id`; `delegation_chain` stays in detail |
 
@@ -116,7 +144,7 @@ PostgreSQL tables:
 
 | Table | Change |
 |---|---|
-| `wyrd.verifier_runs` | `requested_by_principal_id` → pair, both `NOT NULL`; `subject_card_uid` → `card_uid`; `verifier_uid` → `verifier_card_uid`; idempotency unique on `(data_tenant_id, act_principal_id, idempotency_key)` |
+| `wyrd.verifier_runs` | `requested_by_principal_id` → pair, both `NOT NULL`; `subject_card_uid` → `card_uid`; `verifier_uid` → `verifier_card_uid`; idempotency unique on `(data_tenant_id, act_principal_id, idempotency_key)`; the enqueuing trace-context column from verify-attribution D8 is kept unchanged |
 | `wyrd.verification_bindings` | `subject_card_uid` → `card_uid`; `verifier_uid` → `verifier_card_uid` |
 | `wyrd.card_registration_operations` | `principal_id` → pair; unique on `(data_tenant_id, act_principal_id, idempotency_key)` |
 | `wyrd.cards`, `wyrd.auth_service_accounts`, `wyrd.auth_api_keys`, `wyrd.operator_connections` | `created_by` → pair |
@@ -162,7 +190,10 @@ Idempotency is keyed on `act` because the actor is the party that retries.
 
 - **No migrations.** Nothing has shipped, so each change edits the migration or
   Iceberg schema declaration that defines the column, in place:
-  - `20261014000001_verifier_run_requester_every_origin.sql` is deleted;
+  - `20261014000001_verifier_run_requester_every_origin.sql` is deleted. By
+    the time this change lands it also carries verify-attribution's D8
+    enqueuing trace-context column; that column moves into the defining
+    `wyrd.verifier_runs` `CREATE TABLE` with its meaning unchanged;
   - any `ALTER` migration that exists only to adjust a renamed column is
     folded into the defining `CREATE TABLE`;
   - no backfill, compatibility view, or fingerprint migration path is written.
@@ -187,15 +218,35 @@ Idempotency is keyed on `act` because the actor is the party that retries.
   - trace propagation;
   - identity tables listed in REQ-005.
 
+## Relationship to verify-attribution
+
+SPEC-verify-attribution r2 lands first. This change rebases onto it and keeps
+all of its behavior except the attribution columns it renames:
+
+- verify-attribution REQ-004 stamps `run_id` and `card_uid` on judge gateway
+  calls and joins Eval and observation results to their judge calls on
+  `subject_card_uid` = `card_uid`. After this change that join is
+  `card_uid` = `card_uid`, and judge calls carry the REQ-002 judge pair.
+- verify-attribution D6 stamps tenant server-span rows with the requesting
+  principal. This change replaces that stamp with the managed pair (REQ-002,
+  REQ-005); the span frame's attribution comes from the request, like every
+  other server write.
+- verify-attribution D8's enqueuing trace context on `wyrd.verifier_runs` is
+  folded into the defining migration (expensive-to-reverse decisions).
+- Trace continuity, span links, dual export, SDK propagation, and the trace
+  timeline read are unchanged. INV-005 still holds: trace context never sets
+  `sub` or `act`.
+
 ## Relationship to example-journey-fixes
 
-This change branches from the example-journey-fixes integration candidate
-(`c4ba2b050`). It supersedes that change's attribution rules:
+This change rebases onto SPEC-verify-attribution once that lands. It
+supersedes that change's attribution rules:
 - OD-1's "SYSTEM is the requester" clauses;
 - the open judge-authority item;
 - REQ-004's requester for every origin.
 
-OD-1's span link and OD-3 trace behavior are kept.
+OD-1's span link is kept. OD-3's verify-only trace propagation was already
+superseded by verify-attribution D3.
 
 ## Acceptance criteria
 
@@ -210,6 +261,9 @@ OD-1's span link and OD-3 trace behavior are kept.
 | AC-007 | No new migration exists. `20261014000001` is gone. Postgres applies from empty. | `mise run test:sql` |
 | AC-008 | A tenant seeded by `wyrd-dev-fixtures` has an active SYSTEM principal. | integration test |
 | AC-009 | Scoped lanes pass for every touched surface (`test:wyrd`, `test:vala`, `test:bifrost`, `test:gateway:gate`, Python and TypeScript unit and integration lanes, `codegen:check`, `check:tenant-isolation`). | lane output |
+| AC-010 | A sampled, client-traced direct verify writes tenant server-span rows with `sub` = `act` = caller, and with `sub` = A, `act` = B under delegation. The verify-attribution action-timeline journeys still pass, and Eval and observation results join their judge calls on `card_uid`. | Rust journey; the existing action-timeline journeys in Rust, Python and TypeScript |
+| AC-011 | A Workflow step's model call records `sub` = `act` = the run's captured caller (A and B under delegation), `card_uid` = the Workflow Card, and null `run_id`. | Rust journey |
+| AC-012 | A delegated direct verify (B for A) whose judge model A may invoke but B may not is refused at the judge's gateway call; the judge call's `sub` is A. | Rust journey |
 
 ## Open decisions
 
@@ -218,6 +272,12 @@ None.
 ## Revision history
 
 - r1 (2026-10-14): initial, approved.
+- r2 (2026-10-14): lands after SPEC-verify-attribution r2. Adds the
+  server-span row to REQ-002 and REQ-005, folds the D8 trace-context column
+  into the defining migration, renames the judge-call join, and adds AC-010.
+- r3 (2026-10-14): settles Workflow step calls (REQ-002, REQ-004); originating
+  `sub` and delegated authority carry through every internal hop (REQ-002,
+  REQ-003); adds AC-011 and AC-012; no open decisions.
 
 ## Authority
 

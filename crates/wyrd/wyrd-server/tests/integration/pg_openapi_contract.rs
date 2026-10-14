@@ -1097,6 +1097,11 @@ async fn gateway_ingress_publishes_typed_contracts() {
         serde_json::json!(false),
         "the Jev request contract is closed"
     );
+    assert_eq!(
+        schemas["GatewayJevRequest"]["properties"]["state"]["type"],
+        serde_json::json!("string"),
+        "the Jev state is typed text"
+    );
 
     server.shutdown().await.expect("server shuts down");
 }

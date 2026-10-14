@@ -102,6 +102,14 @@ impl PromptDraft {
                 build_gemini(self.system, messages, self.model_settings, false)?
             }
             ProviderName::Vertex => build_gemini(self.system, messages, self.model_settings, true)?,
+            // Jev asks keyed questions, not messages: a Jev Prompt declares its
+            // native `request`.
+            ProviderName::Jev => {
+                return Err(SkaldError::PromptDraftInvalid {
+                    provider: "jev".to_owned(),
+                    message: "a jev Prompt declares its native `request`, not messages".to_owned(),
+                });
+            }
             ProviderName::Custom(name) => {
                 return Err(SkaldError::PromptDraftInvalid {
                     provider: name,

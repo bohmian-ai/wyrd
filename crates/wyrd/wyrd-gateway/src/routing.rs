@@ -4,16 +4,15 @@
 //! defined fallback source — request override, exact `Model` rule,
 //! `Operation` rule, then `Global` — without merging rules. Candidates equal
 //! to the requested model or already listed are skipped, and a candidate with
-//! no deployment declaring the operation is dropped. A candidate on the other
-//! side of the Jev protocol boundary is dropped too: a Jev question never
-//! falls back to an ordinary chat model, nor ordinary chat to Jev. Each remaining
+//! no deployment declaring the operation is dropped, so a Jev question, which
+//! only Jev deployments serve, never falls back to another protocol. Each remaining
 //! candidate's deployments are ordered by weighted selection keyed by the
 //! logical call id, so every replica picks the same first deployment.
 
 use serde_json::Value;
 use wyrd_spec::gateway::{
     FallbackScope, GatewayCallId, GatewayFallbackOverride, GatewayOperation, ModelRef,
-    ProviderAdapter, ProviderDeployment,
+    ProviderDeployment,
 };
 use wyrd_spec::ids::ProviderDeploymentName;
 
@@ -69,12 +68,9 @@ impl CallPlan {
             .or_else(|| rule(&|scope| matches!(scope, FallbackScope::Global)))
             .unwrap_or_default();
 
-        let jev = |model: &ModelRef| {
-            ProviderAdapter::Jev.builtin_provider() == Some(model.provider.as_str())
-        };
         let mut models: Vec<&ModelRef> = vec![&requested];
         for model in fallback {
-            if !models.contains(&model) && jev(model) == jev(&requested) {
+            if !models.contains(&model) {
                 models.push(model);
             }
         }
@@ -398,9 +394,9 @@ mod tests {
         );
     }
 
-    /// Fallback never crosses the Jev protocol boundary: a Jev question keeps
-    /// only Jev candidates and ordinary chat drops every Jev candidate, even
-    /// when both declare Chat Completions.
+    /// Fallback never crosses the Jev protocol boundary: only Jev deployments
+    /// serve `system_one`, so a Jev question keeps only Jev candidates and
+    /// ordinary chat drops every Jev candidate.
     ///
     /// # Panics
     ///
@@ -413,7 +409,7 @@ mod tests {
                 "model": ModelRef::from_projection(model).expect("model"),
                 "adapter": "jev",
                 "auth": {"bearer": {"credential": "jev-key"}},
-                "capabilities": ["system_one", "chat_completions"],
+                "capabilities": ["system_one"],
                 "routing_weight": 1,
             }))
             .expect("jev deployment decodes")
@@ -434,7 +430,7 @@ mod tests {
             models(&CallPlan::new(
                 &snap,
                 call,
-                chat,
+                GatewayOperation::SystemOne,
                 model("jev/jev-latest"),
                 None
             )),

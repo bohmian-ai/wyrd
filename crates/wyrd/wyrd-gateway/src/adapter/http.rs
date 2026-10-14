@@ -366,13 +366,10 @@ impl Client {
                     .send_native(ProviderRequest::GeminiGenerateContent(*request))
                     .await?
             }
-            (Self::Jev(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(&raw(&body)?).await?)
-            }
             (Self::Jev(client), Prepared::Jev(request)) => {
-                let body = to_raw_value(&request)
-                    .map_err(|error| ProviderError::decode("gateway", error))?;
-                ProviderResponse::RawV1(client.send_raw(&body).await?)
+                client
+                    .send_native(ProviderRequest::JevSystemOne(*request))
+                    .await?
             }
             (_, _) => return Err(mismatch()),
         };
@@ -777,7 +774,7 @@ impl ProviderDispatch for HttpProviderDispatch {
             }
         };
         let mapped = tracing::info_span!("gateway.translate", direction = "response")
-            .in_scope(|| complete(response, wire, translated, &id, model));
+            .in_scope(|| complete(response, wire, &id, model));
         match mapped {
             Ok((body, usage))
                 if attempt.operation != GatewayOperation::Embeddings

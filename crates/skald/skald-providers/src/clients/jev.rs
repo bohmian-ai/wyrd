@@ -1,20 +1,29 @@
 //! TypeSafe Jev `systemone` client.
 //!
 //! Jev answers keyed questions over one non-streaming route,
-//! `POST {base}/v1/systemone`, authenticated with a bearer API key. Callers
-//! submit a validated JSON body and receive the answer bytes unchanged, so the
-//! gateway can relay native answers intact or translate them itself.
+//! `POST {base}/v1/systemone`, authenticated with a bearer API key. The client
+//! sends a typed [`skald_spec::JevRequest`] and decodes the typed
+//! [`skald_spec::JevResponse`], exactly as the other provider clients carry
+//! their native wire structs.
 
-use serde_json::value::RawValue;
+use async_trait::async_trait;
+use skald_spec::{ProviderRequest, ProviderResponse};
 
 use crate::auth::OpenAiAuth;
-use crate::error::ProviderResult;
-use crate::raw;
+use crate::error::{ProviderError, ProviderResult};
 use crate::retry::RetryPolicy;
-use crate::transport::HttpTransport;
+use crate::trait_::{ProviderClient, ProviderStream};
+use crate::transport::{HttpTransport, TransportConfig};
 
 /// Production TypeSafe API base URL.
 pub const JEV_BASE_URL: &str = "https://api.typesafe.ai";
+
+/// Environment variable holding the TypeSafe API key [`JevClient::from_env`]
+/// reads.
+pub const JEV_API_KEY_VARIABLE: &str = "TYPESAFE_API_KEY";
+
+/// Provider label on every error this client raises.
+const PROVIDER: &str = "jev";
 
 /// Jev provider client: bearer auth, a shared transport, and a retry policy.
 #[derive(Debug, Clone)]
@@ -33,6 +42,36 @@ impl JevClient {
     #[must_use]
     pub fn auth(api_key: impl Into<String>, base_url: Option<&str>) -> OpenAiAuth {
         OpenAiAuth::new(api_key).with_base_url(base_url.unwrap_or(JEV_BASE_URL))
+    }
+
+    /// Creates a client from explicit auth with the default transport and
+    /// retry policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport construction error.
+    pub fn new(auth: OpenAiAuth) -> ProviderResult<Self> {
+        Ok(Self::with_transport(
+            auth,
+            HttpTransport::new(TransportConfig::default())?,
+            RetryPolicy::default(),
+        ))
+    }
+
+    /// Creates a production client keyed by [`JEV_API_KEY_VARIABLE`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Auth`] when the variable is unset or empty,
+    /// and the transport construction error.
+    pub fn from_env() -> ProviderResult<Self> {
+        let key = std::env::var(JEV_API_KEY_VARIABLE)
+            .ok()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| {
+                ProviderError::auth(PROVIDER, format!("{JEV_API_KEY_VARIABLE} is not set"))
+            })?;
+        Self::new(Self::auth(key, None))
     }
 
     /// Creates a client over a shared transport and retry policy; `auth`
@@ -58,40 +97,66 @@ impl JevClient {
         )
     }
 
-    /// Posts a `systemone` `body` and returns the answer bytes unchanged.
+    /// Sends a typed Jev request and decodes the typed answer.
     ///
-    /// The body is sent as given; callers validate it first. Retries follow
-    /// the client's policy.
+    /// The request is sent as given; callers validate it first with
+    /// [`skald_spec::JevRequest::validate`]. Retries follow the client's
+    /// policy.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::ProviderError::Status`] for a non-success answer,
-    /// [`crate::ProviderError::Decode`] when the answer is not JSON or the
-    /// credential is not a valid header, and [`crate::ProviderError::Connect`],
-    /// [`crate::ProviderError::Timeout`], or [`crate::ProviderError::Upstream`]
-    /// when the exchange fails.
-    pub async fn send_raw(&self, body: &RawValue) -> ProviderResult<Box<RawValue>> {
-        raw::send_raw(
+    /// Returns [`ProviderError::VariantMismatch`] for any request other than
+    /// [`ProviderRequest::JevSystemOne`], [`ProviderError::Status`] for a
+    /// non-success answer, [`ProviderError::Decode`] when the answer is not a
+    /// Jev response or the credential is not a valid header, and
+    /// [`ProviderError::Connect`], [`ProviderError::Timeout`], or
+    /// [`ProviderError::Upstream`] when the exchange fails.
+    pub async fn send_native(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+        let ProviderRequest::JevSystemOne(request) = request else {
+            return Err(ProviderError::variant_mismatch(
+                PROVIDER,
+                super::request_variant_label(&request),
+            ));
+        };
+        let response = super::send_json_with_retry(
             &self.transport,
-            "jev",
+            PROVIDER,
             &self.systemone_url(),
             self.auth.headers()?,
-            body,
+            &request,
             &self.retry,
         )
-        .await
+        .await?;
+        Ok(ProviderResponse::JevSystemOne(response))
+    }
+}
+
+#[async_trait]
+impl ProviderClient for JevClient {
+    /// Sends one Jev request; see [`JevClient::send_native`].
+    async fn send(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+        self.send_native(request).await
+    }
+
+    /// Jev never streams.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`ProviderError::BadRequest`].
+    async fn stream(&self, _request: ProviderRequest) -> ProviderResult<ProviderStream> {
+        Err(ProviderError::bad_request(PROVIDER, "jev does not stream"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use serde_json::value::to_raw_value;
+    use skald_spec::{JevAnswer, JevRequest};
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::{ProviderError, common};
+    use crate::common;
 
     /// Builds a client of `server` with the test key.
     fn client(server: &MockServer) -> JevClient {
@@ -102,41 +167,67 @@ mod tests {
         )
     }
 
-    /// The body reaches `/v1/systemone` with bearer auth and the answer
-    /// returns byte for byte.
+    /// The documented request body.
+    fn request() -> JevRequest {
+        serde_json::from_value(json!({"model": "jev-latest", "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "x"}}}))
+        .expect("request decodes")
+    }
+
+    /// The typed body reaches `/v1/systemone` with bearer auth and the
+    /// answer decodes typed.
     #[tokio::test]
-    async fn systemone_posts_bearer_body_and_returns_answer_bytes() {
+    async fn systemone_posts_bearer_body_and_decodes_the_answer() {
         let server = MockServer::start().await;
-        let request = json!({"model": "jev-latest", "state": "s",
-                             "questions": {"q": {"type": "noul", "instructions": "x"}}});
-        let answer = r#"{"model":"jev-1.13.0","answers":{"q":{"type":"noul","noul":0.9}},"usage":{"input_tokens":3,"output_tokens":1}}"#;
         Mock::given(method("POST"))
             .and(path("/v1/systemone"))
             .and(header("authorization", "Bearer jev-test"))
-            .and(body_json(&request))
-            .respond_with(ResponseTemplate::new(200).set_body_string(answer))
+            .and(body_json(request()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "jev-1.13.0",
+                "answers": {"q": {"type": "noul", "noul": 0.9}},
+                "usage": {"input_tokens": 3, "output_tokens": 1}
+            })))
             .expect(1)
             .mount(&server)
             .await;
 
-        let body = to_raw_value(&request).expect("raw body");
-        let response = client(&server).send_raw(&body).await.expect("answers");
-        assert_eq!(response.get(), answer);
+        let response = client(&server)
+            .send(ProviderRequest::JevSystemOne(request()))
+            .await
+            .expect("answers");
+        let ProviderResponse::JevSystemOne(answer) = response else {
+            panic!("a Jev request answers a Jev response");
+        };
+        assert_eq!(answer.answers["q"], JevAnswer::Noul { noul: 0.9 });
     }
 
-    /// A validation refusal is a status error, not retried.
+    /// A validation refusal is a status error, and another dialect never
+    /// reaches the provider.
     #[tokio::test]
-    async fn refusal_is_a_status_error() {
+    async fn refusal_is_a_status_error_and_other_dialects_mismatch() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/systemone"))
-            .respond_with(ResponseTemplate::new(422).set_body_string(r#"{"detail":"bad"}"#))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"detail":{"error_type":"api_usage_error","message":"Invalid request."}}"#,
+            ))
             .expect(1)
             .mount(&server)
             .await;
 
-        let body = to_raw_value(&json!({})).expect("raw body");
-        let error = client(&server).send_raw(&body).await.expect_err("refused");
-        assert!(matches!(error, ProviderError::Status { status: 422, .. }));
+        let error = client(&server)
+            .send(ProviderRequest::JevSystemOne(request()))
+            .await
+            .expect_err("refused");
+        assert!(matches!(error, ProviderError::Status { status: 400, .. }));
+        let error = client(&server)
+            .send(ProviderRequest::RawV1 {
+                provider: skald_spec::ProviderName::Jev,
+                body: json!({}),
+            })
+            .await
+            .expect_err("mismatch");
+        assert!(matches!(error, ProviderError::VariantMismatch { .. }));
     }
 }

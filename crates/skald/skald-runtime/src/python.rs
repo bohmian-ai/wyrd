@@ -115,6 +115,7 @@ fn provider_name_label(name: &ProviderName) -> String {
         ProviderName::Anthropic => "anthropic".to_owned(),
         ProviderName::Google => "google".to_owned(),
         ProviderName::Vertex => "vertex".to_owned(),
+        ProviderName::Jev => "jev".to_owned(),
         ProviderName::Custom(value) => value.clone(),
     }
 }

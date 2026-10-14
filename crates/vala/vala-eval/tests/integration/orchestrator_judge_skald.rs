@@ -440,6 +440,17 @@ struct JevProvider {
 #[async_trait]
 impl Provider for JevProvider {
     /// Record `request` and answer `helpful` with `noul` 0.9.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error: every request is recorded and answered with
+    /// the same typed judgment.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the capture lock is poisoned by an earlier panicking
+    /// holder, or when the static answer no longer decodes as a typed
+    /// [`ProviderResponse::JevSystemOne`] response.
     async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         self.seen.lock().expect("capture lock").push(request);
         Ok(ProviderResponse::JevSystemOne(
@@ -453,6 +464,11 @@ impl Provider for JevProvider {
     }
 
     /// Jev never streams.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`ProviderError::Timeout`], deliberately, so a judge
+    /// that wrongly streams a Jev request fails rather than answering.
     async fn stream(&self, _request: ProviderRequest) -> Result<ProviderStream, ProviderError> {
         Err(ProviderError::timeout("jev"))
     }

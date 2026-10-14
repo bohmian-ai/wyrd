@@ -131,6 +131,10 @@ impl ShouldSample for ServerSampler {
         let parent = parent_context
             .filter(|context| context.has_active_span())
             .map(TraceContextExt::span);
+        let trace_state = parent
+            .as_ref()
+            .map(|parent| parent.span_context().trace_state().clone())
+            .unwrap_or_default();
         let decision = match parent {
             None if self.operator_samples(trace_id, name, span_kind, attributes, links) => {
                 SamplingDecision::RecordAndSample
@@ -152,17 +156,19 @@ impl ShouldSample for ServerSampler {
         SamplingResult {
             decision,
             attributes: Vec::new(),
-            trace_state: TraceState::default(),
+            trace_state,
         }
     }
 }
 
 /// Wraps the operator's span processor and passes on only the spans the
-/// operator sampled.
+/// operator sampled, without their trace state.
 ///
 /// Spans recorded only for a tenant therefore never enter the operator's
 /// queue, so its content and volume are what the server sampler alone
-/// decides.
+/// decides. The live context keeps a caller's `tracestate` for propagation;
+/// the operator's copy drops it, so client state never reaches the
+/// operator's backend.
 #[derive(Debug)]
 pub(crate) struct OperatorExport<P>(pub(crate) P);
 
@@ -172,9 +178,18 @@ impl<P: SpanProcessor> SpanProcessor for OperatorExport<P> {
         self.0.on_start(span, cx);
     }
 
-    /// Pass on an ended span only when the operator sampled it.
-    fn on_end(&self, span: SpanData) {
+    /// Pass on an ended span, its trace state cleared, only when the
+    /// operator sampled it.
+    fn on_end(&self, mut span: SpanData) {
         if span.span_context.is_sampled() {
+            let context = &span.span_context;
+            span.span_context = SpanContext::new(
+                context.trace_id(),
+                context.span_id(),
+                context.trace_flags(),
+                context.is_remote(),
+                TraceState::default(),
+            );
             self.0.on_end(span);
         }
     }
@@ -635,6 +650,33 @@ mod tests {
         }
     }
 
+    /// Every decision under a parent keeps the parent's trace state, so the
+    /// live context propagates it; a root starts with none.
+    #[test]
+    fn sampling_keeps_the_parents_trace_state() {
+        for policy in [Sampler::AlwaysOn, Sampler::AlwaysOff] {
+            let parent = Context::new().with_remote_span_context(remote(true));
+            let result = ServerSampler::new(policy.clone()).should_sample(
+                Some(&parent),
+                TraceId::from(1_u128),
+                "request",
+                &SpanKind::Server,
+                &[],
+                &[],
+            );
+            assert_eq!(result.trace_state.header(), "vendor=client", "{policy:?}");
+        }
+        let root = ServerSampler::new(Sampler::AlwaysOn).should_sample(
+            None,
+            TraceId::from(1_u128),
+            "request",
+            &SpanKind::Server,
+            &[],
+            &[],
+        );
+        assert_eq!(root.trace_state.header(), "");
+    }
+
     /// A remote parent whose trace id the ratio would sample does not make
     /// the operator sample it; the decision uses a server-drawn id.
     #[test]
@@ -677,8 +719,8 @@ mod tests {
         );
     }
 
-    /// The operator filter passes on sampled spans and withholds recorded-only
-    /// ones.
+    /// The operator filter passes on sampled spans without their trace state
+    /// and withholds recorded-only ones.
     #[test]
     fn operator_filter_admits_only_sampled_spans() {
         let recorder = Recorder::default();
@@ -694,7 +736,7 @@ mod tests {
                     SpanId::from(1_u64),
                     flags,
                     false,
-                    TraceState::default(),
+                    TraceState::from_key_value([("vendor", "client")]).expect("valid trace state"),
                 ),
                 parent_span_id: SpanId::INVALID,
                 parent_span_is_remote: false,
@@ -711,6 +753,15 @@ mod tests {
             });
         }
         assert_eq!(recorder.names(trace_id), ["sampled"]);
+        assert!(
+            recorder
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .all(|span| span.span_context.trace_state().header().is_empty()),
+            "the operator copy carries no client trace state"
+        );
     }
 
     /// One continued request: a bound root with a catalog child and a

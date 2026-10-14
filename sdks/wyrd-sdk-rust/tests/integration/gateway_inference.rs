@@ -227,6 +227,8 @@ struct TenantSpan {
     span_id: String,
     /// The span's parent span identity; `None` for a root span.
     parent_span_id: Option<String>,
+    /// The W3C vendor trace state the span carried.
+    trace_state: String,
 }
 
 /// Publish every captured row, then read every span the tenant retains.
@@ -245,7 +247,7 @@ async fn tenant_spans(deployment: &Deployment) -> Vec<TenantSpan> {
         .sql_as(
             "SELECT scope_name, name, encode(trace_id, 'hex') AS trace_id, \
                     encode(span_id, 'hex') AS span_id, \
-                    encode(parent_span_id, 'hex') AS parent_span_id \
+                    encode(parent_span_id, 'hex') AS parent_span_id, trace_state \
                FROM vala.traces.spans",
             &[],
         )
@@ -352,6 +354,10 @@ async fn gateway_span_joins_the_callers_trace() {
     else {
         panic!("exactly one attempt row joins the caller: {spans:#?}");
     };
+    assert_eq!(
+        attempt.trace_state, CALLER_STATE,
+        "the caller's state propagates"
+    );
     assert!(
         traced.iter().all(|span| span.name != "gateway.attempt"),
         "{spans:#?}"

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wyrd_ai::bifrost::{Correlation, QueryParam, TableConfig};
 use wyrd_ai::{Bifrost, QueryTerminalOutcome, WyrdError};
+use wyrd_spec::vala::ids::RunId;
 
 use crate::support::Deployment;
 
@@ -47,7 +48,9 @@ async fn published() -> (Deployment, Bifrost) {
 
 /// A deployment whose administrator wrote rows 1 to 3 of [`QUERY_ROWS`]
 /// that Scribe acknowledged and nothing published, so every query reads them
-/// from the live tail, and the administrator's query client.
+/// from the live tail, and the administrator's query client. Rows 1 and 2
+/// share one managed `run_id` and row 3 carries another, so a query can
+/// correlate on the column Wyrd stamps.
 ///
 /// # Panics
 /// Panics when the table cannot register or a row cannot be written.
@@ -67,7 +70,12 @@ async fn live() -> (Deployment, Bifrost) {
         .await
         .expect("writer connects");
     writer.register().await.expect("table registers");
-    for (id, value) in [(1, "one"), (2, "two"), (3, "three")] {
+    let (shared, other) = (RunId::new(), RunId::new());
+    for (id, value, run_id) in [
+        (1, "one", &shared),
+        (2, "two", &shared),
+        (3, "three", &other),
+    ] {
         let row = QueryRow {
             id,
             value: value.to_owned(),
@@ -75,7 +83,10 @@ async fn live() -> (Deployment, Bifrost) {
         writer
             .insert(
                 serde_json::to_vec(&row).expect("row serializes"),
-                Correlation::default(),
+                Correlation {
+                    card_uid: None,
+                    run_id: Some(run_id.clone()),
+                },
             )
             .expect("row inserts");
     }
@@ -232,8 +243,9 @@ struct Id {
     id: i64,
 }
 
-/// Scalar, `IN`, and correlated `EXISTS` subqueries over a live table return
-/// the same rows as their equivalent joins.
+/// Scalar, `IN`, and correlated `EXISTS` subqueries over a live table,
+/// including one correlated on the managed `run_id`, return the same rows as
+/// their equivalent joins.
 ///
 /// # Panics
 /// Panics when a query fails or a subquery and its join disagree.
@@ -272,6 +284,18 @@ async fn live_table_subqueries_match_their_joins() {
             format!(
                 "SELECT a.id FROM {QUERY_ROWS} a JOIN {QUERY_ROWS} b \
                  ON b.id = a.id + 1 ORDER BY a.id"
+            ),
+            vec![1, 2],
+        ),
+        (
+            format!(
+                "SELECT a.id FROM {QUERY_ROWS} a WHERE EXISTS \
+                 (SELECT 1 FROM {QUERY_ROWS} b WHERE b.run_id = a.run_id AND b.id <> a.id) \
+                 ORDER BY a.id"
+            ),
+            format!(
+                "SELECT DISTINCT a.id FROM {QUERY_ROWS} a JOIN {QUERY_ROWS} b \
+                 ON b.run_id = a.run_id AND b.id <> a.id ORDER BY a.id"
             ),
             vec![1, 2],
         ),
@@ -327,6 +351,43 @@ async fn unknown_column_carries_the_planners_suggestion() {
             message.contains("r.valeu") && message.contains("Did you mean 'r.value'?"),
             "{sql}: {message}"
         );
+    }
+    deployment.shutdown().await;
+}
+
+/// A planning-time type mismatch and an ambiguous column reference are each a
+/// 400 carrying the planner's own detail naming the fault.
+///
+/// # Panics
+/// Panics when a query succeeds or is refused without the planner's detail.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn type_mismatch_and_ambiguous_reference_carry_the_planners_detail() {
+    let (deployment, bifrost) = live().await;
+
+    for (sql, detail) in [
+        (
+            format!("SELECT value + 1 AS n FROM {QUERY_ROWS}"),
+            "Cannot coerce arithmetic expression Utf8 + Int64",
+        ),
+        (
+            format!("SELECT id FROM {QUERY_ROWS} a JOIN {QUERY_ROWS} b ON a.id = b.id"),
+            "Ambiguous reference to unqualified field id",
+        ),
+    ] {
+        let refused = WyrdError::from(
+            bifrost
+                .sql(&sql, &[])
+                .await
+                .expect_err("the query is refused"),
+        );
+        let message = refused.to_string();
+        assert_eq!(
+            refused.code(),
+            "WYRD_VALA_400_QUERY_INVALID_SQL",
+            "{sql}: {message}"
+        );
+        assert!(message.contains(detail), "{sql}: {message}");
     }
     deployment.shutdown().await;
 }

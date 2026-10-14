@@ -17,6 +17,7 @@ pub(crate) use wyrd_auth::{exchange_api_key, issue_api_key, pg_resolvers, refres
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use axum::http::uri::Authority;
 use axum::http::{HeaderMap, header};
 use url::Url;
 use wyrd_spec::error::WyrdError;
@@ -85,17 +86,21 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestOrigin {
     ///
     /// # Errors
     /// Returns `WYRD_SPEC_400_VALIDATION` when the request names no usable
-    /// host.
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let authority = parts.uri.authority().map(|authority| authority.as_str());
-        Self::from_parts(&parts.headers, authority)
+    /// host. Derivation completes before the returned future is polled.
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        let authority = parts.uri.authority().map(Authority::as_str);
+        let origin = Self::from_parts(&parts.headers, authority)
             .map(Self)
             .ok_or_else(|| {
                 WyrdErrorResponse::from(WyrdError::Validation {
                     message: "the request names no usable Host".to_owned(),
                     details: serde_json::json!({ "reason": "request_origin_invalid" }),
                 })
-            })
+            });
+        std::future::ready(origin)
     }
 }
 

@@ -987,7 +987,7 @@ mod pg_tests {
                 wait_for_blocked_by(fixture, gate_pid).await;
                 match termination {
                     Termination::Deny => {
-                        logins.deny(&slug, &device.user_code).await.expect("denies")
+                        logins.deny(&slug, &device.user_code).await.expect("denies");
                     }
                     Termination::ExpireAndPoll => {
                         sqlx::query(

@@ -897,7 +897,16 @@ class OpenAiResponseItem:
         """Return the JSON ``arguments`` string of a ``"function_call"`` item."""
         ...
     def as_function_call_output(self) -> str:
-        """Return the ``output`` of a ``"function_call_output"`` item."""
+        """Return the ``output`` of a ``"function_call_output"`` item as text.
+
+        A content-parts output returns the concatenated text of its
+        ``input_text`` and ``output_text`` parts, with no separator; non-text
+        parts are omitted.
+
+        Raises:
+            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` when the item is
+                not a ``"function_call_output"``.
+        """
         ...
 
 class OpenAiResponsesSettings:

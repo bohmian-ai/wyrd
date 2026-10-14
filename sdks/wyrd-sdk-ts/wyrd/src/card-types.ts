@@ -2351,6 +2351,15 @@ export interface OpenAiCustomVoice {
   readonly id: string;
 }
 
+/**
+ * Easy input message: `type` may be omitted and `content` may be text.
+ */
+export interface OpenAiEasyInputMessage {
+  readonly content: string | readonly OpenAiResponseContentPart[];
+  readonly role: string;
+  readonly type?: "message";
+}
+
 export type OpenAiEmbeddingsInput = string | readonly string[] | readonly number[] | readonly (readonly number[])[];
 
 export interface OpenAiEmbeddingsRequest {
@@ -2637,7 +2646,7 @@ export type OpenAiResponsesHostedToolKind = "file_search" | "web_search_preview"
  *
  * Both forms decode and re-encode unchanged, so a relayed request keeps the form its caller sent. Editing the conversation first expands the text shorthand into the single user message it stands for.
  */
-export type OpenAiResponsesInput = string | readonly OpenAiResponseItem[];
+export type OpenAiResponsesInput = string | readonly (OpenAiResponseItem | OpenAiEasyInputMessage)[];
 
 export interface OpenAiResponsesMcpToolChoice {
   readonly name?: string | null;

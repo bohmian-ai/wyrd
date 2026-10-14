@@ -1,0 +1,916 @@
+[lints] $ cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
+    Blocking waiting for file lock on build directory
+    Checking cfg-if v1.0.4
+    Checking memchr v2.8.3
+    Checking libc v0.2.186
+    Checking serde_core v1.0.228
+    Checking allocator-api2 v0.2.21
+    Checking equivalent v1.0.2
+    Checking once_cell v1.21.4
+    Checking foldhash v0.2.0
+    Checking zeroize v1.9.0
+    Checking itoa v1.0.18
+    Checking libm v0.2.16
+    Checking bytes v1.12.1
+    Checking zmij v1.0.21
+    Checking pin-project-lite v0.2.17
+    Checking subtle v2.6.1
+    Checking scopeguard v1.2.0
+    Checking log v0.4.33
+    Checking typenum v1.20.1
+    Checking futures-core v0.3.32
+    Checking lock_api v0.4.14
+    Checking hashbrown v0.17.1
+    Checking futures-sink v0.3.32
+    Checking zerocopy v0.8.54
+    Checking slab v0.4.12
+    Checking futures-io v0.3.32
+    Checking futures-channel v0.3.32
+    Checking futures-task v0.3.32
+    Checking percent-encoding v2.3.2
+    Checking base64 v0.22.1
+    Checking tracing-core v0.1.36
+    Checking zerofrom v0.1.8
+    Checking form_urlencoded v1.2.2
+    Checking stable_deref_trait v1.2.1
+    Checking futures-util v0.3.32
+    Checking iana-time-zone v0.1.65
+    Checking yoke v0.8.3
+    Checking const-oid v0.9.6
+    Checking writeable v0.6.3
+    Checking litemap v0.8.2
+    Checking ryu v1.0.23
+    Checking tracing v0.1.44
+    Checking zerovec v0.11.6
+    Checking zerotrie v0.2.4
+    Checking utf8_iter v1.0.4
+    Checking icu_properties_data v2.2.0
+    Checking icu_normalizer_data v2.2.0
+    Checking num-traits v0.2.19
+    Checking rustls-pki-types v1.15.0
+    Checking thiserror v2.0.18
+    Checking aws-lc-sys v0.45.0
+    Checking rand_core v0.10.1
+    Checking zstd-sys v2.1.0+zstd.1.5.7
+    Checking bitflags v2.13.0
+    Checking untrusted v0.9.0
+    Checking http v1.4.2
+    Checking generic-array v0.14.7
+    Checking regex-syntax v0.8.11
+    Checking aho-corasick v1.1.4
+    Checking sha1_smol v1.0.1
+    Checking tinystr v0.8.3
+    Checking potential_utf v0.1.5
+    Checking icu_locale_core v2.2.0
+    Checking getrandom v0.2.17
+    Checking errno v0.3.14
+    Checking mio v1.2.1
+    Checking socket2 v0.6.4
+    Checking signal-hook-registry v1.4.8
+    Checking rand_core v0.6.4
+    Checking block-buffer v0.10.4
+    Checking icu_collections v2.2.0
+    Checking getrandom v0.3.4
+    Checking crypto-common v0.1.7
+    Checking getrandom v0.4.3
+    Checking num-integer v0.1.46
+    Checking http-body v1.0.1
+    Checking digest v0.10.7
+    Checking serde v1.0.228
+    Checking indexmap v2.14.0
+    Checking fnv v1.0.7
+    Checking uuid v1.23.4
+    Checking tower-service v0.3.3
+    Checking atomic-waker v1.1.2
+    Checking try-lock v0.2.5
+    Checking httparse v1.10.1
+    Checking httpdate v1.0.3
+    Checking http-body-util v0.1.3
+    Checking ipnet v2.12.0
+    Checking want v0.3.1
+    Checking adler2 v2.0.1
+    Checking icu_provider v2.2.0
+    Checking simd-adler32 v0.3.9
+    Checking crc32fast v1.5.0
+    Checking sync_wrapper v1.0.2
+    Checking tower-layer v0.3.3
+    Checking aws-lc-rs v1.18.1
+    Checking smallvec v1.15.2
+    Checking chrono v0.4.45
+    Checking zlib-rs v0.6.6
+    Checking miniz_oxide v0.8.9
+    Checking serde_urlencoded v0.7.1
+    Checking cpufeatures v0.3.0
+    Checking icu_properties v2.2.0
+    Checking openssl-probe v0.2.1
+    Checking parking_lot_core v0.9.12
+    Checking icu_normalizer v2.2.0
+    Checking serde_json v1.0.150
+    Checking rustls-native-certs v0.8.4
+    Checking alloc-no-stdlib v2.0.4
+    Checking parking_lot v0.12.5
+    Checking liblzma-sys v0.4.7
+    Checking alloc-stdlib v0.2.4
+    Checking regex-automata v0.4.15
+    Checking brotli-decompressor v5.0.3
+    Checking libbz2-rs-sys v0.2.5
+    Checking zstd-safe v7.2.4
+    Checking tokio v1.52.3
+    Checking liblzma v0.4.7
+    Checking compression-core v0.4.32
+    Checking zstd v0.13.3
+    Checking num-complex v0.4.6
+    Checking bzip2 v0.6.1
+    Checking rustls-webpki v0.103.13
+    Checking idna_adapter v1.2.2
+    Checking flate2 v1.1.9
+    Checking siphasher v1.0.3
+    Checking crossbeam-utils v0.8.22
+    Checking num-bigint v0.5.1
+    Checking idna v1.1.0
+    Checking phf_shared v0.12.1
+    Checking arrow-schema v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking brotli v8.0.4
+    Checking futures-executor v0.3.32
+    Checking phf v0.12.1
+    Checking base64 v0.23.1
+    Checking same-file v1.0.6
+    Checking url v2.5.8
+    Checking chrono-tz v0.10.4
+    Checking cpufeatures v0.2.17
+    Checking rustls v0.23.41
+    Checking walkdir v2.5.0
+    Checking hex v0.4.3
+    Checking lexical-util v1.0.7
+    Checking rand_core v0.9.5
+    Checking unicode-width v0.2.2
+    Checking ahash v0.8.12
+    Checking half v2.7.1
+    Checking ppv-lite86 v0.2.21
+    Checking futures v0.3.32
+    Checking unicode-segmentation v1.13.3
+    Checking chacha20 v0.10.1
+    Checking atoi v3.1.0
+    Checking lexical-parse-integer v1.0.6
+    Checking lexical-write-integer v1.0.6
+    Checking twox-hash v2.1.2
+    Checking rand v0.10.2
+    Checking rand_chacha v0.9.0
+    Checking lexical-parse-float v1.0.6
+    Checking arrow-buffer v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking lz4_flex v0.14.0
+    Checking comfy-table v8.0.1
+    Checking rand v0.9.5
+    Checking lexical-write-float v1.0.6
+    Checking flatbuffers v25.12.19
+    Checking simdutf8 v0.1.5
+    Checking csv-core v0.1.13
+    Checking lexical-core v1.0.6
+    Checking zstd-safe v8.0.0
+    Checking prost v0.14.4
+    Checking csv v1.4.0
+    Checking pin-project v1.1.13
+    Checking either v1.16.0
+    Checking sha2 v0.10.9
+    Checking zstd v0.14.0
+    Checking arrow-data v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking regex v1.13.0
+    Checking dyn-clone v1.0.20
+    Checking hashbrown v0.14.5
+    Checking hybrid-array v0.4.13
+    Checking cmov v0.5.4
+    Checking arrayvec v0.7.8
+    Checking constant_time_eq v0.4.2
+    Checking arrayref v0.3.9
+    Checking const-oid v0.10.2
+    Checking secrecy v0.10.3
+    Checking ctutils v0.4.2
+    Checking linux-raw-sys v0.12.1
+    Checking blake3 v1.8.5
+    Checking num-bigint v0.4.8
+    Checking semver v1.0.28
+    Checking schemars v0.8.22
+    Checking block-buffer v0.12.1
+    Checking crypto-common v0.2.2
+    Checking serde_path_to_error v0.1.20
+    Checking itertools v0.15.0
+    Checking rustix v1.1.4
+    Checking spin v0.10.1
+    Checking nix v0.31.3
+    Checking crc-fast v1.10.0
+    Checking quick-xml v0.41.0
+    Checking humantime v2.4.0
+    Checking crossbeam-channel v0.5.16
+    Checking digest v0.11.3
+    Checking compression-codecs v0.4.38
+    Checking spin v0.9.8
+    Checking md-5 v0.11.0
+    Checking lazy_static v1.5.0
+    Checking wyrd-skald-spec v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-spec)
+    Checking deranged v0.5.8
+    Checking num-conv v0.2.2
+    Checking time-core v0.1.9
+    Checking powerfmt v0.2.0
+    Checking strum v0.27.2
+    Checking mime v0.3.17
+    Checking tagptr v0.2.0
+    Checking ring v0.17.14
+    Checking rustls-platform-verifier v0.7.0
+    Checking matchit v0.8.4
+    Checking axum-core v0.5.6
+    Checking utoipa v5.5.0
+    Checking unsafe-libyaml v0.2.11
+    Checking tokio-util v0.7.18
+    Checking tokio-rustls v0.26.4
+    Checking async-compression v0.4.42
+    Checking num-iter v0.1.46
+   Compiling wyrd-error-derive v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-error-derive)
+    Checking fixedbitset v0.4.2
+    Checking serde_yaml v0.9.34+deprecated
+    Checking ryu-js v0.2.2
+    Checking time v0.3.53
+    Checking petgraph v0.6.5
+    Checking h2 v0.4.15
+    Checking tower v0.5.3
+    Checking tokio-stream v0.1.18
+    Checking serde_jcs v0.1.0
+    Checking portable-atomic v1.13.1
+    Checking signature v2.2.0
+    Checking opentelemetry v0.31.0
+    Checking foldhash v0.1.5
+    Checking num-rational v0.4.2
+    Checking sha2 v0.11.0
+    Checking hashbrown v0.15.5
+    Checking arrow-array v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking const-hex v1.19.1
+    Checking tower-http v0.6.11
+    Checking nom v8.0.0
+   Compiling rustversion v1.0.23
+    Checking wyrd-semver v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-semver)
+    Checking toml_datetime v0.6.11
+    Checking opentelemetry_sdk v0.31.0
+    Checking serde_spanned v0.6.9
+    Checking winnow v0.7.15
+    Checking toml_write v0.1.2
+    Checking fixedbitset v0.5.7
+    Checking concurrent-queue v2.5.0
+    Checking parking v2.2.1
+    Checking petgraph v0.8.3
+    Checking anstyle v1.0.14
+    Checking event-listener v5.4.1
+    Checking utf8parse v0.2.2
+    Checking sharded-slab v0.1.7
+    Checking matchers v0.2.0
+    Checking anstyle-parse v1.0.0
+    Checking tracing-log v0.2.0
+    Checking thread_local v1.1.10
+    Checking colorchoice v1.0.5
+    Checking nu-ansi-term v0.50.3
+    Checking anstyle-query v1.1.5
+    Checking is_terminal_polyfill v1.70.2
+    Checking ref-cast v1.0.25
+    Checking anstream v1.0.0
+    Checking console v0.16.4
+    Checking clap_lex v1.1.0
+    Checking tracing-subscriber v0.3.23
+    Checking strsim v0.11.1
+    Checking schemars v1.2.1
+    Checking clap_builder v4.6.0
+    Checking sse-stream v0.2.6
+    Checking crossbeam-epoch v0.9.20
+    Checking arrow-cmp v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking arrow-row v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking arrow-arith v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking arrow-select v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking toml_edit v0.22.27
+    Checking byteorder v1.5.0
+    Checking bohmian-parquet-variant v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking crossbeam-queue v0.3.13
+    Checking webpki-roots v1.0.8
+    Checking crc-catalog v2.5.0
+    Checking rapidhash v4.5.1
+    Checking wyrd-tls v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-tls)
+    Checking futures-intrusive v0.5.0
+    Checking crc v3.4.0
+    Checking fastrand v2.4.1
+    Checking hyper v1.10.1
+   Compiling target-lexicon v0.13.5
+    Checking event-listener-strategy v0.5.4
+    Checking metrics v0.24.6
+    Checking hashbrown v0.16.1
+    Checking bohmian-parquet-variant-json v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking async-lock v3.4.2
+    Checking tempfile v3.27.0
+    Checking arrow-ord v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking arrow-string v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking arrow-ipc v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking clap v4.6.1
+    Checking bigdecimal v0.4.10
+    Checking hashlink v0.11.1
+    Checking moka v0.12.15
+   Compiling pyo3-build-config v0.28.3
+    Checking simple_asn1 v0.6.4
+    Checking arrow-cast v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking sqlx-core v0.9.0
+    Checking pem v3.0.6
+    Checking hyper-util v0.1.20
+    Checking jsonwebtoken v9.3.1
+    Checking base64ct v1.8.3
+    Checking temp-env v0.3.6
+    Checking rand_chacha v0.3.1
+    Checking pem-rfc7468 v0.7.0
+    Checking rand v0.8.7
+    Checking der v0.7.10
+    Checking wyrd-spec v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd-spec)
+    Checking arrow-csv v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking arrow-json v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking dashmap v5.5.3
+    Checking triomphe v0.1.16
+   Compiling thiserror v1.0.69
+    Checking hyper-rustls v0.27.9
+    Checking axum v0.8.9
+    Checking hyper-timeout v0.5.2
+    Checking reqwest v0.12.28
+   Compiling pyo3-ffi v0.28.3
+    Checking reqwest v0.13.4
+    Checking arrow v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+   Compiling pyo3-macros-backend v0.28.3
+   Compiling pyo3 v0.28.3
+    Checking bohmian-parquet-variant-compute v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking spki v0.7.3
+    Checking mini-moka v0.10.3
+    Checking pkcs8 v0.10.2
+   Compiling thiserror-impl v1.0.69
+   Compiling prettyplease v0.2.37
+    Checking anyhow v1.0.103
+    Checking urlencoding v2.1.3
+    Checking object_store v0.14.2
+    Checking rmcp v3.3.0
+    Checking wyrd-skald-providers v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-providers)
+    Checking wyrd-skald-cache v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-cache)
+   Compiling curve25519-dalek v4.1.3
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling pulldown-cmark v0.13.4
+   Compiling tonic v0.14.6
+    Checking oauth2 v5.0.0
+   Compiling object v0.37.3
+    Checking ed25519 v2.2.3
+   Compiling unicase v2.9.0
+    Checking bit-vec v0.6.3
+    Checking bit-set v0.5.3
+    Checking ed25519-dalek v2.2.0
+    Checking num v0.4.3
+    Checking fraction v0.15.4
+   Compiling tonic-prost v0.14.6
+   Compiling opentelemetry-proto v0.31.0
+   Compiling pyo3-macros v0.28.3
+   Compiling pulldown-cmark-to-cmark v22.0.1
+    Checking fancy-regex v0.13.0
+    Checking iso8601 v0.6.3
+   Compiling prost-types v0.14.4
+    Checking alloc-no-stdlib v3.0.0
+   Compiling multimap v0.10.1
+    Checking num-cmp v0.1.0
+    Checking bytecount v0.6.9
+   Compiling snap v1.1.1
+    Checking alloc-stdlib v0.3.0
+    Checking jsonschema v0.18.3
+   Compiling tonic-build v0.14.6
+    Checking toml v0.8.23
+   Compiling prost-build v0.14.4
+   Compiling ar_archive_writer v0.5.2
+    Checking brotli-decompressor v6.0.1
+   Compiling stacker v0.1.24
+    Checking tracing-opentelemetry v0.32.1
+   Compiling seq-macro v0.3.6
+    Checking tonic-reflection v0.14.6
+    Checking tonic-types v0.14.6
+   Compiling tonic-prost-build v0.14.6
+    Checking tonic-health v0.14.6
+    Checking brotli v9.0.0
+    Checking wyrd-skald-runtime v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-runtime)
+    Checking arc-swap v1.9.2
+   Compiling async-stream-impl v0.3.6
+   Compiling psm v0.1.31
+   Compiling recursive-proc-macro-impl v0.1.1
+   Compiling sqlparser_derive v0.6.0
+   Compiling ucd-trie v0.1.7
+    Checking opentelemetry-http v0.31.0
+    Checking async-stream v0.3.6
+   Compiling pest v2.8.7
+    Checking opentelemetry-otlp v0.31.1
+   Compiling wyrd-tonic v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-tonic)
+    Checking recursive v0.1.1
+    Checking option-ext v0.2.0
+    Checking unit-prefix v0.5.2
+    Checking indicatif v0.18.6
+    Checking sqlparser v0.63.0
+    Checking dirs-sys v0.5.0
+    Checking datafusion-doc v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking dirs v6.0.0
+    Checking shellexpand v3.1.2
+    Checking dashmap v6.2.1
+   Compiling pest_meta v2.8.7
+   Compiling datafusion-macros v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+   Compiling darling_core v0.20.11
+    Checking blake2 v0.11.0
+   Compiling darling_core v0.23.0
+    Checking ulid v1.2.1
+    Checking hmac v0.12.1
+    Checking tinyvec_macros v0.1.1
+    Checking tinyvec v1.12.0
+    Checking hkdf v0.12.4
+    Checking datafusion-common-runtime v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+   Compiling pest_generator v2.8.7
+    Checking unicode-normalization v0.1.25
+    Checking atoi v2.0.0
+    Checking unicode-bidi v0.3.18
+    Checking parquet v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking unicode-properties v0.1.4
+    Checking stringprep v0.1.5
+   Compiling hmac v0.13.0
+    Checking dotenvy v0.15.7
+   Compiling hkdf v0.13.0
+    Checking ff v0.13.1
+    Checking glob v0.3.3
+   Compiling pest_derive v2.8.7
+   Compiling whoami v2.1.2
+    Checking jsonpath-rust v0.7.5
+    Checking base16ct v0.2.0
+   Compiling sqlx-postgres v0.9.0
+    Checking group v0.13.0
+    Checking sec1 v0.7.3
+    Checking crypto-bigint v0.5.5
+    Checking inout v0.1.4
+   Compiling paste v1.0.15
+    Checking cipher v0.4.4
+    Checking itertools v0.10.5
+   Compiling darling_macro v0.20.11
+    Checking universal-hash v0.5.1
+    Checking opaque-debug v0.3.1
+    Checking polyval v0.6.2
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling darling_macro v0.23.0
+   Compiling darling v0.23.0
+    Checking rfc6979 v0.4.0
+   Compiling serde_with_macros v3.21.0
+    Checking elliptic-curve v0.13.8
+   Compiling num-bigint-dig v0.8.6
+    Checking bytemuck v1.25.1
+    Checking ghash v0.5.1
+    Checking aes v0.8.4
+    Checking primeorder v0.13.6
+    Checking ecdsa v0.16.9
+    Checking ctr v0.9.2
+   Compiling derive_builder_macro v0.20.2
+    Checking aead v0.5.2
+    Checking pkcs1 v0.7.5
+    Checking derive_builder v0.20.2
+    Checking aes-gcm v0.10.3
+    Checking croner v4.0.0
+    Checking ordered-float v2.10.1
+    Checking p256 v0.13.2
+    Checking serde_with v3.21.0
+    Checking serde-value v0.7.0
+    Checking p384 v0.13.1
+    Checking serde_plain v1.0.2
+    Checking base64 v0.21.7
+   Compiling typeid v1.0.3
+   Compiling erased-serde v0.4.10
+    Checking rsa v0.9.10
+   Compiling crossbeam-deque v0.8.7
+   Compiling bon-macros v3.9.3
+    Checking serde-big-array v0.5.1
+   Compiling rayon-core v1.13.0
+    Checking minimal-lexical v0.2.1
+   Compiling typetag v0.2.23
+   Compiling fastnum v0.7.5
+    Checking nom v7.1.3
+    Checking bnum v0.12.1
+    Checking openidconnect v4.0.1
+   Compiling typetag-impl v0.2.23
+    Checking webbrowser v1.2.4
+    Checking serde_bytes v0.11.19
+   Compiling typed-builder-macro v0.20.1
+   Compiling sqlx-macros-core v0.9.0
+    Checking regex-lite v0.1.9
+    Checking unicode_categories v0.1.1
+    Checking dissimilar v1.0.11
+    Checking inventory v0.3.24
+    Checking expect-test v1.5.1
+    Checking sqlformat v0.2.6
+    Checking typed-builder v0.20.1
+    Checking roaring v0.11.4
+    Checking backon v1.6.0
+    Checking webpki-roots v0.26.11
+    Checking hashlink v0.9.1
+    Checking itertools v0.13.0
+    Checking ordered-float v4.6.0
+    Checking rustls-pemfile v2.2.0
+   Compiling serde_repr v0.1.20
+    Checking murmur3 v0.5.2
+    Checking array-init v2.1.0
+    Checking as-any v0.3.2
+    Checking bimap v0.6.3
+    Checking rayon v1.12.0
+    Checking sketches-ddsketch v0.3.1
+    Checking md-5 v0.10.6
+    Checking num_cpus v1.17.0
+    Checking home v0.5.12
+    Checking deadpool-runtime v0.1.4
+    Checking whoami v1.6.1
+    Checking password-hash v0.5.0
+    Checking deadpool v0.12.3
+    Checking assert-json-diff v2.0.2
+   Compiling crc32c v0.6.8
+    Checking blake2 v0.10.6
+    Checking safe_arch v0.7.4
+    Checking wiremock v0.6.5
+    Checking arrow-flight v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking argon2 v0.5.3
+   Compiling sqlx-macros v0.9.0
+    Checking mixtrics v0.2.5
+    Checking itertools v0.14.0
+    Checking bincode v1.3.3
+    Checking bon v3.9.3
+    Checking apache-avro v0.21.0
+   Compiling delegate v0.13.5
+   Compiling ctor v0.2.9
+   Compiling matrixmultiply v0.3.10
+    Checking port_scanner v0.1.5
+    Checking wide v0.7.33
+    Checking lru v0.12.5
+    Checking approx v0.5.1
+    Checking rawpointer v0.2.1
+    Checking sqlx-core v0.8.1
+    Checking wyrd-crypt v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-crypt)
+    Checking rand_distr v0.4.3
+    Checking yasna v0.6.0
+    Checking pem v4.0.0
+    Checking raw-cpuid v11.6.0
+   Compiling libmimalloc-sys v0.1.49
+    Checking sqlx v0.9.0
+    Checking wyrd-vault v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-vault)
+    Checking hdrhistogram v7.6.0
+    Checking wyrd-version v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-version)
+    Checking rcgen v0.14.10
+    Checking rand_xoshiro v0.7.0
+    Checking utoipa-axum v0.2.0
+    Checking iceberg v0.10.0 (https://github.com/bohmian-ai/iceberg-rust?rev=0991fef0af3f86336b52d7c56b7f35cf4b2da222#0991fef0)
+   Compiling napi-build v2.4.2
+    Checking simba v0.9.1
+    Checking wait-timeout v0.2.1
+    Checking unicode-ident v1.0.24
+    Checking plotters-backend v0.3.7
+    Checking ciborium-io v0.2.2
+    Checking predicates-core v1.0.10
+    Checking plotters-svg v0.3.7
+    Checking ciborium-ll v0.2.2
+   Compiling napi v3.12.3
+   Compiling convert_case v0.12.0
+    Checking float-cmp v0.10.0
+    Checking libloading v0.9.0
+    Checking difflib v0.4.0
+    Checking mimalloc v0.1.52
+    Checking quanta v0.12.6
+    Checking cast v0.3.0
+    Checking similar v2.7.0
+   Compiling assert_cmd v2.2.2
+    Checking normalize-line-endings v0.3.0
+    Checking metrics-util v0.19.1
+    Checking termtree v0.5.1
+    Checking sqlx-postgres v0.8.1
+    Checking predicates-tree v1.0.13
+    Checking predicates v3.1.4
+    Checking criterion-plot v0.5.0
+    Checking insta v1.48.0
+    Checking metrics-exporter-prometheus v0.16.2
+    Checking napi-sys v3.3.1
+   Compiling napi-derive-backend v6.1.3
+    Checking ciborium v0.2.2
+    Checking plotters v0.3.7
+    Checking datafusion-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking bstr v1.12.3
+    Checking tinytemplate v1.2.1
+    Checking is-terminal v0.4.17
+    Checking oorandom v11.1.5
+    Checking rustc-hash v2.1.3
+    Checking bit-vec v0.8.0
+   Compiling ctor v1.0.8
+    Checking nohash-hasher v0.2.0
+   Compiling proc-macro2 v1.0.106
+    Checking anes v0.1.6
+    Checking quick-error v1.2.3
+    Checking criterion v0.5.1
+    Checking rusty-fork v0.3.1
+    Checking bit-set v0.8.0
+    Checking rand_xorshift v0.4.0
+    Checking yansi v1.0.1
+    Checking unarray v0.1.4
+    Checking diff v0.1.13
+    Checking proptest v1.11.0
+    Checking pretty_assertions v1.4.1
+    Checking nalgebra v0.33.3
+    Checking quote v1.0.46
+    Checking sqlx v0.8.1
+   Compiling wyrd-sdk-ts-testing v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/sdks/wyrd-sdk-ts/native-testing)
+   Compiling wyrd-sdk-ts v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/sdks/wyrd-sdk-ts/native)
+    Checking wyrd-bench v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-bench)
+   Compiling napi-derive v3.6.4
+   Compiling workspace-hack v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/workspace-hack)
+    Checking syn v2.0.118
+    Checking datafusion-proto-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-expr-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+   Compiling serial_test_derive v3.5.0
+    Checking serial_test v3.5.0
+    Checking datafusion-proto-models v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking statrs v0.18.0
+    Checking datafusion-physical-expr-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-functions-aggregate-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-functions-window-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking iceberg-catalog-sql v0.10.0 (https://github.com/bohmian-ai/iceberg-rust?rev=0991fef0af3f86336b52d7c56b7f35cf4b2da222#0991fef0)
+    Checking datafusion-expr v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking wyrd-runtime v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-runtime)
+    Checking wyrd-utils v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-utils)
+    Checking wyrd-types v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-types)
+    Checking wyrd-auth-oidc v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-auth-oidc)
+    Checking wyrd-telemetry v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-telemetry)
+    Checking vala-drift v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/vala/vala-drift)
+    Checking wyrd-interfaces v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-interfaces)
+    Checking wyrd-gateway v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-gateway)
+    Checking wyrd-skald-tool v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-tool)
+    Checking wyrd-queue v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-queue)
+    Checking wyrd-sql v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-sql)
+    Checking wyrd-auth-verify v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-auth-verify)
+    Checking datafusion-physical-expr v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-execution v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-functions-variant v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking wyrd-auth-issue v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-auth-issue)
+    Checking datafusion-functions v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking wyrd-skald-prompt v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-prompt)
+    Checking wyrd-config v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-config)
+    Checking wyrd-loader v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-loader)
+    Checking datafusion-functions-aggregate v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-optimizer v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-functions-window v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking vala-sql v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/vala/vala-sql)
+    Checking wyrd-auth v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-auth)
+    Checking datafusion-physical-plan v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-physical-expr-adapter v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-functions-nested v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking wyrd-skald-agent v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-agent)
+    Checking wyrd-cards v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-cards)
+    Checking wyrd-storage v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-storage)
+    Checking wyrd-dev-fixtures v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-dev-fixtures)
+    Checking datafusion-sql v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking wyrd-skald-workflow v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-workflow)
+    Checking wyrd-client v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-client)
+    Checking vala-eval v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/vala/vala-eval)
+    Checking wyrd v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd)
+    Checking datafusion-session v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking wyrd-mcp v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-mcp)
+    Checking datafusion-datasource v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking wyrd-cli v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-cli)
+    Checking datafusion-pruning v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-catalog v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-datasource-json v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-datasource-csv v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-datasource-arrow v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-datasource-parquet v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-physical-optimizer v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-catalog-listing v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-functions-table v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-proto v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking wyrd-ai v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/sdks/wyrd-sdk-rust)
+    Checking wyrd-rust-examples v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/examples/rust)
+    Checking iceberg-datafusion v0.10.0 (https://github.com/bohmian-ai/iceberg-rust?rev=0991fef0af3f86336b52d7c56b7f35cf4b2da222#0991fef0)
+    Checking datafusion-distributed v4.0.0 (https://github.com/bohmian-ai/datafusion-distributed?rev=8fac2a978bdcf8e06457238ebfe9c7f35023c123#8fac2a97)
+    Checking iceberg-compaction-core v0.1.0 (https://github.com/bohmian-ai/iceberg-compaction?rev=5f4010291869ed4fb71357aa3dec96746010319a#5f401029)
+    Checking vala-bifrost-redux v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/vala/vala-bifrost-redux)
+    Checking wyrd-server v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-server)
+    Checking vala-ingest v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/vala/vala-ingest)
+    Checking wyrd-testing v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-testing)
+    Checking wyrd-sdk-python v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/sdks/wyrd-sdk-python)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 18s
+[lints] $ cargo clippy --locked -p wyrd-server --bin wyrd-server -- -D warnings
+    Blocking waiting for file lock on build directory
+   Compiling libc v0.2.186
+   Compiling serde_core v1.0.228
+    Checking tokio v1.52.3
+   Compiling semver v1.0.28
+   Compiling rustix v1.1.4
+   Compiling hashbrown v0.17.1
+   Compiling log v0.4.33
+   Compiling generic-array v0.14.7
+   Compiling crossbeam-utils v0.8.22
+   Compiling num-traits v0.2.19
+   Compiling serde_json v1.0.150
+   Compiling digest v0.11.3
+   Compiling rustls v0.23.41
+   Compiling rustc_version v0.4.1
+   Compiling foldhash v0.2.0
+   Compiling thiserror v2.0.18
+   Compiling futures-sink v0.3.32
+   Compiling hashbrown v0.16.1
+   Compiling form_urlencoded v1.2.2
+   Compiling flatbuffers v25.12.19
+   Compiling tracing-core v0.1.36
+   Compiling indexmap v2.14.0
+   Compiling slab v0.4.12
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling concurrent-queue v2.5.0
+   Compiling subtle v2.6.1
+   Compiling digest v0.10.7
+   Compiling futures-util v0.3.32
+   Compiling hashlink v0.11.1
+   Compiling event-listener v5.4.1
+   Compiling chrono v0.4.45
+   Compiling tracing v0.1.44
+   Compiling sha2 v0.10.9
+   Compiling crossbeam-queue v0.3.13
+   Compiling jobserver v0.1.35
+   Compiling getrandom v0.4.3
+   Compiling socket2 v0.6.4
+   Compiling mio v1.2.1
+   Compiling hmac v0.13.0
+   Compiling base64 v0.22.1
+   Compiling hkdf v0.13.0
+   Compiling rand v0.10.2
+   Compiling cc v1.2.67
+   Compiling atoi v2.0.0
+   Compiling curve25519-dalek v4.1.3
+   Compiling futures-channel v0.3.32
+   Compiling sha2 v0.11.0
+   Compiling md-5 v0.11.0
+   Compiling byteorder v1.5.0
+   Compiling linux-raw-sys v0.12.1
+   Compiling regex-syntax v0.8.11
+   Compiling hashbrown v0.15.5
+   Compiling serde v1.0.228
+   Compiling cmake v0.1.58
+   Compiling uuid v1.23.4
+    Checking tempfile v3.27.0
+   Compiling petgraph v0.8.3
+   Compiling either v1.16.0
+   Compiling smallvec v1.15.2
+   Compiling utoipa-gen v5.5.0
+    Checking ed25519-dalek v2.2.0
+   Compiling itertools v0.14.0
+   Compiling icu_normalizer v2.2.0
+   Compiling parking_lot_core v0.9.12
+   Compiling parking_lot v0.12.5
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling aws-lc-sys v0.45.0
+   Compiling ring v0.17.14
+   Compiling blake3 v1.8.5
+   Compiling liblzma-sys v0.4.7
+    Checking tokio-util v0.7.18
+   Compiling psm v0.1.31
+    Checking object_store v0.14.2
+   Compiling stacker v0.1.24
+   Compiling prost-derive v0.14.4
+    Checking datafusion-common-runtime v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking h2 v0.4.15
+    Checking tower v0.5.3
+    Checking recursive v0.1.1
+    Checking sqlparser v0.63.0
+    Checking tokio-stream v0.1.18
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling futures-intrusive v0.5.0
+   Compiling url v2.5.8
+    Checking prost v0.14.4
+   Compiling regex-automata v0.4.15
+    Checking prost-types v0.14.4
+    Checking opentelemetry_sdk v0.31.0
+    Checking openidconnect v4.0.1
+    Checking backon v1.6.0
+    Checking nom v8.0.0
+   Compiling regex v1.13.0
+   Compiling prost-build v0.14.4
+    Checking hyper v1.10.1
+   Compiling libmimalloc-sys v0.1.49
+   Compiling tonic-prost-build v0.14.6
+   Compiling crc32c v0.6.8
+    Checking hyper-util v0.1.20
+    Checking utoipa v5.5.0
+   Compiling rmcp v3.3.0
+   Compiling rmcp-macros v3.3.0
+    Checking iso8601 v0.6.3
+   Compiling wyrd-tonic v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-tonic)
+    Checking jsonschema v0.18.3
+    Checking mimalloc v0.1.52
+    Checking axum v0.8.9
+    Checking hyper-timeout v0.5.2
+    Checking wyrd-semver v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-semver)
+    Checking wyrd-spec v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd-spec)
+    Checking jsonwebtoken v9.3.1
+    Checking liblzma v0.4.7
+   Compiling zstd-safe v8.0.0
+   Compiling zstd-safe v7.2.4
+    Checking utoipa-axum v0.2.0
+    Checking zstd v0.13.3
+    Checking zstd v0.14.0
+    Checking compression-codecs v0.4.38
+    Checking apache-avro v0.21.0
+    Checking arrow-ipc v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking async-compression v0.4.42
+    Checking tower-http v0.6.11
+    Checking arrow v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking bohmian-parquet-variant-compute v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking reqwest v0.12.28
+    Checking parquet v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking opentelemetry-http v0.31.0
+    Checking datafusion-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking iceberg v0.10.0 (https://github.com/bohmian-ai/iceberg-rust?rev=0991fef0af3f86336b52d7c56b7f35cf4b2da222#0991fef0)
+   Compiling aws-lc-rs v1.18.1
+    Checking rustls-webpki v0.103.13
+    Checking datafusion-proto-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-expr-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-proto-models v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking tokio-rustls v0.26.4
+    Checking wyrd-tls v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-tls)
+    Checking rustls-platform-verifier v0.7.0
+    Checking sqlx-core v0.9.0
+    Checking sqlx-core v0.8.1
+    Checking hyper-rustls v0.27.9
+    Checking tonic v0.14.6
+    Checking reqwest v0.13.4
+    Checking wyrd-skald-providers v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-providers)
+    Checking wyrd-vault v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-vault)
+    Checking datafusion-physical-expr-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking tonic-prost v0.14.6
+    Checking tonic-types v0.14.6
+    Checking opentelemetry-proto v0.31.0
+    Checking tonic-reflection v0.14.6
+    Checking tonic-health v0.14.6
+    Checking arrow-flight v60.0.0 (https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6da)
+    Checking sqlx-postgres v0.9.0
+    Checking sqlx-postgres v0.8.1
+    Checking datafusion-functions-aggregate-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-functions-window-common v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking wyrd-skald-runtime v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-runtime)
+    Checking datafusion-expr v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking opentelemetry-otlp v0.31.1
+    Checking sqlx v0.8.1
+    Checking iceberg-catalog-sql v0.10.0 (https://github.com/bohmian-ai/iceberg-rust?rev=0991fef0af3f86336b52d7c56b7f35cf4b2da222#0991fef0)
+    Checking datafusion-physical-expr v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-execution v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-functions-variant v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-functions v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+   Compiling sqlx-macros-core v0.9.0
+    Checking datafusion-functions-aggregate v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-functions-window v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-optimizer v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+   Compiling sqlx-macros v0.9.0
+    Checking sqlx v0.9.0
+    Checking datafusion-physical-plan v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-physical-expr-adapter v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-functions-nested v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-sql v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking wyrd-runtime v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-runtime)
+    Checking wyrd-utils v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-utils)
+    Checking wyrd-skald-tool v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-tool)
+    Checking wyrd-auth-oidc v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-auth-oidc)
+    Checking wyrd-types v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-types)
+    Checking wyrd-config v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-config)
+    Checking wyrd-telemetry v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-telemetry)
+    Checking vala-drift v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/vala/vala-drift)
+    Checking wyrd-interfaces v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-interfaces)
+    Checking wyrd-gateway v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-gateway)
+    Checking wyrd-loader v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-loader)
+    Checking wyrd-skald-prompt v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-prompt)
+    Checking wyrd-sql v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-sql)
+    Checking wyrd-auth-verify v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-auth-verify)
+    Checking wyrd-queue v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-queue)
+    Checking wyrd-skald-agent v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-agent)
+    Checking wyrd-cards v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-cards)
+    Checking wyrd-auth-issue v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-auth-issue)
+    Checking datafusion-session v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-datasource v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking wyrd-skald-workflow v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-workflow)
+    Checking wyrd-client v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-client)
+    Checking vala-eval v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/vala/vala-eval)
+    Checking datafusion-pruning v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-catalog v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-datasource-csv v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-datasource-arrow v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-datasource-json v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-datasource-parquet v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-physical-optimizer v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-catalog-listing v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-functions-table v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking vala-sql v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/vala/vala-sql)
+    Checking wyrd-auth v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-auth)
+    Checking datafusion v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking datafusion-proto v55.1.0 (https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2)
+    Checking wyrd-storage v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-storage)
+    Checking iceberg-datafusion v0.10.0 (https://github.com/bohmian-ai/iceberg-rust?rev=0991fef0af3f86336b52d7c56b7f35cf4b2da222#0991fef0)
+    Checking datafusion-distributed v4.0.0 (https://github.com/bohmian-ai/datafusion-distributed?rev=8fac2a978bdcf8e06457238ebfe9c7f35023c123#8fac2a97)
+    Checking iceberg-compaction-core v0.1.0 (https://github.com/bohmian-ai/iceberg-compaction?rev=5f4010291869ed4fb71357aa3dec96746010319a#5f401029)
+    Checking vala-bifrost-redux v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/vala/vala-bifrost-redux)
+    Checking wyrd-server v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 10s

@@ -2402,6 +2402,38 @@
       },
       "additionalProperties": false
     },
+    "OpenAiEasyInputMessage": {
+      "description": "Easy input message: `type` may be omitted and `content` may be text.",
+      "type": "object",
+      "required": [
+        "content",
+        "role"
+      ],
+      "properties": {
+        "content": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/OpenAiResponseContentPart"
+              }
+            }
+          ]
+        },
+        "role": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "message"
+          ]
+        }
+      }
+    },
     "OpenAiEmbeddingsInput": {
       "anyOf": [
         {
@@ -3388,7 +3420,14 @@
           "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
           "type": "array",
           "items": {
-            "$ref": "#/definitions/OpenAiResponseItem"
+            "anyOf": [
+              {
+                "$ref": "#/definitions/OpenAiResponseItem"
+              },
+              {
+                "$ref": "#/definitions/OpenAiEasyInputMessage"
+              }
+            ]
           }
         }
       ]

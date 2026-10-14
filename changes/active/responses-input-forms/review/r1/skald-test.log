@@ -1,0 +1,396 @@
+[test:skald] $ bash scripts/run-family-tests.sh skald
+testing skald packages: wyrd-skald-agent  wyrd-skald-prompt  wyrd-skald-spec  wyrd-skald-runtime  wyrd-skald-cache  wyrd-skald-providers  wyrd-skald-tool  wyrd-skald-workflow
+   Compiling wyrd-semver v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-semver)
+   Compiling ring v0.17.14
+   Compiling mini-moka v0.10.3
+   Compiling dashmap v5.5.3
+   Compiling simple_asn1 v0.6.4
+   Compiling wyrd-tls v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-tls)
+   Compiling pem v3.0.6
+   Compiling triomphe v0.1.16
+   Compiling urlencoding v2.1.3
+   Compiling opentelemetry-http v0.31.0
+   Compiling tracing-opentelemetry v0.32.1
+   Compiling ulid v1.2.1
+   Compiling num_cpus v1.17.0
+   Compiling bit-vec v0.6.3
+   Compiling deadpool-runtime v0.1.4
+   Compiling num v0.4.3
+   Compiling assert-json-diff v2.0.2
+   Compiling iso8601 v0.6.3
+   Compiling deadpool v0.12.3
+   Compiling bit-set v0.5.3
+   Compiling opentelemetry-otlp v0.31.1
+   Compiling fraction v0.15.4
+   Compiling wyrd-spec v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd-spec)
+   Compiling fancy-regex v0.13.0
+   Compiling wiremock v0.6.5
+   Compiling num-cmp v0.1.0
+   Compiling bytecount v0.6.9
+   Compiling wyrd-skald-cache v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-cache)
+   Compiling yasna v0.6.0
+   Compiling pem v4.0.0
+   Compiling wyrd-skald-spec v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-spec)
+   Compiling jsonschema v0.18.3
+   Compiling rcgen v0.14.10
+   Compiling jsonwebtoken v9.3.1
+   Compiling wyrd-skald-providers v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-providers)
+   Compiling wyrd-skald-runtime v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-runtime)
+   Compiling wyrd-utils v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-utils)
+   Compiling wyrd-skald-tool v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-tool)
+   Compiling wyrd-telemetry v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/shared/wyrd-telemetry)
+   Compiling wyrd-interfaces v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/wyrd/wyrd-interfaces)
+   Compiling wyrd-skald-prompt v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-prompt)
+   Compiling wyrd-skald-agent v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-agent)
+   Compiling wyrd-skald-workflow v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/split/responses-input-forms/crates/skald/skald-workflow)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.12s
+────────────
+ Nextest run ID 28c4757b-1705-432c-b063-42ccc50d4d3b with nextest profile: default
+    Starting 345 tests across 11 binaries
+        PASS [   0.004s] (  1/345) wyrd-skald-agent request_builder::tests::rebuild_request_messages_rejects_mismatched_variant
+        PASS [   0.005s] (  2/345) wyrd-skald-agent request_builder::tests::extract_messages_gemini_returns_gemini_variants
+        PASS [   0.005s] (  3/345) wyrd-skald-agent request_builder::tests::rebuild_request_messages_gemini_filters_out_system_role
+        PASS [   0.005s] (  4/345) wyrd-skald-agent request_builder::tests::rebuild_request_messages_anthropic_filters_out_system_role
+        PASS [   0.006s] (  5/345) wyrd-skald-agent registry::tests::system_messages_custom_provider_errors
+        PASS [   0.009s] (  6/345) wyrd-skald-agent::integration agent_fields::agent_clone_bumps_prompt_arc
+        PASS [   0.009s] (  7/345) wyrd-skald-agent::integration agent_construction::agent_with_prompt_overrides_prompt_reference
+        PASS [   0.009s] (  8/345) wyrd-skald-agent::integration agent_fields::agent_add_tool_appends_to_cache_order
+        PASS [   0.009s] (  9/345) wyrd-skald-agent::integration agent_fields::agent_with_prompt_returns_new_agent_with_same_tools
+        PASS [   0.009s] ( 10/345) wyrd-skald-agent::integration agent_fields::agent_set_tools_replaces_full_list
+        PASS [   0.009s] ( 11/345) wyrd-skald-agent::integration agent_fields::agent_tool_names_reflect_tool_internal_name
+        PASS [   0.009s] ( 12/345) wyrd-skald-agent::integration callbacks::agent_run_after_model_replace_swaps_response
+        PASS [   0.009s] ( 13/345) wyrd-skald-agent::integration callbacks::agent_run_before_agent_replace_changes_user_turn
+        PASS [   0.009s] ( 14/345) wyrd-skald-agent::integration agent_journey::custom_provider_prompt_round_trips_and_dispatches_to_its_client
+        PASS [   0.009s] ( 15/345) wyrd-skald-agent::integration agent_fields::agent_new_has_default_public_fields
+        PASS [   0.009s] ( 16/345) wyrd-skald-agent::integration callbacks::agent_run_after_agent_abort_returns_callback_aborted
+        PASS [   0.009s] ( 17/345) wyrd-skald-agent::integration callbacks::agent_run_before_agent_abort_returns_callback_aborted
+        PASS [   0.010s] ( 18/345) wyrd-skald-agent::integration callbacks::agent_run_after_model_abort_returns_callback_aborted
+        PASS [   0.011s] ( 19/345) wyrd-skald-agent::integration agent_construction::agent_new_uses_resolved_prompt_and_default_run_config
+        PASS [   0.011s] ( 20/345) wyrd-skald-agent::integration callbacks::agent_run_after_tool_replace_changes_tool_result
+        PASS [   0.011s] ( 21/345) wyrd-skald-agent::integration agent_timeout::agent_run_genai_google_provider_and_model
+        PASS [   0.011s] ( 22/345) wyrd-skald-agent::integration agent_construction::agent_with_run_config_preserves_config
+        PASS [   0.011s] ( 23/345) wyrd-skald-agent::integration callbacks::agent_run_after_tool_abort_records_error_result
+        PASS [   0.011s] ( 24/345) wyrd-skald-agent::integration agent_journey::journey_try_from_ref_resolves_card_prompt
+        PASS [   0.011s] ( 25/345) wyrd-skald-agent::integration agent_timeout::agent_run_emits_genai_spans_without_payloads
+        PASS [   0.011s] ( 26/345) wyrd-skald-agent::integration agent_journey::journey_author_save_load_run
+        PASS [   0.011s] ( 27/345) wyrd-skald-agent::integration agent_fields::agent_with_run_config_preserves_config
+        PASS [   0.013s] ( 28/345) wyrd-skald-agent::integration agent_journey::vertex_prompt_round_trips_and_dispatches_to_the_vertex_client
+        PASS [   0.008s] ( 29/345) wyrd-skald-agent::integration callbacks::agent_run_before_model_abort_skips_provider_and_after_model
+        PASS [   0.009s] ( 30/345) wyrd-skald-agent::integration callbacks::agent_run_before_model_replace_swaps_native_request
+        PASS [   0.014s] ( 31/345) wyrd-skald-agent::integration callbacks::agent_run_after_agent_replace_can_alter_run
+        PASS [   0.009s] ( 32/345) wyrd-skald-agent::integration callbacks::agent_run_before_tool_abort_records_error_result
+        PASS [   0.009s] ( 33/345) wyrd-skald-agent::integration callbacks::agent_run_before_tool_replace_changes_tool_args
+        PASS [   0.006s] ( 34/345) wyrd-skald-agent::integration construct::agent_try_from_ref_missing_card_errors
+        PASS [   0.015s] ( 35/345) wyrd-skald-agent::integration agent_timeout::agent_run_chat_span_records_callback_replaced_model
+        PASS [   0.005s] ( 36/345) wyrd-skald-agent::integration construct::run_config_spec_converts_to_engine_config
+        PASS [   0.006s] ( 37/345) wyrd-skald-agent::integration delegate::agent_delegate_tool_default_output_schema_is_string
+        PASS [   0.008s] ( 38/345) wyrd-skald-agent::integration construct::agent_try_from_sibling_resolves_against_test_resolver
+        PASS [   0.009s] ( 39/345) wyrd-skald-agent::integration construct::agent_run_uses_collapsed_agent_runtime
+        PASS [   0.009s] ( 40/345) wyrd-skald-agent::integration construct::agent_try_from_ref_inline_succeeds_against_noop_resolver
+        PASS [   0.009s] ( 41/345) wyrd-skald-agent::integration construct::agent_new_with_inline_prompt_is_infallible
+        PASS [   0.008s] ( 42/345) wyrd-skald-agent::integration construct::agent_with_chain_matches_locked_fixture
+        PASS [   0.009s] ( 43/345) wyrd-skald-agent::integration construct::agent_try_from_ref_card_succeeds_with_test_resolver
+        PASS [   0.006s] ( 44/345) wyrd-skald-agent::integration delegate::agent_delegate_tool_depth_cap_at_3
+        PASS [   0.009s] ( 45/345) wyrd-skald-agent::integration construct::clear_prompt_card_registry_removes_previously_registered_entry
+        PASS [   0.004s] ( 46/345) wyrd-skald-agent::integration error_codes::agent_error_codes_match_catalog
+        PASS [   0.007s] ( 47/345) wyrd-skald-agent::integration delegate::agent_delegate_tool_input_missing_returns_invalid_input
+        PASS [   0.007s] ( 48/345) wyrd-skald-agent::integration delegate::agent_delegate_tool_invokes_sub_agent_run
+        PASS [   0.007s] ( 49/345) wyrd-skald-agent::integration delegate::agent_delegate_tool_depth_resets_outside_scope
+        PASS [   0.009s] ( 50/345) wyrd-skald-agent::integration construct::card_prompt_resolution_derives_cascade_and_missing_prompt_code
+        PASS [   0.009s] ( 51/345) wyrd-skald-agent::integration construct::fixture_loads_with_single_version_field
+        PASS [   0.009s] ( 52/345) wyrd-skald-agent::integration construct::local_save_load_allows_tools_but_registrable_rejects_them
+        PASS [   0.010s] ( 53/345) wyrd-skald-agent::integration construct::agent_projects_locked_agent_envelope_shape
+        PASS [   0.006s] ( 54/345) wyrd-skald-agent::integration delegate::agent_delegate_tool_schema_matches_input_envelope
+        PASS [   0.005s] ( 55/345) wyrd-skald-agent::integration error_codes::run_config_default_matches_agentic_default
+        PASS [   0.010s] ( 56/345) wyrd-skald-agent::integration callbacks::agent_run_callbacks_fire_in_order
+        PASS [   0.008s] ( 57/345) wyrd-skald-agent::integration construct::unknown_runtime_local_tool_uses_wyrd_code
+        PASS [   0.008s] ( 58/345) wyrd-skald-agent::integration construct::save_requires_name_and_version_without_defaulting
+        PASS [   0.009s] ( 59/345) wyrd-skald-agent::integration construct::register_prompt_card_rejects_non_prompt_kind_card_ref
+        PASS [   0.007s] ( 60/345) wyrd-skald-agent::integration delegate::agent_delegate_tool_with_description_override
+        PASS [   0.008s] ( 61/345) wyrd-skald-agent::integration delegate::agent_delegate_tool_propagates_sub_agent_error
+        PASS [   0.006s] ( 62/345) wyrd-skald-agent::integration loop_basic::provider_failure_surfaces_provider_code
+        PASS [   0.008s] ( 63/345) wyrd-skald-agent::integration loop_basic::run_prompt_missing_variable_emits_prompt_error
+        PASS [   0.005s] ( 64/345) wyrd-skald-agent::integration session_conversion::agent_context_clone_is_cheap_arc
+        PASS [   0.009s] ( 65/345) wyrd-skald-agent::integration loop_basic::run_prompt_provider_mismatch_returns_409_provider_mismatch
+        PASS [   0.005s] ( 66/345) wyrd-skald-agent::integration session_conversion::callback_outcome_construct_compiles_for_every_t
+        PASS [   0.005s] ( 67/345) wyrd-skald-agent::integration session_conversion::agent_errors_project_onto_the_catalog
+        PASS [   0.005s] ( 68/345) wyrd-skald-agent::integration session_conversion::error_codes_map_to_wyrd_error
+        PASS [   0.008s] ( 69/345) wyrd-skald-agent::integration loop_basic::single_turn_no_tool_calls_returns_immediately
+        PASS [   0.006s] ( 70/345) wyrd-skald-agent::integration session_conversion::conversation_turn_tag_is_lowercase_snake_case
+        PASS [   0.005s] ( 71/345) wyrd-skald-agent::integration session_conversion::journal_event_serde_round_trip_all_variants
+        PASS [   0.004s] ( 72/345) wyrd-skald-agent::integration session_conversion::session_id_round_trip
+        PASS [   0.005s] ( 73/345) wyrd-skald-agent::integration session_conversion::noop_journal_append_returns_ok
+        PASS [   0.008s] ( 74/345) wyrd-skald-agent::integration loop_conversation::agent_conversation_grows_across_iterations_without_session
+        PASS [   0.009s] ( 75/345) wyrd-skald-agent::integration loop_basic::run_prompt_sends_rendered_prompt_verbatim_on_first_turn
+        PASS [   0.005s] ( 76/345) wyrd-skald-agent::integration session_conversion::no_session_recent_returns_empty
+        PASS [   0.008s] ( 77/345) wyrd-skald-agent::integration loop_conversation::agent_loop_threads_tool_result_to_next_iteration
+        PASS [   0.005s] ( 78/345) wyrd-skald-agent::integration session_conversion::no_session_append_returns_ok
+        PASS [   0.008s] ( 79/345) wyrd-skald-agent::integration loop_basic::tool_call_response_now_returns_tool_not_found
+        PASS [   0.008s] ( 80/345) wyrd-skald-agent::integration loop_conversation::agent_render_populates_provider_request_tools_from_agent_tools
+        PASS [   0.008s] ( 81/345) wyrd-skald-agent::integration loop_conversation::agent_conversation_serializes_via_serde_round_trip
+        PASS [   0.009s] ( 82/345) wyrd-skald-agent::integration loop_conversation::agent_max_iterations_exhausted_returns_error
+        PASS [   0.008s] ( 83/345) wyrd-skald-agent::integration loop_conversation::agent_render_omits_tools_when_agent_has_none
+        PASS [   0.008s] ( 84/345) wyrd-skald-agent::integration session_conversion::conversation_serde_round_trip
+        PASS [   0.008s] ( 85/345) wyrd-skald-agent::integration loop_conversation::agent_terminates_when_model_emits_no_tool_calls
+        PASS [   0.008s] ( 86/345) wyrd-skald-agent::integration loop_conversation::agent_run_executes_bounded_loop_against_recording_provider
+        PASS [   0.004s] ( 87/345) wyrd-skald-agent::integration session_conversion::session_turn_round_trip_all_roles
+        PASS [   0.008s] ( 88/345) wyrd-skald-agent::integration loop_responses::responses_session_turns_seed_native_items
+        PASS [   0.006s] ( 89/345) wyrd-skald-agent::integration session_conversion::session_turn_into_conversation_turn_maps_roles
+        PASS [   0.009s] ( 90/345) wyrd-skald-agent::integration loop_gemini::agent_run_executes_gemini_loop_against_mock_provider
+        PASS [   0.005s] ( 91/345) wyrd-skald-agent::integration session_conversion::session_turn_tool_role_none_call_id_produces_empty_string
+        PASS [   0.012s] ( 92/345) wyrd-skald-agent::integration loop_responses::agent_run_executes_openai_responses_tool_loop
+        PASS [   0.004s] ( 93/345) wyrd-skald-cache inmemory::cache_inmemory::capacity_eviction_reduces_entries
+        PASS [   0.004s] ( 94/345) wyrd-skald-cache inmemory::cache_inmemory::get_missing_returns_none
+        PASS [   0.004s] ( 95/345) wyrd-skald-cache inmemory::cache_inmemory::put_then_get_returns_value
+        PASS [   0.005s] ( 96/345) wyrd-skald-cache inmemory::cache_inmemory::invalidate_removes_key_and_reports_miss
+        PASS [   0.005s] ( 97/345) wyrd-skald-prompt builder::builder_tests::native_content_helpers_build_provider_wire_parts
+        PASS [   0.009s] ( 98/345) wyrd-skald-agent::integration session_journal::provider_error_journals_synthetic_model_result_then_agent_error
+        PASS [   0.008s] ( 99/345) wyrd-skald-agent::integration session_journal::session_recent_failure_propagates_and_journals_agent_error
+        PASS [   0.009s] (100/345) wyrd-skald-agent::integration session_journal::before_model_abort_journals_synthetic_model_result_then_agent_finish
+        PASS [   0.010s] (101/345) wyrd-skald-agent::integration session_journal::assistant_turn_appends_after_each_successful_provider_response
+        PASS [   0.009s] (102/345) wyrd-skald-agent::integration session_journal::same_session_id_round_trips_history_across_runs
+        PASS [   0.009s] (103/345) wyrd-skald-agent::integration session_journal::recent_turns_seed_conversation_before_new_user_input
+        PASS [   0.010s] (104/345) wyrd-skald-agent::integration session_journal::journal_records_exactly_one_start_and_finish_on_success
+        PASS [   0.007s] (105/345) wyrd-skald-agent::integration session_journal::user_turn_appends_after_recent_and_before_model_work
+        PASS [   0.008s] (106/345) wyrd-skald-agent::integration session_journal::session_recent_limit_defaults_to_50_and_honors_config
+        PASS [   0.007s] (107/345) wyrd-skald-prompt builder::builder_tests::openai_chat_emits_native_variant_and_response_format
+        PASS [   0.008s] (108/345) wyrd-skald-agent::integration session_journal::tool_turn_appends_only_after_successful_tool_invocation
+        PASS [   0.009s] (109/345) wyrd-skald-agent::integration session_journal::session_is_not_called_without_session_id
+        PASS [   0.009s] (110/345) wyrd-skald-agent::integration session_journal::session_recent_fires_once_per_run
+        PASS [   0.009s] (111/345) wyrd-skald-agent::integration session_journal::session_append_failure_propagates_and_journals_agent_error
+        PASS [   0.008s] (112/345) wyrd-skald-prompt builder::builder_tests::google_and_vertex_emit_distinct_native_variants
+        PASS [   0.008s] (113/345) wyrd-skald-prompt builder::builder_tests::anthropic_output_emits_output_config
+        PASS [   0.004s] (114/345) wyrd-skald-prompt media::media_path_loaders::document_path_loads_and_encodes
+        PASS [   0.004s] (115/345) wyrd-skald-prompt media::media_path_loaders::image_path_rejects_directory_and_bad_extension
+        PASS [   0.006s] (116/345) wyrd-skald-prompt builder::builder_tests::raw_preserves_provider_and_body
+        PASS [   0.007s] (117/345) wyrd-skald-prompt builder::builder_tests::openai_responses_emits_native_text_format
+        PASS [   0.007s] (118/345) wyrd-skald-prompt builder::builder_tests::role_helpers_append_native_messages_without_neutral_storage
+        PASS [   0.005s] (119/345) wyrd-skald-prompt media::media_path_loaders::image_path_rejects_oversize
+        PASS [   0.007s] (120/345) wyrd-skald-prompt media::media_path_loaders::image_path_loads_and_encodes
+        PASS [   0.005s] (121/345) wyrd-skald-prompt prompt::output_schema_tests::normalize_adds_additional_properties_when_absent
+        PASS [   0.006s] (122/345) wyrd-skald-prompt prompt::output_schema_tests::normalize_does_not_overwrite_existing_additional_properties
+        PASS [   0.006s] (123/345) wyrd-skald-providers auth::openai::openai_auth_headers::credentials_produce_their_own_sensitive_header
+        PASS [   0.013s] (124/345) wyrd-skald-agent::integration structured_output::structured_output_parses_when_schema_declared
+        PASS [   0.009s] (125/345) wyrd-skald-prompt builder::builder_tests::output_wins_over_response_format_for_openai_chat
+        PASS [   0.014s] (126/345) wyrd-skald-agent::integration structured_output::structured_output_decode_failure_surfaces_code
+        PASS [   0.015s] (127/345) wyrd-skald-agent::integration structured_output::text_prompt_leaves_structured_output_none
+        PASS [   0.019s] (128/345) wyrd-skald-cache inmemory::cache_inmemory::ttl_eviction_after_expiry
+        PASS [   0.025s] (129/345) wyrd-skald-providers auth::auth_redaction::auth_debug_redacts_secrets
+        PASS [   0.027s] (130/345) wyrd-skald-providers clients::anthropic::anthropic_messages::anthropic_embed_returns_unsupported
+        PASS [   0.027s] (131/345) wyrd-skald-providers clients::bounded_answers::oversized_answers_fail_and_refusals_keep_status_and_body
+        PASS [   0.028s] (132/345) wyrd-skald-providers auth::google_oauth::google_auth_oauth::service_account_json_invalid_token_uri_host_returns_auth_error
+        PASS [   0.029s] (133/345) wyrd-skald-providers auth::google_oauth::google_auth_oauth::inline_access_token_grants_and_cache_reuses_it
+        PASS [   0.027s] (134/345) wyrd-skald-providers clients::google::google_generate::generate_request_body_matches_fixture_and_response_parses
+        PASS [   0.030s] (135/345) wyrd-skald-providers auth::google_oauth::google_auth_oauth::service_account_json_http_token_uri_returns_auth_error
+        PASS [   0.065s] (136/345) wyrd-skald-agent::integration agent_timeout::agent_run_timeout_terminates_cleanly
+        PASS [   0.031s] (137/345) wyrd-skald-providers auth::google_oauth::google_auth_oauth::metadata_server_grants_token
+        PASS [   0.031s] (138/345) wyrd-skald-providers auth::google_oauth::google_auth_oauth::access_token_is_presented_as_a_sensitive_bearer
+        PASS [   0.031s] (139/345) wyrd-skald-providers auth::google_oauth::google_auth_oauth::service_account_json_missing_client_email_returns_auth_error
+        PASS [   0.004s] (140/345) wyrd-skald-providers endpoint::tests::address_policy_blocks_metadata_always_and_internal_in_production
+        PASS [   0.005s] (141/345) wyrd-skald-providers endpoint::tests::admission_follows_profile_scheme_port_and_literal_address
+        PASS [   0.028s] (142/345) wyrd-skald-providers clients::openai::openai_chat::chat_request_body_matches_fixture_and_response_parses
+        PASS [   0.032s] (143/345) wyrd-skald-providers clients::anthropic::anthropic_messages::messages_request_body_matches_fixture_and_response_parses
+        PASS [   0.004s] (144/345) wyrd-skald-providers error::error_mapping::status_errors_keep_the_body_out_of_display
+        PASS [   0.032s] (145/345) wyrd-skald-providers clients::google::google_embed::google_embeddings_request_body_matches_fixture_and_response_parses
+        PASS [   0.031s] (146/345) wyrd-skald-providers clients::jev::tests::systemone_posts_bearer_body_and_decodes_the_answer
+        PASS [   0.033s] (147/345) wyrd-skald-providers clients::anthropic::anthropic_messages::messages_with_cache_control_body_matches_fixture
+        PASS [   0.005s] (148/345) wyrd-skald-providers error::error_mapping::status_errors_map_to_stable_codes
+        PASS [   0.004s] (149/345) wyrd-skald-providers retry::retry_policy::exponential_backoff_is_capped_without_jitter
+        PASS [   0.031s] (150/345) wyrd-skald-providers clients::openai::openai_chat::chat_429_retries_then_succeeds
+        PASS [   0.004s] (151/345) wyrd-skald-providers retry::retry_policy::retry_after_past_http_date_returns_zero
+        PASS [   0.030s] (152/345) wyrd-skald-providers clients::openai::openai_embed::openai_embeddings_request_body_matches_fixture_and_response_parses
+        PASS [   0.029s] (153/345) wyrd-skald-providers clients::openai::openai_responses::responses_request_body_matches_fixture_and_response_parses
+        PASS [   0.031s] (154/345) wyrd-skald-providers clients::openai::openai_chat::chat_tool_calls_response_parses
+        PASS [   0.004s] (155/345) wyrd-skald-providers retry::retry_policy::retry_after_seconds_and_http_date_parse
+        PASS [   0.030s] (156/345) wyrd-skald-providers clients::openai::openai_raw_route::raw_route_sends_and_returns_bytes_unchanged
+        PASS [   0.004s] (157/345) wyrd-skald-providers retry::retry_policy::retry_policy_classifies_statuses
+        PASS [   0.004s] (158/345) wyrd-skald-providers retry::retry_policy::should_retry_respects_max_attempts_boundary
+        PASS [   0.032s] (159/345) wyrd-skald-providers clients::openai::openai_batch::batch_routes_use_their_methods_and_bodies
+        PASS [   0.004s] (160/345) wyrd-skald-providers stream::stream_decode::jsonl_decodes_complete_payload
+        PASS [   0.004s] (161/345) wyrd-skald-providers stream::stream_decode::jsonl_handles_partial_line_buffer
+        PASS [   0.030s] (162/345) wyrd-skald-providers clients::openai::variant_mismatch::wrong_provider_request_variant_returns_variant_mismatch
+        PASS [   0.031s] (163/345) wyrd-skald-providers clients::openai::openai_media::media_answers_are_bounded_and_never_retried
+        PASS [   0.004s] (164/345) wyrd-skald-providers stream::stream_decode::sse_decoder_yields_complete_events_across_pushes_within_a_bound
+        PASS [   0.004s] (165/345) wyrd-skald-providers stream::stream_decode::sse_parses_data_lines_and_skips_keepalive
+        PASS [   0.032s] (166/345) wyrd-skald-providers clients::openai::openai_media::media_routes_send_json_or_multipart_and_return_bytes
+        PASS [   0.004s] (167/345) wyrd-skald-providers transport::transport_config::transport_defaults_match_plan
+        PASS [   0.005s] (168/345) wyrd-skald-runtime::integration mock_echo::test_scripted_expectation_overrides_echo
+        PASS [   0.005s] (169/345) wyrd-skald-runtime::integration mock_echo::test_default_registry_has_mock_provider
+        PASS [   0.004s] (170/345) wyrd-skald-runtime::integration runtime_mock::mock_queues_responses_in_order
+        PASS [   0.005s] (171/345) wyrd-skald-runtime::integration runtime_dispatch::routes_typed_request_by_provider_name
+        PASS [   0.005s] (172/345) wyrd-skald-runtime::integration runtime_dispatch::unregistered_provider_returns_runtime_error
+        PASS [   0.004s] (173/345) wyrd-skald-runtime::integration runtime_mock::mock_unexpected_request_returns_provider_error
+        PASS [   0.005s] (174/345) wyrd-skald-runtime::integration mock_echo::test_echo_returns_user_input_verbatim
+        PASS [   0.005s] (175/345) wyrd-skald-runtime::integration runtime_dispatch::raw_v1_uses_embedded_provider_for_dispatch
+        PASS [   0.005s] (176/345) wyrd-skald-runtime::integration runtime_mock::mock_supports_stream_chunks
+        PASS [   0.004s] (177/345) wyrd-skald-runtime::integration runtime_options::google_cached_content_option_stays_native
+        PASS [   0.005s] (178/345) wyrd-skald-runtime::integration runtime_dispatch::dispatch_stream_unregistered_provider_returns_runtime_error
+        PASS [   0.004s] (179/345) wyrd-skald-runtime::integration runtime_options::registry_reports_registered_provider_names
+        PASS [   0.004s] (180/345) wyrd-skald-runtime::integration runtime_options::request_options_round_trip_through_mock_dispatch
+        PASS [   0.004s] (181/345) wyrd-skald-runtime::integration runtime_telemetry::send_records_usage_accessible_from_native_response
+        PASS [   0.004s] (182/345) wyrd-skald-runtime::integration runtime_text::mock_anthropic_response_text_is_readable_through_adapter
+        PASS [   0.004s] (183/345) wyrd-skald-spec adapter::adapter_tests::anthropic_adapter_reads_text_tool_calls_usage_and_finish
+        PASS [   0.005s] (184/345) wyrd-skald-runtime::integration runtime_options::runtime_config_defaults_are_explicit
+        PASS [   0.004s] (185/345) wyrd-skald-spec adapter::adapter_tests::anthropic_finish_reason_mapping
+        PASS [   0.005s] (186/345) wyrd-skald-runtime::integration runtime_text::mock_google_response_text_is_readable_through_adapter
+        PASS [   0.059s] (187/345) wyrd-skald-agent::integration loop_conversation::agent_tool_results_appended_in_call_order_under_concurrency
+        PASS [   0.004s] (188/345) wyrd-skald-spec adapter::adapter_tests::google_adapter_reads_text_tool_calls_usage_and_finish
+        PASS [   0.004s] (189/345) wyrd-skald-spec adapter::adapter_tests::openai_chat_finish_reason_maps
+        PASS [   0.004s] (190/345) wyrd-skald-spec adapter::adapter_tests::openai_chat_adapter_borrows_contiguous_text
+        PASS [   0.004s] (191/345) wyrd-skald-spec adapter::adapter_tests::jev_adapter_reads_the_typed_answer_as_structured_output
+        PASS [   0.004s] (192/345) wyrd-skald-spec adapter::adapter_tests::google_finish_reason_mapping
+        PASS [   0.006s] (193/345) wyrd-skald-runtime::integration runtime_text::mock_openai_response_text_is_readable_through_adapter
+        PASS [   0.005s] (194/345) wyrd-skald-spec adapter::adapter_tests::openai_chat_adapter_reads_text_tool_calls_structured_usage_and_finish
+        PASS [   0.005s] (195/345) wyrd-skald-spec adapter::adapter_tests::openai_responses_adapter_reads_text_tool_calls_structured_usage_and_finish
+        PASS [   0.004s] (196/345) wyrd-skald-spec authoring::authoring_compile::unknown_provider_returns_draft_invalid
+        PASS [   0.004s] (197/345) wyrd-skald-spec convert::conversion::anthropic_to_gemini_message_converts_text_and_tool_use
+        PASS [   0.003s] (198/345) wyrd-skald-spec convert::conversion::anthropic_to_openai_message_converts_tool_result
+        PASS [   0.004s] (199/345) wyrd-skald-spec convert::conversion::anthropic_to_openai_message_converts_text_and_tool_use
+        PASS [   0.007s] (200/345) wyrd-skald-spec authoring::authoring_compile::model_settings_temperature_decoded
+        PASS [   0.007s] (201/345) wyrd-skald-spec authoring::authoring_compile::compile_google
+        PASS [   0.007s] (202/345) wyrd-skald-spec authoring::authoring_compile::compile_openai_chat
+        PASS [   0.006s] (203/345) wyrd-skald-spec authoring::authoring_compile::system_message_openai_chat
+        PASS [   0.007s] (204/345) wyrd-skald-spec authoring::authoring_compile::compile_vertex
+        PASS [   0.007s] (205/345) wyrd-skald-spec authoring::authoring_compile::single_message_string_deserialized
+        PASS [   0.004s] (206/345) wyrd-skald-spec convert::conversion::openai_to_anthropic_message_converts_tool_result
+        PASS [   0.008s] (207/345) wyrd-skald-spec authoring::authoring_compile::compile_openai_responses
+        PASS [   0.006s] (208/345) wyrd-skald-spec authoring::authoring_compile::variables_extracted_from_template
+        PASS [   0.004s] (209/345) wyrd-skald-spec convert::conversion::gemini_to_anthropic_message_converts_text_and_function_call
+        PASS [   0.008s] (210/345) wyrd-skald-spec authoring::authoring_compile::compile_anthropic
+        PASS [   0.004s] (211/345) wyrd-skald-spec convert::conversion::anthropic_tool_result_blocks_content_converts_text_only
+        PASS [   0.004s] (212/345) wyrd-skald-spec convert::conversion::gemini_to_openai_message_converts_text_and_function_call
+        PASS [   0.004s] (213/345) wyrd-skald-spec convert::conversion::openai_to_anthropic_message_converts_text_and_tool_call
+        PASS [   0.003s] (214/345) wyrd-skald-spec convert::conversion::same_provider_conversion_is_identity
+        PASS [   0.004s] (215/345) wyrd-skald-spec convert::conversion::raw_v1_message_cannot_be_converted_returns_skald_spec_501
+        PASS [   0.004s] (216/345) wyrd-skald-spec convert::conversion::openai_to_gemini_message_converts_text_and_tool_call
+        PASS [   0.005s] (217/345) wyrd-skald-spec prompt::placeholder_syntax_tests::extract_does_not_capture_media_prefix
+        PASS [   0.006s] (218/345) wyrd-skald-spec convert::conversion::unsupported_conversion_pair_returns_skald_spec_501
+        PASS [   0.006s] (219/345) wyrd-skald-spec prompt::placeholder_syntax_tests::extract_finds_dollar_brace
+        PASS [   0.004s] (220/345) wyrd-skald-spec prompt::prompt_media::serde_default_accepts_prompts_without_media_variables
+        PASS [   0.004s] (221/345) wyrd-skald-spec prompt::prompt_render::bind_returns_new_prompt_and_tracks_remaining_variables
+        PASS [   0.005s] (222/345) wyrd-skald-spec prompt::placeholder_syntax_tests::extract_finds_mixed
+        PASS [   0.006s] (223/345) wyrd-skald-spec prompt::placeholder_syntax_tests::extract_finds_mustache
+        PASS [   0.062s] (224/345) wyrd-skald-agent::integration session_journal::tool_results_are_journaled_and_conversation_order_is_deterministic
+        PASS [   0.008s] (225/345) wyrd-skald-spec prompt::placeholder_syntax_tests::extract_does_not_capture_single_brace
+        PASS [   0.006s] (226/345) wyrd-skald-spec prompt::prompt_media::media_placeholder_in_system_message_is_rejected
+        PASS [   0.052s] (227/345) wyrd-skald-providers clients::jev::tests::refusal_is_a_status_error_and_other_dialects_mismatch
+        PASS [   0.007s] (228/345) wyrd-skald-spec prompt::prompt_media::render_fails_when_media_variable_is_unbound
+        PASS [   0.008s] (229/345) wyrd-skald-spec prompt::placeholder_syntax_tests::render_binds_dollar_brace
+        PASS [   0.007s] (230/345) wyrd-skald-spec prompt::prompt_media::text_binding_does_not_touch_media_and_media_binding_does_not_touch_text
+        PASS [   0.007s] (231/345) wyrd-skald-spec prompt::placeholder_syntax_tests::render_binds_mustache
+        PASS [   0.007s] (232/345) wyrd-skald-spec prompt::prompt_media::anthropic_accepts_image_and_document_url_and_base64
+        PASS [   0.007s] (233/345) wyrd-skald-spec prompt::prompt_render::bind_mut_supports_incremental_parameter_injection
+        PASS [   0.007s] (234/345) wyrd-skald-spec prompt::prompt_media::missing_media_placeholder_returns_stable_error
+        PASS [   0.007s] (235/345) wyrd-skald-spec prompt::placeholder_syntax_tests::render_binds_mixed_syntax_in_one_pass
+        PASS [   0.008s] (236/345) wyrd-skald-spec prompt::prompt_media::bind_media_replaces_all_openai_placeholders_and_preserves_text_variables
+        PASS [   0.008s] (237/345) wyrd-skald-spec prompt::prompt_media::google_media_matrix_and_rejections
+        PASS [   0.008s] (238/345) wyrd-skald-spec prompt::prompt_media::openai_media_matrix
+        PASS [   0.006s] (239/345) wyrd-skald-spec prompt::prompt_render::dollar_syntax_is_bound
+        PASS [   0.004s] (240/345) wyrd-skald-spec prompt::prompt_render::response_type_json_schema_roundtrips
+        PASS [   0.004s] (241/345) wyrd-skald-spec request::round_trip::messages_roundtrip
+        PASS [   0.006s] (242/345) wyrd-skald-spec prompt::prompt_render::render_missing_variable_value_returns_skald_error
+        PASS [   0.011s] (243/345) wyrd-skald-spec prompt::prompt_media::media_variables_populated_and_split_at_construction
+        PASS [   0.005s] (244/345) wyrd-skald-spec prompt::prompt_render::render_substitutes_anthropic_variables
+        PASS [   0.004s] (245/345) wyrd-skald-spec request::round_trip::raw_v1_request_reads_back_when_body_precedes_tag
+        PASS [   0.005s] (246/345) wyrd-skald-spec request::round_trip::mismatched_body_is_refused
+        PASS [   0.004s] (247/345) wyrd-skald-spec request::settings_flatten::anthropic_default_max_tokens_is_wire_default
+        PASS [   0.004s] (248/345) wyrd-skald-spec request::round_trip::raw_v1_request_roundtrip_preserves_provider_and_body
+        PASS [   0.004s] (249/345) wyrd-skald-spec request::round_trip::provider_name_yaml_reads_back_through_buffered_json
+        PASS [   0.009s] (250/345) wyrd-skald-spec prompt::prompt_render::jev_state_renders_quotes_and_newlines_verbatim
+        PASS [   0.005s] (251/345) wyrd-skald-spec request::round_trip::raw_v1_response_and_message_roundtrip_preserve_body
+        PASS [   0.004s] (252/345) wyrd-skald-spec request::settings_flatten::openai_settings_flatten_to_top_level_json
+        PASS [   0.004s] (253/345) wyrd-skald-spec request::settings_flatten::google_unknown_top_level_field_is_absorbed
+        PASS [   0.007s] (254/345) wyrd-skald-spec prompt::prompt_render::render_repeated_reference_substitutes_all_occurrences
+        PASS [   0.007s] (255/345) wyrd-skald-spec prompt::prompt_render::render_no_variables_returns_request_unchanged
+        PASS [   0.005s] (256/345) wyrd-skald-spec request::round_trip::provider_requests_roundtrip
+        PASS [   0.004s] (257/345) wyrd-skald-spec request::settings_flatten::openai_unmodeled_field_passthrough
+        PASS [   0.006s] (258/345) wyrd-skald-spec request::round_trip::per_provider_wire_roundtrips
+        PASS [   0.009s] (259/345) wyrd-skald-spec prompt::prompt_render::render_escapes_json_special_characters_and_blocks_injection
+        PASS [   0.028s] (260/345) wyrd-skald-providers transport::transport_config::transport_builds_reqwest_client
+        PASS [   0.006s] (261/345) wyrd-skald-spec request::round_trip::provider_responses_roundtrip
+        PASS [   0.032s] (262/345) wyrd-skald-providers raw::raw_passthrough::raw_v1_writes_body_bytes_directly_and_returns_raw_response
+        PASS [   0.009s] (263/345) wyrd-skald-spec prompt::prompt_render::render_same_type_in_same_type_out_for_all_live_requests
+        PASS [   0.005s] (264/345) wyrd-skald-spec request::settings_flatten::settings_requests_round_trip_each_provider
+        PASS [   0.005s] (265/345) wyrd-skald-spec request::untagged_dispatch::message_num_untagged_dispatch_per_provider
+        PASS [   0.005s] (266/345) wyrd-skald-spec request::untagged_dispatch::provider_response_untagged_dispatch_per_provider
+        PASS [   0.005s] (267/345) wyrd-skald-spec wire::jev::tests::bad_forms_and_bounds_are_rejected
+        PASS [   0.004s] (268/345) wyrd-skald-spec wire::openai_chat::openai_wire::openai_usage_details_are_typed
+        PASS [   0.004s] (269/345) wyrd-skald-spec wire::openai_chat::openai_wire::nested_openai_chat_contracts_reject_unknown_fields
+        PASS [   0.005s] (270/345) wyrd-skald-spec wire::jev::tests::documented_answers_decode_typed
+        PASS [   0.004s] (271/345) wyrd-skald-spec wire::jev::tests::documented_forms_round_trip
+        PASS [   0.004s] (272/345) wyrd-skald-spec wire::openai_chat::openai_wire::responses_stream_events_use_openapi_discriminators
+        PASS [   0.004s] (273/345) wyrd-skald-spec wire::openai_chat::openai_wire::responses_response_accepts_openapi_usage_details
+        PASS [   0.008s] (274/345) wyrd-skald-spec request::settings_flatten::google_generation_config_stays_nested
+        PASS [   0.004s] (275/345) wyrd-skald-spec wire::openai_chat::openai_wire::responses_request_uses_typed_openai_fields
+        PASS [   0.005s] (276/345) wyrd-skald-spec response::tests::text_builds_an_openai_assistant_answer
+        PASS [   0.005s] (277/345) wyrd-skald-spec wire::openai_chat::openai_wire::chat_request_uses_typed_openai_fields
+        PASS [   0.004s] (278/345) wyrd-skald-spec wire::openai_responses::tests::easy_input_messages_decode_as_typed_messages
+        PASS [   0.005s] (279/345) wyrd-skald-spec wire::openai_responses::tests::responses_input_keeps_its_form_until_edited
+        PASS [   0.095s] (280/345) wyrd-skald-agent::integration callbacks::agent_run_callback_panic_maps_to_agent_error
+        PASS [   0.004s] (281/345) wyrd-skald-tool def::agent_tool_trait::agent_tool_is_object_safe
+        PASS [   0.004s] (282/345) wyrd-skald-tool def::agent_tool_trait::tooldef_input_schema_is_serde_json_value
+        PASS [   0.004s] (283/345) wyrd-skald-tool def::tool_def_validate::parameters_schema_must_be_object
+        PASS [   0.004s] (284/345) wyrd-skald-tool def::agent_tool_trait::tooldef_output_schema_for_struct_with_jsonschema_derive
+        PASS [   0.004s] (285/345) wyrd-skald-tool def::tool_def_validate::invalid_meta_schema_rejected
+        PASS [   0.005s] (286/345) wyrd-skald-tool def::agent_tool_trait::tooldef_invoke_rejects_mismatched_input
+        PASS [   0.005s] (287/345) wyrd-skald-tool def::agent_tool_trait::agent_tool_name_and_description_are_owned_strings
+        PASS [   0.005s] (288/345) wyrd-skald-tool def::agent_tool_trait::tooldef_function_constructs_with_derived_schemas
+        PASS [   0.005s] (289/345) wyrd-skald-tool def::tool_def_validate::empty_description_rejected
+        PASS [   0.004s] (290/345) wyrd-skald-tool helpers::tool_use_result::anthropic_tool_use_and_result_round_trip_through_message_num
+        PASS [   0.004s] (291/345) wyrd-skald-tool def::tool_def_validate::invalid_name_rejected
+        PASS [   0.005s] (292/345) wyrd-skald-tool def::agent_tool_trait::tooldef_invoke_round_trips_json
+        PASS [   0.005s] (293/345) wyrd-skald-tool def::tool_def_validate::valid_tool_def_passes
+        PASS [   0.004s] (294/345) wyrd-skald-tool helpers::tool_use_result::google_function_call_and_response_round_trip_through_message_num
+        PASS [   0.006s] (295/345) wyrd-skald-tool def::agent_tool_trait::tooldef_invoke_wraps_closure_error_as_invocation
+        PASS [   0.005s] (296/345) wyrd-skald-tool helpers::tool_use_result::openai_tool_call_and_result_round_trip_through_message_num
+        PASS [   0.004s] (297/345) wyrd-skald-tool registry::registry_tests::test_default_registry_is_process_global_singleton
+        PASS [   0.004s] (298/345) wyrd-skald-tool registry::registry_tests::test_registry_register_duplicate_returns_name_taken
+        PASS [   0.004s] (299/345) wyrd-skald-tool registry::registry_tests::test_registry_clear_removes_all_entries_but_preserves_pre_resolved_arcs
+        PASS [   0.004s] (300/345) wyrd-skald-tool registry::registry_tests::test_default_registry_persists_across_test_threads
+        PASS [   0.004s] (301/345) wyrd-skald-tool toolerror::tests::generic_invocation_code_is_unchanged
+        PASS [   0.004s] (302/345) wyrd-skald-tool registry::registry_tests::test_registry_names_returns_sorted_list
+        PASS [   0.004s] (303/345) wyrd-skald-tool registry::registry_tests::test_tool_resolver_blanket_impl_on_reference_compiles_and_resolves
+        PASS [   0.004s] (304/345) wyrd-skald-tool toolerror::tests::structured_invocation_exposes_source_chain_and_display
+        PASS [   0.004s] (305/345) wyrd-skald-tool toolerror::tests::structured_invocation_accessors_preserve_owned_fields
+        PASS [   0.005s] (306/345) wyrd-skald-tool registry::registry_tests::test_registry_resolve_unknown_includes_available_list
+        PASS [   0.062s] (307/345) wyrd-skald-providers clients::vertex::vertex_embed::vertex_predict_embedding_request_body_matches_fixture_and_response_parses
+        PASS [   0.004s] (308/345) wyrd-skald-tool toolerror::tests::tool_errors_project_onto_the_catalog
+        PASS [   0.006s] (309/345) wyrd-skald-tool registry::registry_tests::test_tool_resolver_trait_is_object_safe
+        PASS [   0.006s] (310/345) wyrd-skald-workflow error::tests::workflow_errors_project_onto_the_catalog
+        PASS [   0.077s] (311/345) wyrd-skald-providers auth::vertex::vertex_endpoint::locations_select_regional_or_global_hosts
+        PASS [   0.010s] (312/345) wyrd-skald-tool registry::registry_tests::test_registry_register_and_resolve_round_trip
+        PASS [   0.011s] (313/345) wyrd-skald-workflow bodies::tests::agent_tools_follow_each_agent_reference
+        PASS [   0.010s] (314/345) wyrd-skald-workflow workflow::tests::run_tracing_spans
+        PASS [   0.059s] (315/345) wyrd-skald-providers clients::vertex::vertex_generate::vertex_generate_request_body_matches_fixture_and_path_has_projectlocation
+        PASS [   0.011s] (316/345) wyrd-skald-workflow workflow::tests::prepared_run_keeps_its_id
+        PASS [   0.010s] (317/345) wyrd-skald-workflow::workflow_surface workflow_builder_add_after_string_dep
+        PASS [   0.011s] (318/345) wyrd-skald-workflow workflow_surface::tests::explicit_builder_contract
+        PASS [   0.012s] (319/345) wyrd-skald-workflow workflow::tests::bounded_attempt_lifecycle
+        PASS [   0.008s] (320/345) wyrd-skald-workflow::workflow_surface workflow_parallel_zero_deps
+        PASS [   0.010s] (321/345) wyrd-skald-workflow::workflow_surface workflow_hydrates_sibling_agent_with_explicit_resolver
+        PASS [   0.013s] (322/345) wyrd-skald-workflow workflow::tests::isolated_route_calls
+        PASS [   0.009s] (323/345) wyrd-skald-workflow::workflow_surface workflow_sequential_anonymous_agents_get_inline_action
+        PASS [   0.059s] (324/345) wyrd-skald-providers endpoint::tests::resolved_blocked_hosts_fail_and_redirects_are_not_followed
+        PASS [   0.058s] (325/345) wyrd-skald-providers endpoint::tests::untrusted_certificates_are_refused_before_any_request_byte
+        PASS [   0.017s] (326/345) wyrd-skald-workflow workflow::tests::agent_deadline_bounds_settlement
+        PASS [   0.009s] (327/345) wyrd-skald-workflow::workflow_surface workflow_sequential_chains_named_agents_with_card_ref_cascade
+        PASS [   0.014s] (328/345) wyrd-skald-workflow workflow_surface::tests::resolved_bindings_reject_before_dispatch
+        PASS [   0.017s] (329/345) wyrd-skald-workflow workflow::tests::explicit_namespaced_results
+        PASS [   0.009s] (330/345) wyrd-skald-workflow::workflow_surface workflow_to_yaml_round_trip_preserves_steps
+        PASS [   0.033s] (331/345) wyrd-skald-workflow workflow::tests::external_gateway_decode_detail_withheld
+        PASS [   0.046s] (332/345) wyrd-skald-workflow workflow::tests::terminal_budget_reserve
+        PASS [   0.072s] (333/345) wyrd-skald-spec wire::wire_snapshots::anthropic_messages_response_matches_fixture
+        PASS [   0.074s] (334/345) wyrd-skald-spec wire::wire_snapshots::google_generate_content_response_matches_fixture
+        PASS [   0.074s] (335/345) wyrd-skald-spec wire::wire_snapshots::openai_chat_response_matches_fixture
+        PASS [   0.075s] (336/345) wyrd-skald-spec wire::wire_snapshots::google_generate_content_request_matches_fixture
+        PASS [   0.065s] (337/345) wyrd-skald-workflow workflow::tests::attempt_panic_matches_span
+        PASS [   0.076s] (338/345) wyrd-skald-spec wire::wire_snapshots::anthropic_with_cache_control_matches_fixture
+        PASS [   0.076s] (339/345) wyrd-skald-spec wire::wire_snapshots::openai_chat_request_matches_fixture
+        PASS [   0.077s] (340/345) wyrd-skald-spec wire::wire_snapshots::anthropic_messages_request_matches_fixture
+        PASS [   0.075s] (341/345) wyrd-skald-spec wire::wire_snapshots::openai_responses_response_matches_fixture
+        PASS [   0.077s] (342/345) wyrd-skald-spec wire::wire_snapshots::openai_responses_request_matches_fixture
+        PASS [   0.077s] (343/345) wyrd-skald-spec wire::wire_snapshots::vertex_predict_request_matches_fixture
+        PASS [   0.081s] (344/345) wyrd-skald-workflow workflow::tests::bound_external_gateway_security
+        PASS [   0.213s] (345/345) wyrd-skald-agent::integration agent_timeout::agent_run_no_timeout_runs_to_completion
+────────────
+     Summary [   0.214s] 345 tests run: 345 passed, 0 skipped

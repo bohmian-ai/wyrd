@@ -1749,6 +1749,15 @@ class OpenAiCustomVoice:
     id: str
 
 
+@dataclass(frozen=True, kw_only=True)
+class OpenAiEasyInputMessage:
+    """Easy input message: `type` may be omitted and `content` may be text."""
+
+    content: str | list[OpenAiResponseContentPart]
+    role: str
+    type: Literal["message"] | None = None
+
+
 OpenAiEmbeddingsInput: TypeAlias = "str | list[str] | list[int] | list[list[int]]"
 
 
@@ -2139,7 +2148,7 @@ OpenAiResponsesHostedToolKind: TypeAlias = 'Literal["file_search", "web_search_p
 # OpenAI Responses `input`: the text shorthand for one user message, or an ordered list of input items.
 #
 # Both forms decode and re-encode unchanged, so a relayed request keeps the form its caller sent. Editing the conversation first expands the text shorthand into the single user message it stands for.
-OpenAiResponsesInput: TypeAlias = "str | list[OpenAiResponseItem]"
+OpenAiResponsesInput: TypeAlias = "str | list[OpenAiResponseItem | OpenAiEasyInputMessage]"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -4272,6 +4281,15 @@ _OBJECTS: dict[str, tuple[tuple[str, bool, tuple], ...]] = {
     ),
     "OpenAiCustomToolFormatText": (("type", True, ("union", [("lit", "text")])),),
     "OpenAiCustomVoice": (("id", True, ("prim", "string")),),
+    "OpenAiEasyInputMessage": (
+        (
+            "content",
+            True,
+            ("union", [("prim", "string"), ("array", ("ref", "OpenAiResponseContentPart"))]),
+        ),
+        ("role", True, ("prim", "string")),
+        ("type", False, ("union", [("lit", "message")])),
+    ),
     "OpenAiEmbeddingsRequest": (
         ("dimensions", False, ("union", [("prim", "integer"), ("prim", "null")])),
         ("encoding_format", False, ("union", [("prim", "string"), ("prim", "null")])),
@@ -5557,7 +5575,13 @@ _ALIASES: dict[str, tuple] = {
     ),
     "OpenAiResponsesInput": (
         "union",
-        [("prim", "string"), ("array", ("ref", "OpenAiResponseItem"))],
+        [
+            ("prim", "string"),
+            (
+                "array",
+                ("union", [("ref", "OpenAiResponseItem"), ("ref", "OpenAiEasyInputMessage")]),
+            ),
+        ],
     ),
     "OpenAiResponsesMcpToolKind": ("union", [("lit", "mcp")]),
     "OpenAiResponsesShellToolKind": ("union", [("lit", "shell")]),

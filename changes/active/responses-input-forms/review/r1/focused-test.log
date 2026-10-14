@@ -1,0 +1,7 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.33s
+────────────
+ Nextest run ID d65ebeb2-02e2-45ba-8c58-60d99d212ded with nextest profile: default
+    Starting 1 test across 1 binary (98 tests skipped)
+        PASS [   0.004s] (1/1) wyrd-skald-spec wire::openai_responses::tests::easy_input_messages_decode_as_typed_messages
+────────────
+     Summary [   0.004s] 1 test run: 1 passed, 98 skipped

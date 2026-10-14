@@ -1,0 +1,2155 @@
+diff --git a/changes/active/responses-input-forms/spec.md b/changes/active/responses-input-forms/spec.md
+new file mode 100644
+index 000000000..e8d255de2
+--- /dev/null
++++ b/changes/active/responses-input-forms/spec.md
+@@ -0,0 +1,55 @@
++---
++id: SPEC-responses-input-forms
++revision: 1
++status: approved
++---
++
++# The gateway accepts every Responses input form the Agents SDK sends
++
++## Objective and user value
++
++An OpenAI Agents SDK agent using the Responses API calls models through the
++Wyrd gateway with no client-side workaround.
++
++## Approval
++
++Approved by the human owner on 2026-10-14 under SPEC-example-journey-fixes r6
++AC-004 (the example runs clean with no workarounds). Split into its own change
++by owner direction on 2026-10-14.
++
++## Defect
++
++The gateway checks a `/v1/responses` body by decoding it as Skald's
++`OpenAiResponsesRequest`, which accepted only the typed message form and string
++tool results. The Agents SDK sends two other forms OpenAI accepts, so every
++Agents SDK Responses agent got `WYRD_GATEWAY_400_INVALID_REQUEST` before any
++provider call:
++
++- the easy input message `{"role": "user", "content": "go"}` (no `type`, text
++  `content`);
++- a tool result whose `output` is content parts
++  (`[{"type": "input_text", "text": ...}]`).
++
++## Required behavior
++
++### REQ-001 Responses input forms
++
++- An easy input message decodes as the typed message it stands for.
++- A function call output accepts text or content parts and keeps the form the
++  caller sent.
++- Both forms reach the provider unchanged.
++
++## Invariants
++
++- INV-001 Tenant isolation holds on every changed path.
++
++## Acceptance obligations
++
++- AC-001 A unit test decodes the captured Agents SDK body shape.
++- AC-002 Format, lints, codegen check, and the owning `mise` lanes pass.
++
++## Open material decisions
++
++None. A TypeScript gateway journey that drives the Agents SDK
++`OpenAIResponsesModel` with a tool through `WyrdTestServer` is not written yet
++and is recorded as a gap in the pull request.
+diff --git a/crates/skald/skald-agent/src/request_builder.rs b/crates/skald/skald-agent/src/request_builder.rs
+index 81f0900b7..097d8d699 100644
+--- a/crates/skald/skald-agent/src/request_builder.rs
++++ b/crates/skald/skald-agent/src/request_builder.rs
+@@ -383,7 +383,7 @@ fn tool_result_message(
+         PromptLoopSupport::OpenAiResponses => {
+             MessageNum::OpenAiResponses(vec![OpenAiResponseItem::FunctionCallOutput {
+                 call_id: call_id.to_owned(),
+-                output: content_text,
++                output: content_text.into(),
+             }])
+         }
+         PromptLoopSupport::OpenAiChat => {
+diff --git a/crates/skald/skald-agent/tests/integration/loop_responses.rs b/crates/skald/skald-agent/tests/integration/loop_responses.rs
+index 8c20a1618..60196b889 100644
+--- a/crates/skald/skald-agent/tests/integration/loop_responses.rs
++++ b/crates/skald/skald-agent/tests/integration/loop_responses.rs
+@@ -136,7 +136,7 @@ async fn agent_run_executes_openai_responses_tool_loop() {
+                 lookup_call(),
+                 OpenAiResponseItem::FunctionCallOutput {
+                     call_id: "c1".to_owned(),
+-                    output: r#"{"answer":42}"#.to_owned(),
++                    output: r#"{"answer":42}"#.to_owned().into(),
+                 },
+             ],
+             true,
+diff --git a/crates/skald/skald-prompt/src/prompt.rs b/crates/skald/skald-prompt/src/prompt.rs
+index 5013cc24a..b03a73b43 100644
+--- a/crates/skald/skald-prompt/src/prompt.rs
++++ b/crates/skald/skald-prompt/src/prompt.rs
+@@ -146,7 +146,7 @@ impl Prompt {
+                     .items_mut()
+                     .push(OpenAiResponseItem::FunctionCallOutput {
+                         call_id: tool_use_id,
+-                        output: content,
++                        output: content.into(),
+                     });
+             }
+             ProviderRequest::AnthropicMessage(request) => {
+diff --git a/crates/skald/skald-prompt/src/python/openai_responses.rs b/crates/skald/skald-prompt/src/python/openai_responses.rs
+index 0ab7c33a0..9024ea6aa 100644
+--- a/crates/skald/skald-prompt/src/python/openai_responses.rs
++++ b/crates/skald/skald-prompt/src/python/openai_responses.rs
+@@ -568,9 +568,20 @@ impl PyOpenAiResponseItem {
+             _ => Err(wrong_variant("function_call", self.kind()).into()),
+         }
+     }
++    /// Returns a `function_call_output` item's result as text.
++    ///
++    /// A text result is returned as sent. A content-parts result is projected
++    /// to the concatenated text of its `input_text` and `output_text` parts, in
++    /// order and with no separator; non-text parts are omitted. The item keeps
++    /// the form it was sent in.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`crate::error::PromptBuilderError::WrongVariant`] when the item
++    /// is not a `function_call_output`.
+     fn as_function_call_output(&self) -> WyrdPyResult<String> {
+         match self.i() {
+-            OpenAiResponseItem::FunctionCallOutput { output, .. } => Ok(output.clone()),
++            OpenAiResponseItem::FunctionCallOutput { output, .. } => Ok(output.text().into_owned()),
+             _ => Err(wrong_variant("function_call_output", self.kind()).into()),
+         }
+     }
+diff --git a/crates/skald/skald-spec/src/wire/openai_responses.rs b/crates/skald/skald-spec/src/wire/openai_responses.rs
+index 8053da053..44a902158 100644
+--- a/crates/skald/skald-spec/src/wire/openai_responses.rs
++++ b/crates/skald/skald-spec/src/wire/openai_responses.rs
+@@ -285,8 +285,95 @@ pub enum OpenAiResponsesShellToolKind {
+ pub enum OpenAiResponsesInput {
+     /// Text shorthand for one user message carrying one `input_text` part.
+     Text(String),
+-    /// Ordered input items.
+-    Items(Vec<OpenAiResponseItem>),
++    /// Ordered input items. Easy input messages (`{"role", "content"}` with
++    /// no `type`, or with text `content`) decode as the message item they
++    /// stand for.
++    Items(
++        #[serde(deserialize_with = "easy_items")]
++        #[cfg_attr(feature = "schemars", schemars(schema_with = "input_items_schema"))]
++        Vec<OpenAiResponseItem>,
++    ),
++}
++
++/// JSON Schema of the item list [`easy_items`] accepts.
++///
++/// The derived schema would publish only canonical [`OpenAiResponseItem`]s,
++/// rejecting the easy input messages the decoder accepts. Each item is
++/// therefore a canonical item or an `OpenAiEasyInputMessage`: a `role` and
++/// text or content-part `content`, with `type` omitted or `message`. The easy
++/// message is registered as a named definition so generated declarations name
++/// it; decoded and re-encoded items stay canonical.
++///
++/// # Panics
++///
++/// Panics only if the literal easy-message schema stops being a valid
++/// [`schemars::schema::Schema`], a fixed invariant of this function.
++#[cfg(feature = "schemars")]
++fn input_items_schema(
++    generator: &mut schemars::r#gen::SchemaGenerator,
++) -> schemars::schema::Schema {
++    const EASY: &str = "OpenAiEasyInputMessage";
++    let item = generator.subschema_for::<OpenAiResponseItem>();
++    let parts = generator.subschema_for::<Vec<OpenAiResponseContentPart>>();
++    let easy = serde_json::from_value(serde_json::json!({
++        "description": "Easy input message: `type` may be omitted and `content` may be text.",
++        "type": "object",
++        "required": ["content", "role"],
++        "properties": {
++            "content": {"anyOf": [{"type": "string"}, parts]},
++            "role": {"type": "string"},
++            "type": {"type": "string", "enum": ["message"]}
++        }
++    }))
++    .expect("the easy input message schema literal is a valid schema");
++    generator.definitions_mut().insert(EASY.to_owned(), easy);
++    let easy_ref = format!("{}{EASY}", generator.settings().definitions_path);
++    serde_json::from_value(serde_json::json!({
++        "type": "array",
++        "items": {"anyOf": [item, {"$ref": easy_ref}]}
++    }))
++    .expect("the input item list schema literal is a valid schema")
++}
++
++/// Decodes Responses input items, accepting `OpenAI`'s easy input message.
++///
++/// `OpenAI` accepts a message item with no `type` and with text `content`,
++/// and stock clients such as the Agents SDK send that form. Each such item is
++/// rewritten to its typed equivalent before the typed decode: `type` becomes
++/// `message`, and text `content` becomes one `input_text` part (one
++/// `output_text` part for an `assistant` message). Every other item decodes
++/// unchanged.
++///
++/// # Errors
++///
++/// Returns the deserializer's error when the input is not an array or an item
++/// does not decode as an [`OpenAiResponseItem`] after the rewrite.
++fn easy_items<'de, D>(deserializer: D) -> Result<Vec<OpenAiResponseItem>, D::Error>
++where
++    D: serde::Deserializer<'de>,
++{
++    Vec::<Value>::deserialize(deserializer)?
++        .into_iter()
++        .map(|mut item| {
++            if let Some(fields) = item.as_object_mut() {
++                if !fields.contains_key("type") && fields.contains_key("role") {
++                    fields.insert("type".to_owned(), Value::from("message"));
++                }
++                if fields.get("type").and_then(Value::as_str) == Some("message")
++                    && let Some(Value::String(text)) = fields.get("content")
++                {
++                    let part = if fields.get("role").and_then(Value::as_str) == Some("assistant") {
++                        "output_text"
++                    } else {
++                        "input_text"
++                    };
++                    let content = serde_json::json!([{ "type": part, "text": text }]);
++                    fields.insert("content".to_owned(), content);
++                }
++            }
++            OpenAiResponseItem::deserialize(item).map_err(serde::de::Error::custom)
++        })
++        .collect()
+ }
+ 
+ impl OpenAiResponsesInput {
+@@ -348,7 +435,8 @@ pub enum OpenAiResponseItem {
+     },
+     FunctionCallOutput {
+         call_id: String,
+-        output: String,
++        /// Tool result, as text or as content parts.
++        output: OpenAiFunctionCallOutput,
+     },
+     Reasoning {
+         /// Provider item identity, required to replay the item statelessly.
+@@ -372,6 +460,48 @@ pub enum OpenAiResponseItem {
+     },
+ }
+ 
++/// A Responses tool result: text, or content parts such as `input_text`.
++///
++/// `OpenAI` accepts both forms, and the Agents SDK sends parts. The form the
++/// caller sent is kept so the item re-encodes unchanged.
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
++#[serde(untagged)]
++pub enum OpenAiFunctionCallOutput {
++    /// Plain text result.
++    Text(String),
++    /// Content parts.
++    Parts(Vec<OpenAiResponseContentPart>),
++}
++
++impl OpenAiFunctionCallOutput {
++    /// The result's text: the text form itself, or the concatenated text of
++    /// every `input_text` and `output_text` part, skipping non-text parts.
++    #[must_use]
++    pub fn text(&self) -> Cow<'_, str> {
++        match self {
++            Self::Text(text) => Cow::Borrowed(text),
++            Self::Parts(parts) => Cow::Owned(
++                parts
++                    .iter()
++                    .filter_map(|part| match part {
++                        OpenAiResponseContentPart::InputText { text }
++                        | OpenAiResponseContentPart::OutputText { text } => Some(text.as_str()),
++                        _ => None,
++                    })
++                    .collect(),
++            ),
++        }
++    }
++}
++
++impl From<String> for OpenAiFunctionCallOutput {
++    /// Wraps `text` as the text form.
++    fn from(text: String) -> Self {
++        Self::Text(text)
++    }
++}
++
+ /// One part of a Responses reasoning item summary.
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -593,4 +723,64 @@ mod tests {
+             ])
+         );
+     }
++
++    /// The published input schema names the easy input message beside the
++    /// canonical item, so schema consumers accept what the decoder accepts.
++    ///
++    /// # Panics
++    ///
++    /// Panics when the input item schema omits either alternative or the easy
++    /// message stops requiring `role` and `content`.
++    #[cfg(feature = "schemars")]
++    #[test]
++    fn input_items_schema_admits_easy_messages() {
++        let root = schemars::schema_for!(OpenAiResponsesRequest);
++        let schema = serde_json::to_value(&root).expect("schema encodes");
++        let input = &schema["definitions"]["OpenAiResponsesInput"]["anyOf"];
++        assert_eq!(
++            input[1]["items"]["anyOf"],
++            json!([
++                {"$ref": "#/definitions/OpenAiResponseItem"},
++                {"$ref": "#/definitions/OpenAiEasyInputMessage"}
++            ])
++        );
++        let easy = &schema["definitions"]["OpenAiEasyInputMessage"];
++        assert_eq!(easy["required"], json!(["content", "role"]));
++        assert_eq!(easy["properties"]["type"]["enum"], json!(["message"]));
++    }
++
++    /// The Agents SDK's request decodes: easy input messages with no `type`
++    /// and text `content` become typed messages, an assistant's text becomes
++    /// `output_text`, and replayed function items decode alongside them, including a tool
++    /// result sent as content parts.
++    ///
++    /// # Panics
++    ///
++    /// Panics when the body does not decode or an item has the wrong shape.
++    #[test]
++    fn easy_input_messages_decode_as_typed_messages() {
++        let request: OpenAiResponsesRequest = serde_json::from_value(json!({
++            "model": "openai/gpt-6-luna",
++            "instructions": "Call echo.",
++            "input": [
++                {"role": "user", "content": "go"},
++                {"type": "message", "role": "assistant", "content": "ok"},
++                {"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "echo", "arguments": "{}", "status": "completed"},
++                {"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "hi"}]}
++            ],
++            "include": [],
++            "stream": false,
++            "reasoning": {"effort": "medium"}
++        }))
++        .expect("the Agents SDK body decodes");
++        assert_eq!(
++            serde_json::to_value(&request.input).expect("encodes"),
++            json!([
++                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
++                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
++                {"type": "function_call", "call_id": "c1", "name": "echo", "arguments": "{}"},
++                {"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "hi"}]}
++            ])
++        );
++    }
+ }
+diff --git a/crates/wyrd-spec/schemas/agent_spec.json b/crates/wyrd-spec/schemas/agent_spec.json
+index 971ee27d8..3bbdfd47f 100644
+--- a/crates/wyrd-spec/schemas/agent_spec.json
++++ b/crates/wyrd-spec/schemas/agent_spec.json
+@@ -2852,6 +2852,38 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiEasyInputMessage": {
++      "description": "Easy input message: `type` may be omitted and `content` may be text.",
++      "type": "object",
++      "required": [
++        "content",
++        "role"
++      ],
++      "properties": {
++        "content": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "array",
++              "items": {
++                "$ref": "#/definitions/OpenAiResponseContentPart"
++              }
++            }
++          ]
++        },
++        "role": {
++          "type": "string"
++        },
++        "type": {
++          "type": "string",
++          "enum": [
++            "message"
++          ]
++        }
++      }
++    },
+     "OpenAiEmbeddingsInput": {
+       "anyOf": [
+         {
+@@ -2975,6 +3007,22 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiFunctionCallOutput": {
++      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.",
++      "anyOf": [
++        {
++          "description": "Plain text result.",
++          "type": "string"
++        },
++        {
++          "description": "Content parts.",
++          "type": "array",
++          "items": {
++            "$ref": "#/definitions/OpenAiResponseContentPart"
++          }
++        }
++      ]
++    },
+     "OpenAiFunctionChoice": {
+       "type": "object",
+       "required": [
+@@ -3524,7 +3572,12 @@
+               "type": "string"
+             },
+             "output": {
+-              "type": "string"
++              "description": "Tool result, as text or as content parts.",
++              "allOf": [
++                {
++                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
++                }
++              ]
+             },
+             "type": {
+               "type": "string",
+@@ -3814,10 +3867,17 @@
+           "type": "string"
+         },
+         {
+-          "description": "Ordered input items.",
++          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
+           "type": "array",
+           "items": {
+-            "$ref": "#/definitions/OpenAiResponseItem"
++            "anyOf": [
++              {
++                "$ref": "#/definitions/OpenAiResponseItem"
++              },
++              {
++                "$ref": "#/definitions/OpenAiEasyInputMessage"
++              }
++            ]
+           }
+         }
+       ]
+diff --git a/crates/wyrd-spec/schemas/card.json b/crates/wyrd-spec/schemas/card.json
+index fe206fb42..b7e497c41 100644
+--- a/crates/wyrd-spec/schemas/card.json
++++ b/crates/wyrd-spec/schemas/card.json
+@@ -6625,6 +6625,38 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiEasyInputMessage": {
++      "description": "Easy input message: `type` may be omitted and `content` may be text.",
++      "type": "object",
++      "required": [
++        "content",
++        "role"
++      ],
++      "properties": {
++        "content": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "array",
++              "items": {
++                "$ref": "#/definitions/OpenAiResponseContentPart"
++              }
++            }
++          ]
++        },
++        "role": {
++          "type": "string"
++        },
++        "type": {
++          "type": "string",
++          "enum": [
++            "message"
++          ]
++        }
++      }
++    },
+     "OpenAiEmbeddingsInput": {
+       "anyOf": [
+         {
+@@ -6748,6 +6780,22 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiFunctionCallOutput": {
++      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.",
++      "anyOf": [
++        {
++          "description": "Plain text result.",
++          "type": "string"
++        },
++        {
++          "description": "Content parts.",
++          "type": "array",
++          "items": {
++            "$ref": "#/definitions/OpenAiResponseContentPart"
++          }
++        }
++      ]
++    },
+     "OpenAiFunctionChoice": {
+       "type": "object",
+       "required": [
+@@ -7297,7 +7345,12 @@
+               "type": "string"
+             },
+             "output": {
+-              "type": "string"
++              "description": "Tool result, as text or as content parts.",
++              "allOf": [
++                {
++                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
++                }
++              ]
+             },
+             "type": {
+               "type": "string",
+@@ -7587,10 +7640,17 @@
+           "type": "string"
+         },
+         {
+-          "description": "Ordered input items.",
++          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
+           "type": "array",
+           "items": {
+-            "$ref": "#/definitions/OpenAiResponseItem"
++            "anyOf": [
++              {
++                "$ref": "#/definitions/OpenAiResponseItem"
++              },
++              {
++                "$ref": "#/definitions/OpenAiEasyInputMessage"
++              }
++            ]
+           }
+         }
+       ]
+diff --git a/crates/wyrd-spec/schemas/eval_spec.json b/crates/wyrd-spec/schemas/eval_spec.json
+index 41dd42d4c..ef8613122 100644
+--- a/crates/wyrd-spec/schemas/eval_spec.json
++++ b/crates/wyrd-spec/schemas/eval_spec.json
+@@ -3603,6 +3603,38 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiEasyInputMessage": {
++      "description": "Easy input message: `type` may be omitted and `content` may be text.",
++      "type": "object",
++      "required": [
++        "content",
++        "role"
++      ],
++      "properties": {
++        "content": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "array",
++              "items": {
++                "$ref": "#/definitions/OpenAiResponseContentPart"
++              }
++            }
++          ]
++        },
++        "role": {
++          "type": "string"
++        },
++        "type": {
++          "type": "string",
++          "enum": [
++            "message"
++          ]
++        }
++      }
++    },
+     "OpenAiEmbeddingsInput": {
+       "anyOf": [
+         {
+@@ -3726,6 +3758,22 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiFunctionCallOutput": {
++      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.",
++      "anyOf": [
++        {
++          "description": "Plain text result.",
++          "type": "string"
++        },
++        {
++          "description": "Content parts.",
++          "type": "array",
++          "items": {
++            "$ref": "#/definitions/OpenAiResponseContentPart"
++          }
++        }
++      ]
++    },
+     "OpenAiFunctionChoice": {
+       "type": "object",
+       "required": [
+@@ -4275,7 +4323,12 @@
+               "type": "string"
+             },
+             "output": {
+-              "type": "string"
++              "description": "Tool result, as text or as content parts.",
++              "allOf": [
++                {
++                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
++                }
++              ]
+             },
+             "type": {
+               "type": "string",
+@@ -4565,10 +4618,17 @@
+           "type": "string"
+         },
+         {
+-          "description": "Ordered input items.",
++          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
+           "type": "array",
+           "items": {
+-            "$ref": "#/definitions/OpenAiResponseItem"
++            "anyOf": [
++              {
++                "$ref": "#/definitions/OpenAiResponseItem"
++              },
++              {
++                "$ref": "#/definitions/OpenAiEasyInputMessage"
++              }
++            ]
+           }
+         }
+       ]
+diff --git a/crates/wyrd-spec/schemas/get_card_response.json b/crates/wyrd-spec/schemas/get_card_response.json
+index 9f70906b3..965959d17 100644
+--- a/crates/wyrd-spec/schemas/get_card_response.json
++++ b/crates/wyrd-spec/schemas/get_card_response.json
+@@ -6655,6 +6655,38 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiEasyInputMessage": {
++      "description": "Easy input message: `type` may be omitted and `content` may be text.",
++      "type": "object",
++      "required": [
++        "content",
++        "role"
++      ],
++      "properties": {
++        "content": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "array",
++              "items": {
++                "$ref": "#/definitions/OpenAiResponseContentPart"
++              }
++            }
++          ]
++        },
++        "role": {
++          "type": "string"
++        },
++        "type": {
++          "type": "string",
++          "enum": [
++            "message"
++          ]
++        }
++      }
++    },
+     "OpenAiEmbeddingsInput": {
+       "anyOf": [
+         {
+@@ -6778,6 +6810,22 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiFunctionCallOutput": {
++      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.",
++      "anyOf": [
++        {
++          "description": "Plain text result.",
++          "type": "string"
++        },
++        {
++          "description": "Content parts.",
++          "type": "array",
++          "items": {
++            "$ref": "#/definitions/OpenAiResponseContentPart"
++          }
++        }
++      ]
++    },
+     "OpenAiFunctionChoice": {
+       "type": "object",
+       "required": [
+@@ -7327,7 +7375,12 @@
+               "type": "string"
+             },
+             "output": {
+-              "type": "string"
++              "description": "Tool result, as text or as content parts.",
++              "allOf": [
++                {
++                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
++                }
++              ]
+             },
+             "type": {
+               "type": "string",
+@@ -7617,10 +7670,17 @@
+           "type": "string"
+         },
+         {
+-          "description": "Ordered input items.",
++          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
+           "type": "array",
+           "items": {
+-            "$ref": "#/definitions/OpenAiResponseItem"
++            "anyOf": [
++              {
++                "$ref": "#/definitions/OpenAiResponseItem"
++              },
++              {
++                "$ref": "#/definitions/OpenAiEasyInputMessage"
++              }
++            ]
+           }
+         }
+       ]
+diff --git a/crates/wyrd-spec/schemas/prompt_ref.json b/crates/wyrd-spec/schemas/prompt_ref.json
+index e2a0cf558..901d7c324 100644
+--- a/crates/wyrd-spec/schemas/prompt_ref.json
++++ b/crates/wyrd-spec/schemas/prompt_ref.json
+@@ -2469,6 +2469,38 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiEasyInputMessage": {
++      "description": "Easy input message: `type` may be omitted and `content` may be text.",
++      "type": "object",
++      "required": [
++        "content",
++        "role"
++      ],
++      "properties": {
++        "content": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "array",
++              "items": {
++                "$ref": "#/definitions/OpenAiResponseContentPart"
++              }
++            }
++          ]
++        },
++        "role": {
++          "type": "string"
++        },
++        "type": {
++          "type": "string",
++          "enum": [
++            "message"
++          ]
++        }
++      }
++    },
+     "OpenAiEmbeddingsInput": {
+       "anyOf": [
+         {
+@@ -2592,6 +2624,22 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiFunctionCallOutput": {
++      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.",
++      "anyOf": [
++        {
++          "description": "Plain text result.",
++          "type": "string"
++        },
++        {
++          "description": "Content parts.",
++          "type": "array",
++          "items": {
++            "$ref": "#/definitions/OpenAiResponseContentPart"
++          }
++        }
++      ]
++    },
+     "OpenAiFunctionChoice": {
+       "type": "object",
+       "required": [
+@@ -3141,7 +3189,12 @@
+               "type": "string"
+             },
+             "output": {
+-              "type": "string"
++              "description": "Tool result, as text or as content parts.",
++              "allOf": [
++                {
++                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
++                }
++              ]
+             },
+             "type": {
+               "type": "string",
+@@ -3431,10 +3484,17 @@
+           "type": "string"
+         },
+         {
+-          "description": "Ordered input items.",
++          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
+           "type": "array",
+           "items": {
+-            "$ref": "#/definitions/OpenAiResponseItem"
++            "anyOf": [
++              {
++                "$ref": "#/definitions/OpenAiResponseItem"
++              },
++              {
++                "$ref": "#/definitions/OpenAiEasyInputMessage"
++              }
++            ]
+           }
+         }
+       ]
+diff --git a/crates/wyrd-spec/schemas/prompt_spec.json b/crates/wyrd-spec/schemas/prompt_spec.json
+index 4faa806b1..7c9a84dbf 100644
+--- a/crates/wyrd-spec/schemas/prompt_spec.json
++++ b/crates/wyrd-spec/schemas/prompt_spec.json
+@@ -2402,6 +2402,38 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiEasyInputMessage": {
++      "description": "Easy input message: `type` may be omitted and `content` may be text.",
++      "type": "object",
++      "required": [
++        "content",
++        "role"
++      ],
++      "properties": {
++        "content": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "array",
++              "items": {
++                "$ref": "#/definitions/OpenAiResponseContentPart"
++              }
++            }
++          ]
++        },
++        "role": {
++          "type": "string"
++        },
++        "type": {
++          "type": "string",
++          "enum": [
++            "message"
++          ]
++        }
++      }
++    },
+     "OpenAiEmbeddingsInput": {
+       "anyOf": [
+         {
+@@ -2525,6 +2557,22 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiFunctionCallOutput": {
++      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.",
++      "anyOf": [
++        {
++          "description": "Plain text result.",
++          "type": "string"
++        },
++        {
++          "description": "Content parts.",
++          "type": "array",
++          "items": {
++            "$ref": "#/definitions/OpenAiResponseContentPart"
++          }
++        }
++      ]
++    },
+     "OpenAiFunctionChoice": {
+       "type": "object",
+       "required": [
+@@ -3074,7 +3122,12 @@
+               "type": "string"
+             },
+             "output": {
+-              "type": "string"
++              "description": "Tool result, as text or as content parts.",
++              "allOf": [
++                {
++                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
++                }
++              ]
+             },
+             "type": {
+               "type": "string",
+@@ -3364,10 +3417,17 @@
+           "type": "string"
+         },
+         {
+-          "description": "Ordered input items.",
++          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
+           "type": "array",
+           "items": {
+-            "$ref": "#/definitions/OpenAiResponseItem"
++            "anyOf": [
++              {
++                "$ref": "#/definitions/OpenAiResponseItem"
++              },
++              {
++                "$ref": "#/definitions/OpenAiEasyInputMessage"
++              }
++            ]
+           }
+         }
+       ]
+diff --git a/crates/wyrd-spec/schemas/verifier_implementation.json b/crates/wyrd-spec/schemas/verifier_implementation.json
+index a292c0b03..9f7321c8e 100644
+--- a/crates/wyrd-spec/schemas/verifier_implementation.json
++++ b/crates/wyrd-spec/schemas/verifier_implementation.json
+@@ -3997,6 +3997,38 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiEasyInputMessage": {
++      "description": "Easy input message: `type` may be omitted and `content` may be text.",
++      "type": "object",
++      "required": [
++        "content",
++        "role"
++      ],
++      "properties": {
++        "content": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "array",
++              "items": {
++                "$ref": "#/definitions/OpenAiResponseContentPart"
++              }
++            }
++          ]
++        },
++        "role": {
++          "type": "string"
++        },
++        "type": {
++          "type": "string",
++          "enum": [
++            "message"
++          ]
++        }
++      }
++    },
+     "OpenAiEmbeddingsInput": {
+       "anyOf": [
+         {
+@@ -4120,6 +4152,22 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiFunctionCallOutput": {
++      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.",
++      "anyOf": [
++        {
++          "description": "Plain text result.",
++          "type": "string"
++        },
++        {
++          "description": "Content parts.",
++          "type": "array",
++          "items": {
++            "$ref": "#/definitions/OpenAiResponseContentPart"
++          }
++        }
++      ]
++    },
+     "OpenAiFunctionChoice": {
+       "type": "object",
+       "required": [
+@@ -4669,7 +4717,12 @@
+               "type": "string"
+             },
+             "output": {
+-              "type": "string"
++              "description": "Tool result, as text or as content parts.",
++              "allOf": [
++                {
++                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
++                }
++              ]
+             },
+             "type": {
+               "type": "string",
+@@ -4959,10 +5012,17 @@
+           "type": "string"
+         },
+         {
+-          "description": "Ordered input items.",
++          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
+           "type": "array",
+           "items": {
+-            "$ref": "#/definitions/OpenAiResponseItem"
++            "anyOf": [
++              {
++                "$ref": "#/definitions/OpenAiResponseItem"
++              },
++              {
++                "$ref": "#/definitions/OpenAiEasyInputMessage"
++              }
++            ]
+           }
+         }
+       ]
+diff --git a/crates/wyrd-spec/schemas/verifier_spec.json b/crates/wyrd-spec/schemas/verifier_spec.json
+index cef237c76..7749fd254 100644
+--- a/crates/wyrd-spec/schemas/verifier_spec.json
++++ b/crates/wyrd-spec/schemas/verifier_spec.json
+@@ -3957,6 +3957,38 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiEasyInputMessage": {
++      "description": "Easy input message: `type` may be omitted and `content` may be text.",
++      "type": "object",
++      "required": [
++        "content",
++        "role"
++      ],
++      "properties": {
++        "content": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "array",
++              "items": {
++                "$ref": "#/definitions/OpenAiResponseContentPart"
++              }
++            }
++          ]
++        },
++        "role": {
++          "type": "string"
++        },
++        "type": {
++          "type": "string",
++          "enum": [
++            "message"
++          ]
++        }
++      }
++    },
+     "OpenAiEmbeddingsInput": {
+       "anyOf": [
+         {
+@@ -4080,6 +4112,22 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiFunctionCallOutput": {
++      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.",
++      "anyOf": [
++        {
++          "description": "Plain text result.",
++          "type": "string"
++        },
++        {
++          "description": "Content parts.",
++          "type": "array",
++          "items": {
++            "$ref": "#/definitions/OpenAiResponseContentPart"
++          }
++        }
++      ]
++    },
+     "OpenAiFunctionChoice": {
+       "type": "object",
+       "required": [
+@@ -4629,7 +4677,12 @@
+               "type": "string"
+             },
+             "output": {
+-              "type": "string"
++              "description": "Tool result, as text or as content parts.",
++              "allOf": [
++                {
++                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
++                }
++              ]
+             },
+             "type": {
+               "type": "string",
+@@ -4919,10 +4972,17 @@
+           "type": "string"
+         },
+         {
+-          "description": "Ordered input items.",
++          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
+           "type": "array",
+           "items": {
+-            "$ref": "#/definitions/OpenAiResponseItem"
++            "anyOf": [
++              {
++                "$ref": "#/definitions/OpenAiResponseItem"
++              },
++              {
++                "$ref": "#/definitions/OpenAiEasyInputMessage"
++              }
++            ]
+           }
+         }
+       ]
+diff --git a/crates/wyrd-spec/schemas/workflow_spec.json b/crates/wyrd-spec/schemas/workflow_spec.json
+index 371bd7067..de7896013 100644
+--- a/crates/wyrd-spec/schemas/workflow_spec.json
++++ b/crates/wyrd-spec/schemas/workflow_spec.json
+@@ -3318,6 +3318,38 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiEasyInputMessage": {
++      "description": "Easy input message: `type` may be omitted and `content` may be text.",
++      "type": "object",
++      "required": [
++        "content",
++        "role"
++      ],
++      "properties": {
++        "content": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "array",
++              "items": {
++                "$ref": "#/definitions/OpenAiResponseContentPart"
++              }
++            }
++          ]
++        },
++        "role": {
++          "type": "string"
++        },
++        "type": {
++          "type": "string",
++          "enum": [
++            "message"
++          ]
++        }
++      }
++    },
+     "OpenAiEmbeddingsInput": {
+       "anyOf": [
+         {
+@@ -3441,6 +3473,22 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiFunctionCallOutput": {
++      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.",
++      "anyOf": [
++        {
++          "description": "Plain text result.",
++          "type": "string"
++        },
++        {
++          "description": "Content parts.",
++          "type": "array",
++          "items": {
++            "$ref": "#/definitions/OpenAiResponseContentPart"
++          }
++        }
++      ]
++    },
+     "OpenAiFunctionChoice": {
+       "type": "object",
+       "required": [
+@@ -3990,7 +4038,12 @@
+               "type": "string"
+             },
+             "output": {
+-              "type": "string"
++              "description": "Tool result, as text or as content parts.",
++              "allOf": [
++                {
++                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
++                }
++              ]
+             },
+             "type": {
+               "type": "string",
+@@ -4280,10 +4333,17 @@
+           "type": "string"
+         },
+         {
+-          "description": "Ordered input items.",
++          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
+           "type": "array",
+           "items": {
+-            "$ref": "#/definitions/OpenAiResponseItem"
++            "anyOf": [
++              {
++                "$ref": "#/definitions/OpenAiResponseItem"
++              },
++              {
++                "$ref": "#/definitions/OpenAiEasyInputMessage"
++              }
++            ]
+           }
+         }
+       ]
+diff --git a/crates/wyrd-spec/tests/fixtures/eval/schemas/eval_spec.schema.json b/crates/wyrd-spec/tests/fixtures/eval/schemas/eval_spec.schema.json
+index 41dd42d4c..ef8613122 100644
+--- a/crates/wyrd-spec/tests/fixtures/eval/schemas/eval_spec.schema.json
++++ b/crates/wyrd-spec/tests/fixtures/eval/schemas/eval_spec.schema.json
+@@ -3603,6 +3603,38 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiEasyInputMessage": {
++      "description": "Easy input message: `type` may be omitted and `content` may be text.",
++      "type": "object",
++      "required": [
++        "content",
++        "role"
++      ],
++      "properties": {
++        "content": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "array",
++              "items": {
++                "$ref": "#/definitions/OpenAiResponseContentPart"
++              }
++            }
++          ]
++        },
++        "role": {
++          "type": "string"
++        },
++        "type": {
++          "type": "string",
++          "enum": [
++            "message"
++          ]
++        }
++      }
++    },
+     "OpenAiEmbeddingsInput": {
+       "anyOf": [
+         {
+@@ -3726,6 +3758,22 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiFunctionCallOutput": {
++      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.",
++      "anyOf": [
++        {
++          "description": "Plain text result.",
++          "type": "string"
++        },
++        {
++          "description": "Content parts.",
++          "type": "array",
++          "items": {
++            "$ref": "#/definitions/OpenAiResponseContentPart"
++          }
++        }
++      ]
++    },
+     "OpenAiFunctionChoice": {
+       "type": "object",
+       "required": [
+@@ -4275,7 +4323,12 @@
+               "type": "string"
+             },
+             "output": {
+-              "type": "string"
++              "description": "Tool result, as text or as content parts.",
++              "allOf": [
++                {
++                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
++                }
++              ]
+             },
+             "type": {
+               "type": "string",
+@@ -4565,10 +4618,17 @@
+           "type": "string"
+         },
+         {
+-          "description": "Ordered input items.",
++          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
+           "type": "array",
+           "items": {
+-            "$ref": "#/definitions/OpenAiResponseItem"
++            "anyOf": [
++              {
++                "$ref": "#/definitions/OpenAiResponseItem"
++              },
++              {
++                "$ref": "#/definitions/OpenAiEasyInputMessage"
++              }
++            ]
+           }
+         }
+       ]
+diff --git a/crates/wyrd-spec/tests/fixtures/eval/schemas/eval_task.schema.json b/crates/wyrd-spec/tests/fixtures/eval/schemas/eval_task.schema.json
+index fe2e458f5..da89d134c 100644
+--- a/crates/wyrd-spec/tests/fixtures/eval/schemas/eval_task.schema.json
++++ b/crates/wyrd-spec/tests/fixtures/eval/schemas/eval_task.schema.json
+@@ -3351,6 +3351,38 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiEasyInputMessage": {
++      "description": "Easy input message: `type` may be omitted and `content` may be text.",
++      "type": "object",
++      "required": [
++        "content",
++        "role"
++      ],
++      "properties": {
++        "content": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "array",
++              "items": {
++                "$ref": "#/definitions/OpenAiResponseContentPart"
++              }
++            }
++          ]
++        },
++        "role": {
++          "type": "string"
++        },
++        "type": {
++          "type": "string",
++          "enum": [
++            "message"
++          ]
++        }
++      }
++    },
+     "OpenAiEmbeddingsInput": {
+       "anyOf": [
+         {
+@@ -3474,6 +3506,22 @@
+       },
+       "additionalProperties": false
+     },
++    "OpenAiFunctionCallOutput": {
++      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.",
++      "anyOf": [
++        {
++          "description": "Plain text result.",
++          "type": "string"
++        },
++        {
++          "description": "Content parts.",
++          "type": "array",
++          "items": {
++            "$ref": "#/definitions/OpenAiResponseContentPart"
++          }
++        }
++      ]
++    },
+     "OpenAiFunctionChoice": {
+       "type": "object",
+       "required": [
+@@ -4023,7 +4071,12 @@
+               "type": "string"
+             },
+             "output": {
+-              "type": "string"
++              "description": "Tool result, as text or as content parts.",
++              "allOf": [
++                {
++                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
++                }
++              ]
+             },
+             "type": {
+               "type": "string",
+@@ -4313,10 +4366,17 @@
+           "type": "string"
+         },
+         {
+-          "description": "Ordered input items.",
++          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
+           "type": "array",
+           "items": {
+-            "$ref": "#/definitions/OpenAiResponseItem"
++            "anyOf": [
++              {
++                "$ref": "#/definitions/OpenAiResponseItem"
++              },
++              {
++                "$ref": "#/definitions/OpenAiEasyInputMessage"
++              }
++            ]
+           }
+         }
+       ]
+diff --git a/crates/wyrd/wyrd-server/tests/integration/pg_openapi_contract.rs b/crates/wyrd/wyrd-server/tests/integration/pg_openapi_contract.rs
+index 3fb9e3f2b..e717bd111 100644
+--- a/crates/wyrd/wyrd-server/tests/integration/pg_openapi_contract.rs
++++ b/crates/wyrd/wyrd-server/tests/integration/pg_openapi_contract.rs
+@@ -830,6 +830,9 @@ async fn gateway_operations_publish_problem_json_refusals() {
+ /// `limit` carries the bounds the runtime enforces; payload retrieval publishes
+ /// a binary string; and the Anthropic Messages and Gemini `GenerateContent`
+ /// routes publish open, typed native bodies and their own error envelopes.
++/// The Responses request contract admits every input item form the gateway
++/// decodes, including easy input messages and content-part tool results, and
++/// refuses malformed items.
+ #[tokio::test]
+ async fn gateway_ingress_publishes_typed_contracts() {
+     let server = WyrdTestServer::start_in_process()
+@@ -1103,6 +1106,35 @@ async fn gateway_ingress_publishes_typed_contracts() {
+         "the Jev state is typed text"
+     );
+ 
++    let responses_request = jsonschema::JSONSchema::compile(&serde_json::json!({
++        "$ref": reference("GatewayResponsesRequest"),
++        "components": document["components"],
++    }))
++    .expect("the served Responses request schema compiles");
++    let responses_body = |item: Value| serde_json::json!({"model": "openai/m", "input": [item]});
++    for item in [
++        serde_json::json!({"role": "user", "content": "go"}),
++        serde_json::json!({"type": "message", "role": "assistant", "content": "ok"}),
++        serde_json::json!({"role": "user", "content": [{"type": "input_text", "text": "go"}]}),
++        serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]}),
++        serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "hi"}]}),
++    ] {
++        assert!(
++            responses_request.is_valid(&responses_body(item.clone())),
++            "the Responses request contract admits {item}"
++        );
++    }
++    for item in [
++        serde_json::json!({"content": "go"}),
++        serde_json::json!({"role": "user", "content": 7}),
++        serde_json::json!({"type": "note", "role": "user", "content": "go"}),
++    ] {
++        assert!(
++            !responses_request.is_valid(&responses_body(item.clone())),
++            "the Responses request contract refuses {item}"
++        );
++    }
++
+     server.shutdown().await.expect("server shuts down");
+ }
+ 
+diff --git a/sdks/wyrd-sdk-python/python/wyrd/_card_types.py b/sdks/wyrd-sdk-python/python/wyrd/_card_types.py
+index e398f2016..f8dcb750d 100644
+--- a/sdks/wyrd-sdk-python/python/wyrd/_card_types.py
++++ b/sdks/wyrd-sdk-python/python/wyrd/_card_types.py
+@@ -1749,6 +1749,15 @@ class OpenAiCustomVoice:
+     id: str
+ 
+ 
++@dataclass(frozen=True, kw_only=True)
++class OpenAiEasyInputMessage:
++    """Easy input message: `type` may be omitted and `content` may be text."""
++
++    content: str | list[OpenAiResponseContentPart]
++    role: str
++    type: Literal["message"] | None = None
++
++
+ OpenAiEmbeddingsInput: TypeAlias = "str | list[str] | list[int] | list[list[int]]"
+ 
+ 
+@@ -1782,6 +1791,12 @@ class OpenAiFunction:
+     strict: bool | None = None
+ 
+ 
++# A Responses tool result: text, or content parts such as `input_text`.
++#
++# `OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.
++OpenAiFunctionCallOutput: TypeAlias = "str | list[OpenAiResponseContentPart]"
++
++
+ @dataclass(frozen=True, kw_only=True)
+ class OpenAiFunctionChoice:
+     """Generated Card schema type."""
+@@ -2001,7 +2016,7 @@ class OpenAiResponseItemFunctionCallOutput:
+     """Generated Card schema type."""
+ 
+     call_id: str
+-    output: str
++    output: OpenAiFunctionCallOutput
+     type: Literal["function_call_output"]
+ 
+ 
+@@ -2133,7 +2148,7 @@ OpenAiResponsesHostedToolKind: TypeAlias = 'Literal["file_search", "web_search_p
+ # OpenAI Responses `input`: the text shorthand for one user message, or an ordered list of input items.
+ #
+ # Both forms decode and re-encode unchanged, so a relayed request keeps the form its caller sent. Editing the conversation first expands the text shorthand into the single user message it stands for.
+-OpenAiResponsesInput: TypeAlias = "str | list[OpenAiResponseItem]"
++OpenAiResponsesInput: TypeAlias = "str | list[OpenAiResponseItem | OpenAiEasyInputMessage]"
+ 
+ 
+ @dataclass(frozen=True, kw_only=True)
+@@ -4266,6 +4281,15 @@ _OBJECTS: dict[str, tuple[tuple[str, bool, tuple], ...]] = {
+     ),
+     "OpenAiCustomToolFormatText": (("type", True, ("union", [("lit", "text")])),),
+     "OpenAiCustomVoice": (("id", True, ("prim", "string")),),
++    "OpenAiEasyInputMessage": (
++        (
++            "content",
++            True,
++            ("union", [("prim", "string"), ("array", ("ref", "OpenAiResponseContentPart"))]),
++        ),
++        ("role", True, ("prim", "string")),
++        ("type", False, ("union", [("lit", "message")])),
++    ),
+     "OpenAiEmbeddingsRequest": (
+         ("dimensions", False, ("union", [("prim", "integer"), ("prim", "null")])),
+         ("encoding_format", False, ("union", [("prim", "string"), ("prim", "null")])),
+@@ -4370,7 +4394,7 @@ _OBJECTS: dict[str, tuple[tuple[str, bool, tuple], ...]] = {
+     ),
+     "OpenAiResponseItemFunctionCallOutput": (
+         ("call_id", True, ("prim", "string")),
+-        ("output", True, ("prim", "string")),
++        ("output", True, ("ref", "OpenAiFunctionCallOutput")),
+         ("type", True, ("union", [("lit", "function_call_output")])),
+     ),
+     "OpenAiResponseItemInputFile": (
+@@ -5453,6 +5477,10 @@ _ALIASES: dict[str, tuple] = {
+             ("array", ("array", ("prim", "integer"))),
+         ],
+     ),
++    "OpenAiFunctionCallOutput": (
++        "union",
++        [("prim", "string"), ("array", ("ref", "OpenAiResponseContentPart"))],
++    ),
+     "OpenAiGrammarSyntax": ("union", [("lit", "lark"), ("lit", "regex")]),
+     "OpenAiMessageContent": (
+         "union",
+@@ -5547,7 +5575,13 @@ _ALIASES: dict[str, tuple] = {
+     ),
+     "OpenAiResponsesInput": (
+         "union",
+-        [("prim", "string"), ("array", ("ref", "OpenAiResponseItem"))],
++        [
++            ("prim", "string"),
++            (
++                "array",
++                ("union", [("ref", "OpenAiResponseItem"), ("ref", "OpenAiEasyInputMessage")]),
++            ),
++        ],
+     ),
+     "OpenAiResponsesMcpToolKind": ("union", [("lit", "mcp")]),
+     "OpenAiResponsesShellToolKind": ("union", [("lit", "shell")]),
+diff --git a/sdks/wyrd-sdk-python/python/wyrd/prompt/__init__.pyi b/sdks/wyrd-sdk-python/python/wyrd/prompt/__init__.pyi
+index f682a0b5c..c7afb2e75 100644
+--- a/sdks/wyrd-sdk-python/python/wyrd/prompt/__init__.pyi
++++ b/sdks/wyrd-sdk-python/python/wyrd/prompt/__init__.pyi
+@@ -898,7 +898,16 @@ class OpenAiResponseItem:
+         """Return the JSON ``arguments`` string of a ``"function_call"`` item."""
+         ...
+     def as_function_call_output(self) -> str:
+-        """Return the ``output`` of a ``"function_call_output"`` item."""
++        """Return the ``output`` of a ``"function_call_output"`` item as text.
++
++        A content-parts output returns the concatenated text of its
++        ``input_text`` and ``output_text`` parts, with no separator; non-text
++        parts are omitted.
++
++        Raises:
++            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` when the item is
++                not a ``"function_call_output"``.
++        """
+         ...
+ 
+ class OpenAiResponsesSettings:
+diff --git a/sdks/wyrd-sdk-python/python/wyrd/stubs/prompt.pyi b/sdks/wyrd-sdk-python/python/wyrd/stubs/prompt.pyi
+index 90ebda46e..06e8dcb00 100644
+--- a/sdks/wyrd-sdk-python/python/wyrd/stubs/prompt.pyi
++++ b/sdks/wyrd-sdk-python/python/wyrd/stubs/prompt.pyi
+@@ -897,7 +897,16 @@ class OpenAiResponseItem:
+         """Return the JSON ``arguments`` string of a ``"function_call"`` item."""
+         ...
+     def as_function_call_output(self) -> str:
+-        """Return the ``output`` of a ``"function_call_output"`` item."""
++        """Return the ``output`` of a ``"function_call_output"`` item as text.
++
++        A content-parts output returns the concatenated text of its
++        ``input_text`` and ``output_text`` parts, with no separator; non-text
++        parts are omitted.
++
++        Raises:
++            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` when the item is
++                not a ``"function_call_output"``.
++        """
+         ...
+ 
+ class OpenAiResponsesSettings:
+diff --git a/sdks/wyrd-sdk-ts/package.json b/sdks/wyrd-sdk-ts/package.json
+index c2b4ffcb9..6a902ab58 100644
+--- a/sdks/wyrd-sdk-ts/package.json
++++ b/sdks/wyrd-sdk-ts/package.json
+@@ -6,6 +6,8 @@
+     "@biomejs/biome": "2.5.15",
+     "@grpc/grpc-js": "^1.14.4",
+     "@napi-rs/cli": "3.4.1",
++    "@openai/agents-core": "^0.20.0",
++    "@openai/agents-openai": "^0.20.0",
+     "@opentelemetry/api": "^1.9.1",
+     "@opentelemetry/api-logs": "^0.222.0",
+     "@opentelemetry/context-async-hooks": "^2.11.0",
+diff --git a/sdks/wyrd-sdk-ts/pnpm-lock.yaml b/sdks/wyrd-sdk-ts/pnpm-lock.yaml
+index e1c55738c..3c0d3b275 100644
+--- a/sdks/wyrd-sdk-ts/pnpm-lock.yaml
++++ b/sdks/wyrd-sdk-ts/pnpm-lock.yaml
+@@ -17,6 +17,12 @@ importers:
+       '@napi-rs/cli':
+         specifier: 3.4.1
+         version: 3.4.1(@emnapi/runtime@1.11.2)(@types/node@24.10.0)
++      '@openai/agents-core':
++        specifier: ^0.20.0
++        version: 0.20.0(zod@4.5.4)
++      '@openai/agents-openai':
++        specifier: ^0.20.0
++        version: 0.20.0(zod@4.5.4)
+       '@opentelemetry/api':
+         specifier: ^1.9.1
+         version: 1.9.1
+@@ -521,6 +527,14 @@ packages:
+   '@js-sdsl/ordered-map@4.4.2':
+     resolution: {integrity: sha512-iUKgm52T8HOE/makSxjqoWhe95ZJA1/G1sYsGev2JDKUSS14KAgg1LHb+Ba+IPow0xflbnSkOsZcO08C7w1gYw==}
+ 
++  '@modelcontextprotocol/client@2.3.1':
++    resolution: {integrity: sha512-mIGZXpHsjnZ6lD+gD/WCMpR5k8yVQQ8nNFH1N0Srf7AvnwTUMYD6pvTY8ng2+He5FfV7YMZLmrjL7cLa/cc3dQ==}
++    engines: {node: '>=20'}
++
++  '@modelcontextprotocol/core@2.3.1':
++    resolution: {integrity: sha512-laVmIhPGpWi7rG9q+0UigblRN0Hws/Yjlb6qLFtVqryXVLkc4h+yN8z731POD2LnAGQlFe7/tXhUm7Bi0YB91g==}
++    engines: {node: '>=20'}
++
+   '@napi-rs/cli@3.4.1':
+     resolution: {integrity: sha512-ayhm+NfrP5Hmh7vy5pfyYm/ktYtLh2PrgdLuqHTAubO7RoO2JkUE4F991AtgYxNewwXI8+guZLxU8itV7QnDrQ==}
+     engines: {node: '>= 16'}
+@@ -927,6 +941,19 @@ packages:
+   '@octokit/types@16.0.0':
+     resolution: {integrity: sha512-sKq+9r1Mm4efXW1FCk7hFSeJo4QKreL/tTbR0rz/qx/r1Oa2VV83LTA/H/MuCOX7uCIJmQVRKBcbmWoySjAnSg==}
+ 
++  '@openai/agents-core@0.20.0':
++    resolution: {integrity: sha512-9nJJ3iyQTwO2kmrZJPMqnHI61g3xp2DgtpW4V0cgNtYot5jocDqAMN5+dkjtsBo64U3Wbl7rIAV0q5kvycoIIA==}
++    peerDependencies:
++      zod: ^4.0.0
++    peerDependenciesMeta:
++      zod:
++        optional: true
++
++  '@openai/agents-openai@0.20.0':
++    resolution: {integrity: sha512-6jAwFlUvlRiN/OBwTZa8xUSwbXb5nxGtSUG6kKEW19Zo70kN+CLqaVLTHy8cQpnQiTEMPuAICAXklRx7kTfE9Q==}
++    peerDependencies:
++      zod: ^4.0.0
++
+   '@opentelemetry/api-logs@0.222.0':
+     resolution: {integrity: sha512-9mb1If+IF6u0ZVXkHQ6ogEae5HwA6ajIVUgpSDQyRASxft6BSXHvBvPooRle3yFN/fKnCdSOnuu0OC3PLcF6+g==}
+     engines: {node: '>=8.0.0'}
+@@ -1343,6 +1370,10 @@ packages:
+     resolution: {integrity: sha512-j/O/d7GcZCyNl7/hwZAb606rzqkyvaDctLmckbxLzHvFBzTJHuGEdodATcP3yIRoDrLHkIATJuvzbFlp/ki2cQ==}
+     engines: {node: '>=18'}
+ 
++  cross-spawn@7.0.6:
++    resolution: {integrity: sha512-uV2QOWP2nWzsy2aMp8aRibhi9dlzF5Hgh5SHaB9OiTGEyDTiJJyx0uy51QXdyWbtAHNua4XJzUKca3OzKUd3vA==}
++    engines: {node: '>= 8'}
++
+   debug@4.4.3:
+     resolution: {integrity: sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==}
+     engines: {node: '>=6.0'}
+@@ -1381,6 +1412,14 @@ packages:
+   estree-walker@3.0.3:
+     resolution: {integrity: sha512-7RUKfXgSMMkzt6ZuXmqapOurLGPPfgj6l9uRZ7lRGolvk0y2yocc35LdcxKC5PQZdn2DMqioAQ2NoWcrTKmm6g==}
+ 
++  eventsource-parser@3.1.1:
++    resolution: {integrity: sha512-EKN1vKAMcZ8MlYMpaNuxN6R9yakzH6uajHcHVTqWJzvu5pWw9DyhbP35HH8MVBQ+dZjAfDxk+A8NiR9KWaXiyQ==}
++    engines: {node: '>=18.0.0'}
++
++  eventsource@3.0.7:
++    resolution: {integrity: sha512-CRT1WTyuQoD771GW56XEZFQ/ZoSfWid1alKGDYMmkt2yl8UXrVR4pspqWNEcqKvVIzg6PAltWjxcSSPrboA4iA==}
++    engines: {node: '>=18.0.0'}
++
+   expect-type@1.4.0:
+     resolution: {integrity: sha512-KfYbmpRm0VbLjEvVa9yGwCi9GI34xvi7A/HXYWQO65CSD2u3MczUJSuwXKFIxlGsgBQizV9q5J9NHj4VG0n+pA==}
+     engines: {node: '>=12.0.0'}
+@@ -1427,6 +1466,12 @@ packages:
+     resolution: {integrity: sha512-zymm5+u+sCsSWyD9qNaejV3DFvhCKclKdizYaJUuHA83RLjb7nSuGnddCHGv0hk+KY7BMAlsWeK4Ueg6EV6XQg==}
+     engines: {node: '>=8'}
+ 
++  isexe@2.0.0:
++    resolution: {integrity: sha512-RHxMLp9lnKHGHRng9QFhRCMbYAcVpn69smSGcq3f36xjgVVWThj4qqLbTLlq7Ssj8B+fIQ1EuCEGI2lKsyQeIw==}
++
++  jose@6.2.12:
++    resolution: {integrity: sha512-9NiFmJEex0sy2Dk58j2UGBSHgUs2ypF9eZSu4L6vjOX3Dp96Sw1F3uL+H+D1sx02jZZdzUT0HgvCy59CuvXcWw==}
++
+   js-yaml@4.3.0:
+     resolution: {integrity: sha512-1td788aAnnZ5qs7V2QIRl1owjtYpbKt749Y3xauqQgwIIGF/xXWz1wMTEBx5O3LK3lXLVuqXPdPxj2BoFHaW9Q==}
+     hasBin: true
+@@ -1487,6 +1532,10 @@ packages:
+       zod:
+         optional: true
+ 
++  path-key@3.1.1:
++    resolution: {integrity: sha512-ojmeN0qd+y0jszEtoY48r0Peq5dwMEkIlCOu6Q5f41lfkswXuKtYrhgoTpLnyIcHm24Uhqx+5Tqm2InSwLhE6Q==}
++    engines: {node: '>=8'}
++
+   pathe@2.0.3:
+     resolution: {integrity: sha512-WUjGcAqP1gQacoQe+OBJsFA7Ld4DyXuUIjZ5cc75cLHvJ7dtNsTugphxIADwspS+AraAUePCKrSVtPLFj/F88w==}
+ 
+@@ -1497,6 +1546,10 @@ packages:
+     resolution: {integrity: sha512-RvwwcruNjI1ncT5xRakeyS9Lf8lcItv34KD+aif+VH9kduAyfYBipGh12274xtenIPZ119/R9BdTBa8gAwSh0A==}
+     engines: {node: '>=12'}
+ 
++  pkce-challenge@5.0.1:
++    resolution: {integrity: sha512-wQ0b/W4Fr01qtpHlqSqspcj3EhBvimsdh0KlHhH8HRZnMsEa0ea2fTULOXOS9ccQr3om+GcGRk4e+isrZWV8qQ==}
++    engines: {node: '>=16.20.0'}
++
+   postcss@8.5.25:
+     resolution: {integrity: sha512-DTPx3RWSSnWyzLxQnlH0rJP+EW5ekl16ZU4/psbIhA0e53kJfdgaN5vKM+xP7yJtXVu+nfdVFmlgFDEKAe4Pyw==}
+     engines: {node: ^10 || ^12 || >=14}
+@@ -1522,6 +1575,14 @@ packages:
+     engines: {node: '>=10'}
+     hasBin: true
+ 
++  shebang-command@2.0.0:
++    resolution: {integrity: sha512-kHxr2zZpYtdmrN1qDjrrX/Z1rR1kG8Dx+gkpK1G4eXmvXswmcE1hTWBWYUzlraYw1/yZp6YuDY77YtvbN0dmDA==}
++    engines: {node: '>=8'}
++
++  shebang-regex@3.0.0:
++    resolution: {integrity: sha512-7++dFhtcx3353uBaq8DDR4NuxBetBzC7ZQOhmTQInHEd6bSrXdiEyzCvG07Z44UYdLShWUyXt5M/yhz8ekcb1A==}
++    engines: {node: '>=8'}
++
+   siginfo@2.0.0:
+     resolution: {integrity: sha512-ybx0WO1/8bSBLEWXZvEd7gMW3Sn3JFlW3TvX1nREbDLRNQNaeNN8WK0meBwPdAaOI7TtRRRJn/Es1zhrrCHu7g==}
+ 
+@@ -1665,6 +1726,11 @@ packages:
+       jsdom:
+         optional: true
+ 
++  which@2.0.2:
++    resolution: {integrity: sha512-BLI3Tl1TW3Pvl70l3yq3Y64i+awpwXqsGBYWkkqMtnbXgrMD+yj7rhW0kuEDxzJaYXGjEW5ogapKNMEKNMjibA==}
++    engines: {node: '>= 8'}
++    hasBin: true
++
+   why-is-node-running@2.3.0:
+     resolution: {integrity: sha512-hUrmaWBdVDcxvYqnyh09zunKzROWjbZTiNy8dBEjkS7ehEDQibXJ7XvlmtbwuTclUiIyN+CyXQD4Vmko8fNm8w==}
+     engines: {node: '>=8'}
+@@ -1989,6 +2055,22 @@ snapshots:
+ 
+   '@js-sdsl/ordered-map@4.4.2': {}
+ 
++  '@modelcontextprotocol/client@2.3.1':
++    dependencies:
++      '@modelcontextprotocol/core': 2.3.1
++      cross-spawn: 7.0.6
++      eventsource: 3.0.7
++      eventsource-parser: 3.1.1
++      jose: 6.2.12
++      pkce-challenge: 5.0.1
++      zod: 4.5.4
++    optional: true
++
++  '@modelcontextprotocol/core@2.3.1':
++    dependencies:
++      zod: 4.5.4
++    optional: true
++
+   '@napi-rs/cli@3.4.1(@emnapi/runtime@1.11.2)(@types/node@24.10.0)':
+     dependencies:
+       '@inquirer/prompts': 7.10.1(@types/node@24.10.0)
+@@ -2310,6 +2392,35 @@ snapshots:
+     dependencies:
+       '@octokit/openapi-types': 27.0.0
+ 
++  '@openai/agents-core@0.20.0(zod@4.5.4)':
++    dependencies:
++      '@standard-schema/spec': 1.1.0
++      debug: 4.4.3
++      openai: 7.17.0(zod@4.5.4)
++    optionalDependencies:
++      '@modelcontextprotocol/client': 2.3.1
++      zod: 4.5.4
++    transitivePeerDependencies:
++      - '@aws-sdk/credential-provider-node'
++      - '@smithy/hash-node'
++      - '@smithy/signature-v4'
++      - supports-color
++      - undici
++      - ws
++
++  '@openai/agents-openai@0.20.0(zod@4.5.4)':
++    dependencies:
++      '@openai/agents-core': 0.20.0(zod@4.5.4)
++      openai: 7.17.0(zod@4.5.4)
++      zod: 4.5.4
++    transitivePeerDependencies:
++      - '@aws-sdk/credential-provider-node'
++      - '@smithy/hash-node'
++      - '@smithy/signature-v4'
++      - supports-color
++      - undici
++      - ws
++
+   '@opentelemetry/api-logs@0.222.0':
+     dependencies:
+       '@opentelemetry/api': 1.9.1
+@@ -2678,6 +2789,13 @@ snapshots:
+ 
+   content-type@2.0.0: {}
+ 
++  cross-spawn@7.0.6:
++    dependencies:
++      path-key: 3.1.1
++      shebang-command: 2.0.0
++      which: 2.0.2
++    optional: true
++
+   debug@4.4.3:
+     dependencies:
+       ms: 2.1.3
+@@ -2725,6 +2843,14 @@ snapshots:
+     dependencies:
+       '@types/estree': 1.0.9
+ 
++  eventsource-parser@3.1.1:
++    optional: true
++
++  eventsource@3.0.7:
++    dependencies:
++      eventsource-parser: 3.1.1
++    optional: true
++
+   expect-type@1.4.0: {}
+ 
+   fdir@6.5.0(picomatch@4.0.5):
+@@ -2748,6 +2874,12 @@ snapshots:
+ 
+   is-fullwidth-code-point@3.0.0: {}
+ 
++  isexe@2.0.0:
++    optional: true
++
++  jose@6.2.12:
++    optional: true
++
+   js-yaml@4.3.0:
+     dependencies:
+       argparse: 2.0.1
+@@ -2776,12 +2908,18 @@ snapshots:
+     optionalDependencies:
+       zod: 4.5.4
+ 
++  path-key@3.1.1:
++    optional: true
++
+   pathe@2.0.3: {}
+ 
+   picocolors@1.1.1: {}
+ 
+   picomatch@4.0.5: {}
+ 
++  pkce-challenge@5.0.1:
++    optional: true
++
+   postcss@8.5.25:
+     dependencies:
+       nanoid: 3.3.16
+@@ -2839,6 +2977,14 @@ snapshots:
+ 
+   semver@7.8.5: {}
+ 
++  shebang-command@2.0.0:
++    dependencies:
++      shebang-regex: 3.0.0
++    optional: true
++
++  shebang-regex@3.0.0:
++    optional: true
++
+   siginfo@2.0.0: {}
+ 
+   signal-exit@4.1.0: {}
+@@ -2941,6 +3087,11 @@ snapshots:
+       - tsx
+       - yaml
+ 
++  which@2.0.2:
++    dependencies:
++      isexe: 2.0.0
++    optional: true
++
+   why-is-node-running@2.3.0:
+     dependencies:
+       siginfo: 2.0.0
+diff --git a/sdks/wyrd-sdk-ts/wyrd/src/card-types.ts b/sdks/wyrd-sdk-ts/wyrd/src/card-types.ts
+index ec9c6346d..d073b08c0 100644
+--- a/sdks/wyrd-sdk-ts/wyrd/src/card-types.ts
++++ b/sdks/wyrd-sdk-ts/wyrd/src/card-types.ts
+@@ -2351,6 +2351,15 @@ export interface OpenAiCustomVoice {
+   readonly id: string;
+ }
+ 
++/**
++ * Easy input message: `type` may be omitted and `content` may be text.
++ */
++export interface OpenAiEasyInputMessage {
++  readonly content: string | readonly OpenAiResponseContentPart[];
++  readonly role: string;
++  readonly type?: "message";
++}
++
+ export type OpenAiEmbeddingsInput = string | readonly string[] | readonly number[] | readonly (readonly number[])[];
+ 
+ export interface OpenAiEmbeddingsRequest {
+@@ -2374,6 +2383,13 @@ export interface OpenAiFunction {
+   readonly strict?: boolean | null;
+ }
+ 
++/**
++ * A Responses tool result: text, or content parts such as `input_text`.
++ *
++ * `OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.
++ */
++export type OpenAiFunctionCallOutput = string | readonly OpenAiResponseContentPart[];
++
+ export interface OpenAiFunctionChoice {
+   readonly name: string;
+ }
+@@ -2529,7 +2545,10 @@ export interface OpenAiResponseItemFunctionCall {
+ 
+ export interface OpenAiResponseItemFunctionCallOutput {
+   readonly call_id: string;
+-  readonly output: string;
++  /**
++   * Tool result, as text or as content parts.
++   */
++  readonly output: OpenAiFunctionCallOutput;
+   readonly type: "function_call_output";
+ }
+ 
+@@ -2627,7 +2646,7 @@ export type OpenAiResponsesHostedToolKind = "file_search" | "web_search_preview"
+  *
+  * Both forms decode and re-encode unchanged, so a relayed request keeps the form its caller sent. Editing the conversation first expands the text shorthand into the single user message it stands for.
+  */
+-export type OpenAiResponsesInput = string | readonly OpenAiResponseItem[];
++export type OpenAiResponsesInput = string | readonly (OpenAiResponseItem | OpenAiEasyInputMessage)[];
+ 
+ export interface OpenAiResponsesMcpToolChoice {
+   readonly name?: string | null;
+diff --git a/sdks/wyrd-sdk-ts/wyrd/tests/integration/gateway-inference.test.ts b/sdks/wyrd-sdk-ts/wyrd/tests/integration/gateway-inference.test.ts
+index 83d9e0f9a..ee654ac3c 100644
+--- a/sdks/wyrd-sdk-ts/wyrd/tests/integration/gateway-inference.test.ts
++++ b/sdks/wyrd-sdk-ts/wyrd/tests/integration/gateway-inference.test.ts
+@@ -1,8 +1,11 @@
+ import { readFileSync } from "node:fs";
+ import { resolve } from "node:path";
+ 
++import { Agent, run, setTracingDisabled, tool } from "@openai/agents-core";
++import { OpenAIResponsesModel } from "@openai/agents-openai";
+ import OpenAI from "openai";
+ import { expect, vi } from "vitest";
++import { z } from "zod";
+ 
+ import { Cards, Gateway, type ProviderDeployment, type RegistrationReceipt, Workflow, WyrdClient } from "wyrd-ai";
+ import { cli } from "@wyrd/testing";
+@@ -25,6 +28,58 @@ const COMPLETION = {
+   usage: { prompt_tokens: 11, completion_tokens: 4, total_tokens: 15 },
+ };
+ 
++/** Responses usage the upstream reports. */
++const RESPONSE_USAGE = {
++  input_tokens: 5,
++  output_tokens: 3,
++  total_tokens: 8,
++  input_tokens_details: { cached_tokens: 0 },
++  output_tokens_details: { reasoning_tokens: 0 },
++};
++
++/** A buffered Responses answer carrying `output`. */
++function response(output: unknown[]): unknown {
++  return {
++    id: "resp_1",
++    object: "response",
++    created_at: 1,
++    model: "gpt-4o-mini",
++    status: "completed",
++    output,
++    usage: RESPONSE_USAGE,
++  };
++}
++
++/**
++ * The upstream's Responses turn: an `echo` call until the input carries its
++ * result, then the final answer.
++ */
++function responsesTurn(body: string): unknown {
++  const answered = (JSON.parse(body) as { input: { type?: string }[] }).input.some(
++    (item) => item.type === "function_call_output",
++  );
++  return answered
++    ? response([
++        {
++          type: "message",
++          id: "msg_1",
++          role: "assistant",
++          status: "completed",
++          content: [{ type: "output_text", text: "echoed", annotations: [] }],
++        },
++      ])
++    : response([
++        {
++          type: "function_call",
++          id: "fc_1",
++          call_id: "c1",
++          name: "echo",
++          arguments: '{"text":"hi"}',
++          status: "completed",
++        },
++      ]);
++}
++
+ /** The code-review example Workflow directory; its Prompts call `gpt-5-5` through the Wyrd gateway. */
+ const EXAMPLE = resolve(import.meta.dirname, "../../../../../examples/workflows/code-review");
+ 
+@@ -51,7 +106,12 @@ function deployment(model: string): ProviderDeployment {
+  * local upstream with the operator's provider key, and the registered `ask`
+  * Workflow.
+  */
+-const test = serverTest({ provider: () => ({ status: 200, body: COMPLETION }) }).extend<{
++const test = serverTest({
++  provider: ({ path, body }) => ({
++    status: 200,
++    body: path === "/v1/responses" ? responsesTurn(body) : COMPLETION,
++  }),
++}).extend<{
+   ask: RegistrationReceipt;
+ }>({
+   ask: [
+@@ -64,6 +124,7 @@ const test = serverTest({ provider: () => ({ status: 200, body: COMPLETION }) })
+       const gateway = Gateway.connect();
+       await gateway.putDeployment(deployment("gpt-4o"));
+       await gateway.putDeployment(deployment("gpt-5-5"));
++      await gateway.putDeployment({ ...deployment("gpt-4o-mini"), capabilities: ["responses"] });
+       await use(await Cards.connect().registerFromPath(fixture("cards/gateway_inference/ask.yaml")));
+     },
+     { scope: "file" },
+@@ -103,6 +164,54 @@ test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {
+   });
+ });
+ 
++/** An Agents SDK agent on the Gateway's Responses API whose `echo` tool returns content parts. */
++function echoAgent(client: OpenAI): Agent {
++  setTracingDisabled(true);
++  const echo = tool({
++    name: "echo",
++    description: "Echo the text.",
++    parameters: z.object({ text: z.string() }),
++    execute: async ({ text }) => ({ type: "text" as const, text }),
++  });
++  return new Agent({
++    name: "echo-agent",
++    instructions: "Call echo.",
++    model: new OpenAIResponsesModel(client, "openai/gpt-4o-mini"),
++    tools: [echo],
++  });
++}
++
++test("agents sdk responses tool loop runs through the gateway", async ({ provider, ask: _ }) => {
++  const { client } = await openai(WyrdClient.connect());
++  const before = provider.received.length;
++
++  const result = await run(echoAgent(client), "go");
++
++  expect(result.finalOutput).toBe("echoed");
++  const upstream = provider.received.slice(before);
++  expect(upstream.map(({ path }) => path)).toEqual(["/v1/responses", "/v1/responses"]);
++  const [first, second] = upstream.map(({ body }) => JSON.parse(body) as { model: string; input: unknown[] });
++  expect(first?.model).toBe("gpt-4o-mini");
++  expect(first?.input).toEqual([{ role: "user", content: "go" }]);
++  expect(second?.input).toContainEqual({ role: "user", content: "go" });
++  expect(second?.input).toContainEqual(
++    expect.objectContaining({
++      type: "function_call_output",
++      call_id: "c1",
++      output: [{ type: "input_text", text: "hi" }],
++    }),
++  );
++});
++
++test("caller without gateway invoke cannot run an agents sdk agent", async ({ server, provider, ask: _ }) => {
++  const reader = WyrdClient.connect({ credential: server.scopedApiKey("gateway_reader", ["gateway:read"]) });
++  const { client } = await openai(reader);
++  const before = provider.received.length;
++
++  await expect(run(echoAgent(client), "go")).rejects.toMatchObject({ status: 403 });
++  expect(provider.received.slice(before)).toEqual([]);
++});
++
+ test("cli issues a card scoped key and writes a provider credential", async ({ ask: _ }) => {
+   const agent = { kind: "Agent", name: "ask-agent", version: "1.0.0", space: "default" } as const;
+   const issued = await cli.issueKey(agent);

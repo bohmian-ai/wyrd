@@ -568,6 +568,17 @@ impl PyOpenAiResponseItem {
             _ => Err(wrong_variant("function_call", self.kind()).into()),
         }
     }
+    /// Returns a `function_call_output` item's result as text.
+    ///
+    /// A text result is returned as sent. A content-parts result is projected
+    /// to the concatenated text of its `input_text` and `output_text` parts, in
+    /// order and with no separator; non-text parts are omitted. The item keeps
+    /// the form it was sent in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::PromptBuilderError::WrongVariant`] when the item
+    /// is not a `function_call_output`.
     fn as_function_call_output(&self) -> WyrdPyResult<String> {
         match self.i() {
             OpenAiResponseItem::FunctionCallOutput { output, .. } => Ok(output.text().into_owned()),

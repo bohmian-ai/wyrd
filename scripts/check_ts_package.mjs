@@ -11,7 +11,6 @@ const sdkDir = join(repository, "sdks", "wyrd-sdk-ts", "wyrd");
 const target = `${process.platform}-${process.arch}`;
 const targetPackage = {
   "darwin-arm64": "darwin-arm64",
-  "darwin-x64": "darwin-x64",
   "linux-arm64": "linux-arm64-gnu",
   "linux-x64": "linux-x64-gnu",
 }[target];

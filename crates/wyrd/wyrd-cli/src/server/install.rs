@@ -390,12 +390,11 @@ pub(super) fn compatible(cli: &Version, server: &Version) -> bool {
 ///
 /// # Errors
 /// Returns [`WyrdCliError::ServerHostUnsupported`] for any host other than
-/// macOS or glibc Linux on x86_64 or aarch64.
+/// macOS on aarch64 or glibc Linux on x86_64 or aarch64.
 fn host_target() -> Result<&'static str, WyrdCliError> {
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
     match (os, arch, cfg!(target_env = "musl")) {
         ("macos", "aarch64", _) => Ok("aarch64-apple-darwin"),
-        ("macos", "x86_64", _) => Ok("x86_64-apple-darwin"),
         ("linux", "x86_64", false) => Ok("x86_64-unknown-linux-gnu"),
         ("linux", "aarch64", false) => Ok("aarch64-unknown-linux-gnu"),
         _ => Err(WyrdCliError::ServerHostUnsupported { os, arch }),

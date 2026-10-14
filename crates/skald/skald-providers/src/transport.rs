@@ -7,7 +7,9 @@ use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 
 use crate::error::{ProviderError, ProviderResult};
 
-const DEFAULT_USER_AGENT: &str = "skald-providers/0.0.1";
+/// The `User-Agent` every provider request sends unless the caller overrides
+/// it: this crate's name and released version.
+const DEFAULT_USER_AGENT: &str = concat!("skald-providers/", env!("CARGO_PKG_VERSION"));
 
 /// Default bound on one decoded provider answer.
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;

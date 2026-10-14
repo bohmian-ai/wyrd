@@ -144,7 +144,7 @@ fn is_problem(content: Option<&Content>) -> bool {
 /// applies the two document-wide modifiers to the result.
 #[derive(OpenApi)]
 #[openapi(
-    info(title = "Wyrd API", version = "0.0.1", license(name = "Apache-2.0")),
+    info(title = "Wyrd API", version = env!("CARGO_PKG_VERSION"), license(name = "Apache-2.0")),
     components(schemas(
         BifrostQueryRequest,
         CancelRunningQueryResponse,

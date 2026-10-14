@@ -9,7 +9,9 @@ AI and Google ADK run scripted models. The official ``mcp`` client's
 Wyrd's dotted tool names are a public contract, so each framework is
 configured the way its users would to forward provider-valid names: OpenAI
 Agents SDK qualifies them with the server name, Pydantic AI renames its
-toolset, and Google ADK renames the tools it declares.
+toolset, and Google ADK, which has no renaming option, declares local renamed
+copies. These are model-facing aliases only; each framework's MCP client still
+calls the dotted wire tool.
 
 The ``mcp-frameworks`` dependency group provides the frameworks, and only
 ``py:test:mcp-frameworks`` collects this directory.
@@ -36,7 +38,8 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import InMemoryRunner
 from google.adk.tools.base_tool import BaseTool
-from google.adk.tools.mcp_tool import McpToolset, StreamableHTTPConnectionParams
+from google.adk.tools.mcp_tool import McpTool, McpToolset, StreamableHTTPConnectionParams
+from google.adk.tools.mcp_tool.mcp_session_manager import MCPSessionManager
 from google.genai import types as genai
 from mcp import types
 from mcp.client import Client
@@ -171,28 +174,35 @@ def pydantic_run(
     return offered, returns
 
 
-class ProviderNamedMcpToolset(McpToolset):
-    """An ADK MCP toolset that declares each tool under its provider-valid name.
+def provider_named(tool: BaseTool) -> BaseTool:
+    """A copy of ADK tool ``tool`` declared to the model under its provider-valid name.
 
-    ADK declares a tool under ``BaseTool.name`` and calls the MCP server
-    under the listed name, so a renamed copy still reaches the Wyrd tool.
+    ADK declares a tool under ``BaseTool.name`` but its MCP client calls the
+    server under the listed name, so the copy still reaches the Wyrd tool.
     """
+    renamed = copy.copy(tool)
+    renamed.name = provider_name(tool.name)
+    return renamed
+
+
+class ProviderNamedMcpToolset(McpToolset):
+    """An ADK MCP toolset that declares each listed tool by ``provider_named``."""
 
     async def get_tools(self, readonly_context=None) -> list[BaseTool]:
-        """The listed tools, each a copy renamed by ``provider_name``."""
-        renamed = []
-        for tool in await super().get_tools(readonly_context):
-            tool = copy.copy(tool)
-            tool.name = provider_name(tool.name)
-            renamed.append(tool)
-        return renamed
+        """The listed tools, each renamed by ``provider_named``."""
+        return [provider_named(tool) for tool in await super().get_tools(readonly_context)]
 
 
-def adk_run(url: str, headers: dict[str, str], call: str, arguments: dict) -> tuple:
-    """Run a Google ADK agent whose scripted model calls ``call`` once, then answers.
+def adk_run(
+    tools: list[BaseTool | McpToolset],
+    connection: McpToolset | MCPSessionManager,
+    calls: list[tuple[str, dict]],
+) -> tuple:
+    """Run a Google ADK agent whose scripted model makes ``calls`` in turn, then answers.
 
-    Returns the function declarations the agent sent its model and the run's
-    function responses.
+    ``connection`` owns the MCP sessions behind ``tools`` and is closed on the
+    run's event loop. Returns the function declarations the agent sent its
+    model and the run's function responses.
     """
     requests: list[LlmRequest] = []
 
@@ -201,19 +211,16 @@ def adk_run(url: str, headers: dict[str, str], call: str, arguments: dict) -> tu
             self, llm_request: LlmRequest, stream: bool = False
         ) -> AsyncGenerator[LlmResponse, None]:
             requests.append(llm_request)
-            part = (
-                genai.Part(function_call=genai.FunctionCall(name=call, args=arguments))
-                if len(requests) == 1
-                else genai.Part(text="done")
-            )
+            if len(requests) <= len(calls):
+                name, args = calls[len(requests) - 1]
+                part = genai.Part(function_call=genai.FunctionCall(name=name, args=args))
+            else:
+                part = genai.Part(text="done")
             yield LlmResponse(content=genai.Content(role="model", parts=[part]))
 
     async def run() -> list[genai.FunctionResponse]:
-        toolset = ProviderNamedMcpToolset(
-            connection_params=StreamableHTTPConnectionParams(url=url, headers=headers)
-        )
         runner = InMemoryRunner(
-            agent=LlmAgent(name="on_call", model=ScriptedModel(model="scripted"), tools=[toolset]),
+            agent=LlmAgent(name="on_call", model=ScriptedModel(model="scripted"), tools=tools),
             app_name="on_call",
         )
         session = await runner.session_service.create_session(app_name="on_call", user_id="on-call")
@@ -227,7 +234,7 @@ def adk_run(url: str, headers: dict[str, str], call: str, arguments: dict) -> tu
                 for response in event.get_function_responses()
             ]
         finally:
-            await toolset.close()
+            await connection.close()
 
     responses = asyncio.run(run())
     declared = [
@@ -236,6 +243,14 @@ def adk_run(url: str, headers: dict[str, str], call: str, arguments: dict) -> tu
         for declaration in tool.function_declarations or []
     ]
     return declared, responses
+
+
+def adk_toolset_run(url: str, headers: dict[str, str], call: str, arguments: dict) -> tuple:
+    """``adk_run`` over every tool Wyrd advertises to ``headers``' caller, calling ``call`` once."""
+    toolset = ProviderNamedMcpToolset(
+        connection_params=StreamableHTTPConnectionParams(url=url, headers=headers)
+    )
+    return adk_run([toolset], toolset, [(call, arguments)])
 
 
 def test_openai_agents_converts_every_tool(mcp_url: str, admin_headers: dict[str, str]) -> None:
@@ -253,8 +268,10 @@ def test_openai_agents_converts_every_tool(mcp_url: str, admin_headers: dict[str
 
     tools, output = asyncio.run(journey())
 
-    assert len(tools) == len(catalog)
-    assert [tool.name for tool in tools if not PROVIDER_TOOL_NAME.match(tool.name)] == []
+    names = [tool.name for tool in tools]
+    assert len(names) == len(catalog)
+    assert len(set(names)) == len(names)
+    assert [name for name in names if not PROVIDER_TOOL_NAME.match(name)] == []
     assert isinstance(output, dict)
     assert json.loads(output["text"])["topic"] == "overview"
 
@@ -266,10 +283,10 @@ def test_pydantic_ai_agent_calls_wyrd_guide(mcp_url: str, admin_headers: dict[st
         mcp_url, admin_headers, catalog, provider_name("wyrd.guide"), GUIDE_ARGUMENTS
     )
 
-    assert sorted(tool.name for tool in offered) == sorted(
-        provider_name(tool.name) for tool in catalog
-    )
-    assert [tool.name for tool in offered if not PROVIDER_TOOL_NAME.match(tool.name)] == []
+    names = [tool.name for tool in offered]
+    assert sorted(names) == sorted(provider_name(tool.name) for tool in catalog)
+    assert len(set(names)) == len(names)
+    assert [name for name in names if not PROVIDER_TOOL_NAME.match(name)] == []
     (guide,) = returns
     assert guide.content["topic"] == "overview"
 
@@ -317,12 +334,14 @@ def test_pydantic_ai_reader_sees_and_reaches_no_write_tool(
 def test_google_adk_declares_every_tool(mcp_url: str, admin_headers: dict[str, str]) -> None:
     catalog = advertised(mcp_url, admin_headers)
 
-    declared, responses = adk_run(
+    declared, responses = adk_toolset_run(
         mcp_url, admin_headers, provider_name("wyrd.guide"), GUIDE_ARGUMENTS
     )
 
-    assert sorted(d.name for d in declared) == sorted(provider_name(tool.name) for tool in catalog)
-    assert [d.name for d in declared if not PROVIDER_TOOL_NAME.match(d.name or "")] == []
+    names = [d.name or "" for d in declared]
+    assert sorted(names) == sorted(provider_name(tool.name) for tool in catalog)
+    assert len(set(names)) == len(names)
+    assert [name for name in names if not PROVIDER_TOOL_NAME.match(name)] == []
     (guide,) = responses
     assert guide.response is not None
     assert json.loads(guide.response["content"][0]["text"])["topic"] == "overview"
@@ -330,17 +349,42 @@ def test_google_adk_declares_every_tool(mcp_url: str, admin_headers: dict[str, s
 
 @pytest.mark.usefixtures("adk_environment")
 def test_google_adk_reader_sees_and_reaches_no_write_tool(
-    mcp_url: str, viewer_headers: dict[str, str]
+    mcp_url: str, admin_headers: dict[str, str], viewer_headers: dict[str, str]
 ) -> None:
     catalog = advertised(mcp_url, viewer_headers)
     assert all(tool.annotations and tool.annotations.read_only_hint for tool in catalog)
 
-    declared, responses = adk_run(
-        mcp_url, viewer_headers, provider_name(HIDDEN_WRITE), HIDDEN_WRITE_ARGUMENTS
+    declared, _ = adk_toolset_run(
+        mcp_url, viewer_headers, provider_name("wyrd.guide"), GUIDE_ARGUMENTS
     )
 
     assert sorted(d.name for d in declared) == sorted(provider_name(tool.name) for tool in catalog)
-    # ADK refuses a name it did not declare and returns the error to the model.
-    (refused,) = responses
+
+    # A descriptor obtained by the administrator lets the reader's agent name
+    # the hidden tool; calling it still runs as the reader.
+    (hidden,) = [tool for tool in advertised(mcp_url, admin_headers) if tool.name == HIDDEN_WRITE]
+    (guide,) = [tool for tool in catalog if tool.name == "wyrd.guide"]
+    sessions = MCPSessionManager(
+        StreamableHTTPConnectionParams(url=mcp_url, headers=viewer_headers)
+    )
+    tools = [
+        provider_named(McpTool(mcp_tool=tool, mcp_session_manager=sessions))
+        for tool in (hidden, guide)
+    ]
+
+    _, responses = adk_run(
+        tools,
+        sessions,
+        [
+            (provider_name(HIDDEN_WRITE), HIDDEN_WRITE_ARGUMENTS),
+            (provider_name("wyrd.guide"), GUIDE_ARGUMENTS),
+        ],
+    )
+
+    # ADK hands Wyrd's refusal back to the model as a tool error, and the same
+    # sessions keep serving the reader.
+    refused, read = responses
     assert refused.response is not None
-    assert list(refused.response) == ["error"]
+    assert "WYRD_PERMISSION_403_DENIED_RBAC" in refused.response["error"]
+    assert read.response is not None
+    assert json.loads(read.response["content"][0]["text"])["topic"] == "overview"

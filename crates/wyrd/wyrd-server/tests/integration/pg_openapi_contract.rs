@@ -594,8 +594,7 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
             // utoipa renders `security(())` as one empty requirement object,
             // which is OpenAPI's way of saying the operation needs nothing.
             assert!(
-                overridden == &serde_json::json!([])
-                    || overridden == &serde_json::json!([{}]),
+                overridden == &serde_json::json!([]) || overridden == &serde_json::json!([{}]),
                 "{method} {path} overrides the document requirement with a second scheme"
             );
             cleared.insert(path.clone());

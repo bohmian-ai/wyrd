@@ -3125,14 +3125,13 @@ async fn tenant_connection_rotation_journey() {
         );
     }
     replica_c.shutdown().await.expect("replica C shuts down");
-    let replica_k2 = replica_b
-        .start_replica(
-            WyrdTestServerBuilder::default().with_sealing_keyring(std::sync::Arc::new(SealingKeyring::new(
-                SecretKey::from_bytes(k2),
-            ))),
-        )
-        .await
-        .expect("a K2-only replica starts once nothing needs K1");
+    let replica_k2 =
+        replica_b
+            .start_replica(WyrdTestServerBuilder::default().with_sealing_keyring(
+                std::sync::Arc::new(SealingKeyring::new(SecretKey::from_bytes(k2))),
+            ))
+            .await
+            .expect("a K2-only replica starts once nothing needs K1");
     let session = human_login(
         &replica_k2,
         &keycloak,

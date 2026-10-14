@@ -44,11 +44,17 @@ const sessionCookie = (tenant: string) => `wyrd_session_${tenant}`;
 /** Each journey drives many real logins, key verifications, and renewals. */
 const journeyTimeout = 60_000;
 
-/** The gateway's routing of a public-origin `/auth/*` URL to Wyrd replica `replica`. */
-function gateway(url: string, replica: 0 | 1 = 0): string {
+/**
+ * The gateway's routing of a public-origin `/auth/*` URL to Wyrd replica
+ * `replica`, with the scheme and host it forwards; the redirect is returned.
+ */
+function gateway(url: string, replica: 0 | 1 = 0): Promise<Response> {
   const target = new URL(url);
   expect(target.origin).toBe(journey.origin);
-  return journey.servers[replica] + target.pathname + target.search;
+  return fetch(journey.servers[replica] + target.pathname + target.search, {
+    redirect: 'manual',
+    headers: { 'x-forwarded-proto': 'http', 'x-forwarded-host': target.host }
+  });
 }
 
 /**
@@ -112,9 +118,14 @@ function expectSafeCookie(raw: string): void {
   expect(raw).not.toMatch(/;\s*Domain=/i);
 }
 
-/** A BFF cookie holds the renewing credential or PKCE state, never an access token. */
-function expectNoAccessToken(value: string): void {
-  expect(decodeURIComponent(value)).not.toMatch(jwt);
+/** A login cookie holds only its tenant and PKCE state. */
+function expectLoginCookie(value: string): void {
+  expect(Object.keys(JSON.parse(decodeURIComponent(value))).sort()).toEqual(['state', 'tenant', 'verifier']);
+}
+
+/** A session cookie holds only its tenant and the credential that renews it, never an access token. */
+function expectSessionCookie(value: string): void {
+  expect(Object.keys(JSON.parse(decodeURIComponent(value))).sort()).toEqual(['credential', 'kind', 'tenant']);
 }
 
 /**
@@ -172,7 +183,7 @@ async function beginSso(
   const begun = await browser.go(replica, `/t/${tenant}/login?/sso`, { form: {} });
   expect(begun.status).toBe(303);
   expectSafeCookie(browser.setCookie('wyrd_login'));
-  expectNoAccessToken(browser.cookies.get('wyrd_login')!);
+  expectLoginCookie(browser.cookies.get('wyrd_login')!);
   const request = new URL(begun.headers.get('location')!);
   expect(request.origin + request.pathname).toBe(`${journey.origin}/auth/authorize`);
   const query = request.searchParams;
@@ -183,7 +194,7 @@ async function beginSso(
   expect(query.get('code_challenge')).toMatch(/^[\w-]{43}$/);
   expect(query.get('state')).toBeTruthy();
   expect(query.get('tenant')).toBe(tenant);
-  const authorized = await fetch(gateway(request.toString(), replica), { redirect: 'manual' });
+  const authorized = await gateway(request.toString(), replica);
   expect(authorized.status, await authorized.clone().text()).toBe(303);
   const authorization = authorized.headers.get('location')!;
   expect(authorization.startsWith(issuer)).toBe(true);
@@ -203,7 +214,7 @@ async function providerCallback(
 ): Promise<string> {
   const callback = new URL(await providerLogin(authorization, user));
   expect(callback.origin + callback.pathname).toBe(`${journey.origin}/auth/callback`);
-  const response = await fetch(gateway(callback.toString(), replica), { redirect: 'manual' });
+  const response = await gateway(callback.toString(), replica);
   expect(response.status, await response.clone().text()).toBe(303);
   const returned = new URL(response.headers.get('location')!);
   expect(returned.origin + returned.pathname).toBe(`${journey.origin}/login/callback`);
@@ -227,7 +238,7 @@ async function ssoLogin(
   expect(browser.cookies.has('wyrd_login')).toBe(false);
   const session = browser.cookies.get(sessionCookie(tenant))!;
   expectSafeCookie(browser.setCookie(sessionCookie(tenant)));
-  expectNoAccessToken(session);
+  expectSessionCookie(session);
   return session;
 }
 
@@ -268,7 +279,7 @@ async function expectMixedCallbackRefused(
 async function providerAuthorizationDenied(browser: Browser, tenant: string): Promise<string> {
   const begun = await browser.go(0, `/t/${tenant}/login?/sso`, { form: {} });
   expect(begun.status).toBe(303);
-  const denied = await fetch(gateway(begun.headers.get('location')!), { redirect: 'manual' });
+  const denied = await gateway(begun.headers.get('location')!);
   expect(denied.status).toBe(303);
   const returned = new URL(denied.headers.get('location')!);
   expect(returned.origin + returned.pathname).toBe(`${journey.origin}/login/callback`);
@@ -372,7 +383,7 @@ test('production SSO crosses replicas', async () => {
   expect(done.headers.get('location')).toBe(`/t/${sso}`);
   const session = alice.cookies.get(sessionCookie(sso))!;
   expectSafeCookie(alice.setCookie(sessionCookie(sso)));
-  expectNoAccessToken(session);
+  expectSessionCookie(session);
   // The code is one-use: its replay with the same login sets no session.
   const replay = new Browser();
   replay.cookies.set('wyrd_login', secondLogin);
@@ -494,9 +505,11 @@ test('OIDC-off credential UI', async () => {
   expect(reader.headers.get('location')).toBe(`/t/${tenant}`);
   expectSafeCookie(browser.setCookie(sessionCookie(tenant)));
   const readerSession = browser.cookies.get(sessionCookie(tenant))!;
-  expectNoAccessToken(readerSession);
+  expectSessionCookie(readerSession);
   await expectNoSecrets(browser, tenant, readerSession);
-  for (const seen of browser.seen) expect(seen).not.toContain(journey.offReaderKey);
+  // Only the HttpOnly session cookie carries the key.
+  for (const seen of browser.seen.filter((value) => !value.startsWith('wyrd_session_')))
+    expect(seen).not.toContain(journey.offReaderKey);
   expect((await browser.go(1, `${settings}?/deactivate`, { form: {} })).status).toBe(403);
   const out = await browser.go(0, '/?/logout', { form: { tenantKey: tenant } });
   expect(out.headers.get('location')).toBe(login);
@@ -662,7 +675,7 @@ test('production provider replacement settings', async () => {
   expect(testSignIn.startsWith(secondIssuer)).toBe(true);
   const testReturn = await providerLogin(testSignIn, journey.users.admin);
   expect(testReturn.startsWith(`${journey.origin}/auth/callback?`)).toBe(true);
-  const testCallback = await fetch(gateway(testReturn, 1), { redirect: 'manual' });
+  const testCallback = await gateway(testReturn, 1);
   expect(testCallback.status, await testCallback.clone().text()).toBe(200);
   expect(await testCallback.text()).toContain('Connection test complete');
   expect(testCallback.headers.getSetCookie()).toEqual([]);

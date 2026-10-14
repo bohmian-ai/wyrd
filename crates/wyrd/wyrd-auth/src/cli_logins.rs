@@ -716,7 +716,10 @@ mod pg_tests {
         let logins = owner(&fixture, &provider, &audit).await;
         let slug = TenantSlug::new(fixture.tenant_slug()).expect("slug");
 
-        let device = logins.authorize(&slug, &origin()).await.expect("authorizes");
+        let device = logins
+            .authorize(&slug, &origin())
+            .await
+            .expect("authorizes");
         let code = device.device_code.expose();
         assert!(!device.verification_uri_complete.as_str().contains(code));
         assert!(
@@ -755,7 +758,10 @@ mod pg_tests {
             assert_eq!(reason(&error), Some("user_code_unavailable"));
         }
         let typed = device.user_code.replace('-', " ").to_lowercase();
-        let url = logins.approve(&slug, &typed, &origin()).await.expect("approves");
+        let url = logins
+            .approve(&slug, &typed, &origin())
+            .await
+            .expect("approves");
         assert!(url.as_str().starts_with(&provider.uri()));
         let error = logins
             .approve(&slug, &device.user_code, &origin())
@@ -775,7 +781,10 @@ mod pg_tests {
             "invalid_grant"
         );
 
-        let expiring = logins.authorize(&slug, &origin()).await.expect("authorizes");
+        let expiring = logins
+            .authorize(&slug, &origin())
+            .await
+            .expect("authorizes");
         sqlx::query(
             "UPDATE wyrd.auth_device_authorizations
                 SET created_at = statement_timestamp() - interval '11 minutes',
@@ -816,8 +825,14 @@ mod pg_tests {
         let logins = owner(&fixture, &provider, &audit).await;
         let slug = TenantSlug::new(fixture.tenant_slug()).expect("slug");
         let tenant = fixture.data_tenant_id();
-        let approved = logins.authorize(&slug, &origin()).await.expect("authorizes");
-        let denied = logins.authorize(&slug, &origin()).await.expect("authorizes");
+        let approved = logins
+            .authorize(&slug, &origin())
+            .await
+            .expect("authorizes");
+        let denied = logins
+            .authorize(&slug, &origin())
+            .await
+            .expect("authorizes");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user = Uuid::now_v7();
@@ -928,7 +943,10 @@ mod pg_tests {
         termination: Termination,
     ) -> (DeviceAuthorization, Result<LoginCompletion, WyrdError>) {
         let slug = TenantSlug::new(fixture.tenant_slug()).expect("slug");
-        let device = logins.authorize(&slug, &origin()).await.expect("authorizes");
+        let device = logins
+            .authorize(&slug, &origin())
+            .await
+            .expect("authorizes");
         let active = logins
             .connections
             .active_connection(fixture.data_tenant_id())
@@ -964,29 +982,32 @@ mod pg_tests {
             .expect("gate pid reads");
 
         let origin = origin();
-        let (approval, ()) = tokio::join!(logins.approve(&slug, &device.user_code, &origin), async {
-            wait_for_blocked_by(fixture, gate_pid).await;
-            match termination {
-                Termination::Deny => logins.deny(&slug, &device.user_code).await.expect("denies"),
-                Termination::ExpireAndPoll => {
-                    sqlx::query(
-                        "UPDATE wyrd.auth_device_authorizations
+        let (approval, ()) =
+            tokio::join!(logins.approve(&slug, &device.user_code, &origin), async {
+                wait_for_blocked_by(fixture, gate_pid).await;
+                match termination {
+                    Termination::Deny => {
+                        logins.deny(&slug, &device.user_code).await.expect("denies")
+                    }
+                    Termination::ExpireAndPoll => {
+                        sqlx::query(
+                            "UPDATE wyrd.auth_device_authorizations
                             SET created_at = statement_timestamp() - interval '11 minutes',
                                 expires_at = statement_timestamp() - interval '1 minute'
                           WHERE device_id = $1",
-                    )
-                    .bind(device_id)
-                    .execute(&fixture.superuser_pool().expect("superuser pool"))
-                    .await
-                    .expect("expires the code");
-                    assert_eq!(
-                        device_error(logins.redeem(&device.device_code, "req-expire").await),
-                        "expired_token"
-                    );
+                        )
+                        .bind(device_id)
+                        .execute(&fixture.superuser_pool().expect("superuser pool"))
+                        .await
+                        .expect("expires the code");
+                        assert_eq!(
+                            device_error(logins.redeem(&device.device_code, "req-expire").await),
+                            "expired_token"
+                        );
+                    }
                 }
-            }
-            gate.rollback().await.expect("the gate releases");
-        });
+                gate.rollback().await.expect("the gate releases");
+            });
         let url = approval.expect("the parked approval begins its login");
         let state = Url::parse(url.as_str())
             .expect("provider URL parses")

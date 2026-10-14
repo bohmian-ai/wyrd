@@ -24,7 +24,8 @@ use wyrd_client::auth::{AuthError, TokenExchange};
 use wyrd_client::saved_login::{SavedLogin, canonical_origin};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_testing::WyrdTestServerBuilder;
-use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_HOST, HUMAN_PUBLIC_ORIGIN, HumanSso, saved_logins,
+use wyrd_testing::human_login::{
+    FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_HOST, HUMAN_PUBLIC_ORIGIN, HumanSso, saved_logins,
 };
 
 /// The shipped CLI with every ambient `WYRD_*` source cleared and its
@@ -102,10 +103,10 @@ async fn decide(
         .post(format!("{server}/auth/device"))
         .header("x-forwarded-host", HUMAN_PUBLIC_HOST)
         .form(&[
-        ("tenant", tenant),
-        ("user_code", user_code),
-        ("decision", decision),
-    ]);
+            ("tenant", tenant),
+            ("user_code", user_code),
+            ("decision", decision),
+        ]);
     if let Some(origin) = origin {
         request = request.header(reqwest::header::ORIGIN, origin);
     }

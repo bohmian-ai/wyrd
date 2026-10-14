@@ -22,8 +22,8 @@ use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
 
-use crate::auth::{RequestOrigin, auth_not_configured};
 use crate::auth::oauth::{ClientForm, OAuthError, OAuthForm, no_store};
+use crate::auth::{RequestOrigin, auth_not_configured};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 

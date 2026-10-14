@@ -253,7 +253,12 @@ async fn test_candidate(
         principal_kind: caller.principal.kind.tag(),
     };
     connections(&state)?
-        .begin_test(caller.data_tenant_id, request.expected_revision, tester, &origin)
+        .begin_test(
+            caller.data_tenant_id,
+            request.expected_revision,
+            tester,
+            &origin,
+        )
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)

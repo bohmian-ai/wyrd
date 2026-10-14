@@ -110,10 +110,7 @@ fn ui_dir() -> PathBuf {
 ///
 /// # Panics
 /// Panics when the build output is missing or the process never answers.
-async fn start_bff(
-    server_url: &str,
-    extra_ca: Option<&std::path::Path>,
-) -> Bff {
+async fn start_bff(server_url: &str, extra_ca: Option<&std::path::Path>) -> Bff {
     let ui = ui_dir();
     assert!(
         ui.join("build/index.js").is_file(),
@@ -405,7 +402,8 @@ async fn sso_tenant(
 async fn production_ui_bff_journey() {
     let host = format!("localhost:{}", free_port());
     let origin = format!("http://{host}");
-    let builder = || WyrdTestServerBuilder::default().with_access_ttl(chrono::Duration::seconds(30));
+    let builder =
+        || WyrdTestServerBuilder::default().with_access_ttl(chrono::Duration::seconds(30));
     let srv = builder().start_bound().await.expect("server starts");
     let server = srv.base_url().expect("bound server has a URL").to_owned();
     let replica = Box::pin(srv.start_bound_replica(builder()))

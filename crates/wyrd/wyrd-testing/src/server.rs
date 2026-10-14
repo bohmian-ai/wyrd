@@ -4384,7 +4384,6 @@ impl WyrdTestServerBuilder {
         self
     }
 
-
     /// Boot workload bindings from `[[workload_bindings]]` config DTOs.
     ///
     /// At [`Self::start_in_process`] these run through the production

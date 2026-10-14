@@ -34,8 +34,7 @@ use secrecy::ExposeSecret;
 use wyrd_client::saved_login::canonical_origin;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_testing::human_login::{
-    FIXTURE_TENANT_SLUG, HumanSso, expire_saved_access, saved_login,
-    saved_logins,
+    FIXTURE_TENANT_SLUG, HumanSso, expire_saved_access, saved_login, saved_logins,
 };
 
 mod pg_tests {

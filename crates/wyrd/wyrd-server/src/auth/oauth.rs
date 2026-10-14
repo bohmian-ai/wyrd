@@ -27,7 +27,9 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use serde::de::DeserializeOwned;
 use url::form_urlencoded;
-use wyrd_spec::auth::{OAuthClientId, OAuthErrorCode, OAuthErrorResponse, TokenAudience, TokenRequest};
+use wyrd_spec::auth::{
+    OAuthClientId, OAuthErrorCode, OAuthErrorResponse, TokenAudience, TokenRequest,
+};
 use wyrd_spec::error::WyrdError;
 
 /// The RFC 8693 token-exchange `grant_type`.
@@ -375,7 +377,10 @@ mod tests {
             identify_client(&none, &form(b"client_id=wyrd-cli")),
             Ok(Some(OAuthClientId::WyrdCli))
         );
-        assert_eq!(identify_client(&none, &form(b"client_id=other")), Err(invalid));
+        assert_eq!(
+            identify_client(&none, &form(b"client_id=other")),
+            Err(invalid)
+        );
         assert_eq!(identify_client(&none, &form(b"")), Ok(None));
         assert_eq!(require_client(&none, &form(b"")), Err(invalid));
         let mut basic = HeaderMap::new();

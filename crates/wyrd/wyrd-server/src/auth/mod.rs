@@ -51,7 +51,12 @@ impl RequestOrigin {
         let first = |name| {
             headers
                 .get(name)
-                .map(|value| value.to_str().ok().and_then(|value| value.split(',').next()))
+                .map(|value| {
+                    value
+                        .to_str()
+                        .ok()
+                        .and_then(|value| value.split(',').next())
+                })
                 .map(|value| value.map(str::trim))
         };
         let host = match first("x-forwarded-host").or_else(|| first(header::HOST.as_str())) {
@@ -134,7 +139,10 @@ mod tests {
     /// Panics when a value is not a valid header value.
     fn headers(host: &str, proto: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, HeaderValue::from_str(host).expect("host value"));
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_str(host).expect("host value"),
+        );
         if let Some(proto) = proto {
             headers.insert(
                 "x-forwarded-proto",
@@ -153,7 +161,8 @@ mod tests {
     #[test]
     fn origin_is_the_host_with_the_forwarded_scheme() {
         let origin = |headers: &HeaderMap, authority| {
-            RequestOrigin::from_parts(headers, authority).map(|url| url.origin().ascii_serialization())
+            RequestOrigin::from_parts(headers, authority)
+                .map(|url| url.origin().ascii_serialization())
         };
         assert_eq!(
             origin(&headers("localhost:8080", None), None).as_deref(),
@@ -185,7 +194,11 @@ mod tests {
             Some("https://wyrd.example.com")
         );
         assert_eq!(origin(&HeaderMap::new(), None), None);
-        for host in ["evil.example/path", "user@wyrd.example.com", "wyrd.example.com?x=1"] {
+        for host in [
+            "evil.example/path",
+            "user@wyrd.example.com",
+            "wyrd.example.com?x=1",
+        ] {
             assert_eq!(origin(&headers(host, None), None), None, "{host}");
         }
     }

@@ -22,8 +22,8 @@ use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 
 use crate::auth::cli_login::page;
-use crate::auth::{RequestOrigin, auth_not_configured};
 use crate::auth::oauth::{GRANT_TYPES, OAuthError, OAuthForm};
+use crate::auth::{RequestOrigin, auth_not_configured};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -211,7 +211,10 @@ fn unique_param(query: &str, name: &str) -> Option<String> {
 
 /// `wyrd-ui`'s redirect URI on `origin`.
 fn ui_redirect_uri(origin: &Url) -> String {
-    format!("{}{UI_REDIRECT_PATH}", origin.origin().ascii_serialization())
+    format!(
+        "{}{UI_REDIRECT_PATH}",
+        origin.origin().ascii_serialization()
+    )
 }
 
 /// Redirect (`303`) to `authorization`'s redirect URI with `params` and the
@@ -366,7 +369,11 @@ mod pg_tests {
     ///
     /// # Panics
     /// Panics when the request cannot be built or answered.
-    async fn get_authorize_at(state: AppState, query: &str, host: &str) -> (StatusCode, Option<Url>) {
+    async fn get_authorize_at(
+        state: AppState,
+        query: &str,
+        host: &str,
+    ) -> (StatusCode, Option<Url>) {
         let response = axum::Router::new()
             .route("/auth/authorize", axum::routing::get(super::authorize))
             .with_state(state)

@@ -677,7 +677,6 @@ impl HumanConnections {
         })
     }
 
-
     /// Open one RLS tenant transaction through the runtime store.
     ///
     /// # Errors

@@ -152,8 +152,9 @@ export class BrowserSessions {
       undefined,
       client.None()
     );
-    // serverUrl() admits plaintext only for loopback.
-    if (new URL(server).protocol === 'http:') client.allowInsecureRequests(configuration);
+    // The authorization endpoint is the browser's own origin, `http:` when the
+    // deployment is served that way; serverUrl() admits plaintext only for loopback.
+    client.allowInsecureRequests(configuration);
     return configuration;
   }
 

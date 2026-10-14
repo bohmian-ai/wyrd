@@ -184,7 +184,7 @@ test('mock data must be explicitly enabled and never falls back when disabled', 
   >[0];
   try {
     for (const setting of ['false', '', undefined]) {
-      env.WYRD_UI_MOCK_DATA = setting;
+      (env as Record<string, string | undefined>).WYRD_UI_MOCK_DATA = setting;
       event.locals.wyrd = new WyrdClient(context, mockDataEnabled({ get: () => undefined }));
       expect(await homeLoad(event)).toMatchObject({
         home: null,

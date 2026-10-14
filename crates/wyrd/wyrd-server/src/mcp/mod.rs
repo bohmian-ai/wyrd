@@ -10,10 +10,10 @@
 //!
 //! The production catalog exposes three read-only Bifrost tools for table
 //! discovery, schema/layout description, and bounded terminal-safe queries,
-//! the Card read, Verification status, and Operator connection read tools,
-//! per-caller write tools for credential revocation, manual Verifier runs,
-//! and Operator connection management, plus the seventeen tenant gateway
-//! administration tools.
+//! the Card read, Verification status, Operator connection, and tenant
+//! gateway read tools, and per-caller write tools for credential revocation,
+//! manual Verifier runs, Operator connection management, and tenant gateway
+//! administration.
 //! A test-support context probe is available only through explicit fixture opt-in.
 
 use std::borrow::Cow;
@@ -151,7 +151,7 @@ impl WyrdMcpHandler {
         catalog.extend(cards::descriptors());
         catalog.extend(verification::descriptors_unscoped());
         catalog.extend(operators::descriptors_unscoped());
-        catalog.extend(gateway::descriptors());
+        catalog.extend(gateway::descriptors_unscoped());
         catalog.push(guide::descriptor());
         catalog
     }
@@ -192,6 +192,7 @@ impl ServerHandler for WyrdMcpHandler {
             .chain(principals::write_descriptors())
             .chain(verification::write_descriptors())
             .chain(operators::write_descriptors())
+            .chain(gateway::descriptors())
             .chain(self.probe_descriptors())
             .find(|tool| tool.name == name)
     }
@@ -221,6 +222,7 @@ impl ServerHandler for WyrdMcpHandler {
             if operators::may_manage(&caller) {
                 catalog.extend(operators::write_descriptors());
             }
+            catalog.extend(gateway::write_descriptors(&caller));
         }
         catalog.extend(self.probe_descriptors());
         // Protocol 2026-07-28 requires cache metadata on list results. The
@@ -429,7 +431,7 @@ pub(crate) fn wyrd_error_to_mcp(error: WyrdError) -> ErrorData {
 
 #[cfg(test)]
 mod tests {
-    use super::{WyrdMcpHandler, operators, principals, verification};
+    use super::{WyrdMcpHandler, gateway, operators, principals, verification};
 
     /// Top-level input keywords OpenAI function tools refuse, rejecting the
     /// whole tool list when any advertised tool carries one.
@@ -445,6 +447,7 @@ mod tests {
             .chain(principals::write_descriptors())
             .chain(verification::write_descriptors())
             .chain(operators::write_descriptors())
+            .chain(gateway::descriptors())
             .collect();
         assert!(catalog.iter().any(|tool| tool.name == operators::CREATE));
         for tool in &catalog {

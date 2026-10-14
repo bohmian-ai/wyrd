@@ -24,8 +24,9 @@ mod pg_tests {
     use wyrd_testing::bifrost::seed_query_fixture;
 
     /// The exact catalog an ordinary Wyrd server advertises over `/mcp` to a
-    /// caller that also holds tenant principal administration, `verifier:run`, and
-    /// `operators:write`: every read tool, then that caller's write tools.
+    /// caller that also holds tenant principal administration, `verifier:run`,
+    /// `operators:write`, `gateway:write`, and `gateway:delete`: every read
+    /// tool, then that caller's write tools.
     const ADVERTISED_TOOLS: [&str; 35] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
@@ -45,6 +46,13 @@ mod pg_tests {
         "gateway.get_capture_policy",
         "gateway.get_provider_credential",
         "gateway.get_provider_deployment",
+        "wyrd.guide",
+        "principals.revoke_credential",
+        "verification.start_run",
+        "verification.execute",
+        "operator_connections.create",
+        "operator_connections.update",
+        "operator_connections.disable",
         "gateway.put_provider_credential",
         "gateway.put_provider_deployment",
         "gateway.put_fallback_policy",
@@ -55,13 +63,6 @@ mod pg_tests {
         "gateway.delete_provider_deployment",
         "gateway.delete_fallback_policy",
         "gateway.delete_governance_policy",
-        "wyrd.guide",
-        "principals.revoke_credential",
-        "verification.start_run",
-        "verification.execute",
-        "operator_connections.create",
-        "operator_connections.update",
-        "operator_connections.disable",
     ];
 
     /// A bound MCP reader and the custom table used to execute guide examples.

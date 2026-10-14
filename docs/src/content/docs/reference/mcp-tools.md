@@ -14,7 +14,7 @@ The Wyrd server exposes its MCP tools over HTTP at `/mcp`. `wyrd mcp proxy` rela
 
 Every request is authenticated in the caller's tenant. Use `tools/list` for the current input and output JSON Schemas and effect annotations. Unknown fields in closed argument objects are refused. IDs and versions below are exact discovered values, not names inferred from a prompt.
 
-Read tools and `wyrd.guide` are always advertised. Principal revocation, verification execution/run creation, and Operator connection writes are advertised only to callers with their required write permission. Gateway writes remain in the catalog and enforce their explicit scopes when invoked. Advertising a tool grants no permission; naming a hidden write tool does not bypass authorization.
+Read tools and `wyrd.guide` are always advertised. Principal revocation, verification execution/run creation, Operator connection writes, and gateway writes, revocation, resets, and deletions are advertised only to callers with their required write or delete permission. Advertising a tool grants no permission; naming a hidden write tool does not bypass authorization.
 
 The tables below summarize wire shapes. Named shapes such as `ExecuteVerificationRequest` or `OperatorConnectionView` are the JSON Schemas `tools/list` returns for that tool; use them for every nested field, enum, and bound. A `{}` input means an empty argument object. Credentials and connection secrets are never returned.
 

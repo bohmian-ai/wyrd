@@ -1994,6 +1994,147 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       ],
       "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
     },
+    "JevNoulCriteria": {
+      "additionalProperties": false,
+      "description": "Outcome descriptions of a `noul` question.",
+      "properties": {
+        "false": {
+          "description": "When the answer is false.",
+          "type": "string"
+        },
+        "true": {
+          "description": "When the answer is true.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "false",
+        "true"
+      ],
+      "type": "object"
+    },
+    "JevQuestion": {
+      "description": "One keyed Jev question, tagged by its answer form.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Yes/no question answered with a probability that it holds.",
+          "properties": {
+            "criteria": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JevNoulCriteria"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional descriptions of the true and false outcomes."
+            },
+            "instructions": {
+              "description": "What to decide about the state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "noul"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "instructions",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Pick exactly one of the keyed options.",
+          "properties": {
+            "criteria": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Option name to its description.",
+              "type": "object"
+            },
+            "instructions": {
+              "description": "What to choose about the state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "choice"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "criteria",
+            "instructions",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Grade on an ordered scale whose levels are indexed from zero.",
+          "properties": {
+            "criteria": {
+              "description": "Level descriptions, lowest first.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "instructions": {
+              "description": "What to grade about the state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "score"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "criteria",
+            "instructions",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "JevRequest": {
+      "additionalProperties": false,
+      "description": "`POST /v1/systemone` request body.",
+      "properties": {
+        "model": {
+          "description": "Native Jev model, such as `jev-latest`.",
+          "type": "string"
+        },
+        "questions": {
+          "additionalProperties": {
+            "$ref": "#/definitions/JevQuestion"
+          },
+          "description": "Questions keyed by the name their answer returns under.",
+          "type": "object"
+        },
+        "state": {
+          "description": "Text the questions are about, such as an agent reply.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model",
+        "questions",
+        "state"
+      ],
+      "type": "object"
+    },
     "NotifyChannel": {
       "description": "Typed notification destinations.",
       "oneOf": [
@@ -4590,6 +4731,13 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
           "type": "string"
         },
         {
+          "description": "TypeSafe Jev provider.",
+          "enum": [
+            "jev"
+          ],
+          "type": "string"
+        },
+        {
           "additionalProperties": false,
           "description": "Provider not modeled by skald-spec.",
           "properties": {
@@ -4730,6 +4878,25 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
             "provider": {
               "enum": [
                 "vertex_predict"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "body",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "TypeSafe Jev `systemone` keyed questions about a state.",
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/JevRequest"
+            },
+            "provider": {
+              "enum": [
+                "jev_system_one"
               ],
               "type": "string"
             }
@@ -11493,6 +11660,147 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
       ],
       "type": "object"
     },
+    "JevNoulCriteria": {
+      "additionalProperties": false,
+      "description": "Outcome descriptions of a `noul` question.",
+      "properties": {
+        "false": {
+          "description": "When the answer is false.",
+          "type": "string"
+        },
+        "true": {
+          "description": "When the answer is true.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "false",
+        "true"
+      ],
+      "type": "object"
+    },
+    "JevQuestion": {
+      "description": "One keyed Jev question, tagged by its answer form.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Yes/no question answered with a probability that it holds.",
+          "properties": {
+            "criteria": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JevNoulCriteria"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional descriptions of the true and false outcomes."
+            },
+            "instructions": {
+              "description": "What to decide about the state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "noul"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "instructions",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Pick exactly one of the keyed options.",
+          "properties": {
+            "criteria": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Option name to its description.",
+              "type": "object"
+            },
+            "instructions": {
+              "description": "What to choose about the state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "choice"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "criteria",
+            "instructions",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Grade on an ordered scale whose levels are indexed from zero.",
+          "properties": {
+            "criteria": {
+              "description": "Level descriptions, lowest first.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "instructions": {
+              "description": "What to grade about the state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "score"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "criteria",
+            "instructions",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "JevRequest": {
+      "additionalProperties": false,
+      "description": "`POST /v1/systemone` request body.",
+      "properties": {
+        "model": {
+          "description": "Native Jev model, such as `jev-latest`.",
+          "type": "string"
+        },
+        "questions": {
+          "additionalProperties": {
+            "$ref": "#/definitions/JevQuestion"
+          },
+          "description": "Questions keyed by the name their answer returns under.",
+          "type": "object"
+        },
+        "state": {
+          "description": "Text the questions are about, such as an agent reply.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model",
+        "questions",
+        "state"
+      ],
+      "type": "object"
+    },
     "OpenAiAllowedTools": {
       "additionalProperties": false,
       "properties": {
@@ -13730,6 +14038,13 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
           "type": "string"
         },
         {
+          "description": "TypeSafe Jev provider.",
+          "enum": [
+            "jev"
+          ],
+          "type": "string"
+        },
+        {
           "additionalProperties": false,
           "description": "Provider not modeled by skald-spec.",
           "properties": {
@@ -13870,6 +14185,25 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
             "provider": {
               "enum": [
                 "vertex_predict"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "body",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "TypeSafe Jev `systemone` keyed questions about a state.",
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/JevRequest"
+            },
+            "provider": {
+              "enum": [
+                "jev_system_one"
               ],
               "type": "string"
             }
@@ -19302,6 +19636,147 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
       ],
       "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
     },
+    "JevNoulCriteria": {
+      "additionalProperties": false,
+      "description": "Outcome descriptions of a `noul` question.",
+      "properties": {
+        "false": {
+          "description": "When the answer is false.",
+          "type": "string"
+        },
+        "true": {
+          "description": "When the answer is true.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "false",
+        "true"
+      ],
+      "type": "object"
+    },
+    "JevQuestion": {
+      "description": "One keyed Jev question, tagged by its answer form.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Yes/no question answered with a probability that it holds.",
+          "properties": {
+            "criteria": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JevNoulCriteria"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional descriptions of the true and false outcomes."
+            },
+            "instructions": {
+              "description": "What to decide about the state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "noul"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "instructions",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Pick exactly one of the keyed options.",
+          "properties": {
+            "criteria": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Option name to its description.",
+              "type": "object"
+            },
+            "instructions": {
+              "description": "What to choose about the state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "choice"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "criteria",
+            "instructions",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Grade on an ordered scale whose levels are indexed from zero.",
+          "properties": {
+            "criteria": {
+              "description": "Level descriptions, lowest first.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "instructions": {
+              "description": "What to grade about the state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "score"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "criteria",
+            "instructions",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "JevRequest": {
+      "additionalProperties": false,
+      "description": "`POST /v1/systemone` request body.",
+      "properties": {
+        "model": {
+          "description": "Native Jev model, such as `jev-latest`.",
+          "type": "string"
+        },
+        "questions": {
+          "additionalProperties": {
+            "$ref": "#/definitions/JevQuestion"
+          },
+          "description": "Questions keyed by the name their answer returns under.",
+          "type": "object"
+        },
+        "state": {
+          "description": "Text the questions are about, such as an agent reply.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model",
+        "questions",
+        "state"
+      ],
+      "type": "object"
+    },
     "JsonPath": {
       "maxLength": 1024,
       "minLength": 1,
@@ -22378,6 +22853,13 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
           "type": "string"
         },
         {
+          "description": "TypeSafe Jev provider.",
+          "enum": [
+            "jev"
+          ],
+          "type": "string"
+        },
+        {
           "additionalProperties": false,
           "description": "Provider not modeled by skald-spec.",
           "properties": {
@@ -22518,6 +23000,25 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
             "provider": {
               "enum": [
                 "vertex_predict"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "body",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "TypeSafe Jev `systemone` keyed questions about a state.",
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/JevRequest"
+            },
+            "provider": {
+              "enum": [
+                "jev_system_one"
               ],
               "type": "string"
             }
@@ -25431,6 +25932,147 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
         }
       ],
       "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
+    },
+    "JevNoulCriteria": {
+      "additionalProperties": false,
+      "description": "Outcome descriptions of a `noul` question.",
+      "properties": {
+        "false": {
+          "description": "When the answer is false.",
+          "type": "string"
+        },
+        "true": {
+          "description": "When the answer is true.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "false",
+        "true"
+      ],
+      "type": "object"
+    },
+    "JevQuestion": {
+      "description": "One keyed Jev question, tagged by its answer form.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Yes/no question answered with a probability that it holds.",
+          "properties": {
+            "criteria": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JevNoulCriteria"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional descriptions of the true and false outcomes."
+            },
+            "instructions": {
+              "description": "What to decide about the state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "noul"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "instructions",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Pick exactly one of the keyed options.",
+          "properties": {
+            "criteria": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Option name to its description.",
+              "type": "object"
+            },
+            "instructions": {
+              "description": "What to choose about the state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "choice"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "criteria",
+            "instructions",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Grade on an ordered scale whose levels are indexed from zero.",
+          "properties": {
+            "criteria": {
+              "description": "Level descriptions, lowest first.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "instructions": {
+              "description": "What to grade about the state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "score"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "criteria",
+            "instructions",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "JevRequest": {
+      "additionalProperties": false,
+      "description": "`POST /v1/systemone` request body.",
+      "properties": {
+        "model": {
+          "description": "Native Jev model, such as `jev-latest`.",
+          "type": "string"
+        },
+        "questions": {
+          "additionalProperties": {
+            "$ref": "#/definitions/JevQuestion"
+          },
+          "description": "Questions keyed by the name their answer returns under.",
+          "type": "object"
+        },
+        "state": {
+          "description": "Text the questions are about, such as an agent reply.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model",
+        "questions",
+        "state"
+      ],
+      "type": "object"
     },
     "LlmRoute": {
       "description": "Workflow model-call route.\n\nResolution is `step.llm_route -> workflow.llm_route -> Native`. The Prompt remains the sole owner of provider, model, request fields, and response shape; the route only selects the execution boundary.",
@@ -28377,6 +29019,13 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "type": "string"
         },
         {
+          "description": "TypeSafe Jev provider.",
+          "enum": [
+            "jev"
+          ],
+          "type": "string"
+        },
+        {
           "additionalProperties": false,
           "description": "Provider not modeled by skald-spec.",
           "properties": {
@@ -28517,6 +29166,25 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
             "provider": {
               "enum": [
                 "vertex_predict"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "body",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "TypeSafe Jev `systemone` keyed questions about a state.",
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/JevRequest"
+            },
+            "provider": {
+              "enum": [
+                "jev_system_one"
               ],
               "type": "string"
             }

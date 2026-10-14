@@ -1,3 +1,5 @@
+import type { Span as AgentsSpan, SpanData, Trace, TracingProcessor } from "@openai/agents-core";
+import type { Context, Span as OtelSpan } from "@opentelemetry/api";
 import { DataType, Table, tableFromIPC, tableToIPC, type Field, type RecordBatch, type Schema } from "apache-arrow";
 import { createRequire } from "node:module";
 
@@ -2714,6 +2716,85 @@ export class Run {
       .active()
       .setValue(api.createContextKey("wyrd.run_scope"), [this.#native.subjectUid, this.#native.runId]);
     return api.context.with(scoped, fn);
+  }
+}
+
+/**
+ * An OpenAI Agents SDK trace processor that records each Agents SDK trace and
+ * span as an OpenTelemetry span on the global tracer provider.
+ *
+ * Pass it to the Agents SDK yourself (`setTraceProcessors` or
+ * `addTraceProcessor`); Wyrd never registers it. An SDK trace becomes a root
+ * span started in the active context, so inside {@link Run.scope} with
+ * {@link WyrdState.startTelemetry} running it carries the Run ID, and each SDK
+ * span becomes a child of its SDK parent. Generation and response spans carry
+ * the OpenTelemetry GenAI model and token attributes. Without
+ * `@opentelemetry/api` installed it records nothing.
+ */
+export class WyrdAgentsTraceProcessor implements TracingProcessor {
+  /** The OpenTelemetry span and its context for each open SDK trace or span, by SDK id. */
+  readonly #open = new Map<string, { readonly span: OtelSpan; readonly context: Context }>();
+
+  /** Start the root span for `trace` in the active context. */
+  async onTraceStart(trace: Trace): Promise<void> {
+    this.#start(trace.traceId, undefined, trace.name);
+  }
+
+  /** End the root span for `trace`. */
+  async onTraceEnd(trace: Trace): Promise<void> {
+    this.#end(trace.traceId);
+  }
+
+  /** Start a child of `span`'s SDK parent, or of its trace when it has none. */
+  async onSpanStart(span: AgentsSpan<SpanData>): Promise<void> {
+    const data = span.spanData;
+    this.#start(span.spanId, span.parentId ?? span.traceId, "name" in data ? data.name : data.type);
+  }
+
+  /** Record `span`'s GenAI attributes and error, then end it. */
+  async onSpanEnd(span: AgentsSpan<SpanData>): Promise<void> {
+    const open = this.#open.get(span.spanId);
+    if (open !== undefined) {
+      const data = span.spanData;
+      const call = data.type === "generation" ? data : data.type === "response" ? data._response : undefined;
+      const attributes = {
+        "gen_ai.request.model": call?.model,
+        "gen_ai.usage.input_tokens": call?.usage?.input_tokens,
+        "gen_ai.usage.output_tokens": call?.usage?.output_tokens,
+      };
+      for (const [key, value] of Object.entries(attributes)) {
+        if (value !== undefined) {
+          open.span.setAttribute(key, value);
+        }
+      }
+      if (span.error !== null) {
+        open.span.setStatus({ code: 2 /* SpanStatusCode.ERROR */, message: span.error.message });
+      }
+    }
+    this.#end(span.spanId);
+  }
+
+  /** Nothing to release: spans export through the application's tracer provider. */
+  async shutdown(): Promise<void> {}
+
+  /** Nothing to flush: spans export through the application's tracer provider. */
+  async forceFlush(): Promise<void> {}
+
+  /** Start the span for SDK id `id` under SDK id `parent`, or the active context when it is not open. */
+  #start(id: string, parent: string | undefined, name: string): void {
+    const api = otel();
+    if (api === null) {
+      return;
+    }
+    const parentContext = (parent !== undefined ? this.#open.get(parent)?.context : undefined) ?? api.context.active();
+    const span = api.trace.getTracer("wyrd.agents").startSpan(name, undefined, parentContext);
+    this.#open.set(id, { span, context: api.trace.setSpan(parentContext, span) });
+  }
+
+  /** End and forget the span for SDK id `id`, if it is open. */
+  #end(id: string): void {
+    this.#open.get(id)?.span.end();
+    this.#open.delete(id);
   }
 }
 

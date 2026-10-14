@@ -120,7 +120,10 @@ impl EvalEngine {
 
     /// Execute one claimed Eval run of `tenant` under `spec`.
     ///
-    /// Reads the frozen record, samples it before any trace or task work
+    /// Reads the frozen record and, when it carries a trace and span, links
+    /// the current execution span to that observation span (a link, not a
+    /// parent, so the run keeps its own trace). It then samples the record
+    /// before any trace or task work
     /// (a sampled-out record completes inconclusive with an empty report),
     /// waits for its trace when a trace task needs it, then scores it and maps
     /// the report to the common verdict. Read, sampling, and scoring failures
@@ -177,6 +180,9 @@ impl EvalEngine {
                 return error.outcome(run_id, RECORD_UNAVAILABLE, "the Eval record cannot be read");
             }
         };
+        if let (Some(trace_id), Some(span_id)) = (&record.trace_id, &record.span_id) {
+            wyrd_telemetry::link_remote_span(&tracing::Span::current(), trace_id, span_id);
+        }
         match sampled(run, spec, record_id, &record.context) {
             Ok(true) => {}
             Ok(false) => {

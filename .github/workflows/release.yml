@@ -466,14 +466,17 @@ jobs:
         with:
           subject-path: dist/typescript-*/*.tgz
 
+      # npm trusted publishing authenticates with this job's OIDC token and
+      # needs npm 11.5.1 or newer; each package names release.yml and the
+      # release environment as its trusted publisher on npmjs.com.
+      - run: npm install -g npm@latest
+
       - name: Publish addons, then the root package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for addon in dist/typescript-*/wyrd-ai-*-*.tgz; do
-            npm publish "$addon" --access public --provenance
+            npm publish "$addon" --access public
           done
-          npm publish dist/typescript-linux-x64-gnu/wyrd-ai-0.0.1.tgz --access public --provenance
+          npm publish dist/typescript-linux-x64-gnu/wyrd-ai-0.0.1.tgz --access public
 
   # ── Server binary + Docker ─────────────────────────────────────────────────
 

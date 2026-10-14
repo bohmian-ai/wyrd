@@ -97,6 +97,8 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
         with:
           docker-images: "false"
+          # azure/login and the tests' credential both shell out to `az`.
+          large-packages: "false"
 
       - name: Authenticate to Azure (OIDC)
         uses: azure/login@v3
@@ -108,4 +110,6 @@ jobs:
       - name: Run Azure cloud tests
         env:
           WYRD_STORAGE_URL: az://${{ secrets.AZURE_CLOUD_ACCOUNT_NAME }}/${{ secrets.AZURE_CLOUD_CONTAINER_NAME }}
+          # object_store reads this and takes its token from the azure/login session.
+          AZURE_USE_AZURE_CLI: "true"
         run: mise run test:storage:azure:cloud

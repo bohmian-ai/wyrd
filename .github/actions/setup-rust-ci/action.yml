@@ -15,6 +15,9 @@ inputs:
   tool-cache:
     description: Let free-disk-space remove the hosted-tool cache.
     default: "true"
+  large-packages:
+    description: Let free-disk-space remove large apt packages, including azure-cli. Set false when the job needs `az`.
+    default: "true"
   cache-key:
     description: >-
       The shared Rust cache this job restores. Jobs that build the same graph
@@ -49,7 +52,7 @@ runs:
         android: true
         dotnet: true
         haskell: true
-        large-packages: true
+        large-packages: ${{ inputs.large-packages }}
         docker-images: ${{ inputs.docker-images }}
         swap-storage: true
 
@@ -84,7 +87,7 @@ runs:
         cache-on-failure: true
 
     - name: Use GNU BFD linker on Linux
-      if: inputs.bfd-linker == 'true' && runner.os == 'Linux'
+      if: inputs.bfd-linker == 'true' && runner.os == 'Linux' && runner.arch == 'X64'
       shell: bash
       run: |
         command -v cc

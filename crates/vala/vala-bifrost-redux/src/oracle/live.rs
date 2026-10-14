@@ -385,7 +385,10 @@ impl ExecutionPlan for LiveScribeExec {
     /// Every filter is reported unsupported, so the leader's `FilterExec`
     /// stays above the leaf. Dynamic filters, which join and `TopK` operators
     /// update while the query runs, are left to the leader: a fragment could
-    /// only carry a stale copy of one.
+    /// only carry a stale copy of one. So are filters reading an uncorrelated
+    /// scalar subquery, such as `id = (SELECT max(id) ...)`: the subquery's
+    /// value lives in the leader's `ScalarSubqueryExec`, so the expression
+    /// cannot be decoded or evaluated on a Scribe.
     ///
     /// # Errors
     /// Never returns an error; the signature is fixed by the trait.
@@ -400,6 +403,7 @@ impl ExecutionPlan for LiveScribeExec {
             .iter()
             .map(|filter| &filter.filter)
             .filter(|filter| !DynamicFilterTracking::classify(filter).contains_dynamic_filter())
+            .filter(|filter| !reads_scalar_subquery(filter))
             .cloned()
             .chain(self.predicate.iter().cloned())
             .collect::<Vec<_>>();
@@ -500,6 +504,22 @@ impl ExecutionPlan for LiveScribeExec {
             read.into_stream(),
         )))
     }
+}
+
+/// Reports whether `filter` reads an uncorrelated scalar subquery's result.
+///
+/// Such a filter can only run where its `ScalarSubqueryExec` runs, which is
+/// the leader, so the live leaf never ships it in a fragment. The walk never
+/// fails; were it to, the filter is conservatively treated as reading one and
+/// stays on the leader.
+fn reads_scalar_subquery(filter: &Arc<dyn PhysicalExpr>) -> bool {
+    filter
+        .exists(|node| {
+            Ok(node
+                .downcast_ref::<datafusion::physical_expr::scalar_subquery::ScalarSubqueryExpr>()
+                .is_some())
+        })
+        .unwrap_or(true)
 }
 
 /// Physical optimizer rule that keeps published work distributable beside a live leaf.

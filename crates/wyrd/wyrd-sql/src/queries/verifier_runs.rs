@@ -27,6 +27,7 @@ use wyrd_spec::card::operator::{MAX_SUMMARY_CHARS, VerifierCounts};
 use wyrd_spec::ids::{
     BindingId, CardUid, OperatorDispatchId, VerificationResultId, VerificationRunId,
 };
+use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::verification::{
     DriftWindow, FrozenTarget, OperatorDispatchState, VerificationBindingStatus, VerificationError,
     VerificationRunStatus, VerificationRunTarget, VerificationVerdict, VerifierReadiness,
@@ -90,7 +91,7 @@ const INSERT_RUN_SQL: &str = r"
         origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
         window_start, window_end, input_record_id, input_event_time,
         requested_by_principal_id, max_attempts, next_attempt_at, created_at, updated_at,
-        idempotency_key, request_sha256, observation_ordinal
+        idempotency_key, request_sha256, observation_ordinal, cause_trace_id, cause_span_id
     ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, $10,
               $11, $12, $13, $14,
               CASE WHEN $5 = 'manual' THEN $15::uuid ELSE (
@@ -103,7 +104,7 @@ const INSERT_RUN_SQL: &str = r"
                   SELECT COALESCE(max(observation_ordinal), 0) + 1
                     FROM wyrd.verifier_runs
                    WHERE binding_id = $7 AND origin = 'observation'
-              ) END)
+              ) END, $19, $20)
     ON CONFLICT DO NOTHING
     RETURNING run_id
 ";
@@ -304,6 +305,7 @@ const CLAIM_RUN_SQL: &str = r"
               r.trigger_digest, r.window_start, r.window_end, r.input_record_id,
               r.input_event_time, r.requested_by_principal_id, r.attempts,
               r.max_attempts, r.lease_expires_at, r.observation_ordinal,
+              r.cause_trace_id, r.cause_span_id,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - r.created_at)
@@ -584,6 +586,9 @@ pub enum RunRequest {
         target: VerificationRunTarget,
         /// Validated Drift window.
         window: DriftWindow,
+        /// Trace and span of the request that enqueued the run, which its
+        /// execution links to; `None` when the request had no recorded span.
+        cause: Option<(TraceId, SpanId)>,
     },
     /// One due cron occurrence of a scheduled binding.
     Scheduled {
@@ -651,6 +656,15 @@ impl RunRequest {
     const fn requested_by(&self) -> Option<PrincipalId> {
         match self {
             Self::Manual { requested_by, .. } => Some(*requested_by),
+            Self::Scheduled { .. } | Self::Observation { .. } => None,
+        }
+    }
+
+    /// The enqueuing request's span a manual run's execution links to; internal
+    /// runs have none.
+    const fn cause(&self) -> Option<&(TraceId, SpanId)> {
+        match self {
+            Self::Manual { cause, .. } => cause.as_ref(),
             Self::Scheduled { .. } | Self::Observation { .. } => None,
         }
     }
@@ -812,6 +826,10 @@ pub struct ClaimedRun {
     /// at enqueue; `None` for scheduled and manual runs. Eval's `every_nth`
     /// sampling selects on it, so every attempt reaches the same decision.
     pub observation_ordinal: Option<u64>,
+    /// Trace and span of the request that enqueued a manual run, which the
+    /// attempt links to without adopting as its parent; `None` for internal
+    /// runs and manual runs enqueued without a recorded span.
+    pub cause: Option<(TraceId, SpanId)>,
     /// How long the run had been claimable when this claim took it: the
     /// claim statement's PostgreSQL instant less the run's due time, or its
     /// lease expiry for a reclaim. Telemetry only; never a coordination input.
@@ -1020,19 +1038,21 @@ impl VerifierRunQueue {
     /// [`ManualEnqueueOutcome::Replayed`] when the request digest matches and
     /// [`ManualEnqueueOutcome::KeyReused`] when it does not. Only an unused
     /// key reaches the shared enqueue path, which stores the key and digest on
-    /// the new run. Refusals write nothing, so a refused key stays unused. The
-    /// caller commits.
+    /// the new run, beside `cause`, the enqueuing request's span the run's
+    /// execution links to. Refusals write nothing, so a refused key stays
+    /// unused. The caller commits.
     ///
     /// # Errors
     /// Returns the database error when the lock, a read, or the insert fails,
     /// or a decode error when stored identities are malformed.
-    #[tracing::instrument(skip(self, conn, target, key), fields(operation = "verification.runs.enqueue_manual", keyed = key.is_some()))]
+    #[tracing::instrument(skip(self, conn, target, cause, key), fields(operation = "verification.runs.enqueue_manual", keyed = key.is_some()))]
     pub async fn enqueue_manual(
         &self,
         conn: &mut TenantConn<'_>,
         requested_by: PrincipalId,
         target: &VerificationRunTarget,
         window: DriftWindow,
+        cause: Option<(TraceId, SpanId)>,
         key: Option<RequestKey<'_>>,
     ) -> Result<ManualEnqueueOutcome, SqlxError> {
         if let Some(key) = key {
@@ -1060,6 +1080,7 @@ impl VerifierRunQueue {
             requested_by,
             target: target.clone(),
             window,
+            cause,
         };
         Ok(match self.insert(conn, &request, key).await? {
             EnqueueOutcome::Enqueued(run_id) | EnqueueOutcome::AlreadyEnqueued(run_id) => {
@@ -1191,6 +1212,12 @@ impl VerifierRunQueue {
             .bind(self.retry.max_attempts)
             .bind(key.map(|key| key.key))
             .bind(key.map(|key| key.request_sha256))
+            .bind(
+                request
+                    .cause()
+                    .map(|(trace, _)| trace.as_bytes().as_slice()),
+            )
+            .bind(request.cause().map(|(_, span)| span.as_bytes().as_slice()))
             .fetch_optional(&mut **conn.transaction())
             .await?;
         if let Some(run_id) = inserted {
@@ -1935,6 +1962,10 @@ struct ClaimedRunRow {
     lease_expires_at: DateTime<Utc>,
     /// Stored observation ordinal.
     observation_ordinal: Option<i64>,
+    /// Enqueuing request's trace id, 16 bytes, for a manual run.
+    cause_trace_id: Option<Vec<u8>>,
+    /// Enqueuing request's span id, 8 bytes, for a manual run.
+    cause_span_id: Option<Vec<u8>>,
     /// Milliseconds the run was claimable before this claim.
     queue_wait_ms: i64,
     /// Milliseconds since the run was created.
@@ -2009,6 +2040,13 @@ impl ClaimedRunRow {
             queue_wait: std::time::Duration::from_millis(stored(u64::try_from(
                 self.queue_wait_ms,
             ))?),
+            cause: match (self.cause_trace_id, self.cause_span_id) {
+                (Some(trace), Some(span)) => Some((
+                    stored(TraceId::from_bytes(fixed_width(trace)?))?,
+                    stored(SpanId::from_bytes(fixed_width(span)?))?,
+                )),
+                _ => None,
+            },
             age: std::time::Duration::from_millis(stored(u64::try_from(self.age_ms))?),
             system_principal: self.system_principal_id.map(PrincipalId::new),
             verifier_present: self
@@ -2106,6 +2144,17 @@ pub(crate) fn settlement(rows_affected: u64) -> Settlement {
 ///
 /// # Errors
 /// Returns [`SqlxError::Decode`] wrapping `value`'s error.
+/// Convert stored identifier bytes into the fixed-width array of `N` bytes.
+///
+/// # Errors
+/// Returns [`SqlxError::Decode`] when the column holds a different width,
+/// which the table's width check precludes.
+fn fixed_width<const N: usize>(bytes: Vec<u8>) -> Result<[u8; N], SqlxError> {
+    bytes
+        .try_into()
+        .map_err(|_| SqlxError::Decode(format!("a stored identifier is not {N} bytes").into()))
+}
+
 pub(crate) fn stored<T, E>(value: Result<T, E>) -> Result<T, SqlxError>
 where
     E: StdError + Send + Sync + 'static,

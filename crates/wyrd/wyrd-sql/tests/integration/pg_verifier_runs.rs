@@ -392,6 +392,7 @@ fn manual_binding(requester: &Principal, binding_id: BindingId) -> RunRequest {
         requested_by: requester.id,
         target: VerificationRunTarget::Binding { binding_id },
         window: window(),
+        cause: None,
     }
 }
 
@@ -455,6 +456,7 @@ async fn manual_enqueue_freezes_binding_and_direct_identities() {
             subject_card_uid: owner.clone(),
         },
         window: window(),
+        cause: None,
     };
     let direct = enqueued(
         queue
@@ -530,6 +532,7 @@ async fn enqueue_refuses_unrunnable_targets_without_writing() {
             subject_card_uid: subject.clone(),
         },
         window: window(),
+        cause: None,
     };
 
     let cases = [
@@ -614,7 +617,14 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
     };
 
     let first = queue
-        .enqueue_manual(&mut conn, actor.id, &target, window(), Some(key(b"a")))
+        .enqueue_manual(
+            &mut conn,
+            actor.id,
+            &target,
+            window(),
+            None,
+            Some(key(b"a")),
+        )
         .await
         .expect("keyed run enqueues");
     let ManualEnqueueOutcome::Enqueued(run_id) = first else {
@@ -622,14 +632,28 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
     };
     assert_eq!(
         queue
-            .enqueue_manual(&mut conn, actor.id, &target, window(), Some(key(b"a")))
+            .enqueue_manual(
+                &mut conn,
+                actor.id,
+                &target,
+                window(),
+                None,
+                Some(key(b"a"))
+            )
             .await
             .expect("replay answers"),
         ManualEnqueueOutcome::Replayed(run_id)
     );
     assert_eq!(
         queue
-            .enqueue_manual(&mut conn, actor.id, &target, window(), Some(key(b"b")))
+            .enqueue_manual(
+                &mut conn,
+                actor.id,
+                &target,
+                window(),
+                None,
+                Some(key(b"b"))
+            )
             .await
             .expect("conflict answers"),
         ManualEnqueueOutcome::KeyReused(run_id)
@@ -644,7 +668,14 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
     assert_eq!(stored, (Some("retry-1".to_owned()), Some(b"a".to_vec())));
 
     let other_run = queue
-        .enqueue_manual(&mut conn, other.id, &target, window(), Some(key(b"a")))
+        .enqueue_manual(
+            &mut conn,
+            other.id,
+            &target,
+            window(),
+            None,
+            Some(key(b"a")),
+        )
         .await
         .expect("other requester enqueues");
     assert!(matches!(other_run, ManualEnqueueOutcome::Enqueued(id) if id != run_id));
@@ -658,7 +689,14 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
     for _ in 0..2 {
         assert_eq!(
             queue
-                .enqueue_manual(&mut conn, actor.id, &unready, window(), Some(refused_key))
+                .enqueue_manual(
+                    &mut conn,
+                    actor.id,
+                    &unready,
+                    window(),
+                    None,
+                    Some(refused_key)
+                )
                 .await
                 .expect("refusal answers"),
             ManualEnqueueOutcome::Refused(EnqueueRefusal::NotReady(
@@ -1539,6 +1577,7 @@ async fn failed_binding_runs_dispatch_each_distinct_operator_once() {
             subject_card_uid: owner.clone(),
         },
         window: window(),
+        cause: None,
     };
 
     let mut settled = Vec::new();

@@ -2654,3 +2654,118 @@ async fn direct_task_judgment_records_one_correlated_result() -> Result<(), Serv
     server.shutdown().await?;
     Ok(())
 }
+
+/// An observation-triggered Eval judges a record through the gateway, which
+/// captures call metadata, and the judge call is attributed from the run's context: the captured gateway call
+/// carries the observed subject Card as `card_uid` and the observation's
+/// application Run as `run_id`, and the run's result joins its judge call on
+/// `subject_card_uid` = `card_uid`.
+///
+/// # Errors
+/// Returns server, registration, SDK lifetime, storage, runtime, or query
+/// errors.
+///
+/// # Panics
+/// Panics when the run does not pass, or the call's attribution or the
+/// result's join differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn observation_judge_call_records_card_and_run_and_joins_its_result()
+-> Result<(), ServerJourneyError> {
+    let root = tempfile::tempdir()?;
+    let service = write_graph(root.path());
+    std::fs::write(
+        &service,
+        "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: eval-service\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: agent\n      ref: ./agent.yaml\n      verified_by:\n        - verifier: ./gated.yaml\n          runs_on: {kind: observations_ready}\n",
+    )?;
+    let bundle = root.path().join("bundle");
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl_eval", "object": "chat.completion", "created": 1_700_000_000,
+            "model": "gpt-test",
+            "choices": [{ "index": 0, "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+        })))
+        .mount(&provider)
+        .await;
+    let server = Box::pin(gateway_server(&provider)).await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let admin = api_key(
+        server
+            .bootstrap_service("eval_attribution_admin", &["admin"])
+            .await?,
+    );
+    server
+        .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
+        .await?;
+    let admin_client = connect(&server, &admin);
+    wyrd_client::gateway::Gateway::with_client(admin_client.clone())
+        .put_capture_policy(&wyrd_spec::gateway::GatewayCapturePolicyWrite {
+            mode: wyrd_spec::gateway::GatewayCaptureMode::Metadata,
+            payload_fields: std::collections::BTreeSet::new(),
+        })
+        .await?;
+    let receipt = register(&admin_client, &service, &bundle).await;
+    let writer = api_key(
+        server
+            .credential_registered_service(&receipt.root, &[JUDGE_ROLE])
+            .await?,
+    );
+    let state = start_state(&bundle, &connect(&server, &writer)).await;
+    let agent = state.run().for_card("agent")?;
+    let agent_uid = agent.subject().uid.clone().ok_or("agent has no UID")?;
+    let run_id = agent.run_id().to_string();
+    let object = format!("{tenant}/cards/{agent_uid}/shot.png");
+    server
+        .state()
+        .storage
+        .put_object(&tenant_path::validate(&object, tenant)?, IMAGE.to_vec())
+        .await?;
+    emit(
+        &agent,
+        &json!({ "answer": "yes", "marker": "attributed" }),
+        Some(&media(&format!("file:///{object}"))),
+        None,
+    );
+    state.shutdown().await?;
+    server.flush_bifrost().await?;
+
+    let (stop, task) = spawn_runtime(&server);
+    let runs = settle(&seed, 1).await;
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    server.flush_bifrost().await?;
+    let record = record_id(&server, tenant, "attributed").await?;
+    let run = run_of(&runs?, "eval-gated", &record)?.clone();
+    assert_completed(&server, tenant, &run, "passed", (2, 0), 0).await?;
+
+    let calls = texts(
+        &query(
+            &server,
+            tenant,
+            "SELECT concat(card_uid, '|', run_id) FROM vala.gateway.calls".to_owned(),
+        )
+        .await?,
+    )?;
+    assert_eq!(calls, [Some(format!("{agent_uid}|{run_id}"))]);
+    let result = run.state.result_id.ok_or("the run has a result")?;
+    let joined = texts(
+        &query(
+            &server,
+            tenant,
+            format!(
+                "SELECT c.run_id FROM vala.verification.results r \
+                   JOIN vala.gateway.calls c ON c.card_uid = r.subject_card_uid \
+                  WHERE r.result_id = '{result}'"
+            ),
+        )
+        .await?,
+    )?;
+    assert_eq!(joined, [Some(run_id)]);
+    server.shutdown().await?;
+    Ok(())
+}

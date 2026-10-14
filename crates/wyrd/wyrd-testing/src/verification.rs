@@ -569,6 +569,7 @@ impl VerificationFixture {
                         subject_card_uid: subject.clone(),
                     },
                     window,
+                    cause: None,
                 },
             )
             .await?;

@@ -20,7 +20,7 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::AuditOutcome;
-use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::verification::DriftWindow;
 use wyrd_spec::verification::{
     ExecuteVerificationRequest, Judgment, StartVerificationRunRequest, VerificationBindingStatus,
@@ -281,7 +281,8 @@ impl<'a> VerificationControl<'a> {
     /// transaction never touches the tenant audit chain and the request never
     /// waits for the audit commit. A request carrying `key` replays the
     /// requester's earlier run for the same body and is refused for a
-    /// different one.
+    /// different one. The run stores the current span, inside this request,
+    /// as its cause, so its later execution links back to the request.
     ///
     /// # Errors
     /// Returns [`WyrdError::VerificationInvalidWindow`] for an invalid window,
@@ -358,6 +359,12 @@ impl<'a> VerificationControl<'a> {
             key: key.as_str(),
             request_sha256: &digest,
         });
+        let cause = wyrd_telemetry::current_context().and_then(|context| {
+            Some((
+                TraceId::from_hex(&context.trace_id).ok()?,
+                SpanId::from_hex(&context.span_id).ok()?,
+            ))
+        });
         let outcome = self
             .queue
             .enqueue_manual(
@@ -365,6 +372,7 @@ impl<'a> VerificationControl<'a> {
                 caller.principal.id,
                 &request.target,
                 request.input.drift_window(),
+                cause,
                 request_key,
             )
             .await

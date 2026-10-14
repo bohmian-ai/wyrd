@@ -28,3 +28,14 @@ $$;
 ALTER TABLE wyrd.verifier_runs
     ADD CONSTRAINT verifier_runs_manual_requester_check
     CHECK (origin <> 'manual' OR requested_by_principal_id IS NOT NULL);
+
+-- A manual run records the span of the request that enqueued it, so its
+-- execution, which runs later in a trace of its own, links to its cause.
+-- Internal runs have no enqueuing request and record none.
+ALTER TABLE wyrd.verifier_runs
+    ADD COLUMN cause_trace_id BYTEA,
+    ADD COLUMN cause_span_id BYTEA,
+    ADD CONSTRAINT verifier_runs_cause_check CHECK (
+        (cause_trace_id IS NULL AND cause_span_id IS NULL)
+        OR (octet_length(cause_trace_id) = 16 AND octet_length(cause_span_id) = 8)
+    );

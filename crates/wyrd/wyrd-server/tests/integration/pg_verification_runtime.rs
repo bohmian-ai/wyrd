@@ -2885,3 +2885,105 @@ async fn eval_judge_gateway_call_descends_from_the_request_span() {
         assert_eq!(names.last(), Some(&"request"), "{kind}: {names:?}");
     }
 }
+
+/// A manually enqueued run records the span of the request that enqueued it,
+/// and the runner's later attempt links to that span without adopting it as
+/// a parent: the attempt keeps its own trace, and the enqueuing request's
+/// trace continues the caller's `traceparent`.
+///
+/// # Panics
+/// Panics when telemetry, the server, seeding, or the runtime fails, the run
+/// is not accepted or never leaves the queue, or the attempt is parented by
+/// the request or does not link to it.
+#[tokio::test]
+async fn manual_run_links_to_its_enqueuing_request() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let harness = Harness::start().await;
+    let verifier = harness
+        .seed
+        .custom_drift_verifier("linked-drift", "score", 1.0, 0.5)
+        .await
+        .expect("profiled verifier registers");
+    let wyrd_testing::Bootstrap::User { jwt, .. } = harness
+        .server
+        .bootstrap_user("linked-run-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
+    let checkpoint = traces.checkpoint();
+    let body = serde_json::json!({
+        "target": { "kind": "verifier", "verifier_uid": verifier,
+                    "subject_card_uid": harness.subject },
+        "input": { "kind": "drift_window", "start": "2026-09-17T00:00:00Z",
+                   "end": "2026-09-17T01:00:00Z" },
+    });
+    let response = harness
+        .server
+        .oneshot_authenticated(
+            &jwt,
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/verification/runs")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    "traceparent",
+                    format!("00-{JUDGE_CALLER_TRACE}-b7ad6b7169203333-01"),
+                )
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("run request builds"),
+        )
+        .await
+        .expect("run request responds");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("run body reads");
+    let accepted: serde_json::Value = serde_json::from_slice(&bytes).expect("run body is JSON");
+    let run_id = accepted["run_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the run is accepted: {accepted}"))
+        .to_owned();
+    harness
+        .wait_run(run_id.parse().expect("the run id parses"), |row| {
+            !matches!(row.status.as_str(), "pending" | "running" | "retrying")
+        })
+        .await;
+    runtime.stop().await;
+
+    let spans = traces.finished_since(checkpoint);
+    let attempt = spans
+        .iter()
+        .find(|span| {
+            span.name == "verification.attempt" && span.attributes.get("run_id") == Some(&run_id)
+        })
+        .unwrap_or_else(|| panic!("the run's attempt is recorded: {spans:#?}"));
+    assert_ne!(attempt.trace_id, JUDGE_CALLER_TRACE, "{attempt:#?}");
+    let [(trace_id, span_id)] = attempt.links.as_slice() else {
+        panic!("the attempt links once to its cause: {attempt:#?}");
+    };
+    assert_eq!(trace_id, JUDGE_CALLER_TRACE, "{attempt:#?}");
+    let cause = spans
+        .iter()
+        .find(|span| span.trace_id == *trace_id && span.span_id == *span_id)
+        .unwrap_or_else(|| panic!("the linked span is the enqueuing request's: {spans:#?}"));
+    let request = spans
+        .iter()
+        .find(|span| span.name == "request" && span.trace_id == JUDGE_CALLER_TRACE)
+        .unwrap_or_else(|| panic!("the enqueuing request continues the caller: {spans:#?}"));
+    let mut ancestor = Some(cause);
+    while let Some(span) = ancestor
+        && span.span_id != request.span_id
+    {
+        ancestor = spans.iter().find(|parent| {
+            parent.trace_id == span.trace_id && parent.span_id == span.parent_span_id
+        });
+    }
+    assert!(
+        ancestor.is_some(),
+        "the linked span lies inside the enqueuing request: {cause:#?}"
+    );
+}

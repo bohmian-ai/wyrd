@@ -34,6 +34,7 @@ use arrow::ipc::writer::StreamWriter;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::cluster::ClusterRegistry;
@@ -120,6 +121,10 @@ pub enum ScribeWrite {
         /// its tenant may see; boxed so the enum stays as small as its
         /// pointer variants.
         spans: Box<ResourceSpans>,
+        /// The span's share of [`TENANT_SPAN_PERMITS`], held while the copy
+        /// is staged or retried and released once it is written, consumed,
+        /// or abandoned.
+        permit: OwnedSemaphorePermit,
     },
 }
 
@@ -213,7 +218,9 @@ impl ScribeWrite {
                     })
                 })
                 .collect(),
-            Self::ServerSpans { principal, spans } => Ok(vec![Rows {
+            Self::ServerSpans {
+                principal, spans, ..
+            } => Ok(vec![Rows {
                 table: ScribeTable::Spans,
                 attribution: None,
                 request: None,
@@ -630,31 +637,51 @@ impl ScribeRoute {
     }
 }
 
+/// Most tenant span copies one process holds unwritten at once.
+///
+/// The outbox queue itself is unbounded; this caps only the span producer, so
+/// a sustained Scribe outage cannot grow the heap without limit while audit,
+/// capture, and result writes keep their own semantics.
+const TENANT_SPAN_PERMITS: usize = 2_048;
+
 /// Stages the tenant copies of server spans on the process Scribe outbox.
 ///
 /// Telemetry hands each copy over as its span ends, already reduced to the
 /// tenant's safe fields; staging returns at once, so a slow or unavailable
-/// Scribe never reaches the request.
+/// Scribe never reaches the request. Each staged copy holds one of
+/// [`TENANT_SPAN_PERMITS`]; when none is free the copy is dropped and counted
+/// lost instead of waiting.
 pub(crate) struct ServerSpanSink {
     /// The process outbox every Scribe write is staged on.
     outbox: Arc<ScribeOutbox>,
+    /// Permits for copies staged and not yet written, consumed, or abandoned.
+    permits: Arc<Semaphore>,
 }
 
 impl ServerSpanSink {
-    /// Stages copies on `outbox`.
-    pub(crate) const fn new(outbox: Arc<ScribeOutbox>) -> Self {
-        Self { outbox }
+    /// Stages copies on `outbox` under a full permit pool.
+    pub(crate) fn new(outbox: Arc<ScribeOutbox>) -> Self {
+        Self {
+            outbox,
+            permits: Arc::new(Semaphore::new(TENANT_SPAN_PERMITS)),
+        }
     }
 }
 
 impl wyrd_telemetry::TenantSpanSink for ServerSpanSink {
-    /// Stages one copy for the route's tenant under its principal.
+    /// Stages one copy for the route's tenant under its principal, or drops
+    /// and counts it lost when every permit is held.
     fn stage(&self, route: wyrd_telemetry::TenantSpanRoute, span: ResourceSpans) {
+        let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+            count_lost::<ScribeSink>(1);
+            return;
+        };
         self.outbox.stage(
             route.tenant,
             ScribeWrite::ServerSpans {
                 principal: route.principal,
                 spans: Box::new(span),
+                permit,
             },
         );
     }
@@ -1003,9 +1030,12 @@ mod tests {
     };
     use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, IngestCaptureResponse};
 
+    use wyrd_telemetry::{TenantSpanRoute, TenantSpanSink as _};
+    use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
     use super::{
         Outbox, SCRIBE_WRITERS, ScribeOutbox, ScribePeers, ScribeRefusal, ScribeRoute, ScribeSink,
-        ScribeWrite, VerifierAttribution, frame_budget,
+        ScribeWrite, ServerSpanSink, TENANT_SPAN_PERMITS, VerifierAttribution, frame_budget,
     };
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};
@@ -1284,6 +1314,25 @@ mod tests {
     /// Scribe to take it.
     #[tokio::test]
     async fn a_peer_route_needs_no_oracle() {
+        let outbox = outage_outbox();
+        assert!(outbox.sink().reaches_scribe());
+        let tenant = DataTenantId::new_v7();
+        outbox.stage(tenant, capture(tenant));
+        let soon = Instant::now() + Duration::from_millis(200);
+        assert_eq!(
+            outbox.settle(soon).await,
+            1,
+            "a write waits for a ready Scribe"
+        );
+    }
+
+    /// An outbox routed over the peer plane while membership names no ready
+    /// Scribe: a sustained outage in which every write stays pending.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no peer route is selected.
+    fn outage_outbox() -> Arc<ScribeOutbox> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused.invalid/none")
             .expect("lazy pool builds without connecting");
@@ -1299,16 +1348,85 @@ mod tests {
         );
         let route = ScribeRoute::select(None, &cluster, Some(&tls));
         assert!(matches!(route, Some(ScribeRoute::Peer(_))));
-        let outbox = ScribeSink::outbox(route, BIFROST_INGEST_REQUEST_LIMIT_BYTES);
-        assert!(outbox.sink().reaches_scribe());
+        ScribeSink::outbox(route, BIFROST_INGEST_REQUEST_LIMIT_BYTES)
+    }
+
+    /// One tenant span copy routed to `tenant`, and the span it carries.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed principal id does not parse.
+    fn span_copy(tenant: DataTenantId) -> (TenantSpanRoute, ResourceSpans) {
+        let span = Span {
+            trace_id: vec![1; 16],
+            span_id: vec![2; 8],
+            name: "request".to_owned(),
+            start_time_unix_nano: 1,
+            end_time_unix_nano: 2,
+            ..Span::default()
+        };
+        (
+            TenantSpanRoute {
+                tenant,
+                principal: "01900000-0000-7000-8000-000000000007"
+                    .parse()
+                    .expect("a principal id"),
+            },
+            ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![span],
+                    ..ScopeSpans::default()
+                }],
+                ..ResourceSpans::default()
+            },
+        )
+    }
+
+    /// Proves tenant span staging is capped through a sustained Scribe
+    /// outage without starving sibling writes: copies beyond the permit pool
+    /// are dropped at once, audit and capture writes still stage, and
+    /// abandoning the outbox at shutdown returns every permit. A copy
+    /// written once Scribe answers returns its permit too.
+    ///
+    /// # Panics
+    ///
+    /// Panics when staging exceeds the cap, a sibling write is refused, or a
+    /// permit is not returned.
+    #[tokio::test]
+    async fn sustained_scribe_outage_caps_tenant_spans() {
+        let outbox = outage_outbox();
+        let spans = ServerSpanSink::new(Arc::clone(&outbox));
         let tenant = DataTenantId::new_v7();
+        for _ in 0..TENANT_SPAN_PERMITS + 16 {
+            let (route, copy) = span_copy(tenant);
+            spans.stage(route, copy);
+        }
+        assert_eq!(outbox.pending(), TENANT_SPAN_PERMITS, "the cap holds");
+        assert_eq!(spans.permits.available_permits(), 0);
+        outbox.stage(tenant, decision("cards.read"));
         outbox.stage(tenant, capture(tenant));
-        let soon = Instant::now() + Duration::from_millis(200);
         assert_eq!(
-            outbox.settle(soon).await,
-            1,
-            "a write waits for a ready Scribe"
+            outbox.pending(),
+            TENANT_SPAN_PERMITS + 2,
+            "audit and capture take no span permit"
         );
+        assert_eq!(
+            outbox.shutdown(Instant::now()).await,
+            TENANT_SPAN_PERMITS + 2
+        );
+        assert_eq!(spans.permits.available_permits(), TENANT_SPAN_PERMITS);
+
+        let scribe = Arc::new(RecordingScribe::default());
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _);
+        let spans = ServerSpanSink::new(Arc::clone(&outbox));
+        let (route, copy) = span_copy(tenant);
+        spans.stage(route, copy);
+        settle(&outbox).await;
+        let received = scribe.received();
+        assert_eq!(received.len(), 1, "{received:?}");
+        assert_eq!(received[0].table, "vala.traces.spans");
+        assert_eq!(received[0].principal, route.principal);
+        assert_eq!(spans.permits.available_permits(), TENANT_SPAN_PERMITS);
     }
 
     /// A Scribe request ceiling well below the default, so a modest Eval

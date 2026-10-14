@@ -37,6 +37,11 @@ on:
 # (build:postgres → db:setup-roles → db:migrate), so no database secret is
 # required.
 
+# A newer push to main supersedes the previous push's run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   id-token: write   # Required for S3 and Azure OIDC credential federation

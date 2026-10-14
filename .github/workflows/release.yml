@@ -13,6 +13,11 @@ on:
   release:
     types: [published]
 
+# A newer push to main supersedes the previous push's run; release runs never cancel.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
 permissions:
   contents: read
 

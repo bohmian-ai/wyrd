@@ -1782,6 +1782,12 @@ class OpenAiFunction:
     strict: bool | None = None
 
 
+# A Responses tool result: text, or content parts such as `input_text`.
+#
+# `OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.
+OpenAiFunctionCallOutput: TypeAlias = "str | list[OpenAiResponseContentPart]"
+
+
 @dataclass(frozen=True, kw_only=True)
 class OpenAiFunctionChoice:
     """Generated Card schema type."""
@@ -2001,7 +2007,7 @@ class OpenAiResponseItemFunctionCallOutput:
     """Generated Card schema type."""
 
     call_id: str
-    output: str
+    output: OpenAiFunctionCallOutput
     type: Literal["function_call_output"]
 
 
@@ -4370,7 +4376,7 @@ _OBJECTS: dict[str, tuple[tuple[str, bool, tuple], ...]] = {
     ),
     "OpenAiResponseItemFunctionCallOutput": (
         ("call_id", True, ("prim", "string")),
-        ("output", True, ("prim", "string")),
+        ("output", True, ("ref", "OpenAiFunctionCallOutput")),
         ("type", True, ("union", [("lit", "function_call_output")])),
     ),
     "OpenAiResponseItemInputFile": (
@@ -5452,6 +5458,10 @@ _ALIASES: dict[str, tuple] = {
             ("array", ("prim", "integer")),
             ("array", ("array", ("prim", "integer"))),
         ],
+    ),
+    "OpenAiFunctionCallOutput": (
+        "union",
+        [("prim", "string"), ("array", ("ref", "OpenAiResponseContentPart"))],
     ),
     "OpenAiGrammarSyntax": ("union", [("lit", "lark"), ("lit", "regex")]),
     "OpenAiMessageContent": (

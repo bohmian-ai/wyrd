@@ -136,7 +136,7 @@ async fn agent_run_executes_openai_responses_tool_loop() {
                 lookup_call(),
                 OpenAiResponseItem::FunctionCallOutput {
                     call_id: "c1".to_owned(),
-                    output: r#"{"answer":42}"#.to_owned(),
+                    output: r#"{"answer":42}"#.to_owned().into(),
                 },
             ],
             true,

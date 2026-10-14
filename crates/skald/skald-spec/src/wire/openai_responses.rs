@@ -285,8 +285,51 @@ pub enum OpenAiResponsesShellToolKind {
 pub enum OpenAiResponsesInput {
     /// Text shorthand for one user message carrying one `input_text` part.
     Text(String),
-    /// Ordered input items.
-    Items(Vec<OpenAiResponseItem>),
+    /// Ordered input items. Easy input messages (`{"role", "content"}` with
+    /// no `type`, or with text `content`) decode as the message item they
+    /// stand for.
+    Items(#[serde(deserialize_with = "easy_items")] Vec<OpenAiResponseItem>),
+}
+
+/// Decodes Responses input items, accepting `OpenAI`'s easy input message.
+///
+/// `OpenAI` accepts a message item with no `type` and with text `content`,
+/// and stock clients such as the Agents SDK send that form. Each such item is
+/// rewritten to its typed equivalent before the typed decode: `type` becomes
+/// `message`, and text `content` becomes one `input_text` part (one
+/// `output_text` part for an `assistant` message). Every other item decodes
+/// unchanged.
+///
+/// # Errors
+///
+/// Returns the deserializer's error when the input is not an array or an item
+/// does not decode as an [`OpenAiResponseItem`] after the rewrite.
+fn easy_items<'de, D>(deserializer: D) -> Result<Vec<OpenAiResponseItem>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<Value>::deserialize(deserializer)?
+        .into_iter()
+        .map(|mut item| {
+            if let Some(fields) = item.as_object_mut() {
+                if !fields.contains_key("type") && fields.contains_key("role") {
+                    fields.insert("type".to_owned(), Value::from("message"));
+                }
+                if fields.get("type").and_then(Value::as_str) == Some("message")
+                    && let Some(Value::String(text)) = fields.get("content")
+                {
+                    let part = if fields.get("role").and_then(Value::as_str) == Some("assistant") {
+                        "output_text"
+                    } else {
+                        "input_text"
+                    };
+                    let content = serde_json::json!([{ "type": part, "text": text }]);
+                    fields.insert("content".to_owned(), content);
+                }
+            }
+            OpenAiResponseItem::deserialize(item).map_err(serde::de::Error::custom)
+        })
+        .collect()
 }
 
 impl OpenAiResponsesInput {
@@ -348,7 +391,8 @@ pub enum OpenAiResponseItem {
     },
     FunctionCallOutput {
         call_id: String,
-        output: String,
+        /// Tool result, as text or as content parts.
+        output: OpenAiFunctionCallOutput,
     },
     Reasoning {
         /// Provider item identity, required to replay the item statelessly.
@@ -370,6 +414,48 @@ pub enum OpenAiResponseItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+}
+
+/// A Responses tool result: text, or content parts such as `input_text`.
+///
+/// `OpenAI` accepts both forms, and the Agents SDK sends parts. The form the
+/// caller sent is kept so the item re-encodes unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum OpenAiFunctionCallOutput {
+    /// Plain text result.
+    Text(String),
+    /// Content parts.
+    Parts(Vec<OpenAiResponseContentPart>),
+}
+
+impl OpenAiFunctionCallOutput {
+    /// The result's text: the text form itself, or the concatenated text of
+    /// every `input_text` and `output_text` part, skipping non-text parts.
+    #[must_use]
+    pub fn text(&self) -> Cow<'_, str> {
+        match self {
+            Self::Text(text) => Cow::Borrowed(text),
+            Self::Parts(parts) => Cow::Owned(
+                parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        OpenAiResponseContentPart::InputText { text }
+                        | OpenAiResponseContentPart::OutputText { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl From<String> for OpenAiFunctionCallOutput {
+    /// Wraps `text` as the text form.
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
 }
 
 /// One part of a Responses reasoning item summary.
@@ -590,6 +676,41 @@ mod tests {
             json!([
                 {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
                 {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}
+            ])
+        );
+    }
+
+    /// The Agents SDK's request decodes: easy input messages with no `type`
+    /// and text `content` become typed messages, an assistant's text becomes
+    /// `output_text`, and replayed function items decode alongside them, including a tool
+    /// result sent as content parts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the body does not decode or an item has the wrong shape.
+    #[test]
+    fn easy_input_messages_decode_as_typed_messages() {
+        let request: OpenAiResponsesRequest = serde_json::from_value(json!({
+            "model": "openai/gpt-6-luna",
+            "instructions": "Call echo.",
+            "input": [
+                {"role": "user", "content": "go"},
+                {"type": "message", "role": "assistant", "content": "ok"},
+                {"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "echo", "arguments": "{}", "status": "completed"},
+                {"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "hi"}]}
+            ],
+            "include": [],
+            "stream": false,
+            "reasoning": {"effort": "medium"}
+        }))
+        .expect("the Agents SDK body decodes");
+        assert_eq!(
+            serde_json::to_value(&request.input).expect("encodes"),
+            json!([
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
+                {"type": "function_call", "call_id": "c1", "name": "echo", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "hi"}]}
             ])
         );
     }

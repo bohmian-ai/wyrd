@@ -1,8 +1,0 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.36s
-────────────
- Nextest run ID 9afd25a5-6d5c-495f-abfe-23b43d3682e4 with nextest profile: default
-    Starting 2 tests across 1 binary (98 tests skipped)
-        PASS [   0.003s] (1/2) wyrd-skald-spec wire::openai_responses::tests::easy_input_messages_decode_as_typed_messages
-        PASS [   0.004s] (2/2) wyrd-skald-spec wire::openai_responses::tests::input_items_schema_admits_easy_messages
-────────────
-     Summary [   0.004s] 2 tests run: 2 passed, 98 skipped

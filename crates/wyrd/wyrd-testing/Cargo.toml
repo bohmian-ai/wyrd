@@ -57,10 +57,6 @@ async-trait = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
 arrow = { workspace = true }
-# The support-workload oracle answers every analytical journey query over
-# in-memory tables; the leaf-predicate peer journey plans its filter as a
-# leader's session does. Already in the cone through `vala-bifrost-redux`.
-datafusion = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
@@ -137,6 +133,8 @@ sysinfo = { workspace = true }
 [dev-dependencies]
 # The peer-context journey encodes a Scribe fragment exactly as a leader does.
 datafusion-proto = { workspace = true }
+# The leaf-predicate peer journey plans its filter as a leader's session does.
+datafusion = { workspace = true }
 # The analytical-layout journey maps an Eval report through the production
 # result payload builder, whose Eval input is this crate's report type.
 vala-eval = { workspace = true }

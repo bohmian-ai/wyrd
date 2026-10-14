@@ -64,6 +64,7 @@ What it saved, in your Wyrd config directory (`WYRD_CONFIG_HOME`, else `$XDG_CON
 | --- | --- |
 | `credentials.toml` | The tenant administrator's API key, as `[default].api_key`, readable only by you |
 | `config.toml` | The HTTP and gRPC endpoints, as `[client].http_url` and `[client].grpc_url` |
+| `server/sealing.key` | The server's sealing key, which encrypts stored secrets such as gateway provider keys, readable only by you |
 
 Other settings in those files are left alone, and an existing key for a different tenant is never overwritten. To run a second local deployment, give it its own `WYRD_CONFIG_HOME`.
 
@@ -90,6 +91,8 @@ wyrd server dev --tenant acme
 ```
 
 Migrations are safe to rerun, and an existing tenant keeps its key. To keep your data, keep all three: the PostgreSQL database, `.wyrd/`, and the config directory.
+
+The sealing key is created on the first run and reused on every later one, so provider keys you stored with `wyrd gateway credential put` keep working. Lose it and the stored provider keys can no longer be decrypted; put them again. To supply your own key instead, set `WYRD_SEALING_KEY_FILE` before starting.
 
 Access tokens are signed with a key generated at startup unless you set `WYRD_SIGNING_KEY_FILE`, so a restart invalidates tokens issued before it. The CLI and SDKs exchange the saved API key for a new token on their next call; you do nothing.
 

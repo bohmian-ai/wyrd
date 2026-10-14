@@ -1,8 +1,8 @@
 //! Sealing-key rotation: rewrap every long-lived sealed secret under the write key.
 //!
-//! The pass covers tenant human-connection and workload-issuer client secrets
-//! and the platform connection secret, so `remaining == 0` speaks for every
-//! ciphertext the provider stores hold.
+//! The pass covers tenant human-connection and workload-issuer client secrets,
+//! the platform connection secret, and gateway `managed_secret` provider keys,
+//! so `remaining == 0` speaks for every ciphertext the deployment stores.
 //!
 //! Rotation procedure (operator runbook in `docs/`): configure the new key K2
 //! as the write key, keep the old key K1 in the retained set, and roll every

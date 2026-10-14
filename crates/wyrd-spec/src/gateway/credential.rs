@@ -90,7 +90,8 @@ impl<'de> Deserialize<'de> for ExternalSecretReference {
 /// `Environment` and `ExternalSecret` name operator-owned authority the server
 /// resolves at runtime. `ManagedSecret` is the one source carrying a value:
 /// it is write-only, crosses the bounded administration ingress once, and is
-/// protected under the tenant's keyring before persistence.
+/// sealed with the deployment sealing keyring, bound to its tenant, name, and
+/// provider, before persistence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]

@@ -14,11 +14,9 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
-use wyrd_crypt::SecretKey;
+use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_dev_fixtures::pg::PgFixture;
-use wyrd_gateway::{
-    CredentialAssignment, CredentialError, ManagedSecretBinding, ManagedSecretKeys, TenantKeyring,
-};
+use wyrd_gateway::{CredentialAssignment, CredentialError, ManagedSecretBinding};
 use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
@@ -113,7 +111,6 @@ fn gateway_config(tenant: DataTenantId) -> GatewayConfig {
                 ]),
             },
         )]),
-        ..Default::default()
     }
 }
 
@@ -377,51 +374,15 @@ async fn gateway_credential_sources_resolve_from_operator_config() {
     settle_audit(&state).await;
 }
 
-/// Builds one tenant keyring whose per-version material derives from `seed`,
-/// so a test can hand a tenant another tenant's material to prove incorrect
-/// key authority fails closed.
-///
-/// # Panics
-///
-/// Panics when `active` names no version in `versions`.
-pub(super) fn keyring(seed: DataTenantId, active: &str, versions: &[&str]) -> TenantKeyring {
-    let material = |version: &str| {
-        let mut bytes = [version.as_bytes()[version.len() - 1]; 32];
-        bytes[..16].copy_from_slice(seed.as_uuid().as_bytes());
-        SecretKey::from_bytes(bytes)
-    };
-    TenantKeyring::new(
-        active.to_owned(),
-        versions
-            .iter()
-            .map(|version| ((*version).to_owned(), material(version)))
-            .collect(),
-    )
-    .expect("keyring")
+/// Builds a deployment sealing keyring whose write key holds repeated `seed`
+/// bytes, the shape boot builds from `WYRD_SEALING_KEY_FILE`.
+pub(super) fn sealing_keyring(seed: u8) -> Arc<SealingKeyring> {
+    Arc::new(SealingKeyring::new(SecretKey::from_bytes([seed; 32])))
 }
 
-/// Builds the keyrings of `tenants`, each seeded by itself so no two tenants
-/// share key material, as the boot-time isolation check requires.
-///
-/// # Panics
-///
-/// Panics when `active` names no version in `versions`.
-pub(super) fn managed_keys(
-    tenants: &[DataTenantId],
-    active: &str,
-    versions: &[&str],
-) -> Arc<ManagedSecretKeys> {
-    Arc::new(ManagedSecretKeys::new(
-        tenants
-            .iter()
-            .map(|tenant| (*tenant, keyring(*tenant, active, versions)))
-            .collect(),
-    ))
-}
-
-/// Reads the persisted credential row of `name` as `(json, key_version,
-/// nonce, ciphertext)`, where `json` is the whole row rendered as text so a
-/// test can assert no column holds submitted plaintext.
+/// Reads the persisted credential row of `name` as `(json, ciphertext)`,
+/// where `json` is the whole row rendered as text so a test can assert no
+/// column holds submitted plaintext.
 ///
 /// # Panics
 ///
@@ -430,10 +391,10 @@ async fn stored_credential(
     fixture: &PgFixture,
     tenant: DataTenantId,
     name: &str,
-) -> (String, Option<String>, Option<Vec<u8>>, Option<Vec<u8>>) {
+) -> (String, Option<Vec<u8>>) {
     let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    let row = sqlx::query_as::<_, (String, Option<String>, Option<Vec<u8>>, Option<Vec<u8>>)>(
-        "SELECT row_to_json(c)::text, c.secret_key_version, c.secret_nonce, c.secret_ciphertext \
+    let row = sqlx::query_as::<_, (String, Option<Vec<u8>>)>(
+        "SELECT row_to_json(c)::text, c.secret_ciphertext \
          FROM wyrd.gateway_provider_credentials c WHERE c.name = $1",
     )
     .bind(name)
@@ -452,16 +413,15 @@ async fn stored_credential(
 ///
 /// Panics when the fixture or any administration call fails, when the view or
 /// the durable row discloses the submitted plaintext, when the envelope is not
-/// sealed under the active version, when a copied envelope opens, or when the
-/// rejected replacement disturbs the stored envelope.
+/// the deployment keyring's versioned form, when a copied envelope opens, or
+/// when the rejected replacement disturbs the stored envelope.
 #[tokio::test]
 async fn gateway_managed_secrets_persist_sealed_and_bound_envelopes() {
     const SUBMITTED: &str = "sk-live-managed-submission";
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
-    let state = test_state(&fixture)
-        .await
-        .with_gateway_secret_keys(managed_keys(&[tenant], "v1", &["v0", "v1"]));
+    let mut state = test_state(&fixture).await;
+    state.auth.sealing_key = Some(sealing_keyring(1));
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
     let managed = |name: &str, secret: &str| {
@@ -493,28 +453,24 @@ async fn gateway_managed_secrets_persist_sealed_and_bound_envelopes() {
         "the view never renders the submitted value"
     );
 
-    let (row, key_version, nonce, ciphertext) =
-        stored_credential(&fixture, tenant, "managed").await;
+    let (row, ciphertext) = stored_credential(&fixture, tenant, "managed").await;
     assert!(
         !row.contains(SUBMITTED),
         "no column of the durable row holds the submitted plaintext"
     );
-    assert_eq!(
-        key_version.as_deref(),
-        Some("v1"),
-        "sealed under the active version"
-    );
-    assert_eq!(nonce.as_deref().map(<[u8]>::len), Some(12));
     let ciphertext = ciphertext.expect("sealed ciphertext");
+    let keyring = state.auth.sealing_key.clone().expect("sealing keyring");
+    assert!(
+        !keyring.needs_rewrap(&ciphertext),
+        "sealed as the deployment keyring's versioned envelope under its write key"
+    );
 
     // The envelope of `managed` copied onto another credential row stays shut.
     let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
     sqlx::query(
-        "UPDATE wyrd.gateway_provider_credentials SET secret_key_version = $1, \
-         secret_nonce = $2, secret_ciphertext = $3 WHERE name = 'copied'",
+        "UPDATE wyrd.gateway_provider_credentials SET secret_ciphertext = $1 \
+         WHERE name = 'copied'",
     )
-    .bind(key_version.as_deref())
-    .bind(nonce.as_deref())
     .bind(ciphertext.as_slice())
     .execute(&mut **conn.transaction())
     .await
@@ -526,17 +482,15 @@ async fn gateway_managed_secrets_persist_sealed_and_bound_envelopes() {
         let credential = snapshot
             .credential(&credential_name(name))
             .expect("admitted");
-        let GatewayCredentialSource::ManagedSecret { envelope } = &credential.source else {
+        let GatewayCredentialSource::ManagedSecret { sealed } = &credential.source else {
             panic!("managed source");
         };
-        state.gateway_secret_keys.open(
-            ManagedSecretBinding {
-                tenant,
-                name: &credential.name,
-                provider: &credential.provider,
-            },
-            envelope,
-        )
+        ManagedSecretBinding {
+            tenant,
+            name: &credential.name,
+            provider: &credential.provider,
+        }
+        .open(&keyring, sealed)
     };
     assert_eq!(
         open("managed").expect("own envelope opens").expose_secret(),
@@ -557,8 +511,7 @@ async fn gateway_managed_secrets_persist_sealed_and_bound_envelopes() {
         .await
         .expect_err("blank secret");
     assert_invalid(&rejected, "source.secret");
-    let (_, replaced_version, _, replaced) = stored_credential(&fixture, tenant, "managed").await;
-    assert_eq!(replaced_version, key_version);
+    let (_, replaced) = stored_credential(&fixture, tenant, "managed").await;
     assert_eq!(replaced, Some(ciphertext));
     assert_eq!(
         open("managed").expect("still opens").expose_secret(),

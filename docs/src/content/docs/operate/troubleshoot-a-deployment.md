@@ -72,3 +72,11 @@ When the server refuses its database, it exits and its last log line says why.
 | `holds TRUNCATE, REFERENCES, or TRIGGER` | The tenant login was granted too much | `REVOKE TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA wyrd, vala FROM wyrd_tenant` |
 | `permission denied for schema vala` | The tenant login has no grants | Run step 2 of [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#2-grant-the-tenant-login-its-access) |
 | `permission denied for database` during `migrate` | The platform login does not own the database | `ALTER DATABASE wyrd OWNER TO wyrd_platform` as the administrator |
+
+## Stored secrets
+
+| Message contains | Cause | Fix |
+| --- | --- | --- |
+| `gateway credential protection is unavailable` | The server has no sealing key, so it cannot encrypt a `managed_secret` provider key | Set `WYRD_SEALING_KEY_FILE` as in [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#4-start-the-server-and-check-readiness) and restart. `wyrd server dev` creates one for you |
+| `exist but no sealing key is configured` at startup | Encrypted secrets are stored, and the server started without the key they were sealed under | Start with the same `WYRD_SEALING_KEY_FILE` as before |
+| A gateway call fails with an upstream-unavailable error after a key change | The provider key was sealed under a key the server no longer holds | List the old key in `WYRD_SEALING_RETAINED_KEYS_FILE` and restart, or put the credential again |

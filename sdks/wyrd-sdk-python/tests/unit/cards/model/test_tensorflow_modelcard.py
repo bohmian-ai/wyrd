@@ -8,15 +8,15 @@ from wyrd.model import ModelCard, ModelCardMetadata, SampleInput, TensorflowInte
 
 pytestmark = pytest.mark.tensorflow
 
-# TensorFlow is installed only on Python 3.13 and earlier.
-pytest.importorskip("tensorflow", reason="TensorFlow supports Python 3.13 and earlier")
+# TensorFlow is installed only on Python 3.13 and earlier, so it is imported
+# dynamically: a static import fails type checking on newer Pythons.
+tf = pytest.importorskip("tensorflow", reason="TensorFlow supports Python 3.13 and earlier")
 
 
 @pytest.fixture
 def keras_model() -> Any:
     """A one-layer Keras regressor over two features."""
-    import keras
-
+    keras = tf.keras
     return keras.Sequential([keras.Input(shape=(2,)), keras.layers.Dense(1)])
 
 
@@ -51,8 +51,6 @@ def test_loaded_keras_model_saves_as_a_new_card(
 
 
 def test_tensorflow_sample_input_survives_save_and_load(tmp_path: Path) -> None:
-    import tensorflow as tf
-
     SampleInput.from_python_object(tf.constant([[1.0, 2.0]])).save(tmp_path)
 
     loaded = SampleInput(kind="tensorflow")

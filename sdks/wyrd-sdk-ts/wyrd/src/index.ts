@@ -2503,12 +2503,29 @@ function activeSpanIds(): { readonly traceId?: string; readonly spanId?: string 
  * Node's active OpenTelemetry span as W3C `traceparent`/`tracestate`; `null`
  * when no API is installed, no span is active, or its context is invalid.
  * Every native call reads it on entry, so the Wyrd requests it sends join the
- * caller's trace.
+ * caller's trace. Given `producerTable`, a queued write's `bifrost.enqueue`
+ * PRODUCER span opens and ends under the active span first, and its context
+ * is returned instead.
  */
-function activeTraceContext(): { traceparent: string; tracestate?: string } | null {
+function activeTraceContext(producerTable?: string | null): { traceparent: string; tracestate?: string } | null {
   const api = otel();
-  const spanContext = api?.trace.getActiveSpan()?.spanContext();
-  if (spanContext === undefined || !api?.isSpanContextValid(spanContext)) {
+  if (api === null) {
+    return null;
+  }
+  let span = api.trace.getActiveSpan();
+  if (typeof producerTable === "string") {
+    span = api.trace.getTracer("wyrd.bifrost").startSpan("bifrost.enqueue", {
+      kind: api.SpanKind.PRODUCER,
+      attributes: {
+        "messaging.system": "bifrost",
+        "messaging.operation.type": "create",
+        "messaging.destination.name": producerTable,
+      },
+    });
+    span.end();
+  }
+  const spanContext = span?.spanContext();
+  if (spanContext === undefined || !api.isSpanContextValid(spanContext)) {
     return null;
   }
   const flags = spanContext.traceFlags.toString(16).padStart(2, "0");

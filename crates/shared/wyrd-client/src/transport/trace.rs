@@ -8,7 +8,10 @@
 //! runtime handed over with [`with_caller_trace`] wins, because Python's and
 //! Node's OpenTelemetry contexts never become Rust's current `tracing` span;
 //! otherwise the current `tracing` span's OpenTelemetry context, when it is
-//! valid. Without either, no trace header is sent.
+//! valid. Without either, no trace header is sent. A queued write records a
+//! `bifrost.enqueue` PRODUCER span through [`producer`], opened in the
+//! foreign runtime's own tracer when that runtime scoped one with
+//! [`with_producer_span`].
 
 use std::future::Future;
 
@@ -19,6 +22,9 @@ use wyrd_spec::trace::TraceContext;
 tokio::task_local! {
     /// The trace context a foreign runtime's caller had active.
     static CALLER: TraceContext;
+    /// Opens and ends a foreign runtime's PRODUCER span for one queued write
+    /// to the named table, returning that span's context.
+    static PRODUCER: Box<dyn Fn(&str) -> Option<TraceContext>>;
 }
 
 /// W3C header carrying the caller's trace and parent span.
@@ -40,16 +46,19 @@ pub async fn with_caller_trace<F: Future>(context: Option<TraceContext>, future:
     }
 }
 
-/// Run the synchronous `call` with `context` as the caller's trace context,
-/// as [`with_caller_trace`] does for a future.
+/// Run the synchronous `call` with `open` as the opener of every queued
+/// write's PRODUCER span.
 ///
-/// A foreign-runtime SDK uses it for a call that sends nothing itself but
-/// records the caller's context, such as a queued write's PRODUCER span.
-pub fn with_caller_trace_sync<R>(context: Option<TraceContext>, call: impl FnOnce() -> R) -> R {
-    match context {
-        Some(context) => CALLER.sync_scope(context, call),
-        None => call(),
-    }
+/// Foreign-runtime SDKs pass a callback that opens and ends a
+/// `bifrost.enqueue` PRODUCER span for the named table in their own tracer,
+/// under their active span, and returns its context, or `None` when that
+/// runtime has no valid span. [`producer`] calls it on the calling thread, so
+/// the span lands in the caller's own trace exporter.
+pub fn with_producer_span<R>(
+    open: impl Fn(&str) -> Option<TraceContext> + 'static,
+    call: impl FnOnce() -> R,
+) -> R {
+    PRODUCER.sync_scope(Box::new(open), call)
 }
 
 /// The trace context the current request is sent under, if any.
@@ -66,11 +75,15 @@ pub(crate) fn outbound() -> Option<TraceContext> {
 /// Record the PRODUCER span of one queued write to `table` and return the
 /// context its rows carry to the server's ingest span.
 ///
-/// A context a foreign runtime handed over with [`with_caller_trace`] is
-/// that caller's own span, which stands as the producer. Otherwise a
+/// A span opener scoped with [`with_producer_span`] records it in the foreign
+/// runtime. Otherwise a context handed over with [`with_caller_trace`] is that
+/// caller's own span, which stands as the producer. Otherwise a
 /// `bifrost.enqueue` PRODUCER span opens and closes under the current span,
 /// and its context is returned; without an OpenTelemetry layer there is none.
 pub(crate) fn producer(table: &str) -> Option<TraceContext> {
+    if let Ok(opened) = PRODUCER.try_with(|open| open(table)) {
+        return opened;
+    }
     CALLER.try_with(Clone::clone).ok().or_else(|| {
         tracing::info_span!(
             "bifrost.enqueue",
@@ -114,7 +127,7 @@ fn current_span_context() -> Option<TraceContext> {
 mod tests {
     use wyrd_spec::trace::TraceContext;
 
-    use super::{outbound, producer, with_caller_trace};
+    use super::{outbound, producer, with_caller_trace, with_producer_span};
 
     /// A valid caller `traceparent`.
     const PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
@@ -144,6 +157,27 @@ mod tests {
             TraceContext::parse_traceparent(PARENT, String::new()).expect("valid traceparent");
         let produced = with_caller_trace(Some(context.clone()), async { producer("t") }).await;
         assert_eq!(produced, Some(context));
+    }
+
+    /// A foreign runtime's span opener records the producer for the written
+    /// table, ahead of a handed-over caller context.
+    #[tokio::test]
+    async fn scoped_span_opener_is_the_producer() {
+        let caller =
+            TraceContext::parse_traceparent(PARENT, String::new()).expect("valid traceparent");
+        let opened = TraceContext {
+            span_id: "00f067aa0ba902b7".to_owned(),
+            ..caller.clone()
+        };
+        let expected = opened.clone();
+        let produced = with_caller_trace(Some(caller), async move {
+            with_producer_span(
+                move |table| (table == "t").then(|| opened.clone()),
+                || producer("t"),
+            )
+        })
+        .await;
+        assert_eq!(produced, Some(expected));
     }
 
     /// Without a foreign caller, a queued write records its own PRODUCER span

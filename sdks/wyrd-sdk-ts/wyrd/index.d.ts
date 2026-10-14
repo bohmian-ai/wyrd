@@ -1231,14 +1231,15 @@ export declare function openWyrdState(path: string): NativeWyrdState
 export declare function runWyrdCli(args: Array<string>): Promise<number>
 
 /**
- * Register the callback each native call reads Node's active span through;
+ * Register the callback each native call reads Node's active span through,
+ * and a queued write opens its PRODUCER span through when given the table;
  * a later registration replaces the earlier one.
  *
  * # Errors
  *
  * Returns a napi error when the callback reference cannot be created.
  */
-export declare function setTraceSource(source: () => NativeCallerTrace | null): void
+export declare function setTraceSource(source: (arg: string | undefined | null) => NativeCallerTrace | null): void
 
 /**
  * Renders one stored timestamp cell as its Bifrost timestamp type's text.

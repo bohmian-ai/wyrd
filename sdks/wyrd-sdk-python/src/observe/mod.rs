@@ -298,7 +298,7 @@ impl PyObserveHandle {
     ) -> WyrdPyResult<()> {
         let json = json_text(py, "features", features)?;
         let session = parse_session_id(session_id).map_err(WyrdPyError::from)?;
-        crate::trace::traced(py, || self.observe().drift_json(&json, session))
+        crate::trace::traced(|| self.observe().drift_json(&json, session))
             .map_err(WyrdPyError::from)
     }
 
@@ -337,8 +337,7 @@ impl PyObserveHandle {
             span_id.or(active_span.as_deref()),
         )
         .map_err(WyrdPyError::from)?;
-        crate::trace::traced(py, || self.observe().eval_json(&json, options))
-            .map_err(WyrdPyError::from)
+        crate::trace::traced(|| self.observe().eval_json(&json, options)).map_err(WyrdPyError::from)
     }
 
     /// Emit one row into a registered caller-owned table.

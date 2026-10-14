@@ -627,16 +627,13 @@ impl Bifrost {
     #[pyo3(signature = (row, card_uid=None, run_id=None))]
     fn insert(
         &self,
-        py: Python<'_>,
         row: &str,
         card_uid: Option<&str>,
         run_id: Option<String>,
     ) -> WyrdPyResult<()> {
         let correlation = correlation(card_uid, run_id)?;
-        crate::trace::traced(py, || {
-            self.handle.insert(row.as_bytes().to_vec(), correlation)
-        })
-        .map_err(client_error)?;
+        crate::trace::traced(|| self.handle.insert(row.as_bytes().to_vec(), correlation))
+            .map_err(client_error)?;
         Ok(())
     }
 

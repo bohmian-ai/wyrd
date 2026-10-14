@@ -488,7 +488,7 @@ pub(crate) async fn register_card_http(
     ),
     tag = "Cards"
 )]
-#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.complete"))]
+#[tracing::instrument(skip(state, caller, headers), fields(operation = "card.registration.complete"))]
 async fn complete_card_http(
     State(state): State<AppState>,
     caller: Caller,

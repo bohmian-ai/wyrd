@@ -20,10 +20,14 @@ test("the official MCP SDK lists the full catalog and validates a structured rea
     }),
   );
   try {
-    // The SDK rejects the whole list when its result or any tool is malformed.
+    // The SDK rejects the whole list when its result or any tool is malformed,
+    // and drops any tool it cannot call; none may be dropped.
     const { tools } = await client.listTools();
-    // An administrator is shown write tools as well as reads.
-    expect(new Set(tools.map((tool) => tool.annotations?.readOnlyHint))).toEqual(new Set([true, false]));
+    // The raw single-page server result is the independent reference.
+    const advertised = await client.request({ method: "tools/list" });
+    expect(advertised.nextCursor).toBeUndefined();
+    const names = (list: { name: string }[]) => list.map((tool) => tool.name).sort();
+    expect(names(tools)).toEqual(names(advertised.tools));
 
     // The SDK checks structured content against the advertised output schema.
     const guide = await client.callTool({ name: "wyrd.guide", arguments: { topic: "overview" } });

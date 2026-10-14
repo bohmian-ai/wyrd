@@ -3006,9 +3006,10 @@ impl Oracle {
     ///
     /// # Errors
     ///
-    /// Returns a repairable invalid-query refusal for typed SQL, schema, or
-    /// unsupported-feature errors. Other planning failures retain their stable
-    /// public mapping without exposing dependency diagnostics.
+    /// Returns a repairable invalid-query refusal carrying the planner's
+    /// message for typed SQL, schema, or unsupported-feature errors, however
+    /// `DataFusion` wraps or collects them. Other planning failures retain
+    /// their stable public mapping without exposing dependency diagnostics.
     ///
     /// The optimized plan passes the payload-column gate before it is
     /// returned, so a projection or filter reaching `vala.gateway.calls`
@@ -3024,10 +3025,10 @@ impl Oracle {
             .sql(sql)
             .await
             .and_then(|frame| frame.with_param_values(bind_values(params)))
-            .map_err(|error| map_query_planning_error(&error))?;
+            .map_err(|error| map_sql_planning_error(&error))?;
         let plan = frame
             .into_optimized_plan()
-            .map_err(|error| map_query_planning_error(&error))?;
+            .map_err(|error| map_sql_planning_error(&error))?;
         authorize_payload_columns(context, &plan)?;
         Ok(plan)
     }
@@ -3731,29 +3732,68 @@ async fn settle_attempt_output(
     release_error(deadline, admitted, error, phase)
 }
 
-/// Classifies typed planning refusals through context/diagnostic wrappers.
+/// Detail of a physical-planning refusal, which names no dependency internals.
+const PHYSICAL_PLANNING_REFUSAL: &str =
+    "Inspect bifrost.describe_table and submit a supported SELECT query.";
+
+/// Returns the caller-fault cause of a planning failure, if it has one.
 ///
-/// Resource refusals take precedence; all other failures retain their complete
-/// original chain for the general mapper. No dependency diagnostic is exposed
-/// to the caller; the complete chain is traced at debug level for operators.
-fn map_query_planning_error(error: &DataFusionError) -> BifrostError {
-    tracing::debug!(%error, "Oracle query planning refused");
+/// Walks the wrappers `DataFusion` adds around a typed refusal — context,
+/// diagnostic, shared, and the collection the SQL planner gathers when several
+/// expressions fail (it reports the first) — down to a SQL, plan, schema, or
+/// unsupported-feature error. Any other leaf, including resource exhaustion,
+/// is not the caller's SQL and yields `None`.
+fn caller_planning_fault(error: &DataFusionError) -> Option<&DataFusionError> {
+    let mut cause = error;
+    loop {
+        cause = match cause {
+            DataFusionError::Context(_, source) | DataFusionError::Diagnostic(_, source) => source,
+            DataFusionError::Shared(source) => source,
+            DataFusionError::Collection(errors) => errors.first()?,
+            DataFusionError::SQL(..)
+            | DataFusionError::Plan(_)
+            | DataFusionError::SchemaError(..)
+            | DataFusionError::NotImplemented(_) => return Some(cause),
+            _ => return None,
+        };
+    }
+}
+
+/// Maps a failure lowering the caller's SQL to its logical plan.
+///
+/// A caller-fault cause becomes [`BifrostError::QueryInvalidSql`] carrying the
+/// planner's own message, such as `No field named r.valeu. Did you mean
+/// 'r.value'?`, so the caller can repair the statement. The message can name
+/// only what the session registered, and the session registers only the
+/// tables authorization already admitted for this caller, so it reveals no
+/// table or column the caller cannot see. Every other failure keeps the
+/// general mapping and exposes nothing.
+fn map_sql_planning_error(error: &DataFusionError) -> BifrostError {
+    tracing::debug!(%error, "Oracle SQL planning refused");
     if datafusion_resources_exhausted(error) {
         return map_datafusion_error(error);
     }
-    let mut cause = error;
-    while let DataFusionError::Context(_, source) | DataFusionError::Diagnostic(_, source) = cause {
-        cause = source;
-    }
-    match cause {
-        DataFusionError::SQL(..)
-        | DataFusionError::Plan(_)
-        | DataFusionError::SchemaError(..)
-        | DataFusionError::NotImplemented(_) => BifrostError::QueryInvalidSql {
-            detail: "Inspect bifrost.describe_table and submit a supported SELECT query."
-                .to_owned(),
+    caller_planning_fault(error).map_or_else(
+        || map_datafusion_error(error),
+        |cause| BifrostError::QueryInvalidSql {
+            detail: cause.strip_backtrace(),
         },
-        _ => map_datafusion_error(error),
+    )
+}
+
+/// Maps a failure building the physical plan from an accepted logical plan.
+///
+/// A caller-fault cause is still a repairable invalid query, but its message
+/// may describe Oracle's own operators, so only a fixed repair action is
+/// exposed; the complete chain is traced at debug level for operators.
+/// Resource refusals and every other failure keep the general mapping.
+fn map_query_planning_error(error: &DataFusionError) -> BifrostError {
+    tracing::debug!(%error, "Oracle query planning refused");
+    if datafusion_resources_exhausted(error) || caller_planning_fault(error).is_none() {
+        return map_datafusion_error(error);
+    }
+    BifrostError::QueryInvalidSql {
+        detail: PHYSICAL_PLANNING_REFUSAL.to_owned(),
     }
 }
 
@@ -4430,47 +4470,86 @@ mod tests {
         }
     }
 
-    /// Planning input errors carry one safe repair action through dependency wrappers.
+    /// Planning input errors are repairable 400s through every dependency
+    /// wrapper: SQL planning carries the planner's own message, physical
+    /// planning one fixed repair action, and neither carries wrapper text.
     #[test]
     fn datafusion_query_rejections_are_safe_and_actionable() {
-        for wrapped in [false, true] {
-            for error in [
-                DataFusionError::Plan("private column".to_owned()),
-                DataFusionError::SchemaError(
-                    Box::new(datafusion::common::SchemaError::DuplicateUnqualifiedField {
-                        name: "private column".to_owned(),
-                    }),
-                    Box::new(None),
+        /// One caller-fault case: how to build the planner error, and the
+        /// detail the caller must receive for it.
+        type Case = (fn() -> DataFusionError, &'static str);
+        let wrappings: [fn(DataFusionError) -> DataFusionError; 4] = [
+            std::convert::identity,
+            |error| {
+                DataFusionError::Context(
+                    "private context".to_owned(),
+                    Box::new(error.with_diagnostic(
+                        datafusion::common::diagnostic::Diagnostic::new_error(
+                            "private diagnostic",
+                            None,
+                        ),
+                    )),
+                )
+            },
+            |error| {
+                DataFusionError::Collection(vec![
+                    error,
+                    DataFusionError::Plan("second failure".to_owned()),
+                ])
+            },
+            |error| DataFusionError::Shared(Arc::new(error)),
+        ];
+        for wrap in wrappings {
+            let cases: [Case; 3] = [
+                (
+                    || DataFusionError::Plan("unknown function".to_owned()),
+                    "Error during planning: unknown function",
                 ),
-                DataFusionError::NotImplemented("private function".to_owned()),
-            ] {
-                let candidate = if wrapped {
-                    DataFusionError::Context(
-                        "private context".to_owned(),
-                        Box::new(error.with_diagnostic(
-                            datafusion::common::diagnostic::Diagnostic::new_error(
-                                "private diagnostic",
-                                None,
-                            ),
-                        )),
-                    )
-                } else {
-                    error
-                };
+                (
+                    || {
+                        DataFusionError::SchemaError(
+                            Box::new(datafusion::common::SchemaError::DuplicateUnqualifiedField {
+                                name: "value".to_owned(),
+                            }),
+                            Box::new(None),
+                        )
+                    },
+                    "Schema error: Schema contains duplicate unqualified field name value",
+                ),
+                (
+                    || DataFusionError::NotImplemented("unsupported shape".to_owned()),
+                    "This feature is not implemented: unsupported shape",
+                ),
+            ];
+            for (error, message) in cases {
+                let physical = wrap(error());
                 assert_eq!(
-                    map_query_planning_error(&candidate),
+                    map_sql_planning_error(&wrap(error())),
                     BifrostError::QueryInvalidSql {
-                        detail:
-                            "Inspect bifrost.describe_table and submit a supported SELECT query."
-                                .to_owned(),
+                        detail: message.to_owned(),
+                    }
+                );
+                assert_eq!(
+                    map_query_planning_error(&physical),
+                    BifrostError::QueryInvalidSql {
+                        detail: PHYSICAL_PLANNING_REFUSAL.to_owned(),
                     }
                 );
             }
         }
-        assert_eq!(
-            map_query_planning_error(&DataFusionError::Internal("private".to_owned())),
-            BifrostError::QueryExecutionFailed
-        );
+        for internal in [
+            DataFusionError::Internal("private".to_owned()),
+            DataFusionError::Collection(vec![DataFusionError::Execution("private".to_owned())]),
+        ] {
+            assert_eq!(
+                map_sql_planning_error(&internal),
+                BifrostError::QueryExecutionFailed
+            );
+            assert_eq!(
+                map_query_planning_error(&internal),
+                BifrostError::QueryExecutionFailed
+            );
+        }
         assert_eq!(
             map_datafusion_error(&DataFusionError::Plan("private".to_owned())),
             BifrostError::QueryExecutionFailed
@@ -4481,6 +4560,10 @@ mod tests {
         );
         assert_eq!(
             map_query_planning_error(&exhausted),
+            BifrostError::QueryResourcesExhausted
+        );
+        assert_eq!(
+            map_sql_planning_error(&exhausted),
             BifrostError::QueryResourcesExhausted
         );
     }

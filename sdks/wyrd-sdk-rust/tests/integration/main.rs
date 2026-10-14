@@ -5,6 +5,8 @@
 //! `fixtures/README.md`; nextest selects a story with
 //! `-E 'test(/^<module>::/)'`.
 
+/// Subquery-heavy SQL over published, live, and mixed rows, against plain DataFusion.
+mod analytical_correctness;
 mod gateway_admin;
 mod gateway_inference;
 /// TypeSafe Jev through the Gateway, natively and as a Verifier's judge.

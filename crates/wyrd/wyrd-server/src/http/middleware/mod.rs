@@ -6,3 +6,4 @@ pub mod edge_capacity;
 pub mod edge_timeout;
 pub mod metrics;
 pub mod request_id;
+pub mod trace_context;

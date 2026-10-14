@@ -2481,6 +2481,23 @@ function activeSpanIds(): { readonly traceId?: string; readonly spanId?: string 
   return { traceId: spanContext.traceId, spanId: spanContext.spanId };
 }
 
+/**
+ * Node's active OpenTelemetry span as W3C `traceparent`/`tracestate`; empty
+ * when no API is installed, no span is active, or its context is invalid.
+ */
+function activeTraceContext(): { readonly traceparent?: string; readonly tracestate?: string } {
+  const api = otel();
+  const spanContext = api?.trace.getActiveSpan()?.spanContext();
+  if (spanContext === undefined || !api?.isSpanContextValid(spanContext)) {
+    return {};
+  }
+  const flags = spanContext.traceFlags.toString(16).padStart(2, "0");
+  return {
+    traceparent: `00-${spanContext.traceId}-${spanContext.spanId}-${flags}`,
+    tracestate: spanContext.traceState?.serialize(),
+  };
+}
+
 /** The application's `@opentelemetry/api`, or `null` when it is not installed. */
 function otel(): typeof import("@opentelemetry/api") | null {
   if (otelApi === undefined) {
@@ -2608,7 +2625,8 @@ export class Observe {
    * Verifier takes an array of flat feature rows. A `failed` verdict resolves
    * normally. Nothing is observed, recorded, enqueued, or dispatched, Bifrost
    * need not be started, and the request is never replayed. It runs as the
-   * state's client.
+   * state's client and carries Node's active OpenTelemetry span as its W3C
+   * trace context, so the server's work joins the caller's trace.
    *
    * @param verifier - The bound Verifier's name.
    * @param input - One Eval context object, or an array of Drift feature rows.
@@ -2624,8 +2642,15 @@ export class Observe {
     input: unknown,
     options: { readonly media?: readonly EvalMediaRef[] } = {},
   ): Promise<Judgment> {
+    const caller = activeTraceContext();
     const judgment = lifecycleValue<Omit<Judgment, "passed">>(
-      await this.#native.verify(verifier, strictJson("input", input), mediaJson(options.media)),
+      await this.#native.verify(
+        verifier,
+        strictJson("input", input),
+        mediaJson(options.media),
+        caller.traceparent,
+        caller.tracestate,
+      ),
     );
     return { ...judgment, passed: judgment.verdict === "passed" };
   }

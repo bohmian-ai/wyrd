@@ -73,6 +73,11 @@ const RESOLVE_DIRECT_SQL: &str = r"
 /// occurrence or observation record conflicts on its partial unique index and
 /// inserts nothing.
 ///
+/// `$15` is a manual run's authenticated caller. Work Wyrd starts internally,
+/// a scheduled or observation run, records the tenant's active SYSTEM
+/// principal as its actor instead, or null when the tenant has none; its
+/// origin stays recorded only as references.
+///
 /// The run becomes claimable on the same clock the claim predicate reads, so
 /// no enqueueing process can write work into the queue's future or past. An
 /// observation run takes the next ordinal of its binding; the caller holds
@@ -87,7 +92,12 @@ const INSERT_RUN_SQL: &str = r"
         requested_by_principal_id, max_attempts, next_attempt_at, created_at, updated_at,
         idempotency_key, request_sha256, observation_ordinal
     ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, $10,
-              $11, $12, $13, $14, $15, $16,
+              $11, $12, $13, $14,
+              CASE WHEN $5 = 'manual' THEN $15::uuid ELSE (
+                  SELECT a.id FROM wyrd.auth_service_accounts a
+                   WHERE a.principal_kind = 'system' AND a.status = 'active'
+              ) END,
+              $16,
               statement_timestamp(), statement_timestamp(), statement_timestamp(), $17, $18,
               CASE WHEN $5 = 'observation' THEN (
                   SELECT COALESCE(max(observation_ordinal), 0) + 1
@@ -137,7 +147,9 @@ const LOCK_OBSERVATION_SUBJECTS_SQL: &str = r"
 /// one statement, due at PostgreSQL's statement time.
 ///
 /// `$1..$4` are parallel arrays of run ID, binding, record ID, and event time
-/// in batch order. Rows whose record already has a run of that binding, and
+/// in batch order. Each run records the tenant's active SYSTEM principal as
+/// its actor, or null when the tenant has none; the record's writer stays
+/// reachable only through the input record. Rows whose record already has a run of that binding, and
 /// later repeats inside the batch, are removed before numbering, so a repeat
 /// inserts nothing and consumes no ordinal. Ordinals continue each binding's
 /// maximum in batch order; the caller holds every binding's row lock from
@@ -148,12 +160,15 @@ const INSERT_OBSERVATION_RUNS_SQL: &str = r"
     INSERT INTO wyrd.verifier_runs (
         run_id, data_tenant_id, verifier_uid, verifier_version, subject_card_uid,
         origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
-        input_record_id, input_event_time, max_attempts,
+        input_record_id, input_event_time, requested_by_principal_id, max_attempts,
         next_attempt_at, created_at, updated_at, observation_ordinal
     )
     SELECT r.run_id, wyrd.current_tenant(), b.verifier_uid, v.version, b.subject_card_uid,
            'observation', b.owner_card_uid, b.binding_id, b.trigger_uid, b.trigger_digest,
-           b.operators, r.record_id, r.event_time, $5,
+           b.operators, r.record_id, r.event_time,
+           (SELECT a.id FROM wyrd.auth_service_accounts a
+             WHERE a.principal_kind = 'system' AND a.status = 'active'),
+           $5,
            statement_timestamp(), statement_timestamp(), statement_timestamp(),
            COALESCE((SELECT max(x.observation_ordinal)
                        FROM wyrd.verifier_runs x
@@ -557,7 +572,8 @@ impl RunInput {
 /// Each origin carries exactly the fields it requires: only a manual request
 /// names a requester and may target a Verifier directly; scheduled and
 /// observation work always comes from a binding, with a Drift window or an
-/// Eval record respectively.
+/// Eval record respectively, and records the tenant SYSTEM principal as its
+/// actor at insert.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunRequest {
     /// An authenticated manual Drift run of a binding or a direct Verifier.
@@ -630,7 +646,8 @@ impl RunRequest {
         }
     }
 
-    /// The manual requester, absent for scheduled and observation work.
+    /// The manual requester; `None` for scheduled and observation work,
+    /// whose SYSTEM actor the insert resolves.
     const fn requested_by(&self) -> Option<PrincipalId> {
         match self {
             Self::Manual { requested_by, .. } => Some(*requested_by),
@@ -786,7 +803,10 @@ pub struct ClaimedRun {
     pub trigger: Option<FrozenTarget>,
     /// Frozen input.
     pub input: RunInput,
-    /// Manual requester; `None` for scheduled and observation runs.
+    /// The run's actor: a manual run's authenticated caller, or the tenant
+    /// SYSTEM principal of a scheduled or observation run; `None` for an
+    /// internal run of a tenant without a SYSTEM principal or one enqueued
+    /// before internal runs recorded it.
     pub requested_by: Option<PrincipalId>,
     /// One-based position among the binding's observation runs, assigned once
     /// at enqueue; `None` for scheduled and manual runs. Eval's `every_nth`
@@ -1905,7 +1925,7 @@ struct ClaimedRunRow {
     input_record_id: Option<String>,
     /// Eval record event time.
     input_event_time: Option<DateTime<Utc>>,
-    /// Manual requester.
+    /// The run's actor: manual caller or internal SYSTEM principal.
     requested_by_principal_id: Option<Uuid>,
     /// Attempt number of this claim.
     attempts: i32,
@@ -2025,7 +2045,7 @@ struct RunStatusRow {
     run_id: Uuid,
     /// Stored execution status.
     status: String,
-    /// Manual requester.
+    /// The run's actor: manual caller or internal SYSTEM principal.
     requested_by_principal_id: Option<Uuid>,
     /// Result pointer.
     result_id: Option<Uuid>,

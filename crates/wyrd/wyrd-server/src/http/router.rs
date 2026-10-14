@@ -140,6 +140,9 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             crate::http::middleware::metrics::track_metrics,
         ))
+        .layer(axum::middleware::from_fn(
+            crate::http::middleware::trace_context::attach_trace_context,
+        ))
         .layer(TraceLayer::new_for_http().make_span_with(request_span))
 }
 

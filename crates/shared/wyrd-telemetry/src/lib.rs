@@ -83,6 +83,9 @@ pub struct CapturedSpan {
     pub status: CapturedSpanStatus,
     /// Events recorded inside this span, in emission order.
     pub events: Vec<CapturedSpanEvent>,
+    /// Spans this span links to, as `(trace_id, span_id)` hex pairs in link
+    /// order; a link records causality without making the target a parent.
+    pub links: Vec<(String, String)>,
 }
 
 /// One `tracing` event the production pipeline attached to a finished span.
@@ -173,6 +176,16 @@ impl TestTraceCapture {
                                     .collect(),
                             })
                             .collect(),
+                        links: span
+                            .links
+                            .iter()
+                            .map(|link| {
+                                (
+                                    link.span_context.trace_id().to_string(),
+                                    link.span_context.span_id().to_string(),
+                                )
+                            })
+                            .collect(),
                         status: match &span.status {
                             opentelemetry::trace::Status::Unset => CapturedSpanStatus::Unset,
                             opentelemetry::trace::Status::Ok => CapturedSpanStatus::Ok,
@@ -246,6 +259,29 @@ impl TelemetryGuard {
             tracing::warn!(error = %e, "OTLP shutdown error");
         }
     }
+}
+
+/// Link `span` to the remote span `span_id` of trace `trace_id`.
+///
+/// The link records that the remote span caused the work `span` measures
+/// without adopting it as a parent, so `span` keeps its own trace. The remote
+/// context is marked sampled and remote. Without an OpenTelemetry layer in the
+/// subscriber, or on a disabled span, this does nothing.
+pub fn link_remote_span(
+    span: &tracing::Span,
+    trace_id: &wyrd_spec::vala::ids::TraceId,
+    span_id: &wyrd_spec::vala::ids::SpanId,
+) {
+    use opentelemetry::trace::{SpanContext, TraceFlags, TraceState};
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    span.add_link(SpanContext::new(
+        opentelemetry::trace::TraceId::from_bytes(*trace_id.as_bytes()),
+        opentelemetry::trace::SpanId::from_bytes(*span_id.as_bytes()),
+        TraceFlags::SAMPLED,
+        true,
+        TraceState::default(),
+    ));
 }
 
 /// Resolve the effective tracing filter from multiple sources in priority order.

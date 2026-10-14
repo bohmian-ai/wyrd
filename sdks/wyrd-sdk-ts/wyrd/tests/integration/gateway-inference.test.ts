@@ -1,13 +1,23 @@
+import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import OpenAI from "openai";
 import { expect, vi } from "vitest";
 
-import { Cards, Gateway, type ProviderDeployment, type RegistrationReceipt, Workflow, WyrdClient } from "wyrd-ai";
+import {
+  Bifrost,
+  Cards,
+  Gateway,
+  type ProviderDeployment,
+  type RegistrationReceipt,
+  Workflow,
+  WyrdClient,
+  gatewayFetch,
+} from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
-import { fixture, registered, serverTest } from "../support/server.js";
+import { columnValues, fixture, registered, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -48,8 +58,8 @@ function deployment(model: string): ProviderDeployment {
 
 /**
  * A server whose `openai` deployments of `gpt-4o` and `gpt-5-5` reach the
- * local upstream with the operator's provider key, and the registered `ask`
- * Workflow.
+ * local upstream with the operator's provider key, call metadata capture, and
+ * the registered `ask` Workflow.
  */
 const test = serverTest({ provider: () => ({ status: 200, body: COMPLETION }) }).extend<{
   ask: RegistrationReceipt;
@@ -64,6 +74,7 @@ const test = serverTest({ provider: () => ({ status: 200, body: COMPLETION }) })
       const gateway = Gateway.connect();
       await gateway.putDeployment(deployment("gpt-4o"));
       await gateway.putDeployment(deployment("gpt-5-5"));
+      await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });
       await use(await Cards.connect().registerFromPath(fixture("cards/gateway_inference/ask.yaml")));
     },
     { scope: "file" },
@@ -93,6 +104,54 @@ test("openai client calls the gateway with an access token", async ({ provider, 
   expect(Object.keys(upstream?.headers ?? {}).filter((name) => name.startsWith("x-wyrd"))).toEqual([]);
 });
 
+/** The gateway's model-call spans in the trace `traceId`, after publishing every captured row. */
+async function gatewaySpans(
+  server: { flushBifrost(): void },
+  traceId: string,
+): Promise<{ parent: unknown; state: unknown }> {
+  server.flushBifrost();
+  const spans = (
+    await (
+      await Bifrost.connect()
+    ).sql(
+      "SELECT encode(parent_span_id, 'hex') AS parent_span_id, trace_state FROM vala.traces.spans " +
+        "WHERE scope_name = 'wyrd.gateway' AND encode(trace_id, 'hex') = $1",
+      [traceId],
+    )
+  ).toArrow();
+  return { parent: columnValues(spans.getChild("parent_span_id")), state: columnValues(spans.getChild("trace_state")) };
+}
+
+test("gateway span joins the caller's trace", async ({ server, ask: _ }) => {
+  const [traceId, spanId] = [randomBytes(16).toString("hex"), randomBytes(8).toString("hex")];
+  const token = await WyrdClient.connect().accessToken();
+  const client = new OpenAI({
+    baseURL: `${WyrdClient.connect().serverUrl}/v1`,
+    apiKey: token,
+    defaultHeaders: { traceparent: `00-${traceId}-${spanId}-01`, tracestate: "wyrd=journey" },
+  });
+
+  const reply = await client.chat.completions.create(ASK);
+
+  expect(reply.choices[0]?.message.content).toBe("hi");
+  expect(await gatewaySpans(server, traceId)).toEqual({ parent: [spanId], state: ["wyrd=journey"] });
+});
+
+test("malformed traceparent is ignored by the gateway", async ({ server, ask: _ }) => {
+  const traceId = randomBytes(16).toString("hex");
+  const token = await WyrdClient.connect().accessToken();
+  const client = new OpenAI({
+    baseURL: `${WyrdClient.connect().serverUrl}/v1`,
+    apiKey: token,
+    defaultHeaders: { traceparent: `00-${traceId}-not-a-span-01` },
+  });
+
+  const reply = await client.chat.completions.create(ASK);
+
+  expect(reply.choices[0]?.message.content).toBe("hi");
+  expect(await gatewaySpans(server, traceId)).toEqual({ parent: [], state: [] });
+});
+
 test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {
   const reader = WyrdClient.connect({ credential: server.scopedApiKey("gateway_reader", ["gateway:read"]) });
   const { client } = await openai(reader);
@@ -101,6 +160,29 @@ test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {
     status: 403,
     error: { code: "WYRD_PERMISSION_403_DENIED_RBAC" },
   });
+});
+
+test("gateway call records a lone run or card", async ({ server, ask }) => {
+  const issued = await cli.issueKey({ kind: "Agent", name: "ask-agent", version: "1.0.0", space: "default" });
+  const caller = WyrdClient.connect({ credential: issued.key });
+  const client = new OpenAI({ baseURL: `${caller.serverUrl}/v1`, apiKey: "wyrd", fetch: gatewayFetch(caller) });
+  const cardUid = registered(ask, "ask-agent").uid;
+
+  for (const headers of [{ "wyrd-run-id": "run-alone" }, { "wyrd-card-uid": cardUid }]) {
+    const reply = await client.chat.completions.create(ASK, { headers });
+    expect(reply.choices[0]?.message.content).toBe("hi");
+  }
+
+  server.flushBifrost();
+  const calls = (
+    await (
+      await Bifrost.connect()
+    ).sql("SELECT run_id, card_uid FROM vala.gateway.calls WHERE caller_principal_id = $1 ORDER BY run_id", [
+      issued.principal_id,
+    ])
+  ).toArrow();
+  expect(columnValues(calls.getChild("run_id"))).toEqual(["run-alone", null]);
+  expect(columnValues(calls.getChild("card_uid"))).toEqual([null, cardUid]);
 });
 
 test("cli issues a card scoped key and writes a provider credential", async ({ ask: _ }) => {

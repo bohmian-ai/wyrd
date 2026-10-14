@@ -165,7 +165,11 @@ pub(crate) fn discover() -> rmcp::ClientLifecycleMode {
 }
 
 mod pg_tests {
-    use super::{McpJourneyError, RequestId, ResolvedCredential, discover, transport};
+    use super::{
+        HeaderName, HeaderValue, McpJourneyError, RequestId, ResolvedCredential,
+        StreamableHttpClientTransport, StreamableHttpClientTransportConfig, WyrdMcpHttpClient,
+        client, discover, transport,
+    };
 
     use std::time::Duration;
 
@@ -303,6 +307,11 @@ mod pg_tests {
             "the chain names the one actor that exchanged the subject token"
         );
         assert_eq!(context["cancelled"], serde_json::Value::Bool(false));
+        assert_eq!(
+            context["trace_id"],
+            serde_json::Value::Null,
+            "a request without traceparent runs untraced"
+        );
         assert!(
             context["request_id"]
                 .as_str()
@@ -311,6 +320,65 @@ mod pg_tests {
         );
 
         client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A tool call carrying a `traceparent` runs under that inbound trace
+    /// context even though the transport serves it on a task of its own, so
+    /// work the tool does — a judge call `verification.execute` makes — joins
+    /// the agent's trace.
+    ///
+    /// # Errors
+    /// Returns [`McpJourneyError`] when the server fails to start or shut down,
+    /// bootstrap or key exchange fails, the MCP client cannot connect, call the
+    /// probe, or cancel, or the probe returns no structured content.
+    ///
+    /// # Panics
+    /// Panics when the probe runs under no trace or another trace.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn traced_tool_call_runs_under_the_callers_trace() -> Result<(), McpJourneyError> {
+        /// The caller's trace id the `traceparent` carries.
+        const TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+        let server = WyrdTestServer::builder()
+            .with_mcp_context_probe_for_test()
+            .start_bound()
+            .await?;
+        let caller = server.bootstrap_service("mcp-traced", &["admin"]).await?;
+        let jwt = server
+            .exchange_api_key(caller.api_key().ok_or("service bootstrap carries a key")?)
+            .await?;
+        let mut config = StreamableHttpClientTransportConfig::with_uri(format!(
+            "{}/mcp",
+            server
+                .base_url()
+                .ok_or("journey requires a bound test server")?
+        ));
+        config.custom_headers.insert(
+            HeaderName::from_static("traceparent"),
+            HeaderValue::from_str(&format!("00-{TRACE}-b7ad6b7169203331-01"))?,
+        );
+        let transport = StreamableHttpClientTransport::with_client(
+            WyrdMcpHttpClient::new(&client(
+                &server,
+                ResolvedCredential::BearerToken(jwt.into()),
+            )?),
+            config,
+        );
+        let mcp = ().serve_with_lifecycle(transport, discover()).await?;
+
+        let context = mcp
+            .call_tool(CallToolRequestParams::new(probe::TOOL_NAME))
+            .await?
+            .structured_content
+            .ok_or("probe returns structured content")?;
+        assert_eq!(
+            context["trace_id"],
+            serde_json::Value::String(TRACE.to_owned())
+        );
+
+        mcp.cancel().await?;
         server.shutdown().await?;
         Ok(())
     }

@@ -1,11 +1,11 @@
 //! Test-support MCP capability used to prove `/mcp` connectivity.
 //!
 //! This tool exists so a real MCP client journey can observe what the Wyrd edge
-//! bound for a request — tenant, principal, delegation chain, roles, request ID
-//! — and can drive request- and process-level cancellation deterministically,
-//! before any production Bifrost tool exists. It is compiled only under the
-//! `test-support` feature and, even then, joins the catalog only when a test
-//! server explicitly opted in through
+//! bound for a request — tenant, principal, delegation chain, roles, request ID,
+//! inbound trace — and can drive request- and process-level cancellation
+//! deterministically, before any production Bifrost tool exists. It is
+//! compiled only under the `test-support` feature and, even then, joins the
+//! catalog only when a test server explicitly opted in through
 //! `WyrdTestServerBuilder::with_mcp_context_probe_for_test`.
 //!
 //! It is not an extension point: there is no registration hook, and the tool
@@ -244,7 +244,8 @@ pub async fn invoke(
     )))
 }
 
-/// Project only server-verified request context into the probe's result.
+/// Project only server-verified request context into the probe's result,
+/// including the trace id of the inbound trace context the tool runs under.
 fn trusted_context(
     caller: &Caller,
     principal: &AuthenticatedPrincipal,
@@ -268,5 +269,7 @@ fn trusted_context(
             .collect::<Vec<_>>(),
         "request_id": request_id.as_str(),
         "cancelled": cancelled,
+        "trace_id": crate::http::middleware::trace_context::active()
+            .map(|context| context.trace_id),
     })
 }

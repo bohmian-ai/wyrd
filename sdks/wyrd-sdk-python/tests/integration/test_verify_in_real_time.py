@@ -8,6 +8,7 @@ its ``agent`` and a PSI Drift Verifier, fitted from the latency baseline, to its
 from pathlib import Path
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
 from wyrd import WyrdError
 from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
@@ -91,6 +92,24 @@ def test_judge_call_is_attributed_to_the_run_and_card(
     assert calls.to_pylist() == [
         {"caller_principal_id": principal, "card_uid": str(judgment.subject.uid)}
     ]
+
+
+def test_traced_verify_joins_the_callers_trace(
+    assistant: WyrdState, wyrd_server: WyrdTestServer, bifrost: Bifrost
+) -> None:
+    Gateway(client_of(wyrd_server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
+    tracer = TracerProvider().get_tracer("journey")
+    with tracer.start_as_current_span("caller") as caller:
+        assistant.run("agent").observe.verify("answer-graded", {"answer": "yes"})
+    wyrd_server.flush_bifrost()
+
+    context = caller.get_span_context()
+    spans = bifrost.sql(
+        "SELECT encode(parent_span_id, 'hex') AS parent_span_id FROM vala.traces.spans "
+        "WHERE scope_name = 'wyrd.gateway' AND encode(trace_id, 'hex') = $1",
+        [format(context.trace_id, "032x")],
+    ).to_arrow()
+    assert spans.to_pylist() == [{"parent_span_id": format(context.span_id, "016x")}]
 
 
 def test_model_latency_like_the_baseline_passes_its_verifier(assistant: WyrdState) -> None:

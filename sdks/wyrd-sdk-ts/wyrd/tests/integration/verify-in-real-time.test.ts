@@ -2,6 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { trace } from "@opentelemetry/api";
 import { expect, vi } from "vitest";
 
 import { Bifrost, Cards, Gateway, WyrdClient, WyrdState } from "wyrd-ai";
@@ -170,6 +171,27 @@ test("judge call is attributed to the run and card", async ({ server, state }) =
   const issued = await cli.issueKey({ kind: "Service", name: "assistant", version: "1.0.0", space: "default" });
   expect(columnValues(calls.getChild("caller_principal_id"))).toEqual([issued.principal_id]);
   expect(columnValues(calls.getChild("card_uid"))).toEqual([judgment.subject.uid]);
+});
+
+test("traced verify joins the caller's trace", async ({ server, state }) => {
+  await state.startTelemetry();
+  const caller = await trace.getTracer("journey").startActiveSpan("caller", async (span) => {
+    await state.run("agent").observe.verify("answer-graded", { answer: "yes" });
+    span.end();
+    return span.spanContext();
+  });
+  server.flushBifrost();
+
+  const spans = (
+    await (
+      await Bifrost.connect()
+    ).sql(
+      "SELECT encode(parent_span_id, 'hex') AS parent_span_id FROM vala.traces.spans " +
+        "WHERE scope_name = 'wyrd.gateway' AND encode(trace_id, 'hex') = $1",
+      [caller.traceId],
+    )
+  ).toArrow();
+  expect(columnValues(spans.getChild("parent_span_id"))).toEqual([caller.spanId]);
 });
 
 test("model latency like the baseline passes its verifier", async ({ server, assistant, state }) => {

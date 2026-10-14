@@ -650,6 +650,9 @@ export declare class NativeRun {
    * `input_json` is one Eval context object or one array of Drift feature
    * rows; `media_json` is one JSON array of media descriptors. One server
    * call, never replayed; nothing is observed, recorded, or dispatched.
+   * `traceparent` and `tracestate` are Node's active OpenTelemetry span,
+   * which the call carries as its W3C trace context so the server's work
+   * joins the caller's trace; a malformed `traceparent` is ignored.
    *
    * # Errors
    *
@@ -658,7 +661,7 @@ export declare class NativeRun {
    * server's verification refusals are returned in
    * [`NativeLifecycleResult`].
    */
-  verify(verifier: string, inputJson: string, mediaJson?: string | undefined | null): Promise<NativeLifecycleResult>
+  verify(verifier: string, inputJson: string, mediaJson?: string | undefined | null, traceparent?: string | undefined | null, tracestate?: string | undefined | null): Promise<NativeLifecycleResult>
   /**
    * Invokes this view's tool-free Agent once through the Wyrd gateway with
    * the string variables of `variables_json` and returns its final text.

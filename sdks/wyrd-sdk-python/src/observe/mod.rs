@@ -13,7 +13,9 @@ use pyo3::types::{PyDict, PyList, PyMapping, PyModule, PyString, PyType};
 use wyrd_cards::card_ref::CardRefPy;
 use wyrd_client::observe::eval::parse_session_id;
 use wyrd_client::observe::{EvalObservationOptions, Observe, Run};
+use wyrd_client::transport::trace::with_caller_trace;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::trace::TraceContext;
 use wyrd_spec::verification::Judgment;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
 
@@ -129,11 +131,20 @@ fn json_array_text(py: Python<'_>, field: &str, value: &Bound<'_, PyAny>) -> Wyr
 /// Python's OpenTelemetry context never becomes Rust's current `tracing` span across
 /// `PyO3`, so the shared Rust fallback cannot see it; this boundary reads it
 /// instead and hands the IDs to the ordinary explicit-options path. Both IDs
-/// or neither: a missing `opentelemetry` package (the optional `otel` extra),
-/// no active span, an invalid context, or any lookup failure supplies nothing,
-/// because correlation is best-effort and must never fail an emit.
+/// or neither, as [`active_trace_context`] supplies them.
 fn active_span_ids(py: Python<'_>) -> (Option<String>, Option<String>) {
-    let lookup = || -> PyResult<Option<(u128, u64)>> {
+    active_trace_context(py).map_or((None, None), |context| {
+        (Some(context.trace_id), Some(context.span_id))
+    })
+}
+
+/// Read Python's active OpenTelemetry span context as W3C trace context.
+///
+/// A missing `opentelemetry` package (the optional `otel` extra), no active
+/// span, an invalid context, or any lookup failure supplies nothing, because
+/// correlation is best-effort and must never fail the call it rides on.
+fn active_trace_context(py: Python<'_>) -> Option<TraceContext> {
+    let lookup = || -> PyResult<Option<TraceContext>> {
         let context = py
             .import("opentelemetry.trace")?
             .call_method0("get_current_span")?
@@ -141,18 +152,19 @@ fn active_span_ids(py: Python<'_>) -> (Option<String>, Option<String>) {
         if !context.getattr("is_valid")?.extract::<bool>()? {
             return Ok(None);
         }
-        Ok(Some((
-            context.getattr("trace_id")?.extract()?,
-            context.getattr("span_id")?.extract()?,
-        )))
+        let trace_id: u128 = context.getattr("trace_id")?.extract()?;
+        let span_id: u64 = context.getattr("span_id")?.extract()?;
+        Ok(Some(TraceContext {
+            trace_id: format!("{trace_id:032x}"),
+            span_id: format!("{span_id:016x}"),
+            trace_flags: context.getattr("trace_flags")?.extract()?,
+            trace_state: context
+                .getattr("trace_state")?
+                .call_method0("to_header")?
+                .extract()?,
+        }))
     };
-    match lookup() {
-        Ok(Some((trace_id, span_id))) => (
-            Some(format!("{trace_id:032x}")),
-            Some(format!("{span_id:016x}")),
-        ),
-        _ => (None, None),
-    }
+    lookup().ok().flatten()
 }
 
 /// Python wrapper for one invocation or one Card-scoped view of it.
@@ -382,7 +394,9 @@ impl PyObserveHandle {
     ///
     /// An Eval Verifier takes one context mapping, dataclass instance, or
     /// Pydantic model plus optional media; a Drift Verifier takes a list of flat
-    /// feature rows. Blocks with the GIL released for the one server call; a
+    /// feature rows. Blocks with the GIL released for the one server call,
+    /// which carries Python's active OpenTelemetry span as its W3C trace
+    /// context so the server's work joins the caller's trace; a
     /// `failed` verdict returns normally. Nothing is observed, recorded,
     /// enqueued, or dispatched, and Bifrost need not be started.
     ///
@@ -412,9 +426,15 @@ impl PyObserveHandle {
             .map_err(|error| invalid_argument("media", error))?
             .unwrap_or_default();
         let observe = self.observe();
-        py.detach(|| wyrd_runtime::runtime().block_on(observe.verify_json(verifier, &json, media)))
-            .map(|inner| PyJudgment { inner })
-            .map_err(WyrdPyError::from)
+        let caller = active_trace_context(py);
+        py.detach(|| {
+            wyrd_runtime::runtime().block_on(with_caller_trace(
+                caller,
+                observe.verify_json(verifier, &json, media),
+            ))
+        })
+        .map(|inner| PyJudgment { inner })
+        .map_err(WyrdPyError::from)
     }
 }
 

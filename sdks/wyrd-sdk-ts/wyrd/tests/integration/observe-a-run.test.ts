@@ -1,7 +1,7 @@
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
-import { WyrdClient, WyrdState } from "@wyrd/sdk";
+import { WyrdClient, WyrdState } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { observedServiceTest as test } from "../support/observed-service.js";

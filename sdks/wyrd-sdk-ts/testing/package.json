@@ -12,6 +12,6 @@
     }
   },
   "dependencies": {
-    "@wyrd/sdk": "workspace:*"
+    "wyrd-ai": "workspace:*"
   }
 }

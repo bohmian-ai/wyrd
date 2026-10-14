@@ -4,7 +4,7 @@ import type {
   ProviderCredentialView,
   RegistrationReceipt,
   WyrdClient,
-} from "@wyrd/sdk";
+} from "wyrd-ai";
 
 export { NativeWyrdTestServer, type NativeTestServerOptions, startTestServer } from "./native.cjs";
 

@@ -18,7 +18,7 @@ import { join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { trace } from "@opentelemetry/api";
-import { Bifrost, Cards, Gateway, type RegistrationReceipt, WyrdClient, WyrdState } from "@wyrd/sdk";
+import { Bifrost, Cards, Gateway, type RegistrationReceipt, WyrdClient, WyrdState } from "wyrd-ai";
 
 /** How many requests {@link serve} answers; every tenth asks for a refund. */
 export const REQUESTS = 100;

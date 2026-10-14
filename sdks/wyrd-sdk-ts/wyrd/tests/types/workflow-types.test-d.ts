@@ -1,7 +1,7 @@
 // Compile-only: `mise run ts:typecheck` fails when an assertion here breaks.
 import { expectTypeOf } from "vitest";
 
-import type { JsonValue, Workflow, WorkflowRun } from "@wyrd/sdk";
+import type { JsonValue, Workflow, WorkflowRun } from "wyrd-ai";
 
 type RunInput = Parameters<Workflow["run"]>[0];
 

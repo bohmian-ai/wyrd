@@ -2,7 +2,7 @@
 // in-process `wyrd` CLI. The native binding is generated into native.cjs.
 import { createRequire } from "node:module";
 
-import { WyrdError } from "@wyrd/sdk";
+import { WyrdError } from "wyrd-ai";
 
 const native = createRequire(import.meta.url)("./native.cjs");
 

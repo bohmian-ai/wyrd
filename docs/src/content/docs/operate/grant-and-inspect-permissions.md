@@ -63,7 +63,7 @@ println!("{} {:?}", result.changed, result.roles);
 <LangTab lang="typescript">
 
 ```typescript
-import { Principals } from "@wyrd/sdk";
+import { Principals } from "wyrd-ai";
 
 const principals = Principals.connect();
 const result = await principals.grantRole(principalId, "editor");

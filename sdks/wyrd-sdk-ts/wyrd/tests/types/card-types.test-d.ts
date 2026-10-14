@@ -1,7 +1,7 @@
 // Compile-only: `mise run ts:typecheck` fails when an assertion here breaks.
 import { expectTypeOf } from "vitest";
 
-import type { DriftBaselineState, RegisteredCard, RegisteredVerifierCard, TypedCardKind } from "@wyrd/sdk";
+import type { DriftBaselineState, RegisteredCard, RegisteredVerifierCard, TypedCardKind } from "wyrd-ai";
 
 // Narrowing a registered envelope by `kind` reaches the Verifier's typed baseline state.
 expectTypeOf<

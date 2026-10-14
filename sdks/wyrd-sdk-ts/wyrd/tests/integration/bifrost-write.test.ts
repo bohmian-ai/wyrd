@@ -2,7 +2,7 @@ import { Field, Int32, RecordBatch, Schema, Struct, makeBuilder, makeData, table
 import { expect, vi } from "vitest";
 import { ZodError, z } from "zod";
 
-import { Bifrost, TableConfig, type TableConfigOptions, WyrdClient, record } from "@wyrd/sdk";
+import { Bifrost, TableConfig, type TableConfigOptions, WyrdClient, record } from "wyrd-ai";
 
 import { serverTest } from "../support/server.js";
 

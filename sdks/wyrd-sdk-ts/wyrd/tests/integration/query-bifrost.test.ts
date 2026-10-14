@@ -1,7 +1,7 @@
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
-import { Bifrost, TableConfig, WyrdClient } from "@wyrd/sdk";
+import { Bifrost, TableConfig, WyrdClient } from "wyrd-ai";
 
 import { serverTest } from "../support/server.js";
 

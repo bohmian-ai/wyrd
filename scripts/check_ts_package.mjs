@@ -143,10 +143,10 @@ try {
   const { stdout: importOutput } = await exec(
     process.execPath,
     ["--input-type=module", "-e", `
-      import { Bifrost, TableConfig } from "@wyrd/sdk";
+      import { Bifrost, TableConfig } from "wyrd-ai";
       if (typeof Bifrost.connect !== "function") throw new Error("Bifrost facade missing");
       if (typeof TableConfig !== "function") throw new Error("TableConfig missing");
-      const resolved = import.meta.resolve("@wyrd/sdk");
+      const resolved = import.meta.resolve("wyrd-ai");
       if (resolved.includes(".ts")) throw new Error("published export resolves to TypeScript: " + resolved);
       console.log(resolved);
     `],
@@ -154,15 +154,15 @@ try {
   );
 
   const installedManifest = JSON.parse(
-    await readFile(join(staging, "node_modules", "@wyrd", "sdk", "package.json"), "utf8"),
+    await readFile(join(staging, "node_modules", "wyrd-ai", "package.json"), "utf8"),
   );
   assertPublishedPaths(installedManifest, "installed SDK manifest");
   assertNoWorkspaceMetadata(installedManifest, "installed SDK manifest");
-  const installedSdkFiles = await walkFiles(join(staging, "node_modules", "@wyrd", "sdk"));
+  const installedSdkFiles = await walkFiles(join(staging, "node_modules", "wyrd-ai"));
   if (JSON.stringify(installedSdkFiles) !== JSON.stringify([...rootAllowed].sort())) {
     throw new Error(`installed SDK inventory mismatch: ${installedSdkFiles.join(", ")}`);
   }
-  const installedAddonRoot = join(staging, "node_modules", "@wyrd", `sdk-${targetPackage}`);
+  const installedAddonRoot = join(staging, "node_modules", `wyrd-ai-${targetPackage}`);
   const installedAddonManifest = JSON.parse(await readFile(join(installedAddonRoot, "package.json"), "utf8"));
   assertNoWorkspaceMetadata(installedAddonManifest, "installed addon manifest");
   const installedAddonFiles = await walkFiles(installedAddonRoot);
@@ -175,7 +175,7 @@ try {
   if (platformManifest.main.endsWith(".ts")) {
     throw new Error("platform addon manifest points at TypeScript");
   }
-  console.log(`packed @wyrd/sdk with ${platformManifest.name} and imported compiled facade`);
+  console.log(`packed wyrd-ai with ${platformManifest.name} and imported compiled facade`);
   if (process.argv.length > 2) {
     const { stdout, stderr } = await exec(process.argv[2], process.argv.slice(3), {
       cwd: repository,

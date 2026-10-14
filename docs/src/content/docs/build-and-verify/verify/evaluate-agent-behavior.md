@@ -177,7 +177,7 @@ let rows = bifrost
 <LangTab lang="typescript">
 
 ```typescript
-import { Bifrost } from "@wyrd/sdk";
+import { Bifrost } from "wyrd-ai";
 
 const bifrost = await Bifrost.connect();
 const rows = await bifrost.sql(

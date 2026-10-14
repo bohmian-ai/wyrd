@@ -5,7 +5,7 @@ import type {
   CreateOperatorConnectionRequest,
   OperatorConnectionView,
   UpdateOperatorConnectionRequest,
-} from "@wyrd/sdk";
+} from "wyrd-ai";
 
 const ORIGIN = "https://hooks.example.com";
 

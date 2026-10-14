@@ -1,12 +1,12 @@
 [package]
-name = "skald-prompt"
+name = "wyrd-skald-prompt"
 version = { workspace = true }
 edition = { workspace = true }
+description = "Client-safe Prompt authoring builder for native Skald requests."
 license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
-publish = false
 
 [features]
 default = []
@@ -28,3 +28,6 @@ workspace = true
 
 [dev-dependencies]
 workspace-hack.workspace = true
+
+[lib]
+name = "skald_prompt"

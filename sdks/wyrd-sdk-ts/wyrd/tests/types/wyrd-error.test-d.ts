@@ -1,7 +1,7 @@
 // Compile-only: `mise run ts:typecheck` fails when an assertion here breaks.
 import { expectTypeOf } from "vitest";
 
-import type { WyrdError, WyrdErrorCode } from "@wyrd/sdk";
+import type { WyrdError, WyrdErrorCode } from "wyrd-ai";
 
 // A caller switches on the generated catalog, never on an arbitrary string.
 expectTypeOf<WyrdError["code"]>().toEqualTypeOf<WyrdErrorCode>();

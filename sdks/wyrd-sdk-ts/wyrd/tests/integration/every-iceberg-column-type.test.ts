@@ -33,7 +33,7 @@ import {
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
-import { Bifrost, TableConfig } from "@wyrd/sdk";
+import { Bifrost, TableConfig } from "wyrd-ai";
 
 import { columnValues, serverTest } from "../support/server.js";
 

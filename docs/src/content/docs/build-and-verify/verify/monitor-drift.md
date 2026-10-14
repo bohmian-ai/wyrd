@@ -127,7 +127,7 @@ println!("{:?}", baseline.map(|b| b.state)); // Pending, Building, Ready, or Fai
 <LangTab lang="typescript">
 
 ```typescript
-import { Cards } from "@wyrd/sdk";
+import { Cards } from "wyrd-ai";
 
 const verifier = await Cards.connect().get({
   kind: "Verifier",
@@ -230,7 +230,7 @@ let rows = Bifrost::from_env()
 <LangTab lang="typescript">
 
 ```typescript
-import { Bifrost } from "@wyrd/sdk";
+import { Bifrost } from "wyrd-ai";
 
 const bifrost = await Bifrost.connect();
 const rows = await bifrost.sql(

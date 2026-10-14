@@ -1,7 +1,7 @@
 {
-  "name": "@wyrd/sdk-linux-x64-gnu",
+  "name": "wyrd-ai-linux-x64-gnu",
   "version": "0.0.1",
-  "description": "Native napi addon for @wyrd/sdk-linux-x64-gnu.",
+  "description": "Native napi addon for wyrd-ai-linux-x64-gnu.",
   "license": "MIT",
   "os": [
     "linux"

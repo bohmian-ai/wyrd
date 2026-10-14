@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 
 import { expect, vi } from "vitest";
 
-import { type CardRef, Cards, type RegisteredCard, type RegistrationReceipt, Workflow, WyrdClient } from "@wyrd/sdk";
+import { type CardRef, Cards, type RegisteredCard, type RegistrationReceipt, Workflow, WyrdClient } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { type RegisteredRef, fixture, registered, serverTest } from "../support/server.js";

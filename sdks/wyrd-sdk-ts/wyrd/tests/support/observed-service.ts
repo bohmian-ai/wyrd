@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Bifrost, Cards, WyrdClient, WyrdState } from "@wyrd/sdk";
+import { Bifrost, Cards, WyrdClient, WyrdState } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { fixture, serverTest } from "./server.js";

@@ -1,6 +1,6 @@
 import { expect, vi } from "vitest";
 
-import { OperatorConnections, WyrdClient } from "@wyrd/sdk";
+import { OperatorConnections, WyrdClient } from "wyrd-ai";
 
 import { serverTest } from "../support/server.js";
 

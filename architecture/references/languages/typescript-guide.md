@@ -1,6 +1,6 @@
 # TypeScript Guide
 
-The `@wyrd/sdk` TypeScript client is a first-class Wyrd client. It projects
+The `wyrd-ai` TypeScript client is a first-class Wyrd client. It projects
 server contracts and bridges through the N-API binding into shared Rust client
 behavior without owning durable server semantics.
 
@@ -13,7 +13,7 @@ References this guide leans on:
 
 - Public TypeScript source and package metadata live under
   `sdks/wyrd-sdk-ts`
-  as `@wyrd/sdk` (see `mise run ts:build`, `ts:test:unit`,
+  as `wyrd-ai` (see `mise run ts:build`, `ts:test:unit`,
   `ts:test:integration`, `ts:typecheck`, and `ts:napi:check`).
 - Native bindings are private modules of `sdks/wyrd-sdk-ts` over
   `wyrd-client`. Test-only bindings remain private to the SDK
@@ -170,7 +170,7 @@ callers can narrow exhaustively.
 
 ## Napi Bridge
 
-For `@wyrd/sdk` N-API-backed features:
+For `wyrd-ai` N-API-backed features:
 
 - The native boundary in `sdks/wyrd-sdk-ts` remains a thin binding over the
   shared Rust client behavior and server wire contracts.

@@ -439,7 +439,7 @@ def test_installed_cli_bootstrap(runtime: str) -> None:
                     "run",
                     "--locked",
                     "-p",
-                    "wyrd-sdk-rust",
+                    "wyrd-ai",
                     "--test",
                     "integration",
                     "-P",

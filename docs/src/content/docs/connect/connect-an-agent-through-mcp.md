@@ -14,7 +14,7 @@ If you ran [`wyrd server dev`](/get-started/setup/) and accepted its offer to co
 
 ## Prerequisites
 
-- The `wyrd` CLI on your `PATH` (`pip install wyrd` or `npm install @wyrd/sdk`).
+- The `wyrd` CLI on your `PATH` (`pip install wyrd-ai` or `npm install wyrd-ai`).
 - A Wyrd server you can reach: the local one from [Set up Wyrd](/get-started/setup/), or a deployed one.
 - At least one supported agent installed and opened once, so its configuration directory exists.
 

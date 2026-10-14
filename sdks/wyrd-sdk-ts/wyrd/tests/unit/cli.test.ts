@@ -9,5 +9,5 @@ test("cli plan of a missing card tree raises its catalog code", () => {
 });
 
 test("the published sdk exports no in-process cli", async () => {
-  expect("cli" in (await import("@wyrd/sdk"))).toBe(false);
+  expect("cli" in (await import("wyrd-ai"))).toBe(false);
 });

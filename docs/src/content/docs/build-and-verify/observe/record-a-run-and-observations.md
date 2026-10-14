@@ -23,7 +23,7 @@ Load the exact Service version you deployed, wrap each request in a run, and rec
   ```
 
   The key prints once. Give it to the service as `WYRD_API_KEY`, alongside `WYRD_SERVER_URL`.
-- The SDK for your language: `pip install wyrd`, `npm install @wyrd/sdk`, or the `wyrd-sdk` crate.
+- The SDK for your language: `pip install wyrd-ai`, `npm install wyrd-ai`, or the `wyrd-ai` crate.
 
 ## 1. Download the bundle
 
@@ -62,7 +62,7 @@ state.start_bifrost().await?;
 <LangTab lang="typescript">
 
 ```typescript
-import { WyrdState } from "@wyrd/sdk";
+import { WyrdState } from "wyrd-ai";
 
 const state = WyrdState.fromPath("./support-desk");
 await state.startBifrost();
@@ -220,7 +220,7 @@ let rows = Bifrost::from_env()
 <LangTab lang="typescript">
 
 ```typescript
-import { Bifrost } from "@wyrd/sdk";
+import { Bifrost } from "wyrd-ai";
 
 const bifrost = await Bifrost.connect();
 const rows = await bifrost.sql(

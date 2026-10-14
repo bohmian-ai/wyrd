@@ -164,7 +164,7 @@ impl for the same error type does not compile.
 
 ## TypeScript Errors
 
-The `@wyrd/sdk` TypeScript boundary throws a `WyrdError` class with `code`,
+The `wyrd-ai` TypeScript boundary throws a `WyrdError` class with `code`,
 `status`, `title`, `detail`, optional `remediation`, and JSON-safe `details`.
 The class may be hand-authored ergonomic TypeScript, but its fields and values
 must project the derive-backed catalog and problem payload exactly. Generated

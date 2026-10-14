@@ -2,6 +2,7 @@
 name = "wyrd-mcp"
 version = { workspace = true }
 edition = { workspace = true }
+description = "First-party Rust MCP client connectivity for Wyrd."
 license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }

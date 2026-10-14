@@ -4,7 +4,7 @@ import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trac
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
-import { Bifrost } from "@wyrd/sdk";
+import { Bifrost } from "wyrd-ai";
 
 import { serverTest } from "../support/server.js";
 

@@ -2,7 +2,7 @@ import { context, trace } from "@opentelemetry/api";
 import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
 import { afterEach, expect, test as bootstrapTest, vi } from "vitest";
 
-import { Cards, WyrdClient, WyrdState } from "@wyrd/sdk";
+import { Cards, WyrdClient, WyrdState } from "wyrd-ai";
 
 import { COMPLETION, work } from "../support/local-development.js";
 import { fixture, serverTest } from "../support/server.js";

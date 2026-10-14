@@ -65,7 +65,7 @@ bifrost.register().await?;
 
 ```typescript
 import { z } from "zod";
-import { Bifrost, TableConfig } from "@wyrd/sdk";
+import { Bifrost, TableConfig } from "wyrd-ai";
 
 const TicketOutcome = z.object({
   ticket_id: z.string(),

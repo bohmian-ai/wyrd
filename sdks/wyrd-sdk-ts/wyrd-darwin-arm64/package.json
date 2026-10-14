@@ -1,7 +1,7 @@
 {
-  "name": "@wyrd/sdk-darwin-arm64",
+  "name": "wyrd-ai-darwin-arm64",
   "version": "0.0.1",
-  "description": "Native napi addon for @wyrd/sdk-darwin-arm64.",
+  "description": "Native napi addon for wyrd-ai-darwin-arm64.",
   "license": "MIT",
   "os": [
     "darwin"

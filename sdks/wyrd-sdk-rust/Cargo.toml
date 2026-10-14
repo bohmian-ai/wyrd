@@ -1,5 +1,5 @@
 [package]
-name = "wyrd-sdk-rust"
+name = "wyrd-ai"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
@@ -55,7 +55,7 @@ workspace-hack.workspace = true
 chrono = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 # The journeys run the in-process CLI commands, `wyrd_sdk::cli`.
-wyrd-sdk-rust = { path = ".", features = ["otel", "testing"] }
+wyrd-ai = { path = ".", features = ["otel", "testing"] }
 # Reads the Arrow batches a streamed Bifrost query yields.
 arrow = { workspace = true }
 # The stock OpenTelemetry exporter the OTLP export story configures from

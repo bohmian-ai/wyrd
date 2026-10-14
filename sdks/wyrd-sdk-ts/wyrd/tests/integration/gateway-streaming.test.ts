@@ -3,7 +3,7 @@
 import OpenAI from "openai";
 import { expect, vi } from "vitest";
 
-import { Gateway, WyrdClient } from "@wyrd/sdk";
+import { Gateway, WyrdClient } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { serverTest } from "../support/server.js";

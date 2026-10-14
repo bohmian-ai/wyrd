@@ -1,6 +1,6 @@
 import { expect, vi } from "vitest";
 
-import { Gateway, type ProviderDeployment, WyrdClient } from "@wyrd/sdk";
+import { Gateway, type ProviderDeployment, WyrdClient } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { serverTest } from "../support/server.js";

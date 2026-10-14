@@ -2,6 +2,7 @@
 name = "wyrd-runtime"
 version = { workspace = true }
 edition = { workspace = true }
+description = "Wyrd runtime singleton and cross-cutting behavior shells."
 license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }

@@ -1,5 +1,5 @@
 {
-  "name": "@wyrd/sdk",
+  "name": "wyrd-ai",
   "version": "0.0.1",
   "private": false,
   "type": "module",
@@ -36,10 +36,10 @@
     ]
   },
   "optionalDependencies": {
-    "@wyrd/sdk-darwin-arm64": "0.0.1",
-    "@wyrd/sdk-darwin-x64": "0.0.1",
-    "@wyrd/sdk-linux-arm64-gnu": "0.0.1",
-    "@wyrd/sdk-linux-x64-gnu": "0.0.1"
+    "wyrd-ai-darwin-arm64": "0.0.1",
+    "wyrd-ai-darwin-x64": "0.0.1",
+    "wyrd-ai-linux-arm64-gnu": "0.0.1",
+    "wyrd-ai-linux-x64-gnu": "0.0.1"
   },
   "dependencies": {
     "apache-arrow": "21.1.0"

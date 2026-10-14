@@ -49,7 +49,7 @@ let binding_ids = service.status.and_then(|status| status.verification).map(|v| 
 <LangTab lang="typescript">
 
 ```typescript
-import { Cards } from "@wyrd/sdk";
+import { Cards } from "wyrd-ai";
 
 const service = await Cards.connect().get({
   kind: "Service",
@@ -162,7 +162,7 @@ let features = bifrost
 <LangTab lang="typescript">
 
 ```typescript
-import { Bifrost } from "@wyrd/sdk";
+import { Bifrost } from "wyrd-ai";
 
 const bifrost = await Bifrost.connect();
 const result = await bifrost.sql(

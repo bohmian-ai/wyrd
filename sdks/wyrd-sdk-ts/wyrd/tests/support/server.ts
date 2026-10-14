@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import type { CardRef, RegistrationReceipt } from "@wyrd/sdk";
+import type { CardRef, RegistrationReceipt } from "wyrd-ai";
 import { type NativeWyrdTestServer, startTestServer } from "@wyrd/testing";
 import { test as base, vi } from "vitest";
 

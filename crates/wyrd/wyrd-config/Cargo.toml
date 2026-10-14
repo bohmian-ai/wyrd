@@ -2,6 +2,9 @@
 name = "wyrd-config"
 version = { workspace = true }
 edition = { workspace = true }
+description = "Wyrd workspace configuration: parses wyrd.toml into card metadata defaults."
+license = { workspace = true }
+repository = { workspace = true }
 rust-version = { workspace = true }
 
 [features]

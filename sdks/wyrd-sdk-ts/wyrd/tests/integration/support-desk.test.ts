@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { context, trace } from "@opentelemetry/api";
 import { afterEach, expect, vi } from "vitest";
 
-import { Bifrost, Cards, Gateway, WyrdClient, WyrdState } from "@wyrd/sdk";
+import { Bifrost, Cards, Gateway, WyrdClient, WyrdState } from "wyrd-ai";
 
 import {
   deploy,

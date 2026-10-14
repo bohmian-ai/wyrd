@@ -1,15 +1,15 @@
 [package]
-name = "skald-runtime"
+name = "wyrd-skald-runtime"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
-publish = false
 description = "Native Skald provider runtime dispatch and mock provider seam."
 
 [lib]
+name = "skald_runtime"
 path = "src/lib.rs"
 
 [features]

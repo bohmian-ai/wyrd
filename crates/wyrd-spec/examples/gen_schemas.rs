@@ -313,7 +313,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Emit the TypeScript `WyrdErrorCode` literal union from the derive-backed
-/// catalog, so `@wyrd/sdk` never hand-maintains the code set.
+/// catalog, so `wyrd-ai` never hand-maintains the code set.
 ///
 /// Codes are sorted and de-duplicated for a stable, reviewable diff.
 ///

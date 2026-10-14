@@ -6977,173 +6977,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
-name = "skald-agent"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "chrono",
- "futures",
- "pyo3",
- "serde",
- "serde_json",
- "serde_yaml",
- "skald-prompt",
- "skald-providers",
- "skald-runtime",
- "skald-spec",
- "skald-tool",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
- "workspace-hack",
- "wyrd-runtime",
- "wyrd-spec",
- "wyrd-telemetry",
- "wyrd-utils",
-]
-
-[[package]]
-name = "skald-cache"
-version = "0.0.1"
-dependencies = [
- "mini-moka",
- "serde",
- "serde_json",
- "skald-spec",
- "workspace-hack",
-]
-
-[[package]]
-name = "skald-prompt"
-version = "0.0.1"
-dependencies = [
- "base64 0.22.1",
- "pyo3",
- "serde",
- "serde_json",
- "skald-spec",
- "thiserror 2.0.18",
- "workspace-hack",
- "wyrd-interfaces",
- "wyrd-spec",
- "wyrd-utils",
-]
-
-[[package]]
-name = "skald-providers"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "httpdate",
- "insta",
- "jsonwebtoken",
- "rand 0.9.5",
- "rcgen",
- "reqwest 0.13.4",
- "rustls",
- "secrecy",
- "serde",
- "serde_json",
- "serde_yaml",
- "skald-spec",
- "temp-env",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "urlencoding",
- "wiremock",
- "workspace-hack",
- "wyrd-tls",
-]
-
-[[package]]
-name = "skald-runtime"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "pyo3",
- "serde_json",
- "skald-cache",
- "skald-providers",
- "skald-spec",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "workspace-hack",
-]
-
-[[package]]
-name = "skald-spec"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "insta",
- "regex",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 2.0.18",
- "workspace-hack",
-]
-
-[[package]]
-name = "skald-tool"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "pyo3",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "skald-spec",
- "thiserror 2.0.18",
- "tokio",
- "workspace-hack",
- "wyrd-runtime",
- "wyrd-spec",
- "wyrd-utils",
-]
-
-[[package]]
-name = "skald-workflow"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "chrono",
- "futures-util",
- "http",
- "jsonschema",
- "pyo3",
- "secrecy",
- "serde",
- "serde_json",
- "serde_yaml",
- "skald-agent",
- "skald-prompt",
- "skald-providers",
- "skald-runtime",
- "skald-spec",
- "skald-tool",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
- "wiremock",
- "workspace-hack",
- "wyrd-spec",
- "wyrd-telemetry",
- "wyrd-utils",
-]
-
-[[package]]
 name = "skeptic"
 version = "0.13.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8648,12 +8481,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
- "skald-agent",
- "skald-prompt",
- "skald-providers",
- "skald-runtime",
- "skald-spec",
- "skald-workflow",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -8662,6 +8489,12 @@ dependencies = [
  "workspace-hack",
  "wyrd-error-derive",
  "wyrd-semver",
+ "wyrd-skald-agent",
+ "wyrd-skald-prompt",
+ "wyrd-skald-providers",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-workflow",
  "wyrd-spec",
  "wyrd-utils",
 ]
@@ -9403,15 +9236,45 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
- "skald-agent",
- "skald-prompt",
- "skald-runtime",
- "skald-spec",
- "skald-tool",
- "skald-workflow",
  "tokio",
  "workspace-hack",
+ "wyrd-skald-agent",
+ "wyrd-skald-prompt",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-tool",
+ "wyrd-skald-workflow",
  "wyrd-spec",
+]
+
+[[package]]
+name = "wyrd-ai"
+version = "0.0.1"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "chrono",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "reqwest 0.13.4",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "wiremock",
+ "workspace-hack",
+ "wyrd-ai",
+ "wyrd-auth-verify",
+ "wyrd-cli",
+ "wyrd-client",
+ "wyrd-spec",
+ "wyrd-testing",
 ]
 
 [[package]]
@@ -9542,8 +9405,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "skald-prompt",
- "skald-spec",
  "tempfile",
  "tokio",
  "workspace-hack",
@@ -9551,6 +9412,8 @@ dependencies = [
  "wyrd-interfaces",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-skald-prompt",
+ "wyrd-skald-spec",
  "wyrd-spec",
  "wyrd-utils",
 ]
@@ -9635,13 +9498,6 @@ dependencies = [
  "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
- "skald-agent",
- "skald-prompt",
- "skald-providers",
- "skald-runtime",
- "skald-spec",
- "skald-tool",
- "skald-workflow",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -9661,6 +9517,13 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-skald-agent",
+ "wyrd-skald-prompt",
+ "wyrd-skald-providers",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-tool",
+ "wyrd-skald-workflow",
  "wyrd-spec",
  "wyrd-testing",
  "wyrd-tls",
@@ -9742,8 +9605,6 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "skald-providers",
- "skald-spec",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -9754,6 +9615,8 @@ dependencies = [
  "wiremock",
  "workspace-hack",
  "wyrd-crypt",
+ "wyrd-skald-providers",
+ "wyrd-skald-spec",
  "wyrd-spec",
  "wyrd-tls",
  "wyrd-utils",
@@ -9875,18 +9738,18 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
- "skald-agent",
- "skald-prompt",
- "skald-runtime",
- "skald-spec",
- "skald-tool",
- "skald-workflow",
  "tempfile",
  "tokio",
  "tracing",
  "workspace-hack",
  "wyrd",
- "wyrd-sdk-rust",
+ "wyrd-ai",
+ "wyrd-skald-agent",
+ "wyrd-skald-prompt",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-tool",
+ "wyrd-skald-workflow",
  "wyrd-spec",
 ]
 
@@ -9902,11 +9765,6 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "skald-agent",
- "skald-prompt",
- "skald-runtime",
- "skald-tool",
- "skald-workflow",
  "tempfile",
  "tracing",
  "url",
@@ -9920,40 +9778,15 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-skald-agent",
+ "wyrd-skald-prompt",
+ "wyrd-skald-runtime",
+ "wyrd-skald-tool",
+ "wyrd-skald-workflow",
  "wyrd-spec",
  "wyrd-testing",
  "wyrd-types",
  "wyrd-utils",
-]
-
-[[package]]
-name = "wyrd-sdk-rust"
-version = "0.0.1"
-dependencies = [
- "arrow",
- "async-trait",
- "chrono",
- "opentelemetry",
- "opentelemetry-http",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "reqwest 0.13.4",
- "secrecy",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "wiremock",
- "workspace-hack",
- "wyrd-auth-verify",
- "wyrd-cli",
- "wyrd-client",
- "wyrd-sdk-rust",
- "wyrd-spec",
- "wyrd-testing",
 ]
 
 [[package]]
@@ -10054,12 +9887,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "shellexpand",
- "skald-prompt",
- "skald-providers",
- "skald-runtime",
- "skald-spec",
- "skald-tool",
- "skald-workflow",
  "sqlx 0.9.0",
  "subtle",
  "temp-env",
@@ -10095,6 +9922,12 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-skald-prompt",
+ "wyrd-skald-providers",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-tool",
+ "wyrd-skald-workflow",
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-storage",
@@ -10106,6 +9939,173 @@ dependencies = [
  "wyrd-utils",
  "wyrd-vault",
  "zeroize",
+]
+
+[[package]]
+name = "wyrd-skald-agent"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "pyo3",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "workspace-hack",
+ "wyrd-runtime",
+ "wyrd-skald-prompt",
+ "wyrd-skald-providers",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-tool",
+ "wyrd-spec",
+ "wyrd-telemetry",
+ "wyrd-utils",
+]
+
+[[package]]
+name = "wyrd-skald-cache"
+version = "0.0.1"
+dependencies = [
+ "mini-moka",
+ "serde",
+ "serde_json",
+ "workspace-hack",
+ "wyrd-skald-spec",
+]
+
+[[package]]
+name = "wyrd-skald-prompt"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "pyo3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "workspace-hack",
+ "wyrd-interfaces",
+ "wyrd-skald-spec",
+ "wyrd-spec",
+ "wyrd-utils",
+]
+
+[[package]]
+name = "wyrd-skald-providers"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "httpdate",
+ "insta",
+ "jsonwebtoken",
+ "rand 0.9.5",
+ "rcgen",
+ "reqwest 0.13.4",
+ "rustls",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "urlencoding",
+ "wiremock",
+ "workspace-hack",
+ "wyrd-skald-spec",
+ "wyrd-tls",
+]
+
+[[package]]
+name = "wyrd-skald-runtime"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "pyo3",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "workspace-hack",
+ "wyrd-skald-cache",
+ "wyrd-skald-providers",
+ "wyrd-skald-spec",
+]
+
+[[package]]
+name = "wyrd-skald-spec"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "insta",
+ "regex",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "workspace-hack",
+]
+
+[[package]]
+name = "wyrd-skald-tool"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "pyo3",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "workspace-hack",
+ "wyrd-runtime",
+ "wyrd-skald-spec",
+ "wyrd-spec",
+ "wyrd-utils",
+]
+
+[[package]]
+name = "wyrd-skald-workflow"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures-util",
+ "http",
+ "jsonschema",
+ "pyo3",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+ "workspace-hack",
+ "wyrd-skald-agent",
+ "wyrd-skald-prompt",
+ "wyrd-skald-providers",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-tool",
+ "wyrd-spec",
+ "wyrd-telemetry",
+ "wyrd-utils",
 ]
 
 [[package]]
@@ -10129,7 +10129,6 @@ dependencies = [
  "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
- "skald-spec",
  "strum",
  "thiserror 2.0.18",
  "url",
@@ -10138,6 +10137,7 @@ dependencies = [
  "workspace-hack",
  "wyrd-error-derive",
  "wyrd-semver",
+ "wyrd-skald-spec",
 ]
 
 [[package]]
@@ -10264,10 +10264,6 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2 0.10.9",
- "skald-prompt",
- "skald-providers",
- "skald-runtime",
- "skald-spec",
  "sqlx 0.9.0",
  "sysinfo",
  "tempfile",
@@ -10298,6 +10294,10 @@ dependencies = [
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-server",
+ "wyrd-skald-prompt",
+ "wyrd-skald-providers",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-storage",

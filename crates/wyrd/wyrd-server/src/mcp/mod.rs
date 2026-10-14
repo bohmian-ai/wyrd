@@ -20,7 +20,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ErrorCode, ErrorData,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ErrorCode, ErrorData,
     InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
     ServerInfo, Tool,
 };
@@ -223,7 +223,12 @@ impl ServerHandler for WyrdMcpHandler {
             }
         }
         catalog.extend(self.probe_descriptors());
-        std::future::ready(Ok(ListToolsResult::with_all_items(catalog)))
+        // Protocol 2026-07-28 requires cache metadata on list results. The
+        // catalog depends on the caller's permissions, which can change at
+        // any time, so it is private to the caller and immediately stale.
+        std::future::ready(Ok(ListToolsResult::with_all_items(catalog)
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private)))
     }
 
     /// Dispatch tools with verified request context and retain the shutdown

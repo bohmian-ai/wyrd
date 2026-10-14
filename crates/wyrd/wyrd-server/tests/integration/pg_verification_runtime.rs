@@ -2422,6 +2422,7 @@ async fn observation_outbox_retains_through_an_outage_and_flushes_at_shutdown() 
     let record = |record_id: &str| ObservationRecord {
         subject: owner.clone(),
         writer: Some(owner.clone()),
+        principal,
         record_id: record_id.to_owned(),
         event_time: Utc::now(),
     };

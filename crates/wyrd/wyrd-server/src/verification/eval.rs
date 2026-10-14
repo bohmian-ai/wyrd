@@ -64,7 +64,7 @@ use super::authority::{SystemReadAuthority, SystemReadAuthorityError, writer_cal
 use super::engines::{EngineOutcome, VerifierReport};
 use super::telemetry::{ExecutionTelemetry, Phase, WaitSink};
 use crate::components::auth::Caller;
-use crate::components::gateway::ServerWyrdGatewayCaller;
+use crate::components::gateway::{GatewayCallSubject, ServerWyrdGatewayCaller};
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::state::AppState;
 
@@ -246,7 +246,15 @@ impl EvalEngine {
         }
         match self
             .score(
-                self.judge_invoker(tenant, writer.as_ref(), telemetry),
+                self.judge_invoker(
+                    tenant,
+                    writer.as_ref(),
+                    Some(GatewayCallSubject {
+                        run_id: observed_run.clone(),
+                        card_uid: Some(run.subject_card_uid.clone()),
+                    }),
+                    telemetry,
+                ),
                 run,
                 spec,
                 &record,
@@ -317,12 +325,16 @@ impl EvalEngine {
     /// the in-process gateway as `caller`, the principal that initiated the
     /// judgment, so its authorization, accounting, capture, and audit apply.
     /// `caller` is `None` only for a spec with no LLM judge; a judge call
-    /// then finds no provider and fails terminally. Shared by the Eval path
-    /// and a direct task Verifier's LLM judge.
+    /// then finds no provider and fails terminally. Every judge model call is
+    /// attributed to `subject`, the Card a real-time verification judges and
+    /// its Run when the request named one; `None` leaves the calls
+    /// uncorrelated. Shared by the Eval path and a direct task Verifier's LLM
+    /// judge.
     pub fn judge_invoker(
         &self,
         tenant: DataTenantId,
         caller: Option<&Caller>,
+        subject: Option<GatewayCallSubject>,
         telemetry: &ExecutionTelemetry,
     ) -> Arc<dyn JudgeInvoker> {
         let registry = Arc::new(TenantRegistry {
@@ -340,10 +352,10 @@ impl EvalEngine {
         )
         .with_media_resolver(media);
         let inner = match caller {
-            Some(caller) => inner.with_wyrd_gateway(Arc::new(ServerWyrdGatewayCaller::new(
-                self.state.clone(),
-                caller.clone(),
-            ))),
+            Some(caller) => inner.with_wyrd_gateway(Arc::new(
+                ServerWyrdGatewayCaller::new(self.state.clone(), caller.clone())
+                    .attributed(subject),
+            )),
             None => inner,
         };
         Arc::new(TimedJudge {

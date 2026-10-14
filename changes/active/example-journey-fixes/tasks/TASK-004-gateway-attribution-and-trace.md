@@ -2,11 +2,15 @@
 
 Spec: `../spec.md` REQ-004, REQ-005, INV-001, AC-001..AC-003.
 
-1. When a Verifier runs in real time for a Run, the gateway calls it makes
-   (for example `llm_judge` through `ServerWyrdGatewayCaller`, which today
-   builds `GatewayCallRequest { subject: None, .. }`) are recorded in
-   `vala.gateway.calls` with the Run's `run_id` and subject `card_uid`.
-   Without a Run, leave attribution absent.
+1. Owner directive 2026-10-14 (attribution from execution context), spec
+   r2: if an invocation carries a `card_uid` and/or a `run_id`, record it;
+   the requesting principal is always recorded. Unpair the gateway subject
+   so `wyrd-run-id` and `wyrd-card-uid` are independent; plumb the
+   execution's subject `card_uid` and optional `run_id` into the judge's
+   gateway call (`ServerWyrdGatewayCaller`, which today builds
+   `GatewayCallRequest { subject: None, .. }`); and record the requesting
+   principal on Verifier executions. Add no binding enforcement or new
+   authorization.
 2. The gateway honors inbound W3C `traceparent`/`tracestate` on inference
    routes so its spans are children of the caller's span, and in-process
    calls made for a traced request inherit the active context. Malformed
@@ -14,5 +18,43 @@ Spec: `../spec.md` REQ-004, REQ-005, INV-001, AC-001..AC-003.
 
 Evidence: journeys in Rust, Python, and TypeScript: a Run with an OTEL span
 calls the gateway and a judge Verifier, then Bifrost shows the judge call with
-the run_id/card_uid and the gateway span sharing the caller's trace_id;
-negative cases for no Run and a malformed traceparent.
+the principal, the subject card_uid, and the run_id when present, joined to the
+result carrying the same principal, and the gateway span sharing the caller's
+trace_id; gateway calls for principal only, + card_uid, + run_id, and + both;
+a judge execution without a Run; and a malformed traceparent.
+
+Revision note (2026-10-14): item 1 amended per owner directive 2026-10-14
+(attribution from execution context); the former "without a Run, leave
+attribution absent" rule is dropped and the scope is limited to the three
+items above.
+
+## Evidence
+
+Reuse: the gateway subject (`GatewayCallSubject`), its card-scope check
+(`GatewayInvocation::attribute`), the capture rows, `ResultPayloadBuilder`, the
+`wyrd.verifier_runs` requester column, and `TraceContext::parse_traceparent`
+were extended in place; the only new owner is the task-local inbound trace
+context middleware (`http/middleware/trace_context.rs`), which the gateway
+read path had no equivalent for.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Gateway call records principal plus whichever of run_id/card_uid it carries | `gateway/ingress.rs::requested_subject`, `invocation.rs::attribute`, `capture.rs` | Rust journey `gateway_inference::gateway_call_records_whichever_attribution_it_carries` (4 cases); unit `components::gateway::ingress::tests::subject_headers_decode_independently`; `pg_invocation_tests` | PASS |
+| Judge call carries subject card_uid and run_id when present (direct, observation, scheduled) | `verification/direct.rs::attributed`, `verification/eval.rs::judge_invoker`, `gateway/workflow.rs::ServerWyrdGatewayCaller::attributed` | Rust `verify_in_real_time::judge_call_is_attributed_to_the_run_and_card`, `…judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card`; Python `test_judge_call_is_attributed_to_the_run_and_card`; TS `judge call is attributed to the run and card` | PASS |
+| Result records requesting principal and joins its judge calls on subject_card_uid | `tables/verification/results.rs`, `verification/results.rs::ResultRun.requested_by`, `components/verification/service.rs::stage_result` | the two Rust verify journeys above (result ↔ call join); unit `verification::results::tests::direct_task_writes_one_summary_row`; `tables::tests::verification_tables_match_their_approved_schemas` | PASS |
+| Scheduled and observation runs record the principal they execute as | migration `20261014000000_verifier_run_requester_every_origin.sql`, `queries/verifier_runs.rs`, `verification/observations.rs` | `wyrd-sql` `pg_verifier_runs::*` (25) incl. `concurrent_schedulers_create_one_run_per_occurrence`; `pg_migration::*`; `wyrd-server` `pg_verification_runtime::*` | PASS |
+| Gateway honors W3C traceparent/tracestate; in-process calls inherit; malformed ignored | `http/middleware/trace_context.rs`, `capture.rs::spans_batch` | Rust `gateway_span_joins_the_callers_trace`, `malformed_traceparent_is_ignored_by_the_gateway`, `malformed_traceparent_is_ignored_by_the_judge_call`; Python and TS gateway trace journeys; unit `http::middleware::trace_context::tests::*` | PASS |
+| No new authorization or binding enforcement | `attribute` keeps the existing card-scope check, applied only when a card_uid is present; server-resolved judge subjects skip it | diff audit | PASS |
+
+Commands: `scripts/postgres/with-test-postgres.sh` + `cargo nextest run -p wyrd-ai --test integration -P journey --run-ignored=all` (6/6),
+pytest `-m integration` on the two Python journey files (3/3), vitest on the
+two TS journey files (24/24), `mise run codegen:regen` then
+`mise run codegen:check`, `mise run check:tenant-isolation`, `mise run fmt`,
+`mise run fmt:check`, `mise run lints`, `mise run py:format`,
+`mise run py:lints`, `mise run ts:format:check`, `mise run ts:lints`,
+`mise run ts:typecheck`, `mise run docs:check`, `git diff --check`: all pass.
+
+Limits: `wyrd.verifier_runs` rows enqueued before the migration keep a null
+requester; the built-in `vala.verification.results` schema gains
+`requested_by_principal_id` in place, following the existing built-in schema
+precedent, with no evolution path for already-created tables.

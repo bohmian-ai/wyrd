@@ -3149,10 +3149,12 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
     conn.commit().await.expect("seed commits");
     let run = RunId::new();
     let call = |card_uid: &CardUid| GatewayCallRequest {
-        subject: Some(super::GatewayCallSubject {
-            run_id: run.clone(),
-            card_uid: card_uid.clone(),
-        }),
+        subject: Some(super::GatewayCallAttribution::Requested(
+            super::GatewayCallSubject {
+                run_id: Some(run.clone()),
+                card_uid: Some(card_uid.clone()),
+            },
+        )),
         ..request("acme/a", Some((1000, 500)), Duration::from_secs(10))
     };
     let invocation = GatewayInvocation::new(&state);

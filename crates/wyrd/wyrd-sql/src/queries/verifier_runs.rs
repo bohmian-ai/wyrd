@@ -73,6 +73,10 @@ const RESOLVE_DIRECT_SQL: &str = r"
 /// occurrence or observation record conflicts on its partial unique index and
 /// inserts nothing.
 ///
+/// `$15` is the requesting principal of a manual or observation request; a
+/// scheduled run records the tenant's active SYSTEM principal it executes as,
+/// or null when the tenant has none.
+///
 /// The run becomes claimable on the same clock the claim predicate reads, so
 /// no enqueueing process can write work into the queue's future or past. An
 /// observation run takes the next ordinal of its binding; the caller holds
@@ -87,7 +91,12 @@ const INSERT_RUN_SQL: &str = r"
         requested_by_principal_id, max_attempts, next_attempt_at, created_at, updated_at,
         idempotency_key, request_sha256, observation_ordinal
     ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, $10,
-              $11, $12, $13, $14, $15, $16,
+              $11, $12, $13, $14,
+              COALESCE($15::uuid, CASE WHEN $5 = 'schedule' THEN (
+                  SELECT a.id FROM wyrd.auth_service_accounts a
+                   WHERE a.principal_kind = 'system' AND a.status = 'active'
+              ) END),
+              $16,
               statement_timestamp(), statement_timestamp(), statement_timestamp(), $17, $18,
               CASE WHEN $5 = 'observation' THEN (
                   SELECT COALESCE(max(observation_ordinal), 0) + 1
@@ -136,8 +145,9 @@ const LOCK_OBSERVATION_SUBJECTS_SQL: &str = r"
 /// Insert one observation run per unseen `(binding, record)` of a batch in
 /// one statement, due at PostgreSQL's statement time.
 ///
-/// `$1..$4` are parallel arrays of run ID, binding, record ID, and event time
-/// in batch order. Rows whose record already has a run of that binding, and
+/// `$1..$4` and `$6` are parallel arrays of run ID, binding, record ID,
+/// event time, and writing principal in batch order; the writing principal is
+/// frozen as the run's `requested_by_principal_id`. Rows whose record already has a run of that binding, and
 /// later repeats inside the batch, are removed before numbering, so a repeat
 /// inserts nothing and consumes no ordinal. Ordinals continue each binding's
 /// maximum in batch order; the caller holds every binding's row lock from
@@ -148,20 +158,21 @@ const INSERT_OBSERVATION_RUNS_SQL: &str = r"
     INSERT INTO wyrd.verifier_runs (
         run_id, data_tenant_id, verifier_uid, verifier_version, subject_card_uid,
         origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
-        input_record_id, input_event_time, max_attempts,
+        input_record_id, input_event_time, requested_by_principal_id, max_attempts,
         next_attempt_at, created_at, updated_at, observation_ordinal
     )
     SELECT r.run_id, wyrd.current_tenant(), b.verifier_uid, v.version, b.subject_card_uid,
            'observation', b.owner_card_uid, b.binding_id, b.trigger_uid, b.trigger_digest,
-           b.operators, r.record_id, r.event_time, $5,
+           b.operators, r.record_id, r.event_time, r.principal, $5,
            statement_timestamp(), statement_timestamp(), statement_timestamp(),
            COALESCE((SELECT max(x.observation_ordinal)
                        FROM wyrd.verifier_runs x
                       WHERE x.binding_id = r.binding_id AND x.origin = 'observation'), 0)
              + row_number() OVER (PARTITION BY r.binding_id ORDER BY r.position)
       FROM (SELECT DISTINCT ON (u.binding_id, u.record_id) u.*
-              FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::timestamptz[])
-                   WITH ORDINALITY AS u(run_id, binding_id, record_id, event_time, position)
+              FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::timestamptz[], $6::uuid[])
+                   WITH ORDINALITY AS u(run_id, binding_id, record_id, event_time, principal,
+                                        position)
              WHERE NOT EXISTS (SELECT 1 FROM wyrd.verifier_runs e
                                 WHERE e.binding_id = u.binding_id
                                   AND e.origin = 'observation'
@@ -555,9 +566,10 @@ impl RunInput {
 /// A request to enqueue one run through the single shared enqueue path.
 ///
 /// Each origin carries exactly the fields it requires: only a manual request
-/// names a requester and may target a Verifier directly; scheduled and
-/// observation work always comes from a binding, with a Drift window or an
-/// Eval record respectively.
+/// may target a Verifier directly; scheduled and observation work always
+/// comes from a binding, with a Drift window or an Eval record respectively.
+/// Manual and observation requests name their requesting principal; a
+/// scheduled run records the tenant SYSTEM principal it executes as.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunRequest {
     /// An authenticated manual Drift run of a binding or a direct Verifier.
@@ -578,6 +590,9 @@ pub enum RunRequest {
     },
     /// One committed Eval observation for an `observations_ready` binding.
     Observation {
+        /// The principal that wrote the record, frozen as
+        /// `requested_by_principal_id`.
+        requested_by: PrincipalId,
         /// The matching binding.
         binding_id: BindingId,
         /// Logical input record ID.
@@ -630,11 +645,14 @@ impl RunRequest {
         }
     }
 
-    /// The manual requester, absent for scheduled and observation work.
+    /// The requesting principal of a manual or observation request; `None`
+    /// for a scheduled run, whose SYSTEM principal the insert resolves.
     const fn requested_by(&self) -> Option<PrincipalId> {
         match self {
-            Self::Manual { requested_by, .. } => Some(*requested_by),
-            Self::Scheduled { .. } | Self::Observation { .. } => None,
+            Self::Manual { requested_by, .. } | Self::Observation { requested_by, .. } => {
+                Some(*requested_by)
+            }
+            Self::Scheduled { .. } => None,
         }
     }
 }
@@ -786,7 +804,10 @@ pub struct ClaimedRun {
     pub trigger: Option<FrozenTarget>,
     /// Frozen input.
     pub input: RunInput,
-    /// Manual requester; `None` for scheduled and observation runs.
+    /// The principal the run was requested by and executes as: the manual
+    /// caller, the observation's writer, or the tenant SYSTEM principal of a
+    /// scheduled run; `None` for a run enqueued before every origin recorded
+    /// one, or a scheduled run of a tenant without a SYSTEM principal.
     pub requested_by: Option<PrincipalId>,
     /// One-based position among the binding's observation runs, assigned once
     /// at enqueue; `None` for scheduled and manual runs. Eval's `every_nth`
@@ -854,6 +875,9 @@ pub struct ObservationRecord {
     /// writer bound to no Card, whose record activates every
     /// `observations_ready` binding of its subject.
     pub writer: Option<CardUid>,
+    /// The principal that wrote the observation, frozen as each run's
+    /// `requested_by_principal_id`.
+    pub principal: PrincipalId,
     /// Logical input record ID, unique per binding's runs.
     pub record_id: String,
     /// Committed observation's server event time, frozen on the run.
@@ -1581,8 +1605,8 @@ impl VerifierRunQueue {
             .bind(writers)
             .fetch_all(&mut **conn.transaction())
             .await?;
-        let (mut run_ids, mut binding_ids, mut record_ids, mut event_times) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut run_ids, mut binding_ids, mut record_ids, mut event_times, mut principals) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (binding, subject, writer) in bindings {
             if !self
                 .accepts_records(conn, stored(BindingId::new(binding))?)
@@ -1601,6 +1625,7 @@ impl VerifierRunQueue {
                 binding_ids.push(binding);
                 record_ids.push(record.record_id.as_str());
                 event_times.push(record.event_time);
+                principals.push(record.principal.as_uuid());
             }
         }
         if run_ids.is_empty() {
@@ -1612,6 +1637,7 @@ impl VerifierRunQueue {
             .bind(record_ids)
             .bind(event_times)
             .bind(self.retry.max_attempts)
+            .bind(principals)
             .execute(&mut **conn.transaction())
             .await?;
         Ok(inserted.rows_affected())

@@ -29,7 +29,8 @@ pub(crate) use capture::{recording, tests as capture_tests};
 pub use ingress::gateway_ingress_router;
 pub(crate) use invocation::unconnected_engine;
 pub use invocation::{
-    GatewayCallRequest, GatewayCallResponse, GatewayCallSubject, GatewayInvocation,
+    GatewayCallAttribution, GatewayCallRequest, GatewayCallResponse, GatewayCallSubject,
+    GatewayInvocation,
 };
 pub use routes::gateway_router;
 pub use service::GatewayAdministration;

@@ -1,6 +1,6 @@
 ---
 id: SPEC-example-journey-fixes
-revision: 1
+revision: 2
 status: approved
 ---
 
@@ -33,7 +33,7 @@ together".
 - REQ-001 Jev provider is typed end to end.
 - REQ-002 Bifrost returns actionable caller errors.
 - REQ-003 Wyrd MCP works with common MCP clients and model tool-calling.
-- REQ-004 Real-time Verifier model calls are attributed to the Run and Card.
+- REQ-004 Verifier executions are attributed from their execution context.
 - REQ-005 Gateway spans join the caller's trace.
 - REQ-006 Bifrost subqueries over live tables work.
 - REQ-007 Local server setup handles the gateway managed-secret keyring.
@@ -92,13 +92,31 @@ release.
   `/mcp`, list the full catalog for an administrator, convert every tool, and
   call a read tool.
 
-### REQ-004 Real-time judge attribution
+### REQ-004 Verifier execution attribution
 
-- When a Verifier runs in real time for a Run (`run_id` and subject Card
-  supplied with the verify request), every gateway model call it makes, such
-  as an `llm_judge` call, is recorded in `vala.gateway.calls` with that
-  `run_id` and the subject `card_uid`, so it joins the Run's other evidence.
-  Without a Run, attribution stays absent rather than invented.
+Owner directive 2026-10-14 (attribution from execution context). Verifiers may
+execute at any time, not only within a Run, so attribution derives from the
+execution's context, not from whether a Run exists.
+
+- If an invocation carries a `card_uid` and/or a `run_id`, it is recorded;
+  the requesting principal is always recorded. `run_id` and `card_uid` are
+  independent: either, both, or neither may be present, an absent one is
+  recorded as null, and neither is inferred or required to record the other.
+- A gateway call in `vala.gateway.calls` records its `caller_principal_id`
+  plus whichever of the `wyrd-run-id` and `wyrd-card-uid` headers it carried.
+  The gateway's existing card-scope authorization applies to a `card_uid`
+  whenever one is present.
+- Every gateway model call a Verifier execution makes (for example an
+  `llm_judge` call through `ServerWyrdGatewayCaller`) records the
+  execution's subject Card as `card_uid` and its `run_id` when present, for
+  direct, observation, and scheduled executions alike.
+- Every Verifier execution records its requesting principal: the
+  verification result carries `requested_by_principal_id`, and
+  `wyrd.verifier_runs` records the principal a scheduled or observation run
+  executes as. The result joins its judge calls on
+  `subject_card_uid` = `card_uid`.
+- No binding enforcement or new authorization is added; direct-execution
+  authorization is unchanged.
 
 ### REQ-005 Trace linking
 
@@ -153,3 +171,10 @@ None.
 ## Revision history
 
 - r1 2026-10-14: initial, from the owner's directive.
+- r2 2026-10-14: REQ-004 amended by owner directive 2026-10-14 (attribution
+  from execution context): the requesting principal is always recorded;
+  `run_id` and `card_uid` are independent and optional, recorded when an
+  invocation carries them; judge calls carry the execution's subject Card and
+  optional Run; results record the requesting principal and join their judge
+  calls on the subject Card; no new authorization. The rule "without a Run,
+  attribution stays absent" is dropped.

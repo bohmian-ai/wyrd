@@ -593,7 +593,8 @@ impl Agent {
     /// # Errors
     ///
     /// Returns [`AgentError::SessionRecentFailed`] when the session store
-    /// cannot be read.
+    /// cannot be read, and [`AgentError::LoopMessageType`] when the Prompt is
+    /// a Jev request, which is not a chat dialect.
     async fn seed_session_recent(
         &self,
         session_id: &SessionId,
@@ -610,7 +611,7 @@ impl Agent {
             })?;
         let request = &self.prompt.native().request;
         for turn in recent {
-            conversation.push(session_turn_to_conversation_turn(turn, request));
+            conversation.push(session_turn_to_conversation_turn(turn, request)?);
         }
         Ok(())
     }

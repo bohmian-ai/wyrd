@@ -3141,21 +3141,50 @@ export interface GatewayCapturePolicy extends GatewayCapturePolicyWrite {
 }
 
 /**
- * A `fetch` that authenticates every request to the Wyrd Gateway as `client`.
+ * The current Wyrd access token, as a source a stock client asks on every call.
  *
- * Hand it to a stock client, such as
- * `new OpenAI({ baseURL: \`${client.serverUrl}/v1\`, apiKey: "wyrd", fetch: gatewayFetch(client) })`.
- * Each request asks `client` for its current access token and sends it as
- * `Authorization: Bearer <token>`, so a long-lived client keeps working after
- * any one access token expires.
+ * Hand it to the OpenAI SDK as its key:
+ * `new OpenAI({ baseURL: \`${process.env.WYRD_SERVER_URL}/v1\`, apiKey: accessTokenSource() })`.
+ * The client resolves once, here, so every call shares one token cache; each
+ * call then asks it for its current access token, which the client exchanges,
+ * caches, and renews, so a long-lived stock client keeps working after any one
+ * token expires.
  *
- * @param client - The client whose access token every request carries.
- * @returns The authenticating `fetch`.
+ * @param options - The client to authenticate as; omitted, the ambient client.
+ * @returns A function resolving the current access token on each call.
+ * @throws {WyrdError} `WYRD_CLIENT_401_NO_CREDENTIALS` when no ambient
+ * credential resolves; the returned function rejects with the client's
+ * exchange error when the credential is refused.
  */
-export function gatewayFetch(client: WyrdClient): typeof fetch {
+export function accessTokenSource(options: ClientOptions = {}): () => Promise<string> {
+  const client = clientOf(options);
+  return () => client.accessToken();
+}
+
+/**
+ * A `fetch` that authenticates every request to Wyrd.
+ *
+ * Hand it to any client that takes a `fetch`, such as the Agents SDK
+ * `new MCPServerStreamableHttp({ url: \`${process.env.WYRD_SERVER_URL}/mcp\`, fetch: wyrdFetch() })`.
+ * The client resolves once, here; each request carries its current access
+ * token as `X-Wyrd-Access-Token: Bearer <token>`, which every Wyrd route and
+ * the gateway accept.
+ *
+ * The gateway refuses a request carrying more than one credential header, so
+ * do not pair this with an OpenAI `apiKey`; use {@link accessTokenSource} as
+ * the key instead.
+ *
+ * @param options - The client to authenticate as; omitted, the ambient client.
+ * @returns The authenticating `fetch`.
+ * @throws {WyrdError} `WYRD_CLIENT_401_NO_CREDENTIALS` when no ambient
+ * credential resolves; a request rejects with the client's exchange error
+ * when the credential is refused.
+ */
+export function wyrdFetch(options: ClientOptions = {}): typeof fetch {
+  const client = clientOf(options);
   return async (input, init) => {
     const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
-    headers.set("authorization", `Bearer ${await client.accessToken()}`);
+    headers.set("x-wyrd-access-token", `Bearer ${await client.accessToken()}`);
     return fetch(input, { ...init, headers });
   };
 }

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
 
 try:
     import httpx
@@ -14,8 +13,7 @@ except ImportError as missing:
         " (httpx and httpx2)"
     ) from missing
 
-if TYPE_CHECKING:
-    from wyrd.client import WyrdClient
+from wyrd.client import WyrdClient
 
 
 class GatewayAuth(httpx.Auth, httpx2.Auth):
@@ -25,11 +23,13 @@ class GatewayAuth(httpx.Auth, httpx2.Auth):
     ``httpx``; both run the same auth-flow protocol, so one instance serves
     either. Each request carries ``Authorization: Bearer <token>`` from
     ``client.access_token()``, asked for on that request, so a long-lived
-    client keeps working after any one access token expires.
+    client keeps working after any one access token expires. Omitting
+    ``client`` resolves the ambient ``WyrdClient()`` once, here, so every
+    request shares one token cache.
     """
 
-    def __init__(self, client: WyrdClient) -> None:
-        self._client = client
+    def __init__(self, client: WyrdClient | None = None) -> None:
+        self._client = client if client is not None else WyrdClient()
 
     # The flows keep their bases' signatures: each base types them with its
     # own Request class, and one instance serves both.

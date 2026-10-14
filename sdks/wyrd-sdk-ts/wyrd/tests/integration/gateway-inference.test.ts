@@ -7,10 +7,18 @@ import OpenAI from "openai";
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
-import { Cards, Gateway, type ProviderDeployment, type RegistrationReceipt, Workflow, WyrdClient } from "wyrd-ai";
+import {
+  Cards,
+  Gateway,
+  type ProviderDeployment,
+  type RegistrationReceipt,
+  Workflow,
+  WyrdClient,
+  accessTokenSource,
+} from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
-import { fixture, registered, serverTest } from "../support/server.js";
+import { fixture, registered, revokedApiKey, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -152,6 +160,26 @@ test("openai client calls the gateway with an access token", async ({ provider, 
   });
   expect(Object.values(upstream?.headers ?? {})).not.toContain(token);
   expect(Object.keys(upstream?.headers ?? {}).filter((name) => name.startsWith("x-wyrd"))).toEqual([]);
+});
+
+test("stock openai client authenticates from the environment alone", async ({ ask: _ }) => {
+  const client = new OpenAI({ baseURL: `${process.env.WYRD_SERVER_URL}/v1`, apiKey: accessTokenSource() });
+
+  for (let turn = 0; turn < 2; turn++) {
+    const reply = await client.chat.completions.create(ASK);
+    expect(reply.choices[0]?.message.content).toBe("hi");
+  }
+});
+
+test("revoked api key is refused by the token exchange, before the gateway", async ({ provider, ask: _ }) => {
+  vi.stubEnv("WYRD_API_KEY", await revokedApiKey("revoked-gateway-caller"));
+  const client = new OpenAI({ baseURL: `${process.env.WYRD_SERVER_URL}/v1`, apiKey: accessTokenSource() });
+  const before = provider.received.length;
+
+  await expect(client.chat.completions.create(ASK)).rejects.toMatchObject({
+    cause: { code: "WYRD_SPEC_400_VALIDATION", details: { error: "invalid_request" } },
+  });
+  expect(provider.received.length).toBe(before);
 });
 
 test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {

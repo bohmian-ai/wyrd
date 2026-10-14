@@ -142,8 +142,10 @@ ProviderAdapter = (
 ``"openai"``, ``"anthropic"``, ``"gemini"``, and ``"jev"`` require the provider
 of the same name. OpenAI-protocol adapters serve every operation except
 ``system_one``; the Anthropic, Gemini, and Vertex adapters serve
-``chat_completions`` only. The Jev adapter serves ``system_one`` only: typed
-``{"model", "state", "questions"}`` requests answered by typed ``answers``.
+``chat_completions`` only. The Jev adapter serves ``system_one``, typed
+``{"model", "state", "questions"}`` requests answered by typed ``answers``, and
+a ``chat_completions`` pass-through whose last user message is the JSON text of
+``{"state", "questions"}`` and whose answer content is Jev's answer as JSON.
 Jev calls carry no usage bound, so a tenant budget or token limit refuses them.
 """
 

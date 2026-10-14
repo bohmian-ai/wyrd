@@ -51,13 +51,13 @@ function answer(noul: number, tone: string) {
 /**
  * The local Jev upstream: helpful and polite unless the state names a
  * scripted case — `Go away` is unhelpful and rude, each `REFUSALS` key is
- * refused.
+ * refused with a body that echoes the operator key after `key cred`.
  */
 function jev(request: ReceivedRequest): Reply {
   const state = JSON.stringify((JSON.parse(request.body) as { state?: unknown }).state);
   const refused = Object.entries(REFUSALS).find(([needle]) => state.includes(needle));
   if (refused) {
-    return { status: refused[1], body: { detail: "key cred" } };
+    return { status: refused[1], body: { detail: `key cred ${JEV_KEY}` } };
   }
   return { status: 200, body: state.includes("Go away") ? answer(0.12, "rude") : answer(0.93, "polite") };
 }
@@ -76,10 +76,24 @@ async function post(route: string, body: unknown): Promise<{ status: number; rep
   return { status: response.status, reply: (await response.json()) as GatewayReply };
 }
 
+/** A stock OpenAI client pointed at the Gateway with the administrator's access token. */
+async function openaiClient(): Promise<OpenAI> {
+  const client = WyrdClient.connect();
+  return new OpenAI({ baseURL: `${client.serverUrl}/v1`, apiKey: await client.accessToken(), maxRetries: 0 });
+}
+
+/** Messages whose last user turn is the typed Jev request about `state`. */
+function chat(state: string): OpenAI.Chat.ChatCompletionMessageParam[] {
+  return [
+    { role: "system", content: "Judge the reply." },
+    { role: "user", content: JSON.stringify({ state, questions: QUESTIONS }) },
+  ];
+}
+
 /**
  * A verification-capable server with one Jev deployment serving
- * `system_one`, the only operation Jev serves, and the hydrated `reviewer` Service
- * acting as its own Card-scoped key.
+ * `system_one` and the `chat_completions` pass-through, and the hydrated
+ * `reviewer` Service acting as its own Card-scoped key.
  */
 const test = serverTest({ provider: jev, verificationRuntime: true }).extend<{ reviewer: WyrdState }>({
   reviewer: [
@@ -94,7 +108,7 @@ const test = serverTest({ provider: jev, verificationRuntime: true }).extend<{ r
         model: { provider: "jev", model: "jev-latest" },
         adapter: "jev",
         auth: { bearer: { credential: "jev-key" } },
-        capabilities: ["system_one"],
+        capabilities: ["system_one", "chat_completions"],
         routing_weight: 1,
       });
       const cards = Cards.connect();
@@ -139,18 +153,27 @@ test("invalid jev questions are refused before jev", async ({ provider, reviewer
   expect(provider.received.slice(before)).toEqual([]);
 });
 
-test("chat completions never reach jev", async ({ provider, reviewer: _ }) => {
+test("chat completions pass typed jev requests through", async ({ provider, reviewer: _ }) => {
   const before = provider.received.length;
-  const client = WyrdClient.connect();
-  const openai = new OpenAI({ baseURL: `${client.serverUrl}/v1`, apiKey: await client.accessToken(), maxRetries: 0 });
+  const openai = await openaiClient();
+  const state = 'He said "thanks".\nAnything else?';
+
+  const completion = await openai.chat.completions.create({ model: "jev/jev-latest", messages: chat(state) });
+
+  expect(JSON.parse(completion.choices[0]?.message.content ?? "")).toEqual(answer(0.93, "polite"));
+  expect(completion.usage).toMatchObject({ prompt_tokens: 378, completion_tokens: 65, total_tokens: 443 });
+  const [upstream, ...rest] = provider.received.slice(before);
+  expect(rest).toEqual([]);
+  expect(upstream).toMatchObject({ path: "/v1/systemone", headers: { authorization: `Bearer ${JEV_KEY}` } });
+  expect(JSON.parse(upstream?.body ?? "")).toEqual({ model: "jev-latest", state, questions: QUESTIONS });
 
   await expect(
     openai.chat.completions.create({
       model: "jev/jev-latest",
-      messages: [{ role: "user", content: JSON.stringify({ state: "Thanks!", questions: QUESTIONS }) }],
+      messages: [{ role: "user", content: "Is this reply helpful?" }],
     }),
-  ).rejects.toMatchObject({ status: 404, code: "WYRD_GATEWAY_404_MODEL_UNAVAILABLE" });
-  expect(provider.received.slice(before)).toEqual([]);
+  ).rejects.toMatchObject({ status: 400, code: "WYRD_GATEWAY_400_INVALID_REQUEST" });
+  expect(provider.received.length).toBe(before + 1);
 });
 
 test("jev judge passes a helpful polite reply", async ({ provider, reviewer }) => {
@@ -188,21 +211,60 @@ test("jev judge judges a reply with quotes and newlines", async ({ provider, rev
   expect(JSON.parse(upstream?.body ?? "")).toMatchObject({ state: reply });
 });
 
-// Last in the file: an upstream refusal cools the shared deployment down.
-test("jev refusals map to stable errors", async ({ reviewer: _ }) => {
-  for (const [state, status, code] of [
-    ["refused-form", 400, "WYRD_GATEWAY_400_INVALID_REQUEST"],
-    ["rate-limited", 429, "WYRD_GATEWAY_429_UPSTREAM_THROTTLED"],
-    ["server-error", 502, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE"],
-    ["overloaded", 502, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE"],
-    ["bad-key", 502, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE"],
-  ] as const) {
-    const { status: answered, reply } = await post("/v1/systemone", {
-      model: "jev-latest",
+/** The OpenAI client error a Chat Completions call to the Jev model about `state` rejects with. */
+async function chatRefusal(openai: OpenAI, state: string): Promise<InstanceType<typeof OpenAI.APIError> | undefined> {
+  return openai.chat.completions.create({ model: "jev/jev-latest", messages: chat(state) }).then(
+    () => undefined,
+    (error: unknown) => error as InstanceType<typeof OpenAI.APIError>,
+  );
+}
+
+// Last in the file: an upstream throttle or server error cools the shared
+// deployment down for 30 seconds. A validation refusal and a refused key do
+// not, so both routes prove them first; throttling is then proven on the
+// Chat Completions route, and the server error and overload that follow
+// answer the same stable error whether Jev or the cooldown refuses them. The
+// gateway adapter's unit tests pin every mapping per route.
+test("jev refusals map to stable errors", async ({ provider, reviewer: _ }) => {
+  const openai = await openaiClient();
+  const native = (state: string) => post("/v1/systemone", { model: "jev-latest", state, questions: QUESTIONS });
+
+  const invalid = await native("refused-form");
+  expect({ status: invalid.status, code: invalid.reply.error?.code }).toEqual({
+    status: 400,
+    code: "WYRD_GATEWAY_400_INVALID_REQUEST",
+  });
+  expect(JSON.stringify(invalid.reply)).not.toContain("key cred");
+  const invalidChat = await chatRefusal(openai, "refused-form");
+  expect({ status: invalidChat?.status, code: invalidChat?.code }).toEqual({
+    status: 400,
+    code: "WYRD_GATEWAY_400_INVALID_REQUEST",
+  });
+  expect(JSON.stringify(invalidChat?.error)).not.toContain("key cred");
+
+  // A refused key relays like every other provider's: the upstream 401
+  // without the operator key, no Wyrd code, and no retry.
+  const before = provider.received.length;
+  const refused = await native("bad-key");
+  expect({ status: refused.status, reply: refused.reply }).toEqual({ status: 401, reply: { detail: "key cred " } });
+  const refusedChat = await chatRefusal(openai, "bad-key");
+  expect(refusedChat).toBeInstanceOf(OpenAI.AuthenticationError);
+  expect(refusedChat?.code ?? null).toBeNull();
+  expect(JSON.stringify(refusedChat?.error)).not.toContain(JEV_KEY);
+  expect(provider.received.length).toBe(before + 2);
+
+  const throttled = await chatRefusal(openai, "rate-limited");
+  expect({ status: throttled?.status, code: throttled?.code }).toEqual({
+    status: 429,
+    code: "WYRD_GATEWAY_429_UPSTREAM_THROTTLED",
+  });
+  for (const state of ["server-error", "overloaded"]) {
+    const { status, reply } = await native(state);
+    expect({ state, status, code: reply.error?.code }).toEqual({
       state,
-      questions: QUESTIONS,
+      status: 502,
+      code: "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE",
     });
-    expect({ state, answered, code: reply.error?.code }).toEqual({ state, answered: status, code });
     expect(JSON.stringify(reply)).not.toContain("key cred");
   }
 });

@@ -4,15 +4,16 @@
 //! defined fallback source — request override, exact `Model` rule,
 //! `Operation` rule, then `Global` — without merging rules. Candidates equal
 //! to the requested model or already listed are skipped, and a candidate with
-//! no deployment declaring the operation is dropped, so a Jev question, which
-//! only Jev deployments serve, never falls back to another protocol. Each remaining
+//! no deployment declaring the operation is dropped. A candidate on the other
+//! side of the Jev protocol boundary is dropped too: a Jev question never
+//! falls back to an ordinary chat model, nor ordinary chat to Jev. Each remaining
 //! candidate's deployments are ordered by weighted selection keyed by the
 //! logical call id, so every replica picks the same first deployment.
 
 use serde_json::Value;
 use wyrd_spec::gateway::{
     FallbackScope, GatewayCallId, GatewayFallbackOverride, GatewayOperation, ModelRef,
-    ProviderDeployment,
+    ProviderAdapter, ProviderDeployment,
 };
 use wyrd_spec::ids::ProviderDeploymentName;
 
@@ -68,9 +69,12 @@ impl CallPlan {
             .or_else(|| rule(&|scope| matches!(scope, FallbackScope::Global)))
             .unwrap_or_default();
 
+        let jev = |model: &ModelRef| {
+            ProviderAdapter::Jev.builtin_provider() == Some(model.provider.as_str())
+        };
         let mut models: Vec<&ModelRef> = vec![&requested];
         for model in fallback {
-            if !models.contains(&model) {
+            if !models.contains(&model) && jev(model) == jev(&requested) {
                 models.push(model);
             }
         }
@@ -394,9 +398,9 @@ mod tests {
         );
     }
 
-    /// Fallback never crosses the Jev protocol boundary: only Jev deployments
-    /// serve `system_one`, so a Jev question keeps only Jev candidates and
-    /// ordinary chat drops every Jev candidate.
+    /// Fallback never crosses the Jev protocol boundary: a Jev question keeps
+    /// only Jev candidates and ordinary chat drops every Jev candidate, even
+    /// when both declare Chat Completions.
     ///
     /// # Panics
     ///
@@ -409,7 +413,7 @@ mod tests {
                 "model": ModelRef::from_projection(model).expect("model"),
                 "adapter": "jev",
                 "auth": {"bearer": {"credential": "jev-key"}},
-                "capabilities": ["system_one"],
+                "capabilities": ["system_one", "chat_completions"],
                 "routing_weight": 1,
             }))
             .expect("jev deployment decodes")
@@ -430,7 +434,7 @@ mod tests {
             models(&CallPlan::new(
                 &snap,
                 call,
-                GatewayOperation::SystemOne,
+                chat,
                 model("jev/jev-latest"),
                 None
             )),

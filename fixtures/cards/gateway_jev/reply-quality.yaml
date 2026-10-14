@@ -6,8 +6,8 @@ metadata:
   space: default
 spec:
   description: >-
-    Jev judges the agent's reply; the reply passes when Jev finds it helpful
-    with probability at least 0.5 and its tone polite.
+    Jev judges the agent's reply to the customer's question; the reply passes
+    when Jev finds it helpful with probability at least 0.5 and its tone polite.
   implementation:
     kind: eval
     spec:
@@ -20,10 +20,9 @@ spec:
             prompt: ./jev-judge-prompt.yaml
             tool_names: []
             run_config: {max_iterations: 1}
-          context_path: $.answer
           operator: is_object
           expected: true
-          max_retries: 0
+          max_retries: 2
         helpful:
           kind: assertion
           id: helpful

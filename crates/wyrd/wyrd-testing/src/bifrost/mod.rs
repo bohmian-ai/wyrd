@@ -9,6 +9,8 @@ pub mod object_reads;
 pub mod peer_ca;
 pub mod query_fixture;
 pub mod scribe_workload;
+/// A seeded support workload, its analytical queries, and their plain-DataFusion answers.
+pub mod support_workload;
 pub mod telemetry;
 /// The two Bifrost write doors tests are allowed to use.
 pub mod write;

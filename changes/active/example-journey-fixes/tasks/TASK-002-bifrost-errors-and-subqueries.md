@@ -64,3 +64,73 @@ Commands (all pass):
 Limit: base failure was reproduced through the Rust journeys only. The MCP,
 Python, and TypeScript journeys exercise the same server path. Non-goals were
 not touched, and no unrelated files changed.
+
+### Analytical correctness suite (owner follow-up)
+
+This suite compares Bifrost's answers with plain DataFusion over the same
+rows.
+
+- **Shared code.** The dataset, the queries, and the oracle live in
+  `crates/wyrd/wyrd-testing/src/bifrost/support_workload.rs`.
+- **Dataset.** A seeded splitmix64 generator builds three tables:
+  - conversations: 310 rows;
+  - calls: about 600 rows;
+  - verdicts: about 450 rows.
+
+  The data includes nulls, retried (duplicate) keys, ties, runs with no calls
+  or no verdicts, orphan calls and verdicts, and null-key failing verdicts.
+  The key column is `run_key`, because `run_id` is a reserved Bifrost
+  correlation column.
+- **Queries.** Ten queries are run against every data state:
+  - `above_average_latency_with_failed_calls`
+  - `delivered_run_profile`
+  - `fail_verdict_membership`
+  - `judged_errors_without_a_fail`
+  - `deployment_spend_on_delivered_runs`
+  - `deployments_against_the_overall_average`
+  - `verifier_outcomes_three_way`
+  - `latency_rank_of_passed_runs`
+  - `slowest_calls_above_their_run_average`
+  - `orphans_and_gaps`
+- **Oracle.** The oracle is an in-memory DataFusion `SessionContext` with one
+  `MemTable` per table.
+  - Ordered queries are compared row by row in order. Unordered queries are
+    sorted first.
+  - The unit test `oracle_agrees_with_hand_counted_answers` checks the oracle.
+    It compares `fail_verdict_membership` and `orphans_and_gaps` with
+    iterator counts that follow SQL's three-valued rules and with pinned
+    literals.
+- **Data states.**
+  - Published, live, and mixed are covered by
+    `sdks/wyrd-sdk-rust/tests/integration/analytical_correctness.rs`, through
+    the public SDK.
+  - Remote live (a Scribe pod separate from the Oracle pods) is covered by
+    `crates/wyrd/wyrd-testing/tests/bifrost/oracle/peer_network/support_workload.rs`.
+    The topology is `PeerCluster` with Oracle, Oracle, and Scribe pods.
+- **Base reproduction.** The fixes were reverted onto ef03f624a source and the
+  same tests were run.
+  - Live state: 2 of 10 queries failed with "query execution failed":
+    `above_average_latency_with_failed_calls` and `verifier_outcomes_three_way`.
+    Both have an uncorrelated scalar subquery in WHERE.
+  - Mixed state: the same 2 queries failed.
+  - Published state: passed.
+  - Remote live state: passed on base. I instrumented the live leaf
+    temporarily (the change was reverted afterwards).
+    - On a single server, the leaf received
+      `CAST(latency_ms AS Float64) > scalar_subquery(<pending>)` and
+      `latency_ms <= scalar_subquery(<pending>)`.
+    - In the peer topology, the leaf received only plain column predicates and
+      `true`. The topologies tried were Oracle+Oracle+Scribe and
+      Oracle+Scribe.
+    - No scalar-subquery filter reached a remote live fragment, so that path
+      could not hit the decode failure.
+  - The original 500 came from the single-server local follower path.
+- **After the fix.** All states pass 10 of 10 queries.
+
+Commands:
+
+- `mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^bifrost::support_workload::tests::/)'` (2 passed)
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^analytical_correctness::/)'` (3 passed; after `db:migrate:all:inner`)
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E 'test(=peer_network::support_workload::remote_live_rows_answer_like_datafusion)'` (1 passed)
+- `mise run fmt`, `mise run lints`, `mise run check:deps` (pass)
+- `mise run test:bifrost` (8/8 lanes pass)

@@ -1,6 +1,6 @@
 ---
 id: SPEC-example-journey-fixes
-revision: 1
+revision: 2
 status: approved
 ---
 
@@ -36,7 +36,8 @@ together".
 - REQ-004 Real-time Verifier model calls are attributed to the Run and Card.
 - REQ-005 Gateway spans join the caller's trace.
 - REQ-006 Bifrost subqueries over live tables work.
-- REQ-007 Local server setup handles the gateway managed-secret keyring.
+- REQ-007 Gateway managed secrets use the deployment sealing keyring, and
+  local server setup provides it.
 
 Non-goals: DeepSeek or other new providers; new Verifier semantics; a public
 release.
@@ -115,14 +116,23 @@ release.
   tables succeed and return the same rows as the equivalent join, including
   correlated predicates on `run_id`, with tenant isolation preserved.
 
-### REQ-007 Local keyring
+### REQ-007 Deployment sealing keyring for managed secrets
 
-- `wyrd server dev --tenant <slug>` leaves a deployment where
-  `wyrd gateway credential put` with a `managed_secret` source succeeds with no
-  manual configuration: it creates an owner-only per-tenant managed-secret key
-  for the tenant it provisions, configures the server with it, and restarts
-  the server when the key did not exist at start. Later runs reuse the key, so
-  stored credentials keep decrypting. The key never appears in logs or output.
+Revised in r2 per owner directive 2026-10-14: reuse the deployment sealing
+keyring.
+
+- Gateway `managed_secret` credentials are sealed and opened with the
+  deployment `SealingKeyring` (`WYRD_SEALING_KEY_FILE` /
+  `WYRD_SEALING_KEY_BASE64`, retained keys for rotation), exactly as the other
+  stored sealed secrets: same envelope, same boot rewrap. Each sealed value is
+  bound to its tenant, name, and provider, so it opens only in its own row.
+- The separate gateway keyring (`gateway.managed_secret_keys` and its
+  per-tenant key plumbing) is removed with no compatibility path.
+- `wyrd server dev --tenant <slug>` gives a fresh deployment a sealing key
+  before first boot: unless the caller supplies one, it creates an owner-only
+  key in the installed server directory on first run and reuses it on later
+  runs, so stored credentials keep decrypting. No restart is needed. The key
+  and stored secrets never appear in logs or output.
 - The docs quickstart's credential step works as written.
 
 ## Invariants
@@ -153,3 +163,7 @@ None.
 ## Revision history
 
 - r1 2026-10-14: initial, from the owner's directive.
+- r2 2026-10-14: owner directive 2026-10-14: reuse the deployment sealing
+  keyring. REQ-007 replaces the per-tenant gateway keyring and the
+  restart-on-new-key behavior with the deployment sealing keyring, which
+  `wyrd server dev` provisions before first boot.

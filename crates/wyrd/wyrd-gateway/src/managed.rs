@@ -1,36 +1,23 @@
-//! Tenant-isolated protection of submitted provider keys.
+//! Tenant-bound protection of submitted provider keys.
 //!
 //! A tenant administrator submits a provider key once; the server seals it
-//! under that tenant's own versioned keyring and stores only the resulting
-//! envelope. No key material reaches Postgres, no key is shared between
-//! tenants, and the sealed payload binds the tenant, credential name, and
-//! provider so an envelope copied to another identity cannot be opened.
+//! under the deployment sealing keyring, the same [`SealingKeyring`] that
+//! protects every other stored secret, and stores only the resulting versioned
+//! envelope in the tenant's row-level-secured credential row. No key material
+//! reaches Postgres, rotation and rewrap follow the deployment keyring, and the
+//! sealed payload binds the tenant, credential name, and provider so an
+//! envelope copied to another identity cannot be opened.
 
-use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use wyrd_crypt::{EncryptedPayload, SecretKey};
+use wyrd_crypt::SealingKeyring;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::ids::{ProviderCredentialName, ProviderId};
 use zeroize::Zeroizing;
 
 use crate::credential::CredentialError;
-
-/// Sealed managed secret exactly as it is persisted and admitted.
-///
-/// The envelope is opaque: it discloses no plaintext, digest, or prefix of the
-/// provider key, only which retained key version can open it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManagedSecretEnvelope {
-    /// Keyring version that sealed the payload and must open it.
-    pub key_version: String,
-    /// AES-GCM nonce.
-    pub nonce: Vec<u8>,
-    /// Sealed payload bytes.
-    pub ciphertext: Vec<u8>,
-}
 
 /// Identity a sealed payload is bound to.
 ///
@@ -47,7 +34,8 @@ pub struct ManagedSecretBinding<'a> {
     pub provider: &'a ProviderId,
 }
 
-/// Payload sealed under the tenant key: the binding plus the provider key.
+/// Payload sealed under the deployment keyring: the binding plus the provider
+/// key.
 ///
 /// This is the one shape in the process that holds an unsealed provider key,
 /// so the key is wrapped and [`Debug`] is written by hand: no derive, tracing
@@ -97,141 +85,58 @@ fn wrap_secret<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SecretStrin
     String::deserialize(deserializer).map(SecretString::from)
 }
 
-/// One tenant's versioned managed-secret keyring.
-///
-/// `active` seals new and replaced values; every retained version stays
-/// available so credentials committed under an older key keep resolving until
-/// their administrator resubmits them.
-#[derive(Debug)]
-pub struct TenantKeyring {
-    /// Version name that seals new values.
-    active: String,
-    /// Every distributed version, including retained older ones.
-    versions: BTreeMap<String, SecretKey>,
-}
-
-impl TenantKeyring {
-    /// Builds a keyring whose `active` version must be present in `versions`.
-    ///
-    /// # Errors
-    /// Returns [`CredentialError::Unconfigured`] when `active` names no
-    /// distributed version, which is an incomplete keyring.
-    pub fn new(
-        active: String,
-        versions: BTreeMap<String, SecretKey>,
-    ) -> Result<Self, CredentialError> {
-        if !versions.contains_key(&active) {
-            return Err(CredentialError::Unconfigured);
-        }
-        Ok(Self { active, versions })
-    }
-}
-
-/// Every configured tenant keyring, keyed by the tenant that owns it.
-///
-/// This is the whole managed-secret protection capability: configuration
-/// builds it once, administration seals through it, and the credential
-/// resolver opens through it. There is no other key selection or envelope
-/// path.
-#[derive(Debug, Default)]
-pub struct ManagedSecretKeys(
-    /// Keyring per configured tenant. A tenant absent from this map has no
-    /// managed-secret protection, so sealing and opening fail closed rather
-    /// than falling back to another tenant's key.
-    BTreeMap<DataTenantId, TenantKeyring>,
-);
-
-impl ManagedSecretKeys {
-    /// Builds the process-wide map of independently configured tenant
-    /// keyrings.
-    #[must_use]
-    pub fn new(keyrings: BTreeMap<DataTenantId, TenantKeyring>) -> Self {
-        Self(keyrings)
-    }
-
-    /// Seals `secret` for `binding` under the tenant's active key version.
+impl ManagedSecretBinding<'_> {
+    /// Seals `secret` for this binding under the keyring's write key.
     ///
     /// The serialized payload holds the provider key in the clear until it is
-    /// encrypted, so it is owned by [`Zeroizing`] and erased on drop.
+    /// encrypted, so it is owned by [`Zeroizing`] and erased on drop. The
+    /// result is the keyring's versioned envelope, so boot rewrap reseals it
+    /// like any other stored secret.
     ///
     /// # Errors
-    /// Returns [`CredentialError::Unconfigured`] when the binding's tenant has
-    /// no keyring, and [`CredentialError::Unavailable`] when the payload
-    /// cannot be encoded or encrypted.
-    pub fn seal(
-        &self,
-        binding: ManagedSecretBinding<'_>,
-        secret: &str,
-    ) -> Result<ManagedSecretEnvelope, CredentialError> {
-        let keyring = self
-            .0
-            .get(&binding.tenant)
-            .ok_or(CredentialError::Unconfigured)?;
-        let key = keyring
-            .versions
-            .get(&keyring.active)
-            .ok_or(CredentialError::Unconfigured)?;
+    /// Returns [`CredentialError::Unavailable`] when the payload cannot be
+    /// encoded or encrypted.
+    pub fn seal(&self, keyring: &SealingKeyring, secret: &str) -> Result<Vec<u8>, CredentialError> {
         let payload = SealedPayload {
-            tenant: binding.tenant,
-            name: binding.name.clone(),
-            provider: binding.provider.clone(),
+            tenant: self.tenant,
+            name: self.name.clone(),
+            provider: self.provider.clone(),
             secret: SecretString::from(secret.to_owned()),
         };
         let plaintext =
             Zeroizing::new(serde_json::to_vec(&payload).map_err(|_| CredentialError::Unavailable)?);
-        let sealed =
-            wyrd_crypt::encrypt(key, &plaintext).map_err(|_| CredentialError::Unavailable)?;
-        Ok(ManagedSecretEnvelope {
-            key_version: keyring.active.clone(),
-            nonce: sealed.nonce.to_vec(),
-            ciphertext: sealed.ciphertext,
-        })
+        keyring
+            .seal(&plaintext)
+            .map_err(|_| CredentialError::Unavailable)
     }
 
-    /// Opens `envelope` for `binding`, returning the provider key.
+    /// Opens `sealed` for this binding, returning the provider key.
     ///
-    /// The recorded key version selects the key; a retired version, another
-    /// tenant's keyring, a tampered envelope, or a payload bound to a
-    /// different identity all fail closed without falling back to any other
-    /// key or source. The decrypted payload holds the provider key in the
-    /// clear until deserialization moves it into a [`SecretString`], so it is
-    /// owned by [`Zeroizing`] and erased on drop.
+    /// The envelope names the keyring key that sealed it, so a value sealed
+    /// before a rotation opens through a retained key. A key the keyring no
+    /// longer holds, a tampered envelope, or a payload bound to a different
+    /// identity all fail closed without falling back to any other source. The
+    /// decrypted payload is owned by [`Zeroizing`] and erased on drop.
     ///
     /// # Errors
-    /// Returns [`CredentialError::Unconfigured`] when the tenant keyring or
-    /// the recorded version is absent, and [`CredentialError::Unavailable`]
-    /// when the nonce is malformed, authentication fails, the payload does not
-    /// decode, or it is bound to another tenant, name, or provider.
+    /// Returns [`CredentialError::Unavailable`] when no held key opens the
+    /// envelope, the payload does not decode, or it is bound to another
+    /// tenant, name, or provider.
     pub fn open(
         &self,
-        binding: ManagedSecretBinding<'_>,
-        envelope: &ManagedSecretEnvelope,
+        keyring: &SealingKeyring,
+        sealed: &[u8],
     ) -> Result<SecretString, CredentialError> {
-        let key = self
-            .0
-            .get(&binding.tenant)
-            .and_then(|keyring| keyring.versions.get(&envelope.key_version))
-            .ok_or(CredentialError::Unconfigured)?;
-        let nonce: [u8; 12] = envelope
-            .nonce
-            .as_slice()
-            .try_into()
-            .map_err(|_| CredentialError::Unavailable)?;
         let plaintext = Zeroizing::new(
-            wyrd_crypt::decrypt(
-                key,
-                &EncryptedPayload {
-                    nonce,
-                    ciphertext: envelope.ciphertext.clone(),
-                },
-            )
-            .map_err(|_| CredentialError::Unavailable)?,
+            keyring
+                .open(sealed)
+                .map_err(|_| CredentialError::Unavailable)?,
         );
         let payload: SealedPayload =
             serde_json::from_slice(&plaintext).map_err(|_| CredentialError::Unavailable)?;
-        let bound = payload.tenant == binding.tenant
-            && &payload.name == binding.name
-            && &payload.provider == binding.provider;
+        let bound = payload.tenant == self.tenant
+            && &payload.name == self.name
+            && &payload.provider == self.provider;
         if !bound {
             return Err(CredentialError::Unavailable);
         }
@@ -241,40 +146,27 @@ impl ManagedSecretKeys {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ManagedSecretBinding, ManagedSecretEnvelope, ManagedSecretKeys, SealedPayload,
-        TenantKeyring,
-    };
+    use super::{ManagedSecretBinding, SealedPayload};
     use crate::credential::CredentialError;
     use secrecy::{ExposeSecret, SecretString};
-    use std::collections::BTreeMap;
-    use wyrd_crypt::SecretKey;
+    use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::ids::{ProviderCredentialName, ProviderId};
 
-    /// Keyring whose `active` version holds a key of repeated `seed` bytes,
-    /// plus any extra `(version, seed)` pairs retained beside it.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `active` is absent from `versions`, which would make the
-    /// fixture itself incomplete.
-    fn keyring(active: &str, versions: &[(&str, u8)]) -> TenantKeyring {
-        let versions = versions
-            .iter()
-            .map(|(name, seed)| ((*name).to_owned(), SecretKey::from_bytes([*seed; 32])))
-            .collect::<BTreeMap<_, _>>();
-        TenantKeyring::new(active.to_owned(), versions).expect("keyring is complete")
+    /// Keyring whose write key holds repeated `seed` bytes.
+    fn keyring(seed: u8) -> SealingKeyring {
+        SealingKeyring::new(SecretKey::from_bytes([seed; 32]))
     }
 
-    /// Opens `envelope` for `binding`, exposing the plaintext so a result can
-    /// be compared directly against the expected value or failure.
+    /// Opens `sealed` for `binding`, exposing the plaintext so a result can be
+    /// compared directly against the expected value or failure.
     fn open(
-        keys: &ManagedSecretKeys,
         binding: ManagedSecretBinding<'_>,
-        envelope: &ManagedSecretEnvelope,
+        keyring: &SealingKeyring,
+        sealed: &[u8],
     ) -> Result<String, CredentialError> {
-        keys.open(binding, envelope)
+        binding
+            .open(keyring, sealed)
             .map(|secret| secret.expose_secret().to_owned())
     }
 
@@ -318,45 +210,29 @@ mod tests {
         assert!(!rendered.contains(SENTINEL), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
 
-        let keys = ManagedSecretKeys::new(BTreeMap::from([(tenant, keyring("v1", &[("v1", 3)]))]));
+        let keys = keyring(3);
         let binding = ManagedSecretBinding {
             tenant,
             name: &name,
             provider: &provider,
         };
-        let envelope = keys.seal(binding, SENTINEL).expect("seals");
-        assert_eq!(open(&keys, binding, &envelope), Ok(SENTINEL.to_owned()));
+        let sealed = binding.seal(&keys, SENTINEL).expect("seals");
+        assert_eq!(open(binding, &keys, &sealed), Ok(SENTINEL.to_owned()));
     }
 
-    /// An incomplete keyring whose active version was never distributed is
-    /// refused at construction instead of failing at the first write.
-    ///
-    /// # Panics
-    ///
-    /// Panics when construction succeeds or reports anything other than
-    /// `CredentialError::Unconfigured`.
-    #[test]
-    fn an_active_version_absent_from_the_keyring_is_refused() {
-        let error = TenantKeyring::new("v2".to_owned(), BTreeMap::new()).expect_err("incomplete");
-        assert_eq!(error, CredentialError::Unconfigured);
-    }
-
-    /// A sealed value opens only for its own tenant, name, provider, and a
-    /// retained key version; every other identity or key fails closed.
+    /// A sealed value opens only for its own tenant, name, and provider under
+    /// a key the deployment keyring holds; every other identity or key fails
+    /// closed even though every tenant shares the deployment keyring.
     ///
     /// # Panics
     ///
     /// Panics when sealing fails, when the ciphertext discloses the plaintext,
-    /// or when any foreign tenant, name, provider, retired version, tampered
-    /// envelope, or unconfigured keyring fails to produce its expected error.
+    /// or when any foreign tenant, name, provider, unheld key, or tampered
+    /// envelope opens.
     #[test]
-    fn sealed_values_open_only_for_their_own_binding_and_keyring() {
+    fn sealed_values_open_only_for_their_own_binding() {
+        let keys = keyring(2);
         let tenant = DataTenantId::new_v7();
-        let other_tenant = DataTenantId::new_v7();
-        let keys = ManagedSecretKeys::new(BTreeMap::from([
-            (tenant, keyring("v2", &[("v1", 1), ("v2", 2)])),
-            (other_tenant, keyring("v2", &[("v2", 9)])),
-        ]));
         let (name, provider) = (name(), provider());
         let binding = ManagedSecretBinding {
             tenant,
@@ -364,127 +240,115 @@ mod tests {
             provider: &provider,
         };
 
-        let envelope = keys.seal(binding, "sk-live-SECRET").expect("seals");
-        assert_eq!(envelope.key_version, "v2", "new values use the active key");
+        let sealed = binding.seal(&keys, "sk-live-SECRET").expect("seals");
         assert!(
-            !String::from_utf8_lossy(&envelope.ciphertext).contains("sk-live"),
+            !String::from_utf8_lossy(&sealed).contains("sk-live"),
             "ciphertext discloses the plaintext"
         );
         assert_eq!(
-            open(&keys, binding, &envelope),
+            open(binding, &keys, &sealed),
             Ok("sk-live-SECRET".to_owned())
         );
 
-        let foreign = ManagedSecretBinding {
-            tenant: other_tenant,
-            name: &name,
-            provider: &provider,
-        };
-        assert_eq!(
-            open(&keys, foreign, &envelope),
-            Err(CredentialError::Unavailable),
-            "another tenant's key of the same version must not open a copied envelope"
-        );
         let renamed = ProviderCredentialName::new("other-key").expect("name");
-        assert_eq!(
-            open(
-                &keys,
-                ManagedSecretBinding {
-                    tenant,
-                    name: &renamed,
-                    provider: &provider
-                },
-                &envelope
-            ),
-            Err(CredentialError::Unavailable),
-            "an envelope copied to another credential name must not open"
-        );
         let elsewhere = ProviderId::new("anthropic").expect("provider");
-        assert_eq!(
-            open(
-                &keys,
+        for (foreign, reason) in [
+            (
                 ManagedSecretBinding {
-                    tenant,
-                    name: &name,
-                    provider: &elsewhere
+                    tenant: DataTenantId::new_v7(),
+                    ..binding
                 },
-                &envelope
+                "an envelope copied to another tenant must not open",
             ),
+            (
+                ManagedSecretBinding {
+                    name: &renamed,
+                    ..binding
+                },
+                "an envelope copied to another credential name must not open",
+            ),
+            (
+                ManagedSecretBinding {
+                    provider: &elsewhere,
+                    ..binding
+                },
+                "an envelope copied to another provider must not open",
+            ),
+        ] {
+            assert_eq!(
+                open(foreign, &keys, &sealed),
+                Err(CredentialError::Unavailable),
+                "{reason}"
+            );
+        }
+        assert_eq!(
+            open(binding, &keyring(9), &sealed),
             Err(CredentialError::Unavailable),
-            "an envelope copied to another provider must not open"
+            "a keyring not holding the sealing key must not open the envelope"
         );
+        let mut tampered = sealed.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
         assert_eq!(
-            open(
-                &keys,
-                binding,
-                &ManagedSecretEnvelope {
-                    key_version: "retired".to_owned(),
-                    ..envelope.clone()
-                }
-            ),
-            Err(CredentialError::Unconfigured),
-            "a retired key version must not fall back to another version"
-        );
-        let mut tampered = envelope.clone();
-        tampered.ciphertext[0] ^= 0xff;
-        assert_eq!(
-            open(&keys, binding, &tampered),
+            open(binding, &keys, &tampered),
             Err(CredentialError::Unavailable),
             "authentication must reject a tampered envelope"
         );
-
-        let unconfigured = ManagedSecretKeys::default();
-        assert_eq!(
-            unconfigured.seal(binding, "sk-live-SECRET"),
-            Err(CredentialError::Unconfigured)
-        );
-        assert_eq!(
-            open(&unconfigured, binding, &envelope),
-            Err(CredentialError::Unconfigured)
-        );
     }
 
-    /// Rotating `active` keeps values committed under a retained version
-    /// readable while new values take the new key.
+    /// Deployment sealing-key rotation covers managed secrets: a retained key
+    /// keeps a committed envelope readable, the keyring's own rewrap moves it
+    /// to the new write key with its binding intact, and retiring the old key
+    /// fails closed only for an envelope that was never rewrapped.
     ///
     /// # Panics
     ///
-    /// Panics when sealing fails, when a retained version stops opening a
-    /// committed envelope, when a new value does not take the rotated key
-    /// version, or when a removed version stops failing closed.
+    /// Panics when sealing or rewrap fails, when a retained key stops opening
+    /// a committed envelope, when a rewrapped envelope loses its binding, or
+    /// when a retired key's envelope still opens.
     #[test]
-    fn rotation_retains_older_versions_until_values_are_resubmitted() {
-        let tenant = DataTenantId::new_v7();
+    fn deployment_rotation_rewraps_managed_secrets_under_the_new_write_key() {
         let (name, provider) = (name(), provider());
         let binding = ManagedSecretBinding {
-            tenant,
+            tenant: DataTenantId::new_v7(),
             name: &name,
             provider: &provider,
         };
-        let before =
-            ManagedSecretKeys::new(BTreeMap::from([(tenant, keyring("v1", &[("v1", 1)]))]));
-        let committed = before.seal(binding, "sk-old").expect("seals");
+        let committed = binding.seal(&keyring(1), "sk-old").expect("seals");
 
-        let after = ManagedSecretKeys::new(BTreeMap::from([(
-            tenant,
-            keyring("v2", &[("v1", 1), ("v2", 2)]),
-        )]));
+        let rotated = keyring(2).with_retained(SecretKey::from_bytes([1; 32]));
         assert_eq!(
-            open(&after, binding, &committed),
+            open(binding, &rotated, &committed),
             Ok("sk-old".to_owned()),
-            "a retained version still opens a committed envelope"
+            "a retained key still opens a committed envelope"
         );
-        assert_eq!(
-            after.seal(binding, "sk-new").expect("seals").key_version,
-            "v2"
-        );
+        let rewrapped = rotated
+            .rewrap(&committed)
+            .expect("rewraps")
+            .expect("an old-key envelope needs rewrap");
 
-        let retired =
-            ManagedSecretKeys::new(BTreeMap::from([(tenant, keyring("v2", &[("v2", 2)]))]));
+        let retired = keyring(2);
         assert_eq!(
-            open(&retired, binding, &committed),
-            Err(CredentialError::Unconfigured),
-            "removing a version still referenced by an envelope fails closed"
+            open(binding, &retired, &rewrapped),
+            Ok("sk-old".to_owned()),
+            "the rewrapped envelope opens under the new key alone"
+        );
+        assert_eq!(
+            open(
+                ManagedSecretBinding {
+                    tenant: DataTenantId::new_v7(),
+                    ..binding
+                },
+                &retired,
+                &rewrapped
+            ),
+            Err(CredentialError::Unavailable),
+            "rewrap keeps the tenant binding"
+        );
+        assert_eq!(
+            open(binding, &retired, &committed),
+            Err(CredentialError::Unavailable),
+            "retiring a key still referenced by an envelope fails closed"
         );
     }
 }

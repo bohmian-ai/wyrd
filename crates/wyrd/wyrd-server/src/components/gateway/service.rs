@@ -11,9 +11,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::Error as SqlxError;
+use wyrd_crypt::SealingKeyring;
 use wyrd_gateway::{
-    GatewayCredentialSnapshot, GatewayCredentialSource, GatewayTenantSnapshot,
-    ManagedSecretBinding, ManagedSecretEnvelope, ManagedSecretKeys,
+    CredentialError, GatewayCredentialSnapshot, GatewayCredentialSource, GatewayTenantSnapshot,
+    ManagedSecretBinding,
 };
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
@@ -26,12 +27,12 @@ use wyrd_spec::gateway::{
 };
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName, ProviderId};
 use wyrd_sql::queries::gateway::{
-    GatewayCredentialEnvelope, GatewayCredentialWrite, GatewayDeploymentWrite, GatewayPricingWrite,
-    delete_gateway_credential, delete_gateway_deployment, gateway_credential,
-    gateway_credential_for_share, gateway_credentials, gateway_deployment, gateway_deployments,
-    gateway_policies, gateway_pricing, gateway_snapshot, lock_gateway_policies,
-    revoke_gateway_credential, update_gateway_policies, upsert_gateway_credential,
-    upsert_gateway_deployment, upsert_gateway_pricing,
+    GatewayCredentialWrite, GatewayDeploymentWrite, GatewayPricingWrite, delete_gateway_credential,
+    delete_gateway_deployment, gateway_credential, gateway_credential_for_share,
+    gateway_credentials, gateway_deployment, gateway_deployments, gateway_policies,
+    gateway_pricing, gateway_snapshot, lock_gateway_policies, revoke_gateway_credential,
+    update_gateway_policies, upsert_gateway_credential, upsert_gateway_deployment,
+    upsert_gateway_pricing,
 };
 use wyrd_sql::row_types::gateway::{GatewayCredentialRow, GatewayPricingRow};
 use wyrd_sql::{SqlError, TenantConn};
@@ -55,8 +56,9 @@ pub struct GatewayAdministration<'a> {
     postgres: &'a ServerPostgres,
     /// Operator-declared bindings and backends.
     config: &'a GatewayConfig,
-    /// Loaded tenant keyrings protecting managed secrets.
-    keys: &'a ManagedSecretKeys,
+    /// Deployment sealing keyring protecting managed secrets; `None` on a
+    /// keyless deployment, which refuses managed-secret writes.
+    keyring: Option<&'a SealingKeyring>,
 }
 
 impl<'a> GatewayAdministration<'a> {
@@ -67,7 +69,7 @@ impl<'a> GatewayAdministration<'a> {
             state,
             postgres: &state.postgres,
             config: &state.gateway,
-            keys: &state.gateway_secret_keys,
+            keyring: state.auth.sealing_key.as_deref(),
         }
     }
 
@@ -75,8 +77,8 @@ impl<'a> GatewayAdministration<'a> {
     ///
     /// Environment and Vault sources must fall within an operator assignment
     /// for the caller's tenant and the credential provider. A `ManagedSecret`
-    /// value is sealed under the caller's own tenant keyring before the row is
-    /// written, so the submitted plaintext exists only for the duration of
+    /// value is sealed under the deployment sealing keyring, bound to the
+    /// caller's tenant, before the row is written, so the submitted plaintext exists only for the duration of
     /// this call. Wyrd stores only the redacted source and, for a managed
     /// secret, its opaque envelope; the response is the redacted view either
     /// way. Protection and the row are written in one transaction, so a failed
@@ -88,8 +90,8 @@ impl<'a> GatewayAdministration<'a> {
     /// submitted secret, or a source not assigned to the tenant and provider
     /// (undeclared and unauthorized sources are indistinguishable),
     /// `GatewayResourceConflict` when the name is revoked or a provider change
-    /// would orphan a deployment, `ServiceUnavailable` when the tenant has no
-    /// usable key authority, and `ServiceUnavailable` when storage fails.
+    /// would orphan a deployment, `ServiceUnavailable` when the deployment has
+    /// no sealing key, and `ServiceUnavailable` when storage fails.
     pub async fn put_credential(
         &self,
         caller: &Caller,
@@ -106,7 +108,7 @@ impl<'a> GatewayAdministration<'a> {
                 require_path_name(name.as_str(), write.name.as_str())?;
                 let view = ProviderCredentialSourceView::from(&write.source);
                 self.validate_source(caller.data_tenant_id, &write.provider, &view)?;
-                let envelope = self.seal(caller.data_tenant_id, name, &write)?;
+                let sealed = self.seal(caller.data_tenant_id, name, &write)?;
                 let source = encode(&view)?;
                 let row = upsert_gateway_credential(
                     &mut conn,
@@ -114,11 +116,7 @@ impl<'a> GatewayAdministration<'a> {
                         name: name.as_str(),
                         provider: write.provider.as_str(),
                         source: &source,
-                        secret: envelope.as_ref().map(|envelope| GatewayCredentialEnvelope {
-                            key_version: &envelope.key_version,
-                            nonce: &envelope.nonce,
-                            ciphertext: &envelope.ciphertext,
-                        }),
+                        secret: sealed.as_deref(),
                     },
                 )
                 .await
@@ -744,8 +742,8 @@ impl<'a> GatewayAdministration<'a> {
         }
     }
 
-    /// Seals a submitted `ManagedSecret` under `tenant`'s keyring, or returns
-    /// `None` for an operator-owned source that carries no value.
+    /// Seals a submitted `ManagedSecret` under the deployment sealing keyring,
+    /// or returns `None` for an operator-owned source that carries no value.
     ///
     /// Sealing happens before the row is written and binds the tenant,
     /// credential name, and provider into the protected payload, so the stored
@@ -753,8 +751,8 @@ impl<'a> GatewayAdministration<'a> {
     ///
     /// # Errors
     /// Returns `GatewayInvalidConfiguration` for field `source.secret` when
-    /// the submitted value is empty, and `ServiceUnavailable` when the tenant
-    /// has no configured keyring or its active key cannot protect the value.
+    /// the submitted value is empty, and `ServiceUnavailable` when the
+    /// deployment has no sealing key or it cannot protect the value.
     /// Neither error discloses the value, the key, or another tenant's
     /// configuration.
     fn seal(
@@ -762,7 +760,7 @@ impl<'a> GatewayAdministration<'a> {
         tenant: DataTenantId,
         name: &ProviderCredentialName,
         write: &ProviderCredentialWrite,
-    ) -> Result<Option<ManagedSecretEnvelope>, WyrdError> {
+    ) -> Result<Option<Vec<u8>>, WyrdError> {
         let ProviderCredentialWriteSource::ManagedSecret { secret } = &write.source else {
             return Ok(None);
         };
@@ -773,15 +771,16 @@ impl<'a> GatewayAdministration<'a> {
                 "must not be empty",
             )));
         }
-        self.keys
-            .seal(
+        self.keyring
+            .ok_or(CredentialError::Unconfigured)
+            .and_then(|keyring| {
                 ManagedSecretBinding {
                     tenant,
                     name,
                     provider: &write.provider,
-                },
-                value,
-            )
+                }
+                .seal(keyring, value)
+            })
             .map(Some)
             .map_err(|error| {
                 tracing::warn!(%error, "gateway managed secret protection unavailable");
@@ -801,8 +800,6 @@ impl<'a> GatewayAdministration<'a> {
             provider,
             source,
             state,
-            secret_key_version,
-            secret_nonce,
             secret_ciphertext,
         } = stored;
         let assignment = self.config.assignment(&source).cloned();
@@ -821,7 +818,7 @@ impl<'a> GatewayAdministration<'a> {
                 GatewayCredentialSource::ExternalSecret { backend, reference }
             }
             ProviderCredentialSourceView::ManagedSecret => GatewayCredentialSource::ManagedSecret {
-                envelope: envelope(secret_key_version, secret_nonce, secret_ciphertext),
+                sealed: sealed(secret_ciphertext),
             },
         };
         GatewayCredentialSnapshot {
@@ -845,36 +842,20 @@ struct StoredCredential {
     source: ProviderCredentialSourceView,
     /// Lifecycle state.
     state: ProviderCredentialState,
-    /// Keyring version that sealed a managed secret; absent otherwise.
-    secret_key_version: Option<String>,
-    /// Base64 AES-GCM nonce of a managed secret; absent otherwise.
-    secret_nonce: Option<String>,
-    /// Base64 sealed payload of a managed secret; absent otherwise.
+    /// Base64 sealing-keyring envelope of a managed secret; absent otherwise.
     secret_ciphertext: Option<String>,
 }
 
-/// Rebuilds the sealed envelope of a managed secret from its snapshot columns.
+/// Decodes the sealed envelope of a managed secret from its snapshot column.
 ///
-/// The database `CHECK` constraints keep the three envelope columns present
-/// exactly together with the managed source, so a row reaching here without
-/// them is corrupt. An absent or undecodable column is still safe: the empty
-/// envelope cannot be opened, so resolution fails closed rather than resolving
-/// some other value.
-fn envelope(
-    key_version: Option<String>,
-    nonce: Option<String>,
-    ciphertext: Option<String>,
-) -> ManagedSecretEnvelope {
-    let decode = |value: Option<String>| {
-        value
-            .and_then(|value| BASE64_STANDARD.decode(value).ok())
-            .unwrap_or_default()
-    };
-    ManagedSecretEnvelope {
-        key_version: key_version.unwrap_or_default(),
-        nonce: decode(nonce),
-        ciphertext: decode(ciphertext),
-    }
+/// The database `CHECK` constraint keeps the envelope present exactly with the
+/// managed source, so a row reaching here without it is corrupt. An absent or
+/// undecodable column is still safe: the empty envelope cannot be opened, so
+/// resolution fails closed rather than resolving some other value.
+fn sealed(ciphertext: Option<String>) -> Vec<u8> {
+    ciphertext
+        .and_then(|value| BASE64_STANDARD.decode(value).ok())
+        .unwrap_or_default()
 }
 
 /// Replaces governance on the locked policy row, merging pricing history.

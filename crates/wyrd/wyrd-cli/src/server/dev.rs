@@ -4,9 +4,12 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use clap::Args;
 use secrecy::{ExposeSecret as _, SecretString};
 use tokio::process::{Child, Command};
@@ -50,6 +53,9 @@ struct DevServer {
     endpoint: String,
     /// macOS memory detected once and supplied only to child processes.
     memory: Option<String>,
+    /// Local deployment sealing key supplied as `WYRD_SEALING_KEY_FILE`;
+    /// `None` when the caller already supplies the server's sealing key.
+    sealing_key: Option<PathBuf>,
     /// Serving child retained across readiness, setup, and foreground waiting.
     child: Option<Child>,
 }
@@ -84,7 +90,8 @@ impl DevArgs {
                 }
             } => installed?,
         };
-        let mut server = DevServer::new(installed, bind, grpc)?;
+        let sealing_key = local_sealing_key(installer.root())?;
+        let mut server = DevServer::new(installed, bind, grpc, sealing_key)?;
         let result = tokio::select! {
             biased;
             signal = &mut interrupted => {
@@ -134,7 +141,8 @@ impl DevArgs {
 }
 
 impl DevServer {
-    /// Retain a compatible installed binary and its loopback listener settings.
+    /// Retain a compatible installed binary, its loopback listener settings,
+    /// and the local sealing key every child receives.
     ///
     /// # Errors
     /// Refuses a release outside the CLI's supported version line.
@@ -145,6 +153,7 @@ impl DevServer {
         installed: InstalledServer,
         bind: SocketAddr,
         grpc: SocketAddr,
+        sealing_key: Option<PathBuf>,
     ) -> Result<Self, WyrdCliError> {
         let cli = semver::Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("the CLI package version is semver");
@@ -160,13 +169,16 @@ impl DevServer {
             grpc,
             endpoint: format!("http://{bind}"),
             memory: None,
+            sealing_key,
             child: None,
         })
     }
 
     /// Construct each child with the same local inputs, leaving database and
     /// storage URLs in the environment and preserving production hardening.
-    /// The selected listeners override any server-file setting.
+    /// The selected listeners override any server-file setting, and the local
+    /// sealing key, when the caller supplied none, is the server's ordinary
+    /// `WYRD_SEALING_KEY_FILE`.
     fn command(&self) -> Command {
         let mut command = Command::new(self.installed.binary());
         command
@@ -176,6 +188,9 @@ impl DevServer {
             .env("WYRD_GRPC_BIND", self.grpc.to_string());
         if let Some(memory) = &self.memory {
             command.env("WYRD_BIFROST_MEMORY_LIMIT_BYTES", memory);
+        }
+        if let Some(sealing_key) = &self.sealing_key {
+            command.env("WYRD_SEALING_KEY_FILE", sealing_key);
         }
         command
     }
@@ -501,6 +516,59 @@ fn disclose_root(printed: &str) {
                 "Platform root initialized. No invoking terminal was available for disclosure; use wyrd-server recover-root when platform administration is needed."
             );
         }
+    }
+}
+
+/// Name of the local deployment sealing key under the install root.
+const SEALING_KEY_FILE: &str = "sealing.key";
+
+/// Ensure the local deployment has the sealing key its server encrypts stored
+/// secrets with, such as gateway managed-secret provider keys, before the
+/// first boot, and return the file to supply as `WYRD_SEALING_KEY_FILE`.
+///
+/// A caller that already supplies `WYRD_SEALING_KEY_FILE` or
+/// `WYRD_SEALING_KEY_BASE64` keeps it and gets `None`. Otherwise the first run
+/// writes 32 random bytes, base64-encoded, to an owner-only `sealing.key`
+/// under the install root and every later run reuses it, so stored secrets
+/// keep opening across restarts and releases. The file is staged beside its
+/// destination and moved into place without replacing an existing key, so an
+/// interrupted or concurrent first run never leaves a partial key. The key is
+/// never printed.
+///
+/// # Errors
+/// Returns a secret-free local-persistence error when the key cannot be
+/// staged or moved into place.
+fn local_sealing_key(root: &Path) -> Result<Option<PathBuf>, WyrdCliError> {
+    if std::env::var_os("WYRD_SEALING_KEY_FILE").is_some()
+        || std::env::var_os("WYRD_SEALING_KEY_BASE64").is_some()
+    {
+        return Ok(None);
+    }
+    let path = root.join(SEALING_KEY_FILE);
+    if path.is_file() {
+        return Ok(Some(path));
+    }
+    let failed = || {
+        dev_error(
+            "local persistence",
+            "the local sealing key could not be written; restore safe permissions on the Wyrd config directory and rerun",
+        )
+    };
+    // `NamedTempFile` is created owner-only, the mode the server requires of
+    // a mounted key file.
+    let mut staged = tempfile::NamedTempFile::new_in(root).map_err(|_| failed())?;
+    staged
+        .write_all(
+            BASE64_STANDARD
+                .encode(rand::random::<[u8; 32]>())
+                .as_bytes(),
+        )
+        .and_then(|()| staged.as_file().sync_all())
+        .map_err(|_| failed())?;
+    match staged.persist_noclobber(&path) {
+        Ok(_) => Ok(Some(path)),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(Some(path)),
+        Err(_) => Err(failed()),
     }
 }
 

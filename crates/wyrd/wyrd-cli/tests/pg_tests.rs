@@ -99,6 +99,8 @@ impl LocalDev {
             .env_remove("WYRD_PLATFORM_DATABASE_URL")
             .env_remove("WYRD_STORAGE_URL")
             .env_remove("WYRD_CONFIG_PATH")
+            .env_remove("WYRD_SEALING_KEY_FILE")
+            .env_remove("WYRD_SEALING_KEY_BASE64")
             .env("APP_ENV", "development")
             .env("WYRD_SERVER_BIND", &self.bind)
             .env("WYRD_GRPC_BIND", &self.grpc)
@@ -182,12 +184,13 @@ impl LocalDev {
         self.child = Some(child);
     }
 
-    /// Interrupt only the CLI and prove it settles its owned server.
+    /// Interrupt only the CLI and prove it settles its owned server,
+    /// returning its captured stdout and stderr for further leak checks.
     ///
     /// # Panics
     /// Panics when interruption fails, the CLI reports a different status,
     /// credentials reach output, or the server listener remains active.
-    async fn stop(&mut self, signal: &str) {
+    async fn stop(&mut self, signal: &str) -> String {
         let mut child = self.child.take().expect("running CLI");
         let pid = child.id().expect("live CLI pid");
         assert!(
@@ -229,6 +232,29 @@ impl LocalDev {
             TcpListener::bind(&self.bind).is_ok(),
             "the server's listener is closed after interrupting its CLI"
         );
+        stdout + &stderr
+    }
+
+    /// Run a fresh `wyrd <args>` that reads the saved local files, piping
+    /// `stdin` to it as the quickstart does for a managed secret.
+    ///
+    /// # Panics
+    /// Panics when the command cannot be spawned, fed, or reaped.
+    async fn stdin_command(&self, args: &[&str], stdin: &str) -> std::process::Output {
+        let mut child = self
+            .command()
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("fresh CLI starts");
+        let mut input = child.stdin.take().expect("stdin pipe");
+        tokio::io::AsyncWriteExt::write_all(&mut input, stdin.as_bytes())
+            .await
+            .expect("stdin written");
+        drop(input);
+        child.wait_with_output().await.expect("fresh CLI exits")
     }
 
     /// Credentials-test environment containing no exported key or endpoint.
@@ -599,4 +625,104 @@ async fn server_dev_selected_mcp_host_reads() {
     assert!(tools.iter().any(|tool| tool == "bifrost.list_tables"));
     assert_ne!(result.is_error, Some(true));
     local.stop("-INT").await;
+}
+
+/// Provider key the quickstart form stores and the mock provider demands.
+const LOCAL_PROVIDER_KEY: &str = "sk-local-dev-managed-secret";
+
+/// A fresh `wyrd server dev` deployment seals a quickstart-form managed
+/// secret on first boot with no extra key step, delivers it to a local
+/// provider through the gateway, and keeps delivering it after a rerun. The
+/// secret never reaches any captured output.
+///
+/// # Panics
+/// Panics when setup, the credential or deployment write, either gateway
+/// call, or a leak check fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_dev_keeps_the_gateway_managed_secret_key() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header(
+            "authorization",
+            format!("Bearer {LOCAL_PROVIDER_KEY}").as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-local",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop", "logprobs": null}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        })))
+        .expect(2)
+        .mount(&provider)
+        .await;
+
+    let mut local = LocalDev::new().await;
+    local.start(&[]).await;
+    let mut printed = String::new();
+    for (args, document) in [
+        (
+            ["gateway", "credential", "put", "--file", "-"],
+            format!(
+                r#"{{"name":"local-key","provider":"local-mock","source":{{"managed_secret":{{"secret":"{LOCAL_PROVIDER_KEY}"}}}}}}"#
+            ),
+        ),
+        (
+            ["gateway", "deployment", "put", "--file", "-"],
+            json!({
+                "name": "local-mock-m",
+                "model": {"provider": "local-mock", "model": "m"},
+                "adapter": {"openai_compatible": {"base_url": format!("{}/v1", provider.uri())}},
+                "auth": {"bearer": {"credential": "local-key"}},
+                "capabilities": ["chat_completions"],
+                "routing_weight": 1,
+            })
+            .to_string(),
+        ),
+    ] {
+        let output = local.stdin_command(&args, &document).await;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{args:?} failed: {text}");
+        printed.push_str(&text);
+    }
+
+    for run in ["first run", "rerun"] {
+        if run == "rerun" {
+            local.start(&[]).await;
+        }
+        let token = local
+            .client()
+            .access_token()
+            .await
+            .expect("saved key exchanges");
+        let answer = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", local.bind))
+            .bearer_auth(token.expose())
+            .json(&json!({
+                "model": "local-mock/m",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+            .expect("gateway call sends");
+        let status = answer.status();
+        let body = answer.text().await.expect("gateway answer");
+        assert_eq!(status.as_u16(), 200, "{run}: {body}");
+        assert!(body.contains("chatcmpl-local"), "{run}: {body}");
+        printed.push_str(&body);
+        printed.push_str(&local.stop("-INT").await);
+    }
+    assert!(
+        !printed.contains(LOCAL_PROVIDER_KEY),
+        "the provider secret never reaches CLI, server, or gateway output"
+    );
 }

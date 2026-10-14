@@ -22,8 +22,8 @@ use wyrd_spec::gateway::{GatewayOperation, ProviderAdapter, ProviderAuth, Provid
 
 use super::stream::{ChatChunks, Frames, MediaCapture, StreamCapture, relay, relay_media};
 use super::{
-    BatchAction, MediaRequest, Prepared, Wire, complete, faithful_embeddings, openai_error_body,
-    prepare, refusal,
+    BatchAction, IngressDialect, MediaRequest, Prepared, Wire, complete, faithful_embeddings,
+    openai_error_body, prepare, refusal,
 };
 use crate::credential::ProviderSecret;
 use crate::engine::{
@@ -366,13 +366,10 @@ impl Client {
                     .send_native(ProviderRequest::GeminiGenerateContent(*request))
                     .await?
             }
-            (Self::Jev(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(&raw(&body)?).await?)
-            }
             (Self::Jev(client), Prepared::Jev(request)) => {
-                let body = to_raw_value(&request)
-                    .map_err(|error| ProviderError::decode("gateway", error))?;
-                ProviderResponse::RawV1(client.send_raw(&body).await?)
+                client
+                    .send_native(ProviderRequest::JevSystemOne(*request))
+                    .await?
             }
             (_, _) => return Err(mismatch()),
         };
@@ -460,21 +457,27 @@ fn failure(
 
 /// Attempt evidence of a failed Jev exchange.
 ///
-/// A non-redirect status becomes a gateway-originated `OpenAI` error envelope
-/// with a stable Wyrd code and a fixed message; Jev's own body is never
-/// relayed, so no provider payload or credential reaches the caller.
-/// Validation refusals (400, 422) are invalid requests; rate limiting (429)
-/// is upstream throttling; a rejected credential (401, 403), overload (529),
-/// and every other status are upstream unavailability. Retry follows the
-/// provider status: throttling and server errors may succeed on another
-/// deployment, validation and authentication refusals are never retried.
-/// Other failures map as [`failure`] maps them.
-fn jev_failure(error: ProviderError) -> AttemptResult {
+/// A rejected credential (401, 403) maps exactly as for every other provider:
+/// [`failure`] relays the upstream status and body, `translated` for the
+/// Chat Completions pass-through, with `credential` removed, and never
+/// retries it. Every other non-redirect status becomes a gateway-originated
+/// `OpenAI` error envelope with a stable Wyrd code and a fixed message, so
+/// Jev's own body is not relayed: validation refusals (400, 422) are invalid
+/// requests; rate limiting (429) is upstream throttling; overload (529) and
+/// every other status are upstream unavailability. Retry follows the provider
+/// status: throttling and server errors may succeed on another deployment,
+/// validation refusals are never retried. Other failures map as [`failure`]
+/// maps them.
+fn jev_failure(
+    error: ProviderError,
+    translated: bool,
+    credential: Option<&ProviderSecret>,
+) -> AttemptResult {
     let ProviderError::Status { status, .. } = error else {
-        return failure(error, false, None);
+        return failure(error, translated, credential);
     };
-    if (300..400).contains(&status) {
-        return failure(error, false, None);
+    if matches!(status, 300..=399 | 401 | 403) {
+        return failure(error, translated, credential);
     }
     let (wyrd, message) = match status {
         400 | 422 => (
@@ -490,13 +493,6 @@ fn jev_failure(error: ProviderError) -> AttemptResult {
                 details: serde_json::Value::Null,
             },
             "the Jev provider is rate limiting this deployment",
-        ),
-        401 | 403 => (
-            WyrdError::GatewayUpstreamUnavailable {
-                message: String::new(),
-                details: serde_json::Value::Null,
-            },
-            "the Jev provider rejected the deployment credential",
         ),
         _ => (
             WyrdError::GatewayUpstreamUnavailable {
@@ -721,7 +717,10 @@ impl ProviderDispatch for HttpProviderDispatch {
             );
             return failed(FailureClass::BeforeDispatch);
         };
-        let translated = !matches!(prepared, Prepared::Native(_));
+        // A Jev request is translated only on the Chat Completions
+        // pass-through; on its native route it answers in its own dialect.
+        let translated =
+            !matches!(prepared, Prepared::Native(_)) && attempt.ingress == IngressDialect::OpenAi;
         let wire = Wire::of(&deployment.adapter);
         let id = format!("chatcmpl-{}", attempt.call_id.as_uuid().simple());
         let model = deployment.model.model.as_str();
@@ -771,7 +770,7 @@ impl ProviderDispatch for HttpProviderDispatch {
                     "gateway provider call failed"
                 );
                 return match wire {
-                    Wire::Jev => jev_failure(error),
+                    Wire::Jev => jev_failure(error, translated, attempt.credential),
                     _ => failure(error, translated, attempt.credential),
                 };
             }

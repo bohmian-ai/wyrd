@@ -5,31 +5,24 @@ metadata:
   version: 1.0.0
   space: default
 spec:
-  provider: {custom: jev}
   request:
-    provider: open_ai_chat_completion
+    provider: jev_system_one
     body:
       model: jev-latest
-      messages:
-        - role: user
-          content: |-
-            {"state": "${answer}",
-             "questions": {
-               "helpful": {"type": "noul", "instructions": "Does the reply help the customer?",
-                           "criteria": {"true": "it resolves or advances the request",
-                                        "false": "it ignores or deflects the request"}},
-               "tone": {"type": "choice", "instructions": "What is the tone of the reply?",
-                        "criteria": {"polite": "courteous and respectful",
-                                     "rude": "curt or dismissive"}}}}
+      state: ${answer}
+      questions:
+        helpful:
+          type: noul
+          instructions: Does the reply help the customer?
+          criteria:
+            "true": it resolves or advances the request
+            "false": it ignores or deflects the request
+        tone:
+          type: choice
+          instructions: What is the tone of the reply?
+          criteria:
+            polite: courteous and respectful
+            rude: curt or dismissive
   model: jev-latest
   variables: [answer]
   media_variables: []
-  response_type:
-    json_schema:
-      name: jev_answers
-      schema:
-        type: object
-        properties:
-          model: {type: string}
-          answers: {type: object}
-        required: [model, answers]

@@ -96,9 +96,9 @@ impl ProviderAdapter {
     /// preparation, and the published operation-support table all agree with
     /// it. `OpenAI`-protocol adapters carry every `OpenAI` operation natively;
     /// Anthropic and Google adapters carry Chat Completions only. Jev alone
-    /// carries [`GatewayOperation::SystemOne`], plus Chat Completions in its
-    /// constrained single-message question form; it never streams, embeds,
-    /// or calls tools.
+    /// carries [`GatewayOperation::SystemOne`], plus Chat Completions as a
+    /// pass-through whose last user message is the typed Jev request; it
+    /// never streams, embeds, or calls tools.
     #[must_use]
     pub const fn serves(&self, operation: GatewayOperation) -> bool {
         match self {
@@ -460,7 +460,7 @@ mod tests {
         let jev_valid: ProviderDeployment = serde_json::from_value(jev.clone()).expect("decodes");
         jev_valid
             .validate()
-            .expect("jev serves systemone and adapted chat");
+            .expect("jev serves systemone and pass-through chat");
         for unserved in ["embeddings", "responses", "batches"] {
             jev["capabilities"] = json!(["system_one", unserved]);
             let jev: ProviderDeployment = serde_json::from_value(jev.clone()).expect("decodes");

@@ -5,8 +5,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
 use skald_providers::{
-    AnthropicClient, GoogleClient, OpenAiClient, ProviderClient, ProviderError, ProviderStream,
-    VertexClient,
+    AnthropicClient, GoogleClient, JevClient, OpenAiClient, ProviderClient, ProviderError,
+    ProviderStream, VertexClient,
     auth::{AnthropicAuth, OpenAiAuth},
 };
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
@@ -62,6 +62,7 @@ provider_client_impl!(OpenAiClient, ProviderName::OpenAi);
 provider_client_impl!(AnthropicClient, ProviderName::Anthropic);
 provider_client_impl!(GoogleClient, ProviderName::Google);
 provider_client_impl!(VertexClient, ProviderName::Vertex);
+provider_client_impl!(JevClient, ProviderName::Jev);
 
 /// Immutable provider registry keyed by native provider name.
 #[derive(Clone, Default)]
@@ -92,6 +93,9 @@ impl ProviderRegistry {
             registry.register(Arc::new(client));
         }
         if let Ok(client) = VertexClient::from_env(default_google_model.as_ref()) {
+            registry.register(Arc::new(client));
+        }
+        if let Ok(client) = JevClient::from_env() {
             registry.register(Arc::new(client));
         }
         registry
@@ -160,6 +164,21 @@ impl ProviderRegistry {
                     None => AnthropicAuth::from_env()?.with_base_url(base_url),
                 };
                 Ok(Self::new().with(Arc::new(AnthropicClient::new(auth)?)))
+            }
+            skald_spec::ProviderName::Jev => {
+                let key = match api_key {
+                    Some(key) => key,
+                    None => std::env::var(skald_providers::JEV_API_KEY_VARIABLE).map_err(|_| {
+                        ProviderError::auth(
+                            "jev",
+                            format!("{} is not set", skald_providers::JEV_API_KEY_VARIABLE),
+                        )
+                    })?,
+                };
+                Ok(Self::new().with(Arc::new(JevClient::new(JevClient::auth(
+                    key,
+                    Some(&base_url),
+                ))?)))
             }
             skald_spec::ProviderName::Google | skald_spec::ProviderName::Vertex => {
                 Err(ProviderError::auth(

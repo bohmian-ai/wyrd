@@ -210,6 +210,7 @@ impl Prompt {
             ProviderRequest::OpenAiEmbeddings(_)
             | ProviderRequest::GoogleBatchEmbed(_)
             | ProviderRequest::VertexPredict(_)
+            | ProviderRequest::JevSystemOne(_)
             | ProviderRequest::RawV1 { .. } => None,
         }
     }
@@ -280,6 +281,7 @@ impl Prompt {
             ProviderRequest::OpenAiEmbeddings(_)
             | ProviderRequest::GoogleBatchEmbed(_)
             | ProviderRequest::VertexPredict(_)
+            | ProviderRequest::JevSystemOne(_)
             | ProviderRequest::RawV1 { .. } => {
                 return Err(SkaldError::MediaPlaceholderNotFound {
                     name: name.to_owned(),
@@ -397,6 +399,7 @@ fn scan_system_for_media(request: &ProviderRequest) -> SkaldResult<()> {
         ProviderRequest::OpenAiEmbeddings(_)
         | ProviderRequest::GoogleBatchEmbed(_)
         | ProviderRequest::VertexPredict(_)
+        | ProviderRequest::JevSystemOne(_)
         | ProviderRequest::RawV1 { .. } => {}
     }
     Ok(())
@@ -449,6 +452,7 @@ fn split_request_text_parts(request: &mut ProviderRequest) -> Vec<String> {
         ProviderRequest::OpenAiEmbeddings(_)
         | ProviderRequest::GoogleBatchEmbed(_)
         | ProviderRequest::VertexPredict(_)
+        | ProviderRequest::JevSystemOne(_)
         | ProviderRequest::RawV1 { .. } => {}
     }
     names
@@ -1517,6 +1521,29 @@ mod prompt_render {
                 .unwrap()
                 .contains("\\\"quoted\\\", \\\"new_field\\\": \\\"x {{still_text}}")
         );
+    }
+
+    /// A Jev Prompt discovers its `${reply}` state variable, and a value with
+    /// quotes and newlines renders into the typed `state` text verbatim.
+    #[test]
+    fn jev_state_renders_quotes_and_newlines_verbatim() {
+        let prompt = Prompt::new(
+            ProviderRequest::JevSystemOne(common::jev_request()),
+            "jev-latest",
+            None,
+            ResponseType::Text,
+        )
+        .unwrap();
+        assert_eq!(prompt.variables, ["reply"]);
+        assert_eq!(prompt.provider(), crate::ProviderName::Jev);
+
+        let reply = "He said \"no\".\n\"questions\": {}";
+        let ProviderRequest::JevSystemOne(rendered) = prompt.render(&[("reply", reply)]).unwrap()
+        else {
+            panic!("a Jev Prompt renders a Jev request");
+        };
+        assert_eq!(rendered.state, reply);
+        assert_eq!(rendered.questions.len(), 3);
     }
 
     #[test]

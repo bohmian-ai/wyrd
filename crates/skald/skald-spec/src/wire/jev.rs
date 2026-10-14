@@ -1,17 +1,17 @@
 //! TypeSafe Jev `POST /v1/systemone` wire types.
 //!
 //! Jev answers keyed questions about a `state` instead of generating
-//! conversational text. A request carries the native model, the `state` to
-//! judge, and keyed `noul`, `choice`, or `score` questions; the answer carries
-//! the resolved model, one typed answer per question key, and token usage.
-//! Answers stay an intact JSON map so every provider field reaches the caller
-//! unchanged. [`JevRequest::validate`] enforces the documented question
+//! conversational text. A request carries the native model, the `state` text
+//! to judge, and keyed `noul`, `choice`, or `score` questions; the answer
+//! carries the resolved model, one typed [`JevAnswer`] per question key, and
+//! token usage. [`JevRequest::validate`] enforces the documented question
 //! bounds before any provider IO.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+
+use crate::wire::common::TokenUsage;
 
 /// Most options one `choice` question may offer.
 pub const JEV_MAX_CHOICE_OPTIONS: usize = 255;
@@ -27,8 +27,8 @@ pub const JEV_MAX_SCORE_LEVELS: usize = 10;
 pub struct JevRequest {
     /// Native Jev model, such as `jev-latest`.
     pub model: String,
-    /// What the questions are about: a string, JSON object, or JSON array.
-    pub state: Value,
+    /// Text the questions are about, such as an agent reply.
+    pub state: String,
     /// Questions keyed by the name their answer returns under.
     pub questions: BTreeMap<String, JevQuestion>,
 }
@@ -81,11 +81,46 @@ pub struct JevNoulCriteria {
 pub struct JevResponse {
     /// Exact model that answered, such as `jev-1.13.0`.
     pub model: String,
-    /// One typed answer per question key, relayed intact.
-    pub answers: Map<String, Value>,
+    /// One typed answer per question key.
+    pub answers: BTreeMap<String, JevAnswer>,
     /// Token usage; absent when the provider omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<JevUsage>,
+}
+
+/// One keyed Jev answer, tagged by the form of the question it answers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum JevAnswer {
+    /// Answer to a `noul` question.
+    Noul {
+        /// Probability, from 0 to 1, that the question holds.
+        noul: f64,
+    },
+    /// Answer to a `choice` question.
+    Choice {
+        /// Name of the chosen option.
+        choice: String,
+        /// Confidence, from 0 to 1, in the chosen option.
+        confidence: f64,
+        /// Option name to its probability.
+        probabilities: BTreeMap<String, f64>,
+    },
+    /// Answer to a `score` question.
+    Score {
+        /// Expected level on the scale, normalized from 0 to 1.
+        score: f64,
+        /// Level index, as a decimal string, to its description.
+        legend: BTreeMap<String, String>,
+        /// Confidence, from 0 to 1, in the most probable level; absent when
+        /// the provider omits it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence: Option<f64>,
+        /// Level index to its probability; absent when the provider omits it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        probabilities: Option<BTreeMap<String, f64>>,
+    },
 }
 
 /// Token usage of a [`JevResponse`].
@@ -96,6 +131,18 @@ pub struct JevUsage {
     pub input_tokens: u64,
     /// Tokens of the answers.
     pub output_tokens: u64,
+}
+
+impl From<JevUsage> for TokenUsage {
+    /// Jev reports only input and output tokens; cache and reasoning counts
+    /// are zero.
+    fn from(usage: JevUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            ..Self::default()
+        }
+    }
 }
 
 /// A request that breaks a documented Jev bound.
@@ -121,8 +168,7 @@ impl JevRequestError {
 impl JevRequest {
     /// Checks the documented Jev bounds that decoding cannot express.
     ///
-    /// The model must be non-empty; `state` must be a string, object, or
-    /// array; at least one question must be present, every key and
+    /// The model must be non-empty; at least one question must be present, every key and
     /// instruction non-empty, a `choice` must offer 1 to
     /// [`JEV_MAX_CHOICE_OPTIONS`] named options, and a `score` must define
     /// [`JEV_MIN_SCORE_LEVELS`] to [`JEV_MAX_SCORE_LEVELS`] levels.
@@ -133,15 +179,6 @@ impl JevRequest {
     pub fn validate(&self) -> Result<(), JevRequestError> {
         if self.model.trim().is_empty() {
             return Err(JevRequestError::new("model", "must be non-empty"));
-        }
-        if !matches!(
-            self.state,
-            Value::String(_) | Value::Object(_) | Value::Array(_)
-        ) {
-            return Err(JevRequestError::new(
-                "state",
-                "must be a string, object, or array",
-            ));
         }
         if self.questions.is_empty() {
             return Err(JevRequestError::new(
@@ -213,7 +250,7 @@ impl JevQuestion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Map, Value, json};
 
     /// Decodes and validates a request body.
     fn checked(body: Value) -> Result<JevRequest, String> {
@@ -228,7 +265,7 @@ mod tests {
     fn documented_forms_round_trip() {
         let body = json!({
             "model": "jev-latest",
-            "state": {"answer": "Thanks, happy to help!"},
+            "state": "Thanks, \"happy\" to help!\nAnything else?",
             "questions": {
                 "helpful": {"type": "noul", "instructions": "Is it helpful?",
                             "criteria": {"true": "helps", "false": "does not help"}},
@@ -287,7 +324,7 @@ mod tests {
             ),
             (
                 json!({"model": "jev-latest", "state": 5, "questions": {"q": {"type": "noul", "instructions": "x"}}}),
-                "state",
+                "invalid type",
             ),
             (
                 json!({"model": "", "state": "s", "questions": {"q": {"type": "noul", "instructions": "x"}}}),
@@ -303,30 +340,45 @@ mod tests {
         }
     }
 
-    /// The documented answer decodes with answers intact and usage typed;
-    /// omitted usage stays absent.
+    /// Every documented answer form decodes typed, as the live provider
+    /// sends it, and re-encodes to the same body; omitted usage stays absent.
     #[test]
-    fn response_keeps_answers_intact() {
+    fn documented_answers_decode_typed() {
         let body = json!({
             "model": "jev-1.13.0",
             "answers": {
                 "helpful": {"type": "noul", "noul": 0.93},
                 "tone": {"type": "choice", "choice": "polite", "confidence": 0.76,
-                         "probabilities": {"polite": 0.88, "rude": 0.12}}
+                         "probabilities": {"polite": 0.88, "rude": 0.12}},
+                "quality": {"type": "score", "score": 0.19, "confidence": 0.71,
+                            "legend": {"0": "poor", "1": "ok", "2": "great"},
+                            "probabilities": {"0": 0.83, "1": 0.15, "2": 0.02}}
             },
             "usage": {"input_tokens": 378, "output_tokens": 65}
         });
         let response: JevResponse = serde_json::from_value(body.clone()).expect("decodes");
+        assert_eq!(response.answers["helpful"], JevAnswer::Noul { noul: 0.93 });
+        assert!(matches!(
+            &response.answers["tone"],
+            JevAnswer::Choice { choice, .. } if choice == "polite"
+        ));
+        assert!(matches!(
+            &response.answers["quality"],
+            JevAnswer::Score { legend, .. } if legend["2"] == "great"
+        ));
         assert_eq!(
-            response.usage,
-            Some(JevUsage {
-                input_tokens: 378,
-                output_tokens: 65
-            })
+            TokenUsage::from(response.usage.expect("usage")).output_tokens,
+            65
         );
         assert_eq!(serde_json::to_value(&response).expect("encodes"), body);
         let bare: JevResponse =
             serde_json::from_value(json!({"model": "m", "answers": {}})).expect("decodes");
         assert_eq!(bare.usage, None);
+        assert!(
+            serde_json::from_value::<JevResponse>(json!({"model": "m",
+                "answers": {"q": {"type": "essay"}}}))
+            .is_err(),
+            "an unknown answer form is not a Jev answer"
+        );
     }
 }

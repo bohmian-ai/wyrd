@@ -54,6 +54,7 @@ impl<'a> ResponseAdapter<'a> {
             ProviderResponse::OpenAiEmbeddings(_)
             | ProviderResponse::GoogleBatchEmbed(_)
             | ProviderResponse::VertexPredict(_)
+            | ProviderResponse::JevSystemOne(_)
             | ProviderResponse::RawV1(_) => None,
         }
     }
@@ -122,15 +123,21 @@ impl<'a> ResponseAdapter<'a> {
             ProviderResponse::OpenAiEmbeddings(_)
             | ProviderResponse::GoogleBatchEmbed(_)
             | ProviderResponse::VertexPredict(_)
+            | ProviderResponse::JevSystemOne(_)
             | ProviderResponse::RawV1(_) => Vec::new(),
         }
     }
 
     /// Parse the first text payload that is valid JSON as structured output.
     ///
-    /// Providers in S02 store structured output as assistant text, so this
-    /// method returns an owned raw JSON value parsed from that text.
+    /// Conversational providers store structured output as assistant text, so
+    /// this method returns an owned raw JSON value parsed from that text. A
+    /// Jev answer is structured by its protocol: its output is the whole typed
+    /// response, so `answers.<key>.noul` and the like address it directly.
     pub fn structured_output(&self) -> Option<Box<RawValue>> {
+        if let ProviderResponse::JevSystemOne(response) = self.response {
+            return serde_json::value::to_raw_value(response).ok();
+        }
         let text = self.text()?;
         RawValue::from_string(text.into_owned()).ok()
     }
@@ -150,6 +157,7 @@ impl<'a> ResponseAdapter<'a> {
             ProviderResponse::GeminiGenerateContent(response) => {
                 response.usage_metadata.clone().map(TokenUsage::from)
             }
+            ProviderResponse::JevSystemOne(response) => response.usage.map(TokenUsage::from),
             ProviderResponse::OpenAiEmbeddings(_)
             | ProviderResponse::GoogleBatchEmbed(_)
             | ProviderResponse::VertexPredict(_)
@@ -190,6 +198,7 @@ impl<'a> ResponseAdapter<'a> {
                 .first()
                 .and_then(|candidate| candidate.finish_reason.as_ref())
                 .map_or(FinishReason::Other, google_finish_reason),
+            ProviderResponse::JevSystemOne(_) => FinishReason::Stop,
             ProviderResponse::OpenAiEmbeddings(_)
             | ProviderResponse::GoogleBatchEmbed(_)
             | ProviderResponse::VertexPredict(_)
@@ -378,6 +387,23 @@ mod adapter_tests {
         assert_eq!(adapter.usage().unwrap().usage.cache_read_input_tokens, 4);
         assert_eq!(adapter.usage().unwrap().usage.reasoning_tokens, 3);
         assert_eq!(adapter.finish_reason(), FinishReason::ToolCalls);
+    }
+
+    /// A Jev answer has no text or tool calls; its structured output is the
+    /// whole typed answer, and its usage and finish read from it.
+    #[test]
+    fn jev_adapter_reads_the_typed_answer_as_structured_output() {
+        let response = ProviderResponse::JevSystemOne(common::jev_response());
+        let adapter = response.adapter();
+
+        assert!(adapter.text().is_none());
+        assert!(adapter.tool_calls().is_empty());
+        let output: serde_json::Value =
+            serde_json::from_str(adapter.structured_output().unwrap().get()).unwrap();
+        assert_eq!(output["answers"]["helpful"]["noul"], json!(0.9));
+        assert_eq!(output["answers"]["tone"]["choice"], json!("polite"));
+        assert_eq!(adapter.usage().unwrap().usage.input_tokens, 12);
+        assert_eq!(adapter.finish_reason(), FinishReason::Stop);
     }
 
     #[test]

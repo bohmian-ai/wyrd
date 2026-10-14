@@ -1,9 +1,11 @@
 """A tenant reaches TypeSafe Jev through the Wyrd Gateway.
 
-Native ``POST /v1/systemone`` callers and the unmodified OpenAI client both
-reach one Jev deployment, and the ``reply-quality`` Verifier uses that
-deployment as its LLM judge. A local recording upstream stands in for
-``api.typesafe.ai`` and sees only the operator's Jev key.
+Native ``POST /v1/systemone`` callers reach one Jev deployment with typed
+questions and get typed answers back, a stock OpenAI client reaches the same
+deployment on ``/v1/chat/completions`` by sending the typed Jev request as its
+last user message, and the ``reply-quality`` Verifier uses that deployment as
+its LLM judge through a native Jev Prompt. A local recording upstream stands
+in for ``api.typesafe.ai`` and sees only the operator's Jev key.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from typing import Any
 import httpx
 import openai
 import pytest
-from wyrd import WyrdError
+from openai.types.chat import ChatCompletionMessageParam
 from wyrd.cards import Cards
 from wyrd.gateway import Gateway
 from wyrd.state import WyrdState
@@ -39,7 +41,13 @@ QUESTIONS = {
     },
 }
 
-REFUSALS = {"rate-limited": 429, "overloaded": 529, "bad-key": 401}
+REFUSALS = {
+    "refused-form": 400,
+    "rate-limited": 429,
+    "server-error": 500,
+    "overloaded": 529,
+    "bad-key": 401,
+}
 """State text → the status the upstream refuses it with."""
 
 
@@ -64,7 +72,8 @@ class JevUpstream(BaseHTTPRequestHandler):
     """Mock ``/v1/systemone`` recording each request into ``upstream``.
 
     Answers helpful and polite unless the state names a scripted case:
-    ``Go away`` is unhelpful and rude, and each ``REFUSALS`` key is refused.
+    ``Go away`` is unhelpful and rude, and each ``REFUSALS`` key is refused
+    with a body that echoes the operator key after ``key cred``.
     """
 
     upstream: Receiver
@@ -79,7 +88,7 @@ class JevUpstream(BaseHTTPRequestHandler):
             reply = answer(0.12, "rude")
         for needle, refused in REFUSALS.items():
             if needle in state:
-                status, reply = refused, {"detail": "key cred"}
+                status, reply = refused, {"detail": f"key cred {JEV_KEY}"}
         payload = json.dumps(reply).encode()
         self.send_response(status)
         self.send_header("content-type", "application/json")
@@ -172,79 +181,126 @@ def test_native_systemone_answers_relay_intact(jev: tuple[WyrdTestServer, Receiv
     assert delivery.headers["authorization"] == f"Bearer {JEV_KEY}"
 
 
-def test_chat_completions_reach_jev_as_questions(jev: tuple[WyrdTestServer, Receiver]) -> None:
+def test_invalid_jev_questions_are_refused_before_jev(
+    jev: tuple[WyrdTestServer, Receiver],
+) -> None:
     server, upstream = jev
     asked = len(upstream.deliveries)
-    client = openai.OpenAI(
-        base_url=f"{server.base_url}/v1", api_key=server.access_token(), max_retries=0
-    )
 
-    completion = client.chat.completions.create(
-        model="jev/jev-latest",
-        messages=[
-            {"role": "user", "content": json.dumps({"state": "Thanks!", "questions": QUESTIONS})}
-        ],
-    )
-
-    content = completion.choices[0].message.content
-    assert content is not None
-    assert json.loads(content) == {
-        "model": "jev-1.13.0",
-        "answers": answer(0.93, "polite")["answers"],
-    }
-    assert (completion.model, completion.choices[0].finish_reason) == ("jev-1.13.0", "stop")
-    assert completion.usage is not None
-    assert (completion.usage.prompt_tokens, completion.usage.total_tokens) == (378, 443)
-    (delivery,) = upstream.deliveries[asked:]
-    assert delivery.body == {"model": "jev-latest", "state": "Thanks!", "questions": QUESTIONS}
-
-
-def test_ordinary_chat_is_refused_before_jev(jev: tuple[WyrdTestServer, Receiver]) -> None:
-    server, upstream = jev
-    asked = len(upstream.deliveries)
-    questions = json.dumps({"state": "Thanks!", "questions": QUESTIONS})
-
-    for route, body in [
-        (
-            "/v1/chat/completions",
-            {"model": "jev/jev-latest", "messages": [{"role": "user", "content": "hi"}]},
-        ),
-        (
-            "/v1/chat/completions",
-            {
-                "model": "jev/jev-latest",
-                "stream": True,
-                "messages": [{"role": "user", "content": questions}],
-            },
-        ),
-        (
-            "/v1/systemone",
-            {
-                "model": "jev-latest",
-                "state": "s",
-                "questions": {"q": {"type": "essay", "instructions": "x"}},
-            },
-        ),
+    for body in [
+        {
+            "model": "jev-latest",
+            "state": "s",
+            "questions": {"q": {"type": "essay", "instructions": "x"}},
+        },
+        {"model": "jev-latest", "state": {"answer": "s"}, "questions": QUESTIONS},
+        {"model": "jev-latest", "state": "s", "questions": QUESTIONS, "temperature": 0},
     ]:
-        reply = post(server, route, body)
-        assert reply.status_code == 400, reply.text
-        assert reply.json()["error"]["code"] == "WYRD_GATEWAY_400_INVALID_REQUEST"
+        reply = post(server, "/v1/systemone", body)
+        assert (reply.status_code, reply.json()["error"]["code"]) == (
+            400,
+            "WYRD_GATEWAY_400_INVALID_REQUEST",
+        ), reply.text
     assert upstream.deliveries[asked:] == []
 
 
-def test_jev_refusals_map_to_stable_errors(jev: tuple[WyrdTestServer, Receiver]) -> None:
-    server, _ = jev
-    for state, status, code in [
-        ("rate-limited", 429, "WYRD_GATEWAY_429_UPSTREAM_THROTTLED"),
-        ("overloaded", 502, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE"),
-        ("bad-key", 502, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE"),
-    ]:
-        reply = post(
-            server,
-            "/v1/systemone",
-            {"model": "jev-latest", "state": state, "questions": QUESTIONS},
+def openai_client(server: WyrdTestServer) -> openai.OpenAI:
+    """A stock OpenAI client pointed at the Gateway with an administrator token."""
+    return openai.OpenAI(
+        base_url=f"{server.base_url}/v1", api_key=server.access_token(), max_retries=0
+    )
+
+
+def chat(state: str) -> list[ChatCompletionMessageParam]:
+    """Messages whose last user turn is the typed Jev request about ``state``."""
+    return [
+        {"role": "system", "content": "Judge the reply."},
+        {"role": "user", "content": json.dumps({"state": state, "questions": QUESTIONS})},
+    ]
+
+
+def test_chat_completions_pass_typed_jev_requests_through(
+    jev: tuple[WyrdTestServer, Receiver],
+) -> None:
+    server, upstream = jev
+    asked = len(upstream.deliveries)
+    client = openai_client(server)
+    state = 'He said "thanks".\nAnything else?'
+
+    completion = client.chat.completions.create(model="jev/jev-latest", messages=chat(state))
+
+    content = completion.choices[0].message.content
+    assert content is not None
+    assert json.loads(content) == answer(0.93, "polite")
+    assert completion.usage is not None
+    assert (
+        completion.usage.prompt_tokens,
+        completion.usage.completion_tokens,
+        completion.usage.total_tokens,
+    ) == (378, 65, 443)
+    (delivery,) = upstream.deliveries[asked:]
+    assert (delivery.path, delivery.body) == (
+        "/v1/systemone",
+        {"model": "jev-latest", "state": state, "questions": QUESTIONS},
+    )
+    assert delivery.headers["authorization"] == f"Bearer {JEV_KEY}"
+
+    with pytest.raises(openai.BadRequestError) as raised:
+        client.chat.completions.create(
+            model="jev/jev-latest",
+            messages=[{"role": "user", "content": "Is this reply helpful?"}],
         )
-        assert (reply.status_code, reply.json()["error"]["code"]) == (status, code), state
+    assert raised.value.code == "WYRD_GATEWAY_400_INVALID_REQUEST"
+    assert len(upstream.deliveries) == asked + 1, "ordinary chat never reaches Jev"
+
+
+def test_jev_refusals_map_to_stable_errors(jev: tuple[WyrdTestServer, Receiver]) -> None:
+    """Jev refusals on both routes.
+
+    A validation refusal and a refused key never cool the deployment down, so
+    both routes prove them. Throttling, proven on the Chat Completions route,
+    cools the one deployment down for 30 seconds: the server error and
+    overload that follow answer the same stable error whether Jev or the
+    cooldown refuses them. The gateway adapter's unit tests pin every mapping
+    per route.
+    """
+    server, upstream = jev
+    client = openai_client(server)
+
+    def native(state: str) -> httpx.Response:
+        return post(
+            server, "/v1/systemone", {"model": "jev-latest", "state": state, "questions": QUESTIONS}
+        )
+
+    reply = native("refused-form")
+    assert (reply.status_code, reply.json()["error"]["code"]) == (
+        400,
+        "WYRD_GATEWAY_400_INVALID_REQUEST",
+    )
+    assert "key cred" not in reply.text
+    with pytest.raises(openai.BadRequestError) as invalid:
+        client.chat.completions.create(model="jev/jev-latest", messages=chat("refused-form"))
+    assert invalid.value.code == "WYRD_GATEWAY_400_INVALID_REQUEST"
+    assert "key cred" not in invalid.value.response.text
+
+    asked = len(upstream.deliveries)
+    reply = native("bad-key")
+    assert (reply.status_code, reply.json()) == (401, {"detail": "key cred "})
+    with pytest.raises(openai.AuthenticationError) as refused:
+        client.chat.completions.create(model="jev/jev-latest", messages=chat("bad-key"))
+    assert refused.value.code is None
+    assert JEV_KEY not in refused.value.response.text
+    assert len(upstream.deliveries) == asked + 2, "a refused key is never retried"
+
+    with pytest.raises(openai.RateLimitError) as throttled:
+        client.chat.completions.create(model="jev/jev-latest", messages=chat("rate-limited"))
+    assert throttled.value.code == "WYRD_GATEWAY_429_UPSTREAM_THROTTLED"
+    for state in ["server-error", "overloaded"]:
+        reply = native(state)
+        assert (reply.status_code, reply.json()["error"]["code"]) == (
+            502,
+            "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE",
+        ), state
         assert "key cred" not in reply.text
 
 
@@ -292,16 +348,19 @@ def test_jev_judge_fails_an_unhelpful_rude_reply(
     )
 
 
-def test_jev_judge_refuses_a_reply_that_breaks_the_question_json(
+def test_jev_judge_judges_a_reply_with_quotes_and_newlines(
     jev: tuple[WyrdTestServer, Receiver], reviewer_bundle: Path
 ) -> None:
     server, upstream = jev
     asked = len(upstream.deliveries)
+    reply = 'He said "your refund is on its way".\nAnything else?'
 
-    with pytest.raises(WyrdError) as raised:
-        reviewer(server, reviewer_bundle).run("agent").observe.verify(
-            "reply-quality", {"answer": 'He said "no".'}
-        )
+    judgment = (
+        reviewer(server, reviewer_bundle)
+        .run("agent")
+        .observe.verify("reply-quality", {"answer": reply})
+    )
 
-    assert raised.value.code == "WYRD_VERIFICATION_502_DEPENDENCY_FAILED"
-    assert upstream.deliveries[asked:] == []
+    assert judgment.verdict == "passed"
+    (delivery,) = upstream.deliveries[asked:]
+    assert delivery.body["state"] == reply

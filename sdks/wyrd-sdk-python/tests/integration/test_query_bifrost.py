@@ -172,7 +172,7 @@ def test_type_mismatch_and_ambiguous_reference_carry_the_planners_detail(
 def test_unauthorized_table_refusal_reveals_no_columns(
     wyrd_server: WyrdTestServer, live_table: str
 ) -> None:
-    datasets_only = {
+    datasets_only: dict[str, object] = {
         "resource": "bifrost_query",
         "action": "read",
         "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "datasets"}}},

@@ -10211,6 +10211,7 @@ dependencies = [
 name = "wyrd-telemetry"
 version = "0.1.0"
 dependencies = [
+ "http",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

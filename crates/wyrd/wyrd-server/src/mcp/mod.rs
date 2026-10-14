@@ -29,6 +29,7 @@ use rmcp::transport::streamable_http_server::session::never::NeverSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{RoleServer, ServerHandler};
 use serde::Serialize;
+use tracing::Instrument as _;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
@@ -227,13 +228,14 @@ impl ServerHandler for WyrdMcpHandler {
         std::future::ready(Ok(ListToolsResult::with_all_items(catalog)))
     }
 
-    /// Dispatch tools under the request's inbound trace context.
+    /// Dispatch tools inside the HTTP request's span and inbound trace context.
     ///
-    /// The transport serves each request on a task of its own, so the context
-    /// the HTTP edge made active is not visible here; it is read again from
-    /// the original request headers, letting a judge call a
-    /// `verification.execute` makes join the agent's trace like an HTTP
-    /// verification does.
+    /// The transport serves each request on a task of its own, so neither the
+    /// request span nor the context the HTTP edge made active is visible here;
+    /// both are read again from the original request, so every span a tool
+    /// opens — a `verification.execute` and the judge and gateway calls inside
+    /// it — descends from the request span, which continues the agent's trace
+    /// like an HTTP verification does.
     ///
     /// # Errors
     /// Every error of [`WyrdMcpHandler::dispatch`].
@@ -242,11 +244,14 @@ impl ServerHandler for WyrdMcpHandler {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let inbound = context
-            .extensions
-            .get::<axum::http::request::Parts>()
-            .and_then(|parts| trace_context::inbound(&parts.headers));
-        trace_context::within(inbound, self.dispatch(request, context)).await
+        let parts = context.extensions.get::<axum::http::request::Parts>();
+        let inbound = parts.and_then(|parts| wyrd_telemetry::inbound_context(&parts.headers));
+        let span = parts
+            .and_then(|parts| parts.extensions.get::<trace_context::RequestSpan>())
+            .map_or_else(tracing::Span::current, |span| span.0.clone());
+        trace_context::within(inbound, self.dispatch(request, context))
+            .instrument(span)
+            .await
     }
 }
 

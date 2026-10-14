@@ -2,6 +2,10 @@
 
 #![deny(missing_docs)]
 
+mod context;
+
+pub use context::{continue_remote, current_context, inbound_context};
+
 #[cfg(feature = "test-support")]
 use std::collections::BTreeMap;
 #[cfg(feature = "test-support")]
@@ -75,6 +79,9 @@ pub struct CapturedSpan {
     pub parent_span_id: String,
     /// Exact instrumentation span name.
     pub name: String,
+    /// OpenTelemetry span kind, such as `Server` for a request span or
+    /// `Internal` for work inside it.
+    pub kind: String,
     /// Scrubbed span attributes keyed by their production field names.
     pub attributes: BTreeMap<String, String>,
     /// Measured wall-clock duration from the production span timestamps.
@@ -143,6 +150,7 @@ impl TestTraceCapture {
                         span_id: span.span_context.span_id().to_string(),
                         parent_span_id: span.parent_span_id.to_string(),
                         name: span.name.to_string(),
+                        kind: format!("{:?}", span.span_kind),
                         attributes: span
                             .attributes
                             .iter()

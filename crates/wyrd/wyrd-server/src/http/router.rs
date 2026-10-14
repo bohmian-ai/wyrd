@@ -146,19 +146,27 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http().make_span_with(request_span))
 }
 
-/// Opens the root span of one HTTP request.
+/// Opens the SERVER span of one HTTP request.
 ///
-/// It records the method, path, and version but never the query: a URL-borne
+/// A valid inbound `traceparent` makes the caller's span its parent, so the
+/// request and everything done on its behalf continue the caller's trace; a
+/// missing, malformed, or repeated one leaves it the root of a new trace. It
+/// records the method, path, and version but never the query: a URL-borne
 /// credential, such as a provider SDK's `?key=` that ingress refuses, is
 /// already in the request when this span opens, before any authentication
 /// runs, and must not reach logs or exported traces.
 fn request_span(request: &Request) -> Span {
-    tracing::debug_span!(
+    let span = tracing::info_span!(
         "request",
+        otel.kind = "server",
         method = %request.method(),
         path = request.uri().path(),
         version = ?request.version(),
-    )
+    );
+    if let Some(caller) = wyrd_telemetry::inbound_context(request.headers()) {
+        wyrd_telemetry::continue_remote(&span, &caller);
+    }
+    span
 }
 
 /// Apply the core protective edge stack to `router`: request-id propagation,

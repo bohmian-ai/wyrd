@@ -59,6 +59,7 @@ dev = [
 ]
 # Agent frameworks the MCP journeys drive; only py:test:mcp-frameworks installs them.
 mcp-frameworks = [
+    "google-adk[mcp]>=2.12.0",
     "httpx2>=2.7",
     "mcp>=2.3.0",
     "openai-agents>=0.23.1",
@@ -116,7 +117,7 @@ unused-ignore-comment = "error"
 package = false
 
 [tool.uv.dependency-groups]
-# Pydantic AI requires Python 3.11.
+# Pydantic AI and Google ADK require Python 3.11.
 mcp-frameworks = { requires-python = ">=3.11" }
 
 # Linux takes the CPU-only torch build: no test uses a GPU, and the default

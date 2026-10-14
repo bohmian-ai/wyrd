@@ -18,6 +18,16 @@ Read tools and `wyrd.guide` are always advertised. Principal revocation, verific
 
 The tables below summarize wire shapes. Named shapes such as `ExecuteVerificationRequest` or `OperatorConnectionView` are the JSON Schemas `tools/list` returns for that tool; use them for every nested field, enum, and bound. A `{}` input means an empty argument object. Credentials and connection secrets are never returned.
 
+## Agent frameworks
+
+Wyrd serves MCP protocol revision 2026-07-28 only, and its tool names contain dots. Some model providers accept only `^[a-zA-Z0-9_-]{1,64}$` as a tool name, so configure each framework to forward provider-valid names; calls still reach the dotted Wyrd tool.
+
+| Framework | Settings |
+| --- | --- |
+| OpenAI Agents SDK (Python) | `mcp_config={"include_server_in_tool_names": True}` forwards names such as `mcp_wyrd__wyrd_guide`. |
+| Pydantic AI | `MCPToolset(url, headers=...).renamed({"wyrd_guide": "wyrd.guide", ...})`. |
+| Google ADK | Set `ADK_ENABLE_MCP_MODERN_PROTOCOL=1` (experimental in ADK) to negotiate 2026-07-28, and `GOOGLE_API_USE_CLIENT_CERTIFICATE=false` to skip ADK's Google Cloud mTLS probe. Gemini accepts dotted names; for other providers, override `McpToolset.get_tools` to return copies with renamed `name`. |
+
 ## Investigation guide
 
 | Tool | Effect / permission | Input → output | Purpose |

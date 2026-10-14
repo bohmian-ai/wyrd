@@ -1127,7 +1127,7 @@ dir = "sdks/wyrd-sdk-python"
 run = "uv run python -m pytest -q -m 'integration and not identity and not local_dev'"
 
 [tasks."py:test:mcp-frameworks"]
-description = "Run the OpenAI Agents SDK and Pydantic AI journeys against Wyrd's /mcp on a live Postgres-backed server"
+description = "Run the OpenAI Agents SDK, Pydantic AI, and Google ADK journeys against Wyrd's /mcp on a live Postgres-backed server"
 depends = ["py:setup"]
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run py:test:mcp-frameworks:inner'"
 

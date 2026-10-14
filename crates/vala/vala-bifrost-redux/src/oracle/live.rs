@@ -277,6 +277,45 @@ impl LiveScribeExec {
         &self.scan_metrics
     }
 
+    /// Returns this leaf with its predicate snapshotted to static
+    /// expressions and its routes narrowed by that snapshot.
+    ///
+    /// Called once per execution, after any `ScalarSubqueryExec` above has
+    /// populated its values, so a resolved scalar becomes a literal that both
+    /// prunes routes and ships in every fragment. Narrowing only removes
+    /// routes from the planning-time selection, before any is dealt to a
+    /// partition. `self` keeps the runtime-bound predicate for re-execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns the snapshot error when the predicate reads execution state
+    /// that is not yet populated.
+    fn resolved(&self) -> DataFusionResult<Self> {
+        let mut leaf = self.clone();
+        if let Some(predicate) = &self.predicate {
+            let predicate = snapshot_physical_expr(Arc::clone(predicate))?;
+            leaf.routes = Arc::new(self.routes.selected_by(
+                &predicate,
+                &self.schema(),
+                self.time_axis.column(),
+            ));
+            leaf.predicate = Some(predicate);
+        }
+        Ok(leaf)
+    }
+
+    /// Returns the routes output `partition` reads: route `i` belongs to
+    /// partition `i % partitions`, so every route is read exactly once.
+    fn partition_routes(&self, partition: usize) -> Vec<LiveScribeRoute> {
+        self.routes
+            .routes
+            .iter()
+            .skip(partition)
+            .step_by(self.properties.partitioning.partition_count())
+            .cloned()
+            .collect()
+    }
+
     /// Builds the signed fragment and destination for one route.
     ///
     /// The encoded plan is the same identity-bound placeholder a Scribe
@@ -499,24 +538,8 @@ impl ExecutionPlan for LiveScribeExec {
                 "live Scribe source has no partition {partition}"
             )));
         }
-        let mut leaf = self.clone();
-        if let Some(predicate) = &self.predicate {
-            let predicate = snapshot_physical_expr(Arc::clone(predicate))?;
-            leaf.routes = Arc::new(self.routes.selected_by(
-                &predicate,
-                &self.schema(),
-                self.time_axis.column(),
-            ));
-            leaf.predicate = Some(predicate);
-        }
-        let routes = leaf
-            .routes
-            .routes
-            .iter()
-            .skip(partition)
-            .step_by(partitions)
-            .cloned()
-            .collect();
+        let leaf = self.resolved()?;
+        let routes = leaf.partition_routes(partition);
         let lock = super::bindings::bindings_for_task(context.as_ref())?;
         let read = LiveFragmentRead {
             leaf,
@@ -1034,6 +1057,143 @@ mod tests {
             matches!(root.physical_plan_type, Some(PhysicalPlanType::Filter(_))),
             "the fragment ships the filter above its placeholder"
         );
+    }
+
+    /// A scalar-subquery conjunct stays on the live leaf without deferring
+    /// static pruning, and each execution ships its resolved value.
+    ///
+    /// Over four hourly routes, planning prunes by the static
+    /// `event_time >= H1` alone while the scalar is pending. Execution then
+    /// fails while the scalar is pending, and once populated with H2 snapshots
+    /// it to a literal: the routes narrow to H2 and H3, are dealt across two
+    /// partitions exactly once each, and the fragment carries no scalar
+    /// subquery. A reset and re-execution with H3 resolves anew, because the
+    /// planned leaf keeps the runtime-bound expression.
+    ///
+    /// # Panics
+    /// Panics when a fixture cannot be built, or pruning, snapshotting,
+    /// dealing, or the encoded fragment differ from the above.
+    #[test]
+    fn scalar_subquery_resolves_per_execution_after_static_pruning() {
+        use super::super::exec::tests::FIXTURE_TIME_COLUMN;
+        use arrow::datatypes::TimeUnit;
+        use datafusion::logical_expr::Operator;
+        use datafusion::logical_expr::physical_planning_context::{
+            ScalarSubqueryResults, SubqueryIndex,
+        };
+        use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+        use datafusion::physical_expr::scalar_subquery::ScalarSubqueryExpr;
+        use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
+        use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
+        use datafusion::scalar::ScalarValue;
+        use datafusion_proto::protobuf::PhysicalPlanNode;
+        use prost::Message as _;
+
+        /// One hour in microseconds, the width of each route's partition.
+        const HOUR_MICROS: i64 = 3_600_000_000;
+        let first_hour = 1_787_493_600_000_000_i64;
+        let zone: Option<Arc<str>> = Some("UTC".into());
+        let hour = |n: i64| {
+            ScalarValue::TimestampMicrosecond(Some(first_hour + n * HOUR_MICROS), zone.clone())
+        };
+        let mut routes =
+            crate::oracle::exec::tests::one_live_route(wyrd_spec::DataTenantId::new_v7());
+        let template = routes.routes[0].clone();
+        routes.routes = (0..4)
+            .map(|n| LiveScribeRoute {
+                time_partition: TimePartitionWire::new(
+                    wyrd_spec::vala::api::TimeGranularityWire::Hour,
+                    DateTime::from_timestamp_micros(first_hour + n * HOUR_MICROS).expect("instant"),
+                )
+                .expect("hour boundary"),
+                ..template.clone()
+            })
+            .collect();
+        let all = routes.routes.clone();
+        let time_type = DataType::Timestamp(TimeUnit::Microsecond, zone.clone());
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, false),
+            Field::new(FIXTURE_TIME_COLUMN, time_type.clone(), false),
+        ]));
+        let leaf = Arc::new(LiveScribeExec::new(
+            routes,
+            crate::catalog::TimeAxis::new(
+                FIXTURE_TIME_COLUMN,
+                crate::catalog::TimeGranularity::Hour,
+            ),
+            "f".repeat(64),
+            vec!["v".to_owned(), FIXTURE_TIME_COLUMN.to_owned()],
+            Arc::clone(&schema),
+            2,
+        ));
+        let results = ScalarSubqueryResults::new(1);
+        let at_least = |right: Arc<dyn PhysicalExpr>| -> Arc<dyn PhysicalExpr> {
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new(FIXTURE_TIME_COLUMN, 1)),
+                Operator::GtEq,
+                right,
+            ))
+        };
+        let predicate = Arc::new(BinaryExpr::new(
+            at_least(Arc::new(Literal::new(hour(1)))),
+            Operator::And,
+            at_least(Arc::new(ScalarSubqueryExpr::new(
+                time_type,
+                false,
+                SubqueryIndex::new(0),
+                results.clone(),
+            ))),
+        ));
+        let plan = FilterPushdown::new()
+            .optimize(
+                Arc::new(FilterExec::try_new(predicate, leaf).expect("filter plans")),
+                &ConfigOptions::default(),
+            )
+            .expect("pushdown runs");
+        let live = plan
+            .downcast_ref::<FilterExec>()
+            .expect("the leader keeps its filter")
+            .input()
+            .downcast_ref::<LiveScribeExec>()
+            .expect("the live leaf stays under the filter");
+        assert_eq!(
+            live.routes.routes,
+            all[1..],
+            "planning prunes by the static conjunct"
+        );
+        assert!(live.resolved().is_err(), "a pending scalar cannot resolve");
+
+        for (value, expected) in [(2, &all[2..]), (3, &all[3..])] {
+            results.clear();
+            results
+                .set(SubqueryIndex::new(0), hour(value))
+                .expect("scalar populates");
+            let resolved = live.resolved().expect("the populated scalar resolves");
+            assert_eq!(
+                resolved.routes.routes, expected,
+                "the scalar narrows routes"
+            );
+            let mut dealt = [resolved.partition_routes(0), resolved.partition_routes(1)].concat();
+            dealt.sort_by_key(|route| route.time_partition.start_unix_micros());
+            assert_eq!(dealt, expected, "every route is dealt exactly once");
+            let (fragment, _) = resolved
+                .fragment(&resolved.routes.routes[0], 0)
+                .expect("the fragment encodes");
+            let encoded = format!(
+                "{:?}",
+                PhysicalPlanNode::decode(fragment.physical_plan_bytes.as_slice())
+                    .expect("the fragment plan decodes")
+            );
+            assert!(
+                !encoded.contains("ScalarSubquery"),
+                "no scalar subquery ships"
+            );
+            let micros = first_hour + value * HOUR_MICROS;
+            assert!(
+                encoded.contains(&micros.to_string()),
+                "the resolved literal ships"
+            );
+        }
     }
 
     /// A time-column predicate keeps only the routes whose hour it can match,

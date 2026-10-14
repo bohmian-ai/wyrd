@@ -36,6 +36,22 @@ struct Count {
 /// # Panics
 /// Panics when the table cannot register or a row cannot be written.
 async fn published() -> (Deployment, Bifrost) {
+    let (deployment, bifrost) = live().await;
+    deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+    (deployment, bifrost)
+}
+
+/// A deployment whose administrator wrote rows 1 to 3 of [`QUERY_ROWS`]
+/// that Scribe acknowledged and nothing published, so every query reads them
+/// from the live tail, and the administrator's query client.
+///
+/// # Panics
+/// Panics when the table cannot register or a row cannot be written.
+async fn live() -> (Deployment, Bifrost) {
     let deployment = Deployment::start().await;
     let admin = deployment.admin();
     let table = TableConfig::from_json_schema(
@@ -64,11 +80,6 @@ async fn published() -> (Deployment, Bifrost) {
             .expect("row inserts");
     }
     writer.shutdown().await.expect("writer drains");
-    deployment
-        .server()
-        .flush_bifrost()
-        .await
-        .expect("rows publish");
     (
         deployment,
         Bifrost::connect(&admin).await.expect("Bifrost connects"),
@@ -210,6 +221,168 @@ async fn caller_without_bifrost_read_is_refused() {
     assert_eq!(
         WyrdError::from(refused).code(),
         "WYRD_PERMISSION_403_DENIED_RBAC"
+    );
+    deployment.shutdown().await;
+}
+
+/// One `id` result.
+#[derive(Debug, PartialEq, Deserialize)]
+struct Id {
+    /// The selected row's ordinal.
+    id: i64,
+}
+
+/// Scalar, `IN`, and correlated `EXISTS` subqueries over a live table return
+/// the same rows as their equivalent joins.
+///
+/// # Panics
+/// Panics when a query fails or a subquery and its join disagree.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn live_table_subqueries_match_their_joins() {
+    let (deployment, bifrost) = live().await;
+    let cases = [
+        (
+            format!(
+                "SELECT id FROM {QUERY_ROWS} WHERE id = \
+                 (SELECT id FROM {QUERY_ROWS} ORDER BY id DESC LIMIT 1)"
+            ),
+            format!(
+                "SELECT a.id FROM {QUERY_ROWS} a JOIN \
+                 (SELECT MAX(id) AS id FROM {QUERY_ROWS}) b ON a.id = b.id"
+            ),
+            vec![3],
+        ),
+        (
+            format!(
+                "SELECT id FROM {QUERY_ROWS} WHERE id IN \
+                 (SELECT id FROM {QUERY_ROWS} WHERE value <> 'two') ORDER BY id"
+            ),
+            format!(
+                "SELECT a.id FROM {QUERY_ROWS} a JOIN {QUERY_ROWS} b \
+                 ON a.id = b.id WHERE b.value <> 'two' ORDER BY a.id"
+            ),
+            vec![1, 3],
+        ),
+        (
+            format!(
+                "SELECT a.id FROM {QUERY_ROWS} a WHERE EXISTS \
+                 (SELECT 1 FROM {QUERY_ROWS} b WHERE b.id = a.id + 1) ORDER BY a.id"
+            ),
+            format!(
+                "SELECT a.id FROM {QUERY_ROWS} a JOIN {QUERY_ROWS} b \
+                 ON b.id = a.id + 1 ORDER BY a.id"
+            ),
+            vec![1, 2],
+        ),
+    ];
+
+    for (subquery, join, expected) in cases {
+        let ids = |rows: Vec<Id>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+        let from_subquery: Vec<Id> = bifrost
+            .sql_as(&subquery, &[])
+            .await
+            .unwrap_or_else(|error| panic!("{subquery}: {}", WyrdError::from(error)));
+        let from_join: Vec<Id> = bifrost
+            .sql_as(&join, &[])
+            .await
+            .unwrap_or_else(|error| panic!("{join}: {}", WyrdError::from(error)));
+        assert_eq!(ids(from_subquery), expected, "{subquery}");
+        assert_eq!(ids(from_join), expected, "{join}");
+    }
+    deployment.shutdown().await;
+}
+
+/// An unknown column is a 400 carrying the planner's suggestion, alone, in a
+/// three-way join, and inside a subquery.
+///
+/// # Panics
+/// Panics when a query succeeds or is refused without the suggestion.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn unknown_column_carries_the_planners_suggestion() {
+    let (deployment, bifrost) = live().await;
+
+    for sql in [
+        format!("SELECT r.valeu FROM {QUERY_ROWS} r"),
+        format!(
+            "SELECT r.valeu, r.valeu AS again FROM {QUERY_ROWS} r JOIN {QUERY_ROWS} s ON r.id = s.id \
+             JOIN vala.verification.results v ON v.result_id = s.value"
+        ),
+        format!("SELECT id FROM {QUERY_ROWS} WHERE id IN (SELECT r.valeu FROM {QUERY_ROWS} r)"),
+    ] {
+        let refused = WyrdError::from(
+            bifrost
+                .sql(&sql, &[])
+                .await
+                .expect_err("the unknown column is refused"),
+        );
+        let message = refused.to_string();
+        assert_eq!(
+            refused.code(),
+            "WYRD_VALA_400_QUERY_INVALID_SQL",
+            "{sql}: {message}"
+        );
+        assert!(
+            message.contains("r.valeu") && message.contains("Did you mean 'r.value'?"),
+            "{sql}: {message}"
+        );
+    }
+    deployment.shutdown().await;
+}
+
+/// A caller granted only `vala.datasets` who names another schema's table is
+/// refused without learning its columns, even when the SQL misspells one.
+///
+/// # Panics
+/// Panics when the query succeeds, or its refusal differs or names a column.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn unauthorized_table_refusal_reveals_no_columns() {
+    let (deployment, _) = live().await;
+    let datasets_only = serde_json::from_value(json!({
+        "resource": "bifrost_query",
+        "action": "read",
+        "scope": { "bifrost": { "schema": { "catalog": "vala", "schema": "datasets" } } },
+    }))
+    .expect("permission parses");
+    deployment
+        .server()
+        .seed_role("datasets_reader", &[datasets_only])
+        .await
+        .expect("role seeds");
+    let reader = Bifrost::connect(
+        &deployment.client(
+            &deployment
+                .key("datasets_reader", &["datasets_reader"])
+                .await,
+        ),
+    )
+    .await
+    .expect("Bifrost connects");
+
+    let rows: Vec<Id> = reader
+        .sql_as(&format!("SELECT id FROM {QUERY_ROWS} ORDER BY id"), &[])
+        .await
+        .expect("the granted table reads");
+    assert_eq!(rows.len(), 3);
+    let refused = WyrdError::from(
+        reader
+            .sql(
+                &format!(
+                    "SELECT q.id, v.verdcit FROM {QUERY_ROWS} q \
+                     JOIN vala.verification.results v ON v.result_id = q.value"
+                ),
+                &[],
+            )
+            .await
+            .expect_err("the ungranted table is refused"),
+    );
+    let message = refused.to_string();
+    assert_eq!(refused.code(), "WYRD_VALA_403_QUERY_FORBIDDEN", "{message}");
+    assert!(
+        !message.contains("verdict") && !message.contains("verdcit"),
+        "{message}"
     );
     deployment.shutdown().await;
 }

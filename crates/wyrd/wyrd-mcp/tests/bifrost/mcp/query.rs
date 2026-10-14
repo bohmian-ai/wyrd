@@ -319,7 +319,15 @@ mod pg_tests {
             ),
             (
                 "unknown field",
-                serde_json::json!({"sql": format!("SELECT no_such_column FROM {table}")}),
+                serde_json::json!({"sql": format!("SELECT t.valeu FROM {table} t")}),
+                "WYRD_VALA_400_QUERY_INVALID_SQL",
+            ),
+            (
+                "unknown field in a join",
+                serde_json::json!({"sql": format!(
+                    "SELECT t.valeu, t.valeu AS again FROM {table} t JOIN {table} u ON t.id = u.id \
+                     JOIN vala.verification.results v ON v.result_id = u.value"
+                )}),
                 "WYRD_VALA_400_QUERY_INVALID_SQL",
             ),
             (
@@ -335,10 +343,17 @@ mod pg_tests {
                 serde_json::json!(code),
                 "{case}: {refusal}"
             );
-            if matches!(case, "unknown field" | "unsupported shape") {
-                assert_eq!(
-                    refusal["detail"],
-                    "invalid or unsupported query SQL: Inspect bifrost.describe_table and submit a supported SELECT query."
+            let detail = refusal["detail"].as_str().unwrap_or_default();
+            if case.starts_with("unknown field") {
+                assert!(
+                    detail.contains("No field named t.valeu. Did you mean 't.value'?"),
+                    "{case} carries the planner's suggestion: {refusal}"
+                );
+            }
+            if case == "unsupported shape" {
+                assert!(
+                    detail.contains("evil_udf"),
+                    "{case} names the unknown function: {refusal}"
                 );
             }
             for field in [
@@ -358,6 +373,82 @@ mod pg_tests {
                 refusal.get("rows").is_none() && refusal.get("columns").is_none(),
                 "{case} must carry no result payload: {refusal}"
             );
+        }
+
+        client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// An agent's scalar, `IN`, and correlated `EXISTS` subqueries over a live
+    /// table answer exactly like their equivalent joins.
+    ///
+    /// Every row of the fixture is still unsealed in Scribe, so each query
+    /// reads the live tail; the scalar subquery's filter must stay on the
+    /// leader beside the subquery it reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture, transport, tool-call, or shutdown failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a subquery fails or disagrees with its join.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn live_table_subqueries_answer_like_joins() -> Result<(), McpJourneyError> {
+        let server = WyrdTestServer::start_bound().await?;
+        let (table, token) = server.prepare_oracle_query_fixture(true).await?;
+        let client = ()
+            .serve_with_lifecycle(
+                transport(&server, ResolvedCredential::BearerToken(token.into()), None)?,
+                discover(),
+            )
+            .await?;
+
+        for (subquery, join, expected) in [
+            (
+                format!(
+                    "SELECT id FROM {table} WHERE id = \
+                     (SELECT id FROM {table} ORDER BY id DESC LIMIT 1)"
+                ),
+                format!(
+                    "SELECT a.id FROM {table} a JOIN \
+                     (SELECT MAX(id) AS id FROM {table}) b ON a.id = b.id"
+                ),
+                serde_json::json!([[3]]),
+            ),
+            (
+                format!(
+                    "SELECT id FROM {table} WHERE id IN \
+                     (SELECT id FROM {table} WHERE value <> 'second') ORDER BY id"
+                ),
+                format!(
+                    "SELECT a.id FROM {table} a JOIN {table} b ON a.id = b.id \
+                     WHERE b.value <> 'second' ORDER BY a.id"
+                ),
+                serde_json::json!([[1], [3]]),
+            ),
+            (
+                format!(
+                    "SELECT a.id FROM {table} a WHERE EXISTS \
+                     (SELECT 1 FROM {table} b WHERE b.id = a.id + 1) ORDER BY a.id"
+                ),
+                format!(
+                    "SELECT a.id FROM {table} a JOIN {table} b ON b.id = a.id + 1 \
+                     ORDER BY a.id"
+                ),
+                serde_json::json!([[1], [2]]),
+            ),
+        ] {
+            for sql in [&subquery, &join] {
+                let result = structured(
+                    client
+                        .call_tool(query(serde_json::json!({"sql": sql, "max_rows": 10})))
+                        .await?,
+                )?;
+                assert_eq!(result["rows"], expected, "{sql}: {result}");
+            }
         }
 
         client.cancel().await?;

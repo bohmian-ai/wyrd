@@ -15,6 +15,8 @@ mod otel_export;
 /// Principal discovery and Role assignment through `Principals`.
 mod principal_roles;
 mod query_bifrost;
+/// Common analytical SQL over part-published, part-live tables.
+mod query_coverage;
 mod register_and_hydrate;
 mod saved_user_auth;
 mod scheduled_drift_alerts_operator;

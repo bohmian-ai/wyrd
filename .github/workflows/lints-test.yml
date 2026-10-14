@@ -67,7 +67,7 @@ jobs:
             python='[{"os":"ubuntu-24.04","python-version":"3.13"},{"os":"macos-15","python-version":"3.13"}'
           fi
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            python+=',{"os":"ubuntu-24.04","python-version":"3.14"},{"os":"ubuntu-24.04","python-version":"3.15"}'
+            python+=',{"os":"ubuntu-24.04","python-version":"3.14"}'
           fi
           echo "python=$python]" >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"

@@ -12,8 +12,8 @@ inputs:
   docker-images:
     description: Let free-disk-space remove preinstalled Docker images. Set false when the job needs Docker (emulators, OIDC providers).
     default: "true"
-  tool-cache:
-    description: Let free-disk-space remove the hosted-tool cache.
+  preinstalled-runtimes:
+    description: Let free-disk-space remove preinstalled language runtimes (the hosted-tool cache).
     default: "true"
   large-packages:
     description: Let free-disk-space remove large apt packages, including azure-cli. Set false when the job needs `az`.
@@ -48,7 +48,7 @@ runs:
       if: inputs.free-disk == 'true' && runner.os == 'Linux'
       uses: jlumbroso/free-disk-space@v2
       with:
-        tool-cache: ${{ inputs.tool-cache }}
+        preinstalled-runtimes: ${{ inputs.preinstalled-runtimes }}
         android: true
         dotnet: true
         haskell: true

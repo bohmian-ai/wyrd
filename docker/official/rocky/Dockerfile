@@ -24,6 +24,7 @@ RUN chmod 0755 /usr/local/bin/wyrd-server /entrypoint.sh \
 # private WAL/staging live there. Postgres and the signing key are external.
 ENV WYRD_SERVER_BIND=127.0.0.1:8081 \
     WYRD_GRPC_BIND=127.0.0.1:50053 \
+    WYRD_STORAGE_URL=file:///var/lib/wyrd/storage \
     WYRD_BIFROST_DATA_DIR=/var/lib/wyrd/bifrost
 VOLUME ["/var/lib/wyrd"]
 WORKDIR /app

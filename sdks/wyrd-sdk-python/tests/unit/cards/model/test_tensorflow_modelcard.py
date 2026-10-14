@@ -8,6 +8,9 @@ from wyrd.model import ModelCard, ModelCardMetadata, SampleInput, TensorflowInte
 
 pytestmark = pytest.mark.tensorflow
 
+# TensorFlow is installed only on Python 3.13 and earlier.
+pytest.importorskip("tensorflow", reason="TensorFlow supports Python 3.13 and earlier")
+
 
 @pytest.fixture
 def keras_model() -> Any:

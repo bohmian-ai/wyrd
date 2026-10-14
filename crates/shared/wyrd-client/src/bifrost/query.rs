@@ -630,6 +630,12 @@ pub struct QueryResultStream {
     client: QueryClient,
     /// Server-pinned absolute deadline bounding every settlement wait.
     deadline_ms: i64,
+    /// Client transport timeout bounding the close after a received terminal.
+    ///
+    /// The query deadline bounds terminal production; once a terminal has
+    /// arrived, the EOF behind it is the connection closing, which this
+    /// configured transport bound governs instead.
+    close_timeout: std::time::Duration,
     /// Settlement this stream still owes, or [`StreamSettlement::Settled`].
     settlement: StreamSettlement,
     /// Validated logical-frame stream.
@@ -646,12 +652,17 @@ pub struct QueryResultStream {
 
 impl QueryResultStream {
     /// Constructs the Arrow projection over a raw protocol stream.
+    ///
+    /// The close bound after a terminal is read from `client`'s configured
+    /// transport timeout here, so every stream carries the same value its
+    /// transport applies to retried requests.
     fn new(
         raw: RawQueryStream,
         request_id: RequestId,
         client: QueryClient,
         deadline_ms: i64,
     ) -> Self {
+        let close_timeout = client.client.http.request_timeout();
         // Without `internal` nothing settles a stream, so the client it would
         // settle with is not retained.
         #[cfg(not(feature = "internal"))]
@@ -661,6 +672,7 @@ impl QueryResultStream {
             #[cfg(feature = "internal")]
             client,
             deadline_ms,
+            close_timeout,
             settlement: StreamSettlement::Healthy,
             raw,
             schema: None,
@@ -769,23 +781,29 @@ impl QueryResultStream {
     /// before the body closes would let a duplicate terminal, a late schema, or
     /// a trailing batch arrive behind a result the caller already believes is
     /// complete. The raw stream retains the provisional terminal across cancelled
-    /// reads. One further frame is polled within the remaining server-pinned
-    /// deadline; only clean EOF promotes it to this stream's public result. A
+    /// reads. Only clean EOF promotes it to this stream's public result. A
     /// failed terminal follows the same proof, so a duplicate terminal or any
     /// other post-failure frame is a broken stream, not a validated failure.
+    ///
+    /// The two waits have different owners. The server-pinned query deadline
+    /// bounds terminal production, and a timeout terminal is produced at or
+    /// after that deadline by design, so the deadline has done its job once a
+    /// terminal arrives. The read for the EOF behind it is the connection
+    /// closing, which the client's configured transport timeout bounds; each
+    /// call, including one resumed after cancellation, waits at most that long.
     ///
     /// # Errors
     /// Returns [`BifrostClientError::FailedTerminal`] when a failed terminal is
     /// followed by clean EOF, [`BifrostClientError::Protocol`] when any frame follows the terminal,
     /// the raw stream's own error unchanged when the body fails, and
-    /// [`BifrostClientError::IncompleteQueryStream`] when the deadline passes before
-    /// the body closes. Every one of those marks the body broken first.
+    /// [`BifrostClientError::IncompleteQueryStream`] when the transport timeout
+    /// passes before the body closes. Every one of those marks the body broken first.
     async fn finish_at_clean_eof(
         &mut self,
         terminal: QueryTerminalFrame,
     ) -> Result<Option<RecordBatch>, BifrostClientError> {
-        let remaining = self.remaining();
-        let observed = tokio::time::timeout(remaining, self.raw.next_decoded_frame()).await;
+        let observed =
+            tokio::time::timeout(self.close_timeout, self.raw.next_decoded_frame()).await;
         self.encoded_bytes = self.raw.received_bytes();
         match observed {
             Ok(Ok(None)) => {
@@ -916,17 +934,24 @@ impl QueryResultStream {
 
     /// Drains a healthy body to its terminal within the query deadline.
     ///
-    /// Returns whether the terminal actually arrived. A drain that hits the
-    /// deadline or a late decode failure leaves the caller with no proof, so it
-    /// reports `false` and the status poll takes over.
+    /// The query deadline bounds only terminal production. When it expires
+    /// after the terminal arrived but before its EOF, the cancelled read left
+    /// that terminal provisional in the raw stream, so one more read proves the
+    /// close under the transport timeout [`Self::finish_at_clean_eof`] applies.
+    ///
+    /// Returns whether the terminal was accepted. A drain whose terminal never
+    /// arrived by the deadline, or a late decode failure, leaves the caller
+    /// with no proof, so it reports `false` and the status poll takes over.
     #[cfg(feature = "internal")]
     async fn drain_to_terminal(&mut self) -> bool {
-        let drained = tokio::time::timeout(self.remaining(), async {
+        let produced = tokio::time::timeout(self.remaining(), async {
             while let Ok(Some(_)) = self.next_batch().await {}
-            self.terminal.is_some()
         })
         .await;
-        drained.unwrap_or(false)
+        if produced.is_err() && self.terminal.is_none() && self.raw.terminal().is_some() {
+            let _ = self.next_batch().await;
+        }
+        self.terminal.is_some()
     }
 
     /// Polls one query's status until the server proves it is no longer running.
@@ -981,6 +1006,7 @@ impl QueryResultStream {
     /// A deadline that has already passed yields zero rather than a negative
     /// duration, which makes every bounded settlement wait resolve immediately
     /// instead of panicking on the conversion.
+    #[cfg(feature = "internal")]
     fn remaining(&self) -> std::time::Duration {
         Self::remaining_until(self.deadline_ms)
     }
@@ -990,6 +1016,7 @@ impl QueryResultStream {
     /// Settlement's status poll owns its collaborators by value so its future
     /// stays `Send`, and it must recompute the remainder before every wait, so
     /// the deadline arithmetic lives here rather than on `&self`.
+    #[cfg(feature = "internal")]
     fn remaining_until(deadline_ms: i64) -> std::time::Duration {
         let now = std::time::SystemTime::UNIX_EPOCH
             .elapsed()
@@ -2395,11 +2422,18 @@ mod tests {
 
     /// Builds a query client bound to one base URL with a static credential.
     fn client_for(base_url: &str) -> QueryClient {
+        client_with_timeout(base_url, 2_000)
+    }
+
+    /// Builds a query client for `base_url` with a configured transport
+    /// timeout of `timeout_ms`, which also bounds each stream's close after
+    /// its terminal.
+    fn client_with_timeout(base_url: &str, timeout_ms: u64) -> QueryClient {
         let config = crate::config::ClientConfig {
             credential: Some(secrecy::SecretString::from("test-key")),
             http: crate::transport::config::HttpConfig {
                 base_url: base_url.to_owned(),
-                timeout_ms: 2_000,
+                timeout_ms,
                 ..crate::transport::config::HttpConfig::default()
             },
             ..crate::config::ClientConfig::default()
@@ -2463,7 +2497,7 @@ mod tests {
     /// Panics if cancellation loses terminal metadata or exposes success before EOF.
     #[tokio::test]
     async fn cancelled_terminal_eof_wait_resumes_safely() {
-        for case in ["incremental", "collect", "expired", "late frame"] {
+        for case in ["incremental", "collect", "close timeout", "late frame"] {
             let schema = test_schema();
             let (mut ipc, prefix) = TestQueryIpc::open(&schema);
             let batch = ipc.batch(&schema, &[1, 2]);
@@ -2495,8 +2529,12 @@ mod tests {
             let mut result = QueryResultStream::new(
                 RawQueryStream::new(body),
                 RequestId::now_v7(),
-                offline_client(),
-                deadline_in(if case == "expired" { 200 } else { 30_000 }),
+                if case == "close timeout" {
+                    client_with_timeout("http://127.0.0.1:1", 200)
+                } else {
+                    offline_client()
+                },
+                deadline_in(30_000),
             );
             assert_eq!(
                 result
@@ -2518,18 +2556,15 @@ mod tests {
             }
             assert!(result.terminal().is_none());
             assert_eq!(result.settlement, StreamSettlement::Healthy);
-            if case == "expired" {
-                let deadline = result.deadline_ms();
-                tokio::time::sleep(result.remaining()).await;
+            if case == "close timeout" {
                 let resumed =
                     tokio::time::timeout(std::time::Duration::from_secs(1), result.next_batch())
                         .await
-                        .expect("resumption remains bounded by the original deadline");
+                        .expect("resumption remains bounded by the transport timeout");
                 assert!(matches!(
                     resumed,
                     Err(BifrostClientError::IncompleteQueryStream)
                 ));
-                assert_eq!(result.deadline_ms(), deadline);
                 assert_eq!(result.settlement, StreamSettlement::Broken);
                 assert!(result.terminal().is_none());
                 continue;
@@ -2564,6 +2599,130 @@ mod tests {
                 assert_eq!(result.settlement, StreamSettlement::Settled);
             }
         }
+    }
+
+    /// Opens a stream whose deadline has passed and whose body has already
+    /// delivered a schema and a typed timeout terminal, as a server that ended
+    /// the query at its deadline sends them.
+    ///
+    /// The returned sender holds the body open, so the caller decides whether
+    /// EOF, a trailing frame, or nothing at all follows the terminal. The
+    /// client's configured transport timeout is `timeout_ms`.
+    ///
+    /// # Panics
+    /// Panics if the two frames do not fit the body channel.
+    fn deadline_terminal_stream(
+        timeout_ms: u64,
+    ) -> (
+        QueryResultStream,
+        QueryTerminalFrame,
+        tokio::sync::mpsc::Sender<Result<Bytes, reqwest::Error>>,
+    ) {
+        let (prefix, _eos) = empty_ipc(&test_schema());
+        let terminal = failed_terminal_with(BifrostError::QueryTimeout, 0);
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        for frame in [
+            QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: String::new(),
+                arrow_ipc_schema: prefix,
+            }),
+            QueryStreamFrame::Terminal(terminal.clone()),
+        ] {
+            sender
+                .try_send(Ok(Bytes::from(encoded(frame))))
+                .expect("frame fits");
+        }
+        let result = QueryResultStream::new(
+            RawQueryStream::new(tokio_stream::wrappers::ReceiverStream::new(receiver)),
+            RequestId::now_v7(),
+            client_with_timeout("http://127.0.0.1:1", timeout_ms),
+            deadline_in(-1),
+        );
+        (result, terminal, sender)
+    }
+
+    /// A timeout terminal the server sent at the deadline survives a late EOF.
+    ///
+    /// The server can only emit its typed timeout once the deadline has
+    /// passed, so the terminal always arrives with no deadline left. Its EOF
+    /// lands in a later body read here, which is what a loaded host produces;
+    /// the caller must still see the typed 504 timeout, never an incomplete
+    /// stream, because the deadline bounds terminal production, not the close.
+    ///
+    /// # Panics
+    /// Panics if the late EOF turns the timeout terminal into any other error.
+    #[tokio::test]
+    async fn deadline_terminal_with_late_eof_keeps_the_typed_timeout() {
+        let (mut result, terminal, sender) = deadline_terminal_stream(2_000);
+        let eof = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(sender);
+        });
+        let error = result
+            .next_batch()
+            .await
+            .expect_err("a timeout terminal is a failure");
+        eof.await.expect("EOF task completes");
+        let BifrostClientError::FailedTerminal { terminal: retained } = &error else {
+            panic!("the late EOF must keep the typed terminal: {error:?}");
+        };
+        assert_eq!(retained, &terminal);
+        assert_eq!(
+            WyrdError::from(&error).code(),
+            WyrdError::from(BifrostError::QueryTimeout).code()
+        );
+        assert_eq!(result.terminal(), Some(&terminal));
+        assert_eq!(result.settlement, StreamSettlement::Settled);
+    }
+
+    /// A frame after a deadline terminal is still a protocol violation.
+    ///
+    /// Moving the close off the query deadline must not loosen the
+    /// exactly-one-terminal rule: anything but EOF behind the terminal breaks
+    /// the stream and is never accepted as the server's failure.
+    ///
+    /// # Panics
+    /// Panics if a trailing frame yields anything but a protocol error.
+    #[tokio::test]
+    async fn deadline_terminal_followed_by_a_frame_is_a_protocol_error() {
+        let (mut result, terminal, sender) = deadline_terminal_stream(2_000);
+        sender
+            .try_send(Ok(Bytes::from(encoded(QueryStreamFrame::Terminal(
+                terminal,
+            )))))
+            .expect("trailing frame fits");
+        let error = result
+            .next_batch()
+            .await
+            .expect_err("a trailing frame never validates");
+        assert!(
+            matches!(error, BifrostClientError::Protocol(_)),
+            "{error:?}"
+        );
+        assert!(result.terminal().is_none());
+        assert_eq!(result.settlement, StreamSettlement::Broken);
+    }
+
+    /// A connection that never closes after its terminal fails at the
+    /// configured transport timeout as an incomplete stream.
+    ///
+    /// # Panics
+    /// Panics if the hang is not bounded by the transport timeout or is
+    /// accepted as the terminal.
+    #[tokio::test]
+    async fn terminal_without_eof_fails_at_the_transport_timeout() {
+        let (mut result, _terminal, sender) = deadline_terminal_stream(100);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), result.next_batch())
+            .await
+            .expect("the close is bounded by the transport timeout")
+            .expect_err("an unclosed body never validates its terminal");
+        drop(sender);
+        assert!(
+            matches!(error, BifrostClientError::IncompleteQueryStream),
+            "{error:?}"
+        );
+        assert!(result.terminal().is_none());
+        assert_eq!(result.settlement, StreamSettlement::Broken);
     }
 
     /// Schema, one batch, and terminal decode incrementally and retain metadata.

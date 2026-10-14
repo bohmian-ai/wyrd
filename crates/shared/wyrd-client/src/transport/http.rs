@@ -182,6 +182,17 @@ impl HttpTransport {
         })
     }
 
+    /// The configured transport timeout, `HttpConfig::timeout_ms`.
+    ///
+    /// Retried requests use it as each attempt's total deadline. A terminal
+    /// query stream uses it to bound only the connection close that must
+    /// follow its terminal frame; the body before the terminal stays bounded
+    /// by the server-pinned query deadline, never by this value.
+    #[must_use]
+    pub(crate) const fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
     /// Copy this transport with a per-attempt deadline of at least `floor`,
     /// sharing its connection pool and auth path.
     ///

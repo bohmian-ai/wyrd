@@ -403,14 +403,6 @@ pub struct Scribe {
     fragment_executions: Arc<AtomicU64>,
     /// Footer frames emitted by the Scribe follower owner.
     fragment_footers: Arc<AtomicU64>,
-    /// Rows every emitted footer reported, so a journey can bound what its
-    /// fragments returned.
-    #[cfg(feature = "test-support")]
-    fragment_footer_rows: Arc<AtomicU64>,
-    /// Encoded physical plan of the latest fragment this Scribe executed, so a
-    /// journey can inspect the predicate a leader shipped.
-    #[cfg(feature = "test-support")]
-    last_fragment_plan: Arc<std::sync::Mutex<Vec<u8>>>,
     /// Root-derived Scribe resource capability.
     resources: ScribeResources,
     /// Shared current-ready cluster registry.
@@ -883,10 +875,6 @@ impl Scribe {
             fragment_follower,
             fragment_executions: Arc::new(AtomicU64::new(0)),
             fragment_footers: Arc::new(AtomicU64::new(0)),
-            #[cfg(feature = "test-support")]
-            fragment_footer_rows: Arc::new(AtomicU64::new(0)),
-            #[cfg(feature = "test-support")]
-            last_fragment_plan: Arc::default(),
             resources,
             cluster,
             registered_role,
@@ -920,45 +908,14 @@ impl Scribe {
         &self.fragment_follower
     }
 
-    /// Records one Scribe-owned fragment execution after authenticated
-    /// resolution; under `test-support` it also retains `physical_plan_bytes`
-    /// as the latest executed fragment plan.
-    pub(crate) fn record_fragment_execution(&self, physical_plan_bytes: &[u8]) {
+    /// Records one Scribe-owned fragment execution after authenticated resolution.
+    pub(crate) fn record_fragment_execution(&self) {
         self.fragment_executions.fetch_add(1, Ordering::AcqRel);
-        #[cfg(feature = "test-support")]
-        if let Ok(mut plan) = self.last_fragment_plan.lock() {
-            physical_plan_bytes.clone_into(&mut plan);
-        }
-        #[cfg(not(feature = "test-support"))]
-        let _ = physical_plan_bytes;
     }
 
-    /// Records one footer emitted by the Scribe-owned fragment stream, which
-    /// reported `rows` delivered rows.
-    pub(crate) fn record_fragment_footer(&self, rows: u64) {
+    /// Records one footer emitted by the Scribe-owned fragment stream.
+    pub(crate) fn record_fragment_footer(&self) {
         self.fragment_footers.fetch_add(1, Ordering::AcqRel);
-        #[cfg(feature = "test-support")]
-        self.fragment_footer_rows.fetch_add(rows, Ordering::AcqRel);
-        #[cfg(not(feature = "test-support"))]
-        let _ = rows;
-    }
-
-    /// Returns the rows every footer this Scribe emitted reported, summed.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn fragment_footer_rows(&self) -> u64 {
-        self.fragment_footer_rows.load(Ordering::Acquire)
-    }
-
-    /// Returns the encoded physical plan of the latest fragment this Scribe
-    /// executed, empty before the first one or after a poisoned record.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn last_fragment_plan(&self) -> Vec<u8> {
-        self.last_fragment_plan
-            .lock()
-            .map(|plan| plan.clone())
-            .unwrap_or_default()
     }
 
     /// Returns exact Scribe follower activity for production-shaped journeys.

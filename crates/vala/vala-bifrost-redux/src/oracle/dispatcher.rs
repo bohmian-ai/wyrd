@@ -711,12 +711,6 @@ impl NativeOutputTally {
         Ok(())
     }
 
-    /// Returns the rows delivered so far, which the footer will report.
-    #[must_use]
-    pub const fn rows(&self) -> u64 {
-        self.rows
-    }
-
     /// Closes the fragment with its delivered totals and scan evidence.
     #[must_use]
     pub fn complete(self, plan_fingerprint: String, scan_stats: WorkerScanStats) -> LiveFrame {

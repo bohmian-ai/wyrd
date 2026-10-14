@@ -90,8 +90,8 @@ mod pg_tests {
             ().serve_with_lifecycle(transport(&server, api_key(&admin)?, None)?, discover())
                 .await?;
 
-        let create = json!({ "provider": "slack", "name": "mcp-slack",
-                             "workspace_id": "T0001", "bot_token": SECRETS[0] });
+        let create = json!({ "request": { "provider": "slack", "name": "mcp-slack",
+                             "workspace_id": "T0001", "bot_token": SECRETS[0] } });
         let created = admin_client
             .call_tool(call("operator_connections.create", create)?)
             .await?;
@@ -106,14 +106,14 @@ mod pg_tests {
         let mut ids = vec![id.clone()];
         for (create, rotate) in [
             (
-                json!({ "provider": "pager_duty", "name": "mcp-pagerduty",
-                        "integration_key": SECRETS[2] }),
+                json!({ "request": { "provider": "pager_duty", "name": "mcp-pagerduty",
+                        "integration_key": SECRETS[2] } }),
                 json!({ "provider": "pager_duty", "integration_key": SECRETS[3] }),
             ),
             (
-                json!({ "provider": "http", "name": "mcp-http",
+                json!({ "request": { "provider": "http", "name": "mcp-http",
                         "origin": "https://hooks.example.com",
-                        "auth": { "scheme": "bearer", "token": SECRETS[4] } }),
+                        "auth": { "scheme": "bearer", "token": SECRETS[4] } } }),
                 json!({ "provider": "http", "auth": { "scheme": "bearer", "token": SECRETS[5] } }),
             ),
         ] {
@@ -264,8 +264,8 @@ mod pg_tests {
         let refused = writer_client
             .call_tool(call(
                 "operator_connections.create",
-                json!({ "provider": "pager_duty", "name": "mcp-pd",
-                        "integration_key": SECRETS[0] }),
+                json!({ "request": { "provider": "pager_duty", "name": "mcp-pd",
+                        "integration_key": SECRETS[0] } }),
             )?)
             .await;
         let rendered = match refused {

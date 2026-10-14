@@ -27,7 +27,6 @@ use uuid::Uuid;
 use vala_bifrost_redux::tables::DomainTable;
 use vala_bifrost_redux::tables::gateway::{CallsTable, REQUEST_PAYLOAD, RESPONSE_PAYLOAD};
 use vala_bifrost_redux::tables::signal::correlation_fields;
-use vala_bifrost_redux::tables::traces::project_resource_spans;
 use wyrd_gateway::{AttemptRecord, IngressDialect, MediaRequest, UploadContent};
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::DataTenantId;
@@ -51,7 +50,7 @@ use wyrd_tonic::otlp::trace::v1::status::StatusCode;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 
 use super::invocation::GatewayCallSubject;
-use crate::scribe_outbox::ScribeTable;
+use crate::scribe_outbox::{ScribeTable, project_spans};
 use crate::state::AppState;
 
 /// Value substituted for a redacted secret.
@@ -400,12 +399,9 @@ impl CallCapture {
             }],
             ..Default::default()
         };
-        let (batch, outcome) = project_resource_spans(&[resource], None, usize::MAX)
-            .map_err(|_| CaptureDrop::Projection)?;
-        if outcome.rejected_spans > 0 {
-            return Err(CaptureDrop::Projection);
-        }
-        Ok(Some(batch))
+        project_spans(&resource)
+            .map(Some)
+            .ok_or(CaptureDrop::Projection)
     }
 
     /// The row batch and, when the call made attempts, the span batch, each

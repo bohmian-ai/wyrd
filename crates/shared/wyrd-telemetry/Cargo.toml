@@ -20,6 +20,7 @@ wyrd-spec = { path = "../../wyrd-spec", version = "0.1.0" }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
+opentelemetry-proto = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 http = { workspace = true }
 ulid = { workspace = true }

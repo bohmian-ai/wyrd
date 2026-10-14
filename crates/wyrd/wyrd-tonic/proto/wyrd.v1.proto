@@ -119,9 +119,11 @@ message ListActiveStreamsResponse { repeated ActiveTailStream streams = 1; }
 // One server-internal batch: tenant and destination are explicit because the
 // caller holds no token. batch_id is the deterministic UUID Scribe
 // deduplicates on. verifier is present exactly for a Verifier result table.
+// principal_id is non-empty exactly for a batch of server-span tenant copies,
+// naming the authenticated caller Scribe stamps as principal_id.
 message IngestCaptureRequest {
   string tenant_id = 1; string table = 2; string batch_id = 3; string request_id = 4;
-  bytes arrow_ipc = 5; VerifierResultAttribution verifier = 6;
+  bytes arrow_ipc = 5; VerifierResultAttribution verifier = 6; string principal_id = 7;
 }
 // The frozen run identity a Verifier result batch is written under: the run,
 // the exact Verifier Card reference and UID Scribe stamps as card_uid, and the

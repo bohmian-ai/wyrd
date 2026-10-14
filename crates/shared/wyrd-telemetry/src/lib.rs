@@ -3,8 +3,10 @@
 #![deny(missing_docs)]
 
 mod context;
+mod export;
 
 pub use context::{continue_remote, current_context, inbound_context};
+pub use export::{TenantSpanRoute, TenantSpanSink, bind_tenant_route, set_tenant_span_sink};
 
 #[cfg(feature = "test-support")]
 use std::collections::BTreeMap;
@@ -323,9 +325,11 @@ pub fn init_test_only_no_global(config: TelemetryConfig) -> TelemetryGuard {
 
 /// Initialize a tracing subscriber for server processes.
 ///
-/// When `config.endpoint` is set, a layered subscriber with an OTLP span
-/// exporter is installed. Otherwise a plain `fmt` subscriber is installed with
-/// a no-op OTel provider so the OTel pipeline is always wired.
+/// Installs one global subscriber: the configured filter, formatted log
+/// output, and an OpenTelemetry layer over the process tracer provider. The
+/// provider is always built, so tenant span export works with or without an
+/// operator destination. When `config.endpoint` is set, the spans the server
+/// sampler samples are also batched to that OTLP endpoint.
 ///
 /// # Errors
 /// Returns an error if another Rustls provider already owns the process, a
@@ -335,50 +339,41 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
     use opentelemetry::trace::TracerProvider as _;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-    let filter = resolve_filter(&config);
-    let resource = telemetry_resource(&config);
-    let sampler = telemetry_sampler(&config);
-
-    let (provider, tracer_provider) = if let Some(endpoint) = config.endpoint.as_deref() {
-        let exporter = build_otlp_exporter(&config, endpoint)?;
-        let p = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_batch_exporter(exporter)
-            .with_sampler(sampler)
-            .with_resource(resource)
-            .build();
-        let tracer = p.tracer("wyrd");
-        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(tracing_subscriber::fmt::layer())
-            .with(otel_layer)
-            .try_init()
-            .map_err(|_| WyrdError::Conflict {
-                message: "global tracing subscriber already set".to_string(),
-                details: serde_json::json!({ "component": "telemetry" }),
-            })?;
-        (Some(p), true)
-    } else {
-        let subscriber = tracing_subscriber::fmt().with_env_filter(filter).finish();
-        tracing::subscriber::set_global_default(subscriber).map_err(|_| WyrdError::Conflict {
+    let operator = config
+        .endpoint
+        .as_deref()
+        .map(|endpoint| build_otlp_exporter(&config, endpoint))
+        .transpose()?
+        .map(|exporter| {
+            export::OperatorExport(
+                opentelemetry_sdk::trace::BatchSpanProcessor::builder(exporter).build(),
+            )
+        });
+    let provider = export::tracer_provider(
+        telemetry_sampler(&config),
+        telemetry_resource(&config),
+        operator,
+    );
+    tracing_subscriber::registry()
+        .with(resolve_filter(&config))
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("wyrd")))
+        .try_init()
+        .map_err(|_| WyrdError::Conflict {
             message: "global tracing subscriber already set".to_string(),
             details: serde_json::json!({ "component": "telemetry" }),
         })?;
-        (None, false)
-    };
-
-    let _ = tracer_provider;
     Ok(TelemetryGuard {
         config,
-        tracer_provider: provider,
+        tracer_provider: Some(provider),
     })
 }
 
 /// Install a production-shaped OpenTelemetry provider with in-memory export.
 ///
-/// This initializer uses the same resource, sampler, SDK provider, OTel layer,
-/// filter, formatter, and global subscriber path as [`init`]. The exporter
-/// destination differs, allowing journeys to inspect completed spans without a
+/// This initializer uses the same resource, sampler, SDK provider, tenant
+/// export, OTel layer, filter, formatter, and global subscriber path as
+/// [`init`]. The operator's exporter destination differs, allowing journeys to inspect completed spans without a
 /// second telemetry implementation, and every captured span also carries its
 /// `tracing` level as the `level` attribute.
 ///
@@ -400,11 +395,13 @@ pub fn init_test_capture(
     let exporter = CaptureExporter {
         spans: Arc::clone(&capture.spans),
     };
-    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_simple_exporter(exporter)
-        .with_sampler(telemetry_sampler(&config))
-        .with_resource(telemetry_resource(&config))
-        .build();
+    let provider = export::tracer_provider(
+        telemetry_sampler(&config),
+        telemetry_resource(&config),
+        Some(export::OperatorExport(
+            opentelemetry_sdk::trace::SimpleSpanProcessor::new(exporter),
+        )),
+    );
     let tracer = provider.tracer("wyrd");
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_filter(resolve_filter(&config)))
@@ -438,7 +435,10 @@ fn telemetry_resource(config: &TelemetryConfig) -> opentelemetry_sdk::Resource {
         .build()
 }
 
-/// Select the production sampler from the configured ratio.
+/// Select the operator sampling policy from the configured ratio.
+///
+/// The process sampler applies it without reading any client-supplied trace
+/// field; see the `export` module.
 fn telemetry_sampler(config: &TelemetryConfig) -> opentelemetry_sdk::trace::Sampler {
     config.sample_ratio.map_or(
         opentelemetry_sdk::trace::Sampler::AlwaysOn,

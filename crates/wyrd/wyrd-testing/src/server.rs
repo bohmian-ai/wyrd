@@ -1960,6 +1960,54 @@ impl WyrdTestServer {
         projection: &str,
         predicate: &str,
     ) -> Result<Vec<Vec<Option<String>>>, WyrdTestServerError> {
+        self.retained_records(
+            tenant,
+            format!(
+                "SELECT {projection} FROM {AUDIT_LOG} WHERE ({predicate}) \
+                 AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
+                 ORDER BY created_at"
+            ),
+        )
+        .await
+    }
+
+    /// Reads the tenant's retained `vala.traces.spans` rows, every selected
+    /// column projected as text, in `(start_time_unix_nano, span_id)` order.
+    ///
+    /// `projection` is the `SELECT` list and must cast each scalar column to
+    /// text, as for [`Self::retained_audit_records`]; `predicate` names the
+    /// spans under assertion.
+    ///
+    /// # Errors
+    /// Returns the authorization, query, decode, or stream failure. A tenant
+    /// that has never published spans reads as no rows.
+    pub async fn retained_span_records(
+        &self,
+        tenant: DataTenantId,
+        projection: &str,
+        predicate: &str,
+    ) -> Result<Vec<Vec<Option<String>>>, WyrdTestServerError> {
+        self.retained_records(
+            tenant,
+            format!(
+                "SELECT {projection} FROM vala.traces.spans WHERE ({predicate}) \
+                 ORDER BY start_time_unix_nano, span_id"
+            ),
+        )
+        .await
+    }
+
+    /// Runs `sql` against the tenant's retained data under the inspection
+    /// context, every selected column decoded as text or Variant JSON.
+    ///
+    /// # Errors
+    /// Returns the authorization, query, decode, or stream failure. A table
+    /// the tenant has never published reads as no rows.
+    async fn retained_records(
+        &self,
+        tenant: DataTenantId,
+        sql: String,
+    ) -> Result<Vec<Vec<Option<String>>>, WyrdTestServerError> {
         use futures_util::StreamExt as _;
         use vala_bifrost_redux::oracle::QueryIpcDecoder;
         use wyrd_spec::vala::api::QueryStreamFrame;
@@ -1975,11 +2023,7 @@ impl WyrdTestServer {
                 context,
                 wyrd_spec::vala::api::BifrostQueryRequest {
                     params: Vec::new(),
-                    sql: format!(
-                        "SELECT {projection} FROM {AUDIT_LOG} WHERE ({predicate}) \
-                         AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
-                         ORDER BY created_at"
-                    ),
+                    sql,
                     deadline_ms: Some(60_000),
                 },
             )

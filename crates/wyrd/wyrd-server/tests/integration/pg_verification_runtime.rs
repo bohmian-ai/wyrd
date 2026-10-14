@@ -2987,3 +2987,400 @@ async fn manual_run_links_to_its_enqueuing_request() {
         "the linked span lies inside the enqueuing request: {cause:#?}"
     );
 }
+
+/// One span a tenant reads back from its own `vala.traces.spans`.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TenantSpan {
+    /// Hex span id, equal to the operator's id for the same span.
+    span_id: String,
+    /// Hex parent span id; the caller's span for the request span.
+    parent_span_id: String,
+    /// Span name.
+    name: String,
+    /// Principal Scribe stamped on the row.
+    principal_id: String,
+    /// Attribute keys the tenant copy kept.
+    attributes: Vec<String>,
+}
+
+/// Seeds a deterministic Task Verifier and a subject in `tenant` and returns
+/// a token for a caller there, so a traced execution needs no provider.
+///
+/// # Panics
+/// Panics when the tenant, Cards, or caller cannot be provisioned.
+async fn traced_tenant(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    name: &str,
+) -> (CardUid, CardUid, wyrd_spec::auth::PrincipalId, String) {
+    server
+        .ensure_builtin_tables_for_test(tenant)
+        .await
+        .expect("tenant receives every built-in table");
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant)
+        .await
+        .expect("tenant provisions");
+    let (subject, _) = seed.service("traced").await.expect("subject registers");
+    let verifier = seed
+        .verifier(
+            "traced-assertion",
+            &serde_json::json!({ "implementation": { "kind": "task", "spec": {
+                "kind": "assertion", "id": "x_is_one", "context_path": "$.x",
+                "operator": "equals", "expected": 1
+            } } }),
+        )
+        .await
+        .expect("task Verifier registers");
+    let wyrd_testing::Bootstrap::Machine { id, api_key, .. } = server
+        .bootstrap_service_in_tenant(tenant, name, &["editor"])
+        .await
+        .expect("caller bootstraps")
+    else {
+        panic!("service bootstrap returned a user principal");
+    };
+    let jwt = server
+        .exchange_api_key(&api_key)
+        .await
+        .expect("caller key exchanges");
+    (verifier, subject, id, jwt)
+}
+
+/// Executes `verifier` against `subject` as `jwt` under `traceparent`,
+/// returning the response status once the body is read, so every span of the
+/// request has ended.
+///
+/// # Panics
+/// Panics when the request cannot be built or the body cannot be read.
+async fn traced_execute(
+    server: &WyrdTestServer,
+    jwt: Option<&str>,
+    (verifier, subject): (&CardUid, &CardUid),
+    traceparent: &str,
+) -> axum::http::StatusCode {
+    let body = serde_json::json!({
+        "verifier_uid": verifier,
+        "subject_card_uid": subject,
+        "input": { "kind": "task_context", "context": { "x": 1 } },
+    });
+    let request = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/v1/verification/execute")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header("traceparent", traceparent)
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("execute request builds");
+    let response = match jwt {
+        Some(jwt) => server.oneshot_authenticated(jwt, request).await,
+        None => server.oneshot(request).await,
+    }
+    .expect("execute request responds");
+    let status = response.status();
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("execute body reads");
+    status
+}
+
+/// Flushes Scribe and reads `tenant`'s retained spans of `trace`.
+///
+/// # Panics
+/// Panics when the flush or the read fails, or a row is malformed.
+async fn tenant_spans(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    trace: &str,
+) -> Vec<TenantSpan> {
+    server.flush_bifrost().await.expect("Scribe flushes");
+    let mut spans: Vec<TenantSpan> = server
+        .retained_span_records(
+            tenant,
+            "encode(span_id, 'hex'), encode(parent_span_id, 'hex'), name, principal_id, attributes",
+            &format!("trace_id = X'{trace}'"),
+        )
+        .await
+        .expect("tenant spans read")
+        .into_iter()
+        .map(|row| {
+            let [
+                Some(span_id),
+                Some(parent_span_id),
+                Some(name),
+                Some(principal_id),
+                attributes,
+            ] = <[Option<String>; 5]>::try_from(row).expect("five projected columns")
+            else {
+                panic!("a tenant span row is missing a column");
+            };
+            let attributes = attributes
+                .map(|json| {
+                    serde_json::from_str::<serde_json::Value>(&json).expect("attributes are JSON")
+                })
+                .and_then(|value| value.as_object().map(|map| map.keys().cloned().collect()))
+                .unwrap_or_default();
+            TenantSpan {
+                span_id,
+                parent_span_id,
+                name,
+                principal_id,
+                attributes,
+            }
+        })
+        .collect();
+    spans.sort();
+    spans
+}
+
+/// Asserts that `tenant` holds exactly the behavior spans of the request the
+/// caller span `caller` parents, each with the operator's ids and parents,
+/// stamped with `principal`, and keeping only safe attributes.
+///
+/// # Panics
+/// Panics when the tenant copy is missing a behavior span, holds a span the
+/// operator did not export or another request's span, names another
+/// principal, or keeps an attribute outside the allowlist.
+fn assert_tenant_copy(
+    tenant: &[TenantSpan],
+    operator: &[wyrd_telemetry::CapturedSpan],
+    caller: &str,
+    principal: wyrd_spec::auth::PrincipalId,
+) {
+    let names: Vec<&str> = tenant.iter().map(|span| span.name.as_str()).collect();
+    for behavior in ["request", "verification.execute"] {
+        assert!(
+            names.contains(&behavior),
+            "{behavior} reaches the tenant: {tenant:#?}"
+        );
+    }
+    let request = tenant
+        .iter()
+        .find(|span| span.name == "request")
+        .expect("the request span reaches the tenant");
+    assert_eq!(request.parent_span_id, caller, "{tenant:#?}");
+    for span in tenant {
+        assert!(
+            operator
+                .iter()
+                .any(|exported| exported.span_id == span.span_id
+                    && exported.parent_span_id == span.parent_span_id
+                    && exported.name == span.name),
+            "the tenant copy keeps the operator's ids and parent: {span:#?}"
+        );
+        assert_eq!(span.principal_id, principal.to_string(), "{span:#?}");
+        for key in &span.attributes {
+            assert!(
+                key.starts_with("wyrd.")
+                    || key.starts_with("gen_ai.")
+                    || key.starts_with("http.")
+                    || key.starts_with("rpc.")
+                    || key == "error.type",
+                "{key} is not a tenant-safe attribute: {span:#?}"
+            );
+        }
+    }
+}
+
+/// Caller trace whose spans the export matrix asserts.
+const EXPORT_TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+/// Under an accepting operator policy, a request continuing a sampled caller
+/// trace reaches both the operator and its tenant, while one continuing an
+/// unsampled caller trace reaches the operator only.
+///
+/// # Panics
+/// Panics when telemetry, the server, or seeding fails, or either export
+/// diverges from the matrix.
+#[tokio::test]
+async fn continued_request_spans_reach_operator_and_tenant() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let server = WyrdTestServer::builder()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    let (verifier, subject, principal, jwt) = traced_tenant(&server, tenant, "traced-caller").await;
+    let unsampled = "5bf92f3577b34da6a3ce929d0e0e4736";
+    let checkpoint = traces.checkpoint();
+    for (trace, flags) in [(EXPORT_TRACE, "01"), (unsampled, "00")] {
+        let status = traced_execute(
+            &server,
+            Some(&jwt),
+            (&verifier, &subject),
+            &format!("00-{trace}-00f067aa0ba902b7-{flags}"),
+        )
+        .await;
+        assert!(status.is_success(), "{trace}: {status}");
+    }
+    let operator = traces.finished_since(checkpoint);
+    let sampled: Vec<_> = operator
+        .iter()
+        .filter(|span| span.trace_id == EXPORT_TRACE)
+        .cloned()
+        .collect();
+    assert!(
+        operator
+            .iter()
+            .any(|span| span.trace_id == unsampled && span.name == "request"),
+        "the operator exports the unsampled caller's request: {operator:#?}"
+    );
+    assert_tenant_copy(
+        &tenant_spans(&server, tenant, EXPORT_TRACE).await,
+        &sampled,
+        "00f067aa0ba902b7",
+        principal,
+    );
+    assert_eq!(
+        tenant_spans(&server, tenant, unsampled).await,
+        Vec::new(),
+        "an unsampled caller receives no tenant copy"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Under a rejecting operator policy, a request continuing a sampled caller
+/// trace still reaches its tenant but not the operator, and one continuing an
+/// unsampled caller trace reaches neither.
+///
+/// # Panics
+/// Panics when telemetry, the server, or seeding fails, or either export
+/// diverges from the matrix.
+#[tokio::test]
+async fn operator_rejected_requests_still_reach_a_continuing_tenant() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig {
+            sample_ratio: Some(0.0),
+            ..wyrd_telemetry::TelemetryConfig::default()
+        })
+        .expect("production-shaped telemetry installs");
+    let server = WyrdTestServer::builder()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    let (verifier, subject, principal, jwt) =
+        traced_tenant(&server, tenant, "rejected-caller").await;
+    let unsampled = "6bf92f3577b34da6a3ce929d0e0e4736";
+    let checkpoint = traces.checkpoint();
+    for (trace, flags) in [(EXPORT_TRACE, "01"), (unsampled, "00")] {
+        let status = traced_execute(
+            &server,
+            Some(&jwt),
+            (&verifier, &subject),
+            &format!("00-{trace}-00f067aa0ba902b7-{flags}"),
+        )
+        .await;
+        assert!(status.is_success(), "{trace}: {status}");
+    }
+    let operator = traces.finished_since(checkpoint);
+    assert!(
+        operator
+            .iter()
+            .all(|span| span.trace_id != EXPORT_TRACE && span.trace_id != unsampled),
+        "the operator policy rejects both requests: {operator:#?}"
+    );
+    let tenant_copy = tenant_spans(&server, tenant, EXPORT_TRACE).await;
+    assert!(
+        tenant_copy.iter().any(|span| span.name == "request"
+            && span.parent_span_id == "00f067aa0ba902b7"
+            && span.principal_id == principal.to_string()),
+        "the sampled caller still receives its tenant copy: {tenant_copy:#?}"
+    );
+    assert_eq!(tenant_spans(&server, tenant, unsampled).await, Vec::new());
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Two tenants continuing the same caller trace id each receive only their
+/// own request's spans, stamped with their own principal.
+///
+/// # Panics
+/// Panics when telemetry, the server, or seeding fails, or a tenant receives
+/// the other's spans.
+#[tokio::test]
+async fn same_inbound_trace_id_routes_each_tenant_separately() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let server = WyrdTestServer::builder()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let other = DataTenantId::new_v7();
+    server
+        .pg_fixture()
+        .seed_additional_tenant_with_uuid(other, "traced-other")
+        .await
+        .expect("second tenant seeds");
+    let checkpoint = traces.checkpoint();
+    let mut callers = Vec::new();
+    for (tenant, name, caller) in [
+        (server.data_tenant_id(), "first-caller", "00f067aa0ba902b1"),
+        (other, "second-caller", "00f067aa0ba902b2"),
+    ] {
+        let (verifier, subject, principal, jwt) = traced_tenant(&server, tenant, name).await;
+        let status = traced_execute(
+            &server,
+            Some(&jwt),
+            (&verifier, &subject),
+            &format!("00-{EXPORT_TRACE}-{caller}-01"),
+        )
+        .await;
+        assert!(status.is_success(), "{name}: {status}");
+        callers.push((tenant, caller, principal));
+    }
+    let operator: Vec<_> = traces
+        .finished_since(checkpoint)
+        .into_iter()
+        .filter(|span| span.trace_id == EXPORT_TRACE)
+        .collect();
+    for (tenant, caller, principal) in callers {
+        let copy = tenant_spans(&server, tenant, EXPORT_TRACE).await;
+        assert_eq!(
+            copy.iter().filter(|span| span.name == "request").count(),
+            1,
+            "each tenant receives only its own request: {copy:#?}"
+        );
+        assert_tenant_copy(&copy, &operator, caller, principal);
+    }
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A request that continues a sampled caller trace but never authenticates
+/// is exported to the operator only: no tenant receives its spans.
+///
+/// # Panics
+/// Panics when telemetry or the server fails, the request is not refused,
+/// the operator misses it, or the fixture tenant receives a copy.
+#[tokio::test]
+async fn unrouted_spans_export_only_to_the_operator() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let server = WyrdTestServer::builder()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    let (verifier, subject, _, _) = traced_tenant(&server, tenant, "unrouted-caller").await;
+    let checkpoint = traces.checkpoint();
+    let status = traced_execute(
+        &server,
+        None,
+        (&verifier, &subject),
+        &format!("00-{EXPORT_TRACE}-00f067aa0ba902b7-01"),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    let operator = traces.finished_since(checkpoint);
+    assert!(
+        operator
+            .iter()
+            .any(|span| span.trace_id == EXPORT_TRACE && span.name == "request"),
+        "the operator exports the unauthenticated request: {operator:#?}"
+    );
+    assert_eq!(
+        tenant_spans(&server, tenant, EXPORT_TRACE).await,
+        Vec::new()
+    );
+    server.shutdown().await.expect("test server shuts down");
+}

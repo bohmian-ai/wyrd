@@ -226,8 +226,8 @@ struct AdmittedCall {
     requested: ModelRef,
     /// Authorized Run and Card attribution, carrying the Card's UID.
     subject: Option<GatewayCallSubject>,
-    /// Caller trace context active when the call was admitted; the call's
-    /// spans join that trace as children of its span.
+    /// Context of the call's `gateway.call` span when the call continues a
+    /// caller's trace; its captured attempt spans are children of that span.
     trace: Option<TraceContext>,
 }
 
@@ -486,7 +486,9 @@ impl<'a> GatewayInvocation<'a> {
             Some(GatewayCallAttribution::Resolved(subject)) => Some(subject),
             None => None,
         };
-        let trace = trace_context::active();
+        // A call continuing a caller's trace parents its captured attempts on
+        // this `gateway.call` span; an untraced call keeps its own trace.
+        let trace = trace_context::active().and_then(|_| wyrd_telemetry::current_context());
 
         let tenant = caller.data_tenant_id;
         let snapshot = GatewayAdministration::new(self.state)

@@ -149,7 +149,8 @@ pub(crate) struct CallFacts {
     pub(crate) policy: GatewayCapturePolicy,
     /// Authorized Run and Card attribution, its Card carrying the UID.
     pub(crate) subject: Option<GatewayCallSubject>,
-    /// Caller trace context the call was admitted under, if any.
+    /// Context of the call's `gateway.call` span when the call continued a
+    /// caller's trace, the parent of every attempt span.
     pub(crate) trace: Option<TraceContext>,
     /// Unredacted request content, present only when the policy selects it.
     pub(crate) request: Option<Value>,
@@ -181,7 +182,8 @@ pub struct CallCapture {
     request_id: RequestId,
     /// Authorized Run and Card the row is correlated to.
     subject: Option<GatewayCallSubject>,
-    /// Caller trace context the attempt spans join, if any.
+    /// Context of the `gateway.call` span the attempt spans are children of,
+    /// when the call continued a caller's trace.
     trace: Option<TraceContext>,
 }
 
@@ -348,10 +350,9 @@ impl CallCapture {
     /// Builds the canonical `vala.traces.spans` batch of the attempt spans.
     ///
     /// Every span shares one trace, so they link to each other and to the row
-    /// by `gateway_call_id`: the caller's trace, each span a child of the
-    /// caller's span carrying its trace state, when the call was admitted
-    /// under a caller trace context, and otherwise a trace whose id is the
-    /// call id. Span ids derive from the call id and attempt ordinal, so they
+    /// by `gateway_call_id`: when the call continued a caller's trace, that
+    /// trace, each span a child of the exported `gateway.call` span, and
+    /// otherwise a trace whose id is the call id. Span ids derive from the call id and attempt ordinal, so they
     /// stay distinct when many calls share a caller's trace. Each carries exactly the
     /// [`GatewayAttemptSpanFieldsV1`] attributes, nulls omitted, plus the
     /// standard GenAI operation, provider, and request-model attributes.
@@ -366,7 +367,7 @@ impl CallCapture {
             return Ok(None);
         }
         let call_id = *self.payload.call_id.as_uuid().as_bytes();
-        let parent = self.trace.as_ref().map(caller_parent).transpose()?;
+        let parent = self.trace.as_ref().map(parent_ids).transpose()?;
         let operation = gen_ai_operation(self.operation);
         let spans = self
             .spans
@@ -854,13 +855,13 @@ fn attempt_span(
     }
 }
 
-/// The caller's trace id, parent span id, and trace state as OTLP bytes.
+/// The parent's trace id, span id, and trace state as OTLP bytes.
 ///
 /// # Errors
 ///
-/// Returns [`CaptureDrop::Projection`] when an id is not hex, which the
-/// validated W3C parse that produced `trace` precludes.
-fn caller_parent(trace: &TraceContext) -> Result<([u8; 16], [u8; 8], String), CaptureDrop> {
+/// Returns [`CaptureDrop::Projection`] when an id is not hex, which a span
+/// context read from the tracer precludes.
+fn parent_ids(trace: &TraceContext) -> Result<([u8; 16], [u8; 8], String), CaptureDrop> {
     let trace_id =
         u128::from_str_radix(&trace.trace_id, 16).map_err(|_| CaptureDrop::Projection)?;
     let span_id = u64::from_str_radix(&trace.span_id, 16).map_err(|_| CaptureDrop::Projection)?;

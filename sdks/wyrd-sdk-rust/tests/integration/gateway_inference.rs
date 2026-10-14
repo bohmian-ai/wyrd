@@ -211,22 +211,29 @@ const CALLER_SPAN: &str = "00f067aa0ba902b7";
 /// The vendor trace state the caller sends with its `traceparent`.
 const CALLER_STATE: &str = "wyrd=journey";
 
-/// One gateway span's trace identity and parent, as hex.
+/// Scope of the gateway's captured model-call attempt spans.
+const GATEWAY_SCOPE: &str = "wyrd.gateway";
+
+/// One retained span's identity, parent, and name, ids as hex.
 #[derive(Debug, PartialEq, serde::Deserialize)]
-struct GatewaySpan {
+struct TenantSpan {
+    /// Instrumentation scope; [`GATEWAY_SCOPE`] for a captured attempt.
+    scope_name: String,
+    /// Span name.
+    name: String,
     /// The span's trace identity.
     trace_id: String,
+    /// The span's own identity.
+    span_id: String,
     /// The span's parent span identity; `None` for a root span.
     parent_span_id: Option<String>,
-    /// The vendor trace state.
-    trace_state: String,
 }
 
-/// Publish every captured row, then read the gateway's model-call spans.
+/// Publish every captured row, then read every span the tenant retains.
 ///
 /// # Panics
 /// Panics when the flush or the read fails.
-async fn gateway_spans(deployment: &Deployment) -> Vec<GatewaySpan> {
+async fn tenant_spans(deployment: &Deployment) -> Vec<TenantSpan> {
     deployment
         .server()
         .flush_bifrost()
@@ -236,13 +243,14 @@ async fn gateway_spans(deployment: &Deployment) -> Vec<GatewaySpan> {
         .await
         .expect("Bifrost connects")
         .sql_as(
-            "SELECT encode(trace_id, 'hex') AS trace_id, \
-                    encode(parent_span_id, 'hex') AS parent_span_id, trace_state \
-               FROM vala.traces.spans WHERE scope_name = 'wyrd.gateway'",
+            "SELECT scope_name, name, encode(trace_id, 'hex') AS trace_id, \
+                    encode(span_id, 'hex') AS span_id, \
+                    encode(parent_span_id, 'hex') AS parent_span_id \
+               FROM vala.traces.spans",
             &[],
         )
         .await
-        .expect("gateway spans read back")
+        .expect("tenant spans read back")
 }
 
 /// Write the managed provider credential `name` holding `secret` with the
@@ -311,12 +319,14 @@ async fn openai_client_calls_the_gateway_with_an_access_token() {
     inference.deployment.shutdown().await;
 }
 
-/// A caller's `traceparent` makes the gateway's model-call span a child of
-/// the caller's span, so the application span and the call share one trace.
+/// A caller's `traceparent` puts the gateway's one captured attempt in the
+/// caller's trace under the exported `gateway.call` span, which descends
+/// through the request span from the caller's span; the attempt's own
+/// tracing span is never exported a second time.
 ///
 /// # Panics
-/// Panics when the call, flush, or read fails or the span is not the
-/// caller's child.
+/// Panics when the call, flush, or read fails, the attempt is not captured
+/// exactly once, or the chain to the caller is broken.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn gateway_span_joins_the_callers_trace() {
@@ -330,13 +340,37 @@ async fn gateway_span_joins_the_callers_trace() {
         .await;
 
     assert_eq!(status, 200, "{reply}");
+    let spans = tenant_spans(&inference.deployment).await;
+    let traced: Vec<&TenantSpan> = spans
+        .iter()
+        .filter(|span| span.trace_id == CALLER_TRACE)
+        .collect();
+    let [attempt] = traced
+        .iter()
+        .filter(|span| span.scope_name == GATEWAY_SCOPE)
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("exactly one attempt row joins the caller: {spans:#?}");
+    };
+    assert!(
+        traced.iter().all(|span| span.name != "gateway.attempt"),
+        "{spans:#?}"
+    );
+    let mut chain = vec![*attempt];
+    while let Some(parent) = chain.last().and_then(|span| {
+        traced
+            .iter()
+            .find(|parent| Some(&parent.span_id) == span.parent_span_id.as_ref())
+    }) {
+        chain.push(parent);
+    }
+    let names: Vec<&str> = chain.iter().map(|span| span.name.as_str()).collect();
+    assert_eq!(names.get(1), Some(&"gateway.call"), "{names:?}");
+    assert_eq!(names.last(), Some(&"request"), "{names:?} in {traced:#?}");
     assert_eq!(
-        gateway_spans(&inference.deployment).await,
-        [GatewaySpan {
-            trace_id: CALLER_TRACE.to_owned(),
-            parent_span_id: Some(CALLER_SPAN.to_owned()),
-            trace_state: CALLER_STATE.to_owned(),
-        }]
+        chain.last().and_then(|span| span.parent_span_id.as_deref()),
+        Some(CALLER_SPAN),
+        "{names:?}"
     );
     inference.deployment.shutdown().await;
 }
@@ -359,7 +393,11 @@ async fn malformed_traceparent_is_ignored_by_the_gateway() {
         .await;
 
     assert_eq!(status, 200, "{reply}");
-    let spans = gateway_spans(&inference.deployment).await;
+    let spans: Vec<TenantSpan> = tenant_spans(&inference.deployment)
+        .await
+        .into_iter()
+        .filter(|span| span.scope_name == GATEWAY_SCOPE)
+        .collect();
     assert_eq!(spans.len(), 1, "{spans:?}");
     assert_ne!(spans[0].trace_id, CALLER_TRACE);
     assert_eq!(spans[0].parent_span_id, None);

@@ -1,7 +1,8 @@
-//! Outbound W3C trace context for Wyrd HTTP requests.
+//! Outbound W3C trace context for Wyrd requests.
 //!
-//! [`HttpTransport`](super::HttpTransport) sends the caller's active trace
-//! context as `traceparent`/`tracestate` on every Wyrd request, so server work
+//! [`HttpTransport`](super::HttpTransport) and the Bifrost gRPC transport send
+//! the caller's active trace context as `traceparent`/`tracestate` on every
+//! Wyrd request through [`headers`], so server work
 //! done for the request — a gateway call, or a judge call a verification makes
 //! — joins the caller's trace. [`outbound`] picks that context: one a foreign
 //! runtime handed over with [`with_caller_trace`] wins, because Python's and
@@ -48,6 +49,18 @@ pub(crate) fn outbound() -> Option<TraceContext> {
         .try_with(Clone::clone)
         .ok()
         .or_else(current_span_context)
+}
+
+/// The W3C headers the current request carries: `traceparent`, plus
+/// `tracestate` when non-empty; none without an [`outbound`] context.
+pub(crate) fn headers() -> Vec<(&'static str, String)> {
+    outbound().map_or_else(Vec::new, |context| {
+        let mut headers = vec![(TRACEPARENT, context.to_traceparent())];
+        if !context.trace_state.is_empty() {
+            headers.push((TRACESTATE, context.trace_state));
+        }
+        headers
+    })
 }
 
 /// The current `tracing` span's valid OpenTelemetry span context as W3C

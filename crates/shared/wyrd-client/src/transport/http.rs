@@ -238,8 +238,10 @@ impl HttpTransport {
     /// Wyrd's edge rejects an unusable credential before any service acts on
     /// the request, so a refused first attempt applied nothing.
     ///
-    /// The replay reuses the first attempt's header map — correlation id
-    /// included — and swaps only the bearer, so both HTTP requests join to one
+    /// The caller's W3C trace context is decorated alongside them, as on
+    /// every authenticated request. The replay reuses the first attempt's
+    /// header map — correlation id and trace context included — and swaps
+    /// only the bearer, so both HTTP requests join to one
     /// logical message in the server's audit and traces.
     ///
     /// `status_of` is the caller's only contribution: reading a status out of
@@ -276,6 +278,13 @@ impl HttpTransport {
         if let Entry::Vacant(slot) = custom_headers.entry(request_id_header()) {
             slot.insert(
                 HeaderValue::from_str(&self.auth.request_id(None))
+                    .map_err(|error| AuthenticatedReplayError::header(&error))?,
+            );
+        }
+        for (name, value) in trace::headers() {
+            custom_headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_str(&value)
                     .map_err(|error| AuthenticatedReplayError::header(&error))?,
             );
         }
@@ -904,15 +913,11 @@ impl HttpTransport {
             .request(method, url)
             .header(HEADER_WYRD_ACCESS_TOKEN, format!("Bearer {bearer}"))
             .header(HEADER_REQUEST_ID, request_id);
-        let Some(context) = trace::outbound() else {
-            return request;
-        };
-        let request = request.header(trace::TRACEPARENT, context.to_traceparent());
-        if context.trace_state.is_empty() {
-            request
-        } else {
-            request.header(trace::TRACESTATE, context.trace_state)
-        }
+        trace::headers()
+            .into_iter()
+            .fold(request, |request, (name, value)| {
+                request.header(name, value)
+            })
     }
 
     /// Resolve a path or absolute URL to a same-origin URL suitable for

@@ -250,10 +250,13 @@ impl BifrostGrpcTransport {
         }
     }
 
-    /// Attaches the bearer token and `wyrd-request-id` to one attempt.
+    /// Attaches the bearer token, `wyrd-request-id`, and the caller's W3C
+    /// trace context to one attempt.
     ///
     /// A supplied `request_id` is forwarded unchanged through the shared
     /// [`crate::auth::AuthMiddleware::request_id`]; otherwise one is minted.
+    /// The trace context is the shared transport's outbound context, sent as
+    /// `traceparent` and, when non-empty, `tracestate` metadata.
     ///
     /// # Errors
     ///
@@ -290,6 +293,14 @@ impl BifrostGrpcTransport {
                 details: serde_json::json!({}),
             })?;
         request.metadata_mut().insert("wyrd-request-id", request_id);
+        for (name, value) in crate::transport::trace::headers() {
+            let value =
+                MetadataValue::try_from(value.as_str()).map_err(|_| WyrdError::Internal {
+                    message: "trace context cannot be represented as gRPC metadata".to_owned(),
+                    details: serde_json::json!({}),
+                })?;
+            request.metadata_mut().insert(name, value);
+        }
         Ok(())
     }
 }

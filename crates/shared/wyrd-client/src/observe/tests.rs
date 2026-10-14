@@ -950,7 +950,7 @@ async fn execute_outlives_the_configured_timeout() {
     }))
     .expect("request decodes");
 
-    let error = super::verify::execute(&client, &request, None)
+    let error = super::verify::execute(&client, &request)
         .await
         .expect_err("the server's deadline answer is an error");
     assert_eq!(error.code(), "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT");

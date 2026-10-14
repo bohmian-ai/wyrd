@@ -208,6 +208,12 @@ mod pg_tests {
     /// # Errors
     ///
     /// Returns fixture, transport, or shutdown failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a malformed argument succeeds or fails other than as MCP
+    /// invalid params, or when a SQL refusal has another code, lacks the
+    /// planner's detail or a repairable problem field, or carries rows.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn bifrost_query_errors_are_actionable_before_row_execution()

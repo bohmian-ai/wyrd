@@ -4,7 +4,7 @@
 
 use serde_json::{Value, json};
 use wyrd_ai::Bifrost;
-use wyrd_ai::bifrost::{Correlation, TableConfig};
+use wyrd_ai::bifrost::{BifrostClientError, Correlation, TableConfig};
 
 use crate::support::Deployment;
 
@@ -28,15 +28,17 @@ struct Case {
 }
 
 /// Every corpus query returns exactly its expected rows when customers 1–2
-/// and orders 10–12 are published and the rest are live in Scribe.
+/// and orders 10–12 are published and the rest are live in Scribe, and every
+/// [`refusals`] query fails at execution.
 ///
 /// Order 13 has no customer and order 14 names customer 5, who does not
 /// exist, so outer joins, `NOT IN` over a NULL, and `NOT EXISTS` each have a
 /// row that decides them.
 ///
 /// # Panics
-/// Panics when a table cannot register or a row cannot be written, and with
-/// every query whose rows differ or that fails.
+/// Panics when a table cannot register or a row cannot be written, with
+/// every query whose rows differ or that fails, and with every refusal query
+/// that returns rows or fails other than at execution.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn common_queries_answer_over_published_and_live_rows() {
@@ -115,6 +117,15 @@ async fn common_queries_answer_over_published_and_live_rows() {
                 case.name, case.expected
             )),
             Err(error) => mismatches.push(format!("{}: {error}", case.name)),
+        }
+    }
+    for (name, sql) in refusals() {
+        match bifrost.sql_as::<Value>(&sql, &[]).await {
+            Err(BifrostClientError::Transport(refusal))
+                if refusal.code() == "WYRD_VALA_500_QUERY_EXECUTION_FAILED" => {}
+            other => mismatches.push(format!(
+                "{name}: got {other:?}, expected an execution refusal"
+            )),
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
@@ -291,6 +302,29 @@ fn cases() -> Vec<Case> {
                 {"order_id": 15, "r": 4},
             ]),
         },
+    ]
+}
+
+/// Scalar subqueries that must fail because their input has two rows: the
+/// published order 11 and the live order 15, both of amount 30.
+///
+/// Joined as a set, the equal values would match outer rows or multiply them
+/// instead of refusing the query; the last query has no outer row to match.
+fn refusals() -> Vec<(&'static str, String)> {
+    let two_rows = format!("(SELECT amount FROM {ORDERS} WHERE order_id IN (11, 15))");
+    vec![
+        (
+            "two-row scalar subquery in a filter",
+            format!("SELECT order_id FROM {ORDERS} WHERE amount = {two_rows}"),
+        ),
+        (
+            "two-row scalar subquery in a projection",
+            format!("SELECT order_id, {two_rows} AS amount FROM {ORDERS}"),
+        ),
+        (
+            "two-row scalar subquery with no outer row to match",
+            format!("SELECT order_id FROM {ORDERS} WHERE order_id > 99 AND amount = {two_rows}"),
+        ),
     ]
 }
 

@@ -4473,6 +4473,13 @@ mod tests {
     /// Planning input errors are repairable 400s through every dependency
     /// wrapper: SQL planning carries the planner's own message, physical
     /// planning one fixed repair action, and neither carries wrapper text.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a wrapped input error maps to anything but its invalid-SQL
+    /// detail, an internal, collected, or bare plan error to anything but the
+    /// opaque execution failure, or a wrapped exhaustion to anything but the
+    /// resources-exhausted error.
     #[test]
     fn datafusion_query_rejections_are_safe_and_actionable() {
         /// One caller-fault case: how to build the planner error, and the

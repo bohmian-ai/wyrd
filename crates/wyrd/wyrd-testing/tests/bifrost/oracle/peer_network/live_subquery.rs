@@ -1,8 +1,9 @@
 //! Subqueries over live rows held by a Scribe on another pod.
 //!
 //! A selective scalar subquery reaches the remote Scribe as a literal bound,
-//! so the fragment returns only qualifying rows; and a common join over two
-//! remote live tables returns its exact rows.
+//! so the fragment returns only qualifying rows; a scalar subquery over two
+//! rows is refused; and a common join over two remote live tables returns its
+//! exact rows.
 
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use serde::Deserialize;
+use wyrd_client::bifrost::BifrostClientError;
 use wyrd_server::config::BifrostTarget;
 use wyrd_tonic::prost::Message as _;
 
@@ -58,6 +60,53 @@ impl LiveTables {
     /// The `id` of the event in `hour` at `second`.
     const fn id(hour: i64, second: i64) -> i64 {
         hour * ROWS_PER_HOUR + second
+    }
+
+    /// Registers `table` on [`SCRIBE_POD`] with an `id` and an hourly
+    /// `event_time`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registration failure.
+    async fn register(&self, table: &str) -> Result<(), PeerJourneyError> {
+        self.cluster
+            .register_table_with_layout(
+                SCRIBE_POD,
+                table,
+                schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect(),
+                Some(timed_layout()),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Writes rows with `ids` and `times` to `table` and leaves them live on
+    /// [`SCRIBE_POD`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the batch or ingest failure.
+    async fn ingest(
+        &self,
+        table: &str,
+        ids: Vec<i64>,
+        times: Vec<i64>,
+    ) -> Result<(), PeerJourneyError> {
+        let batch = RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
+            ],
+        )?;
+        self.cluster
+            .ingest_live_batch(SCRIBE_POD, table, &batch)
+            .await?;
+        Ok(())
     }
 }
 
@@ -155,6 +204,73 @@ async fn prove_remote_scalar_subquery_ships_as_a_literal() -> Result<(), PeerJou
     Ok(())
 }
 
+/// A scalar subquery whose input has two rows, one published and one live
+/// on a remote Scribe, is refused in a filter and in a projection instead of
+/// matching or multiplying outer rows.
+///
+/// Both rows name the picked event's instant, so the duplicate is still two
+/// rows, and a filter treating the subquery as a set would return the picked
+/// event.
+///
+/// # Panics
+///
+/// Panics when setup fails, or when either query returns rows or fails other
+/// than at execution.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn remote_two_row_scalar_subquery_is_refused() {
+    Box::pin(prove_remote_two_row_scalar_subquery_is_refused())
+        .await
+        .expect("remote two-row scalar subquery journey");
+}
+
+/// Drives [`remote_two_row_scalar_subquery_is_refused`].
+///
+/// # Errors
+///
+/// Returns the setup failure, or a message naming the query that returned
+/// rows or failed other than at execution.
+async fn prove_remote_two_row_scalar_subquery_is_refused() -> Result<(), PeerJourneyError> {
+    let tables = Box::pin(seed()).await?;
+    let pair = unique_table("live_pair");
+    let picked = tables.at(PICKED.0, PICKED.1);
+    tables.register(&pair).await?;
+    tables.ingest(&pair, vec![0], vec![picked]).await?;
+    tables.cluster.flush(SCRIBE_POD).await?;
+    tables.ingest(&pair, vec![1], vec![picked]).await?;
+    tables.cluster.refresh_snapshots().await?;
+    let api_key = tables
+        .cluster
+        .provision_public_api_key("live-subquery")
+        .await?;
+    let client = public_client(tables.cluster.server(COORDINATOR)?, &api_key)?;
+    let bifrost = wyrd_client::Bifrost::query_only(&client);
+    let scalar = format!("(SELECT event_time FROM vala.bifrost.{pair})");
+    for sql in [
+        format!(
+            "SELECT id FROM vala.bifrost.{events} WHERE event_time = {scalar}",
+            events = tables.events
+        ),
+        format!(
+            "SELECT id, {scalar} AS picked FROM vala.bifrost.{events}",
+            events = tables.events
+        ),
+    ] {
+        match bifrost.sql_as::<serde_json::Value>(&sql, &[]).await {
+            Ok(rows) => {
+                return Err(format!("{sql} returned {} rows, not a refusal", rows.len()).into());
+            }
+            Err(BifrostClientError::Transport(refusal))
+                if refusal.code() == "WYRD_VALA_500_QUERY_EXECUTION_FAILED" => {}
+            Err(error) => {
+                return Err(format!("{sql} failed other than at execution: {error}").into());
+            }
+        }
+    }
+    tables.cluster.shutdown().await?;
+    Ok(())
+}
+
 /// A join of two tables whose rows are all live on a remote Scribe returns
 /// exactly the matching pair.
 ///
@@ -219,10 +335,6 @@ async fn seed() -> Result<LiveTables, PeerJourneyError> {
         pick: unique_table("live_pick"),
         first_hour,
     };
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        event_time_field(),
-    ]));
     let (ids, times): (Vec<i64>, Vec<i64>) = (0..HOURS)
         .flat_map(|hour| (0..ROWS_PER_HOUR).map(move |second| (hour, second)))
         .map(|(hour, second)| (LiveTables::id(hour, second), tables.at(hour, second)))
@@ -231,33 +343,19 @@ async fn seed() -> Result<LiveTables, PeerJourneyError> {
         (&tables.events, ids, times),
         (&tables.pick, vec![0], vec![tables.at(PICKED.0, PICKED.1)]),
     ] {
-        tables
-            .cluster
-            .register_table_with_layout(
-                SCRIBE_POD,
-                table,
-                schema
-                    .fields()
-                    .iter()
-                    .map(|field| field.as_ref().clone())
-                    .collect(),
-                Some(timed_layout()),
-            )
-            .await?;
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(ids)),
-                Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
-            ],
-        )?;
-        tables
-            .cluster
-            .ingest_live_batch(SCRIBE_POD, table, &batch)
-            .await?;
+        tables.register(table).await?;
+        tables.ingest(table, ids, times).await?;
     }
     tables.cluster.refresh_snapshots().await?;
     Ok(tables)
+}
+
+/// The schema of every table here: a required `id` and an `event_time`.
+fn schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        event_time_field(),
+    ]))
 }
 
 /// Renders `micros` since the epoch as an RFC 3339 UTC instant, a literal

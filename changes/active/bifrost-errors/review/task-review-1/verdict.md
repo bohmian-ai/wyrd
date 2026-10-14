@@ -82,4 +82,3 @@ This is the first review round. There are no prior `FIND-*` findings to close.
 ## Verdict
 
 **FIX_REQUIRED**
-

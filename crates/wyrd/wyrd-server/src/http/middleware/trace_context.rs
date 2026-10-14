@@ -5,7 +5,8 @@
 //! request's task, so work done on the request's behalf — a gateway call, or
 //! a judge call a direct verification makes in process — joins the caller's
 //! trace through [`active`]. A missing or malformed `traceparent` leaves no
-//! active context; it is never an error. A transport that serves the request
+//! active context; it is never an error. A malformed `tracestate` is dropped
+//! on its own, keeping a valid parent. A transport that serves the request
 //! on a task of its own — the `/mcp` service spawns one per request — scopes
 //! that task again with [`within`].
 
@@ -13,6 +14,7 @@ use axum::extract::Request;
 use axum::http::HeaderMap;
 use axum::middleware::Next;
 use axum::response::Response;
+use opentelemetry::trace::TraceState;
 use wyrd_spec::trace::TraceContext;
 
 tokio::task_local! {
@@ -53,7 +55,10 @@ pub(crate) fn active() -> Option<TraceContext> {
 ///
 /// W3C trace context treats a repeated `traceparent` as invalid, so only a
 /// single parseable value is accepted. Repeated `tracestate` headers are
-/// combined into one list in order; one that is not visible ASCII is dropped.
+/// combined into one list in order. The combined list must parse as W3C
+/// `tracestate` (OpenTelemetry's [`TraceState`] parser); otherwise the state
+/// is dropped and the valid parent is kept with empty state, as W3C requires
+/// a vendor list that fails to parse to be discarded independently.
 pub(crate) fn inbound(headers: &HeaderMap) -> Option<TraceContext> {
     let mut parents = headers.get_all(TRACEPARENT).iter();
     let parent = parents.next()?.to_str().ok()?;
@@ -66,6 +71,7 @@ pub(crate) fn inbound(headers: &HeaderMap) -> Option<TraceContext> {
         .map(|value| value.to_str().ok())
         .collect::<Option<Vec<_>>>()
         .map(|values| values.join(","))
+        .filter(|state| state.parse::<TraceState>().is_ok())
         .unwrap_or_default();
     TraceContext::parse_traceparent(parent, state).ok()
 }
@@ -110,6 +116,19 @@ mod tests {
                 "a=1,b=2"
             )
         );
+    }
+
+    /// A malformed `tracestate`, whether in one header or one of several, is
+    /// dropped while the valid parent is kept.
+    #[test]
+    fn malformed_tracestate_is_dropped_keeping_the_parent() {
+        for state in [vec!["not a list member"], vec!["a=1", "B=2"], vec!["a=1,b"]] {
+            let mut pairs = vec![("traceparent", PARENT)];
+            pairs.extend(state.iter().map(|value| ("tracestate", *value)));
+            let context = inbound(&headers(&pairs)).expect("the parent survives");
+            assert_eq!(context.span_id, "b7ad6b7169203331", "{pairs:?}");
+            assert_eq!(context.trace_state, "", "{pairs:?}");
+        }
     }
 
     /// A malformed, zero, or repeated `traceparent` yields no context.

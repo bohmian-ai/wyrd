@@ -14,6 +14,9 @@ importers:
       '@grpc/grpc-js':
         specifier: ^1.14.4
         version: 1.14.4
+      '@modelcontextprotocol/client':
+        specifier: ^2.3.1
+        version: 2.3.1
       '@napi-rs/cli':
         specifier: 3.4.1
         version: 3.4.1(@emnapi/runtime@1.11.2)(@types/node@24.10.0)
@@ -2064,12 +2067,10 @@ snapshots:
       jose: 6.2.12
       pkce-challenge: 5.0.1
       zod: 4.5.4
-    optional: true
 
   '@modelcontextprotocol/core@2.3.1':
     dependencies:
       zod: 4.5.4
-    optional: true
 
   '@napi-rs/cli@3.4.1(@emnapi/runtime@1.11.2)(@types/node@24.10.0)':
     dependencies:
@@ -2794,7 +2795,6 @@ snapshots:
       path-key: 3.1.1
       shebang-command: 2.0.0
       which: 2.0.2
-    optional: true
 
   debug@4.4.3:
     dependencies:
@@ -2843,13 +2843,11 @@ snapshots:
     dependencies:
       '@types/estree': 1.0.9
 
-  eventsource-parser@3.1.1:
-    optional: true
+  eventsource-parser@3.1.1: {}
 
   eventsource@3.0.7:
     dependencies:
       eventsource-parser: 3.1.1
-    optional: true
 
   expect-type@1.4.0: {}
 
@@ -2874,11 +2872,9 @@ snapshots:
 
   is-fullwidth-code-point@3.0.0: {}
 
-  isexe@2.0.0:
-    optional: true
+  isexe@2.0.0: {}
 
-  jose@6.2.12:
-    optional: true
+  jose@6.2.12: {}
 
   js-yaml@4.3.0:
     dependencies:
@@ -2908,8 +2904,7 @@ snapshots:
     optionalDependencies:
       zod: 4.5.4
 
-  path-key@3.1.1:
-    optional: true
+  path-key@3.1.1: {}
 
   pathe@2.0.3: {}
 
@@ -2917,8 +2912,7 @@ snapshots:
 
   picomatch@4.0.5: {}
 
-  pkce-challenge@5.0.1:
-    optional: true
+  pkce-challenge@5.0.1: {}
 
   postcss@8.5.25:
     dependencies:
@@ -2980,10 +2974,8 @@ snapshots:
   shebang-command@2.0.0:
     dependencies:
       shebang-regex: 3.0.0
-    optional: true
 
-  shebang-regex@3.0.0:
-    optional: true
+  shebang-regex@3.0.0: {}
 
   siginfo@2.0.0: {}
 
@@ -3090,7 +3082,6 @@ snapshots:
   which@2.0.2:
     dependencies:
       isexe: 2.0.0
-    optional: true
 
   why-is-node-running@2.3.0:
     dependencies:

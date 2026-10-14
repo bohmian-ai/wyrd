@@ -13,7 +13,7 @@ mod pg_tests {
     use super::{McpJourneyError, discover, problem, refusal, structured, transport};
 
     use rmcp::ClientServiceExt as _;
-    use rmcp::model::{CallToolRequestParams, Tool};
+    use rmcp::model::{CacheScope, CallToolRequestParams, Tool};
     use rmcp::service::{RoleClient, RunningService};
     use serde_json::{Value as JsonValue, json};
     use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
@@ -24,8 +24,9 @@ mod pg_tests {
     use wyrd_testing::bifrost::seed_query_fixture;
 
     /// The exact catalog an ordinary Wyrd server advertises over `/mcp` to a
-    /// caller that also holds tenant principal administration, `verifier:run`, and
-    /// `operators:write`: every read tool, then that caller's write tools.
+    /// caller that also holds tenant principal administration, `verifier:run`,
+    /// `operators:write`, `gateway:write`, and `gateway:delete`: every read
+    /// tool, then that caller's write tools.
     const ADVERTISED_TOOLS: [&str; 35] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
@@ -45,6 +46,13 @@ mod pg_tests {
         "gateway.get_capture_policy",
         "gateway.get_provider_credential",
         "gateway.get_provider_deployment",
+        "wyrd.guide",
+        "principals.revoke_credential",
+        "verification.start_run",
+        "verification.execute",
+        "operator_connections.create",
+        "operator_connections.update",
+        "operator_connections.disable",
         "gateway.put_provider_credential",
         "gateway.put_provider_deployment",
         "gateway.put_fallback_policy",
@@ -55,13 +63,6 @@ mod pg_tests {
         "gateway.delete_provider_deployment",
         "gateway.delete_fallback_policy",
         "gateway.delete_governance_policy",
-        "wyrd.guide",
-        "principals.revoke_credential",
-        "verification.start_run",
-        "verification.execute",
-        "operator_connections.create",
-        "operator_connections.update",
-        "operator_connections.disable",
     ];
 
     /// A bound MCP reader and the custom table used to execute guide examples.
@@ -125,6 +126,11 @@ mod pg_tests {
             let instructions = info.instructions.as_deref().ok_or("server instructions")?;
             assert!(instructions.contains("tools/list"));
             assert!(instructions.contains("wyrd.guide"));
+            // Protocol 2026-07-28 requires cache metadata; strict clients
+            // reject a list result without it.
+            let page = self.agent.list_tools(None).await?;
+            assert_eq!(page.ttl_ms, Some(0));
+            assert_eq!(page.cache_scope, Some(CacheScope::Private));
             let tools = self.agent.list_all_tools().await?;
             for tool in &tools {
                 assert_eq!(
@@ -133,7 +139,21 @@ mod pg_tests {
                     "MCP requires an object input schema: {}",
                     tool.name
                 );
+                // OpenAI function tools reject the whole list when any input
+                // root is a combinator or a constant.
+                for keyword in ["oneOf", "anyOf", "allOf", "enum", "const", "not"] {
+                    assert!(
+                        !tool.input_schema.contains_key(keyword),
+                        "{} input root carries {keyword}",
+                        tool.name
+                    );
+                }
             }
+            assert_eq!(
+                tools.len(),
+                ADVERTISED_TOOLS.len(),
+                "the checked catalog is the complete every-scope catalog"
+            );
             for name in ["cards.list", "cards.get_by_ref", "wyrd.guide"] {
                 let tool = tools
                     .iter()

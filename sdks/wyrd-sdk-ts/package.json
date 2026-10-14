@@ -5,6 +5,7 @@
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
     "@grpc/grpc-js": "^1.14.4",
+    "@modelcontextprotocol/client": "^2.3.1",
     "@napi-rs/cli": "3.4.1",
     "@openai/agents-core": "^0.20.0",
     "@openai/agents-openai": "^0.20.0",

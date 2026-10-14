@@ -57,6 +57,14 @@ dev = [
     "google-genai>=2.24.0",
     "openai>=3.14.1",
 ]
+# Agent frameworks the MCP journeys drive; only py:test:mcp-frameworks installs them.
+mcp-frameworks = [
+    "google-adk[mcp]>=2.12.0",
+    "httpx2>=2.7",
+    "mcp>=2.3.0",
+    "openai-agents>=0.23.1",
+    "pydantic-ai-slim[mcp]>=2.56.0",
+]
 
 [tool.maturin]
 python-source = "python"
@@ -67,6 +75,9 @@ features = ["python", "pyo3/extension-module", "pyo3/abi3-py310"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["python"]
+# The agent framework journeys need the mcp-frameworks group; only
+# py:test:mcp-frameworks names their directory. The rest are pytest's defaults.
+norecursedirs = ["*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}", "mcp_frameworks"]
 markers = [
     "tensorflow: marks TensorFlow tests that run in the dedicated TensorFlow task",
     "integration: marks tests that require a live WyrdTestServer and run in the gated integration lane",
@@ -95,13 +106,19 @@ convention = "google"
 # Public modules are typed by their ``__init__.pyi``; the ``stubs/`` sources are
 # assembled into those files, so neither is checked twice.
 include = ["python/wyrd", "scripts", "tests"]
-exclude = ["python/wyrd/stubs", "python/wyrd/**/__init__.py"]
+# The agent framework journeys import the mcp-frameworks group, which only
+# their own lane installs.
+exclude = ["python/wyrd/stubs", "python/wyrd/**/__init__.py", "tests/integration/mcp_frameworks"]
 
 [tool.ty.rules]
 unused-ignore-comment = "error"
 
 [tool.uv]
 package = false
+
+[tool.uv.dependency-groups]
+# Pydantic AI and Google ADK require Python 3.11.
+mcp-frameworks = { requires-python = ">=3.11" }
 
 # Linux takes the CPU-only torch build: no test uses a GPU, and the default
 # Linux wheel pulls about 3 GB of CUDA libraries into every environment.

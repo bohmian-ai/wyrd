@@ -16,8 +16,6 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::security::SecretRef;
 
-use crate::managed::ManagedSecretEnvelope;
-
 /// Complete gateway configuration of one tenant at call admission.
 #[derive(Debug, Clone)]
 pub struct GatewayTenantSnapshot {
@@ -125,9 +123,10 @@ pub enum GatewayCredentialSource {
         reference: ExternalSecretReference,
     },
     /// Sealed tenant-submitted secret. The snapshot carries the opaque
-    /// envelope only; the key opening it is process configuration.
+    /// envelope only; the deployment sealing keyring opening it is process
+    /// configuration.
     ManagedSecret {
-        /// Sealed envelope and the keyring version that must open it.
-        envelope: ManagedSecretEnvelope,
+        /// Versioned sealing-keyring envelope of the bound payload.
+        sealed: Vec<u8>,
     },
 }

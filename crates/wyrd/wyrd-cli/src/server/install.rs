@@ -175,6 +175,13 @@ impl ServerInstaller {
         })
     }
 
+    /// Directory holding `versions/`, the `current` link, and the local
+    /// deployment's sealing key; it outlives every installed release.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// The active installation, if one exists.
     ///
     /// Reads the `current` link; a missing link, unparsable version, or

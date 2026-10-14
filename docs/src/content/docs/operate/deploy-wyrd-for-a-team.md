@@ -69,6 +69,7 @@ Set the persistent settings, then start `wyrd-server` with the same two database
 | --- | --- | --- |
 | `WYRD_STORAGE_URL` | `s3://bucket`, `gs://bucket`, or `az://account/container`; bucket only, no path. S3 reads its region from `AWS_REGION` | Data goes to a local directory that only this process sees |
 | `WYRD_SIGNING_KEY_FILE` | Path to an Ed25519 private key in PEM form, the same file on every replica. `WYRD_SIGNING_KEY_PEM` takes the PEM inline instead; set one, not both | Startup fails when `APP_ENV=production`; otherwise each process signs with its own temporary key, and tokens do not survive a restart or work across replicas |
+| `WYRD_SEALING_KEY_FILE` | Path to a file holding a base64 32-byte key, the same file on every replica. It encrypts stored secrets, including gateway provider keys put as `managed_secret`. `WYRD_SEALING_KEY_BASE64` takes the key inline instead; set one, not both. | Storing a `managed_secret` credential fails with `gateway credential protection is unavailable`, and startup fails while encrypted secrets are stored |
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' http://<server-host>:8080/readyz

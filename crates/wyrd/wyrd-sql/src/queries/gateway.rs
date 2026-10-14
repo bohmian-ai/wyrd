@@ -25,14 +25,11 @@ use crate::row_types::gateway::{
 /// the composite foreign key with `23503`.
 const UPSERT_CREDENTIAL_SQL: &str = r"
     INSERT INTO wyrd.gateway_provider_credentials AS c (
-        data_tenant_id, name, provider, source, secret_key_version,
-        secret_nonce, secret_ciphertext, state
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
+        data_tenant_id, name, provider, source, secret_ciphertext, state
+    ) VALUES ($1, $2, $3, $4, $5, 'active')
     ON CONFLICT (data_tenant_id, name) DO UPDATE SET
         provider = EXCLUDED.provider,
         source = EXCLUDED.source,
-        secret_key_version = EXCLUDED.secret_key_version,
-        secret_nonce = EXCLUDED.secret_nonce,
         secret_ciphertext = EXCLUDED.secret_ciphertext,
         updated_at = now(),
         rotated_at = now()
@@ -288,10 +285,8 @@ const SNAPSHOT_SQL: &str = r"
                        'provider', c.provider,
                        'source', c.source,
                        'state', c.state,
-                       'secret_key_version', c.secret_key_version,
                        -- encode() wraps base64 every 76 characters; the
                        -- reader decodes one unbroken string.
-                       'secret_nonce', replace(encode(c.secret_nonce, 'base64'), E'\n', ''),
                        'secret_ciphertext',
                            replace(encode(c.secret_ciphertext, 'base64'), E'\n', '')
                    ) ORDER BY c.name)
@@ -318,23 +313,11 @@ pub struct GatewayCredentialWrite<'a> {
     pub provider: &'a str,
     /// Redacted source view JSON.
     pub source: &'a Value,
-    /// Sealed managed-secret envelope, or `None` for an operator-owned source
-    /// whose value Wyrd never holds.
-    pub secret: Option<GatewayCredentialEnvelope<'a>>,
-}
-
-/// Sealed managed-secret columns of one credential row.
-///
-/// The server seals the value before this write, so the query layer stores
-/// opaque bytes and never sees plaintext or key material.
-#[derive(Debug, Clone, Copy)]
-pub struct GatewayCredentialEnvelope<'a> {
-    /// Tenant keyring version that sealed the payload.
-    pub key_version: &'a str,
-    /// AES-GCM nonce.
-    pub nonce: &'a [u8],
-    /// Sealed payload bytes.
-    pub ciphertext: &'a [u8],
+    /// Deployment sealing-keyring envelope of a managed secret, or `None` for
+    /// an operator-owned source whose value Wyrd never holds. The server seals
+    /// the value before this write, so the query layer stores opaque bytes and
+    /// never sees plaintext or key material.
+    pub secret: Option<&'a [u8]>,
 }
 
 /// Column values for one deployment create-or-replace.
@@ -406,9 +389,7 @@ pub async fn upsert_gateway_credential(
         .bind(write.name)
         .bind(write.provider)
         .bind(write.source)
-        .bind(write.secret.map(|secret| secret.key_version))
-        .bind(write.secret.map(|secret| secret.nonce))
-        .bind(write.secret.map(|secret| secret.ciphertext))
+        .bind(write.secret)
         .fetch_optional(&mut **conn.transaction())
         .await
 }

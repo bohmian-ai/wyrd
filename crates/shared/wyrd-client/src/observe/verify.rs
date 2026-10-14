@@ -5,22 +5,17 @@
 //! Verifier's kind takes, in the same forms `observe.eval` and
 //! `observe.drift` accept, and owns the one transport call to
 //! `POST /v1/verification/execute`. It writes no observation, run, or
-//! dispatch; the server records the judgment as one result of the Run. That
-//! request alone carries the caller's W3C trace context, because a judge call
-//! the server makes for it is the server work that joins the caller's trace.
+//! dispatch; the server records the judgment as one result of the Run.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use opentelemetry::trace::TraceContextExt as _;
 use reqwest::Method;
 #[cfg(feature = "internal")]
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
-use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use wyrd_spec::card::verifier::VerifierImplementation;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::trace::TraceContext;
 use wyrd_spec::vala::eval::media::MediaRef;
 use wyrd_spec::verification::{
     DirectVerificationInput, DriftSample, EXECUTION_DEADLINE, ExecuteVerificationRequest, Judgment,
@@ -162,29 +157,7 @@ fn shape(value: &Value) -> &'static str {
     }
 }
 
-/// The current `tracing` span's valid OpenTelemetry span context as W3C
-/// trace context; `None` without an OpenTelemetry layer or an active span.
-///
-/// A Rust caller's verify sends this as its trace context. Foreign runtimes
-/// read their own OpenTelemetry context instead, because it never becomes
-/// Rust's current span across the binding.
-pub(crate) fn current_trace_context() -> Option<TraceContext> {
-    let context = tracing::Span::current().context();
-    let span = context.span();
-    let span_context = span.span_context();
-    span_context.is_valid().then(|| TraceContext {
-        trace_id: span_context.trace_id().to_string(),
-        span_id: span_context.span_id().to_string(),
-        trace_flags: span_context.trace_flags().to_u8(),
-        trace_state: span_context.trace_state().header(),
-    })
-}
-
 /// Send one direct execution and return its judgment.
-///
-/// `trace`, when present, is sent as `traceparent` and, when its state is
-/// non-empty, `tracestate`, so the server's judge call joins the caller's
-/// trace. It is observability linkage only and never affects authorization.
 ///
 /// The request carries no `Idempotency-Key`, so an ambiguous transport
 /// failure is surfaced rather than replayed: a judge call is never silently
@@ -206,30 +179,11 @@ pub(crate) fn current_trace_context() -> Option<TraceContext> {
 pub(crate) async fn execute(
     client: &WyrdClient,
     request: &ExecuteVerificationRequest,
-    trace: Option<&TraceContext>,
 ) -> Result<Judgment, WyrdError> {
     request.validate()?;
-    let traceparent = trace.map(TraceContext::to_traceparent);
-    let tracestate = trace.map(|trace| trace.trace_state.as_str());
-    let headers: Vec<(&str, &str)> = [
-        ("traceparent", traceparent.as_deref()),
-        ("tracestate", tracestate),
-    ]
-    .into_iter()
-    .filter_map(|(name, value)| {
-        value
-            .filter(|value| !value.is_empty())
-            .map(|value| (name, value))
-    })
-    .collect();
     client
         .with_min_request_timeout(EXECUTION_DEADLINE + EXECUTE_RESPONSE_GRACE)
         .http
-        .request_json_with_headers(
-            Method::POST,
-            "/v1/verification/execute",
-            Some(request),
-            &headers,
-        )
+        .request_json(Method::POST, "/v1/verification/execute", Some(request))
         .await
 }

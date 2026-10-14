@@ -77,12 +77,9 @@ rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 workspace-hack.workspace = true
-# The ambient OpenTelemetry span a gateway call must not propagate.
-opentelemetry_sdk = { workspace = true }
 secrecy = { workspace = true }
 vala-bifrost-redux = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
-tracing-subscriber = { workspace = true }
 wiremock = { workspace = true }
 wyrd-testing = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["client", "server"] }

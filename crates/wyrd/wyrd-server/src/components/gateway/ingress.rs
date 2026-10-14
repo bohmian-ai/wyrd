@@ -337,7 +337,11 @@ pub(super) fn requested_subject(
 /// stream that ends without `message_stop` ends with an `error` event or an
 /// aborted transport. Gateway-originated failures render as the Anthropic
 /// error envelope.
-#[tracing::instrument(name = "gateway.invoke", skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn anthropic_messages(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -416,7 +420,11 @@ pub(crate) async fn anthropic_messages(
 /// unchanged. Jev never streams. Gateway-originated failures render as the
 /// `OpenAI` error envelope with a stable Wyrd code; a provider refusal relays
 /// its status and body through the shared refusal path, credential removed.
-#[tracing::instrument(name = "gateway.invoke", skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn jev_systemone(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -509,7 +517,11 @@ fn jev_call(
 /// `alt=sse` and relays Gemini events, and a stream that ends before every
 /// candidate finishes aborts its transport. Gateway-originated failures render
 /// as the Google error envelope.
-#[tracing::instrument(name = "gateway.invoke", skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn gemini_generate_content(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,

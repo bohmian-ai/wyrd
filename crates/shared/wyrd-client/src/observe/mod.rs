@@ -26,7 +26,6 @@ use serde_json::{Value, json};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::trace::TraceContext;
 use wyrd_spec::vala::eval::media::MediaRef;
 use wyrd_spec::vala::ids::{RunId, SessionId};
 use wyrd_spec::verification::{ExecuteVerificationRequest, Judgment};
@@ -407,13 +406,8 @@ impl Observe<'_> {
         verifier: &str,
         input: &T,
     ) -> Result<Judgment, WyrdError> {
-        self.verify_value(
-            verifier,
-            to_value(input, "verify input")?,
-            Vec::new(),
-            verify::current_trace_context(),
-        )
-        .await
+        self.verify_value(verifier, to_value(input, "verify input")?, Vec::new())
+            .await
     }
 
     /// Judge one Eval context carrying media a judge Prompt binds by `id`.
@@ -435,13 +429,8 @@ impl Observe<'_> {
         context: &T,
         media: Vec<MediaRef>,
     ) -> Result<Judgment, WyrdError> {
-        self.verify_value(
-            verifier,
-            to_value(context, "verify input")?,
-            media,
-            verify::current_trace_context(),
-        )
-        .await
+        self.verify_value(verifier, to_value(context, "verify input")?, media)
+            .await
     }
 
     /// Judge input from a foreign runtime's JSON text.
@@ -450,9 +439,6 @@ impl Observe<'_> {
     /// * `verifier` - The `metadata.name` of a Verifier bound to this view's subject.
     /// * `json` - The input as JSON text, in the shape [`Observe::verify`] takes.
     /// * `media` - Media references a judge Prompt binds by `id`; empty for none.
-    /// * `caller_trace` - The foreign runtime's active OpenTelemetry span as
-    ///   W3C trace context, sent with the request so the server's judge call
-    ///   joins the caller's trace; `None` sends no trace context.
     ///
     /// # Errors
     /// As [`Observe::verify_with_media`], plus an invalid-observation error
@@ -467,20 +453,13 @@ impl Observe<'_> {
         verifier: &str,
         json: &str,
         media: Vec<MediaRef>,
-        caller_trace: Option<TraceContext>,
     ) -> Result<Judgment, WyrdError> {
         verify::check_drift_integer_literals(json)?;
-        self.verify_value(
-            verifier,
-            parse_json(json, "verify input")?,
-            media,
-            caller_trace,
-        )
-        .await
+        self.verify_value(verifier, parse_json(json, "verify input")?, media)
+            .await
     }
 
-    /// Resolve the bound Verifier, build its request, and execute it with
-    /// `trace` as the request's W3C trace context.
+    /// Resolve the bound Verifier, build its request, and execute it.
     ///
     /// Resolution and input conversion are local and complete before the
     /// client is resolved, so a refusal of either sends nothing.
@@ -492,7 +471,6 @@ impl Observe<'_> {
         verifier: &str,
         input: Value,
         media: Vec<MediaRef>,
-        trace: Option<TraceContext>,
     ) -> Result<Judgment, WyrdError> {
         let state = &self.run.state;
         let bound = state.bound_verifier(&self.run.subject, verifier)?;
@@ -502,7 +480,7 @@ impl Observe<'_> {
             input: verify::direct_input(bound.implementation, input, media)?,
             run_id: Some(self.run.run_id.clone()),
         };
-        verify::execute(state.client()?, &request, trace.as_ref()).await
+        verify::execute(state.client()?, &request).await
     }
 }
 

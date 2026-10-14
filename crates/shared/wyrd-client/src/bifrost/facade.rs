@@ -26,11 +26,14 @@ use wyrd_queue::QueueConfig;
 use wyrd_queue::variant::WyrdJsonEncoderFactory;
 #[cfg(feature = "internal")]
 use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, QueryParam,
     QueryTerminalFrame, RegisterOutcome, RegisterTableResponse, RunningQuerySummary,
 };
+use wyrd_spec::vala::ids::TraceId;
+use wyrd_spec::vala::trace::SpanRecord;
 
 #[cfg(feature = "internal")]
 use crate::bifrost::BifrostMetrics;
@@ -39,9 +42,14 @@ use crate::bifrost::handle::WriterPool;
 use crate::bifrost::query::{BifrostClientError, QueryClient, QueryResultStream};
 #[cfg(feature = "internal")]
 use crate::bifrost::query::{CollectedQueryLimits, CollectedQueryResult};
+use crate::bifrost::rows::{SPAN_COLUMNS, span_record};
 use crate::bifrost::scope::ClientScope;
 use crate::bifrost::sink::BifrostIngestSink;
 use crate::bifrost::table::{Correlation, TableConfig, WriterTable};
+
+/// The catalog code a query of a tenant's span table reports before its
+/// first span export creates the table.
+const SPANS_NOT_CREATED: &str = "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND";
 
 /// The one Bifrost client: query any authorized table, write to the active one.
 ///
@@ -804,6 +812,67 @@ impl Bifrost {
         params: &[QueryParam],
     ) -> Result<Vec<T>, BifrostClientError> {
         self.sql(query, params).await?.deserialize()
+    }
+
+    /// Read the span tree of `trace_id` as canonical span records: every span
+    /// of that trace plus every span of each trace holding a span that links
+    /// directly to it.
+    ///
+    /// The closure is one inbound-link hop: a trace linking only to a linked
+    /// trace is not read. Spans are deduplicated by trace and span id and
+    /// ordered by start time, then trace id, then span id. The read is one
+    /// query over the caller's authorized `vala.traces.spans` with the trace
+    /// id bound as a parameter, so it inherits the query deadline and result
+    /// limits, and another tenant's trace or one never seen reads empty.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::sql`], with the span table not yet created reading empty,
+    /// plus [`BifrostClientError::RowDeserialization`] when a span row does
+    /// not decode. Either failure is total: no partial timeline is returned.
+    pub async fn trace_timeline(
+        &self,
+        trace_id: TraceId,
+    ) -> Result<Vec<SpanRecord>, BifrostClientError> {
+        let query = format!(
+            "SELECT {SPAN_COLUMNS} FROM vala.traces.spans \
+             WHERE trace_id = decode($1, 'hex') OR trace_id IN ( \
+               SELECT trace_id FROM ( \
+                 SELECT trace_id, unnest(links) AS link FROM vala.traces.spans) \
+               WHERE link['trace_id'] = decode($1, 'hex'))"
+        );
+        let result = match self
+            .sql(&query, &[QueryParam::String(trace_id.to_hex())])
+            .await
+        {
+            Ok(result) => result,
+            Err(error) if WyrdError::from(&error).code() == SPANS_NOT_CREATED => {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut spans = result
+            .batches()
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows()).map(move |row| span_record(batch, row)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BifrostClientError::RowDeserialization)?;
+        spans.sort_by(|left, right| {
+            (
+                left.start_time,
+                left.trace_id.as_bytes(),
+                left.span_id.as_bytes(),
+            )
+                .cmp(&(
+                    right.start_time,
+                    right.trace_id.as_bytes(),
+                    right.span_id.as_bytes(),
+                ))
+        });
+        spans.dedup_by(|later, earlier| {
+            (later.trace_id, later.span_id) == (earlier.trace_id, earlier.span_id)
+        });
+        Ok(spans)
     }
 
     /// Run one SQL SELECT and return its batches as they arrive.

@@ -44,6 +44,7 @@ mod grpc;
 mod handle;
 pub mod observe;
 mod query;
+pub mod rows;
 mod scope;
 mod sink;
 mod table;

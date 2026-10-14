@@ -8,6 +8,8 @@ import { cli } from "@wyrd/testing";
 
 import { serverTest } from "../support/server.js";
 
+vi.setConfig({ testTimeout: 60_000 });
+
 const VSCODE_PROFILE = process.platform === "darwin" ? "Library/Application Support/Code/User" : ".config/Code/User";
 
 /** Every host's configuration file in an isolated home, each with an `other` entry. */

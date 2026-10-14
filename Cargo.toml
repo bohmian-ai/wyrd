@@ -260,17 +260,17 @@ datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distr
 # Parquet read planner) replaces these crates for every consumer, including the
 # iceberg, compaction, and distributed git dependencies.
 [patch.crates-io]
-datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b" }
-datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b" }
-datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b" }
-datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b" }
-datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b" }
-datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b" }
-datafusion-functions-variant = { git = "https://github.com/bohmian-ai/datafusion", rev = "fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b" }
-datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b" }
-datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b" }
-datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b" }
-datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b" }
+datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "5697cfa35192f175bbcd54f59a5fd88527c2bbf5" }
+datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "5697cfa35192f175bbcd54f59a5fd88527c2bbf5" }
+datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "5697cfa35192f175bbcd54f59a5fd88527c2bbf5" }
+datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "5697cfa35192f175bbcd54f59a5fd88527c2bbf5" }
+datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "5697cfa35192f175bbcd54f59a5fd88527c2bbf5" }
+datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "5697cfa35192f175bbcd54f59a5fd88527c2bbf5" }
+datafusion-functions-variant = { git = "https://github.com/bohmian-ai/datafusion", rev = "5697cfa35192f175bbcd54f59a5fd88527c2bbf5" }
+datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "5697cfa35192f175bbcd54f59a5fd88527c2bbf5" }
+datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "5697cfa35192f175bbcd54f59a5fd88527c2bbf5" }
+datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "5697cfa35192f175bbcd54f59a5fd88527c2bbf5" }
+datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "5697cfa35192f175bbcd54f59a5fd88527c2bbf5" }
 # Arrow-rs 60.0.0 with the unshred_variant buffer pre-size fix, the same
 # revision the DataFusion fork pins.
 arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }

@@ -29,7 +29,8 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::DynamicFilterTracking;
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_expr::utils::conjunction;
+use datafusion::physical_expr::utils::{conjunction, split_conjunction};
+use datafusion::physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::filter_pushdown::{
@@ -385,10 +386,13 @@ impl ExecutionPlan for LiveScribeExec {
     /// Every filter is reported unsupported, so the leader's `FilterExec`
     /// stays above the leaf. Dynamic filters, which join and `TopK` operators
     /// update while the query runs, are left to the leader: a fragment could
-    /// only carry a stale copy of one. So are filters reading an uncorrelated
-    /// scalar subquery, such as `id = (SELECT max(id) ...)`: the subquery's
-    /// value lives in the leader's `ScalarSubqueryExec`, so the expression
-    /// cannot be decoded or evaluated on a Scribe.
+    /// only carry a stale copy of one.
+    ///
+    /// Filters bound to execution state, such as `id = (SELECT max(id) ...)`
+    /// whose value `ScalarSubqueryExec` supplies before this leaf executes,
+    /// are kept in the predicate but cannot prune routes yet: planning prunes
+    /// by the conjuncts that already snapshot to static expressions, and
+    /// [`ExecutionPlan::execute`] narrows further once the rest resolve.
     ///
     /// # Errors
     /// Never returns an error; the signature is fixed by the trait.
@@ -403,7 +407,6 @@ impl ExecutionPlan for LiveScribeExec {
             .iter()
             .map(|filter| &filter.filter)
             .filter(|filter| !DynamicFilterTracking::classify(filter).contains_dynamic_filter())
-            .filter(|filter| !reads_scalar_subquery(filter))
             .cloned()
             .chain(self.predicate.iter().cloned())
             .collect::<Vec<_>>();
@@ -412,9 +415,15 @@ impl ExecutionPlan for LiveScribeExec {
             return Ok(propagation);
         }
         let predicate = conjunction(filters);
+        let static_predicate = conjunction(
+            split_conjunction(&predicate)
+                .into_iter()
+                .filter(|conjunct| snapshot_physical_expr(Arc::clone(conjunct)).is_ok())
+                .cloned(),
+        );
         let mut leaf = self.clone();
         leaf.routes = Arc::new(self.routes.selected_by(
-            &predicate,
+            &static_predicate,
             &self.schema(),
             self.time_axis.column(),
         ));
@@ -462,14 +471,23 @@ impl ExecutionPlan for LiveScribeExec {
     /// Streams this partition's routes' fragments, one route after another,
     /// as their batches arrive.
     ///
+    /// The pushed predicate is snapshotted once per invocation, after any
+    /// `ScalarSubqueryExec` above has populated its values, so a resolved
+    /// scalar ships to every Scribe as a literal. That one snapshot narrows
+    /// the planning-time routes before they are dealt across partitions, and
+    /// every fragment this invocation opens encodes it. The plan keeps the
+    /// runtime-bound predicate, so a re-execution snapshots its new values.
+    ///
     /// Nothing is opened until the returned stream is first polled, and
     /// dropping it drops the open fragment stream, which cancels the Scribe
     /// fragment and releases its snapshot and lease. See [`LiveFragmentRead`]
     /// for how each outcome maps to the query terminal.
     ///
     /// # Errors
-    /// Returns a plan error for a partition this leaf does not advertise, and
-    /// an execution error when the task carries no bound execution bindings.
+    /// Returns a plan error for a partition this leaf does not advertise, the
+    /// snapshot error when the predicate reads execution state not yet
+    /// populated, and an execution error when the task carries no bound
+    /// execution bindings.
     fn execute(
         &self,
         partition: usize,
@@ -481,7 +499,17 @@ impl ExecutionPlan for LiveScribeExec {
                 "live Scribe source has no partition {partition}"
             )));
         }
-        let routes = self
+        let mut leaf = self.clone();
+        if let Some(predicate) = &self.predicate {
+            let predicate = snapshot_physical_expr(Arc::clone(predicate))?;
+            leaf.routes = Arc::new(self.routes.selected_by(
+                &predicate,
+                &self.schema(),
+                self.time_axis.column(),
+            ));
+            leaf.predicate = Some(predicate);
+        }
+        let routes = leaf
             .routes
             .routes
             .iter()
@@ -491,7 +519,7 @@ impl ExecutionPlan for LiveScribeExec {
             .collect();
         let lock = super::bindings::bindings_for_task(context.as_ref())?;
         let read = LiveFragmentRead {
-            leaf: self.clone(),
+            leaf,
             routes,
             lock,
             open_time: MetricBuilder::new(&self.metrics)
@@ -504,22 +532,6 @@ impl ExecutionPlan for LiveScribeExec {
             read.into_stream(),
         )))
     }
-}
-
-/// Reports whether `filter` reads an uncorrelated scalar subquery's result.
-///
-/// Such a filter can only run where its `ScalarSubqueryExec` runs, which is
-/// the leader, so the live leaf never ships it in a fragment. The walk never
-/// fails; were it to, the filter is conservatively treated as reading one and
-/// stays on the leader.
-fn reads_scalar_subquery(filter: &Arc<dyn PhysicalExpr>) -> bool {
-    filter
-        .exists(|node| {
-            Ok(node
-                .downcast_ref::<datafusion::physical_expr::scalar_subquery::ScalarSubqueryExpr>()
-                .is_some())
-        })
-        .unwrap_or(true)
 }
 
 /// Physical optimizer rule that keeps published work distributable beside a live leaf.

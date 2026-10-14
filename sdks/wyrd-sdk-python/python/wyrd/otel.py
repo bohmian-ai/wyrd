@@ -13,6 +13,9 @@ optional and fail-open: without ``opentelemetry-api`` it is a no-op.
 
 ``WyrdState.start_telemetry`` delegates to ``_start_telemetry``, which installs
 one global SDK tracer provider exporting through ``span_exporter``.
+
+``WyrdAgentsTraceProcessor`` is an OpenAI Agents SDK trace processor the
+application passes to ``agents.set_trace_processors``; Wyrd never registers it.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
+    from agents.tracing import Span, Trace
     from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
     from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -33,6 +37,14 @@ except ImportError:  # optional: run correlation becomes a no-op
     _OTEL_AVAILABLE = False
 else:
     _OTEL_AVAILABLE = True
+
+if TYPE_CHECKING:
+    from agents.tracing import TracingProcessor as _AgentsTracingProcessor
+else:
+    try:
+        from agents.tracing import TracingProcessor as _AgentsTracingProcessor
+    except ImportError:  # optional: the Agents SDK trace processor is then a plain object
+        _AgentsTracingProcessor = object
 
 
 _CARD_UID = "wyrd.card_uid"
@@ -260,3 +272,87 @@ def metric_exporter(client: WyrdClient) -> OTLPMetricExporter:
     except ImportError as missing:
         raise ImportError(_EXPORTER_EXTRA) from missing
     return OTLPMetricExporter(endpoint=_endpoint(client, "metrics"), session=_session(client))
+
+
+class WyrdAgentsTraceProcessor(_AgentsTracingProcessor):
+    """OpenAI Agents SDK trace processor recording each trace and span as an OTel span.
+
+    Pass it to the Agents SDK yourself (``set_trace_processors`` or
+    ``add_trace_processor``); Wyrd never registers it. An SDK trace becomes a
+    root span started in the current context, so inside ``with state.run(...)``
+    with ``start_telemetry`` running it carries the Run ID, and each SDK span
+    becomes a child of its SDK parent. Generation and response spans carry the
+    OpenTelemetry GenAI model and token attributes. Without
+    ``opentelemetry-api`` installed it records nothing.
+    """
+
+    def __init__(self) -> None:
+        # The OTel span and its context for each open SDK trace or span, by SDK id.
+        self._open: dict[str, tuple[Any, Any]] = {}
+
+    def on_trace_start(self, trace: Trace) -> None:
+        """Start the root span for ``trace`` in the current context."""
+        self._start(trace.trace_id, None, trace.name)
+
+    def on_trace_end(self, trace: Trace) -> None:
+        """End the root span for ``trace``."""
+        self._end(trace.trace_id)
+
+    def on_span_start(self, span: Span[Any]) -> None:
+        """Start a child of ``span``'s SDK parent, or of its trace when it has none."""
+        data = span.span_data
+        self._start(span.span_id, span.parent_id or span.trace_id, getattr(data, "name", data.type))
+
+    def on_span_end(self, span: Span[Any]) -> None:
+        """Record ``span``'s GenAI attributes and error, then end it."""
+        open_span = self._open.get(span.span_id)
+        if open_span is not None:
+            otel_span = open_span[0]
+            for key, value in _gen_ai_attributes(span.span_data).items():
+                if value is not None:
+                    otel_span.set_attribute(key, value)
+            if span.error is not None:
+                otel_span.set_status(
+                    _otel_trace.Status(_otel_trace.StatusCode.ERROR, span.error["message"])
+                )
+        self._end(span.span_id)
+
+    def shutdown(self) -> None:
+        """Nothing to release: spans export through the application's tracer provider."""
+
+    def force_flush(self) -> None:
+        """Nothing to flush: spans export through the application's tracer provider."""
+
+    def _start(self, sdk_id: str, parent: str | None, name: str) -> None:
+        """Start the span for ``sdk_id`` under ``parent``, or the current context when it is not open."""
+        if not _OTEL_AVAILABLE:
+            return
+        parent_span = self._open.get(parent) if parent is not None else None
+        parent_context = parent_span[1] if parent_span is not None else _otel_context.get_current()
+        otel_span = _otel_trace.get_tracer("wyrd.agents").start_span(name, parent_context)
+        self._open[sdk_id] = (otel_span, _otel_trace.set_span_in_context(otel_span, parent_context))
+
+    def _end(self, sdk_id: str) -> None:
+        """End and forget the span for ``sdk_id``, if it is open."""
+        open_span = self._open.pop(sdk_id, None)
+        if open_span is not None:
+            open_span[0].end()
+
+
+def _gen_ai_attributes(data: Any) -> dict[str, Any]:
+    """The GenAI model and token attributes of a generation or response span's data."""
+    if data.type == "generation":
+        usage = data.usage or {}
+        return {
+            "gen_ai.request.model": data.model,
+            "gen_ai.usage.input_tokens": usage.get("input_tokens"),
+            "gen_ai.usage.output_tokens": usage.get("output_tokens"),
+        }
+    if data.type == "response" and data.response is not None:
+        usage = data.response.usage
+        return {
+            "gen_ai.request.model": data.response.model,
+            "gen_ai.usage.input_tokens": usage.input_tokens if usage else None,
+            "gen_ai.usage.output_tokens": usage.output_tokens if usage else None,
+        }
+    return {}

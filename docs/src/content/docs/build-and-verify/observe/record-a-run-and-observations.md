@@ -154,6 +154,42 @@ The Python `with` block tags every OpenTelemetry span started inside it with the
 
 `drift` and `eval` return once the row is queued, and add almost no time to a request. `record` is async in Rust and TypeScript because the first call for a table looks it up on the server.
 
+### Trace an OpenAI Agents SDK agent
+
+The OpenAI Agents SDK records its own traces rather than OpenTelemetry spans. Give it `WyrdAgentsTraceProcessor`, and each agent, tool, handoff, and model call becomes an OpenTelemetry span. Model calls carry `gen_ai.request.model` and token counts. Wyrd never installs the processor for you. Run the agent inside the run's scope after `start_telemetry()` (`startTelemetry()` in TypeScript), and its spans land in `vala.traces.spans` with the run's `run_id`.
+
+<LangTabs langs={['python', 'typescript']}>
+<LangTab lang="python">
+
+```python
+from agents import Runner, set_trace_processors
+from wyrd.otel import WyrdAgentsTraceProcessor
+
+state.start_telemetry()
+set_trace_processors([WyrdAgentsTraceProcessor()])
+
+with state.run("agent"):
+    result = Runner.run_sync(agent, question)
+```
+
+</LangTab>
+<LangTab lang="typescript">
+
+```typescript
+import { run, setTraceProcessors } from "@openai/agents";
+import { WyrdAgentsTraceProcessor } from "wyrd-ai";
+
+await state.startTelemetry();
+setTraceProcessors([new WyrdAgentsTraceProcessor()]);
+
+const result = await state.run("agent").scope(() => run(agent, question));
+```
+
+</LangTab>
+</LangTabs>
+
+`set_trace_processors` replaces the SDK's default exporter to OpenAI; use `add_trace_processor` (`addTraceProcessor`) to keep it. Install `wyrd[agents]` in Python.
+
 ## 4. Shut down cleanly
 
 Queued rows are not stored yet. Flush before you depend on them, and shut down once when the process stops:

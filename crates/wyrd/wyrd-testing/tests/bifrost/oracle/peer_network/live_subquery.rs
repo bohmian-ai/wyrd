@@ -212,9 +212,13 @@ async fn prove_remote_scalar_subquery_ships_as_a_literal() -> Result<(), PeerJou
 /// rows, and a filter treating the subquery as a set would return the picked
 /// event.
 ///
+/// Two inputs whose row bound DataFusion cannot prove are refused the same
+/// way: a FULL JOIN of two unmatched singletons and one row under
+/// `GROUPING SETS ((x), ())` each yield two rows.
+///
 /// # Panics
 ///
-/// Panics when setup fails, or when either query returns rows or fails other
+/// Panics when setup fails, or when any query returns rows or fails other
 /// than at execution.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
@@ -253,6 +257,18 @@ async fn prove_remote_two_row_scalar_subquery_is_refused() -> Result<(), PeerJou
         ),
         format!(
             "SELECT id, {scalar} AS picked FROM vala.bifrost.{events}",
+            events = tables.events
+        ),
+        format!(
+            "SELECT id, (SELECT COALESCE(l.x, r.x) FROM (VALUES (1)) l(x) \
+             FULL JOIN (VALUES (2)) r(x) ON l.x = r.x) AS picked \
+             FROM vala.bifrost.{events}",
+            events = tables.events
+        ),
+        format!(
+            "SELECT id, (SELECT COUNT(*) FROM (VALUES (1)) t(x) \
+             GROUP BY GROUPING SETS ((x), ())) AS picked \
+             FROM vala.bifrost.{events}",
             events = tables.events
         ),
     ] {

@@ -1,6 +1,6 @@
 ---
 id: SPEC-jev-provider
-revision: 1
+revision: 2
 status: approved
 ---
 
@@ -17,6 +17,13 @@ r6. Split into its own change by owner direction on 2026-10-14 so each problem
 is reviewed and verified on its own. The requirement text is carried over
 unchanged.
 
+Revision 2 approved by the human owner on 2026-10-14: Jev onboards exactly
+like every other provider and earns no special path. Its upstream refusals use
+the shared refusal path, the Jev-only `WYRD_GATEWAY_429_UPSTREAM_THROTTLED`
+code is removed, fallback isolation comes from deployment capabilities and
+request representability rather than provider identity, and the `llm_judge`
+requirement is stated as a provider-neutral capability.
+
 ## Required behavior
 
 ### REQ-001 Jev provider is typed
@@ -28,8 +35,12 @@ unchanged.
   probabilities and confidence, a score answer its score and legend) is a
   first-class provider dialect with fully typed request and response
   structures, aligned with how OpenAI, Anthropic, Google, and Vertex are
-  modeled (`ProviderRequest`/`ProviderResponse` variants, wire types, provider
-  client, gateway adapter, schemas, and SDK types).
+  modeled (`ProviderRequest`/`ProviderResponse` variants, wire types, a
+  standalone `JevAuth`, provider client, gateway adapter, schemas, and SDK
+  types).
+- (r2) There is one way to onboard a provider. Jev touches only the
+  per-dialect owners every provider touches; no shared path (Agent loop,
+  judge, gateway failure mapping, fallback planning) branches on Jev by name.
 - A Prompt Card declares a Jev request natively (its own `request.provider`
   dialect and typed body). Prompt variables substitute into the request's
   string fields with the existing render escaping, so any variable value,
@@ -48,20 +59,35 @@ unchanged.
   any provider IO. The typed Jev answer returns serialized as JSON in
   `choices[0].message.content`, with Jev usage mapped to the completion usage.
   No schema mapping or chat-to-question translation is added.
-- Upstream error mapping on both routes: 400/422 invalid request, 429
-  throttled, other non-auth upstream failures unavailable, with those upstream
-  bodies never relayed. (r3) An upstream 401 or 403 behaves exactly as for the
-  other providers: the upstream status and body are relayed through the shared
-  refusal path with the credential removed, and are not retried.
-- A Verifier `llm_judge` task can use a Jev Prompt as its judge, and a
-  dependent assertion can threshold a typed answer field (for example
-  `$.task.judge.parsed.answers.helpful.noul >= 0.5`).
+- (r2) Every upstream refusal on both routes behaves exactly as for the other
+  providers: the upstream status and body relay through the shared refusal
+  path with the credential removed, and retry follows the shared status
+  classification. No Jev-specific error code exists.
+- (r2) Fallback never leaves the Jev protocol because only deployments
+  declaring `system_one` serve a `systemone` question and a deployment whose
+  adapter cannot represent a request body is dropped, the same rules that
+  govern every provider.
+- (r2) A Verifier `llm_judge` judge is one model call for every provider: its
+  Prompt must yield structured output, either by a declared JSON schema or
+  because its dialect answers with a typed object by protocol (Jev). A Jev
+  Prompt therefore works as a judge, and a dependent assertion can threshold
+  a typed answer field (for example
+  `$.task.judge.parsed.answers.helpful.noul >= 0.5`). A judge provider
+  refusal is retried by the shared classification for every provider.
+- (r2) Out of scope: correlating a judge's gateway call to the judgment's
+  Run and Card. That is SPEC-verify-attribution REQ-004 for every provider,
+  and SPEC-sub-act-attribution reshapes it. The Jev journeys prove only the
+  passing result and the judge's one recorded `system_one` call;
+  verify-attribution's judge-correlation journey adds a Jev case when it
+  rebases onto this change.
 
 ## Invariants
 
 - INV-001 Tenant isolation holds on every changed path.
 - INV-002 Provider credentials and keys are never logged or returned.
 - INV-004 No compatibility aliases for the removed Jev chat shim; the r3
+  unified-route pass-through is the only chat entry to Jev, and it carries the
+  typed Jev request, not a translation.
 
 ## Acceptance obligations
 
@@ -70,7 +96,8 @@ unchanged.
   the base and passes on the candidate, booting the server the way users do
   where the defect was harness-masked (REQ-003 uses the official TypeScript
   MCP SDK; REQ-007 drives the CLI).
-- AC-002 Negative flows: Jev invalid question type and upstream 400/429/5xx;
+- AC-002 Negative flows: Jev invalid question type and upstream 400/401/429
+  relayed like other providers (5xx pinned by adapter unit tests);
   Bifrost unauthorized-table errors leak nothing; malformed `traceparent`.
 - AC-003 Format, lints, codegen check, and the owning `mise` lanes pass.
 

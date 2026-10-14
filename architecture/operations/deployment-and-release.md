@@ -221,7 +221,7 @@ contract. Missing or one-sided compatibility fails closed.
 The official images (`docker/official/{ubuntu,debian,rocky}/Dockerfile`) run
 `wyrd-server` behind nginx, which proxies HTTP on 8080 and gRPC on 50051 to
 the server's loopback listeners. Each copies a Linux server bundle and
-compiles nothing. Release publishes `wyrdai/wyrd:<distro>-<arch>-<version>`
+compiles nothing. Release publishes `bohmian/wyrd:<distro>-<arch>-<version>`
 for ubuntu, debian, and rocky on amd64 and ubuntu and debian on arm64, each
 built on a native runner from the bundle its build job recorded, then the
 multi-arch tags `<distro>-<version>` and `<distro>-latest`, with ubuntu also

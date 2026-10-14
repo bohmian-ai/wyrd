@@ -10,7 +10,7 @@ status: partial
 
 <Aside type="tip" title="Setting up Wyrd for a team?">
 
-This page runs a server on your own machine. To run a shared server, or to deploy the `wyrdai/wyrd` container, follow [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/). If you just want to try Wyrd locally, stay here.
+This page runs a server on your own machine. To run a shared server, or to deploy the `bohmian/wyrd` container, follow [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/). If you just want to try Wyrd locally, stay here.
 
 </Aside>
 

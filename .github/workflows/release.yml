@@ -583,7 +583,7 @@ jobs:
             runner: ubuntu-24.04-arm
             bundle: aarch64-unknown-linux-gnu
     env:
-      IMAGE: wyrdai/wyrd:${{ matrix.distro }}-${{ matrix.arch }}-${{ github.event.release.tag_name }}
+      IMAGE: bohmian/wyrd:${{ matrix.distro }}-${{ matrix.arch }}-${{ github.event.release.tag_name }}
     steps:
       - uses: actions/checkout@v7
 
@@ -633,11 +633,11 @@ jobs:
 
       - uses: actions/attest-build-provenance@v4
         with:
-          subject-name: index.docker.io/wyrdai/wyrd
+          subject-name: index.docker.io/bohmian/wyrd
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
-  # `docker pull wyrdai/wyrd` resolves through these multi-arch tags: one per
+  # `docker pull bohmian/wyrd` resolves through these multi-arch tags: one per
   # distro, and the ubuntu image as the bare version and latest.
   publish-docker-manifests:
     name: docker manifests
@@ -657,7 +657,7 @@ jobs:
 
       - name: Publish the multi-arch tags
         run: |
-          repo=wyrdai/wyrd
+          repo=bohmian/wyrd
           docker buildx imagetools create -t "$repo:$TAG" -t "$repo:latest" \
             -t "$repo:ubuntu-$TAG" -t "$repo:ubuntu-latest" \
             "$repo:ubuntu-amd64-$TAG" "$repo:ubuntu-arm64-$TAG"

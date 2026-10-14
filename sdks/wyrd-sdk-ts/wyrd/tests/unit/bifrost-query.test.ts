@@ -1,7 +1,7 @@
 import { tableFromArrays, tableToIPC } from "apache-arrow";
 import { describe, expect, test } from "vitest";
 
-import { BifrostQueryStream, IncompleteQueryStreamError, TableConfig, type CompactionType } from "@wyrd/sdk";
+import { BifrostQueryStream, IncompleteQueryStreamError, TableConfig, type CompactionType } from "wyrd-ai";
 
 const REQUEST_ID = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1bff";
 

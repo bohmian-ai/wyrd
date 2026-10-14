@@ -102,7 +102,7 @@ run = """
 cargo test --locked -p wyrd-sql --test integration -- pg_cards_register:: --nocapture --test-threads=1
 cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E 'test(/^pg_card_registration_route::/)'
 cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E 'test(/^pg_verification_routes::/)'
-cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^register_and_hydrate::/)'
+cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^register_and_hydrate::/)'
 """
 
 [tasks."test:workflow:journey"]
@@ -112,7 +112,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 [tasks."test:workflow:journey:inner"]
 hide = true
 description = "Run the Rust SDK Workflow loading journeys with their lifecycle already provisioned"
-run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^workflow_loading::/)'"
+run = "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^workflow_loading::/)'"
 
 [tasks."test:principals:unit"]
 description = "Run the principal and credential model unit slices"
@@ -153,7 +153,7 @@ cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^revoke::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^refresh::pg_tests::/)'
 cargo nextest run --locked -p wyrd-server --lib -E 'test(/^components::admin::routes::pg_tests::/)'
 cargo nextest run --locked -p wyrd-server --test integration -E 'test(/^(pg_openapi_contract|pg_principal_roles)::/)'
-cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^principal_roles::/)'
+cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^principal_roles::/)'
 """
 
 [tasks."test:cli:journey"]
@@ -189,8 +189,8 @@ hide = true
 description = "Run the real-server CLI and Rust SDK typed WyrdState journeys with their lifecycle already provisioned"
 run = [
   "cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=card_lifecycle::pg_tests::cli_bundle_loads_typed_wyrdstate_after_server_shutdown)'",
-  "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(=register_and_hydrate::service_graph_registers_and_hydrates)'",
-  "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(gateway_admin|operator_connections)::/)'",
+  "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=register_and_hydrate::service_graph_registers_and_hydrates)'",
+  "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(gateway_admin|operator_connections)::/)'",
 ]
 
 [tasks."test:gateway:native"]
@@ -223,7 +223,7 @@ run = """scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate
   && mise run test:gateway:native:inner \
   && mise run test:gateway:vault:inner \
   && mise run test:gateway:journey:surfaces:inner \
-  && cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E \"test(/^(gateway_admin|gateway_inference)::/)\" \
+  && cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E \"test(/^(gateway_admin|gateway_inference)::/)\" \
   && mise run py:test:gateway:journey:inner \
   && mise run ts:test:gateway:journey:inner'"""
 
@@ -310,7 +310,7 @@ run = "bash scripts/run-family-tests.sh shared"
 [tasks."test:wyrd-sdk"]
 hide = true
 description = "Run the Rust SDK projection unit tests"
-run = "cargo nextest run --locked -p wyrd-sdk-rust --lib"
+run = "cargo nextest run --locked -p wyrd-ai --lib"
 
 [tasks."test:bifrost"]
 description = "Run every Bifrost unit, integration, and Rust/Python/TypeScript journey test under one Postgres lifecycle."
@@ -464,16 +464,16 @@ description = "Tier-1 journeys: the scoped observation surface over one WyrdStat
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:observe:inner'"
 [tasks."test:bifrost:journey:observe:inner"]
 hide = true
-description = "wyrd-sdk-rust observe_a_run, query_bifrost, otel_export, local_development, and support_desk stories"
-run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|otel_export|local_development|support_desk)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'"
+description = "wyrd-ai observe_a_run, query_bifrost, otel_export, local_development, and support_desk stories"
+run = "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|otel_export|local_development|support_desk)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'"
 
 [tasks."test:bifrost:journey:drift"]
 description = "Tier-1 journeys: Verifiers judge in real time, and a failed scheduled drift run alerts its Operator"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:drift:inner'"
 [tasks."test:bifrost:journey:drift:inner"]
 hide = true
-description = "wyrd-sdk-rust verify_in_real_time and scheduled_drift_alerts_operator stories"
-run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(verify_in_real_time|scheduled_drift_alerts_operator)::/)'"
+description = "wyrd-ai verify_in_real_time and scheduled_drift_alerts_operator stories"
+run = "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(verify_in_real_time|scheduled_drift_alerts_operator)::/)'"
 
 [tasks."test:bifrost:journey:forge"]
 description = "Tier-1 journeys: compaction, maintenance, publication recovery, lease reclaim"
@@ -679,14 +679,14 @@ test:identity:journey."""
 depends = ["check", "codegen:check", "py:format:check", "py:lints", "py:typecheck", "check:py-wheel-no-testing", "py:test:unit", "py:test:tensorflow", "py:test:testing", "py:test:integration", "test:local-dev:journey"]
 
 [tasks."verify:rust-sdk"]
-description = """Complete Rust SDK gate: fmt, Clippy, the wyrd-sdk-rust unit tests and every story journey on one
+description = """Complete Rust SDK gate: fmt, Clippy, the wyrd-ai unit tests and every story journey on one
 Postgres lifecycle. The identity journeys run only in test:identity:journey."""
 depends = ["check", "test:rust-sdk:journey", "test:local-dev:journey"]
 
 [tasks."test:rust-sdk:journey"]
 hide = true
-description = "The wyrd-sdk-rust unit tests and every story journey except the identity and installed-CLI ones, on one Postgres lifecycle"
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sdk-rust -P journey --run-ignored=all -E 'not test(/^(saved_user_auth|signed_in_development)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'\""
+description = "The wyrd-ai unit tests and every story journey except the identity and installed-CLI ones, on one Postgres lifecycle"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-ai -P journey --run-ignored=all -E 'not test(/^(saved_user_auth|signed_in_development)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'\""
 
 [tasks."verify:typescript-sdk"]
 description = """Complete TypeScript SDK gate: fmt, Clippy, codegen, napi declarations, the package, types, unit
@@ -830,7 +830,7 @@ cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all -
 
 cargo nextest run --locked -p wyrd-cli --test cli --run-ignored=all -E 'test(=cli_device_login_journey)'
 cargo nextest run --locked -p wyrd-client --test integration --run-ignored=all -E 'test(=pg_auth_e2e_against_fixture::concurrent_saved_renewal)'
-cargo nextest run --locked -p wyrd-sdk-rust --test integration --run-ignored=all -E 'test(/^(saved_user_auth|signed_in_development)::/)'
+cargo nextest run --locked -p wyrd-ai --test integration --run-ignored=all -E 'test(/^(saved_user_auth|signed_in_development)::/)'
 
 mise run py:setup
 (cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m identity tests/integration/test_saved_user_auth.py tests/integration/test_signed_in_development.py)
@@ -1477,7 +1477,7 @@ diff -u "$BEFORE" "$AFTER" \
 # checks it.
 # Every `ts:*` task needs the napi bindings + package roots (slice 13a). Two separate
 # pnpm packages under `sdks/wyrd-sdk-ts/` glued by `sdks/wyrd-sdk-ts/pnpm-workspace.yaml`:
-# public `@wyrd/sdk` (`sdks/wyrd-sdk-ts/wyrd`, built from `sdks/wyrd-sdk-ts/native`) and
+# public `wyrd-ai` (`sdks/wyrd-sdk-ts/wyrd`, built from `sdks/wyrd-sdk-ts/native`) and
 # private `@wyrd/testing` (`sdks/wyrd-sdk-ts/testing`, built from
 # `sdks/wyrd-sdk-ts/native-testing`, test-tier). One napi addon per package so the
 # harness never overwrites the SDK's generated loader/`.d.ts`. 13a adds
@@ -1486,12 +1486,12 @@ diff -u "$BEFORE" "$AFTER" \
 
 [tasks."ts:install"]
 hide = true
-description = "Install the sdks/wyrd-sdk-ts/ pnpm workspace (@wyrd/sdk + @wyrd/testing) from the frozen lockfile (slice 13a)"
+description = "Install the sdks/wyrd-sdk-ts/ pnpm workspace (wyrd-ai + @wyrd/testing) from the frozen lockfile (slice 13a)"
 dir = "sdks/wyrd-sdk-ts"
 run = "pnpm install --frozen-lockfile"
 
 [tasks."ts:build"]
-description = "Build the public @wyrd/sdk napi addon (sdks/wyrd-sdk-ts/native) + emit index.d.ts into sdks/wyrd-sdk-ts/wyrd (slice 13a)"
+description = "Build the public wyrd-ai napi addon (sdks/wyrd-sdk-ts/native) + emit index.d.ts into sdks/wyrd-sdk-ts/wyrd (slice 13a)"
 depends = ["ts:install"]
 dir = "sdks/wyrd-sdk-ts/wyrd"
 run = "pnpm exec napi build --platform --manifest-path ../native/Cargo.toml --output-dir . --package-json-path package.json && test ! -f index.js || mv index.js index.generated.cjs && cp index.d.ts index.d.cts && pnpm exec tsc -p tsconfig.build.json && node -e 'require(\"node:fs\").rmSync(\"index.generated.cjs\", { force: true })'"
@@ -1503,13 +1503,13 @@ dir = "sdks/wyrd-sdk-ts/testing"
 run = "pnpm exec napi build --platform --manifest-path ../native-testing/Cargo.toml --output-dir . --package-json-path package.json --js native.cjs --dts native.d.cts"
 
 [tasks."ts:napi:check"]
-description = "Fail if the public @wyrd/sdk napi-generated index.d.ts is not committed/current (slice 13a; Node analogue of .pyi drift). Scoped to the SDK declaration, not the harness."
+description = "Fail if the public wyrd-ai napi-generated index.d.ts is not committed/current (slice 13a; Node analogue of .pyi drift). Scoped to the SDK declaration, not the harness."
 depends = ["ts:build"]
 dir = "sdks/wyrd-sdk-ts/wyrd"
 run = "git diff --exit-code -- index.d.ts || { echo 'napi .d.ts drift - run mise run ts:build and commit sdks/wyrd-sdk-ts/wyrd/index.d.ts'; exit 1; }"
 
 [tasks."ts:pack:check"]
-description = "Pack the compiled @wyrd/sdk and current-host napi addon, then import the installed package from a clean ESM project"
+description = "Pack the compiled wyrd-ai and current-host napi addon, then import the installed package from a clean ESM project"
 depends = ["ts:build"]
 run = "node scripts/check_ts_package.mjs"
 
@@ -1531,22 +1531,22 @@ dir = "sdks/wyrd-sdk-ts"
 run = "pnpm exec biome lint --error-on-warnings"
 
 [tasks."ts:typecheck"]
-description = "Typecheck @wyrd/sdk incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a)"
+description = "Typecheck wyrd-ai incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a)"
 depends = ["ts:build", "ts:build:testing"]
 dir = "sdks/wyrd-sdk-ts/wyrd"
 run = "pnpm exec tsc --noEmit"
 
 [tasks."ts:test:unit"]
-description = "@wyrd/sdk unit tests: auth-parity + an error-set native {value,error} envelope makes unwrapNative throw instanceof WyrdError (hand-authored TS class) exposing code/status/title/detail as properties, not parsed from message (slice 13a)"
+description = "wyrd-ai unit tests: auth-parity + an error-set native {value,error} envelope makes unwrapNative throw instanceof WyrdError (hand-authored TS class) exposing code/status/title/detail as properties, not parsed from message (slice 13a)"
 depends = ["ts:build", "ts:build:testing"]
 dir = "sdks/wyrd-sdk-ts/wyrd"
 run = "pnpm exec vitest run tests/unit"
 
 [tasks."ts:test:integration"]
-description = """@wyrd/sdk client->server->client Bifrost journey (slice 13/13a).
-Builds the public @wyrd/sdk addon and the private @wyrd/testing harness addon, then runs
+description = """wyrd-ai client->server->client Bifrost journey (slice 13/13a).
+Builds the public wyrd-ai addon and the private @wyrd/testing harness addon, then runs
 Vitest, which boots WyrdTestServer IN-PROCESS against the repository-managed Postgres,
-seeds a tenant, mints a key, and drives @wyrd/sdk against it, tearing down via shutdown()
+seeds a tenant, mints a key, and drives wyrd-ai against it, tearing down via shutdown()
 in finally — symmetric with the Python journey.
 """
 depends = ["ts:build", "ts:build:testing"]
@@ -1554,10 +1554,10 @@ depends = ["ts:build", "ts:build:testing"]
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run ts:test:integration:inner'"
 [tasks."ts:test:integration:inner"]
 hide = true
-description = """@wyrd/sdk client->server->client Bifrost journey (slice 13/13a).
-Builds the public @wyrd/sdk addon and the private @wyrd/testing harness addon, then runs
+description = """wyrd-ai client->server->client Bifrost journey (slice 13/13a).
+Builds the public wyrd-ai addon and the private @wyrd/testing harness addon, then runs
 Vitest, which boots WyrdTestServer IN-PROCESS against the repository-managed Postgres,
-seeds a tenant, mints a key, and drives @wyrd/sdk against it, tearing down via shutdown()
+seeds a tenant, mints a key, and drives wyrd-ai against it, tearing down via shutdown()
 in finally — symmetric with the Python journey.
 """
 dir = "sdks/wyrd-sdk-ts/wyrd"

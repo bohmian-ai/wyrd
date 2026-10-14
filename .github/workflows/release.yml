@@ -277,8 +277,8 @@ jobs:
       - name: Install and smoke-test
         shell: bash
         run: |
-          pip install wyrd --no-deps --no-index --force-reinstall --find-links dist
-          python -c "import wyrd; from importlib.metadata import version; print(version('wyrd'))"
+          pip install wyrd-ai --no-deps --no-index --force-reinstall --find-links dist
+          python -c "import wyrd; from importlib.metadata import version; print(version('wyrd-ai'))"
 
   publish-pypi:
     name: publish python
@@ -323,10 +323,13 @@ jobs:
 
       - run: twine check --strict dist/*.whl dist/*.tar.gz
 
-      - run: twine upload dist/*.whl dist/*.tar.gz
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+      # PyPI trusted publishing: the action exchanges this job's OIDC token,
+      # so wyrd-ai names release.yml and the release environment on pypi.org.
+      - run: mkdir upload && cp dist/*.whl dist/*.tar.gz upload/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: upload/
 
   # ── TypeScript SDK + napi platform addons ────────────────────────────────
 
@@ -396,8 +399,8 @@ jobs:
           cp "$addon" "dist/addon/wyrd.${{ matrix.package }}.node"
           npm pack ./dist/addon --pack-destination "$PWD/dist" --json
           npm pack ./sdks/wyrd-sdk-ts/wyrd --pack-destination "$PWD/dist" --json
-          test -f "dist/wyrd-sdk-0.0.1.tgz"
-          test -f "dist/wyrd-sdk-${{ matrix.package }}-0.0.1.tgz"
+          test -f "dist/wyrd-ai-0.0.1.tgz"
+          test -f "dist/wyrd-ai-${{ matrix.package }}-0.0.1.tgz"
 
       - name: Install and smoke-test native package
         shell: bash
@@ -405,8 +408,8 @@ jobs:
           smoke=$(mktemp -d)
           trap 'rm -rf "$smoke"' EXIT
           printf '{"type":"module","private":true}\n' > "$smoke/package.json"
-          root_tgz=$(realpath "dist/wyrd-sdk-0.0.1.tgz")
-          addon_tgz=$(realpath "dist/wyrd-sdk-${{ matrix.package }}-0.0.1.tgz")
+          root_tgz=$(realpath "dist/wyrd-ai-0.0.1.tgz")
+          addon_tgz=$(realpath "dist/wyrd-ai-${{ matrix.package }}-0.0.1.tgz")
           # Omit the other platform optional dependencies; install the exact
           # addon built on this runner explicitly below.
           npm install --ignore-scripts --no-audit --no-fund --omit=optional \
@@ -414,16 +417,69 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund --package-lock=false \
             "$addon_tgz" --prefix "$smoke"
           (cd "$smoke" && node --input-type=module -e '
-            import { WyrdClient } from "@wyrd/sdk";
+            import { WyrdClient } from "wyrd-ai";
             const client = new WyrdClient("http://127.0.0.1:1", "release-smoke-token");
             if (!(client instanceof WyrdClient)) throw new Error("WyrdClient construction failed");
           ')
 
+      - name: Record tested package digests
+        shell: bash
+        run: (cd dist && shasum -a 256 ./*.tgz | sed 's|  \./|  |' > SHA256SUMS.typescript_${{ matrix.package }})
+
       - uses: actions/upload-artifact@v4
         with:
           name: typescript-${{ matrix.package }}
-          path: dist/*.tgz
+          path: |
+            dist/*.tgz
+            dist/SHA256SUMS.*
           retention-days: 1
+
+  # Every runner packs the same root facade; the x64 Linux one is published
+  # after the four platform addons it optionally depends on.
+  publish-npm:
+    name: publish typescript
+    if: github.event_name == 'release'
+    needs: [qualify, release-commit, build-typescript]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify version matches release tag
+        run: test "v$(node -p 'require("./sdks/wyrd-sdk-ts/wyrd/package.json").version')" = "${{ github.ref_name }}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: typescript-*
+          path: dist
+
+      - name: Verify the tested package bytes
+        run: for dir in dist/typescript-*; do bash .github/scripts/verify-release-artifacts.sh "$dir"; done
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/typescript-*/*.tgz
+
+      # npm trusted publishing authenticates with this job's OIDC token and
+      # needs npm 11.5.1 or newer; each package names release.yml and the
+      # release environment as its trusted publisher on npmjs.com.
+      - run: npm install -g npm@latest
+
+      - name: Publish addons, then the root package
+        run: |
+          for addon in dist/typescript-*/wyrd-ai-*-*.tgz; do
+            npm publish "$addon" --access public
+          done
+          npm publish dist/typescript-linux-x64-gnu/wyrd-ai-0.0.1.tgz --access public
 
   # ── Server binary + Docker ─────────────────────────────────────────────────
 
@@ -465,8 +521,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
           - os: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
@@ -667,7 +721,7 @@ jobs:
       # release-plz publishes the crates named in release-plz.toml.
       - name: Package and record published crates
         run: |
-          cargo package --locked --no-verify -p wyrd-spec
+          cargo package --locked --no-verify $(python3 -c 'import tomllib; print(" ".join("-p " + p["name"] for p in tomllib.load(open("release-plz.toml", "rb"))["package"] if p.get("publish")))')
           mkdir -p dist
           cp target/package/*.crate dist/
           (cd dist && shasum -a 256 ./*.crate | sed 's|  \./|  |' > SHA256SUMS.rust-crates)
@@ -715,7 +769,7 @@ jobs:
       - name: Verify the tested crate bytes
         run: |
           bash .github/scripts/verify-release-artifacts.sh dist
-          cargo package --locked --no-verify -p wyrd-spec
+          cargo package --locked --no-verify $(python3 -c 'import tomllib; print(" ".join("-p " + p["name"] for p in tomllib.load(open("release-plz.toml", "rb"))["package"] if p.get("publish")))')
           (cd target/package && sha256sum --check --strict ../../dist/SHA256SUMS.rust-crates)
 
       - uses: actions/attest-build-provenance@v2

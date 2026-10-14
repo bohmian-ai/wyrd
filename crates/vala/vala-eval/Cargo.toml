@@ -6,7 +6,6 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
-publish = false
 description = "In-memory eval engine: DAG-stage execution, operator runtime, scoring, aggregation, and comparison over the wyrd-spec eval contract."
 
 [lib]

@@ -11,7 +11,7 @@ import { z } from "zod";
 import type { NativeWyrdTestServer } from "@wyrd/testing";
 import { expect, vi } from "vitest";
 
-import { Bifrost, TableConfig, WyrdError } from "@wyrd/sdk";
+import { Bifrost, TableConfig, WyrdError } from "wyrd-ai";
 
 import { serverTest } from "../support/server.js";
 

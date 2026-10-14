@@ -3,9 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
-use wyrd_sdk::bifrost::QueryParam;
-use wyrd_sdk::state::WyrdState;
-use wyrd_sdk::{Bifrost, QueueConfig, SessionId, WyrdClient};
+use wyrd_ai::bifrost::QueryParam;
+use wyrd_ai::state::WyrdState;
+use wyrd_ai::{Bifrost, QueueConfig, SessionId, WyrdClient};
 
 use crate::support::{Deployment, hydrate, register};
 

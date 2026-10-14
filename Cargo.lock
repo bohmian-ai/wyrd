@@ -261,7 +261,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 [[package]]
 name = "arrow"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -281,7 +281,7 @@ dependencies = [
 [[package]]
 name = "arrow-arith"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -294,7 +294,7 @@ dependencies = [
 [[package]]
 name = "arrow-array"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "ahash",
  "arrow-buffer",
@@ -312,7 +312,7 @@ dependencies = [
 [[package]]
 name = "arrow-buffer"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "bytes",
  "half",
@@ -323,7 +323,7 @@ dependencies = [
 [[package]]
 name = "arrow-cast"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -344,7 +344,7 @@ dependencies = [
 [[package]]
 name = "arrow-cmp"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -354,7 +354,7 @@ dependencies = [
 [[package]]
 name = "arrow-csv"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -368,7 +368,7 @@ dependencies = [
 [[package]]
 name = "arrow-data"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -380,7 +380,7 @@ dependencies = [
 [[package]]
 name = "arrow-flight"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -400,7 +400,7 @@ dependencies = [
 [[package]]
 name = "arrow-ipc"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -415,7 +415,7 @@ dependencies = [
 [[package]]
 name = "arrow-json"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -439,7 +439,7 @@ dependencies = [
 [[package]]
 name = "arrow-ord"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -452,7 +452,7 @@ dependencies = [
 [[package]]
 name = "arrow-row"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -464,7 +464,7 @@ dependencies = [
 [[package]]
 name = "arrow-schema"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "serde_core",
  "serde_json",
@@ -473,7 +473,7 @@ dependencies = [
 [[package]]
 name = "arrow-select"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -487,7 +487,7 @@ dependencies = [
 [[package]]
 name = "arrow-string"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -926,6 +926,48 @@ checksum = "f781dba93de3a5ef6dc5b17c9958b208f6f3f021623b360fb605ea51ce443f10"
 dependencies = [
  "serde",
  "serde-big-array",
+]
+
+[[package]]
+name = "bohmian-parquet-variant"
+version = "60.0.0"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
+dependencies = [
+ "arrow-schema",
+ "chrono",
+ "half",
+ "indexmap 2.14.0",
+ "simdutf8",
+ "uuid",
+]
+
+[[package]]
+name = "bohmian-parquet-variant-compute"
+version = "60.0.0"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "bohmian-parquet-variant",
+ "bohmian-parquet-variant-json",
+ "chrono",
+ "half",
+ "indexmap 2.14.0",
+ "num-traits",
+ "uuid",
+]
+
+[[package]]
+name = "bohmian-parquet-variant-json"
+version = "60.0.0"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
+dependencies = [
+ "arrow-schema",
+ "base64 0.23.1",
+ "bohmian-parquet-variant",
+ "chrono",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -1818,7 +1860,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "datafusion"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -1871,7 +1913,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1895,7 +1937,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog-listing"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1918,11 +1960,12 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "arrow-ipc",
  "arrow-schema",
+ "bohmian-parquet-variant-compute",
  "chrono",
  "foldhash 0.2.0",
  "half",
@@ -1934,8 +1977,6 @@ dependencies = [
  "num-traits",
  "object_store",
  "parquet",
- "parquet-variant",
- "parquet-variant-compute",
  "recursive",
  "sqlparser",
  "tokio",
@@ -1946,7 +1987,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "futures",
  "log",
@@ -1956,7 +1997,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "async-compression",
@@ -1992,7 +2033,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-arrow"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -2016,7 +2057,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-csv"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2039,7 +2080,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-json"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2062,7 +2103,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-parquet"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2131,12 +2172,12 @@ dependencies = [
 [[package]]
 name = "datafusion-doc"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 
 [[package]]
 name = "datafusion-execution"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -2161,7 +2202,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2185,7 +2226,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr-common"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2196,7 +2237,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -2227,7 +2268,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "arrow-select",
@@ -2249,7 +2290,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate-common"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2260,7 +2301,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-nested"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -2284,7 +2325,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-table"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2299,22 +2340,22 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-variant"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
+ "bohmian-parquet-variant",
+ "bohmian-parquet-variant-compute",
+ "bohmian-parquet-variant-json",
  "datafusion-common",
  "datafusion-expr",
  "datafusion-expr-common",
- "parquet-variant",
- "parquet-variant-compute",
- "parquet-variant-json",
  "serde_json",
 ]
 
 [[package]]
 name = "datafusion-functions-window"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2330,7 +2371,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window-common"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -2339,7 +2380,7 @@ dependencies = [
 [[package]]
 name = "datafusion-macros"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "datafusion-doc",
  "quote",
@@ -2349,7 +2390,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "chrono",
@@ -2368,7 +2409,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2392,7 +2433,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-adapter"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2406,7 +2447,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-common"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "chrono",
@@ -2424,7 +2465,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-optimizer"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2443,7 +2484,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "arrow-data",
@@ -2480,7 +2521,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "datafusion-catalog",
@@ -2506,7 +2547,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto-common"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2516,7 +2557,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto-models"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "datafusion-common",
  "datafusion-proto-common",
@@ -2526,7 +2567,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pruning"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2541,7 +2582,7 @@ dependencies = [
 [[package]]
 name = "datafusion-session"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -2556,7 +2597,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=2183432dd327d19041f9514250ed151798a08d9c#2183432dd327d19041f9514250ed151798a08d9c"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -5132,7 +5173,7 @@ dependencies = [
 [[package]]
 name = "parquet"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=3978b6dadde458809497d9084464a2d2615db054#3978b6dadde458809497d9084464a2d2615db054"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -5142,6 +5183,8 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "base64 0.23.1",
+ "bohmian-parquet-variant",
+ "bohmian-parquet-variant-compute",
  "brotli 9.0.0",
  "bytes",
  "chrono",
@@ -5154,8 +5197,6 @@ dependencies = [
  "num-integer",
  "num-traits",
  "object_store",
- "parquet-variant",
- "parquet-variant-compute",
  "ring",
  "seq-macro",
  "simdutf8",
@@ -5163,48 +5204,6 @@ dependencies = [
  "tokio",
  "twox-hash",
  "zstd 0.14.0",
-]
-
-[[package]]
-name = "parquet-variant"
-version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
-dependencies = [
- "arrow-schema",
- "chrono",
- "half",
- "indexmap 2.14.0",
- "simdutf8",
- "uuid",
-]
-
-[[package]]
-name = "parquet-variant-compute"
-version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
-dependencies = [
- "arrow",
- "arrow-schema",
- "chrono",
- "half",
- "indexmap 2.14.0",
- "num-traits",
- "parquet-variant",
- "parquet-variant-json",
- "uuid",
-]
-
-[[package]]
-name = "parquet-variant-json"
-version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=e0f604e20f76a1f55da0970c9269ecb9b2dc1337#e0f604e20f76a1f55da0970c9269ecb9b2dc1337"
-dependencies = [
- "arrow-schema",
- "base64 0.23.1",
- "chrono",
- "parquet-variant",
- "serde_json",
- "uuid",
 ]
 
 [[package]]
@@ -6978,173 +6977,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
-name = "skald-agent"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "chrono",
- "futures",
- "pyo3",
- "serde",
- "serde_json",
- "serde_yaml",
- "skald-prompt",
- "skald-providers",
- "skald-runtime",
- "skald-spec",
- "skald-tool",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
- "workspace-hack",
- "wyrd-runtime",
- "wyrd-spec",
- "wyrd-telemetry",
- "wyrd-utils",
-]
-
-[[package]]
-name = "skald-cache"
-version = "0.0.1"
-dependencies = [
- "mini-moka",
- "serde",
- "serde_json",
- "skald-spec",
- "workspace-hack",
-]
-
-[[package]]
-name = "skald-prompt"
-version = "0.0.1"
-dependencies = [
- "base64 0.22.1",
- "pyo3",
- "serde",
- "serde_json",
- "skald-spec",
- "thiserror 2.0.18",
- "workspace-hack",
- "wyrd-interfaces",
- "wyrd-spec",
- "wyrd-utils",
-]
-
-[[package]]
-name = "skald-providers"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "httpdate",
- "insta",
- "jsonwebtoken",
- "rand 0.9.5",
- "rcgen",
- "reqwest 0.13.4",
- "rustls",
- "secrecy",
- "serde",
- "serde_json",
- "serde_yaml",
- "skald-spec",
- "temp-env",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "urlencoding",
- "wiremock",
- "workspace-hack",
- "wyrd-tls",
-]
-
-[[package]]
-name = "skald-runtime"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "pyo3",
- "serde_json",
- "skald-cache",
- "skald-providers",
- "skald-spec",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "workspace-hack",
-]
-
-[[package]]
-name = "skald-spec"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "insta",
- "regex",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 2.0.18",
- "workspace-hack",
-]
-
-[[package]]
-name = "skald-tool"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "pyo3",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "skald-spec",
- "thiserror 2.0.18",
- "tokio",
- "workspace-hack",
- "wyrd-runtime",
- "wyrd-spec",
- "wyrd-utils",
-]
-
-[[package]]
-name = "skald-workflow"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "chrono",
- "futures-util",
- "http",
- "jsonschema",
- "pyo3",
- "secrecy",
- "serde",
- "serde_json",
- "serde_yaml",
- "skald-agent",
- "skald-prompt",
- "skald-providers",
- "skald-runtime",
- "skald-spec",
- "skald-tool",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
- "wiremock",
- "workspace-hack",
- "wyrd-spec",
- "wyrd-telemetry",
- "wyrd-utils",
-]
-
-[[package]]
 name = "skeptic"
 version = "0.13.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8557,6 +8389,8 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
+ "bohmian-parquet-variant",
+ "bohmian-parquet-variant-compute",
  "bytes",
  "chrono",
  "crc32c",
@@ -8578,8 +8412,6 @@ dependencies = [
  "num-traits",
  "object_store",
  "parquet",
- "parquet-variant",
- "parquet-variant-compute",
  "pin-project",
  "prost",
  "rand 0.8.7",
@@ -8649,12 +8481,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
- "skald-agent",
- "skald-prompt",
- "skald-providers",
- "skald-runtime",
- "skald-spec",
- "skald-workflow",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -8663,6 +8489,12 @@ dependencies = [
  "workspace-hack",
  "wyrd-error-derive",
  "wyrd-semver",
+ "wyrd-skald-agent",
+ "wyrd-skald-prompt",
+ "wyrd-skald-providers",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-workflow",
  "wyrd-spec",
  "wyrd-utils",
 ]
@@ -9404,15 +9236,45 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
- "skald-agent",
- "skald-prompt",
- "skald-runtime",
- "skald-spec",
- "skald-tool",
- "skald-workflow",
  "tokio",
  "workspace-hack",
+ "wyrd-skald-agent",
+ "wyrd-skald-prompt",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-tool",
+ "wyrd-skald-workflow",
  "wyrd-spec",
+]
+
+[[package]]
+name = "wyrd-ai"
+version = "0.0.1"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "chrono",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "reqwest 0.13.4",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "wiremock",
+ "workspace-hack",
+ "wyrd-ai",
+ "wyrd-auth-verify",
+ "wyrd-cli",
+ "wyrd-client",
+ "wyrd-spec",
+ "wyrd-testing",
 ]
 
 [[package]]
@@ -9543,8 +9405,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "skald-prompt",
- "skald-spec",
  "tempfile",
  "tokio",
  "workspace-hack",
@@ -9552,6 +9412,8 @@ dependencies = [
  "wyrd-interfaces",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-skald-prompt",
+ "wyrd-skald-spec",
  "wyrd-spec",
  "wyrd-utils",
 ]
@@ -9636,13 +9498,6 @@ dependencies = [
  "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
- "skald-agent",
- "skald-prompt",
- "skald-providers",
- "skald-runtime",
- "skald-spec",
- "skald-tool",
- "skald-workflow",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -9662,6 +9517,13 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-skald-agent",
+ "wyrd-skald-prompt",
+ "wyrd-skald-providers",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-tool",
+ "wyrd-skald-workflow",
  "wyrd-spec",
  "wyrd-testing",
  "wyrd-tls",
@@ -9743,8 +9605,6 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "skald-providers",
- "skald-spec",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -9755,6 +9615,8 @@ dependencies = [
  "wiremock",
  "workspace-hack",
  "wyrd-crypt",
+ "wyrd-skald-providers",
+ "wyrd-skald-spec",
  "wyrd-spec",
  "wyrd-tls",
  "wyrd-utils",
@@ -9833,10 +9695,10 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "async-trait",
+ "bohmian-parquet-variant",
+ "bohmian-parquet-variant-compute",
+ "bohmian-parquet-variant-json",
  "futures-util",
- "parquet-variant",
- "parquet-variant-compute",
- "parquet-variant-json",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -9876,18 +9738,18 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
- "skald-agent",
- "skald-prompt",
- "skald-runtime",
- "skald-spec",
- "skald-tool",
- "skald-workflow",
  "tempfile",
  "tokio",
  "tracing",
  "workspace-hack",
  "wyrd",
- "wyrd-sdk-rust",
+ "wyrd-ai",
+ "wyrd-skald-agent",
+ "wyrd-skald-prompt",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-tool",
+ "wyrd-skald-workflow",
  "wyrd-spec",
 ]
 
@@ -9903,11 +9765,6 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "skald-agent",
- "skald-prompt",
- "skald-runtime",
- "skald-tool",
- "skald-workflow",
  "tempfile",
  "tracing",
  "url",
@@ -9921,40 +9778,15 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-skald-agent",
+ "wyrd-skald-prompt",
+ "wyrd-skald-runtime",
+ "wyrd-skald-tool",
+ "wyrd-skald-workflow",
  "wyrd-spec",
  "wyrd-testing",
  "wyrd-types",
  "wyrd-utils",
-]
-
-[[package]]
-name = "wyrd-sdk-rust"
-version = "0.0.1"
-dependencies = [
- "arrow",
- "async-trait",
- "chrono",
- "opentelemetry",
- "opentelemetry-http",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "reqwest 0.13.4",
- "secrecy",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "wiremock",
- "workspace-hack",
- "wyrd-auth-verify",
- "wyrd-cli",
- "wyrd-client",
- "wyrd-sdk-rust",
- "wyrd-spec",
- "wyrd-testing",
 ]
 
 [[package]]
@@ -10055,12 +9887,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "shellexpand",
- "skald-prompt",
- "skald-providers",
- "skald-runtime",
- "skald-spec",
- "skald-tool",
- "skald-workflow",
  "sqlx 0.9.0",
  "subtle",
  "temp-env",
@@ -10096,6 +9922,12 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-skald-prompt",
+ "wyrd-skald-providers",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-tool",
+ "wyrd-skald-workflow",
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-storage",
@@ -10107,6 +9939,173 @@ dependencies = [
  "wyrd-utils",
  "wyrd-vault",
  "zeroize",
+]
+
+[[package]]
+name = "wyrd-skald-agent"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "pyo3",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "workspace-hack",
+ "wyrd-runtime",
+ "wyrd-skald-prompt",
+ "wyrd-skald-providers",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-tool",
+ "wyrd-spec",
+ "wyrd-telemetry",
+ "wyrd-utils",
+]
+
+[[package]]
+name = "wyrd-skald-cache"
+version = "0.0.1"
+dependencies = [
+ "mini-moka",
+ "serde",
+ "serde_json",
+ "workspace-hack",
+ "wyrd-skald-spec",
+]
+
+[[package]]
+name = "wyrd-skald-prompt"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "pyo3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "workspace-hack",
+ "wyrd-interfaces",
+ "wyrd-skald-spec",
+ "wyrd-spec",
+ "wyrd-utils",
+]
+
+[[package]]
+name = "wyrd-skald-providers"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "httpdate",
+ "insta",
+ "jsonwebtoken",
+ "rand 0.9.5",
+ "rcgen",
+ "reqwest 0.13.4",
+ "rustls",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "urlencoding",
+ "wiremock",
+ "workspace-hack",
+ "wyrd-skald-spec",
+ "wyrd-tls",
+]
+
+[[package]]
+name = "wyrd-skald-runtime"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "pyo3",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "workspace-hack",
+ "wyrd-skald-cache",
+ "wyrd-skald-providers",
+ "wyrd-skald-spec",
+]
+
+[[package]]
+name = "wyrd-skald-spec"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "insta",
+ "regex",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "workspace-hack",
+]
+
+[[package]]
+name = "wyrd-skald-tool"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "pyo3",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "workspace-hack",
+ "wyrd-runtime",
+ "wyrd-skald-spec",
+ "wyrd-spec",
+ "wyrd-utils",
+]
+
+[[package]]
+name = "wyrd-skald-workflow"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures-util",
+ "http",
+ "jsonschema",
+ "pyo3",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+ "workspace-hack",
+ "wyrd-skald-agent",
+ "wyrd-skald-prompt",
+ "wyrd-skald-providers",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
+ "wyrd-skald-tool",
+ "wyrd-spec",
+ "wyrd-telemetry",
+ "wyrd-utils",
 ]
 
 [[package]]
@@ -10130,7 +10129,6 @@ dependencies = [
  "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
- "skald-spec",
  "strum",
  "thiserror 2.0.18",
  "url",
@@ -10139,6 +10137,7 @@ dependencies = [
  "workspace-hack",
  "wyrd-error-derive",
  "wyrd-semver",
+ "wyrd-skald-spec",
 ]
 
 [[package]]
@@ -10232,6 +10231,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bohmian-parquet-variant-compute",
  "bytes",
  "chrono",
  "clap",
@@ -10254,7 +10254,6 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "parquet",
- "parquet-variant-compute",
  "rand 0.9.5",
  "rcgen",
  "reqwest 0.13.4",
@@ -10265,10 +10264,6 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2 0.10.9",
- "skald-prompt",
- "skald-providers",
- "skald-runtime",
- "skald-spec",
  "sqlx 0.9.0",
  "sysinfo",
  "tempfile",
@@ -10299,6 +10294,10 @@ dependencies = [
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-server",
+ "wyrd-skald-prompt",
+ "wyrd-skald-providers",
+ "wyrd-skald-runtime",
+ "wyrd-skald-spec",
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-storage",
@@ -10349,8 +10348,8 @@ name = "wyrd-types"
 version = "0.0.1"
 dependencies = [
  "arrow-schema",
+ "bohmian-parquet-variant-compute",
  "chrono",
- "parquet-variant-compute",
  "schemars 0.8.22",
  "serde",
  "serde_json",

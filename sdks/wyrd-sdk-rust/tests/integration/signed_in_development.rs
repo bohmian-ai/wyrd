@@ -4,10 +4,10 @@
 
 use std::time::Duration;
 
-use wyrd_sdk::bifrost::QueryParam;
-use wyrd_sdk::config::ClientConfig;
-use wyrd_sdk::environment::Environment;
-use wyrd_sdk::{Bifrost, GlobalConfig, WyrdClient};
+use wyrd_ai::bifrost::QueryParam;
+use wyrd_ai::config::ClientConfig;
+use wyrd_ai::environment::Environment;
+use wyrd_ai::{Bifrost, GlobalConfig, WyrdClient};
 use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso};
 use wyrd_testing::server::WyrdTestServer;
 

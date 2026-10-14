@@ -2,7 +2,7 @@
 // `operator_connections` story. Not mirrored.
 import { expect, vi } from "vitest";
 
-import { OperatorConnections } from "@wyrd/sdk";
+import { OperatorConnections } from "wyrd-ai";
 
 import { serverTest } from "../support/server.js";
 

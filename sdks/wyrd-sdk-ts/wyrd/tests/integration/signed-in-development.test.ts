@@ -5,7 +5,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 import { expect, vi } from "vitest";
 
-import { Bifrost, WyrdClient } from "@wyrd/sdk";
+import { Bifrost, WyrdClient } from "wyrd-ai";
 
 import { Attributed, COMPLETION, exportSpan, invoke, work } from "../support/local-development.js";
 import { serverTest } from "../support/server.js";

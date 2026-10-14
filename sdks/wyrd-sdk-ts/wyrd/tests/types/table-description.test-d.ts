@@ -1,7 +1,7 @@
 // Compile-only: `mise run ts:typecheck` fails when an assertion here breaks.
 import { expectTypeOf } from "vitest";
 
-import type { TableDescription } from "@wyrd/sdk";
+import type { TableDescription } from "wyrd-ai";
 
 type DataType = TableDescription["user_fields"][number]["data_type"];
 

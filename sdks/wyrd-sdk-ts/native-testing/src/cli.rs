@@ -21,7 +21,7 @@ use wyrd_spec::ids::ProviderCredentialName;
 /// Explicit client a command runs as: a public `WyrdClient`'s endpoints and
 /// its current access token.
 ///
-/// Native objects cannot cross from `@wyrd/sdk` into this addon, so the
+/// Native objects cannot cross from `wyrd-ai` into this addon, so the
 /// wrapper reads the client's public `serverUrl`, `grpcUrl`, and
 /// `accessToken()` and the command presents that token verbatim.
 #[napi(object)]

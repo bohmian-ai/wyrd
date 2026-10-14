@@ -10,12 +10,12 @@ use std::time::Duration;
 use serde_json::json;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_sdk::gateway::{
+use wyrd_ai::gateway::{
     GatewayOperation, ModelId, ModelRef, ProviderAdapter, ProviderAuth, ProviderDeployment,
     ProviderDeploymentName, ProviderId,
 };
-use wyrd_sdk::state::WyrdState;
-use wyrd_sdk::{Bifrost, Gateway};
+use wyrd_ai::state::WyrdState;
+use wyrd_ai::{Bifrost, Gateway};
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::local_development::configure_gateway;
@@ -114,7 +114,7 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
         panic!("another provider's gpt-4o does not serve the Agent");
     };
     let missing = missing
-        .downcast_ref::<wyrd_sdk::WyrdError>()
+        .downcast_ref::<wyrd_ai::WyrdError>()
         .expect("the refusal is a Wyrd error");
     assert_eq!(missing.code(), "WYRD_GATEWAY_404_MODEL_UNAVAILABLE");
     assert!(

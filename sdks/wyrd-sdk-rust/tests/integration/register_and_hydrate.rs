@@ -1,10 +1,10 @@
 //! A team registers its support desk Service graph and hydrates it to run
 //! offline, through `Cards` and through the in-process CLI.
 
-use wyrd_sdk::cards::{CardKind, CardSelector, Cards, RegistrationReceipt};
-use wyrd_sdk::cli::{self, SelectorArgs};
-use wyrd_sdk::state::WyrdState;
-use wyrd_sdk::{Card, Spec, VerifierImplementation};
+use wyrd_ai::cards::{CardKind, CardSelector, Cards, RegistrationReceipt};
+use wyrd_ai::cli::{self, SelectorArgs};
+use wyrd_ai::state::WyrdState;
+use wyrd_ai::{Card, Spec, VerifierImplementation};
 
 use crate::support::{Deployment, fixture, hydrate, register};
 

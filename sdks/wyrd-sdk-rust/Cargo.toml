@@ -1,5 +1,5 @@
 [package]
-name = "wyrd-sdk-rust"
+name = "wyrd-ai"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
@@ -8,17 +8,13 @@ repository = { workspace = true }
 authors = { workspace = true }
 description = "First-class Rust Wyrd SDK: a thin projection of wyrd-client."
 
-[lib]
-name = "wyrd_sdk"
-path = "src/lib.rs"
-
 [features]
-# Test-only surface: the in-process `wyrd` CLI commands (`wyrd_sdk::cli`),
+# Test-only surface: the in-process `wyrd` CLI commands (`wyrd_ai::cli`),
 # the same implementation the executable renders. Never enabled by a
 # production build.
 testing = ["dep:wyrd-cli"]
 # Stock OpenTelemetry OTLP/HTTP exporters authenticated by a `WyrdClient`,
-# and `start_telemetry`'s `tracing` pipeline over them (`wyrd_sdk::otel`).
+# and `start_telemetry`'s `tracing` pipeline over them (`wyrd_ai::otel`).
 otel = [
     "dep:async-trait",
     "dep:opentelemetry",
@@ -54,8 +50,8 @@ workspace-hack.workspace = true
 # Short access-token lifetimes for the signed-in expiry story.
 chrono = { workspace = true }
 wyrd-auth-verify = { workspace = true }
-# The journeys run the in-process CLI commands, `wyrd_sdk::cli`.
-wyrd-sdk-rust = { path = ".", features = ["otel", "testing"] }
+# The journeys run the in-process CLI commands, `wyrd_ai::cli`.
+wyrd-ai = { path = ".", features = ["otel", "testing"] }
 # Reads the Arrow batches a streamed Bifrost query yields.
 arrow = { workspace = true }
 # The stock OpenTelemetry exporter the OTLP export story configures from

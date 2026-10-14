@@ -7,8 +7,8 @@
 //! Run with:
 //!     cargo run -p wyrd-rust-examples --bin transport_http
 
-use wyrd_sdk::config::ClientConfig;
-use wyrd_sdk::transport::HttpConfig;
+use wyrd_ai::config::ClientConfig;
+use wyrd_ai::transport::HttpConfig;
 
 fn main() -> anyhow::Result<()> {
     let http = HttpConfig {

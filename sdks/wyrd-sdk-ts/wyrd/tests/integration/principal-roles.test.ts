@@ -3,7 +3,7 @@
 // until `editor` is granted, and each change reaches the key's next token.
 import { expect, vi } from "vitest";
 
-import { Bifrost, type CardRef, Cards, Principals, WyrdClient } from "@wyrd/sdk";
+import { Bifrost, type CardRef, Cards, Principals, WyrdClient } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { observedServiceTest as test } from "../support/observed-service.js";

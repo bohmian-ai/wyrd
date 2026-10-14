@@ -1,13 +1,14 @@
 [package]
-name = "skald-spec"
+name = "wyrd-skald-spec"
 version = "0.1.0"
+description = "Native Skald provider types shared end to end: pure Rust, no IO."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 [lib]
+name = "skald_spec"
 path = "src/lib.rs"
 
 [dependencies]

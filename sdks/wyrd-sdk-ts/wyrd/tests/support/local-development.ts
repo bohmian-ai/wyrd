@@ -7,7 +7,7 @@ import OpenAI from "openai";
 import { expect } from "vitest";
 import { z } from "zod";
 
-import { Bifrost, Cards, Gateway, type Run, type WyrdClient, WyrdState, gatewayFetch } from "@wyrd/sdk";
+import { Bifrost, Cards, Gateway, type Run, type WyrdClient, WyrdState, gatewayFetch } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { fixture } from "./server.js";

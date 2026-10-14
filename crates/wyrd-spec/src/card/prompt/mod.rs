@@ -564,8 +564,14 @@ mod prompt_declarative_tests {
         assert_eq!(decoded, redecoded);
     }
 
+    /// An authored Card that omits `apiVersion` deserializes as `wyrd/v1`
+    /// and serializes the value explicitly.
+    ///
+    /// # Panics
+    /// Panics when the Card does not deserialize, carries another version, or
+    /// serializes without an explicit `apiVersion`.
     #[test]
-    fn api_version_is_required() {
+    fn api_version_defaults_to_v1() {
         let yaml = r"
     kind: Prompt
     metadata:
@@ -577,8 +583,13 @@ mod prompt_declarative_tests {
       messages:
         - Hello
     ";
-        let result: Result<Card, _> = format::yaml::from_str(yaml);
-        assert!(result.is_err(), "apiVersion must be explicit");
+        let card: Card = format::yaml::from_str(yaml).expect("omitted apiVersion deserializes");
+        assert_eq!(card.api_version.as_str(), "wyrd/v1");
+        assert!(
+            format::yaml::to_string(&card)
+                .expect("card serializes")
+                .contains("apiVersion: wyrd/v1")
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@
 name = "wyrd-cards"
 version = { workspace = true }
 edition = { workspace = true }
+description = "Wyrd Card implementations."
 license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }

@@ -1,6 +1,6 @@
 import { expect, test, vi } from "vitest";
 
-import { Gateway, WyrdClient, gatewayFetch } from "@wyrd/sdk";
+import { Gateway, WyrdClient, gatewayFetch } from "wyrd-ai";
 
 /** Sits where a number is required, so a serde message would quote it verbatim. */
 const SENTINEL = "sk-live-typescript-surface-sentinel";

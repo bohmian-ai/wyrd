@@ -2,6 +2,7 @@
 name = "wyrd-error-derive"
 version = { workspace = true }
 edition = { workspace = true }
+description = "Proc-macro support for Wyrd error-code enums."
 license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }

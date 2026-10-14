@@ -24,7 +24,7 @@ This page runs a server on your own machine. To run a shared server, or to deplo
 - The `wyrd` CLI, which ships in the Python and TypeScript packages:
 
   ```bash
-  pip install wyrd          # or: npm install @wyrd/sdk
+  pip install wyrd-ai          # or: npm install wyrd-ai
   ```
 
 - PostgreSQL 16 with an ordinary login that owns the `wyrd` database. The server refuses superuser and `BYPASSRLS` logins.

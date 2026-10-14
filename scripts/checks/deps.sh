@@ -45,22 +45,22 @@ deny 'sqlx|tokio-postgres|postgres|deltalake|datafusion|axum|kube|aws-sdk-.*|azu
   -p wyrd-client --all-features
 deny 'sqlx|datafusion|vala-bifrost-redux|vala-sql|axum' -p wyrd-mcp --all-features
 deny 'sqlx|wyrd-sql|vala-sql|wyrd-auth-issue|wyrd-server|wyrd-dev-fixtures' -p wyrd-cli -p wyrd-sdk-python
-deny 'wyrd-sdk-python|wyrd-sdk-ts' -p wyrd-sdk-rust
+deny 'wyrd-sdk-python|wyrd-sdk-ts' -p wyrd-ai
 deny 'wyrd-server' -p wyrd-dev-fixtures --all-features
 
 # Vala's durable layer never reaches the Skald engine; skald-spec arrives only
 # through wyrd-spec.
-deny 'skald-(agent|cache|prompt|providers|runtime|tool|workflow)' -p vala-sql --all-features
+deny 'wyrd-skald-(agent|cache|prompt|providers|runtime|tool|workflow)' -p vala-sql --all-features
 
 # Skald: the prompt boundary is runtime-free; engine crates reach Wyrd only
 # through the locked foundation crates.
-deny 'reqwest|tokio|hyper|axum|sqlx|opentelemetry|skald-runtime|skald-providers|skald-cache|skald-tool' \
-  -p skald-prompt --all-features
+deny 'reqwest|tokio|hyper|axum|sqlx|opentelemetry|wyrd-skald-(runtime|providers|cache|tool)' \
+  -p wyrd-skald-prompt --all-features
 for crate in crates/skald/*/; do
-  crate=$(basename "$crate")
+  crate="wyrd-$(basename "$crate")"
   hits=$(cargo tree --locked -p "$crate" --all-features -e normal --prefix none |
     rg '^(wyrd|vala)-' |
-    rg -v '^(wyrd-spec|wyrd-semver|wyrd-interfaces|wyrd-utils|wyrd-runtime|wyrd-error-derive|wyrd-tls) ' |
+    rg -v '^(wyrd-skald-[a-z]+|wyrd-spec|wyrd-semver|wyrd-interfaces|wyrd-utils|wyrd-runtime|wyrd-error-derive|wyrd-tls) ' |
     sort -u || true)
   if [[ -n "$hits" ]]; then
     echo "FAIL: $crate reaches Wyrd/Vala crates outside the Skald foundation set:"
@@ -71,7 +71,7 @@ done
 
 # Provider-credential mutation stays in the CLI and scoped MCP.
 if rg -q '^[^/]*gateway_credential' sdks/wyrd-sdk-rust/src; then
-  echo 'FAIL: wyrd-sdk-rust projects gateway_credential'
+  echo 'FAIL: wyrd-ai projects gateway_credential'
   exit 1
 fi
 
@@ -81,12 +81,12 @@ fi
 # reached by its production graph. The test-only `testing` feature reaches it
 # through the in-process CLI and is absent from production builds.
 if rg -q 'wyrd-client/internal|^wyrd-client\s*=.*"internal"' sdks/wyrd-sdk-rust/Cargo.toml; then
-  echo 'FAIL: wyrd-sdk-rust enables wyrd-client/internal'
+  echo 'FAIL: wyrd-ai enables wyrd-client/internal'
   exit 1
 fi
-if cargo tree --locked -p wyrd-sdk-rust -e features,normal,build --prefix none |
+if cargo tree --locked -p wyrd-ai -e features,normal,build --prefix none |
   rg -q '^wyrd-client feature "internal"'; then
-  echo 'FAIL: the wyrd-sdk-rust production graph enables wyrd-client/internal'
+  echo 'FAIL: the wyrd-ai production graph enables wyrd-client/internal'
   exit 1
 fi
 

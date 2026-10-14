@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { beforeEach, expect, test, vi } from "vitest";
 
-import { Bifrost, Cards, TableConfig, WyrdClient } from "@wyrd/sdk";
+import { Bifrost, Cards, TableConfig, WyrdClient } from "wyrd-ai";
 
 /** A loopback port nothing listens on. */
 const UNREACHABLE = "http://127.0.0.1:1";

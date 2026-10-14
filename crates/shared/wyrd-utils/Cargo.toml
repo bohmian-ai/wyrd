@@ -2,6 +2,7 @@
 name = "wyrd-utils"
 version = { workspace = true }
 edition = { workspace = true }
+description = "Small shared Wyrd helpers with no server dependencies."
 license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }

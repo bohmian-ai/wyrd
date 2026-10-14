@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { expect, vi } from "vitest";
 
-import { Bifrost, Cards, WyrdClient, WyrdState } from "@wyrd/sdk";
+import { Bifrost, Cards, WyrdClient, WyrdState } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { configureGateway } from "../support/local-development.js";

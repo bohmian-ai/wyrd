@@ -37,7 +37,7 @@ pub struct AuthoredCard {
 /// Raw envelope shape for parsing multi-doc YAML.
 #[derive(Debug, Deserialize, Serialize)]
 struct RawCardEnvelope {
-    #[serde(rename = "apiVersion")]
+    #[serde(rename = "apiVersion", default)]
     api_version: ApiVersion,
     kind: CardKind,
     metadata: Metadata,
@@ -198,10 +198,7 @@ fn parse_single_envelope(path: &Path, raw: serde_yaml::Value) -> Result<Authored
         // Check for missing required envelope fields
         let error_msg = e.to_string();
         if error_msg.contains("apiVersion") || error_msg.contains("api_version") {
-            Diagnostic::invalid_envelope(
-                path.into(),
-                "Missing required field: apiVersion".to_string(),
-            )
+            Diagnostic::invalid_envelope(path.into(), "Invalid field: apiVersion".to_string())
         } else if error_msg.contains("kind") {
             Diagnostic::invalid_envelope(path.into(), "Missing required field: kind".to_string())
         } else if error_msg.contains("metadata") {
@@ -353,36 +350,6 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn parse_rejects_missing_api_version() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            r#"
-kind: Agent
-metadata:
-  name: test
-  space: default
-  version: "1.0.0"
-spec:
-  prompt:
-    kind: Prompt
-    provider: anthropic
-    model: claude-sonnet-4.5
-    messages: []
-"#
-        )
-        .unwrap();
-        file.flush().unwrap();
-
-        let result = parse_file(file.path());
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.diagnostics.len(), 1);
-        assert_eq!(err.diagnostics[0].code, "WYRD_LOADER_400_INVALID_ENVELOPE");
-        assert!(err.diagnostics[0].message.contains("apiVersion"));
-    }
-
-    #[test]
     fn parse_rejects_missing_kind() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(
@@ -464,7 +431,6 @@ spec:
   model: claude-sonnet-4.5
   messages: []
 ---
-apiVersion: wyrd/v1
 kind: Agent
 metadata:
   name: test-agent
@@ -487,6 +453,7 @@ spec:
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].kind, CardKind::Prompt);
         assert_eq!(cards[1].kind, CardKind::Agent);
+        assert_eq!(cards[1].api_version, ApiVersion::v1());
     }
 
     #[test]
@@ -521,11 +488,8 @@ spec:
         writeln!(
             file,
             r#"
+apiVersion: wyrd/v1
 kind: Prompt
-metadata:
-  name: test
-  space: default
-  version: "1.0.0"
 spec:
   provider: anthropic
   model: claude-sonnet-4.5
@@ -550,7 +514,7 @@ spec:
         let err = result.unwrap_err();
         assert_eq!(err.diagnostics.len(), 2);
         // Both docs have violations
-        assert!(err.diagnostics[0].message.contains("apiVersion"));
+        assert!(err.diagnostics[0].message.contains("metadata"));
         assert!(err.diagnostics[1].message.contains("kind"));
     }
 

@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 
-import { WyrdClient } from "@wyrd/sdk";
+import { WyrdClient } from "wyrd-ai";
 
 const CREDENTIAL = "wyrd_test_actor";
 

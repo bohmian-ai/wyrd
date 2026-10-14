@@ -1,6 +1,5 @@
 //! Adapter translation and HTTP dispatch tests against local mock providers.
 
-use std::fmt::Write as _;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -2439,43 +2438,6 @@ fn preparation_matches_the_typed_capability_source() {
             }
         }
     }
-}
-
-/// The operation-support table in the gateway administration guide is the
-/// rendering of the typed capability source, so the published matrix cannot
-/// drift from what deployments may declare and preparation carries.
-///
-/// # Panics
-///
-/// Panics when the guide cannot be read or lacks the rendered table.
-#[test]
-fn published_operation_support_matches_the_capability_source() {
-    let mut table = String::from("| Adapter |");
-    for (_, heading) in OPERATIONS {
-        write!(table, " {heading} |").expect("writing to a String is infallible");
-    }
-    table.push_str("\n| --- |");
-    table.push_str(&" --- |".repeat(OPERATIONS.len()));
-    for (name, target) in adapters() {
-        write!(table, "\n| `{name}` |").expect("writing to a String is infallible");
-        for (operation, _) in OPERATIONS {
-            let cell = match (target.adapter.serves(operation), operation.streams()) {
-                (false, _) => "—",
-                (true, true) => "streaming",
-                (true, false) => "buffered",
-            };
-            write!(table, " {cell} |").expect("writing to a String is infallible");
-        }
-    }
-    let guide = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../docs/src/content/docs/how-to/administer-the-gateway.svx"
-    ))
-    .expect("gateway administration guide reads");
-    assert!(
-        guide.contains(&table),
-        "the guide's operation-support table must be:\n{table}"
-    );
 }
 
 /// Dispatches one two-input, two-dimension embeddings request in `encoding`

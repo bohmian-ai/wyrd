@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { expect, vi } from "vitest";
 
-import { Cards, OperatorConnections, type RegistrationReceipt, WyrdClient, WyrdState } from "@wyrd/sdk";
+import { Cards, OperatorConnections, type RegistrationReceipt, WyrdClient, WyrdState } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { Receiver } from "../support/http-receiver.js";

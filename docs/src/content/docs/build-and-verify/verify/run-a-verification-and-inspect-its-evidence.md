@@ -37,7 +37,7 @@ print(service.status.verification.binding_ids)
 <LangTab lang="rust">
 
 ```rust
-use wyrd_sdk::cards::{CardKind, CardSelector, Cards};
+use wyrd_ai::cards::{CardKind, CardSelector, Cards};
 
 let selector = CardSelector::named(CardKind::Service, "default".parse()?, "support-desk".parse()?)
     .with_version("1.0.0".parse()?);
@@ -49,7 +49,7 @@ let binding_ids = service.status.and_then(|status| status.verification).map(|v| 
 <LangTab lang="typescript">
 
 ```typescript
-import { Cards } from "@wyrd/sdk";
+import { Cards } from "wyrd-ai";
 
 const service = await Cards.connect().get({
   kind: "Service",
@@ -138,7 +138,7 @@ print(result.to_pandas(), features.to_pandas())
 <LangTab lang="rust">
 
 ```rust
-use wyrd_sdk::{Bifrost, bifrost::QueryParam};
+use wyrd_ai::{Bifrost, bifrost::QueryParam};
 
 let bifrost = Bifrost::from_env().await?;
 let id = [QueryParam::String(result_id.to_string())];
@@ -162,7 +162,7 @@ let features = bifrost
 <LangTab lang="typescript">
 
 ```typescript
-import { Bifrost } from "@wyrd/sdk";
+import { Bifrost } from "wyrd-ai";
 
 const bifrost = await Bifrost.connect();
 const result = await bifrost.sql(

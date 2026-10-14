@@ -1,18 +1,18 @@
 //! An operator writes provider credentials with the CLI, and administers
-//! deployments and capture through `wyrd_sdk::Gateway`, which reads
+//! deployments and capture through `wyrd_ai::Gateway`, which reads
 //! credentials only as redacted views.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
-use wyrd_sdk::cli;
-use wyrd_sdk::gateway::{
+use wyrd_ai::cli;
+use wyrd_ai::gateway::{
     CredentialBindingName, GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation,
     GatewayPayloadField, ModelId, ModelRef, ProviderAdapter, ProviderAuth, ProviderCredentialName,
     ProviderCredentialState, ProviderCredentialView, ProviderCredentialWrite,
     ProviderCredentialWriteSource, ProviderDeployment, ProviderDeploymentName, ProviderId,
 };
-use wyrd_sdk::{Gateway, WyrdClient};
+use wyrd_ai::{Gateway, WyrdClient};
 use wyrd_testing::server::TEST_GATEWAY_CREDENTIAL_BINDING;
 
 use crate::support::Deployment;

@@ -14,18 +14,18 @@ use std::path::PathBuf;
 use serde_json::{Map, Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_sdk::cards::{CardKind, CardSelector, RegistrationReceipt};
-use wyrd_sdk::cli;
-use wyrd_sdk::gateway::{
+use wyrd_ai::cards::{CardKind, CardSelector, RegistrationReceipt};
+use wyrd_ai::cli;
+use wyrd_ai::gateway::{
     GatewayOperation, ModelId, ModelRef, ProviderAdapter, ProviderAuth, ProviderCredentialName,
     ProviderCredentialWrite, ProviderCredentialWriteSource, ProviderDeployment,
     ProviderDeploymentName, ProviderId,
 };
-use wyrd_sdk::operator_connections::SecretBearer;
-use wyrd_sdk::{Gateway, Workflow, WorkflowRunStatus, WyrdClient};
+use wyrd_ai::operator_connections::SecretBearer;
+use wyrd_ai::{Gateway, Workflow, WorkflowRunStatus, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
 
-use wyrd_sdk::state::WyrdState;
+use wyrd_ai::state::WyrdState;
 
 use crate::support::{Deployment, hydrate, register};
 

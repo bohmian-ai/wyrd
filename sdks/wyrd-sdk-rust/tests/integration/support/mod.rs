@@ -12,11 +12,11 @@
 use std::path::{Path, PathBuf};
 
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_sdk::WyrdClient;
-use wyrd_sdk::cards::{CardRef, CardSelector, Cards, HydrationMode, RegistrationReceipt};
-use wyrd_sdk::cli;
-use wyrd_sdk::config::ClientConfig;
-use wyrd_sdk::transport::{GrpcConfig, HttpConfig};
+use wyrd_ai::WyrdClient;
+use wyrd_ai::cards::{CardRef, CardSelector, Cards, HydrationMode, RegistrationReceipt};
+use wyrd_ai::cli;
+use wyrd_ai::config::ClientConfig;
+use wyrd_ai::transport::{GrpcConfig, HttpConfig};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 

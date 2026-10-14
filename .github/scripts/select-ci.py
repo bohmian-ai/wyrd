@@ -76,19 +76,17 @@ LANGUAGE_PACKAGES = {"wyrd-sdk-python", "wyrd-sdk-ts", "wyrd-sdk-ts-testing", "w
 # Packages whose ignored Bifrost journeys test:bifrost:gate runs.
 BIFROST_JOURNEY = {"vala-bifrost-redux", "wyrd-client", "wyrd-testing", "wyrd-mcp"}
 # Packages whose ignored gateway journeys test:gateway:gate runs.
-GATEWAY_JOURNEY = {"wyrd-testing", "wyrd-cli", "wyrd-mcp", "wyrd-sdk-rust"}
+GATEWAY_JOURNEY = {"wyrd-testing", "wyrd-cli", "wyrd-mcp", "wyrd-ai"}
 STORAGE_PACKAGES = {"wyrd-storage", "wyrd-server", "wyrd-sql"}
 # The identity journeys drive the server, the CLI, and every SDK's saved login.
 IDENTITY_PACKAGES = {
     "wyrd-auth", "wyrd-auth-check", "wyrd-auth-issue", "wyrd-auth-oidc",
     "wyrd-auth-verify", "wyrd-client", "wyrd-server", "wyrd-testing", "wyrd-cli",
-    "wyrd-sdk-rust", "wyrd-sdk-python", "wyrd-sdk-ts", "wyrd-sdk-ts-testing",
+    "wyrd-ai", "wyrd-sdk-python", "wyrd-sdk-ts", "wyrd-sdk-ts-testing",
 }
 CODEGEN_PACKAGES = {"wyrd-spec", "wyrd-client", "wyrd-sdk-python"}
-RUST_CLIENT_PACKAGES = {"wyrd-client", "wyrd-sdk-rust"}
+RUST_CLIENT_PACKAGES = {"wyrd-client", "wyrd-ai"}
 EXAMPLE_PACKAGES = {"wyrd-rust-examples", "wyrd-cli"}
-# release-plz publishes these crates.
-PUBLISHED_CRATES = {"wyrd-spec"}
 # Each Rust test family is a directory tree; scripts/run-family-tests.sh
 # uses the same prefixes.
 FAMILY_DIRS = (
@@ -138,6 +136,12 @@ def ci_jobs(sel, outputs):
     if sel.flags.get("storage"):
         jobs.append({"name": "storage", "lanes": "test:storage:matrix", "cache": "test"})
     return jobs
+
+
+def published_crates(root):
+    """Return the crates release-plz.toml opts in to crates.io publishing."""
+    with open(os.path.join(root, "release-plz.toml"), "rb") as manifest:
+        return {p["name"] for p in tomllib.load(manifest)["package"] if p.get("publish")}
 
 
 def read_metadata(root):
@@ -320,7 +324,7 @@ def select(paths, root):
         sel.flag("package_typescript", "the TypeScript addon contents are affected")
     if "wyrd-server" in shipped:
         sel.flag("package_server", "the server binary is affected")
-    if shipped & PUBLISHED_CRATES:
+    if shipped & published_crates(root):
         sel.flag("package_crates", "a published crate is affected")
     return sel, outputs
 

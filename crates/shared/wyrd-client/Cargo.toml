@@ -6,7 +6,6 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
-publish = false
 description = "Shared Wyrd client: transport, authentication, and composed client capabilities."
 
 [lib]
@@ -18,7 +17,7 @@ path = "src/lib.rs"
 test-support = []
 # Exposes the low-level surface outside the SDK parity contract: raw requests,
 # writer internals, and bundle introspection. Enabled by the CLI, MCP, testing,
-# and language-binding crates; never by wyrd-sdk-rust (`check:deps`).
+# and language-binding crates; never by wyrd-ai (`check:deps`).
 internal = []
 
 [dependencies]

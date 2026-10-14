@@ -82,7 +82,7 @@ skald-workflow = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing = { workspace = true }
 wyrd = { path = "../../crates/wyrd/wyrd" }
-wyrd-sdk-rust = { path = "../../sdks/wyrd-sdk-rust", features = ["otel"] }
+wyrd-ai = { path = "../../sdks/wyrd-sdk-rust", features = ["otel"] }
 wyrd-spec = { workspace = true }
 
 [dev-dependencies]

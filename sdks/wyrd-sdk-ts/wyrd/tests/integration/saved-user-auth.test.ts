@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { expect, vi } from "vitest";
 
-import { Cards, WyrdClient } from "@wyrd/sdk";
+import { Cards, WyrdClient } from "wyrd-ai";
 
 import { fixture, serverTest } from "../support/server.js";
 

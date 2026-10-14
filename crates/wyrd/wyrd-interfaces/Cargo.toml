@@ -2,6 +2,7 @@
 name = "wyrd-interfaces"
 version = { workspace = true }
 edition = { workspace = true }
+description = "Wyrd data interface implementations."
 license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }

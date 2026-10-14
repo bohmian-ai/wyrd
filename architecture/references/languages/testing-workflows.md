@@ -149,7 +149,7 @@ mise run py:typecheck         # after stubs/exports/typing changes
 ```bash
 mise run ts:build             # napi addon build
 mise run ts:typecheck
-mise run ts:test:unit         # @wyrd/sdk auth-parity + error envelope
+mise run ts:test:unit         # wyrd-ai auth-parity + error envelope
 mise run ts:test:integration  # in-process WyrdTestServer client→server journey
 mise run ts:napi:check        # napi-generated index.d.ts committed
 ```

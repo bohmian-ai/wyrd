@@ -6,8 +6,8 @@ use arrow::array::AsArray;
 use arrow::datatypes::Int64Type;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use wyrd_sdk::bifrost::{Correlation, QueryParam, TableConfig};
-use wyrd_sdk::{Bifrost, QueryTerminalOutcome, WyrdError};
+use wyrd_ai::bifrost::{Correlation, QueryParam, TableConfig};
+use wyrd_ai::{Bifrost, QueryTerminalOutcome, WyrdError};
 
 use crate::support::Deployment;
 

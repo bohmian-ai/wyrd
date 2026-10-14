@@ -2,12 +2,12 @@
 //! Roles through `Principals`; each change reaches the principal's next token.
 
 use serde::Deserialize;
-use wyrd_sdk::cards::{CardRef, Cards};
-use wyrd_sdk::cli;
-use wyrd_sdk::principals::{
+use wyrd_ai::cards::{CardRef, Cards};
+use wyrd_ai::cli;
+use wyrd_ai::principals::{
     PrincipalId, PrincipalKindTag, PrincipalQuery, Principals, RoleAssignment, RoleSource,
 };
-use wyrd_sdk::{Bifrost, WyrdError};
+use wyrd_ai::{Bifrost, WyrdError};
 use wyrd_testing::Bootstrap;
 
 use crate::support::{Deployment, coordinates, fixture, register};

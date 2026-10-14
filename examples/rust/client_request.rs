@@ -12,8 +12,8 @@
 //! (e.g. `WYRD_SERVER_URL` + `WYRD_API_KEY`). Run with:
 //!     cargo run -p wyrd-rust-examples --bin client_request
 
-use wyrd_sdk::WyrdClient;
-use wyrd_sdk::cards::{Cards, ListCardsRequest};
+use wyrd_ai::WyrdClient;
+use wyrd_ai::cards::{Cards, ListCardsRequest};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

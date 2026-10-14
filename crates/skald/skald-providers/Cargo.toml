@@ -1,13 +1,14 @@
 [package]
-name = "skald-providers"
+name = "wyrd-skald-providers"
+description = "Native HTTP provider clients for Skald."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-publish = false
 
 [lib]
+name = "skald_providers"
 path = "src/lib.rs"
 
 [dependencies]

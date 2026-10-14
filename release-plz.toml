@@ -10,12 +10,113 @@ publish = false
 repo_url = "https://github.com/bohmian-ai/wyrd"
 publish_no_verify = true
 
-# Opt-in crates for crates.io publishing.
-# Add a crate here when it has a stable public API intended for external use.
-# wyrd-enterprise and downstream crates depend on these.
+# Opt-in crates for crates.io publishing: the Rust SDK (`wyrd-ai`) and every
+# workspace crate it depends on, since crates.io requires each dependency of a
+# published crate, optional ones included, to be published too. The release
+# workflow and .github/scripts/select-ci.py read this list.
 # Server-tier crates (wyrd-server, wyrd-sql, wyrd-storage, wyrd-testing,
-# wyrd-auth, wyrd-tonic, wyrd-config) stay publish = false permanently.
+# wyrd-auth) stay unpublished.
+
+[[package]]
+name = "vala-eval"
+publish = true
+
+[[package]]
+name = "wyrd-ai"
+publish = true
+
+[[package]]
+name = "wyrd-cards"
+publish = true
+
+[[package]]
+name = "wyrd-cli"
+publish = true
+
+[[package]]
+name = "wyrd-client"
+publish = true
+
+[[package]]
+name = "wyrd-config"
+publish = true
+
+[[package]]
+name = "wyrd-error-derive"
+publish = true
+
+[[package]]
+name = "wyrd-interfaces"
+publish = true
+
+[[package]]
+name = "wyrd-loader"
+publish = true
+
+[[package]]
+name = "wyrd-mcp"
+publish = true
+
+[[package]]
+name = "wyrd-queue"
+publish = true
+
+[[package]]
+name = "wyrd-runtime"
+publish = true
+
+[[package]]
+name = "wyrd-semver"
+publish = true
+
+[[package]]
+name = "wyrd-skald-agent"
+publish = true
+
+[[package]]
+name = "wyrd-skald-cache"
+publish = true
+
+[[package]]
+name = "wyrd-skald-prompt"
+publish = true
+
+[[package]]
+name = "wyrd-skald-providers"
+publish = true
+
+[[package]]
+name = "wyrd-skald-runtime"
+publish = true
+
+[[package]]
+name = "wyrd-skald-spec"
+publish = true
+
+[[package]]
+name = "wyrd-skald-tool"
+publish = true
+
+[[package]]
+name = "wyrd-skald-workflow"
+publish = true
 
 [[package]]
 name = "wyrd-spec"
+publish = true
+
+[[package]]
+name = "wyrd-tls"
+publish = true
+
+[[package]]
+name = "wyrd-tonic"
+publish = true
+
+[[package]]
+name = "wyrd-types"
+publish = true
+
+[[package]]
+name = "wyrd-utils"
 publish = true

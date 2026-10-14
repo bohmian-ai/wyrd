@@ -89,13 +89,13 @@ importers:
       '@opentelemetry/sdk-trace-base':
         specifier: ^2.11.0
         version: 2.11.0(@opentelemetry/api@1.9.1)
-      '@wyrd/sdk':
+      wyrd-ai:
         specifier: workspace:*
         version: link:../../../sdks/wyrd-sdk-ts/wyrd
 
   testing:
     dependencies:
-      '@wyrd/sdk':
+      wyrd-ai:
         specifier: workspace:*
         version: link:../wyrd
 
@@ -123,21 +123,18 @@ importers:
         specifier: 21.1.0
         version: 21.1.0
     optionalDependencies:
-      '@wyrd/sdk-darwin-arm64':
+      wyrd-ai-darwin-arm64:
         specifier: 0.0.1
         version: link:../wyrd-darwin-arm64
-      '@wyrd/sdk-darwin-x64':
+      wyrd-ai-darwin-x64:
         specifier: 0.0.1
         version: link:../wyrd-darwin-x64
-      '@wyrd/sdk-linux-arm64-gnu':
+      wyrd-ai-linux-arm64-gnu:
         specifier: 0.0.1
         version: link:../wyrd-linux-arm64-gnu
-      '@wyrd/sdk-linux-x64-gnu':
+      wyrd-ai-linux-x64-gnu:
         specifier: 0.0.1
         version: link:../wyrd-linux-x64-gnu
-      '@wyrd/sdk-win32-x64-msvc':
-        specifier: 0.0.1
-        version: link:../wyrd-win32-x64-msvc
 
   wyrd-darwin-arm64: {}
 
@@ -146,8 +143,6 @@ importers:
   wyrd-linux-arm64-gnu: {}
 
   wyrd-linux-x64-gnu: {}
-
-  wyrd-win32-x64-msvc: {}
 
 packages:
 

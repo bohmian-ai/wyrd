@@ -5,7 +5,7 @@ import { tableFromIPC } from "apache-arrow";
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
-import { Bifrost, TableConfig } from "@wyrd/sdk";
+import { Bifrost, TableConfig } from "wyrd-ai";
 
 import { serverTest } from "../support/server.js";
 

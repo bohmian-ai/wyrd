@@ -7,7 +7,7 @@ mod support_desk;
 
 use std::time::Duration;
 
-use wyrd_sdk::WyrdClient;
+use wyrd_ai::WyrdClient;
 
 /// Deploys the support desk, serves its requests, waits for the Verifier
 /// verdicts, and prints one passing and one failing explanation.

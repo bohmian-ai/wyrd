@@ -16,7 +16,7 @@ use opentelemetry_otlp::SpanExporter;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use wyrd_sdk::Bifrost;
+use wyrd_ai::Bifrost;
 
 use crate::support::Deployment;
 

@@ -10,7 +10,7 @@ import { RecordBatch, TimestampMicrosecond, makeVector } from "apache-arrow";
 import { z } from "zod";
 import { expect, vi } from "vitest";
 
-import { Bifrost, TableConfig, TimestampLTZ, TimestampNTZ, TimestampTZ } from "@wyrd/sdk";
+import { Bifrost, TableConfig, TimestampLTZ, TimestampNTZ, TimestampTZ } from "wyrd-ai";
 import type { NativeWyrdTestServer } from "@wyrd/testing";
 
 import { serverTest } from "../support/server.js";

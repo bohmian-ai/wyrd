@@ -21,15 +21,12 @@ const target = (() => {
     if (process.arch === "x64") return "darwin-x64";
     if (process.arch === "arm64") return "darwin-arm64";
   }
-  if (process.platform === "win32" && process.arch === "x64") {
-    return "win32-x64-msvc";
-  }
   return undefined;
 })();
 
 if (target === undefined) {
   throw new Error(
-    `@wyrd/sdk does not ship a native addon for ${process.platform}/${process.arch}`,
+    `wyrd-ai does not ship a native addon for ${process.platform}/${process.arch}`,
   );
 }
 
@@ -42,13 +39,13 @@ try {
 }
 if (nativeBinding === undefined) {
   try {
-    nativeBinding = require(`@wyrd/sdk-${target}`);
+    nativeBinding = require(`wyrd-ai-${target}`);
   } catch (error) {
     loadErrors.push(error);
   }
 }
 if (nativeBinding === undefined) {
-  const error = new Error(`Failed to load @wyrd/sdk native addon for ${target}`);
+  const error = new Error(`Failed to load wyrd-ai native addon for ${target}`);
   error.cause = loadErrors.at(-1);
   throw error;
 }

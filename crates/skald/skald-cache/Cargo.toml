@@ -1,13 +1,14 @@
 [package]
-name = "skald-cache"
+name = "wyrd-skald-cache"
+description = "Native prompt cache primitives for Skald provider requests."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-publish = false
 
 [lib]
+name = "skald_cache"
 path = "src/lib.rs"
 
 [dependencies]

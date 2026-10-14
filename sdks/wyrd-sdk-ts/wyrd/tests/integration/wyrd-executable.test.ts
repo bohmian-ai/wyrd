@@ -1,4 +1,4 @@
-// TypeScript's own surface: the `wyrd` executable `@wyrd/sdk` installs. Not one
+// TypeScript's own surface: the `wyrd` executable `wyrd-ai` installs. Not one
 // of the shared stories in `fixtures/README.md`; it alone runs a child process,
 // because running the installed executable is what it proves.
 import { execFile } from "node:child_process";
@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 
 import { expect, vi } from "vitest";
 
-import { Cards, type RegistrationReceipt } from "@wyrd/sdk";
+import { Cards, type RegistrationReceipt } from "wyrd-ai";
 
 import { fixture, serverTest } from "../support/server.js";
 

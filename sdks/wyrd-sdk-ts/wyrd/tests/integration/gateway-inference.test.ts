@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import OpenAI from "openai";
 import { expect, vi } from "vitest";
 
-import { Cards, Gateway, type ProviderDeployment, type RegistrationReceipt, Workflow, WyrdClient } from "@wyrd/sdk";
+import { Cards, Gateway, type ProviderDeployment, type RegistrationReceipt, Workflow, WyrdClient } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { fixture, registered, serverTest } from "../support/server.js";

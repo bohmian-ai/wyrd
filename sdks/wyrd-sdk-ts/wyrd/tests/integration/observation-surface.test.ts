@@ -7,7 +7,7 @@ import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trac
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
-import { Bifrost, TableConfig, WyrdError, WyrdState } from "@wyrd/sdk";
+import { Bifrost, TableConfig, WyrdError, WyrdState } from "wyrd-ai";
 
 import { StorageContextManager } from "../support/otel-context.js";
 import { observedServiceTest as test } from "../support/observed-service.js";

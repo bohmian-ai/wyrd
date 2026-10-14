@@ -2,6 +2,9 @@
 name = "wyrd-tonic"
 version = "0.0.1"
 edition = "2021"
+description = "Wyrd-owned tonic facade with the client-safe tonic surface."
+license = { workspace = true }
+repository = { workspace = true }
 
 # tonic's default features pull `transport` → `server` → `router` → axum. We take
 # only the client-safe surface here so client-tier consumers (wyrd-client) never

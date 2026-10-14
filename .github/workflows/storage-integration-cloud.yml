@@ -19,11 +19,11 @@ on:
   push:
     branches: [main]
 
-# Required repository secrets:
+# Required secrets in the `storage-integration` environment:
 #   AWS_CLOUD_ROLE_ARN          — IAM role ARN for OIDC assumption (e.g. arn:aws:iam::ACCOUNT:role/wyrd-ci-storage)
 #   AWS_CLOUD_BUCKET_NAME       — S3 bucket name (e.g. wyrd-ci-storage)
 #   AWS_CLOUD_REGION            — S3 region (e.g. us-east-1)
-#   GCP_CLOUD_ACCOUNT_JSON_BASE64 — base64 GCS service-account key JSON; object_store
+#   GOOGLE_APPLICATION_CREDENTIALS_JSON — GCS service-account key JSON; object_store
 #                                   reads no workload-identity (external_account)
 #                                   credentials, and V4 URL signing needs the key
 #   GCP_CLOUD_BUCKET_NAME       — GCS bucket name
@@ -48,6 +48,7 @@ jobs:
   s3-cloud:
     name: S3 real-cloud
     runs-on: ubuntu-24.04
+    environment: storage-integration
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -70,6 +71,7 @@ jobs:
   gcs-cloud:
     name: GCS real-cloud
     runs-on: ubuntu-24.04
+    environment: storage-integration
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -81,12 +83,13 @@ jobs:
       - name: Run GCS cloud tests
         env:
           WYRD_STORAGE_URL: gs://${{ secrets.GCP_CLOUD_BUCKET_NAME }}
-          GOOGLE_ACCOUNT_JSON_BASE64: ${{ secrets.GCP_CLOUD_ACCOUNT_JSON_BASE64 }}
+          GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
         run: mise run test:storage:gcs:cloud
 
   azure-cloud:
     name: Azure real-cloud
     runs-on: ubuntu-24.04
+    environment: storage-integration
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4

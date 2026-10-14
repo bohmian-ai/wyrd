@@ -1,15 +1,15 @@
 [package]
-name = "skald-agent"
+name = "wyrd-skald-agent"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
-publish = false
 description = "Live Skald agent: identity, single provider, tools, bounded tool loop."
 
 [lib]
+name = "skald_agent"
 path = "src/lib.rs"
 
 [features]

@@ -9,7 +9,7 @@ import { Field, Int64, RecordBatch, Schema, Struct, TimestampMicrosecond, makeDa
 import { z } from "zod";
 import { expect } from "vitest";
 
-import { Bifrost, TableConfig } from "@wyrd/sdk";
+import { Bifrost, TableConfig } from "wyrd-ai";
 
 import { serverTest } from "../support/server.js";
 

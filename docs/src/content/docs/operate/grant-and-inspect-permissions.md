@@ -52,7 +52,7 @@ print(result["changed"], result["roles"])
 <LangTab lang="rust">
 
 ```rust
-use wyrd_sdk::{Principals, WyrdClient};
+use wyrd_ai::{Principals, WyrdClient};
 
 let principals = Principals::with_client(WyrdClient::from_global()?);
 let result = principals.grant_role(&principal_id, "editor").await?;
@@ -63,7 +63,7 @@ println!("{} {:?}", result.changed, result.roles);
 <LangTab lang="typescript">
 
 ```typescript
-import { Principals } from "@wyrd/sdk";
+import { Principals } from "wyrd-ai";
 
 const principals = Principals.connect();
 const result = await principals.grantRole(principalId, "editor");

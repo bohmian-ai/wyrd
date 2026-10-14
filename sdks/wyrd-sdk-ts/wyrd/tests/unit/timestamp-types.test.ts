@@ -2,7 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 
-import { TableConfig, TimestampLTZ, TimestampNTZ, TimestampTZ } from "@wyrd/sdk";
+import { TableConfig, TimestampLTZ, TimestampNTZ, TimestampTZ } from "wyrd-ai";
 
 const NTZ = "Timestamp<MICROSECOND>";
 const LTZ = "Timestamp<MICROSECOND, +00:00>";

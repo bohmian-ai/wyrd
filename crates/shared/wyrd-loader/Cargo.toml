@@ -6,7 +6,6 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
-publish = false
 description = "Offline Wyrd card authoring loader."
 
 [lib]

@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
-name = "wyrd"
+name = "wyrd-ai"
 version = "0.0.1"
 description = "Python bindings for Wyrd"
 readme = { text = "Python SDK for Wyrd verification and assurance.", content-type = "text/markdown" }

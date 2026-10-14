@@ -1,7 +1,7 @@
 import { TraceFlags, context, trace } from "@opentelemetry/api";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
-import { type EvalMediaRef, Observe } from "@wyrd/sdk";
+import { type EvalMediaRef, Observe } from "wyrd-ai";
 
 import { StorageContextManager } from "../support/otel-context.js";
 

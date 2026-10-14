@@ -95,8 +95,10 @@ impl ProviderAdapter {
     /// This is the typed capability source: deployment validation, request
     /// preparation, and the published operation-support table all agree with
     /// it. `OpenAI`-protocol adapters carry every `OpenAI` operation natively;
-    /// Anthropic and Google adapters carry Chat Completions only. Jev carries
-    /// [`GatewayOperation::SystemOne`] alone, and only Jev carries it.
+    /// Anthropic and Google adapters carry Chat Completions only. Jev alone
+    /// carries [`GatewayOperation::SystemOne`], plus Chat Completions as a
+    /// pass-through whose last user message is the typed Jev request; it
+    /// never streams, embeds, or calls tools.
     #[must_use]
     pub const fn serves(&self, operation: GatewayOperation) -> bool {
         match self {
@@ -106,7 +108,10 @@ impl ProviderAdapter {
             Self::Anthropic | Self::Gemini | Self::Vertex { .. } => {
                 matches!(operation, GatewayOperation::ChatCompletions)
             }
-            Self::Jev => matches!(operation, GatewayOperation::SystemOne),
+            Self::Jev => matches!(
+                operation,
+                GatewayOperation::SystemOne | GatewayOperation::ChatCompletions
+            ),
         }
     }
 }
@@ -451,10 +456,12 @@ mod tests {
         );
         let mut jev = deployment("jev", json!("jev"));
         jev["auth"] = json!({"bearer": {"credential": "jev-key"}});
-        jev["capabilities"] = json!(["system_one"]);
+        jev["capabilities"] = json!(["system_one", "chat_completions"]);
         let jev_valid: ProviderDeployment = serde_json::from_value(jev.clone()).expect("decodes");
-        jev_valid.validate().expect("jev serves systemone");
-        for unserved in ["chat_completions", "embeddings", "responses", "batches"] {
+        jev_valid
+            .validate()
+            .expect("jev serves systemone and pass-through chat");
+        for unserved in ["embeddings", "responses", "batches"] {
             jev["capabilities"] = json!(["system_one", unserved]);
             let jev: ProviderDeployment = serde_json::from_value(jev.clone()).expect("decodes");
             assert!(jev.validate().is_err(), "jev does not serve {unserved}");

@@ -1,11 +1,13 @@
 //! A tenant reaches TypeSafe Jev through the Wyrd Gateway: native
 //! `POST /v1/systemone` callers reach one Jev deployment with typed questions
-//! and get typed answers back, and a Verifier uses that deployment as its LLM
-//! judge through a native Jev Prompt. The local upstream stands in for `api.typesafe.ai` and sees
-//! only the operator's Jev key.
+//! and get typed answers back, OpenAI-shaped callers reach the same deployment
+//! on `/v1/chat/completions` by sending the typed Jev request as their last
+//! user message, and a Verifier uses that deployment as its LLM judge through
+//! a native Jev Prompt. The local upstream stands in for `api.typesafe.ai` and
+//! sees only the operator's Jev key.
 //!
-//! No Jev SDK is a dependency: a Jev caller is a plain JSON POST with a bearer
-//! token, which is the whole of what such a client sends.
+//! No Jev or OpenAI SDK is a dependency: each caller is a plain JSON POST with
+//! a bearer token, which is the whole of what such a client sends.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
@@ -52,6 +54,15 @@ fn answer(noul: f64, tone: &str) -> Value {
     })
 }
 
+/// A Chat Completions call to the Jev model whose last user message is the
+/// typed Jev request about `state`, after an earlier system turn.
+fn chat(state: &str) -> Value {
+    json!({"model": "jev/jev-latest", "messages": [
+        {"role": "system", "content": "Judge the reply."},
+        {"role": "user", "content": json!({"state": state, "questions": questions()}).to_string()},
+    ]})
+}
+
 /// One agent reply, the input `reply-quality` judges.
 #[derive(Serialize)]
 struct Reply {
@@ -64,7 +75,8 @@ struct Reply {
 /// The upstream answers a helpful, polite verdict unless the state names a
 /// scripted case: `Go away` is judged unhelpful and rude, `refused-form` is
 /// refused with 400, `rate-limited` is throttled with 429, `server-error`
-/// answers 500, `overloaded` answers 529, and `bad-key` answers 401.
+/// answers 500, `overloaded` answers 529, and `bad-key` answers 401. Every
+/// refusal body echoes the operator key after `key cred`.
 struct Jev {
     /// The deployment.
     deployment: Deployment,
@@ -75,7 +87,8 @@ struct Jev {
 impl Jev {
     /// Start the upstream and a verification-capable server, write the
     /// `jev-key` credential with the CLI as the administrator, and deploy
-    /// `jev/jev-latest` serving `system_one`, the only operation Jev serves.
+    /// `jev/jev-latest` serving `system_one` and the `chat_completions`
+    /// pass-through.
     ///
     /// # Panics
     /// Panics when a setup step fails.
@@ -92,7 +105,8 @@ impl Jev {
                 .and(path("/v1/systemone"))
                 .and(body_string_contains(needle))
                 .respond_with(
-                    ResponseTemplate::new(status).set_body_json(json!({"detail": "key cred"})),
+                    ResponseTemplate::new(status)
+                        .set_body_json(json!({"detail": format!("key cred {JEV_KEY}")})),
                 )
                 .with_priority(1)
                 .mount(&upstream)
@@ -141,7 +155,10 @@ impl Jev {
                 auth: ProviderAuth::Bearer {
                     credential: ProviderCredentialName::new("jev-key").expect("credential"),
                 },
-                capabilities: BTreeSet::from([GatewayOperation::SystemOne]),
+                capabilities: BTreeSet::from([
+                    GatewayOperation::SystemOne,
+                    GatewayOperation::ChatCompletions,
+                ]),
                 routing_weight: NonZeroU32::MIN,
             })
             .await
@@ -280,62 +297,143 @@ async fn invalid_jev_questions_are_refused_before_jev() {
     jev.deployment.shutdown().await;
 }
 
-/// Chat Completions never reach Jev: Jev serves only `system_one`, so an
-/// OpenAI-shaped call naming the Jev model finds no deployment serving it
-/// and is refused before Jev is called.
+/// A Chat Completions call to the Jev model passes the typed Jev request in
+/// its last user message through to Jev with the operator key and the
+/// deployment's model, and returns a chat completion whose content is Jev's
+/// typed answer as JSON with Jev's usage mapped; ordinary chat text is
+/// refused as an invalid request before Jev is called.
 ///
 /// # Panics
-/// Panics when the call is answered or Jev is reached.
+/// Panics when a step fails or the reply or upstream request differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn chat_completions_never_reach_jev() {
+async fn chat_completions_pass_typed_jev_requests_through() {
     let jev = Jev::start().await;
-    let content = json!({"state": "Thanks!", "questions": questions()}).to_string();
+    let state = "He said \"thanks\".\nAnything else?";
+
+    let (status, reply) = jev.post("/v1/chat/completions", &chat(state)).await;
+
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["object"], "chat.completion");
+    let content = reply["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("the answer is text");
+    assert_eq!(
+        serde_json::from_str::<Value>(content).expect("the content is the answer's JSON"),
+        answer(0.93, "polite")
+    );
+    assert_eq!(
+        (
+            &reply["usage"]["prompt_tokens"],
+            &reply["usage"]["completion_tokens"],
+            &reply["usage"]["total_tokens"]
+        ),
+        (&json!(378), &json!(65), &json!(443))
+    );
+    let received = jev.received().await;
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].0.as_deref(), Some("Bearer jev-operator-key"));
+    assert_eq!(
+        received[0].1,
+        json!({"model": "jev-latest", "state": state, "questions": questions()})
+    );
 
     let (status, reply) = jev
         .post(
             "/v1/chat/completions",
             &json!({"model": "jev/jev-latest",
-                    "messages": [{"role": "user", "content": content}]}),
+                    "messages": [{"role": "user", "content": "Is this reply helpful?"}]}),
         )
         .await;
-
     assert_eq!(
         (status, reply["error"]["code"].as_str()),
-        (404, Some("WYRD_GATEWAY_404_MODEL_UNAVAILABLE")),
+        (400, Some("WYRD_GATEWAY_400_INVALID_REQUEST")),
         "{reply}"
     );
-    assert!(jev.received().await.is_empty(), "Jev was never called");
+    assert_eq!(
+        jev.received().await.len(),
+        1,
+        "ordinary chat never reaches Jev"
+    );
     jev.deployment.shutdown().await;
 }
 
-/// Jev's validation refusal, throttling, server errors, overload, and a
-/// refused key map to stable Wyrd errors that never relay Jev's own body.
+/// Jev refusals on both routes. A validation refusal maps to the stable
+/// invalid-request error and never relays Jev's body; a refused key relays
+/// like every other provider's: the upstream 401 with the operator key
+/// removed, no Wyrd code, and no retry. Neither cools the deployment down.
+/// Throttling is then proven on the Chat Completions route; it cools the one
+/// deployment down for 30 seconds, so the server error and overload that
+/// follow on the native route answer the same stable unavailable error
+/// whether Jev or the cooldown refuses them. Each mapping is pinned per route
+/// by the gateway adapter's unit tests.
 ///
 /// # Panics
-/// Panics when a refusal maps to another status or code, or leaks the body.
+/// Panics when a refusal maps to another status or code, leaks the body or
+/// the key, or a refused key is retried.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn jev_refusals_map_to_stable_errors() {
     let jev = Jev::start().await;
+    let native =
+        |state: &str| json!({"model": "jev-latest", "state": state, "questions": questions()});
 
-    for (state, status, code) in [
-        ("refused-form", 400, "WYRD_GATEWAY_400_INVALID_REQUEST"),
-        ("rate-limited", 429, "WYRD_GATEWAY_429_UPSTREAM_THROTTLED"),
-        ("server-error", 502, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE"),
-        ("overloaded", 502, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE"),
-        ("bad-key", 502, "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE"),
+    for (route, body) in [
+        ("/v1/systemone", native("refused-form")),
+        ("/v1/chat/completions", chat("refused-form")),
     ] {
-        let (answered, reply) = jev
-            .post(
-                "/v1/systemone",
-                &json!({"model": "jev-latest", "state": state, "questions": questions()}),
-            )
-            .await;
+        let (answered, reply) = jev.post(route, &body).await;
+        assert_eq!(
+            (answered, reply["error"]["code"].as_str()),
+            (400, Some("WYRD_GATEWAY_400_INVALID_REQUEST")),
+            "{route}: {reply}"
+        );
+        assert!(!reply.to_string().contains("key cred"), "{reply}");
+    }
+
+    let before = jev.received().await.len();
+    let (answered, reply) = jev.post("/v1/systemone", &native("bad-key")).await;
+    assert_eq!(answered, 401, "{reply}");
+    assert_eq!(
+        reply["detail"], "key cred ",
+        "Jev's body relays without the key"
+    );
+    let (answered, reply) = jev.post("/v1/chat/completions", &chat("bad-key")).await;
+    assert_eq!(answered, 401, "{reply}");
+    assert_eq!(reply["error"]["type"], "authentication_error", "{reply}");
+    assert_eq!(reply["error"]["code"], Value::Null, "no Wyrd code: {reply}");
+    assert!(!reply.to_string().contains(JEV_KEY), "{reply}");
+    assert_eq!(
+        jev.received().await.len(),
+        before + 2,
+        "a refused key is never retried"
+    );
+
+    for (route, body, status, code) in [
+        (
+            "/v1/chat/completions",
+            chat("rate-limited"),
+            429,
+            "WYRD_GATEWAY_429_UPSTREAM_THROTTLED",
+        ),
+        (
+            "/v1/systemone",
+            native("server-error"),
+            502,
+            "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE",
+        ),
+        (
+            "/v1/systemone",
+            native("overloaded"),
+            502,
+            "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE",
+        ),
+    ] {
+        let (answered, reply) = jev.post(route, &body).await;
         assert_eq!(
             (answered, reply["error"]["code"].as_str()),
             (status, Some(code)),
-            "{state}: {reply}"
+            "{route}: {reply}"
         );
         assert!(!reply.to_string().contains("key cred"), "{reply}");
     }

@@ -1,6 +1,6 @@
 ---
 id: SPEC-example-journey-fixes
-revision: 1
+revision: 2
 status: approved
 ---
 
@@ -58,14 +58,25 @@ release.
   dialect and typed body). Prompt variables substitute into the request's
   string fields with the existing render escaping, so any variable value,
   including quotes and newlines, produces a valid request.
-- No Jev path tunnels a JSON document through an OpenAI chat message string,
-  and no raw `serde_json::Value` stands in for the Jev request or response
-  body. The rejected chat-route shim is removed.
-- The gateway serves Jev on its native route with typed validation; tenant
-  credentials, deployments, governance, capture, fallback isolation, and
-  stable error mapping (400/422 invalid request, 429 throttled, other
-  upstream failures unavailable, upstream bodies never relayed) behave as for
-  other providers.
+- No raw `serde_json::Value` stands in for the Jev request or response body,
+  and no Jev path maps a chat conversation onto Jev questions. The rejected
+  chat-route shim (single-message tunnel with an untyped answer) is removed.
+- The gateway serves Jev on its native route (`/v1/systemone`) with typed
+  validation; tenant credentials, deployments, governance, capture, fallback
+  isolation, and stable error mapping behave as for other providers.
+- (r2) The gateway also serves a Jev deployment on the unified route
+  (`/v1/chat/completions`) as a typed pass-through, so stock OpenAI clients can
+  reach it: the text of the last user message is the JSON of the typed Jev
+  request `{state, questions}` and is decoded with the same typed structures;
+  text that does not decode is refused with one typed bad-request error before
+  any provider IO. The typed Jev answer returns serialized as JSON in
+  `choices[0].message.content`, with Jev usage mapped to the completion usage.
+  No schema mapping or chat-to-question translation is added.
+- Upstream error mapping on both routes: 400/422 invalid request, 429
+  throttled, other non-auth upstream failures unavailable, with those upstream
+  bodies never relayed. (r2) An upstream 401 or 403 behaves exactly as for the
+  other providers: the upstream status and body are relayed through the shared
+  refusal path with the credential removed, and are not retried.
 - A Verifier `llm_judge` task can use a Jev Prompt as its judge, and a
   dependent assertion can threshold a typed answer field (for example
   `$.task.judge.parsed.answers.helpful.noul >= 0.5`).
@@ -130,7 +141,9 @@ release.
 - INV-001 Tenant isolation holds on every changed path.
 - INV-002 Provider credentials and keys are never logged or returned.
 - INV-003 Audit stays non-blocking; no new audit failure mode.
-- INV-004 No compatibility aliases for the removed Jev chat shim.
+- INV-004 No compatibility aliases for the removed Jev chat shim; the r2
+  unified-route pass-through is the only chat entry to Jev, and it carries the
+  typed Jev request, not a translation.
 
 ## Acceptance obligations
 
@@ -153,3 +166,7 @@ None.
 ## Revision history
 
 - r1 2026-10-14: initial, from the owner's directive.
+- r2 2026-10-14: owner approval "I approve jev r2" (relayed by the
+  coordinator; the owner should confirm directly). Allows the unified-route
+  Jev pass-through, relays an upstream Jev 401/403 like other providers, and
+  relaxes INV-004 to match.

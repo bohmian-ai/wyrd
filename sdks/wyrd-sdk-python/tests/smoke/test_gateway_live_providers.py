@@ -290,11 +290,13 @@ def test_google_client_reaches_live_gemini() -> None:
 
 @pytest.mark.smoke
 def test_jev_answers_live_typed_questions() -> None:
-    """Real Jev answers one typed question of each form through ``system_one``.
+    """Real Jev answers one typed question of each form on both routes.
 
     The native body is what a Jev client sends to ``POST /v1/systemone``; its
-    state carries quotes and a newline as text. Every answer must come back in
-    Jev's typed form, which proves the request bounds and the typed answer
+    state carries quotes and a newline as text. A stock OpenAI client then
+    sends the same request as the last user message on
+    ``/v1/chat/completions``. Every answer must come back in Jev's typed form,
+    which proves the request bounds, the pass-through, and the typed answer
     decoding against the real provider.
     """
     secret = credential("jev")
@@ -312,10 +314,9 @@ def test_jev_answers_live_typed_questions() -> None:
         },
     }
     state = 'Thank you for waiting; "your refund" has been issued.\nAnything else?'
-    with live_server("jev", secret, deployments=[("jev-latest", ["system_one"])]) as (
-        server,
-        token,
-    ):
+    with live_server(
+        "jev", secret, deployments=[("jev-latest", ["system_one", "chat_completions"])]
+    ) as (server, token):
         native = httpx.post(
             f"{server.base_url}/v1/systemone",
             json={"model": "jev-latest", "state": state, "questions": questions},
@@ -323,10 +324,22 @@ def test_jev_answers_live_typed_questions() -> None:
             timeout=60,
         )
         assert native.status_code == 200, f"jev native call answered {native.status_code}"
-        answers = native.json()["answers"]
-        assert 0.0 <= answers["polite"]["noul"] <= 1.0
-        assert answers["tone"]["choice"] in {"polite", "rude"}
-        assert answers["quality"]["type"] == "score"
+        client = openai.OpenAI(base_url=f"{server.base_url}/v1", api_key=token, max_retries=0)
+        completion = client.chat.completions.create(
+            model="jev/jev-latest",
+            messages=[
+                {"role": "system", "content": "Judge the reply."},
+                {"role": "user", "content": json.dumps({"state": state, "questions": questions})},
+            ],
+        )
+        content = completion.choices[0].message.content
+        assert content is not None
+        assert completion.usage is not None
+        for answer in (native.json(), json.loads(content)):
+            answers = answer["answers"]
+            assert 0.0 <= answers["polite"]["noul"] <= 1.0
+            assert answers["tone"]["choice"] in {"polite", "rude"}
+            assert answers["quality"]["type"] == "score"
 
 
 @contextlib.contextmanager

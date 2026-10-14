@@ -11,3 +11,6 @@ allowBuilds:
   # `@grpc/grpc-js`, which the upstream OTLP/gRPC exporters dial through,
   # pulls in protobufjs; its postinstall generates the CommonJS wrappers.
   protobufjs: true
+# The root package's platform optional dependencies resolve to these workspace
+# directories, never to the registry copies of the same names.
+linkWorkspacePackages: true

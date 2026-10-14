@@ -26,8 +26,10 @@ class GatewayAuth(httpx.Auth, httpx2.Auth):
         ...
 
 GatewayOperation = Literal[
-    "chat_completions", "responses", "embeddings", "images", "audio", "batches"
+    "chat_completions", "responses", "embeddings", "images", "audio", "batches", "system_one"
 ]
+"""``"system_one"`` is Jev's ``POST /v1/systemone`` question answering, served
+only by the ``"jev"`` adapter."""
 ProviderCredentialState = Literal["active", "revoked"]
 GatewayCaptureMode = Literal["disabled", "metadata", "payload"]
 """``"disabled"`` publishes nothing to Bifrost, ``"metadata"`` publishes call
@@ -42,8 +44,8 @@ class ModelRef(TypedDict):
     """One exact provider-native model.
 
     ``provider`` is a lowercase Wyrd name (3 to 64 of ``a-z``, ``0-9``, ``_``,
-    ``-``, starting with a letter); ``openai``, ``anthropic``, ``gemini``, and
-    ``vertex`` are reserved for the built-in adapters. ``model`` is the
+    ``-``, starting with a letter); ``openai``, ``anthropic``, ``gemini``,
+    ``vertex``, and ``jev`` are reserved for the built-in adapters. ``model`` is the
     provider's own identifier, 1 to 255 bytes without control characters, and
     may contain ``/``.
     """
@@ -132,12 +134,18 @@ class OpenAiCompatibleAdapter(TypedDict):
 
     openai_compatible: _OpenAiCompatibleBase
 
-ProviderAdapter = Literal["openai", "anthropic", "gemini"] | VertexAdapter | OpenAiCompatibleAdapter
+ProviderAdapter = (
+    Literal["openai", "anthropic", "gemini", "jev"] | VertexAdapter | OpenAiCompatibleAdapter
+)
 """Upstream protocol family a deployment speaks.
 
-``"openai"``, ``"anthropic"``, and ``"gemini"`` require the provider of the
-same name. OpenAI-protocol adapters serve every operation; the Anthropic,
-Gemini, and Vertex adapters serve ``chat_completions`` only.
+``"openai"``, ``"anthropic"``, ``"gemini"``, and ``"jev"`` require the provider
+of the same name. OpenAI-protocol adapters serve every operation except
+``system_one``; the Anthropic, Gemini, and Vertex adapters serve
+``chat_completions`` only. The Jev adapter serves ``system_one`` and a
+``chat_completions`` projection whose single user message is the JSON text of
+``{"state", "questions"}``. Jev calls carry no usage bound, so a tenant budget
+or token limit refuses them.
 """
 
 class _BearerAuth(TypedDict):

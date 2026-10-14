@@ -11,16 +11,19 @@ use reqwest::header::HeaderName;
 use serde_json::value::{RawValue, to_raw_value};
 use skald_providers::auth::{AnthropicAuth, GoogleApiKeyAuth, GoogleOAuth, OpenAiAuth, VertexAuth};
 use skald_providers::{
-    AnthropicClient, GoogleClient, HttpTransport, MediaAnswer, OpenAiClient, OpenAiMediaRoute,
-    OpenAiRoute, ProviderByteStream, ProviderError, ProviderResult, RetryPolicy, VertexClient,
+    AnthropicClient, GoogleClient, HttpTransport, JevClient, MediaAnswer, OpenAiClient,
+    OpenAiMediaRoute, OpenAiRoute, ProviderByteStream, ProviderError, ProviderResult, RetryPolicy,
+    VertexClient,
 };
 use skald_spec::{ProviderRequest, ProviderResponse};
 use url::Url;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{GatewayOperation, ProviderAdapter, ProviderAuth, ProviderDeployment};
 
 use super::stream::{ChatChunks, Frames, MediaCapture, StreamCapture, relay, relay_media};
 use super::{
-    BatchAction, MediaRequest, Prepared, Wire, complete, faithful_embeddings, prepare, refusal,
+    BatchAction, MediaRequest, Prepared, Wire, complete, faithful_embeddings, openai_error_body,
+    prepare, refusal,
 };
 use crate::credential::ProviderSecret;
 use crate::engine::{
@@ -45,6 +48,8 @@ pub struct BuiltinEndpoints {
     /// Vertex AI base; `None` selects the regional endpoint of each
     /// deployment's location.
     pub vertex: Option<Url>,
+    /// TypeSafe API base, without the `/v1` segment.
+    pub jev: Option<Url>,
 }
 
 /// Provider dispatch through Skald provider clients under an endpoint policy.
@@ -84,7 +89,8 @@ impl HttpProviderDispatch {
     ///
     /// `OpenAI` takes bearer authentication; compatible endpoints take any
     /// style; Anthropic takes its `x-api-key` header; Gemini its
-    /// `x-goog-api-key` header; Vertex a bearer access token. Returns `None`
+    /// `x-goog-api-key` header; Vertex a bearer access token; Jev a bearer API
+    /// key. Returns `None`
     /// for any other combination, a base URL the policy does not admit, a
     /// missing credential, or a credential or header name that is not a valid
     /// header.
@@ -98,6 +104,7 @@ impl HttpProviderDispatch {
             ProviderAdapter::Anthropic => self.endpoints.anthropic.clone(),
             ProviderAdapter::Gemini => self.endpoints.gemini.clone(),
             ProviderAdapter::Vertex { .. } => self.endpoints.vertex.clone(),
+            ProviderAdapter::Jev => self.endpoints.jev.clone(),
             ProviderAdapter::OpenAiCompatible { base_url } => {
                 Some(Url::parse(base_url.as_str()).ok()?)
             }
@@ -183,6 +190,13 @@ impl HttpProviderDispatch {
                     retry,
                 ))
             }
+            (ProviderAdapter::Jev, ProviderAuth::Bearer { .. }) => {
+                Client::Jev(JevClient::with_transport(
+                    JevClient::auth(key()?, base.as_deref()),
+                    self.transport.clone(),
+                    retry,
+                ))
+            }
             _ => return None,
         };
         Some(client)
@@ -199,6 +213,8 @@ enum Client {
     Google(GoogleClient),
     /// Vertex `GenerateContent`.
     Vertex(VertexClient),
+    /// Jev `systemone`.
+    Jev(JevClient),
 }
 
 impl Client {
@@ -222,6 +238,7 @@ impl Client {
             Prepared::Native(body) => to_raw_value(body),
             Prepared::Anthropic(request) => to_raw_value(request),
             Prepared::Google(request) => to_raw_value(request),
+            Prepared::Jev(request) => to_raw_value(request),
         }
         .map_err(|error| ProviderError::decode("gateway", error))?;
         match (self, prepared) {
@@ -349,6 +366,14 @@ impl Client {
                     .send_native(ProviderRequest::GeminiGenerateContent(*request))
                     .await?
             }
+            (Self::Jev(client), Prepared::Native(body)) => {
+                ProviderResponse::RawV1(client.send_raw(&raw(&body)?).await?)
+            }
+            (Self::Jev(client), Prepared::Jev(request)) => {
+                let body = to_raw_value(&request)
+                    .map_err(|error| ProviderError::decode("gateway", error))?;
+                ProviderResponse::RawV1(client.send_raw(&body).await?)
+            }
             (_, _) => return Err(mismatch()),
         };
         Ok(response)
@@ -429,6 +454,63 @@ fn failure(
     };
     AttemptResult::Failed {
         class,
+        usage: AttemptUsage::default(),
+    }
+}
+
+/// Attempt evidence of a failed Jev exchange.
+///
+/// A non-redirect status becomes a gateway-originated `OpenAI` error envelope
+/// with a stable Wyrd code and a fixed message; Jev's own body is never
+/// relayed, so no provider payload or credential reaches the caller.
+/// Validation refusals (400, 422) are invalid requests; rate limiting (429)
+/// is upstream throttling; a rejected credential (401, 403), overload (529),
+/// and every other status are upstream unavailability. Retry follows the
+/// provider status: throttling and server errors may succeed on another
+/// deployment, validation and authentication refusals are never retried.
+/// Other failures map as [`failure`] maps them.
+fn jev_failure(error: ProviderError) -> AttemptResult {
+    let ProviderError::Status { status, .. } = error else {
+        return failure(error, false, None);
+    };
+    if (300..400).contains(&status) {
+        return failure(error, false, None);
+    }
+    let (wyrd, message) = match status {
+        400 | 422 => (
+            WyrdError::GatewayInvalidRequest {
+                message: String::new(),
+                details: serde_json::Value::Null,
+            },
+            "the Jev provider rejected the request as invalid",
+        ),
+        429 => (
+            WyrdError::GatewayUpstreamThrottled {
+                message: String::new(),
+                details: serde_json::Value::Null,
+            },
+            "the Jev provider is rate limiting this deployment",
+        ),
+        401 | 403 => (
+            WyrdError::GatewayUpstreamUnavailable {
+                message: String::new(),
+                details: serde_json::Value::Null,
+            },
+            "the Jev provider rejected the deployment credential",
+        ),
+        _ => (
+            WyrdError::GatewayUpstreamUnavailable {
+                message: String::new(),
+                details: serde_json::Value::Null,
+            },
+            "the Jev provider is overloaded or unavailable",
+        ),
+    };
+    let answered = wyrd.status();
+    AttemptResult::Refused {
+        class: refusal_class(status),
+        status: answered,
+        body: openai_error_body(answered, message, Some(wyrd.code()), None),
         usage: AttemptUsage::default(),
     }
 }
@@ -688,11 +770,14 @@ impl ProviderDispatch for HttpProviderDispatch {
                     code = error.code(),
                     "gateway provider call failed"
                 );
-                return failure(error, translated, attempt.credential);
+                return match wire {
+                    Wire::Jev => jev_failure(error),
+                    _ => failure(error, translated, attempt.credential),
+                };
             }
         };
         let mapped = tracing::info_span!("gateway.translate", direction = "response")
-            .in_scope(|| complete(response, wire, &id, model));
+            .in_scope(|| complete(response, wire, translated, &id, model));
         match mapped {
             Ok((body, usage))
                 if attempt.operation != GatewayOperation::Embeddings

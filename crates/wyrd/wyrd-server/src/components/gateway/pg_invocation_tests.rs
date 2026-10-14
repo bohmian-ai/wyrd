@@ -5351,7 +5351,8 @@ async fn public_ingress_workflow_fallback() {
             openai: Some(openai),
             anthropic: Some(root.clone()),
             gemini: Some(root.clone()),
-            vertex: Some(root),
+            vertex: Some(root.clone()),
+            jev: Some(root),
         },
     )
     .expect("gateway dispatch builds");

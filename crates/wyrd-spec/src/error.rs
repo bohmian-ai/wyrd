@@ -966,6 +966,21 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// The provider rate-limited the call. Distinct from
+    /// [`Self::GatewayLimitExceeded`], which is a Wyrd tenant limit.
+    #[error("[WYRD_GATEWAY_429_UPSTREAM_THROTTLED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GATEWAY_429_UPSTREAM_THROTTLED",
+        status = 429,
+        title = "Gateway upstream throttled",
+        remediation = "Retry with backoff. If throttling persists, a tenant administrator should raise the provider account's rate limit or add a deployment."
+    )]
+    GatewayUpstreamThrottled {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Every eligible upstream attempt failed.
     #[error("[WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE] {message}")]
     #[wyrd_error(
@@ -4041,6 +4056,7 @@ impl WyrdError {
             | Self::GatewayCostUnbounded { message, details }
             | Self::GatewayLimitExceeded { message, details }
             | Self::GatewayBudgetExceeded { message, details }
+            | Self::GatewayUpstreamThrottled { message, details }
             | Self::GatewayUpstreamUnavailable { message, details }
             | Self::GatewayDeadlineExceeded { message, details }
             | Self::AuthVerifyUnavailable { message, details }

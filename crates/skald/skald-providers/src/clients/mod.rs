@@ -4,12 +4,14 @@ pub mod anthropic;
 pub mod embeddings;
 pub mod external;
 pub mod google;
+pub mod jev;
 pub mod openai;
 pub mod vertex;
 
 pub use anthropic::AnthropicClient;
 pub use external::ExternalGatewayClient;
 pub use google::GoogleClient;
+pub use jev::{JEV_BASE_URL, JevClient};
 pub use openai::{
     MediaAnswer, OpenAiBatchRoute, OpenAiClient, OpenAiMediaRoute, OpenAiRoute, UploadContent,
     UploadFile,

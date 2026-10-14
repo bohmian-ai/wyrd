@@ -171,6 +171,7 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1/gateway/payload-objects/{digest}",
         "/v1/chat/completions",
         "/v1/messages",
+        "/v1/systemone",
         "/v1beta/models/{target}",
     ] {
         assert!(paths.contains_key(path), "missing {path}");
@@ -1029,6 +1030,12 @@ async fn gateway_ingress_publishes_typed_contracts() {
             "GatewayGeminiGenerateContentResponse",
             "GoogleErrorEnvelope",
         ),
+        (
+            "/v1/systemone",
+            "GatewayJevRequest",
+            "GatewayJevResponse",
+            "OpenAiErrorEnvelope",
+        ),
     ] {
         let operation = &document["paths"][path]["post"];
         assert_eq!(
@@ -1073,6 +1080,28 @@ async fn gateway_ingress_publishes_typed_contracts() {
             "{component} must accept native extensions"
         );
     }
+    for (component, fields) in [
+        ("GatewayJevRequest", &["model", "state", "questions"][..]),
+        ("GatewayJevResponse", &["model", "answers", "usage"]),
+    ] {
+        let schema = &schemas[component];
+        for field in fields {
+            assert!(
+                schema["properties"].get(*field).is_some(),
+                "{component} must publish {field}: {schema}"
+            );
+        }
+    }
+    assert_eq!(
+        schemas["GatewayJevRequest"]["additionalProperties"],
+        serde_json::json!(false),
+        "the Jev request contract is closed"
+    );
+    assert_eq!(
+        schemas["GatewayJevRequest"]["properties"]["state"]["type"],
+        serde_json::json!("string"),
+        "the Jev state is typed text"
+    );
 
     server.shutdown().await.expect("server shuts down");
 }
@@ -1108,6 +1137,7 @@ async fn gateway_inference_ingress_publishes_the_fallback_header() {
         "/v1/chat/completions",
         "/v1/responses",
         "/v1/messages",
+        "/v1/systemone",
         "/v1beta/models/{target}",
     ] {
         let header = fallback(path).unwrap_or_else(|| panic!("{path} publishes the header"));

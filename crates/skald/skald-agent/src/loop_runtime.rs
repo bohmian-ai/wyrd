@@ -19,7 +19,9 @@ use crate::callbacks::{
 use crate::conversation::{Conversation, ConversationTurn};
 use crate::error::{AgentError, AgentResult};
 use crate::journal::JournalEvent;
-use crate::request_builder::{assistant_message, extract_messages, request_from_conversation};
+use crate::request_builder::{
+    assistant_message, extract_messages, request_from_conversation, validate_prompt_loop_request,
+};
 use crate::run::{AgentRun, FinishReason};
 use crate::session::{Role, SessionId, SessionTurn, session_turn_to_conversation_turn};
 
@@ -83,6 +85,9 @@ impl Agent {
                     .await
                     .map_err(|source| AgentError::JournalAppendFailed { source })?;
 
+                // Refuse a request shape the loop cannot drive before any
+                // session turn is converted into its dialect.
+                validate_prompt_loop_request(&self.id, &self.prompt.native().request)?;
                 let mut conversation = Conversation::new();
                 if let Some(session_id) = session_id.as_ref() {
                     self.seed_session_recent(session_id, &mut conversation)
@@ -946,6 +951,7 @@ fn genai_provider_name(provider: &ProviderName) -> &str {
         ProviderName::Anthropic => "anthropic",
         ProviderName::Google => "gcp.gemini",
         ProviderName::Vertex => "gcp.vertex_ai",
+        ProviderName::Jev => "jev",
         ProviderName::Custom(name) => name,
     }
 }
@@ -956,6 +962,7 @@ fn provider_label(provider: &ProviderName) -> String {
         ProviderName::Anthropic => "anthropic".to_owned(),
         ProviderName::Google => "google".to_owned(),
         ProviderName::Vertex => "vertex".to_owned(),
+        ProviderName::Jev => "jev".to_owned(),
         ProviderName::Custom(name) => name.clone(),
     }
 }

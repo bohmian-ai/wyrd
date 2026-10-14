@@ -1301,6 +1301,54 @@ class InlineableRef_for_TriggerSpecSibling:
     sibling: CardRef
 
 
+@dataclass(frozen=True, kw_only=True)
+class JevNoulCriteria:
+    """Outcome descriptions of a `noul` question."""
+
+    false: str
+    true: str
+
+
+# One keyed Jev question, tagged by its answer form.
+JevQuestion: TypeAlias = "JevQuestionNoul | JevQuestionChoice | JevQuestionScore"
+
+
+@dataclass(frozen=True, kw_only=True)
+class JevQuestionChoice:
+    """Pick exactly one of the keyed options."""
+
+    criteria: dict[str, str]
+    instructions: str
+    type: Literal["choice"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class JevQuestionNoul:
+    """Yes/no question answered with a probability that it holds."""
+
+    criteria: JevNoulCriteria | None = None
+    instructions: str
+    type: Literal["noul"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class JevQuestionScore:
+    """Grade on an ordered scale whose levels are indexed from zero."""
+
+    criteria: list[str]
+    instructions: str
+    type: Literal["score"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class JevRequest:
+    """`POST /v1/systemone` request body."""
+
+    model: str
+    questions: dict[str, JevQuestion]
+    state: str
+
+
 JsonPath: TypeAlias = "str"
 
 # JSON value-type set used by [`ComparisonOperator::IsType`].
@@ -2571,7 +2619,9 @@ class PromptSpec:
 
 
 # Which provider a request targets.
-ProviderName: TypeAlias = 'Literal["open_ai", "anthropic", "google", "vertex"] | ProviderNameCustom'
+ProviderName: TypeAlias = (
+    'Literal["open_ai", "anthropic", "google", "vertex", "jev"] | ProviderNameCustom'
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -2584,7 +2634,7 @@ class ProviderNameCustom:
 # One native LLM request, tagged with the provider dialect its body speaks.
 #
 # Serialized as `{"provider": "<variant>", "body": <native provider JSON>}`. The tag selects the variant, so a body that does not match its named dialect fails to deserialize. The tag names a wire schema, not a destination: one schema served by several providers is one variant.
-ProviderRequest: TypeAlias = "ProviderRequestOpenAiChatCompletion | ProviderRequestOpenAiResponses | ProviderRequestOpenAiEmbeddings | ProviderRequestAnthropicMessage | ProviderRequestGeminiGenerateContent | ProviderRequestGoogleBatchEmbed | ProviderRequestVertexPredict | ProviderRequestRawV1"
+ProviderRequest: TypeAlias = "ProviderRequestOpenAiChatCompletion | ProviderRequestOpenAiResponses | ProviderRequestOpenAiEmbeddings | ProviderRequestAnthropicMessage | ProviderRequestGeminiGenerateContent | ProviderRequestGoogleBatchEmbed | ProviderRequestVertexPredict | ProviderRequestJevSystemOne | ProviderRequestRawV1"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -2609,6 +2659,14 @@ class ProviderRequestGoogleBatchEmbed:
 
     body: GoogleBatchEmbedRequest
     provider: Literal["google_batch_embed"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class ProviderRequestJevSystemOne:
+    """TypeSafe Jev `systemone` keyed questions about a state."""
+
+    body: JevRequest
+    provider: Literal["jev_system_one"]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -3987,6 +4045,27 @@ _OBJECTS: dict[str, tuple[tuple[str, bool, tuple], ...]] = {
     "InlineableRef_for_OperatorSpecSibling": (("sibling", True, ("ref", "CardRef")),),
     "InlineableRef_for_PromptSibling": (("sibling", True, ("ref", "CardRef")),),
     "InlineableRef_for_TriggerSpecSibling": (("sibling", True, ("ref", "CardRef")),),
+    "JevNoulCriteria": (("false", True, ("prim", "string")), ("true", True, ("prim", "string"))),
+    "JevQuestionChoice": (
+        ("criteria", True, ("map", ("prim", "string"))),
+        ("instructions", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "choice")])),
+    ),
+    "JevQuestionNoul": (
+        ("criteria", False, ("union", [("ref", "JevNoulCriteria"), ("prim", "null")])),
+        ("instructions", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "noul")])),
+    ),
+    "JevQuestionScore": (
+        ("criteria", True, ("array", ("prim", "string"))),
+        ("instructions", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "score")])),
+    ),
+    "JevRequest": (
+        ("model", True, ("prim", "string")),
+        ("questions", True, ("map", ("ref", "JevQuestion"))),
+        ("state", True, ("prim", "string")),
+    ),
     "JsonlMeta": (
         ("compression", True, ("ref", "JsonlCompression")),
         ("lines_per_file", False, ("union", [("prim", "integer"), ("prim", "null")])),
@@ -4591,6 +4670,10 @@ _OBJECTS: dict[str, tuple[tuple[str, bool, tuple], ...]] = {
     "ProviderRequestGoogleBatchEmbed": (
         ("body", True, ("ref", "GoogleBatchEmbedRequest")),
         ("provider", True, ("union", [("lit", "google_batch_embed")])),
+    ),
+    "ProviderRequestJevSystemOne": (
+        ("body", True, ("ref", "JevRequest")),
+        ("provider", True, ("union", [("lit", "jev_system_one")])),
     ),
     "ProviderRequestOpenAiChatCompletion": (
         ("body", True, ("ref", "OpenAiChatRequest")),
@@ -5262,6 +5345,10 @@ _ALIASES: dict[str, tuple] = {
             ("prim", "string"),
         ],
     ),
+    "JevQuestion": (
+        "union",
+        [("ref", "JevQuestionNoul"), ("ref", "JevQuestionChoice"), ("ref", "JevQuestionScore")],
+    ),
     "JsonPath": ("prim", "string"),
     "JsonValueType": (
         "union",
@@ -5605,6 +5692,7 @@ _ALIASES: dict[str, tuple] = {
             ("union", [("lit", "anthropic")]),
             ("union", [("lit", "google")]),
             ("union", [("lit", "vertex")]),
+            ("union", [("lit", "jev")]),
             ("ref", "ProviderNameCustom"),
         ],
     ),
@@ -5618,6 +5706,7 @@ _ALIASES: dict[str, tuple] = {
             ("ref", "ProviderRequestGeminiGenerateContent"),
             ("ref", "ProviderRequestGoogleBatchEmbed"),
             ("ref", "ProviderRequestVertexPredict"),
+            ("ref", "ProviderRequestJevSystemOne"),
             ("ref", "ProviderRequestRawV1"),
         ],
     ),

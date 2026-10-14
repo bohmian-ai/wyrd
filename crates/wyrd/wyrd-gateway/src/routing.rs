@@ -4,8 +4,9 @@
 //! defined fallback source — request override, exact `Model` rule,
 //! `Operation` rule, then `Global` — without merging rules. Candidates equal
 //! to the requested model or already listed are skipped, and a candidate with
-//! no deployment declaring the operation is dropped. Each remaining
-//! candidate's deployments are ordered by weighted selection keyed by the
+//! no deployment declaring the operation is dropped; a deployment whose
+//! adapter cannot represent the request body is dropped later by
+//! [`CallPlan::retain_representable`]. Each remaining candidate's deployments are ordered by weighted selection keyed by the
 //! logical call id, so every replica picks the same first deployment.
 
 use serde_json::Value;
@@ -390,6 +391,70 @@ mod tests {
         assert!(
             fallback.candidates.is_empty(),
             "a fallback deployment is not the pin"
+        );
+    }
+
+    /// Fallback stays within the protocol by capability and representability
+    /// alone: a `systemone` question keeps only deployments declaring that
+    /// operation, and an ordinary chat body drops every Jev deployment because
+    /// the Jev adapter cannot represent it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a plan keeps a candidate that cannot carry the request.
+    #[test]
+    fn fallback_keeps_only_capable_and_representable_candidates() {
+        let jev = |name: &str, model: &str| -> ProviderDeployment {
+            serde_json::from_value(json!({
+                "name": name,
+                "model": ModelRef::from_projection(model).expect("model"),
+                "adapter": "jev",
+                "auth": {"bearer": {"credential": "jev-key"}},
+                "capabilities": ["system_one", "chat_completions"],
+                "routing_weight": 1,
+            }))
+            .expect("jev deployment decodes")
+        };
+        let snap = snapshot(
+            vec![
+                jev("jev-a", "jev/jev-latest"),
+                jev("jev-b", "jev/jev-preview"),
+                deployment("chat", "acme/chat", 1, &["chat_completions"]),
+            ],
+            json!({"rules": [{"scope": "global", "candidates": [
+                model("jev/jev-latest"), model("jev/jev-preview"), model("acme/chat"),
+            ]}]}),
+        );
+        let call = GatewayCallId::new_v7();
+        assert_eq!(
+            models(&CallPlan::new(
+                &snap,
+                call,
+                GatewayOperation::SystemOne,
+                model("jev/jev-preview"),
+                None
+            )),
+            ["jev/jev-preview", "jev/jev-latest"],
+            "only systemone-capable deployments answer a Jev question"
+        );
+        let mut chat = CallPlan::new(
+            &snap,
+            call,
+            GatewayOperation::ChatCompletions,
+            model("acme/chat"),
+            None,
+        );
+        chat.retain_representable(
+            IngressDialect::OpenAi,
+            false,
+            &json!({"model": "acme/chat", "messages": [{"role": "user", "content": "hi"}]}),
+            None,
+        )
+        .expect("ordinary chat is representable");
+        assert_eq!(
+            models(&chat),
+            ["acme/chat"],
+            "an ordinary chat body is not a Jev request"
         );
     }
 }

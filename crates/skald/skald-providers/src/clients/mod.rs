@@ -4,12 +4,14 @@ pub mod anthropic;
 pub mod embeddings;
 pub mod external;
 pub mod google;
+pub mod jev;
 pub mod openai;
 pub mod vertex;
 
 pub use anthropic::AnthropicClient;
 pub use external::ExternalGatewayClient;
 pub use google::GoogleClient;
+pub use jev::JevClient;
 pub use openai::{
     MediaAnswer, OpenAiBatchRoute, OpenAiClient, OpenAiMediaRoute, OpenAiRoute, UploadContent,
     UploadFile,
@@ -191,6 +193,7 @@ pub fn request_variant_label(request: &skald_spec::ProviderRequest) -> &'static 
         skald_spec::ProviderRequest::GeminiGenerateContent(_) => "gemini_generate_content",
         skald_spec::ProviderRequest::GoogleBatchEmbed(_) => "google_batch_embed",
         skald_spec::ProviderRequest::VertexPredict(_) => "vertex_predict",
+        skald_spec::ProviderRequest::JevSystemOne(_) => "jev_system_one",
         skald_spec::ProviderRequest::RawV1 { .. } => "raw_v1",
         _ => "unknown",
     }

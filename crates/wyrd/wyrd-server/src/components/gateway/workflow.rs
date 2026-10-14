@@ -93,7 +93,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             operation,
             ingress,
             usage_bound: match ingress {
-                IngressDialect::OpenAi => usage_bound(operation, &body),
+                IngressDialect::OpenAi | IngressDialect::Jev => usage_bound(operation, &body),
                 IngressDialect::AnthropicMessages => anthropic_usage_bound(&body),
                 IngressDialect::GeminiGenerateContent | IngressDialect::VertexGenerateContent => {
                     google_usage_bound(&body)
@@ -143,6 +143,8 @@ enum Answer {
     AnthropicMessages,
     /// Google `GenerateContent`, from Gemini or Vertex.
     GeminiGenerateContent,
+    /// Jev `systemone` typed answers.
+    Jev,
 }
 
 impl Answer {
@@ -159,6 +161,7 @@ impl Answer {
             Self::GeminiGenerateContent => {
                 decode(body).map(ProviderResponse::GeminiGenerateContent)
             }
+            Self::Jev => decode(body).map(ProviderResponse::JevSystemOne),
         }
     }
 }
@@ -181,7 +184,9 @@ impl NativeCall {
     /// The model always comes from `model`, never from the request body:
     /// `OpenAI` bodies carry its `<provider>/<model>` projection, Anthropic
     /// bodies its provider-native model, and Google bodies none, since the
-    /// gateway routes them by `model` alone. A Google GenerateContent body
+    /// gateway routes them by `model` alone. Jev bodies carry the
+    /// provider-native model and enter the native `systemone` route. A Google
+    /// GenerateContent body
     /// enters as Vertex when `model` names the `vertex` provider, which the
     /// Workflow derives from a Prompt whose provider is Vertex.
     ///
@@ -227,6 +232,15 @@ impl NativeCall {
                 Answer::GeminiGenerateContent,
                 encode(&body)?,
             ),
+            ProviderRequest::JevSystemOne(mut body) => {
+                body.model = model.model.to_string();
+                (
+                    GatewayOperation::SystemOne,
+                    IngressDialect::Jev,
+                    Answer::Jev,
+                    encode(&body)?,
+                )
+            }
             _ => {
                 return Err(ProviderError::bad_request(
                     PROVIDER,

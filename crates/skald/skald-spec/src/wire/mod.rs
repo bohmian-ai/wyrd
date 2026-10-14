@@ -3,6 +3,7 @@ pub mod anthropic_messages;
 pub mod common;
 pub mod google_embeddings;
 pub mod google_generate;
+pub mod jev;
 pub mod openai_chat;
 pub mod openai_embeddings;
 pub mod openai_responses;

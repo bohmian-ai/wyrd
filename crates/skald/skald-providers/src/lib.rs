@@ -15,7 +15,7 @@ pub mod trait_;
 pub mod transport;
 
 pub use clients::{
-    AnthropicClient, ExternalGatewayClient, GoogleClient, MediaAnswer, OpenAiBatchRoute,
+    AnthropicClient, ExternalGatewayClient, GoogleClient, JevClient, MediaAnswer, OpenAiBatchRoute,
     OpenAiClient, OpenAiMediaRoute, OpenAiRoute, ProviderByteStream, UploadContent, UploadFile,
     VertexClient,
 };

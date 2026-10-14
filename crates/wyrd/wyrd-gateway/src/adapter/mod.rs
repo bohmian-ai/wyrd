@@ -5,14 +5,18 @@
 //! its model rewritten to the native identifier; `OpenAI` Chat Completions
 //! ingress translates to Anthropic Messages or Google `GenerateContent` through
 //! typed Skald wire structs. Anything the target cannot represent faithfully
-//! is rejected before dispatch rather than dropped. [`complete`] maps the
-//! provider's answer back to the ingress dialect and extracts usage; streamed
-//! answers relay through [`stream::relay`].
+//! is rejected before dispatch rather than dropped. Jev speaks only its own
+//! `systemone` question protocol, carried as typed Skald [`JevRequest`] and
+//! answers; Chat Completions reach it only as a pass-through of that typed
+//! request in the last user message. [`complete`] maps the provider's answer back to the ingress
+//! dialect and extracts usage; streamed answers relay through
+//! [`stream::relay`].
 
 mod anthropic;
 mod batch;
 mod google;
 mod http;
+mod jev;
 mod media;
 mod stream;
 
@@ -26,6 +30,7 @@ use serde_json::{Map, Value, json};
 use skald_spec::ProviderResponse;
 use skald_spec::wire::anthropic_messages::{AnthropicMessagesRequest, AnthropicUsage};
 use skald_spec::wire::google_generate::{GoogleGenerateContentRequest, GoogleUsageMetadata};
+use skald_spec::wire::jev::{JevRequest, JevUsage};
 use skald_spec::wire::openai_chat::{
     OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiImageUrl, OpenAiMessageContent,
     OpenAiStop, OpenAiStreamOptions, OpenAiToolCall, OpenAiUsage,
@@ -60,6 +65,8 @@ pub enum IngressDialect {
     GeminiGenerateContent,
     /// Native Vertex `GenerateContent` produced by Skald.
     VertexGenerateContent,
+    /// Native Jev `systemone` questions.
+    Jev,
 }
 
 /// A requested operation or feature the selected deployment cannot represent.
@@ -91,6 +98,8 @@ pub(crate) enum Wire {
     Anthropic,
     /// Google `GenerateContent` on Gemini or Vertex.
     Google,
+    /// Jev `systemone`.
+    Jev,
 }
 
 impl Wire {
@@ -100,6 +109,7 @@ impl Wire {
             ProviderAdapter::OpenAi | ProviderAdapter::OpenAiCompatible { .. } => Self::OpenAi,
             ProviderAdapter::Anthropic => Self::Anthropic,
             ProviderAdapter::Gemini | ProviderAdapter::Vertex { .. } => Self::Google,
+            ProviderAdapter::Jev => Self::Jev,
         }
     }
 }
@@ -116,6 +126,10 @@ pub(crate) enum Prepared {
     /// Chat Completions translated to Google `GenerateContent`; the answer
     /// translates back. Boxed so the variant does not inflate every `Native`.
     Google(Box<GoogleGenerateContentRequest>),
+    /// A typed Jev question request with the deployment's model; the typed
+    /// answer returns as Jev's own response. Boxed so the variant does not
+    /// inflate every `Native`.
+    Jev(Box<JevRequest>),
 }
 
 /// Builds the upstream request of `body` for `deployment`.
@@ -130,7 +144,9 @@ pub(crate) enum Prepared {
 /// does not stream, a `stream` member that disagrees with `stream`, a `media`
 /// route or file set [`media::validate`] rejects, or any translated feature
 /// without a faithful target representation. Images and Audio pass through
-/// only to `OpenAI`-protocol adapters, as do Batches lifecycle bodies.
+/// only to `OpenAI`-protocol adapters, as do Batches lifecycle bodies. Jev
+/// `systemone` bodies reach only Jev deployments; a Chat Completions body
+/// reaches Jev only as the typed Jev request in its last user message.
 pub(crate) fn prepare(
     ingress: IngressDialect,
     operation: GatewayOperation,
@@ -174,7 +190,16 @@ pub(crate) fn prepare(
             }
             // A batch body carries no model; its input file names the model.
             GatewayOperation::Batches => Ok(Prepared::Native(native(body, None)?)),
+            GatewayOperation::SystemOne => {
+                Err(unsupported_operation(operation, &deployment.adapter))
+            }
         },
+        (IngressDialect::Jev, ProviderAdapter::Jev) if operation == GatewayOperation::SystemOne => {
+            Ok(Prepared::Jev(Box::new(jev::request(body, model)?)))
+        }
+        (IngressDialect::OpenAi, ProviderAdapter::Jev) if chat => {
+            Ok(Prepared::Jev(Box::new(jev::chat_request(body, model)?)))
+        }
         (IngressDialect::OpenAi, ProviderAdapter::Anthropic) if chat => Ok(Prepared::Anthropic(
             Box::new(anthropic::request(chat_request(body)?, model)?),
         )),
@@ -211,7 +236,10 @@ pub(crate) fn prepare(
 /// A raw answer is a native passthrough whose bytes return unchanged; a parsed
 /// copy only yields its usage, read as `wire`. Typed Anthropic and Google
 /// answers translate to a chat completion, serialized once and named `id`
-/// when the provider supplies no usable identifier.
+/// when the provider supplies no usable identifier. A typed Jev answer
+/// returns as Jev's own response with its usage, or, when `translated` (the
+/// Chat Completions pass-through), as a chat completion whose content is
+/// that answer's JSON.
 ///
 /// # Errors
 ///
@@ -221,10 +249,11 @@ pub(crate) fn prepare(
 pub(crate) fn complete(
     response: ProviderResponse,
     wire: Wire,
+    translated: bool,
     id: &str,
     model: &str,
 ) -> Result<(Box<RawValue>, AttemptUsage), AttemptUsage> {
-    let translated = |usage: AttemptUsage, chat: Option<OpenAiChatResponse>| {
+    let chat_completion = |usage: AttemptUsage, chat: Option<OpenAiChatResponse>| {
         chat.and_then(|chat| to_raw_value(&chat).ok())
             .map(|chat| (chat, usage.clone()))
             .ok_or(usage)
@@ -241,14 +270,26 @@ pub(crate) fn complete(
                 Wire::Anthropic,
                 &serde_json::to_value(&native).unwrap_or_default(),
             );
-            translated(usage, anthropic::response(native, model))
+            chat_completion(usage, anthropic::response(native, model))
         }
         ProviderResponse::GeminiGenerateContent(native) => {
             let usage = usage(
                 Wire::Google,
                 &serde_json::to_value(&native).unwrap_or_default(),
             );
-            translated(usage, google::response(native, id, model))
+            chat_completion(usage, google::response(native, id, model))
+        }
+        ProviderResponse::JevSystemOne(answer) => {
+            let usage = usage(
+                Wire::Jev,
+                &serde_json::to_value(&answer).unwrap_or_default(),
+            );
+            if translated {
+                return chat_completion(usage, jev::chat_response(&answer, id));
+            }
+            to_raw_value(&answer)
+                .map(|body| (body, usage.clone()))
+                .map_err(|_| usage)
         }
         _ => Err(AttemptUsage::default()),
     }
@@ -858,7 +899,7 @@ fn now() -> u64 {
 /// usage unknown.
 fn usage(wire: Wire, body: &Value) -> AttemptUsage {
     let object = match wire {
-        Wire::OpenAi | Wire::Anthropic => body.get("usage"),
+        Wire::OpenAi | Wire::Anthropic | Wire::Jev => body.get("usage"),
         Wire::Google => body
             .get("usage_metadata")
             .or_else(|| body.get("usageMetadata")),
@@ -890,6 +931,8 @@ fn usage(wire: Wire, body: &Value) -> AttemptUsage {
                 .checked_add(usage.thoughts_token_count)?;
             Some((usage.prompt_token_count, Some(output), json))
         }),
+        Wire::Jev => typed::<JevUsage>(object)
+            .map(|(usage, json)| (usage.input_tokens, Some(usage.output_tokens), json)),
     };
     let Some((input, output, json)) = counts else {
         return AttemptUsage::default();

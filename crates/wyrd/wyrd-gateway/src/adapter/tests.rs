@@ -74,7 +74,8 @@ fn dispatch(server: &MockServer) -> HttpProviderDispatch {
             openai: Some(openai),
             anthropic: Some(base.clone()),
             gemini: Some(base.clone()),
-            vertex: Some(base),
+            vertex: Some(base.clone()),
+            jev: Some(base),
         },
     )
     .expect("dispatch builds")
@@ -2339,13 +2340,14 @@ fn batches_require_an_openai_protocol_adapter() {
 }
 
 /// Operations in published column order with their column headings.
-const OPERATIONS: [(GatewayOperation, &str); 6] = [
+const OPERATIONS: [(GatewayOperation, &str); 7] = [
     (GatewayOperation::ChatCompletions, "Chat Completions"),
     (GatewayOperation::Responses, "Responses"),
     (GatewayOperation::Embeddings, "Embeddings"),
     (GatewayOperation::Images, "Images"),
     (GatewayOperation::Audio, "Audio"),
     (GatewayOperation::Batches, "Batches"),
+    (GatewayOperation::SystemOne, "Jev systemone"),
 ];
 
 /// One deployment per adapter with its published name.
@@ -2401,6 +2403,7 @@ fn representative(operation: GatewayOperation, stream: bool) -> (Value, Option<M
             media(OpenAiMediaRoute::AudioSpeech),
         ),
         GatewayOperation::Batches => (json!({"input_file_id": "file-1"}), None),
+        GatewayOperation::SystemOne => (jev_body(), None),
     };
     if stream {
         body["stream"] = Value::Bool(true);
@@ -3232,4 +3235,481 @@ async fn a_truncated_gemini_candidate_becomes_a_length_choice() {
     assert_eq!(answer["choices"][0]["finish_reason"], json!("length"));
     assert_eq!(answer["choices"][0]["message"]["content"], Value::Null);
     assert_eq!(usage.normalized, Some(tokens(8, 13)));
+}
+
+/// Native Jev `systemone` body holding one question of each form; the state
+/// carries quotes and a newline, which typed text carries verbatim.
+fn jev_body() -> Value {
+    json!({
+        "model": "jev-latest",
+        "state": "Thanks, \"happy\" to help!\nAnything else?",
+        "questions": jev_questions(),
+    })
+}
+
+/// One question of each Jev form.
+fn jev_questions() -> Value {
+    json!({
+        "helpful": {"type": "noul", "instructions": "Is the answer helpful?"},
+        "tone": {"type": "choice", "instructions": "Tone?",
+                 "criteria": {"polite": "courteous", "rude": "curt"}},
+        "quality": {"type": "score", "instructions": "Quality?",
+                    "criteria": ["poor", "ok", "great"]},
+    })
+}
+
+/// The documented live Jev answer to [`jev_body`].
+fn jev_answer() -> Value {
+    json!({
+        "model": "jev-1.13.0",
+        "answers": {
+            "helpful": {"type": "noul", "noul": 0.93},
+            "tone": {"type": "choice", "choice": "polite", "confidence": 0.76,
+                     "probabilities": {"polite": 0.88, "rude": 0.12}},
+            "quality": {"type": "score", "score": 1.1, "confidence": 0.79,
+                        "legend": {"0": "poor", "1": "ok", "2": "great"},
+                        "probabilities": {"0": 0.02, "1": 0.86, "2": 0.12}},
+        },
+        "usage": {"input_tokens": 378, "output_tokens": 65},
+    })
+}
+
+/// Jev deployment of `jev/jev-latest` with bearer credential `cred`.
+fn jev_deployment() -> ProviderDeployment {
+    serde_json::from_value(json!({
+        "name": "jev",
+        "model": ModelRef::from_projection("jev/jev-latest").expect("model"),
+        "adapter": "jev",
+        "auth": bearer(),
+        "capabilities": ["system_one", "chat_completions"],
+        "routing_weight": 1,
+    }))
+    .expect("jev deployment")
+}
+
+/// Chat Completions pass-through of [`jev_body`]: earlier turns of any role
+/// precede the last user message, whose text is the typed Jev request without
+/// its model.
+fn jev_chat() -> Value {
+    let request = json!({"state": jev_body()["state"], "questions": jev_questions()});
+    json!({"model": "jev/jev-latest", "messages": [
+        {"role": "system", "content": "Judge the reply."},
+        {"role": "user", "content": "an earlier turn"},
+        {"role": "assistant", "content": "noted"},
+        {"role": "user", "content": request.to_string()},
+    ]})
+}
+
+/// Runs one buffered Jev attempt of `body` as `operation` in `ingress`.
+async fn jev_attempt(
+    dispatch: &HttpProviderDispatch,
+    operation: GatewayOperation,
+    ingress: IngressDialect,
+    body: &Value,
+) -> AttemptResult {
+    let target = jev_deployment();
+    let secret = ProviderSecret::new("cred".to_owned().into());
+    let cancel = CancellationToken::new();
+    dispatch
+        .dispatch(ProviderAttempt {
+            call_id: GatewayCallId::from_uuid(uuid::Uuid::from_u128(0xbee)),
+            ordinal: NonZeroU32::MIN,
+            operation,
+            ingress,
+            deployment: &target,
+            credential: Some(&secret),
+            body,
+            media: None,
+            batch: None,
+            stream: false,
+            capture: false,
+            deadline: later(),
+            cancel: &cancel,
+        })
+        .await
+}
+
+/// [`jev_body`] with the question `helpful` replaced by `question`.
+fn jev_with_question(question: Value) -> Value {
+    let mut body = jev_body();
+    body["questions"]["helpful"] = question;
+    body
+}
+
+/// Bad Jev forms, native broken bounds, chat whose last user message is not a
+/// typed Jev request (ordinary text, a `model` member, non-text parts, an
+/// unknown question form), streaming, and every other dialect are refused by
+/// preparation, so they never reach the provider; Jev bodies never reach
+/// `OpenAI` adapters either. The last user message is read even when a later
+/// assistant turn follows it.
+///
+/// # Panics
+///
+/// Panics when an unrepresentable request prepares or reaches the provider.
+#[tokio::test]
+async fn jev_bad_forms_are_rejected_before_provider_io() {
+    let jev = jev_deployment();
+    let one = GatewayOperation::SystemOne;
+    let mut extra = jev_body();
+    extra["temperature"] = json!(0.2);
+    let mut structured_state = jev_body();
+    structured_state["state"] = json!({"answer": "hi"});
+    let chat = GatewayOperation::ChatCompletions;
+    let ordinary = json!({"model": "jev/jev-latest",
+        "messages": [{"role": "user", "content": "Is this reply helpful?"}]});
+    let with_model = json!({"model": "jev/jev-latest",
+        "messages": [{"role": "user", "content": jev_body().to_string()}]});
+    let mut answered_last = jev_chat();
+    answered_last["messages"]
+        .as_array_mut()
+        .expect("messages")
+        .push(json!({"role": "assistant", "content": "done"}));
+    let mut image = jev_chat();
+    image["messages"][3]["content"] = json!([
+        {"type": "text", "text": "{}"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+    ]);
+    let mut streamed = jev_chat();
+    streamed["stream"] = json!(true);
+    let mut unknown_form = jev_chat();
+    unknown_form["messages"][3]["content"] = json!(
+        json!({"state": "s", "questions": {"helpful": {"type": "essay", "instructions": "x"}}})
+            .to_string()
+    );
+    let cases = [
+        (IngressDialect::Jev, one, extra, false, "body"),
+        (IngressDialect::Jev, one, structured_state, false, "body"),
+        (
+            IngressDialect::Jev,
+            one,
+            jev_with_question(json!({"type": "essay", "instructions": "x"})),
+            false,
+            "body",
+        ),
+        (
+            IngressDialect::Jev,
+            one,
+            jev_with_question(json!({"type": "score", "instructions": "x", "criteria": ["one"]})),
+            false,
+            "questions.helpful.criteria",
+        ),
+        (
+            IngressDialect::Jev,
+            one,
+            jev_with_question(json!({"type": "noul", "instructions": " "})),
+            false,
+            "questions.helpful.instructions",
+        ),
+        (IngressDialect::Jev, one, jev_body(), true, "stream"),
+        (
+            IngressDialect::OpenAi,
+            chat,
+            ordinary.clone(),
+            false,
+            "messages",
+        ),
+        (IngressDialect::OpenAi, chat, with_model, false, "messages"),
+        (IngressDialect::OpenAi, chat, image, false, "messages"),
+        (IngressDialect::OpenAi, chat, streamed, true, "stream"),
+        (
+            IngressDialect::OpenAi,
+            chat,
+            unknown_form,
+            false,
+            "messages",
+        ),
+        (IngressDialect::OpenAi, one, jev_body(), false, "operation"),
+    ];
+    for (ingress, operation, body, stream, field) in cases {
+        let error = prepare(ingress, operation, stream, &body, &jev, None).expect_err(field);
+        assert_eq!(error.field, field, "{error}");
+    }
+    assert!(
+        matches!(
+            prepare(
+                IngressDialect::OpenAi,
+                chat,
+                false,
+                &answered_last,
+                &jev,
+                None
+            ),
+            Ok(Prepared::Jev(_))
+        ),
+        "the last user message is read even when an assistant turn follows it"
+    );
+    let openai = deployment("openai/m", json!("openai"), bearer());
+    assert_eq!(
+        prepare(IngressDialect::Jev, one, false, &jev_body(), &openai, None)
+            .expect_err("a Jev body never reaches OpenAI")
+            .field,
+        "body"
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(jev_answer()))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let result = jev_attempt(&dispatch(&server), chat, IngressDialect::OpenAi, &ordinary).await;
+    assert!(
+        matches!(
+            result,
+            AttemptResult::Failed {
+                class: FailureClass::Rejected,
+                ..
+            }
+        ),
+        "{result:?}"
+    );
+}
+
+/// Expected accounting of [`jev_answer`]'s usage.
+fn jev_usage() -> AttemptUsage {
+    let amount = |dimension: &str, quantity: &str| GatewayUsageAmount {
+        dimension: dimension.to_owned(),
+        unit: "tokens".to_owned(),
+        quantity: GatewayDecimal::new(quantity).expect("decimal"),
+    };
+    AttemptUsage {
+        provider_usage_json: Some(r#"{"input_tokens":378,"output_tokens":65}"#.to_owned()),
+        normalized: Some(vec![
+            amount("input_tokens", "378"),
+            amount("output_tokens", "65"),
+        ]),
+    }
+}
+
+/// A Jev call sends the typed question request with the deployment's model
+/// and bearer credential, returns Jev's typed answer, and accounts usage from
+/// Jev's own usage.
+///
+/// # Panics
+///
+/// Panics when the request, answer, or usage diverge.
+#[tokio::test]
+async fn jev_answers_return_typed_with_usage() {
+    let server = MockServer::start().await;
+    answer(
+        &server,
+        "/v1/systemone",
+        "authorization",
+        "Bearer cred",
+        jev_answer(),
+    )
+    .await;
+
+    let mut asked = jev_body();
+    asked["model"] = json!("jev-preview");
+    let result = jev_attempt(
+        &dispatch(&server),
+        GatewayOperation::SystemOne,
+        IngressDialect::Jev,
+        &asked,
+    )
+    .await;
+    let AttemptResult::Completed { body, usage, .. } = result else {
+        panic!("completes: {result:?}");
+    };
+    assert_eq!(parsed(&body), jev_answer());
+    assert_eq!(usage, jev_usage());
+
+    let requests = server.received_requests().await.expect("recording");
+    assert_eq!(requests.len(), 1);
+    let sent: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        sent,
+        jev_body(),
+        "the deployment's model replaces the caller's"
+    );
+}
+
+/// An answer without usage returns with usage unknown, never fabricated.
+///
+/// # Panics
+///
+/// Panics when usage is invented.
+#[tokio::test]
+async fn jev_omitted_usage_stays_unknown() {
+    let server = MockServer::start().await;
+    let mut bare = jev_answer();
+    bare.as_object_mut().expect("object").remove("usage");
+    answer(
+        &server,
+        "/v1/systemone",
+        "authorization",
+        "Bearer cred",
+        bare.clone(),
+    )
+    .await;
+
+    let result = jev_attempt(
+        &dispatch(&server),
+        GatewayOperation::SystemOne,
+        IngressDialect::Jev,
+        &jev_body(),
+    )
+    .await;
+    let AttemptResult::Completed { body, usage, .. } = result else {
+        panic!("completes: {result:?}");
+    };
+    assert_eq!(parsed(&body), bare);
+    assert_eq!(usage, AttemptUsage::default());
+}
+
+/// Every Jev refusal relays through the shared refusal path exactly as for
+/// other providers, on both routes: the upstream status relays, the native
+/// route carries Jev's own body and the Chat Completions route an `OpenAI`
+/// error envelope, neither carries the credential, no Wyrd code is invented,
+/// and the retry class follows the status (throttling and server errors may
+/// succeed elsewhere; validation and credential refusals never retry).
+///
+/// # Panics
+///
+/// Panics when a refusal is remapped, mis-classified, or leaks the credential.
+#[tokio::test]
+async fn jev_refusals_relay_like_other_providers() {
+    for (status, retryable) in [
+        (400_u16, false),
+        (401, false),
+        (403, false),
+        (422, false),
+        (429, true),
+        (500, true),
+        (529, true),
+    ] {
+        let server = MockServer::start().await;
+        let detail = json!({"detail": {"error_type": "api_usage_error",
+            "message": "Invalid request for key cred"}});
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(detail))
+            .mount(&server)
+            .await;
+        let dispatch = dispatch(&server);
+        for (operation, ingress, request, native) in [
+            (
+                GatewayOperation::SystemOne,
+                IngressDialect::Jev,
+                jev_body(),
+                true,
+            ),
+            (
+                GatewayOperation::ChatCompletions,
+                IngressDialect::OpenAi,
+                jev_chat(),
+                false,
+            ),
+        ] {
+            let result = jev_attempt(&dispatch, operation, ingress, &request).await;
+            let AttemptResult::Refused {
+                class,
+                status: relayed,
+                body,
+                ..
+            } = result
+            else {
+                panic!("{status} refuses: {result:?}");
+            };
+            assert_eq!(relayed, status, "{status}: the upstream status relays");
+            assert_eq!(class == FailureClass::Upstream, retryable, "{status}");
+            if native {
+                assert_eq!(
+                    body["detail"]["error_type"], "api_usage_error",
+                    "the native route relays Jev's body"
+                );
+            } else {
+                assert_eq!(body["error"]["code"], Value::Null, "no Wyrd code: {body}");
+            }
+            assert!(!body.to_string().contains("cred"), "{status}: {body}");
+        }
+        let requests = server.received_requests().await.expect("recording");
+        assert_eq!(
+            requests.len(),
+            2,
+            "{status}: one provider request per route"
+        );
+    }
+}
+
+/// The Chat Completions pass-through sends the typed Jev request read from
+/// the last user message with the deployment's model, and returns a chat
+/// completion whose sole content is Jev's typed answer as JSON, with Jev usage
+/// mapped to the completion usage and accounted as on the native route. A
+/// typed request breaking a native-only bound (a blank instruction) is passed
+/// through to the provider unvalidated.
+///
+/// # Panics
+///
+/// Panics when the request, answer, or usage diverge.
+#[tokio::test]
+async fn jev_chat_pass_through_carries_the_typed_request_and_answer() {
+    let server = MockServer::start().await;
+    answer(
+        &server,
+        "/v1/systemone",
+        "authorization",
+        "Bearer cred",
+        jev_answer(),
+    )
+    .await;
+
+    let result = jev_attempt(
+        &dispatch(&server),
+        GatewayOperation::ChatCompletions,
+        IngressDialect::OpenAi,
+        &jev_chat(),
+    )
+    .await;
+    let AttemptResult::Completed { body, usage, .. } = result else {
+        panic!("completes: {result:?}");
+    };
+    assert_eq!(usage, jev_usage());
+    let completion = parsed(&body);
+    assert_eq!(completion["object"], "chat.completion");
+    assert_eq!(completion["model"], "jev-1.13.0");
+    assert_eq!(completion["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(completion["choices"][0]["finish_reason"], "stop");
+    let content = completion["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("text content");
+    assert_eq!(
+        serde_json::from_str::<Value>(content).expect("answer JSON"),
+        jev_answer()
+    );
+    let mapped = &completion["usage"];
+    assert_eq!(
+        [
+            &mapped["prompt_tokens"],
+            &mapped["completion_tokens"],
+            &mapped["total_tokens"]
+        ],
+        [&json!(378), &json!(65), &json!(443)]
+    );
+
+    let unbounded = json!({"state": "s",
+        "questions": {"helpful": {"type": "noul", "instructions": " "}}});
+    let mut unbounded_chat = jev_chat();
+    unbounded_chat["messages"][3]["content"] = json!(unbounded.to_string());
+    let result = jev_attempt(
+        &dispatch(&server),
+        GatewayOperation::ChatCompletions,
+        IngressDialect::OpenAi,
+        &unbounded_chat,
+    )
+    .await;
+    assert!(
+        matches!(result, AttemptResult::Completed { .. }),
+        "{result:?}"
+    );
+
+    let requests = server.received_requests().await.expect("recording");
+    assert_eq!(requests.len(), 2);
+    let sent: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(sent, jev_body(), "only the typed Jev request is sent");
+    let mut expected = unbounded;
+    expected["model"] = json!("jev-latest");
+    let sent: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(sent, expected, "a native-only bound is not applied");
 }

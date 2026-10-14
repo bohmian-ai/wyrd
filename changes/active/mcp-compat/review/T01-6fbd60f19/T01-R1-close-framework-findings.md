@@ -1,7 +1,7 @@
 ---
 id: T01-R1
 kind: remediation
-status: ready
+status: implemented
 spec: SPEC-mcp-compat
 spec_revision: 3
 requirements: [REQ-003, INV-001, INV-002, INV-003, INV-004, AC-001, AC-002, AC-003, AC-004]
@@ -300,3 +300,46 @@ automatic stop: r3 explicitly permits the bounded local alias already present.
 
 Handoff: `$wyrd-implement` with this task. This packet does not implement,
 commit, merge, push, deploy, or claim the findings closed.
+
+## Execution record
+
+Status: `IMPLEMENTED` against spec r3. Authority transition: the r2 verdict
+remains historical; FIND-T01-3 closes under r3's model-alias allowance
+(REQ-003 last bullet, INV-004), not by reinterpreting r2.
+
+Commits: `cfa7004e1` (r3 spec, review packet), `58dfce43e` (TS),
+`52cb06c06` (Python journeys), `b80425fd4` (rustdoc), `e340170fe` (docs).
+
+### Sensitivity experiments (RED → restored GREEN)
+
+| Finding | Temporary mutation | Observed failure | Restored |
+|---|---|---|---|
+| FIND-T01-1 | Filter `cards.list` out of `listTools()` names | `expected [ 'bifrost.describe_table', …(33) ] to deeply equal [ …(34) ]`, diff `- "cards.list"` | Exact TS reference journey: 1 passed |
+| FIND-T01-2 | Give the ADK agent the viewer's discovered toolset instead of the descriptor-bound `McpTool`s | `assert 'WYRD_PERMISSION_403_DENIED_RBAC' in 'Invoking \`verification_execute()\` failed as no tool with that name is available…'` | Exact ADK reader test: 1 passed |
+| FIND-T01-3 | `provider_name` maps `cards.get_by_ref` to `cards_get` (real alias collision) | ADK: `assert len(set(names)) == len(names)` → `34 == 35`; Pydantic AI: `.renamed` drops the colliding key, so catalog equality fails | Exact ADK declares test and full lane pass |
+
+FIND-T01-4 is documentation-only; proof is static comparison with the bodies
+and `gated` plus `mise run fmt` and `cargo check -p wyrd-server --tests`.
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-T01-1 exact TS name equality against independent unfiltered server result; guide validation kept | `mcp-reference-client.test.ts`: `client.request({method: "tools/list"})`, `nextCursor` undefined, sorted-name equality with `listTools()`; hint-set surrogate removed; `callTool` guide unchanged | Exact TS selector passes; omission experiment fails; `ts:format:check`, `ts:lints`, `ts:typecheck` pass | PASS |
+| FIND-T01-2 ADK viewer call receives Wyrd RBAC code, then guide succeeds on the same manager; viewer catalog has no writes | `test_google_adk_reader_sees_and_reaches_no_write_tool`: viewer toolset declaration equality kept; admin-discovered `verification.execute` descriptor and viewer guide descriptor wrapped in public `McpTool` over one viewer `MCPSessionManager`, closed in `adk_run`'s `finally`; asserts code then `topic == "overview"`; local unknown-name case removed | Exact ADK reader selector passes; local-error experiment fails | PASS |
+| FIND-T01-3 valid unique model names per framework; aliased guide reaches the original tool; honest docs | Uniqueness assertion added to the OpenAI, Pydantic AI and ADK full-catalog tests; ADK override reduced to shared `provider_named` copy (no new mechanism); module docstring and `mcp-tools.md` describe aliases over unchanged dotted wire names, tested settings, ADK experimental flag, and drop the untested Gemini claim | `py:test:mcp-frameworks` 6 passed; exact ADK declares selector passes; collision experiment fails; `docs:check` passes | PASS |
+| FIND-T01-4 four Rust items document their panics | `mcp/gateway.rs` `descriptors`, `descriptors_unscoped`, `write_descriptors` gain `# Panics` via `gated`; `mcp/mod.rs` catalog test gains `# Panics` for its assertions; no body changes | `mise run fmt` clean; `cargo check --locked -p wyrd-server --tests` passes | PASS |
+
+Other checks: `py:format:check`, `py:lints`, `git diff --check` clean.
+Python typecheck deliberately excludes this optional-dependency directory and
+was not claimed.
+
+Non-goals held: no server, schema, permission, timeout, dependency, lockfile,
+route, wire-name, alias registry, SDK export or host configuration change.
+The write set is the TS reference test, the Python framework module,
+`mcp-tools.md`, rustdoc on the four cited items, and this record.
+
+Limits: ADK aliasing still depends on ADK calling `_mcp_tool.name` rather than
+`BaseTool.name`, which is internal behaviour and is guarded by the guide round
+trip. ADK's modern protocol remains experimental. Broader MCP/SDK journey
+suites and the integrated aggregate are left to change review.

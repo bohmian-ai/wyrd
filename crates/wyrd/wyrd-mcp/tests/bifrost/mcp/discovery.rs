@@ -138,7 +138,21 @@ mod pg_tests {
                     "MCP requires an object input schema: {}",
                     tool.name
                 );
+                // OpenAI function tools reject the whole list when any input
+                // root is a combinator or a constant.
+                for keyword in ["oneOf", "anyOf", "allOf", "enum", "const", "not"] {
+                    assert!(
+                        !tool.input_schema.contains_key(keyword),
+                        "{} input root carries {keyword}",
+                        tool.name
+                    );
+                }
             }
+            assert_eq!(
+                tools.len(),
+                ADVERTISED_TOOLS.len(),
+                "the checked catalog is the complete every-scope catalog"
+            );
             for name in ["cards.list", "cards.get_by_ref", "wyrd.guide"] {
                 let tool = tools
                     .iter()

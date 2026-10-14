@@ -80,7 +80,7 @@ A token already minted from a revoked credential lapses within five minutes. The
 | --- | --- | --- | --- |
 | `operator_connections.list` | Read; `operators:read` | `{}` → `{connections}` | List redacted connection metadata |
 | `operator_connections.get` | Read; `operators:read` | `{connection_id}` → OperatorConnectionView | Read one connection |
-| `operator_connections.create` | Write; `operators:write` | CreateOperatorConnectionRequest → OperatorConnectionView | Create provider-tagged Slack, PagerDuty, or HTTP configuration |
+| `operator_connections.create` | Write; `operators:write` | `{request: CreateOperatorConnectionRequest}` → OperatorConnectionView | Create provider-tagged Slack, PagerDuty, or HTTP configuration |
 | `operator_connections.update` | Write; `operators:write` | `{connection_id, request}` → OperatorConnectionView | Patch configuration, secret, or status; provider/name remain fixed |
 | `operator_connections.disable` | Write; `operators:write` | `{connection_id}` → OperatorConnectionView | Retain the connection in disabled state |
 

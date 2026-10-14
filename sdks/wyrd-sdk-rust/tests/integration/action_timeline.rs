@@ -9,7 +9,11 @@
 //! SDK's `span_exporter` as the Service, as `start_telemetry` would for a
 //! Service in its own process.
 
+use std::collections::HashMap;
+
+use opentelemetry::propagation::TextMapPropagator as _;
 use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use serde_json::{Value, json};
 use tracing::Instrument as _;
@@ -52,23 +56,18 @@ fn service_telemetry(client: &WyrdClient) -> (tracing::Dispatch, SdkTracerProvid
     (dispatch, provider)
 }
 
-/// The W3C `traceparent` of the current `tracing` span, as an OpenTelemetry
-/// instrumented HTTP client sends it.
-fn current_traceparent() -> String {
-    let context = tracing::Span::current().context();
-    let span = context.span();
-    let span = span.span_context();
-    format!(
-        "00-{}-{}-{:02x}",
-        span.trace_id(),
-        span.span_id(),
-        span.trace_flags().to_u8()
-    )
+/// The W3C trace headers of the current `tracing` span, injected by the
+/// standard trace-context propagator as an OpenTelemetry-instrumented HTTP
+/// client sends them.
+fn trace_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    TraceContextPropagator::new().inject_context(&tracing::Span::current().context(), &mut headers);
+    headers
 }
 
 /// Send one Chat Completions turn through the Gateway as `client`, the way
 /// an OpenTelemetry-instrumented OpenAI client does, with the current span's
-/// `traceparent`.
+/// [`trace_headers`].
 ///
 /// # Panics
 /// Panics when no token mints or the Gateway does not answer.
@@ -83,7 +82,11 @@ async fn ask_the_gateway(deployment: &Deployment, client: &WyrdClient) {
                 .expect("bound server has a URL")
         ))
         .bearer_auth(token.expose())
-        .header("traceparent", current_traceparent())
+        .headers(
+            (&trace_headers())
+                .try_into()
+                .expect("trace headers are valid HTTP headers"),
+        )
         .json(&json!({
             "model": "openai/gpt-4o",
             "messages": [{ "role": "user", "content": "hi" }],

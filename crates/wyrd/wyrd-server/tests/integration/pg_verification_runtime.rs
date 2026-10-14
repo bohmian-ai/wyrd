@@ -2718,3 +2718,170 @@ async fn a_refused_run_pauses_claiming_until_a_running_run_finishes() {
     assert_eq!(row.attempts, 1, "the refusal consumed no attempt");
     runtime.stop().await;
 }
+
+/// Trace id of the caller whose direct judge executions continue its trace.
+const JUDGE_CALLER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+
+/// Spans from a judge's gateway execution up to the request span, innermost
+/// first: one subtree from the verification through the gateway.
+const JUDGE_CHAIN: [&str; 8] = [
+    "gateway.execute",
+    "gateway.call",
+    "workflow.gateway.call",
+    "dispatch",
+    "verification.judge",
+    "verification.score",
+    "verification.execute",
+    "request",
+];
+
+/// A direct execution of a Task `llm_judge` and of an Eval `llm_judge`, each
+/// carrying the caller's `traceparent`, produces one subtree under its
+/// request span: the gateway execution of the judge's model call descends,
+/// span by span, through the gateway call, the judge, the score, and the
+/// verification execute span to the request span the caller parents. The
+/// Eval case crosses the Eval executor's per-task fan-out.
+///
+/// # Panics
+/// Panics when telemetry, the mock provider, the server, or a fixture fails
+/// to start, an execution is not judged `passed`, or a chain is missing or
+/// broken.
+#[tokio::test]
+async fn eval_judge_gateway_call_descends_from_the_request_span() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl_traced", "object": "chat.completion", "created": 1_700_000_000,
+            "model": "gpt-test",
+            "choices": [{ "index": 0, "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+        })))
+        .mount(&provider)
+        .await;
+    let server = WyrdTestServer::builder()
+        .with_gateway_provider_root_for_test(provider.uri().parse().expect("mock URL parses"))
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let seed = server
+        .verification_fixture()
+        .await
+        .expect("verification fixture provisions");
+    let (subject, _) = seed
+        .service("traced-judged")
+        .await
+        .expect("subject registers");
+    let check = crate::pg_verification_routes::judge_check();
+    let task = seed
+        .verifier(
+            "traced-task-judge",
+            &serde_json::json!({ "implementation": { "kind": "task", "spec": check } }),
+        )
+        .await
+        .expect("task judge Verifier registers");
+    let eval = seed
+        .verifier(
+            "traced-eval-judge",
+            &serde_json::json!({ "implementation": { "kind": "eval", "spec": {
+                "pass_gate": { "kind": "all_pass" },
+                "tasks": { "judge": check }
+            } } }),
+        )
+        .await
+        .expect("Eval judge Verifier registers");
+    server
+        .deploy_gateway_model_for_test("gpt-test", "traced_judge_invoker")
+        .await
+        .expect("judge model deploys");
+    let wyrd_testing::Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("traced-judge-writer", &["editor", "traced_judge_invoker"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let cases = [
+        (task, "task_context", "b7ad6b7169203331"),
+        (eval, "eval_record", "b7ad6b7169203332"),
+    ];
+    let checkpoint = traces.checkpoint();
+    for (verifier, kind, caller_span) in &cases {
+        let body = serde_json::json!({
+            "verifier_uid": verifier,
+            "subject_card_uid": subject,
+            "input": { "kind": kind, "context": { "answer": "yes" } },
+        });
+        let response = server
+            .oneshot_authenticated(
+                &jwt,
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/verification/execute")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header(
+                        "traceparent",
+                        format!("00-{JUDGE_CALLER_TRACE}-{caller_span}-01"),
+                    )
+                    .body(axum::body::Body::from(body.to_string()))
+                    .expect("execute request builds"),
+            )
+            .await
+            .expect("execute request responds");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("execute body reads");
+        let judged: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("execute body is JSON");
+        assert_eq!(judged["verdict"], "passed", "{kind}: {judged}");
+    }
+    server.shutdown().await.expect("test server shuts down");
+
+    let spans: Vec<_> = traces
+        .finished_since(checkpoint)
+        .into_iter()
+        .filter(|span| span.trace_id == JUDGE_CALLER_TRACE)
+        .collect();
+    let by_id: BTreeMap<&str, &wyrd_telemetry::CapturedSpan> = spans
+        .iter()
+        .map(|span| (span.span_id.as_str(), span))
+        .collect();
+    for (_, kind, caller_span) in &cases {
+        let chain = spans
+            .iter()
+            .filter(|span| span.name == JUDGE_CHAIN[0])
+            .map(|execute| {
+                let mut chain = vec![execute];
+                while let Some(parent) = chain
+                    .last()
+                    .and_then(|span| by_id.get(span.parent_span_id.as_str()))
+                {
+                    chain.push(parent);
+                }
+                chain
+            })
+            .find(|chain| {
+                chain
+                    .last()
+                    .is_some_and(|root| root.parent_span_id == *caller_span)
+            })
+            .unwrap_or_else(|| panic!("{kind}: no gateway execution under the caller: {spans:#?}"));
+        let names: Vec<&str> = chain.iter().map(|span| span.name.as_str()).collect();
+        let mut expected = JUDGE_CHAIN.iter().peekable();
+        for name in &names {
+            expected.next_if(|step| *step == name);
+        }
+        assert!(
+            expected.peek().is_none(),
+            "{kind}: {names:?} contains {JUDGE_CHAIN:?} in order"
+        );
+        assert_eq!(names.last(), Some(&"request"), "{kind}: {names:?}");
+    }
+}

@@ -508,6 +508,23 @@ impl PeerCluster {
         table: &str,
         user_fields: Vec<arrow::datatypes::Field>,
     ) -> Result<(), JourneyError> {
+        self.register_table_with_layout(index, table, user_fields, None)
+            .await
+    }
+
+    /// Registers `table` with `user_fields` and `physical_layout` through pod
+    /// `index`; `None` takes the default layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the pod composes no catalog, or the refusal.
+    pub(crate) async fn register_table_with_layout(
+        &self,
+        index: usize,
+        table: &str,
+        user_fields: Vec<arrow::datatypes::Field>,
+        physical_layout: Option<wyrd_spec::vala::api::PhysicalLayoutWire>,
+    ) -> Result<(), JourneyError> {
         let catalog = self
             .server(index)?
             .state()
@@ -518,7 +535,7 @@ impl PeerCluster {
                 table: table_ref(table),
                 user_fields,
                 tenant: self.tenant(),
-                physical_layout: None,
+                physical_layout,
             })
             .await?;
         Ok(())
@@ -905,6 +922,24 @@ impl PeerCluster {
             .ok_or_else(|| format!("pod {index} composes no Scribe"))?
             .fragment_inspection()
             .0)
+    }
+
+    /// Reads the rows every footer pod `index`'s Scribe emitted reported,
+    /// summed, and the encoded plan of the latest fragment it executed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the pod composes no Scribe.
+    pub(crate) fn scribe_fragment_output(
+        &self,
+        index: usize,
+    ) -> Result<(u64, Vec<u8>), JourneyError> {
+        let scribe = self
+            .server(index)?
+            .state()
+            .bifrost_ingest()
+            .ok_or_else(|| format!("pod {index} composes no Scribe"))?;
+        Ok((scribe.fragment_footer_rows(), scribe.last_fragment_plan()))
     }
 
     /// Reads the process-wide physical-build observation plus pod `index`'s

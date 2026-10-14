@@ -278,42 +278,43 @@ impl LiveScribeExec {
     }
 
     /// Returns this leaf with its predicate snapshotted to static
-    /// expressions and its routes narrowed by that snapshot.
+    /// expressions, and the routes output `partition` reads under that
+    /// snapshot.
     ///
-    /// Called once per execution, after any `ScalarSubqueryExec` above has
-    /// populated its values, so a resolved scalar becomes a literal that both
-    /// prunes routes and ships in every fragment. Narrowing only removes
-    /// routes from the planning-time selection, before any is dealt to a
-    /// partition. `self` keeps the runtime-bound predicate for re-execution.
+    /// Route `i` of the planning-time selection belongs to partition
+    /// `i % partitions`, so every route is dealt exactly once whatever each
+    /// partition's snapshot says; the snapshot then only drops routes from
+    /// this partition's share. Called when the partition's stream is first
+    /// polled: a `ScalarSubqueryExec` above has populated its values by then,
+    /// and a join has finished its build side before polling its probe side,
+    /// so a resolved scalar or a join's dynamic filter becomes a static
+    /// predicate that both prunes routes and ships in every fragment. `self`
+    /// keeps the runtime-bound predicate for re-execution.
     ///
     /// # Errors
     ///
     /// Returns the snapshot error when the predicate reads execution state
     /// that is not yet populated.
-    fn resolved(&self) -> DataFusionResult<Self> {
+    fn resolved(&self, partition: usize) -> DataFusionResult<(Self, Vec<LiveScribeRoute>)> {
+        let routes = LiveTableRoutes {
+            binding: self.routes.binding.clone(),
+            routes: self
+                .routes
+                .routes
+                .iter()
+                .skip(partition)
+                .step_by(self.properties.partitioning.partition_count())
+                .cloned()
+                .collect(),
+        };
         let mut leaf = self.clone();
-        if let Some(predicate) = &self.predicate {
-            let predicate = snapshot_physical_expr(Arc::clone(predicate))?;
-            leaf.routes = Arc::new(self.routes.selected_by(
-                &predicate,
-                &self.schema(),
-                self.time_axis.column(),
-            ));
-            leaf.predicate = Some(predicate);
-        }
-        Ok(leaf)
-    }
-
-    /// Returns the routes output `partition` reads: route `i` belongs to
-    /// partition `i % partitions`, so every route is read exactly once.
-    fn partition_routes(&self, partition: usize) -> Vec<LiveScribeRoute> {
-        self.routes
-            .routes
-            .iter()
-            .skip(partition)
-            .step_by(self.properties.partitioning.partition_count())
-            .cloned()
-            .collect()
+        let Some(predicate) = &self.predicate else {
+            return Ok((leaf, routes.routes));
+        };
+        let predicate = snapshot_physical_expr(Arc::clone(predicate))?;
+        let routes = routes.selected_by(&predicate, &self.schema(), self.time_axis.column());
+        leaf.predicate = Some(predicate);
+        Ok((leaf, routes.routes))
     }
 
     /// Builds the signed fragment and destination for one route.
@@ -419,19 +420,21 @@ impl ExecutionPlan for LiveScribeExec {
         }
     }
 
-    /// Takes the static filters `DataFusion` pushes to this leaf as the
-    /// predicate every fragment ships with.
+    /// Takes the filters `DataFusion` pushes to this leaf as the predicate
+    /// every fragment ships with: the static filters of the `Pre` phase, then
+    /// the dynamic filters of the `Post` phase that joins and `TopK`
+    /// operators update while the query runs.
     ///
-    /// Every filter is reported unsupported, so the leader's `FilterExec`
-    /// stays above the leaf. Dynamic filters, which join and `TopK` operators
-    /// update while the query runs, are left to the leader: a fragment could
-    /// only carry a stale copy of one.
+    /// Every filter is reported unsupported, so the leader's `FilterExec` and
+    /// the producing operator stay the authority over correctness above the
+    /// leaf.
     ///
-    /// Filters bound to execution state, such as `id = (SELECT max(id) ...)`
-    /// whose value `ScalarSubqueryExec` supplies before this leaf executes,
-    /// are kept in the predicate but cannot prune routes yet: planning prunes
-    /// by the conjuncts that already snapshot to static expressions, and
-    /// [`ExecutionPlan::execute`] narrows further once the rest resolve.
+    /// Filters bound to execution state — a dynamic filter, or
+    /// `id = (SELECT max(id) ...)` whose value `ScalarSubqueryExec` supplies
+    /// before this leaf executes — are kept in the predicate but cannot prune
+    /// routes yet: planning prunes by the conjuncts that already snapshot to
+    /// static expressions, and each partition narrows its share further once
+    /// the rest resolve, when its stream is first polled.
     ///
     /// # Errors
     /// Never returns an error; the signature is fixed by the trait.
@@ -441,18 +444,21 @@ impl ExecutionPlan for LiveScribeExec {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> DataFusionResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        let filters = child_pushdown_result
+        let pushed = child_pushdown_result
             .parent_filters
             .iter()
             .map(|filter| &filter.filter)
-            .filter(|filter| !DynamicFilterTracking::classify(filter).contains_dynamic_filter())
+            .filter(|filter| {
+                DynamicFilterTracking::classify(filter).contains_dynamic_filter()
+                    == (phase == FilterPushdownPhase::Post)
+            })
             .cloned()
-            .chain(self.predicate.iter().cloned())
             .collect::<Vec<_>>();
         let propagation = FilterPushdownPropagation::all_unsupported(child_pushdown_result);
-        if phase != FilterPushdownPhase::Pre || filters.is_empty() {
+        if pushed.is_empty() {
             return Ok(propagation);
         }
+        let filters = self.predicate.iter().cloned().chain(pushed);
         let predicate = conjunction(filters);
         let static_predicate = conjunction(
             split_conjunction(&predicate)
@@ -510,23 +516,20 @@ impl ExecutionPlan for LiveScribeExec {
     /// Streams this partition's routes' fragments, one route after another,
     /// as their batches arrive.
     ///
-    /// The pushed predicate is snapshotted once per invocation, after any
-    /// `ScalarSubqueryExec` above has populated its values, so a resolved
-    /// scalar ships to every Scribe as a literal. That one snapshot narrows
-    /// the planning-time routes before they are dealt across partitions, and
-    /// every fragment this invocation opens encodes it. The plan keeps the
-    /// runtime-bound predicate, so a re-execution snapshots its new values.
-    ///
-    /// Nothing is opened until the returned stream is first polled, and
-    /// dropping it drops the open fragment stream, which cancels the Scribe
-    /// fragment and releases its snapshot and lease. See [`LiveFragmentRead`]
-    /// for how each outcome maps to the query terminal.
+    /// Nothing is opened until the returned stream is first polled. Then the
+    /// pushed predicate is snapshotted once, by [`LiveScribeExec::resolved`],
+    /// so a resolved scalar or a join's completed dynamic filter ships to
+    /// every Scribe as a literal and narrows this partition's routes. The
+    /// plan keeps the runtime-bound predicate, so a re-execution snapshots its
+    /// new values. Dropping the stream drops the open fragment stream, which
+    /// cancels the Scribe fragment and releases its snapshot and lease. See
+    /// [`LiveFragmentRead`] for how each outcome maps to the query terminal.
     ///
     /// # Errors
-    /// Returns a plan error for a partition this leaf does not advertise, the
-    /// snapshot error when the predicate reads execution state not yet
-    /// populated, and an execution error when the task carries no bound
-    /// execution bindings.
+    /// Returns a plan error for a partition this leaf does not advertise and
+    /// an execution error when the task carries no bound execution bindings;
+    /// the stream fails with the snapshot error when the predicate reads
+    /// execution state not yet populated.
     fn execute(
         &self,
         partition: usize,
@@ -538,12 +541,10 @@ impl ExecutionPlan for LiveScribeExec {
                 "live Scribe source has no partition {partition}"
             )));
         }
-        let leaf = self.resolved()?;
-        let routes = leaf.partition_routes(partition);
         let lock = super::bindings::bindings_for_task(context.as_ref())?;
         let read = LiveFragmentRead {
-            leaf,
-            routes,
+            leaf: self.clone(),
+            partition,
             lock,
             open_time: MetricBuilder::new(&self.metrics)
                 .subset_time("fragment_open_time", partition),
@@ -636,10 +637,11 @@ impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionBoundary
 
 /// One partition's fragment reads, from dispatch through footer validation.
 struct LiveFragmentRead {
-    /// Leaf whose closure the fragments are signed for.
+    /// Leaf whose closure the fragments are signed for, its predicate not
+    /// yet snapshotted.
     leaf: LiveScribeExec,
-    /// The routes this partition reads, in order.
-    routes: Vec<LiveScribeRoute>,
+    /// The output partition whose share of the routes this read covers.
+    partition: usize,
     /// Execution bindings bound after admission.
     lock: Arc<super::bindings::OracleExecutionLock>,
     /// Time spent opening fragments until each peer accepted its stream,
@@ -671,14 +673,14 @@ impl LiveFragmentRead {
             let grant = bindings.grant();
             grant.ensure_live()?;
             let live = bindings.live()?;
-            let schema = self.leaf.schema();
-            'routes: for route in &self.routes {
-                let (fragment, candidate) = self
-                    .leaf
+            let (leaf, routes) = self.leaf.resolved(self.partition)?;
+            let schema = leaf.schema();
+            'routes: for route in &routes {
+                let (fragment, candidate) = leaf
                     .fragment(route, grant.deadline.timestamp_millis())?;
                 let mut decoder = LiveFrameDecoder::new(
                     fragment.plan_fingerprint.clone(),
-                    Arc::clone(&self.leaf.scan_metrics),
+                    Arc::clone(&leaf.scan_metrics),
                 );
                 let open = self.open_time.timer();
                 let opened = live
@@ -1161,23 +1163,22 @@ mod tests {
             all[1..],
             "planning prunes by the static conjunct"
         );
-        assert!(live.resolved().is_err(), "a pending scalar cannot resolve");
+        assert!(live.resolved(0).is_err(), "a pending scalar cannot resolve");
 
         for (value, expected) in [(2, &all[2..]), (3, &all[3..])] {
             results.clear();
             results
                 .set(SubqueryIndex::new(0), hour(value))
                 .expect("scalar populates");
-            let resolved = live.resolved().expect("the populated scalar resolves");
-            assert_eq!(
-                resolved.routes.routes, expected,
-                "the scalar narrows routes"
-            );
-            let mut dealt = [resolved.partition_routes(0), resolved.partition_routes(1)].concat();
+            let (resolved, mut dealt) = live.resolved(0).expect("the populated scalar resolves");
+            dealt.extend(live.resolved(1).expect("the populated scalar resolves").1);
             dealt.sort_by_key(|route| route.time_partition.start_unix_micros());
-            assert_eq!(dealt, expected, "every route is dealt exactly once");
+            assert_eq!(
+                dealt, expected,
+                "the scalar narrows routes, each dealt exactly once"
+            );
             let (fragment, _) = resolved
-                .fragment(&resolved.routes.routes[0], 0)
+                .fragment(&expected[0], 0)
                 .expect("the fragment encodes");
             let encoded = format!(
                 "{:?}",

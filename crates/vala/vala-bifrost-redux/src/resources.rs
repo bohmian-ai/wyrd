@@ -4090,9 +4090,14 @@ impl OracleSessionShape {
     /// inexact (an exact count would let `count(*)` skip the footer tenant
     /// proof), so the planner is told to trust those estimates: a scan that
     /// fits in one batch is then neither split nor round-robined, as it is for
-    /// an exact count. The logical optimizer runs its rules once, not
-    /// `DataFusion`'s default three passes: each pass walks the whole plan and
-    /// costs tens of microseconds on every query. The optimizer does not split
+    /// an exact count. The logical optimizer runs two passes, not
+    /// `DataFusion`'s default three: each pass walks the whole plan and costs
+    /// tens of microseconds on every query, but one is too few, because
+    /// `ExtractEquijoinPredicate` runs before `PushDownFilter` within a pass.
+    /// An equality pushed into a join — such as the one a scalar subquery
+    /// rewritten to a join leaves behind — only becomes a hash join key on
+    /// the second pass, and stays a nested-loop filter without it. The
+    /// optimizer does not split
     /// file scans: an Oracle Parquet leaf splits itself, capped at the row
     /// groups it can give work to, and a second split by the optimizer would
     /// spread those row groups back over every target partition. The leader's planning and
@@ -4114,7 +4119,7 @@ impl OracleSessionShape {
             .options_mut()
             .execution
             .use_row_number_estimates_to_optimize_partitioning = true;
-        config.options_mut().optimizer.max_passes = 1;
+        config.options_mut().optimizer.max_passes = 2;
         config.options_mut().optimizer.repartition_file_scans = false;
         config
     }

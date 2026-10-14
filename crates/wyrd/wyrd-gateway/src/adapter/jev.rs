@@ -4,10 +4,10 @@
 //! [`JevRequest`], is bound-checked, and takes the deployment's native model;
 //! its typed answer returns as Jev's own response. On the unified
 //! `/v1/chat/completions` route Jev is a pass-through, not a translation: the
-//! text of the last user message must be the JSON of the typed Jev request
-//! `{state, questions}`, and the typed answer returns serialized as JSON in
-//! the sole assistant message. No chat conversation is mapped onto Jev
-//! questions.
+//! text of the last user message must deserialize as the typed Jev request
+//! `{state, questions}`, which is forwarded without per-field validation, and
+//! the typed answer returns serialized as JSON in the sole assistant message.
+//! No chat conversation is mapped onto Jev questions.
 
 use std::collections::BTreeMap;
 
@@ -52,14 +52,17 @@ pub(super) fn request(body: &Value, model: &str) -> Result<JevRequest, Unsupport
 /// message of a Chat Completions `body`.
 ///
 /// Every other chat member and message is ignored: the pass-through carries
-/// only the Jev request. Streaming is refused because Jev answers whole.
+/// only the Jev request. Typed deserialization (closed question forms, no
+/// unknown members) is the only check; the native route's documented bounds
+/// are not applied, so the provider judges the request. Streaming is refused
+/// because Jev answers whole.
 ///
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] naming `body` when it is not a chat
-/// request, `stream` for a streaming call, `messages` when the last user
+/// request, `stream` for a streaming call, or `messages` when the last user
 /// message holds no text that decodes as `{state, questions}` (a `model`
-/// member there included), or the member that breaks a documented Jev bound.
+/// member there included).
 pub(super) fn chat_request(body: &Value, model: &str) -> Result<JevRequest, UnsupportedRequest> {
     let chat = super::chat_request(body)?;
     if chat.stream == Some(true) {
@@ -87,7 +90,7 @@ pub(super) fn chat_request(body: &Value, model: &str) -> Result<JevRequest, Unsu
                 ),
             )
         })?;
-    checked(JevRequest {
+    Ok(JevRequest {
         model: model.to_owned(),
         state: questions.state,
         questions: questions.questions,
@@ -108,7 +111,7 @@ fn text(content: &OpenAiMessageContent) -> Option<String> {
     }
 }
 
-/// Applies the documented Jev bounds to `request`.
+/// Applies the documented Jev bounds to a native `systemone` `request`.
 ///
 /// # Errors
 ///

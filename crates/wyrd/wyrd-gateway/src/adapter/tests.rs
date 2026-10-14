@@ -3336,11 +3336,12 @@ fn jev_with_question(question: Value) -> Value {
     body
 }
 
-/// Bad Jev forms, broken bounds, chat whose last user message is not a typed
-/// Jev request (ordinary text, a `model` member, non-text parts), streaming,
-/// and every other dialect are refused by preparation, so they never reach the
-/// provider; Jev bodies never reach `OpenAI` adapters either. The last user
-/// message is read even when a later assistant turn follows it.
+/// Bad Jev forms, native broken bounds, chat whose last user message is not a
+/// typed Jev request (ordinary text, a `model` member, non-text parts, an
+/// unknown question form), streaming, and every other dialect are refused by
+/// preparation, so they never reach the provider; Jev bodies never reach
+/// `OpenAI` adapters either. The last user message is read even when a later
+/// assistant turn follows it.
 ///
 /// # Panics
 ///
@@ -3370,9 +3371,9 @@ async fn jev_bad_forms_are_rejected_before_provider_io() {
     ]);
     let mut streamed = jev_chat();
     streamed["stream"] = json!(true);
-    let mut unbounded = jev_chat();
-    unbounded["messages"][3]["content"] = json!(
-        json!({"state": "s", "questions": {"helpful": {"type": "noul", "instructions": " "}}})
+    let mut unknown_form = jev_chat();
+    unknown_form["messages"][3]["content"] = json!(
+        json!({"state": "s", "questions": {"helpful": {"type": "essay", "instructions": "x"}}})
             .to_string()
     );
     let cases = [
@@ -3413,9 +3414,9 @@ async fn jev_bad_forms_are_rejected_before_provider_io() {
         (
             IngressDialect::OpenAi,
             chat,
-            unbounded,
+            unknown_form,
             false,
-            "questions.helpful.instructions",
+            "messages",
         ),
         (IngressDialect::OpenAi, one, jev_body(), false, "operation"),
     ];
@@ -3693,7 +3694,9 @@ async fn jev_credential_refusals_relay_like_other_providers() {
 /// The Chat Completions pass-through sends the typed Jev request read from
 /// the last user message with the deployment's model, and returns a chat
 /// completion whose sole content is Jev's typed answer as JSON, with Jev usage
-/// mapped to the completion usage and accounted as on the native route.
+/// mapped to the completion usage and accounted as on the native route. A
+/// typed request breaking a native-only bound (a blank instruction) is passed
+/// through to the provider unvalidated.
 ///
 /// # Panics
 ///
@@ -3743,8 +3746,28 @@ async fn jev_chat_pass_through_carries_the_typed_request_and_answer() {
         [&json!(378), &json!(65), &json!(443)]
     );
 
+    let unbounded = json!({"state": "s",
+        "questions": {"helpful": {"type": "noul", "instructions": " "}}});
+    let mut unbounded_chat = jev_chat();
+    unbounded_chat["messages"][3]["content"] = json!(unbounded.to_string());
+    let result = jev_attempt(
+        &dispatch(&server),
+        GatewayOperation::ChatCompletions,
+        IngressDialect::OpenAi,
+        &unbounded_chat,
+    )
+    .await;
+    assert!(
+        matches!(result, AttemptResult::Completed { .. }),
+        "{result:?}"
+    );
+
     let requests = server.received_requests().await.expect("recording");
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     let sent: Value = serde_json::from_slice(&requests[0].body).expect("json body");
     assert_eq!(sent, jev_body(), "only the typed Jev request is sent");
+    let mut expected = unbounded;
+    expected["model"] = json!("jev-latest");
+    let sent: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(sent, expected, "a native-only bound is not applied");
 }

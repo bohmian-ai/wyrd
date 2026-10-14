@@ -2351,6 +2351,15 @@ export interface OpenAiCustomVoice {
   readonly id: string;
 }
 
+/**
+ * Easy input message: `type` may be omitted and `content` may be text.
+ */
+export interface OpenAiEasyInputMessage {
+  readonly content: string | readonly OpenAiResponseContentPart[];
+  readonly role: string;
+  readonly type?: "message";
+}
+
 export type OpenAiEmbeddingsInput = string | readonly string[] | readonly number[] | readonly (readonly number[])[];
 
 export interface OpenAiEmbeddingsRequest {
@@ -2373,6 +2382,13 @@ export interface OpenAiFunction {
   readonly parameters?: Readonly<Record<string, unknown>> | null;
   readonly strict?: boolean | null;
 }
+
+/**
+ * A Responses tool result: text, or content parts such as `input_text`.
+ *
+ * `OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.
+ */
+export type OpenAiFunctionCallOutput = string | readonly OpenAiResponseContentPart[];
 
 export interface OpenAiFunctionChoice {
   readonly name: string;
@@ -2529,7 +2545,10 @@ export interface OpenAiResponseItemFunctionCall {
 
 export interface OpenAiResponseItemFunctionCallOutput {
   readonly call_id: string;
-  readonly output: string;
+  /**
+   * Tool result, as text or as content parts.
+   */
+  readonly output: OpenAiFunctionCallOutput;
   readonly type: "function_call_output";
 }
 
@@ -2627,7 +2646,7 @@ export type OpenAiResponsesHostedToolKind = "file_search" | "web_search_preview"
  *
  * Both forms decode and re-encode unchanged, so a relayed request keeps the form its caller sent. Editing the conversation first expands the text shorthand into the single user message it stands for.
  */
-export type OpenAiResponsesInput = string | readonly OpenAiResponseItem[];
+export type OpenAiResponsesInput = string | readonly (OpenAiResponseItem | OpenAiEasyInputMessage)[];
 
 export interface OpenAiResponsesMcpToolChoice {
   readonly name?: string | null;

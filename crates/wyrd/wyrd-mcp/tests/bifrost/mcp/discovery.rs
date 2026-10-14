@@ -13,7 +13,7 @@ mod pg_tests {
     use super::{McpJourneyError, discover, problem, refusal, structured, transport};
 
     use rmcp::ClientServiceExt as _;
-    use rmcp::model::{CallToolRequestParams, Tool};
+    use rmcp::model::{CacheScope, CallToolRequestParams, Tool};
     use rmcp::service::{RoleClient, RunningService};
     use serde_json::{Value as JsonValue, json};
     use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
@@ -125,6 +125,11 @@ mod pg_tests {
             let instructions = info.instructions.as_deref().ok_or("server instructions")?;
             assert!(instructions.contains("tools/list"));
             assert!(instructions.contains("wyrd.guide"));
+            // Protocol 2026-07-28 requires cache metadata; strict clients
+            // reject a list result without it.
+            let page = self.agent.list_tools(None).await?;
+            assert_eq!(page.ttl_ms, Some(0));
+            assert_eq!(page.cache_scope, Some(CacheScope::Private));
             let tools = self.agent.list_all_tools().await?;
             for tool in &tools {
                 assert_eq!(

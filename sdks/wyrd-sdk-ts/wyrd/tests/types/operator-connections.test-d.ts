@@ -1,11 +1,7 @@
 // Compile-only: `mise run ts:typecheck` fails when an assertion here breaks.
 import { expectTypeOf } from "vitest";
 
-import type {
-  CreateOperatorConnectionRequest,
-  OperatorConnectionView,
-  UpdateOperatorConnectionRequest,
-} from "wyrd-ai";
+import type { CreateOperatorConnectionRequest, OperatorConnectionView, UpdateOperatorConnectionRequest } from "wyrd-ai";
 
 const ORIGIN = "https://hooks.example.com";
 

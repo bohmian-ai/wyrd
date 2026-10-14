@@ -1,6 +1,6 @@
 ---
 id: SPEC-example-journey-fixes
-revision: 5
+revision: 6
 status: approved
 ---
 
@@ -38,6 +38,11 @@ together".
 - REQ-006 Bifrost subqueries over live tables work.
 - REQ-007 Gateway managed secrets use the deployment sealing keyring, and
   local server setup provides it.
+- REQ-008 Stock clients authenticate through the standard credential chain.
+- REQ-009 Callers address a gateway deployment by name, and a deployment
+  serves every model of its provider unless it lists models.
+- REQ-010 Wyrd ships an OpenAI Agents SDK trace processor the user passes to
+  the SDK.
 
 Non-goals: DeepSeek or other new providers; new Verifier semantics; a public
 release.
@@ -194,6 +199,91 @@ exchanges, caches, and renews.
 - An unresolvable credential fails with the existing client error
   (`WYRD_CLIENT_401_NO_CREDENTIALS`), not an opaque provider error.
 
+### REQ-009 Deployments are addressed by name and open by default (r6)
+
+Owner directive 2026-10-14: an active provider makes all of its models usable;
+a team can hold a second key for the same provider (for example provisioned
+throughput) and address it separately; `gateway:invoke` is open by default and
+a deployment can require an additional scope, like Bifrost permissions.
+
+Deployment shape:
+
+```yaml
+name: openai-pt          # the prefix callers write: openai-pt/gpt-6-luna
+adapter: openai          # upstream protocol
+auth: {bearer: {credential: openai-pt}}
+models: [gpt-6-luna]     # optional; omitted means every model
+access: granted          # optional; omitted means open
+```
+
+- A caller's model string is `<deployment>/<model>`. The gateway resolves the
+  one deployment with that name. The adapter, not the prefix, decides the
+  upstream. A missing deployment, or a model outside a declared `models`
+  list, fails with `GatewayModelUnavailable` before any provider IO.
+- `models` is optional. Omitted, the deployment serves every model of its
+  provider. `capabilities` is optional. Omitted, it is every operation the
+  adapter serves.
+- A deployment name is any valid deployment identifier. A deployment using a
+  built-in adapter may have any name (`openai-pt`); the rule that a built-in
+  adapter requires its reserved provider name is removed.
+- Weighted selection is removed: `routing_weight` and weighted ordering no
+  longer exist. Each model string names exactly one deployment. Failover
+  between deployments is a fallback rule.
+- Fallback rules, pricing, and governance limits name `<deployment>/<model>`,
+  so a provisioned-throughput deployment can carry its own fallback (for
+  example `openai-pt/gpt-6-luna` falls back to `openai/gpt-6-luna`) and its
+  own prices.
+- Aliases: a tenant may define an alias, a name that resolves to one
+  `<deployment>/<model>` target. A caller may send the alias as its model
+  string. Authorization, pricing, and fallback apply to the target. An alias
+  name never contains `/` and never shadows a deployment.
+- `/v1/models` lists the models of deployments that declare `models`, plus
+  aliases. A deployment that serves every model is not enumerated; the
+  gateway never probes upstream.
+- A Prompt Card may name `spec.deployment`. Omitted, the deployment is the
+  built-in name of the Prompt's provider (`openai`, `anthropic`, `gemini`,
+  `vertex`, `jev`, or the custom provider's name). Workflow and judge calls
+  use that deployment, and the Workflow chooses the Google dialect from the
+  deployment's adapter, not its name.
+
+Authorization:
+
+- `gateway:invoke` scopes are `all`, `{deployment}`, and
+  `{deployment, model}`. The `{deployment}` scope replaces today's provider
+  scope.
+- An `open` deployment (the default) is covered by `all`, by a grant naming
+  it, or by a grant naming one of its models. Built-in roles keep `all`, so
+  every Service can call every open deployment.
+- A `granted` deployment is covered only by a grant that names it or one of
+  its models. `all` does not cover it. This mirrors the extra
+  `gateway_payload_read` permission Bifrost requires for payload columns.
+- The check runs against the call's subject principal. An uncovered requested
+  target is refused with the existing invoke permission error; an uncovered
+  fallback target is dropped from the plan. Both decisions are audited as
+  today.
+
+### REQ-010 OpenAI Agents SDK trace processor (r6)
+
+Owner directive 2026-10-14: Wyrd works with OpenTelemetry instrumentation as
+a standard OTLP backend, and provides a trace processor that the user gives
+to the Agents SDK. Wyrd stays framework agnostic and never registers it.
+
+- TypeScript `wyrd-ai` exports `WyrdAgentsTraceProcessor`, implementing the
+  `@openai/agents` `TracingProcessor` interface. Python `wyrd` exports the
+  same processor for `openai-agents`. Each converts Agents SDK traces and
+  spans into OpenTelemetry spans on the active global tracer provider,
+  preserving parent and child structure. Generation and response spans carry
+  OpenTelemetry GenAI attributes (`gen_ai.request.model`,
+  `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`).
+- The user installs it with the SDK's own API, for example
+  `setTraceProcessors([new WyrdAgentsTraceProcessor()])`. `startTelemetry()`
+  neither exports nor registers it, and Wyrd never patches the Agents SDK.
+- `@openai/agents` and `openai-agents` are optional dependencies; importing
+  `wyrd-ai` or `wyrd` without them works.
+- With `startTelemetry()` running inside `Run.scope`, the converted spans
+  carry `wyrd.run_id` and `wyrd.card_uid` like any other span and land in
+  `vala.traces.spans`.
+
 ## Invariants
 
 - INV-001 Tenant isolation holds on every changed path.
@@ -221,6 +311,21 @@ exchanges, caches, and renews.
   Journeys prove a stock OpenAI client (TypeScript and Python) and the
   official TypeScript MCP SDK succeed with only the ambient environment, and
   that a revoked API key is refused.
+- AC-006 (r6) Gateway journeys in Rust, Python, and TypeScript: a deployment
+  without `models` serves a model it never named; two deployments with the
+  same adapter and different credentials are each reached by their prefix; a
+  `granted` deployment refuses a principal holding only `all` and serves a
+  principal granted that deployment; an uncovered fallback is dropped; an
+  alias routes to its target; a Prompt with `spec.deployment` reaches that
+  deployment from a Workflow or judge call.
+- AC-007 (r6) TypeScript and Python journeys: an Agents SDK agent run with
+  `WyrdAgentsTraceProcessor` installed and `startTelemetry()` running inside
+  `Run.scope` produces spans in `vala.traces.spans` carrying the Run ID and
+  GenAI model attribute. Importing the SDK without the Agents SDK installed
+  succeeds.
+- AC-008 (r6) `wyrd-example-ts` sets up the gateway with one credential and
+  one deployment per provider, no capture step, and installs
+  `WyrdAgentsTraceProcessor` instead of disabling tracing.
 
 ## Open material decisions
 
@@ -249,3 +354,8 @@ None.
   exports". Adds REQ-008 (ambient `accessTokenSource` and `wyrdFetch`, Python
   `GatewayAuth()` default, `gatewayFetch` removed) and AC-005. The server does
   not accept raw API keys on the gateway or `/mcp`.
+- r6 2026-10-14: owner approval, given directly: "yes and then execute it",
+  of the gateway and tracing recommendation. Adds REQ-009 (deployments
+  addressed by name, every model by default, `granted` access, aliases,
+  weighted routing removed, Prompt `spec.deployment`), REQ-010 (Agents SDK
+  trace processor, independent of `startTelemetry`), and AC-006 to AC-008.

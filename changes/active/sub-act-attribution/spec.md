@@ -68,7 +68,7 @@ a client can never supply either one.
 
 ### REQ-003 Authorization and cost follow sub
 
-- Every gateway call and every judge call checks the `model:invoke` permission
+- Every gateway call and every judge call checks the `gateway:invoke` permission
   of the call's `sub`. This holds whether the call came in through the gateway
   or was started inside Wyrd.
 - A delegated external call keeps today's rule: its permissions are the
@@ -202,7 +202,7 @@ OD-1's span link and OD-3 trace behavior are kept.
 | ID | Criterion | Evidence |
 |---|---|---|
 | AC-001 | A scheduled binding run, its judge calls (where Eval), and its result rows record `sub` = owner principal, `act` = SYSTEM. | Rust journey against `WyrdTestServer` and Postgres |
-| AC-002 | An observation-triggered run records `sub` = binding owner principal, `act` = SYSTEM, even when another principal wrote the observation. Its judge gateway call is refused when the owner lacks `model:invoke` on the judge model, and its spend lands on the owner. | Rust journey |
+| AC-002 | An observation-triggered run records `sub` = binding owner principal, `act` = SYSTEM, even when another principal wrote the observation. Its judge gateway call is refused when the owner lacks `gateway:invoke` on the judge model, and its spend lands on the owner. | Rust journey |
 | AC-003 | A direct gateway call and a direct verify record `sub` = `act` = caller in Bifrost, and the audit row matches. | journeys in Rust, Python and TypeScript |
 | AC-004 | A delegated call (B on behalf of A) records `sub` = A and `act` = B on the gateway row and the audit row. | Rust journey |
 | AC-005 | A client frame declaring `sub_principal_id` or `act_principal_id` is rejected with the existing reserved-column error. | journey in each SDK |

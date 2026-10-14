@@ -8,7 +8,7 @@ use axum::extract::Request;
 use axum::middleware;
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnResponse, OnResponse as _, TraceLayer};
 use tracing::Span;
 use utoipa::{Modify, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
@@ -143,7 +143,11 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             crate::http::middleware::trace_context::attach_trace_context,
         ))
-        .layer(TraceLayer::new_for_http().make_span_with(request_span))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(request_span)
+                .on_response(record_response),
+        )
 }
 
 /// Opens the SERVER span of one HTTP request.
@@ -154,7 +158,10 @@ pub fn build_router(state: AppState) -> Router {
 /// records the method, path, and version but never the query: a URL-borne
 /// credential, such as a provider SDK's `?key=` that ingress refuses, is
 /// already in the request when this span opens, before any authentication
-/// runs, and must not reach logs or exported traces.
+/// runs, and must not reach logs or exported traces. It also carries the
+/// OpenTelemetry HTTP server attributes: `http.request.method`, `http.route`
+/// as the matched route template (never the raw path), and
+/// `http.response.status_code`, which [`record_response`] fills in.
 fn request_span(request: &Request) -> Span {
     let span = tracing::info_span!(
         "request",
@@ -162,11 +169,24 @@ fn request_span(request: &Request) -> Span {
         method = %request.method(),
         path = request.uri().path(),
         version = ?request.version(),
+        http.request.method = %request.method(),
+        http.route = request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(axum::extract::MatchedPath::as_str),
+        http.response.status_code = tracing::field::Empty,
     );
     if let Some(caller) = wyrd_telemetry::inbound_context(request.headers()) {
         wyrd_telemetry::continue_remote(&span, &caller);
     }
     span
+}
+
+/// Records the response status on the request span, then logs the response
+/// as the default `TraceLayer` does.
+fn record_response(response: &axum::response::Response, latency: std::time::Duration, span: &Span) {
+    span.record("http.response.status_code", response.status().as_u16());
+    DefaultOnResponse::default().on_response(response, latency, span);
 }
 
 /// Apply the core protective edge stack to `router`: request-id propagation,

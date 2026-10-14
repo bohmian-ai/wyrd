@@ -3203,6 +3203,16 @@ fn assert_tenant_copy(
         .find(|span| span.name == "request")
         .expect("the request span reaches the tenant");
     assert_eq!(request.parent_span_id, caller, "{tenant:#?}");
+    for key in [
+        "http.request.method",
+        "http.route",
+        "http.response.status_code",
+    ] {
+        assert!(
+            request.attributes.iter().any(|kept| kept == key),
+            "the request span carries {key}: {request:#?}"
+        );
+    }
     for span in tenant {
         assert!(
             operator

@@ -49,12 +49,13 @@ execution is connected back to its originating state where possible.
 
 ## OD-3 Trace context
 
-- Every client request path carries the caller's W3C trace context:
-  - the shared HTTP builder;
-  - the MCP client's `authenticated_replay` path;
-  - gRPC ingest metadata;
-  - Python and TypeScript at their shared native boundary, not only on
-    `verify`.
+- The run context (`Run.scope` plus `startTelemetry`) already stamps
+  `wyrd.run_id` and `wyrd.card_uid` on application spans, and observations
+  already record the active `trace_id`/`span_id`. No further client-side
+  injection is added.
+- Server-side work done on the caller's behalf joins the caller's trace when
+  the request carries `traceparent`. In practice that is a judge model call
+  during `verify`.
 - Trace context is observability linkage only. It never authorizes or
   attributes anything.
 

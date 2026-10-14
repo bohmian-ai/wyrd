@@ -15,7 +15,7 @@ from wyrd.gateway import Gateway
 from wyrd.testing import WyrdTestServer, cli
 
 from .gateway.support import PROVIDER_KEY, deploy
-from .support import FIXTURES, Receiver, client_of
+from .support import FIXTURES, Receiver, client_of, register
 
 pytestmark = pytest.mark.integration
 
@@ -116,6 +116,32 @@ def test_malformed_traceparent_is_ignored_by_the_gateway(
 
     assert completion.choices[0].message.content == "hi"
     assert gateway_spans(server, trace_id) == []
+
+
+def test_gateway_call_records_a_lone_run_or_card(server: WyrdTestServer, admin: WyrdClient) -> None:
+    card_uid = str(register(Cards(admin), "cards/gateway_inference/ask.yaml")["ask-agent"].uid)
+    issued = cli.issue_key(
+        kind="Agent", name="ask-agent", version="1.0.0", space="default", client=admin
+    )
+    agent = openai_client(client_of(server, issued.key))
+
+    for headers in ({"wyrd-run-id": "run-alone"}, {"wyrd-card-uid": card_uid}):
+        completion = agent.chat.completions.create(
+            model="openai/gpt-4o",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_headers=headers,
+        )
+        assert completion.choices[0].message.content == "hi"
+
+    server.flush_bifrost()
+    calls = Bifrost(client=admin).sql(
+        "SELECT run_id, card_uid FROM vala.gateway.calls WHERE caller_principal_id = $1 ORDER BY run_id",
+        [str(issued.principal_id)],
+    )
+    assert calls.to_arrow().to_pylist() == [
+        {"run_id": "run-alone", "card_uid": None},
+        {"run_id": None, "card_uid": card_uid},
+    ]
 
 
 def test_caller_without_gateway_invoke_is_refused(

@@ -33,6 +33,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
 use crate::components::auth::{AuthenticatedPrincipal, Caller};
+use crate::http::middleware::trace_context;
 use crate::state::AppState;
 
 mod bifrost;
@@ -231,6 +232,30 @@ impl ServerHandler for WyrdMcpHandler {
             .with_cache_scope(CacheScope::Private)))
     }
 
+    /// Dispatch tools under the request's inbound trace context.
+    ///
+    /// The transport serves each request on a task of its own, so the context
+    /// the HTTP edge made active is not visible here; it is read again from
+    /// the original request headers, letting a judge call a
+    /// `verification.execute` makes join the agent's trace like an HTTP
+    /// verification does.
+    ///
+    /// # Errors
+    /// Every error of [`WyrdMcpHandler::dispatch`].
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let inbound = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| trace_context::inbound(&parts.headers));
+        trace_context::within(inbound, self.dispatch(request, context)).await
+    }
+}
+
+impl WyrdMcpHandler {
     /// Dispatch tools with verified request context and retain the shutdown
     /// tracker token through execution and cancellation settlement.
     ///
@@ -238,7 +263,7 @@ impl ServerHandler for WyrdMcpHandler {
     /// Returns invalid parameters for unknown tools, mapped context errors when
     /// trusted extensions are missing, or the owning tool's protocol error.
     /// Domain failures remain structured tool results.
-    async fn call_tool(
+    async fn dispatch(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,

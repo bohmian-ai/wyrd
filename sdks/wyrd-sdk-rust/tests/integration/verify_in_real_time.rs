@@ -567,6 +567,72 @@ async fn judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
     assistant.deployment.shutdown().await;
 }
 
+/// A Run's verify made inside a `tracing` span that carries an OpenTelemetry
+/// context sends that context with the request, so the judge's gateway span
+/// joins the caller's trace. The OpenTelemetry layer is scoped to the verify
+/// so the journey does not contend for the process-global subscriber a
+/// `WYRD_LOG` test server installs.
+///
+/// # Panics
+/// Panics when the verify, flush, or read fails or the judge call is in
+/// another trace.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn traced_sdk_verify_joins_the_callers_trace() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry::trace::{
+        SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId, TraceState,
+    };
+    use tracing::Instrument as _;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let assistant = Assistant::start().await;
+    let state = assistant.state().await;
+    let run = state.run_for_card("agent").expect("agent run opens");
+    let traced = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(
+                opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                    .build()
+                    .tracer("journey"),
+            ),
+        ),
+    );
+    let caller = tracing::dispatcher::with_default(&traced, || tracing::info_span!("caller"));
+    caller
+        .set_parent(
+            opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+                TraceId::from_hex(CALLER_TRACE).expect("trace id"),
+                SpanId::from_hex(CALLER_SPAN).expect("span id"),
+                TraceFlags::SAMPLED,
+                true,
+                TraceState::default(),
+            )),
+        )
+        .expect("the caller span joins the caller's trace");
+
+    run.observe()
+        .verify("answer-graded", &Answer { answer: "yes" })
+        .instrument(caller)
+        .with_subscriber(traced)
+        .await
+        .expect("the answer is judged");
+    state.shutdown().await.expect("Bifrost stops");
+
+    let calls = assistant.judge_calls().await;
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.trace_id.as_str())
+            .collect::<Vec<_>>(),
+        [CALLER_TRACE],
+        "{calls:?}"
+    );
+    assistant.deployment.shutdown().await;
+}
+
 /// A malformed `traceparent` is ignored: the judgment succeeds and its judge
 /// call keeps a trace of its own.
 ///

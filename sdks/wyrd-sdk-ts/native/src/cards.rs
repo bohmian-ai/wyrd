@@ -13,9 +13,11 @@ use wyrd_client::cards::{CardKind, CardSelector, Cards, HydrationMode, ListCards
 use wyrd_client::observe::eval::parse_session_id;
 use wyrd_client::observe::{EvalObservationOptions, Run};
 use wyrd_client::state::WyrdState;
+use wyrd_client::transport::trace::with_caller_trace;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefParseError};
+use wyrd_spec::trace::TraceContext;
 
 use crate::client::{NativeWyrdClient, NativeWyrdClientResult};
 use crate::workflow::{NativeWorkflowLoad, parse_workflow_selector};
@@ -666,6 +668,9 @@ impl NativeRun {
     /// `input_json` is one Eval context object or one array of Drift feature
     /// rows; `media_json` is one JSON array of media descriptors. One server
     /// call, never replayed; nothing is observed, recorded, or dispatched.
+    /// `traceparent` and `tracestate` are Node's active OpenTelemetry span,
+    /// which the call carries as its W3C trace context so the server's work
+    /// joins the caller's trace; a malformed `traceparent` is ignored.
     ///
     /// # Errors
     ///
@@ -679,7 +684,12 @@ impl NativeRun {
         verifier: String,
         input_json: String,
         media_json: Option<String>,
+        traceparent: Option<String>,
+        tracestate: Option<String>,
     ) -> Result<NativeLifecycleResult> {
+        let caller = traceparent.and_then(|parent| {
+            TraceContext::parse_traceparent(&parent, tracestate.unwrap_or_default()).ok()
+        });
         let media = match media_json.as_deref().map(serde_json::from_str).transpose() {
             Ok(media) => media.unwrap_or_default(),
             Err(error) => {
@@ -690,11 +700,12 @@ impl NativeRun {
             }
         };
         NativeLifecycleResult::outcome(
-            Box::pin(
+            Box::pin(with_caller_trace(
+                caller,
                 self.run
                     .observe()
                     .verify_json(&verifier, &input_json, media),
-            )
+            ))
             .await,
         )
     }

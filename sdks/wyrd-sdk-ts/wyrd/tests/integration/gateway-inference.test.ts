@@ -13,6 +13,7 @@ import {
   type RegistrationReceipt,
   Workflow,
   WyrdClient,
+  gatewayFetch,
 } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
@@ -159,6 +160,29 @@ test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {
     status: 403,
     error: { code: "WYRD_PERMISSION_403_DENIED_RBAC" },
   });
+});
+
+test("gateway call records a lone run or card", async ({ server, ask }) => {
+  const issued = await cli.issueKey({ kind: "Agent", name: "ask-agent", version: "1.0.0", space: "default" });
+  const caller = WyrdClient.connect({ credential: issued.key });
+  const client = new OpenAI({ baseURL: `${caller.serverUrl}/v1`, apiKey: "wyrd", fetch: gatewayFetch(caller) });
+  const cardUid = registered(ask, "ask-agent").uid;
+
+  for (const headers of [{ "wyrd-run-id": "run-alone" }, { "wyrd-card-uid": cardUid }]) {
+    const reply = await client.chat.completions.create(ASK, { headers });
+    expect(reply.choices[0]?.message.content).toBe("hi");
+  }
+
+  server.flushBifrost();
+  const calls = (
+    await (
+      await Bifrost.connect()
+    ).sql("SELECT run_id, card_uid FROM vala.gateway.calls WHERE caller_principal_id = $1 ORDER BY run_id", [
+      issued.principal_id,
+    ])
+  ).toArrow();
+  expect(columnValues(calls.getChild("run_id"))).toEqual(["run-alone", null]);
+  expect(columnValues(calls.getChild("card_uid"))).toEqual([null, cardUid]);
 });
 
 test("cli issues a card scoped key and writes a provider credential", async ({ ask: _ }) => {

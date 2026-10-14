@@ -61,6 +61,10 @@ opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 # The spans the local-development story starts inside a `Run::scope`.
 tracing = { workspace = true }
+# Parents the traced-verify story's span on a known caller trace under an
+# OpenTelemetry subscriber scoped to that verify.
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
 # The OpenAI-compatible Chat Completions caller of the gateway inference story.
 reqwest = { workspace = true }
 secrecy = { workspace = true }

@@ -58,3 +58,29 @@ Limits: `wyrd.verifier_runs` rows enqueued before the migration keep a null
 requester; the built-in `vala.verification.results` schema gains
 `requested_by_principal_id` in place, following the existing built-in schema
 precedent, with no evolution path for already-created tables.
+
+### Follow-up (2026-10-14): client subject headers and caller trace propagation
+
+Revision note: per coordinator follow-up, `wyrd-client` sends `wyrd-run-id`
+and `wyrd-card-uid` independently, and SDK requests carry the caller's active
+OpenTelemetry context (REQ-005).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Client sends run_id and card_uid independently | `wyrd-client` `workflow/gateway.rs::PublicWyrdGatewayCaller::with_subject` (each `Option`) | `wyrd-client` integration `workflow_transport::public_gateway_call_carries_run_and_card_uid` (both, none, run only, card only); Rust `gateway_call_records_whichever_attribution_it_carries`; Python `test_gateway_call_records_a_lone_run_or_card`; TS `gateway call records a lone run or card` | PASS |
+| SDK requests carry the caller's trace context; traced verify joins the caller's trace | `wyrd-client` `transport/trace.rs` (one outbound pick: foreign-runtime scope, else current `tracing` span), `transport/http.rs::authenticated` (every HTTP request); Python and TS `verify` hand their active OTel span over with `with_caller_trace` | unit `transport::trace::tests::*`; Rust `traced_sdk_verify_joins_the_callers_trace`; Python `test_traced_verify_joins_the_callers_trace`; TS `traced verify joins the caller's trace` | PASS |
+| MCP-initiated verifies inherit the inbound trace | `/mcp` serves each request on a spawned task, losing the edge's task-local context; `mcp/mod.rs::call_tool` re-scopes dispatch from the original request headers via `trace_context::within` | `wyrd-mcp` `connectivity::pg_tests::traced_tool_call_runs_under_the_callers_trace` (probe reports the inbound trace id) and `…streamable_http_client_reaches_authenticated_server_context` (no header, no trace) | PASS |
+
+Limits: the header-map replay path (`authenticated_replay`) and gRPC send no
+trace headers; Python and TypeScript bridge their OTel context for `verify`
+only, since their other calls reach no traced server path.
+
+Commands: `mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=transport::trace::tests::no_active_context_sends_none) | test(=transport::trace::tests::scoped_caller_context_is_outbound)'` (2/2);
+`mise exec -- cargo nextest run --locked -p wyrd-client --test integration -E 'test(=workflow_transport::public_gateway_call_carries_run_and_card_uid)'` (1/1);
+`scripts/postgres/with-test-postgres.sh` + `cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/judge_call|traceparent|joins_the_callers|whichever_attribution|traced_sdk_verify/)'` (7/7);
+`scripts/postgres/with-test-postgres.sh` + `cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(=connectivity::pg_tests::traced_tool_call_runs_under_the_callers_trace) | test(=connectivity::pg_tests::streamable_http_client_reaches_authenticated_server_context)'` (2/2);
+pytest `-m integration -k 'joins_the_callers_trace or malformed_traceparent or judge_call_is_attributed or lone_run_or_card'` on the two Python files (5/5);
+vitest on the two TS files (26/26); `mise run fmt`, `fmt:check`, `lints`,
+`py:format`, `py:lints`, `py:typecheck`, `codegen:check`, `ts:format:check`,
+`ts:lints`, `ts:typecheck`, `ts:napi:check` (after staging the regenerated
+`index.d.ts`), `check:deps`, `docs:check`, `git diff --check`: all pass.

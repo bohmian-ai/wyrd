@@ -5,7 +5,9 @@
 //! request's task, so work done on the request's behalf — a gateway call, or
 //! a judge call a direct verification makes in process — joins the caller's
 //! trace through [`active`]. A missing or malformed `traceparent` leaves no
-//! active context; it is never an error.
+//! active context; it is never an error. A transport that serves the request
+//! on a task of its own — the `/mcp` service spawns one per request — scopes
+//! that task again with [`within`].
 
 use axum::extract::Request;
 use axum::http::HeaderMap;
@@ -27,9 +29,16 @@ const TRACESTATE: &str = "tracestate";
 ///
 /// A request without exactly one valid `traceparent` runs unchanged.
 pub async fn attach_trace_context(request: Request, next: Next) -> Response {
-    match inbound(request.headers()) {
-        Some(context) => INBOUND.scope(context, next.run(request)).await,
-        None => next.run(request).await,
+    within(inbound(request.headers()), next.run(request)).await
+}
+
+/// Run `future` with `context` as the active inbound trace context.
+///
+/// `None` runs `future` unchanged, so an untraced request stays untraced.
+pub(crate) async fn within<F: Future>(context: Option<TraceContext>, future: F) -> F::Output {
+    match context {
+        Some(context) => INBOUND.scope(context, future).await,
+        None => future.await,
     }
 }
 
@@ -45,7 +54,7 @@ pub(crate) fn active() -> Option<TraceContext> {
 /// W3C trace context treats a repeated `traceparent` as invalid, so only a
 /// single parseable value is accepted. Repeated `tracestate` headers are
 /// combined into one list in order; one that is not visible ASCII is dropped.
-fn inbound(headers: &HeaderMap) -> Option<TraceContext> {
+pub(crate) fn inbound(headers: &HeaderMap) -> Option<TraceContext> {
     let mut parents = headers.get_all(TRACEPARENT).iter();
     let parent = parents.next()?.to_str().ok()?;
     if parents.next().is_some() {

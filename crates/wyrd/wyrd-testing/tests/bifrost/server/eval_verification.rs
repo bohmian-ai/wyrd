@@ -2770,15 +2770,15 @@ async fn observation_judge_call_records_card_and_run_and_joins_its_result()
     Ok(())
 }
 
-/// Add Services `owner-a`, `owner-b`, and `owner-c` beside [`write_graph`]'s
-/// Cards, each binding the shared Agent to the gated LLM-judge Eval on
+/// Add Services `owner-a` through `owner-e` beside [`write_graph`]'s Cards,
+/// each binding the shared Agent to the gated LLM-judge Eval on
 /// `observations_ready`, and return their paths.
 ///
 /// # Panics
 /// Panics when a fixture file cannot be written.
-fn write_background_owners(root: &Path) -> [PathBuf; 3] {
+fn write_background_owners(root: &Path) -> [PathBuf; 5] {
     write_graph(root);
-    ["owner-a", "owner-b", "owner-c"].map(|name| {
+    ["owner-a", "owner-b", "owner-c", "owner-d", "owner-e"].map(|name| {
         let path = root.join(format!("{name}.yaml"));
         std::fs::write(
             &path,
@@ -2796,19 +2796,58 @@ const RUN_PAIRS_SQL: &str = "SELECT concat(o.name, '|', r.sub_principal_id, '|',
     FROM wyrd.verifier_runs r JOIN wyrd.cards o ON o.card_uid = r.owner_card_uid \
     WHERE r.origin = 'observation' ORDER BY o.name";
 
+/// The owner Card of every observation binding refused since `checkpoint`,
+/// waiting until `expected` distinct owners are refused.
+///
+/// The run-request sink logs each refusal inside its
+/// `verification.observation_runs` span, so the event is read from the
+/// process telemetry capture once that span ends.
+///
+/// # Errors
+/// Returns a timeout naming the refusals seen when fewer than `expected`
+/// arrive within [`WAIT`].
+async fn refused_owners(
+    capture: &wyrd_testing::bifrost::BifrostTelemetryCapture,
+    checkpoint: &wyrd_testing::bifrost::BifrostTelemetryCheckpoint,
+    expected: usize,
+) -> Result<std::collections::BTreeSet<String>, ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let refused: std::collections::BTreeSet<String> = capture
+            .spans_since(checkpoint)
+            .into_iter()
+            .filter(|span| span.name == "verification.observation_runs")
+            .flat_map(|span| span.events)
+            .filter(|event| event.name.starts_with("observation run not accepted"))
+            .filter_map(|event| event.attributes.get("owner_card_uid").cloned())
+            .collect();
+        if refused.len() >= expected {
+            return Ok(refused);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("expected {expected} refused owners, saw {refused:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// An observation-triggered run serves its binding owner with SYSTEM as
 /// actor, never the record's writer (AC-001/002/008/017).
 ///
-/// Services A, B, and C bind the same Agent to the gated LLM-judge Eval. Only
+/// Services A through E bind the same Agent to the gated LLM-judge Eval. Only
 /// A's owner may invoke the judge model; B's owner authenticates, then holds
-/// no role;
-/// C's owner is suspended. An unbound administrator writes one record
-/// about the Agent. The tenant's seeded SYSTEM principal is active, so A and
-/// B each get one run, accepted as owner/SYSTEM, and C, whose owner is
-/// suspended, gets none rather than falling back to the writer or SYSTEM. A's
-/// judge call reaches the provider and its gateway call and result rows carry
-/// A's owner/SYSTEM; B's judge is refused under B's owner authority without
-/// an upstream request, so the provider sees exactly one call.
+/// no role; C's owner is suspended; D's owner principal is gone; and E's
+/// owner principal now exists only in another tenant. An unbound
+/// administrator writes one record about the Agent. The tenant's seeded
+/// SYSTEM principal is active, so A and B each get one run, accepted as
+/// owner/SYSTEM, while C, D, and E get none rather than falling back to the
+/// writer, SYSTEM, or the foreign principal, and each refusal is logged with
+/// its binding's owner Card. A's judge call reaches the provider and its
+/// gateway call and result rows carry A's owner/SYSTEM; B's judge is refused
+/// under B's owner authority without an upstream request, so the provider
+/// sees exactly one call. Once the tenant's SYSTEM principal is removed, a
+/// second record starts no run for any binding and every binding's refusal
+/// is logged.
 ///
 /// # Errors
 /// Returns server, registration, SDK lifetime, runtime, or query errors, or a
@@ -2817,7 +2856,9 @@ const RUN_PAIRS_SQL: &str = "SELECT concat(o.name, '|', r.sub_principal_id, '|',
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn background_owner_subject_system_actor() -> Result<(), ServerJourneyError> {
     let root = tempfile::tempdir()?;
-    let [service_a, service_b, service_c] = write_background_owners(root.path());
+    let [service_a, service_b, service_c, service_d, service_e] =
+        write_background_owners(root.path());
+    let (_telemetry, capture) = wyrd_testing::bifrost::shared_process_telemetry_for_test()?;
     let provider = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -2857,15 +2898,48 @@ async fn background_owner_subject_system_actor() -> Result<(), ServerJourneyErro
             payload_fields: std::collections::BTreeSet::new(),
         })
         .await?;
-    let bundles = ["bundle-a", "bundle-b", "bundle-c"].map(|name| root.path().join(name));
+    let bundles = ["bundle-a", "bundle-b", "bundle-c", "bundle-d", "bundle-e"]
+        .map(|name| root.path().join(name));
     let receipt_a = register(&admin, &service_a, &bundles[0]).await;
     let receipt_b = register(&admin, &service_b, &bundles[1]).await;
     let receipt_c = register(&admin, &service_c, &bundles[2]).await;
-    let owner_c = receipt_c.root.uid.as_ref().ok_or("C has no UID")?.as_uuid();
+    let receipt_d = register(&admin, &service_d, &bundles[3]).await;
+    let receipt_e = register(&admin, &service_e, &bundles[4]).await;
+    let [owner_c, owner_d, owner_e] = [&receipt_c, &receipt_d, &receipt_e].map(|receipt| {
+        receipt
+            .root
+            .uid
+            .as_ref()
+            .map(wyrd_spec::ids::CardUid::as_uuid)
+    });
+    let (Some(owner_c), Some(owner_d), Some(owner_e)) = (owner_c, owner_d, owner_e) else {
+        return Err("a registered owner has no UID".into());
+    };
     sqlx::query("UPDATE wyrd.auth_service_accounts SET status = 'suspended' WHERE card_uid = $1")
         .bind(owner_c)
         .execute(&superuser)
         .await?;
+    sqlx::query("DELETE FROM wyrd.auth_service_accounts WHERE card_uid = $1")
+        .bind(owner_d)
+        .execute(&superuser)
+        .await?;
+    let foreign = server
+        .pg_fixture()
+        .seed_additional_tenant("foreign-owner")
+        .await?;
+    sqlx::query(
+        "WITH moved AS (DELETE FROM wyrd.auth_service_accounts WHERE card_uid = $1 RETURNING *) \
+         INSERT INTO wyrd.auth_service_accounts (id, data_tenant_id, principal_kind, card_kind, \
+             card_uid, card_ref, space, name, version, description, status, \
+             sub_principal_id, act_principal_id) \
+         SELECT id, $2, principal_kind, card_kind, card_uid, card_ref, space, name, version, \
+                description, status, sub_principal_id, act_principal_id \
+           FROM moved",
+    )
+    .bind(owner_e)
+    .bind(foreign.as_uuid())
+    .execute(&superuser)
+    .await?;
     let mut owners = Vec::new();
     for (receipt, roles, bundle) in [
         (&receipt_a, &[JUDGE_ROLE][..], &bundles[0]),
@@ -2890,6 +2964,7 @@ async fn background_owner_subject_system_actor() -> Result<(), ServerJourneyErro
         .execute(&superuser)
         .await?;
 
+    let checkpoint = capture.checkpoint()?;
     let state = start_state(&bundles[0], &admin).await;
     let agent = state.run().for_card("agent")?;
     let agent_uid = agent.subject().uid.clone().ok_or("agent has no UID")?;
@@ -2994,6 +3069,53 @@ async fn background_owner_subject_system_actor() -> Result<(), ServerJourneyErro
             "expected only A to pass and every result as owner/SYSTEM, read {results:?} for {runs:?}"
         )
         .into());
+    }
+    let unaccepted =
+        std::collections::BTreeSet::from([owner_c, owner_d, owner_e].map(|uid| uid.to_string()));
+    let refused = refused_owners(&capture, &checkpoint, unaccepted.len()).await?;
+    if refused != unaccepted {
+        return Err(format!("expected C, D, and E refused, read {refused:?}").into());
+    }
+
+    // Without the tenant's SYSTEM principal no binding's run can be
+    // accepted, so a second record enqueues nothing and refuses every owner.
+    sqlx::query(
+        "DELETE FROM wyrd.auth_service_accounts \
+         WHERE data_tenant_id = $1 AND principal_kind = 'system'",
+    )
+    .bind(tenant.as_uuid())
+    .execute(&superuser)
+    .await?;
+    let checkpoint = capture.checkpoint()?;
+    let state = start_state(&bundles[0], &admin).await;
+    emit(
+        &state.run().for_card("agent")?,
+        &json!({ "answer": "yes", "marker": "systemless" }),
+        None,
+        None,
+    );
+    state.shutdown().await?;
+    server.flush_bifrost().await?;
+    let mut every_owner = unaccepted;
+    for receipt in [&receipt_a, &receipt_b] {
+        every_owner.insert(
+            receipt
+                .root
+                .uid
+                .as_ref()
+                .ok_or("an owner has no UID")?
+                .to_string(),
+        );
+    }
+    let refused = refused_owners(&capture, &checkpoint, every_owner.len()).await?;
+    if refused != every_owner {
+        return Err(
+            format!("expected every owner refused without SYSTEM, read {refused:?}").into(),
+        );
+    }
+    let runs = seed.observation_runs().await?.len();
+    if runs != 2 {
+        return Err(format!("a SYSTEM-less tenant accepted runs: {runs} observation runs").into());
     }
     server.shutdown().await?;
     Ok(())

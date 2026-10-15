@@ -877,8 +877,8 @@ pub struct ObservationBinding {
     pub binding_id: BindingId,
     /// The Card the binding verifies.
     card_uid: CardUid,
-    /// The binding's owner Card.
-    owner_card_uid: CardUid,
+    /// The binding's owner Card, named when its runs cannot be accepted.
+    pub owner_card_uid: CardUid,
     /// The owner's Card-bound principal the binding's runs serve; `None` when
     /// the owner has none, so no run can be accepted.
     pub owner: Option<PrincipalId>,

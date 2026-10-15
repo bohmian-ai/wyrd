@@ -83,8 +83,11 @@ impl OutboxSink for ObservationRunSink {
     /// may activate on its subject in the tenant's transaction and commits it.
     ///
     /// Each binding's runs are accepted under its owner's current authority
-    /// with the tenant SYSTEM actor; a binding without a resolvable owner or
-    /// SYSTEM gets no run.
+    /// with the tenant SYSTEM actor. A binding whose owner Card has no
+    /// principal in this tenant, or whose owner or SYSTEM cannot be resolved,
+    /// gets no run: the refusal is logged with the tenant, binding, and owner
+    /// Card, never retried, and never falls back to the writer or another
+    /// identity, while the batch's other bindings still enqueue.
     ///
     /// Repeating the write is harmless: the insert is keyed by tenant,
     /// binding, and record with `ON CONFLICT DO NOTHING`.
@@ -101,6 +104,7 @@ impl OutboxSink for ObservationRunSink {
     /// batch in `outbox_events_lost_total`. A later repeat of the same
     /// records is safe, because the tenant/binding/record key absorbs any run
     /// that did commit.
+    #[tracing::instrument(name = "verification.observation_runs", skip_all, fields(%tenant))]
     async fn write(
         &self,
         tenant: DataTenantId,
@@ -114,11 +118,19 @@ impl OutboxSink for ObservationRunSink {
             .map_err(SqlError::Query)?;
         let mut authorized = Vec::with_capacity(bindings.len());
         for binding in bindings {
-            let Some(owner) = binding.owner else {
-                continue;
+            let authority = match binding.owner {
+                Some(owner) => self.authority.resolve(&mut conn, owner).await?,
+                None => None,
             };
-            if let Some(authority) = self.authority.resolve(&mut conn, owner).await? {
-                authorized.push((binding, authority));
+            match authority {
+                Some(authority) => authorized.push((binding, authority)),
+                None => tracing::warn!(
+                    %tenant,
+                    binding_id = %binding.binding_id,
+                    owner_card_uid = %binding.owner_card_uid,
+                    owner = ?binding.owner,
+                    "observation run not accepted: the binding owner or SYSTEM has no authority"
+                ),
             }
         }
         self.runs

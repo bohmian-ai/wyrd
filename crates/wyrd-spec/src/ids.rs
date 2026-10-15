@@ -128,6 +128,11 @@ id_type!(
     "Name of a `${media:id}` binding slot in a resolved judge Prompt.",
     validate_card_token
 );
+id_type!(
+    SlotName,
+    "Name of one Verifier input slot, addressed as `inputs.<slot>`.",
+    validate_identifier
+);
 id_type!(SplitName, "DataCard split label.", validate_card_token);
 id_type!(QueryName, "DataCard SQL query key.", validate_card_token);
 id_type!(
@@ -378,6 +383,15 @@ uuid7_id_type!(
 );
 
 uuid7_id_type!(
+    /// Server-issued identity of one exact Verifier execution.
+    ///
+    /// The server mints it for every real-time or queued execution. One
+    /// application Run can own many executions; scheduled executions have no
+    /// Run. It addresses the execution's status and its result.
+    ExecutionId
+);
+
+uuid7_id_type!(
     /// Durable identity of one Operator dispatch in `wyrd.operator_dispatches`.
     ///
     /// Settlement of a failed binding-created run mints one per distinct
@@ -424,6 +438,20 @@ fn validate_token_with_min(value: &str, min_len: usize) -> Result<(), IdError> {
         Ok(())
     } else {
         Err(IdError::InvalidToken)
+    }
+}
+
+/// Accepts an identifier matching `[a-zA-Z_][a-zA-Z0-9_]{0,63}`.
+///
+/// # Errors
+///
+/// Returns [`IdError::InvalidIdentifier`] for an empty, over-long, or
+/// non-identifier value.
+fn validate_identifier(value: &str) -> Result<(), IdError> {
+    if value.len() <= 64 && crate::card::prompt::is_valid_parameter_name(value) {
+        Ok(())
+    } else {
+        Err(IdError::InvalidIdentifier)
     }
 }
 
@@ -495,4 +523,45 @@ pub enum IdError {
     /// Model identifier was empty, longer than 255 bytes, or held a control character.
     #[error("model identifier must be 1..=255 UTF-8 bytes without control characters")]
     InvalidModelId,
+    /// Identifier did not match `[a-zA-Z_][a-zA-Z0-9_]{0,63}`.
+    #[error("identifier must match [a-zA-Z_][a-zA-Z0-9_]{{0,63}}")]
+    InvalidIdentifier,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Slot names use the identifier grammar so every SDK can pass them as
+    /// named arguments and references can address them as dotted fields.
+    ///
+    /// # Panics
+    /// Panics when the identifier grammar accepts or refuses the wrong names.
+    #[test]
+    fn slot_name_uses_identifier_grammar() {
+        for valid in ["answer", "Policy_2", "_x"] {
+            SlotName::new(valid).expect(valid);
+        }
+        for invalid in ["", "2x", "a-b", "a.b", "a b", &"x".repeat(65)] {
+            assert!(SlotName::new(invalid).is_err(), "{invalid}");
+        }
+        assert!(serde_json::from_str::<SlotName>("\"a.b\"").is_err());
+    }
+
+    /// Execution identities are server-minted `UUIDv7` values.
+    ///
+    /// # Panics
+    /// Panics when a non-v7 UUID is accepted.
+    #[test]
+    fn execution_id_requires_uuid7() {
+        let minted = ExecutionId::new_v7();
+        assert_eq!(
+            minted
+                .to_string()
+                .parse::<ExecutionId>()
+                .expect("round trip"),
+            minted
+        );
+        assert!(Uuid::nil().to_string().parse::<ExecutionId>().is_err());
+    }
 }

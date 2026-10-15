@@ -12,7 +12,9 @@ use crate::card::prompt::validate::PromptError;
 use crate::error::WyrdError;
 
 /// Valid prompt parameter name matching `^[a-zA-Z_][a-zA-Z0-9_]*$`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(transparent)]
 pub struct ParameterName(String);

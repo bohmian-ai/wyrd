@@ -219,6 +219,13 @@ impl Journey {
     /// Submits [`PROVIDER_KEY`] as the tenant's managed credential for
     /// `provider` and stores one built-in deployment of `model`
     /// authenticated by `header`, the order a tenant administrator follows.
+    ///
+    /// The two writes are separate requests, not one transaction: a panic
+    /// or cancellation after the first leaves the credential stored without
+    /// its deployment.
+    ///
+    /// # Panics
+    /// Panics when either request fails to send or is refused.
     pub(crate) async fn deploy(
         &self,
         provider: &str,
@@ -233,6 +240,13 @@ impl Journey {
     /// Deploys like [`Self::deploy`] as the administrator whose access token
     /// is `admin`, so the credential and deployment belong to that token's
     /// tenant.
+    ///
+    /// The credential is stored before the deployment in a separate request,
+    /// so a panic or cancellation between them leaves the credential without
+    /// its deployment; nothing is rolled back.
+    ///
+    /// # Panics
+    /// Panics when either request fails to send or is refused.
     pub(crate) async fn deploy_as(
         &self,
         admin: &str,

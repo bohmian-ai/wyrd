@@ -658,9 +658,9 @@ async fn captured_calls(
 /// reader's key is still denied before dispatch, and a second tenant's key
 /// sees only its own deployments and ledger. Malformed keys earn the API-key
 /// error in each native envelope, ambiguous and URL-borne keys stay refused,
-/// and no refusal reaches a provider. A revoked key keeps working only from
-/// its cached exchange, never beyond sixty seconds after it, however often it
-/// is used. The raw key reaches no provider request, response, refusal,
+/// and no refusal reaches a provider. A retired key, whose principal stays
+/// active, keeps working only from its cached exchange, never beyond sixty
+/// seconds after it, however often it is used. The raw key reaches no provider request, response, refusal,
 /// captured call row, or production-shaped span.
 ///
 /// # Panics
@@ -718,14 +718,14 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
         )
         .await;
     let Bootstrap::Machine {
-        api_key: revoked,
-        id: revoked_id,
+        api_key: retired,
+        id: retired_id,
         ..
     } = journey
         .server
-        .bootstrap_service("key_revoked", &[INVOKER_ROLE])
+        .bootstrap_service("key_retired", &[INVOKER_ROLE])
         .await
-        .expect("revoked caller bootstraps")
+        .expect("retired caller bootstraps")
     else {
         panic!("service bootstrap returned a user principal");
     };
@@ -744,7 +744,7 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
     let reader = api_key(&journey.server, "key_reader", &[]).await;
     let inspector = api_key(&journey.server, "key_inspector", &["admin"]).await;
     let keys = [
-        revoked.expose_secret().to_owned(),
+        retired.expose_secret().to_owned(),
         caller.expose_secret().to_owned(),
         reader.expose_secret().to_owned(),
     ];
@@ -762,8 +762,9 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
     let generate = "/v1beta/models/gemini-2.5-flash:generateContent";
     let mut bodies = Vec::new();
 
-    // Warm the key that is revoked below, then revoke it: the cached exchange
-    // keeps working, but only until sixty seconds after that exchange.
+    // Warm the key that is retired below, then retire that one credential
+    // while its principal stays active: the cached exchange keeps working,
+    // but only until sixty seconds after that exchange.
     let warmed_at = Instant::now();
     let warm = journey
         .post("/v1/messages", &anthropic(&keys[0]), &messages)
@@ -771,25 +772,60 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
     let warmed_by = Instant::now();
     assert_eq!(warm.status().as_u16(), 200);
     bodies.push(warm.text().await.expect("answer"));
-    let revoke = journey
-        .http
-        .post(format!(
-            "{}/v1/principals/{revoked_id}/revoke",
-            journey.base
-        ))
-        .header("x-wyrd-access-token", format!("Bearer {}", journey.admin))
-        .json(&json!({"principal_kind": "service", "reason": "journey revokes this key"}))
-        .send()
-        .await
-        .expect("revocation sends");
+    let admin = |request: reqwest::RequestBuilder| {
+        request.header("x-wyrd-access-token", format!("Bearer {}", journey.admin))
+    };
+    let listed: Value = admin(journey.http.get(format!(
+        "{}/v1/principals/{retired_id}/credentials",
+        journey.base
+    )))
+    .send()
+    .await
+    .expect("credential list sends")
+    .json()
+    .await
+    .expect("credential list parses");
+    let credentials = listed["credentials"].as_array().expect("credential list");
     assert_eq!(
-        revoke.status().as_u16(),
-        200,
-        "the key's principal is revoked"
+        credentials.len(),
+        1,
+        "the principal holds the warmed key only"
+    );
+    let credential = &credentials[0];
+    assert!(
+        keys[0].contains(credential["prefix"].as_str().expect("prefix")),
+        "the listed credential is the warmed key"
+    );
+    let retire = admin(journey.http.delete(format!(
+        "{}/v1/principals/{retired_id}/credentials/{}",
+        journey.base,
+        credential["id"].as_str().expect("credential id")
+    )))
+    .send()
+    .await
+    .expect("retirement sends");
+    assert_eq!(
+        retire.status().as_u16(),
+        204,
+        "the warmed credential is retired"
+    );
+    let principals: Value = admin(journey.http.get(format!(
+        "{}/v1/principals?kind=service&name=key_retired",
+        journey.base
+    )))
+    .send()
+    .await
+    .expect("principal read sends")
+    .json()
+    .await
+    .expect("principal read parses");
+    assert_eq!(
+        principals["principals"][0]["status"], "active",
+        "only the credential is retired, never its principal: {principals}"
     );
     assert!(
-        journey.server.exchange_api_key(&revoked).await.is_err(),
-        "the revoked key no longer exchanges at /auth/token"
+        journey.server.exchange_api_key(&retired).await.is_err(),
+        "the retired key no longer exchanges at /auth/token"
     );
     let cached = journey
         .post("/v1/messages", &anthropic(&keys[0]), &messages)
@@ -1022,7 +1058,7 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
         "the second tenant's ledger holds only its call"
     );
 
-    // Repeated hits never extend the revoked key's window.
+    // Repeated hits never extend the retired key's window.
     let mid = warmed_at + Duration::from_secs(50);
     assert!(
         Instant::now() < mid,
@@ -1055,7 +1091,7 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
     assert_eq!(
         journey.upstream_calls().await.len(),
         dispatched,
-        "the revoked key reaches no provider once its window ends"
+        "the retired key reaches no provider once its window ends"
     );
 
     // The raw key reaches no provider, response, capture row, or span.

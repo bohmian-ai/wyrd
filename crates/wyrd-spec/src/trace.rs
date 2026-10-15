@@ -19,11 +19,22 @@ pub struct TraceContext {
 impl TraceContext {
     /// Parse a W3C `traceparent` header.
     ///
+    /// Version `00` is exactly `00-<32hex>-<16hex>-<2hex>`. A later version
+    /// is read forward-compatibly, as W3C requires: its first four fields
+    /// parse as version `00` does and any further `-`-separated fields are
+    /// ignored.
+    ///
     /// # Errors
-    /// Returns an error when the header is not `00-<32hex>-<16hex>-<2hex>`.
+    /// Returns an error when the version is not two lowercase hex digits or
+    /// is the invalid `ff`, when a version `00` header has other than four
+    /// fields, or when the ids or flags are malformed or the ids all zero.
     pub fn parse_traceparent(header: &str, trace_state: String) -> Result<Self, TraceError> {
         let parts: Vec<&str> = header.split('-').collect();
-        if parts.len() != 4 || parts[0] != "00" {
+        let version = parts[0];
+        if !is_lower_hex(version, 2) || version == "ff" || parts.len() < 4 {
+            return Err(TraceError::BadHeader);
+        }
+        if version == "00" && parts.len() != 4 {
             return Err(TraceError::BadHeader);
         }
         if !is_lower_hex(parts[1], 32) || is_all_zero(parts[1]) {

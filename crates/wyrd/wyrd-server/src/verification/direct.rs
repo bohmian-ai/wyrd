@@ -41,6 +41,7 @@ use super::engines::{EngineOutcome, VerifierReport};
 use super::eval::{EvalEngine, ScoreFailure};
 use super::telemetry::ExecutionTelemetry;
 use crate::components::auth::Caller;
+use crate::components::gateway::GatewayCallSubject;
 use crate::state::AppState;
 
 pub use wyrd_spec::verification::EXECUTION_DEADLINE;
@@ -48,22 +49,36 @@ pub use wyrd_spec::verification::EXECUTION_DEADLINE;
 /// Owner of the engine half of a direct execution.
 ///
 /// Built per request from the process state: it holds the fitted-baseline
-/// loader and the Eval engine, whose judges call the gateway as the caller.
+/// loader and the Eval engine, whose judges call the gateway as the caller,
+/// attributed to the request's Run and subject when it names a Run.
 pub struct DirectExecutor {
     /// Ready fitted baselines of PSI and SPC Verifiers.
     baselines: FittedBaselines,
     /// The one Eval execution path, shared with queued runs.
     eval: EvalEngine,
+    /// Run and subject Card every judge model call is attributed to; `None`
+    /// when the request names no Run.
+    subject: Option<GatewayCallSubject>,
 }
 
 impl DirectExecutor {
-    /// Build an executor over `state`.
+    /// Build an executor over `state` whose judge calls are uncorrelated.
     #[must_use]
     pub fn new(state: &AppState) -> Self {
         Self {
             baselines: FittedBaselines::new(state.clone()),
             eval: EvalEngine::new(state.clone(), Duration::ZERO),
+            subject: None,
         }
+    }
+
+    /// Attribute every judge model call to `subject`: the request's subject
+    /// Card, already resolved in the caller's tenant, and its Run when it
+    /// carried one. `None` leaves the calls uncorrelated.
+    #[must_use]
+    pub fn attributed(mut self, subject: Option<GatewayCallSubject>) -> Self {
+        self.subject = subject;
+        self
     }
 
     /// Judge `input` with `implementation` of `verifier_uid` for `caller`.
@@ -257,6 +272,7 @@ impl DirectExecutor {
             VerifierTask::LlmJudge(task) => JudgeTaskExecutor::new(self.eval.judge_invoker(
                 caller.data_tenant_id,
                 Some(caller),
+                self.subject.clone(),
                 telemetry,
             ))
             .judge(task, &snapshot, 0)
@@ -353,8 +369,12 @@ impl DirectExecutor {
         let run = RunId::from_string(execution_id.to_string());
         self.eval
             .judge_record(
-                self.eval
-                    .judge_invoker(caller.data_tenant_id, Some(caller), telemetry),
+                self.eval.judge_invoker(
+                    caller.data_tenant_id,
+                    Some(caller),
+                    self.subject.clone(),
+                    telemetry,
+                ),
                 run,
                 spec,
                 record,

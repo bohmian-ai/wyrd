@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::StreamExt as _;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
+use tonic::codegen::http::Request as HttpRequest;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::server::{Connected, Router as TonicRouter, TcpConnectInfo};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
@@ -142,6 +143,9 @@ pub struct GrpcRouterConfig {
     pub reflection_enabled: bool,
     /// Optional PEM identity applied before any service is mounted.
     pub tls_identity: Option<Identity>,
+    /// The serving server's tenant span sink, bound to every request that
+    /// continues a caller's trace; `None` copies no request spans to tenants.
+    pub tenant_spans: Option<Arc<dyn wyrd_telemetry::TenantSpanSink>>,
 }
 
 /// Build and return the configured tonic router.
@@ -175,7 +179,9 @@ where
     I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
 {
     wyrd_tls::install_crypto_provider()?;
-    let mut server = Server::builder();
+    let tenant_spans = cfg.tenant_spans;
+    let mut server =
+        Server::builder().trace_fn(move |request| request_span(request, tenant_spans.as_ref()));
     if let Some(identity) = cfg.tls_identity {
         server = server
             .tls_config(ServerTlsConfig::new().identity(identity))
@@ -207,6 +213,40 @@ where
     };
 
     Ok(router)
+}
+
+/// Opens the SERVER span of one public gRPC request.
+///
+/// A valid `traceparent` metadata entry (an HTTP/2 header on the wire) makes
+/// the caller's span its parent, so every service mounted on the public
+/// router continues the caller's trace; a missing, malformed, or repeated one
+/// leaves the span the root of a new trace. The span carries the RPC service
+/// and method from the request path, never metadata values. A continued
+/// trace stages its tenant span copies on the serving server's
+/// `tenant_spans` sink.
+fn request_span(
+    request: &HttpRequest<()>,
+    tenant_spans: Option<&Arc<dyn wyrd_telemetry::TenantSpanSink>>,
+) -> tracing::Span {
+    let (service, method) = request
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .split_once('/')
+        .unwrap_or_default();
+    let span = tracing::info_span!(
+        "request",
+        otel.kind = "server",
+        rpc.system = "grpc",
+        rpc.service = service,
+        rpc.method = method,
+    );
+    wyrd_telemetry::serve_request(
+        &span,
+        wyrd_telemetry::inbound_context(request.headers()).as_ref(),
+        tenant_spans,
+    );
+    span
 }
 
 /// Drive the tonic server to completion.
@@ -489,6 +529,7 @@ mod tests {
             GrpcRouterConfig {
                 reflection_enabled: false,
                 tls_identity: None,
+                tenant_spans: None,
             },
         );
         assert!(result.is_ok());
@@ -504,6 +545,7 @@ mod tests {
             GrpcRouterConfig {
                 reflection_enabled: true,
                 tls_identity: None,
+                tenant_spans: None,
             },
         );
         assert!(result.is_ok());

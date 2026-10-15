@@ -224,7 +224,8 @@ fn api_key(bootstrap: Bootstrap) -> String {
     }
 }
 
-/// Emit one Eval record from `view` with optional media JSON and trace.
+/// Emit one Eval record from `view` with optional media JSON and trace; a
+/// traced record names [`OBSERVED_SPAN`] as its span within that trace.
 ///
 /// # Panics
 /// Panics when the options or the emit are refused.
@@ -232,7 +233,7 @@ fn emit(view: &Run, context: &Value, media: Option<&str>, trace: Option<&str>) {
     view.observe()
         .eval(
             context,
-            EvalObservationOptions::from_parts(None, media, trace, None)
+            EvalObservationOptions::from_parts(None, media, trace, trace.map(|_| OBSERVED_SPAN))
                 .expect("journey options parse"),
         )
         .expect("eval emits");
@@ -1404,6 +1405,8 @@ const EVIDENCE_TRACE: &str = "7d0a111920253035a5b5c5d5e5f50515";
 const LINKED_TRACE: &str = "8e1b222a31364146b6c6d6e6f6061626";
 /// Span the evidence trace's first span links to.
 const LINKED_SPAN: &str = "2b3c4d5e6f708192";
+/// Span every traced emitted record names as the one it was observed in.
+const OBSERVED_SPAN: &str = "3c4d5e6f70819203";
 /// Trace holding exactly the server's span ceiling.
 const CEILING_TRACE: &str = "9f2c333b42475257c7d7e7f707172737";
 /// Trace holding one span more than the server's span ceiling.
@@ -1687,7 +1690,10 @@ async fn system_reads(
 /// time out awaiting their trace. A second
 /// in-window record over the same trace, scored by a restarted runtime,
 /// produces identical canonical items. Every input read before and after the
-/// restart is audited as the tenant's one stored System principal.
+/// restart is audited as the tenant's one stored System principal. The
+/// emitted record's execution span links to the observation's trace and span
+/// without joining that trace, and the raw records, which carry no span,
+/// link nothing.
 ///
 /// # Errors
 /// Returns server, registration, query, or fixture errors, or a description of
@@ -1696,6 +1702,8 @@ async fn system_reads(
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), ServerJourneyError> {
     let journey = TraceJourney::start().await?;
+    let (_telemetry, capture) = wyrd_testing::bifrost::shared_process_telemetry_for_test()?;
+    let traced = capture.checkpoint()?;
     let mut first = span_at(EVIDENCE_TRACE, "first-span", 1, 0);
     first.events = vec![wyrd_tonic::otlp::trace::v1::span::Event {
         time_unix_nano: *EVIDENCE_START + 500,
@@ -1755,6 +1763,27 @@ async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), Se
     }
     let run = run_of(&runs, "eval-trace-evidence", &evidence)?;
     assert_completed(&journey.server, journey.tenant, run, "passed", (6, 0), 0).await?;
+    let observed = (EVIDENCE_TRACE.to_owned(), OBSERVED_SPAN.to_owned());
+    let engines = capture
+        .spans_since(&traced)
+        .into_iter()
+        .filter(|span| span.name == "verification.engine")
+        .collect::<Vec<_>>();
+    let (linked, unlinked): (Vec<_>, Vec<_>) =
+        engines.iter().partition(|span| !span.links.is_empty());
+    if linked.is_empty()
+        || unlinked.is_empty()
+        || linked.iter().any(|span| {
+            span.links.as_slice() != std::slice::from_ref(&observed)
+                || span.trace_id == EVIDENCE_TRACE
+        })
+    {
+        return Err(format!(
+            "the emitted record's execution must link, not join, its observation \
+             span {observed:?}, and spanless records link nothing: {engines:#?}"
+        )
+        .into());
+    }
     let items = journey.items(run.state.result_id).await?;
     let expected = [
         "event=\"retrieval\"".to_owned(),
@@ -2622,6 +2651,121 @@ async fn direct_task_judgment_records_one_correlated_result() -> Result<(), Serv
     if !seed.observation_runs().await?.is_empty() {
         return Err("a direct task created a verifier run".into());
     }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// An observation-triggered Eval judges a record through the gateway, which
+/// captures call metadata, and the judge call is attributed from the run's context: the captured gateway call
+/// carries the observed subject Card as `card_uid` and the observation's
+/// application Run as `run_id`, and the run's result joins its judge call on
+/// `subject_card_uid` = `card_uid`.
+///
+/// # Errors
+/// Returns server, registration, SDK lifetime, storage, runtime, or query
+/// errors.
+///
+/// # Panics
+/// Panics when the run does not pass, or the call's attribution or the
+/// result's join differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn observation_judge_call_records_card_and_run_and_joins_its_result()
+-> Result<(), ServerJourneyError> {
+    let root = tempfile::tempdir()?;
+    let service = write_graph(root.path());
+    std::fs::write(
+        &service,
+        "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: eval-service\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: agent\n      ref: ./agent.yaml\n      verified_by:\n        - verifier: ./gated.yaml\n          runs_on: {kind: observations_ready}\n",
+    )?;
+    let bundle = root.path().join("bundle");
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl_eval", "object": "chat.completion", "created": 1_700_000_000,
+            "model": "gpt-test",
+            "choices": [{ "index": 0, "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+        })))
+        .mount(&provider)
+        .await;
+    let server = Box::pin(gateway_server(&provider)).await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let admin = api_key(
+        server
+            .bootstrap_service("eval_attribution_admin", &["admin"])
+            .await?,
+    );
+    server
+        .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
+        .await?;
+    let admin_client = connect(&server, &admin);
+    wyrd_client::gateway::Gateway::with_client(admin_client.clone())
+        .put_capture_policy(&wyrd_spec::gateway::GatewayCapturePolicyWrite {
+            mode: wyrd_spec::gateway::GatewayCaptureMode::Metadata,
+            payload_fields: std::collections::BTreeSet::new(),
+        })
+        .await?;
+    let receipt = register(&admin_client, &service, &bundle).await;
+    let writer = api_key(
+        server
+            .credential_registered_service(&receipt.root, &[JUDGE_ROLE])
+            .await?,
+    );
+    let state = start_state(&bundle, &connect(&server, &writer)).await;
+    let agent = state.run().for_card("agent")?;
+    let agent_uid = agent.subject().uid.clone().ok_or("agent has no UID")?;
+    let run_id = agent.run_id().to_string();
+    let object = format!("{tenant}/cards/{agent_uid}/shot.png");
+    server
+        .state()
+        .storage
+        .put_object(&tenant_path::validate(&object, tenant)?, IMAGE.to_vec())
+        .await?;
+    emit(
+        &agent,
+        &json!({ "answer": "yes", "marker": "attributed" }),
+        Some(&media(&format!("file:///{object}"))),
+        None,
+    );
+    state.shutdown().await?;
+    server.flush_bifrost().await?;
+
+    let (stop, task) = spawn_runtime(&server);
+    let runs = settle(&seed, 1).await;
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    server.flush_bifrost().await?;
+    let record = record_id(&server, tenant, "attributed").await?;
+    let run = run_of(&runs?, "eval-gated", &record)?.clone();
+    assert_completed(&server, tenant, &run, "passed", (2, 0), 0).await?;
+
+    let calls = texts(
+        &query(
+            &server,
+            tenant,
+            "SELECT concat(card_uid, '|', run_id) FROM vala.gateway.calls".to_owned(),
+        )
+        .await?,
+    )?;
+    assert_eq!(calls, [Some(format!("{agent_uid}|{run_id}"))]);
+    let result = run.state.result_id.ok_or("the run has a result")?;
+    let joined = texts(
+        &query(
+            &server,
+            tenant,
+            format!(
+                "SELECT c.run_id FROM vala.verification.results r \
+                   JOIN vala.gateway.calls c ON c.card_uid = r.subject_card_uid \
+                  WHERE r.result_id = '{result}'"
+            ),
+        )
+        .await?,
+    )?;
+    assert_eq!(joined, [Some(run_id)]);
     server.shutdown().await?;
     Ok(())
 }

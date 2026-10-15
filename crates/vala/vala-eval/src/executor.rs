@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::task::JoinSet;
+use tracing::Instrument as _;
 
 use wyrd_spec::vala::eval::{
     AssertionResult, ConditionCombinator, EvalCondition, EvalTask, ExecutionPlan, Stage, TaskId,
@@ -386,7 +387,9 @@ fn order_stage_outcomes(
 ///
 /// [`fan_out_all_buckets`] calls this once per kind (assertion, judge, trace,
 /// agent) for one stage. Each task gets its own Tokio task on a `JoinSet`
-/// sharing `snapshot` and `executor`; outputs are collected in completion
+/// sharing `snapshot` and `executor`, running inside the caller's current
+/// span so a task's work (a judge's gateway call) stays in the caller's
+/// trace; outputs are collected in completion
 /// order, and [`order_stage_outcomes`] later restores declaration order. An
 /// empty bucket returns immediately without spawning.
 ///
@@ -418,10 +421,13 @@ async fn fan_out_bucket(
     for task in tasks {
         let snapshot = Arc::clone(&snapshot);
         let executor = Arc::clone(&executor);
-        set.spawn(async move {
-            let output = executor.execute(&task, &snapshot, stage).await?;
-            Ok((task.id().clone(), output))
-        });
+        set.spawn(
+            async move {
+                let output = executor.execute(&task, &snapshot, stage).await?;
+                Ok((task.id().clone(), output))
+            }
+            .instrument(tracing::Span::current()),
+        );
     }
 
     let mut collected = Vec::new();

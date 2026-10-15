@@ -6,7 +6,8 @@
 
 use std::result::Result as StdResult;
 
-use napi::Result;
+use napi::Env;
+use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -120,8 +121,15 @@ pub(crate) fn parse_workflow_selector(selector_json: &str) -> StdResult<CardSele
 /// completed reads may already have happened, but no partial Workflow is
 /// returned and nothing durable is written.
 #[napi]
-pub async fn load_workflow_from_path(path: String) -> NativeWorkflowLoad {
-    NativeWorkflowLoad::from_outcome(Workflow::from_path(path).await)
+pub fn load_workflow_from_path(
+    env: &Env,
+    path: String,
+) -> napi::Result<PromiseRaw<'_, NativeWorkflowLoad>> {
+    crate::trace::spawn(env, async move {
+        Ok(NativeWorkflowLoad::from_outcome(
+            Workflow::from_path(path).await,
+        ))
+    })
 }
 
 /// Parse a Workflow from its Card envelope YAML text, resolving inline
@@ -150,10 +158,19 @@ impl NativeWyrdClient {
     /// in [`NativeWorkflowLoad::error`] with its catalog code. Cancellation
     /// behaves as for [`load_workflow_from_path`].
     #[napi]
-    pub async fn load_workflow_from_path(&self, path: String) -> NativeWorkflowLoad {
-        NativeWorkflowLoad::from_outcome(
-            Workflow::from_path_with_client(path, self.client.clone()).await,
-        )
+    pub fn load_workflow_from_path<'env>(
+        &self,
+        env: &'env Env,
+        path: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeWorkflowLoad>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            Ok({
+                NativeWorkflowLoad::from_outcome(
+                    Workflow::from_path_with_client(path, client.clone()).await,
+                )
+            })
+        })
     }
 }
 
@@ -200,20 +217,27 @@ impl NativeWorkflow {
     /// Returns a napi error only when the run cannot be serialized; a
     /// malformed input or pre-dispatch refusal is returned in the result.
     #[napi]
-    pub async fn run(&self, input_json: Option<String>) -> Result<NativeLifecycleResult> {
-        let input = input_json
-            .as_deref()
-            .map_or(Ok(Value::Object(Map::new())), serde_json::from_str);
-        let run = match input {
-            Ok(Value::String(text)) => self.workflow.run(text).await,
-            Ok(Value::Object(input)) => self.workflow.run(input).await,
-            _ => {
-                return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::Validation {
-                    message: "Workflow input must be a string or a JSON object".to_owned(),
-                    details: serde_json::json!({ "field": "input" }),
-                }));
-            }
-        };
-        NativeLifecycleResult::outcome(run.map_err(WyrdError::from))
+    pub fn run<'env>(
+        &self,
+        env: &'env Env,
+        input_json: Option<String>,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let workflow = self.workflow.clone();
+        crate::trace::spawn(env, async move {
+            let input = input_json
+                .as_deref()
+                .map_or(Ok(Value::Object(Map::new())), serde_json::from_str);
+            let run = match input {
+                Ok(Value::String(text)) => workflow.run(text).await,
+                Ok(Value::Object(input)) => workflow.run(input).await,
+                _ => {
+                    return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::Validation {
+                        message: "Workflow input must be a string or a JSON object".to_owned(),
+                        details: serde_json::json!({ "field": "input" }),
+                    }));
+                }
+            };
+            NativeLifecycleResult::outcome(run.map_err(WyrdError::from))
+        })
     }
 }

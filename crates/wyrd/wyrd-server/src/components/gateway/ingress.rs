@@ -40,7 +40,8 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
 
 use super::invocation::{
-    GatewayCallRequest, GatewayCallSubject, GatewayInvocation, invalid_request,
+    GatewayCallAttribution, GatewayCallRequest, GatewayCallSubject, GatewayInvocation,
+    invalid_request,
 };
 use super::routes::{self, PUBLIC_CALL_TIMEOUT, openai_error, relay, token_bound, typed_body};
 use crate::components::auth::Caller;
@@ -281,33 +282,33 @@ pub(super) fn requested_fallback(
 
 /// OpenAPI description of the optional `wyrd-run-id` request header.
 pub(super) const RUN_HEADER_DOC: &str = "Optional application Run the call belongs to: 1 to 128 \
-    bytes of visible ASCII, sent together with `wyrd-card-uid`. A repeated, empty, oversized, \
-    or unpaired value is refused before dispatch with WYRD_GATEWAY_400_INVALID_REQUEST naming \
-    the header. The header never reaches a provider.";
+    bytes of visible ASCII, independent of `wyrd-card-uid`. A repeated, empty, or oversized \
+    value is refused before dispatch with WYRD_GATEWAY_400_INVALID_REQUEST naming the header. \
+    The header never reaches a provider.";
 
 /// OpenAPI description of the optional `wyrd-card-uid` request header.
 pub(super) const CARD_UID_HEADER_DOC: &str = "Optional Card the call is attributed to, as its \
-    Card UID, sent together with `wyrd-run-id`. A malformed or unpaired value is refused with \
+    Card UID, independent of `wyrd-run-id`. A repeated or malformed value is refused with \
     WYRD_GATEWAY_400_INVALID_REQUEST; a UID outside the caller's signed Card scope, or, for a \
     caller bound to no Card, one naming no registered observation-target Card of the tenant, \
     with WYRD_VALA_403_BIFROST_CARD_SCOPE. Every refusal precedes dispatch. The header never \
     reaches a provider.";
 
-/// Reads the optional Run and Card attribution of a call from its paired
-/// `wyrd-run-id` and `wyrd-card-uid` headers.
+/// Reads the optional Run and Card attribution of a call from its
+/// independent `wyrd-run-id` and `wyrd-card-uid` headers.
 ///
-/// Both headers are consumed here and never reach a provider; their joint
-/// absence leaves the call uncorrelated. The Card is only parsed here;
-/// admission authorizes it against the caller.
+/// Both headers are consumed here and never reach a provider; either may
+/// appear alone, and their joint absence leaves the call uncorrelated. The
+/// Card is only parsed here, as a [`GatewayCallAttribution::Requested`]
+/// attribution admission authorizes against the caller.
 ///
 /// # Errors
 /// Returns `GatewayInvalidRequest` naming the offending header when either
-/// repeats or is not visible ASCII, appears without the other, the Run is
-/// empty or longer than [`MAX_RUN_HEADER_BYTES`], or the Card is not a Card
-/// UID.
+/// repeats or is not visible ASCII, the Run is empty or longer than
+/// [`MAX_RUN_HEADER_BYTES`], or the Card is not a Card UID.
 pub(super) fn requested_subject(
     headers: &HeaderMap,
-) -> Result<Option<GatewayCallSubject>, WyrdError> {
+) -> Result<Option<GatewayCallAttribution>, WyrdError> {
     let invalid = |field, reason| invalid_request(GatewayContractError::new(field, reason));
     let single = |name: &'static str| {
         let mut values = headers.get_all(name).iter();
@@ -323,23 +324,25 @@ pub(super) fn requested_subject(
             })
             .transpose()
     };
-    match (single(RUN_HEADER)?, single(CARD_UID_HEADER)?) {
-        (None, None) => Ok(None),
-        (Some(_), None) => Err(invalid(CARD_UID_HEADER, "must accompany wyrd-run-id")),
-        (None, Some(_)) => Err(invalid(RUN_HEADER, "must accompany wyrd-card-uid")),
-        (Some(run), Some(card)) => {
+    let run_id = single(RUN_HEADER)?
+        .map(|run| {
             if run.is_empty() || run.len() > MAX_RUN_HEADER_BYTES {
                 return Err(invalid(RUN_HEADER, "must be 1 to 128 bytes"));
             }
-            let card_uid = card
-                .parse::<CardUid>()
-                .map_err(|_| invalid(CARD_UID_HEADER, "must be a Card UID"))?;
-            Ok(Some(GatewayCallSubject {
-                run_id: RunId::from_string(run.to_owned()),
-                card_uid,
-            }))
-        }
-    }
+            Ok(RunId::from_string(run.to_owned()))
+        })
+        .transpose()?;
+    let card_uid = single(CARD_UID_HEADER)?
+        .map(|card| {
+            card.parse::<CardUid>()
+                .map_err(|_| invalid(CARD_UID_HEADER, "must be a Card UID"))
+        })
+        .transpose()?;
+    Ok(
+        (run_id.is_some() || card_uid.is_some()).then_some(GatewayCallAttribution::Requested(
+            GatewayCallSubject { run_id, card_uid },
+        )),
+    )
 }
 
 #[utoipa::path(
@@ -380,7 +383,11 @@ pub(super) fn requested_subject(
 /// stream that ends without `message_stop` ends with an `error` event or an
 /// aborted transport. Gateway-originated failures render as the Anthropic
 /// error envelope.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn anthropic_messages(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -459,7 +466,11 @@ pub(crate) async fn anthropic_messages(
 /// unchanged. Jev never streams. Gateway-originated failures render as the
 /// `OpenAI` error envelope with a stable Wyrd code; a provider refusal relays
 /// its status and body through the shared refusal path, credential removed.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn jev_systemone(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -552,7 +563,11 @@ fn jev_call(
 /// `alt=sse` and relays Gemini events, and a stream that ends before every
 /// candidate finishes aborts its transport. Gateway-originated failures render
 /// as the Google error envelope.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn gemini_generate_content(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -718,30 +733,45 @@ mod tests {
         }
     }
 
-    /// Absent headers leave a call uncorrelated, a valid pair decodes to its
-    /// Run and Card, and every repeated, unpaired, empty, oversized, or
-    /// malformed value is refused naming the offending header.
+    /// Absent headers leave a call uncorrelated, each header decodes alone or
+    /// with the other into its Run and Card, and every repeated, empty,
+    /// oversized, or malformed value is refused naming the offending header.
     ///
     /// # Panics
     /// Panics when a header set decodes differently than documented.
     #[test]
-    fn subject_headers_decode_only_as_a_valid_pair() {
+    fn subject_headers_decode_independently() {
         let card = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00";
         assert!(
             requested_subject(&HeaderMap::new())
                 .expect("absent")
                 .is_none()
         );
-        let subject =
-            requested_subject(&headers(&[(RUN_HEADER, "run-1"), (CARD_UID_HEADER, card)]))
-                .expect("a valid pair")
-                .expect("a subject");
-        assert_eq!(subject.run_id.as_str(), "run-1");
-        assert_eq!(subject.card_uid.as_str(), card);
+        for (pairs, run, uid) in [
+            (
+                vec![(RUN_HEADER, "run-1"), (CARD_UID_HEADER, card)],
+                Some("run-1"),
+                Some(card),
+            ),
+            (vec![(RUN_HEADER, "run-1")], Some("run-1"), None),
+            (vec![(CARD_UID_HEADER, card)], None, Some(card)),
+        ] {
+            let Some(GatewayCallAttribution::Requested(subject)) =
+                requested_subject(&headers(&pairs)).expect("a valid header set")
+            else {
+                panic!("{pairs:?} is a requested subject");
+            };
+            assert_eq!(subject.run_id.as_ref().map(RunId::as_str), run, "{pairs:?}");
+            assert_eq!(
+                subject.card_uid.as_ref().map(CardUid::as_str),
+                uid,
+                "{pairs:?}"
+            );
+        }
         let long = "r".repeat(MAX_RUN_HEADER_BYTES + 1);
         for (pairs, field) in [
-            (vec![(RUN_HEADER, "run-1")], CARD_UID_HEADER),
-            (vec![(CARD_UID_HEADER, card)], RUN_HEADER),
+            (vec![(RUN_HEADER, "")], RUN_HEADER),
+            (vec![(CARD_UID_HEADER, "not-a-uid")], CARD_UID_HEADER),
             (vec![(RUN_HEADER, ""), (CARD_UID_HEADER, card)], RUN_HEADER),
             (
                 vec![(RUN_HEADER, long.as_str()), (CARD_UID_HEADER, card)],

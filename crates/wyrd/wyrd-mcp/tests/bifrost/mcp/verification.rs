@@ -12,11 +12,16 @@
 //!
 //! Through `verification.execute` the Service also judges supplied samples
 //! inline and receives the verdict in the tool result.
+//!
+//! A tool call carrying the caller's `traceparent` continues the caller's
+//! trace: the request span and the verification, judge, and gateway work it
+//! does descend from the caller's span.
 
 /// The Postgres-backed half of the verification journey.
 mod pg_tests {
     use crate::connectivity::{
         McpJourneyError, client, discover, problem, refusal, structured, transport,
+        transport_with_headers,
     };
 
     use std::path::Path;
@@ -945,6 +950,201 @@ mod pg_tests {
         );
         foreign_client.cancel().await?;
         server.shutdown().await?;
+        Ok(())
+    }
+
+    /// Trace id of the caller span the continuity journey sends.
+    const CALLER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+
+    /// Span id of the caller span the continuity journey sends.
+    const CALLER_SPAN: &str = "b7ad6b7169203331";
+
+    /// Spans the judged execution opens beneath its request span.
+    const DESCENDANTS: [&str; 4] = [
+        "verification.judge",
+        "workflow.gateway.call",
+        "gateway.call",
+        "gateway.execute",
+    ];
+
+    /// Start a bound server whose gateway answers `gpt-4o` judge calls from a
+    /// local provider that passes every answer, register the judge Eval
+    /// Verifier and a Service to judge, and return a credential for that
+    /// Service that may run Verifiers and invoke the judge model.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider, server, registration, deployment, or bootstrap
+    /// failures.
+    async fn judging_server() -> Result<
+        (
+            WyrdTestServer,
+            wiremock::MockServer,
+            ResolvedCredential,
+            JsonValue,
+        ),
+        McpJourneyError,
+    > {
+        let judge = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-judge", "object": "chat.completion", "created": 1,
+                    "model": "gpt-4o",
+                    "choices": [{ "index": 0, "finish_reason": "stop",
+                        "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
+                    "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+                })),
+            )
+            .mount(&judge)
+            .await;
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_gateway_provider_root_for_test(judge.uri().parse()?)
+                .start_bound(),
+        )
+        .await?;
+        let admin = server
+            .bootstrap_service("mcp-traced-admin", &["admin"])
+            .await?;
+        let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
+        let fixture = register_fixture(&cards).await?;
+        let judged = Box::pin(cards.register_from_path(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/verify_in_real_time/answer-is-judged.yaml"
+        ))))
+        .await?;
+        server
+            .deploy_gateway_model_for_test("gpt-4o", "mcp_judge_invoker")
+            .await?;
+        let agent = server
+            .credential_registered_service(&fixture.service_ref, &["editor", "mcp_judge_invoker"])
+            .await?;
+        let request = serde_json::json!({
+            "verifier_uid": judged.root.uid.ok_or("a registered Card has a UID")?.to_string(),
+            "subject_card_uid": fixture.service_uid,
+            "input": { "kind": "eval_record", "context": { "answer": "yes" } },
+        });
+        Ok((server, judge, api_key(&agent)?, request))
+    }
+
+    /// Execute `request` once over a fresh MCP connection sending `headers`,
+    /// asserting the judge passed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns MCP transport or tool-call failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the verdict is not `passed`.
+    async fn execute_traced(
+        server: &WyrdTestServer,
+        credential: ResolvedCredential,
+        request: &JsonValue,
+        headers: [(&'static str, &str); 2],
+    ) -> Result<(), McpJourneyError> {
+        let headers = headers
+            .into_iter()
+            .map(|(name, value)| Ok((http::HeaderName::from_static(name), value.parse()?)))
+            .collect::<Result<Vec<_>, McpJourneyError>>()?;
+        let agent = ()
+            .serve_with_lifecycle(
+                transport_with_headers(server, credential, headers)?,
+                discover(),
+            )
+            .await?;
+        let judged = structured(agent.call_tool(call(EXECUTE, request.clone())?).await?)?;
+        assert_eq!(judged["verdict"], "passed", "{judged}");
+        agent.cancel().await?;
+        Ok(())
+    }
+
+    /// A tool call carrying the caller's sampled `traceparent` continues the
+    /// caller's trace: its SERVER request span is a child of the caller's
+    /// span, and the judge and gateway spans the execution opens descend from
+    /// that request span. A call with a malformed `traceparent` and
+    /// `tracestate` still succeeds, on a new trace.
+    ///
+    /// # Errors
+    ///
+    /// Returns telemetry, server, fixture, MCP transport, or tool-call
+    /// failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a verdict, the request span's parentage, or a descendant
+    /// span's ancestry differs from the expectation.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn verification_tool_continues_trace_context() -> Result<(), McpJourneyError> {
+        let (_telemetry, traces) =
+            wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())?;
+        let (server, _judge, credential, request) = judging_server().await?;
+        let checkpoint = traces.checkpoint();
+        let parent = format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01");
+        execute_traced(
+            &server,
+            credential.clone(),
+            &request,
+            [("traceparent", &parent), ("tracestate", "wyrd=caller")],
+        )
+        .await?;
+        execute_traced(
+            &server,
+            credential,
+            &request,
+            [("traceparent", "00-not-a-trace-01"), ("tracestate", "@@")],
+        )
+        .await?;
+        server.shutdown().await?;
+
+        let spans = traces.finished_since(checkpoint);
+        let continued: Vec<_> = spans
+            .iter()
+            .filter(|span| {
+                span.name == "request"
+                    && span.trace_id == CALLER_TRACE
+                    && span.parent_span_id == CALLER_SPAN
+            })
+            .collect();
+        assert!(
+            !continued.is_empty(),
+            "the tool call continues the caller: {spans:#?}"
+        );
+        assert!(
+            continued.iter().all(|span| span.kind == "Server"),
+            "{continued:#?}"
+        );
+        let parents: std::collections::HashMap<&str, &str> = spans
+            .iter()
+            .filter(|span| span.trace_id == CALLER_TRACE)
+            .map(|span| (span.span_id.as_str(), span.parent_span_id.as_str()))
+            .collect();
+        for name in DESCENDANTS {
+            let span = spans
+                .iter()
+                .find(|span| span.name == name && span.trace_id == CALLER_TRACE)
+                .ok_or_else(|| format!("{name} joins the caller's trace: {spans:#?}"))?;
+            let mut ancestor = Some(span.parent_span_id.as_str());
+            while let Some(id) = ancestor
+                && !continued.iter().any(|request| request.span_id == id)
+            {
+                ancestor = parents.get(id).copied();
+            }
+            assert!(
+                ancestor.is_some(),
+                "{name} descends from a request span: {span:#?}"
+            );
+        }
+        assert!(
+            spans
+                .iter()
+                .filter(|span| span.name == "verification.judge")
+                .any(|span| span.trace_id != CALLER_TRACE),
+            "the malformed call is judged on a new trace: {spans:#?}"
+        );
         Ok(())
     }
 }

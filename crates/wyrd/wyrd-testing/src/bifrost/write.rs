@@ -233,6 +233,7 @@ impl RawIngest {
             frame: OwnedIpcBytes::new(arrow_ipc, guard),
             rows: 0,
             request_id: Some(request_id.clone()),
+            producer_traces: Vec::new(),
         };
         self.transport
             .insert_batch(&batch)

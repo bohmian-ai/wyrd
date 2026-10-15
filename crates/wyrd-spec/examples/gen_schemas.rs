@@ -84,6 +84,7 @@ use wyrd_spec::vala::api::{
     RegisterTableResponse, RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary,
     SortDirectionWire, SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit,
 };
+use wyrd_spec::vala::trace::SpanRecord;
 use wyrd_spec::verification::{
     Judgment, StartVerificationRunRequest, StartVerificationRunResponse, VerificationBindingStatus,
     VerificationRunStatus,
@@ -305,6 +306,7 @@ fn contracts() -> Value {
         CreateOperatorConnectionRequest,
         UpdateOperatorConnectionRequest,
         OperatorConnectionView,
+        SpanRecord,
     )
     .into_iter()
     .collect();

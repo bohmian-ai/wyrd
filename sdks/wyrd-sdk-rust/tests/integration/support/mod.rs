@@ -12,11 +12,11 @@
 use std::path::{Path, PathBuf};
 
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_ai::WyrdClient;
 use wyrd_ai::cards::{CardRef, CardSelector, Cards, HydrationMode, RegistrationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::config::ClientConfig;
 use wyrd_ai::transport::{GrpcConfig, HttpConfig};
+use wyrd_ai::{Bifrost, SpanRecord, TraceId, WyrdClient};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
@@ -207,6 +207,21 @@ impl Deployment {
         )
     }
 
+    /// Publish every captured row, then read the timeline of `trace`, given
+    /// as 32 hex characters, as the administrator.
+    ///
+    /// # Panics
+    /// Panics when the id is malformed or the flush or the read fails.
+    pub async fn timeline(&self, trace: &str) -> Vec<SpanRecord> {
+        self.server.flush_bifrost().await.expect("rows publish");
+        Bifrost::connect(&self.admin())
+            .await
+            .expect("Bifrost connects")
+            .trace_timeline(TraceId::from_hex(trace).expect("trace id"))
+            .await
+            .expect("the timeline reads")
+    }
+
     /// Stop the server.
     ///
     /// # Panics
@@ -217,6 +232,20 @@ impl Deployment {
             .await
             .expect("test server shuts down");
     }
+}
+
+/// `span` followed by each ancestor its parent ids reach within `timeline`,
+/// nearest first; the last entry's parent, if any, lies outside the timeline.
+pub fn ancestry<'a>(timeline: &'a [SpanRecord], span: &'a SpanRecord) -> Vec<&'a SpanRecord> {
+    let mut chain = vec![span];
+    while let Some(parent) = chain.last().and_then(|child| {
+        timeline.iter().find(|parent| {
+            parent.trace_id == child.trace_id && Some(parent.span_id) == child.parent_span_id
+        })
+    }) {
+        chain.push(parent);
+    }
+    chain
 }
 
 /// The `kind`, `name`, `version`, and `space` arguments the card-selecting

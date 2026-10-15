@@ -55,6 +55,7 @@ WIRE_ROOTS = [
     "CancelRunningQueryResponse",
     "QueryTerminalFrame",
     "RunningQuerySummary",
+    "SpanRecord",
     # Authentication and principals.
     "CreateServicePrincipalRequest",
     "CreateServicePrincipalResponse",

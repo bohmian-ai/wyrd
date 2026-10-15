@@ -1313,7 +1313,7 @@ async fn direct_execution_refusals_are_stable() {
 ///
 /// # Panics
 /// Panics when the judge prompt cannot be built.
-fn judge_check() -> Value {
+pub(crate) fn judge_check() -> Value {
     let prompt = skald_prompt::openai_chat(
         "gpt-test",
         skald_prompt::OpenAiChatOptions {

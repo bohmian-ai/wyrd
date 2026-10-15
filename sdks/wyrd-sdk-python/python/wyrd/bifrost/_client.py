@@ -7,7 +7,7 @@ import json
 import sys
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Protocol, TypedDict, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, TypeVar, cast, overload
 
 import pyarrow
 
@@ -934,6 +934,26 @@ class Bifrost(_BifrostBase):
 
         return cast("CancelRunningQueryResult", self._native.cancel(request_id))
 
+    def trace_timeline(self, trace_id: str) -> list[SpanRecord]:
+        """Read one trace's span tree plus each trace linking directly to it.
+
+        Spans come back deduplicated, ordered by start time, then trace id,
+        then span id. A trace no span names reads as an empty list.
+
+        Args:
+            trace_id: the 32-character lowercase hex W3C trace id.
+
+        Returns:
+            The canonical span records.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a malformed or
+                all-zero ``trace_id``, before any request; otherwise a query,
+                authorization, or transport failure.
+        """
+
+        return cast("list[SpanRecord]", self._native.trace_timeline(trace_id))
+
     def describe_table(self, namespace: str, name: str) -> TableDescription:
         """Describe the registered ``namespace.name`` table's stored schema and layout.
 
@@ -1130,6 +1150,24 @@ class AsyncBifrost(_BifrostBase):
             await asyncio.to_thread(self._native.cancel, request_id),
         )
 
+    async def trace_timeline(self, trace_id: str) -> list[SpanRecord]:
+        """Read one trace's span tree; as ``Bifrost.trace_timeline()``.
+
+        Args:
+            trace_id: the 32-character lowercase hex W3C trace id.
+
+        Returns:
+            The canonical span records.
+
+        Raises:
+            WyrdError: As for ``Bifrost.trace_timeline()``.
+        """
+
+        return cast(
+            "list[SpanRecord]",
+            await asyncio.to_thread(self._native.trace_timeline, trace_id),
+        )
+
     async def describe_table(self, namespace: str, name: str) -> TableDescription:
         """Describe the registered ``namespace.name`` table's stored schema and layout.
 
@@ -1276,6 +1314,106 @@ class CancelRunningQueryResult(TypedDict):
 
     request_id: str
     cancellation_started: bool
+
+
+class _ResourceOptional(TypedDict, total=False):
+    service_namespace: str
+    service_version: str
+    service_instance_id: str
+
+
+class Resource(_ResourceOptional):
+    """OTel resource of the process that produced a span."""
+
+    service_name: str
+    attributes: dict[str, Any]
+
+
+class _InstrumentationScopeOptional(TypedDict, total=False):
+    version: str
+
+
+class InstrumentationScope(_InstrumentationScopeOptional):
+    """OTel instrumentation scope that produced a span."""
+
+    name: str
+    attributes: dict[str, Any]
+
+
+class _SpanStatusUnset(TypedDict):
+    """No status set; the OTel default."""
+
+    code: Literal["unset"]
+
+
+class _SpanStatusOk(TypedDict):
+    """The operation completed successfully."""
+
+    code: Literal["ok"]
+
+
+class _SpanStatusErrorOptional(TypedDict, total=False):
+    description: str
+
+
+class _SpanStatusError(_SpanStatusErrorOptional):
+    """The operation failed, with an optional human-readable description."""
+
+    code: Literal["error"]
+
+
+SpanStatus = _SpanStatusUnset | _SpanStatusOk | _SpanStatusError
+"""OTel span status, tagged by ``code``; only ``error`` carries ``description``."""
+
+
+class SpanEvent(TypedDict):
+    """One timestamped event inside a span."""
+
+    timestamp: str
+    name: str
+    attributes: dict[str, Any]
+    dropped_attributes_count: int
+
+
+class SpanLink(TypedDict):
+    """A link from one span to another span's identity."""
+
+    trace_id: str
+    span_id: str
+    trace_state: str
+    flags: int
+    attributes: dict[str, Any]
+    dropped_attributes_count: int
+
+
+class _SpanRecordOptional(TypedDict, total=False):
+    parent_span_id: str
+
+
+class SpanRecord(_SpanRecordOptional):
+    """One canonical OTel span as ``trace_timeline`` returns it.
+
+    ``parent_span_id`` is absent on a root span.
+    """
+
+    trace_id: str
+    span_id: str
+    flags: int
+    trace_state: str
+    name: str
+    kind: Literal["internal", "server", "client", "producer", "consumer"]
+    start_time: str
+    end_time: str
+    duration_ms: int
+    status: SpanStatus
+    attributes: dict[str, Any]
+    dropped_attributes_count: int
+    events: list[SpanEvent]
+    dropped_events_count: int
+    links: list[SpanLink]
+    dropped_links_count: int
+    scope: InstrumentationScope
+    resource: Resource
 
 
 def _validated_rows(result: QueryResult, model: type[_Row]) -> list[_Row]:

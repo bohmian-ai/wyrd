@@ -9490,6 +9490,7 @@ dependencies = [
  "indicatif",
  "oauth2",
  "opentelemetry",
+ "opentelemetry_sdk",
  "reqwest 0.13.4",
  "rustix",
  "schemars 0.8.22",
@@ -9509,6 +9510,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
  "urlencoding",
  "uuid",
  "vala-bifrost-redux",
@@ -9681,12 +9683,14 @@ dependencies = [
  "uuid",
  "vala-bifrost-redux",
  "vala-eval",
+ "wiremock",
  "workspace-hack",
  "wyrd-client",
  "wyrd-runtime",
  "wyrd-server",
  "wyrd-spec",
  "wyrd-sql",
+ "wyrd-telemetry",
  "wyrd-testing",
 ]
 
@@ -9878,6 +9882,7 @@ dependencies = [
  "num-traits",
  "oauth2",
  "object_store",
+ "opentelemetry",
  "rand 0.9.5",
  "reqwest 0.13.4",
  "rmcp",
@@ -10210,8 +10215,10 @@ dependencies = [
 name = "wyrd-telemetry"
 version = "0.1.0"
 dependencies = [
+ "http",
  "opentelemetry",
  "opentelemetry-otlp",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
  "serde",
  "serde_json",
@@ -10341,6 +10348,7 @@ dependencies = [
  "uuid",
  "workspace-hack",
  "wyrd-spec",
+ "wyrd-telemetry",
  "wyrd-tls",
  "wyrd-tonic",
 ]

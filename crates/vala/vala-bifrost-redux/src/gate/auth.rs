@@ -54,9 +54,16 @@ impl AuthContext {
     /// Build the context of one request whose caller is already verified.
     ///
     /// The tenant is the verified principal's own, and the request correlator
-    /// is read from `metadata` or minted, as for a bearer request.
+    /// is read from `metadata` or minted, as for a bearer request. Every
+    /// verified gRPC caller passes through here, so this also routes the
+    /// current request's tenant span copies to that tenant and principal; a
+    /// request that did not continue a sampled client trace is not routed.
     #[must_use]
     pub fn from_verified(verified: VerifiedToken, metadata: &MetadataMap) -> Self {
+        wyrd_telemetry::bind_tenant_route(wyrd_telemetry::TenantSpanRoute {
+            tenant: verified.principal.tenant_id,
+            principal: verified.principal.id,
+        });
         Self {
             tenant: verified.principal.tenant_id,
             principal: verified.principal,

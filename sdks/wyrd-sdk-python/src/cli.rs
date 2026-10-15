@@ -26,7 +26,7 @@ fn run_wyrd_cli(py: Python<'_>) -> PyResult<u8> {
         .import("sys")?
         .getattr("argv")?
         .extract::<Vec<String>>()?;
-    let code = py.detach(|| wyrd_runtime::runtime().block_on(wyrd_cli::run_cli_code(args)));
+    let code = crate::trace::block_on(py, wyrd_cli::run_cli_code(args));
     // Tokio already settled the interrupted command; preserve its exit code.
     if code == 130
         && let Err(error) = py.check_signals()

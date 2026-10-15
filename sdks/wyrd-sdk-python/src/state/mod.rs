@@ -225,12 +225,13 @@ impl PyWyrdState {
         client_byte_limit_bytes: Option<usize>,
     ) -> CardPyResult<()> {
         let table = table.map(PyTableConfig::into_native);
-        py.detach(|| {
-            wyrd_runtime::runtime().block_on(self.inner.start_bifrost_with_config(
+        crate::trace::block_on(
+            py,
+            self.inner.start_bifrost_with_config(
                 table,
                 wyrd_queue::QueueConfig::with_client_byte_limit(client_byte_limit_bytes),
-            ))
-        })
+            ),
+        )
         .map_err(WyrdPyError::from)
     }
 
@@ -261,8 +262,7 @@ impl PyWyrdState {
     /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the first producer or
     /// sink failure from the drain.
     fn flush(&self, py: Python<'_>) -> CardPyResult<()> {
-        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.flush()))
-            .map_err(WyrdPyError::from)
+        crate::trace::block_on(py, self.inner.flush()).map_err(WyrdPyError::from)
     }
 
     /// Drain every producer of this state's writer and close it to writes.
@@ -282,8 +282,7 @@ impl PyWyrdState {
         if let Some(provider) = self.telemetry.get() {
             provider.call_method0(py, "force_flush")?;
         }
-        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.shutdown()))
-            .map_err(WyrdPyError::from)
+        crate::trace::block_on(py, self.inner.shutdown()).map_err(WyrdPyError::from)
     }
 
     /// Return the exact root `CardRef` of this bundle, independent of aliases.
@@ -1785,7 +1784,7 @@ impl PyCards {
         py: Python<'_>,
         path: PathBuf,
     ) -> CardPyResult<PyRegistrationReceipt> {
-        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.register_from_path(&path)))
+        crate::trace::block_on(py, self.inner.register_from_path(&path))
             .map(PyRegistrationReceipt::from)
             .map_err(WyrdPyError::from)
     }
@@ -1810,9 +1809,8 @@ impl PyCards {
     fn get(&self, py: Python<'_>, card_ref: PyRef<'_, CardRefPy>) -> CardPyResult<PyCardEnvelope> {
         let requested = card_ref.0.clone();
         let selector = CardSelector::exact(requested.clone());
-        let card = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.inner.get(selector)))
-            .map_err(WyrdPyError::from)?;
+        let card =
+            crate::trace::block_on(py, self.inner.get(selector)).map_err(WyrdPyError::from)?;
         let card_ref = CardRef {
             uid: card.metadata.uid.clone().or(requested.uid),
             ..requested
@@ -1886,8 +1884,7 @@ impl PyCards {
     #[pyo3(signature = (card_ref))]
     fn delete(&self, py: Python<'_>, card_ref: PyRef<'_, CardRefPy>) -> CardPyResult<()> {
         let selector = CardSelector::exact(card_ref.0.clone());
-        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.delete(selector)))
-            .map_err(WyrdPyError::from)
+        crate::trace::block_on(py, self.inner.delete(selector)).map_err(WyrdPyError::from)
     }
 
     /// Download a registered Card's reachable graph as a local bundle.
@@ -1920,11 +1917,9 @@ impl PyCards {
         } else {
             HydrationMode::Complete
         };
-        py.detach(|| {
-            wyrd_runtime::runtime().block_on(self.inner.hydrate(selector, &destination, mode))
-        })
-        .map(PyHydrationSummary::from)
-        .map_err(WyrdPyError::from)
+        crate::trace::block_on(py, self.inner.hydrate(selector, &destination, mode))
+            .map(PyHydrationSummary::from)
+            .map_err(WyrdPyError::from)
     }
 }
 
@@ -2261,7 +2256,7 @@ fn list_registry(
         limit: query.limit,
         cursor: query.cursor,
     };
-    py.detach(|| wyrd_runtime::runtime().block_on(registry.list(request)))
+    crate::trace::block_on(py, registry.list(request))
         .map(PyCardList::from)
         .map_err(WyrdPyError::from)
 }
@@ -2284,7 +2279,7 @@ fn resolve_latest_registry(
 ) -> CardPyResult<CardRefPy> {
     let space = parse_space(space)?;
     let name = parse_name(name)?;
-    py.detach(|| wyrd_runtime::runtime().block_on(registry.resolve_latest(kind, space, name)))
+    crate::trace::block_on(py, registry.resolve_latest(kind, space, name))
         .map(CardRefPy)
         .map_err(WyrdPyError::from)
 }
@@ -2297,8 +2292,7 @@ fn resolve_latest_registry(
 ///
 /// Returns the registry's not-found, authorization, or transport error.
 fn delete_registry(py: Python<'_>, registry: &Cards, selector: CardSelector) -> CardPyResult<()> {
-    py.detach(|| wyrd_runtime::runtime().block_on(registry.delete(selector)))
-        .map_err(WyrdPyError::from)
+    crate::trace::block_on(py, registry.delete(selector)).map_err(WyrdPyError::from)
 }
 
 /// Registers a holder through a typed registry view, enforcing its kind.
@@ -2506,10 +2500,8 @@ impl PyDataCardRegistry {
             let path = workspace.path().join("artifacts");
             let client = self.inner.clone();
             let download_path = path.clone();
-            py.detach(move || {
-                wyrd_runtime::runtime().block_on(client.download_artifacts_to(&uid, &download_path))
-            })
-            .map_err(WyrdPyError::from)?;
+            crate::trace::block_on(py, client.download_artifacts_to(&uid, &download_path))
+                .map_err(WyrdPyError::from)?;
             card.load(
                 py,
                 Some(path),
@@ -2710,10 +2702,8 @@ impl PyModelCardRegistry {
             let path = workspace.path().join("artifacts");
             let client = self.inner.clone();
             let download_path = path.clone();
-            py.detach(move || {
-                wyrd_runtime::runtime().block_on(client.download_artifacts_to(&uid, &download_path))
-            })
-            .map_err(WyrdPyError::from)?;
+            crate::trace::block_on(py, client.download_artifacts_to(&uid, &download_path))
+                .map_err(WyrdPyError::from)?;
             card.load(
                 py,
                 Some(path),
@@ -2957,8 +2947,7 @@ impl PyWorkflowCards {
                 ));
             }
         };
-        let workflow = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.inner.workflow().load(&selector)))
+        let workflow = crate::trace::block_on(py, self.inner.workflow().load(&selector))
             .map_err(WyrdPyError::from)?;
         Ok(PyWorkflow::from(workflow))
     }
@@ -3077,12 +3066,16 @@ fn register_python_card(
         .transpose()?
         .unwrap_or(VersionBump::Patch);
     let saved = save_python_card(py, card, save_args, &kind, bump, bump_supplied)?;
+    let caller = crate::trace::active_trace_context(py);
     let receipt = py
         .detach(move || {
             let prepared = PreparedPythonCard::new(saved)?;
             let _keep_alive = &prepared.tempdir;
             wyrd_runtime::runtime()
-                .block_on(registry.register(&prepared.input))
+                .block_on(wyrd_client::transport::trace::with_caller_trace(
+                    caller,
+                    registry.register(&prepared.input),
+                ))
                 .map_err(WyrdPyError::from)
         })
         .map(PyRegistrationReceipt::from)?;
@@ -3293,8 +3286,7 @@ fn extract_model_save_args(
 ///
 /// Returns the registry's not-found, validation, authorization, or transport error.
 fn download_card(py: Python<'_>, registry: &Cards, selector: CardSelector) -> CardPyResult<Card> {
-    py.detach(|| wyrd_runtime::runtime().block_on(registry.get(selector)))
-        .map_err(WyrdPyError::from)
+    crate::trace::block_on(py, registry.get(selector)).map_err(WyrdPyError::from)
 }
 
 /// Writes the server-resolved identity back onto the caller-owned holder.

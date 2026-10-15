@@ -7,8 +7,9 @@
 //! cancelled. Nothing about one call is stored on the caller, so concurrent
 //! steps cannot see each other's fallback, deadline, or correlation.
 //! Workflow correlation travels only in this call's tracing span; a caller
-//! bound to one application Run with [`PublicWyrdGatewayCaller::with_subject`]
-//! sends that Run and Card UID as the gateway correlation headers. Refusals in the
+//! given an application Run, a Card UID, or both with
+//! [`PublicWyrdGatewayCaller::with_subject`] sends each one it has as its own
+//! gateway correlation header. Refusals in the
 //! protocol's native error envelope are normalized to a redacted
 //! [`RemoteProblem`].
 
@@ -41,9 +42,12 @@ const PROVIDER: &str = "wyrd_gateway";
 pub struct PublicWyrdGatewayCaller {
     /// Authenticated transport every call is sent through.
     client: WyrdClient,
-    /// The application Run and Card UID text every call carries as the
-    /// `wyrd-run-id` and `wyrd-card-uid` headers; `None` sends neither.
-    subject: Option<(String, String)>,
+    /// The application Run every call carries as `wyrd-run-id`; `None`
+    /// sends no Run header.
+    run_id: Option<String>,
+    /// The Card UID every call carries as `wyrd-card-uid`; `None` sends no
+    /// Card header.
+    card_uid: Option<String>,
 }
 
 impl PublicWyrdGatewayCaller {
@@ -56,16 +60,19 @@ impl PublicWyrdGatewayCaller {
     pub fn new(client: WyrdClient) -> Self {
         Self {
             client,
-            subject: None,
+            run_id: None,
+            card_uid: None,
         }
     }
 
-    /// Correlate every call to application Run `run_id` and the Card, by UID
-    /// `card_uid`, it invokes; the gateway authorizes and captures both
-    /// together.
+    /// Correlate every call to application Run `run_id` and to the Card, by
+    /// UID `card_uid`, it invokes. Each is independent: whichever is given is
+    /// sent as its own header, the gateway records each one it receives, and
+    /// it authorizes a Card UID against the caller's card scope.
     #[must_use]
-    pub fn with_subject(mut self, run_id: &RunId, card_uid: &CardUid) -> Self {
-        self.subject = Some((run_id.to_string(), card_uid.to_string()));
+    pub fn with_subject(mut self, run_id: Option<&RunId>, card_uid: Option<&CardUid>) -> Self {
+        self.run_id = run_id.map(ToString::to_string);
+        self.card_uid = card_uid.map(ToString::to_string);
         self
     }
 }
@@ -116,11 +123,11 @@ impl WyrdGatewayCaller for PublicWyrdGatewayCaller {
             .iter()
             .map(|value| (FALLBACK_HEADER, value.as_str()))
             .collect();
-        if let Some((run_id, card_uid)) = &self.subject {
-            headers.extend([
-                (RUN_HEADER, run_id.as_str()),
-                (CARD_UID_HEADER, card_uid.as_str()),
-            ]);
+        if let Some(run_id) = &self.run_id {
+            headers.push((RUN_HEADER, run_id.as_str()));
+        }
+        if let Some(card_uid) = &self.card_uid {
+            headers.push((CARD_UID_HEADER, card_uid.as_str()));
         }
         let send = self
             .client

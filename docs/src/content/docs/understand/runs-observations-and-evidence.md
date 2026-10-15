@@ -14,7 +14,7 @@ Observe is how you record what the declared system actually does. Observations g
 - agent and model eval results;
 - custom data in your own tables.
 
-You write observations through the Rust, Python, or TypeScript SDK, through OpenTelemetry instrumentation, or through the HTTP API. Each observation is tied to the Card and run that produced it, so a verdict can always point back to exactly what ran.
+You write observations through the Rust, Python, or TypeScript SDK, through OpenTelemetry instrumentation such as an [agent framework's spans](/build-and-verify/observe/record-a-run-and-observations/#trace-an-agent-framework), or through the HTTP API. Each observation is tied to the Card and run that produced it, so a verdict can always point back to exactly what ran.
 
 If the data already lives elsewhere, such as Prometheus or a SQL warehouse, a Source Card describes where it is. The server does not read Source Cards yet; see [Read data where it already lives](#read-data-where-it-already-lives).
 

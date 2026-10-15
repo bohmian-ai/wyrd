@@ -12,9 +12,6 @@ Agents SDK qualifies them with the server name, Pydantic AI renames its
 toolset, and Google ADK, which has no renaming option, declares local renamed
 copies. These are model-facing aliases only; each framework's MCP client still
 calls the dotted wire tool.
-
-The ``mcp-frameworks`` dependency group provides the frameworks, and only
-``py:test:mcp-frameworks`` collects this directory.
 """
 
 from __future__ import annotations
@@ -24,6 +21,7 @@ import copy
 import json
 import re
 from collections.abc import AsyncGenerator
+from typing import Any
 
 import httpx2
 import pytest
@@ -33,6 +31,7 @@ from agents.mcp import MCPServerStreamableHttp
 from agents.tool import FunctionTool
 from agents.tool_context import ToolContext
 from google.adk.agents import LlmAgent
+from google.adk.agents.llm_agent import ToolUnion
 from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
@@ -194,7 +193,7 @@ class ProviderNamedMcpToolset(McpToolset):
 
 
 def adk_run(
-    tools: list[BaseTool | McpToolset],
+    tools: list[ToolUnion],
     connection: McpToolset | MCPSessionManager,
     calls: list[tuple[str, dict]],
 ) -> tuple:
@@ -240,6 +239,7 @@ def adk_run(
     declared = [
         declaration
         for tool in requests[0].config.tools or []
+        if isinstance(tool, genai.Tool)
         for declaration in tool.function_declarations or []
     ]
     return declared, responses
@@ -256,7 +256,7 @@ def adk_toolset_run(url: str, headers: dict[str, str], call: str, arguments: dic
 def test_openai_agents_converts_every_tool(mcp_url: str, admin_headers: dict[str, str]) -> None:
     catalog = advertised(mcp_url, admin_headers)
 
-    async def journey() -> tuple[list[FunctionTool], object]:
+    async def journey() -> tuple[list[FunctionTool], Any]:
         async with openai_server(mcp_url, admin_headers) as server:
             tools = await openai_tools(server)
             (guide,) = [tool for tool in tools if tool.name == "mcp_wyrd__wyrd_guide"]
@@ -367,7 +367,7 @@ def test_google_adk_reader_sees_and_reaches_no_write_tool(
     sessions = MCPSessionManager(
         StreamableHTTPConnectionParams(url=mcp_url, headers=viewer_headers)
     )
-    tools = [
+    tools: list[ToolUnion] = [
         provider_named(McpTool(mcp_tool=tool, mcp_session_manager=sessions))
         for tool in (hidden, guide)
     ]

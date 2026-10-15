@@ -1,3 +1,4 @@
+import type { Span as OtelSpan } from "@opentelemetry/api";
 import { DataType, Table, tableFromIPC, tableToIPC, type Field, type RecordBatch, type Schema } from "apache-arrow";
 import { createRequire } from "node:module";
 
@@ -93,6 +94,7 @@ const {
   storedTimestampText,
   tableConfigFromArrowIpc,
   tableConfigFromJsonSchema,
+  telemetryFlushError,
   telemetryProviderExists,
   timestampFormat,
   timestampKinds,
@@ -2532,6 +2534,222 @@ export interface AgentCard extends RegisteredAgentCard {
 export type HydratedCard = AgentCard | PromptCard | Exclude<RegisteredCard, RegisteredAgentCard | RegisteredPromptCard>;
 
 /**
+ * The fields of an Agents SDK span's data the processor reads. Declared here,
+ * not imported, so the package's types never require the optional
+ * `@openai/agents-core`; every one of its `SpanData` values is assignable.
+ */
+interface AgentsSpanData {
+  readonly type: string;
+  readonly name?: unknown;
+  readonly model?: unknown;
+  readonly usage?: AgentsUsage;
+  readonly _response?: { readonly model?: unknown; readonly usage?: AgentsUsage };
+}
+
+/** The token counts an Agents SDK model span may supply. */
+interface AgentsUsage {
+  readonly input_tokens?: unknown;
+  readonly output_tokens?: unknown;
+}
+
+/** The fields of an Agents SDK span the processor reads. */
+interface AgentsSpan {
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly parentId: string | null;
+  readonly spanData: AgentsSpanData;
+  readonly error: unknown;
+  readonly startedAt: string | null;
+  readonly endedAt: string | null;
+}
+
+/** The fields of an Agents SDK trace the processor reads. */
+interface AgentsTrace {
+  readonly traceId: string;
+  readonly name: string;
+}
+
+/**
+ * An OpenAI Agents SDK trace processor that records each Agents SDK trace and
+ * span as an OpenTelemetry span on the global tracer provider.
+ *
+ * Pass it to the Agents SDK yourself: `addTraceProcessor` keeps the SDK's
+ * default OpenAI exporter alongside it, `setTraceProcessors` replaces it. Wyrd
+ * never registers it. Spans export wherever the application's OpenTelemetry
+ * pipeline does.
+ *
+ * An SDK trace becomes a span started in the active context, so it nests
+ * under any enclosing OpenTelemetry span and carries the {@link Run.scope}
+ * active when it started; each SDK span becomes a child of its SDK parent,
+ * else its trace. Framework timestamps are kept when valid. Agent, tool, and
+ * model spans follow the GenAI conventions for operation, agent and tool
+ * name, model, and token usage, read when the span ends. Prompts, completions,
+ * tool arguments and results, and error messages are never recorded: an SDK
+ * error sets ERROR status and `error.type` only.
+ *
+ * A repeated start is ignored, as are ends with no start and every callback
+ * after {@link WyrdAgentsTraceProcessor.shutdown}, which ends unfinished spans
+ * with ERROR. Neither `shutdown` nor `forceFlush` touches the provider.
+ * Without `@opentelemetry/api` installed it records nothing.
+ */
+export class WyrdAgentsTraceProcessor {
+  /** The OpenTelemetry span for each open SDK trace or span, by SDK id. */
+  readonly #open = new Map<string, OtelSpan>();
+  /** Set by {@link WyrdAgentsTraceProcessor.shutdown}; later callbacks are ignored. */
+  #closed = false;
+
+  /** Start the span for `trace` in the active context. */
+  async onTraceStart(trace: AgentsTrace): Promise<void> {
+    this.#start(trace.traceId, [], trace.name, null);
+  }
+
+  /** End the span for `trace`. */
+  async onTraceEnd(trace: AgentsTrace): Promise<void> {
+    this.#end(trace.traceId, undefined, null);
+  }
+
+  /** Start a child of `span`'s SDK parent, else its trace, else the active context. */
+  async onSpanStart(span: AgentsSpan): Promise<void> {
+    const parents = span.parentId ? [span.parentId, span.traceId] : [span.traceId];
+    this.#start(span.spanId, parents, agentsSpanName(span.spanData), span.startedAt);
+  }
+
+  /** Record `span`'s GenAI attributes and error status, then end it. */
+  async onSpanEnd(span: AgentsSpan): Promise<void> {
+    this.#end(span.spanId, span, span.endedAt);
+  }
+
+  /** End every unfinished span with ERROR and ignore later callbacks. */
+  async shutdown(): Promise<void> {
+    this.#closed = true;
+    for (const span of this.#open.values()) {
+      span.setStatus({ code: 2 /* SpanStatusCode.ERROR */, message: AGENTS_INTERRUPTED });
+      span.end();
+    }
+    this.#open.clear();
+  }
+
+  /** Nothing to flush: the application's tracer provider owns export. */
+  async forceFlush(): Promise<void> {}
+
+  /**
+   * Start the span for SDK id `id` under the first open SDK id in `parents`,
+   * placed in the active context so the Run scope is the one active now.
+   */
+  #start(id: string, parents: readonly string[], name: string, startedAt: string | null): void {
+    const api = otel();
+    if (api === null || this.#closed || this.#open.has(id)) {
+      return;
+    }
+    const parent = parents.map((candidate) => this.#open.get(candidate)).find((span) => span !== undefined);
+    const active = api.context.active();
+    const parentContext = parent === undefined ? active : api.trace.setSpan(active, parent);
+    const span = api.trace
+      .getTracer("wyrd.agents")
+      .startSpan(name, { startTime: agentsTime(startedAt) }, parentContext);
+    this.#open.set(id, span);
+  }
+
+  /** Record `span`'s final data on, and end, the open span for SDK id `id`. */
+  #end(id: string, span: AgentsSpan | undefined, endedAt: string | null): void {
+    const open = this.#open.get(id);
+    if (open === undefined) {
+      return;
+    }
+    this.#open.delete(id);
+    if (span !== undefined) {
+      const { name, attributes } = agentsGenAi(span.spanData);
+      if (name !== undefined) {
+        open.updateName(name);
+      }
+      open.setAttributes(attributes);
+      if (span.error != null) {
+        open.setAttribute("error.type", "_OTHER");
+        open.setStatus({ code: 2 /* SpanStatusCode.ERROR */ });
+      }
+    }
+    open.end(agentsTime(endedAt));
+  }
+}
+
+/**
+ * Classify a rejected `forceFlush` without reading any message into the
+ * result. OpenTelemetry JS rejects with an array of per-processor errors and
+ * marks an expired bound only in the message text, so a `TimeoutError` name or
+ * a message naming the timeout is a timeout; the cause is the error type name.
+ */
+function telemetryFlushFailure(rejection: unknown): { timedOut: boolean; cause: string } {
+  const errors = Array.isArray(rejection) ? rejection : [rejection];
+  // ponytail: OTEL JS has no typed timeout error; match its message until it exports one.
+  const timedOut = errors.some(
+    (error) => error instanceof Error && (error.name === "TimeoutError" || /timeout/i.test(error.message)),
+  );
+  const first: unknown = errors[0];
+  const cause = first instanceof Error ? first.name : typeof first;
+  return { timedOut, cause: timedOut ? `forceFlush timed out (${cause})` : cause };
+}
+
+/** The fixed, payload-free status description of a span ended by processor shutdown. */
+const AGENTS_INTERRUPTED = "span did not finish before the trace processor shut down";
+
+/** An SDK ISO-8601 timestamp as epoch milliseconds, or `undefined` for callback time. */
+function agentsTime(timestamp: string | null | undefined): number | undefined {
+  const millis = timestamp == null ? Number.NaN : Date.parse(timestamp);
+  return Number.isFinite(millis) ? millis : undefined;
+}
+
+/** The GenAI start-time span name for agent and tool spans, else the SDK name or type. */
+function agentsSpanName(data: AgentsSpanData): string {
+  const name = typeof data.name === "string" && data.name !== "" ? data.name : undefined;
+  if (data.type === "agent" && name !== undefined) {
+    return `invoke_agent ${name}`;
+  }
+  if (data.type === "function" && name !== undefined) {
+    return `execute_tool ${name}`;
+  }
+  return name ?? data.type;
+}
+
+/**
+ * The final span name, if it changes, and the GenAI attributes `data`
+ * supplies. Only identity, model, and token counts are read; content never is.
+ */
+function agentsGenAi(data: AgentsSpanData): { name?: string; attributes: Record<string, string | number> } {
+  if (data.type === "agent") {
+    return {
+      attributes: suppliedAttributes({ "gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": data.name }),
+    };
+  }
+  if (data.type === "function") {
+    return {
+      attributes: suppliedAttributes({ "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": data.name }),
+    };
+  }
+  const call = data.type === "generation" ? data : data.type === "response" ? data._response : undefined;
+  if (call === undefined) {
+    return { attributes: {} };
+  }
+  const attributes = suppliedAttributes({
+    "gen_ai.operation.name": "chat",
+    "gen_ai.request.model": call.model,
+    "gen_ai.usage.input_tokens": call.usage?.input_tokens,
+    "gen_ai.usage.output_tokens": call.usage?.output_tokens,
+  });
+  return { name: typeof call.model === "string" && call.model !== "" ? `chat ${call.model}` : "chat", attributes };
+}
+
+/** The string and number values of `supplied`; any other value is omitted. */
+function suppliedAttributes(supplied: Record<string, unknown>): Record<string, string | number> {
+  const attributes: Record<string, string | number> = {};
+  for (const [key, value] of Object.entries(supplied)) {
+    if (typeof value === "string" || typeof value === "number") {
+      attributes[key] = value;
+    }
+  }
+  return attributes;
+}
+
+/**
  * Offline view of a hydrated Card bundle over the shared Rust `WyrdState`.
  *
  * Reads never contact Wyrd; an unknown alias or invalid bundle throws a
@@ -2542,6 +2760,32 @@ export class WyrdState {
   readonly #native: NativeWyrdState;
   /** The tracer provider {@link WyrdState.startTelemetry} installed. */
   #telemetry: { forceFlush(): Promise<void> } | undefined;
+
+  /**
+   * Flush completed spans from the provider {@link WyrdState.startTelemetry}
+   * installed, within its configured `forceFlushTimeoutMillis`. Resolves to
+   * the payload-free failure, or `undefined` when there is no managed provider
+   * or it flushed; never rejects.
+   */
+  async #flushTelemetry(): Promise<{ timedOut: boolean; cause: string } | undefined> {
+    try {
+      await this.#telemetry?.forceFlush();
+      return undefined;
+    } catch (error) {
+      return telemetryFlushFailure(error);
+    }
+  }
+
+  /**
+   * Throw the managed telemetry failure, carrying the native drain's code,
+   * else the native drain's own error.
+   */
+  static #settle(telemetry: { timedOut: boolean; cause: string } | undefined, native: NativeLifecycleResult): void {
+    if (telemetry !== undefined) {
+      throw projectedError(telemetryFlushError(telemetry.timedOut, telemetry.cause, native.errorCode ?? null));
+    }
+    lifecycleValue<null>(native);
+  }
 
   private constructor(native: NativeWyrdState) {
     this.#native = native;
@@ -2759,6 +3003,10 @@ export class WyrdState {
     const native = this.#native.client();
     const client = WyrdClient.fromNative(nativeHandle(native.client, native.error));
     const { startTelemetry } = await import("./otel.js");
+    // An overlapping call on this state may have installed during the await.
+    if (this.#telemetry !== undefined) {
+      return;
+    }
     const provider = startTelemetry(client);
     if (provider === undefined) {
       throw projectedError(telemetryProviderExists());
@@ -2782,15 +3030,22 @@ export class WyrdState {
   }
 
   /**
-   * Drain every producer of this state's writer without closing it.
+   * Export completed spans from the provider {@link WyrdState.startTelemetry}
+   * installed, then drain every producer of this state's writer without
+   * closing it.
    *
-   * The explicit durability barrier for a test or a finite job.
+   * The explicit durability barrier for a test or a finite job. The provider
+   * flush leaves active spans active, and the native drain is attempted even
+   * when it fails. An application's own provider is never touched.
    *
-   * @throws a {@link WyrdError} before startup, after shutdown, or for the
-   * first producer or sink failure.
+   * @throws a {@link WyrdError}: `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` or
+   * `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` when the managed provider did not
+   * flush, with any drain failure's code as `details.native_code`; otherwise
+   * before startup, after shutdown, or for the first producer or sink failure.
    */
   async flush(): Promise<void> {
-    lifecycleValue<null>(await this.#native.flush());
+    const telemetry = await this.#flushTelemetry();
+    WyrdState.#settle(telemetry, await this.#native.flush());
   }
 
   /**
@@ -2801,13 +3056,17 @@ export class WyrdState {
    * resolves can lose pending rows. After an ambiguous failure, retry
    * `shutdown()` on the same state rather than replacing the writer; a
    * successfully closed state stays closed. A tracer provider
-   * {@link WyrdState.startTelemetry} installed is flushed first.
+   * {@link WyrdState.startTelemetry} installed is flushed first but stays
+   * installed and usable; the drain is attempted even when that flush fails.
    *
-   * @throws a {@link WyrdError} for the first producer or sink failure.
+   * @throws a {@link WyrdError}: `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` or
+   * `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` when the managed provider did not
+   * flush, with any drain failure's code as `details.native_code`; otherwise
+   * the first producer or sink failure.
    */
   async shutdown(): Promise<void> {
-    await this.#telemetry?.forceFlush();
-    lifecycleValue<null>(await this.#native.shutdown());
+    const telemetry = await this.#flushTelemetry();
+    WyrdState.#settle(telemetry, await this.#native.shutdown());
   }
 }
 

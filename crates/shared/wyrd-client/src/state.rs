@@ -2114,6 +2114,84 @@ struct AliasRecord {
     card_path: String,
 }
 
+/// How a state's runtime-managed OpenTelemetry tracer provider failed to flush.
+///
+/// Python and TypeScript state flush and shutdown first flush the provider
+/// their `start_telemetry` installed, then always attempt the native Bifrost
+/// drain. This value carries the provider stage's outcome across that drain so
+/// both runtimes report the same catalog error: OTEL is primary and the
+/// drain's stable code, when it also failed, is secondary detail. `cause` is a
+/// payload-free stage description such as an exception type name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryFlushFailure {
+    /// Whether the provider reported its configured export bound expired.
+    timed_out: bool,
+    /// Payload-free description of the failure, never an exception message.
+    cause: String,
+}
+
+impl TelemetryFlushFailure {
+    /// A provider flush that did not finish within its configured bound.
+    pub fn timeout(cause: impl Into<String>) -> Self {
+        Self {
+            timed_out: true,
+            cause: cause.into(),
+        }
+    }
+
+    /// A provider flush that raised or rejected for any other reason.
+    pub fn failed(cause: impl Into<String>) -> Self {
+        Self {
+            timed_out: false,
+            cause: cause.into(),
+        }
+    }
+
+    /// Build the catalog error, recording `native_code` from a failed drain.
+    ///
+    /// Produces `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` or
+    /// `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` with `details.stage`,
+    /// `details.cause`, and `details.native_code` (null when the drain passed).
+    pub fn into_error(self, native_code: Option<&str>) -> WyrdError {
+        let details = json!({
+            "stage": "opentelemetry",
+            "cause": self.cause,
+            "native_code": native_code,
+        });
+        if self.timed_out {
+            WyrdError::SdkTelemetryFlushTimeout {
+                message: format!(
+                    "the managed OpenTelemetry provider did not flush completed spans within its export timeout ({})",
+                    self.cause
+                ),
+                details,
+            }
+        } else {
+            WyrdError::SdkTelemetryFlushFailed {
+                message: format!(
+                    "the managed OpenTelemetry provider failed to flush completed spans ({})",
+                    self.cause
+                ),
+                details,
+            }
+        }
+    }
+
+    /// Combine an optional provider failure with the native drain's result.
+    ///
+    /// # Errors
+    /// Returns the telemetry error carrying the drain's code when the provider
+    /// failed, otherwise the drain's own error unchanged.
+    pub fn settle(telemetry: Option<Self>, native: Result<(), WyrdError>) -> Result<(), WyrdError> {
+        match (telemetry, native) {
+            (None, native) => native,
+            (Some(failure), native) => {
+                Err(failure.into_error(native.as_ref().err().map(WyrdError::code)))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 /// Exercises local hydrated-bundle loading, typed Card projections, reference
 /// closure, alias identity, and artifact confinement without network access.
@@ -3909,5 +3987,49 @@ pub(crate) mod tests {
                 .parent()
                 .expect("artifact parent exists")
         );
+    }
+
+    /// A provider failure is primary and keeps the drain's code as secondary
+    /// detail; a provider success passes the drain's own result through.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a settlement that must fail succeeds, when a failed
+    /// settlement is not the expected timeout or failure variant, or when a
+    /// code, `native_code` detail, or passed-through drain result differs.
+    #[test]
+    fn telemetry_flush_failure_settles_with_the_native_drain() {
+        use super::TelemetryFlushFailure;
+
+        let native = WyrdError::SdkBifrostClosed {
+            message: "closed".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let both = TelemetryFlushFailure::settle(
+            Some(TelemetryFlushFailure::timeout("force_flush returned false")),
+            Err(native.clone()),
+        )
+        .expect_err("telemetry timeout must fail");
+        assert_eq!(both.code(), "WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT");
+        let WyrdError::SdkTelemetryFlushTimeout { details, .. } = &both else {
+            panic!("expected the timeout variant, got {both:?}");
+        };
+        assert_eq!(details["native_code"], "WYRD_SDK_409_BIFROST_CLOSED");
+
+        let only = TelemetryFlushFailure::settle(
+            Some(TelemetryFlushFailure::failed("ValueError")),
+            Ok(()),
+        )
+        .expect_err("telemetry failure must fail");
+        assert_eq!(only.code(), "WYRD_SDK_503_TELEMETRY_FLUSH_FAILED");
+        let WyrdError::SdkTelemetryFlushFailed { details, .. } = &only else {
+            panic!("expected the failure variant, got {only:?}");
+        };
+        assert!(details["native_code"].is_null());
+
+        let native_only =
+            TelemetryFlushFailure::settle(None, Err(native)).expect_err("drain failure");
+        assert_eq!(native_only.code(), "WYRD_SDK_409_BIFROST_CLOSED");
+        assert!(TelemetryFlushFailure::settle(None, Ok(())).is_ok());
     }
 }

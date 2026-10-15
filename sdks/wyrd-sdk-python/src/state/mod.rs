@@ -2,10 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
+use pyo3::exceptions::PyTimeoutError;
 use pyo3::prelude::*;
+use pyo3::sync::MutexExt;
 use pyo3::types::{PyAny, PyDict, PyMapping, PyModule, PyTuple};
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
@@ -26,7 +28,7 @@ use wyrd_spec::registry::{
     RegistrationOutcomeKind, RegistrationReceipt,
 };
 
-use wyrd_client::state::WyrdState;
+use wyrd_client::state::{TelemetryFlushFailure, WyrdState};
 
 use crate::bifrost::PyTableConfig;
 use crate::client::PyWyrdClient;
@@ -88,8 +90,13 @@ pub struct PyWyrdState {
     models: BTreeMap<String, Py<ModelCard>>,
     /// Loaded Data holders by exact `CardRef`.
     data: BTreeMap<String, Py<DataCard>>,
-    /// The tracer provider `start_telemetry` installed, flushed by `shutdown`.
+    /// The `wyrd.otel._ManagedTelemetry` handle over the tracer provider
+    /// `start_telemetry` installed, flushed by `flush` and `shutdown`.
     telemetry: OnceLock<Py<PyAny>>,
+    /// Serializes `start_telemetry`'s check, install, and publication, so a
+    /// concurrent call on this state waits for the first instead of losing
+    /// the global install to it. Traversal and readers use `telemetry` alone.
+    telemetry_setup: Mutex<()>,
 }
 
 #[pymethods]
@@ -161,6 +168,7 @@ impl PyWyrdState {
             models: hydrated.models,
             data: hydrated.data,
             telemetry: OnceLock::new(),
+            telemetry_setup: Mutex::new(()),
         })
     }
 
@@ -170,7 +178,9 @@ impl PyWyrdState {
     /// Delegates to `wyrd.otel._start_telemetry`: the stock OTLP/HTTP span
     /// exporter refreshes the client's token on every export, and spans
     /// started inside `with state.run(...)` carry that Run and Card. A second
-    /// call is idempotent; `shutdown` flushes only this provider.
+    /// call is idempotent, including one made while the first is installing,
+    /// which waits for it; `shutdown` flushes only this provider. A failed
+    /// call installs nothing and can be retried.
     ///
     /// # Errors
     ///
@@ -178,12 +188,23 @@ impl PyWyrdState {
     /// already installed its own tracer provider, `ImportError` naming the
     /// `otel` extra when it is not installed, and the credential error when
     /// the state's client cannot resolve.
-    fn start_telemetry(&self, py: Python<'_>) -> CardPyResult<()> {
+    fn start_telemetry(&self, py: Python<'_>) -> PyResult<()> {
+        if self.telemetry.get().is_some() {
+            return Ok(());
+        }
+        // Detaches while waiting so the running setup can take the GIL. The
+        // gate guards no data, so a poisoned lock is still usable.
+        let _setup = self
+            .telemetry_setup
+            .lock_py_attached(py)
+            .unwrap_or_else(PoisonError::into_inner);
         if self.telemetry.get().is_some() {
             return Ok(());
         }
         let client =
             PyWyrdClient::from_native(self.inner.client().map_err(WyrdPyError::from)?.clone());
+        // A Python failure, such as the ImportError naming the `otel` extra,
+        // propagates unchanged rather than as a generic boundary error.
         let provider = py
             .import("wyrd.otel")?
             .call_method1("_start_telemetry", (client,))?;
@@ -191,7 +212,8 @@ impl PyWyrdState {
             return Err(WyrdPyError::from(WyrdError::SdkTelemetryProviderExists {
                 message: "an OpenTelemetry tracer provider is already installed".to_owned(),
                 details: serde_json::json!({}),
-            }));
+            })
+            .into());
         }
         let _ = self.telemetry.set(provider.unbind());
         Ok(())
@@ -254,15 +276,26 @@ impl PyWyrdState {
         Ok(PyRun::new(run))
     }
 
-    /// Drain every producer of this state's writer without closing it.
+    /// Export completed spans from the provider `start_telemetry` installed,
+    /// then drain every producer of this state's writer without closing it.
+    ///
+    /// The provider flush runs first, waiting at most the OpenTelemetry SDK's
+    /// default flush bound, and leaves active spans active. The native drain is
+    /// attempted even when the provider flush fails. An application's own
+    /// provider is never touched.
     ///
     /// # Errors
     ///
-    /// Raises `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// Raises `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` or
+    /// `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` when the managed provider did not
+    /// flush, with any drain failure's code as `details.native_code`; otherwise
+    /// `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
     /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the first producer or
     /// sink failure from the drain.
     fn flush(&self, py: Python<'_>) -> CardPyResult<()> {
-        crate::trace::block_on(py, self.inner.flush()).map_err(WyrdPyError::from)
+        let telemetry = self.flush_telemetry(py);
+        let native = crate::trace::block_on(py, self.inner.flush());
+        TelemetryFlushFailure::settle(telemetry, native).map_err(WyrdPyError::from)
     }
 
     /// Drain every producer of this state's writer and close it to writes.
@@ -271,18 +304,20 @@ impl PyWyrdState {
     /// observation: queue admission is not a durable acknowledgement, so an
     /// abrupt exit before this returns can lose pending rows. After an ambiguous
     /// failure, retry `shutdown()` on the same state rather than replacing the
-    /// writer. A tracer provider `start_telemetry` installed is flushed first;
-    /// an application's own provider is never touched.
+    /// writer. A tracer provider `start_telemetry` installed is flushed first
+    /// but stays installed and usable; an application's own provider is never
+    /// touched. The drain is attempted even when the provider flush fails.
     ///
     /// # Errors
     ///
-    /// Raises the provider's own exception when it fails to flush, then the
-    /// first producer or sink failure from the drain.
+    /// Raises `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` or
+    /// `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` when the managed provider did not
+    /// flush, with any drain failure's code as `details.native_code`; otherwise
+    /// the first producer or sink failure from the drain.
     fn shutdown(&self, py: Python<'_>) -> CardPyResult<()> {
-        if let Some(provider) = self.telemetry.get() {
-            provider.call_method0(py, "force_flush")?;
-        }
-        crate::trace::block_on(py, self.inner.shutdown()).map_err(WyrdPyError::from)
+        let telemetry = self.flush_telemetry(py);
+        let native = crate::trace::block_on(py, self.inner.shutdown());
+        TelemetryFlushFailure::settle(telemetry, native).map_err(WyrdPyError::from)
     }
 
     /// Return the exact root `CardRef` of this bundle, independent of aliases.
@@ -502,6 +537,34 @@ impl PyWyrdState {
         self.models.clear();
         self.data.clear();
         self.telemetry.take();
+    }
+}
+
+impl PyWyrdState {
+    /// Flush completed spans from the provider `start_telemetry` installed.
+    ///
+    /// Calls the managed handle's `force_flush`, which waits at most the SDK's
+    /// default flush bound even when the stock processor ignores it. A
+    /// `False` result or `TimeoutError` is a timeout; any other exception is a
+    /// failure described only by its type name, never its message. Returns
+    /// `None` when no managed provider exists or the flush succeeded.
+    fn flush_telemetry(&self, py: Python<'_>) -> Option<TelemetryFlushFailure> {
+        let provider = self.telemetry.get()?;
+        match provider.call_method0(py, "force_flush") {
+            Ok(flushed) if flushed.is_truthy(py).unwrap_or(false) => None,
+            Ok(_) => Some(TelemetryFlushFailure::timeout("force_flush returned false")),
+            Err(error) => {
+                let cause = error
+                    .get_type(py)
+                    .qualname()
+                    .map_or_else(|_| "exception".to_owned(), |name| name.to_string());
+                Some(if error.is_instance_of::<PyTimeoutError>(py) {
+                    TelemetryFlushFailure::timeout(cause)
+                } else {
+                    TelemetryFlushFailure::failed(cause)
+                })
+            }
+        }
     }
 }
 

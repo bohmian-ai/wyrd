@@ -235,10 +235,16 @@ class WyrdState:
     def flush(self) -> None:
         """Drain every producer of this state's writer without closing it.
 
-        The explicit durability barrier for a test or a finite job.
+        The explicit durability barrier for a test or a finite job. A tracer
+        provider ``start_telemetry`` installed is force-flushed first; the
+        writer drains even when that flush fails.
 
         Raises:
-            WyrdError: ``WYRD_SDK_400_BIFROST_NOT_STARTED`` before startup,
+            WyrdError: ``WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT`` or
+                ``WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`` when the telemetry
+                flush timed out or failed (``details["native_code"]`` names any
+                writer failure too); otherwise
+                ``WYRD_SDK_400_BIFROST_NOT_STARTED`` before startup,
                 ``WYRD_SDK_409_BIFROST_CLOSED`` after shutdown, or the first
                 producer or sink failure.
         """
@@ -253,10 +259,16 @@ class WyrdState:
         ambiguous failure, retry ``shutdown()`` on the same state rather than
         replacing the writer. A successfully shut-down state stays closed;
         create a new ``WyrdState`` to start again. A tracer provider
-        ``start_telemetry`` installed is flushed first.
+        ``start_telemetry`` installed is force-flushed first, and the writer
+        drains even when that flush fails. An application-owned provider is
+        never flushed here; shut it down yourself.
 
         Raises:
-            WyrdError: The first producer or sink failure from the drain.
+            WyrdError: ``WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT`` or
+                ``WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`` when the telemetry
+                flush timed out or failed (``details["native_code"]`` names any
+                drain failure too); otherwise the first producer or sink
+                failure from the drain.
         """
         ...
 

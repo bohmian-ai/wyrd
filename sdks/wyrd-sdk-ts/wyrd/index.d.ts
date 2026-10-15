@@ -1375,6 +1375,15 @@ export declare function tableConfigFromArrowIpc(table: string, schemaIpc: Buffer
 export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null, compactionType?: string | undefined | null): NativeTableConfigResult
 
 /**
+ * The catalog error `WyrdState.flush` and `WyrdState.shutdown` throw when the
+ * tracer provider `startTelemetry` installed did not flush, built by the
+ * shared [`TelemetryFlushFailure`] so Python and TypeScript report the same
+ * code and details. `cause` is payload-free; `native_code` is the stable code
+ * of a native drain that also failed.
+ */
+export declare function telemetryFlushError(timedOut: boolean, cause: string, nativeCode?: string | undefined | null): NativeWyrdError
+
+/**
  * The catalog refusal `WyrdState.startTelemetry` throws when a global tracer
  * provider is already registered, so its title and remediation come from the
  * one Rust catalog.

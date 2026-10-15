@@ -722,7 +722,18 @@ or signing one; the request then runs under the same authorization, audit,
 and limits as a bearer caller. A revoked key fails at its next export. `x-wyrd-access-token`
 remains valid on OTLP, and no other route accepts `x-wyrd-api-key`. An exporter
 is configured only with standard settings, for example
-`OTEL_EXPORTER_OTLP_HEADERS=x-wyrd-api-key=<key>`; no SDK exporter helper exists.
+`OTEL_EXPORTER_OTLP_HEADERS=x-wyrd-api-key=<key>`. This stock-exporter path
+requires no Wyrd SDK. Optional SDK exporter helpers configure the stock OTLP
+exporters with the shared client's current access token on each export; they
+reuse that client's credential resolution and refresh rather than introducing
+another authentication implementation. Applications may attach those exporters
+to their own OpenTelemetry providers. Framework instrumentation remains owned
+by the application and framework; Wyrd never discovers or patches frameworks.
+A state's `start_telemetry` installs one managed global provider; that state's
+`flush` and `shutdown` force-flush it before draining the writer, still drain
+when it fails, and report the failure as `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT`
+or `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`. An application-owned provider is
+never flushed by a state.
 
 Env vars in deployed services:
 

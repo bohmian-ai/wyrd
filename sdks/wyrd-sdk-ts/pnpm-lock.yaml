@@ -98,6 +98,15 @@ importers:
       '@opentelemetry/context-async-hooks':
         specifier: ^2.11.0
         version: 2.12.0(@opentelemetry/api@1.9.1)
+      '@opentelemetry/core':
+        specifier: ^2.11.0
+        version: 2.11.0(@opentelemetry/api@1.9.1)
+      '@opentelemetry/exporter-logs-otlp-proto':
+        specifier: ^0.222.0
+        version: 0.222.0(@opentelemetry/api@1.9.1)
+      '@opentelemetry/exporter-metrics-otlp-proto':
+        specifier: ^0.222.0
+        version: 0.222.0(@opentelemetry/api@1.9.1)
       '@opentelemetry/exporter-trace-otlp-proto':
         specifier: ^0.222.0
         version: 0.222.0(@opentelemetry/api@1.9.1)
@@ -116,6 +125,9 @@ importers:
 
   wyrd:
     dependencies:
+      '@openai/agents-core':
+        specifier: ^0.20.0
+        version: 0.20.0(zod@4.5.4)
       '@opentelemetry/api':
         specifier: ^1.9.1
         version: 1.9.1

@@ -52,7 +52,7 @@ const client = new OpenAI({ baseURL: `${wyrd.serverUrl}/v1`, apiKey: "wyrd", fet
 </LangTab>
 </LangTabs>
 
-The OpenAI Agents SDK builds on this client, so pass it to `OpenAIResponsesModel` or `OpenAIChatCompletionsModel` as usual.
+The OpenAI Agents SDK builds on this client, so pass it to `OpenAIResponsesModel` or `OpenAIChatCompletionsModel` as usual. To trace those agents into Wyrd as well, see [Trace an agent framework](/build-and-verify/observe/record-a-run-and-observations/#trace-an-agent-framework).
 
 ## Anthropic
 

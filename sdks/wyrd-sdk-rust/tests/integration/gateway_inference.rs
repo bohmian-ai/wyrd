@@ -20,7 +20,7 @@ use wyrd_ai::gateway::{
     ProviderDeploymentName, ProviderId,
 };
 use wyrd_ai::operator_connections::SecretBearer;
-use wyrd_ai::{Gateway, WyrdClient};
+use wyrd_ai::{ExecutionRoute, Gateway, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
 
 use wyrd_ai::state::WyrdState;
@@ -71,22 +71,8 @@ impl Inference {
             ),
         )
         .await;
-        put_managed(deployment.admin(), "openai", "openai-key", PROVIDER_KEY).await;
-        let gateway = Gateway::with_client(deployment.admin());
-        gateway
-            .put_deployment(&ProviderDeployment {
-                name: ProviderDeploymentName::new("openai").expect("deployment name"),
-                adapter: ProviderAdapter::OpenAi,
-                auth: ProviderAuth::Bearer {
-                    credential: ProviderCredentialName::new("openai-key").expect("credential"),
-                },
-                models: None,
-                capabilities: Some(BTreeSet::from([GatewayOperation::ChatCompletions])),
-                access: DeploymentAccess::Open,
-            })
-            .await
-            .expect("deployment puts");
-        gateway
+        put_openai(&deployment, "openai", PROVIDER_KEY, DeploymentAccess::Open).await;
+        Gateway::with_client(deployment.admin())
             .put_capture_policy(&GatewayCapturePolicyWrite {
                 mode: GatewayCaptureMode::Metadata,
                 payload_fields: BTreeSet::new(),
@@ -210,6 +196,30 @@ async fn put_managed(client: WyrdClient, provider: &str, name: &str, secret: &st
     .await
     .expect("the CLI writes the credential");
     serde_json::to_value(view).expect("view serializes")
+}
+
+/// Write the `{name}-key` credential holding `secret` as the administrator
+/// and deploy `name` on the OpenAI adapter with it, serving Chat Completions
+/// for every model under `access`.
+///
+/// # Panics
+/// Panics when the credential or deployment is refused.
+async fn put_openai(deployment: &Deployment, name: &str, secret: &str, access: DeploymentAccess) {
+    let credential = format!("{name}-key");
+    put_managed(deployment.admin(), "openai", &credential, secret).await;
+    Gateway::with_client(deployment.admin())
+        .put_deployment(&ProviderDeployment {
+            name: ProviderDeploymentName::new(name).expect("deployment name"),
+            adapter: ProviderAdapter::OpenAi,
+            auth: ProviderAuth::Bearer {
+                credential: ProviderCredentialName::new(&credential).expect("credential"),
+            },
+            models: None,
+            capabilities: Some(BTreeSet::from([GatewayOperation::ChatCompletions])),
+            access,
+        })
+        .await
+        .expect("deployment puts");
 }
 
 /// An OpenAI-compatible Chat Completions call with the caller's Wyrd access
@@ -607,6 +617,92 @@ async fn run_invokes_its_agent_through_the_gateway() {
             .len(),
         1,
         "refusals precede upstream IO"
+    );
+    inference.deployment.shutdown().await;
+}
+
+/// An Agent declaring the `openai` gateway route and a concurrent invocation
+/// overriding it with `openai-backup` each reach their own deployment's
+/// credential; the override changes neither the Agent's declared route nor
+/// the other invocation. An override to the `granted` deployment
+/// `openai-granted` is authorized on its own, so a caller holding only an
+/// unscoped gateway grant is refused before upstream IO.
+///
+/// # Panics
+/// Panics when a step fails or an answer, refusal, or upstream credential
+/// differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn agent_routes_and_pre_run_overrides() {
+    const BACKUP_KEY: &str = "sk-backup-upstream";
+    let inference = Inference::start().await;
+    put_openai(
+        &inference.deployment,
+        "openai-backup",
+        BACKUP_KEY,
+        DeploymentAccess::Open,
+    )
+    .await;
+    put_openai(
+        &inference.deployment,
+        "openai-granted",
+        BACKUP_KEY,
+        DeploymentAccess::Granted,
+    )
+    .await;
+    let cards = inference.deployment.cards();
+    let service = register(&cards, "cards/gateway_inference/ask-service.yaml").await;
+    let bundle = hydrate(&cards, &service.root).await;
+    let client = inference
+        .deployment
+        .client(&inference.deployment.service_key(&service.root).await);
+    let state = WyrdState::from_path_with_client(bundle.path().join("bundle"), client)
+        .expect("bundle loads offline");
+    let run = state.run_for_card("agent").expect("agent view resolves");
+    let route = |name: &str| ExecutionRoute::WyrdGateway {
+        deployment: ProviderDeploymentName::new(name).expect("deployment name"),
+    };
+    let question = [("question", "hi")];
+
+    let backup = route("openai-backup");
+    let (declared, overridden) =
+        tokio::join!(run.invoke(&question), run.invoke_on(&backup, &question));
+
+    assert_eq!(
+        (
+            declared.expect("declared route answers"),
+            overridden.expect("override answers")
+        ),
+        ("hi".to_owned(), "hi".to_owned())
+    );
+    let mut credentials = inference.upstream_authorizations().await;
+    credentials.sort();
+    assert_eq!(
+        credentials,
+        vec![
+            Some(format!("Bearer {BACKUP_KEY}")),
+            Some(format!("Bearer {PROVIDER_KEY}"))
+        ]
+    );
+    assert_eq!(
+        state.agent("agent").expect("agent").spec.execution_route,
+        route("openai"),
+        "an override never changes the declared route"
+    );
+
+    let refused = run
+        .invoke_on(&route("openai-granted"), &question)
+        .await
+        .expect_err("a granted deployment needs its own grant");
+    assert_eq!(
+        refused.code(),
+        "WYRD_PERMISSION_403_DENIED_RBAC",
+        "{refused}"
+    );
+    assert_eq!(
+        inference.upstream_authorizations().await.len(),
+        2,
+        "the refusal precedes upstream IO"
     );
     inference.deployment.shutdown().await;
 }

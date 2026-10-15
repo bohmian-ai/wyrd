@@ -37,7 +37,7 @@ const RETRYABLE_GATEWAY_CODES: [&str; 3] = [
 pub struct WyrdGatewayCall {
     /// Native request exactly as the Agent loop produced it.
     pub request: ProviderRequest,
-    /// Gateway model identity of the Agent's Prompt provider and model.
+    /// Gateway address: the route's deployment and the Prompt's model.
     pub model: ModelRef,
     /// Remaining time the call may take; the caller enforces it.
     pub timeout: Duration,
@@ -64,24 +64,29 @@ pub trait WyrdGatewayCaller: Send + Sync {
     ) -> Result<ProviderResponse, ProviderError>;
 }
 
-/// Build a provider registry serving `prompt`'s model calls through `caller`.
+/// Build a provider registry serving `prompt`'s model calls through `caller`
+/// at `<deployment>/<prompt model>`.
 ///
 /// It holds one gateway adapter keyed by the Prompt's provider; each call
-/// carries [`DEFAULT_GATEWAY_CALL_TIMEOUT`] and a never-cancelled token.
-/// Returns `None` when the Prompt's provider and model are not a gateway
-/// model identity.
+/// carries [`DEFAULT_GATEWAY_CALL_TIMEOUT`] and a never-cancelled token. The
+/// deployment comes from the Agent's execution route and is never derived
+/// from the Prompt provider. Returns `None` when the Prompt model is not a
+/// gateway model identifier.
 #[must_use]
 pub fn wyrd_gateway_registry(
     caller: Arc<dyn WyrdGatewayCaller>,
     prompt: &Prompt,
+    deployment: &ProviderDeploymentName,
 ) -> Option<ProviderRegistry> {
-    let provider = prompt.provider();
-    let model = gateway_model(&provider, &prompt.model)?;
+    let model = ModelRef {
+        deployment: deployment.clone(),
+        model: ModelId::new(&prompt.model).ok()?,
+    };
     Some(ProviderRegistry::new().with(Arc::new(WyrdGatewayProvider {
         caller,
         model,
         cancellation: CancellationToken::new(),
-        provider,
+        provider: prompt.provider(),
     })))
 }
 
@@ -119,26 +124,6 @@ fn provider_error_retryable(error: &ProviderError) -> bool {
         }
         _ => false,
     }
-}
-
-/// Project a Prompt's provider and model onto the gateway model identity.
-///
-/// Built-in providers map to the gateway's built-in provider IDs (Google AI
-/// Studio is `gemini`); any other provider keeps its own name. Returns `None`
-/// when either half is not a valid gateway identity.
-fn gateway_model(provider: &ProviderName, model: &str) -> Option<ModelRef> {
-    let provider = match provider {
-        ProviderName::OpenAi => "openai",
-        ProviderName::Anthropic => "anthropic",
-        ProviderName::Google => "gemini",
-        ProviderName::Vertex => "vertex",
-        ProviderName::Jev => "jev",
-        ProviderName::Custom(name) => name,
-    };
-    Some(ModelRef {
-        deployment: ProviderDeploymentName::new(provider).ok()?,
-        model: ModelId::new(model).ok()?,
-    })
 }
 
 /// Provider adapter submitting an Agent's model calls to the Wyrd gateway.

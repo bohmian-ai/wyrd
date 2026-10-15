@@ -79,6 +79,10 @@ pub use wyrd_spec::error::WyrdError;
 /// typed spec.
 pub use wyrd_spec::envelope::{Card, Spec};
 
+/// Where an Agent's model calls go: declared on every Agent Card and
+/// replaceable whole for one invocation with `Run::invoke_on`.
+pub use wyrd_spec::ExecutionRoute;
+
 /// How a Verifier Card judges: an Eval or a Drift implementation.
 pub use wyrd_spec::card::verifier::VerifierImplementation;
 

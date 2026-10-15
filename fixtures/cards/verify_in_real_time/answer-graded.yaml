@@ -13,7 +13,7 @@ spec:
       id: judge
       judge_ref:
         prompt: ./judge-prompt.yaml
-        execution_route: {kind: native}
+        execution_route: {kind: wyrd_gateway, deployment: openai}
         tool_names: []
         run_config: {max_iterations: 1}
       context_path: $.answer

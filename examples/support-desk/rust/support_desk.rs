@@ -20,17 +20,13 @@ use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite, ModelId};
 use wyrd_ai::observe::EvalObservationOptions;
 use wyrd_ai::otel::start_telemetry;
 use wyrd_ai::state::WyrdState;
-use wyrd_ai::{Bifrost, Gateway, Spec, WyrdClient, WyrdError};
+use wyrd_ai::{Bifrost, ExecutionRoute, Gateway, Spec, WyrdClient, WyrdError};
 
 /// The failure any support-desk step returns.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// How many requests [`serve`] answers; every tenth asks for a refund.
 pub const REQUESTS: usize = 100;
-
-/// The gateway deployment the Prompt's `open_ai_chat_completion` request routes
-/// to; with the Prompt's model it is the exact deployment `deploy` requires.
-const PROVIDER: &str = "openai";
 
 /// The checked-in Service Cards.
 #[must_use]
@@ -99,8 +95,8 @@ struct Answer<'a> {
 /// Returns the registration refusal, including
 /// `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` for an incompatible existing
 /// `tickets` table, and `WYRD_GATEWAY_404_MODEL_UNAVAILABLE` naming the exact
-/// gateway deployment to configure when none serves the Prompt's provider and
-/// model.
+/// gateway deployment to configure when the Agent's gateway route names a
+/// deployment that does not serve the Prompt's model.
 pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Desk, Error> {
     let cards = Cards::with_client(client.clone());
     let receipt = cards
@@ -124,21 +120,25 @@ pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Desk, Error> {
     let Spec::Prompt(prompt) = &state.card("prompt")?.spec else {
         return Err("the `prompt` component is not a Prompt".into());
     };
+    let ExecutionRoute::WyrdGateway { deployment: name } =
+        &state.agent("agent")?.spec.execution_route
+    else {
+        return Ok(Desk { receipt, state });
+    };
     let model = &prompt.prompt.model;
     let served = ModelId::new(model)?;
     if !gateway
         .deployments()
         .await?
         .iter()
-        .any(|deployment| deployment.name.as_str() == PROVIDER && deployment.permits(&served))
+        .any(|deployment| &deployment.name == name && deployment.permits(&served))
     {
-        let route = format!("{PROVIDER}/{model}");
         return Err(WyrdError::GatewayModelUnavailable {
             message: format!(
-                "the support Agent's model {route} is not deployed; configure the gateway \
-                 deployment {PROVIDER} (PUT /v1/admin/gateway/provider-deployments/{PROVIDER})"
+                "the support Agent's model {name}/{model} is not deployed; configure the gateway \
+                 deployment {name} (PUT /v1/admin/gateway/provider-deployments/{name})"
             ),
-            details: json!({ "deployment": PROVIDER, "model": model }),
+            details: json!({ "deployment": name, "model": model }),
         }
         .into());
     }

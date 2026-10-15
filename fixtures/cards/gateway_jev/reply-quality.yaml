@@ -18,7 +18,7 @@ spec:
           id: judge
           judge_ref:
             prompt: ./jev-judge-prompt.yaml
-            execution_route: {kind: native}
+            execution_route: {kind: wyrd_gateway, deployment: jev}
             tool_names: []
             run_config: {max_iterations: 1}
           operator: is_object

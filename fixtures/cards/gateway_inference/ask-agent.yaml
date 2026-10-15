@@ -7,7 +7,8 @@ metadata:
 spec:
   prompt: ./ask-prompt.yaml
   execution_route:
-    kind: native
+    kind: wyrd_gateway
+    deployment: openai
   tool_names: []
   run_config:
     max_iterations: 1

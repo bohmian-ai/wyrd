@@ -23,9 +23,6 @@ import { Bifrost, Cards, Gateway, type RegistrationReceipt, WyrdClient, WyrdStat
 /** How many requests {@link serve} answers; every tenth asks for a refund. */
 export const REQUESTS = 100;
 
-/** The gateway provider the Prompt's `open_ai_chat_completion` request routes to. */
-const PROVIDER = "openai";
-
 /** The checked-in Service Cards. */
 export const SERVICE = resolve(import.meta.dirname, "../service");
 
@@ -64,8 +61,8 @@ export function uid(desk: Desk, name: string): string {
  * @throws WyrdError - the registration refusal, including
  *   `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` for an incompatible existing
  *   `tickets` table.
- * @throws Error - naming the exact gateway deployment to configure when none
- *   serves the Prompt's provider and model.
+ * @throws Error - naming the exact gateway deployment to configure when the
+ *   Agent's gateway route names a deployment that does not exist.
  */
 export async function deploy(client: WyrdClient, bundle: string): Promise<Desk> {
   const cards = Cards.connect({ client });
@@ -78,9 +75,17 @@ export async function deploy(client: WyrdClient, bundle: string): Promise<Desk> 
   if (prompt.kind !== "Prompt") {
     throw new Error("the `prompt` component is not a Prompt");
   }
-  const route = `${PROVIDER}/${prompt.spec.model}`;
+  const agent = state.card("agent");
+  if (agent.kind !== "Agent") {
+    throw new Error("the `agent` component is not an Agent");
+  }
+  const { execution_route: executionRoute } = agent.spec;
+  if (executionRoute.kind === "native") {
+    return { receipt, state };
+  }
+  const route = `${executionRoute.deployment}/${prompt.spec.model}`;
   const deployed = await gateway.deployments();
-  if (!deployed.some(({ model }) => model.provider === PROVIDER && model.model === prompt.spec.model)) {
+  if (!deployed.some(({ name }) => name === executionRoute.deployment)) {
     throw new Error(
       `the support Agent's model ${route} is not deployed; configure a gateway provider deployment ` +
         `for ${route} (PUT /v1/admin/gateway/provider-deployments/{name})`,

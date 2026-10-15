@@ -13,7 +13,7 @@ use skald_prompt::Prompt;
 use skald_providers::ProviderError;
 use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
 use tokio::sync::Mutex;
-use wyrd_spec::card::agent::AgentSpec;
+use wyrd_spec::card::agent::{AgentSpec, ExecutionRoute};
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::vala::eval::media::MediaRef as EvalMediaRef;
 
@@ -89,11 +89,15 @@ impl SkaldJudgeInvoker {
         self
     }
 
-    /// Serve every judge model call through the Wyrd gateway `caller`.
+    /// Serve judge model calls through the Wyrd gateway `caller`, marking
+    /// this invoker as server-controlled.
     ///
-    /// The judge Agent then dispatches only to the gateway adapter keyed by
-    /// its Prompt's provider, so the gateway's authorization, accounting,
-    /// capture, and audit apply to each call and `providers` is never used.
+    /// A judge Agent's `wyrd_gateway` route then dispatches only to the
+    /// gateway adapter bound to `<deployment>/<Prompt model>`, so the
+    /// gateway's authorization, accounting, capture, and audit apply to each
+    /// call and `providers` is never used; a `native` route is refused rather
+    /// than reaching server credentials. Without a caller, a native route uses
+    /// `providers` and a gateway route is refused.
     #[must_use]
     pub fn with_wyrd_gateway(mut self, caller: Arc<dyn WyrdGatewayCaller>) -> Self {
         self.gateway = Some(caller);
@@ -186,16 +190,29 @@ impl SkaldJudgeInvoker {
             || "inline-judge".to_owned(),
             |reference| reference.name.to_string(),
         );
-        let gateway = match &self.gateway {
-            Some(caller) => Some(Arc::new(
-                wyrd_gateway_registry(Arc::clone(caller), prompt.native()).ok_or_else(|| {
-                    JudgeError::Terminal {
-                        reason: "judge Prompt provider and model are not a gateway model identity"
-                            .to_owned(),
-                    }
-                })?,
+        let gateway = match (&spec.execution_route, &self.gateway) {
+            (ExecutionRoute::WyrdGateway { deployment }, Some(caller)) => Some(Arc::new(
+                wyrd_gateway_registry(Arc::clone(caller), prompt.native(), deployment).ok_or_else(
+                    || JudgeError::Terminal {
+                        reason: "judge Prompt model is not a gateway model identifier".to_owned(),
+                    },
+                )?,
             )),
-            None => None,
+            (ExecutionRoute::Native {}, None) => None,
+            (ExecutionRoute::WyrdGateway { .. }, None) => {
+                return Err(JudgeError::Terminal {
+                    reason: "judge Agent routes through the Wyrd gateway, which this invoker \
+                             is not configured with"
+                        .to_owned(),
+                });
+            }
+            (ExecutionRoute::Native {}, Some(_)) => {
+                return Err(JudgeError::Terminal {
+                    reason: "server-controlled judge execution refuses a native judge Agent \
+                             route; declare a wyrd_gateway route"
+                        .to_owned(),
+                });
+            }
         };
         let mut agent = Agent::new(prompt)
             .with_id(id)

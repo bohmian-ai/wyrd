@@ -428,11 +428,12 @@ def _gen_ai(data: Any) -> tuple[str | None, dict[str, Any]]:
         model, usage = data.model, data.usage or {}
         input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
     elif data.type == "response":
+        # The SDK supplies usage even when content capture withholds the response.
         response = data.response
         model = getattr(response, "model", None)
-        usage = getattr(response, "usage", None)
-        input_tokens = getattr(usage, "input_tokens", None)
-        output_tokens = getattr(usage, "output_tokens", None)
+        usage, full = data.usage or {}, getattr(response, "usage", None)
+        input_tokens = usage.get("input_tokens", getattr(full, "input_tokens", None))
+        output_tokens = usage.get("output_tokens", getattr(full, "output_tokens", None))
     else:
         return None, {}
     attributes = {

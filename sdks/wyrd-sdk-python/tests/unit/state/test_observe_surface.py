@@ -985,6 +985,11 @@ def test_agents_callback_lifecycle(
     )
     processor.on_span_start(response)
     processor.on_span_end(response)
+    # With content capture off the SDK withholds the response but still supplies usage.
+    withheld = _agents_span("withheld", ResponseSpanData(), parent_id="agent")
+    processor.on_span_start(withheld)
+    withheld.span_data.usage = {"input_tokens": 7, "output_tokens": 0}
+    processor.on_span_end(withheld)
     custom = _agents_span(
         "custom", CustomSpanData(name="checkpoint", data={"secret": "SECRET"}), parent_id="agent"
     )
@@ -1023,6 +1028,11 @@ def test_agents_callback_lifecycle(
         "wyrd.run_id": run_a.run_id,
     }
     assert finished["chat resp-model"].attributes["gen_ai.usage.output_tokens"] == 2
+    assert dict(finished["chat"].attributes) == {
+        "gen_ai.operation.name": "chat",
+        "gen_ai.usage.input_tokens": 7,
+        "gen_ai.usage.output_tokens": 0,
+    }
     assert not any(key.startswith("gen_ai") for key in finished["checkpoint"].attributes)
     for span in finished.values():
         rendered = f"{dict(span.attributes)} {span.status.description} {span.events}"
@@ -1035,6 +1045,7 @@ def test_agents_callback_lifecycle(
         "execute_tool lookup": run_a.run_id,
         "chat local-model": run_a.run_id,
         "chat resp-model": None,
+        "chat": None,
         "checkpoint": None,
     }
 

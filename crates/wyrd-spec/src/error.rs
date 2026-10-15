@@ -1252,6 +1252,24 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A verification execution did not settle within the caller's wait.
+    ///
+    /// The execution may still be queued or running, or its staged
+    /// submission may have been lost before queue acceptance; waiting never
+    /// invents a result from a status.
+    #[error("[WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT",
+        status = 504,
+        title = "Verification execution did not settle in time",
+        remediation = "Wait again with the same execution ID, or read its status; a submission lost before queue acceptance never settles and must be submitted again."
+    )]
+    SdkVerificationWaitTimedOut {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// A second `start_bifrost` was attempted on a state that already owns a
     /// connected writer.
     ///
@@ -3734,6 +3752,7 @@ impl WyrdError {
             | Self::SdkInvalidStateBundle { message, details }
             | Self::SdkUnknownAlias { message, details }
             | Self::SdkUnknownVerifier { message, details }
+            | Self::SdkVerificationWaitTimedOut { message, details }
             | Self::SdkBifrostAlreadyStarted { message, details }
             | Self::SdkTelemetryProviderExists { message, details }
             | Self::SdkTelemetryFlushTimeout { message, details }

@@ -59,7 +59,8 @@ mod pg_tests {
         }
     }
 
-    /// MCP gateway reads return the HTTP-configured redacted resources, MCP
+    /// MCP gateway reads return the HTTP-configured redacted resources,
+    /// including a named deployment's model allowlist and access level; MCP
     /// replacements and deletions are observed over HTTP with the same
     /// invalid-configuration and conflict problems, and a reader without
     /// gateway permission is denied reads and writes with a 403 problem.
@@ -92,7 +93,9 @@ mod pg_tests {
                 "name": "primary",
                 "adapter": "openai",
                 "auth": {"bearer": {"credential": "primary"}},
+                "models": ["gpt-4o"],
                 "capabilities": ["chat_completions"],
+                "access": "granted",
             }))?)
             .await?;
 
@@ -126,7 +129,12 @@ mod pg_tests {
                 ))
                 .await?,
         )?;
-        assert_eq!(deployments["items"][0]["name"], "primary");
+        assert_eq!(
+            deployments["items"],
+            serde_json::to_value(gateway.deployments().await?)?,
+            "MCP projects the same named deployments as HTTP"
+        );
+        assert_eq!(deployments["items"][0]["access"], "granted");
         let capture = structured(
             client
                 .call_tool(CallToolRequestParams::new("gateway.get_capture_policy"))

@@ -236,6 +236,7 @@ mod pg_tests {
     use arrow::record_batch::RecordBatch;
     use reqwest::StatusCode;
     use wyrd_runtime::Permission;
+    use wyrd_spec::auth::TokenAudience;
     use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
     use wyrd_tonic::otlp::metrics_service::{
         ExportMetricsServiceRequest, ExportMetricsServiceResponse,
@@ -385,27 +386,49 @@ mod pg_tests {
     /// One publisher's replay is exactly once; two publishers are two row sets.
     ///
     /// Retry suppression derives `wyrd_batch_id` from the accepted rows rather
-    /// than from transport metadata, so it must be scoped to the authenticated
-    /// publisher and the accepted correlation attribution it carries. This
-    /// case exports the same wholly valid spans three ways: twice as the
-    /// journey's own principal (the at-least-once replay), once as a second
-    /// authorized principal in the same tenant, and once as the first
-    /// principal again under a different accepted `wyrd.run_id`. The replay
-    /// must converge on one fence and store one row set, while each of the
-    /// other two must reach its own fence and store its own rows with its own
-    /// `principal_id` and `run_id` — otherwise an acknowledgement would have
-    /// claimed a row that was never stored under its own attribution.
+    /// than from transport metadata, so it must be scoped to the verified
+    /// publisher (subject and current actor) and the accepted correlation
+    /// attribution it carries. This case exports the same wholly valid spans
+    /// as: the journey's own principal over gRPC twice and OTLP/HTTP once (the
+    /// at-least-once replay, across transports); a second authorized principal
+    /// in the same tenant; the first principal again under a different
+    /// accepted `wyrd.run_id`; and two actors each delegated by the first
+    /// principal, each replaying over both transports. Every replay must
+    /// converge on one fence and store one row set, while every distinct
+    /// publisher pair or run correlation must reach its own fence and store its
+    /// own rows with its own `sub_principal_id`, `act_principal_id`, and
+    /// `run_id` — otherwise an acknowledgement would have claimed a row that
+    /// was never stored under its own attribution.
     ///
     /// # Panics
     ///
-    /// Panics when an export is refused, when the replay duplicates or drops a
-    /// row, or when a distinct principal or run correlation does not produce
-    /// its own complete, correctly attributed row set.
+    /// Panics when an export or delegation is refused, when a replay
+    /// duplicates or drops a row, or when a distinct publisher pair or run
+    /// correlation does not produce its own complete, correctly attributed
+    /// row set.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn identical_exports_from_two_principals_each_keep_their_own_attribution() {
         let journey = OtlpJourney::start().await;
         let anchor = support::anchor_nanos();
+        let export_over_http = async |token: &str| {
+            let request = ExportTraceServiceRequest {
+                resource_spans: negative_resource_spans(anchor, &[]),
+            };
+            let (status, body) = post_otlp_raw(
+                &journey,
+                "/v1/traces",
+                HttpEncoding::Protobuf,
+                HttpEncoding::Protobuf.encode(&request),
+                Some(token),
+            )
+            .await;
+            assert!(
+                status.is_success(),
+                "the collector accepts the export ({status}): {}",
+                String::from_utf8_lossy(&body)
+            );
+        };
 
         for attempt in 0..2 {
             let partial = export_traces_over_grpc(&journey, negative_resource_spans(anchor, &[]))
@@ -416,6 +439,7 @@ mod pg_tests {
                 "attempt {attempt}: a wholly valid export rejects no span"
             );
         }
+        export_over_http(journey.token()).await;
 
         let second = journey
             .token_with_permissions(
@@ -426,18 +450,36 @@ mod pg_tests {
         export_traces_over_grpc_as(&journey, &second, negative_resource_spans(anchor, &[])).await;
         export_traces_over_grpc(&journey, correlated_resource_spans(anchor)).await;
 
+        let third = journey
+            .token_with_permissions(
+                "otlp_attribution_actor",
+                &[Permission::bifrost_record_write()],
+            )
+            .await;
+        for actor in [&second, &third] {
+            let delegated = journey
+                .server()
+                .delegate(journey.token(), actor, TokenAudience::Wyrd)
+                .await
+                .expect("the journey principal delegates to the actor");
+            export_traces_over_grpc_as(&journey, &delegated, negative_resource_spans(anchor, &[]))
+                .await;
+            export_over_http(&delegated).await;
+        }
+
         journey.publish().await;
 
         let rows = journey
             .query(&format!(
-                "SELECT trace_state, principal_id, run_id FROM {SPANS_TABLE} \
-                 WHERE scope_name = '{NEGATIVE_TRACE_SCOPE}'"
+                "SELECT trace_state, sub_principal_id, act_principal_id, run_id \
+                 FROM {SPANS_TABLE} WHERE scope_name = '{NEGATIVE_TRACE_SCOPE}'"
             ))
             .await;
-        let mut attributed: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        let mut attributed: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
         for batch in &rows {
             let markers = support::column::<StringArray>(batch, "trace_state");
-            let principals = support::column::<StringArray>(batch, "principal_id");
+            let subjects = support::column::<StringArray>(batch, "sub_principal_id");
+            let actors = support::column::<StringArray>(batch, "act_principal_id");
             let runs = support::column::<StringArray>(batch, "run_id");
             for index in 0..batch.num_rows() {
                 let run = if runs.is_null(index) {
@@ -446,7 +488,11 @@ mod pg_tests {
                     runs.value(index).to_owned()
                 };
                 attributed
-                    .entry((principals.value(index).to_owned(), run))
+                    .entry((
+                        subjects.value(index).to_owned(),
+                        actors.value(index).to_owned(),
+                        run,
+                    ))
                     .or_default()
                     .push(markers.value(index).to_owned());
             }
@@ -454,17 +500,40 @@ mod pg_tests {
 
         assert_eq!(
             attributed.len(),
-            3,
-            "the replay collapses onto one fence while the second principal and the \
-             differently correlated export each keep their own: {attributed:?}"
+            5,
+            "each replay collapses onto one fence while the second principal, the \
+             differently correlated export, and each delegated actor keep their own: \
+             {attributed:?}"
         );
-        let principals: BTreeSet<&String> = attributed.keys().map(|(id, _)| id).collect();
+        let direct: BTreeSet<&String> = attributed
+            .keys()
+            .filter(|(subject, actor, _)| subject == actor)
+            .map(|(subject, _, _)| subject)
+            .collect();
         assert_eq!(
-            principals.len(),
+            direct.len(),
             2,
-            "two authorized publishers keep two distinct principal attributions"
+            "two authorized direct publishers keep two distinct subjects: {attributed:?}"
         );
-        let runs: BTreeSet<&String> = attributed.keys().map(|(_, run)| run).collect();
+        let (subject, _, _) = attributed
+            .keys()
+            .find(|(_, _, run)| run == ATTRIBUTION_RUN)
+            .expect("the run-correlated export is stored");
+        let delegated: BTreeSet<&String> = attributed
+            .keys()
+            .filter(|(sub, actor, _)| sub == subject && actor != subject)
+            .map(|(_, actor, _)| actor)
+            .collect();
+        assert_eq!(
+            delegated.len(),
+            2,
+            "two actors delegated by one subject keep two distinct actor stamps: {attributed:?}"
+        );
+        assert!(
+            delegated.iter().any(|actor| direct.contains(actor)),
+            "the second principal acting for the subject is stamped as the actor: {attributed:?}"
+        );
+        let runs: BTreeSet<&String> = attributed.keys().map(|(_, _, run)| run).collect();
         assert!(
             runs.contains(&String::new()) && runs.contains(&ATTRIBUTION_RUN.to_owned()),
             "the uncorrelated and the run-correlated exports are stored apart: {runs:?}"

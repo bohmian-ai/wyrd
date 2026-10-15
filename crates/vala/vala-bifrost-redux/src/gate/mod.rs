@@ -44,7 +44,7 @@ use crate::scribe::preprocess::{LogicalIdentity, correlation_data_identity};
 use crate::tables::{
     CallsTable, DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, TableError,
 };
-use wyrd_spec::auth::{Attribution, PrincipalId};
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome, BifrostQueryRequest};

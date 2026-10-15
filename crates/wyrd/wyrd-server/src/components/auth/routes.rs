@@ -954,7 +954,7 @@ mod pg_tests {
             .parse()
             .expect("target principal id is a uuid");
         assert_eq!(
-            row.audit_principal_id, creator,
+            row.sub_principal_id, creator,
             "audit records the issuing actor"
         );
         assert_eq!(

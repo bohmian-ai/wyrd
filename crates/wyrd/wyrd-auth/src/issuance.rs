@@ -22,7 +22,8 @@ use wyrd_auth_verify::{ActClaim, TokenAudience, TokenPrincipalRef, VerifiedToken
 use wyrd_runtime::audit::AuditStage;
 use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
 use wyrd_spec::auth::{
-    ExchangeTokenType, OAuthClientId, PrincipalKindTag, SecretBearer, TokenResponse, TokenType,
+    Attribution, ExchangeTokenType, OAuthClientId, PrincipalKindTag, SecretBearer, TokenResponse,
+    TokenType,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRefScope;
@@ -811,7 +812,7 @@ fn exchange_audit_event(
         return auth_event(
             request_id,
             TOKEN_EXCHANGE_OPERATION,
-            issued.id,
+            Attribution::direct(issued.id),
             issued.kind,
             issued.card_ref.clone(),
             AuditOutcome::Allowed,
@@ -834,7 +835,7 @@ fn exchange_audit_event(
     let mut event = auth_event(
         request_id,
         TOKEN_EXCHANGE_OPERATION,
-        subject.id,
+        Attribution::new(subject.id, issued.id),
         subject.kind,
         subject.card_ref.clone(),
         AuditOutcome::Allowed,

@@ -40,7 +40,7 @@ use crate::components::auth::Caller;
 use crate::components::gateway::GatewayCallSubject;
 use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::http::middleware::edge_timeout::EdgeTimer;
-use crate::scribe_outbox::{ScribeWrite, VerifierAttribution};
+use crate::scribe_outbox::ScribeWrite;
 use crate::state::{AppState, registry_db_error};
 use crate::verification::direct::{self, DirectExecutor, EXECUTION_DEADLINE};
 use crate::verification::engines::VerifierReport;
@@ -67,7 +67,7 @@ struct DirectTarget {
     implementation: VerifierImplementation,
     /// Exact subject reference.
     subject: CardRef,
-    /// The tenant's active SYSTEM principal the result is attributed to.
+    /// The tenant's active SYSTEM principal, which executes the Verifier.
     system_principal: Option<PrincipalId>,
 }
 
@@ -461,6 +461,11 @@ impl<'a> VerificationControl<'a> {
         }
         let kind = VerifierKind::of(&target.implementation);
         telemetry.classify(kind);
+        let system = target.system_principal.ok_or_else(|| WyrdError::Internal {
+            message: "the tenant has no active SYSTEM principal to execute the Verifier".to_owned(),
+            details: serde_json::json!({}),
+        })?;
+        let executor = caller.clone().executed_by_system(system);
         let started_at = Utc::now();
         let executed = telemetry
             .phase(
@@ -473,7 +478,7 @@ impl<'a> VerificationControl<'a> {
                             card_uid: Some(request.subject_card_uid.clone()),
                         }))
                         .execute(
-                            caller,
+                            &executor,
                             execution_id,
                             &request.verifier_uid,
                             &target.implementation,
@@ -521,16 +526,15 @@ impl<'a> VerificationControl<'a> {
     /// Stage a completed direct execution's result on the Scribe outbox.
     ///
     /// The result takes the execution's identity, so the response's
-    /// `execution_id` is the `result_id` of its rows. It is attributed to the
-    /// tenant SYSTEM principal and the exact Verifier exactly like a queued
-    /// result, records `caller` as its requesting principal, carries the
-    /// caller's application Run `run_id` when supplied,
-    /// and has no owner, binding, or Trigger. A Drift result records the
-    /// execution interval as its window; an Eval or task result records the
-    /// application Run's record (the `execution_id` when no Run is supplied)
-    /// as its source. The verdict is already decided, so a
-    /// missing SYSTEM principal or an unbuildable payload is logged and the
-    /// result is not recorded.
+    /// `execution_id` is the `result_id` of its rows. Its rows name the
+    /// subject Card as `card_uid` and the exact Verifier as
+    /// `verifier_card_uid`, are attributed to the caller's subject and actor,
+    /// carry the caller's application Run `run_id` when supplied, and have no
+    /// owner, binding, or Trigger. A Drift result records the execution
+    /// interval as its window; an Eval or task result records the application
+    /// Run's record (the `execution_id` when no Run is supplied) as its
+    /// source. The verdict is already decided, so an unbuildable payload is logged and
+    /// the result is not recorded.
     fn stage_result(
         &self,
         caller: &Caller,
@@ -540,10 +544,6 @@ impl<'a> VerificationControl<'a> {
         report: &VerifierReport,
         started_at: DateTime<Utc>,
     ) {
-        let Some(principal) = target.system_principal else {
-            tracing::warn!(%execution_id, "the tenant has no SYSTEM principal; the direct result is not recorded");
-            return;
-        };
         let (Some(subject), Some(verifier), Ok(result_id)) = (
             target.subject.uid.as_ref(),
             target.verifier.uid.as_ref(),
@@ -572,8 +572,7 @@ impl<'a> VerificationControl<'a> {
             ResultRun {
                 run_id,
                 verifier_version: &verifier_version,
-                subject_card_uid: subject,
-                requested_by: Some(caller.principal.id),
+                card_uid: subject,
                 owner_card_uid: None,
                 binding_id: None,
                 trigger: None,
@@ -590,10 +589,7 @@ impl<'a> VerificationControl<'a> {
                 caller.data_tenant_id,
                 ScribeWrite::Result {
                     payload,
-                    attribution: VerifierAttribution {
-                        verifier: target.verifier.clone(),
-                        principal,
-                    },
+                    attribution: caller.attribution(),
                 },
             ),
             Err(error) => {

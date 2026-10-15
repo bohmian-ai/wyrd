@@ -193,7 +193,6 @@ impl PlatformAuthorization {
         resource: &str,
         allowed: bool,
     ) -> AuditEvent {
-        let principal_id = context.principal_id();
         let outcome = if allowed {
             AuditOutcome::Allowed
         } else {
@@ -205,14 +204,13 @@ impl PlatformAuthorization {
             operation: PLATFORM_AUTHZ_OPERATION.to_owned(),
             resource: resource.to_owned(),
             card_ref: None,
-            principal_id,
-            principal_kind: context.principal_kind(),
+            sub_principal_id: context.principal_id(),
+            sub_principal_kind: context.principal_kind(),
+            act_principal_id: context.principal_id(),
             credential_id: context.credential_id(),
             permission: required.to_string(),
             outcome,
             detail: Some(AuditDetail::AuthzCheck {
-                caller_principal_id: principal_id,
-                callee_principal_id: principal_id,
                 delegation_chain: Vec::new(),
                 outcome,
                 deny_reason: (!allowed).then_some(AuditErrorCode::PermissionDenied),
@@ -282,7 +280,7 @@ mod pg_tests {
             .operation(PLATFORM_AUTHZ_OPERATION)
             .into_iter()
             .filter(|(tenant, event)| {
-                *tenant == DataTenantId::SYSTEM_OWNER && event.principal_id == principal
+                *tenant == DataTenantId::SYSTEM_OWNER && event.sub_principal_id == principal
             })
             .map(|(_, event)| event)
             .collect()
@@ -371,7 +369,7 @@ mod pg_tests {
 
         for (principal, expected) in decided {
             assert_eq!(
-                staged(&audit, principal)[0].principal_kind.as_str(),
+                staged(&audit, principal)[0].sub_principal_kind.as_str(),
                 expected,
                 "a {expected} decision is recorded as some other kind"
             );

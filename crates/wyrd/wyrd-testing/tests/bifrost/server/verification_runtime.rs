@@ -46,14 +46,14 @@ use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, WyrdJsonEncoderF
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
-use wyrd_server::scribe_outbox::{ScribeSink, ScribeWrite, VerifierAttribution};
+use wyrd_server::scribe_outbox::{ScribeSink, ScribeWrite};
 use wyrd_server::verification::VerificationRuntime;
 use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
 use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId};
 use wyrd_spec::reference::CardRef;
@@ -65,7 +65,9 @@ use wyrd_spec::vala::api::{
 use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::vala::eval::operator::ComparisonOperator;
 use wyrd_spec::vala::eval::result::AssertionResult;
-use wyrd_spec::vala::managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
+use wyrd_spec::vala::managed_columns::{
+    ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT,
+};
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
 use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::RunInput;
@@ -174,8 +176,8 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
     let identity = |alias: &str| {
         format!(
             "{alias}{RUN_ID} IS NULL AND {alias}result_id = '{result}' \
-             AND {alias}{PRINCIPAL_ID} = '{system}' AND {alias}{CARD_UID} = '{verifier}' \
-             AND {alias}subject_card_uid = '{subject}' AND {alias}owner_card_uid = '{owner}' \
+             AND {alias}{ACT_PRINCIPAL_ID} = '{system}' AND {alias}verifier_card_uid = '{verifier}' \
+             AND {alias}{CARD_UID} = '{subject}' AND {alias}owner_card_uid = '{owner}' \
              AND {alias}binding_id = '{binding}'"
         )
     };
@@ -205,7 +207,7 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
                 "SELECT f.result_id FROM vala.drift.result_features f \
                  JOIN vala.verification.results r \
                    ON f.result_id = r.result_id \
-                  AND f.{PRINCIPAL_ID} = r.{PRINCIPAL_ID} AND f.{CARD_UID} = r.{CARD_UID} \
+                  AND f.{ACT_PRINCIPAL_ID} = r.{ACT_PRINCIPAL_ID} AND f.{CARD_UID} = r.{CARD_UID} \
                  WHERE {}",
                 identity("f.")
             ),
@@ -454,7 +456,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         oracle,
         tenant,
         format!(
-            "SELECT {PRINCIPAL_ID}, {CARD_UID}, series FROM vala.drift.observations \
+            "SELECT {SUB_PRINCIPAL_ID}, {CARD_UID}, series FROM vala.drift.observations \
              WHERE record_id = '{record}' ORDER BY series"
         ),
     )
@@ -491,7 +493,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
             oracle,
             tenant,
             format!(
-                "SELECT {CARD_UID}, subject_card_uid, verdict, {RUN_ID} \
+                "SELECT verifier_card_uid, {CARD_UID}, verdict, {RUN_ID} \
                  FROM vala.verification.results WHERE binding_id = '{binding}'"
             ),
         )
@@ -835,8 +837,7 @@ impl<'a> ResultLayoutJourney<'a> {
             ResultRun {
                 run_id: None,
                 verifier_version: "1.0.0",
-                subject_card_uid: &self.subject,
-                requested_by: None,
+                card_uid: &self.subject,
                 owner_card_uid: Some(&self.subject),
                 binding_id: Some(BindingId::new_v7()),
                 trigger: None,
@@ -860,10 +861,7 @@ impl<'a> ResultLayoutJourney<'a> {
             self.tenant,
             ScribeWrite::Result {
                 payload,
-                attribution: VerifierAttribution {
-                    verifier: self.verifier.clone(),
-                    principal: self.system,
-                },
+                attribution: Attribution::direct(self.system),
             },
         );
         let lost = outbox
@@ -922,12 +920,12 @@ impl<'a> ResultLayoutJourney<'a> {
     /// Returns a filesystem or Parquet error, or names the first table with
     /// no file or the first column chunk without a Bloom filter.
     fn assert_blooms(&self) -> Result<(), ServerJourneyError> {
-        let floor = [RUN_ID, CARD_UID, PRINCIPAL_ID];
+        let floor = [RUN_ID, CARD_UID, SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID];
         let tables: [(&str, &str, &[&str]); 3] = [
             (
                 "vala.verification.results",
                 "execution_status",
-                &["result_id", "subject_card_uid", "binding_id"],
+                &["result_id", "verifier_card_uid", "binding_id"],
             ),
             ("vala.drift.result_features", "feature", &["result_id"]),
             ("vala.eval.result_items", "task_id", &["result_id"]),
@@ -2511,7 +2509,6 @@ impl TypedPayloadJourney {
         .await?;
         let (subject, _) = seed.service("typed-subject").await?;
         let uid = seed.drift_verifier("typed-drift").await?;
-        let verifier: CardRef = format!("default/Verifier/typed-drift@1.0.0#{uid}").parse()?;
         for (namespace, name) in [
             ("verification", "results"),
             ("drift", "result_features"),
@@ -2580,8 +2577,7 @@ impl TypedPayloadJourney {
                 ResultRun {
                     run_id: None,
                     verifier_version: "1.0.0",
-                    subject_card_uid: &subject,
-                    requested_by: None,
+                    card_uid: &subject,
                     owner_card_uid: Some(&subject),
                     binding_id: Some(BindingId::new_v7()),
                     trigger: None,
@@ -2597,10 +2593,7 @@ impl TypedPayloadJourney {
                 self.gateway.tenant,
                 ScribeWrite::Result {
                     payload,
-                    attribution: VerifierAttribution {
-                        verifier: verifier.clone(),
-                        principal: PrincipalId::new(seed.system_principal()),
-                    },
+                    attribution: Attribution::direct(PrincipalId::new(seed.system_principal())),
                 },
             );
             published.push(result);
@@ -2706,7 +2699,7 @@ impl TypedPayloadJourney {
             operation.clone(),
             "vala.oracle.admission".to_owned(),
             None,
-            PrincipalId::new(uuid::Uuid::now_v7()),
+            Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())),
             PrincipalKindTag::User,
             "bifrost:query:read".to_owned(),
             AuditOutcome::Allowed,

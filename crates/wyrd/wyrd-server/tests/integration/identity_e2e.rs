@@ -2362,7 +2362,7 @@ async fn roles_sync_events(srv: &WyrdTestServer, principal_id: &str) -> usize {
         srv.data_tenant_id(),
         &format!(
             "operation = 'auth.user.roles.sync' AND outcome = 'allowed' \
-             AND audit_principal_id = '{principal_id}' \
+             AND sub_principal_id = '{principal_id}' \
              AND resource = 'principal:{principal_id}'"
         ),
     )
@@ -2403,7 +2403,7 @@ async fn activation_decisions(
         .expect("audit retention settles");
     srv.retained_audit_records(
         tenant,
-        "audit_principal_id, credential_id, permission, outcome",
+        "sub_principal_id, credential_id, permission, outcome",
         "operation = 'identity.oidc.candidate.activate'",
     )
     .await
@@ -3641,7 +3641,7 @@ async fn tenant_human_login_journey() {
         srv.data_tenant_id(),
         &format!(
             "operation = 'auth.token.exchange' AND outcome = 'allowed' \
-             AND audit_principal_id = '{alice}'"
+             AND sub_principal_id = '{alice}'"
         ),
     )
     .await;

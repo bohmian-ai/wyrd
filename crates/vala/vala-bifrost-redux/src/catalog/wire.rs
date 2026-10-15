@@ -90,8 +90,8 @@ pub struct DescribedFields {
 /// than a restatement. A table whose correlation policy appends no
 /// `card_uid` or `run_id` column still accepts one on the wire, so the missing
 /// correlation input is synthesized nullable `Utf8` with no field id. Card
-/// correlation is optional: a row without one is stored with an authenticated
-/// `principal_id` and a null `card_uid`.
+/// correlation is optional: a row without one is stored with its authenticated
+/// `sub_principal_id`/`act_principal_id` pair and a null `card_uid`.
 ///
 /// # Errors
 ///
@@ -190,7 +190,7 @@ mod tests {
     ///
     /// The split is what tells a client which columns it declares, which it
     /// supplies as correlation inputs, and which the server stamps. Leaking a
-    /// server-stamped column such as `principal_id` into `user_fields` would
+    /// server-stamped column such as `sub_principal_id` into `user_fields` would
     /// present it as an ordinary declarable column.
     ///
     /// # Panics

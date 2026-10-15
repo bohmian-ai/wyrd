@@ -2068,9 +2068,9 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
             .iter()
             .filter(|row| {
                 row["operation"].as_deref() == Some("platform.authz")
-                    && row["audit_principal_id"].as_deref() == Some(principal)
+                    && row["sub_principal_id"].as_deref() == Some(principal)
             })
-            .map(|row| row["principal_kind"].clone())
+            .map(|row| row["sub_principal_kind"].clone())
             .collect::<Vec<_>>();
         kinds.sort_unstable();
         kinds.dedup();
@@ -2083,7 +2083,7 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
     assert!(
         decisions
             .iter()
-            .filter(|row| row["audit_principal_id"].as_deref() == Some(registered_id.as_str()))
+            .filter(|row| row["sub_principal_id"].as_deref() == Some(registered_id.as_str()))
             .all(|row| row["credential_id"].is_none()),
         "a federated session names no credential, so its decisions must not claim one"
     );
@@ -2791,7 +2791,7 @@ async fn an_operator_rotates_the_deployment_root_credential() {
     let replacement_id = issued["id"].as_str().expect("the replacement's id");
     assert!(
         decisions.iter().any(|row| {
-            row["audit_principal_id"].as_deref() == Some(principal_id.as_str())
+            row["sub_principal_id"].as_deref() == Some(principal_id.as_str())
                 && row["credential_id"].as_deref() == Some(replacement_id)
         }),
         "the replacement session's decisions name its credential id"

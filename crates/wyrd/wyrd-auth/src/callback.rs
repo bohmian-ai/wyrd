@@ -30,6 +30,7 @@ use wyrd_auth_oidc::{CodeRedemption, MappedClaims, TrustedIssuer};
 use wyrd_runtime::audit::AuditStage;
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::auth::{
     ClientAuthorization, IssuerUrl, LoginInitiation, OAuthClientId, ProviderResponse, SecretBearer,
@@ -678,8 +679,8 @@ pub fn audit_authorization_code_failure(
     let event = auth_event(
         request_id,
         TOKEN_EXCHANGE_OPERATION,
-        PrincipalId::new(Uuid::nil()),
-        PrincipalKindTag::User,
+        Attribution::unresolved(),
+        PrincipalKindTag::Service,
         None,
         AuditOutcome::Denied,
         AuditDetail::AuthFailure {
@@ -745,7 +746,7 @@ fn login_event(request_id: &str, principal_id: Uuid) -> AuditEvent {
     principal_event(
         request_id,
         LOGIN_OPERATION,
-        PrincipalId::new(principal_id),
+        Attribution::direct(PrincipalId::new(principal_id)),
         PrincipalKindTag::User,
         None,
         AuditOutcome::Allowed,
@@ -762,7 +763,7 @@ fn roles_sync_event(request_id: &str, principal_id: Uuid) -> AuditEvent {
     principal_event(
         request_id,
         USER_ROLES_SYNC_OPERATION,
-        PrincipalId::new(principal_id),
+        Attribution::direct(PrincipalId::new(principal_id)),
         PrincipalKindTag::User,
         None,
         AuditOutcome::Allowed,

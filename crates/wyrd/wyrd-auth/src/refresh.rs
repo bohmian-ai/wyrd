@@ -14,6 +14,7 @@ use wyrd_auth_issue::IssueError;
 use wyrd_auth_verify::RefreshTokenClaims;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::auth::OAuthClientId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
@@ -189,7 +190,7 @@ impl RefreshTokens {
             let event = auth_event(
                 request_id,
                 REFRESH_FAMILY_REVOKE_OPERATION,
-                owner,
+                Attribution::direct(owner),
                 owner_kind,
                 None,
                 AuditOutcome::Denied,
@@ -348,7 +349,8 @@ mod pg_tests {
             .into_iter()
             .filter(|(staged, event)| {
                 *staged == tenant
-                    && principal.is_none_or(|principal| event.principal_id.as_uuid() == principal)
+                    && principal
+                        .is_none_or(|principal| event.sub_principal_id.as_uuid() == principal)
             })
             .map(|(_, event)| event.credential_id)
             .collect()
@@ -1444,7 +1446,7 @@ mod pg_tests {
         let decision = principal_event(
             "req-deactivate",
             "identity.oidc.active.deactivate",
-            PrincipalId::new(Uuid::new_v4()),
+            wyrd_spec::auth::Attribution::direct(PrincipalId::new(Uuid::new_v4())),
             PrincipalKindTag::User,
             None,
             AuditOutcome::Allowed,

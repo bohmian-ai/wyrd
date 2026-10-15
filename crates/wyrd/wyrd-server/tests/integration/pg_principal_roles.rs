@@ -124,7 +124,7 @@ async fn decisions(
         .retained_audit_records(
             server.data_tenant_id(),
             "permission, outcome",
-            &format!("operation = '{operation}' AND audit_principal_id = '{principal}'"),
+            &format!("operation = '{operation}' AND sub_principal_id = '{principal}'"),
         )
         .await
         .expect("audit rows read")

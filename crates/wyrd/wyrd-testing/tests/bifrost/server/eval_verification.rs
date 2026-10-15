@@ -1671,8 +1671,8 @@ async fn system_reads(
     Ok(server
         .retained_audit_records(
             tenant,
-            "audit_principal_id",
-            "operation = 'bifrost.query.read_decision' AND principal_kind = 'system'",
+            "sub_principal_id",
+            "operation = 'bifrost.query.read_decision' AND sub_principal_kind = 'system'",
         )
         .await?
         .into_iter()
@@ -2157,8 +2157,8 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
     let denials = server
         .retained_audit_records(
             tenant,
-            "audit_principal_id",
-            "operation = 'vala.query.sync' AND outcome = 'denied' AND principal_kind = 'system'",
+            "sub_principal_id",
+            "operation = 'vala.query.sync' AND outcome = 'denied' AND sub_principal_kind = 'system'",
         )
         .await?;
     let expected = Some(system.to_string());

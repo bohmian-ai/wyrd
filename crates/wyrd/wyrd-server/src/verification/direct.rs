@@ -81,12 +81,13 @@ impl DirectExecutor {
         self
     }
 
-    /// Judge `input` with `implementation` of `verifier_uid` for `caller`.
+    /// Judge `input` with `implementation` of `verifier_uid` as `caller`.
     ///
     /// Drift scores the supplied columns with the shared `vala-drift` scorer;
     /// Eval scores one synthetic record through the queued Eval path; a task
     /// runs its one assertion or LLM judge directly on the supplied context.
-    /// Every judge model call goes through the gateway as `caller`.
+    /// Every judge model call goes through the gateway as `caller`: the
+    /// accepted request authority executed by the tenant SYSTEM principal.
     /// Preparation — baseline load, input conversion, plan construction —
     /// is the `prepare` phase on `telemetry`.
     ///

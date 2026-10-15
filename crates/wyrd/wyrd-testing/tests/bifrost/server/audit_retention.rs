@@ -11,7 +11,7 @@ use vala_bifrost_redux::oracle::peer::PeerSecurityAudit;
 use wyrd_runtime::audit::AuditStage;
 use wyrd_server::oracle::PostgresPeerSecurityAudit;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, BifrostSecurityViolationKind};
 use wyrd_testing::WyrdTestServer;
@@ -29,7 +29,7 @@ fn decision(operation: &str) -> AuditEvent {
         operation.to_owned(),
         "bifrost".to_owned(),
         None,
-        PrincipalId::new(uuid::Uuid::now_v7()),
+        Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())),
         PrincipalKindTag::Service,
         operation.to_owned(),
         AuditOutcome::Allowed,
@@ -94,20 +94,20 @@ async fn retained_history_carries_both_credential_shapes() -> Result<(), ServerJ
     let mut rows = server
         .retained_audit_records(
             tenant,
-            "audit_principal_id, credential_id, outcome, permission",
+            "sub_principal_id, credential_id, outcome, permission",
             &format!("operation = '{operation}'"),
         )
         .await?;
     rows.sort();
     let mut expected = vec![
         vec![
-            Some(without.principal_id.to_string()),
+            Some(without.sub_principal_id.to_string()),
             None,
             Some("allowed".to_owned()),
             Some(operation.clone()),
         ],
         vec![
-            Some(with.principal_id.to_string()),
+            Some(with.sub_principal_id.to_string()),
             Some(credential.to_string()),
             Some("allowed".to_owned()),
             Some(operation.clone()),

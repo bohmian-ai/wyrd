@@ -1402,7 +1402,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
             tenant,
             "operation, resource, detail",
             &format!(
-                "audit_principal_id = '{}' \
+                "sub_principal_id = '{}' \
                  AND operation IN ('auth.token.exchange', '{READ_DECISION_OPERATION}')",
                 a.id()
             ),
@@ -1449,7 +1449,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
             tenant,
             "permission, credential_id",
             &format!(
-                "audit_principal_id = '{}' AND operation = 'auth.token.exchange' \
+                "sub_principal_id = '{}' AND operation = 'auth.token.exchange' \
                  AND resource = 'bifrost' AND outcome = 'allowed'",
                 a.id()
             ),
@@ -1477,7 +1477,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     let writes = server
         .retained_audit_records(
             tenant,
-            "outcome, audit_principal_id, detail, credential_id",
+            "outcome, sub_principal_id, detail, credential_id",
             "operation = 'bifrost.record.write'",
         )
         .await?;

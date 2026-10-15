@@ -30,7 +30,7 @@ use vala_bifrost_redux::tables::signal::correlation_fields;
 use wyrd_gateway::{AttemptRecord, IngressDialect, MediaRequest, UploadContent};
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::gateway::{
     GATEWAY_JSON_MAX_BYTES, GatewayAccountingEntryV1, GatewayAttemptSpanFieldsV1, GatewayCallId,
     GatewayCallOutcome, GatewayCallPayloadV1, GatewayCaptureMode, GatewayCapturePolicy,
@@ -116,8 +116,9 @@ pub(crate) struct CallFacts {
     pub(crate) call_id: GatewayCallId,
     /// Verified tenant.
     pub(crate) tenant: DataTenantId,
-    /// Verified caller whose invocation caused the call.
-    pub(crate) caller: PrincipalId,
+    /// Subject and actor pair the call was performed under, which Scribe
+    /// stamps as the row's managed attribution.
+    pub(crate) attribution: Attribution,
     /// Request that admitted the call, which both publications carry.
     pub(crate) request_id: RequestId,
     /// Requested operation.
@@ -180,6 +181,8 @@ pub struct CallCapture {
     spans: Vec<GatewayAttemptSpanFieldsV1>,
     /// Request that admitted the call, published with both batches.
     request_id: RequestId,
+    /// Subject and actor pair both batches are stamped with.
+    attribution: Attribution,
     /// Authorized Run and Card the row is correlated to.
     subject: Option<GatewayCallSubject>,
     /// Context of the `gateway.call` span the attempt spans are children of,
@@ -241,7 +244,6 @@ impl CallCapture {
         let payload = GatewayCallPayloadV1 {
             schema_version: 1,
             call_id: facts.call_id,
-            caller_principal_id: facts.caller,
             operation: facts.operation,
             ingress_dialect: ingress_dialect(facts.ingress, facts.operation),
             requested_model: facts.requested,
@@ -277,6 +279,7 @@ impl CallCapture {
             objects,
             spans,
             request_id: facts.request_id,
+            attribution: facts.attribution,
             subject: facts.subject,
             trace: facts.trace,
         })
@@ -427,6 +430,11 @@ impl CallCapture {
     /// Request that admitted the call, which both batches carry.
     pub(crate) const fn request_id(&self) -> &RequestId {
         &self.request_id
+    }
+
+    /// Subject and actor pair both batches are stamped with.
+    pub(crate) const fn attribution(&self) -> Attribution {
+        self.attribution
     }
 
     /// Writes and verifies every object the row references, then releases
@@ -968,7 +976,7 @@ pub(crate) mod tests {
         UploadFile,
     };
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_spec::gateway::{
         GATEWAY_JSON_MAX_BYTES, GatewayCallId, GatewayCallOutcome, GatewayCaptureMode,
         GatewayCapturePolicy, GatewayOperation, GatewayPayloadField, ModelRef,
@@ -1005,7 +1013,7 @@ pub(crate) mod tests {
         CallFacts {
             call_id: GatewayCallId::new_v7(),
             tenant: DataTenantId::new_v7(),
-            caller: PrincipalId::new(uuid::Uuid::now_v7()),
+            attribution: Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())),
             request_id: wyrd_spec::request_id::RequestId::now_v7(),
             operation: GatewayOperation::ChatCompletions,
             ingress: IngressDialect::OpenAi,
@@ -1291,7 +1299,7 @@ pub(crate) mod recording {
     };
     use wyrd_queue::variant::variant_cell_to_json;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_spec::ids::CardUid;
     use wyrd_spec::reference::CardRefScope;
     use wyrd_spec::request_id::RequestId;
@@ -1311,10 +1319,13 @@ pub(crate) mod recording {
         pub(crate) operation: String,
         /// Resource the decision was taken on.
         pub(crate) resource: String,
-        /// Principal the decision was taken for; nil when none resolved.
-        pub(crate) audit_principal_id: uuid::Uuid,
-        /// Stable snake-case principal kind tag.
-        pub(crate) principal_kind: String,
+        /// Principal the decision was taken for; the platform audit principal
+        /// when none resolved.
+        pub(crate) sub_principal_id: uuid::Uuid,
+        /// Stable snake-case kind tag of the subject.
+        pub(crate) sub_principal_kind: String,
+        /// Principal that performed the decided operation.
+        pub(crate) act_principal_id: uuid::Uuid,
         /// Permission the decision evaluated.
         pub(crate) permission: String,
         /// `allowed` or `denied`.
@@ -1330,8 +1341,10 @@ pub(crate) mod recording {
     pub(crate) struct Received {
         /// Authenticated tenant of the frame.
         pub(crate) tenant: DataTenantId,
-        /// Principal the frame was submitted under.
+        /// Transport principal the frame was submitted under.
         pub(crate) principal: PrincipalId,
+        /// Subject and actor pair Scribe stamps on the frame's rows.
+        pub(crate) attribution: Attribution,
         /// Card UIDs Scribe authorizes `card_uid` against: the frame's
         /// attributed UIDs when it carries them, otherwise its principal's
         /// signed scope.
@@ -1354,6 +1367,7 @@ pub(crate) mod recording {
             Self {
                 tenant: frame.authenticated_tenant,
                 principal: frame.principal.id,
+                attribution: frame.attribution,
                 card_scope: frame
                     .attributed_cards
                     .clone()
@@ -1507,8 +1521,9 @@ pub(crate) mod recording {
                     request_id: required("request_id"),
                     operation: required("operation"),
                     resource: required("resource"),
-                    audit_principal_id: uuid(required("audit_principal_id")),
-                    principal_kind: required("principal_kind"),
+                    sub_principal_id: uuid(required("sub_principal_id")),
+                    sub_principal_kind: required("sub_principal_kind"),
+                    act_principal_id: uuid(required("act_principal_id")),
                     permission: required("permission"),
                     outcome: required("outcome"),
                     credential_id: text("credential_id", row).map(uuid),

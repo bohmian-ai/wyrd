@@ -204,6 +204,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
         ScribeIngressFrame {
             attributed_cards: None,
             authenticated_tenant: tenant,
+            attribution: wyrd_spec::auth::Attribution::direct(principal.id),
             principal,
             table,
             expected_schema_fingerprint: Some(ReduxSchemaFingerprint::from_arrow_schema(
@@ -1016,7 +1017,7 @@ impl ResultTableHarness {
         self.server
             .retained_audit_records(
                 self.tenant,
-                "principal_kind, resource, permission, outcome",
+                "sub_principal_kind, resource, permission, outcome",
                 "operation = 'bifrost.record.write'",
             )
             .await
@@ -1275,7 +1276,7 @@ async fn system_read_authority_reads_only_the_named_table() {
     );
 
     let predicate = format!(
-        "audit_principal_id = '{}' \
+        "sub_principal_id = '{}' \
          AND operation IN ('bifrost.query.read_decision', 'vala.query.sync')",
         harness.system
     );

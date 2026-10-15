@@ -8,7 +8,7 @@ use uuid::Uuid;
 use wyrd_auth_issue::IssueError;
 use wyrd_runtime::audit::AuditStage;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -179,7 +179,7 @@ pub fn stage_scope_mint_success_audit(
     let event = auth_event(
         request_id,
         CARD_SCOPE_MINT_OPERATION,
-        PrincipalId::new(principal_id),
+        Attribution::direct(PrincipalId::new(principal_id)),
         card_principal_kind(root),
         Some(root.clone()),
         AuditOutcome::Allowed,
@@ -217,7 +217,7 @@ pub fn stage_scope_mint_failure_audit(
     let event = auth_event(
         request_id,
         CARD_SCOPE_MINT_OPERATION,
-        PLATFORM_AUDIT_PRINCIPAL,
+        Attribution::unresolved(),
         PrincipalKindTag::Service,
         Some(root.clone()),
         AuditOutcome::Denied,

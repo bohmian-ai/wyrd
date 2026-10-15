@@ -23,7 +23,6 @@
 //! that produced it.
 
 use std::collections::{BTreeSet, HashMap};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -51,17 +50,14 @@ use vala_bifrost_redux::tables::{
 use wyrd_runtime::outbox::{Outbox, OutboxSink, count_lost};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
-use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::CardUid;
-use wyrd_spec::reference::{CardRef, CardRefScope};
+use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditEvent, NodeId};
 use wyrd_tonic::otlp::trace::v1::ResourceSpans;
 use wyrd_tonic::tonic::Code;
 use wyrd_tonic::tonic::transport::Channel;
+use wyrd_tonic::wyrd::v1::IngestCaptureRequest;
 use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
-use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, VerifierResultAttribution};
 
 use crate::components::gateway::{CallCapture, CaptureDrop};
 use crate::verification::results::ResultPayload;
@@ -107,16 +103,18 @@ pub enum ScribeWrite {
     Capture(Box<CallCapture>),
     /// One Verifier judgment's summary and detail rows.
     Result {
-        /// The result's rows, details before the summary.
+        /// The result's rows, details before the summary, each naming the
+        /// Card verified as its `card_uid`.
         payload: ResultPayload,
-        /// The exact Verifier and SYSTEM principal the rows are written under.
-        attribution: VerifierAttribution,
+        /// The run's subject and actor, which Scribe stamps on every row.
+        attribution: Attribution,
     },
-    /// One server span's tenant copy, written under the authenticated caller
-    /// of the request it belongs to.
+    /// One server span's tenant copy, attributed to the operation that
+    /// emitted it.
     ServerSpans {
-        /// The requesting principal, which Scribe stamps as `principal_id`.
-        principal: PrincipalId,
+        /// The emitting operation's subject and actor, which Scribe stamps on
+        /// the row.
+        attribution: Attribution,
         /// The span as one OTLP resource span, already reduced to the fields
         /// its tenant may see; boxed so the enum stays as small as its
         /// pointer variants.
@@ -150,12 +148,11 @@ impl From<CallCapture> for ScribeWrite {
 struct Rows<'a> {
     /// Destination table.
     table: ScribeTable,
-    /// Verifier attribution of result rows; `None` otherwise.
-    attribution: Option<&'a VerifierAttribution>,
+    /// Subject and actor Scribe stamps on the rows; the unresolved sentinel
+    /// pair for audit rows, which carry their own attribution as content.
+    attribution: Attribution,
     /// Request the rows were admitted under, when the write has one.
     request: Option<&'a RequestId>,
-    /// Requesting principal of server-span rows; `None` otherwise.
-    principal: Option<PrincipalId>,
     /// The rows.
     batch: RecordBatch,
 }
@@ -182,9 +179,8 @@ impl ScribeWrite {
         match self {
             Self::Audit { event, decided_at } => Ok(vec![Rows {
                 table: ScribeTable::AuditLog,
-                attribution: None,
+                attribution: Attribution::unresolved(),
                 request: None,
-                principal: None,
                 batch: project_audit_event(event, *decided_at).map_err(|_| "projection")?,
             }]),
             Self::Capture(capture) => Ok(capture
@@ -193,9 +189,8 @@ impl ScribeWrite {
                 .into_iter()
                 .map(|(table, batch)| Rows {
                     table,
-                    attribution: None,
+                    attribution: capture.attribution(),
                     request: Some(capture.request_id()),
-                    principal: None,
                     batch,
                 })
                 .collect()),
@@ -211,20 +206,18 @@ impl ScribeWrite {
                         .ok_or("projection")?;
                     Ok(Rows {
                         table,
-                        attribution: Some(attribution),
+                        attribution: *attribution,
                         request: None,
-                        principal: None,
                         batch: batch.batch.clone(),
                     })
                 })
                 .collect(),
             Self::ServerSpans {
-                principal, spans, ..
+                attribution, spans, ..
             } => Ok(vec![Rows {
                 table: ScribeTable::Spans,
-                attribution: None,
+                attribution: *attribution,
                 request: None,
-                principal: Some(*principal),
                 batch: project_spans(spans).ok_or("projection")?,
             }]),
         }
@@ -279,8 +272,7 @@ impl ScribeTable {
         Self::ALL.into_iter().find(|table| table.fqn() == fqn)
     }
 
-    /// Whether this destination is a Verifier result table, which is written
-    /// only under a [`VerifierAttribution`].
+    /// Whether this destination is a Verifier result table.
     pub(crate) const fn is_result(self) -> bool {
         matches!(self, Self::Results | Self::DriftFeatures | Self::EvalItems)
     }
@@ -297,69 +289,6 @@ impl ScribeTable {
             }
             Self::EvalItems => TableRef::new(BifrostNamespace::Eval, ResultItemsTable::NAME),
         }
-    }
-}
-
-/// The identity a Verifier result is written under.
-///
-/// The frame principal built from it is the tenant SYSTEM principal scoped to
-/// exactly this Verifier, so Scribe stamps that principal as `principal_id`
-/// and the Verifier UID as `card_uid`, and refuses a row whose `card_uid`
-/// names another Card.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifierAttribution {
-    /// The exact Verifier Card, carrying its UID.
-    pub verifier: CardRef,
-    /// The tenant's SYSTEM principal.
-    pub principal: PrincipalId,
-}
-
-impl VerifierAttribution {
-    /// Projects this attribution onto the peer RPC, the Verifier reference
-    /// and its UID as separate fields.
-    fn to_wire(&self) -> VerifierResultAttribution {
-        VerifierResultAttribution {
-            verifier_ref: CardRef {
-                uid: None,
-                ..self.verifier.clone()
-            }
-            .to_string(),
-            verifier_uid: self
-                .verifier
-                .uid
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default(),
-            principal_id: self.principal.to_string(),
-        }
-    }
-
-    /// Parses a peer-submitted attribution.
-    ///
-    /// # Errors
-    ///
-    /// Returns a static reason when the principal id is malformed, the
-    /// reference is not an exact Verifier Card reference, or the UID is
-    /// malformed.
-    pub(crate) fn from_wire(wire: &VerifierResultAttribution) -> Result<Self, &'static str> {
-        let mut verifier = CardRef::from_str(&wire.verifier_ref)
-            .map_err(|_| "result verifier_ref is not a Card reference")?;
-        if verifier.kind != CardKind::Verifier || verifier.uid.is_some() {
-            return Err("result verifier_ref does not name a Verifier version");
-        }
-        verifier.uid = Some(
-            wire.verifier_uid
-                .parse::<CardUid>()
-                .map_err(|_| "result verifier_uid is not a Card UID")?,
-        );
-        let principal = wire
-            .principal_id
-            .parse::<PrincipalId>()
-            .map_err(|_| "result principal_id is not a principal id")?;
-        Ok(Self {
-            verifier,
-            principal,
-        })
     }
 }
 
@@ -424,10 +353,7 @@ impl ScribeRefusal {
 /// One encoded frame bound for one tenant's destination.
 ///
 /// The sink and the peer service both submit through [`Self::into_frame`],
-/// so a frame is identical in-process and over the peer plane. A result
-/// table's frame carries its [`VerifierAttribution`], a server-span frame
-/// carries its requesting principal, and an audit or capture frame carries
-/// neither; the peer service refuses any other combination.
+/// so a frame is identical in-process and over the peer plane.
 #[derive(Debug, Clone)]
 pub(crate) struct ScribeBatch {
     /// Tenant the rows belong to.
@@ -440,47 +366,36 @@ pub(crate) struct ScribeBatch {
     pub(crate) request_id: RequestId,
     /// The rows as one Arrow IPC stream.
     pub(crate) ipc: Bytes,
-    /// Verifier attribution of a result frame; `None` for audit and capture.
-    pub(crate) verifier: Option<VerifierAttribution>,
-    /// Requesting principal of a server-span frame; `None` otherwise.
-    pub(crate) principal: Option<PrincipalId>,
+    /// Subject and actor Scribe stamps on the frame's rows.
+    pub(crate) attribution: Attribution,
 }
 
 impl ScribeBatch {
     /// Builds the Scribe frame for this batch.
     ///
-    /// An audit frame is submitted under the platform audit principal, the
-    /// one principal Scribe admits for the system owner's audit history; a
-    /// capture frame under the reserved capture principal, attributed to the
-    /// UID-bearing Cards its rows name, which the gateway authorized against
-    /// the caller before the call; a server-span frame under the requesting
-    /// principal the request authenticated as, attributed to the Cards its
-    /// rows name; a result frame
-    /// under the tenant SYSTEM principal whose Card scope is exactly the
-    /// Verifier, from which Scribe stamps `card_uid`. The principal carries no
-    /// permission: all are server-internal writes that evaluate none, and its
-    /// id is what Scribe stamps as `principal_id`.
+    /// Scribe stamps the batch's [`Attribution`] on every row and authorizes
+    /// each row's `card_uid` against the UID-bearing Cards the rows name,
+    /// which the producing owner authorized before staging. The transport
+    /// principal only carries the frame: the platform audit principal, the
+    /// one principal Scribe admits for the system owner's audit history, for
+    /// an audit frame, and the stamped actor otherwise. It carries no
+    /// permission, since every write here is server-internal and evaluates
+    /// none.
     pub(crate) fn into_frame(self) -> ScribeIngressFrame {
-        let (id, kind) = match (&self.verifier, self.principal) {
-            (None, Some(principal)) => (principal, PrincipalKind::User),
-            (None, None) if self.table == ScribeTable::AuditLog => {
-                (PLATFORM_AUDIT_PRINCIPAL, PrincipalKind::User)
-            }
-            (None, None) => (GATEWAY_CAPTURE_PRINCIPAL, PrincipalKind::User),
-            (Some(attribution), _) => (
-                attribution.principal,
-                PrincipalKind::System {
-                    card_ref_scope: CardRefScope::own(&attribution.verifier),
-                },
-            ),
-        };
-        let attributed_cards = match self.verifier {
-            None => Some(native_card_uids(&self.ipc)).filter(|uids| !uids.is_empty()),
-            Some(_) => None,
+        let transport = match self.table {
+            ScribeTable::AuditLog => PLATFORM_AUDIT_PRINCIPAL,
+            _ => self.attribution.act_principal_id,
         };
         ScribeIngressFrame {
-            attributed_cards,
-            principal: Principal::new(id, kind, self.tenant, Vec::new(), PermissionSet::new()),
+            attributed_cards: Some(native_card_uids(&self.ipc)).filter(|uids| !uids.is_empty()),
+            attribution: self.attribution,
+            principal: Principal::new(
+                transport,
+                PrincipalKind::User,
+                self.tenant,
+                Vec::new(),
+                PermissionSet::new(),
+            ),
             authenticated_tenant: self.tenant,
             table: self.table.table_ref(),
             expected_schema_fingerprint: None,
@@ -576,12 +491,8 @@ impl ScribePeers {
                 batch_id: batch.batch_id.to_string(),
                 request_id: batch.request_id.as_str().to_owned(),
                 arrow_ipc: batch.ipc.clone(),
-                verifier: batch.verifier.as_ref().map(VerifierAttribution::to_wire),
-                principal_id: batch
-                    .principal
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
+                sub_principal_id: batch.attribution.sub_principal_id.to_string(),
+                act_principal_id: batch.attribution.act_principal_id.to_string(),
             })
             .await
             .map(|_| ())
@@ -669,8 +580,8 @@ impl ServerSpanSink {
 }
 
 impl wyrd_telemetry::TenantSpanSink for ServerSpanSink {
-    /// Stages one copy for the route's tenant under its principal, or drops
-    /// and counts it lost when every permit is held.
+    /// Stages one copy for the route's tenant under its attribution, or
+    /// drops and counts it lost when every permit is held.
     fn stage(&self, route: wyrd_telemetry::TenantSpanRoute, span: ResourceSpans) {
         let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
             count_lost::<ScribeSink>(1);
@@ -679,7 +590,7 @@ impl wyrd_telemetry::TenantSpanSink for ServerSpanSink {
         self.outbox.stage(
             route.tenant,
             ScribeWrite::ServerSpans {
-                principal: route.principal,
+                attribution: route.attribution,
                 spans: Box::new(span),
                 permit,
             },
@@ -740,12 +651,10 @@ impl ScribeSink {
 struct Frame<'a> {
     /// Destination table.
     table: ScribeTable,
-    /// Verifier attribution of result rows.
-    attribution: Option<&'a VerifierAttribution>,
+    /// Subject and actor Scribe stamps on every row.
+    attribution: Attribution,
     /// Request every row was admitted under, when they share one.
     request: Option<&'a RequestId>,
-    /// Requesting principal of server-span rows.
-    principal: Option<PrincipalId>,
     /// The rows, all of one schema.
     batches: Vec<RecordBatch>,
     /// In-memory size of `batches`.
@@ -756,12 +665,11 @@ struct Frame<'a> {
 
 impl Frame<'_> {
     /// Whether `rows` share this frame's destination, attribution, request,
-    /// principal, and schema, so one Scribe frame can carry both.
+    /// and schema, so one Scribe frame can carry both.
     fn shares(&self, rows: &Rows<'_>) -> bool {
         self.table == rows.table
             && self.attribution == rows.attribution
             && self.request == rows.request
-            && self.principal == rows.principal
             && self.batches[0].schema() == rows.batch.schema()
     }
 }
@@ -770,7 +678,7 @@ impl ScribeSink {
     /// Groups `items` into frames, in first-seen destination order.
     ///
     /// Rows join the latest frame they share a destination, attribution,
-    /// request, principal, and schema with while it stays within `budget` bytes in
+    /// request, and schema with while it stays within `budget` bytes in
     /// memory, and otherwise open a new one, so the frames of an identical slice are
     /// identical. Gateway capture carries its admitting request, which Scribe
     /// stamps as `wyrd_request_id`, so captures group per request. Result summary frames are moved after every detail frame,
@@ -812,7 +720,6 @@ impl ScribeSink {
                         table: rows.table,
                         attribution: rows.attribution,
                         request: rows.request,
-                        principal: rows.principal,
                         batches: vec![rows.batch],
                         bytes: size,
                         items: BTreeSet::from([index]),
@@ -877,7 +784,7 @@ impl ScribeSink {
     /// Wraps one encoded stream of `frame` under its content-derived identity.
     ///
     /// The batch id hashes the tenant, destination, attribution, request,
-    /// principal, and encoded rows, so a retry of the identical slice resubmits the same
+    /// and encoded rows, so a retry of the identical slice resubmits the same
     /// identity and Scribe's batch-id dedup absorbs frames it already
     /// accepted. A frame with no originating request is admitted under a
     /// request id derived from the batch id, so it too is stable across
@@ -892,15 +799,10 @@ impl ScribeSink {
         digest.update(b"wyrd.scribe.outbox.batch-id.v1");
         digest.update(tenant.as_uuid().as_bytes());
         digest.update(frame.table.fqn().as_bytes());
-        if let Some(attribution) = frame.attribution {
-            digest.update(attribution.principal.to_string().as_bytes());
-            digest.update(attribution.verifier.to_string().as_bytes());
-        }
+        digest.update(frame.attribution.sub_principal_id.as_uuid().as_bytes());
+        digest.update(frame.attribution.act_principal_id.as_uuid().as_bytes());
         if let Some(request) = frame.request {
             digest.update(request.as_str().as_bytes());
-        }
-        if let Some(principal) = frame.principal {
-            digest.update(principal.to_string().as_bytes());
         }
         digest.update(&ipc);
         let digest: [u8; 32] = digest.finalize().into();
@@ -918,8 +820,7 @@ impl ScribeSink {
             batch_id,
             request_id,
             ipc: Bytes::from(ipc),
-            verifier: frame.attribution.cloned(),
-            principal: frame.principal,
+            attribution: frame.attribution,
         }
     }
 }
@@ -1007,12 +908,9 @@ mod tests {
     use vala_eval::executor::{EvalReport, TaskRunOutcome};
     use wyrd_runtime::audit::AuditStage;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{
-        GATEWAY_CAPTURE_PRINCIPAL, PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag,
-    };
+    use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
     use wyrd_spec::gateway::GatewayCaptureMode;
     use wyrd_spec::ids::{CardUid, VerificationResultId};
-    use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
         AuditEvent, AuditOutcome, ClusterCapabilities, ClusterNodeKey, ClusterRole,
@@ -1035,7 +933,7 @@ mod tests {
 
     use super::{
         Outbox, SCRIBE_WRITERS, ScribeOutbox, ScribePeers, ScribeRefusal, ScribeRoute, ScribeSink,
-        ScribeWrite, ServerSpanSink, TENANT_SPAN_PERMITS, VerifierAttribution, frame_budget,
+        ScribeWrite, ServerSpanSink, TENANT_SPAN_PERMITS, frame_budget,
     };
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};
@@ -1043,9 +941,6 @@ mod tests {
     use crate::grpc::capture_peer::ScribeCapturePeerGrpc;
     use crate::verification::engines::VerifierReport;
     use crate::verification::results::{ResultPayloadBuilder, ResultRun};
-
-    /// Verifier reference every test result is written by.
-    const VERIFIER: &str = "default/Verifier/drift-check@1.0.0";
 
     /// One validated `Metadata` capture for `tenant`: a call row and one
     /// attempt span under its own admitting request.
@@ -1059,25 +954,31 @@ mod tests {
         CallCapture::from_facts(facts).expect("metadata projects")
     }
 
-    /// The exact Verifier, with its UID, the result attribution names.
+    /// A fresh Card UID.
     ///
     /// # Panics
     ///
-    /// Panics when the fixed reference does not parse.
-    fn verifier() -> CardRef {
-        let mut verifier: CardRef = VERIFIER.parse().expect("a Verifier reference");
-        verifier.uid = Some(CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid"));
-        verifier
+    /// Panics when a v7 UUID is not a Card UID.
+    fn uid() -> CardUid {
+        CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid")
     }
 
-    /// One unscored Drift judgment of a fresh subject: its summary row only,
-    /// attributed to `attribution`.
+    /// A fresh subject judged by the tenant SYSTEM principal.
+    fn background() -> Attribution {
+        Attribution::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalId::new(uuid::Uuid::now_v7()),
+        )
+    }
+
+    /// One unscored Drift judgment of `subject` by a fresh Verifier: its
+    /// summary row only, attributed to `attribution`.
     ///
     /// # Panics
     ///
     /// Panics when the payload does not build.
-    fn result(attribution: &VerifierAttribution) -> ScribeWrite {
-        let subject = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+    fn result(subject: &CardUid, attribution: Attribution) -> ScribeWrite {
+        let verifier = uid();
         let now = Utc::now();
         let input = RunInput::DriftWindow(DriftWindow {
             start: now - chrono::Duration::hours(1),
@@ -1087,18 +988,13 @@ mod tests {
             ResultRun {
                 run_id: None,
                 verifier_version: "1.0.0",
-                subject_card_uid: &subject,
-                requested_by: None,
+                card_uid: subject,
                 owner_card_uid: None,
                 binding_id: None,
                 trigger: None,
                 input: &input,
             },
-            attribution
-                .verifier
-                .uid
-                .as_ref()
-                .expect("the fixture Verifier carries its UID"),
+            &verifier,
             VerificationResultId::new_v7(),
             now,
             now,
@@ -1107,7 +1003,7 @@ mod tests {
         .expect("an unscored Drift result builds");
         ScribeWrite::Result {
             payload,
-            attribution: attribution.clone(),
+            attribution,
         }
     }
 
@@ -1122,10 +1018,10 @@ mod tests {
     }
 
     /// Proves one tenant slice becomes one frame per destination: three
-    /// results by one Verifier share a single summary frame under the scoped
-    /// SYSTEM principal, the capture writes its row and span frames under the
-    /// capture principal and admitting request, and the summary frame is
-    /// submitted last although it was staged first.
+    /// results of one run attribution share a single summary frame stamped
+    /// with that pair and scoped to the Cards verified, the capture writes its
+    /// row and span frames under the call's pair and admitting request, and
+    /// the summary frame is submitted last although it was staged first.
     ///
     /// # Panics
     ///
@@ -1135,15 +1031,14 @@ mod tests {
         let scribe = Arc::new(RecordingScribe::default());
         let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _);
         let tenant = DataTenantId::new_v7();
-        let attribution = VerifierAttribution {
-            verifier: verifier(),
-            principal: PrincipalId::new(uuid::Uuid::now_v7()),
-        };
-        for _ in 0..3 {
-            outbox.stage(tenant, result(&attribution));
+        let attribution = background();
+        let subjects = [uid(), uid(), uid()];
+        for subject in &subjects {
+            outbox.stage(tenant, result(subject, attribution));
         }
         let captured = capture(tenant);
         let request = captured.request_id().clone();
+        let call = captured.attribution();
         outbox.stage(tenant, captured);
         settle(&outbox).await;
 
@@ -1161,12 +1056,15 @@ mod tests {
             ]
         );
         for frame in &received[..2] {
-            assert_eq!(frame.principal, GATEWAY_CAPTURE_PRINCIPAL);
+            assert_eq!(frame.attribution, call);
             assert_eq!(frame.request_id, request);
             assert!(frame.card_scope.is_empty());
         }
-        assert_eq!(received[2].principal, attribution.principal);
-        assert_eq!(received[2].card_scope, attribution.verifier.uid.as_slice());
+        assert_eq!(received[2].attribution, attribution);
+        assert_eq!(
+            received[2].card_scope.iter().collect::<HashSet<_>>(),
+            subjects.iter().collect::<HashSet<_>>()
+        );
         assert!(received.iter().all(|frame| frame.tenant == tenant));
         assert!(
             received
@@ -1183,7 +1081,7 @@ mod tests {
             operation.to_owned(),
             "bifrost".to_owned(),
             None,
-            PrincipalId::new(uuid::Uuid::now_v7()),
+            Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())),
             PrincipalKindTag::User,
             operation.to_owned(),
             AuditOutcome::Allowed,
@@ -1368,9 +1266,11 @@ mod tests {
         (
             TenantSpanRoute {
                 tenant,
-                principal: "01900000-0000-7000-8000-000000000007"
-                    .parse()
-                    .expect("a principal id"),
+                attribution: Attribution::direct(
+                    "01900000-0000-7000-8000-000000000007"
+                        .parse()
+                        .expect("a principal id"),
+                ),
             },
             ResourceSpans {
                 scope_spans: vec![ScopeSpans {
@@ -1425,7 +1325,7 @@ mod tests {
         let received = scribe.received();
         assert_eq!(received.len(), 1, "{received:?}");
         assert_eq!(received[0].table, "vala.traces.spans");
-        assert_eq!(received[0].principal, route.principal);
+        assert_eq!(received[0].attribution, route.attribution);
         assert_eq!(spans.permits.available_permits(), TENANT_SPAN_PERMITS);
     }
 
@@ -1452,12 +1352,8 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the payload does not build.
-    fn eval_result(
-        attribution: &VerifierAttribution,
-        tasks: usize,
-        expected_bytes: usize,
-    ) -> ScribeWrite {
-        let subject = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+    fn eval_result(attribution: Attribution, tasks: usize, expected_bytes: usize) -> ScribeWrite {
+        let (subject, verifier) = (uid(), uid());
         let now = Utc::now();
         let input = RunInput::EvalRecord {
             record_id: "record-1".to_owned(),
@@ -1482,18 +1378,13 @@ mod tests {
             ResultRun {
                 run_id: None,
                 verifier_version: "1.0.0",
-                subject_card_uid: &subject,
-                requested_by: None,
+                card_uid: &subject,
                 owner_card_uid: None,
                 binding_id: None,
                 trigger: None,
                 input: &input,
             },
-            attribution
-                .verifier
-                .uid
-                .as_ref()
-                .expect("the fixture Verifier carries its UID"),
+            &verifier,
             VerificationResultId::new_v7(),
             now,
             now,
@@ -1506,15 +1397,7 @@ mod tests {
         .expect("an Eval result builds");
         ScribeWrite::Result {
             payload,
-            attribution: attribution.clone(),
-        }
-    }
-
-    /// A fresh attribution under the test Verifier.
-    fn attribution() -> VerifierAttribution {
-        VerifierAttribution {
-            verifier: verifier(),
-            principal: PrincipalId::new(uuid::Uuid::now_v7()),
+            attribution,
         }
     }
 
@@ -1654,10 +1537,7 @@ mod tests {
             seen: AtomicUsize::new(0),
         };
         let outbox = route_outbox(ScribeRoute::Local(Arc::new(scribe)), SMALL_REQUEST_BYTES);
-        outbox.stage(
-            DataTenantId::new_v7(),
-            eval_result(&attribution(), 64, 1024),
-        );
+        outbox.stage(DataTenantId::new_v7(), eval_result(background(), 64, 1024));
         settle(&outbox).await;
 
         let submitted = recording.submitted();
@@ -1695,7 +1575,7 @@ mod tests {
         );
         outbox.stage(
             DataTenantId::new_v7(),
-            eval_result(&attribution(), 1, SMALL_REQUEST_BYTES),
+            eval_result(background(), 1, SMALL_REQUEST_BYTES),
         );
         settle(&outbox).await;
 
@@ -1849,7 +1729,7 @@ mod tests {
         let outbox = route_outbox(ScribeRoute::Peer(peers), SMALL_REQUEST_BYTES);
         let tenant = DataTenantId::new_v7();
         let other = DataTenantId::new_v7();
-        outbox.stage(tenant, eval_result(&attribution(), 64, 1024));
+        outbox.stage(tenant, eval_result(background(), 64, 1024));
         outbox.stage(other, capture(other));
         settle(&outbox).await;
 

@@ -10,7 +10,9 @@ use arrow::datatypes::{Field, TimeUnit};
 
 use crate::tables::CorrelationPolicy;
 use crate::tables::fields::{CanonicalField, CanonicalType, canonical_arrow_fields};
-use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
+use wyrd_spec::vala::{
+    ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+};
 
 /// Which tables a managed column is appended to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +78,8 @@ impl ManagedColumn {
 /// Correlation columns come first, then the ingestion time:
 ///
 /// - `run_id`, `card_uid`: optional correlation to a run and a Card version;
-/// - `principal_id`: the authenticated writer;
+/// - `sub_principal_id`: the principal the row's work was for;
+/// - `act_principal_id`: the principal that performed it;
 /// - `wyrd_request_id`: the request that wrote the row, the join key to audit;
 /// - `wyrd_ingested_at`: when Wyrd accepted the row, read once per batch from
 ///   `PostgreSQL` and never caller-supplied.
@@ -87,7 +90,8 @@ impl ManagedColumn {
 pub static MANAGED_COLUMNS: &[ManagedColumn] = &[
     ManagedColumn::identity(RUN_ID, true, ManagedScope::Correlation),
     ManagedColumn::identity(CARD_UID, true, ManagedScope::Correlation),
-    ManagedColumn::identity(PRINCIPAL_ID, false, ManagedScope::Correlation),
+    ManagedColumn::identity(SUB_PRINCIPAL_ID, false, ManagedScope::Correlation),
+    ManagedColumn::identity(ACT_PRINCIPAL_ID, false, ManagedScope::Correlation),
     ManagedColumn::identity(WYRD_REQUEST_ID, false, ManagedScope::Request),
     ManagedColumn::time(WYRD_INGESTED_AT),
 ];
@@ -111,6 +115,20 @@ impl CorrelationPolicy {
         MANAGED_COLUMNS
             .iter()
             .filter(move |column| self.appends(column))
+    }
+
+    /// Report whether a write to a table under this policy may not supply `name`.
+    ///
+    /// Every [`RESERVED_PREFIX`] name and every managed column the policy
+    /// stamps is server-owned. A `None` table declares its own identity
+    /// columns, so the audit log's `sub_principal_id` and `act_principal_id`
+    /// are server-built content there rather than stamped correlation.
+    #[must_use]
+    pub fn reserves(self, name: &str) -> bool {
+        name.starts_with(RESERVED_PREFIX)
+            || self
+                .managed_columns()
+                .any(|column| column.field.name == name)
     }
 }
 
@@ -206,13 +224,15 @@ mod tests {
             vec![
                 RUN_ID,
                 CARD_UID,
-                PRINCIPAL_ID,
+                SUB_PRINCIPAL_ID,
+                ACT_PRINCIPAL_ID,
                 WYRD_REQUEST_ID,
                 WYRD_INGESTED_AT,
             ]
         );
         assert!(!fields[2].is_nullable());
         assert!(!fields[3].is_nullable());
+        assert!(!fields[4].is_nullable());
     }
 
     /// Tables without a correlation policy append only the ingestion time.
@@ -258,10 +278,12 @@ mod tests {
         assert!(!is_managed_column("wyrd_batch_id"));
         assert!(!is_managed_column("value"));
         assert!(is_reserved_column("wyrd_batch_id"));
-        assert!(is_reserved_column(PRINCIPAL_ID));
+        assert!(is_reserved_column(SUB_PRINCIPAL_ID));
+        assert!(is_reserved_column(ACT_PRINCIPAL_ID));
         assert!(!is_reserved_column("value"));
         assert!(is_correlation_column(RUN_ID));
-        assert!(is_correlation_column(PRINCIPAL_ID));
+        assert!(is_correlation_column(SUB_PRINCIPAL_ID));
+        assert!(is_correlation_column(ACT_PRINCIPAL_ID));
         assert!(!is_correlation_column(WYRD_REQUEST_ID));
         assert!(!is_correlation_column(WYRD_INGESTED_AT));
     }

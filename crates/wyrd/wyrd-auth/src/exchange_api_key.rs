@@ -333,7 +333,7 @@ impl DelegateToken {
         let mut event = auth_event(
             request_id,
             TOKEN_EXCHANGE_OPERATION,
-            subject.id,
+            wyrd_runtime::delegated_attribution(subject, chain),
             subject.kind.tag(),
             subject.card_ref().cloned(),
             AuditOutcome::Allowed,
@@ -915,7 +915,7 @@ pub(crate) mod pg_tests {
             .filter(|(staged, event)| {
                 *staged == tenant
                     && event.permission == TOKEN_EXCHANGE_OPERATION
-                    && event.principal_id.as_uuid() == principal_id
+                    && event.sub_principal_id.as_uuid() == principal_id
             })
             .collect();
         let credential = records.first().and_then(|(_, event)| event.credential_id);
@@ -1008,7 +1008,9 @@ pub(crate) mod pg_tests {
         let mints = audit
             .operation(CARD_SCOPE_MINT_OPERATION)
             .iter()
-            .filter(|(staged, event)| *staged == tenant && event.principal_id.as_uuid() == sa_id)
+            .filter(|(staged, event)| {
+                *staged == tenant && event.sub_principal_id.as_uuid() == sa_id
+            })
             .count();
         assert_eq!(
             mints, 1,
@@ -1499,7 +1501,7 @@ pub(crate) mod pg_tests {
                 (
                     event.outcome,
                     event.permission,
-                    event.principal_id.as_uuid(),
+                    event.sub_principal_id.as_uuid(),
                     event.credential_id,
                     event
                         .detail

@@ -227,6 +227,7 @@ mod pg_tests {
                 .expect("request id parses"),
             // Nondelegated fixture caller: no verified `act` chain exists.
             delegation_chain: Vec::new(),
+            executed_by: None,
         }
     }
 
@@ -291,7 +292,7 @@ mod pg_tests {
             "denial attributes the required read permission"
         );
         assert_eq!(row.outcome, "denied");
-        assert_eq!(row.audit_principal_id, caller.principal.id.as_uuid());
+        assert_eq!(row.sub_principal_id, caller.principal.id.as_uuid());
         assert_eq!(row.request_id, caller.request_id.as_str());
     }
 

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::oneshot;
 use uuid::Uuid;
-use wyrd_runtime::Principal;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::request_id::RequestId;
 
 use crate::catalog::TableRef;
@@ -83,8 +83,8 @@ pub(crate) enum AdmittedRows {
 pub(crate) struct NativeAdmittedRows {
     /// Transport-owned Arrow IPC stream, decoded zero-copy where aligned.
     pub(crate) bytes: Bytes,
-    /// Authenticated principal used for managed correlation columns.
-    pub(crate) principal: Principal,
+    /// Trusted subject/actor pair stamped as managed correlation columns.
+    pub(crate) attribution: Attribution,
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
@@ -339,7 +339,7 @@ fn stamp_native_source(
     crate::scribe::execution_lanes::decode_native_batch(
         rows,
         &crate::scribe::execution_lanes::DecodeContext {
-            principal: &source.principal,
+            attribution: source.attribution,
             card_scope: source.card_scope.as_deref(),
             expected_schema_fingerprint: source.expected_schema_fingerprint,
             request_id: &source.request_id,
@@ -1016,7 +1016,7 @@ mod tests {
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use bytes::Bytes;
-    use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
+    use wyrd_spec::auth::Attribution;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
@@ -1063,14 +1063,7 @@ mod tests {
             conform: Arc::default(),
             expanded_limit_bytes: crate::gate::limits::IngestLimits::default().expanded_bytes(),
             bytes,
-            principal: Principal {
-                id: PrincipalId::new(uuid::Uuid::now_v7()),
-                kind: PrincipalKind::User,
-                tenant_id: tenant,
-                roles: Vec::new(),
-                effective_permissions: PermissionSet::new(),
-                credential_id: None,
-            },
+            attribution: Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())),
             expected_schema_fingerprint: fingerprint,
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),

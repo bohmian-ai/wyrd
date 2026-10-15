@@ -73,7 +73,7 @@ mod pg_tests {
                 operation.to_owned(),
                 resource.to_owned(),
                 None,
-                PrincipalId::new(Uuid::now_v7()),
+                wyrd_spec::auth::Attribution::direct(PrincipalId::new(Uuid::now_v7())),
                 PrincipalKindTag::User,
                 "bifrost.forge".to_owned(),
                 AuditOutcome::Allowed,

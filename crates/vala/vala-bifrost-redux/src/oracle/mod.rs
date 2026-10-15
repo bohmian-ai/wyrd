@@ -701,7 +701,7 @@ fn query_audit_event(
         operation.to_owned(),
         "bifrost.query".to_owned(),
         context.principal.card_ref().cloned(),
-        context.principal.id,
+        wyrd_runtime::delegated_attribution(&context.principal, &context.delegation_chain),
         context.principal.kind.tag(),
         context.permission.to_string(),
         outcome,

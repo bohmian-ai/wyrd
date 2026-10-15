@@ -48,7 +48,7 @@ use opentelemetry_sdk::trace::{
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::auth::Attribution;
 
 /// Resource attribute naming the service, the only resource attribute a
 /// tenant copy keeps.
@@ -242,14 +242,14 @@ impl<P: SpanProcessor> SpanProcessor for OperatorExport<P> {
 /// The authenticated identity a request's tenant span copies are written
 /// under.
 ///
-/// Rows are stamped with `principal` and written to `tenant`. The tenant is
+/// Rows are stamped with `attribution` and written to `tenant`. The tenant is
 /// never a span attribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TenantSpanRoute {
     /// Tenant whose `vala.traces.spans` receives the copies.
     pub tenant: DataTenantId,
-    /// Authenticated caller of the request, stamped as each row's principal.
-    pub principal: PrincipalId,
+    /// Subject and actor of the emitting operation, stamped on each row.
+    pub attribution: Attribution,
 }
 
 /// Where tenant span copies are staged.
@@ -540,7 +540,7 @@ mod tests {
     use opentelemetry_sdk::error::OTelSdkResult;
     use opentelemetry_sdk::trace::{Sampler, ShouldSample as _, Span, SpanData, SpanProcessor};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::auth::{Attribution, PrincipalId};
 
     use super::{
         OperatorExport, ROUTES, RequestSink, ServerSampler, TenantSpanRoute, TenantSpanSink,
@@ -863,9 +863,11 @@ mod tests {
                 root.span_context(),
                 TenantSpanRoute {
                     tenant: DataTenantId::new_v7(),
-                    principal: "01900000-0000-7000-8000-000000000007"
-                        .parse::<PrincipalId>()
-                        .expect("a principal id"),
+                    attribution: Attribution::direct(
+                        "01900000-0000-7000-8000-000000000007"
+                            .parse::<PrincipalId>()
+                            .expect("a principal id"),
+                    ),
                 },
             );
         }
@@ -1016,9 +1018,11 @@ mod tests {
                 write.span().span_context(),
                 TenantSpanRoute {
                     tenant: DataTenantId::new_v7(),
-                    principal: "01900000-0000-7000-8000-000000000007"
-                        .parse::<PrincipalId>()
-                        .expect("a principal id"),
+                    attribution: Attribution::direct(
+                        "01900000-0000-7000-8000-000000000007"
+                            .parse::<PrincipalId>()
+                            .expect("a principal id"),
+                    ),
                 },
             );
             let trace_id = write.span().span_context().trace_id();
@@ -1070,9 +1074,11 @@ mod tests {
                 root.span_context(),
                 TenantSpanRoute {
                     tenant: DataTenantId::new_v7(),
-                    principal: "01900000-0000-7000-8000-000000000007"
-                        .parse::<PrincipalId>()
-                        .expect("a principal id"),
+                    attribution: Attribution::direct(
+                        "01900000-0000-7000-8000-000000000007"
+                            .parse::<PrincipalId>()
+                            .expect("a principal id"),
+                    ),
                 },
             );
             root.end();

@@ -28,7 +28,9 @@ use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
     TimePartitionWire,
 };
-use wyrd_spec::vala::managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
+use wyrd_spec::vala::managed_columns::{
+    ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT,
+};
 use wyrd_spec::vala::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
 
 /// Managed Bloom floor, in the stable order every writer must emit it.
@@ -40,7 +42,7 @@ use wyrd_spec::vala::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation
 /// No tenant column exists to Bloom: every tenant owns its own Iceberg
 /// namespace and object prefix, and each file proves its tenant in footer
 /// metadata.
-pub const MANAGED_BLOOM_FLOOR: [&str; 3] = [RUN_ID, CARD_UID, PRINCIPAL_ID];
+pub const MANAGED_BLOOM_FLOOR: [&str; 4] = [RUN_ID, CARD_UID, SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID];
 
 /// Largest number of sort keys one declaration may carry.
 ///
@@ -1317,7 +1319,9 @@ mod tests {
     use wyrd_spec::vala::api::{
         NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
     };
-    use wyrd_spec::vala::managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
+    use wyrd_spec::vala::managed_columns::{
+        ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT,
+    };
     use wyrd_spec::vala::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
 
     /// Canonical fully-qualified name every case in this module resolves under.
@@ -1355,7 +1359,8 @@ mod tests {
             ),
             Field::new(RUN_ID, DataType::Utf8, true),
             Field::new(CARD_UID, DataType::Utf8, true),
-            Field::new(PRINCIPAL_ID, DataType::Utf8, true),
+            Field::new(SUB_PRINCIPAL_ID, DataType::Utf8, true),
+            Field::new(ACT_PRINCIPAL_ID, DataType::Utf8, true),
             Field::new("customer", DataType::Utf8, true),
             Field::new("region", DataType::Utf8, true),
         ])
@@ -1484,11 +1489,17 @@ mod tests {
         // additions keep their request order behind the floor.
         assert_eq!(
             managed.bloom_columns(),
-            [RUN_ID, CARD_UID, PRINCIPAL_ID, "region"]
-                .iter()
-                .map(|column| (*column).to_owned())
-                .collect::<Vec<_>>()
-                .as_slice()
+            [
+                RUN_ID,
+                CARD_UID,
+                SUB_PRINCIPAL_ID,
+                ACT_PRINCIPAL_ID,
+                "region"
+            ]
+            .iter()
+            .map(|column| (*column).to_owned())
+            .collect::<Vec<_>>()
+            .as_slice()
         );
 
         // The canonical form is a fixed point, and the wire it projects carries
@@ -1574,11 +1585,11 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
-            Field::new(PRINCIPAL_ID, DataType::Utf8, true),
+            Field::new(SUB_PRINCIPAL_ID, DataType::Utf8, true),
         ]);
         let resolved = PhysicalLayout::resolve(TABLE, &schema, None)
             .expect("a narrow schema resolves under the default");
-        assert_eq!(resolved.bloom_columns(), [PRINCIPAL_ID.to_owned()]);
+        assert_eq!(resolved.bloom_columns(), [SUB_PRINCIPAL_ID.to_owned()]);
     }
 
     /// A declared time column is the source of the one Iceberg partition field

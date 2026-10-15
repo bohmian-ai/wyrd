@@ -26,7 +26,9 @@ pub use principal::{
     AuthContext, CardAttribution, InvalidRoleName, PlatformPrincipal, Principal, PrincipalId,
     PrincipalKind, PrincipalRef, RoleRef,
 };
-pub use request_context::{DelegationStep, RequestContext, TraceParent, audit_delegation_chain};
+pub use request_context::{
+    DelegationStep, RequestContext, TraceParent, audit_delegation_chain, delegated_attribution,
+};
 pub use wyrd_spec::reference::CardRefScope;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();

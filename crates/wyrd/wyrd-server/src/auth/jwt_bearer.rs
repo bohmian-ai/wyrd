@@ -125,7 +125,7 @@ mod pg_tests {
     use wyrd_runtime::{PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::IssuerTokenPolicy;
+    use wyrd_spec::auth::{IssuerTokenPolicy, PLATFORM_AUDIT_PRINCIPAL};
     use wyrd_spec::auth::{IssuerUrl, TokenType};
     use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::error::WyrdError;
@@ -315,8 +315,8 @@ mod pg_tests {
 
         let rows = audit_rows(&state, &scribe, tenant).await;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].subject_principal_id, Uuid::nil());
-        assert_eq!(rows[0].actor_principal_id, Uuid::nil());
+        assert_eq!(rows[0].subject_principal_id, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
+        assert_eq!(rows[0].actor_principal_id, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
         assert_eq!(rows[0].error_tag, "INVALID_TOKEN");
     }
 
@@ -835,7 +835,7 @@ mod pg_tests {
                     detail
                         .get(field)
                         .and_then(serde_json::Value::as_str)
-                        .map_or(decision.audit_principal_id, |value| {
+                        .map_or(decision.sub_principal_id, |value| {
                             value.parse().expect("audit principal id is a uuid")
                         })
                 };

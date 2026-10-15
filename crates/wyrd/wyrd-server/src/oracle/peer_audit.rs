@@ -144,8 +144,8 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         for row in &rows {
-            assert_eq!(row.audit_principal_id, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
-            assert_eq!(row.principal_kind, "service");
+            assert_eq!(row.sub_principal_id, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
+            assert_eq!(row.sub_principal_kind, "service");
             assert_eq!(row.permission, "bifrost:query:peer_execute");
             assert_eq!(row.outcome, "denied");
         }

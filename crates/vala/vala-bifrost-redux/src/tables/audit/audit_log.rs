@@ -8,14 +8,14 @@ use crate::tables::fields::{ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
-/// `vala.system.audit_log` — 12 authorization-decision content columns plus the
+/// `vala.system.audit_log` — 13 authorization-decision content columns plus the
 /// managed physical envelope.
 ///
-/// Audit carries its own principal and Card identity, so the table appends no
-/// universal correlation envelope. Those two content columns keep an `audit_`
-/// prefix because `principal_id` is a reserved Redux correlation name that the
-/// ingest path excludes from a batch's logical identity; the row's own subject
-/// must be named out of that set to travel as content.
+/// Audit carries its own subject/actor pair and Card identity, so the table
+/// appends no universal correlation envelope. The pair is the decision's
+/// verified identity built by the server, never the outbox's transport
+/// identity; the Card column keeps its `audit_` prefix because `card_uid` is
+/// caller correlation on the ingest path.
 ///
 /// The decision instant is the `created_at` content column and the table's
 /// time column, so a retained row partitions by when the boundary decided
@@ -61,8 +61,9 @@ impl DomainTable for AuditLogTable {
             utf8("operation", false),
             utf8("resource", false),
             utf8("audit_card_ref", true),
-            utf8("audit_principal_id", false),
-            utf8("principal_kind", false),
+            utf8("sub_principal_id", false),
+            utf8("sub_principal_kind", false),
+            utf8("act_principal_id", false),
             utf8("permission", false),
             utf8("outcome", false),
             variant_field(DETAIL, true),
@@ -75,7 +76,7 @@ impl DomainTable for AuditLogTable {
         daily_layout(
             CREATED_AT,
             vec![sort_desc(CREATED_AT)],
-            &["audit_principal_id", "resource", "operation"],
+            &["sub_principal_id", "resource", "operation"],
         )
     }
 }

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::DataTenantId;
-use crate::auth::{PrincipalId, PrincipalKindTag};
+use crate::auth::{Attribution, PrincipalId, PrincipalKindTag};
 use crate::error::WyrdProblem;
 use crate::reference::CardRef;
 use crate::request_id::RequestId;
@@ -116,8 +116,8 @@ pub struct BifrostTableDescription {
     /// with the field id its physical column holds.
     ///
     /// Card correlation is optional, so a writer may omit `card_uid` entirely;
-    /// the server then stores the row with its authenticated `principal_id` and
-    /// a null `card_uid`. A supplied UID is stored only once the server has
+    /// the server then stores the row with its authenticated subject/actor
+    /// pair and a null `card_uid`. A supplied UID is stored only once the server has
     /// confirmed the writer may correlate to that Card.
     pub correlation_fields: Vec<FieldSpec>,
     /// Lower-case 64-character hex of the complete canonical physical
@@ -2354,11 +2354,20 @@ pub struct AuditEvent {
     /// Writer-identity card of the acting principal; `None` for a `User`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card_ref: Option<CardRef>,
-    /// Stable ID of the acting principal.
-    pub principal_id: PrincipalId,
-    /// Kind of the acting principal (tag encoding; card payload is not the audit
-    /// subject — `card_ref` is its own field).
-    pub principal_kind: PrincipalKindTag,
+    /// The verified principal the decision was for: the token's top-level
+    /// principal, or [`PLATFORM_AUDIT_PRINCIPAL`] when no identity was
+    /// verified.
+    ///
+    /// [`PLATFORM_AUDIT_PRINCIPAL`]: crate::auth::PLATFORM_AUDIT_PRINCIPAL
+    pub sub_principal_id: PrincipalId,
+    /// Kind of the subject principal (tag encoding; card payload is not the
+    /// audit subject — `card_ref` is its own field).
+    pub sub_principal_kind: PrincipalKindTag,
+    /// The verified principal that acted: the outermost delegated actor, the
+    /// subject itself for direct work, or the same unavailable-identity
+    /// sentinel as the subject. Older actors stay in the detail's delegation
+    /// chain.
+    pub act_principal_id: PrincipalId,
     /// Non-secret id of the credential that authenticated the request, when one
     /// did.
     ///
@@ -2391,8 +2400,8 @@ impl AuditEvent {
         operation: String,
         resource: String,
         card_ref: Option<CardRef>,
-        principal_id: PrincipalId,
-        principal_kind: PrincipalKindTag,
+        attribution: Attribution,
+        sub_principal_kind: PrincipalKindTag,
         permission: String,
         outcome: AuditOutcome,
     ) -> Self {
@@ -2402,8 +2411,9 @@ impl AuditEvent {
             operation,
             resource,
             card_ref,
-            principal_id,
-            principal_kind,
+            sub_principal_id: attribution.sub_principal_id,
+            sub_principal_kind,
+            act_principal_id: attribution.act_principal_id,
             credential_id: None,
             permission,
             outcome,

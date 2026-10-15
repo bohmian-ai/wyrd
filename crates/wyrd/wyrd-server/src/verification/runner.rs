@@ -34,12 +34,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use tracing::field::{Empty, display};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_spec::card::operator::VerifierCounts;
 use wyrd_spec::card::verifier::VerifierImplementation;
-use wyrd_spec::envelope::{CardKind, Spec};
+use wyrd_spec::envelope::Spec;
 use wyrd_spec::ids::VerificationResultId;
-use wyrd_spec::reference::CardRef;
 use wyrd_spec::verification::{VerificationError, VerificationVerdict, VerifierKind};
 use wyrd_sql::queries::cards::fetch_card_row;
 use wyrd_sql::queries::verifier_runs::{
@@ -59,7 +58,7 @@ use super::health::RuntimeCapability;
 use super::leases::LeaseRenewal;
 use super::results::{ResultPayloadBuilder, ResultRun};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
-use crate::scribe_outbox::{ScribeOutbox, ScribeWrite, VerifierAttribution};
+use crate::scribe_outbox::{ScribeOutbox, ScribeWrite};
 
 /// Stable error code when the exact Verifier Card cannot be loaded or is not
 /// a Verifier.
@@ -305,17 +304,10 @@ impl VerifierRunner {
         let Spec::Verifier(spec) = card.spec else {
             return Ok(Err(unavailable(&"the Card is not a Verifier")));
         };
-        let reference = CardRef {
-            kind: CardKind::Verifier,
-            name: card.name,
-            version: card.version,
-            space: Some(card.space),
-            uid: Some(card.card_uid),
-        };
         Ok(Ok(self.cache.insert(
             tenant,
             run.verifier_uid.clone(),
-            CachedVerifier::new(reference, spec.implementation),
+            CachedVerifier::new(spec.implementation),
         )))
     }
 
@@ -362,7 +354,7 @@ impl VerifierRunner {
         };
         let transition = match outcome {
             EngineOutcome::Completed(report) => {
-                return result(run, &verifier.reference, &report, started_at);
+                return result(run, &report, started_at);
             }
             EngineOutcome::Retry(error) => Transition::Retry(error),
             EngineOutcome::AwaitingTrace(error) => Transition::AwaitTrace(error),
@@ -738,7 +730,6 @@ impl VerifierRunner {
 /// counts (a task, which is never queued) terminates `errored` with no write.
 fn result(
     run: &ClaimedRun,
-    verifier: &CardRef,
     report: &VerifierReport,
     started_at: DateTime<Utc>,
 ) -> (Transition, Option<ScribeWrite>) {
@@ -782,10 +773,7 @@ fn result(
         },
         Some(ScribeWrite::Result {
             payload,
-            attribution: VerifierAttribution {
-                verifier: verifier.clone(),
-                principal,
-            },
+            attribution: Attribution::new(run.requested_by.unwrap_or(principal), principal),
         }),
     )
 }

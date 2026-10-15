@@ -1961,7 +1961,7 @@ impl WyrdTestServer {
             tenant,
             format!(
                 "SELECT {projection} FROM {AUDIT_LOG} WHERE ({predicate}) \
-                 AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
+                 AND sub_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
                  ORDER BY created_at"
             ),
         )
@@ -2093,7 +2093,7 @@ impl WyrdTestServer {
                     params: Vec::new(),
                     sql: format!(
                         "SELECT operation FROM {AUDIT_LOG} WHERE ({predicate}) \
-                 AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}'"
+                 AND sub_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}'"
                     ),
                     deadline_ms: Some(60_000),
                 })

@@ -3,6 +3,7 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::AuditDelegationStep;
@@ -47,6 +48,20 @@ impl DelegationStep {
 #[must_use]
 pub fn audit_delegation_chain(chain: &[DelegationStep]) -> Vec<AuditDelegationStep> {
     chain.iter().map(DelegationStep::audit_projection).collect()
+}
+
+/// The subject/actor pair of a verified principal and its delegation chain.
+///
+/// The subject is always the verified top-level principal. The chain is
+/// initiator-first, so its last step is the current (outermost `act`) actor;
+/// with no chain the principal acts for itself. Older actors stay history in
+/// audit detail and never become the current actor.
+#[must_use]
+pub fn delegated_attribution(principal: &Principal, chain: &[DelegationStep]) -> Attribution {
+    Attribution::new(
+        principal.id,
+        chain.last().map_or(principal.id, |step| step.principal.id),
+    )
 }
 
 /// Per-request context carried through runtime boundaries.

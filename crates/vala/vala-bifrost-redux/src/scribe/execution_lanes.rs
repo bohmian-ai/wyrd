@@ -25,18 +25,16 @@ use crate::scribe::wal::{
     PreparedWalAppend, WalAppendResult, WalHandle, WalSegment, WalSegmentRef,
 };
 use std::str::FromStr;
-use wyrd_runtime::Principal;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::managed_columns::{
-    CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+    ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
 
 use crate::tables::CorrelationPolicy;
-use crate::tables::managed_columns::{
-    ensure_managed_columns, is_managed_column, is_reserved_column,
-};
+use crate::tables::managed_columns::{ensure_managed_columns, is_managed_column};
 
 #[cfg(test)]
 const INGRESS_QUEUE_ITEMS: usize = 256;
@@ -222,7 +220,7 @@ impl ScribeIngressCpuPool {
         inputs: IngressDecodeInputs,
     ) -> Result<RecordBatch, ScribeError> {
         let IngressDecodeInputs {
-            principal,
+            attribution,
             card_scope,
             expected_schema_fingerprint,
             request_id,
@@ -255,7 +253,7 @@ impl ScribeIngressCpuPool {
                 decode(
                     payload,
                     &DecodeContext {
-                        principal: &principal,
+                        attribution,
                         card_scope: card_scope.as_deref(),
                         expected_schema_fingerprint,
                         request_id: &request_id,
@@ -462,8 +460,8 @@ pub(crate) fn decode_native_batch(
 /// The lane moves these into its worker, so they are owned rather than the
 /// borrowed [`DecodeContext`] the decode itself assembles from them.
 pub(crate) struct IngressDecodeInputs {
-    /// Authenticated principal stamped as the writer.
-    pub(crate) principal: Principal,
+    /// Trusted subject/actor pair stamped on every row.
+    pub(crate) attribution: Attribution,
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<CardUid>>,
@@ -488,8 +486,8 @@ pub(crate) struct IngressDecodeInputs {
 /// request; every batch of one request stamps the same request identity and
 /// admission instant.
 pub(crate) struct DecodeContext<'a> {
-    /// Authenticated principal stamped as the writer.
-    pub(crate) principal: &'a Principal,
+    /// Trusted subject/actor pair stamped on every row.
+    pub(crate) attribution: Attribution,
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<&'a [CardUid]>,
@@ -562,7 +560,7 @@ fn decode_rows(
         // unconditionally server-owned, so supplying one is a refusal rather
         // than an override.
         let name = field.name().as_str();
-        if is_reserved_column(name) && name != RUN_ID && name != CARD_UID {
+        if correlation_policy(context).reserves(name) && name != RUN_ID && name != CARD_UID {
             return Err(ScribeError::InvalidFrame);
         }
     }
@@ -953,7 +951,8 @@ fn enforce_canonical_physical_identity(
 
 /// Fingerprints the caller-owned block of one source schema.
 ///
-/// Server-owned correlation (`card_uid`, `principal_id`, and `run_id`) and
+/// Server-owned correlation (`card_uid`, `sub_principal_id`,
+/// `act_principal_id`, and `run_id`) and
 /// every `wyrd_*` column are dropped first, so the result is comparable with
 /// the registered table's user-field fingerprint.
 fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
@@ -962,7 +961,10 @@ fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
         .iter()
         .filter(|field| {
             let name = field.name().as_str();
-            !matches!(name, CARD_UID | PRINCIPAL_ID | RUN_ID) && !name.starts_with("wyrd_")
+            !matches!(
+                name,
+                CARD_UID | SUB_PRINCIPAL_ID | ACT_PRINCIPAL_ID | RUN_ID
+            ) && !name.starts_with("wyrd_")
         })
         .map(|field| field.as_ref().clone())
         .collect();
@@ -1085,12 +1087,12 @@ fn stamp_correlation_columns(
     context: &DecodeContext<'_>,
 ) -> Result<RecordBatch, ScribeError> {
     let DecodeContext {
-        principal,
+        attribution,
         request_id,
         receipt_micros,
         ..
     } = context;
-    let (principal, request_id, receipt_micros) = (*principal, *request_id, *receipt_micros);
+    let (attribution, request_id, receipt_micros) = (*attribution, *request_id, *receipt_micros);
     let card_uids = authorized_card_uids(rows, context.card_scope)?;
     let caller_run_id = caller_run_id_column(rows)?;
     let policy = correlation_policy(context);
@@ -1100,7 +1102,7 @@ fn stamp_correlation_columns(
     columns.extend(managed_arrays(
         rows,
         &ManagedValues {
-            principal,
+            attribution,
             card_uid: Arc::new(StringArray::from(card_uids)),
             request_id,
             receipt_micros,
@@ -1203,8 +1205,8 @@ fn correlation_policy(context: &DecodeContext<'_>) -> CorrelationPolicy {
 
 /// The per-batch values the managed columns are stamped from.
 struct ManagedValues<'a> {
-    /// Authenticated writer stamped as `principal_id`.
-    principal: &'a Principal,
+    /// Trusted pair stamped as `sub_principal_id` and `act_principal_id`.
+    attribution: Attribution,
     /// Authorized `card_uid` of each row, in row order.
     card_uid: ArrayRef,
     /// Request identity stamped as `wyrd_request_id`.
@@ -1245,8 +1247,18 @@ fn managed_arrays(
                     Arc::clone,
                 ),
                 CARD_UID => Arc::clone(&values.card_uid),
-                PRINCIPAL_ID => Arc::new(StringArray::from(vec![
-                    values.principal.id.to_string();
+                SUB_PRINCIPAL_ID => Arc::new(StringArray::from(vec![
+                    values
+                        .attribution
+                        .sub_principal_id
+                        .to_string();
+                    row_count
+                ])),
+                ACT_PRINCIPAL_ID => Arc::new(StringArray::from(vec![
+                    values
+                        .attribution
+                        .act_principal_id
+                        .to_string();
                     row_count
                 ])),
                 WYRD_REQUEST_ID => Arc::new(StringArray::from(vec![
@@ -2172,13 +2184,14 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use uuid::Uuid;
     use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
+    use wyrd_spec::auth::Attribution;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::CardUid;
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::managed_columns::{
-        CARD_UID, PRINCIPAL_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+        ACT_PRINCIPAL_ID, CARD_UID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
     };
 
     use bytes::Bytes;
@@ -2221,7 +2234,7 @@ mod tests {
     ) -> super::DecodeContext<'a> {
         super::DecodeContext {
             definition: None,
-            principal,
+            attribution: Attribution::direct(principal.id),
             card_scope,
             expected_schema_fingerprint: SchemaFingerprint([0_u8; 32]),
             request_id,
@@ -2331,7 +2344,7 @@ mod tests {
         decode(
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
             &DecodeContext {
-                principal: &principal(),
+                attribution: Attribution::direct(principal().id),
                 card_scope: principal()
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -2548,7 +2561,7 @@ mod tests {
         let refusal = decode(
             ipc_payload(&rows),
             &DecodeContext {
-                principal: &principal(),
+                attribution: Attribution::direct(principal().id),
                 card_scope: principal()
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -2983,7 +2996,7 @@ mod tests {
                 rows.clone(),
             ])),
             &DecodeContext {
-                principal: &principal(),
+                attribution: Attribution::direct(principal().id),
                 card_scope: principal()
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3032,7 +3045,7 @@ mod tests {
         decode(
             payload,
             &DecodeContext {
-                principal,
+                attribution: Attribution::direct(principal.id),
                 card_scope: principal
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3164,7 +3177,7 @@ mod tests {
                 rows.clone(),
             ])),
             &DecodeContext {
-                principal: &principal,
+                attribution: Attribution::direct(principal.id),
                 card_scope: principal
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3214,7 +3227,7 @@ mod tests {
                 rows.clone(),
             ])),
             &DecodeContext {
-                principal: &principal(),
+                attribution: Attribution::direct(principal().id),
                 card_scope: principal()
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3256,7 +3269,7 @@ mod tests {
                 rows.clone(),
             ])),
             &DecodeContext {
-                principal: &principal(),
+                attribution: Attribution::direct(principal().id),
                 card_scope: principal()
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3312,7 +3325,7 @@ mod tests {
                 rows.clone(),
             ])),
             &DecodeContext {
-                principal: &principal(),
+                attribution: Attribution::direct(principal().id),
                 card_scope: principal()
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3327,7 +3340,8 @@ mod tests {
         )
         .expect("schema is valid");
         assert!(decoded.schema().index_of("data_tenant_id").is_err());
-        assert!(decoded.schema().index_of(PRINCIPAL_ID).is_ok());
+        assert!(decoded.schema().index_of(SUB_PRINCIPAL_ID).is_ok());
+        assert!(decoded.schema().index_of(ACT_PRINCIPAL_ID).is_ok());
         assert!(decoded.schema().index_of("wyrd_batch_id").is_err());
         assert!(decoded.schema().index_of(WYRD_INGESTED_AT).is_ok());
         assert!(decoded.schema().index_of(WYRD_INGESTED_AT).is_ok());
@@ -3420,7 +3434,7 @@ mod tests {
         let decoded = decode(
             ipc_payload(&rows),
             &DecodeContext {
-                principal: &principal,
+                attribution: Attribution::direct(principal.id),
                 card_scope: principal
                     .card_ref_scope()
                     .map(CardRefScope::uids)
@@ -3455,7 +3469,8 @@ mod tests {
         for reserved in [
             WYRD_INGESTED_AT,
             WYRD_REQUEST_ID,
-            PRINCIPAL_ID,
+            SUB_PRINCIPAL_ID,
+            ACT_PRINCIPAL_ID,
             "wyrd_custom",
         ] {
             let rows = batch(
@@ -3471,7 +3486,7 @@ mod tests {
             let error = decode(
                 ipc_payload(&rows),
                 &DecodeContext {
-                    principal: &principal,
+                    attribution: Attribution::direct(principal.id),
                     card_scope: principal
                         .card_ref_scope()
                         .map(CardRefScope::uids)
@@ -3625,20 +3640,17 @@ mod tests {
                 None,
                 "{label} correlation stamps no card_uid"
             );
-            let principal_index = stamped
-                .schema()
-                .index_of(PRINCIPAL_ID)
-                .expect("principal_id column");
-            let principals = stamped
-                .column(principal_index)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("principal_id is Utf8");
-            assert_eq!(
-                principals.value(0),
-                principal.id.to_string(),
-                "{label} correlation still stamps the exact principal"
-            );
+            for column in [SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID] {
+                let stamped_principal = stamped
+                    .column_by_name(column)
+                    .and_then(|values| values.as_any().downcast_ref::<StringArray>())
+                    .unwrap_or_else(|| panic!("{column} is a Utf8 column"));
+                assert_eq!(
+                    stamped_principal.value(0),
+                    principal.id.to_string(),
+                    "{label} correlation still stamps the exact {column}"
+                );
+            }
         }
 
         for member in [&root, &secondary] {

@@ -25,7 +25,7 @@ use url::Url;
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
-    AbsoluteUrl, DeviceAuthorization, LoginInitiation, OAuthClientId, PrincipalId,
+    AbsoluteUrl, Attribution, DeviceAuthorization, LoginInitiation, OAuthClientId, PrincipalId,
     PrincipalKindTag, SecretBearer, Sha256Hex, TokenResponse,
 };
 use wyrd_spec::error::WyrdError;
@@ -284,8 +284,8 @@ impl CliLogins {
             let event = auth_event(
                 request_id,
                 DEVICE_CODE_GRANT_OPERATION,
-                PrincipalId::new(Uuid::nil()),
-                PrincipalKindTag::User,
+                Attribution::unresolved(),
+                PrincipalKindTag::Service,
                 None,
                 AuditOutcome::Denied,
                 AuditDetail::AuthFailure {
@@ -368,7 +368,7 @@ impl CliLogins {
         let event = principal_event(
             request_id,
             DEVICE_CODE_GRANT_OPERATION,
-            PrincipalId::new(principal_id),
+            Attribution::direct(PrincipalId::new(principal_id)),
             PrincipalKindTag::User,
             None,
             AuditOutcome::Allowed,
@@ -436,7 +436,7 @@ impl CliLogins {
         let event = principal_event(
             request_id,
             TOKEN_REVOCATION_OPERATION,
-            PrincipalId::new(row.principal_id),
+            Attribution::direct(PrincipalId::new(row.principal_id)),
             principal_kind_tag(&row.principal_kind),
             None,
             AuditOutcome::Allowed,
@@ -1228,7 +1228,7 @@ mod pg_tests {
                 .operation(TOKEN_REVOCATION_OPERATION)
                 .iter()
                 .filter(|(staged, event)| {
-                    *staged == tenant && event.principal_id == PrincipalId::new(user)
+                    *staged == tenant && event.sub_principal_id == PrincipalId::new(user)
                 })
                 .count()
         };

@@ -6,7 +6,7 @@ use uuid::Uuid;
 use wyrd_runtime::audit::AuditStage;
 use wyrd_runtime::{Permission, Principal, PrincipalId};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse, SecretBearer};
+use wyrd_spec::auth::{Attribution, IssueKeyRequest, IssueKeyResponse, SecretBearer};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
@@ -154,7 +154,7 @@ impl IssueApiKey {
         let mut event = auth_event(
             request_id,
             API_KEY_ISSUE_OPERATION,
-            actor.id,
+            Attribution::direct(actor.id),
             actor.kind.tag(),
             actor.card_ref().cloned(),
             AuditOutcome::Allowed,

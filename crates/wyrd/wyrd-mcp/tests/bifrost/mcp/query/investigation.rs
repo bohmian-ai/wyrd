@@ -14,9 +14,10 @@ use wyrd_client::cards::Cards;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_runtime::Permission;
 use wyrd_runtime::principal::PrincipalId;
-use wyrd_server::scribe_outbox::{ScribeWrite, VerifierAttribution};
+use wyrd_server::scribe_outbox::ScribeWrite;
 use wyrd_server::verification::engines::VerifierReport;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::VerificationResultId;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::GetCardResponse;
@@ -163,8 +164,7 @@ impl EvidenceInvestigation {
             let run = ResultRun {
                 run_id: None,
                 verifier_version: &version,
-                subject_card_uid: subject_uid,
-                requested_by: None,
+                card_uid: subject_uid,
                 owner_card_uid: Some(subject_uid),
                 binding_id: None,
                 trigger: None,
@@ -176,10 +176,7 @@ impl EvidenceInvestigation {
                 self.server.data_tenant_id(),
                 ScribeWrite::Result {
                     payload,
-                    attribution: VerifierAttribution {
-                        verifier: reference.clone(),
-                        principal: PrincipalId::new(seed.system_principal()),
-                    },
+                    attribution: Attribution::direct(PrincipalId::new(seed.system_principal())),
                 },
             );
         }

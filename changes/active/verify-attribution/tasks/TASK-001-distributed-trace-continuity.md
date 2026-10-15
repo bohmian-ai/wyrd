@@ -687,3 +687,102 @@ journeys where they already fit.
 - `architecture/references/languages/spec-driven-development.md`
 - `architecture/references/languages/implementation-execution.md`
 - `architecture/references/languages/testing-workflows.md`
+
+## Implementation Evidence
+
+Commits `ef4f6b025..HEAD` on `split/verify-attribution`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| HTTP, gRPC, MCP continue a valid inbound context as SERVER children; malformed context starts a new trace and succeeds | `wyrd-telemetry` `context.rs`; `wyrd-server` `http/router.rs::request_span`; `wyrd-tonic` `server/mod.rs::request_span`; MCP replay keeps `traceparent` | `test:bifrost:integration:server`; `gateway_inference::{gateway_span_joins_the_callers_trace,malformed_traceparent_is_ignored_by_the_gateway}` (Rust, Python) | PASS |
+| Verifier → judge → gateway is one descendant chain for Task and Eval | `verification/{direct,eval}.rs`; `vala-eval` executor fan-out instrumented; gateway attempt parent gated on the span tree | `test:bifrost:integration:server`; `verify_in_real_time::traced_sdk_verify_joins_the_callers_trace` (Rust, Python, TS) | PASS |
+| Deferred runs link, not parent; manual-enqueue context persisted | verifier-run context column + `verifier_runs.rs`; runner links | `pg_verification_runtime` | PASS |
+| Observation judge calls carry `card_uid`/`run_id`; results join judge calls | `observe` judge attribution | `test:bifrost:integration:server` | PASS |
+| Operator export unchanged; client fields never change the operator decision | `export.rs` sampler: operator decision drawn on a server trace id | `wyrd-telemetry` lib `sampling_matrix_holds_with_and_without_an_operator`, `remote_parent_rows_combine_operator_and_client_decisions` | PASS |
+| Four-row sampling matrix with and without an operator endpoint | `export.rs` | `wyrd-telemetry` lib (18/18) | PASS |
+| Tenant rows only for allowlisted spans of sampled, continued, authenticated requests; same ids; tenants isolated; no disallowed attribute; no attempt twice | `export.rs` routes (identity + per-server sink), catalog-ancestry filter, `tenant_copy` | `pg_verification_runtime::{continued_request_spans_reach_operator_and_tenant,same_inbound_trace_id_routes_each_tenant_separately,unrouted_spans_export_only_to_the_operator,operator_rejected_requests_still_reach_a_continuing_tenant}`; `action_timeline::another_tenant_cannot_read_the_timeline` | PASS |
+| Tenant staging capped at 2,048 per process; overflow counted; outage never blocks | `ServerSpanSink` permit pool, one per server in `state.rs` | `pg_verification_runtime`; `wyrd-telemetry` lib | PASS |
+| Every SDK request propagates context; presigned do not; no context no header; queued writes link ≤32 sealed contexts, identical on retry | `wyrd_client::transport::trace` (`CALLER`, `PRODUCER`, `with_producer_span`); `wyrd-queue` `SealedBatch`; Gate `producer_links`; Rust `start_telemetry` installs the W3C propagator | `wyrd-client` trace unit tests (5/5); `test:shared`; `local_development::admin_key_completes_the_local_workflow`; `test_sdk_requests_carry_the_active_trace` (Python, TS) | PASS |
+| `trace_timeline` seed + one-hop links, deduplicated, ordered; `SpanRecord` in all SDKs; invalid ids fail locally; unseen/foreign empty | `wyrd_client::bifrost` `trace_timeline`, `rows` decoder; Python/TS projections | `pg_bifrost_e2e::trace_timeline`; `invalid_trace_id_fails_locally`; `another_tenant_cannot_read_the_timeline` | PASS |
+| Action-timeline journeys in all three SDKs; Rust proves the operator view | `wyrd-ai` `action_timeline.rs`; Python `test_action_timeline.py`; TS `verify-in-real-time.test.ts` | Rust `action_timeline::*` (2/2); Python `test_service_action_timeline_is_one_connected_tree`; TS `service action timeline is one connected tree`; each asserts the tenant-visible CONSUMER per producer | PASS |
+| Both architecture documents state the REQ-009 model | `architecture/wyrd-design.md`, `architecture/bifrost-design.md` | `git grep -n "sole correlator" architecture/` returns nothing | PASS |
+
+### Resolved spec conflict — CONSUMER span in the tenant timeline
+
+AC-002 asks the tenant timeline to contain the PRODUCER/CONSUMER-linked
+Bifrost writes, but REQ-007 r2 made tenant export depend on the request
+continuing a sampled client trace, and background ingest carries its
+producers only as links (independent OTel review
+`review/codex-otel-review-2/findings.md` F1). Spec r3, approved by the owner,
+makes a linked ingest tenant-eligible. Implementation is one rule in
+`wyrd-telemetry` `export.rs`: a span whose parent or one of whose links is a
+sampled remote span is recorded for the tenant (`ServerSampler`) and opens a
+route (`TenantRoutes::start`); catalog descendants join it. The gate adds its
+producer links, with their real sampled flags, before `bifrost.gate.write`
+starts (`link_remote_span`), as OTel expects links to be supplied at
+creation. Ids, parents, and links are the operator's; the operator copy is
+unchanged. All three action-timeline journeys assert that each producer's
+CONSUMER span reads back in the tenant timeline.
+
+### Deviations
+
+- Python and Node open their `bifrost.enqueue` PRODUCER span in the host
+  tracer through `wyrd_client::transport::trace::with_producer_span`, so the
+  producer is a child of the caller's active span and is exported by the
+  caller's own pipeline; Rust records it through `tracing`.
+- The Rust action-timeline journey installs a scoped dispatcher instead of
+  `start_telemetry`, because the process-global tracer cannot be replaced
+  between journeys; `local_development` proves `start_telemetry` and the W3C
+  propagator.
+- The TypeScript timeline journey lives in `verify-in-real-time.test.ts`
+  to reuse its server, Cards, and Verifier fixtures.
+- The tenant span sink is carried in the request span's OpenTelemetry
+  context by each server's HTTP and gRPC edges (`serve_request`, which also
+  continues the caller's trace), not set process-wide; see diagnosis.
+- The TypeScript gateway trace test reads the timeline and asserts the
+  caller is the attempt's top ancestor, as the Rust and Python tests already
+  did since attempts are parented on the exported gateway call span; the
+  `ancestry` and `timeline` helpers moved to `tests/support/server.ts`.
+- Earlier recorded deviations stand: review F6 helper reuse; the TS trace
+  source callback; `@opentelemetry/core` as an optional peer; the span-row
+  decoder in `wyrd_client::bifrost::rows`; `otel_export.rs` span SQL kept.
+
+### Diagnosis — order-dependent Python trace failures
+
+- **Symptom:** run in one pytest process after the gateway tests,
+  `test_traced_verify_joins_the_callers_trace` and
+  `test_sdk_requests_carry_the_active_trace` read an empty or partial
+  tenant timeline; each passed alone.
+- **Evidence:** every `WyrdTestServer` boot called the process-global
+  `set_tenant_span_sink`, replacing the earlier server's sink; ended spans
+  were staged on whichever server booted last, often one already shut down.
+- **Cause:** the tenant sink was process state while the route it served was
+  per request; multiple servers in one process (Python's in-process test
+  servers, the Rust multi-node cluster harness) staged copies on the wrong
+  outbox. One-server production processes were unaffected.
+- **Fix site:** `wyrd-telemetry` `TenantRoutes` (independent diagnostician's
+  finding): each route owns its sink alongside its identity; `wyrd-server`
+  builds one `ServerSpanSink` per server in `state.rs`, and both request
+  edges carry it in the request span's context, from which a route takes it
+  when it opens. Callers checked: HTTP router, gRPC router, every
+  `GrpcRouterConfig` literal in tests, `pg_verification_runtime` tenant tests.
+- **Proof:** the five-test Python sequence passes in order; Rust journeys and
+  `test:bifrost:integration:server` (96/96) pass.
+
+### Verification commands
+
+- `mise exec -- cargo nextest run --locked -p wyrd-telemetry --lib` — 20/20,
+  including `export::tests::a_sampled_link_records_for_the_tenant` and
+  `export::tests::a_sampled_producer_link_routes_the_consumer`.
+- `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise run test:bifrost:integration:server:inner"` — 96/96.
+- Rust journeys: `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner >/dev/null && mise exec -- cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^action_timeline::/) | test(=gateway_inference::gateway_span_joins_the_callers_trace) | test(=gateway_inference::malformed_traceparent_is_ignored_by_the_gateway) | test(=local_development::admin_key_completes_the_local_workflow) | test(=verify_in_real_time::traced_sdk_verify_joins_the_callers_trace)'"` — 6/6.
+- Python: `mise run py:setup && scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m integration tests/integration/test_action_timeline.py tests/integration/test_gateway_inference.py::test_gateway_span_joins_the_callers_trace tests/integration/test_gateway_inference.py::test_malformed_traceparent_is_ignored_by_the_gateway tests/integration/test_verify_in_real_time.py::test_traced_verify_joins_the_callers_trace tests/integration/test_verify_in_real_time.py::test_sdk_requests_carry_the_active_trace'` — 5/5.
+- TypeScript: `mise run ts:build && mise run ts:build:testing && scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/integration/verify-in-real-time.test.ts tests/integration/gateway-inference.test.ts"` — 28/28.
+- Static: `mise run fmt`, `lints`, `check:deps`, `git diff --check` — exit 0.
+- Owner lanes after the linked-ingest change, all exit 0:
+  `test:bifrost:integration:server`, `test:bifrost:journey:server`,
+  `test:gateway:journey`, `test:shared`, `test:vala`; earlier in the task,
+  also `test:bifrost:journey:drift`, `test:bifrost:journey:mcp`, `test:sql`.
+- Static, all exit 0: `fmt`, `lints`, `codegen:check`, `check:deps`,
+  `check:tenant-isolation`, `py:format`, `py:lints`, `py:typecheck`,
+  `ts:format`, `ts:typecheck`, `ts:napi:check`, `git diff --check`.

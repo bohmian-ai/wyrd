@@ -603,6 +603,72 @@ untracked diffs for unrelated work and secrets. A red required check blocks
 completion regardless of authorship; diagnose the failure itself, never run a
 baseline checkout to establish blame.
 
+### Implementation evidence (2026-10-15)
+
+Every selector above was run exactly as written from the repository root;
+each selected one test and passed (nonempty discovery confirmed by the
+runner's `1 test run` / `1 passed` line).
+
+| Test | Scenario | REQ / INV / AC | Result |
+|---|---|---|---|
+| T01 | 1, 7 | REQ-005, REQ-007–REQ-009, REQ-011; INV-003; AC-004, AC-006 | PASS |
+| T02 | 2 | REQ-006–REQ-008; AC-006 | PASS |
+| T03 | 3 | REQ-001, REQ-003; INV-001–INV-003; AC-001 | PASS |
+| T04 | 3, 4 | REQ-001–REQ-002; INV-001–INV-002; AC-001–AC-002 | PASS |
+| T05 | 5 | REQ-003–REQ-004; INV-001–INV-002; AC-003 | PASS |
+| T06 | 6 | REQ-003; INV-003; AC-012 | PASS (first run hit a transient Postgres port answered by an HTTP listener, `SSLRequest: 0x48`; traced rerun passed unchanged) |
+| T07 | 7 | REQ-005–REQ-008, REQ-011; AC-004, AC-006 | PASS |
+| T08 | 8 | REQ-009–REQ-010; INV-004, INV-007; AC-002, AC-005 | PASS |
+| T09 | 8 | REQ-009–REQ-010; INV-004, INV-006–INV-007; AC-005 | PASS |
+| T10 | 9 | REQ-010; AC-008 | PASS |
+| T11 | 10 | REQ-008–REQ-011; AC-002, AC-007 | PASS |
+| T12 | 11, 12 | REQ-011–REQ-012; INV-003; AC-009–AC-010 | PASS |
+| T13 | 13 | REQ-013; INV-001–INV-002; AC-003, AC-011–AC-012 | PASS (inside `mise run test:local-dev:journey`, exit 0) |
+| T14 | 8, 12 | REQ-009, REQ-011; INV-005; AC-004–AC-006, AC-009 | PASS |
+| T15 | 8, 12 | REQ-009, REQ-011; INV-005; AC-004–AC-006, AC-009 | PASS |
+| T16 | 12 | REQ-002, REQ-011; AC-009 | PASS |
+| T17 | 3 | REQ-001; INV-003 | PASS |
+
+Supporting test added for judge-route refusal (Scenario 10, AC-007):
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-eval --test integration -E 'test(=orchestrator_judge_skald::judge_routes_its_context_cannot_serve_are_refused)'
+```
+
+PASS. A server-controlled judge refuses a native Agent route and a
+gateway route without a gateway caller, both terminal and before upstream IO.
+
+Judge attribution follows `architecture/bifrost-design.md`: a direct result
+carries the caller's pair, a queued result carries the run's subject with
+SYSTEM as actor, and the judge's gateway call carries SYSTEM. T11 asserts the
+direct-result pair and the SYSTEM call actor.
+
+Route evidence reuses existing columns: the Card default is reachable through
+`card_uid`, the effective route is `requested_model.deployment`, and the
+deployment that served is `resolved_model` / `resolved_deployment`. No columns
+were added.
+
+INV-005 (one shared owner): Python `Run.invoke(route=...)` and TypeScript
+`run.invoke(vars, { route })` decode into the Rust `ExecutionRoute` and call
+`Run::invoke_on`. Neither adds routing logic, and a malformed route is
+`WYRD_SPEC_400_VALIDATION`. INV-006: the audit/capture outbox path is
+unchanged (source inspection), and T09 retains outbox failure behavior.
+
+Owner checks, all exit 0: `fmt`, `lints`, `codegen:check`, `check:deps`,
+`check:tenant-isolation`, `check:py-wheel-no-testing`, `py:format`,
+`py:lints`, `py:typecheck`, `ts:format:check`, `ts:lints`, `ts:typecheck`,
+`ts:napi:check`, `docs:check`, `check:examples`. `ts:typecheck` first failed
+on two TypeScript test helpers still using the retired deployment shape
+(`model`, `routing_weight`). They now deploy named `openai`/`anthropic`
+targets like their Python peers, and the support-desk TypeScript journey
+passes.
+
+Environment-only failures seen in broader workspace runs, not in this task's
+write set: OIDC/Dex identity journeys, saved-user auth, CLI device login,
+Vault, kind startup image, cgroup capacity, and live Slack/PagerDuty smoke.
+Each needs external infrastructure that is absent locally. The final
+integrated aggregate belongs to change review.
+
 ## Material Stop Conditions
 
 Stop affected work and route to specification authority if correctness needs:

@@ -2918,14 +2918,14 @@ mod kind_tests {
     use proptest::prelude::*;
     use serde_json::json;
 
-    /// Lock 16 native kinds (15 registrable plus `External`), with `Verifier`
-    /// replacing both `Drift` and `Eval`.
+    /// Lock 15 native kinds (14 registrable plus `External`), with `Verifier`
+    /// replacing both `Drift` and `Eval` and no `Workflow`.
     #[test]
     fn native_card_kind_count_is_locked() {
         assert_eq!(CardKind::native().len(), CardKind::NATIVE_COUNT);
-        assert_eq!(CardKind::NATIVE_COUNT, 16);
+        assert_eq!(CardKind::NATIVE_COUNT, 15);
         assert_eq!(CardKind::registrable().len(), CardKind::REGISTRABLE_COUNT);
-        assert_eq!(CardKind::REGISTRABLE_COUNT, 15);
+        assert_eq!(CardKind::REGISTRABLE_COUNT, 14);
         assert!(CardKind::registrable().contains(&CardKind::Verifier));
         assert!(!CardKind::registrable().contains(&CardKind::External));
         assert!(
@@ -2984,7 +2984,8 @@ mod kind_tests {
         assert!(enum_values.contains(&json!("Verifier")));
         assert!(!enum_values.contains(&json!("Drift")));
         assert!(!enum_values.contains(&json!("Eval")));
-        assert_eq!(enum_values.len(), 15);
+        assert!(!enum_values.contains(&json!("Workflow")));
+        assert_eq!(enum_values.len(), 14);
     }
 
     proptest! {

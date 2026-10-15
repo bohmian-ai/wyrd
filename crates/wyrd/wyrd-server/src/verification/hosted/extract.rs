@@ -827,4 +827,4 @@ fn push(stack: &mut [Node], child: Child) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

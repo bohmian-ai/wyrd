@@ -9,6 +9,7 @@
 
 pub mod evidence;
 pub mod extract;
+pub mod workspace;
 
 /// The Deployment limits the hosted capabilities enforce.
 ///
@@ -30,6 +31,14 @@ pub struct HostedLimits {
     pub extract_max_pages: usize,
     /// Most extracted text bytes per extraction.
     pub extract_text_max_bytes: usize,
+    /// Largest materialized bytes per workspace.
+    pub scratch_max_bytes: u64,
+    /// Largest bytes of one file code or tools write under `/work`.
+    pub work_write_max_bytes: u64,
+    /// Largest serialized tool result, in bytes.
+    pub tool_result_max_bytes: usize,
+    /// Most concurrent workspaces per process.
+    pub max_workspaces: usize,
 }
 
 impl Default for HostedLimits {
@@ -44,6 +53,10 @@ impl Default for HostedLimits {
             archive_max_ratio: 100,
             extract_max_pages: 500,
             extract_text_max_bytes: 10 * 1024 * 1024,
+            scratch_max_bytes: 250 * MIB,
+            work_write_max_bytes: 50 * MIB,
+            tool_result_max_bytes: 64 * 1024,
+            max_workspaces: 16,
         }
     }
 }

@@ -297,6 +297,17 @@ def run_python(env: dict[str, str], name: str) -> None:
     assert ran.returncode == 0 and "1 passed" in ran.stdout, ran.stdout + ran.stderr
 
 
+def run_rust(env: dict[str, str], name: str) -> None:
+    """Run the ignored ``wyrd-client`` integration test ``name`` in a fresh process with ``env``."""
+    root = Path(__file__).resolve().parents[4]
+    command = [
+        *("mise", "exec", "--", "cargo", "nextest", "run", "--locked"),
+        *("-p", "wyrd-client", "--test", "integration", "--run-ignored=all"),
+        *("-E", f"test(={name})"),
+    ]
+    subprocess.run(command, cwd=root, env=env, check=True)
+
+
 def local_listener() -> str:
     """Ask the OS for a loopback port for an isolated server listener."""
     with socket.socket() as bound:
@@ -608,7 +619,8 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
     with the saved deployment alone, and each upstream sees its own key and
     never a Wyrd credential. One Agent per provider is then applied, downloaded
     with ``wyrd get``, and loaded and run from that bundle by a fresh Python
-    process, which never calls a native provider. A restarted server still
+    process and by a fresh Rust process through the public Agent loader,
+    neither of which calls a native provider. A restarted server still
     decrypts the credentials and serves the same downloaded Agents, and a
     revoked credential or an under-granted caller is refused.
     """
@@ -729,7 +741,8 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 }
                 agent_env.pop("TYPESAFE_API_KEY", None)
                 run_python(agent_env, "test_cli_gateway_agents")
-                assert calls_since(recorded, direct) == AGENT_CALLS
+                run_rust(agent_env, "local_development::cli_gateway_agents")
+                assert calls_since(recorded, direct) == AGENT_CALLS * 2
 
             wyrd_credentials = (home / "wyrd/credentials.toml").read_text()
             assert sorted(calls_since(recorded, 0)[:direct]) == sorted(
@@ -741,7 +754,8 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 run_typescript(env, "cli_gateway_setup")
                 rerun = len(recorded.deliveries)
                 run_python(agent_env, "test_cli_gateway_agents")
-                assert calls_since(recorded, rerun) == AGENT_CALLS
+                run_rust(agent_env, "local_development::cli_gateway_agents")
+                assert calls_since(recorded, rerun) == AGENT_CALLS * 2
                 revoked = wyrd("gateway", "credential", "revoke", "openai-key")
                 assert revoked.returncode == 0, revoked.stderr
                 delivered = len(recorded.deliveries)

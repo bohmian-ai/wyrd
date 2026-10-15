@@ -3978,27 +3978,30 @@ fn inline_agent_request(name: &str, message: &str, idempotency_key: &str) -> Req
                 "apiVersion": "wyrd/v1",
                 "kind": "Agent",
                 "metadata": { "name": name, "space": "default" },
-                "spec": { "prompt": native_prompt(message) },
+                "spec": {
+                    "prompt": portable_prompt(message),
+                    "execution_route": { "kind": "native" }
+                },
                 "artifacts": []
             }]
         }),
     )
 }
 
-/// Compile a one-message declarative Prompt into the native inline body an
-/// Agent's `prompt` slot carries.
+/// The one-message portable Prompt body an Agent's inline `prompt` slot or a
+/// Prompt Card's `spec` carries, as validated by `PromptSpec`.
 ///
 /// # Panics
-/// Panics when the fixed `openai`/`gpt-4o` declarative fixture no longer
-/// deserializes as a `PromptSpec`, or its compiled native Prompt does not
-/// serialize back to JSON.
-fn native_prompt(message: &str) -> Value {
+/// Panics when the fixed `openai`/`gpt-4o` portable fixture no longer
+/// deserializes as a `PromptSpec`, or its Prompt does not serialize back to
+/// JSON.
+fn portable_prompt(message: &str) -> Value {
     let spec: wyrd_spec::card::prompt::PromptSpec = serde_json::from_value(json!({
         "provider": "openai",
         "model": "gpt-4o",
-        "messages": [message]
+        "messages": [{ "role": "user", "content": message }]
     }))
-    .expect("declarative prompt compiles");
+    .expect("portable prompt validates");
     serde_json::to_value(spec.prompt).expect("native prompt serializes")
 }
 
@@ -4192,7 +4195,11 @@ fn pinned_inline_agent(name: &str, version: &str, message: &str, tool_names: &[&
         "apiVersion": "wyrd/v1",
         "kind": "Agent",
         "metadata": { "name": name, "version": version, "space": "default" },
-        "spec": { "prompt": native_prompt(message), "tool_names": tool_names },
+        "spec": {
+            "prompt": portable_prompt(message),
+            "execution_route": { "kind": "native" },
+            "tool_names": tool_names
+        },
         "artifacts": []
     })
 }
@@ -4459,7 +4466,7 @@ async fn inline_agent_prompt_reuses_transaction_selection() {
                 "apiVersion": "wyrd/v1",
                 "kind": "Prompt",
                 "metadata": { "name": "authored-agent-prompt", "version": "0.1.0", "space": "default" },
-                "spec": native_prompt("same"),
+                "spec": portable_prompt("same"),
                 "artifacts": []
             }),
             pinned_inline_agent("authored-agent", "1.0.0", "same", &[]),
@@ -4518,7 +4525,7 @@ async fn inline_agent_prompt_reuses_transaction_selection() {
                 "apiVersion": "wyrd/v1",
                 "kind": "Prompt",
                 "metadata": { "name": "twin-agent-prompt", "version": "0.1.0", "space": "default" },
-                "spec": native_prompt("other"),
+                "spec": portable_prompt("other"),
                 "artifacts": []
             }),
             pinned_inline_agent("clash-agent", "1.0.0", "other", &[]),

@@ -352,3 +352,25 @@ material justification rather than private invention.
 - [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md)
 - [Execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing](../../../../architecture/references/languages/testing-workflows.md)
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| A: HTTP parity, outcomes, exact refs, relationship, lifecycle, refusal/rollback | `wyrd-server/src/components/cards/service.rs` `RegistrationWriter::write` + `inline_prompt_submission` (reuses `persist_node` in the Card transaction) | A `pg_card_registration_route::inline_agent_prompt_materializes` | PASS |
+| B: naming, replay, version pinning, no cross-Agent sharing, authored-line clash, tenant separation, path/ref regression, hydration without Prompt component | Same server owner; fixtures `fixtures/cards/agent_prompt/` | B `register_and_hydrate::agent_prompt_registration_identity` | PASS |
+| Doctrine/protocol scoped to registered Agent inline Prompts | `architecture/wyrd-design.md` doctrine 17, Prompt/Agent, pre-registration, Reference forms; `architecture/wyrd-doctrine.mdx`; `docs/.../cards-versions-and-relationships.md` | `mise run docs:check` | PASS |
+| No public state-level Prompt accessor; no external repo edit | `wyrd-client/src/state.rs` (`agent_prompt`/`resolve_agent_prompt` removed) | diff audit | PASS |
+| R/P/T: all authoring forms, authentic refs/payloads, explicit alias agreement, reads after shutdown | Rust `HydratedAgent`/`HydratedCard`, `WyrdState::agent`/`get`; Python `PyAgentCard::prompt`, `PromptCard.ref`, `WyrdState.get`/`__getitem__`; TS `AgentCard`/`PromptCard`/`HydratedCard`, `WyrdState.get` over native `hydrated_agent` | R `register_and_hydrate::hydrated_agent_prompt_card_navigation`; P `test_hydrated_agent_prompt_card_navigation`; T `hydrated agent prompt card navigation` | PASS |
+| Python union narrows with `isinstance`; TS union narrows by literal kind | `python/wyrd/state/__init__.pyi` `HydratedCard`; `wyrd/src/index.ts` `HydratedCard` | `tests/typecheck/state_contracts.py` (`mise run py:typecheck`); `tests/types/card-types.test-d.ts` (`mise run ts:typecheck`) | PASS |
+| Typed accessors exact; `agent.prompt()` is PromptCard, `.ref` is CardRef; negative type cases | Stubs `cards/__init__.pyi`, `prompt/__init__.pyi`, `state/__init__.pyi`; TS interfaces | Same compile-only suites (`ty: ignore` with unused-ignore errors; `@ts-expect-error`) | PASS |
+| `prompt_ref`/`promptRef` identity; `AgentSpec.prompt` unchanged | `HydratedAgent::prompt_ref`, `PyAgentCard.prompt_ref`, TS `promptRef` | R/P/T | PASS |
+| Invocation preserved through the shared relationship | `wyrd-client/src/observe/invoke.rs` uses `state.agent(..).prompt()` | I `gateway_inference::run_invokes_its_agent_through_the_gateway` | PASS |
+| AC-004 stable errors: unknown alias, kind mismatch, invalid bundle | `TypedCards::agent` load-time invariant | R/P/T negatives; `wyrd-client` lib `agent_with_inline_prompt_is_an_invalid_bundle`, `agent_prompt_rejects_missing_target`, `agent_prompt_rejects_non_prompt_target`; Python `test_agent_with_an_inline_only_prompt_is_an_invalid_bundle` | PASS |
+| Consumers, exports, stubs, declarations, examples updated | CLI `card_lifecycle` counts/aliases; Python unit/integration consumers; TS `index.d.ts`/`index.d.cts`; old inline-only Python bundle moved to `bundles/inline-only-agent` | `mise run py:test:unit` (592 passed), CLI `card_lifecycle` (19), `wyrd-client` lib (262), `cargo check -p wyrd-rust-examples`, `mise run ts:napi:check` | PASS |
+
+Commands (all exact selectors above via `scripts/postgres/with-test-postgres.sh` as listed in Verification), plus `mise run fmt`, `lints`, `check:deps`, `codegen:check`, `py:format`, `py:lints`, `py:typecheck`, `ts:format:check`, `ts:lints`, `ts:typecheck`, `ts:napi:check`, `docs:check`, `git diff --check`: all pass.
+
+Limits: RED was not observed for A before the server change landed; B/R/P/T were written after their implementation, so their proof is GREEN-only. Cross-tenant reads report the existing `WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE`. A Python `AgentCard` not loaded through `WyrdState` raises a validation `WyrdError` from `prompt()`; authored inline prompts stay readable via `prompt_ref.prompt`.
+
+Non-goals confirmed: no other inline-kind change, no standalone Workflow registration, no cascading deletion, no migration, no new Cargo feature, no compatibility alias, no Bifrost/UI change, no external repository edit, `cca791ab6` not used.

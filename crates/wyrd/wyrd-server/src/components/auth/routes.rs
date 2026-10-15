@@ -595,7 +595,7 @@ async fn issue_key(
         .map_err(|error| WyrdErrorResponse::from(store_unavailable(error)))?;
     let service = IssueApiKey::default();
     let issued = service
-        .execute(&mut conn, request, caller.principal())
+        .execute(&mut conn, request, audited_caller.attribution())
         .await
         .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
     conn.commit()
@@ -813,14 +813,14 @@ mod pg_tests {
     async fn insert_test_service_account(
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,
-        created_by: Uuid,
+        creator: Uuid,
         card_ref: &CardRef,
     ) -> Uuid {
         let sa_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO wyrd.auth_service_accounts
-                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, space, name, version, status, created_by)
-             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, $6, $7, 'active', $8)",
+                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, space, name, version, status, sub_principal_id, act_principal_id)
+             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, $6, $7, 'active', $8, $8)",
         )
         .bind(sa_id)
         .bind(tenant.as_uuid())
@@ -835,7 +835,7 @@ mod pg_tests {
         )
         .bind(format!("svc-{sa_id}"))
         .bind(card_ref.version.as_str())
-        .bind(created_by)
+        .bind(creator)
         .execute(&mut **conn.transaction())
         .await
         .expect("service account inserts");

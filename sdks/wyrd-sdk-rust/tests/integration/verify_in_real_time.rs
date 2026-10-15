@@ -246,8 +246,8 @@ impl Assistant {
             .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
             .header("traceparent", traceparent)
             .json(&json!({
-                "verifier_uid": self.answer_graded.uid,
-                "subject_card_uid": self.agent.uid,
+                "verifier_card_uid": self.answer_graded.uid,
+                "card_uid": self.agent.uid,
                 "input": { "kind": "task_context", "context": { "answer": "yes" } },
             }))
             .send()

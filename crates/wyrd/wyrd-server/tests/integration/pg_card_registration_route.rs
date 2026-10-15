@@ -20,6 +20,7 @@ use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_loader::{build_registration_input, load};
+use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, DataTenantId, SpaceName};
@@ -78,8 +79,8 @@ async fn seed_card(
     let spec_hash = blake3::hash(name.as_bytes()).to_hex().to_string();
     sqlx::query(
         "INSERT INTO wyrd.cards \
-            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status) \
-         VALUES ($1, $2, $3, 'default', $4, '1.0.0', $5, $6, $7)",
+            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
+         VALUES ($1, $2, $3, 'default', $4, '1.0.0', $5, $6, $7, '00000000-0000-7000-8000-000000000000', '00000000-0000-7000-8000-000000000000')",
     )
     .bind(uid.as_uuid())
     .bind(tenant.as_uuid())
@@ -3085,7 +3086,7 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
         .await
         .expect("tenant connection opens");
     let registered_runs: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.verifier_runs WHERE owner_card_uid = $1 OR subject_card_uid = $1",
+        "SELECT count(*) FROM wyrd.verifier_runs WHERE owner_card_uid = $1 OR card_uid = $1",
     )
     .bind(service_uid)
     .fetch_one(&mut **conn.transaction())
@@ -3823,12 +3824,22 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         .tenant_conn_for(server.data_tenant_id())
         .await
         .expect("tenant connection opens");
+    let queue = VerifierRunQueue::default();
+    let state = server.state();
+    let authority = BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox));
     let mut outcomes = Vec::new();
-    while let Some(tick) = VerifierRunQueue::default()
-        .schedule_next_due(&mut conn)
-        .await
-        .expect("scheduler ticks")
-    {
+    while let Some(due) = queue.claim_due(&mut conn).await.expect("scheduler claims") {
+        let accepted = match due.owner() {
+            Some(owner) => authority
+                .resolve(&mut conn, owner)
+                .await
+                .expect("owner authority resolves"),
+            None => None,
+        };
+        let tick = queue
+            .schedule_due(&mut conn, due, accepted)
+            .await
+            .expect("scheduler ticks");
         outcomes.push(tick.outcome);
     }
     let (runs, cursor_ahead): (i64, f64) = sqlx::query_as(

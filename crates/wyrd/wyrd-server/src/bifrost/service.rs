@@ -86,6 +86,7 @@ pub async fn register_table(
     catalog
         .register_dataset(
             caller.data_tenant_id,
+            caller.attribution(),
             table,
             user_fields,
             body.physical_layout,

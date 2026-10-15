@@ -8,6 +8,7 @@ use uuid::Uuid;
 use wyrd_semver::VersionBlock;
 
 use wyrd_runtime::principal::PrincipalId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::metadata::{Annotations, Labels};
@@ -19,7 +20,7 @@ use crate::error::SqlError;
 /// Must stay in lockstep with the positional `FromRow` decode order on [`CardRow`].
 pub const CARD_ROW_COLUMNS: &str = "card_uid, data_tenant_id, kind, space, name, version, \
      spec, spec_hash, artifact_hash, labels, annotations, \
-     status, created_by, created_at, updated_at, card_blob_uri";
+     status, sub_principal_id, act_principal_id, created_at, updated_at, card_blob_uri";
 
 /// Live `wyrd.cards` row, decoded for handler return.
 ///
@@ -55,8 +56,10 @@ pub struct CardRow {
     pub annotations: serde_json::Value,
     /// Lifecycle status literal from the card registration state machine.
     pub status: String,
-    /// Creating principal UUID, if known.
-    pub created_by: Option<Uuid>,
+    /// Subject the Card was created for.
+    pub sub_principal_id: Uuid,
+    /// Actor that created the Card.
+    pub act_principal_id: Uuid,
     /// Row creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Row update timestamp.
@@ -103,8 +106,8 @@ pub struct ParsedCardRow {
     pub annotations: Annotations,
     /// Lifecycle status.
     pub status: CardStatus,
-    /// Creating principal UUID, when known.
-    pub created_by: Option<PrincipalId>,
+    /// Subject and actor that created the Card; later updates keep it.
+    pub attribution: Attribution,
     /// Row creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Row update timestamp.
@@ -136,7 +139,10 @@ impl TryFrom<CardRow> for ParsedCardRow {
             })?;
         let status = CardStatus::from_db_str(&row.status)?;
         let card_uid = CardUid::from_uuid(row.card_uid).map_err(SqlError::from_id_error)?;
-        let created_by = row.created_by.map(PrincipalId::new);
+        let attribution = Attribution::new(
+            PrincipalId::new(row.sub_principal_id),
+            PrincipalId::new(row.act_principal_id),
+        );
         Ok(Self {
             card_uid,
             data_tenant_id: row.data_tenant_id,
@@ -150,7 +156,7 @@ impl TryFrom<CardRow> for ParsedCardRow {
             labels,
             annotations,
             status,
-            created_by,
+            attribution,
             created_at: row.created_at,
             updated_at: row.updated_at,
             card_blob_uri: row.card_blob_uri,

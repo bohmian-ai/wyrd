@@ -162,6 +162,7 @@ async fn scribe_wal_fault_is_role_local() -> Result<(), super::query::ServerJour
                 false,
             )],
             tenant: server.data_tenant_id(),
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;
@@ -302,6 +303,7 @@ async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJou
                 false,
             )],
             tenant: server.data_tenant_id(),
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;

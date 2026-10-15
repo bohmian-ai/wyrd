@@ -806,7 +806,7 @@ impl From<WyrdTestServerError> for wyrd_spec::error::WyrdError {
                 wyrd_spec::error::WyrdError::VerificationBaselineNotReady {
                     message: msg,
                     details: serde_json::json!({
-                        "verifier_uid": verifier,
+                        "verifier_card_uid": verifier,
                         "baseline": last,
                     }),
                 }
@@ -3098,7 +3098,7 @@ impl WyrdTestServer {
             principal.id,
             &api_key.prefix,
             &key_hash,
-            creator_id,
+            wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
             Some(Duration::from_hours(8760)),
         )
         .await
@@ -3269,7 +3269,7 @@ impl WyrdTestServer {
                     None,
                     "tenant-admin",
                     Some("Tenant administrative principal"),
-                    creator_id,
+                    wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
                 )
                 .await
                 .map_err(sql)?;
@@ -3283,7 +3283,7 @@ impl WyrdTestServer {
             principal_id,
             &api_key.prefix,
             &wyrd_auth_issue::hash_secret(api_key.secret.expose_secret()),
-            creator_id,
+            wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
             None,
         )
         .await
@@ -3609,7 +3609,7 @@ impl WyrdTestServer {
             Some(card_ref),
             card_ref.name.as_str(),
             None,
-            creator_id,
+            wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
         )
         .await
         .map_err(sql)?;
@@ -3695,7 +3695,7 @@ impl WyrdTestServer {
             Some(&card_ref),
             name,
             None,
-            creator_id,
+            wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
         )
         .await
         .map_err(sql)?;
@@ -3705,7 +3705,7 @@ impl WyrdTestServer {
             principal_id,
             &api_key.prefix,
             &key_hash,
-            creator_id,
+            wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
             Some(std::time::Duration::from_hours(8760)),
         )
         .await
@@ -5003,6 +5003,7 @@ impl WyrdTestServerBuilder {
             resources: bifrost_resources,
             cluster: cluster_registry,
             token_verifier: Arc::clone(&verifier),
+            issuing_key: Some(Arc::clone(&issuing_key)),
             peer_tls,
             config: bifrost_config,
             forge_config: forge_runtime,
@@ -5619,7 +5620,7 @@ async fn insert_fixture_card(
             labels,
             annotations,
             status,
-            created_by
+            sub_principal_id, act_principal_id
         )
         VALUES (
             $1,
@@ -5634,7 +5635,7 @@ async fn insert_fixture_card(
             '{}'::jsonb,
             '{}'::jsonb,
             'active',
-            $8
+            $8, $8
         )
         ",
     )

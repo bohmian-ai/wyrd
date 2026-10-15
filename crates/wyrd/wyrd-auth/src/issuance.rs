@@ -1115,11 +1115,19 @@ mod pg_tests {
     }
 
     /// Seed an active Card-less tenant automation principal, returning its id.
-    async fn seed_automation(conn: &mut TenantConn<'_>, created_by: Uuid) -> Uuid {
+    async fn seed_automation(conn: &mut TenantConn<'_>, creator: Uuid) -> Uuid {
         let id = Uuid::new_v4();
-        insert_service_account(conn, id, "service", None, "automation", None, created_by)
-            .await
-            .expect("service account inserts");
+        insert_service_account(
+            conn,
+            id,
+            "service",
+            None,
+            "automation",
+            None,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(creator)),
+        )
+        .await
+        .expect("service account inserts");
         id
     }
 
@@ -1245,13 +1253,13 @@ mod pg_tests {
     ///
     /// # Panics
     /// Panics when a generated identity is invalid or any fixture write fails.
-    async fn seed_bound_service(conn: &mut TenantConn<'_>, created_by: Uuid) -> Uuid {
+    async fn seed_bound_service(conn: &mut TenantConn<'_>, creator: Uuid) -> Uuid {
         let card_uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID");
         sqlx::query(
             "INSERT INTO wyrd.cards \
-                (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status) \
+                (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
              VALUES ($1, wyrd.current_tenant(), 'Service', 'default', 'bound-svc', '1.0.0', \
-                     '{}'::jsonb, 'spec-hash', 'active')",
+                     '{}'::jsonb, 'spec-hash', 'active', '00000000-0000-7000-8000-000000000000', '00000000-0000-7000-8000-000000000000')",
         )
         .bind(card_uid.as_uuid())
         .execute(&mut **conn.transaction())
@@ -1270,7 +1278,7 @@ mod pg_tests {
             Some(&card_ref),
             "bound-svc",
             None,
-            created_by,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(creator)),
         )
         .await
         .expect("bound service account inserts");
@@ -1281,8 +1289,8 @@ mod pg_tests {
             &CardKind::Service,
             &[NewBinding {
                 subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
-                subject_card_uid: card_uid.clone(),
-                verifier_uid: verifier,
+                card_uid: card_uid.clone(),
+                verifier_card_uid: verifier,
                 trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
                 operators: Vec::new(),
                 activation: BindingActivation::Schedule {

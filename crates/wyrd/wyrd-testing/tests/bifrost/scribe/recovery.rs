@@ -161,6 +161,7 @@ async fn variant_staging_restores_and_publishes_once() {
                 wyrd_types::variant::variant_field("v", true),
             ],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await

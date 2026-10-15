@@ -230,7 +230,7 @@ impl EvidenceInvestigation {
             ("vala.traces", "spans", "trace_id"),
             ("vala.logs", "records", "span_id"),
             ("vala.datasets", "investigation_events", "value"),
-            ("vala.verification", "results", "subject_card_uid"),
+            ("vala.verification", "results", "verifier_card_uid"),
             ("vala.drift", "result_features", "score"),
             ("vala.eval", "result_items", "passed"),
         ] {
@@ -291,7 +291,7 @@ impl EvidenceInvestigation {
             assert_eq!(response.card.metadata.uid, reference.uid);
         }
         let uid = self.subject.uid.as_ref().ok_or("subject UID")?;
-        let rows = self.query(&format!("SELECT implementation, verdict FROM vala.verification.results WHERE subject_card_uid = '{uid}' ORDER BY implementation LIMIT 20")).await?;
+        let rows = self.query(&format!("SELECT implementation, verdict FROM vala.verification.results WHERE card_uid = '{uid}' ORDER BY implementation LIMIT 20")).await?;
         assert_eq!(rows, json!([["drift", "failed"], ["eval", "failed"]]));
         let rows = self.query(&format!("SELECT feature, score, threshold, verdict FROM vala.drift.result_features WHERE result_id = '{}' LIMIT 20", self.drift_result)).await?;
         assert_eq!(rows, json!([["latency", 3.0, 1.0, "drift"]]));

@@ -1287,6 +1287,7 @@ async fn register_forge_table(server: &WyrdTestServer, table: &str) {
                 false,
             )],
             tenant: server.data_tenant_id(),
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await

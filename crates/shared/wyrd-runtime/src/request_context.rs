@@ -333,7 +333,9 @@ mod tests {
         assert_eq!(parsed.attribution().sub_principal_id, subject.id);
         assert_eq!(parsed.attribution().act_principal_id, actor.id);
         assert_eq!(
-            AcceptedAuthority::new(&subject, &[]).attribution().act_principal_id,
+            AcceptedAuthority::new(&subject, &[])
+                .attribution()
+                .act_principal_id,
             subject.id
         );
     }

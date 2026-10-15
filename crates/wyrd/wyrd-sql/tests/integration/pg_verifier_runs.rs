@@ -118,7 +118,7 @@ async fn insert_card(conn: &mut TenantConn<'_>, actor: &Principal, card: &Card) 
         conn,
         NewRegistrationOperation {
             operation_id,
-            principal_id: actor.id,
+            attribution: wyrd_spec::auth::Attribution::direct(actor.id),
             idempotency_key: &key,
             request_hash: "request-hash",
         },
@@ -130,7 +130,7 @@ async fn insert_card(conn: &mut TenantConn<'_>, actor: &Principal, card: &Card) 
         NewCardRow {
             card,
             card_uid: uid(),
-            principal_id: actor.id,
+            attribution: wyrd_spec::auth::Attribution::direct(actor.id),
             operation_id,
             status: CardStatus::Pending,
             spec_hash: "spec-hash",
@@ -171,9 +171,14 @@ async fn register_service(
 ) -> (CardUid, PrincipalId) {
     let card = service_card(name);
     let card_uid = insert_card(conn, actor, &card).await;
-    let principal = upsert_service_account_from_card(conn, &card_uid, &card, actor)
-        .await
-        .expect("principal projects");
+    let principal = upsert_service_account_from_card(
+        conn,
+        &card_uid,
+        &card,
+        wyrd_spec::auth::Attribution::direct(actor.id),
+    )
+    .await
+    .expect("principal projects");
     sqlx::query("UPDATE wyrd.cards SET status = 'active' WHERE card_uid = $1")
         .bind(card_uid.as_uuid())
         .execute(&mut **conn.transaction())

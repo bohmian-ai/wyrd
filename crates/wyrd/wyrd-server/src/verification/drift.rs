@@ -702,7 +702,7 @@ impl DriftEngine {
                 "a Drift run needs a drift window input",
             ));
         };
-        let window = ObservationWindow::new(&run.subject_card_uid, window);
+        let window = ObservationWindow::new(&run.card_uid, window);
         let invalid = |message: String| terminal(DRIFT_INVALID, message);
         let scored = |result: Result<vala_drift::DriftReport, vala_drift::DriftScoreError>| {
             result.map(Some).map_err(|error| invalid(error.to_string()))

@@ -72,10 +72,11 @@ DECLARE
     provisioned uuid;
 BEGIN
     INSERT INTO wyrd.auth_service_accounts (
-        id, data_tenant_id, principal_kind, name, description, status, created_by
+        id, data_tenant_id, principal_kind, name, description, status,
+        sub_principal_id, act_principal_id
     ) VALUES (
         candidate, wyrd.current_tenant(), 'system', 'verification-results-writer',
-        'Internal verification-result writer', 'active', candidate
+        'Internal verification-result writer', 'active', candidate, candidate
     )
     ON CONFLICT (data_tenant_id) WHERE principal_kind = 'system' DO NOTHING;
 

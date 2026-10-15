@@ -727,15 +727,15 @@ pub(crate) mod pg_tests {
     pub(crate) async fn insert_test_service_account(
         conn: &mut TenantConn<'_>,
         tenant_id: DataTenantId,
-        created_by: Uuid,
+        creator: Uuid,
         card_ref: &CardRef,
     ) -> Uuid {
-        seed_backing_card(conn, card_ref, created_by).await;
+        seed_backing_card(conn, card_ref, creator).await;
         let sa_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO wyrd.auth_service_accounts
-                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, space, name, version, status, created_by)
-             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, $6, $7, 'active', $8)",
+                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, space, name, version, status, sub_principal_id, act_principal_id)
+             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, $6, $7, 'active', $8, $8)",
         )
         .bind(sa_id)
         .bind(tenant_id.as_uuid())
@@ -750,7 +750,7 @@ pub(crate) mod pg_tests {
         )
         .bind(format!("svc-{sa_id}"))
         .bind(card_ref.version.as_str())
-        .bind(created_by)
+        .bind(creator)
         .execute(&mut **conn.transaction())
         .await
         .expect("service account inserts");
@@ -761,21 +761,21 @@ pub(crate) mod pg_tests {
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,
         sa_id: Uuid,
-        created_by: Uuid,
+        creator: Uuid,
         prefix: &str,
         expires_at: chrono::DateTime<Utc>,
         revoked: bool,
     ) {
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
-                 (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at, revoked_at)
-             VALUES ($1, $2, $3, $4, 'placeholder-hash', $5, $6, CASE WHEN $7 THEN now() ELSE NULL END)",
+                 (id, data_tenant_id, principal_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at, revoked_at)
+             VALUES ($1, $2, $3, $4, 'placeholder-hash', $5, $5, $6, CASE WHEN $7 THEN now() ELSE NULL END)",
         )
         .bind(Uuid::new_v4())
         .bind(tenant.as_uuid())
         .bind(sa_id)
         .bind(prefix)
-        .bind(created_by)
+        .bind(creator)
         .bind(expires_at)
         .bind(revoked)
         .execute(&mut **conn.transaction())
@@ -876,22 +876,22 @@ pub(crate) mod pg_tests {
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,
         principal_id: Uuid,
-        created_by: Uuid,
+        creator: Uuid,
     ) -> (Uuid, SecretString) {
         let key = WyrdApiKey::generate(tenant);
         let hash = wyrd_auth_issue::hash_secret(key.secret.expose_secret());
         let api_key_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
-                 (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, now() + interval '1 day')",
+                 (id, data_tenant_id, principal_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $6, now() + interval '1 day')",
         )
         .bind(api_key_id)
         .bind(tenant.as_uuid())
         .bind(principal_id)
         .bind(&key.prefix)
         .bind(&hash)
-        .bind(created_by)
+        .bind(creator)
         .execute(&mut **conn.transaction())
         .await
         .expect("live api key inserts");
@@ -943,8 +943,8 @@ pub(crate) mod pg_tests {
         let admin_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO wyrd.auth_service_accounts
-                 (id, data_tenant_id, principal_kind, name, status, created_by)
-             VALUES ($1, $2, 'tenant_admin', $3, 'active', $4)",
+                 (id, data_tenant_id, principal_kind, name, status, sub_principal_id, act_principal_id)
+             VALUES ($1, $2, 'tenant_admin', $3, 'active', $4, $4)",
         )
         .bind(admin_id)
         .bind(tenant.as_uuid())
@@ -1039,8 +1039,8 @@ pub(crate) mod pg_tests {
         let hash = wyrd_auth_issue::hash_secret(key.secret.expose_secret());
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
-                 (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, now() + interval '1 day')",
+                 (id, data_tenant_id, principal_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $6, now() + interval '1 day')",
         )
         .bind(Uuid::new_v4())
         .bind(tenant.as_uuid())
@@ -1147,20 +1147,20 @@ pub(crate) mod pg_tests {
     async fn seed_suspended_account_key(
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,
-        created_by: Uuid,
+        creator: Uuid,
         base_card: &CardRef,
     ) -> SecretString {
         let card_ref = CardRef {
             name: CardName::new("suspended-exchange-subject").expect("static name"),
             ..base_card.clone()
         };
-        let sa_id = insert_test_service_account(conn, tenant, created_by, &card_ref).await;
+        let sa_id = insert_test_service_account(conn, tenant, creator, &card_ref).await;
         sqlx::query("UPDATE wyrd.auth_service_accounts SET status = 'suspended' WHERE id = $1")
             .bind(sa_id)
             .execute(&mut **conn.transaction())
             .await
             .expect("service account suspends");
-        insert_live_api_key(conn, tenant, sa_id, created_by).await.1
+        insert_live_api_key(conn, tenant, sa_id, creator).await.1
     }
 
     /// Seed a live service-account API key in a second tenant, then suspend
@@ -1362,8 +1362,8 @@ pub(crate) mod pg_tests {
         // service returns NotFound.
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
-                 (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at, revoked_at)
-             VALUES ($1, $2, $3, $4, 'placeholder-hash', $5, now() + interval '1 year', now())",
+                 (id, data_tenant_id, principal_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at, revoked_at)
+             VALUES ($1, $2, $3, $4, 'placeholder-hash', $5, $5, now() + interval '1 year', now())",
         )
         .bind(Uuid::new_v4())
         .bind(tenant.as_uuid())
@@ -1396,8 +1396,8 @@ pub(crate) mod pg_tests {
         // Store a verifier that is not this key's SHA-256 digest.
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
-                 (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at)
-             VALUES ($1, $2, $3, $4, 'not-a-valid-phc-hash', $5, now() + interval '1 year')",
+                 (id, data_tenant_id, principal_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at)
+             VALUES ($1, $2, $3, $4, 'not-a-valid-phc-hash', $5, $5, now() + interval '1 year')",
         )
         .bind(Uuid::new_v4())
         .bind(tenant.as_uuid())

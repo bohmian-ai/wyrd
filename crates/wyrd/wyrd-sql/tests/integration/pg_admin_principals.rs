@@ -412,7 +412,7 @@ mod pg_tests {
             None,
             "api-key-clock",
             None,
-            Uuid::now_v7(),
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(Uuid::now_v7())),
         )
         .await
         .expect("principal inserts");
@@ -426,7 +426,7 @@ mod pg_tests {
             principal,
             "wyrd_sk_active",
             &verifier("active"),
-            principal,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(principal)),
             Some(std::time::Duration::from_hours(1)),
         )
         .await
@@ -456,7 +456,7 @@ mod pg_tests {
             principal,
             "wyrd_sk_expired",
             &verifier("expired"),
-            principal,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(principal)),
             Some(std::time::Duration::ZERO),
         )
         .await
@@ -469,7 +469,7 @@ mod pg_tests {
             principal,
             "wyrd_sk_revoked",
             &verifier("revoked"),
-            principal,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(principal)),
             Some(std::time::Duration::from_hours(1)),
         )
         .await
@@ -590,7 +590,7 @@ mod pg_tests {
             None,
             "tenant-admin",
             Some("tenant root of trust"),
-            Uuid::now_v7(),
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(Uuid::now_v7())),
         )
         .await
         .expect("card-free administrative principal inserts");
@@ -627,9 +627,9 @@ mod pg_tests {
         let result = sqlx::query(
             "INSERT INTO wyrd.auth_service_accounts
                  (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref,
-                  space, name, version, status, created_by)
+                  space, name, version, status, sub_principal_id, act_principal_id)
              VALUES ($1, $2, 'tenant_admin', 'Service', $3, '{}'::jsonb,
-                     'system', 'bogus', '1.0.0', 'active', $4)",
+                     'system', 'bogus', '1.0.0', 'active', $4, $4)",
         )
         .bind(Uuid::now_v7())
         .bind(fixture.data_tenant_id().as_uuid())
@@ -686,7 +686,7 @@ mod pg_tests {
             None,
             "tenant-admin",
             None,
-            Uuid::now_v7(),
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(Uuid::now_v7())),
         )
         .await
         .expect("A principal inserts");
@@ -696,7 +696,7 @@ mod pg_tests {
             principal,
             "wyrd_sk_rlsprobe",
             &verifier("rls"),
-            principal,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(principal)),
             None,
         )
         .await
@@ -927,9 +927,9 @@ mod pg_tests {
             (
                 "a second writer",
                 "INSERT INTO wyrd.auth_service_accounts \
-                    (id, data_tenant_id, principal_kind, name, status, created_by) \
+                    (id, data_tenant_id, principal_kind, name, status, sub_principal_id, act_principal_id) \
                  VALUES (gen_random_uuid(), wyrd.current_tenant(), 'system', 'second', \
-                         'active', gen_random_uuid())",
+                         'active', gen_random_uuid(), gen_random_uuid())",
             ),
         ];
         for (label, statement) in refusals {

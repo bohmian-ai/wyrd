@@ -640,12 +640,13 @@ async fn replay(
     request_hash: &str,
 ) -> Result<Option<(RegistrationOperationId, RegistrationReplaySeed)>, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let operation = match lookup_existing_operation(&mut conn, caller.principal.id, idempotency_key)
-        .await?
-    {
-        Some(operation) => Some(operation),
-        None => lookup_expired_operation(&mut conn, caller.principal.id, idempotency_key).await?,
-    };
+    let operation =
+        match lookup_existing_operation(&mut conn, caller.attribution(), idempotency_key).await? {
+            Some(operation) => Some(operation),
+            None => {
+                lookup_expired_operation(&mut conn, caller.attribution(), idempotency_key).await?
+            }
+        };
     conn.commit().await.map_err(registry_db_error)?;
     let Some(operation) = operation else {
         return Ok(None);
@@ -1083,7 +1084,7 @@ impl RegistrationWriter<'_> {
             &mut conn,
             NewRegistrationOperation {
                 operation_id,
-                principal_id: self.caller.principal.id,
+                attribution: self.caller.attribution(),
                 idempotency_key,
                 request_hash: &plan.request_hash,
             },
@@ -1183,7 +1184,7 @@ async fn persist_node(
         NewCardRow {
             card: &card,
             card_uid,
-            principal_id: caller.principal.id,
+            attribution: caller.attribution(),
             operation_id,
             status: CardStatus::Pending,
             spec_hash: spec_hash.as_str(),
@@ -1194,7 +1195,7 @@ async fn persist_node(
     persist_outbound_relationships(conn, &row.card_uid, &outbound_refs).await?;
     insert_artifact_manifest_rows(conn, &row.card_uid, &submission.artifacts).await?;
     if matches!(card.kind, CardKind::Service | CardKind::Agent) {
-        upsert_service_account_from_card(conn, &row.card_uid, &card, &caller.principal).await?;
+        upsert_service_account_from_card(conn, &row.card_uid, &card, caller.attribution()).await?;
         BindingProjector::new(conn)
             .project(&row.card_uid, &card.kind, &card.spec)
             .await?;
@@ -1324,8 +1325,8 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
                     .collect::<Result<_, _>>()?;
                 bindings.push(NewBinding {
                     subject_occurrence_key: occurrence.to_owned(),
-                    subject_card_uid: subject.clone(),
-                    verifier_uid: pinned_uid(binding.verifier.as_card_ref())?,
+                    card_uid: subject.clone(),
+                    verifier_card_uid: pinned_uid(binding.verifier.as_card_ref())?,
                     trigger,
                     operators,
                     activation: match activation {

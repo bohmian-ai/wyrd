@@ -23,6 +23,8 @@ pub struct BifrostTableRow {
     pub updated_at: chrono::DateTime<chrono::Utc>,
     /// Audit origin (Stage 1: `system`; Stage 3: real identity).
     pub origin: Option<String>,
-    /// Audit actor (Stage 1: `system`; Stage 3: real identity).
-    pub actor: Option<String>,
+    /// Subject the table was registered for.
+    pub sub_principal_id: Uuid,
+    /// Actor that registered the table.
+    pub act_principal_id: Uuid,
 }

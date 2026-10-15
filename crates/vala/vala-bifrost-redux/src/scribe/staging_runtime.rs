@@ -2327,6 +2327,7 @@ mod pg_tests {
             &[0_u8; 32],
             &serde_json::to_value(crate::tables::hourly_test_layout(schema.as_ref()).to_wire())
                 .expect("fixture layout encodes"),
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await
         .expect("register the fixture control row");

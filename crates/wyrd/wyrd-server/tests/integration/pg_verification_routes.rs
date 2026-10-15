@@ -56,8 +56,8 @@ async fn seed_card(
         .expect("superuser pool opens");
     sqlx::query(
         "INSERT INTO wyrd.cards \
-            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status) \
-         VALUES ($1, $2, $3, 'default', $4, '1.0.0', $5, $4, 'active')",
+            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
+         VALUES ($1, $2, $3, 'default', $4, '1.0.0', $5, $4, 'active', '00000000-0000-7000-8000-000000000000', '00000000-0000-7000-8000-000000000000')",
     )
     .bind(uid.as_uuid())
     .bind(tenant.as_uuid())
@@ -90,8 +90,8 @@ async fn bind(
         &CardKind::Service,
         &[NewBinding {
             subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
-            subject_card_uid: owner.clone(),
-            verifier_uid: verifier.clone(),
+            card_uid: owner.clone(),
+            verifier_card_uid: verifier.clone(),
             trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
             operators: Vec::new(),
             activation: BindingActivation::Schedule {
@@ -277,7 +277,7 @@ async fn run_identity(
         .await
         .expect("tenant connection opens");
     let row = sqlx::query_as(
-        "SELECT origin, owner_card_uid, binding_id, requested_by_principal_id \
+        "SELECT origin, owner_card_uid, binding_id, sub_principal_id \
            FROM wyrd.verifier_runs WHERE run_id = $1::uuid",
     )
     .bind(run_id)
@@ -378,7 +378,7 @@ async fn manual_runs_enqueue_replay_and_read_back() {
     assert_eq!(conflict["code"], "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT");
 
     let direct_body = run_body(json!({
-        "kind": "verifier", "verifier_uid": fixture.custom, "subject_card_uid": fixture.service
+        "kind": "verifier", "verifier_card_uid": fixture.custom, "card_uid": fixture.service
     }));
     let (status, direct) = post_run(&server, &jwt, &direct_body, None).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{direct}");
@@ -411,7 +411,8 @@ async fn manual_runs_enqueue_replay_and_read_back() {
     let (status, run) = get(&server, &jwt, &format!("/v1/verification/runs/{bound_run}")).await;
     assert_eq!(status, StatusCode::OK, "{run}");
     assert_eq!(run["status"], "pending");
-    assert_eq!(run["requested_by_principal_id"], requester.to_string());
+    assert_eq!(run["sub_principal_id"], requester.to_string());
+    assert_eq!(run["act_principal_id"], requester.to_string());
     assert_eq!(run["result_id"], Value::Null);
     assert_eq!(run["dispatches"], json!([]));
     let (status, binding) = get(
@@ -422,8 +423,8 @@ async fn manual_runs_enqueue_replay_and_read_back() {
     .await;
     assert_eq!(status, StatusCode::OK, "{binding}");
     assert_eq!(binding["owner_card_uid"], fixture.service.to_string());
-    assert_eq!(binding["subject_card_uid"], fixture.service.to_string());
-    assert_eq!(binding["verifier_uid"], fixture.custom.to_string());
+    assert_eq!(binding["card_uid"], fixture.service.to_string());
+    assert_eq!(binding["verifier_card_uid"], fixture.custom.to_string());
     assert_eq!(binding["readiness"], "ready");
     assert_eq!(binding["active"], false);
     assert!(binding["last_run_id"].is_string());
@@ -492,20 +493,26 @@ async fn manual_run_refusals_fail_before_enqueue() {
             "WYRD_VERIFICATION_409_VERIFIER_NOT_READY",
         ),
         (
-            run_body(json!({ "kind": "verifier", "verifier_uid": fixture.eval,
-                             "subject_card_uid": fixture.service })),
+            run_body(
+                json!({ "kind": "verifier", "verifier_card_uid": fixture.eval,
+                             "card_uid": fixture.service }),
+            ),
             StatusCode::BAD_REQUEST,
             "WYRD_VERIFICATION_400_INVALID_TARGET",
         ),
         (
-            run_body(json!({ "kind": "verifier", "verifier_uid": fixture.service,
-                             "subject_card_uid": fixture.service })),
+            run_body(
+                json!({ "kind": "verifier", "verifier_card_uid": fixture.service,
+                             "card_uid": fixture.service }),
+            ),
             StatusCode::BAD_REQUEST,
             "WYRD_VERIFICATION_400_INVALID_TARGET",
         ),
         (
-            run_body(json!({ "kind": "verifier", "verifier_uid": fixture.custom,
-                             "subject_card_uid": Uuid::now_v7() })),
+            run_body(
+                json!({ "kind": "verifier", "verifier_card_uid": fixture.custom,
+                             "card_uid": Uuid::now_v7() }),
+            ),
             StatusCode::BAD_REQUEST,
             "WYRD_VERIFICATION_400_INVALID_TARGET",
         ),
@@ -899,7 +906,7 @@ fn task_assertion_spec() -> Value {
 
 /// A direct execution body judging `subject` with `verifier` over `input`.
 fn execute_body(verifier: &CardUid, subject: &CardUid, input: Value) -> Value {
-    json!({ "verifier_uid": verifier, "subject_card_uid": subject, "input": input })
+    json!({ "verifier_card_uid": verifier, "card_uid": subject, "input": input })
 }
 
 /// `drift_samples` input of one numeric column.
@@ -1137,7 +1144,7 @@ async fn direct_execution_refusals_are_stable() {
             "WYRD_VERIFICATION_400_INPUT_INVALID",
         ),
         (
-            json!({ "verifier_uid": direct.custom, "subject_card_uid": service,
+            json!({ "verifier_card_uid": direct.custom, "card_uid": service,
                     "input": samples("latency", &[1.0]), "x": 1 })
             .to_string(),
             StatusCode::BAD_REQUEST,

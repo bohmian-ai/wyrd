@@ -98,8 +98,8 @@ fn response(topic: GuideTopic) -> GuideResponse {
             vec![
                 "Read the owner Card's status.verification.binding_ids and call verification.get_binding for the exact owner, subject, Verifier, readiness, and last run.",
                 "Call verification.get_run for execution status, result_id, execution errors, and Operator dispatches. A failed judgment differs from an execution failure. Pending, errored, and timed-out runs do not establish a completed judgment.",
-                "Persisted judgment history lives in Bifrost SQL: query vala.verification.results by result_id, or by exact subject_card_uid or owner_card_uid within a suitable time window. Then inspect vala.drift.result_features or vala.eval.result_items by matching result_id.",
-                "Managed card_uid identifies the Verifier; subject_card_uid identifies the component judged. Verification details and Eval actual/expected/message follow table query permission. Gateway request/response payload columns additionally require gateway_payload:read. Empty evidence is not proof of a passing judgment.",
+                "Persisted judgment history lives in Bifrost SQL: query vala.verification.results by result_id, or by exact card_uid or owner_card_uid within a suitable time window. Then inspect vala.drift.result_features or vala.eval.result_items by matching result_id.",
+                "card_uid identifies the Card verified and verifier_card_uid the Verifier; sub_principal_id and act_principal_id record who the work was for and who performed it. Verification details and Eval actual/expected/message follow table query permission. Gateway request/response payload columns additionally require gateway_payload:read. Empty evidence is not proof of a passing judgment.",
                 "verification.execute requires verifier:run and returns a one-off judgment directly. It enqueues, persists, and dispatches nothing. verification.start_run durably enqueues a bounded Drift window; poll its run and read published evidence through SQL.",
             ],
             vec![
@@ -115,7 +115,7 @@ fn response(topic: GuideTopic) -> GuideResponse {
                 ),
                 sql_example(
                     "Find recent subject judgments",
-                    "SELECT result_id, implementation, verdict, subject_card_uid FROM vala.verification.results WHERE subject_card_uid = '<subject_card_uid>' AND ended_at >= TIMESTAMP '2026-01-01 00:00:00' AND ended_at < TIMESTAMP '2027-01-01 00:00:00' ORDER BY ended_at DESC LIMIT 20",
+                    "SELECT result_id, implementation, verdict, card_uid FROM vala.verification.results WHERE card_uid = '<card_uid>' AND ended_at >= TIMESTAMP '2026-01-01 00:00:00' AND ended_at < TIMESTAMP '2027-01-01 00:00:00' ORDER BY ended_at DESC LIMIT 20",
                 ),
             ],
         ),
@@ -144,7 +144,7 @@ fn response(topic: GuideTopic) -> GuideResponse {
                 ),
                 sql_example(
                     "Read a completed judgment",
-                    "SELECT result_id, implementation, execution_status, verdict, subject_card_uid FROM vala.verification.results WHERE result_id = '<result_id>' LIMIT 20",
+                    "SELECT result_id, implementation, execution_status, verdict, card_uid FROM vala.verification.results WHERE result_id = '<result_id>' LIMIT 20",
                 ),
                 sql_example(
                     "Read scored Drift features",

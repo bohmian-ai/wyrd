@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_drift::{DriftReport, DriftVerdict, FeatureDriftReport};
+use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_server::verification::drift::DRIFT_INVALID;
 use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
 use wyrd_server::verification::fault::{PublicationFault, SentBatch};
@@ -2426,7 +2427,9 @@ async fn observation_outbox_retains_through_an_outage_and_flushes_at_shutdown() 
         event_time: Utc::now(),
     };
     let postgres = harness.server.state().postgres.wyrd().clone();
-    let outbox = ObservationRunSink::outbox(postgres.clone());
+    let state = harness.server.state();
+    let authority = BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox));
+    let outbox = ObservationRunSink::outbox(postgres.clone(), authority.clone());
 
     refuse_run_writes(&harness.assertion, true).await;
     outbox.stage(tenant, record("r-1"));
@@ -2461,7 +2464,7 @@ async fn observation_outbox_retains_through_an_outage_and_flushes_at_shutdown() 
         ["r-1", "r-2", "r-3", "r-4"]
     );
 
-    let stranded = ObservationRunSink::outbox(postgres);
+    let stranded = ObservationRunSink::outbox(postgres, authority);
     refuse_run_writes(&harness.assertion, true).await;
     stranded.stage(tenant, record("r-5"));
     assert_eq!(
@@ -2838,8 +2841,8 @@ async fn eval_judge_gateway_call_descends_from_the_request_span() {
     let checkpoint = traces.checkpoint();
     for (verifier, kind, caller_span) in &cases {
         let body = serde_json::json!({
-            "verifier_uid": verifier,
-            "subject_card_uid": subject,
+            "verifier_card_uid": verifier,
+            "card_uid": subject,
             "input": { "kind": kind, "context": { "answer": "yes" } },
         });
         let response = server
@@ -2964,8 +2967,8 @@ async fn manual_run_links_to_its_enqueuing_request() {
     let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
     let checkpoint = traces.checkpoint();
     let body = serde_json::json!({
-        "target": { "kind": "verifier", "verifier_uid": verifier,
-                    "subject_card_uid": harness.subject },
+        "target": { "kind": "verifier", "verifier_card_uid": verifier,
+                    "card_uid": harness.subject },
         "input": { "kind": "drift_window", "start": "2026-09-17T00:00:00Z",
                    "end": "2026-09-17T01:00:00Z" },
     });
@@ -3105,8 +3108,8 @@ async fn traced_execute(
     traceparent: &str,
 ) -> axum::http::StatusCode {
     let body = serde_json::json!({
-        "verifier_uid": verifier,
-        "subject_card_uid": subject,
+        "verifier_card_uid": verifier,
+        "card_uid": subject,
         "input": { "kind": "task_context", "context": { "x": 1 } },
     });
     let request = axum::http::Request::builder()

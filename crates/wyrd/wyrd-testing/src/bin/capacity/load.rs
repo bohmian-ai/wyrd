@@ -352,8 +352,8 @@ impl Lane {
             Work::Direct(kind) => {
                 let (verifier, subject) = tenant.target(kind)?;
                 let build = |failing| ExecuteVerificationRequest {
-                    verifier_uid: verifier.clone(),
-                    subject_card_uid: subject.clone(),
+                    verifier_card_uid: verifier.clone(),
+                    card_uid: subject.clone(),
                     input: kind.input(0, failing),
                     run_id: None,
                 };
@@ -364,8 +364,8 @@ impl Lane {
                 let (start, end) = tenant.window.ok_or("a queued Drift lane needs a window")?;
                 Request::Start(Arc::new(StartVerificationRunRequest {
                     target: VerificationRunTarget::Verifier {
-                        verifier_uid: verifier.clone(),
-                        subject_card_uid: subject.clone(),
+                        verifier_card_uid: verifier.clone(),
+                        card_uid: subject.clone(),
                     },
                     input: VerificationRunInput::DriftWindow { start, end },
                 }))

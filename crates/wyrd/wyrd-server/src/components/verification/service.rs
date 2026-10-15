@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tracing::Instrument as _;
-use wyrd_runtime::{CardAttribution, Permission};
+use wyrd_runtime::{AcceptedAuthority, CardAttribution, Permission};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::card::verifier::VerifierImplementation;
 use wyrd_spec::envelope::Spec;
@@ -131,9 +131,9 @@ fn target_resource(target: &VerificationRunTarget) -> String {
             format!("verification.binding:{binding_id}")
         }
         VerificationRunTarget::Verifier {
-            verifier_uid,
-            subject_card_uid,
-        } => format!("verifier:{verifier_uid}/subject:{subject_card_uid}"),
+            verifier_card_uid,
+            card_uid,
+        } => format!("verifier:{verifier_card_uid}/subject:{card_uid}"),
     }
 }
 
@@ -369,7 +369,7 @@ impl<'a> VerificationControl<'a> {
             .queue
             .enqueue_manual(
                 &mut conn,
-                caller.principal.id,
+                AcceptedAuthority::new(&caller.principal, &caller.delegation_chain),
                 &request.target,
                 request.input.drift_window(),
                 cause,
@@ -434,9 +434,9 @@ impl<'a> VerificationControl<'a> {
         span.record("execution_id", tracing::field::display(execution_id));
         let resource = format!(
             "verifier:{}/subject:{}/execution:{execution_id}",
-            request.verifier_uid, request.subject_card_uid
+            request.verifier_card_uid, request.card_uid
         );
-        let required = Permission::verifier_run(request.verifier_uid.clone());
+        let required = Permission::verifier_run(request.verifier_card_uid.clone());
         if let Err(reason) = self
             .state
             .authz
@@ -475,12 +475,12 @@ impl<'a> VerificationControl<'a> {
                     DirectExecutor::new(self.state)
                         .attributed(Some(GatewayCallSubject {
                             run_id: request.run_id.clone(),
-                            card_uid: Some(request.subject_card_uid.clone()),
+                            card_uid: Some(request.card_uid.clone()),
                         }))
                         .execute(
                             &executor,
                             execution_id,
-                            &request.verifier_uid,
+                            &request.verifier_card_uid,
                             &target.implementation,
                             &request.input,
                             &telemetry,
@@ -617,8 +617,8 @@ impl<'a> VerificationControl<'a> {
             .state
             .registry_tenant_conn(caller.data_tenant_id)
             .await?;
-        let verifier = Self::card(&mut conn, &request.verifier_uid).await?;
-        let subject = Self::card(&mut conn, &request.subject_card_uid).await?;
+        let verifier = Self::card(&mut conn, &request.verifier_card_uid).await?;
+        let subject = Self::card(&mut conn, &request.card_uid).await?;
         let system_principal = system_principal_id(&mut conn)
             .await
             .map_err(registry_db_error)?
@@ -690,8 +690,8 @@ impl<'a> VerificationControl<'a> {
             message: "no active Verifier and subject Card with these UIDs in the caller's tenant"
                 .to_owned(),
             details: serde_json::json!({
-                "verifier_uid": request.verifier_uid,
-                "subject_card_uid": request.subject_card_uid,
+                "verifier_card_uid": request.verifier_card_uid,
+                "card_uid": request.card_uid,
             }),
         }
     }

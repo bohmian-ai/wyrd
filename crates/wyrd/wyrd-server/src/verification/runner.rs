@@ -290,11 +290,11 @@ impl VerifierRunner {
             return Ok(Err(unavailable(&"the Verifier Card is deleted")));
         }
         let tenant = conn.data_tenant_id();
-        if let Some(cached) = self.cache.get(tenant, &run.verifier_uid) {
+        if let Some(cached) = self.cache.get(tenant, &run.verifier_card_uid) {
             return Ok(Ok(cached));
         }
         tracing::debug!(run_id = %run.lease.run_id, "Verifier Card cache miss");
-        let Some(row) = fetch_card_row(conn, &run.verifier_uid).await? else {
+        let Some(row) = fetch_card_row(conn, &run.verifier_card_uid).await? else {
             return Ok(Err(unavailable(&"the Verifier Card is deleted")));
         };
         let card = match ParsedCardRow::try_from(row) {
@@ -306,7 +306,7 @@ impl VerifierRunner {
         };
         Ok(Ok(self.cache.insert(
             tenant,
-            run.verifier_uid.clone(),
+            run.verifier_card_uid.clone(),
             CachedVerifier::new(spec.implementation),
         )))
     }
@@ -747,7 +747,7 @@ fn result(
     };
     let payload = match ResultPayloadBuilder::new(
         ResultRun::claimed(run, report.run_id()),
-        &run.verifier_uid,
+        &run.verifier_card_uid,
         result_id,
         started_at,
         ended_at,
@@ -773,7 +773,7 @@ fn result(
         },
         Some(ScribeWrite::Result {
             payload,
-            attribution: Attribution::new(run.requested_by.unwrap_or(principal), principal),
+            attribution: Attribution::new(run.attribution.sub_principal_id, principal),
         }),
     )
 }

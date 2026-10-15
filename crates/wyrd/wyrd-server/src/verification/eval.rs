@@ -57,7 +57,7 @@ use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput, TerminalStatus};
 use wyrd_storage::tenant_path;
 use wyrd_storage::{StorageError, StorageHandle};
 
-use super::authority::{SystemReadAuthority, SystemReadAuthorityError, writer_caller};
+use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use super::engines::{EngineOutcome, VerifierReport};
 use super::telemetry::{ExecutionTelemetry, Phase, WaitSink};
 use crate::components::auth::Caller;
@@ -157,13 +157,13 @@ impl EvalEngine {
                 .await
                 .map_err(ReadStart::Authority)?;
                 let record = reader
-                    .record(&run.subject_card_uid.to_string(), record_id, *event_time)
+                    .record(&run.card_uid.to_string(), record_id, *event_time)
                     .await
                     .map_err(ReadStart::Record)?;
                 Ok::<_, ReadStart>((reader, record))
             })
             .await;
-        let (reader, (record, observed_run, writer)) = match read {
+        let (reader, (record, observed_run)) = match read {
             Ok(read) => read,
             Err(ReadStart::Authority(error)) => {
                 return EngineOutcome::Retry(failed(
@@ -198,28 +198,10 @@ impl EvalEngine {
                 ));
             }
         }
-        let writer = match writer.filter(|_| needs_judge(spec)) {
-            None => None,
-            Some(writer) => match writer_caller(&self.state, tenant, &writer).await {
-                Ok(caller) => Some(caller),
-                Err(error) if error.status() >= 500 => {
-                    return EngineOutcome::Retry(failed(
-                        run_id,
-                        EXECUTION_FAILED,
-                        "the observation writer's authority cannot be recovered",
-                        &error,
-                    ));
-                }
-                Err(error) => {
-                    return terminal(failed(
-                        run_id,
-                        EXECUTION_FAILED,
-                        "the observation writer has no authority to judge",
-                        &error,
-                    ));
-                }
-            },
-        };
+        let judge_caller = run
+            .system_principal
+            .filter(|_| needs_judge(spec))
+            .map(|system| Caller::accepted(&run.authority, system));
         let traces = InMemoryTraceSource::new();
         if let Some(trace_id) = record.trace_id.filter(|_| needs_trace(spec)) {
             match telemetry
@@ -251,10 +233,10 @@ impl EvalEngine {
             .score(
                 self.judge_invoker(
                     tenant,
-                    writer.as_ref(),
+                    judge_caller.as_ref(),
                     Some(GatewayCallSubject {
                         run_id: observed_run.clone(),
-                        card_uid: Some(run.subject_card_uid.clone()),
+                        card_uid: Some(run.card_uid.clone()),
                     }),
                     telemetry,
                 ),
@@ -277,7 +259,7 @@ impl EvalEngine {
     ///
     /// A trace that is still missing when a task needs it waits; every other
     /// execution error retries and never becomes a failed assertion. `judge`
-    /// calls run as the observation's writer.
+    /// calls run under the run's accepted authority, executed by SYSTEM.
     async fn score(
         &self,
         judge: Arc<dyn JudgeInvoker>,
@@ -628,8 +610,7 @@ impl BifrostReader {
     /// Read one committed observation of `subject` by its record ID, pruned
     /// to the UTC day of its `created_at`, the table's time column, which the
     /// run froze as `event_time`, with the managed application `run_id` that
-    /// wrote it (`None` when the row names none) and its managed writer
-    /// `principal_id`.
+    /// wrote it (`None` when the row names none).
     ///
     /// # Errors
     /// Returns [`ReadError::Admission`] when Bifrost refuses the read at
@@ -640,10 +621,10 @@ impl BifrostReader {
         subject: &str,
         record_id: &str,
         event_time: DateTime<Utc>,
-    ) -> Result<(EvalRecordObservation, Option<RunId>, Option<String>), ReadError> {
+    ) -> Result<(EvalRecordObservation, Option<RunId>), ReadError> {
         let (start, end) = utc_day(event_time);
         let batches = self.query(format!(
-            "SELECT record_id, session_id, context, trace_id, span_id, created_at, media, run_id, principal_id \
+            "SELECT record_id, session_id, context, trace_id, span_id, created_at, media, run_id \
                  FROM vala.eval.observations \
                  WHERE card_uid = '{}' AND record_id = '{}' \
                    AND created_at >= TIMESTAMP '{start}' \
@@ -698,7 +679,7 @@ impl BifrostReader {
             "media": variant("media")?,
         }))
         .map_err(|error| format!("record {record_id} does not decode: {error}"))?;
-        Ok((record, run_id, text(batch, "principal_id", 0)?))
+        Ok((record, run_id))
     }
 
     /// Read the visible spans of `trace_id` that started from the start of

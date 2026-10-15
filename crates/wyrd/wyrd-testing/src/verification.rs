@@ -9,9 +9,10 @@
 use serde_json::Value;
 use sqlx::Error as SqlxError;
 use uuid::Uuid;
-use wyrd_runtime::PermissionSet;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
+use wyrd_runtime::{AcceptedAuthority, PermissionSet};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid, VerificationRunId};
@@ -25,7 +26,9 @@ use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::verification::{
     BindingActivation, FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
 };
-use wyrd_sql::queries::verifier_runs::{EnqueueOutcome, RunRequest, VerifierRunQueue};
+use wyrd_sql::queries::verifier_runs::{
+    EnqueueOutcome, RunAuthority, RunRequest, VerifierRunQueue,
+};
 use wyrd_sql::row_types::cards::CardStatus;
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
@@ -67,7 +70,7 @@ pub struct ObservationRun {
     /// Name of the Verifier Card the run executes.
     pub verifier: String,
     /// Exact Verifier Card version the run executes.
-    pub verifier_uid: Uuid,
+    pub verifier_card_uid: Uuid,
     /// The frozen `record_id` of the observation that created the run.
     pub record_id: String,
     /// The frozen `created_at`, the table's time column, of that observation.
@@ -86,7 +89,7 @@ struct ObservationRunRow {
     /// The Verifier Card name.
     verifier: String,
     /// The exact Verifier Card version.
-    verifier_uid: Uuid,
+    verifier_card_uid: Uuid,
     /// The frozen observation record ID.
     record_id: String,
     /// The frozen observation event time.
@@ -176,9 +179,14 @@ impl VerificationFixture {
         let card = card("Service", name, &serde_json::json!({}))?;
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let uid = self.insert(&mut conn, &card).await?;
-        let principal = upsert_service_account_from_card(&mut conn, &uid, &card, &self.actor)
-            .await
-            .map_err(|error| VerificationFixtureError::Card(error.to_string()))?;
+        let principal = upsert_service_account_from_card(
+            &mut conn,
+            &uid,
+            &card,
+            Attribution::direct(self.actor.id),
+        )
+        .await
+        .map_err(|error| VerificationFixtureError::Card(error.to_string()))?;
         conn.commit().await?;
         Ok((uid, principal))
     }
@@ -402,8 +410,8 @@ impl VerificationFixture {
             &CardKind::Service,
             &[NewBinding {
                 subject_occurrence_key: occurrence.to_owned(),
-                subject_card_uid: subject.clone(),
-                verifier_uid: verifier.clone(),
+                card_uid: subject.clone(),
+                verifier_card_uid: verifier.clone(),
                 trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
                 operators,
                 activation,
@@ -563,10 +571,10 @@ impl VerificationFixture {
             .enqueue(
                 &mut conn,
                 &RunRequest::Manual {
-                    requested_by: self.actor.id,
+                    authority: RunAuthority::manual(AcceptedAuthority::new(&self.actor, &[])),
                     target: VerificationRunTarget::Verifier {
-                        verifier_uid: verifier.clone(),
-                        subject_card_uid: subject.clone(),
+                        verifier_card_uid: verifier.clone(),
+                        card_uid: subject.clone(),
                     },
                     window,
                     cause: None,
@@ -628,12 +636,12 @@ impl VerificationFixture {
     pub async fn observation_runs(&self) -> Result<Vec<ObservationRun>, VerificationFixtureError> {
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let rows: Vec<ObservationRunRow> = sqlx::query_as(
-            "SELECT r.run_id, c.name AS verifier, r.verifier_uid, r.input_record_id AS record_id, \
+            "SELECT r.run_id, c.name AS verifier, r.verifier_card_uid, r.input_record_id AS record_id, \
                     r.input_event_time AS event_time, r.status, r.attempts, r.result_id, \
                     r.error->>'code' AS error_code, \
                     (SELECT count(*) FROM wyrd.operator_dispatches d \
                       WHERE d.run_id = r.run_id) AS dispatches \
-               FROM wyrd.verifier_runs r JOIN wyrd.cards c ON c.card_uid = r.verifier_uid \
+               FROM wyrd.verifier_runs r JOIN wyrd.cards c ON c.card_uid = r.verifier_card_uid \
               WHERE r.origin = 'observation' ORDER BY r.created_at, r.run_id",
         )
         .fetch_all(&mut **conn.transaction())
@@ -644,7 +652,7 @@ impl VerificationFixture {
                     run: VerificationRunId::new(row.run_id)
                         .map_err(|error| VerificationFixtureError::Card(error.to_string()))?,
                     verifier: row.verifier,
-                    verifier_uid: row.verifier_uid,
+                    verifier_card_uid: row.verifier_card_uid,
                     record_id: row.record_id,
                     event_time: row.event_time,
                     state: RunRow {
@@ -674,7 +682,7 @@ impl VerificationFixture {
             conn,
             NewRegistrationOperation {
                 operation_id,
-                principal_id: self.actor.id,
+                attribution: Attribution::direct(self.actor.id),
                 idempotency_key: &key,
                 request_hash: "request-hash",
             },
@@ -688,7 +696,7 @@ impl VerificationFixture {
             NewCardRow {
                 card,
                 card_uid,
-                principal_id: self.actor.id,
+                attribution: Attribution::direct(self.actor.id),
                 operation_id,
                 status: CardStatus::Pending,
                 spec_hash: "spec-hash",

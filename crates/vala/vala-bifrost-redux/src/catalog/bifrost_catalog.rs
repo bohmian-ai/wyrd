@@ -19,6 +19,7 @@ use vala_sql::queries::file_list::HotFileCut;
 use vala_sql::queries::oracle_reader_authority::{CutTableRef, OracleTableCuts, TableCut};
 use vala_sql::row_types::file_list::HotFileRow;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::vala::api::{
     BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, PhysicalLayoutWire,
     RegisterOutcome, RegisterTableResponse,
@@ -112,6 +113,9 @@ pub struct CreateTableRequest {
     pub user_fields: Vec<Field>,
     /// Authenticated organization that owns the registration and physical table.
     pub tenant: DataTenantId,
+    /// Verified subject and actor registering the table, stored once on its
+    /// control row.
+    pub attribution: Attribution,
     /// Optional caller-declared physical layout.
     ///
     /// `None` means "no declaration": the catalog resolves the canonical
@@ -849,6 +853,7 @@ impl BifrostCatalog {
     pub async fn register_dataset(
         &self,
         tenant: DataTenantId,
+        attribution: Attribution,
         table: TableRef,
         user_fields: Vec<Field>,
         physical_layout: Option<PhysicalLayoutWire>,
@@ -865,6 +870,7 @@ impl BifrostCatalog {
                     table,
                     user_fields,
                     tenant,
+                    attribution,
                     physical_layout,
                 },
                 None,
@@ -886,6 +892,8 @@ impl BifrostCatalog {
     /// active tenant at startup. Ingest and describe never create one and
     /// treat a missing built-in as an unregistered table.
     /// Repeating it for an existing built-in returns the same [`TableUid`].
+    /// A built-in is a platform-internal registration with no caller, so its
+    /// control row carries the [`Attribution::unresolved`] platform pair.
     ///
     /// A built-in this node has already resolved answers from the immutable
     /// registration cache; only the first ensure per tenant and table takes the
@@ -920,6 +928,7 @@ impl BifrostCatalog {
                 table: table.clone(),
                 user_fields: (definition.arrow_fields)(),
                 tenant,
+                attribution: Attribution::unresolved(),
                 physical_layout: Some((definition.physical_layout)()),
             },
             Some((definition.schema)()),
@@ -1049,6 +1058,7 @@ impl BifrostCatalog {
             &fqn,
             &fingerprint.0,
             &layout_json,
+            request.attribution,
         )
         .await?;
         conn.commit().await?;
@@ -2364,6 +2374,7 @@ mod production_pin_tests {
             let registered = catalog
                 .register_dataset(
                     tenant,
+                    wyrd_spec::auth::Attribution::unresolved(),
                     table.clone(),
                     vec![arrow::datatypes::Field::new(
                         "value",
@@ -2594,6 +2605,7 @@ mod production_pin_tests {
             catalog
                 .register_dataset(
                     tenant,
+                    wyrd_spec::auth::Attribution::unresolved(),
                     table.clone(),
                     vec![arrow::datatypes::Field::new(
                         "value",
@@ -2709,6 +2721,7 @@ mod production_pin_tests {
             catalog
                 .register_dataset(
                     tenant,
+                    wyrd_spec::auth::Attribution::unresolved(),
                     table.clone(),
                     vec![arrow::datatypes::Field::new(
                         "value",

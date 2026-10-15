@@ -1,6 +1,8 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use wyrd_runtime::{DelegationStep, Principal, PrincipalId, delegated_attribution};
+use wyrd_runtime::{
+    AcceptedAuthority, DelegationStep, Principal, PrincipalId, delegated_attribution,
+};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::request_id::RequestId;
@@ -59,6 +61,23 @@ impl Caller {
             request_id,
             delegation_chain,
             executed_by: None,
+        }
+    }
+
+    /// The caller deferred work runs as: the `authority` its run accepted,
+    /// executed by Wyrd as `system`, the tenant SYSTEM principal.
+    ///
+    /// The effective principal and delegation chain are exactly the stored
+    /// ones, so a queued Verifier's judge calls are checked against what was
+    /// accepted and record its subject with SYSTEM as actor.
+    #[must_use]
+    pub fn accepted(authority: &AcceptedAuthority, system: PrincipalId) -> Self {
+        Self {
+            data_tenant_id: authority.principal.tenant_id,
+            principal: authority.principal.clone(),
+            request_id: RequestId::now_v7(),
+            delegation_chain: authority.delegation_chain.clone(),
+            executed_by: Some(system),
         }
     }
 

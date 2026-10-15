@@ -317,13 +317,13 @@ impl DirectExecutor {
                 EngineOutcome::Terminal(_, error) if error.code == BASELINE_NOT_READY => {
                     WyrdError::VerificationBaselineNotReady {
                         message: error.message,
-                        details: json!({ "verifier_uid": verifier_uid }),
+                        details: json!({ "verifier_card_uid": verifier_uid }),
                     }
                 }
                 EngineOutcome::Terminal(_, error) if error.code == BASELINE_LEGACY => {
                     WyrdError::VerificationBaselineLegacy {
                         message: error.message,
-                        details: json!({ "verifier_uid": verifier_uid }),
+                        details: json!({ "verifier_card_uid": verifier_uid }),
                     }
                 }
                 EngineOutcome::Retry(_) => {

@@ -473,7 +473,7 @@ mod pg_tests {
                 )?)
                 .await?,
         )?;
-        assert_eq!(text(&binding, "/subject_card_uid")?, service_uid);
+        assert_eq!(text(&binding, "/card_uid")?, service_uid);
         assert_eq!(text(&binding, "/readiness")?, "ready");
 
         // Act: a keyed start, then a replay that returns the same run.
@@ -653,7 +653,7 @@ mod pg_tests {
     /// kinds; it then starts a keyed direct Verifier/subject run; a keyed retry returns
     /// the same `run_id`. Polling `verification.get_run` reaches `completed`
     /// with a Bifrost `result_id`, the Service's own principal as
-    /// `requested_by_principal_id`, and no Operator dispatch. `bifrost.query`
+    /// `sub_principal_id` and `act_principal_id`, and no Operator dispatch. `bifrost.query`
     /// returns exactly one failed summary row and one Custom feature row for
     /// that `result_id`, both with null `owner_card_uid` and `binding_id` and
     /// the exact subject UID. A reader is refused the start; another tenant's
@@ -718,8 +718,8 @@ mod pg_tests {
         let start = serde_json::json!({
             "target": {
                 "kind": "verifier",
-                "verifier_uid": fixture.verifier_uid,
-                "subject_card_uid": fixture.service_uid,
+                "verifier_card_uid": fixture.verifier_uid,
+                "card_uid": fixture.service_uid,
             },
             "input": {
                 "kind": "drift_window",
@@ -747,11 +747,13 @@ mod pg_tests {
 
         let run = settle(&agent_client, &run_id).await?;
         assert_eq!(run["status"], "completed", "{run}");
-        assert_eq!(
-            text(&run, "/requested_by_principal_id")?,
-            agent.id().to_string(),
-            "the run records the authenticated requester: {run}"
-        );
+        for pair in ["/sub_principal_id", "/act_principal_id"] {
+            assert_eq!(
+                text(&run, pair)?,
+                agent.id().to_string(),
+                "a direct run records the authenticated requester as {pair}: {run}"
+            );
+        }
         assert_eq!(
             run["dispatches"],
             serde_json::json!([]),
@@ -765,7 +767,7 @@ mod pg_tests {
         let summary = rows(
             &agent_client,
             format!(
-                "SELECT execution_status, verdict, subject_card_uid, owner_card_uid, binding_id \
+                "SELECT execution_status, verdict, card_uid, owner_card_uid, binding_id \
                  FROM vala.verification.results WHERE result_id = '{result_id}'"
             ),
         )
@@ -784,7 +786,7 @@ mod pg_tests {
         let features = rows(
             &agent_client,
             format!(
-                "SELECT method, feature, verdict, subject_card_uid, owner_card_uid, binding_id \
+                "SELECT method, feature, verdict, card_uid, owner_card_uid, binding_id \
                  FROM vala.drift.result_features WHERE result_id = '{result_id}'"
             ),
         )
@@ -889,8 +891,8 @@ mod pg_tests {
                 .await?;
         let request = |score: f64| {
             serde_json::json!({
-                "verifier_uid": fixture.verifier_uid,
-                "subject_card_uid": fixture.service_uid,
+                "verifier_card_uid": fixture.verifier_uid,
+                "card_uid": fixture.service_uid,
                 "input": { "kind": "drift_samples", "columns": { "score": [score] } },
             })
         };
@@ -1022,8 +1024,8 @@ mod pg_tests {
             .credential_registered_service(&fixture.service_ref, &["editor", "mcp_judge_invoker"])
             .await?;
         let request = serde_json::json!({
-            "verifier_uid": judged.root.uid.ok_or("a registered Card has a UID")?.to_string(),
-            "subject_card_uid": fixture.service_uid,
+            "verifier_card_uid": judged.root.uid.ok_or("a registered Card has a UID")?.to_string(),
+            "card_uid": fixture.service_uid,
             "input": { "kind": "eval_record", "context": { "answer": "yes" } },
         });
         Ok((server, judge, api_key(&agent)?, request))

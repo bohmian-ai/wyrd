@@ -70,8 +70,8 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::Permission;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
     use wyrd_spec::auth::IssuerTokenPolicy;
+    use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
     use wyrd_spec::auth::{
         ClientAuthorization, ConnectionTester, IssuerUrl, LoginInitiation, OAuthClientId,
         OAuthErrorCode, PrincipalId, PrincipalKindTag, ProviderResponse, SecretBearer, Sha256Hex,

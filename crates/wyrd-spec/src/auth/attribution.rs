@@ -35,10 +35,11 @@ impl Attribution {
         Self::new(principal, principal)
     }
 
-    /// The explicit unavailable-identity pair of an audit record with no
-    /// verified identity: [`PLATFORM_AUDIT_PRINCIPAL`] as both subject and
-    /// actor. It is a marker, never SYSTEM and never a principal whose
-    /// permissions authorize work.
+    /// The explicit unavailable-identity pair of a record with no verified
+    /// caller — an audit record of an unauthenticated request, or a
+    /// platform-internal operation such as built-in table provisioning:
+    /// [`PLATFORM_AUDIT_PRINCIPAL`] as both subject and actor. It is a marker,
+    /// never SYSTEM and never a principal whose permissions authorize work.
     #[must_use]
     pub const fn unresolved() -> Self {
         Self::direct(PLATFORM_AUDIT_PRINCIPAL)

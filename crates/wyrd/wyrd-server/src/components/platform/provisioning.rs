@@ -23,8 +23,8 @@ use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
-    CreateTenantRequest, CreateTenantResponse, ProvisionedTenant, ProvisionedTenantAdmin,
-    SecretBearer, TenantListResponse,
+    Attribution, CreateTenantRequest, CreateTenantResponse, ProvisionedTenant,
+    ProvisionedTenantAdmin, SecretBearer, TenantListResponse,
 };
 use wyrd_sql::queries::auth::{
     grant_role_to_service_account, insert_api_key, insert_service_account, list_api_key_metadata,
@@ -223,8 +223,12 @@ impl TenantProvisioning {
     ) -> Result<CreateTenantResponse, ProvisionError> {
         let established = match conn.map_err(|e| ProvisionError::Store(e.to_string())) {
             Ok(conn) => {
-                self.establish_and_promote(conn, data_tenant_id, caller.principal_id().as_uuid())
-                    .await
+                self.establish_and_promote(
+                    conn,
+                    data_tenant_id,
+                    Attribution::direct(caller.principal_id()),
+                )
+                .await
             }
             Err(error) => Err(error),
         };
@@ -275,10 +279,10 @@ impl TenantProvisioning {
         &self,
         conn: TenantConn<'_>,
         data_tenant_id: DataTenantId,
-        created_by: Uuid,
+        attribution: Attribution,
     ) -> Result<ProvisionedTenantAdmin, ProvisionError> {
         let admin = self
-            .establish_tenant_administration(conn, data_tenant_id, created_by)
+            .establish_tenant_administration(conn, data_tenant_id, attribution)
             .await?;
         self.builtins
             .ensure_tenant(data_tenant_id)
@@ -444,7 +448,7 @@ impl TenantProvisioning {
         &self,
         mut conn: TenantConn<'_>,
         data_tenant_id: DataTenantId,
-        created_by: Uuid,
+        attribution: Attribution,
     ) -> Result<ProvisionedTenantAdmin, ProvisionError> {
         seed_builtin_roles_for_tenant(&mut conn, data_tenant_id)
             .await
@@ -484,7 +488,7 @@ impl TenantProvisioning {
                 None,
                 "tenant-admin",
                 Some("Tenant administrative principal"),
-                created_by,
+                attribution,
             )
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
@@ -507,7 +511,7 @@ impl TenantProvisioning {
             principal_id,
             &plaintext.prefix,
             &key_hash,
-            created_by,
+            attribution,
             Some(INITIAL_CREDENTIAL_LIFETIME),
         )
         .await

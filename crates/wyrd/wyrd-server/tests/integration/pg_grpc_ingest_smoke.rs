@@ -186,6 +186,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
         .expect("composed server exposes its Bifrost catalog")
         .register_dataset(
             tenant,
+            wyrd_spec::auth::Attribution::unresolved(),
             table.clone(),
             vec![Field::new("value", DataType::Int64, false)],
             None,
@@ -594,6 +595,7 @@ async fn ingest_logical_batch(
         .expect("composed server exposes its Bifrost catalog")
         .register_dataset(
             tenant,
+            wyrd_spec::auth::Attribution::unresolved(),
             TableRef::new(BifrostNamespace::Datasets, table_name),
             vec![Field::new("value", DataType::Int64, false)],
             None,

@@ -101,7 +101,7 @@ async fn register_service(
         conn,
         NewRegistrationOperation {
             operation_id,
-            principal_id: actor.id,
+            attribution: wyrd_spec::auth::Attribution::direct(actor.id),
             idempotency_key: &key,
             request_hash: "request-hash",
         },
@@ -113,7 +113,7 @@ async fn register_service(
         NewCardRow {
             card,
             card_uid: uid(),
-            principal_id: actor.id,
+            attribution: wyrd_spec::auth::Attribution::direct(actor.id),
             operation_id,
             status: CardStatus::Pending,
             spec_hash: "spec-hash",
@@ -122,9 +122,14 @@ async fn register_service(
     )
     .await
     .expect("card inserts");
-    let principal = upsert_service_account_from_card(conn, &row.card_uid, card, actor)
-        .await
-        .expect("principal projects");
+    let principal = upsert_service_account_from_card(
+        conn,
+        &row.card_uid,
+        card,
+        wyrd_spec::auth::Attribution::direct(actor.id),
+    )
+    .await
+    .expect("principal projects");
     sqlx::query("UPDATE wyrd.cards SET status = 'active' WHERE card_uid = $1")
         .bind(row.card_uid.as_uuid())
         .execute(&mut **conn.transaction())
@@ -188,9 +193,14 @@ async fn first_projection_grants_default_role_once_and_revocation_stands() {
         [DEFAULT_CARD_ROLE]
     );
 
-    let reapplied = upsert_service_account_from_card(&mut conn, &card_uid, &card, &actor)
-        .await
-        .expect("principal re-projects");
+    let reapplied = upsert_service_account_from_card(
+        &mut conn,
+        &card_uid,
+        &card,
+        wyrd_spec::auth::Attribution::direct(actor.id),
+    )
+    .await
+    .expect("principal re-projects");
     assert_eq!(reapplied, principal);
     assert_eq!(
         list_service_account_roles(&mut conn, principal.as_uuid())
@@ -204,9 +214,14 @@ async fn first_projection_grants_default_role_once_and_revocation_stands() {
             .await
             .expect("role revokes")
     );
-    upsert_service_account_from_card(&mut conn, &card_uid, &card, &actor)
-        .await
-        .expect("principal re-projects");
+    upsert_service_account_from_card(
+        &mut conn,
+        &card_uid,
+        &card,
+        wyrd_spec::auth::Attribution::direct(actor.id),
+    )
+    .await
+    .expect("principal re-projects");
     assert!(
         list_service_account_roles(&mut conn, principal.as_uuid())
             .await
@@ -511,8 +526,8 @@ async fn excluded_principals_record_nothing() {
     let cardless = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO wyrd.auth_service_accounts \
-             (id, data_tenant_id, principal_kind, name, status, created_by) \
-         VALUES ($1, wyrd.current_tenant(), 'service', 'automation', 'active', $2)",
+             (id, data_tenant_id, principal_kind, name, status, sub_principal_id, act_principal_id) \
+         VALUES ($1, wyrd.current_tenant(), 'service', 'automation', 'active', $2, $2)",
     )
     .bind(cardless)
     .bind(actor.id.as_uuid())
@@ -718,9 +733,9 @@ async fn non_v7_stored_identities_are_refused() {
     let v4_owner = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO wyrd.cards \
-            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status) \
+            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
          VALUES ($1, wyrd.current_tenant(), 'Service', 'default', 'v4-owner', '1.0.0', \
-                 '{}'::jsonb, 'spec-hash', 'active')",
+                 '{}'::jsonb, 'spec-hash', 'active', '00000000-0000-7000-8000-000000000000', '00000000-0000-7000-8000-000000000000')",
     )
     .bind(v4_owner)
     .execute(&mut **conn.transaction())

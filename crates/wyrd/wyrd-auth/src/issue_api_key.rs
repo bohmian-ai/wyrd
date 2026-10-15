@@ -69,6 +69,9 @@ pub enum IssueKeyError {
 impl IssueApiKey {
     /// Issue an API key for a registered Service or Agent card.
     ///
+    /// The key row records `attribution`, the verified subject and actor of
+    /// the issuing request.
+    ///
     /// # Errors
     /// Returns a typed error when the card cannot be bound, hashing fails, or
     /// the database rejects the insert.
@@ -79,14 +82,14 @@ impl IssueApiKey {
     #[tracing::instrument(
         level = "debug",
         skip(self, conn, request),
-        fields(card_ref = %request.card_ref, actor = %actor.id),
+        fields(card_ref = %request.card_ref, sub = %attribution.sub_principal_id),
         err,
     )]
     pub async fn execute(
         &self,
         conn: &mut TenantConn<'_>,
         request: IssueKeyRequest,
-        actor: &Principal,
+        attribution: Attribution,
     ) -> Result<IssuedApiKey, IssueKeyError> {
         let principal_kind = principal_kind_for_card(&request.card_ref)?;
         let Some(row) =
@@ -116,7 +119,7 @@ impl IssueApiKey {
             row.id,
             &prefix,
             &key_hash,
-            actor.id.as_uuid(),
+            attribution,
             Some(ttl),
         )
         .await?;

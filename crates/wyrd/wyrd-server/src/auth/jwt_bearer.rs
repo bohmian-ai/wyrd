@@ -125,7 +125,7 @@ mod pg_tests {
     use wyrd_runtime::{PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{IssuerTokenPolicy, PLATFORM_AUDIT_PRINCIPAL};
+    use wyrd_spec::auth::{Attribution, IssuerTokenPolicy, PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
     use wyrd_spec::auth::{IssuerUrl, TokenType};
     use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::error::WyrdError;
@@ -315,8 +315,14 @@ mod pg_tests {
 
         let rows = audit_rows(&state, &scribe, tenant).await;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].subject_principal_id, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
-        assert_eq!(rows[0].actor_principal_id, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
+        assert_eq!(
+            rows[0].subject_principal_id,
+            PLATFORM_AUDIT_PRINCIPAL.as_uuid()
+        );
+        assert_eq!(
+            rows[0].actor_principal_id,
+            PLATFORM_AUDIT_PRINCIPAL.as_uuid()
+        );
         assert_eq!(rows[0].error_tag, "INVALID_TOKEN");
     }
 
@@ -686,7 +692,7 @@ mod pg_tests {
             Some(&card_ref),
             name,
             None,
-            creator_id,
+            Attribution::direct(PrincipalId::new(creator_id)),
         )
         .await?;
         for role_name in role_names {
@@ -702,7 +708,7 @@ mod pg_tests {
     async fn insert_test_card(
         conn: &mut TenantConn<'_>,
         target_ref: &CardRef,
-        created_by: Uuid,
+        creator: Uuid,
     ) -> Result<(), sqlx::Error> {
         let spec = match &target_ref.kind {
             CardKind::Service => {
@@ -720,7 +726,7 @@ mod pg_tests {
                     }),
                 )
                 .expect("prompt fixture spec decodes");
-                seed_card_with_spec(conn, &prompt_ref, &prompt_spec, created_by).await;
+                seed_card_with_spec(conn, &prompt_ref, &prompt_spec, creator).await;
                 Spec::from_kind_and_value(
                     &CardKind::Agent,
                     serde_json::json!({
@@ -740,7 +746,7 @@ mod pg_tests {
             .expect("prompt fixture spec decodes"),
             other => panic!("unexpected test card kind: {other:?}"),
         };
-        seed_card_with_spec(conn, target_ref, &spec, created_by).await;
+        seed_card_with_spec(conn, target_ref, &spec, creator).await;
         Ok(())
     }
 
@@ -783,7 +789,7 @@ mod pg_tests {
         conn.commit().await.expect("principal lookup commits");
         let key = WyrdApiKey::generate(tenant);
         let key_hash = wyrd_auth_issue::hash_secret(key.secret.expose_secret());
-        let created_by = insert_creator_user(fixture, tenant)
+        let creator = insert_creator_user(fixture, tenant)
             .await
             .expect("creator user inserts");
         let mut conn = fixture
@@ -797,7 +803,7 @@ mod pg_tests {
             principal_id,
             &prefix,
             &key_hash,
-            created_by,
+            Attribution::direct(PrincipalId::new(creator)),
             Some(std::time::Duration::from_hours(720)),
         )
         .await

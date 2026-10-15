@@ -249,6 +249,7 @@ async fn signed_forwarding_preserves_shorter_absolute_deadline() -> Result<(), S
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;
@@ -338,6 +339,7 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;
@@ -602,6 +604,7 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;
@@ -792,6 +795,7 @@ async fn oracle_only_pod_retains_audit_staged_before_its_drain() -> Result<(), S
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;
@@ -1794,6 +1798,7 @@ async fn query_edge_timeout_yields_to_oracle_deadline() -> Result<(), ServerJour
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;
@@ -1906,6 +1911,7 @@ async fn silent_remote_oracle_delivery_yields_typed_query_timeout() -> Result<()
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;
@@ -2147,6 +2153,7 @@ async fn configured_default_deadline_is_shared_by_local_and_forwarded_queries()
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;

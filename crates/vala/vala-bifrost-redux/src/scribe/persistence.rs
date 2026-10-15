@@ -3174,6 +3174,7 @@ mod tests {
                 &fqn,
                 &[0_u8; 32],
                 &serde_json::to_value(layout.to_wire()).expect("canonical layout encodes"),
+                wyrd_spec::auth::Attribution::unresolved(),
             )
             .await
             .expect("register the fixture control row");

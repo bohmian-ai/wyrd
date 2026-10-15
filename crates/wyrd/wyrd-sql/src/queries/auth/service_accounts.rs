@@ -6,6 +6,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use sqlx::Error as SqlxError;
 use sqlx::types::{Json, Uuid};
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::reference::CardRef;
 
 use crate::TenantConn;
@@ -92,7 +93,8 @@ pub enum ApiKeyStatus {
 /// Insert a Service or Agent principal row.
 ///
 /// The database check constraint enforces the allowed `principal_kind` and
-/// `card_kind` combinations.
+/// `card_kind` combinations. `attribution` is the verified subject and actor
+/// creating the principal.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert.
@@ -107,7 +109,7 @@ pub async fn insert_service_account(
     card_ref: Option<&CardRef>,
     name: &str,
     description: Option<&str>,
-    created_by: Uuid,
+    attribution: Attribution,
 ) -> Result<(), sqlx::Error> {
     // Card binding is a property of a deployable machine principal, so every
     // Card-derived column travels with the Card or is absent with it. A tenant
@@ -131,8 +133,9 @@ pub async fn insert_service_account(
         r"
         INSERT INTO wyrd.auth_service_accounts (
             id, data_tenant_id, principal_kind, card_kind, card_uid,
-            card_ref, space, name, version, description, status, created_by
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active', $11)
+            card_ref, space, name, version, description, status,
+            sub_principal_id, act_principal_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active', $11, $12)
         ",
     )
     .bind(id)
@@ -145,7 +148,8 @@ pub async fn insert_service_account(
     .bind(name)
     .bind(version)
     .bind(description)
-    .bind(created_by)
+    .bind(attribution.sub_principal_id.as_uuid())
+    .bind(attribution.act_principal_id.as_uuid())
     .execute(&mut **conn.transaction())
     .await?;
     Ok(())
@@ -302,6 +306,7 @@ pub async fn tenant_admin_principal_id(
 ///
 /// Stores only the SHA-256 verifier and non-secret lookup metadata; the
 /// plaintext is returned once by the issuing caller and never persisted.
+/// `attribution` is the verified subject and actor issuing the credential.
 /// `lifetime` is optional: an administrative credential issued during tenant
 /// provisioning or recovery has no natural lifetime, while a workload key
 /// supplies the bounded lifetime its issuance path requested. `PostgreSQL` turns
@@ -318,16 +323,17 @@ pub async fn insert_api_key(
     principal_id: Uuid,
     prefix: &str,
     key_hash: &str,
-    created_by: Uuid,
+    attribution: Attribution,
     lifetime: Option<Duration>,
 ) -> Result<(DateTime<Utc>, Option<DateTime<Utc>>), sqlx::Error> {
     sqlx::query_as(
         r"
         INSERT INTO wyrd.auth_api_keys (
-            id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at
-        ) VALUES ($1, $2, $3, $4, $5, $6,
-                  CASE WHEN $7::double precision IS NULL THEN NULL
-                       ELSE statement_timestamp() + ($7 * interval '1 second')
+            id, data_tenant_id, principal_id, prefix, key_hash,
+            sub_principal_id, act_principal_id, expires_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7,
+                  CASE WHEN $8::double precision IS NULL THEN NULL
+                       ELSE statement_timestamp() + ($8 * interval '1 second')
                   END)
         RETURNING created_at, expires_at
         ",
@@ -337,7 +343,8 @@ pub async fn insert_api_key(
     .bind(principal_id)
     .bind(prefix)
     .bind(key_hash)
-    .bind(created_by)
+    .bind(attribution.sub_principal_id.as_uuid())
+    .bind(attribution.act_principal_id.as_uuid())
     .bind(lifetime.map(|lifetime| lifetime.as_secs_f64()))
     .fetch_one(&mut **conn.transaction())
     .await

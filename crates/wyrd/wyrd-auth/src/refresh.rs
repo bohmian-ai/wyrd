@@ -428,10 +428,10 @@ mod pg_tests {
 
     async fn insert_test_service_account(
         conn: &mut TenantConn<'_>,
-        created_by: Uuid,
+        creator: Uuid,
         card_ref: &CardRef,
     ) -> Uuid {
-        seed_backing_card(conn, card_ref, created_by).await;
+        seed_backing_card(conn, card_ref, creator).await;
         let sa_id = Uuid::new_v4();
         insert_service_account(
             conn,
@@ -440,7 +440,7 @@ mod pg_tests {
             Some(card_ref),
             "test-sa",
             None,
-            created_by,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(creator)),
         )
         .await
         .expect("service account inserts");

@@ -82,6 +82,10 @@ pub struct BifrostBuildInputs {
     pub cluster: Arc<ClusterRegistry>,
     /// Exact public and private request token verifier.
     pub token_verifier: Arc<TokenVerifier>,
+    /// Tenant token signing key; observation-triggered runs recover their
+    /// binding owner's authority through an issuer over it. `None` accepts no
+    /// observation run.
+    pub issuing_key: Option<Arc<wyrd_auth_issue::IssuingKey>>,
     /// Cluster mTLS identity loaded from `WYRD_PEER_TLS_DIR`.
     ///
     /// `Some` exactly in explicit peer mode. A process-local node has no

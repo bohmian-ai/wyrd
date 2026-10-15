@@ -533,7 +533,7 @@ async fn assert_unresulted(
         format!(
             "SELECT result_id FROM vala.verification.results \
              WHERE {CARD_UID} = '{}' AND source_record_id = '{}'",
-            run.verifier_uid, run.record_id
+            run.verifier_card_uid, run.record_id
         ),
     )
     .await?;

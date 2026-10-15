@@ -855,8 +855,8 @@ async fn revocation_requires_admin_permission() {
 ///   1. Admin SA (`admin`) bootstrapped via harness SQL.
 ///   2. Target SA bootstrapped via harness SQL (the key is issued for this card).
 ///   3. Admin key → `POST /auth/token` → access token.
-///   4. `POST /auth/issue-key` authenticated as the admin SA; `created_by` is the
-///      SA's `service_account.id` — the direct assertion that the relaxed FK
+///   4. `POST /auth/issue-key` authenticated as the admin SA; the key's `sub_principal_id`
+///      and `act_principal_id` are the SA's `service_account.id` — the direct assertion that the relaxed FK
 ///      (commit 01) accepts a non-user issuer (pre-migration this would 500).
 ///   5. Issued key → `POST /auth/token` → access token.
 ///   6. `assert_v1_delegated_write_ok` → `POST /v1/cards 201`.
@@ -898,8 +898,8 @@ async fn service_account_issuer_full_chain() {
         .clone();
 
     // POST /auth/issue-key as the admin SA.
-    // The issuer principal is a service account (not a user), so `created_by`
-    // must resolve to `service_account.id` — the FK-relaxation path from commit 01.
+    // The issuer principal is a service account (not a user), so the key's
+    // sub/act pair must resolve to `service_account.id` — the FK-relaxation path from commit 01.
     let issue_req = IssueKeyRequest {
         card_ref: target_card_ref,
         label: Some("sa-chain".to_owned()),

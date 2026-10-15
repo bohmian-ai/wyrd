@@ -12,6 +12,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use serde_json::{Value, json};
 use uuid::Uuid;
+use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_sql::queries::auth::{
     delete_service_account, insert_service_account, replace_idp_user_roles,
 };
@@ -369,7 +370,7 @@ async fn unassignable_principals_are_not_enumerable() {
         None,
         "pr-tenant-admin",
         None,
-        admin,
+        Attribution::direct(PrincipalId::new(admin)),
     )
     .await
     .expect("tenant administrator inserts");

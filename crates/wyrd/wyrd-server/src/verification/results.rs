@@ -164,7 +164,7 @@ impl<'a> ResultRun<'a> {
         Self {
             run_id,
             verifier_version: &run.verifier_version,
-            card_uid: &run.subject_card_uid,
+            card_uid: &run.card_uid,
             owner_card_uid: run.owner_card_uid.as_ref(),
             binding_id: run.binding_id,
             trigger: run.trigger.as_ref(),

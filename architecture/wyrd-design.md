@@ -733,8 +733,14 @@ workload assertions; human SSO never replaces or disables them.
 
 #### Cross-service delegation
 
-The API key is exchanged at `/auth/token` — never on the wire. The JWT — not the API
-key — is what travels on cross-service calls in the dedicated
+The API key is exchanged at `/auth/token` — never on the wire, with one
+exception: public gateway ingress (the OpenAI-compatible, Anthropic Messages,
+and Gemini `GenerateContent` inference routes) accepts a `wyrd_sk_` key in its
+existing credential headers for stock clients that hold only a static key. The
+server exchanges it through the same API-key grant, reuses the minted token per
+key hash for at most 60 seconds, and authorizes the call as that token's
+principal. `/mcp`, `/v1` management, and Bifrost do not gain it. The JWT
+— not the API key — is what travels on cross-service calls in the dedicated
 `X-Wyrd-Access-Token: Bearer <jwt>` header. The JWT must be a **delegated**
 Wyrd token: its top-level `principal` identifies the subject being acted
 for, and its `act` chain identifies the actor(s) acting for it, the

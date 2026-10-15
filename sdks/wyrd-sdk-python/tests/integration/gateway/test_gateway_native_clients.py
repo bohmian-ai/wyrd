@@ -1,7 +1,8 @@
 """Unmodified Anthropic and Google GenAI clients call the Wyrd gateway natively.
 
-Each client holds a Wyrd access token in its own API-key slot, the way a
-LiteLLM-style proxy is used. The server's built-in adapters reach the shared
+Each client holds a Wyrd access token, or a static Wyrd API key the gateway
+exchanges for one, in its own API-key slot, the way a LiteLLM-style proxy is
+used. The server's built-in adapters reach the shared
 recording upstream, which proves the operator provider key, never the caller
 token, travels upstream, and each call is recorded in ``vala.gateway.calls``.
 """
@@ -94,6 +95,26 @@ def test_anthropic_client_calls_and_streams_through_the_gateway(
     assert_upstream_credentials(upstream, "x-api-key", PROVIDER_KEY, token)
 
 
+def test_anthropic_client_authenticates_with_a_wyrd_api_key(
+    anthropic_gateway: tuple[WyrdTestServer, Receiver],
+) -> None:
+    server, upstream = anthropic_gateway
+    api_key = server.bootstrap_service(["workload"], name="anthropic-key-caller")
+    client = anthropic.Anthropic(base_url=server.base_url, api_key=api_key, max_retries=0)
+
+    message = client.messages.create(model="claude-sonnet-5", max_tokens=16, messages=MESSAGES)
+    with client.messages.stream(
+        model="claude-sonnet-5", max_tokens=16, messages=MESSAGES
+    ) as stream:
+        streamed = "".join(stream.text_stream)
+
+    (block,) = message.content
+    assert isinstance(block, TextBlock)
+    assert (block.text, streamed) == ("hi", "hi")
+    assert len(upstream.deliveries) == 2
+    assert_upstream_credentials(upstream, "x-api-key", PROVIDER_KEY, api_key)
+
+
 def test_anthropic_refusals_never_reach_the_provider(
     anthropic_gateway: tuple[WyrdTestServer, Receiver],
 ) -> None:
@@ -161,6 +182,25 @@ def test_gemini_client_calls_and_streams_through_the_gateway(
         "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
     ]
     assert_upstream_credentials(upstream, "x-goog-api-key", PROVIDER_KEY, token)
+
+
+def test_gemini_client_authenticates_with_a_wyrd_api_key(
+    gemini_gateway: tuple[WyrdTestServer, Receiver],
+) -> None:
+    server, upstream = gemini_gateway
+    api_key = server.bootstrap_service(["workload"], name="gemini-key-caller")
+    client = genai.Client(
+        api_key=api_key,
+        http_options=genai_types.HttpOptions(base_url=server.base_url, retry_options=None),
+    )
+
+    answer = client.models.generate_content(model="gemini-2.5-flash", contents="hi")
+    chunks = list(client.models.generate_content_stream(model="gemini-2.5-flash", contents="hi"))
+
+    assert answer.text == "hi"
+    assert "".join(chunk.text or "" for chunk in chunks) == "hi"
+    assert len(upstream.deliveries) == 2
+    assert_upstream_credentials(upstream, "x-goog-api-key", PROVIDER_KEY, api_key)
 
 
 def test_gemini_refusals_never_reach_the_provider(

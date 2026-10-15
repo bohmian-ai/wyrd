@@ -1,8 +1,9 @@
 //! Public gateway inference ingress.
 //!
 //! Every inference route authenticates through [`GatewayIngress`], which
-//! reads the Wyrd access token from the headers its protocol's SDKs send and
-//! renders refusals in that protocol's error envelope. The `OpenAI`-compatible
+//! reads the Wyrd access token, or a Wyrd API key it exchanges for one, from
+//! the headers its protocol's SDKs send and renders refusals in that
+//! protocol's error envelope. The `OpenAI`-compatible
 //! handlers live in [`super::routes`]; the Anthropic Messages and Gemini
 //! `GenerateContent` handlers here take each provider's native body and
 //! answer with its native response or stream, and the Jev `systemone` handler
@@ -17,6 +18,7 @@ use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderName, Method};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -34,6 +36,7 @@ use wyrd_spec::gateway::{
 };
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::ids::{ModelId, ProviderId};
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
 
 use super::invocation::{
@@ -110,24 +113,40 @@ impl GatewayIngress {
 
     /// Authenticates one request of this protocol before its handler runs.
     ///
-    /// The single accepted credential header is verified as a Wyrd access
-    /// token and the principal inserted for the handler's [`Caller`]; a
-    /// missing, ambiguous, URL-borne, or invalid credential is refused in the
-    /// protocol's envelope without reading the body.
+    /// The single accepted credential header is classified by
+    /// [`GatewayCredential::classify`]: a Wyrd API key is exchanged through
+    /// [`super::GatewayApiKeys`], anything else is verified as a Wyrd access token,
+    /// and the principal is inserted for the handler's [`Caller`]. A missing,
+    /// ambiguous, URL-borne, or invalid credential, or a key the exchange
+    /// refuses, is refused in the protocol's envelope without reading the
+    /// body; a refused key never falls back to token verification.
     async fn authenticate(self, state: AppState, mut request: Request, next: Next) -> Response {
         let native = self.native_header();
-        let verified = match extract_gateway_access_token(
+        let credential = extract_gateway_access_token(
             request.headers(),
             native.as_ref(),
             request.uri().query(),
             self.query_names(&request),
-        ) {
-            Ok(token) => verify_access_token(
+        )
+        .map(GatewayCredential::classify);
+        let verified = match credential {
+            Ok(GatewayCredential::AccessToken(token)) => verify_access_token(
                 state.auth.token_verifier.as_deref(),
                 token,
                 wyrd_auth_verify::TokenAudience::Wyrd,
             )
             .map_err(|WyrdErrorResponse(error)| error),
+            Ok(GatewayCredential::ApiKey(api_key)) => {
+                let request_id = request
+                    .extensions()
+                    .get::<RequestId>()
+                    .cloned()
+                    .unwrap_or_else(RequestId::now_v7);
+                state
+                    .gateway_api_keys
+                    .authenticate(&state, &api_key, request_id.as_str())
+                    .await
+            }
             Err(error) => Err(error),
         };
         match verified {
@@ -147,6 +166,33 @@ impl GatewayIngress {
                 self.authenticate(state, request, next)
             },
         ))
+    }
+}
+
+/// Prefix every Wyrd API key starts with.
+const API_KEY_PREFIX: &str = "wyrd_sk_";
+
+/// The one credential a public gateway ingress request presented.
+#[derive(Debug)]
+enum GatewayCredential {
+    /// A Wyrd API key, exchanged for an access token of its own principal.
+    ApiKey(SecretString),
+    /// A Wyrd access token, verified as presented.
+    AccessToken(SecretString),
+}
+
+impl GatewayCredential {
+    /// Classifies an extracted credential by its value alone.
+    ///
+    /// Every value starting with `wyrd_sk_`, well-formed or not, is an API
+    /// key, so a malformed key earns the API-key error; every other value is
+    /// an access token, as before API keys were accepted.
+    fn classify(credential: SecretString) -> Self {
+        if credential.expose_secret().starts_with(API_KEY_PREFIX) {
+            Self::ApiKey(credential)
+        } else {
+            Self::AccessToken(credential)
+        }
     }
 }
 
@@ -307,7 +353,7 @@ pub(super) fn requested_subject(
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
         ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
     ),
-    request_body(content = GatewayAnthropicMessagesRequest, description = "Anthropic Messages request whose `model` is an exact Anthropic model id; the Wyrd access token travels in `x-api-key` or an `Authorization` bearer"),
+    request_body(content = GatewayAnthropicMessagesRequest, description = "Anthropic Messages request whose `model` is an exact Anthropic model id; the Wyrd access token, or a `wyrd_sk_` Wyrd API key the gateway exchanges for one, travels in `x-api-key` or an `Authorization` bearer"),
     responses(
         (status = 200, description = "Anthropic message as JSON, or Anthropic server-sent events when `stream` is true", content(
             (GatewayAnthropicMessage = "application/json"),
@@ -488,7 +534,7 @@ fn jev_call(
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
         ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
     ),
-    request_body(content = GatewayGeminiGenerateContentRequest, description = "Gemini GenerateContent request; the Wyrd access token travels in `x-goog-api-key` or an `Authorization` bearer"),
+    request_body(content = GatewayGeminiGenerateContentRequest, description = "Gemini GenerateContent request; the Wyrd access token, or a `wyrd_sk_` Wyrd API key the gateway exchanges for one, travels in `x-goog-api-key` or an `Authorization` bearer"),
     responses(
         (status = 200, description = "Gemini GenerateContent response as JSON, or its server-sent events for streamGenerateContent", content(
             (GatewayGeminiGenerateContentResponse = "application/json"),
@@ -652,6 +698,39 @@ mod tests {
             headers.append(*name, value.parse().expect("header value"));
         }
         headers
+    }
+
+    /// Every `wyrd_sk_` value, malformed or not, selects the API-key
+    /// exchange, and every other value, including one merely containing the
+    /// prefix, stays an access token.
+    ///
+    /// # Panics
+    /// Panics when a credential is classified differently than documented.
+    #[test]
+    fn gateway_credentials_select_key_exchange_or_token_verification() {
+        for value in [
+            "wyrd_sk_01890f287c4a7cc398e74f4a3c2d1b00_1a2b3c4d_secret",
+            "wyrd_sk_",
+            "wyrd_sk_not-a-key",
+        ] {
+            let credential = GatewayCredential::classify(SecretString::from(value));
+            assert!(
+                matches!(&credential, GatewayCredential::ApiKey(key) if key.expose_secret() == value),
+                "{value}"
+            );
+        }
+        for value in [
+            "eyJhbGciOiJFZERTQSJ9.e30.sig",
+            "jwt",
+            "Wyrd_sk_x",
+            "x_wyrd_sk_y",
+        ] {
+            let credential = GatewayCredential::classify(SecretString::from(value));
+            assert!(
+                matches!(&credential, GatewayCredential::AccessToken(token) if token.expose_secret() == value),
+                "{value}"
+            );
+        }
     }
 
     /// Absent headers leave a call uncorrelated, each header decodes alone or

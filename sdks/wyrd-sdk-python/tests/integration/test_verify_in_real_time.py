@@ -75,9 +75,8 @@ def test_judged_answer_passes_the_llm_judge(assistant: WyrdState, receiver: Rece
 
 
 def test_judge_call_is_attributed_to_the_run_and_card(
-    assistant: WyrdState, wyrd_server: WyrdTestServer, bifrost: Bifrost
+    assistant: WyrdState, wyrd_server: WyrdTestServer, bifrost: Bifrost, metadata_capture: None
 ) -> None:
-    Gateway(client_of(wyrd_server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
     run = assistant.run("agent")
     judgment = run.observe.verify("answer-graded", {"answer": "yes"})
     wyrd_server.flush_bifrost()
@@ -96,9 +95,8 @@ def test_judge_call_is_attributed_to_the_run_and_card(
 
 
 def test_traced_verify_joins_the_callers_trace(
-    assistant: WyrdState, wyrd_server: WyrdTestServer
+    assistant: WyrdState, wyrd_server: WyrdTestServer, metadata_capture: None
 ) -> None:
-    Gateway(client_of(wyrd_server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
     tracer = TracerProvider().get_tracer("journey")
     with tracer.start_as_current_span("caller") as caller:
         assistant.run("agent").observe.verify("answer-graded", {"answer": "yes"})
@@ -116,7 +114,7 @@ def test_sdk_requests_carry_the_active_trace(wyrd_server: WyrdTestServer) -> Non
     gateway = Gateway(client_of(wyrd_server))
     tracer = TracerProvider().get_tracer("journey")
     with tracer.start_as_current_span("caller") as caller:
-        gateway.put_capture_policy({"mode": "metadata", "payload_fields": []})
+        gateway.capture_policy()
 
     context = caller.get_span_context()
     spans = timeline(wyrd_server, format(context.trace_id, "032x"))

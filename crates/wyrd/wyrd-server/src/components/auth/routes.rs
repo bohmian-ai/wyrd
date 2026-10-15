@@ -190,7 +190,8 @@ async fn token(
 /// configuration and the request's id.
 ///
 /// OTLP ingest authenticates a stock exporter's API key through the same
-/// API-key verification, so it is crate-visible.
+/// API-key verification, and gateway ingress exchanges a presented API key
+/// through the same API-key grant, so it is crate-visible.
 pub(crate) struct TokenGrants<'a> {
     /// Server state holding the auth owners and the runtime store.
     pub(crate) state: &'a AppState,
@@ -233,7 +234,7 @@ impl<'a> TokenGrants<'a> {
     /// Returns [`WyrdError::ApiKeyInvalid`] for every unusable key, its
     /// refusal staged on the audit outbox when it names a tenant, and a store
     /// or issuance error.
-    async fn api_key(&self, api_key: &SecretBearer) -> Result<TokenResponse, WyrdError> {
+    pub(crate) async fn api_key(&self, api_key: &SecretBearer) -> Result<TokenResponse, WyrdError> {
         let presented = SecretString::from(api_key.expose().to_owned());
         let (parsed, mut conn, exchange) = self.api_key_exchange(api_key.expose()).await?;
         let exchanged = match exchange

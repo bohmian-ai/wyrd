@@ -167,15 +167,16 @@ const GATEWAY_CREDENTIAL_HEADERS: [HeaderName; 4] = [
     GOOGLE_API_KEY_HEADER,
 ];
 
-/// Extracts the one Wyrd access token of a public gateway ingress request.
+/// Extracts the one Wyrd credential of a public gateway ingress request.
 ///
-/// A token travels in `X-Wyrd-Access-Token` or `Authorization`, each as a
+/// A credential travels in `X-Wyrd-Access-Token` or `Authorization`, each as a
 /// `Bearer` credential, or as the bare value of the route's `native` SDK
 /// header, if any. Exactly one credential header value must be present: presenting
 /// several, repeating one, or using a provider header the route does not
 /// accept fails closed. Every query parameter must be named in `query_names`,
-/// so a token placed in the URL is refused rather than ignored. The value is
-/// always a Wyrd access token, never a provider key.
+/// so a credential placed in the URL is refused rather than ignored. The value
+/// is a Wyrd access token or a Wyrd API key, never a provider key; ingress
+/// tells them apart after extraction.
 ///
 /// # Errors
 /// Returns `BadTokenFormat` for a query parameter outside `query_names`,

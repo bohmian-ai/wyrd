@@ -20,7 +20,8 @@ use crate::batch_builder::{PreparedRows, RowPreflight};
 use crate::config::QueueConfig;
 use crate::error::WyrdQueueError;
 use crate::queue::{
-    Entry, FlushOutcome, InFlight, OwnedBatch, RecordQueue, Row, Settled, context_bytes,
+    Entry, FlushOutcome, InFlight, OwnedBatch, ProducerTrace, RecordQueue, Row, Settled,
+    context_bytes,
 };
 use crate::sink::BatchSink;
 
@@ -532,8 +533,9 @@ impl Producer {
     /// `trace` is the PRODUCER span the record was enqueued under. Every row
     /// keeps it, and the frame its rows seal into carries it, bounded and
     /// deduplicated, so the server's ingest span can link back to it. Its
-    /// string bytes are part of the record's reservation, so admission
-    /// refuses a record whose context would pass the budget.
+    /// string bytes are charged at admission, so admission refuses a record
+    /// whose context would pass the budget, and that one charge moves with
+    /// the shared context to the sealed batch.
     ///
     /// # Errors
     ///
@@ -550,9 +552,11 @@ impl Producer {
         let (batch, charge) = prepared.into_parts();
         let count = batch.num_rows();
         let reserved = charge + trace.as_ref().map_or(0, context_bytes);
-        let trace = trace.map(Arc::new);
         let admitted = self.admission_check(reserved).and_then(|()| {
-            let guard = Arc::new(self.budget.reserve(reserved)?);
+            let guard = Arc::new(self.budget.reserve(charge)?);
+            let trace = trace
+                .map(|trace| ProducerTrace::charged(&self.budget, trace).map(Arc::new))
+                .transpose()?;
             let bytes = charge / count.max(1);
             Ok(Entry::Rows(
                 (0..count)
@@ -2031,8 +2035,10 @@ mod tests {
     }
 
     /// Admitted rows cannot take the sealing headroom: with the admission
-    /// ceiling exhausted, a flush still reserves its frame and publishes the
-    /// staged rows.
+    /// ceiling exhausted by a record and its sampled producer context, a
+    /// flush still reserves its frame and publishes the staged row with that
+    /// context, whose admitted charge moves to the sealed batch rather than
+    /// being reserved a second time.
     #[test]
     fn admitted_rows_cannot_take_the_sealing_headroom() {
         let config = QueueConfig {
@@ -2050,12 +2056,19 @@ mod tests {
         )
         .expect("producer starts");
         let row = rows(1);
+        let context = TraceContext {
+            trace_id: "0af7651916cd43dd8448eb211c80319c".to_owned(),
+            span_id: "b7ad6b7169203331".to_owned(),
+            trace_flags: 1,
+            trace_state: "wyrd=producer".to_owned(),
+        };
+        let reserved = charge(&row) + crate::queue::context_bytes(&context);
         let blocker = budget
-            .reserve(budget.admission_limit() - budget.used_bytes() - charge(&row))
-            .expect("test exhausts admission but for one row");
+            .reserve(budget.admission_limit() - budget.used_bytes() - reserved)
+            .expect("test exhausts admission but for one traced row");
         producer
-            .enqueue_rows(row, Some(card()), None, None)
-            .expect("the last admissible row is admitted");
+            .enqueue_rows(row, Some(card()), None, Some(context.clone()))
+            .expect("the last admissible traced row is admitted");
         assert!(matches!(
             budget.reserve(1),
             Err(WyrdQueueError::Backpressure)
@@ -2064,6 +2077,7 @@ mod tests {
             .flush()
             .expect("the frame comes from the sealing headroom");
         assert_eq!(received_rows(&sink), 1);
+        assert_eq!(sink.received()[0].producer_traces, vec![context]);
         drop(blocker);
         producer.shutdown().expect("nothing remains");
     }

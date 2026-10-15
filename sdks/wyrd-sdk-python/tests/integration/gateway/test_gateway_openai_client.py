@@ -1,6 +1,7 @@
 """The unmodified OpenAI client calls every backend through the gateway's compatible surface.
 
-The client holds a normal Wyrd access token, the server's in-process gateway
+The client holds a normal Wyrd access token, or a static Wyrd API key the
+gateway exchanges for one, the server's in-process gateway
 reaches the shared recording upstream, and each call is recorded in
 ``vala.gateway.calls``.
 """
@@ -130,6 +131,33 @@ def test_openai_client_reaches_the_backend_through_the_server(
     assert sorted(row["streaming"] for row in rows) == [False, True]
     assert {row["outcome"] for row in rows} == {"succeeded"}
     assert usage(rows) == expected_usage
+
+
+def test_openai_client_authenticates_with_a_wyrd_api_key(
+    backends: tuple[WyrdTestServer, Receiver],
+) -> None:
+    server, upstream = backends
+    api_key = server.bootstrap_service(["workload"], name="openai-key-caller")
+    client = openai.OpenAI(base_url=f"{server.base_url}/v1", api_key=api_key, max_retries=0)
+
+    completion = client.chat.completions.create(
+        model="openai/gpt-4o", messages=MESSAGES, max_completion_tokens=16
+    )
+    chunks = list(
+        client.chat.completions.create(
+            model="openai/gpt-4o",
+            messages=MESSAGES,
+            max_completion_tokens=16,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+    )
+
+    assert completion.choices[0].message.content == "hi"
+    assert "".join(c.choices[0].delta.content or "" for c in chunks if c.choices) == "hi"
+    assert chunks[-1].usage is not None
+    assert len(upstream.deliveries) == 2
+    assert_upstream_credentials(upstream, "authorization", f"Bearer {PROVIDER_KEY}", api_key)
 
 
 def test_openai_client_receives_stable_refusals_without_dispatch_or_leakage(

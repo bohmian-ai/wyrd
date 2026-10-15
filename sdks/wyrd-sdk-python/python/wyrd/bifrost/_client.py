@@ -1320,90 +1320,103 @@ class CancelRunningQueryResult(TypedDict):
 
 
 class _ResourceOptional(TypedDict, total=False):
-    attributes: dict[str, Any]
-    service_instance_id: str | None
-    service_namespace: str | None
-    service_version: str | None
+    service_namespace: str
+    service_version: str
+    service_instance_id: str
 
 
 class Resource(_ResourceOptional):
     """OTel resource of the process that produced a span."""
 
     service_name: str
+    attributes: dict[str, Any]
 
 
 class _InstrumentationScopeOptional(TypedDict, total=False):
-    attributes: dict[str, Any]
-    version: str | None
+    version: str
 
 
 class InstrumentationScope(_InstrumentationScopeOptional):
     """OTel instrumentation scope that produced a span."""
 
     name: str
-
-
-class _SpanStatusOptional(TypedDict, total=False):
-    description: str | None
-
-
-class SpanStatus(_SpanStatusOptional):
-    """OTel span status; ``description`` appears only on ``error``."""
-
-    code: Literal["unset", "ok", "error"]
-
-
-class _SpanEventOptional(TypedDict, total=False):
     attributes: dict[str, Any]
-    dropped_attributes_count: int
 
 
-class SpanEvent(_SpanEventOptional):
+class _SpanStatusUnset(TypedDict):
+    """No status set; the OTel default."""
+
+    code: Literal["unset"]
+
+
+class _SpanStatusOk(TypedDict):
+    """The operation completed successfully."""
+
+    code: Literal["ok"]
+
+
+class _SpanStatusErrorOptional(TypedDict, total=False):
+    description: str
+
+
+class _SpanStatusError(_SpanStatusErrorOptional):
+    """The operation failed, with an optional human-readable description."""
+
+    code: Literal["error"]
+
+
+SpanStatus = _SpanStatusUnset | _SpanStatusOk | _SpanStatusError
+"""OTel span status, tagged by ``code``; only ``error`` carries ``description``."""
+
+
+class SpanEvent(TypedDict):
     """One timestamped event inside a span."""
 
-    name: str
     timestamp: str
-
-
-class _SpanLinkOptional(TypedDict, total=False):
+    name: str
     attributes: dict[str, Any]
     dropped_attributes_count: int
-    flags: int
-    trace_state: str
 
 
-class SpanLink(_SpanLinkOptional):
+class SpanLink(TypedDict):
     """A link from one span to another span's identity."""
 
     trace_id: str
     span_id: str
+    trace_state: str
+    flags: int
+    attributes: dict[str, Any]
+    dropped_attributes_count: int
 
 
 class _SpanRecordOptional(TypedDict, total=False):
-    attributes: dict[str, Any]
-    dropped_attributes_count: int
-    dropped_events_count: int
-    dropped_links_count: int
-    events: list[SpanEvent]
-    flags: int
-    links: list[SpanLink]
-    parent_span_id: str | None
-    trace_state: str
+    parent_span_id: str
 
 
 class SpanRecord(_SpanRecordOptional):
-    """One canonical OTel span as ``trace_timeline`` returns it."""
+    """One canonical OTel span as ``trace_timeline`` returns it.
+
+    ``parent_span_id`` is absent on a root span.
+    """
 
     trace_id: str
     span_id: str
+    flags: int
+    trace_state: str
     name: str
     kind: Literal["internal", "server", "client", "producer", "consumer"]
     start_time: str
     end_time: str
     duration_ms: int
-    resource: Resource
-    scope: InstrumentationScope
     status: SpanStatus
+    attributes: dict[str, Any]
+    dropped_attributes_count: int
+    events: list[SpanEvent]
+    dropped_events_count: int
+    links: list[SpanLink]
+    dropped_links_count: int
+    scope: InstrumentationScope
+    resource: Resource
 
 
 def _validated_rows(result: QueryResult, model: type[_Row]) -> list[_Row]:

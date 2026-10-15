@@ -16,10 +16,9 @@ from opentelemetry.propagate import inject
 from pydantic import BaseModel
 from wyrd.bifrost import Bifrost, SpanRecord, TableConfig
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway
 from wyrd.testing import WyrdTestServer
 
-from .support import ancestry, client_of, hydrated, timeline
+from .support import ancestry, hydrated, timeline
 
 pytestmark = pytest.mark.integration
 
@@ -55,8 +54,8 @@ def test_service_action_timeline_is_one_connected_tree(
     assistant_bundle: Path,
     assistant_key: str,
     fresh_tracer_provider: None,
+    metadata_capture: None,
 ) -> None:
-    Gateway(client_of(wyrd_server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
     Bifrost(TableConfig(Action, ACTIONS)).register()
     service = WyrdClient(credential=assistant_key)
     state = hydrated(assistant_bundle, service)

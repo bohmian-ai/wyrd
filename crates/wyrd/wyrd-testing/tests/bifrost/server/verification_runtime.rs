@@ -3396,6 +3396,7 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
                 },
             )
         }),
+        prompt_provider: None,
     };
     let reloaded = wyrd_server::components::auth::Caller::accepted(&claimed.authority, system);
     if let Ok(response) = wyrd_server::components::gateway::GatewayInvocation::new(server.state())

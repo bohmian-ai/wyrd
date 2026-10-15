@@ -509,7 +509,7 @@ pub fn google_error_body(status: u16, message: &str, code: &str) -> Value {
 }
 
 /// Name of `adapter` as it appears on the wire.
-fn adapter_name(adapter: &ProviderAdapter) -> &'static str {
+pub(crate) fn adapter_name(adapter: &ProviderAdapter) -> &'static str {
     adapter.builtin_provider().unwrap_or("openai_compatible")
 }
 

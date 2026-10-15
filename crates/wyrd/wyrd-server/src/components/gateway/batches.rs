@@ -210,6 +210,7 @@ fn request(
         stream: false,
         usage_bound: None,
         timeout: BATCH_CALL_TIMEOUT,
+        prompt_provider: None,
         subject: None,
     }
 }

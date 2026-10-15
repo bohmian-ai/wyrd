@@ -111,6 +111,7 @@ fn chat_answer() -> Value {
 /// Panics when `model` is not a valid identity.
 fn gateway_call(request: ProviderRequest, model: &str, timeout: Duration) -> WyrdGatewayCall {
     WyrdGatewayCall {
+        provider: request.provider(),
         request,
         model: ModelRef::from_projection(model).expect("model ref"),
         timeout,
@@ -494,6 +495,14 @@ async fn public_gateway_call_context_and_errors() {
         .iter()
         .map(|request| {
             assert!(request.headers.contains_key("x-wyrd-access-token"));
+            assert_eq!(
+                request
+                    .headers
+                    .get("wyrd-prompt-provider")
+                    .map(reqwest::header::HeaderValue::as_bytes),
+                Some(&b"openai"[..]),
+                "each call binds its initial target to its Prompt provider"
+            );
             let body: Value = serde_json::from_slice(&request.body).expect("JSON body");
             body["model"].as_str().expect("model").to_owned()
         })

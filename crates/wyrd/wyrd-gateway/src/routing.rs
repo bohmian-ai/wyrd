@@ -11,13 +11,14 @@
 //! [`CallPlan::retain_representable`].
 
 use serde_json::Value;
+use skald_spec::ProviderName;
 use wyrd_spec::gateway::{
     FallbackScope, GatewayCallId, GatewayFallbackOverride, GatewayOperation, ModelRef,
-    ProviderDeployment,
+    ProviderAdapter, ProviderDeployment,
 };
 use wyrd_spec::ids::ProviderDeploymentName;
 
-use crate::adapter::{IngressDialect, MediaRequest, UnsupportedRequest, prepare};
+use crate::adapter::{IngressDialect, MediaRequest, UnsupportedRequest, adapter_name, prepare};
 use crate::snapshot::GatewayTenantSnapshot;
 
 /// One address the call may use and the deployment it names.
@@ -114,6 +115,55 @@ impl CallPlan {
     /// Keeps only candidates for which `keep` returns true, preserving order.
     pub fn retain(&mut self, mut keep: impl FnMut(&ModelRef) -> bool) {
         self.candidates.retain(|candidate| keep(&candidate.model));
+    }
+
+    /// Refuses an Agent call whose requested deployment's adapter is outside
+    /// the initial-target compatibility matrix of its Prompt `provider`.
+    ///
+    /// `openai` and custom Prompts need an `openai` or `openai_compatible`
+    /// adapter, `anthropic` an `anthropic`, `google` a `gemini`, `vertex` a
+    /// `vertex`, and `jev` a `jev` adapter. Only the requested address is
+    /// bound: fallback candidates keep ordinary conversion, and a plan whose
+    /// requested deployment no longer serves the call is left to the
+    /// unavailable-model refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnsupportedRequest`] naming `model` when the requested
+    /// deployment's adapter cannot serve a `provider` Prompt.
+    pub fn require_compatible_initial(
+        &self,
+        provider: &ProviderName,
+    ) -> Result<(), UnsupportedRequest> {
+        let Some(initial) = self
+            .candidates
+            .iter()
+            .find(|candidate| candidate.model == self.requested)
+        else {
+            return Ok(());
+        };
+        let compatible = matches!(
+            (provider, &initial.deployment.adapter),
+            (
+                ProviderName::OpenAi | ProviderName::Custom(_),
+                ProviderAdapter::OpenAi | ProviderAdapter::OpenAiCompatible { .. },
+            ) | (ProviderName::Anthropic, ProviderAdapter::Anthropic)
+                | (ProviderName::Google, ProviderAdapter::Gemini)
+                | (ProviderName::Vertex, ProviderAdapter::Vertex { .. })
+                | (ProviderName::Jev, ProviderAdapter::Jev)
+        );
+        if compatible {
+            Ok(())
+        } else {
+            Err(UnsupportedRequest::new(
+                "model",
+                format!(
+                    "deployment `{}` uses the {} adapter, which cannot serve a {provider} Prompt",
+                    initial.deployment.name,
+                    adapter_name(&initial.deployment.adapter)
+                ),
+            ))
+        }
     }
 
     /// Drops candidates whose adapter cannot represent `body` in `ingress`
@@ -283,6 +333,66 @@ mod tests {
             )),
             ["primary/text-embedding-3-small"],
             "omitted capabilities permit every adapter operation"
+        );
+    }
+
+    /// An Agent's requested deployment must use an adapter its Prompt
+    /// provider is compatible with, whatever the deployment is named, while
+    /// an incompatible fallback candidate and a missing requested deployment
+    /// are left to ordinary routing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a compatible pair is refused or an incompatible one is
+    /// admitted.
+    #[test]
+    fn agent_initial_target_follows_the_prompt_provider_matrix() {
+        let native = |name: &str, adapter: Value| -> ProviderDeployment {
+            serde_json::from_value(json!({"name": name, "adapter": adapter, "auth": "none"}))
+                .expect("deployment decodes")
+        };
+        let snap = snapshot(
+            vec![
+                native("openai", json!("openai")),
+                deployment("compat", None, None),
+                native("claude", json!("anthropic")),
+                native("vertex", json!("gemini")),
+                native(
+                    "gcp",
+                    json!({"vertex": {"project": "acme", "location": "us-central1"}}),
+                ),
+                native("judge", json!("jev")),
+            ],
+            json!({"rules": [{"scope": "global", "candidates": [model("claude/m")]}]}),
+        );
+        let provider = |name: &str| name.parse::<ProviderName>().expect("provider");
+        for (prompt, deployment, compatible) in [
+            ("openai", "openai", true),
+            ("openai", "compat", true),
+            ("local", "compat", true),
+            ("anthropic", "claude", true),
+            ("google", "vertex", true),
+            ("vertex", "gcp", true),
+            ("jev", "judge", true),
+            ("openai", "claude", false),
+            ("openai", "gcp", false),
+            ("google", "gcp", false),
+            ("vertex", "vertex", false),
+            ("anthropic", "openai", false),
+            ("jev", "openai", false),
+        ] {
+            let plan = chat(&snap, &format!("{deployment}/m"));
+            let outcome = plan.require_compatible_initial(&provider(prompt));
+            assert_eq!(outcome.is_ok(), compatible, "{prompt} -> {deployment}");
+            if let Err(error) = outcome {
+                assert_eq!(error.field, "model");
+            }
+        }
+        assert!(
+            chat(&snap, "missing/m")
+                .require_compatible_initial(&provider("openai"))
+                .is_ok(),
+            "a missing requested deployment is the unavailable-model refusal"
         );
     }
 

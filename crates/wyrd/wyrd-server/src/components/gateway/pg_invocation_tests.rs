@@ -268,6 +268,7 @@ fn request(requested: &str, bound: Option<(u64, u64)>, timeout: Duration) -> Gat
         }),
         timeout,
         subject: None,
+        prompt_provider: None,
     }
 }
 
@@ -1691,6 +1692,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         usage_bound: None,
         timeout: Duration::from_secs(10),
         subject: None,
+        prompt_provider: None,
     };
 
     let response = GatewayInvocation::new(&state)
@@ -4280,6 +4282,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
         usage_bound: None,
         timeout: Duration::from_secs(10),
         subject: None,
+        prompt_provider: None,
     };
     let invocation = GatewayInvocation::new(&state);
 
@@ -5601,4 +5604,105 @@ async fn public_ingress_fallback_override() {
         "the header never reaches a provider"
     );
     drain_gateway(&state).await;
+}
+
+/// An Agent call through the in-process caller starts only on a deployment
+/// whose adapter its Prompt provider is compatible with: an OpenAI Prompt is
+/// refused on the Anthropic deployment before dispatch, yet the same Agent
+/// call on an OpenAI-compatible deployment still falls back to that
+/// Anthropic deployment by tenant policy, and a direct client's OpenAI call
+/// to it keeps protocol translation.
+///
+/// # Panics
+/// Panics when a setup step fails, the refusal differs, or a call is
+/// dispatched to an unexpected deployment.
+#[tokio::test]
+async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let state = replica(&fixture, dispatch.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let gateway = GatewayAdministration::new(&state);
+    let claude: ProviderDeployment = serde_json::from_value(json!({
+        "name": "claude", "adapter": "anthropic", "auth": "none",
+        "capabilities": ["chat_completions"],
+    }))
+    .expect("deployment decodes");
+    gateway
+        .put_deployment(
+            &admin(tenant),
+            &ProviderDeploymentName::new("claude").expect("name"),
+            claude,
+        )
+        .await
+        .expect("deployment stores");
+    gateway
+        .put_fallback(
+            &admin(tenant),
+            serde_json::from_value(
+                json!({"rules": [{"scope": "global", "candidates": [model("claude/m")]}]}),
+            )
+            .expect("fallback decodes"),
+        )
+        .await
+        .expect("fallback stores");
+    let caller = invoker(tenant, 1, [open_access()]);
+    let agent = super::ServerWyrdGatewayCaller::new(state.clone(), caller.clone());
+    let chat = |requested: &str| skald_agent::WyrdGatewayCall {
+        request: skald_spec::ProviderRequest::OpenAiChatCompletion(
+            serde_json::from_value(json!({"model": "m", "max_tokens": 4,
+                    "messages": [{"role": "user", "content": "hi"}]}))
+            .expect("chat request"),
+        ),
+        model: model(requested),
+        provider: skald_spec::ProviderName::OpenAi,
+        timeout: Duration::from_secs(10),
+    };
+    // Dispatch answers in the caller's dialect, as a translating adapter does.
+    let answer = || AttemptResult::Completed {
+        body: ResponseBody::Json(
+            serde_json::value::to_raw_value(&json!({
+                "id": "chatcmpl-test", "object": "chat.completion", "created": 0, "model": "m",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "ok"}}]
+            }))
+            .expect("json"),
+        ),
+        usage: usage(1, 1),
+        capture: None,
+    };
+
+    let refused =
+        skald_agent::WyrdGatewayCaller::call(&agent, chat("claude/m"), &CancellationToken::new())
+            .await
+            .expect_err("an OpenAI Prompt cannot start on an Anthropic deployment");
+    match refused {
+        skald_providers::ProviderError::RemoteProblem(problem) => {
+            assert_eq!(problem.code, "WYRD_GATEWAY_400_INVALID_REQUEST");
+        }
+        other => panic!("unexpected refusal: {other:?}"),
+    }
+    assert!(dispatch.seen().is_empty(), "the refusal precedes dispatch");
+
+    dispatch.push(Step::Return(failed(1, 0)));
+    dispatch.push(Step::Return(answer()));
+    skald_agent::WyrdGatewayCaller::call(&agent, chat("dep-a/a"), &CancellationToken::new())
+        .await
+        .expect("a compatible start falls back across adapters");
+    assert_eq!(dispatch.seen(), ["dep-a", "claude"]);
+
+    dispatch.push(Step::Return(answer()));
+    GatewayInvocation::new(&state)
+        .invoke(
+            &caller,
+            GatewayCallRequest {
+                body: json!({"model": "claude/m", "max_tokens": 4,
+                    "messages": [{"role": "user", "content": "hi"}]}),
+                ..request("claude/m", None, Duration::from_secs(10))
+            },
+        )
+        .await
+        .expect("a direct client call keeps protocol translation");
+    assert_eq!(dispatch.seen(), ["dep-a", "claude", "claude"]);
 }

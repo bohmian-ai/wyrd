@@ -731,7 +731,9 @@ async fn agent_routes_and_pre_run_overrides() {
 /// their native ingress with the full address: each upstream receives the
 /// complete Prompt model, including the Google model's slash, and the Jev
 /// Agent answers in one call with its keyed answers. A Vertex Prompt routed
-/// through the public gateway is refused before any IO.
+/// through the public gateway, and an OpenAI Agent overridden onto the
+/// Anthropic or Gemini deployment its Prompt is not compatible with, are refused
+/// before any upstream IO.
 ///
 /// # Panics
 /// Panics when a step fails or an answer, refusal, or upstream target
@@ -829,6 +831,30 @@ async fn agent_routes_reach_named_native_ingress() {
         answers,
         json!({ "helpful": { "type": "noul", "noul": 0.9 } })
     );
+
+    let asks = register(&cards, "cards/gateway_inference/ask-service.yaml").await;
+    let asks = WyrdState::from_path_with(
+        hydrate(&cards, &asks.root).await.path().join("bundle"),
+        inference
+            .deployment
+            .client(&inference.deployment.service_key(&asks.root).await),
+    )
+    .expect("bundle loads offline");
+    let openai_agent = asks.run_for_card("agent").expect("agent view resolves");
+    for deployment in ["claude-prod", "vertex"] {
+        let route = ExecutionRoute::WyrdGateway {
+            deployment: ProviderDeploymentName::new(deployment).expect("deployment name"),
+        };
+        let refused = openai_agent
+            .invoke_on(&route, &[("question", "hi")])
+            .await
+            .expect_err("an OpenAI Prompt cannot start on a non-OpenAI adapter");
+        assert_eq!(
+            refused.code(),
+            "WYRD_GATEWAY_400_INVALID_REQUEST",
+            "{deployment}: {refused}"
+        );
+    }
 
     let targets = inference
         .upstream

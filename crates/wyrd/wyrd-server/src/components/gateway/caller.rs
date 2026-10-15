@@ -127,6 +127,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             stream: false,
             timeout: call.timeout,
             subject: self.subject.clone().map(GatewayCallAttribution::Resolved),
+            prompt_provider: Some(call.provider),
         };
         let outcome = GatewayInvocation::new(&self.state)
             .run(&self.caller, request, false, cancellation)

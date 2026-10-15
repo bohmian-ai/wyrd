@@ -39,6 +39,9 @@ pub struct WyrdGatewayCall {
     pub request: ProviderRequest,
     /// Gateway address: the route's deployment and the Prompt's model.
     pub model: ModelRef,
+    /// Prompt provider, which bounds the adapters the requested deployment
+    /// may use.
+    pub provider: ProviderName,
     /// Remaining time the call may take; the caller enforces it.
     pub timeout: Duration,
 }
@@ -149,6 +152,7 @@ impl Provider for WyrdGatewayProvider {
         let call = WyrdGatewayCall {
             request,
             model: self.model.clone(),
+            provider: self.provider.clone(),
             timeout: DEFAULT_GATEWAY_CALL_TIMEOUT,
         };
         self.caller.call(call, &self.cancellation).await

@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::value::to_raw_value;
 use serde_json::{Value, json};
+use skald_spec::ProviderName;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -25,7 +26,7 @@ use wyrd_gateway::{
     AttemptResult, AttemptUsage, BatchAction, CallExecution, CallInput, CallPlan,
     CredentialResolver, DeploymentHealth, FailureClass, GatewayEngine, GatewayTenantSnapshot,
     IngressDialect, MediaRequest, ProviderAttempt, ProviderDispatch, ResponseBody, ResponseCapture,
-    StreamEnd, outcome_error_code, outcome_name,
+    StreamEnd, UnsupportedRequest, outcome_error_code, outcome_name,
 };
 use wyrd_runtime::principal::CardAttribution;
 use wyrd_runtime::{Permission, PermissionDenyReason, Principal};
@@ -93,6 +94,9 @@ pub struct GatewayCallRequest {
     /// Application Run and Card the call is attributed to; `None` records an
     /// uncorrelated call.
     pub subject: Option<GatewayCallAttribution>,
+    /// Prompt provider of an Agent call, which bounds the requested
+    /// deployment's adapter before any IO; `None` for a direct client call.
+    pub prompt_provider: Option<ProviderName>,
 }
 
 /// How a governed call's Run and Card attribution reached the gateway.
@@ -524,12 +528,16 @@ impl<'a> GatewayInvocation<'a> {
     /// Plans the candidate routes of one call inside a `gateway.route` span.
     ///
     /// Builds the fallback plan from the admitted `snapshot`, applies a pinned
-    /// deployment, authorizes every fallback model other than the requested
-    /// one, and keeps only candidates that can represent the request.
+    /// deployment, binds an Agent call's requested deployment to its Prompt
+    /// provider's compatible adapters, authorizes every fallback model other
+    /// than the requested one, and keeps only candidates that can represent
+    /// the request.
     ///
     /// # Errors
-    /// Returns `GatewayInvalidRequest` when no authorized candidate can
-    /// represent the request and `GatewayModelUnavailable` when no authorized
+    /// Returns `GatewayInvalidRequest` naming `model` when an Agent call's
+    /// requested deployment uses an adapter its Prompt provider is not
+    /// compatible with, `GatewayInvalidRequest` when no authorized candidate can
+    /// represent the request, and `GatewayModelUnavailable` when no authorized
     /// candidate remains. An authorization decision returns no error of its
     /// own: its audit is staged off the request path, so a failed append is
     /// logged and counted rather than surfaced here.
@@ -550,6 +558,10 @@ impl<'a> GatewayInvocation<'a> {
         );
         if let Some(deployment) = &request.deployment {
             plan.pin(deployment);
+        }
+        if let Some(provider) = &request.prompt_provider {
+            plan.require_compatible_initial(provider)
+                .map_err(|error| CallFailure::from(unsupported_request(&error)))?;
         }
         let mut denied = Vec::new();
         for candidate in &plan.candidates {
@@ -572,10 +584,7 @@ impl<'a> GatewayInvocation<'a> {
             .err();
         if plan.candidates.is_empty() {
             return Err(CallFailure::from(match unsupported {
-                Some(error) => WyrdError::GatewayInvalidRequest {
-                    message: error.to_string(),
-                    details: json!({ "field": error.field, "reason": error.reason }),
-                },
+                Some(error) => unsupported_request(&error),
                 None => WyrdError::GatewayModelUnavailable {
                     message: "no authorized deployment serves the requested operation".to_owned(),
                     details: json!({}),
@@ -1304,6 +1313,15 @@ pub(crate) fn unconnected_engine() -> GatewayEngine {
 
 /// Stable rejection of an invalid call request.
 pub(crate) fn invalid_request(error: GatewayContractError) -> WyrdError {
+    WyrdError::GatewayInvalidRequest {
+        message: error.to_string(),
+        details: json!({ "field": error.field, "reason": error.reason }),
+    }
+}
+
+/// The `GatewayInvalidRequest` refusal of a request no candidate can serve,
+/// naming the unsupported member and its reason.
+fn unsupported_request(error: &UnsupportedRequest) -> WyrdError {
     WyrdError::GatewayInvalidRequest {
         message: error.to_string(),
         details: json!({ "field": error.field, "reason": error.reason }),

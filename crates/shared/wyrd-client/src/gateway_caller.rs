@@ -7,7 +7,10 @@
 //! calls cannot see each other's deadline. A caller given an application Run,
 //! a Card UID, or both with
 //! [`PublicWyrdGatewayCaller::with_subject`] sends each one it has as its own
-//! gateway correlation header. Refusals in the
+//! gateway correlation header. Every call names its Prompt provider in the
+//! `wyrd-prompt-provider` header, so the gateway refuses a requested
+//! deployment whose adapter that provider is not compatible with before any
+//! provider IO. Refusals in the
 //! protocol's native error envelope are normalized to a redacted
 //! [`RemoteProblem`].
 
@@ -23,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::native::{AnthropicErrorEnvelope, GoogleErrorEnvelope};
 use wyrd_spec::gateway::openai::OpenAiErrorEnvelope;
-use wyrd_spec::gateway::{CARD_UID_HEADER, ModelRef, RUN_HEADER};
+use wyrd_spec::gateway::{CARD_UID_HEADER, ModelRef, PROMPT_PROVIDER_HEADER, RUN_HEADER};
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::ids::RunId;
 
@@ -100,7 +103,7 @@ impl WyrdGatewayCaller for PublicWyrdGatewayCaller {
         cancellation: &CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
         let native = NativeCall::project(call.request, &call.model)?;
-        let mut headers: Vec<(&str, &str)> = Vec::new();
+        let mut headers: Vec<(&str, &str)> = vec![(PROMPT_PROVIDER_HEADER, call.provider.as_str())];
         if let Some(run_id) = &self.run_id {
             headers.push((RUN_HEADER, run_id.as_str()));
         }

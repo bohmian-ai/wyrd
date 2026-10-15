@@ -2356,10 +2356,43 @@ export class Run {
   }
 }
 
-/** A hydrated Prompt Card: its stored envelope and exact registered identity. */
+/**
+ * A hydrated Prompt Card: its stored envelope, exact registered identity, and
+ * the metadata the shared Rust runtime derives from its spec. The derived
+ * fields are read-only views; they are never stored or sent back.
+ */
 export interface PromptCard extends RegisteredPromptCard {
   /** The exact reference, carrying the registered version and UID. */
   readonly ref: CardRef;
+  /** Text placeholder names rendering requires, in first-appearance order. */
+  readonly variables: readonly string[];
+  /** Media placeholder names (`${media:name}`) left to bind. */
+  readonly mediaVariables: readonly string[];
+  /** The declared structured-output JSON Schema; `null` for a plain-text Prompt. */
+  readonly responseSchema: Readonly<Record<string, JsonValue>> | null;
+  /** The structured-output schema name; `null` for a plain-text Prompt. */
+  readonly responseSchemaName: string | null;
+}
+
+/** The native projection of a hydrated Prompt: its envelope plus derived metadata. */
+interface NativeHydratedPrompt {
+  card: RegisteredPromptCard;
+  variables: string[];
+  media_variables: string[];
+  response_schema: Readonly<Record<string, JsonValue>> | null;
+  response_schema_name: string | null;
+}
+
+/** Shape a native hydrated Prompt projection as the public {@link PromptCard}. */
+function promptCard(prompt: NativeHydratedPrompt, ref: CardRef): PromptCard {
+  return {
+    ...prompt.card,
+    ref,
+    variables: prompt.variables,
+    mediaVariables: prompt.media_variables,
+    responseSchema: prompt.response_schema,
+    responseSchemaName: prompt.response_schema_name,
+  };
 }
 
 /** A hydrated Agent Card, navigable to the registered Prompt Card it pins. */
@@ -2746,22 +2779,21 @@ export class WyrdState {
     } = lifecycleValue<{
       card: RegisteredAgentCard;
       prompt_ref: CardRef;
-      prompt: RegisteredPromptCard;
+      prompt: NativeHydratedPrompt;
     }>(this.#native.agent(alias));
-    const promptCard: PromptCard = { ...prompt, ref: promptRef };
-    return { ...card, promptRef, prompt: () => promptCard };
+    const hydrated = promptCard(prompt, promptRef);
+    return { ...card, promptRef, prompt: () => hydrated };
   }
 
   /**
    * The hydrated Prompt Card an alias names.
    *
    * @param alias - A bundle alias of a Prompt Card.
-   * @returns The envelope with its exact identity at `ref`.
+   * @returns The envelope with its exact identity at `ref` and its derived metadata.
    * @throws {@link WyrdError} as {@link WyrdState.verifier}.
    */
   prompt(alias: string): PromptCard {
-    const prompt = lifecycleValue<RegisteredPromptCard>(this.#native.prompt(alias));
-    return { ...prompt, ref: this.cardRef(alias) };
+    return promptCard(lifecycleValue<NativeHydratedPrompt>(this.#native.prompt(alias)), this.cardRef(alias));
   }
 
   /**

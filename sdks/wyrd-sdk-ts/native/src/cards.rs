@@ -15,6 +15,7 @@ use wyrd_client::cards::{CardKind, CardSelector, Cards, HydrationMode, ListCards
 use wyrd_client::observe::eval::parse_session_id;
 use wyrd_client::observe::{EvalObservationOptions, Run};
 use wyrd_client::state::WyrdState;
+use wyrd_spec::ExecutionRoute;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefParseError};
@@ -538,6 +539,25 @@ impl NativeWyrdState {
     }
 }
 
+/// Decodes an optional JSON argument named `field` from the TypeScript layer.
+///
+/// # Errors
+///
+/// Returns the stable `WYRD_SPEC_400_VALIDATION` error naming `field` when the
+/// present value is not valid JSON of type `T`.
+fn parse_optional_json<T: serde::de::DeserializeOwned>(
+    field: &str,
+    value: Option<&str>,
+) -> StdResult<Option<T>, WyrdError> {
+    value
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| WyrdError::Validation {
+            message: format!("{field} is invalid: {error}"),
+            details: serde_json::json!({ "field": field, "reason": error.to_string() }),
+        })
+}
+
 /// Parses a Card reference passed as its text form or serialized JSON object.
 ///
 /// # Errors
@@ -719,43 +739,49 @@ impl NativeRun {
         })
     }
 
-    /// Invokes this view's tool-free Agent once through the Wyrd gateway with
-    /// the string variables of `variables_json` and returns its final text.
+    /// Invokes this view's tool-free Agent once with the string variables of
+    /// `variables_json` and returns its final text.
+    ///
+    /// `route_json`, when given, is an execution route that replaces the
+    /// Agent's declared route whole for this invocation; it is decoded into
+    /// the Rust `ExecutionRoute` and passed to `Run::invoke_on`, which owns
+    /// every routing decision. Omitted, the declared route is used.
     ///
     /// # Errors
     ///
     /// Returns a napi error only when the outcome cannot be projected; a
-    /// non-Agent view, an Agent with tools, malformed variables, and the
-    /// gateway's refusals are returned in [`NativeLifecycleResult`].
+    /// non-Agent view, an Agent with tools, malformed variables or route, and
+    /// the gateway's refusals are returned in [`NativeLifecycleResult`].
     #[napi]
     pub fn invoke<'env>(
         &self,
         env: &'env Env,
         variables_json: Option<String>,
+        route_json: Option<String>,
     ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
         let run = self.run.clone();
         crate::trace::spawn(env, async move {
-            let variables: std::collections::BTreeMap<String, String> = match variables_json
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()
-            {
-                Ok(variables) => variables.unwrap_or_default(),
-                Err(error) => {
-                    return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::Validation {
-                        message: format!("variables are invalid: {error}"),
-                        details: serde_json::json!({
-                            "field": "variables",
-                            "reason": error.to_string(),
-                        }),
-                    }));
-                }
+            let parsed = parse_optional_json::<std::collections::BTreeMap<String, String>>(
+                "variables",
+                variables_json.as_deref(),
+            )
+            .and_then(|variables| {
+                parse_optional_json::<ExecutionRoute>("route", route_json.as_deref())
+                    .map(|route| (variables.unwrap_or_default(), route))
+            });
+            let (variables, route) = match parsed {
+                Ok(parsed) => parsed,
+                Err(error) => return Ok(NativeLifecycleResult::from_wyrd(&error)),
             };
             let pairs: Vec<(&str, &str)> = variables
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str()))
                 .collect();
-            NativeLifecycleResult::outcome(Box::pin(run.invoke(&pairs)).await)
+            let invoked = match &route {
+                Some(route) => Box::pin(run.invoke_on(route, &pairs)).await,
+                None => Box::pin(run.invoke(&pairs)).await,
+            };
+            NativeLifecycleResult::outcome(invoked)
         })
     }
 

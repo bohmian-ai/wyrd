@@ -922,13 +922,14 @@ async fn prove_scheduled_analytical_completion(
     let entered =
         tokio::time::timeout(std::time::Duration::from_secs(10), pause.wait_paused()).await;
     // The held follower is released by the graph cancel itself, so the cancel
-    // always lands while the leader is still opening and fails that open.
+    // always lands while the leader is still opening; the open the owner fails
+    // is the same incomplete stream a cancel after the open reports.
     cancellation.cancel();
     entered?;
     let error = scheduled
         .await?
         .expect_err("an actively cancelled schedule has no outcome");
-    assert_eq!(error.code(), "WYRD_VALA_500_QUERY_EXECUTION_FAILED");
+    assert_eq!(error.code(), "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE");
     await_owners_released(cluster).await?;
     assert_eq!(
         audit_rows(ingress, tenant, "bifrost.query.read_decision").await?,

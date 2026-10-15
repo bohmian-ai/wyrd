@@ -19,8 +19,8 @@ use serde_json::error::Category;
 use wyrd_client::Gateway;
 use wyrd_spec::error::WyrdError;
 
-use crate::{NativeLifecycleResult, NativeWyrdError};
 use crate::client::NativeWyrdClient;
+use crate::{NativeLifecycleResult, NativeWyrdError};
 
 /// Tenant gateway administration handle over the shared `wyrd_client` Gateway.
 ///

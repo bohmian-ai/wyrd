@@ -1173,9 +1173,9 @@ impl NativeBifrost {
         let client = self.client.clone();
         crate::trace::spawn(env, async move {
             match client.list_tables().await {
-                Ok(entries) => {
-                    NativeLifecycleResult::success(&serde_json::to_value(entries).map_err(napi_error)?)
-                }
+                Ok(entries) => NativeLifecycleResult::success(
+                    &serde_json::to_value(entries).map_err(napi_error)?,
+                ),
                 Err(error) => Ok(NativeLifecycleResult::failure(&error)),
             }
         })

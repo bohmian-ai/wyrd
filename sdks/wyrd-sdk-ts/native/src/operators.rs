@@ -18,8 +18,8 @@ use wyrd_client::operator_connections::{
 };
 use wyrd_spec::error::WyrdError;
 
-use crate::{NativeLifecycleResult, NativeWyrdError};
 use crate::client::NativeWyrdClient;
+use crate::{NativeLifecycleResult, NativeWyrdError};
 
 /// Decode one serialized JavaScript argument, naming only the argument and
 /// the decode category so a secret value is never echoed; shared by the

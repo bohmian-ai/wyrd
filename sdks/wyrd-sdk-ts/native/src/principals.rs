@@ -14,9 +14,9 @@ use wyrd_client::principals::{
 };
 use wyrd_spec::error::WyrdError;
 
-use crate::{NativeLifecycleResult, NativeWyrdError};
 use crate::client::NativeWyrdClient;
 use crate::operators::decode;
+use crate::{NativeLifecycleResult, NativeWyrdError};
 
 /// Decode one principal id string.
 ///

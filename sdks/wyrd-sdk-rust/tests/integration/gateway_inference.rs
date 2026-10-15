@@ -204,7 +204,12 @@ async fn put_managed(client: WyrdClient, provider: &str, name: &str, secret: &st
 ///
 /// # Panics
 /// Panics when the credential or deployment is refused.
-async fn put_openai(deployment: &Deployment, name: &str, secret: &str, access: DeploymentAccess) {
+pub(crate) async fn put_openai(
+    deployment: &Deployment,
+    name: &str,
+    secret: &str,
+    access: DeploymentAccess,
+) {
     let credential = format!("{name}-key");
     put_managed(deployment.admin(), "openai", &credential, secret).await;
     Gateway::with_client(deployment.admin())

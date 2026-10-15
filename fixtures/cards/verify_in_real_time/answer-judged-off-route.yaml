@@ -1,0 +1,25 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: answer-judged-off-route
+  version: 1.0.0
+  space: default
+spec:
+  description: An LLM judge routed to a deployment the caller holds no grant for.
+  implementation:
+    kind: eval
+    spec:
+      pass_gate: {kind: all_pass}
+      tasks:
+        judge:
+          kind: llm_judge
+          id: judge
+          judge_ref:
+            prompt: ./judge-prompt.yaml
+            execution_route: {kind: wyrd_gateway, deployment: openai-granted}
+            tool_names: []
+            run_config: {max_iterations: 1}
+          context_path: $.answer
+          operator: equals
+          expected: {passed: true}
+          max_retries: 0

@@ -8,13 +8,13 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::cards::CardRef;
-use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
+use wyrd_ai::gateway::{DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::{
     Bifrost, Gateway, SpanRecord, VerificationVerdict, VerifierCounts, VerifierKind, WyrdClient,
@@ -22,6 +22,7 @@ use wyrd_ai::{
 };
 use wyrd_testing::server::WyrdTestServer;
 
+use crate::gateway_inference::put_openai;
 use crate::local_development::configure_gateway;
 use crate::support::{Deployment, ancestry, coordinates, hydrate, register, registered};
 
@@ -513,6 +514,73 @@ async fn judged_answer_passes_the_llm_judge() {
     assert!(
         String::from_utf8_lossy(&graded[0].body).contains("Grade the answer yes."),
         "the judge received the answer"
+    );
+    assistant.deployment.shutdown().await;
+}
+
+/// Judges authored in the native (`answer-is-judged`) and portable
+/// (`answer-graded`) Prompt forms both send a structured-output request for
+/// `gpt-4o` through their Agent's declared `openai` route and pass on the
+/// parsed answer. A judge routed to the `granted` deployment `openai-granted`
+/// is authorized for the requesting Service, which holds no grant for it, so
+/// it never reaches the provider and the verify fails as a dependency
+/// failure.
+///
+/// # Panics
+/// Panics when a verify, judgment, refusal, or judge request differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn judge_prompt_forms_use_agent_execution_route() {
+    let assistant = Assistant::start().await;
+    put_openai(
+        &assistant.deployment,
+        "openai-granted",
+        "sk-granted-upstream",
+        DeploymentAccess::Granted,
+    )
+    .await;
+    let state = assistant.state().await;
+    let run = state.run_for_card("agent").expect("agent run opens");
+
+    for verifier in ["answer-is-judged", "answer-graded"] {
+        let judgment = run
+            .observe()
+            .verify(verifier, &Answer { answer: "yes" })
+            .await
+            .expect("the answer is judged");
+        assert_eq!(judgment.verdict, VerificationVerdict::Passed, "{verifier}");
+    }
+    let refused = run
+        .observe()
+        .verify("answer-judged-off-route", &Answer { answer: "yes" })
+        .await;
+
+    let graded = assistant
+        .judge
+        .received_requests()
+        .await
+        .expect("the judge records requests");
+    let bodies: Vec<Value> = graded
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).expect("JSON request"))
+        .collect();
+    assert_eq!(
+        bodies.len(),
+        2,
+        "the off-route judge never reaches the provider"
+    );
+    for body in &bodies {
+        assert_eq!(
+            (&body["model"], &body["response_format"]["type"]),
+            (&json!("gpt-4o"), &json!("json_schema")),
+            "{body}"
+        );
+    }
+    let refused = refused.expect_err("the off-route judge is refused");
+    assert_eq!(
+        refused.code(),
+        "WYRD_VERIFICATION_502_DEPENDENCY_FAILED",
+        "{refused}"
     );
     assistant.deployment.shutdown().await;
 }

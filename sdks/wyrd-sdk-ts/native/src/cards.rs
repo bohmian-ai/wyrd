@@ -15,10 +15,11 @@ use wyrd_client::cards::{CardKind, CardSelector, Cards, HydrationMode, ListCards
 use wyrd_client::observe::eval::parse_session_id;
 use wyrd_client::observe::{EvalObservationOptions, Run};
 use wyrd_client::state::{TelemetryFlushFailure, WyrdState};
-use wyrd_spec::ExecutionRoute;
+use wyrd_spec::envelope::Card;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefParseError};
+use wyrd_spec::{ExecutionRoute, Prompt, ResponseType};
 
 use crate::client::{NativeWyrdClient, NativeWyrdClientResult};
 use crate::{NativeLifecycleResult, NativeTableConfig, NativeWyrdError};
@@ -419,7 +420,8 @@ impl NativeWyrdState {
     }
 
     /// Returns the stored envelope of the Agent Card an alias names, with
-    /// the exact Prompt reference it pins and that Prompt's stored envelope.
+    /// the exact Prompt reference it pins and that Prompt's stored envelope
+    /// and derived metadata.
     ///
     /// The Prompt is the one the shared state's hydrated Agent resolves, so
     /// the wrapper navigates without resolving the relationship itself.
@@ -432,7 +434,8 @@ impl NativeWyrdState {
         self.read(|state| NativeLifecycleResult::outcome(hydrated_agent(state, &alias)))
     }
 
-    /// Returns the stored envelope of the Prompt Card an alias names.
+    /// Returns the stored envelope of the Prompt Card an alias names, with
+    /// the metadata the shared state's hydrated Prompt derives from it.
     ///
     /// # Errors
     ///
@@ -440,7 +443,12 @@ impl NativeWyrdState {
     #[napi]
     pub fn prompt(&self, alias: String) -> Result<NativeLifecycleResult> {
         self.read(|state| {
-            NativeLifecycleResult::outcome(state.prompt(&alias).and_then(|_| state.card(&alias)))
+            NativeLifecycleResult::outcome(state.prompt(&alias).and_then(|prompt| {
+                Ok(hydrated_prompt(
+                    state.card(&alias)?,
+                    &prompt.metadata.prompt,
+                ))
+            }))
         })
     }
 
@@ -609,7 +617,8 @@ fn parse_optional_json<T: serde::de::DeserializeOwned>(
 }
 
 /// Projects the Agent an alias names as its stored envelope, the exact
-/// Prompt reference it pins, and that Prompt's stored envelope.
+/// Prompt reference it pins, and that Prompt's [`hydrated_prompt`]
+/// projection.
 ///
 /// # Errors
 ///
@@ -629,8 +638,28 @@ fn hydrated_agent(state: &WyrdState, alias: &str) -> StdResult<serde_json::Value
     Ok(serde_json::json!({
         "card": state.card(alias)?,
         "prompt_ref": agent.prompt_ref(),
-        "prompt": prompt,
+        "prompt": hydrated_prompt(prompt, &agent.prompt().metadata.prompt),
     }))
+}
+
+/// Projects a hydrated Prompt as its stored envelope plus the text variables,
+/// media variables, and response schema and name the shared runtime Prompt
+/// derives; a plain-text Prompt has a null schema and name.
+///
+/// The derived values are read, never recomputed, so TypeScript reports
+/// exactly what the Rust and Python surfaces report.
+fn hydrated_prompt(card: &Card, prompt: &Prompt) -> serde_json::Value {
+    let (schema, name) = match &prompt.response_type {
+        ResponseType::JsonSchema { name, schema } => (Some(schema), Some(name)),
+        ResponseType::Text => (None, None),
+    };
+    serde_json::json!({
+        "card": card,
+        "variables": prompt.variables,
+        "media_variables": prompt.media_variables,
+        "response_schema": schema,
+        "response_schema_name": name,
+    })
 }
 
 /// Parses a Card reference passed as its text form or serialized JSON object.

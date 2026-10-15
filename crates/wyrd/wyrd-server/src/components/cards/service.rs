@@ -1123,6 +1123,16 @@ impl RegistrationWriter<'_> {
             let mut spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
                 .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
             bind_card_references(&mut spec, &plan.external_refs, &sibling_uids)?;
+            if let Spec::Agent(agent) = &mut spec
+                && let InlineableRef::Inline(prompt) = &agent.prompt
+            {
+                let mut prompt_submission = inline_prompt_submission(&submission, prompt)?;
+                let outcome =
+                    persist_node(&mut conn, self.caller, operation_id, &mut prompt_submission)
+                        .await?;
+                agent.prompt = InlineableRef::Ref(outcome.card_ref.clone());
+                outcomes.push(outcome);
+            }
             submission.spec =
                 serde_json::to_value(&spec).map_err(WyrdError::from_spec_serialization)?;
             let outcome =
@@ -1537,6 +1547,42 @@ fn replay_seed(
         outcomes: response.outcomes.clone(),
         artifact_manifest_paths,
     }
+}
+
+/// Build the Prompt Card submission an Agent's inline Prompt registers as.
+///
+/// The Prompt is named `<agent-name>-prompt` in the Agent's space and carries
+/// no version intent, so [`persist_node`] reuses an identical existing version
+/// or allocates the next one on the Prompt's own line. The Agent then pins the
+/// exact UID-bearing reference [`persist_node`] returns.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the derived name is not a
+/// valid Card name or the Prompt body does not serialize.
+fn inline_prompt_submission(
+    agent: &CardSubmission,
+    prompt: &skald_spec::Prompt,
+) -> Result<CardSubmission, WyrdError> {
+    let name = CardName::new(format!("{}-prompt", agent.metadata.name))
+        .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+    Ok(CardSubmission {
+        api_version: ApiVersion::v1(),
+        kind: CardKind::Prompt,
+        metadata: Metadata {
+            name,
+            version: None,
+            bump: None,
+            space: agent.metadata.space.clone(),
+            uid: None,
+            labels: Default::default(),
+            annotations: Default::default(),
+            spec_hash: None,
+            artifact_hash: None,
+            origin: None,
+        },
+        spec: serde_json::to_value(prompt).map_err(WyrdError::from_spec_serialization)?,
+        artifacts: Vec::new(),
+    })
 }
 
 /// Decode one submission into the typed card envelope persisted by SQL.

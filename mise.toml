@@ -654,7 +654,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m 'integration and not local_dev' tests/integration/bifrost tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_local_development.py tests/integration/test_support_desk.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py && uv run --group mcp-frameworks python -m pytest -q tests/integration/otel/frameworks"
+run = "uv run python -m pytest -q -m 'integration and not local_dev' tests/integration/bifrost tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_local_development.py tests/integration/test_support_desk.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py tests/integration/otel/frameworks"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -674,9 +674,8 @@ depends = ["check", "check:deps", "check:tenant-isolation", "test:bifrost"]
 [tasks."verify:python-sdk"]
 description = """Complete Python SDK gate: fmt, Clippy, codegen, Python format/lint/types, the wheel boundary, and
 every Python test tier. py:test:integration selects every integration-marked test, so it already runs the Bifrost,
-gateway, Card, WyrdState, and story journeys. The agent framework MCP journeys need their own dependency group and
-run in py:test:mcp-frameworks. The identity journeys need Keycloak and Dex and run only in test:identity:journey."""
-depends = ["check", "codegen:check", "py:format:check", "py:lints", "py:typecheck", "check:py-wheel-no-testing", "py:test:unit", "py:test:tensorflow", "py:test:testing", "py:test:integration", "py:test:mcp-frameworks", "test:local-dev:journey"]
+gateway, Card, WyrdState, story, and agent framework journeys. The identity journeys need Keycloak and Dex and run only in test:identity:journey."""
+depends = ["check", "codegen:check", "py:format:check", "py:lints", "py:typecheck", "check:py-wheel-no-testing", "py:test:unit", "py:test:tensorflow", "py:test:testing", "py:test:integration", "test:local-dev:journey"]
 
 [tasks."verify:rust-sdk"]
 description = """Complete Rust SDK gate: fmt, Clippy, the wyrd-ai unit tests and every story journey on one
@@ -1124,17 +1123,6 @@ hide = true
 description = "Run wyrd.testing integration journeys against a live Postgres-backed server"
 dir = "sdks/wyrd-sdk-python"
 run = "uv run python -m pytest -q -m 'integration and not identity and not local_dev'"
-
-[tasks."py:test:mcp-frameworks"]
-description = "Run the OpenAI Agents SDK, Pydantic AI, and Google ADK journeys against Wyrd's /mcp and OTLP telemetry on a live Postgres-backed server"
-depends = ["py:setup"]
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run py:test:mcp-frameworks:inner'"
-
-[tasks."py:test:mcp-frameworks:inner"]
-hide = true
-description = "Run the agent framework MCP and telemetry journeys with their lifecycle already provisioned"
-dir = "sdks/wyrd-sdk-python"
-run = "uv run --group mcp-frameworks python -m pytest -q tests/integration/mcp_frameworks tests/integration/otel/frameworks"
 
 [tasks."py:test:cards:integration"]
 hide = true
@@ -1609,7 +1597,7 @@ depends = ["test:storage:matrix"]
 [tasks."gate:python"]
 hide = true
 description = "Gate shard: Python format, lint, types, wheel boundary, every Python test tier, and the DataCard example"
-depends = ["py:format:check", "py:lints", "py:typecheck", "check:py-wheel-no-testing", "py:test:unit", "py:test:tensorflow", "py:test:testing", "py:test:integration", "py:test:mcp-frameworks", "examples:python:datacard"]
+depends = ["py:format:check", "py:lints", "py:typecheck", "check:py-wheel-no-testing", "py:test:unit", "py:test:tensorflow", "py:test:testing", "py:test:integration", "examples:python:datacard"]
 
 [tasks."gate:typescript"]
 hide = true

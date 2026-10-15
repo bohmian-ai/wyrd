@@ -84,16 +84,18 @@ class LocalModel(BaseHTTPRequestHandler):
     def _openai(self, body: dict[str, Any], text: str) -> None:
         """Answer one Chat Completions turn, streamed when the request asks."""
         topic = "FAIL-TOOL" if "FAIL-TOOL" in text else "x"
+        message: dict[str, Any]
         if body.get("tools") and not any(m.get("role") == "tool" for m in body["messages"]):
             call = {"name": "lookup", "arguments": json.dumps({"topic": topic})}
-            message: dict[str, Any] = {
+            message = {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [{"id": "call_1", "type": "function", "function": call}],
             }
             finish = "tool_calls"
         else:
-            message, finish = {"role": "assistant", "content": "done"}, "stop"
+            message = {"role": "assistant", "content": "done"}
+            finish = "stop"
         usage = {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}
         head = {"id": "c", "created": 1, "model": body["model"]}
         if not body.get("stream"):
@@ -147,14 +149,14 @@ def lookup(topic: str) -> str:
 
 def pydantic_ai(url: str) -> Ask:
     """A Pydantic AI agent with native instrumentation that omits content."""
-    from pydantic_ai import Agent
+    from pydantic_ai import Agent, Tool
     from pydantic_ai.models.instrumented import InstrumentationSettings
     from pydantic_ai.models.openai import OpenAIChatModel
     from pydantic_ai.providers.openai import OpenAIProvider
 
     Agent.instrument_all(InstrumentationSettings(include_content=False))
     model = OpenAIChatModel(MODEL, provider=OpenAIProvider(base_url=f"{url}/v1", api_key="local"))
-    agent = Agent(model, tools=[lookup])
+    agent = Agent(model, tools=[Tool(lookup, takes_ctx=False)])
 
     async def ask(prompt: str, stream: bool) -> str:
         if not stream:

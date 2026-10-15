@@ -32,7 +32,7 @@ python = [
 testing = ["python", "dep:wyrd-testing", "dep:tracing", "dep:url", "dep:chrono", "dep:wyrd-auth-verify"]
 
 [dependencies]
-pyo3 = { workspace = true, features = ["extension-module", "abi3-py310", "chrono"], optional = true }
+pyo3 = { workspace = true, features = ["extension-module", "abi3-py311", "chrono"], optional = true }
 wyrd-cli = { workspace = true }
 skald-agent = { workspace = true }
 skald-workflow = { workspace = true }

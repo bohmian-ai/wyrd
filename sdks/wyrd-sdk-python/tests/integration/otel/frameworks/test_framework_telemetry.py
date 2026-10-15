@@ -6,9 +6,6 @@ key, and an empty config home. The framework's own instrumentation, or for the
 Agents SDK ``WyrdAgentsTraceProcessor``, emits spans for real model and tool
 calls against a scripted local upstream; the session administrator reads them
 back with ``Bifrost.trace_timeline``.
-
-The ``mcp-frameworks`` dependency group provides the frameworks, and only
-``py:test:mcp-frameworks`` collects this directory.
 """
 
 from __future__ import annotations

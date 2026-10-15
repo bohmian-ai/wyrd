@@ -152,3 +152,20 @@ const wyrdTools = new MCPServerStreamableHttp({ url: `${wyrd.serverUrl}/mcp`, fe
 ## Without a transport hook
 
 If a client has no transport hook but accepts a callable API key, pass the access token as the key instead, for example `apiKey: () => wyrd.accessToken()` in the TypeScript OpenAI SDK. For shells and `apiKeyHelper`-style tools, `wyrd auth access-token` prints the current token followed by a newline.
+
+## Fallback: a static Wyrd API key
+
+Some tools take only a base URL and a static key: environment-only setups, curl, or a language without a Wyrd SDK. The gateway's inference routes (OpenAI-compatible `/v1`, Anthropic Messages, and Gemini `GenerateContent`) also accept a Wyrd API key wherever they accept a token, so these tools need no Wyrd import:
+
+```bash
+export OPENAI_BASE_URL=$WYRD_SERVER_URL/v1
+export OPENAI_API_KEY=$WYRD_API_KEY
+```
+
+Anthropic clients send the key as `x-api-key` with `ANTHROPIC_BASE_URL=$WYRD_SERVER_URL`. Gemini clients send it as `x-goog-api-key` against `$WYRD_SERVER_URL`. The server exchanges the key for the key's own principal, exactly as `wyrd auth access-token` would. Every call is still authorized against that principal's permissions, and only the operator's provider credential travels upstream.
+
+Use the access-token paths above when you can:
+
+- The API key is long-lived, and this fallback sends it on every request, so every proxy, log, and process that sees the traffic can see it. An access token expires in minutes.
+- The server reuses each key's exchange for up to 60 seconds. A revoked key keeps working for up to 60 seconds after its last exchange.
+- Only the gateway's inference routes take a key this way. `/mcp`, the `/v1` management API, and Bifrost still require an access token.

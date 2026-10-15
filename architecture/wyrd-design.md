@@ -132,7 +132,7 @@ not a passive integration or inventory product.
     An observation may carry its subject `card_uid`; when present, the
     server authorizes it against that scope's mapped UIDs and stores it.
     Generic telemetry may omit it and retains the authenticated publisher through
-    `principal_id`. A separate emit credential was redundant — see "Observation
+    the managed `sub_principal_id`/`act_principal_id` pair. A separate emit credential was redundant — see "Observation
     identity — Card → Run → Observation".
     - **Auth** gates Wyrd API calls: `Permission { resource, action, scope }` on
       the handler, stateless pubkey verify of the access token. Answers "is this

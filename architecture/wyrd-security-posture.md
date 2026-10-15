@@ -68,17 +68,20 @@ Card-free machine principal therefore carries no emit scope. `tenant_admin`,
 identity is not a registered AI-system component.
 
 Gateway capture is a server-internal write that holds no token, evaluates no
-permission, and writes no audit decision. Its rows carry the reserved
-`GATEWAY_CAPTURE_PRINCIPAL`, which, like `PLATFORM_AUDIT_PRINCIPAL`, never
-appears in a token: every issuer refuses it, every verifier rejects a token
-naming it, it never appears in a delegation chain, and it never replaces the
-invocation caller in audit. Gate refuses every public write to
-`vala.gateway.calls`. A pod without Scribe sends capture over the peer plane's
-capture-only RPC, admitted by `wyrd-peer` mTLS alone; that RPC accepts only the
-two capture tables and, with a Verifier attribution, the three result tables,
-and never the reserved system tenant, so a compromised
-cluster member, already out of scope, is the only caller that could misuse
-it.
+permission, and writes no audit decision. Its rows carry the verified
+subject/actor pair the call ran under. The reserved
+`GATEWAY_CAPTURE_PRINCIPAL`, like `PLATFORM_AUDIT_PRINCIPAL`, never appears in
+a token: every issuer refuses it, every verifier rejects a token naming it, it
+never appears in a delegation chain, and it never replaces the invocation
+caller in audit. Gate refuses every public write to `vala.gateway.calls`. A pod
+without Scribe sends its outbox writes over the peer plane's capture RPC,
+admitted by `wyrd-peer` mTLS alone. Each request carries the subject/actor
+pair the local writer would stamp, and the RPC accepts only the six
+server-internal destinations: retained audit history, the two capture tables,
+and the three Verifier result tables. Only audit history may name the reserved
+system tenant; an audit row keeps its decision pair as content and travels
+under the `PLATFORM_AUDIT_PRINCIPAL` transport identity. A compromised cluster
+member, already out of scope, is the only caller that could misuse it.
 
 Card-bound identities are provisioned idempotently by tenant, principal kind,
 Card kind, and Card UID. Re-applying a Card preserves the principal identity.
@@ -200,30 +203,21 @@ credential.
   exchange, OIDC login, human refresh, workload `jwt-bearer`, and delegation.
   Verification is local and synchronous — signature, issuer, audience, expiry —
   and reads no store, holds no cache, and resolves no roles.
-- Internal verification-result tokens use that same issuer and token format,
-  but load the tenant's persisted `system` principal and carry no roles,
-  credential, delegation chain, or bound root Card. Their Card scope contains
-  exactly one UID-bearing Verifier, and their permissions are exactly one
-  fixed purpose: `bifrost_record:write` for result publication, or
-  `bifrost_query:read` scoped to the tenant's registered
-  `vala.drift.observations` table UID for Drift reads. No token carries both.
-  The read token's Verifier scope is attribution only; Oracle's table
-  authorization enforces the read, and the server-built SQL, not the token,
-  limits subject, series, and window. These fixed server capabilities are not
-  public grants.
-  The same principal's continuous Eval input reads mint no token: the server
-  resolves the stored principal and binds it in-process to `bifrost_query:read`
-  scoped to the two Eval input tables only, kept separate from the result-write
-  scope. A missing principal, mismatched tenant, or insufficient table scope
-  fails closed before any row is returned.
+- Internal verification work mints no token. Results are staged on the
+  process Scribe outbox under the operation's pair: a direct request's
+  verified caller, or a queued run's subject with SYSTEM as actor. Drift and
+  Eval input reads use the credentialless SYSTEM read authority described
+  above, granted `bifrost_query:read` only on the run's registered input table
+  UIDs; a missing SYSTEM principal or unreadable table identity fails closed
+  before any row is returned.
 - Revoking a credential, suspending or deleting a principal, suspending a
   tenant, or changing grants refuses the next issuance immediately. A tenant
   token already issued keeps its snapshot authority until its five-minute
   expiry; there is no revocation list or authorization epoch. The platform
   plane instead revalidates current state on every request.
-- An accepted server Workflow run is the one bounded exception to
-  request-scoped authority. Its audited `workflows:run` submission captures a
-  token-free snapshot of principal attribution and scopes, bounded to the
+- An accepted server Workflow run, like the accepted Verifier run described
+  above, is a bounded exception to request-scoped authority. Its audited
+  `workflows:run` submission captures a token-free snapshot of principal attribution and scopes, bounded to the
   run's pinned graph and total deadline; no bearer token or secret is
   retained, renewed, or exposed. Token expiry, revocation, or later grant
   change neither cancels nor widens the run, and the snapshot ends with it.

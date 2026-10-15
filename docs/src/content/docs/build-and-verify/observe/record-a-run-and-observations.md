@@ -205,9 +205,9 @@ print(rows.to_pandas())
 <LangTab lang="rust">
 
 ```rust
-use wyrd_ai::{Bifrost, bifrost::QueryParam};
+use wyrd_ai::{Bifrost, bifrost::{BifrostOptions, QueryParam}};
 
-let rows = Bifrost::from_env()
+let rows = Bifrost::connect(BifrostOptions::default())
     .await?
     .sql(
         "SELECT ticket_id, answer, card_uid FROM vala.datasets.tickets WHERE run_id = $1",

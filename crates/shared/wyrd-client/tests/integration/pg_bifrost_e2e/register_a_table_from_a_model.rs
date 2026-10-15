@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use wyrd_client::bifrost::BifrostOptions;
 use wyrd_client::bifrost::{Bifrost, Correlation, TableConfig};
 use wyrd_spec::vala::api::RegisterOutcome;
 use wyrd_testing::server::WyrdTestServer;
@@ -106,9 +107,15 @@ fn requests() -> Vec<ApiRequest> {
 /// Panics when registration, the insert, the flush, or publication fails.
 async fn api_requests(srv: &WyrdTestServer) -> Bifrost {
     let client = service_client(srv, "register-a-table-from-a-model", &["admin"]).await;
-    let api_requests = Bifrost::connect_with_table(
+    let api_requests = Bifrost::connect_with(
         &client,
-        TableConfig::from_model::<ApiRequest>(API_REQUESTS).expect("the model declares a table"),
+        BifrostOptions {
+            table: Some(
+                TableConfig::from_model::<ApiRequest>(API_REQUESTS)
+                    .expect("the model declares a table"),
+            ),
+            ..BifrostOptions::default()
+        },
     )
     .await
     .expect("the writer connects");

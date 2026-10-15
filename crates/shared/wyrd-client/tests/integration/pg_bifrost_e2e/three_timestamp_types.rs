@@ -8,6 +8,7 @@
 //! and the customer's local hour is queryable.
 
 use std::sync::Arc;
+use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::array::{Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::compute::concat_batches;
@@ -83,9 +84,12 @@ async fn orders<T: schemars::JsonSchema, R: Serialize>(
     rows: &[R],
 ) -> Bifrost {
     let client = service_client(srv, "three-timestamp-types", &["admin"]).await;
-    let orders = Bifrost::connect_with_table(
+    let orders = Bifrost::connect_with(
         &client,
-        TableConfig::from_model::<T>(table).expect("the model declares a table"),
+        BifrostOptions {
+            table: Some(TableConfig::from_model::<T>(table).expect("the model declares a table")),
+            ..BifrostOptions::default()
+        },
     )
     .await
     .expect("the writer connects");
@@ -305,10 +309,18 @@ fn arrow_order(zone: Option<&str>) -> RecordBatch {
 async fn an_arrow_instant_in_any_zone_is_one_instant_and_a_naive_one_is_refused() {
     let srv = WyrdTestServer::start_bound().await.expect("server starts");
     let client = service_client(&srv, "three-timestamp-types", &["admin"]).await;
-    let orders = Bifrost::connect_with_table(
+    let orders = Bifrost::connect_with(
         &client,
-        TableConfig::from_arrow(ARROW_ORDERS, arrow_order(Some("America/New_York")).schema())
-            .expect("the schema declares a table"),
+        BifrostOptions {
+            table: Some(
+                TableConfig::from_arrow(
+                    ARROW_ORDERS,
+                    arrow_order(Some("America/New_York")).schema(),
+                )
+                .expect("the schema declares a table"),
+            ),
+            ..BifrostOptions::default()
+        },
     )
     .await
     .expect("the writer connects");

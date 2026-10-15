@@ -22,10 +22,11 @@ use crate::operators::{decode, to_python};
 /// Every call blocks the calling thread with the GIL released. A Role change
 /// reaches the principal at its next token; already-issued tokens keep the
 /// Roles they were signed with.
-#[pyclass(module = "wyrd._wyrd.principals", name = "Principals")]
+#[pyclass(module = "wyrd._wyrd.auth", name = "Principals")]
 pub struct Principals {
-    /// The shared native handle every call delegates to.
-    inner: NativePrincipals,
+    /// The one native connection every call delegates to, connected on the
+    /// first server operation (or by `connect`).
+    inner: crate::client::LazyConnection<NativePrincipals>,
 }
 
 /// Decode a principal id argument.
@@ -37,27 +38,63 @@ fn principal_id(value: &str) -> WyrdPyResult<PrincipalId> {
     decode("principal_id", Value::from(value))
 }
 
+impl Principals {
+    /// Return the connected native handle, connecting it on first use.
+    ///
+    /// # Errors
+    /// Returns the stable configuration, credential, or refused-exchange
+    /// error of the shared Rust `connect`.
+    fn handle(&self, py: Python<'_>) -> WyrdPyResult<&NativePrincipals> {
+        Ok(self.inner.get(py, |client| async move {
+            match client {
+                Some(client) => NativePrincipals::connect_with(&client).await,
+                None => NativePrincipals::connect().await,
+            }
+        })?)
+    }
+}
+
 #[pymethods]
 impl Principals {
-    /// Build a handle acting as `client`; omitted, the client resolves from
-    /// the ambient chain.
+    /// Build a principal administration handle acting as `client`, performing no IO.
     ///
-    /// No network call happens here.
+    /// The client, or the ambient chain when `client` is omitted, resolves
+    /// and connects once on the first server operation, exactly as `connect`
+    /// does; until then nothing is read from the environment or the network.
+    ///
+    /// # Arguments
+    /// * `client` - The `WyrdClient` every call is sent as, or `None` for the
+    ///   ambient chain.
+    #[new]
+    #[pyo3(signature = (client=None))]
+    fn __new__(client: Option<PyRef<'_, crate::client::PyWyrdClient>>) -> Self {
+        Self {
+            inner: crate::client::LazyConnection::new(client.as_deref()),
+        }
+    }
+
+    /// Connect a principal administration handle acting as `client` now.
+    ///
+    /// Resolves the client (the ambient chain when omitted) and completes any
+    /// credential exchange it requires before returning; a supplied bearer
+    /// or fresh cached token is reused without a request.
     ///
     /// # Arguments
     /// * `client` - The `WyrdClient` every call is sent as, or `None` for the
     ///   ambient chain.
     ///
     /// # Errors
-    /// Raises `WyrdError` when the ambient server URL or credential cannot be
-    /// resolved.
-    #[new]
+    /// Raises `WyrdError` with the stable configuration, credential, or
+    /// refused-exchange error.
+    #[staticmethod]
     #[pyo3(signature = (client=None))]
-    fn __new__(client: Option<PyRef<'_, crate::client::PyWyrdClient>>) -> WyrdPyResult<Self> {
-        let client = crate::client::PyWyrdClient::resolve(client.as_deref())?;
-        Ok(Self {
-            inner: NativePrincipals::with_client(client),
-        })
+    fn connect(
+        py: Python<'_>,
+        client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
+    ) -> WyrdPyResult<Self> {
+        let handle = Self::__new__(client);
+        handle.handle(py)?;
+        Ok(handle)
     }
 
     /// Create an unbound Service principal from a
@@ -74,7 +111,8 @@ impl Principals {
         request: &Bound<'_, PyAny>,
     ) -> WyrdPyResult<Py<PyAny>> {
         let request: CreateServicePrincipalRequest = decode("request", pyobject_to_json(request)?)?;
-        let created = crate::trace::block_on(py, self.inner.create_service_principal(&request))?;
+        let created =
+            crate::trace::block_on(py, self.handle(py)?.create_service_principal(&request))?;
         to_python(py, &created)
     }
 
@@ -86,7 +124,7 @@ impl Principals {
     /// fails.
     fn issue_credential(&self, py: Python<'_>, principal_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let id = self::principal_id(principal_id)?;
-        let issued = crate::trace::block_on(py, self.inner.issue_credential(&id))?;
+        let issued = crate::trace::block_on(py, self.handle(py)?.issue_credential(&id))?;
         to_python(py, &issued)
     }
 
@@ -98,7 +136,7 @@ impl Principals {
     /// fails.
     fn list_credentials(&self, py: Python<'_>, principal_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let id = self::principal_id(principal_id)?;
-        let listed = crate::trace::block_on(py, self.inner.list_credentials(&id))?;
+        let listed = crate::trace::block_on(py, self.handle(py)?.list_credentials(&id))?;
         to_python(py, &listed)
     }
 
@@ -116,7 +154,7 @@ impl Principals {
     ) -> WyrdPyResult<()> {
         let id = self::principal_id(principal_id)?;
         let credential = decode("credential_id", Value::from(credential_id))?;
-        crate::trace::block_on(py, self.inner.revoke_credential(&id, credential))?;
+        crate::trace::block_on(py, self.handle(py)?.revoke_credential(&id, credential))?;
         Ok(())
     }
 
@@ -134,7 +172,7 @@ impl Principals {
     ) -> WyrdPyResult<()> {
         let id = self::principal_id(principal_id)?;
         let request: RevokePrincipalRequest = decode("request", pyobject_to_json(request)?)?;
-        crate::trace::block_on(py, self.inner.revoke_principal(&id, &request))?;
+        crate::trace::block_on(py, self.handle(py)?.revoke_principal(&id, &request))?;
         Ok(())
     }
 
@@ -160,7 +198,7 @@ impl Principals {
                 "kind": kind, "email": email, "name": name, "limit": limit, "after": after,
             }),
         )?;
-        let page = crate::trace::block_on(py, self.inner.list(&query))?;
+        let page = crate::trace::block_on(py, self.handle(py)?.list(&query))?;
         to_python(py, &page)
     }
 
@@ -172,7 +210,7 @@ impl Principals {
     /// request fails.
     fn roles(&self, py: Python<'_>, principal_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let id = self::principal_id(principal_id)?;
-        let roles = crate::trace::block_on(py, self.inner.roles(&id))?;
+        let roles = crate::trace::block_on(py, self.handle(py)?.roles(&id))?;
         to_python(py, &roles)
     }
 
@@ -190,7 +228,7 @@ impl Principals {
         role: &str,
     ) -> WyrdPyResult<Py<PyAny>> {
         let id = self::principal_id(principal_id)?;
-        let change = crate::trace::block_on(py, self.inner.grant_role(&id, role))?;
+        let change = crate::trace::block_on(py, self.handle(py)?.grant_role(&id, role))?;
         to_python(py, &change)
     }
 
@@ -208,7 +246,7 @@ impl Principals {
         role: &str,
     ) -> WyrdPyResult<Py<PyAny>> {
         let id = self::principal_id(principal_id)?;
-        let change = crate::trace::block_on(py, self.inner.revoke_role(&id, role))?;
+        let change = crate::trace::block_on(py, self.handle(py)?.revoke_role(&id, role))?;
         to_python(py, &change)
     }
 }

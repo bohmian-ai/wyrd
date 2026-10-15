@@ -183,6 +183,14 @@ fn uid() -> CardUid {
 }
 
 /// `Cards::list` encodes filters as query parameters and sends no GET body.
+///
+/// A one-response local server answers an empty page; the bearer client's
+/// handle connects without a request, so the listing is the only request.
+///
+/// # Panics
+/// Panics when the local server, a test space name, the handle, or the typed
+/// list fails, or when the page is not empty, the request is not a bodyless
+/// `GET /v1/cards`, or its query parameters differ from the filters.
 #[tokio::test]
 async fn list_uses_typed_query_parameters_and_an_empty_get_body() {
     let server = TestServer::start(vec![json_response(
@@ -194,7 +202,9 @@ async fn list_uses_typed_query_parameters_and_an_empty_get_body() {
     )])
     .await;
 
-    let cards = Cards::with_client(client(server.uri()));
+    let cards = Cards::connect_with(&client(server.uri()))
+        .await
+        .expect("handle connects");
     let page = cards
         .list(ListCardsRequest {
             kind: Some(CardKind::Prompt),
@@ -233,6 +243,13 @@ async fn list_uses_typed_query_parameters_and_an_empty_get_body() {
 }
 
 /// UID deletes hit the kind-qualified path and treat a 404 as already deleted.
+///
+/// The local server answers `deleted: false`, the already-deleted outcome the
+/// handle must accept as success.
+///
+/// # Panics
+/// Panics when the local server, the handle, or the delete fails, or when the
+/// request is not a bodyless `DELETE` on the kind-qualified UID path.
 #[tokio::test]
 async fn uid_delete_uses_kind_qualified_path_and_preserves_idempotence() {
     let server = TestServer::start(vec![json_response(
@@ -244,7 +261,9 @@ async fn uid_delete_uses_kind_qualified_path_and_preserves_idempotence() {
     )])
     .await;
 
-    let cards = Cards::with_client(client(server.uri()));
+    let cards = Cards::connect_with(&client(server.uri()))
+        .await
+        .expect("handle connects");
     cards
         .delete(CardSelector::uid(CardKind::Prompt, uid()))
         .await
@@ -259,6 +278,14 @@ async fn uid_delete_uses_kind_qualified_path_and_preserves_idempotence() {
 }
 
 /// A server problem+json refusal keeps its code and status through the registry boundary.
+///
+/// The local server answers a 404 problem with redacted details to a UID
+/// `get`.
+///
+/// # Panics
+/// Panics when the local server or the handle fails, the `get` succeeds, the
+/// refusal's code, status, or details differ from the problem, or the request
+/// is not a `GET` on the kind-qualified UID path.
 #[tokio::test]
 async fn server_problem_code_and_status_survive_registry_boundary() {
     let server = TestServer::start(vec![json_response(
@@ -271,7 +298,9 @@ async fn server_problem_code_and_status_survive_registry_boundary() {
     )])
     .await;
 
-    let cards = Cards::with_client(client(server.uri()));
+    let cards = Cards::connect_with(&client(server.uri()))
+        .await
+        .expect("handle connects");
     let error = cards
         .get(CardSelector::uid(CardKind::Prompt, uid()))
         .await

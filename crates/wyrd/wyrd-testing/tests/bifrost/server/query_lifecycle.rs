@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::datatypes::{DataType, Field, Schema};
 
@@ -63,9 +64,14 @@ impl LifecycleFixture {
             DataType::Int64,
             false,
         )]));
-        Bifrost::connect_with_table(
+        Bifrost::connect_with(
             &owner,
-            TableConfig::from_arrow(&table_fqn, schema).expect("declared lifecycle table"),
+            BifrostOptions {
+                table: Some(
+                    TableConfig::from_arrow(&table_fqn, schema).expect("declared lifecycle table"),
+                ),
+                ..BifrostOptions::default()
+            },
         )
         .await
         .expect("the owner connects")
@@ -388,8 +394,9 @@ async fn denied_describe_is_audited_before_admission() {
         .seed_role("describe_denied", &[permission])
         .await
         .expect("seed the query-only role");
-    let writer = Bifrost::connect(
+    let writer = Bifrost::connect_with(
         &LifecycleFixture::client(&server, None, "describe_denied", &["describe_denied"]).await,
+        BifrostOptions::default(),
     )
     .await
     .expect("the query-only writer connects");

@@ -30,17 +30,46 @@ pub struct NativeCards {
     cards: Cards,
 }
 
+/// Closed result of connecting one Card registry handle: the handle or a
+/// catalog error.
+#[napi(object, object_from_js = false)]
+pub struct NativeCardsConnection {
+    /// Connected handle when the connection succeeded.
+    pub handle: Option<NativeCards>,
+    /// Catalog failure otherwise.
+    pub error: Option<NativeWyrdError>,
+}
+
 #[napi]
 impl NativeWyrdClient {
-    /// Builds one Card registry handle that calls the server as this client.
+    /// Connects one Card registry handle that calls the server as this client.
     ///
-    /// No IO happens here; the public TypeScript `Cards.connect` passes the
-    /// caller's client or the ambient one.
+    /// Completes any credential exchange this client requires before
+    /// resolving, as `Cards::connect_with` does; the public TypeScript
+    /// `Cards.connect` passes the caller's client or the ambient one. A refused
+    /// or unreachable exchange is returned as catalog metadata.
+    ///
+    /// # Errors
+    ///
+    /// Never returns a napi error; failures are carried in the result.
     #[napi]
-    pub fn cards(&self) -> NativeCards {
-        NativeCards {
-            cards: Cards::with_client(self.client.clone()),
-        }
+    pub fn cards<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeCardsConnection>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            Ok(match Cards::connect_with(&client).await {
+                Ok(cards) => NativeCardsConnection {
+                    handle: Some(NativeCards { cards }),
+                    error: None,
+                },
+                Err(error) => NativeCardsConnection {
+                    handle: None,
+                    error: Some(NativeWyrdError::from_wyrd(&error)),
+                },
+            })
+        })
     }
 
     /// Loads and validates one hydrated bundle whose server calls run as this
@@ -55,7 +84,7 @@ impl NativeWyrdClient {
     #[napi]
     pub fn open_wyrd_state(&self, path: String) -> NativeWyrdState {
         NativeWyrdState {
-            state: WyrdState::from_path_with_client(path, self.client.clone()),
+            state: WyrdState::from_path_with(path, self.client.clone()),
         }
     }
 }

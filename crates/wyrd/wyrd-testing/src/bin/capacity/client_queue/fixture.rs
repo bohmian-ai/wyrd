@@ -56,7 +56,7 @@ impl Tenant {
         std::fs::write(root.join("model.yaml"), MODEL)?;
         std::fs::write(root.join("service.yaml"), SERVICE)?;
         let admin = connect(&setup.api_key, None)?;
-        let cards = Cards::with_client(WyrdClient::clone(&admin));
+        let cards = Cards::connect_with(&admin).await?;
         let service = Box::pin(cards.register_from_path(&root.join("service.yaml"))).await?;
         let issued: IssueKeyResponse = admin
             .request_json(

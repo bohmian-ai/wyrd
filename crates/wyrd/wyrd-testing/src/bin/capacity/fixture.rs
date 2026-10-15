@@ -225,7 +225,7 @@ impl Tenant {
         std::fs::create_dir_all(&directory)?;
         write_graph(&directory)?;
         let admin = connect(SERVER_URL, &setup.api_key)?;
-        let cards = Cards::with_client(WyrdClient::clone(&admin));
+        let cards = Cards::connect_with(&admin).await?;
         let register = |name: &str| {
             let path = directory.join(name);
             let cards = &cards;
@@ -396,7 +396,7 @@ impl Tenant {
     /// not returned, so no queued Drift step reads it.
     async fn seed(&self) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
         let start = Utc::now();
-        let state = WyrdState::from_path_with_client(&self.bundle, self.service(SERVER_URL)?)?;
+        let state = WyrdState::from_path_with(&self.bundle, self.service(SERVER_URL)?)?;
         state
             .start_bifrost_with_config(None, QueueConfig::default())
             .await?;

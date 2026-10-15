@@ -9,6 +9,7 @@
 //! child prints the exported identities on one stdout line.
 
 use std::process::Command;
+use wyrd_ai::bifrost::BifrostOptions;
 
 use opentelemetry::trace::{Span as _, Status, TraceContextExt, Tracer, TracerProvider as _};
 use opentelemetry::{Context, InstrumentationScope, KeyValue};
@@ -153,7 +154,7 @@ async fn stock_exporter_span_reads_back_through_bifrost() {
         .await
         .expect("spans publish");
 
-    let rows: Vec<SpanRow> = Bifrost::connect(&deployment.admin())
+    let rows: Vec<SpanRow> = Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
         .await
         .expect("Bifrost connects")
         .sql_as(

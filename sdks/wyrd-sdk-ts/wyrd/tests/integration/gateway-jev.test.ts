@@ -116,7 +116,7 @@ const test = serverTest({ provider: jev, verificationRuntime: true }).extend<{ r
         provider: "jev",
         source: { environment: { binding: "test-jev-key" } },
       });
-      await Gateway.connect().putDeployment({
+      await (await Gateway.connect()).putDeployment({
         name: "jev-latest",
         model: { provider: "jev", model: "jev-latest" },
         adapter: "jev",
@@ -124,8 +124,8 @@ const test = serverTest({ provider: jev, verificationRuntime: true }).extend<{ r
         capabilities: ["system_one", "chat_completions"],
         routing_weight: 1,
       });
-      await Gateway.connect().putCapturePolicy({ mode: "metadata", payload_fields: [] });
-      const cards = Cards.connect();
+      await (await Gateway.connect()).putCapturePolicy({ mode: "metadata", payload_fields: [] });
+      const cards = await Cards.connect();
       const receipt = await cards.registerFromPath(fixture("cards/gateway_jev/reviewer.yaml"));
       const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-reviewer-"));
       await cards.hydrate(receipt.root, bundle);

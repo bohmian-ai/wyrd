@@ -33,7 +33,7 @@ const test = serverTest({
         provider: "openai",
         source: { environment: { binding: "test-provider-key" } },
       });
-      await Gateway.connect().putDeployment({
+      await (await Gateway.connect()).putDeployment({
         name: "gpt-4o",
         model: { provider: "openai", model: "gpt-4o" },
         adapter: "openai",

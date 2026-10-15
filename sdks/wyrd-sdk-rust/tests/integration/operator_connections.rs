@@ -47,7 +47,9 @@ fn slack() -> CreateOperatorConnectionRequest {
 /// # Panics
 /// Panics when the connection cannot be created.
 async fn admin_with_slack(deployment: &Deployment) -> (OperatorConnections, OperatorConnectionId) {
-    let admin = OperatorConnections::with_client(deployment.admin());
+    let admin = OperatorConnections::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
     let created = admin.create(&slack()).await.expect("connection creates");
     (admin, created.connection_id)
 }
@@ -144,13 +146,15 @@ async fn admin_manages_redacted_connections() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn writer_is_refused() {
     let deployment = Deployment::start().await;
-    let writer = OperatorConnections::with_client(
-        deployment.client(
+    let writer = OperatorConnections::connect_with(
+        &deployment.client(
             &deployment
                 .scoped_key("card_writer", &["cards:read", "cards:write"])
                 .await,
         ),
-    );
+    )
+    .await
+    .expect("handle connects");
 
     let refused = writer.list().await.expect_err("a writer cannot list");
 
@@ -169,9 +173,11 @@ async fn writer_is_refused() {
 async fn other_tenant_sees_nothing() {
     let deployment = Deployment::start().await;
     let (admin, slack_id) = admin_with_slack(&deployment).await;
-    let foreign = OperatorConnections::with_client(
-        deployment.client(&deployment.other_tenant_admin("other-tenant").await),
-    );
+    let foreign = OperatorConnections::connect_with(
+        &deployment.client(&deployment.other_tenant_admin("other-tenant").await),
+    )
+    .await
+    .expect("handle connects");
 
     let listed = foreign.list().await.expect("foreign list");
     let hidden = foreign
@@ -217,13 +223,15 @@ async fn other_tenant_sees_nothing() {
 async fn reader_cannot_disable_a_connection() {
     let deployment = Deployment::start().await;
     let (admin, slack_id) = admin_with_slack(&deployment).await;
-    let reader = OperatorConnections::with_client(
-        deployment.client(
+    let reader = OperatorConnections::connect_with(
+        &deployment.client(
             &deployment
                 .scoped_key("operator_reader", &["operators:read"])
                 .await,
         ),
-    );
+    )
+    .await
+    .expect("handle connects");
 
     assert_eq!(
         reader.get(&slack_id).await.expect("the reader reads"),

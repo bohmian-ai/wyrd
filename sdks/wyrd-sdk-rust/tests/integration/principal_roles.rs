@@ -2,11 +2,12 @@
 //! Roles through `Principals`; each change reaches the principal's next token.
 
 use serde::Deserialize;
-use wyrd_ai::cards::{CardRef, Cards};
-use wyrd_ai::cli;
-use wyrd_ai::principals::{
+use wyrd_ai::auth::{
     PrincipalId, PrincipalKindTag, PrincipalQuery, Principals, RoleAssignment, RoleSource,
 };
+use wyrd_ai::bifrost::BifrostOptions;
+use wyrd_ai::cards::{CardRef, Cards};
+use wyrd_ai::cli;
 use wyrd_ai::{Bifrost, WyrdError};
 use wyrd_testing::Bootstrap;
 
@@ -40,7 +41,7 @@ fn assignment(role: &str, source: RoleSource) -> RoleAssignment {
 /// Panics when registration or issuance fails.
 async fn service_principal() -> (Deployment, PrincipalId, String) {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     register(&cards, "cards/observe_a_run/observed-model.yaml").await;
     let service: CardRef = register(&cards, "cards/observe_a_run/observed-service.yaml")
         .await
@@ -65,10 +66,12 @@ async fn service_principal() -> (Deployment, PrincipalId, String) {
 /// client so the call carries the principal's next token.
 ///
 /// # Errors
-/// Returns the registration error, `WYRD_PERMISSION_403_DENIED_RBAC` when the
-/// principal's Roles do not include Card authoring.
+/// Returns the server's refusal of the key's exchange, the registration
+/// error, or `WYRD_PERMISSION_403_DENIED_RBAC` when the principal's Roles do
+/// not include Card authoring.
 async fn author(deployment: &Deployment, key: &str) -> Result<(), WyrdError> {
-    Cards::with_client(deployment.client(key))
+    Cards::connect_with(&deployment.client(key))
+        .await?
         .register_from_path(&fixture(AUTHORED))
         .await
         .map(|_| ())
@@ -84,17 +87,20 @@ async fn author(deployment: &Deployment, key: &str) -> Result<(), WyrdError> {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn granted_editor_reaches_the_next_token_until_revoked() {
     let (deployment, principal, key) = service_principal().await;
-    let principals = Principals::with_client(deployment.admin());
+    let principals = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
 
     let held = principals.roles(&principal).await.expect("roles list");
     assert_eq!(held.kind, PrincipalKindTag::Service);
     assert_eq!(held.roles, [assignment("workload", RoleSource::Direct)]);
-    let counted: Vec<Count> = Bifrost::connect(&deployment.client(&key))
-        .await
-        .expect("Bifrost connects")
-        .sql_as(TENANT_WIDE, &[])
-        .await
-        .expect("workload queries tenant-wide");
+    let counted: Vec<Count> =
+        Bifrost::connect_with(&deployment.client(&key), BifrostOptions::default())
+            .await
+            .expect("Bifrost connects")
+            .sql_as(TENANT_WIDE, &[])
+            .await
+            .expect("workload queries tenant-wide");
     assert_eq!(counted.len(), 1);
     assert!(counted[0].n >= 0);
     let refused = author(&deployment, &key)
@@ -145,7 +151,9 @@ async fn granted_editor_reaches_the_next_token_until_revoked() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn only_a_tenant_admin_assigns_roles() {
     let (deployment, principal, key) = service_principal().await;
-    let principals = Principals::with_client(deployment.client(&key));
+    let principals = Principals::connect_with(&deployment.client(&key))
+        .await
+        .expect("handle connects");
 
     let granted = principals
         .grant_role(&principal, "editor")
@@ -179,7 +187,9 @@ async fn direct_and_idp_user_assignments_coexist() {
     else {
         panic!("user bootstrap returned a machine principal");
     };
-    let principals = Principals::with_client(deployment.admin());
+    let principals = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
 
     let page = principals
         .list(&PrincipalQuery {

@@ -41,7 +41,7 @@ The same call from an SDK:
 <LangTab lang="python">
 
 ```python
-from wyrd.principals import Principals
+from wyrd.auth import Principals
 
 principals = Principals()
 result = principals.grant_role(principal_id, "editor")
@@ -52,9 +52,9 @@ print(result["changed"], result["roles"])
 <LangTab lang="rust">
 
 ```rust
-use wyrd_ai::{Principals, WyrdClient};
+use wyrd_ai::auth::Principals;
 
-let principals = Principals::with_client(WyrdClient::from_global()?);
+let principals = Principals::connect().await?;
 let result = principals.grant_role(&principal_id, "editor").await?;
 println!("{} {:?}", result.changed, result.roles);
 ```
@@ -65,7 +65,7 @@ println!("{} {:?}", result.changed, result.roles);
 ```typescript
 import { Principals } from "wyrd-ai";
 
-const principals = Principals.connect();
+const principals = await Principals.connect();
 const result = await principals.grantRole(principalId, "editor");
 console.log(result.changed, result.roles);
 ```

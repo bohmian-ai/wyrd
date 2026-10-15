@@ -1348,6 +1348,20 @@ export class Bifrost {
   }
 
   /**
+   * List the compact entries of every table the caller may read.
+   *
+   * Visible built-in tables and the tenant's own, without schemas; call
+   * {@link Bifrost.describeTable} for one table's schema when it is needed.
+   *
+   * @returns The server's authorized table entries.
+   * @throws {@link WyrdError} when the principal lacks `bifrost_table:read`,
+   * or for a transport failure.
+   */
+  async listTables(): Promise<TableEntry[]> {
+    return lifecycleValue<TableEntry[]>(await this.#native.listTables());
+  }
+
+  /**
    * Describe one registered table's stored physical schema.
    *
    * @param namespace - The table's namespace, such as `vala.datasets`.
@@ -1582,15 +1596,19 @@ export class Cards {
   }
 
   /**
-   * Build a registry client without performing IO.
+   * Connect a registry client, completing any credential exchange the client
+   * requires before resolving. A presented-as-is bearer or fresh cached token
+   * is reused without a request, so a later call may still be refused.
    *
    * @param options - `client` to call the registry as; omitted, the ambient
    * client is resolved.
    * @returns The registry client.
-   * @throws {@link WyrdError} when the ambient client cannot be resolved.
+   * @throws {@link WyrdError} when the ambient client cannot be resolved or a
+   * required credential exchange is refused or unreachable.
    */
-  static connect(options: ClientOptions = {}): Cards {
-    return new Cards(wyrdClientNative(clientOf(options)).cards());
+  static async connect(options: ClientOptions = {}): Promise<Cards> {
+    const connection = await wyrdClientNative(clientOf(options)).cards();
+    return new Cards(nativeHandle(connection.handle, connection.error));
   }
 
   /**
@@ -1871,15 +1889,19 @@ export class OperatorConnections {
   }
 
   /**
-   * Build an Operator connection client without performing IO.
+   * Connect an Operator connection client, completing any credential exchange the client
+   * requires before resolving. A presented-as-is bearer or fresh cached token
+   * is reused without a request, so a later call may still be refused.
    *
    * @param options - `client` to call the server as; omitted, the ambient
    * client is resolved.
    * @returns The connection client.
-   * @throws {@link WyrdError} when the ambient client cannot be resolved.
+   * @throws {@link WyrdError} when the ambient client cannot be resolved or a
+   * required credential exchange is refused or unreachable.
    */
-  static connect(options: ClientOptions = {}): OperatorConnections {
-    return new OperatorConnections(wyrdClientNative(clientOf(options)).operatorConnections());
+  static async connect(options: ClientOptions = {}): Promise<OperatorConnections> {
+    const connection = await wyrdClientNative(clientOf(options)).operatorConnections();
+    return new OperatorConnections(nativeHandle(connection.handle, connection.error));
   }
 
   /**
@@ -1957,15 +1979,19 @@ export class Principals {
   }
 
   /**
-   * Build a principal client without performing IO.
+   * Connect a principal client, completing any credential exchange the client
+   * requires before resolving. A presented-as-is bearer or fresh cached token
+   * is reused without a request, so a later call may still be refused.
    *
    * @param options - `client` to call the server as; omitted, the ambient
    * client is resolved.
    * @returns The principal client.
-   * @throws {@link WyrdError} when the ambient client cannot be resolved.
+   * @throws {@link WyrdError} when the ambient client cannot be resolved or a
+   * required credential exchange is refused or unreachable.
    */
-  static connect(options: ClientOptions = {}): Principals {
-    return new Principals(wyrdClientNative(clientOf(options)).principals());
+  static async connect(options: ClientOptions = {}): Promise<Principals> {
+    const connection = await wyrdClientNative(clientOf(options)).principals();
+    return new Principals(nativeHandle(connection.handle, connection.error));
   }
 
   /**
@@ -2805,15 +2831,19 @@ export class Gateway {
   }
 
   /**
-   * Build an administration client without performing IO.
+   * Connect an administration client, completing any credential exchange the client
+   * requires before resolving. A presented-as-is bearer or fresh cached token
+   * is reused without a request, so a later call may still be refused.
    *
    * @param options - `client` to call the server as; omitted, the ambient
    * client is resolved.
    * @returns The administration client.
-   * @throws {@link WyrdError} when the ambient client cannot be resolved.
+   * @throws {@link WyrdError} when the ambient client cannot be resolved or a
+   * required credential exchange is refused or unreachable.
    */
-  static connect(options: ClientOptions = {}): Gateway {
-    return new Gateway(wyrdClientNative(clientOf(options)).gateway());
+  static async connect(options: ClientOptions = {}): Promise<Gateway> {
+    const connection = await wyrdClientNative(clientOf(options)).gateway();
+    return new Gateway(nativeHandle(connection.handle, connection.error));
   }
 
   /**

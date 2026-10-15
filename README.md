@@ -144,6 +144,14 @@ versions. The Eval runs asynchronously after the observation is committed. A
 failed verdict is retained as evidence and dispatches the configured Slack
 Operator.
 
+Nothing above builds a client. The SDKs find the server and credential the
+same way the CLI does, from `WYRD_SERVER_URL` and `WYRD_API_KEY` or the config
+`wyrd server dev` saves. Every server-facing handle opens with `connect` in
+Rust, Python, and TypeScript, and Python also accepts the plain constructor,
+such as `Cards()`, which connects on first use. Pass a client
+only for tests, unusual configuration, or acting on someone's behalf. See
+[Connect from an SDK](docs/src/content/docs/get-started/setup.md#connect-from-an-sdk).
+
 ## Why Wyrd exists
 
 An AI service can remain available and return valid responses while its quality,

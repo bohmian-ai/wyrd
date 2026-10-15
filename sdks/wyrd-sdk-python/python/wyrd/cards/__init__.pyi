@@ -406,19 +406,35 @@ class Cards:
     """
 
     def __init__(self, client: WyrdClient | None = None) -> None:
-        """Build a registry client. No network call or token exchange happens here.
+        """Build a handle; no IO or credential resolution happens here.
+
+        The first server operation connects exactly as ``connect`` does, once
+        per handle, and raises its errors.
 
         Args:
             client: the ``WyrdClient`` to act as, sharing its transport and
                 token cache. Omitted, the ambient client resolves from
-                ``[client]`` in the Wyrd ``config.toml``
-                (``~/.config/wyrd/config.toml`` by default), then the
+                ``[client]`` in the Wyrd ``config.toml``, then the
                 environment, then the saved ``wyrd auth login``.
 
+        """
+        ...
+    @staticmethod
+    def connect(client: WyrdClient | None = None) -> Cards:
+        """Build a handle and connect it now.
+
+        Resolves the client and completes any credential exchange it needs; a
+        bearer token or fresh cached token makes no request.
+
+        Args:
+            client: the ``WyrdClient`` to act as. Omitted, the ambient client
+                resolves as for the constructor.
+
         Raises:
-            WyrdError: ``WYRD_CLIENT_400_CONFIG_INVALID`` for an unreadable
-                ``config.toml``; ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no
-                ambient credential resolves.
+            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no credential
+                resolves; ``WYRD_CLIENT_400_CONFIG_INVALID`` for an unreadable
+                ``config.toml``; the server's error for a refused credential
+                exchange.
 
         """
         ...

@@ -76,7 +76,7 @@ def test_wyrd_tenant_is_refused_beside_a_self_naming_credential(monkeypatch):
     monkeypatch.setenv("WYRD_TENANT", "acme")
     monkeypatch.setenv("WYRD_SERVER_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("WYRD_ACCESS_TOKEN", "wyrd_test_actor")
-    for build in (lambda: WyrdClient(credential="wyrd_test_actor"), Cards):
+    for build in (lambda: WyrdClient(credential="wyrd_test_actor"), Cards.connect):
         with pytest.raises(WyrdError) as captured:
             build()
         assert captured.value.code == "WYRD_CLIENT_400_CONFIG_INVALID"

@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::array::Array;
 use arrow_schema::{DataType, Field, Schema};
@@ -141,6 +142,18 @@ async fn read_ids(
 
 /// Before restart: derive gRPC from the server URL, write through HTTP and
 /// gRPC, and prove an explicit gRPC override also works.
+///
+/// Records the registered Card UID and table name in the lane's state
+/// directory for [`startup_image_verify`] after the restart.
+///
+/// # Panics
+/// Panics when the environment client or state directory is unavailable;
+/// when the server URL is not loopback or gRPC does not derive from it; when
+/// connecting a handle (including its API-key exchange), Card registration,
+/// either Bifrost connection, table registration, an insert, a flush, or a
+/// drain fails; when the table is not newly created; when the override
+/// client cannot be built; when both rows are not read back in time; or
+/// when the state file cannot be written.
 #[tokio::test]
 #[ignore = "run by scripts/server/test-startup-prod.sh against the official image"]
 async fn startup_image_write() {
@@ -151,16 +164,24 @@ async fn startup_image_write() {
     assert_eq!(client.grpc_url(), derived, "gRPC derives from server_url");
 
     let dir = state_dir();
-    let receipt = Cards::with_client(client.clone())
+    let receipt = Cards::connect_with(&client)
+        .await
+        .expect("handle connects")
         .register_from_path(std::path::Path::new(CARD))
         .await
         .expect("register a Card with a local artifact through nginx");
     let card_uid = receipt.root.uid.expect("registered root carries its uid");
 
     let fqn = format!("vala.datasets.startup_{}", uuid::Uuid::now_v7().simple());
-    let bifrost = Bifrost::connect_with_table(&client, table(&fqn))
-        .await
-        .expect("Bifrost over derived gRPC");
+    let bifrost = Bifrost::connect_with(
+        &client,
+        BifrostOptions {
+            table: Some(table(&fqn)),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("Bifrost over derived gRPC");
     assert_eq!(
         bifrost.register().await.expect("register"),
         RegisterOutcome::Created
@@ -187,9 +208,15 @@ async fn startup_image_write() {
         Some(derived),
     ))
     .expect("client with explicit gRPC override");
-    let explicit = Bifrost::connect_with_table(&overridden, table(&fqn))
-        .await
-        .expect("Bifrost over explicit gRPC");
+    let explicit = Bifrost::connect_with(
+        &overridden,
+        BifrostOptions {
+            table: Some(table(&fqn)),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("Bifrost over explicit gRPC");
     explicit
         .insert(
             JourneyRow {
@@ -212,6 +239,16 @@ async fn startup_image_write() {
 
 /// After restart: the credential, Card, artifact bytes, and acknowledged
 /// Bifrost rows written before the restart are all still readable.
+///
+/// Reads the Card UID and table name [`startup_image_write`] saved.
+///
+/// # Panics
+/// Panics when the state directory or file is missing or malformed, the
+/// saved Card UID is invalid, the environment client cannot be built,
+/// connecting a handle (including its API-key exchange), the artifact
+/// download, the Bifrost connection, or the drain fails, the downloaded
+/// artifact differs from the original bytes, or the acknowledged rows are
+/// not read back in time.
 #[tokio::test]
 #[ignore = "run by scripts/server/test-startup-prod.sh against the official image"]
 async fn startup_image_verify() {
@@ -223,7 +260,9 @@ async fn startup_image_verify() {
 
     let client = env_client();
     let download = dir.join("download");
-    Cards::with_client(client.clone())
+    Cards::connect_with(&client)
+        .await
+        .expect("handle connects")
         .download_artifacts_to(&card_uid, &download)
         .await
         .expect("download the artifact after restart");
@@ -232,9 +271,15 @@ async fn startup_image_verify() {
         ARTIFACT
     );
 
-    let bifrost = Bifrost::connect_with_table(&client, table(&fqn))
-        .await
-        .expect("Bifrost after restart");
+    let bifrost = Bifrost::connect_with(
+        &client,
+        BifrostOptions {
+            table: Some(table(&fqn)),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("Bifrost after restart");
     await_ids(&bifrost, &fqn, &[1, 2]).await;
     bifrost.shutdown().await.expect("drain");
 }
@@ -244,9 +289,15 @@ async fn startup_image_verify() {
 /// # Panics
 /// Panics when the table cannot be opened or a row is not acknowledged.
 async fn insert_ids(client: &WyrdClient, fqn: &str, ids: std::ops::RangeInclusive<i64>) {
-    let bifrost = Bifrost::connect_with_table(client, table(fqn))
-        .await
-        .expect("Bifrost on the anchor");
+    let bifrost = Bifrost::connect_with(
+        client,
+        BifrostOptions {
+            table: Some(table(fqn)),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("Bifrost on the anchor");
     bifrost
         .register()
         .await
@@ -274,9 +325,15 @@ async fn kind_seed() {
     let client = env_client();
     let fqn = format!("vala.datasets.kind_{}", uuid::Uuid::now_v7().simple());
     insert_ids(&client, &fqn, 1..=4).await;
-    let bifrost = Bifrost::connect_with_table(&client, table(&fqn))
-        .await
-        .expect("Bifrost for the seed read");
+    let bifrost = Bifrost::connect_with(
+        &client,
+        BifrostOptions {
+            table: Some(table(&fqn)),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("Bifrost for the seed read");
     await_ids(&bifrost, &fqn, &[1, 2, 3, 4]).await;
     bifrost.shutdown().await.expect("drain");
     std::fs::write(state_dir().join("kind_table"), &fqn).expect("kind state");

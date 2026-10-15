@@ -98,7 +98,8 @@ pub async fn list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
         limit: args.limit,
         after: args.after.as_deref().map(principal_id).transpose()?,
     };
-    let page = crate::client::principals(args.endpoint.server.as_str())?
+    let page = crate::client::principals(args.endpoint.server.as_str())
+        .await?
         .list(&query)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
@@ -140,7 +141,7 @@ pub async fn dispatch(command: RoleCommand) -> Result<ExitCode, WyrdCliError> {
             (&args.endpoint, principal_id(&args.principal)?)
         }
     };
-    let principals = crate::client::principals(endpoint.server.as_str())?;
+    let principals = crate::client::principals(endpoint.server.as_str()).await?;
     let server = |source| WyrdCliError::Server { source };
     let roles = match &command {
         RoleCommand::List(_) => principals.roles(&principal).await.map_err(server)?.roles,

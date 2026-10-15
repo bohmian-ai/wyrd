@@ -11,6 +11,6 @@ A Role change reaches the principal at its next token. Identity-provider
 assignments are owned by login; ``revoke_role`` removes only direct grants.
 """
 
-from .._wyrd.principals import Principals
+from .._wyrd.auth import Principals
 
 __all__ = ["Principals"]

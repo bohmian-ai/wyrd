@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use crate::WyrdClient;
-use crate::bifrost::{Bifrost, QueueConfig, TableConfig};
+use crate::bifrost::{Bifrost, BifrostOptions, QueueConfig, TableConfig};
 use crate::observe::Run;
 use crate::observe::lifecycle::{BifrostLifecycle, StartedBifrost};
 use base64::Engine;
@@ -575,10 +575,7 @@ impl WyrdState {
     ///
     /// # Errors
     /// As [`Self::from_path`].
-    pub fn from_path_with_client(
-        path: impl AsRef<Path>,
-        client: WyrdClient,
-    ) -> Result<Self, WyrdError> {
+    pub fn from_path_with(path: impl AsRef<Path>, client: WyrdClient) -> Result<Self, WyrdError> {
         let state = Self::from_path(path)?;
         let _ = state.client.set(client);
         Ok(state)
@@ -629,8 +626,8 @@ impl WyrdState {
     /// Connect this state's one Bifrost writer with an active write table and
     /// queue configuration.
     ///
-    /// Mirrors [`Bifrost::connect_with_config`] over the state's client, under
-    /// the same start claim.
+    /// Calls [`Bifrost::connect_with`] over the state's client with `table`
+    /// and `queue` as its [`BifrostOptions`], under the same start claim.
     ///
     /// # Arguments
     /// * `table` - The handle's active write table, or `None`, with the
@@ -640,7 +637,7 @@ impl WyrdState {
     ///
     /// # Errors
     /// As [`WyrdState::start_bifrost`], plus the queue-configuration refusal of
-    /// [`Bifrost::connect_with_config`].
+    /// [`Bifrost::connect_with`].
     ///
     /// # Cancellation
     /// As [`WyrdState::start_bifrost`].
@@ -652,7 +649,7 @@ impl WyrdState {
         let claim = self.bifrost.claim()?;
         let client = self.client()?;
         claim
-            .complete(Bifrost::connect_with_config(client, table, queue).await?)
+            .complete(Bifrost::connect_with(client, BifrostOptions { table, queue }).await?)
             .await
     }
 

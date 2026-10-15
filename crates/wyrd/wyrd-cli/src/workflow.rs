@@ -213,10 +213,11 @@ impl RunArgs {
         let workflow = match source {
             Source::File(path) => Workflow::from_path(path).await?,
             Source::Registered(Registered::Uid(selector)) => {
-                ambient_cards()?.workflow().load(&selector).await?
+                ambient_cards().await?.workflow().load(&selector).await?
             }
             Source::Registered(Registered::Exact(card_ref)) => {
-                ambient_cards()?
+                ambient_cards()
+                    .await?
                     .workflow()
                     .load(&CardSelector::exact(card_ref))
                     .await?
@@ -243,7 +244,7 @@ impl RunArgs {
         let workflow = match registered {
             Registered::Exact(card_ref) => card_ref,
             Registered::Uid(selector) => {
-                exact_card_ref(&Cards::with_client(client.clone()).get(selector).await?)?
+                exact_card_ref(&Cards::connect_with(&client).await?.get(selector).await?)?
             }
         };
         let workflows = Workflows::new(client);
@@ -380,12 +381,15 @@ impl RunIdArgs {
     }
 }
 
-/// Build the registry handle from the ambient client configuration.
+/// Connect the registry handle from the ambient client configuration,
+/// completing the credential exchange before any command runs.
 ///
 /// # Errors
-/// Returns the client construction errors of [`crate::client::from_global`].
-fn ambient_cards() -> Result<Cards, WyrdCliError> {
-    Ok(Cards::with_client(crate::client::from_global(None)?))
+/// Returns the client construction errors of [`crate::client::from_global`],
+/// or the server's refusal of the credential exchange or a transport error
+/// when it cannot be reached.
+async fn ambient_cards() -> Result<Cards, WyrdCliError> {
+    Ok(Cards::connect_with(&crate::client::from_global(None)?).await?)
 }
 
 /// Renders run snapshots in the selected output encoding.

@@ -199,7 +199,7 @@ fn connect(server: &WyrdTestServer, credential: &str) -> WyrdClient {
 /// # Panics
 /// Panics when registration or hydration fails.
 async fn register(client: &WyrdClient, service: &Path, bundle: &Path) -> RegistrationReceipt {
-    let cards = Cards::with_client(WyrdClient::clone(client));
+    let cards = Cards::connect_with(client).await.expect("handle connects");
     let receipt = Box::pin(cards.register_from_path(service))
         .await
         .expect("the Eval Service graph registers");
@@ -255,8 +255,8 @@ fn media_as(uri: &str, media_type: &str) -> String {
 /// # Panics
 /// Panics when the bundle does not load or Bifrost does not start.
 async fn start_state(bundle: &Path, client: &WyrdClient) -> WyrdState {
-    let state = WyrdState::from_path_with_client(bundle, client.clone())
-        .expect("complete bundle loads offline");
+    let state =
+        WyrdState::from_path_with(bundle, client.clone()).expect("complete bundle loads offline");
     state
         .start_bifrost_with_config(None, QueueConfig::default())
         .await
@@ -2579,7 +2579,7 @@ async fn direct_task_judgment_records_one_correlated_result() -> Result<(), Serv
         ),
     );
     register(&admin, &service, &bundle).await;
-    let state = WyrdState::from_path_with_client(&bundle, admin.clone())?;
+    let state = WyrdState::from_path_with(&bundle, admin.clone())?;
     let run = state.run();
     let agent = run.for_card("agent")?;
     let judgment = agent
@@ -2705,7 +2705,9 @@ async fn observation_judge_call_records_card_and_run_and_joins_its_result()
         .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
         .await?;
     let admin_client = connect(&server, &admin);
-    wyrd_client::gateway::Gateway::with_client(admin_client.clone())
+    wyrd_client::gateway::Gateway::connect_with(&admin_client)
+        .await
+        .expect("handle connects")
         .put_capture_policy(&wyrd_spec::gateway::GatewayCapturePolicyWrite {
             mode: wyrd_spec::gateway::GatewayCaptureMode::Metadata,
             payload_fields: std::collections::BTreeSet::new(),
@@ -2894,7 +2896,8 @@ async fn background_owner_subject_system_actor() -> Result<(), ServerJourneyErro
         .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
         .await?;
     let admin = connect(&server, server.tenant_admin_key().await?.expose_secret());
-    wyrd_client::gateway::Gateway::with_client(admin.clone())
+    wyrd_client::gateway::Gateway::connect_with(&admin)
+        .await?
         .put_capture_policy(&wyrd_spec::gateway::GatewayCapturePolicyWrite {
             mode: wyrd_spec::gateway::GatewayCaptureMode::Metadata,
             payload_fields: std::collections::BTreeSet::new(),
@@ -3198,7 +3201,7 @@ async fn verify_as(
     bundle: &Path,
     verifier: &str,
 ) -> Result<wyrd_spec::verification::Judgment, ServerJourneyError> {
-    let state = WyrdState::from_path_with_client(bundle, client.clone())?;
+    let state = WyrdState::from_path_with(bundle, client.clone())?;
     Ok(state
         .run()
         .for_card("agent")?
@@ -3261,7 +3264,8 @@ async fn realtime_subject_actor_authority() -> Result<(), ServerJourneyError> {
         )
         .await?;
     let admin = connect(&server, server.tenant_admin_key().await?.expose_secret());
-    wyrd_client::gateway::Gateway::with_client(admin.clone())
+    wyrd_client::gateway::Gateway::connect_with(&admin)
+        .await?
         .put_capture_policy(&wyrd_spec::gateway::GatewayCapturePolicyWrite {
             mode: wyrd_spec::gateway::GatewayCaptureMode::Metadata,
             payload_fields: std::collections::BTreeSet::new(),

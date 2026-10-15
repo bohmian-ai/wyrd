@@ -77,7 +77,9 @@ fn deployment(name: &str, credential_name: &str) -> ProviderDeployment {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn cli_written_credential_reads_back_through_the_gateway() {
     let deployment = Deployment::start().await;
-    let gateway = Gateway::with_client(deployment.admin());
+    let gateway = Gateway::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
 
     let written = put_credential(deployment.admin(), "read-back-key").await;
 
@@ -106,7 +108,9 @@ async fn cli_written_credential_reads_back_through_the_gateway() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn deployment_round_trips() {
     let deployment = Deployment::start().await;
-    let gateway = Gateway::with_client(deployment.admin());
+    let gateway = Gateway::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
     put_credential(deployment.admin(), "round-trip-key").await;
     let primary = self::deployment("round-trip", "round-trip-key");
 
@@ -150,7 +154,9 @@ async fn deployment_without_capabilities_is_refused() {
     let deployment = Deployment::start().await;
     put_credential(deployment.admin(), "no-capability-key").await;
 
-    let refused = Gateway::with_client(deployment.admin())
+    let refused = Gateway::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects")
         .put_deployment(&ProviderDeployment {
             capabilities: BTreeSet::new(),
             ..self::deployment("no-capability", "no-capability-key")
@@ -172,7 +178,9 @@ async fn deployment_without_capabilities_is_refused() {
 async fn credential_in_use_cannot_be_deleted() {
     let deployment = Deployment::start().await;
     put_credential(deployment.admin(), "in-use-key").await;
-    Gateway::with_client(deployment.admin())
+    Gateway::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects")
         .put_deployment(&self::deployment("in-use", "in-use-key"))
         .await
         .expect("deployment puts");
@@ -203,7 +211,9 @@ async fn deleting_a_credential_twice_succeeds() {
             .expect("the delete succeeds");
     }
 
-    let gone = Gateway::with_client(deployment.admin())
+    let gone = Gateway::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects")
         .credential(&credential("deleted-key"))
         .await
         .expect_err("a deleted credential is gone");
@@ -220,7 +230,9 @@ async fn deleting_a_credential_twice_succeeds() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn capture_policy_round_trips() {
     let deployment = Deployment::start().await;
-    let gateway = Gateway::with_client(deployment.admin());
+    let gateway = Gateway::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
     assert_eq!(
         gateway.capture_policy().await.expect("capture reads").mode,
         GatewayCaptureMode::Disabled
@@ -260,17 +272,21 @@ async fn gateway_reader_cannot_delete_a_deployment() {
     let deployment = Deployment::start().await;
     put_credential(deployment.admin(), "reader-key").await;
     let read_only = self::deployment("read-only", "reader-key");
-    Gateway::with_client(deployment.admin())
+    Gateway::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects")
         .put_deployment(&read_only)
         .await
         .expect("deployment puts");
-    let reader = Gateway::with_client(
-        deployment.client(
+    let reader = Gateway::connect_with(
+        &deployment.client(
             &deployment
                 .scoped_key("gateway_reader", &["gateway:read"])
                 .await,
         ),
-    );
+    )
+    .await
+    .expect("handle connects");
 
     assert_eq!(
         reader

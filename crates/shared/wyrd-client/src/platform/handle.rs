@@ -56,6 +56,21 @@ pub struct Platform {
 }
 
 impl Platform {
+    /// Exchange the ambient platform credential for a session and bind a
+    /// client to it.
+    ///
+    /// The server URL and credential resolve as [`WyrdClient::from_global`]
+    /// resolves them; the credential must be a platform credential, which is
+    /// classified as presented-as-is, so resolution makes no tenant exchange.
+    /// Then this is [`Self::connect_with`].
+    ///
+    /// # Errors
+    /// Returns the configuration or credential-resolution error, and
+    /// otherwise as [`Self::connect_with`].
+    pub async fn connect() -> Result<Self, WyrdError> {
+        Self::connect_with(&WyrdClient::from_global().map_err(WyrdError::from)?).await
+    }
+
     /// Exchange `client`'s platform credential for a session and bind a
     /// client to it.
     ///
@@ -76,7 +91,7 @@ impl Platform {
     /// but a presented-as-is credential, and for every credential rejection,
     /// indistinguishably, and a transport error when the server cannot be
     /// reached.
-    pub async fn with_client(client: &WyrdClient) -> Result<Self, WyrdError> {
+    pub async fn connect_with(client: &WyrdClient) -> Result<Self, WyrdError> {
         let auth = &client.auth;
         let ResolvedCredential::BearerToken(credential) = auth.credential() else {
             return Err(WyrdError::Unauthenticated {

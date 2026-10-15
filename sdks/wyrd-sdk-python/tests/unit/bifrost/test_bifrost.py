@@ -17,7 +17,7 @@ class Event(BaseModel):
 @pytest.mark.usefixtures("no_credentials")
 def test_bifrost_without_a_resolvable_credential_raises() -> None:
     with pytest.raises(WyrdError) as captured:
-        Bifrost()
+        Bifrost.connect()
 
     assert captured.value.code == "WYRD_CLIENT_401_NO_CREDENTIALS"
 

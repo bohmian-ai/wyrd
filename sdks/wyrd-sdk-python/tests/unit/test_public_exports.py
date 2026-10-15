@@ -19,7 +19,7 @@ PUBLIC_MODULES = [
     "wyrd.model",
     "wyrd.observe",
     "wyrd.operators",
-    "wyrd.principals",
+    "wyrd.auth",
     "wyrd.prompt",
     "wyrd.state",
     "wyrd.testing",

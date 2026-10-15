@@ -81,9 +81,9 @@ fn assemble(config: ClientConfig) -> Result<WyrdClient, WyrdCliError> {
 /// endpoint.
 ///
 /// # Errors
-/// Returns the same construction errors as [`from_global`].
-pub fn principals(server: &str) -> Result<Principals, WyrdCliError> {
-    Ok(Principals::with_client(from_global(Some(server))?))
+/// Returns the same construction errors as [`from_global`], or the stable error of a refused required credential exchange.
+pub async fn principals(server: &str) -> Result<Principals, WyrdCliError> {
+    Ok(Principals::connect_with(&from_global(Some(server))?).await?)
 }
 
 /// Build the tenant Operator connection handle for one deployment.
@@ -92,9 +92,9 @@ pub fn principals(server: &str) -> Result<Principals, WyrdCliError> {
 /// re-points only the endpoint.
 ///
 /// # Errors
-/// Returns the same construction errors as [`from_global`].
-pub fn operator_connections(server: &str) -> Result<OperatorConnections, WyrdCliError> {
-    Ok(OperatorConnections::with_client(from_global(Some(server))?))
+/// Returns the same construction errors as [`from_global`], or the stable error of a refused required credential exchange.
+pub async fn operator_connections(server: &str) -> Result<OperatorConnections, WyrdCliError> {
+    Ok(OperatorConnections::connect_with(&from_global(Some(server))?).await?)
 }
 
 /// Project a client-assembly failure onto the CLI's local error catalog.

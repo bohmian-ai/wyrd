@@ -19,8 +19,8 @@ use serde_json::error::Category;
 use wyrd_client::Gateway;
 use wyrd_spec::error::WyrdError;
 
-use crate::NativeLifecycleResult;
 use crate::client::NativeWyrdClient;
+use crate::{NativeLifecycleResult, NativeWyrdError};
 
 /// Tenant gateway administration handle over the shared `wyrd_client` Gateway.
 ///
@@ -36,18 +36,46 @@ pub struct NativeGateway {
     gateway: Gateway,
 }
 
+/// Closed result of connecting one gateway administration handle: the handle or a
+/// catalog error.
+#[napi(object, object_from_js = false)]
+pub struct NativeGatewayConnection {
+    /// Connected handle when the connection succeeded.
+    pub handle: Option<NativeGateway>,
+    /// Catalog failure otherwise.
+    pub error: Option<NativeWyrdError>,
+}
+
 #[napi]
 impl NativeWyrdClient {
-    /// Builds one gateway administration handle that calls the server as this
-    /// client.
+    /// Connects one gateway administration handle that calls the server as this client.
     ///
-    /// No IO happens here; the public TypeScript `Gateway.connect` passes the
-    /// caller's client or the ambient one.
+    /// Completes any credential exchange this client requires before
+    /// resolving, as `Gateway::connect_with` does; the public TypeScript
+    /// `Gateway.connect` passes the caller's client or the ambient one. A refused
+    /// or unreachable exchange is returned as catalog metadata.
+    ///
+    /// # Errors
+    ///
+    /// Never returns a napi error; failures are carried in the result.
     #[napi]
-    pub fn gateway(&self) -> NativeGateway {
-        NativeGateway {
-            gateway: Gateway::with_client(self.client.clone()),
-        }
+    pub fn gateway<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeGatewayConnection>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            Ok(match Gateway::connect_with(&client).await {
+                Ok(gateway) => NativeGatewayConnection {
+                    handle: Some(NativeGateway { gateway }),
+                    error: None,
+                },
+                Err(error) => NativeGatewayConnection {
+                    handle: None,
+                    error: Some(NativeWyrdError::from_wyrd(&error)),
+                },
+            })
+        })
     }
 }
 

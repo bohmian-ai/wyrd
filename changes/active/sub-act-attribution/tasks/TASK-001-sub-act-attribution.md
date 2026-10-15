@@ -503,3 +503,114 @@ may use regression/no-op proof; do not create churn to manufacture RED.
 - [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md)
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+
+## Implementation Evidence
+
+Commits `d917a2751..HEAD` on `change/sub-act-attribution` (prerequisite
+`split/verify-attribution` integrated at `c7ec3ef91`). Features: default
+per-target features; `mise run lints` and the type-check lanes use
+`--all-features`.
+
+### Acceptance
+
+| Criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-001/002, AC-008 | `wyrd-sql` `verifier_runs.rs` enqueue owner/SYSTEM; server `scheduler.rs`, `runner.rs`; `wyrd-dev-fixtures/src/pg.rs` seeds SYSTEM | V2 `eval_verification::background_owner_subject_system_actor` | PASS |
+| AC-003/004 | `caller_extractor.rs` keeps the verified pair; `audit/mod.rs`, `scribe_outbox.rs` stage it as content; SDK row projections | V1, V5, V6 `audit_retention::subject_actor_decisions_preserve_trusted_identity`, V7, V9, V10 | PASS |
+| AC-005 | Reserved names in `vala-bifrost-redux` managed columns and the `wyrd-client`/`wyrd-queue` row and table checks; `RegisterTableRequest.fields` doc | V5, V9 Python `test_subject_actor_rows_and_reserved_columns`, V9 TS `subject actor rows and reserved columns` | PASS |
+| AC-006 | Old names removed from schemas, wire types, SDKs, generators, examples, architecture | Disposition inventory below; `mise run codegen:check` | PASS |
+| AC-007 | Defining migrations edited; `20261014000001_verifier_run_requester_every_origin.sql` deleted; no migration added in `b22718f2c..HEAD` | `mise run test:sql` | PASS |
+| AC-009 | Focused commands below plus owner/static lanes | This record | PASS |
+| AC-010 | `wyrd-telemetry` `TenantSpanRoute`/`TenantRoutes::rebind`; server span staging under the operation pair | V7 Rust, V10 Python/TS, V11 MCP: request A/A (A/B delegated), judge gateway spans A/SYSTEM | PASS |
+| AC-011 | `components/workflow/host.rs` attributes hosted steps with the Workflow Card and no Run | V8 `gateway_inference::loaded_workflow_calls_the_gateway_through_its_loading_client`, `gateway_inference::hosted_workflow_calls_record_the_caller_and_the_workflow_card` | PASS |
+| AC-012/018 | `verification/direct.rs`, `service.rs`, `ServerWyrdGatewayCaller` carry subject and delegated intersection to the judge | V1 `eval_verification::realtime_subject_actor_authority`; TS `judge call is attributed to the run and card` | PASS |
+| AC-013 | Accepted authority frozen on `wyrd.verifier_runs` and rebuilt on claim | V3 `verification_runtime::queued_subject_authority_survives_restart` | PASS |
+| AC-014 | Pair-scoped idempotency in `cards/register.rs` and `verifier_runs.rs` | V4 `pg_cards_register::subject_actor_creation_and_replay`, `pg_verifier_runs::subject_actor_manual_replay` | PASS |
+| AC-015 | Audit stages verified pair; refusals before resolution record nothing; platform pairs retained | V6; `platform_admin_e2e::an_operator_configures_and_removes_federated_platform_sign_in`; `auth::jwt_bearer::pg_tests::wrong_audience_is_rejected_and_audited`; V11 | PASS |
+| AC-016 | Gate `AuthContext` pair through HTTP/gRPC/peer frames; `claim_sample.rs` strata on subject | V5/V9 rows; `test:sql`; V7/V10/V11 spans | PASS |
+| AC-017 | Missing identities fail at enqueue/claim; tenant isolation preserved | V2, V3; `mise run check:tenant-isolation` | PASS |
+
+Non-goals stayed out of scope: no token/permission evaluator changes, no new
+store, queue, audit sink, migration, alias, or compatibility path.
+
+### Exact commands
+
+Postgres-backed commands ran under
+`scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && …"`.
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-sql --test integration -E 'test(=pg_cards_register::subject_actor_creation_and_replay) | test(=pg_verifier_runs::subject_actor_manual_replay)'   # 2 passed
+mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(=eval_verification::realtime_subject_actor_authority) | test(=eval_verification::background_owner_subject_system_actor) | test(=verification_runtime::queued_subject_authority_survives_restart)'   # 3 passed
+mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(=audit_retention::subject_actor_decisions_preserve_trusted_identity)'   # 1 passed
+mise exec -- cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=query_bifrost::subject_actor_rows_and_reserved_columns) | test(=gateway_inference::loaded_workflow_calls_the_gateway_through_its_loading_client) | test(=gateway_inference::hosted_workflow_calls_record_the_caller_and_the_workflow_card) | test(=action_timeline::service_action_timeline_is_one_connected_tree)'   # 4 passed
+mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(=verification::pg_tests::verification_tool_continues_trace_context)'   # 1 passed
+mise exec -- cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all -E 'binary_id(wyrd-server::integration) & (test(/pg_workflow_runs::/) | test(/workflow/))'   # 10 passed
+mise exec -- cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all -E 'test(=platform_admin_e2e::an_operator_configures_and_removes_federated_platform_sign_in)'   # 1 passed
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(/workflow/) | test(/gateway::/) | test(=auth::jwt_bearer::pg_tests::wrong_audience_is_rejected_and_audited)'   # 57 passed
+cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py::test_subject_actor_rows_and_reserved_columns tests/integration/test_action_timeline.py::test_service_action_timeline_is_one_connected_tree   # passed
+cd sdks/wyrd-sdk-ts/wyrd && mise exec -- pnpm exec vitest run tests/integration/bifrost-write.test.ts -t "^subject actor rows and reserved columns"   # passed
+cd sdks/wyrd-sdk-ts/wyrd && mise exec -- pnpm exec vitest run tests/integration/verify-in-real-time.test.ts -t "^(service action timeline is one connected tree|judge call is attributed to the run and card)$"   # passed
+```
+
+Owner and static lanes: `mise run test:sql`, `mise run fmt`, `mise run lints`,
+`mise exec -- cargo check --locked --workspace --all-targets`,
+`mise run codegen:check`, `mise run check:deps`,
+`mise run check:tenant-isolation`, `mise run py:format`, `mise run py:lints`,
+`mise run py:typecheck`, `mise run ts:format:check`, `mise run ts:lints`,
+`mise run ts:typecheck` — all pass. `git diff --check main...HEAD` is clean
+after trimming two blank-at-EOF lines inherited in the prerequisite's review
+records.
+
+### Diagnoses
+
+- **Audit fingerprint.** Symptom: audit_log registration fingerprint mismatch.
+  Cause: `source_schema_fingerprint` dropped sub/act for every table, but
+  audit_log carries them as content. Fix site: the fingerprint owner keeps the
+  pair for content-attributed tables (`517b49438`).
+- **V2 owner denial.** Symptom: owner B's background judge call was allowed.
+  Cause: a registered Service principal holds the built-in workload role,
+  which grants gateway invoke. Fix site: test setup removes B's owner roles
+  (V2) and A's default Card role (V1); production unchanged.
+- **V5 client reservation.** Symptom: the client accepted a
+  `sub_principal_id` column. Cause: the `wyrd-queue` reserved-name copy lacked
+  the pair (the client tier cannot depend on `vala-bifrost-redux`). Fix site:
+  that copy, with a unit assertion (`85a9f49f5`).
+- **V6 refusals.** Symptoms: `not-a-token` returned 400, and the delegated
+  user actor failed. Causes: a malformed bearer is documented
+  `WYRD_AUTH_400_BAD_TOKEN_FORMAT`; a forged-but-well-formed token needs a real
+  signature; RFC 8693 delegation requires a Card-bound actor
+  (`actor_not_card_bound`). Fix site: test expectations and setup.
+- **V8 Workflow Card.** Symptom: the Workflow step's gateway row had a null
+  `card_uid`. Cause: `host.rs` built an unattributed
+  `ServerWyrdGatewayCaller`. Fix site: `WorkflowHost::prepare` attributes the
+  pinned Workflow Card with no Run (`8022c3076`). Other callers checked:
+  `eval.rs` and the verification service already attribute.
+- **V10 Python.** Symptom: `AttributeError: _native`. Cause: the test passed
+  the client positionally into `Bifrost(table=…)`. Fix site: the test.
+- **V11 classification.** Symptom: the judge pair set held A/A. Evidence: per
+  span, `verification.*` spans carry the request pair, and `gateway.*` and
+  `workflow.gateway.call` carry A/SYSTEM. Cause: the test counted
+  `verification.judge` (the caller's operation) as a judge call. Fix site:
+  the test selects gateway spans, matching V7/V10.
+
+### Old-name disposition (AC-006)
+
+`git grep -w` over the live tree, excluding `changes/`:
+
+| Name | Remaining | Disposition |
+|---|---|---|
+| `caller_principal_id`, `requested_by_principal_id`, `subject_card_uid`, `audit_principal_id`, `created_by` | none | removed |
+| `verifier_uid` | `wyrd.drift_baselines` key and its queries, fitter/direct/drift locals, `results.rs` field written as `verifier_card_uid`, MCP test fixture field | identity key/local names, not attribution |
+| `principal_id` | `auth_refresh_tokens`, `platform.credentials`, `platform.principal_identities`, `auth_api_keys`, login-state and device-authorization bindings | owner/identity keys per spec |
+| TokenExchange `AuditDetail.subject_principal_id`/`actor_principal_id` | audit detail | describes the minted token, retained |
+
+### Limits and risks
+
+- Manual queued runs are exercised for Drift only.
+- Nested (multi-hop) delegation is not exercised beyond one actor.
+- Local SDK Workflow calls carry no Workflow Card; the client Card header is
+  checked against Card scope, so only hosted runs attribute the Workflow Card.
+- V7/V10 assert direct span pairs; delegated span pairs are proven in V11 and
+  delegated rows in V1/V5/V6/V9.
+- The hosted V8 test had no separate RED; the same missing Workflow Card
+  failed on the local path first.

@@ -8,6 +8,7 @@
 mod analytical;
 mod join;
 mod listener;
+mod live_subquery;
 mod security;
 mod support;
 mod transport;

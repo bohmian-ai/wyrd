@@ -11,6 +11,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::vala::ids::RunId;
 
 /// Deterministic two-row query fixture returned by [`seed_query_fixture`].
 #[derive(Debug, Clone)]
@@ -138,7 +139,9 @@ impl WyrdTestServer {
     /// Two rows travel through the public gRPC ingest path and a third follows
     /// as a live row, which Oracle reaches by discovering this server's Scribe
     /// stream. Unless `fused`, Scribe seals the first two rows before the third
-    /// is written; with `fused`, all three rows stay unsealed. The token
+    /// is written; with `fused`, all three rows stay unsealed. Rows 1 and 2
+    /// share one managed `run_id` and row 3 carries another, so a query can
+    /// correlate on the column the server stamps. The token
     /// comes from exchanging a fresh admin service key through the real auth
     /// route. Language-client journeys use this as their query prerequisite.
     ///
@@ -207,26 +210,24 @@ impl WyrdTestServer {
                 .clone(),
         )
         .await?;
-        writer
-            .write(
-                &table_fqn,
-                &schema,
-                [
-                    br#"{"id": 1, "value": "first"}"#.to_vec(),
-                    br#"{"id": 2, "value": "second"}"#.to_vec(),
-                ],
-            )
-            .await?;
+        let (shared, other) = (RunId::new(), RunId::new());
+        for row in [
+            br#"{"id": 1, "value": "first"}"#.to_vec(),
+            br#"{"id": 2, "value": "second"}"#.to_vec(),
+        ] {
+            writer.enqueue(&table_fqn, &schema, row, Some(&shared))?;
+        }
+        writer.flush().await?;
         if !fused {
             self.flush_bifrost().await.map_err(WyrdError::from)?;
         }
-        writer
-            .write(
-                &table_fqn,
-                &schema,
-                [br#"{"id": 3, "value": "live"}"#.to_vec()],
-            )
-            .await?;
+        writer.enqueue(
+            &table_fqn,
+            &schema,
+            br#"{"id": 3, "value": "live"}"#.to_vec(),
+            Some(&other),
+        )?;
+        writer.flush().await?;
         let token = self
             .exchange_api_key(api_key)
             .await

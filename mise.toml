@@ -464,8 +464,8 @@ description = "Tier-1 journeys: the scoped observation surface over one WyrdStat
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:observe:inner'"
 [tasks."test:bifrost:journey:observe:inner"]
 hide = true
-description = "wyrd-ai observe_a_run, query_bifrost, otel_export, local_development, and support_desk stories"
-run = "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|otel_export|local_development|support_desk)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'"
+description = "wyrd-ai observe_a_run, query_bifrost, query_coverage, otel_export, local_development, and support_desk stories"
+run = "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|query_coverage|otel_export|local_development|support_desk)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'"
 
 [tasks."test:bifrost:journey:drift"]
 description = "Tier-1 journeys: Verifiers judge in real time, and a failed scheduled drift run alerts its Operator"

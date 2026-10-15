@@ -29,7 +29,8 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::DynamicFilterTracking;
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_expr::utils::conjunction;
+use datafusion::physical_expr::utils::{conjunction, split_conjunction};
+use datafusion::physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::filter_pushdown::{
@@ -276,6 +277,46 @@ impl LiveScribeExec {
         &self.scan_metrics
     }
 
+    /// Returns this leaf with its predicate snapshotted to static
+    /// expressions, and the routes output `partition` reads under that
+    /// snapshot.
+    ///
+    /// Route `i` of the planning-time selection belongs to partition
+    /// `i % partitions`, so every route is dealt exactly once whatever each
+    /// partition's snapshot says; the snapshot then only drops routes from
+    /// this partition's share. Called when the partition's stream is first
+    /// polled: a `ScalarSubqueryExec` above has populated its values by then,
+    /// and a join has finished its build side before polling its probe side,
+    /// so a resolved scalar or a join's dynamic filter becomes a static
+    /// predicate that both prunes routes and ships in every fragment. `self`
+    /// keeps the runtime-bound predicate for re-execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns the snapshot error when the predicate reads execution state
+    /// that is not yet populated.
+    fn resolved(&self, partition: usize) -> DataFusionResult<(Self, Vec<LiveScribeRoute>)> {
+        let routes = LiveTableRoutes {
+            binding: self.routes.binding.clone(),
+            routes: self
+                .routes
+                .routes
+                .iter()
+                .skip(partition)
+                .step_by(self.properties.partitioning.partition_count())
+                .cloned()
+                .collect(),
+        };
+        let mut leaf = self.clone();
+        let Some(predicate) = &self.predicate else {
+            return Ok((leaf, routes.routes));
+        };
+        let predicate = snapshot_physical_expr(Arc::clone(predicate))?;
+        let routes = routes.selected_by(&predicate, &self.schema(), self.time_axis.column());
+        leaf.predicate = Some(predicate);
+        Ok((leaf, routes.routes))
+    }
+
     /// Builds the signed fragment and destination for one route.
     ///
     /// The encoded plan is the same identity-bound placeholder a Scribe
@@ -379,13 +420,21 @@ impl ExecutionPlan for LiveScribeExec {
         }
     }
 
-    /// Takes the static filters `DataFusion` pushes to this leaf as the
-    /// predicate every fragment ships with.
+    /// Takes the filters `DataFusion` pushes to this leaf as the predicate
+    /// every fragment ships with: the static filters of the `Pre` phase, then
+    /// the dynamic filters of the `Post` phase that joins and `TopK`
+    /// operators update while the query runs.
     ///
-    /// Every filter is reported unsupported, so the leader's `FilterExec`
-    /// stays above the leaf. Dynamic filters, which join and `TopK` operators
-    /// update while the query runs, are left to the leader: a fragment could
-    /// only carry a stale copy of one.
+    /// Every filter is reported unsupported, so the leader's `FilterExec` and
+    /// the producing operator stay the authority over correctness above the
+    /// leaf.
+    ///
+    /// Filters bound to execution state — a dynamic filter, or
+    /// `id = (SELECT max(id) ...)` whose value `ScalarSubqueryExec` supplies
+    /// before this leaf executes — are kept in the predicate but cannot prune
+    /// routes yet: planning prunes by the conjuncts that already snapshot to
+    /// static expressions, and each partition narrows its share further once
+    /// the rest resolve, when its stream is first polled.
     ///
     /// # Errors
     /// Never returns an error; the signature is fixed by the trait.
@@ -395,22 +444,31 @@ impl ExecutionPlan for LiveScribeExec {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> DataFusionResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        let filters = child_pushdown_result
+        let pushed = child_pushdown_result
             .parent_filters
             .iter()
             .map(|filter| &filter.filter)
-            .filter(|filter| !DynamicFilterTracking::classify(filter).contains_dynamic_filter())
+            .filter(|filter| {
+                DynamicFilterTracking::classify(filter).contains_dynamic_filter()
+                    == (phase == FilterPushdownPhase::Post)
+            })
             .cloned()
-            .chain(self.predicate.iter().cloned())
             .collect::<Vec<_>>();
         let propagation = FilterPushdownPropagation::all_unsupported(child_pushdown_result);
-        if phase != FilterPushdownPhase::Pre || filters.is_empty() {
+        if pushed.is_empty() {
             return Ok(propagation);
         }
+        let filters = self.predicate.iter().cloned().chain(pushed);
         let predicate = conjunction(filters);
+        let static_predicate = conjunction(
+            split_conjunction(&predicate)
+                .into_iter()
+                .filter(|conjunct| snapshot_physical_expr(Arc::clone(conjunct)).is_ok())
+                .cloned(),
+        );
         let mut leaf = self.clone();
         leaf.routes = Arc::new(self.routes.selected_by(
-            &predicate,
+            &static_predicate,
             &self.schema(),
             self.time_axis.column(),
         ));
@@ -458,14 +516,20 @@ impl ExecutionPlan for LiveScribeExec {
     /// Streams this partition's routes' fragments, one route after another,
     /// as their batches arrive.
     ///
-    /// Nothing is opened until the returned stream is first polled, and
-    /// dropping it drops the open fragment stream, which cancels the Scribe
-    /// fragment and releases its snapshot and lease. See [`LiveFragmentRead`]
-    /// for how each outcome maps to the query terminal.
+    /// Nothing is opened until the returned stream is first polled. Then the
+    /// pushed predicate is snapshotted once, by [`LiveScribeExec::resolved`],
+    /// so a resolved scalar or a join's completed dynamic filter ships to
+    /// every Scribe as a literal and narrows this partition's routes. The
+    /// plan keeps the runtime-bound predicate, so a re-execution snapshots its
+    /// new values. Dropping the stream drops the open fragment stream, which
+    /// cancels the Scribe fragment and releases its snapshot and lease. See
+    /// [`LiveFragmentRead`] for how each outcome maps to the query terminal.
     ///
     /// # Errors
-    /// Returns a plan error for a partition this leaf does not advertise, and
-    /// an execution error when the task carries no bound execution bindings.
+    /// Returns a plan error for a partition this leaf does not advertise and
+    /// an execution error when the task carries no bound execution bindings;
+    /// the stream fails with the snapshot error when the predicate reads
+    /// execution state not yet populated.
     fn execute(
         &self,
         partition: usize,
@@ -477,18 +541,10 @@ impl ExecutionPlan for LiveScribeExec {
                 "live Scribe source has no partition {partition}"
             )));
         }
-        let routes = self
-            .routes
-            .routes
-            .iter()
-            .skip(partition)
-            .step_by(partitions)
-            .cloned()
-            .collect();
         let lock = super::bindings::bindings_for_task(context.as_ref())?;
         let read = LiveFragmentRead {
             leaf: self.clone(),
-            routes,
+            partition,
             lock,
             open_time: MetricBuilder::new(&self.metrics)
                 .subset_time("fragment_open_time", partition),
@@ -581,10 +637,11 @@ impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionBoundary
 
 /// One partition's fragment reads, from dispatch through footer validation.
 struct LiveFragmentRead {
-    /// Leaf whose closure the fragments are signed for.
+    /// Leaf whose closure the fragments are signed for, its predicate not
+    /// yet snapshotted.
     leaf: LiveScribeExec,
-    /// The routes this partition reads, in order.
-    routes: Vec<LiveScribeRoute>,
+    /// The output partition whose share of the routes this read covers.
+    partition: usize,
     /// Execution bindings bound after admission.
     lock: Arc<super::bindings::OracleExecutionLock>,
     /// Time spent opening fragments until each peer accepted its stream,
@@ -616,14 +673,14 @@ impl LiveFragmentRead {
             let grant = bindings.grant();
             grant.ensure_live()?;
             let live = bindings.live()?;
-            let schema = self.leaf.schema();
-            'routes: for route in &self.routes {
-                let (fragment, candidate) = self
-                    .leaf
+            let (leaf, routes) = self.leaf.resolved(self.partition)?;
+            let schema = leaf.schema();
+            'routes: for route in &routes {
+                let (fragment, candidate) = leaf
                     .fragment(route, grant.deadline.timestamp_millis())?;
                 let mut decoder = LiveFrameDecoder::new(
                     fragment.plan_fingerprint.clone(),
-                    Arc::clone(&self.leaf.scan_metrics),
+                    Arc::clone(&leaf.scan_metrics),
                 );
                 let open = self.open_time.timer();
                 let opened = live
@@ -1002,6 +1059,142 @@ mod tests {
             matches!(root.physical_plan_type, Some(PhysicalPlanType::Filter(_))),
             "the fragment ships the filter above its placeholder"
         );
+    }
+
+    /// A scalar-subquery conjunct stays on the live leaf without deferring
+    /// static pruning, and each execution ships its resolved value.
+    ///
+    /// Over four hourly routes, planning prunes by the static
+    /// `event_time >= H1` alone while the scalar is pending. Execution then
+    /// fails while the scalar is pending, and once populated with H2 snapshots
+    /// it to a literal: the routes narrow to H2 and H3, are dealt across two
+    /// partitions exactly once each, and the fragment carries no scalar
+    /// subquery. A reset and re-execution with H3 resolves anew, because the
+    /// planned leaf keeps the runtime-bound expression.
+    ///
+    /// # Panics
+    /// Panics when a fixture cannot be built, or pruning, snapshotting,
+    /// dealing, or the encoded fragment differ from the above.
+    #[test]
+    fn scalar_subquery_resolves_per_execution_after_static_pruning() {
+        use super::super::exec::tests::FIXTURE_TIME_COLUMN;
+        use arrow::datatypes::TimeUnit;
+        use datafusion::logical_expr::Operator;
+        use datafusion::logical_expr::physical_planning_context::{
+            ScalarSubqueryResults, SubqueryIndex,
+        };
+        use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+        use datafusion::physical_expr::scalar_subquery::ScalarSubqueryExpr;
+        use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
+        use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
+        use datafusion::scalar::ScalarValue;
+        use datafusion_proto::protobuf::PhysicalPlanNode;
+        use prost::Message as _;
+
+        /// One hour in microseconds, the width of each route's partition.
+        const HOUR_MICROS: i64 = 3_600_000_000;
+        let first_hour = 1_787_493_600_000_000_i64;
+        let zone: Option<Arc<str>> = Some("UTC".into());
+        let hour = |n: i64| {
+            ScalarValue::TimestampMicrosecond(Some(first_hour + n * HOUR_MICROS), zone.clone())
+        };
+        let mut routes =
+            crate::oracle::exec::tests::one_live_route(wyrd_spec::DataTenantId::new_v7());
+        let template = routes.routes[0].clone();
+        routes.routes = (0..4)
+            .map(|n| LiveScribeRoute {
+                time_partition: TimePartitionWire::new(
+                    wyrd_spec::vala::api::TimeGranularityWire::Hour,
+                    DateTime::from_timestamp_micros(first_hour + n * HOUR_MICROS).expect("instant"),
+                )
+                .expect("hour boundary"),
+                ..template.clone()
+            })
+            .collect();
+        let all = routes.routes.clone();
+        let time_type = DataType::Timestamp(TimeUnit::Microsecond, zone.clone());
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, false),
+            Field::new(FIXTURE_TIME_COLUMN, time_type.clone(), false),
+        ]));
+        let leaf = Arc::new(LiveScribeExec::new(
+            routes,
+            crate::catalog::TimeAxis::new(
+                FIXTURE_TIME_COLUMN,
+                crate::catalog::TimeGranularity::Hour,
+            ),
+            "f".repeat(64),
+            vec!["v".to_owned(), FIXTURE_TIME_COLUMN.to_owned()],
+            Arc::clone(&schema),
+            2,
+        ));
+        let results = ScalarSubqueryResults::new(1);
+        let at_least = |right: Arc<dyn PhysicalExpr>| -> Arc<dyn PhysicalExpr> {
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new(FIXTURE_TIME_COLUMN, 1)),
+                Operator::GtEq,
+                right,
+            ))
+        };
+        let predicate = Arc::new(BinaryExpr::new(
+            at_least(Arc::new(Literal::new(hour(1)))),
+            Operator::And,
+            at_least(Arc::new(ScalarSubqueryExpr::new(
+                time_type,
+                false,
+                SubqueryIndex::new(0),
+                results.clone(),
+            ))),
+        ));
+        let plan = FilterPushdown::new()
+            .optimize(
+                Arc::new(FilterExec::try_new(predicate, leaf).expect("filter plans")),
+                &ConfigOptions::default(),
+            )
+            .expect("pushdown runs");
+        let live = plan
+            .downcast_ref::<FilterExec>()
+            .expect("the leader keeps its filter")
+            .input()
+            .downcast_ref::<LiveScribeExec>()
+            .expect("the live leaf stays under the filter");
+        assert_eq!(
+            live.routes.routes,
+            all[1..],
+            "planning prunes by the static conjunct"
+        );
+        assert!(live.resolved(0).is_err(), "a pending scalar cannot resolve");
+
+        for (value, expected) in [(2, &all[2..]), (3, &all[3..])] {
+            results.clear();
+            results
+                .set(SubqueryIndex::new(0), hour(value))
+                .expect("scalar populates");
+            let (resolved, mut dealt) = live.resolved(0).expect("the populated scalar resolves");
+            dealt.extend(live.resolved(1).expect("the populated scalar resolves").1);
+            dealt.sort_by_key(|route| route.time_partition.start_unix_micros());
+            assert_eq!(
+                dealt, expected,
+                "the scalar narrows routes, each dealt exactly once"
+            );
+            let (fragment, _) = resolved
+                .fragment(&expected[0], 0)
+                .expect("the fragment encodes");
+            let encoded = format!(
+                "{:?}",
+                PhysicalPlanNode::decode(fragment.physical_plan_bytes.as_slice())
+                    .expect("the fragment plan decodes")
+            );
+            assert!(
+                !encoded.contains("ScalarSubquery"),
+                "no scalar subquery ships"
+            );
+            let micros = first_hour + value * HOUR_MICROS;
+            assert!(
+                encoded.contains(&micros.to_string()),
+                "the resolved literal ships"
+            );
+        }
     }
 
     /// A time-column predicate keeps only the routes whose hour it can match,

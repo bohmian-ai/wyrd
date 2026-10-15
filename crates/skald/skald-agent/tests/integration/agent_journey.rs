@@ -1,9 +1,21 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+
 use skald_agent::{
-    Agent, FinishReason, RunConfig, clear_prompt_card_registry, default_prompt_resolver,
-    register_prompt_card,
+    Agent, FinishReason, RunConfig, WyrdGatewayCall, WyrdGatewayCaller, clear_prompt_card_registry,
+    default_prompt_resolver, register_prompt_card, wyrd_gateway_registry,
+};
+use skald_providers::ProviderError;
+use tokio_util::sync::CancellationToken;
+use wyrd_spec::gateway::ModelRef;
+use wyrd_spec::ids::ProviderDeploymentName;
+
+use crate::callbacks::{
+    RecordingTool, openai_text_response as callback_text_response, openai_tool_call_response,
+    test_prompt as callback_prompt, tool_call,
 };
 use skald_prompt::Prompt;
 use skald_runtime::{MockProvider, ProviderRegistry};
@@ -243,4 +255,95 @@ fn prompt_card_ref(name: &str) -> CardRef {
         space: Some("default".parse().expect("valid space")),
         uid: None,
     }
+}
+
+/// Gateway caller answering each call from a script and recording the
+/// address every call targeted.
+struct ScriptedGateway {
+    /// Replies returned in order.
+    replies: std::sync::Mutex<VecDeque<ProviderResponse>>,
+    /// Gateway address of every call, in order.
+    targets: std::sync::Mutex<Vec<ModelRef>>,
+}
+
+#[async_trait]
+impl WyrdGatewayCaller for ScriptedGateway {
+    /// Record the call's address and return the next scripted reply.
+    ///
+    /// # Errors
+    /// Never fails.
+    async fn call(
+        &self,
+        call: WyrdGatewayCall,
+        _cancellation: &CancellationToken,
+    ) -> Result<ProviderResponse, ProviderError> {
+        self.targets.lock().expect("targets lock").push(call.model);
+        Ok(self
+            .replies
+            .lock()
+            .expect("replies lock")
+            .pop_front()
+            .expect("a scripted reply remains"))
+    }
+}
+
+/// Two concurrent runs of one Agent definition bound to different gateway
+/// deployments keep their own route on every call of the bounded tool loop:
+/// each model call, before and after the tool, targets only its run's
+/// deployment with the Prompt's model, and neither run falls back to the
+/// host provider registry, which is empty here.
+#[tokio::test]
+async fn execution_route_isolated_through_tool_loop() {
+    let tool = Arc::new(RecordingTool::new(
+        "lookup",
+        serde_json::json!({"found": true}),
+    ));
+    let prompt = callback_prompt();
+    let routed = |deployment: &str| {
+        let caller = Arc::new(ScriptedGateway {
+            replies: std::sync::Mutex::new(VecDeque::from([
+                openai_tool_call_response(vec![tool_call(
+                    "c1",
+                    "lookup",
+                    serde_json::json!({"order": deployment}),
+                )]),
+                callback_text_response("done"),
+            ])),
+            targets: std::sync::Mutex::new(Vec::new()),
+        });
+        let deployment = ProviderDeploymentName::new(deployment).expect("deployment name");
+        let registry = wyrd_gateway_registry(caller.clone(), prompt.native(), &deployment)
+            .expect("gpt-4o is a gateway model");
+        let agent = Agent::from_resolved("routed", Arc::clone(&prompt))
+            .add_tool(tool.clone())
+            .with_run_config(RunConfig {
+                max_iterations: 3,
+                ..Default::default()
+            })
+            .with_provider_registry(Arc::new(registry));
+        (caller, agent)
+    };
+    let (primary, primary_agent) = routed("primary");
+    let (backup, backup_agent) = routed("backup");
+    let host = ProviderRegistry::new();
+
+    let (primary_run, backup_run) = tokio::join!(
+        primary_agent.run_with(&host, None, "where is my order?"),
+        backup_agent.run_with(&host, None, "where is my order?")
+    );
+
+    assert_eq!(primary_run.expect("primary run").output, "done");
+    assert_eq!(backup_run.expect("backup run").output, "done");
+    let targets = |caller: &ScriptedGateway| {
+        caller
+            .targets
+            .lock()
+            .expect("targets lock")
+            .iter()
+            .map(|target| format!("{}/{}", target.deployment, target.model))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(targets(&primary), ["primary/gpt-4o", "primary/gpt-4o"]);
+    assert_eq!(targets(&backup), ["backup/gpt-4o", "backup/gpt-4o"]);
+    assert_eq!(tool.calls().len(), 2, "each run called the tool once");
 }

@@ -1096,9 +1096,9 @@ run = "uv run ruff format --check python/wyrd tests scripts"
 
 [tasks."py:lints"]
 hide = true
-description = "Run Wyrd Python Ruff lint checks"
+description = "Run Wyrd Python Ruff lint checks and validate the authored public stubs"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run ruff check python/wyrd tests scripts"
+run = ["uv run ruff check python/wyrd tests scripts", "uv run python scripts/check_stubs.py"]
 
 [tasks."py:typecheck"]
 hide = true

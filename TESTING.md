@@ -137,7 +137,7 @@ For scoped verification (`gate` already includes its checks):
 
 ```bash
 mise run fmt lints                       # relevant Rust format and lint checks
-mise run codegen:check                   # contracts, schemas, stubs
+mise run codegen:check                   # TS wire types, error codes, UI examples, theme tokens
 mise run check:deps                      # crate boundaries on the dependency graph
 ```
 

@@ -275,6 +275,8 @@ path and applicable negative and edge paths, including permission denial,
 conflict, replay, backpressure, and rejection behavior. Integration and unit
 tests isolate supporting seams; they do not replace the journey.
 
-Generated schemas, stubs, OpenAPI, and golden contracts are derived from their
-owning sources and checked for drift. Runtime MCP catalogs are verified by
-their owning MCP tests. Never edit a generated artifact directly.
+Generated SDK types, error codes, OpenAPI, and golden contracts are derived
+from their owning sources and checked for drift; JSON Schemas are derived at
+runtime or transiently, never committed. Python `.pyi` stubs are authored
+typing, not generated output. Runtime MCP catalogs are verified by their owning
+MCP tests. Never edit a generated artifact directly.

@@ -381,10 +381,13 @@ impl RunIdArgs {
     }
 }
 
-/// Build the registry handle from the ambient client configuration.
+/// Connect the registry handle from the ambient client configuration,
+/// completing the credential exchange before any command runs.
 ///
 /// # Errors
-/// Returns the client construction errors of [`crate::client::from_global`].
+/// Returns the client construction errors of [`crate::client::from_global`],
+/// or the server's refusal of the credential exchange or a transport error
+/// when it cannot be reached.
 async fn ambient_cards() -> Result<Cards, WyrdCliError> {
     Ok(Cards::connect_with(&crate::client::from_global(None)?).await?)
 }

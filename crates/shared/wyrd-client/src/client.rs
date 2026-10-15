@@ -532,6 +532,10 @@ mod tests {
 
     /// Build a client against `server` presenting `credential`, with an
     /// in-memory token cache so no test touches a token file.
+    ///
+    /// # Panics
+    /// Panics when the auth middleware or HTTP transport cannot be built for
+    /// the mock server's URL.
     fn client_for(server: &MockServer, credential: ResolvedCredential) -> WyrdClient {
         let mut config = ClientConfig::default();
         config.http.base_url = server.uri();
@@ -547,6 +551,10 @@ mod tests {
     /// presented-as-is bearer connects every handle with no request at all, a
     /// refused exchange fails `connect_with` with the server's stable error,
     /// and `Platform` keeps its own platform-session exchange.
+    ///
+    /// # Panics
+    /// Panics when a handle fails to connect, a refused exchange connects, or
+    /// the mock server sees a number of exchanges other than its expectation.
     #[tokio::test]
     async fn server_handles_connect_eagerly_and_share_the_client_auth_path() {
         let server = MockServer::start().await;

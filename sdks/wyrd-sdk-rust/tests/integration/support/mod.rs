@@ -107,7 +107,11 @@ impl Deployment {
         self.client(&self.admin_key)
     }
 
-    /// The administrator's Cards handle.
+    /// The administrator's Cards handle, connected eagerly so the
+    /// administrator key is exchanged before a story's first call.
+    ///
+    /// # Panics
+    /// Panics when the server refuses or cannot be reached for the exchange.
     pub async fn cards(&self) -> Cards {
         Cards::connect_with(&self.admin())
             .await

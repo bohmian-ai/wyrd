@@ -53,7 +53,8 @@ impl EvidenceInvestigation {
     /// Seed shared telemetry and a checked-in Service; publish native fixture reports.
     ///
     /// # Errors
-    /// Returns server, registration, ingestion, publication, or MCP failures.
+    /// Returns server, credential-exchange, registration, ingestion,
+    /// publication, or MCP failures.
     pub(super) async fn start() -> Result<Self, McpJourneyError> {
         let server = WyrdTestServer::start_bound().await?;
         let signals =
@@ -64,7 +65,7 @@ impl EvidenceInvestigation {
         let key = admin.api_key().ok_or("administrator has a machine key")?;
         let credential = ResolvedCredential::ApiKey(key.expose_secret().to_owned().into());
         let http = client(&server, credential)?;
-        let cards = Cards::connect_with(&http).await.expect("handle connects");
+        let cards = Cards::connect_with(&http).await?;
         let fixtures = Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../../fixtures/cards"

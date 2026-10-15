@@ -161,8 +161,9 @@ pub(crate) fn transport_with_headers(
 ///
 /// # Errors
 ///
-/// Returns an error when the server is not bound to a listener or when the
-/// client cannot be constructed for `credential`.
+/// Returns an error when the server is not bound to a listener, when the
+/// client cannot be constructed for `credential`, or when the server refuses
+/// or cannot be reached for the credential exchange connecting completes.
 pub(crate) async fn principals(
     server: &WyrdTestServer,
     credential: ResolvedCredential,

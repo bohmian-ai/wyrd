@@ -538,8 +538,8 @@ impl WyrdState {
     /// Connect this state's one Bifrost writer with an active write table and
     /// queue configuration.
     ///
-    /// Mirrors [`Bifrost::connect_with_config`] over the state's client, under
-    /// the same start claim.
+    /// Calls [`Bifrost::connect_with`] over the state's client with `table`
+    /// and `queue` as its [`BifrostOptions`], under the same start claim.
     ///
     /// # Arguments
     /// * `table` - The handle's active write table, or `None`, with the
@@ -549,7 +549,7 @@ impl WyrdState {
     ///
     /// # Errors
     /// As [`WyrdState::start_bifrost`], plus the queue-configuration refusal of
-    /// [`Bifrost::connect_with_config`].
+    /// [`Bifrost::connect_with`].
     ///
     /// # Cancellation
     /// As [`WyrdState::start_bifrost`].

@@ -665,15 +665,17 @@ pub async fn dispatch_delete(args: DeleteArgs) -> Result<ExitCode, WyrdCliError>
     Ok(ExitCode::SUCCESS)
 }
 
-/// Build the card-administration handle, optionally re-pointed at `server`.
+/// Connect the card-administration handle, optionally re-pointed at `server`.
 ///
 /// Construction lives in [`crate::client`]: the ambient configuration is the
 /// right default here, because `wyrd apply` and `wyrd card get` administer the
-/// deployment the user is already pointed at.
+/// deployment the user is already pointed at. Connecting completes the
+/// credential exchange before any command runs.
 ///
 /// # Errors
 /// Returns the client-assembly errors documented on
-/// [`crate::client::from_global`].
+/// [`crate::client::from_global`], or the server's refusal of the credential
+/// exchange or a transport error when it cannot be reached.
 async fn build_cards(server: Option<&str>) -> Result<Cards, WyrdCliError> {
     Ok(Cards::connect_with(&crate::client::from_global(server)?).await?)
 }

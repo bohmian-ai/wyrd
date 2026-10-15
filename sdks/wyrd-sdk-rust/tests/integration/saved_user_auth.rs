@@ -93,10 +93,14 @@ impl SavedLogins {
         config
     }
 
-    /// `Cards` resolved from the saved logins, selecting `tenant`'s.
+    /// `Cards` connected from the saved logins, selecting `tenant`'s.
+    ///
+    /// Connecting is eager: an expired saved access token is renewed through
+    /// its refresh token before this returns.
     ///
     /// # Errors
-    /// Returns the client's refusal when no usable credential resolves.
+    /// Returns the client's refusal when no usable credential resolves, or
+    /// when the selected login's renewal is refused.
     async fn cards(&self, tenant: Option<&str>) -> Result<Cards, WyrdError> {
         Cards::connect_with(&WyrdClient::with_config(self.config(tenant))?).await
     }
@@ -193,10 +197,11 @@ async fn stale_login_refreshes_and_saves_the_renewal() {
     logins.deployment.shutdown().await;
 }
 
-/// A saved login whose refresh chain was revoked cannot renew.
+/// A saved login whose refresh chain was revoked cannot renew, so `connect`
+/// itself is refused.
 ///
 /// # Panics
-/// Panics when the read succeeds or is refused with another code.
+/// Panics when the connection succeeds or is refused with another code.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the Keycloak identity lane; run via `mise run test:identity:journey`"]
 async fn revoked_login_is_refused() {
@@ -212,10 +217,8 @@ async fn revoked_login_is_refused() {
     let refused = logins
         .cards(Some(FIXTURE_TENANT_SLUG))
         .await
-        .expect("bob's login resolves")
-        .list(prompts())
-        .await
-        .expect_err("a revoked login cannot renew");
+        .err()
+        .expect("a revoked login cannot renew");
 
     assert_eq!(refused.code(), "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE");
     logins.deployment.shutdown().await;

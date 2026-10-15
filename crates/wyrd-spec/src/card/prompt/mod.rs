@@ -844,42 +844,6 @@ mod prompt_promptref_tests {
 }
 
 #[cfg(test)]
-mod prompt_schema_drift_tests {
-    use crate::{ParameterName, PromptRef, PromptSpec};
-    use schemars::schema_for;
-
-    #[test]
-    fn prompt_spec_schema_matches_golden() {
-        assert_schema_matches::<PromptSpec>("prompt_spec");
-    }
-
-    #[test]
-    fn prompt_ref_schema_matches_golden() {
-        assert_schema_matches::<PromptRef>("prompt_ref");
-    }
-
-    #[test]
-    fn parameter_name_schema_matches_golden() {
-        assert_schema_matches::<ParameterName>("parameter_name");
-    }
-
-    fn assert_schema_matches<T: schemars::JsonSchema>(name: &str) {
-        let mut schema = schema_for!(T);
-        schema.meta_schema = Some("https://json-schema.org/draft/2020-12/schema".to_owned());
-        let actual = format!(
-            "{}\n",
-            serde_json::to_string_pretty(&schema).expect("schema serializes")
-        );
-        let expected = std::fs::read_to_string(format!(
-            "{}/schemas/{name}.json",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .expect("golden schema exists");
-        assert_eq!(actual, expected, "schema drift: run mise run codegen:regen");
-    }
-}
-
-#[cfg(test)]
 mod prompt_skald_boundary_tests {
     use super::prompt_support::{
         anthropic_with_system, openai_chat_request, prompt_card, prompt_spec, raw_request,

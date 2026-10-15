@@ -36,4 +36,4 @@ An unknown `section` or `topic` fails the build. The "Last updated" date comes f
 
 ## Generated pages
 
-`mise run docs:generate` rewrites `public/llms.txt` and `public/llms-full.txt`, and refreshes generated reference pages in `src/content/docs/cards/` and `src/content/docs/api/` from `crates/wyrd-spec/schemas/`. A generated page is never created by the generator; to publish one, add its file (for example `src/content/docs/cards/data.md`) and run the task. `mise run docs:check` fails when generated output is stale or uncommitted.
+`mise run docs:generate` rewrites `public/llms.txt` and `public/llms-full.txt` from the content tree, and refreshes generated reference pages in `src/content/docs/api/`. A generated page is never created by the generator; to publish one, add its file (for example `src/content/docs/api/errors.md`) and run the task. `mise run docs:check` fails when generated output is stale or uncommitted.

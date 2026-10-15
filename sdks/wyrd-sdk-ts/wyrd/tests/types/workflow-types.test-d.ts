@@ -1,7 +1,7 @@
 // Compile-only: `mise run ts:typecheck` fails when an assertion here breaks.
 import { expectTypeOf } from "vitest";
 
-import type { JsonValue, Workflow, WorkflowRun } from "wyrd-ai";
+import type { CardRef, JsonValue, Workflow, WorkflowRun } from "wyrd-ai";
 
 type RunInput = Parameters<Workflow["run"]>[0];
 
@@ -16,3 +16,9 @@ type Step = WorkflowRun["steps"][string];
 expectTypeOf<Step["attempts"]>().toEqualTypeOf<number>();
 expectTypeOf<NonNullable<Step["error"]>["details"]>().toEqualTypeOf<JsonValue>();
 expectTypeOf<NonNullable<WorkflowRun["error"]>["remediation"]>().toExtend<string | null | undefined>();
+
+// Rust always serializes these unskipped Options, so each key is present and null when unset.
+expectTypeOf<WorkflowRun["workflow"]>().toEqualTypeOf<CardRef | null>();
+expectTypeOf<WorkflowRun["started_at"]>().toEqualTypeOf<string | null>();
+expectTypeOf<Step["text"]>().toEqualTypeOf<string | null>();
+expectTypeOf<Step["structured_output"]>().toEqualTypeOf<JsonValue>();

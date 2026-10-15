@@ -4,7 +4,7 @@
 //! the same redacted contract through [`GatewayAdministration`], which owns
 //! authorization, audit, validation, and tenancy. Replacement tools take the
 //! route's request body as their arguments and publish that contract's
-//! generated JSON Schema; named reads, revocation, and deletions take the
+//! derived JSON Schema; named reads, revocation, and deletions take the
 //! resource `name`. Reads require `gateway:read`, replacements and revocation
 //! `gateway:write`, and deletions `gateway:delete` or `gateway:write` exactly
 //! as the HTTP routes do. Read tools are always advertised; a write tool is
@@ -19,10 +19,14 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value as JsonValue};
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::gateway::GatewayContractError;
+use wyrd_spec::gateway::{
+    GatewayCapturePolicyWrite, GatewayContractError, GatewayFallbackPolicy,
+    GatewayGovernancePolicy, ProviderCredentialWrite, ProviderDeployment,
+};
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName};
 
 use super::WyrdMcpHandler;
+use super::principals::schema_of;
 use crate::components::auth::Caller;
 use crate::components::gateway::{GatewayAdministration, invalid};
 
@@ -105,6 +109,19 @@ const NO_INPUT: &str = r#"{"type":"object","properties":{},"additionalProperties
 /// Input schema of tools addressing one named tenant resource.
 const NAME_INPUT: &str = r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string","description":"Tenant-scoped resource name"}},"additionalProperties":false}"#;
 
+/// Parses one of the static argument-free or named-resource input schemas.
+///
+/// # Panics
+///
+/// Panics if `schema` is not a JSON object, which [`NO_INPUT`] and
+/// [`NAME_INPUT`] never are.
+fn literal(schema: &'static str) -> Arc<Map<String, JsonValue>> {
+    let Ok(schema) = serde_json::from_str(schema) else {
+        unreachable!("every static gateway tool input schema is a JSON object")
+    };
+    Arc::new(schema)
+}
+
 /// How a tool's effects are annotated for agents.
 #[derive(Clone, Copy)]
 enum Effect {
@@ -139,14 +156,13 @@ impl Effect {
 /// permission its operation enforces.
 ///
 /// The permission decides who is shown a write tool; dispatch still authorizes
-/// every call through [`GatewayAdministration`]. Replacement inputs are the
-/// generated contract schemas that `codegen:check` keeps in step with
-/// `wyrd_spec::gateway`.
+/// every call through [`GatewayAdministration`]. Replacement inputs are derived
+/// from the same `wyrd_spec::gateway` request types the handler deserializes.
 ///
 /// # Panics
 ///
-/// Panics if an embedded input schema is not a JSON object, which the static
-/// literals and generated contract schemas never are.
+/// Panics if an input schema is not a JSON object, which the static literals
+/// and derived request-struct schemas never are.
 fn gated() -> Vec<(Tool, Permission)> {
     [
         (
@@ -155,7 +171,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             "List this tenant's provider credentials as redacted views: name, provider, source \
              kind and operator reference, state, and timestamps. Never returns secret material. \
              Requires gateway read permission.",
-            NO_INPUT,
+            literal(NO_INPUT),
             Effect::Read,
             Permission::gateway_read(),
         ),
@@ -164,7 +180,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             "List gateway provider deployments",
             "List this tenant's provider deployments: model, adapter, upstream auth by credential \
              name, declared capabilities, and routing weight. Requires gateway read permission.",
-            NO_INPUT,
+            literal(NO_INPUT),
             Effect::Read,
             Permission::gateway_read(),
         ),
@@ -173,7 +189,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             "Get gateway fallback policy",
             "Read this tenant's effective gateway fallback policy. Requires gateway read \
              permission.",
-            NO_INPUT,
+            literal(NO_INPUT),
             Effect::Read,
             Permission::gateway_read(),
         ),
@@ -182,7 +198,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             "Get gateway governance policy",
             "Read this tenant's effective gateway limits, budgets, pricing, and unknown-cost \
              policy. Requires gateway read permission.",
-            NO_INPUT,
+            literal(NO_INPUT),
             Effect::Read,
             Permission::gateway_read(),
         ),
@@ -191,7 +207,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             "Get gateway capture policy",
             "Read this tenant's effective gateway payload capture policy and its version. \
              Requires gateway read permission.",
-            NO_INPUT,
+            literal(NO_INPUT),
             Effect::Read,
             Permission::gateway_read(),
         ),
@@ -200,7 +216,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             "Get gateway provider credential",
             "Read one redacted provider credential by name. Never returns secret material. \
              Requires gateway read permission.",
-            NAME_INPUT,
+            literal(NAME_INPUT),
             Effect::Read,
             Permission::gateway_read(),
         ),
@@ -208,7 +224,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             GET_DEPLOYMENT,
             "Get gateway provider deployment",
             "Read one provider deployment by name. Requires gateway read permission.",
-            NAME_INPUT,
+            literal(NAME_INPUT),
             Effect::Read,
             Permission::gateway_read(),
         ),
@@ -222,7 +238,7 @@ fn gated() -> Vec<(Tool, Permission)> {
              as bounded plaintext, seals it into a tenant-encrypted envelope before it is \
              stored, and is never readable again: responses, listings, logs, and errors show \
              only the redacted source. Requires gateway write permission.",
-            include_str!("../../../../wyrd-spec/schemas/gateway_provider_credential_write.json"),
+            schema_of::<ProviderCredentialWrite>(),
             Effect::Replace,
             Permission::gateway_write(),
         ),
@@ -231,7 +247,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             "Put gateway provider deployment",
             "Create or replace a provider deployment. Newly admitted calls observe the change. \
              Requires gateway write permission.",
-            include_str!("../../../../wyrd-spec/schemas/gateway_provider_deployment.json"),
+            schema_of::<ProviderDeployment>(),
             Effect::Replace,
             Permission::gateway_write(),
         ),
@@ -239,7 +255,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             PUT_FALLBACK,
             "Put gateway fallback policy",
             "Replace this tenant's gateway fallback policy. Requires gateway write permission.",
-            include_str!("../../../../wyrd-spec/schemas/gateway_fallback_policy.json"),
+            schema_of::<GatewayFallbackPolicy>(),
             Effect::Replace,
             Permission::gateway_write(),
         ),
@@ -248,7 +264,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             "Put gateway governance policy",
             "Replace this tenant's gateway limits, budgets, pricing, and unknown-cost policy. \
              Requires gateway write permission.",
-            include_str!("../../../../wyrd-spec/schemas/gateway_governance_policy.json"),
+            schema_of::<GatewayGovernancePolicy>(),
             Effect::Replace,
             Permission::gateway_write(),
         ),
@@ -257,7 +273,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             "Put gateway capture policy",
             "Replace this tenant's gateway payload capture policy and return its version. \
              Requires gateway write permission.",
-            include_str!("../../../../wyrd-spec/schemas/gateway_capture_policy_write.json"),
+            schema_of::<GatewayCapturePolicyWrite>(),
             Effect::Replace,
             Permission::gateway_write(),
         ),
@@ -266,7 +282,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             "Revoke gateway provider credential",
             "Terminally revoke a provider credential and return its redacted view; repeating \
              returns the same revocation. Requires gateway write permission.",
-            NAME_INPUT,
+            literal(NAME_INPUT),
             Effect::Destroy,
             Permission::gateway_write(),
         ),
@@ -275,7 +291,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             "Delete gateway provider credential",
             "Delete a provider credential no deployment references; an absent name succeeds. \
              Requires gateway delete permission.",
-            NAME_INPUT,
+            literal(NAME_INPUT),
             Effect::Destroy,
             Permission::gateway_delete(),
         ),
@@ -284,7 +300,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             "Delete gateway provider deployment",
             "Delete a provider deployment; an absent name succeeds. Requires gateway delete \
              permission.",
-            NAME_INPUT,
+            literal(NAME_INPUT),
             Effect::Destroy,
             Permission::gateway_delete(),
         ),
@@ -293,7 +309,7 @@ fn gated() -> Vec<(Tool, Permission)> {
             "Reset gateway fallback policy",
             "Restore this tenant's default gateway fallback policy. Requires gateway write \
              permission.",
-            NO_INPUT,
+            literal(NO_INPUT),
             Effect::Destroy,
             Permission::gateway_write(),
         ),
@@ -302,17 +318,14 @@ fn gated() -> Vec<(Tool, Permission)> {
             "Reset gateway governance policy",
             "Restore this tenant's default gateway governance policy. Requires gateway write \
              permission.",
-            NO_INPUT,
+            literal(NO_INPUT),
             Effect::Destroy,
             Permission::gateway_write(),
         ),
     ]
     .into_iter()
     .map(|(name, title, description, schema, effect, permission)| {
-        let Ok(schema) = serde_json::from_str::<Map<String, JsonValue>>(schema) else {
-            unreachable!("every gateway tool input schema is a JSON object")
-        };
-        let tool = Tool::new(name, description, Arc::new(schema))
+        let tool = Tool::new(name, description, schema)
             .with_title(title)
             .annotate(effect.annotations());
         (tool, permission)
@@ -324,9 +337,8 @@ fn gated() -> Vec<(Tool, Permission)> {
 ///
 /// # Panics
 ///
-/// Panics, through [`gated`], if an embedded gateway input schema is not a
-/// JSON object, which the static literals and generated contract schemas never
-/// are.
+/// Panics, through [`gated`], if a gateway input schema is not a JSON object,
+/// which the static literals and derived request-struct schemas never are.
 #[must_use]
 pub(super) fn descriptors() -> Vec<Tool> {
     gated().into_iter().map(|(tool, _)| tool).collect()
@@ -336,9 +348,8 @@ pub(super) fn descriptors() -> Vec<Tool> {
 ///
 /// # Panics
 ///
-/// Panics, through [`gated`], if an embedded gateway input schema is not a
-/// JSON object, which the static literals and generated contract schemas never
-/// are.
+/// Panics, through [`gated`], if a gateway input schema is not a JSON object,
+/// which the static literals and derived request-struct schemas never are.
 #[must_use]
 pub(super) fn descriptors_unscoped() -> Vec<Tool> {
     gated()
@@ -356,9 +367,8 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
 ///
 /// # Panics
 ///
-/// Panics, through [`gated`], if an embedded gateway input schema is not a
-/// JSON object, which the static literals and generated contract schemas never
-/// are.
+/// Panics, through [`gated`], if a gateway input schema is not a JSON object,
+/// which the static literals and derived request-struct schemas never are.
 #[must_use]
 pub(super) fn write_descriptors(caller: &Caller) -> Vec<Tool> {
     gated()
@@ -453,13 +463,13 @@ impl WyrdMcpHandler {
             })
             .await),
             PUT_CREDENTIAL => Ok(structured(async {
-                let write = body::<wyrd_spec::gateway::ProviderCredentialWrite>(arguments)?;
+                let write = body::<ProviderCredentialWrite>(arguments)?;
                 let name = write.name.clone();
                 gateway.put_credential(caller, &name, write).await
             })
             .await),
             PUT_DEPLOYMENT => Ok(structured(async {
-                let deployment = body::<wyrd_spec::gateway::ProviderDeployment>(arguments)?;
+                let deployment = body::<ProviderDeployment>(arguments)?;
                 let name = deployment.name.clone();
                 gateway.put_deployment(caller, &name, deployment).await
             })

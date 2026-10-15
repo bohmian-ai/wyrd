@@ -1,12 +1,7 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
 from pathlib import Path
 from typing import Any
 
 from ..cards import CardKind
-
-#### end of imports ####
 
 class ConfigDefaults:
     """Workspace `[defaults]` merged into every Card's metadata."""

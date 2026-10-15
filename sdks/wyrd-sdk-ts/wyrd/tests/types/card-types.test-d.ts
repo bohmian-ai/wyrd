@@ -1,7 +1,18 @@
 // Compile-only: `mise run ts:typecheck` fails when an assertion here breaks.
 import { expectTypeOf } from "vitest";
 
-import type { DriftBaselineState, RegisteredCard, RegisteredVerifierCard, TypedCardKind } from "wyrd-ai";
+import type {
+  CardKind,
+  CardRegistrationOutcome,
+  CardSummary,
+  CardTypes,
+  DriftBaselineState,
+  Judgment,
+  PrincipalSummary,
+  RegisteredCard,
+  RegisteredVerifierCard,
+  TypedCardKind,
+} from "wyrd-ai";
 
 // Narrowing a registered envelope by `kind` reaches the Verifier's typed baseline state.
 expectTypeOf<
@@ -27,3 +38,15 @@ const undeclared: RegisteredVerifierCard = {
   spec: { implementation_kind: "drift" },
 };
 void undeclared;
+
+// Registry summaries carry the Rust contract's timestamps and owning enums.
+expectTypeOf<CardSummary["created_at"]>().toEqualTypeOf<string>();
+expectTypeOf<CardSummary["updated_at"]>().toEqualTypeOf<string>();
+expectTypeOf<CardSummary["kind"]>().toEqualTypeOf<CardKind>();
+expectTypeOf<CardSummary["status"]>().toEqualTypeOf<CardTypes.CardLifecycleStatus>();
+
+// Response Options Rust always serializes are required and nullable; skipped ones are optional and non-null.
+expectTypeOf<CardSummary["artifact_hash"]>().toEqualTypeOf<string | null>();
+expectTypeOf<CardRegistrationOutcome["card_blob_uri"]>().toEqualTypeOf<string | null>();
+expectTypeOf<PrincipalSummary["email"]>().toEqualTypeOf<string | null>();
+expectTypeOf<Judgment["counts"]>().toEqualTypeOf<CardTypes.VerifierCounts | undefined>();

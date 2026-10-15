@@ -1,12 +1,6 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
-
 from typing import Literal
 
 from ._http_auth import HttpAuth
-
-#### end of imports ####
 
 class WyrdClient:
     """Authenticated Wyrd client that can act for another principal.

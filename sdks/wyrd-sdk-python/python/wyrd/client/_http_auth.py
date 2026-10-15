@@ -33,15 +33,32 @@ class HttpAuth(httpx.Auth, httpx2.Auth):
     """
 
     def __init__(self, client: WyrdClient) -> None:
+        """Authenticate as ``client``.
+
+        Args:
+            client: The client whose access token every request carries.
+        """
         self._client = client
 
     # The flows keep their bases' signatures: each base types them with its
     # own Request class, and one instance serves both.
     def sync_auth_flow(self, request):
+        """Swap the provider key headers for a fresh token on one synchronous request.
+
+        Args:
+            request: The outgoing ``httpx`` or ``httpx2`` request.
+        """
         _authenticate(request, self._client.access_token())
         yield request
 
     async def async_auth_flow(self, request):
+        """Swap the provider key headers for a fresh token on one asynchronous request.
+
+        The token is fetched in a worker thread so the event loop never blocks.
+
+        Args:
+            request: The outgoing ``httpx`` or ``httpx2`` request.
+        """
         _authenticate(request, await asyncio.to_thread(self._client.access_token))
         yield request
 

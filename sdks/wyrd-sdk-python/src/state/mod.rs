@@ -46,9 +46,10 @@ use registry::PythonCardRegistry;
 pub struct PyCardEnvelope {
     /// Complete native Card retained as the projection source of truth.
     card: Card,
-    /// Exact identity validated during bundle loading.
+    /// Exact identity validated during bundle loading or by the registry read.
     card_ref: CardRef,
-    /// Stable aliases resolving to this exact Card.
+    /// Stable aliases resolving to this exact Card; nonempty for hydrated
+    /// state and empty for a registry read, which belongs to no graph.
     aliases: Vec<String>,
 }
 
@@ -591,28 +592,23 @@ impl PyCardEnvelope {
     fn card_ref(&self) -> CardRefPy {
         CardRefPy(self.card_ref.clone())
     }
-    /// Return the persistent aliases for this Card in stable order.
+    /// Return the stable aliases for this Card in stable order.
     ///
-    /// The tuple owns its Python strings while the envelope retains the
-    /// authoritative alias list; this accessor performs no payload or IO read.
+    /// A hydrated `WyrdState` envelope carries the nonempty alias list it
+    /// validated during construction; a registry `Cards.get` envelope belongs
+    /// to no graph and returns an empty tuple. The tuple owns its Python
+    /// strings and this accessor performs no payload or IO read.
     ///
     /// # Errors
     ///
-    /// Returns invalid-state when no alias exists, or a stable allocation
-    /// error containing the exact alias and `CardRef`.
+    /// Returns a stable allocation error containing the exact `CardRef`.
     #[getter]
     fn aliases(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
-        let alias = self.aliases.first().ok_or_else(|| {
-            WyrdPyError::from(WyrdError::SdkInvalidStateBundle {
-                message: "Card has no stable alias".to_owned(),
-                details: serde_json::json!({"card_ref": self.card_ref}),
-            })
-        })?;
-        PyTuple::new(py, self.aliases.clone())
+        PyTuple::new(py, &self.aliases)
             .map(|tuple| tuple.unbind().into_any())
             .map_err(|_| WyrdPyError::from(WyrdError::SdkRuntimeHydrationFailed {
                 message: "Python envelope alias tuple allocation failed".to_owned(),
-                details: serde_json::json!({"alias": alias, "card_ref": self.card_ref, "stage": "python_allocation", "reason": "alias tuple allocation failed"}),
+                details: serde_json::json!({"card_ref": self.card_ref, "stage": "python_allocation", "reason": "alias tuple allocation failed"}),
             }))
     }
     /// Return the retained Card kind.
@@ -1794,33 +1790,38 @@ impl PyCards {
             .map_err(WyrdPyError::from)
     }
 
-    /// Fetch one registered Card by exact reference, typed by its kind.
+    /// Fetch one registered Card by exact reference as its complete envelope.
     ///
-    /// The shared Rust `Cards::get` reads and validates the typed envelope
-    /// while the GIL is released. The envelope then crosses the boundary once,
-    /// through the generated `wyrd._card_types.from_wire`, into the frozen
-    /// dataclass for its `kind`, read by attribute. No artifact bytes are
-    /// downloaded.
+    /// The shared Rust `Cards::get` reads the envelope while the GIL is
+    /// released and rejects a response whose identity differs from the
+    /// requested reference. The native `Card` is then retained by a
+    /// `CardEnvelope` whose `card_ref` is the requested identity pinned to the
+    /// server's UID. Registry reads hydrate no graph, so the envelope carries
+    /// no aliases, and no artifact bytes are downloaded.
     ///
     /// # Arguments
     /// * `card_ref` - Exact `CardRef` carrying its space and version.
     ///
     /// # Errors
     /// Returns a Wyrd error when the reference lacks its space, the Card is
-    /// absent, the server request fails, or the envelope cannot be converted
-    /// to Python values.
+    /// absent, the server request fails, or the response identity differs
+    /// from the request.
     #[pyo3(signature = (card_ref))]
-    fn get(&self, py: Python<'_>, card_ref: PyRef<'_, CardRefPy>) -> CardPyResult<Py<PyAny>> {
-        let selector = CardSelector::exact(card_ref.0.clone());
+    fn get(&self, py: Python<'_>, card_ref: PyRef<'_, CardRefPy>) -> CardPyResult<PyCardEnvelope> {
+        let requested = card_ref.0.clone();
+        let selector = CardSelector::exact(requested.clone());
         let card = py
             .detach(|| wyrd_runtime::runtime().block_on(self.inner.get(selector)))
             .map_err(WyrdPyError::from)?;
-        let wire = json_to_py(py, &serde_json::to_value(&card)?)?;
-        Ok(py
-            .import("wyrd._card_types")?
-            .getattr("from_wire")?
-            .call1((wire,))?
-            .unbind())
+        let card_ref = CardRef {
+            uid: card.metadata.uid.clone().or(requested.uid),
+            ..requested
+        };
+        Ok(PyCardEnvelope {
+            card,
+            card_ref,
+            aliases: Vec::new(),
+        })
     }
 
     /// List metadata-only summaries of registered Cards of any kind.

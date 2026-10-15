@@ -464,8 +464,8 @@ description = "Tier-1 journeys: the scoped observation surface over one WyrdStat
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:observe:inner'"
 [tasks."test:bifrost:journey:observe:inner"]
 hide = true
-description = "wyrd-ai observe_a_run, query_bifrost, otel_export, local_development, and support_desk stories"
-run = "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|otel_export|local_development|support_desk)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'"
+description = "wyrd-ai observe_a_run, query_bifrost, query_coverage, otel_export, local_development, and support_desk stories"
+run = "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|query_coverage|otel_export|local_development|support_desk)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'"
 
 [tasks."test:bifrost:journey:drift"]
 description = "Tier-1 journeys: Verifiers judge in real time, and a failed scheduled drift run alerts its Operator"
@@ -556,7 +556,7 @@ eval "$phase"
 phase 10 5 docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
 phase 10 5 docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
 phase 10 5 scripts/postgres/with-test-postgres.sh -- bash -lc '
-set -euo pipefail
+set -eu
 eval "$phase"
 binary=()
 if [[ " $* " == *" --profile "* ]]; then
@@ -604,7 +604,7 @@ run = '''
 docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
 docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
 scripts/postgres/with-test-postgres.sh -- bash -lc '
-set -euo pipefail
+set -eu
 cargo build --locked --release -p wyrd-server --features cloud
 cargo run --locked --release -p wyrd-testing --bin capacity -- client-queue "$@"' _
 '''
@@ -616,7 +616,7 @@ run = '''
 docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
 docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
 scripts/postgres/with-test-postgres.sh -- bash -lc '
-set -euo pipefail
+set -eu
 cargo build --locked --release -p wyrd-server --features cloud
 cargo run --locked --release -p wyrd-testing --features wyrd-server/cloud --bin bifrost_forge_capacity -- "$@"' _
 '''
@@ -1050,7 +1050,6 @@ run = "cargo sqlx prepare --workspace"
 [tasks."py:setup"]
 description = "Sync Python dev dependencies and build the Wyrd native extension with the wyrd.testing harness"
 dir = "sdks/wyrd-sdk-python"
-depends = ["codegen:stubs"]
 run = ["uv sync --all-extras --group dev", "uv run maturin develop --features testing"]
 
 [tasks."py:test:unit"]
@@ -1097,9 +1096,9 @@ run = "uv run ruff format --check python/wyrd tests scripts"
 
 [tasks."py:lints"]
 hide = true
-description = "Run Wyrd Python Ruff lint checks"
+description = "Run Wyrd Python Ruff lint checks and validate the authored public stubs"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run ruff check python/wyrd tests scripts"
+run = ["uv run ruff check python/wyrd tests scripts", "uv run python scripts/check_stubs.py"]
 
 [tasks."py:typecheck"]
 hide = true
@@ -1304,19 +1303,24 @@ run = "pnpm install --frozen-lockfile"
 
 [tasks."docs:generate"]
 hide = true
-description = "Generate docs pages from Wyrd schemas and API metadata"
+description = "Generate docs pages and llms indexes from the content tree and API metadata"
 dir = "docs"
 run = """
-uv run python scripts/generate_card_docs.py
 uv run python scripts/generate_api_docs.py
 uv run python scripts/generate_llms_txt.py
 """
 
 [tasks."docs:test"]
 hide = true
-description = "Run the docs site unit tests (navigation, content contract, shell links, indexes)"
+description = "Run the docs site unit tests (navigation, content contract, shell links, indexes, diagram contracts)"
 dir = "docs"
-run = "pnpm test"
+run = """
+set -eu
+WYRD_CONTRACTS=$(mktemp)
+trap 'rm -f "$WYRD_CONTRACTS"' EXIT
+(cd .. && cargo run --locked -q -p wyrd-spec --example gen_schemas --features server -- contracts) > "$WYRD_CONTRACTS"
+WYRD_CONTRACTS="$WYRD_CONTRACTS" pnpm test
+"""
 
 [tasks."docs:check:commands"]
 hide = true
@@ -1359,7 +1363,7 @@ description = "Docs gate: install, generate, drift check, unit tests, command ch
 depends = ["docs:install"]
 run = """
 mise run docs:generate
-GENERATED="docs/src/content/docs/cards/ docs/src/content/docs/api/ docs/public/llms.txt docs/public/llms-full.txt"
+GENERATED="docs/src/content/docs/api/ docs/public/llms.txt docs/public/llms-full.txt"
 (git diff --exit-code -- $GENERATED && test -z "$(git ls-files --others --exclude-standard -- $GENERATED)") || (echo "Generated docs are out of date. Run 'mise run docs:generate' and commit the result." && exit 1)
 mise run docs:test
 mise run docs:check:commands
@@ -1434,43 +1438,25 @@ cargo hakari verify
 """
 
 [tasks."codegen:regen"]
-description = "Regenerate JSON schemas / MCP tool list / pyi stubs / typed Card envelopes from source"
+description = "Regenerate the consumed contract outputs: UI problem examples, TypeScript error codes, and TypeScript wire types"
 run = """
+set -eu
 cargo run --locked -p wyrd-spec --example gen_schemas --features server
-python3 scripts/gen_card_types.py
-(cd sdks/wyrd-sdk-python && uv run ruff format python/wyrd/_card_types.py)
-mise run codegen:stubs
-"""
-
-[tasks."codegen:stubs"]
-hide = true
-description = "Regenerate Python type stubs"
-dir = "sdks/wyrd-sdk-python"
-run = """
-uv run python scripts/assemble_stubs.py
-uv run ruff check --fix --select I python/wyrd
+cargo run --locked -q -p wyrd-spec --example gen_schemas --features server -- contracts \
+  | python3 scripts/gen_ts_types.py
 """
 
 [tasks."codegen:check"]
-description = "Fail if generated schemas, pyi stubs, TypeScript error codes, typed Card envelopes, or UI theme tokens drift from source"
+description = "Fail if UI problem examples, TypeScript error codes, TypeScript wire types, or UI theme tokens drift from source"
 run = """
-snapshot_codegen() {
-  {
-    find crates/wyrd-spec/schemas -type f -name '*.json'
-    printf '%s\n' sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts sdks/wyrd-sdk-ts/wyrd/src/card-types.ts \
-      sdks/wyrd-sdk-python/python/wyrd/_card_types.py
-    find sdks/wyrd-sdk-python/python/wyrd -type f -name '*.pyi' \
-      ! -path 'sdks/wyrd-sdk-python/python/wyrd/stubs/*'
-  } | sort | while IFS= read -r file; do
-    shasum -a 256 "$file"
-  done
-}
+set -eu
+GENERATED="crates/wyrd-spec/schemas/ui_problem_examples.json sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts sdks/wyrd-sdk-ts/wyrd/src/card-types.ts"
 BEFORE=$(mktemp)
 AFTER=$(mktemp)
 trap 'rm -f "$BEFORE" "$AFTER"' EXIT
-snapshot_codegen > "$BEFORE"
+shasum -a 256 $GENERATED > "$BEFORE"
 mise run codegen:regen
-snapshot_codegen > "$AFTER"
+shasum -a 256 $GENERATED > "$AFTER"
 diff -u "$BEFORE" "$AFTER" \
   || { echo 'codegen drift detected - run mise run codegen:regen and commit'; exit 1; }
 (cd crates/wyrd/wyrd-server/wyrd-ui && node --test brand/gen-theme.test.mjs && node brand/gen-theme.mjs --check)

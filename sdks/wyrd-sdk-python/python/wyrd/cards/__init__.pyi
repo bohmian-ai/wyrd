@@ -1,83 +1,21 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
-
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
-from typing import Any, Literal, Protocol, TypeAlias, TypeVar, overload
+from typing import Any, Literal, TypeAlias, TypeVar, overload
 
-from .._card_types import (
-    AgentSpec,
-    DataSpec,
-    DriftBaselineState,
-    DriftBaselineStatus,
-    ModelSpec,
-    OperatorSpec,
-    PromptSpec,
-    RegisteredAgentCard,
-    RegisteredArtifactCard,
-    RegisteredAuditCard,
-    RegisteredCard,
-    RegisteredDataCard,
-    RegisteredExperimentCard,
-    RegisteredMcpCard,
-    RegisteredModelCard,
-    RegisteredOperatorCard,
-    RegisteredPolicyCard,
-    RegisteredPromptCard,
-    RegisteredServiceCard,
-    RegisteredSourceCard,
-    RegisteredTriggerCard,
-    RegisteredUntypedCard,
-    RegisteredVerifierCard,
-    RegisteredWorkflowCard,
-    ServiceSpec,
-    TriggerSpec,
-    TypedCardKind,
-    VerificationStatus,
-    VerifierSpec,
-)
-from .._card_types import (
-    Metadata as CardMetadata,
-)
-from .._card_types import (
-    Relationships as CardRelationships,
-)
-from .._card_types import (
-    Status as CardStatus,
-)
 from ..agent import Workflow
 from ..client import WyrdClient
 from ..data import DataCard, DataInterface
 from ..model import ModelCard, ModelInterface
 from ..prompt import Prompt, PromptCard, PromptReference
-
-#### end of imports ####
+from ..state import CardEnvelope
+from ._card import Card
 
 _DataInterfaceT = TypeVar("_DataInterfaceT", bound=DataInterface)
 _ModelInterfaceT = TypeVar("_ModelInterfaceT", bound=ModelInterface)
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list[JsonValue] | dict[str, JsonValue]
-
-class Card(Protocol):
-    """Shared authoring capability implemented by native card holders.
-
-    `DataCard`, `ModelCard`, and `PromptCard` are the registerable public
-    implementations. `AgentCard` is an envelope holder, not a registry input.
-    Pass one of those objects to `Cards.register`; do not construct `Card`
-    directly.
-    """
-
-    space: str
-    name: str
-    version: str
-    uid: str
-
-    def _to_card_envelope_json(self) -> str:
-        """Return the holder's single Wyrd envelope conversion."""
-        ...
 
 RegisterableCard: TypeAlias = DataCard[Any] | ModelCard[Any] | PromptCard
 
@@ -563,15 +501,15 @@ class Cards:
         """
         ...
 
-    def get(self, card_ref: CardRef) -> RegisteredCard:
-        """Fetch one registered Card by exact reference, typed by its kind.
+    def get(self, card_ref: CardRef) -> CardEnvelope:
+        """Fetch one registered Card by exact reference as its complete envelope.
 
-        The result is a frozen dataclass chosen by `kind`, read by attribute:
-        `spec` and `status` are typed for Data, Model, Prompt, Agent,
-        Verifier, Service, Trigger, and Operator Cards, including a Drift
-        Verifier's `status.verification.baseline` state. Other kinds return
-        `RegisteredUntypedCard`, whose `spec` is a plain mapping. No artifact
-        bytes are downloaded.
+        The result is the native `CardEnvelope`: `card_ref` is the exact
+        UID-pinned identity, `kind` is the `CardKind`, and `metadata`, `spec`,
+        `relationships`, and `status` are JSON-compatible mappings of the
+        server envelope. A registry read belongs to no hydrated graph, so
+        `aliases` is `()`. No artifact bytes are downloaded and nothing is
+        hydrated.
 
         Args:
             card_ref: Exact reference carrying its space and version.
@@ -586,8 +524,8 @@ class Cards:
         Example:
             ```python
             card = cards.get(CardRef("Verifier", "churn-drift", "1.0.0", space="ml"))
-            if card.kind == "Verifier" and card.status is not None:
-                verification = card.status.verification
+            if card.kind == CardKind.Verifier and card.status is not None:
+                verification = card.status.get("verification")
             ```
         """
         ...
@@ -1405,36 +1343,4 @@ __all__ = [
     "RegistrationReceipt",
     "HydrationSummary",
     "WorkflowCards",
-    "AgentSpec",
-    "CardMetadata",
-    "CardRelationships",
-    "CardStatus",
-    "DataSpec",
-    "DriftBaselineState",
-    "DriftBaselineStatus",
-    "ModelSpec",
-    "OperatorSpec",
-    "PromptSpec",
-    "RegisteredAgentCard",
-    "RegisteredCard",
-    "RegisteredDataCard",
-    "RegisteredModelCard",
-    "RegisteredOperatorCard",
-    "RegisteredPromptCard",
-    "RegisteredServiceCard",
-    "RegisteredTriggerCard",
-    "RegisteredUntypedCard",
-    "RegisteredVerifierCard",
-    "RegisteredArtifactCard",
-    "RegisteredAuditCard",
-    "RegisteredExperimentCard",
-    "RegisteredMcpCard",
-    "RegisteredPolicyCard",
-    "RegisteredSourceCard",
-    "RegisteredWorkflowCard",
-    "ServiceSpec",
-    "TriggerSpec",
-    "TypedCardKind",
-    "VerificationStatus",
-    "VerifierSpec",
 ]

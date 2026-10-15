@@ -1,7 +1,3 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
-
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Generic, overload
@@ -11,8 +7,6 @@ from typing_extensions import Self, TypeVar
 from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError
 from ..cards import CardRef, JsonValue, ModelLoadArgs
 from ..data import FieldSpec
-
-#### end of imports ####
 
 class ModelInterface:
     """Base class for ModelCard model interfaces.

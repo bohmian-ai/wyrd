@@ -1,7 +1,5 @@
 """Public Python package for Wyrd."""
 
-from typing import Protocol
-
 from . import cards, client, config, data, model, prompt, state
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError
 from .agent import (
@@ -18,7 +16,7 @@ from .agent import (
     local_registry,
     tool,
 )
-from .cards import AgentCard, CardKind, CardRef, Cards, RegistrationReceipt
+from .cards import AgentCard, Card, CardKind, CardRef, Cards, RegistrationReceipt
 from .cli import run_wyrd_cli
 from .client import WyrdClient
 from .config import WyrdConfig
@@ -39,27 +37,6 @@ from .prompt import (
     ResponseFormat,
 )
 from .state import CardEnvelope, HydratedArtifact, WyrdState
-
-
-class Card(Protocol):
-    """Shared authoring capability implemented by native card holders.
-
-    ``DataCard``, ``ModelCard``, and ``PromptCard`` are the registerable
-    implementations; pass one to ``Cards.register``. Do not construct
-    ``Card`` directly.
-    """
-
-    space: str
-    name: str
-    version: str
-    uid: str
-
-    def _to_card_envelope_json(self) -> str:
-        """Return the holder's single Wyrd envelope conversion."""
-        ...
-
-
-cards.Card = Card
 
 __all__ = [
     "Agent",

@@ -570,3 +570,58 @@ the following:
 - [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md)
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+
+## Implementation Evidence
+
+Commits on `change/sdk-client-instantiation`: `7feabed67` (Rust owners and
+callers), `9c6858846` (Python lazy handles, `wyrd.auth`), `be1f17b54`
+(TypeScript), `e84739f09` / `b6fef0233` (Rust and Python journeys),
+`c5feb76db` (architecture authorities, lint findings), plus the formatting and
+evidence commits that follow.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-001 approved forms; removed forms and `principals` paths absent; TS constructors private | `wyrd-client` handles `connect`/`connect_with`; `sdks/wyrd-sdk-rust/src/lib.rs` (`auth` re-export, 19 compile-fail doctests); Python `__new__` + `connect` staticmethods, `python/wyrd/auth`; TS private constructors + `static async connect` | `wyrd-ai` `tests::sdk_root_exposes_the_supported_surface` and doctests; `test_sdk_client_instantiation.py::test_handles_expose_only_the_common_construction_forms`; TS `exports only the common handle construction forms` | PASS |
+| AC-002 ambient connect opens every handle (env-only, saved-only); Python lazy first use; options need no client | `WyrdClient::connect_ambient`; Python `LazyConnection`; `BifrostOptions` | Rust `sdk_client_instantiation::ambient_connect_opens_every_handle` (incl. Platform); Python `test_ambient_connect_opens_every_handle`, `test_lazy_constructors_open_every_handle_on_first_operation`; TS `ambient connect opens every handle` | PASS (see limit 1) |
+| AC-003 delegated clients authoritative | Supplied client passed unchanged through every boundary | Rust/Python/TS `delegated connect uses the subject principal`: the subject's authority decides the call, and the actor's own call succeeds | PASS (see limit 2) |
+| AC-004 eager failures; Python defers to first use; bearer/cache make no extra request | `WyrdClient::connected` (`access_token`) | `client::tests::server_handles_connect_eagerly_and_share_the_client_auth_path`; `connect_without_a_credential_fails_eagerly`; `credential_paths_preserve_exchange_and_bearer_behavior` (Rust/Python/TS); Python `test_connect_and_lazy_first_call_share_the_no_credentials_error`; TS `every handle connect fails eagerly without a credential` | PASS (see limit 3) |
+| AC-005 `Bifrost()`/`AsyncBifrost()` do no IO; async construction does not block | Native `Bifrost.__new__` retains its arguments; `AsyncBifrost.connect` runs on `asyncio.to_thread` | `test_constructors_are_io_free`, `test_async_bifrost_constructor_does_not_block` | PASS |
+| AC-006 (TASK-001 portion) authorities, stubs, declarations, examples | `architecture/wyrd-design.md#client-model`, `patterns.md`, `python-api-and-stubs.md`, `typescript-guide.md`; `.pyi` stubs; regenerated N-API declarations; examples migrated | `py:lints`, `py:typecheck`, `ts:typecheck`, `ts:napi:check`, `codegen:check`, `check:examples` | PASS |
+| AC-007 resolve once, reuse the cache, renew | Handles retain one `WyrdClient`; Python caches the connected handle in `OnceLock` | Rust `connected_handles_reuse_the_client_cache_and_renew` (saved config rewritten after connect; 35 s TTL); Python `test_handles_reuse_the_client_cache_and_renew`; TS `handles reuse the client cache and renew` | PASS |
+| AC-008–AC-009 Bifrost `list_tables`/`listTables`, compact typed entries | `QueryClient::list_tables`, async/blocking facades, PyO3 `list_tables` (existing `TableEntry` TypedDict), TS `listTables(): Promise<TableEntry[]>` | `bifrost_lists_tables_and_describes_on_demand` (Rust/Python/TS): user table and `vala.drift.observations` listed, other tenant's table hidden, 403 without `bifrost_table:read`, describe returns declared fields | PASS |
+| INV-001–INV-005 unchanged behavior | No route, wire type, error, permission, dependency, or feature added | `check:deps`, `check:py-wheel-no-testing`, `test:rust-sdk:journey` (102 passed), `py:test:integration` (254 passed), `ts:test:integration` (214 passed), `test:shared` | PASS |
+
+Lanes run: `fmt`, `lints`, `py:format`, `py:lints`, `py:typecheck`,
+`ts:format`, `ts:lints`, `ts:typecheck`, `test:shared`, `test:wyrd-sdk`,
+`py:test:unit`, `ts:test:unit`, `codegen:check`, `ts:napi:check`,
+`check:py-wheel-no-testing`, `check:deps`, `check:examples`, `git diff --check`.
+
+Material limits:
+
+1. The Rust journeys drive the ambient chain through a fixed `Environment` with
+   `ClientConfig::from_environment`, the same resolver `connect()` reaches
+   through `WyrdClient::from_global`. This follows the `saved_user_auth.rs`
+   precedent. The workspace denies `unsafe_code`, so a test cannot mutate the
+   process environment, and spawning a child process was rejected. `connect()`
+   itself is the one-line composition `from_global` + `connected`. Python and
+   TypeScript drive true no-client `connect()` against a mutated environment.
+2. Delegated attribution is proven by authorization outcome (the subject's
+   grant decides), matching the existing Python delegated-Bifrost journey. The
+   audit rows are not read back.
+3. A refused API-key exchange surfaces the existing client mapping of the OAuth
+   refusal, `WYRD_SPEC_400_VALIDATION`, even though the server body carries
+   `WYRD_AUTH_401_API_KEY_INVALID`. The journeys assert the existing code
+   unchanged. This is likely a pre-existing defect in `wyrd-client`'s exchange
+   error mapping and is outside this task.
+4. The saved-login identity journeys (`saved_user_auth`,
+   `signed_in_development`, TS `saved-user-auth`) need the Keycloak lane and
+   were migrated but not run.
+5. Docsite and README references (for example
+   `docs/src/content/docs/operate/grant-and-inspect-permissions.md`, which still
+   imports `wyrd.principals` and calls synchronous `Principals.connect()`)
+   belong to TASK-002.
+
+Non-goals remained excluded: no Platform projection to Python or TypeScript,
+no compatibility aliases, no new server route, wire type, cache, or dependency.
+
+Status: IMPLEMENTED.

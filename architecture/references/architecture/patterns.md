@@ -146,6 +146,9 @@ Clients (Rust, Python, TypeScript SDKs):
   validation messages, tracing hooks, runtime integrations are allowed.
 - Do not bypass registry, storage, policy, audit, tenancy, relationship,
   or status ownership from a convenience path.
+- Open every server-facing handle through the one construction vocabulary
+  in [Client model](../../wyrd-design.md#client-model): eager `connect`
+  over the ambient or a supplied client, retained for the handle's lifetime.
 
 Bifrost has one client composition:
 

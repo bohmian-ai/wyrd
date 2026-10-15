@@ -2,7 +2,8 @@
 
 One recording stdlib HTTP server stands in for every built-in provider the
 test server's adapters reach: OpenAI under ``/v1``, Anthropic Messages, Gemini
-and Vertex ``GenerateContent``, and OpenAI embeddings and images. Journeys
+and Vertex ``GenerateContent``, Jev ``systemone``, and OpenAI embeddings and
+images. Journeys
 point a real ``WyrdTestServer`` at it, drive unmodified clients through the
 server, and read the published ``vala.gateway.calls`` rows once.
 """
@@ -150,6 +151,12 @@ EMBEDDING = {
     "usage": {"prompt_tokens": 6, "total_tokens": 6},
 }
 
+JEV_ANSWER = {
+    "model": "jev-latest",
+    "answers": {"helpful": {"type": "noul", "noul": 0.9}},
+    "usage": {"input_tokens": 3, "output_tokens": 1},
+}
+
 IMAGE_BYTES = b"\x89PNG\r\n\x1a\nwyrd-gateway-journey-image"
 
 IMAGE_DIGEST = "sha256:f9356b2f6c0a4aacf9c5728186a6bb26677be8b3b0dbe951b4dd886e39e21956"
@@ -205,6 +212,8 @@ class Upstream(BaseHTTPRequestHandler):
             )
         elif self.path.endswith(":generateContent"):
             self._send("application/json", json.dumps(GEMINI_ANSWER))
+        elif self.path == "/v1/systemone":
+            self._send("application/json", json.dumps(JEV_ANSWER))
         else:
             self.send_error(404)
 

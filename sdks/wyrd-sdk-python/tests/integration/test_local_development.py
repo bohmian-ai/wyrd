@@ -10,6 +10,7 @@ one client, so the signed-in story proves the same steps for a saved login.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import pty
 import select
@@ -362,9 +363,9 @@ def local_deployment() -> Iterator[tuple[Path, dict[str, str]]]:
 
 @contextmanager
 def installed_local_cli(
-    cli_path: str, home: Path, env: dict[str, str], terminal: str
+    cli_path: str, home: Path, env: dict[str, str], terminal: str, tenant: str = "local"
 ) -> Iterator[None]:
-    """Run a real installed CLI against ``home`` until the block ends."""
+    """Run a real installed CLI serving ``tenant`` against ``home`` until the block ends."""
     command_env = dict(env)
     master, slave = pty.openpty() if terminal else (-1, -1)
     if terminal:
@@ -372,7 +373,7 @@ def installed_local_cli(
         command_env["CODEX_HOME"] = str(home / "codex")
     with tempfile.TemporaryFile(mode="w+") as errors:
         child = subprocess.Popen(
-            [cli_path, "server", "dev", "--tenant", "local"],
+            [cli_path, "server", "dev", "--tenant", tenant],
             cwd=home,
             env=command_env,
             stdin=slave if terminal else subprocess.DEVNULL,
@@ -406,6 +407,24 @@ def installed_local_cli(
             finally:
                 if terminal:
                     os.close(master)
+
+
+def run_typescript(env: dict[str, str], name: str) -> None:
+    """Run the local-development TypeScript test ``name`` in a fresh Node process with ``env``."""
+    root = Path(__file__).resolve().parents[4]
+    command = [
+        "mise",
+        "exec",
+        "--",
+        "pnpm",
+        "exec",
+        "vitest",
+        "run",
+        "tests/integration/local-development.test.ts",
+        "-t",
+        name,
+    ]
+    subprocess.run(command, cwd=root / "sdks/wyrd-sdk-ts/wyrd", env=env, check=True)
 
 
 @pytest.mark.local_dev
@@ -458,19 +477,7 @@ def test_installed_cli_bootstrap(runtime: str) -> None:
                 ]
                 subprocess.run(command, cwd=root / "sdks/wyrd-sdk-python", env=env, check=True)
             elif runtime == "typescript":
-                command = [
-                    "mise",
-                    "exec",
-                    "--",
-                    "pnpm",
-                    "exec",
-                    "vitest",
-                    "run",
-                    "tests/integration/local-development.test.ts",
-                    "-t",
-                    "cli_bootstrap_saved_config",
-                ]
-                subprocess.run(command, cwd=root / "sdks/wyrd-sdk-ts/wyrd", env=env, check=True)
+                run_typescript(env, "cli_bootstrap_saved_config")
         if not terminal:
             return
         saved = [
@@ -483,3 +490,148 @@ def test_installed_cli_bootstrap(runtime: str) -> None:
             (home / name).read_bytes()
             for name in ("wyrd/credentials.toml", "wyrd/config.toml", "codex/config.toml")
         ]
+
+
+UPSTREAM_KEYS = {
+    "openai": ("authorization", "Bearer sk-openai-local"),
+    "anthropic": ("x-api-key", "sk-anthropic-local"),
+    "gemini": ("x-goog-api-key", "sk-gemini-local"),
+    "jev": ("authorization", "Bearer sk-jev-local"),
+}
+"""Provider → the upstream credential header and value its fixture key arrives as."""
+
+UPSTREAM_CALLS = {
+    "/v1/chat/completions": ("openai", "gpt-4o"),
+    "/v1/messages": ("anthropic", "claude-sonnet-4-5"),
+    "/v1beta/models/gemini-2.5-flash:generateContent": ("gemini", None),
+    "/v1/systemone": ("jev", "jev-latest"),
+}
+"""Upstream path → the provider serving it and the body model it must receive unchanged."""
+
+
+@pytest.mark.local_dev
+def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
+    """Set up four named deployments with the installed CLI, as ``examples/gateway-setup`` does.
+
+    The server reaches local provider fixtures through its non-production
+    ``[gateway.endpoints]`` configuration. Refused files write nothing,
+    reapplying converges, a fresh TypeScript process calls every deployment
+    with the saved deployment alone, each upstream sees its own key and never
+    a Wyrd credential, a restarted server still decrypts the credentials, and
+    a revoked credential or an under-granted caller is refused.
+    """
+    root = Path(__file__).resolve().parents[4]
+    cli_path = str(root / "target/debug/wyrd")
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    recorded = Receiver(url=f"http://127.0.0.1:{upstream.server_address[1]}")
+    upstream.RequestHandlerClass = type("SetupUpstream", (Upstream,), {"upstream": recorded})
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    for name in ("gateway.json", "capture-policy.json"):
+        shutil.copy2(root / "examples/gateway-setup" / name, tmp_path / name)
+    entries = json.loads((tmp_path / "gateway.json").read_text())
+    for provider, (_, value) in UPSTREAM_KEYS.items():
+        secret = value.removeprefix("Bearer ")
+        source = {"managed_secret": {"secret": secret}}
+        document = {"name": f"{provider}-key", "provider": provider, "source": source}
+        (tmp_path / f"{provider}-credential.json").write_text(json.dumps(document))
+    (tmp_path / "openai-prod.json").write_text(json.dumps(entries[0]))
+    (tmp_path / "malformed.json").write_text("[{")
+    (tmp_path / "duplicate.json").write_text(json.dumps([entries[0], entries[0]]))
+    try:
+        with local_deployment() as (home, env):
+            (home / "server.toml").write_text(
+                "[gateway.endpoints]\n"
+                f'openai = "{recorded.url}/v1"\n'
+                f'anthropic = "{recorded.url}"\n'
+                f'gemini = "{recorded.url}"\n'
+                f'jev = "{recorded.url}"\n'
+            )
+            env["WYRD_CONFIG_PATH"] = str(home / "server.toml")
+
+            def wyrd(*args: str, caller: dict[str, str] = env) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [cli_path, *args], cwd=tmp_path, env=caller, capture_output=True, text=True
+                )
+
+            def deployments() -> list[str]:
+                listed = wyrd("gateway", "deployment", "list")
+                assert listed.returncode == 0, listed.stderr
+                return sorted(deployment["name"] for deployment in json.loads(listed.stdout))
+
+            with installed_local_cli(cli_path, home, env, "", tenant="acme"):
+                for refused in ("malformed.json", "duplicate.json"):
+                    failed = wyrd("gateway", "deployment", "put", "--file", refused)
+                    assert failed.returncode != 0 and "--file" in failed.stderr, failed.stderr
+                missing = wyrd("gateway", "deployment", "put", "--file", "gateway.json")
+                assert missing.returncode != 0
+                assert [o["status"] for o in json.loads(missing.stdout)] == [
+                    "failed",
+                    *["unattempted"] * 3,
+                ], missing.stdout
+                assert deployments() == []
+
+                for provider in UPSTREAM_KEYS:
+                    put = wyrd(
+                        "gateway", "credential", "put", "--file", f"{provider}-credential.json"
+                    )
+                    assert put.returncode == 0, put.stderr
+                    assert "sk-" not in put.stdout + put.stderr
+                for _ in range(2):
+                    applied = wyrd("gateway", "deployment", "put", "--file", "gateway.json")
+                    assert applied.returncode == 0, applied.stderr
+                    assert {o["status"] for o in json.loads(applied.stdout)} == {"completed"}
+                single = wyrd("gateway", "deployment", "put", "--file", "openai-prod.json")
+                assert json.loads(single.stdout)["name"] == "openai-prod", single.stderr
+                names = sorted(entry["name"] for entry in entries)
+                assert deployments() == names
+                captured = wyrd("gateway", "capture-policy", "put", "--file", "capture-policy.json")
+                assert captured.returncode == 0, captured.stderr
+
+                agent = root / "fixtures/cards/gateway_inference/ask-agent.yaml"
+                assert wyrd("apply", str(agent)).returncode == 0
+                issued = wyrd(
+                    *("auth", "issue-key", "--kind", "Agent", "--name", "ask-agent"),
+                    *("--version", "1.0.0", "--space", "default"),
+                    *("--server", f"http://{env['WYRD_SERVER_BIND']}"),
+                )
+                assert issued.returncode == 0, issued.stderr
+                key = next(
+                    line.split()[1]
+                    for line in issued.stdout.splitlines()
+                    if line.startswith("key:")
+                )
+                under_granted = {**env, "WYRD_API_KEY": key}
+                denied = wyrd(
+                    "gateway",
+                    "deployment",
+                    "put",
+                    "--file",
+                    "openai-prod.json",
+                    caller=under_granted,
+                )
+                assert denied.returncode != 0 and "403" in denied.stderr, denied.stderr
+
+                run_typescript(env, "cli_gateway_setup")
+
+            wyrd_credentials = (home / "wyrd/credentials.toml").read_text()
+            assert sorted(UPSTREAM_CALLS) == sorted({d.path for d in recorded.deliveries})
+            for delivery in recorded.deliveries:
+                provider, model = UPSTREAM_CALLS[delivery.path]
+                header, value = UPSTREAM_KEYS[provider]
+                assert (delivery.body.get("model"), delivery.headers[header]) == (model, value)
+                assert header == "authorization" or "authorization" not in delivery.headers
+                assert not any(name.startswith("x-wyrd") for name in delivery.headers)
+                assert "wyrd_" not in json.dumps(delivery.headers)
+                assert not any(v.startswith("Bearer ey") for v in delivery.headers.values())
+
+            with installed_local_cli(cli_path, home, env, "", tenant="acme"):
+                assert deployments() == names
+                run_typescript(env, "cli_gateway_setup")
+                revoked = wyrd("gateway", "credential", "revoke", "openai-key")
+                assert revoked.returncode == 0, revoked.stderr
+                delivered = len(recorded.deliveries)
+                run_typescript(env, "cli_gateway_revoked")
+                assert len(recorded.deliveries) == delivered, "a revoked credential was sent"
+            assert (home / "wyrd/credentials.toml").read_text() == wyrd_credentials
+    finally:
+        upstream.shutdown()

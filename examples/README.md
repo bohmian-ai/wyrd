@@ -5,6 +5,8 @@ points without searching crate internals.
 
 - `examples/python/` contains Python examples.
 - `examples/rust/` contains Rust examples.
+- `examples/gateway-setup/` sets up named provider deployments with the
+  installed CLI on a local server.
 - `examples/support-desk/` is the canonical verified Service, the same story
   in Rust, Python, and TypeScript.
 - `examples/workflows/` contains language-neutral Workflow Card bundles; the

@@ -1,4 +1,4 @@
-"""Public Agent package — Agent runtime + Workflow composition + session memory."""
+"""Public Agent package — Agent runtime + session memory."""
 
 from __future__ import annotations
 
@@ -13,15 +13,10 @@ from .._wyrd.agent import (
     Role,
     RunConfig,
     SessionTurn,
-    Workflow,
-    WorkflowRun,
 )
 from ._session import (
     NoSession,
     SessionMemory,
-    WorkflowRunDict,
-    WorkflowRunError,
-    WorkflowStepResult,
 )
 from .tool import local_registry, tool
 
@@ -38,11 +33,6 @@ __all__ = [
     "RunConfig",
     "SessionMemory",
     "SessionTurn",
-    "Workflow",
-    "WorkflowRun",
-    "WorkflowRunDict",
-    "WorkflowRunError",
-    "WorkflowStepResult",
     "local_registry",
     "tool",
 ]

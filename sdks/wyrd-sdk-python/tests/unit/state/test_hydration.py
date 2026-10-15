@@ -2,6 +2,7 @@
 
 import gc
 import shutil
+import typing
 import weakref
 from collections import UserDict
 from pathlib import Path
@@ -9,10 +10,11 @@ from pathlib import Path
 import joblib
 import pytest
 import wyrd
-from wyrd.cards import DataLoadArgs, ModelLoadArgs
+from wyrd.cards import AgentCard, DataLoadArgs, ModelLoadArgs
+from wyrd.data import DataCard
 from wyrd.model import ModelCard
 from wyrd.prompt import PromptCard
-from wyrd.state import WyrdState
+from wyrd.state import CardEnvelope, HydratedCard, WyrdState
 
 from .support import TinyDataInterface, TinyModelInterface
 
@@ -421,3 +423,14 @@ def test_metadata_only_bundle_is_rejected_with_stable_error(fixtures_dir: Path) 
     with pytest.raises(wyrd.WyrdError) as caught:
         WyrdState.from_path(fixtures_dir / "bundles" / "metadata-only")
     assert caught.value.code == "WYRD_SDK_400_UNHYDRATED_ARTIFACT"
+
+
+def test_hydrated_card_is_public_runtime_type() -> None:
+    assert "HydratedCard" in wyrd.state.__all__
+    assert typing.get_args(HydratedCard) == (
+        AgentCard,
+        PromptCard,
+        ModelCard,
+        DataCard,
+        CardEnvelope,
+    )

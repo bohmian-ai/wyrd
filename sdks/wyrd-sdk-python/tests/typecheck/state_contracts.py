@@ -8,17 +8,12 @@ collection.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from typing_extensions import assert_type
 from wyrd.cards import AgentCard, CardRef
 from wyrd.data import DataCard
 from wyrd.model import ModelCard
 from wyrd.prompt import PromptCard
-from wyrd.state import CardEnvelope, WyrdState
-
-if TYPE_CHECKING:
-    from wyrd.state import HydratedCard
+from wyrd.state import CardEnvelope, HydratedCard, WyrdState
 
 
 def typed_accessors_navigate_to_exact_types(state: WyrdState) -> None:

@@ -1,6 +1,6 @@
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any
 
 from ..bifrost import TableConfig
 from ..cards import AgentCard, CardKind, CardRef, DataLoadArgs, ModelLoadArgs
@@ -9,6 +9,7 @@ from ..data import DataCard
 from ..model import ModelCard
 from ..observe import Run
 from ..prompt import PromptCard
+from ._hydrated import HydratedCard
 
 class CardEnvelope:
     """Complete read-only projection of one registered Card.
@@ -75,13 +76,6 @@ class CardEnvelope:
             WyrdError: If the retained native envelope cannot be serialized.
         """
         ...
-
-HydratedCard: TypeAlias = AgentCard | PromptCard | ModelCard | DataCard | CardEnvelope
-"""A Card ``WyrdState.get`` returns, in its kind's hydrated holder.
-
-Narrow it with ``isinstance``; kinds without a typed holder are a
-``CardEnvelope``.
-"""
 
 class HydratedArtifact:
     """Read-only path and integrity metadata for one verified local artifact.
@@ -441,4 +435,4 @@ class WyrdState:
         """
         ...
 
-__all__ = ["CardEnvelope", "HydratedArtifact", "WyrdState"]
+__all__ = ["CardEnvelope", "HydratedArtifact", "HydratedCard", "WyrdState"]

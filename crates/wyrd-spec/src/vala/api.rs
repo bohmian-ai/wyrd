@@ -437,7 +437,8 @@ pub struct RegisterTableRequest {
     pub namespace: String,
     /// Table name.
     pub name: String,
-    /// User fields only; `wyrd_*`/`card_uid`/`run_id` reserved names are rejected.
+    /// User fields only; `wyrd_*`, `card_uid`, `run_id`, `sub_principal_id`, and
+    /// `act_principal_id` reserved names are rejected.
     pub fields: Vec<FieldSpec>,
     /// Optional physical layout declaration.
     ///

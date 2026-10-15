@@ -2070,6 +2070,13 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
                 row["operation"].as_deref() == Some("platform.authz")
                     && row["sub_principal_id"].as_deref() == Some(principal)
             })
+            .inspect(|row| {
+                assert_eq!(
+                    row["act_principal_id"].as_deref(),
+                    Some(principal),
+                    "a platform principal acts for itself"
+                );
+            })
             .map(|row| row["sub_principal_kind"].clone())
             .collect::<Vec<_>>();
         kinds.sort_unstable();

@@ -241,7 +241,8 @@ class TableConfig:
                 Datetime fields declare the timestamp types in
                 ``wyrd.types``: ``NaiveDatetime`` is ``TIMESTAMP_NTZ`` and any
                 other ``datetime`` is ``TIMESTAMP_LTZ``.
-                ``card_uid``, ``run_id``, and ``wyrd_*`` names are reserved.
+                ``card_uid``, ``run_id``, ``sub_principal_id``,
+                ``act_principal_id``, and ``wyrd_*`` names are reserved.
             table: the ``"<namespace>.<name>"`` name SQL uses.
             partition_granularity: ``"hour"`` or ``"day"`` partitions on
                 the time column. Omitted while another layout argument is
@@ -329,7 +330,8 @@ class TableConfig:
         Args:
             table: the ``"<namespace>.<name>"`` name SQL uses.
             schema: a JSON Schema object with a ``properties`` mapping.
-                ``card_uid``, ``run_id``, and ``wyrd_*`` names are reserved.
+                ``card_uid``, ``run_id``, ``sub_principal_id``,
+                ``act_principal_id``, and ``wyrd_*`` names are reserved.
             partition_granularity: ``"hour"`` or ``"day"``, as for
                 ``TableConfig()``.
             sort_keys: up to four ``SortKey`` mappings, as for

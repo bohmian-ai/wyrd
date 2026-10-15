@@ -7,14 +7,17 @@
 
 use std::sync::Arc;
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use vala_bifrost_redux::oracle::peer::PeerSecurityAudit;
+use wyrd_runtime::Permission;
 use wyrd_runtime::audit::AuditStage;
 use wyrd_server::oracle::PostgresPeerSecurityAudit;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag, TokenAudience};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, BifrostSecurityViolationKind};
-use wyrd_testing::WyrdTestServer;
+use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 use super::query::ServerJourneyError;
 
@@ -162,6 +165,106 @@ async fn system_owner_security_rejections_retain_once() -> Result<(), ServerJour
         before + 1,
         "the system-owner rejection must retain in exactly one batch"
     );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Retained decisions name the verified subject and actor, allowed or denied,
+/// and an unauthenticated request leaves no decision at all (AC-003/004/015).
+///
+/// User A and Service B may read Cards and Service C may not. A, B for A, C, and C for A each
+/// read one absent Card over HTTP, so the tenant retains exactly A/A and A/B
+/// allowed and C/C and A/C denied for that Card. A request with no
+/// credential, an unparsable token, or A's claims under B's signature is
+/// refused before any principal resolves and so is never retained, least of
+/// all as A.
+///
+/// # Errors
+/// Returns the server, bootstrap, exchange, request, or settle failure.
+///
+/// # Panics
+/// Panics when a response or a retained pair differs from the story.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn subject_actor_decisions_preserve_trusted_identity() -> Result<(), ServerJourneyError> {
+    const READER: &str = "audit_card_reader";
+    let server = WyrdTestServer::start_bound().await?;
+    let tenant = server.data_tenant_id();
+    server.seed_role(READER, &[Permission::card_read()]).await?;
+    let a = server.bootstrap_user("audit-a", &[READER]).await?;
+    let b = server.bootstrap_service("audit-b", &[READER]).await?;
+    let c = server.bootstrap_service("audit-c", &[]).await?;
+    let a_jwt = a.jwt().ok_or("a user carries a token")?.to_owned();
+    let exchange = async |service: &Bootstrap| -> Result<String, ServerJourneyError> {
+        let key = service.api_key().ok_or("a service carries an API key")?;
+        Ok(server.exchange_api_key(key).await?)
+    };
+    let (b_jwt, c_jwt) = (exchange(&b).await?, exchange(&c).await?);
+    let card = uuid::Uuid::now_v7();
+    let read = async |token: Option<&str>| -> Result<StatusCode, ServerJourneyError> {
+        let request = Request::builder()
+            .uri(format!("/v1/cards/by-uid/Service/{card}"))
+            .body(Body::empty())?;
+        Ok(match token {
+            Some(token) => server.oneshot_authenticated(token, request).await?,
+            None => server.oneshot(request).await?,
+        }
+        .status())
+    };
+
+    let (claims, _) = a_jwt.rsplit_once('.').ok_or("a token has a signature")?;
+    let (_, signature) = b_jwt.rsplit_once('.').ok_or("a token has a signature")?;
+    for (token, status) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some("not-a-token".to_owned()), StatusCode::BAD_REQUEST),
+        (
+            Some(format!("{claims}.{signature}")),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        assert_eq!(read(token.as_deref()).await?, status);
+    }
+    let b_for_a = server.delegate(&a_jwt, &b_jwt, TokenAudience::Wyrd).await?;
+    let c_for_a = server.delegate(&a_jwt, &c_jwt, TokenAudience::Wyrd).await?;
+    for (token, status) in [
+        (&a_jwt, StatusCode::NOT_FOUND),
+        (&b_for_a, StatusCode::NOT_FOUND),
+        (&c_jwt, StatusCode::FORBIDDEN),
+        (&c_for_a, StatusCode::FORBIDDEN),
+    ] {
+        assert_eq!(read(Some(token)).await?, status);
+    }
+
+    let predicate = format!("resource = 'card:{card}'");
+    server.await_audit_retained().await?;
+    server
+        .await_retained_audit_count(tenant, &predicate, 4)
+        .await?;
+    let mut rows = server
+        .retained_audit_records(
+            tenant,
+            "sub_principal_id, act_principal_id, outcome",
+            &predicate,
+        )
+        .await?;
+    rows.sort();
+    let (a, b, c) = (a.id().to_string(), b.id().to_string(), c.id().to_string());
+    let pair = |sub: &str, act: &str, outcome: &str| {
+        vec![
+            Some(sub.to_owned()),
+            Some(act.to_owned()),
+            Some(outcome.to_owned()),
+        ]
+    };
+    let mut expected = vec![
+        pair(&a, &a, "allowed"),
+        pair(&a, &b, "allowed"),
+        pair(&c, &c, "denied"),
+        pair(&a, &c, "denied"),
+    ];
+    expected.sort();
+    assert_eq!(rows, expected, "each decision keeps its verified pair");
 
     server.shutdown().await?;
     Ok(())

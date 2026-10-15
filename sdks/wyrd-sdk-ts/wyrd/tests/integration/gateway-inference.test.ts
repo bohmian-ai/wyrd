@@ -20,7 +20,7 @@ import {
   WyrdClient,
   WyrdError,
 } from "wyrd-ai";
-import { cli } from "@wyrd/testing";
+import { cli, type NativeWyrdTestServer } from "@wyrd/testing";
 
 import { ancestry, columnValues, fixture, registered, serverTest, timeline } from "../support/server.js";
 
@@ -381,9 +381,20 @@ test("cli issues a card scoped key and writes a provider credential", async ({ a
   expect(JSON.stringify(view)).not.toContain("sk-managed");
 });
 
-test("loaded workflow calls the gateway through its loading client", async ({ provider, ask }) => {
+/** Cards of the tenant administrator `wyrd setup` issues, who is bound to no Card and so may run any registered Workflow. */
+function tenantAdminCards(server: NativeWyrdTestServer): Cards {
+  return Cards.connect({
+    client: WyrdClient.connect({
+      serverUrl: server.baseUrl,
+      credential: server.tenantAdminKey(),
+      grpcUrl: server.grpcUrl,
+    }),
+  });
+}
+
+test("loaded workflow calls the gateway through its loading client", async ({ server, provider, ask }) => {
   const before = provider.received.length;
-  const workflow = await Cards.connect().workflow.load({ uid: registered(ask).uid });
+  const workflow = await tenantAdminCards(server).workflow.load({ uid: registered(ask).uid });
 
   const run = await workflow.run({ question: "hi" });
 
@@ -412,10 +423,10 @@ test("applying a workflow calls no model", async ({ provider, ask: _ }) => {
   expect(provider.received.slice(before)).toEqual([]);
 });
 
-test("registered example runs through the gateway", async ({ provider, ask: _ }) => {
+test("registered example runs through the gateway", async ({ server, provider, ask: _ }) => {
   await cli.apply(EXAMPLE);
   const before = provider.received.length;
-  const registeredExample = await Cards.connect().workflow.load({
+  const registeredExample = await tenantAdminCards(server).workflow.load({
     space: "engineering",
     name: "code-review",
     version: "1.0.0",

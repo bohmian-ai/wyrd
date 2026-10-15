@@ -14,6 +14,14 @@
 //! A [`BlockError`] is either retryable, spending the step's retry budget,
 //! or terminal, making the block inconclusive at once.
 
+pub(crate) mod agent;
+mod tools;
+
+pub use agent::{
+    AgentCardResolver, AgentExecutor, EvidenceReader, PromptCardResolver, block_error,
+};
+pub use tools::{AgentToolset, ToolSession, provider_tool_name};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;

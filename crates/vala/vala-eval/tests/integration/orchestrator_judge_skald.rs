@@ -14,6 +14,7 @@ use skald_providers::{ProviderError, ProviderStream};
 use skald_runtime::{Provider, ProviderRegistry};
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 use tokio_util::sync::CancellationToken;
+use vala_eval::blocks::BlockError;
 use vala_eval::orchestrator::{
     AgentCardResolver, MediaResolver, PromptCardResolver, SkaldJudgeInvoker,
 };
@@ -38,7 +39,7 @@ impl AgentCardResolver for StaticAgentResolver {
     ///
     /// # Errors
     /// Never fails.
-    async fn resolve(&self, _agent_ref: &CardRef) -> Result<AgentSpec, JudgeError> {
+    async fn resolve(&self, _agent_ref: &CardRef) -> Result<AgentSpec, BlockError> {
         if let Some(calls) = &self.calls {
             calls.fetch_add(1, Ordering::Relaxed);
         }
@@ -57,7 +58,7 @@ impl AgentCardResolver for StaticAgentResolver {
 
 #[async_trait]
 impl PromptCardResolver for StaticResolver {
-    async fn resolve(&self, _judge_ref: &CardRef) -> Result<skald_prompt::Prompt, JudgeError> {
+    async fn resolve(&self, _judge_ref: &CardRef) -> Result<skald_prompt::Prompt, BlockError> {
         Ok(self.prompt.clone())
     }
 }

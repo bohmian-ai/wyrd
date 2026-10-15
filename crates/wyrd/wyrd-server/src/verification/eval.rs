@@ -28,6 +28,7 @@ use vala_eval::orchestrator::{
     AgentCardResolver, MediaResolver, OrchestratorError, PromptCardResolver, ScenarioScoring,
     SkaldJudgeInvoker,
 };
+use vala_eval::blocks::BlockError;
 use vala_eval::sampling::RecordSample;
 use vala_eval::{
     EvalExecError, EvalReport, InMemoryTraceSource, JudgeError, JudgeInvoker, MediaBindings,
@@ -806,7 +807,7 @@ impl JudgeInvoker for TimedJudge {
     }
 }
 
-/// Resolves judge Agent and Prompt Cards from the run tenant's registry.
+/// Resolves Agent and Prompt Cards from the run tenant's registry.
 struct TenantRegistry {
     /// Server state owning the Wyrd Postgres registry.
     state: AppState,
@@ -818,17 +819,17 @@ impl TenantRegistry {
     /// Load the Card `reference` names, by UID when pinned.
     ///
     /// # Errors
-    /// Returns [`JudgeError::Retryable`] for a connection failure and
-    /// [`JudgeError::Terminal`] for an unpinned reference without a space or
+    /// Returns [`BlockError::Retryable`] for a connection failure and
+    /// [`BlockError::Terminal`] for an unpinned reference without a space or
     /// an absent or unparseable Card.
-    async fn spec(&self, reference: &CardRef) -> Result<Spec, JudgeError> {
+    async fn spec(&self, reference: &CardRef) -> Result<Spec, BlockError> {
         let mut conn = self
             .state
             .postgres
             .wyrd()
             .tenant_conn(self.tenant)
             .await
-            .map_err(|error| JudgeError::Retryable {
+            .map_err(|error| BlockError::Retryable {
                 reason: error.to_string(),
             })?;
         let card = match (&reference.uid, &reference.space) {
@@ -844,13 +845,13 @@ impl TenantRegistry {
                 .await
             }
             (None, None) => {
-                return Err(JudgeError::Terminal {
-                    reason: format!("judge reference {reference} names no space or uid"),
+                return Err(BlockError::Terminal {
+                    reason: format!("reference {reference} names no space or uid"),
                 });
             }
         };
         card.map(|card| card.spec)
-            .map_err(|error| JudgeError::Terminal {
+            .map_err(|error| BlockError::Terminal {
                 reason: error.to_string(),
             })
     }
@@ -859,10 +860,10 @@ impl TenantRegistry {
 #[async_trait]
 impl AgentCardResolver for TenantRegistry {
     /// Resolve an Agent Card of this tenant.
-    async fn resolve(&self, agent_ref: &CardRef) -> Result<AgentSpec, JudgeError> {
+    async fn resolve(&self, agent_ref: &CardRef) -> Result<AgentSpec, BlockError> {
         match self.spec(agent_ref).await? {
             Spec::Agent(spec) => Ok(spec),
-            _ => Err(JudgeError::Terminal {
+            _ => Err(BlockError::Terminal {
                 reason: format!("card {agent_ref} is not an Agent"),
             }),
         }
@@ -872,10 +873,10 @@ impl AgentCardResolver for TenantRegistry {
 #[async_trait]
 impl PromptCardResolver for TenantRegistry {
     /// Resolve a Prompt Card of this tenant into its runtime prompt.
-    async fn resolve(&self, prompt_ref: &CardRef) -> Result<skald_prompt::Prompt, JudgeError> {
+    async fn resolve(&self, prompt_ref: &CardRef) -> Result<skald_prompt::Prompt, BlockError> {
         match self.spec(prompt_ref).await? {
             Spec::Prompt(spec) => Ok(skald_prompt::Prompt::from_native(spec.prompt)),
-            _ => Err(JudgeError::Terminal {
+            _ => Err(BlockError::Terminal {
                 reason: format!("card {prompt_ref} is not a Prompt"),
             }),
         }

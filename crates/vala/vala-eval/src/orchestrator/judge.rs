@@ -5,33 +5,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
-use skald_agent::{
-    Agent, AgentError, WyrdGatewayCaller, agent_error_retryable,
-    run_config_from_agent_run_config_spec,
-};
+use skald_agent::{Agent, AgentError, WyrdGatewayCaller, run_config_from_agent_run_config_spec};
 use skald_prompt::Prompt;
-use skald_providers::ProviderError;
 use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
 use tokio::sync::Mutex;
 use wyrd_spec::card::agent::{AgentSpec, ExecutionRoute};
-use wyrd_spec::reference::{CardRef, InlineableRef};
+use wyrd_spec::reference::InlineableRef;
 use wyrd_spec::vala::eval::media::MediaRef as EvalMediaRef;
 
+use crate::blocks::agent::render;
+use crate::blocks::{AgentCardResolver, BlockError, PromptCardResolver, block_error};
 use crate::{JudgeError, JudgeInvoker, MediaBindings};
-
-/// Resolves a durable Agent card into its pure Agent spec.
-#[async_trait]
-pub trait AgentCardResolver: Send + Sync {
-    /// Resolve an Agent card reference.
-    async fn resolve(&self, agent_ref: &CardRef) -> Result<AgentSpec, JudgeError>;
-}
-
-/// Resolves a durable Prompt card into a runtime Skald prompt.
-#[async_trait]
-pub trait PromptCardResolver: Send + Sync {
-    /// Resolve a Prompt card reference.
-    async fn resolve(&self, prompt_ref: &CardRef) -> Result<Prompt, JudgeError>;
-}
 
 /// Reads the authorized object behind an Eval media descriptor.
 ///
@@ -168,7 +152,7 @@ impl SkaldJudgeInvoker {
 
         let spec = match judge_ref {
             InlineableRef::Ref(agent_ref) | InlineableRef::Sibling { sibling: agent_ref } => {
-                self.agents.resolve(agent_ref).await?
+                self.agents.resolve(agent_ref).await.map_err(judge_error)?
             }
             InlineableRef::Inline(spec) => (**spec).clone(),
             InlineableRef::Path(path) => {
@@ -187,7 +171,11 @@ impl SkaldJudgeInvoker {
             InlineableRef::Ref(prompt_ref)
             | InlineableRef::Sibling {
                 sibling: prompt_ref,
-            } => self.prompts.resolve(prompt_ref).await?,
+            } => self
+                .prompts
+                .resolve(prompt_ref)
+                .await
+                .map_err(judge_error)?,
             InlineableRef::Path(path) => {
                 return Err(JudgeError::Terminal {
                     reason: format!(
@@ -326,35 +314,17 @@ fn validate_judge_agent(spec: &AgentSpec) -> Result<(), JudgeError> {
     Ok(())
 }
 
-/// Classify a judge model-call failure for the judge retry loop.
-///
-/// A provider answer follows the shared Workflow classification for every
-/// provider: transport failures, timeouts, throttling, server errors, and
-/// retryable gateway problems retry; validation and credential refusals and
-/// terminal gateway problems do not. A runtime failure with no provider
-/// answer, such as an unregistered provider, stays retryable. A gateway
-/// problem keeps its stable code and message; any other provider failure
-/// names only its stable provider code, never the provider body.
+/// Classify a judge model-call failure with the shared Agent block
+/// classification.
 fn map_provider_error(error: SkaldRuntimeError) -> JudgeError {
-    let error = AgentError::Provider(error);
-    let reason = match &error {
-        AgentError::Provider(SkaldRuntimeError::Provider {
-            source: ProviderError::RemoteProblem(problem),
-            ..
-        }) => format!("{}: {}", problem.code, problem.message),
-        AgentError::Provider(SkaldRuntimeError::Provider { source, .. }) => {
-            format!("provider failure {}", source.code())
-        }
-        other => other.to_string(),
-    };
-    let retryable = match &error {
-        AgentError::Provider(SkaldRuntimeError::Provider { .. }) => agent_error_retryable(&error),
-        _ => true,
-    };
-    if retryable {
-        JudgeError::Retryable { reason }
-    } else {
-        JudgeError::Terminal { reason }
+    judge_error(block_error(AgentError::Provider(error)))
+}
+
+/// The judge form of a shared block failure.
+fn judge_error(error: BlockError) -> JudgeError {
+    match error {
+        BlockError::Retryable { reason } => JudgeError::Retryable { reason },
+        BlockError::Terminal { reason } => JudgeError::Terminal { reason },
     }
 }
 
@@ -377,13 +347,6 @@ fn context_variables(prompt: &Prompt, value: &Value) -> Vec<(String, String)> {
             name.map(|name| vec![(name.clone(), render(scalar))])
                 .unwrap_or_default()
         }
-    }
-}
-
-fn render(value: &Value) -> String {
-    match value {
-        Value::String(value) => value.clone(),
-        other => other.to_string(),
     }
 }
 

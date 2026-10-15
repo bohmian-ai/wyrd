@@ -8523,6 +8523,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "jsonpath-rust",
+ "jsonschema",
  "regex",
  "schemars 0.8.22",
  "serde",
@@ -8543,6 +8544,7 @@ dependencies = [
  "wyrd-skald-providers",
  "wyrd-skald-runtime",
  "wyrd-skald-spec",
+ "wyrd-skald-tool",
  "wyrd-spec",
  "wyrd-utils",
 ]

@@ -10,6 +10,8 @@ import importlib
 import sys
 import threading
 from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -22,6 +24,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import BaseModel
+from wyrd.client import WyrdClient
 from wyrd.observe import Observe, Run
 from wyrd.otel import install_run_correlation
 from wyrd.state import WyrdState
@@ -607,3 +610,469 @@ def test_nested_entry_never_overwrites_an_active_span_correlation(
         "restored": root,
         "outer": root,
     }
+
+
+# ── Managed telemetry setup, owned providers, lifecycle, and the Agents bridge ──
+
+
+UNREACHABLE = "http://127.0.0.1:9"
+
+
+@pytest.fixture
+def unset_global_provider(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Unset OpenTelemetry's once-only global provider, and shut down what a test installs."""
+    from opentelemetry.util._once import Once
+
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", None)
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
+    yield
+    installed = trace._TRACER_PROVIDER
+    if isinstance(installed, TracerProvider):
+        installed.shutdown()
+
+
+@pytest.fixture
+def client_state(complete_bundle: Path, interfaces: dict[str, Any]) -> WyrdState:
+    """The complete bundle bound to an explicit client whose server is never dialled."""
+    client = WyrdClient(server_url=UNREACHABLE, credential="wyrd_unit_unused")
+    return WyrdState.from_path(complete_bundle, client, interfaces=interfaces)
+
+
+def _second_state(complete_bundle: Path, interfaces: dict[str, Any]) -> WyrdState:
+    """Another state over the same bundle with its own client."""
+    client = WyrdClient(server_url=UNREACHABLE, credential="wyrd_unit_other")
+    return WyrdState.from_path(complete_bundle, client, interfaces=interfaces)
+
+
+@pytest.mark.usefixtures("unset_global_provider")
+@pytest.mark.parametrize("case", ["repeat", "other_state", "application", "lost_race"])
+def test_telemetry_setup(
+    case: str,
+    client_state: WyrdState,
+    complete_bundle: Path,
+    interfaces: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One managed provider per application: repeats are idempotent, others are refused intact."""
+    if case == "repeat":
+        client_state.start_telemetry()
+        installed = trace.get_tracer_provider()
+        client_state.start_telemetry()
+        assert trace.get_tracer_provider() is installed
+        assert isinstance(installed, TracerProvider)
+        return
+    if case == "other_state":
+        _second_state(complete_bundle, interfaces).start_telemetry()
+    elif case == "application":
+        trace.set_tracer_provider(TracerProvider())
+    else:
+        # Another installer wins between the check and the install; the losing
+        # provider must be released rather than left exporting in the background.
+        released: list[TracerProvider] = []
+        monkeypatch.setattr(trace, "set_tracer_provider", lambda provider: None)
+        monkeypatch.setattr(TracerProvider, "shutdown", lambda provider: released.append(provider))
+    existing = trace.get_tracer_provider()
+    with pytest.raises(wyrd.WyrdError) as refused:
+        client_state.start_telemetry()
+    assert refused.value.code == "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS"
+    assert trace.get_tracer_provider() is existing
+    if case == "lost_race":
+        assert len(released) == 1
+
+
+def test_telemetry_setup_names_the_otel_extra_without_the_sdk(client_state: WyrdState) -> None:
+    """Managed setup without the OpenTelemetry SDK names the extra that installs it."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(sys.modules, "opentelemetry.sdk.trace", None)
+        with pytest.raises(ImportError, match=r"wyrd\[otel\]"):
+            client_state.start_telemetry()
+
+
+class _FailOnce:
+    """A provider whose first registration raises and later ones succeed."""
+
+    def __init__(self) -> None:
+        self.processors: list[object] = []
+        self.calls = 0
+
+    def add_span_processor(self, processor: object) -> None:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("transient registration failure")
+        self.processors.append(processor)
+
+
+def test_owned_provider_correlation(state: WyrdState) -> None:
+    """A failed registration is retryable, success is idempotent, and owned settings stay."""
+    flaky = _FailOnce()
+    assert install_run_correlation(flaky) is False
+    assert install_run_correlation(flaky) is True
+    assert install_run_correlation(flaky) is True
+    assert len(flaky.processors) == 1
+
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
+
+    exporter = InMemorySpanExporter()
+    owned = TracerProvider(resource=Resource.create({"service.name": "owned"}))
+    owned.add_span_processor(SimpleSpanProcessor(exporter))
+    assert install_run_correlation(owned) is True
+    run, model = state.run(), state.run().for_card("model")
+
+    async def scoped(view: Run, name: str) -> None:
+        with view:
+            await asyncio.sleep(0)
+            owned.get_tracer("framework").start_span(name).end()
+
+    async def both() -> None:
+        await asyncio.gather(scoped(run, "a"), scoped(model, "b"))
+
+    asyncio.run(both())
+    owned.get_tracer("framework").start_span("unscoped").end()
+    assert _correlation(exporter) == {
+        "a": (_ref(state, run), run.run_id),
+        "b": (_ref(state, model), model.run_id),
+        "unscoped": None,
+    }
+    assert all(
+        span.resource.attributes["service.name"] == "owned"
+        for span in exporter.get_finished_spans()
+    )
+
+    unsampled = TracerProvider(sampler=ALWAYS_OFF)
+    dropped = InMemorySpanExporter()
+    unsampled.add_span_processor(SimpleSpanProcessor(dropped))
+    assert install_run_correlation(unsampled) is True
+    with run:
+        unsampled.get_tracer("framework").start_span("dropped").end()
+    assert dropped.get_finished_spans() == ()
+
+
+@pytest.mark.usefixtures("unset_global_provider")
+@pytest.mark.parametrize(
+    ("outcome", "method", "code", "native_code"),
+    [
+        (
+            False,
+            "flush",
+            "WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT",
+            "WYRD_SDK_400_BIFROST_NOT_STARTED",
+        ),
+        (
+            TimeoutError,
+            "flush",
+            "WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT",
+            "WYRD_SDK_400_BIFROST_NOT_STARTED",
+        ),
+        (
+            RuntimeError,
+            "flush",
+            "WYRD_SDK_503_TELEMETRY_FLUSH_FAILED",
+            "WYRD_SDK_400_BIFROST_NOT_STARTED",
+        ),
+        (True, "flush", "WYRD_SDK_400_BIFROST_NOT_STARTED", None),
+        (False, "shutdown", "WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT", None),
+        (RuntimeError, "shutdown", "WYRD_SDK_503_TELEMETRY_FLUSH_FAILED", None),
+        (True, "shutdown", None, None),
+    ],
+    ids=[
+        "false",
+        "timeout",
+        "raises",
+        "native-only",
+        "shutdown-false",
+        "shutdown-raises",
+        "shutdown-ok",
+    ],
+)
+def test_managed_telemetry_lifecycle(
+    client_state: WyrdState,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: object,
+    method: str,
+    code: str | None,
+    native_code: str | None,
+) -> None:
+    """The managed provider flushes first; every failure is reported and the drain still runs.
+
+    Bifrost is never started here, so a flush's native drain reports
+    ``BIFROST_NOT_STARTED`` and a shutdown's drain succeeds: either result in
+    the error proves the drain was attempted after the provider failed.
+    """
+    client_state.start_telemetry()
+    provider = trace.get_tracer_provider()
+    assert isinstance(provider, TracerProvider)
+    flushes: list[str] = []
+
+    def force_flush(timeout_millis: int = 30000) -> bool:
+        flushes.append("otel")
+        if isinstance(outcome, type):
+            raise outcome("SECRET payload in a provider error")
+        return bool(outcome)
+
+    monkeypatch.setattr(provider, "force_flush", force_flush)
+    active = provider.get_tracer("framework").start_span("active")
+    if code is None:
+        getattr(client_state, method)()
+    else:
+        with pytest.raises(wyrd.WyrdError) as failed:
+            getattr(client_state, method)()
+        assert failed.value.code == code
+        assert "SECRET" not in str(failed.value)
+        if code.startswith("WYRD_SDK_50"):
+            assert failed.value.details["stage"] == "opentelemetry"
+            assert failed.value.details["native_code"] == native_code
+    assert flushes == ["otel"]
+    assert active.is_recording()
+    active.end()
+    assert trace.get_tracer_provider() is provider
+
+
+def test_application_provider_is_never_flushed_by_state(
+    client_state: WyrdState,
+    spans: tuple[TracerProvider, InMemorySpanExporter],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A state that did not install telemetry flushes and shuts down only its writer."""
+    provider, _ = spans
+    monkeypatch.setattr(provider, "force_flush", _broken)
+    monkeypatch.setattr(provider, "shutdown", _broken)
+    client_state.shutdown()
+
+
+class _ExportHeaders(BaseHTTPRequestHandler):
+    """A local OTLP/HTTP receiver recording each export's Wyrd token header."""
+
+    tokens: list[str] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server's handler name
+        self.rfile.read(int(self.headers["content-length"]))
+        type(self).tokens.append(self.headers["x-wyrd-access-token"])
+        self.send_response(200)
+        self.send_header("content-type", "application/x-protobuf")
+        self.send_header("content-length", "0")
+        self.end_headers()
+
+    def log_message(self, *args: object) -> None:
+        """Keep the test output quiet."""
+
+
+class _RotatingClient:
+    """A client stand-in returning a new access token on each request."""
+
+    def __init__(self, server_url: str) -> None:
+        self.server_url = server_url
+        self.issued = 0
+
+    def access_token(self) -> str:
+        self.issued += 1
+        return f"token-{self.issued}"
+
+
+def test_exporter_token_freshness() -> None:
+    """Every export asks the client for its current token; none is copied at setup."""
+    _ExportHeaders.tokens = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ExportHeaders)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        client = _RotatingClient(f"http://127.0.0.1:{server.server_address[1]}")
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(wyrd.otel.span_exporter(client)))  # type: ignore[arg-type]
+        assert client.issued == 0
+        provider.get_tracer("framework").start_span("first").end()
+        provider.get_tracer("framework").start_span("second").end()
+        provider.shutdown()
+    finally:
+        server.shutdown()
+    assert _ExportHeaders.tokens == ["Bearer token-1", "Bearer token-2"]
+
+
+# The Agents SDK callbacks, driven with real SDK span data and stand-in span handles.
+
+
+def _agents_span(
+    span_id: str,
+    data: Any,
+    *,
+    parent_id: str | None = None,
+    started_at: str | None = None,
+    ended_at: str | None = None,
+    error: dict[str, Any] | None = None,
+) -> Any:
+    """A stand-in Agents SDK span carrying only what the processor reads."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        span_id=span_id,
+        trace_id="trace_1",
+        parent_id=parent_id,
+        span_data=data,
+        started_at=started_at,
+        ended_at=ended_at,
+        error=error,
+    )
+
+
+def _finished(exporter: InMemorySpanExporter) -> dict[str, Any]:
+    """Finished spans by name."""
+    return {span.name: span for span in exporter.get_finished_spans()}
+
+
+def test_agents_callback_lifecycle(
+    state: WyrdState, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """Hierarchy, timestamps, GenAI data, safe errors, scope, and lifecycle edges survive."""
+    from types import SimpleNamespace
+
+    from agents.tracing.span_data import (
+        AgentSpanData,
+        CustomSpanData,
+        FunctionSpanData,
+        GenerationSpanData,
+        ResponseSpanData,
+    )
+    from wyrd.otel import WyrdAgentsTraceProcessor
+
+    provider, exporter = spans
+    processor = WyrdAgentsTraceProcessor()
+    trace_handle = SimpleNamespace(trace_id="trace_1", name="workflow")
+    run_a, run_b = state.run(), state.run()
+
+    with provider.get_tracer("app").start_as_current_span("enclosing") as enclosing, run_a:
+        processor.on_trace_start(trace_handle)
+        agent = _agents_span(
+            "agent", AgentSpanData(name="assistant"), started_at="2026-01-01T00:00:00+00:00"
+        )
+        processor.on_span_start(agent)
+        processor.on_span_start(agent)  # duplicate start of a live id is ignored
+        tool = _agents_span(
+            "tool",
+            FunctionSpanData(name="lookup", input="SECRET-ARGS", output="SECRET-RESULT"),
+            parent_id="agent",
+            started_at="not a timestamp",
+        )
+        processor.on_span_start(tool)
+        generation = _agents_span(
+            "generation",
+            GenerationSpanData(
+                input=[{"content": "SECRET-PROMPT"}], output=[{"content": "SECRET-REPLY"}]
+            ),
+            parent_id="missing-parent",
+        )
+        processor.on_span_start(generation)
+    # Late data and completion in another Run's scope.
+    generation.span_data.model = "local-model"
+    generation.span_data.usage = {"input_tokens": 3, "output_tokens": 1}
+    with run_b:
+        processor.on_span_end(generation)
+        tool.error = {"message": "SECRET-ERROR", "data": {"secret": "SECRET-DATA"}}
+        processor.on_span_end(tool)
+        processor.on_span_end(tool)  # duplicate end is harmless
+        processor.on_span_end(_agents_span("never-started", CustomSpanData(name="x", data={})))
+    response = _agents_span(
+        "response",
+        ResponseSpanData(
+            response=SimpleNamespace(
+                model="resp-model", usage=SimpleNamespace(input_tokens=5, output_tokens=2)
+            )
+        ),
+        parent_id="agent",
+    )
+    processor.on_span_start(response)
+    processor.on_span_end(response)
+    custom = _agents_span(
+        "custom", CustomSpanData(name="checkpoint", data={"secret": "SECRET"}), parent_id="agent"
+    )
+    processor.on_span_start(custom)
+    processor.on_span_end(custom)
+    agent.ended_at = "2026-01-01T00:00:02+00:00"
+    processor.on_span_end(agent)
+    processor.on_trace_end(trace_handle)
+
+    finished = _finished(exporter)
+    names = [span.name for span in exporter.get_finished_spans()]
+    assert len(names) == len(set(names)), names
+    root = finished["workflow"]
+    assert root.parent.span_id == enclosing.get_span_context().span_id
+    assert {span.context.trace_id for span in finished.values()} == {
+        enclosing.get_span_context().trace_id
+    }
+    agent_span = finished["invoke_agent assistant"]
+    assert agent_span.parent.span_id == root.context.span_id
+    assert agent_span.start_time == 1_767_225_600 * 10**9
+    assert agent_span.end_time == 1_767_225_602 * 10**9
+    assert agent_span.attributes["gen_ai.agent.name"] == "assistant"
+    tool_span = finished["execute_tool lookup"]
+    assert tool_span.parent.span_id == agent_span.context.span_id
+    assert tool_span.attributes["gen_ai.tool.name"] == "lookup"
+    assert tool_span.status.status_code == trace.StatusCode.ERROR
+    assert tool_span.attributes["error.type"] == "_OTHER"
+    chat = finished["chat local-model"]
+    assert chat.parent.span_id == root.context.span_id  # unresolved parent falls back to the trace
+    assert dict(chat.attributes) == {
+        "gen_ai.operation.name": "chat",
+        "gen_ai.request.model": "local-model",
+        "gen_ai.usage.input_tokens": 3,
+        "gen_ai.usage.output_tokens": 1,
+        "wyrd.card_uid": _ref(state, run_a),
+        "wyrd.run_id": run_a.run_id,
+    }
+    assert finished["chat resp-model"].attributes["gen_ai.usage.output_tokens"] == 2
+    assert not any(key.startswith("gen_ai") for key in finished["checkpoint"].attributes)
+    for span in finished.values():
+        rendered = f"{dict(span.attributes)} {span.status.description} {span.events}"
+        assert "SECRET" not in rendered, span.name
+    scoped = {name: span.attributes.get("wyrd.run_id") for name, span in finished.items()}
+    assert scoped == {
+        "enclosing": run_a.run_id,
+        "workflow": run_a.run_id,
+        "invoke_agent assistant": run_a.run_id,
+        "execute_tool lookup": run_a.run_id,
+        "chat local-model": run_a.run_id,
+        "chat resp-model": None,
+        "checkpoint": None,
+    }
+
+    # Shutdown ends unfinished spans with ERROR, is idempotent, and ignores late callbacks.
+    exporter.clear()
+    processor.on_trace_start(SimpleNamespace(trace_id="trace_2", name="interrupted"))
+    processor.shutdown()
+    processor.shutdown()
+    processor.on_span_start(_agents_span("late", CustomSpanData(name="late", data={})))
+    processor.on_trace_end(SimpleNamespace(trace_id="trace_2", name="interrupted"))
+    processor.force_flush()
+    (interrupted,) = exporter.get_finished_spans()
+    assert interrupted.name == "interrupted"
+    assert interrupted.status.status_code == trace.StatusCode.ERROR
+    assert interrupted.status.description == wyrd.otel._INTERRUPTED
+
+
+def test_agents_callbacks_are_thread_safe(
+    spans: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    """Concurrent callbacks on one processor start and end every span exactly once."""
+    from agents.tracing.span_data import CustomSpanData
+    from wyrd.otel import WyrdAgentsTraceProcessor
+
+    _, exporter = spans
+    processor = WyrdAgentsTraceProcessor()
+    barrier = threading.Barrier(8)
+
+    def work(worker: int) -> None:
+        barrier.wait()
+        for index in range(50):
+            span = _agents_span(
+                f"{worker}-{index}", CustomSpanData(name=f"{worker}-{index}", data={})
+            )
+            processor.on_span_start(span)
+            processor.on_span_start(span)
+            processor.on_span_end(span)
+            processor.on_span_end(span)
+
+    threads = [threading.Thread(target=work, args=(worker,)) for worker in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    names = [span.name for span in exporter.get_finished_spans()]
+    assert len(names) == 400 == len(set(names))

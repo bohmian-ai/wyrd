@@ -1,12 +1,14 @@
 //! A team registers its support desk Service graph and hydrates it to run
 //! offline, through `Cards` and through the in-process CLI.
 
-use wyrd_ai::cards::{CardKind, CardSelector, Cards, RegistrationReceipt};
+use std::path::{Path, PathBuf};
+
+use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, RegistrationReceipt};
 use wyrd_ai::cli::{self, SelectorArgs};
-use wyrd_ai::state::WyrdState;
+use wyrd_ai::state::{HydratedCard, WyrdState};
 use wyrd_ai::{Card, Spec, VerifierImplementation};
 
-use crate::support::{Deployment, fixture, hydrate, register};
+use crate::support::{Deployment, fixture, hydrate, register, registered};
 
 /// The support desk Service the stories register.
 const DESK: &str = "cards/register_and_hydrate/support-desk.yaml";
@@ -19,6 +21,94 @@ const DESK: &str = "cards/register_and_hydrate/support-desk.yaml";
 async fn register_desk(cards: &Cards) -> (RegistrationReceipt, RegistrationReceipt) {
     let model = register(cards, "cards/register_and_hydrate/support-model.yaml").await;
     (model, register(cards, DESK).await)
+}
+
+/// The Service whose Agents declare their Prompt inline, by path and by
+/// CardRef, beside an explicit `my_prompt` alias of the shared Prompt.
+const PROMPT_DESK: &str = "cards/agent_prompt/prompt-desk.yaml";
+
+/// Register the authored Prompt the ref-form Agent pins, then the prompt
+/// desk, and return the desk's receipt.
+///
+/// # Panics
+/// Panics when a registration is refused.
+async fn register_prompt_desk(cards: &Cards) -> RegistrationReceipt {
+    register(cards, "cards/agent_prompt/desk-prompt.yaml").await;
+    register(cards, PROMPT_DESK).await
+}
+
+/// Write an unversioned Agent named `name` whose inline Prompt sends
+/// `message` into `dir`, and return its path.
+///
+/// # Panics
+/// Panics when the file cannot be written.
+fn inline_agent(dir: &Path, name: &str, message: &str) -> PathBuf {
+    let path = dir.join(format!("{name}-{}.yaml", message.len()));
+    std::fs::write(
+        &path,
+        format!(
+            "apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: {name}
+  space: default
+spec:
+  prompt:
+    request:
+      provider: gemini_generate_content
+      body:
+        contents:
+          - role: user
+            parts:
+              - text: {message}
+    model: gpt-4o
+    variables: []
+    media_variables: []
+    response_type: text
+"
+        ),
+    )
+    .expect("inline agent writes");
+    path
+}
+
+/// Register the inline Agent `name` sending `message` and return the exact
+/// references the receipt records for the Agent and its Prompt.
+///
+/// # Panics
+/// Panics when registration is refused or records either Card missing.
+async fn register_inline(
+    cards: &Cards,
+    dir: &Path,
+    name: &str,
+    message: &str,
+) -> (CardRef, CardRef) {
+    let receipt = cards
+        .register_from_path(inline_agent(dir, name, message))
+        .await
+        .expect("inline agent registers");
+    (
+        registered(&receipt, name),
+        registered(&receipt, &format!("{name}-prompt")),
+    )
+}
+
+/// The Prompt reference the registry persisted in Agent `agent`'s spec.
+///
+/// # Panics
+/// Panics when the Agent cannot be read or pins no Card reference.
+async fn persisted_prompt(cards: &Cards, agent: &CardRef) -> CardRef {
+    let card = cards
+        .get(CardSelector::exact(agent.clone()))
+        .await
+        .expect("agent reads");
+    let Spec::Agent(spec) = card.spec else {
+        panic!("{agent} is an Agent");
+    };
+    spec.prompt
+        .as_card_ref()
+        .expect("the persisted Agent pins a registered Prompt")
+        .clone()
 }
 
 /// The CLI selector naming `name` at 1.0.0 in the default space.
@@ -326,4 +416,131 @@ async fn refused_cli_command_raises_its_catalog_code() {
 
     assert_eq!(refused.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND");
     deployment.shutdown().await;
+}
+
+/// An inline Prompt registers as its own `<agent>-prompt` Card that replay
+/// reuses, changed content versions while older Agents stay pinned, and
+/// another Agent never shares; path and CardRef Prompts keep their authored
+/// identity, and the generated Prompt hydrates without a Service component.
+///
+/// # Panics
+/// Panics when a registration, read, or hydration differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn agent_prompt_registration_identity() {
+    let deployment = Deployment::start().await;
+    let cards = deployment.cards();
+    let dir = tempfile::tempdir().expect("fixture directory creates");
+
+    let (agent, prompt) =
+        register_inline(&cards, dir.path(), "first-agent", "Answer briefly.").await;
+    let replay = register_inline(&cards, dir.path(), "first-agent", "Answer briefly.").await;
+    let (changed_agent, changed_prompt) =
+        register_inline(&cards, dir.path(), "first-agent", "Answer at length.").await;
+    let (_, other_prompt) =
+        register_inline(&cards, dir.path(), "second-agent", "Answer briefly.").await;
+
+    assert_eq!(prompt.kind, CardKind::Prompt);
+    assert_eq!(prompt.space, agent.space);
+    assert_eq!(persisted_prompt(&cards, &agent).await, prompt);
+    assert_eq!(replay, (agent.clone(), prompt.clone()));
+    assert_ne!(changed_prompt.version, prompt.version);
+    assert_eq!(
+        persisted_prompt(&cards, &changed_agent).await,
+        changed_prompt
+    );
+    assert_eq!(persisted_prompt(&cards, &agent).await, prompt);
+    assert_eq!(other_prompt.name.as_str(), "second-agent-prompt");
+    assert_ne!(other_prompt.uid, prompt.uid);
+
+    let desk = register_prompt_desk(&cards).await;
+    let authored = registered(&desk, "desk-prompt");
+    let inline = registered(&desk, "inline-agent-prompt");
+    assert_eq!(authored.version.to_string(), "1.0.0");
+    for (name, expected) in [
+        ("path-agent", &authored),
+        ("ref-agent", &authored),
+        ("inline-agent", &inline),
+    ] {
+        assert_eq!(
+            &persisted_prompt(&cards, &registered(&desk, name)).await,
+            expected
+        );
+    }
+    let bundle = hydrate(&cards, &desk.root).await;
+    let state = WyrdState::from_path(bundle.path().join("bundle")).expect("bundle loads");
+    let aliases = state
+        .aliases_for(&inline)
+        .expect("the generated Prompt hydrates");
+    assert_eq!(
+        state
+            .prompt(&aliases[0])
+            .expect("the generated Prompt reads")
+            .as_card_ref()
+            .expect("prompt identity is valid"),
+        inline
+    );
+    deployment.shutdown().await;
+}
+
+/// Every Agent of the hydrated prompt desk navigates offline to its
+/// registered Prompt Card; path and CardRef forms agree with the explicit
+/// `my_prompt` alias, generic lookup returns kind-appropriate Cards, and
+/// unknown or mismatched aliases are refused with stable codes.
+///
+/// # Panics
+/// Panics when registration, hydration, a read, or a refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn hydrated_agent_prompt_card_navigation() {
+    let deployment = Deployment::start().await;
+    let cards = deployment.cards();
+    let desk = register_prompt_desk(&cards).await;
+    let bundle = hydrate(&cards, &desk.root).await;
+    deployment.shutdown().await;
+
+    let state = WyrdState::from_path(bundle.path().join("bundle")).expect("bundle loads offline");
+    let explicit = state.prompt("my_prompt").expect("explicit alias reads");
+    let explicit_ref = explicit.as_card_ref().expect("prompt identity is valid");
+    assert_eq!(explicit_ref, registered(&desk, "desk-prompt"));
+    for (alias, prompt) in [
+        ("inline_agent", "inline-agent-prompt"),
+        ("path_agent", "desk-prompt"),
+        ("ref_agent", "desk-prompt"),
+    ] {
+        let agent = state.agent(alias).expect("agent reads");
+        let card = agent.prompt();
+        assert_eq!(
+            card.as_card_ref().expect("prompt identity is valid"),
+            registered(&desk, prompt)
+        );
+        assert_eq!(agent.prompt_ref(), &registered(&desk, prompt));
+        let Ok(HydratedCard::Agent(generic)) = state.get(alias) else {
+            panic!("{alias} is looked up as an Agent");
+        };
+        assert!(std::ptr::eq(generic.prompt(), card));
+    }
+    assert!(std::ptr::eq(
+        state.agent("path_agent").expect("agent reads").prompt(),
+        explicit
+    ));
+    assert!(
+        matches!(state.get("my_prompt"), Ok(HydratedCard::Prompt(card)) if std::ptr::eq(card, explicit))
+    );
+    assert_eq!(
+        state
+            .get("missing")
+            .err()
+            .expect("unknown alias is refused")
+            .code(),
+        "WYRD_SDK_404_UNKNOWN_ALIAS"
+    );
+    assert_eq!(
+        state
+            .agent("my_prompt")
+            .err()
+            .expect("a Prompt is not an Agent")
+            .code(),
+        "WYRD_SDK_400_CARD_KIND_MISMATCH"
+    );
 }

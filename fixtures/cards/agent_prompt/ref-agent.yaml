@@ -1,0 +1,15 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: ref-agent
+  version: 1.0.0
+  space: default
+spec:
+  prompt:
+    kind: Prompt
+    name: desk-prompt
+    version: 1.0.0
+    space: default
+  run_config:
+    max_iterations: 2
+    timeout_ms: 1000

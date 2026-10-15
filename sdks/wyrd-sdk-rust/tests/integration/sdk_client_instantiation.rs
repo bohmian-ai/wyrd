@@ -266,7 +266,7 @@ async fn credential_paths_preserve_exchange_and_bearer_behavior() {
 
 /// Handles connected with a delegated client act with the subject's
 /// authority, not the actor's, and the server's retained audit attributes a
-/// delegated query to the subject with the actor in its delegation chain.
+/// delegated query to the subject with the actor as `act_principal_id`.
 ///
 /// # Panics
 /// Panics when the delegation fails, a call is decided with the actor's
@@ -339,9 +339,9 @@ async fn delegated_connect_uses_the_subject_principal() {
     let decisions = server
         .retained_audit_records(
             server.data_tenant_id(),
-            "detail",
+            "act_principal_id",
             &format!(
-                "operation = 'bifrost.query.read_decision' AND audit_principal_id = '{}'",
+                "operation = 'bifrost.query.read_decision' AND sub_principal_id = '{}'",
                 ids[0]
             ),
         )
@@ -349,15 +349,7 @@ async fn delegated_connect_uses_the_subject_principal() {
         .expect("retained audit reads");
     let actors: Vec<String> = decisions
         .iter()
-        .map(|record| {
-            let detail: serde_json::Value =
-                serde_json::from_str(record[0].as_deref().expect("a decision has detail"))
-                    .expect("detail is JSON");
-            detail["delegation_chain"][0]["principal_id"]
-                .as_str()
-                .expect("the decision names its actor")
-                .to_owned()
-        })
+        .map(|record| record[0].clone().expect("the decision names its actor"))
         .collect();
     assert_eq!(
         actors,

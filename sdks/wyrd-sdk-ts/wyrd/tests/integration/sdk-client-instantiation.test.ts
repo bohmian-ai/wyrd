@@ -142,11 +142,11 @@ test("delegated connect uses the subject principal", async ({ server }) => {
 
   server.flushBifrost();
   const decisions = await asActor.sql(
-    "SELECT detail FROM vala.system.audit_log WHERE operation = 'bifrost.query.read_decision' AND audit_principal_id = $1",
+    "SELECT act_principal_id FROM vala.system.audit_log WHERE operation = 'bifrost.query.read_decision' AND sub_principal_id = $1",
     [subjectId ?? ""],
-    z.object({ detail: z.object({ delegation_chain: z.array(z.object({ principal_id: z.string() })) }) }),
+    z.object({ act_principal_id: z.string() }),
   );
-  expect(decisions.map((row) => row.detail.delegation_chain[0]?.principal_id)).toEqual([actorId]);
+  expect(decisions.map((row) => row.act_principal_id)).toEqual([actorId]);
 });
 
 test("handles reuse the client cache and renew", async ({ server }) => {

@@ -54,7 +54,7 @@ class Event(BaseModel):
 
 
 class Decision(BaseModel):
-    detail: dict[str, Any]
+    act_principal_id: str
 
 
 @pytest.fixture(scope="module")
@@ -202,12 +202,12 @@ def test_delegated_connect_uses_the_subject_principal(server: WyrdTestServer) ->
 
     server.flush_bifrost()
     decisions = Bifrost.connect(client=actor).sql(
-        "SELECT detail FROM vala.system.audit_log "
-        "WHERE operation = 'bifrost.query.read_decision' AND audit_principal_id = $1",
+        "SELECT act_principal_id FROM vala.system.audit_log "
+        "WHERE operation = 'bifrost.query.read_decision' AND sub_principal_id = $1",
         [subject_id],
         model=Decision,
     )
-    actors = [row.detail["delegation_chain"][0]["principal_id"] for row in decisions]
+    actors = [row.act_principal_id for row in decisions]
     assert actors == [actor_id, actor_id]
 
 

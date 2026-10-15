@@ -120,7 +120,7 @@ fn write_graph(root: &Path) -> PathBuf {
             "gated.yaml",
             verifier(
                 "eval-gated",
-                "      pass_gate: {kind: all_pass}\n      tasks:\n        answer: {kind: assertion, id: answer, context_path: $.answer, operator: equals, expected: \"yes\"}\n        judge:\n          kind: llm_judge\n          id: judge\n          judge_ref: {prompt: ./judge-prompt.json, tool_names: [], run_config: {max_iterations: 1}}\n          context_path: $.answer\n          operator: equals\n          expected: {passed: true}\n          max_retries: 0\n",
+                "      pass_gate: {kind: all_pass}\n      tasks:\n        answer: {kind: assertion, id: answer, context_path: $.answer, operator: equals, expected: \"yes\"}\n        judge:\n          kind: llm_judge\n          id: judge\n          judge_ref: {prompt: ./judge-prompt.json, execution_route: {kind: wyrd_gateway, deployment: openai}, tool_names: [], run_config: {max_iterations: 1}}\n          context_path: $.answer\n          operator: equals\n          expected: {passed: true}\n          max_retries: 0\n",
             ),
         ),
         (
@@ -169,7 +169,7 @@ fn write_graph(root: &Path) -> PathBuf {
 /// One Agent Card named `name` over the shared agent Prompt.
 fn agent(name: &str) -> String {
     format!(
-        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  prompt: ./agent-prompt.yaml\n  run_config:\n    max_iterations: 1\n"
+        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  prompt: ./agent-prompt.yaml\n  execution_route: {{kind: wyrd_gateway, deployment: openai}}\n  run_config:\n    max_iterations: 1\n"
     )
 }
 
@@ -1459,7 +1459,7 @@ fn write_trace_graph(root: &Path) -> PathBuf {
     ]
     .concat();
     let ceiling = format!(
-        "{}        judge:\n          kind: llm_judge\n          id: judge\n          judge_ref: {{prompt: ./judge-prompt.json, tool_names: [], run_config: {{max_iterations: 1}}}}\n          context_path: $.answer\n          operator: equals\n          expected: {{passed: true}}\n          max_retries: 0\n",
+        "{}        judge:\n          kind: llm_judge\n          id: judge\n          judge_ref: {{prompt: ./judge-prompt.json, execution_route: {{kind: wyrd_gateway, deployment: openai}}, tool_names: [], run_config: {{max_iterations: 1}}}}\n          context_path: $.answer\n          operator: equals\n          expected: {{passed: true}}\n          max_retries: 0\n",
         task("first", "$.spans[0].name", "span-0")
     );
     let files = [
@@ -1654,11 +1654,11 @@ fn stamped_observation(
     )
 }
 
-/// The principal ID of every retained Oracle read decision `tenant` made as
-/// a System principal, in decision order, once its audit has published.
+/// The actor of every retained Oracle read decision `tenant` made for a
+/// different subject, in decision order, once its audit has published.
 ///
-/// Only continuous Eval reads as the System principal; the journey's own
-/// inspection reads run as users and are excluded.
+/// Continuous Eval reads for the run's subject with an actor; the journey's
+/// own inspection reads run as users acting for themselves and are excluded.
 ///
 /// # Errors
 /// Returns the publication or retained-history failure.
@@ -1670,8 +1670,8 @@ async fn system_reads(
     Ok(server
         .retained_audit_records(
             tenant,
-            "sub_principal_id",
-            "operation = 'bifrost.query.read_decision' AND sub_principal_kind = 'system'",
+            "act_principal_id",
+            "operation = 'bifrost.query.read_decision' AND act_principal_id <> sub_principal_id",
         )
         .await?
         .into_iter()
@@ -3158,7 +3158,7 @@ fn write_realtime_graph(root: &Path) -> PathBuf {
         "metadata": { "name": "realtime-judge-prompt", "version": "1.0.0", "space": "default" },
         "spec": judge.into_native(),
     });
-    let check = "kind: llm_judge, id: judge, judge_ref: {prompt: ./realtime-judge-prompt.json, tool_names: [], run_config: {max_iterations: 1}}, context_path: $.answer, operator: equals, expected: {passed: true}, max_retries: 0";
+    let check = "kind: llm_judge, id: judge, judge_ref: {prompt: ./realtime-judge-prompt.json, execution_route: {kind: wyrd_gateway, deployment: openai}, tool_names: [], run_config: {max_iterations: 1}}, context_path: $.answer, operator: equals, expected: {passed: true}, max_retries: 0";
     let files = [
         ("realtime-judge-prompt.json", prompt.to_string()),
         (

@@ -5540,6 +5540,7 @@ async fn seed_machine_card(
                 &CardKind::Agent,
                 serde_json::json!({
                     "prompt": prompt_ref,
+                    "execution_route": { "kind": "native" },
                 }),
             )
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
@@ -5568,7 +5569,7 @@ async fn seed_prompt_card(
         serde_json::json!({
             "provider": "openai",
             "model": "gpt-4o-mini",
-            "messages": "Fixture agent."
+            "messages": [{ "role": "user", "content": "Fixture agent." }]
         }),
     )
     .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;

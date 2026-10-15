@@ -504,7 +504,7 @@ impl<'a> VerificationControl<'a> {
         telemetry.finish(outcome, outcome != "completed");
         let report = result?;
         self.stage_result(
-            &executor,
+            caller,
             execution_id,
             request.run_id.as_ref(),
             &target,
@@ -528,7 +528,7 @@ impl<'a> VerificationControl<'a> {
     /// The result takes the execution's identity, so the response's
     /// `execution_id` is the `result_id` of its rows. Its rows name the
     /// subject Card as `card_uid` and the exact Verifier as
-    /// `verifier_card_uid`, are attributed to the executor's pair (caller subject, SYSTEM actor),
+    /// `verifier_card_uid`, are attributed to the caller's subject and actor,
     /// carry the caller's application Run `run_id` when supplied, and have no
     /// owner, binding, or Trigger. A Drift result records the execution
     /// interval as its window; an Eval or task result records the application

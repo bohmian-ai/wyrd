@@ -332,11 +332,12 @@ struct ResultJudgeCall {
 
 impl ResultJudgeCall {
     /// Assert `joined` is exactly one result and judge call, both for
-    /// `principal` on `run`, both performed by the same SYSTEM actor.
+    /// `principal` on `run`: the realtime result carries the caller's own
+    /// pair, and the judge call is performed by the SYSTEM actor.
     ///
     /// # Panics
     /// Panics when the rows differ.
-    fn assert_judged_as_system(joined: &[Self], principal: &str, run: Option<&str>) {
+    fn assert_called_as_system(joined: &[Self], principal: &str, run: Option<&str>) {
         let [row] = joined else {
             panic!("exactly one joined judge call: {joined:?}");
         };
@@ -350,7 +351,7 @@ impl ResultJudgeCall {
             (principal, principal, run, run),
             "{row:?}"
         );
-        assert_eq!(row.result_actor, row.call_actor, "{row:?}");
+        assert_eq!(row.result_actor, principal, "{row:?}");
         assert_ne!(
             row.call_actor, principal,
             "SYSTEM performs the judgment: {row:?}"
@@ -629,7 +630,7 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
         )],
         "{calls:?}"
     );
-    ResultJudgeCall::assert_judged_as_system(
+    ResultJudgeCall::assert_called_as_system(
         &assistant
             .result_with_its_judge_calls(&judgment.execution_id.to_string())
             .await,
@@ -644,7 +645,7 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
 /// joined on its call id, descends from the caller's span, and the call
 /// records the requesting principal as subject, SYSTEM as actor, and the
 /// verified Card with a null Run rather than an invented one. The result
-/// records the same pair and joins the call on that Card.
+/// records the caller's own pair and joins the call on that Card.
 ///
 /// # Panics
 /// Panics when the verify, flush, or read fails or the call differs.
@@ -688,7 +689,7 @@ async fn judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
         Some(CALLER_SPAN),
         "{chain:#?}"
     );
-    ResultJudgeCall::assert_judged_as_system(
+    ResultJudgeCall::assert_called_as_system(
         &assistant.result_with_its_judge_calls(&execution).await,
         &principal,
         None,

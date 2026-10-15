@@ -1381,7 +1381,12 @@ mod tests {
             .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None, Some(first))
             .expect("one charged context fits");
         assert!(matches!(
-            producer.enqueue(br#"{"id":2}"#.to_vec(), Some(card()), None, Some(context('b'))),
+            producer.enqueue(
+                br#"{"id":2}"#.to_vec(),
+                Some(card()),
+                None,
+                Some(context('b'))
+            ),
             Err(WyrdQueueError::Backpressure)
         ));
         assert!(budget.used_bytes() <= budget.admission_limit());

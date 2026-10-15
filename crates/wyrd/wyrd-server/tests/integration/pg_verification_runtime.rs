@@ -3441,3 +3441,225 @@ async fn unrouted_spans_export_only_to_the_operator() {
     );
     server.shutdown().await.expect("test server shuts down");
 }
+
+/// The tenant span permits one server holds, mirroring the server's fixed
+/// per-process cap on unwritten tenant copies.
+const SPAN_PERMITS: usize = 2_048;
+
+/// The caller trace every request during the Scribe outage continues.
+const OUTAGE_TRACE: &str = "7bf92f3577b34da6a3ce929d0e0e4736";
+
+/// The caller trace of the one request after Scribe returns.
+const RECOVERED_TRACE: &str = "8bf92f3577b34da6a3ce929d0e0e4736";
+
+/// The process's count of Scribe-outbox writes lost, read from the rendered
+/// production recorder; zero before the first loss.
+///
+/// # Panics
+/// Panics when the rendered counter value is not a number.
+fn lost_scribe_writes(cluster: &wyrd_testing::bifrost::cluster::WyrdTestCluster) -> u64 {
+    cluster
+        .telemetry()
+        .render()
+        .lines()
+        .find_map(|line| line.strip_prefix(r#"outbox_events_lost_total{outbox="scribe"} "#))
+        .map_or(0, |value| {
+            value.trim().parse::<f64>().expect("a numeric counter") as u64
+        })
+}
+
+/// Durable rows `tenant` holds in `table`, from the published file list.
+///
+/// # Panics
+/// Panics when the file list cannot be read.
+async fn published_rows(assertion: &PgPool, tenant: DataTenantId, table: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE(SUM(row_count), 0)::bigint FROM vala.file_list \
+         WHERE data_tenant_id = $1 AND namespace || '.' || table_name = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(table)
+    .fetch_one(assertion)
+    .await
+    .expect("published row count")
+}
+
+/// Calls `tools/list` on `server`'s stateless `/mcp` as `jwt`, returning the
+/// status and the response body.
+///
+/// # Panics
+/// Panics when the request cannot be built or the server does not respond.
+async fn mcp_tools_list(server: &WyrdTestServer, jwt: &str) -> (axum::http::StatusCode, String) {
+    let version = "2026-07-28";
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": { "_meta": {
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientInfo": { "name": "outage-probe", "version": "1" },
+            "io.modelcontextprotocol/clientCapabilities": {},
+        } },
+    });
+    let request = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/mcp")
+        .header(axum::http::header::HOST, "localhost")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .header("mcp-protocol-version", version)
+        .header("mcp-method", "tools/list")
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("MCP request builds");
+    let response = server
+        .oneshot_authenticated(jwt, request)
+        .await
+        .expect("MCP request responds");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("MCP body reads");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Checks `server`'s gRPC health service answers.
+///
+/// # Panics
+/// Panics when the server has no gRPC listener or the check fails.
+async fn grpc_health_answers(server: &WyrdTestServer) {
+    use wyrd_tonic::tonic_health::pb::HealthCheckRequest;
+    use wyrd_tonic::tonic_health::pb::health_client::HealthClient;
+
+    let channel = wyrd_tonic::tonic::transport::Channel::from_shared(
+        server.grpc_url().expect("the pod serves gRPC"),
+    )
+    .expect("gRPC endpoint parses")
+    .connect()
+    .await
+    .expect("gRPC connects");
+    HealthClient::new(channel)
+        .check(HealthCheckRequest::default())
+        .await
+        .expect("gRPC health answers during the outage");
+}
+
+/// A sustained Scribe outage caps an Oracle pod's unwritten tenant span
+/// copies without starving its siblings, and the same outbox recovers.
+///
+/// The role-separated cluster boots its Oracle pods while its only Scribe pod
+/// is held back, so the Oracle pod's peer route reaches no Scribe. Traced
+/// executions continue a sampled caller until the Scribe-outbox loss counter
+/// rises, proving copies past the permit pool are dropped at once; each also
+/// stages its Verifier result, and HTTP, gRPC, and MCP keep answering. Once
+/// the Scribe pod joins, that same outbox drains: exactly the permitted copies
+/// and every result publish, and one later copy is accepted with no loss.
+///
+/// # Panics
+/// Panics when the cluster or seeding fails, a request is refused, the cap
+/// does not hold, a result is lost, the outbox does not drain, or the later
+/// copy is dropped.
+#[tokio::test]
+async fn sustained_scribe_outage_caps_tenant_spans() {
+    use wyrd_testing::bifrost::cluster::{BifrostClusterSpec, WyrdTestCluster};
+
+    let spec = BifrostClusterSpec::role_separated();
+    let scribe = spec.nodes.last().expect("a Scribe node").node_id;
+    let mut cluster = WyrdTestCluster::start_spec_delayed_last(spec)
+        .await
+        .expect("the Oracle pods start without their Scribe");
+    let tenant = cluster.data_tenant_id();
+    let oracle = cluster.server(0).expect("an Oracle pod");
+    let (verifier, subject, _, jwt) = traced_tenant(oracle, tenant, "outage-caller").await;
+    let outbox = Arc::clone(&oracle.state().scribe_outbox);
+    let assertion = oracle
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+
+    let lost_before = lost_scribe_writes(&cluster);
+    let mut requests = 0_u64;
+    while lost_scribe_writes(&cluster) == lost_before {
+        assert!(
+            requests < 4 * SPAN_PERMITS as u64,
+            "the tenant span cap never dropped a copy"
+        );
+        requests += 1;
+        let status = traced_execute(
+            oracle,
+            Some(&jwt),
+            (&verifier, &subject),
+            &format!("00-{OUTAGE_TRACE}-{requests:016x}-01"),
+        )
+        .await;
+        assert!(status.is_success(), "request {requests}: {status}");
+    }
+    assert!(
+        requests > 1,
+        "the cap was reached only after earlier copies held permits"
+    );
+    grpc_health_answers(oracle).await;
+    let (status, tools) = mcp_tools_list(oracle, &jwt).await;
+    assert!(
+        status.is_success() && tools.contains(r#""tools":["#),
+        "MCP lists tools during the outage: {status} {tools}"
+    );
+
+    cluster
+        .restart_node(scribe)
+        .await
+        .expect("the Scribe pod joins");
+    assert_eq!(
+        outbox.settle(std::time::Instant::now() + WAIT).await,
+        0,
+        "the same outbox drains to the joined Scribe"
+    );
+    let scribe_pod = cluster.server_by_node(scribe).expect("the Scribe pod");
+    scribe_pod.flush_bifrost().await.expect("Scribe flushes");
+    let oracle = cluster.server(0).expect("an Oracle pod");
+    let copies = oracle
+        .retained_span_records(
+            tenant,
+            "encode(span_id, 'hex')",
+            &format!("trace_id = X'{OUTAGE_TRACE}'"),
+        )
+        .await
+        .expect("outage copies read");
+    assert_eq!(
+        copies.len(),
+        SPAN_PERMITS,
+        "exactly the permitted copies publish"
+    );
+    assert_eq!(
+        published_rows(&assertion, tenant, RESULTS).await,
+        i64::try_from(requests).expect("a small count"),
+        "every Verifier result staged during the outage publishes"
+    );
+
+    let lost_after_recovery = lost_scribe_writes(&cluster);
+    let status = traced_execute(
+        oracle,
+        Some(&jwt),
+        (&verifier, &subject),
+        &format!("00-{RECOVERED_TRACE}-00f067aa0ba902b7-01"),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    assert_eq!(outbox.settle(std::time::Instant::now() + WAIT).await, 0);
+    scribe_pod.flush_bifrost().await.expect("Scribe flushes");
+    let recovered = oracle
+        .retained_span_records(tenant, "name", &format!("trace_id = X'{RECOVERED_TRACE}'"))
+        .await
+        .expect("recovered copies read");
+    assert!(
+        recovered
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|name| name == "request"),
+        "a copy after recovery is accepted: {recovered:?}"
+    );
+    assert_eq!(lost_scribe_writes(&cluster), lost_after_recovery);
+}

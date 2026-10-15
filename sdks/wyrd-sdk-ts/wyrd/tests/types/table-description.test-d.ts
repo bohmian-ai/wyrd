@@ -9,4 +9,4 @@ type DataType = TableDescription["user_fields"][number]["data_type"];
 expectTypeOf<Extract<DataType, { List: unknown }>["List"]["data_type"]>().toEqualTypeOf<DataType>();
 expectTypeOf<Extract<DataType, { Struct: unknown }>["Struct"][number]["name"]>().toEqualTypeOf<string>();
 expectTypeOf<TableDescription["physical_layout"]["sort_keys"][number]["column"]>().toEqualTypeOf<string>();
-expectTypeOf<TableDescription["canonical_physical_fingerprint"]>().toEqualTypeOf<string | undefined>();
+expectTypeOf<TableDescription["canonical_physical_fingerprint"]>().toEqualTypeOf<string | null | undefined>();

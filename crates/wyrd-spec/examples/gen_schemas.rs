@@ -13,8 +13,10 @@ use std::path::Path;
 use schemars::r#gen::SchemaGenerator;
 use serde_json::{Map, Value, json, to_string_pretty};
 use wyrd_spec::auth::{
-    AbsoluteUrl, CallbackQuery, GatewayAccess, IssuerUrl, LoginInitResponse, PrincipalKindTag,
-    RevokePrincipalRequest, TokenRequest, TokenResponse,
+    AbsoluteUrl, CallbackQuery, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
+    CredentialListResponse, GatewayAccess, IssuedCredential, IssuerUrl, LoginInitResponse,
+    PrincipalKindTag, PrincipalPage, PrincipalQuery, PrincipalRoles, RevokePrincipalRequest,
+    RoleAssignmentChange, TokenAudience, TokenRequest, TokenResponse,
 };
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::artifact::{ArtifactSpec, FrameworkAdapterRef};
@@ -65,7 +67,7 @@ use wyrd_spec::registry::{
     CardRegistrationOutcome, CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan,
     CreateCardRequest, CreateCardResponse, DeleteCardResponse, GetCardResponse, ListCardsRequest,
     ListCardsResponse, ListVersionsResponse, RegistrationOperationId, RegistrationOutcomeKind,
-    RegistrationReplaySeed, RelativeArtifactPath, StoredArtifactEntry,
+    RegistrationReceipt, RegistrationReplaySeed, RelativeArtifactPath, StoredArtifactEntry,
 };
 use wyrd_spec::run::{RunKind, RunRef};
 use wyrd_spec::security::{SecretRef, TlsConfig};
@@ -78,12 +80,12 @@ use wyrd_spec::vala::api::{
     AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, BifrostTableDescription,
     BifrostTableEntry, CancelRunningQueryRequest, CancelRunningQueryResponse, DataTypeSpec,
     FieldSpec as BifrostFieldSpec, GetRunningQueryRequest, ListRunningQueriesResponse,
-    NullOrderWire, PhysicalLayoutWire, RegisterOutcome, RegisterTableRequest,
+    NullOrderWire, PhysicalLayoutWire, QueryTerminalFrame, RegisterOutcome, RegisterTableRequest,
     RegisterTableResponse, RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary,
     SortDirectionWire, SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit,
 };
 use wyrd_spec::verification::{
-    StartVerificationRunRequest, StartVerificationRunResponse, VerificationBindingStatus,
+    Judgment, StartVerificationRunRequest, StartVerificationRunResponse, VerificationBindingStatus,
     VerificationRunStatus,
 };
 
@@ -223,6 +225,7 @@ fn contracts() -> Value {
         CardUploadEntry,
         CreateCardRequest,
         CreateCardResponse,
+        RegistrationReceipt,
         RegistrationReplaySeed,
         RegistrationOperationId,
         RelativeArtifactPath,
@@ -245,6 +248,15 @@ fn contracts() -> Value {
         CallbackQuery,
         PrincipalKindTag,
         RevokePrincipalRequest,
+        TokenAudience,
+        CreateServicePrincipalRequest,
+        CreateServicePrincipalResponse,
+        IssuedCredential,
+        CredentialListResponse,
+        PrincipalRoles,
+        RoleAssignmentChange,
+        PrincipalPage,
+        PrincipalQuery,
         SecretRef,
         TlsConfig,
         GatewayAccess,
@@ -281,6 +293,7 @@ fn contracts() -> Value {
         GetRunningQueryRequest,
         CancelRunningQueryRequest,
         CancelRunningQueryResponse,
+        QueryTerminalFrame,
         AuditEvent,
         AuthMethod,
         AuditOutcome,
@@ -288,6 +301,7 @@ fn contracts() -> Value {
         StartVerificationRunResponse,
         VerificationBindingStatus,
         VerificationRunStatus,
+        Judgment,
         CreateOperatorConnectionRequest,
         UpdateOperatorConnectionRequest,
         OperatorConnectionView,

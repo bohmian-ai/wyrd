@@ -1,7 +1,15 @@
 // Compile-only: `mise run ts:typecheck` fails when an assertion here breaks.
 import { expectTypeOf } from "vitest";
 
-import type { DriftBaselineState, RegisteredCard, RegisteredVerifierCard, TypedCardKind } from "wyrd-ai";
+import type {
+  CardKind,
+  CardSummary,
+  CardTypes,
+  DriftBaselineState,
+  RegisteredCard,
+  RegisteredVerifierCard,
+  TypedCardKind,
+} from "wyrd-ai";
 
 // Narrowing a registered envelope by `kind` reaches the Verifier's typed baseline state.
 expectTypeOf<
@@ -27,3 +35,9 @@ const undeclared: RegisteredVerifierCard = {
   spec: { implementation_kind: "drift" },
 };
 void undeclared;
+
+// Registry summaries carry the Rust contract's timestamps and owning enums.
+expectTypeOf<CardSummary["created_at"]>().toEqualTypeOf<string>();
+expectTypeOf<CardSummary["updated_at"]>().toEqualTypeOf<string>();
+expectTypeOf<CardSummary["kind"]>().toEqualTypeOf<CardKind>();
+expectTypeOf<CardSummary["status"]>().toEqualTypeOf<CardTypes.CardLifecycleStatus>();

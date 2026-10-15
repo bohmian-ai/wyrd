@@ -288,7 +288,9 @@ test("agents sdk responses tool loop runs through the gateway", async ({ provide
 });
 
 test("caller without gateway invoke cannot run an agents sdk agent", async ({ server, provider, ask: _ }) => {
-  const reader = WyrdClient.connect({ credential: server.scopedApiKey("gateway_reader", ["gateway:read"]) });
+  // Each scoped key mints a principal named for its role on this file's server,
+  // so this caller's role must differ from the earlier refused caller's.
+  const reader = WyrdClient.connect({ credential: server.scopedApiKey("agent_reader", ["gateway:read"]) });
   const { client } = await openai(reader);
   const before = provider.received.length;
 

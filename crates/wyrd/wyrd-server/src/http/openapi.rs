@@ -17,8 +17,9 @@ pub(crate) const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 ///
 /// One caller scheme, because there is one header: `X-Wyrd-Access-Token` carries the
 /// token on every plane. The public gateway inference ingress additionally
-/// accepts the same Wyrd access token in the header its provider SDK sends
-/// (`Authorization`, `x-api-key`, or `x-goog-api-key`); no other route reads the
+/// accepts the same Wyrd access token, or a Wyrd API key it exchanges for one,
+/// in the header its provider SDK sends (`Authorization`, `x-api-key`, or
+/// `x-goog-api-key`); no other route reads the
 /// caller's own `Authorization` header. The scheme is applied document-wide, so a route added
 /// tomorrow is documented as authenticated without anyone remembering to say so;
 /// the handful of operations a caller reaches before it has a session clear the

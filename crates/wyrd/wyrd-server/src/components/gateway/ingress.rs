@@ -350,7 +350,7 @@ pub(super) fn requested_subject(
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
         ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
     ),
-    request_body(content = GatewayAnthropicMessagesRequest, description = "Anthropic Messages request whose `model` is an exact Anthropic model id; the Wyrd access token travels in `x-api-key` or an `Authorization` bearer"),
+    request_body(content = GatewayAnthropicMessagesRequest, description = "Anthropic Messages request whose `model` is an exact Anthropic model id; the Wyrd access token, or a `wyrd_sk_` Wyrd API key the gateway exchanges for one, travels in `x-api-key` or an `Authorization` bearer"),
     responses(
         (status = 200, description = "Anthropic message as JSON, or Anthropic server-sent events when `stream` is true", content(
             (GatewayAnthropicMessage = "application/json"),
@@ -523,7 +523,7 @@ fn jev_call(
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
         ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
     ),
-    request_body(content = GatewayGeminiGenerateContentRequest, description = "Gemini GenerateContent request; the Wyrd access token travels in `x-goog-api-key` or an `Authorization` bearer"),
+    request_body(content = GatewayGeminiGenerateContentRequest, description = "Gemini GenerateContent request; the Wyrd access token, or a `wyrd_sk_` Wyrd API key the gateway exchanges for one, travels in `x-goog-api-key` or an `Authorization` bearer"),
     responses(
         (status = 200, description = "Gemini GenerateContent response as JSON, or its server-sent events for streamGenerateContent", content(
             (GatewayGeminiGenerateContentResponse = "application/json"),

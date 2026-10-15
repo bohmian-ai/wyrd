@@ -139,8 +139,9 @@ async fn ignores_second_hop_links() {
     assert_eq!(ids(&timeline), [(0x0a, 0x01), (0x0b, 0x01)]);
 }
 
-/// A span stored twice reads once, and spans starting together order by
-/// trace id, then span id.
+/// A span stored twice reads once, keeping its earliest copy even when its
+/// copies start apart and another span sorts between them, and spans starting
+/// together order by trace id, then span id.
 ///
 /// # Panics
 ///
@@ -152,7 +153,8 @@ async fn deduplicates_and_orders_ties_by_trace_and_span() {
         span(0x0b, 0x01, 0, &[0x0a]),
         span(0x0a, 0x02, 0, &[]),
         span(0x0a, 0x01, 0, &[]),
-        span(0x0a, 0x01, 0, &[]),
+        span(0x0a, 0x01, 20, &[]),
+        span(0x0a, 0x04, 10, &[]),
         span(0x0a, 0x03, -10, &[]),
     ])
     .await;
@@ -161,7 +163,13 @@ async fn deduplicates_and_orders_ties_by_trace_and_span() {
 
     assert_eq!(
         ids(&timeline),
-        [(0x0a, 0x03), (0x0a, 0x01), (0x0a, 0x02), (0x0b, 0x01)]
+        [
+            (0x0a, 0x03),
+            (0x0a, 0x01),
+            (0x0a, 0x02),
+            (0x0b, 0x01),
+            (0x0a, 0x04)
+        ]
     );
 }
 

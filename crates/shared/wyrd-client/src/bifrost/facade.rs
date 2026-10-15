@@ -7,7 +7,7 @@
 //! asymmetry is the server's, and it is why [`Bifrost::sql`] takes a query and
 //! [`Bifrost::insert`] takes only a row.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -819,8 +819,9 @@ impl Bifrost {
     /// directly to it.
     ///
     /// The closure is one inbound-link hop: a trace linking only to a linked
-    /// trace is not read. Spans are deduplicated by trace and span id and
-    /// ordered by start time, then trace id, then span id. The read is one
+    /// trace is not read. Spans are ordered by start time, then trace id, then
+    /// span id, and a span id stored more than once keeps only its first copy
+    /// in that order. The read is one
     /// query over the caller's authorized `vala.traces.spans` with the trace
     /// id bound as a parameter, so it inherits the query deadline and result
     /// limits, and another tenant's trace or one never seen reads empty.
@@ -869,9 +870,8 @@ impl Bifrost {
                     right.span_id.as_bytes(),
                 ))
         });
-        spans.dedup_by(|later, earlier| {
-            (later.trace_id, later.span_id) == (earlier.trace_id, earlier.span_id)
-        });
+        let mut seen = HashSet::new();
+        spans.retain(|span| seen.insert((span.trace_id, span.span_id)));
         Ok(spans)
     }
 

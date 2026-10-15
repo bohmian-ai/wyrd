@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use arrow::record_batch::RecordBatch;
 use vala_drift::{DriftReport, DriftVerdict, FittedBaseline, score_drift};
 use wyrd_spec::card::blocks::DriftCheck;
-use wyrd_spec::card::drift::DriftMethod;
+use wyrd_spec::card::drift::{DriftMethod, DriftProfile};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::verification::execution::{CallProvenance, RequirementDetail, Verdict};
@@ -53,11 +53,21 @@ impl DriftChecks {
     /// Missing samples, an unready baseline, and any scoring refusal are
     /// inconclusive with the cause as reason; a scored report maps `NoDrift`
     /// to passed, `Drift` to failed, and `Inconclusive` to inconclusive.
+    /// A Custom window with a null measurement of its configured metric is
+    /// the unscored report, since the Custom scorer would otherwise average
+    /// only the non-null rows; nulls in other columns do not matter.
     #[must_use]
     pub fn judge(&self, requirement: &TaskId, check: &DriftCheck) -> CheckOutput {
         let Some(samples) = check.on.slot().and_then(|slot| self.samples.get(slot)) else {
             return self.inconclusive(format!("no samples were recorded for `{}`", check.on));
         };
+        if let Some(DriftProfile::Custom(profile)) = &check.spec.profile
+            && samples
+                .column_by_name(&profile.metric_name)
+                .is_some_and(|column| column.null_count() > 0)
+        {
+            return self.scored(&DriftReport::unscored(check.spec.method));
+        }
         let custom = FittedBaseline::Custom;
         let baseline = match check.spec.method {
             DriftMethod::Custom => &custom,

@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use tokio::sync::{Barrier, Notify};
 use wyrd_spec::vala::ids::{SpanId, TraceId};
+use wyrd_spec::verification::DriftWindow;
 use wyrd_spec::verification::execution::Verdict;
 
 use super::*;
@@ -1192,4 +1193,113 @@ async fn drift_requirements_score_through_vala_drift() {
         "every drift result names its window"
     );
     assert!(script.calls().is_empty());
+}
+
+/// A Custom drift window with a null measurement of its configured metric
+/// is unscored and inconclusive, keeping its window and empty report, rather
+/// than passing on the non-null mean; nulls in unrelated columns do not
+/// matter, complete windows still pass or fail, and a missing metric column
+/// is still the scorer's refusal.
+///
+/// # Panics
+/// Panics when a Custom outcome, detail, or provenance differs.
+#[tokio::test(start_paused = true)]
+async fn custom_drift_needs_complete_measurements() {
+    use arrow::array::{Float64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use chrono::{TimeZone, Utc};
+    let custom = |id: &str, slot: &str, baseline: f64| {
+        drift_requirement(
+            id,
+            slot,
+            json!({"method": "Custom", "signal": {"kind": "Metric", "name": "ms"},
+            "profile": {"kind": "Custom", "metric_name": "ms", "baseline_value": baseline, "alert_threshold": 5.0}}),
+        )
+    };
+    let spec = verifier(json!({
+        "inputs": {
+            "holes": {"type": "samples", "features": ["ms"]},
+            "noted": {"type": "samples", "features": ["ms"]},
+            "renamed": {"type": "samples", "features": ["ms"]}
+        },
+        "requirements": [
+            custom("holes", "holes", 100.0), custom("noted", "noted", 100.0),
+            custom("noted-slow", "noted", 50.0), custom("renamed", "renamed", 100.0)
+        ]
+    }));
+    let schema = Schema::new(vec![
+        Field::new("ms", DataType::Float64, true),
+        Field::new("note", DataType::Utf8, true),
+    ]);
+    let noted = arrow::record_batch::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Float64Array::from(vec![99.0, 101.0])),
+            Arc::new(StringArray::from(vec![None::<&str>, None])),
+        ],
+    )
+    .expect("noted batch");
+    let holes = arrow::record_batch::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("ms", DataType::Float64, true)])),
+        vec![Arc::new(Float64Array::from(vec![Some(100.0), None]))],
+    )
+    .expect("holes batch");
+    let window = DriftWindow {
+        start: Utc
+            .with_ymd_and_hms(2026, 10, 1, 0, 0, 0)
+            .single()
+            .expect("start"),
+        end: Utc
+            .with_ymd_and_hms(2026, 10, 2, 0, 0, 0)
+            .single()
+            .expect("end"),
+    };
+    let drift = DriftChecks::new(
+        Some(window),
+        BTreeMap::new(),
+        BTreeMap::from([
+            (SlotName::new("holes").expect("slot"), holes),
+            (SlotName::new("noted").expect("slot"), noted),
+            (
+                SlotName::new("renamed").expect("slot"),
+                samples("latency", [100.0]),
+            ),
+        ]),
+    );
+    let script = Arc::new(Script::default());
+    let outcome = engine(&script, InMemoryTraceSource::new(), 4)
+        .with_drift(drift)
+        .run(
+            Arc::clone(&spec),
+            BTreeMap::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .expect("outcome");
+    assert_eq!(
+        outcomes(&outcome),
+        BTreeMap::from([
+            ("holes", RequirementOutcome::Inconclusive),
+            ("noted", RequirementOutcome::Passed),
+            ("noted-slow", RequirementOutcome::Failed),
+            ("renamed", RequirementOutcome::Inconclusive),
+        ])
+    );
+    assert_eq!(outcome.verdict, VerificationVerdict::Failed);
+    let holes = requirement(&outcome, "holes");
+    assert!(
+        matches!(&holes.detail, Some(RequirementDetail::Drift(report)) if report.features.is_empty()),
+        "{holes:?}"
+    );
+    assert!(
+        requirement(&outcome, "renamed").reason.contains("ms"),
+        "the scorer's missing-feature refusal is kept"
+    );
+    assert!(
+        outcome.requirements.iter().all(|r| r.provenance
+            == Some(CallProvenance::Drift {
+                window: Some(window)
+            })),
+        "every drift result names its window"
+    );
 }

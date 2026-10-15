@@ -57,7 +57,13 @@ CREATE UNIQUE INDEX auth_service_accounts_cardless_name
 -- `app.current_tenant`; the partial unique index makes concurrent callers
 -- converge on one row. The id is a UUIDv7: a millisecond Unix timestamp over a
 -- random v4 body, with the version nibble raised from 4 to 7.
-CREATE OR REPLACE FUNCTION wyrd.provision_system_principal() RETURNS uuid
+--
+-- `creator_sub`/`creator_act` is the verified creator pair: the platform
+-- operator that provisions the tenant, or the no-verified-caller sentinel when
+-- no caller exists. SYSTEM never creates itself, and the first pair stays
+-- fixed when a later call finds the row already present.
+CREATE OR REPLACE FUNCTION wyrd.provision_system_principal(creator_sub uuid, creator_act uuid)
+RETURNS uuid
 LANGUAGE plpgsql VOLATILE AS $$
 DECLARE
     candidate uuid := encode(
@@ -72,10 +78,11 @@ DECLARE
     provisioned uuid;
 BEGIN
     INSERT INTO wyrd.auth_service_accounts (
-        id, data_tenant_id, principal_kind, name, description, status, created_by
+        id, data_tenant_id, principal_kind, name, description, status,
+        sub_principal_id, act_principal_id
     ) VALUES (
         candidate, wyrd.current_tenant(), 'system', 'verification-results-writer',
-        'Internal verification-result writer', 'active', candidate
+        'Internal verification-result writer', 'active', creator_sub, creator_act
     )
     ON CONFLICT (data_tenant_id) WHERE principal_kind = 'system' DO NOTHING;
 
@@ -91,7 +98,9 @@ END $$;
 --
 -- The `wyrd-system` sentinel seeded by 20260601000015 is the platform plane's
 -- audit owner, not a data tenant: it writes no verification results and is
--- never provisioned through tenant administration, so it gets no writer.
+-- never provisioned through tenant administration, so it gets no writer. The
+-- backfill has no verified caller, so it records the no-verified-caller
+-- sentinel (`PLATFORM_AUDIT_PRINCIPAL`) as both subject and actor.
 -- ---------------------------------------------------------------------------
 DO $$
 DECLARE
@@ -102,6 +111,9 @@ BEGIN
          WHERE data_tenant_id <> '00000000-0000-7000-8000-000000000000'::uuid
     LOOP
         PERFORM set_config('app.current_tenant', tenant::text, true);
-        PERFORM wyrd.provision_system_principal();
+        PERFORM wyrd.provision_system_principal(
+            '00000000-0000-0000-0000-007779726401'::uuid,
+            '00000000-0000-0000-0000-007779726401'::uuid
+        );
     END LOOP;
 END $$;

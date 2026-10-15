@@ -410,8 +410,8 @@ pub enum BifrostError {
         card_ref: String,
     },
 
-    /// The authenticated principal could not be stamped onto the ingest row.
-    #[error("principal_id cannot be stamped for authenticated write")]
+    /// The authenticated subject/actor pair could not be stamped onto the ingest row.
+    #[error("sub_principal_id and act_principal_id cannot be stamped for authenticated write")]
     #[wyrd_error(
         code = "WYRD_VALA_401_PRINCIPAL_UNRESOLVED",
         status = 401,

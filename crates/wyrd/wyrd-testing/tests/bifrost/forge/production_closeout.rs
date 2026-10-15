@@ -566,6 +566,7 @@ impl CloseoutJourney {
             .create_bifrost_table_for_test(CreateTableRequest {
                 table: table_ref.clone(),
                 tenant,
+                attribution: wyrd_spec::auth::Attribution::unresolved(),
                 user_fields: payload_schema()
                     .fields()
                     .iter()

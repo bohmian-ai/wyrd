@@ -6,7 +6,8 @@
 CREATE TABLE wyrd.card_registration_operations (
     operation_id       UUID PRIMARY KEY,
     data_tenant_id     UUID NOT NULL REFERENCES platform.tenants(data_tenant_id),
-    principal_id        UUID NOT NULL,
+    sub_principal_id   UUID NOT NULL,
+    act_principal_id   UUID NOT NULL,
     idempotency_key    TEXT NOT NULL,
     request_hash       TEXT NOT NULL,
     stored_response    JSONB,
@@ -17,7 +18,7 @@ CREATE TABLE wyrd.card_registration_operations (
     CONSTRAINT card_registration_operations_status_check
         CHECK (status IN ('pending', 'committed', 'expired')),
     CONSTRAINT card_registration_operations_idempotency_key_unique
-        UNIQUE (data_tenant_id, principal_id, idempotency_key),
+        UNIQUE (data_tenant_id, sub_principal_id, act_principal_id, idempotency_key),
     CONSTRAINT card_registration_operations_operation_tenant_unique
         UNIQUE (operation_id, data_tenant_id),
     CONSTRAINT card_registration_operations_no_url

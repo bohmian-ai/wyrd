@@ -141,7 +141,9 @@ fn holds_in_order(names: &[&str], steps: &[fn(&str) -> bool]) -> bool {
 /// rooted at the action's span. The queued writes are PRODUCER spans in that
 /// tree, and the same read returns the CONSUMER ingest span linking each
 /// producer as a linked trace. The operator's export holds every server span
-/// of the action's trace with the same ids, and the consumers too.
+/// of the action's trace with the same ids, and the consumers too. Every
+/// request span is stamped with the Service as subject and actor, and the
+/// judge's Gateway call keeps the Service as subject under the system actor.
 ///
 /// # Panics
 /// Panics when a step fails or the timeline or operator export differs.
@@ -288,6 +290,53 @@ async fn service_action_timeline_is_one_connected_tree() {
             ]
         )),
         "verification, judge, gateway: {attempts:?}"
+    );
+
+    let server = assistant.deployment.server();
+    let stamped = server
+        .retained_span_records(
+            server.data_tenant_id(),
+            "encode(span_id, 'hex'), sub_principal_id, act_principal_id",
+            &format!("trace_id = X'{trace}'"),
+        )
+        .await
+        .expect("the stamped pairs read");
+    let pair = |span: &SpanRecord| {
+        stamped
+            .iter()
+            .find(|row| row[0].as_deref() == Some(span.span_id.to_hex().as_str()))
+            .map(|row| (row[1].clone(), row[2].clone()))
+            .expect("every tenant span is stamped")
+    };
+    let requests: Vec<_> = timeline
+        .iter()
+        .filter(|span| span.name == "request")
+        .map(pair)
+        .collect();
+    let judge: Vec<_> = timeline
+        .iter()
+        .filter(|span| {
+            span.scope.name == GATEWAY_SCOPE
+                && lineage(&timeline, span)
+                    .iter()
+                    .any(|name| name.starts_with("verification."))
+        })
+        .map(pair)
+        .collect();
+    let service = requests.first().and_then(|(sub, _)| sub.clone());
+    assert!(
+        service.is_some()
+            && requests
+                .iter()
+                .all(|(sub, act)| *sub == service && *act == service),
+        "each request is the Service acting for itself: {requests:?}"
+    );
+    assert!(
+        !judge.is_empty()
+            && judge
+                .iter()
+                .all(|(sub, act)| *sub == service && act.is_some() && *act != service),
+        "the judge call keeps the Service as subject under the system actor: {judge:?}"
     );
 
     let exported = operator.spans_since(&checkpoint);

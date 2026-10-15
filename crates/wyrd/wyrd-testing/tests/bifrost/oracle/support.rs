@@ -189,6 +189,7 @@ pub(crate) async fn register(
             table: TableRef::new(BifrostNamespace::Bifrost, table),
             user_fields,
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout,
         })
         .await?;

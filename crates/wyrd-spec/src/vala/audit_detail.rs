@@ -704,6 +704,10 @@ pub enum AuditDetail {
         api_key_id: uuid::Uuid,
         /// Credential expiry.
         expires_at: chrono::DateTime<chrono::Utc>,
+        /// Verified initiator-first delegation chain of the issuing request,
+        /// empty and omitted when the caller presented no `act` claim.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delegation_chain: Vec<AuditDelegationStep>,
     },
     /// Token exchange metadata; bearer values are never representable here.
     TokenExchange {
@@ -745,12 +749,9 @@ pub enum AuditDetail {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         delegation_chain: Vec<AuditDelegationStep>,
     },
-    /// Authorization decision metadata.
+    /// Authorization decision metadata; the event's subject/actor pair names
+    /// who was authorized.
     AuthzCheck {
-        /// Calling principal.
-        caller_principal_id: PrincipalId,
-        /// Called principal.
-        callee_principal_id: PrincipalId,
         /// Typed delegation chain.
         delegation_chain: Vec<CardRef>,
         /// Authorization outcome.
@@ -1342,8 +1343,8 @@ mod tests {
                 r#"{"actor_principal_id":"00000000-0000-0000-0000-000000000001","delegation_chain":[{"kind":"Agent","name":"worker","space":"prod","version":"1.0.0"}],"expires_at":"2026-01-02T03:04:05Z","kind":"token_exchange","subject_principal_id":"00000000-0000-0000-0000-000000000002"}"#,
             ),
             (
-                r#"{"deny_reason":"PERMISSION_DENIED","delegation_chain":[],"outcome":"denied","callee_principal_id":"00000000-0000-0000-0000-000000000002","kind":"authz_check","caller_principal_id":"00000000-0000-0000-0000-000000000001"}"#,
-                r#"{"callee_principal_id":"00000000-0000-0000-0000-000000000002","caller_principal_id":"00000000-0000-0000-0000-000000000001","delegation_chain":[],"deny_reason":"PERMISSION_DENIED","kind":"authz_check","outcome":"denied"}"#,
+                r#"{"deny_reason":"PERMISSION_DENIED","delegation_chain":[],"outcome":"denied","kind":"authz_check"}"#,
+                r#"{"delegation_chain":[],"deny_reason":"PERMISSION_DENIED","kind":"authz_check","outcome":"denied"}"#,
             ),
             (
                 r#"{"after_spec_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","card_uid":"01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00","operation":"register","kind":"card_registration","card_kind":"Agent","outcome":"created","before_spec_hash":null}"#,
@@ -1377,7 +1378,7 @@ mod tests {
             "bifrost.ingest".to_owned(),
             "vala.events".to_owned(),
             None,
-            PrincipalId::new(uuid::Uuid::nil()),
+            crate::auth::Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())),
             PrincipalKindTag::User,
             "bifrost:write".to_owned(),
             AuditOutcome::Allowed,

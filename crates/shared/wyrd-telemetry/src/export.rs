@@ -48,7 +48,7 @@ use opentelemetry_sdk::trace::{
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::auth::Attribution;
 
 /// Resource attribute naming the service, the only resource attribute a
 /// tenant copy keeps.
@@ -242,14 +242,14 @@ impl<P: SpanProcessor> SpanProcessor for OperatorExport<P> {
 /// The authenticated identity a request's tenant span copies are written
 /// under.
 ///
-/// Rows are stamped with `principal` and written to `tenant`. The tenant is
+/// Rows are stamped with `attribution` and written to `tenant`. The tenant is
 /// never a span attribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TenantSpanRoute {
     /// Tenant whose `vala.traces.spans` receives the copies.
     pub tenant: DataTenantId,
-    /// Authenticated caller of the request, stamped as each row's principal.
-    pub principal: PrincipalId,
+    /// Subject and actor of the emitting operation, stamped on each row.
+    pub attribution: Attribution,
 }
 
 /// Where tenant span copies are staged.
@@ -364,6 +364,24 @@ impl TenantRoutes {
         }
     }
 
+    /// Give the live `span` and the spans it opens afterwards their own
+    /// route to `route` on the same sink.
+    ///
+    /// The request and its other spans keep their binding. A span with no
+    /// route ignores the call, as [`Self::bind`] does.
+    fn rebind(&self, span: &SpanContext, route: TenantSpanRoute) {
+        let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = (span.trace_id(), span.span_id());
+        let Some(slot) = live.get(&key) else {
+            return;
+        };
+        let own = Arc::new(Route {
+            identity: OnceLock::from(route),
+            sink: Arc::clone(&slot.sink),
+        });
+        live.insert(key, own);
+    }
+
     /// The route of the live `span`, if it has one.
     fn slot(&self, span: &SpanContext) -> Option<RouteSlot> {
         self.live
@@ -393,6 +411,22 @@ pub fn bind_tenant_route(route: TenantSpanRoute) {
     }
     let context = tracing::Span::current().context();
     ROUTES.bind(context.span().span_context(), route);
+}
+
+/// Route the tenant copies of the current span and the spans it opens to
+/// `route`, apart from the rest of its request.
+///
+/// An operation performed by a different actor than its request binds its
+/// own pair here, such as a judge call the tenant SYSTEM principal makes for
+/// the request's subject. The request and its other spans keep the pair
+/// [`bind_tenant_route`] bound. An unrouted span and the reserved system
+/// tenant are not routed.
+pub fn bind_operation_route(route: TenantSpanRoute) {
+    if route.tenant == DataTenantId::SYSTEM_OWNER {
+        return;
+    }
+    let context = tracing::Span::current().context();
+    ROUTES.rebind(context.span().span_context(), route);
 }
 
 /// Stages each ended span on a bound route as its tenant copy.
@@ -540,7 +574,7 @@ mod tests {
     use opentelemetry_sdk::error::OTelSdkResult;
     use opentelemetry_sdk::trace::{Sampler, ShouldSample as _, Span, SpanData, SpanProcessor};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::auth::{Attribution, PrincipalId};
 
     use super::{
         OperatorExport, ROUTES, RequestSink, ServerSampler, TenantSpanRoute, TenantSpanSink,
@@ -863,9 +897,11 @@ mod tests {
                 root.span_context(),
                 TenantSpanRoute {
                     tenant: DataTenantId::new_v7(),
-                    principal: "01900000-0000-7000-8000-000000000007"
-                        .parse::<PrincipalId>()
-                        .expect("a principal id"),
+                    attribution: Attribution::direct(
+                        "01900000-0000-7000-8000-000000000007"
+                            .parse::<PrincipalId>()
+                            .expect("a principal id"),
+                    ),
                 },
             );
         }
@@ -1016,9 +1052,11 @@ mod tests {
                 write.span().span_context(),
                 TenantSpanRoute {
                     tenant: DataTenantId::new_v7(),
-                    principal: "01900000-0000-7000-8000-000000000007"
-                        .parse::<PrincipalId>()
-                        .expect("a principal id"),
+                    attribution: Attribution::direct(
+                        "01900000-0000-7000-8000-000000000007"
+                            .parse::<PrincipalId>()
+                            .expect("a principal id"),
+                    ),
                 },
             );
             let trace_id = write.span().span_context().trace_id();
@@ -1070,9 +1108,11 @@ mod tests {
                 root.span_context(),
                 TenantSpanRoute {
                     tenant: DataTenantId::new_v7(),
-                    principal: "01900000-0000-7000-8000-000000000007"
-                        .parse::<PrincipalId>()
-                        .expect("a principal id"),
+                    attribution: Attribution::direct(
+                        "01900000-0000-7000-8000-000000000007"
+                            .parse::<PrincipalId>()
+                            .expect("a principal id"),
+                    ),
                 },
             );
             root.end();
@@ -1089,6 +1129,74 @@ mod tests {
             );
             assert_eq!(server.of(own).len(), 1);
         }
+    }
+
+    /// An operation that binds its own pair stages itself and the spans it
+    /// opens under that pair on the request's sink; the request and its
+    /// other spans keep the request's pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a copy is staged under the other span's pair.
+    #[test]
+    fn an_operation_route_rebinds_only_its_subtree() {
+        let provider = tracer_provider(
+            Sampler::AlwaysOn,
+            Resource::builder_empty().build(),
+            None::<OperatorExport<Recorder>>,
+        );
+        let tracer = provider.tracer("wyrd");
+        let staged = Arc::new(Staged::default());
+        let parent = remote(true);
+        let trace_id = parent.trace_id();
+        let principal = |n: u8| {
+            format!("01900000-0000-7000-8000-00000000000{n}")
+                .parse::<PrincipalId>()
+                .expect("a principal id")
+        };
+        let tenant = DataTenantId::new_v7();
+        let request_pair = Attribution::new(principal(1), principal(2));
+        let judge_pair = Attribution::new(principal(1), principal(3));
+        let edge = Context::new()
+            .with_remote_span_context(parent)
+            .with_value(RequestSink(Arc::clone(&staged) as Arc<dyn TenantSpanSink>));
+        let request = edge.with_span(tracer.start_with_context("request", &edge));
+        ROUTES.bind(
+            request.span().span_context(),
+            TenantSpanRoute {
+                tenant,
+                attribution: request_pair,
+            },
+        );
+        let judge = request.with_span(tracer.start_with_context("workflow.gateway.call", &request));
+        ROUTES.rebind(
+            judge.span().span_context(),
+            TenantSpanRoute {
+                tenant,
+                attribution: judge_pair,
+            },
+        );
+        tracer.start_with_context("gateway.invoke", &judge).end();
+        judge.span().end();
+        tracer
+            .start_with_context("verification.result", &request)
+            .end();
+        request.span().end();
+
+        let copies = staged
+            .of(trace_id)
+            .into_iter()
+            .map(|(route, name, ..)| (name, route.attribution))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            copies,
+            vec![
+                ("gateway.invoke".to_owned(), judge_pair),
+                ("workflow.gateway.call".to_owned(), judge_pair),
+                ("verification.result".to_owned(), request_pair),
+                ("request".to_owned(), request_pair),
+            ]
+        );
     }
 
     /// An ended span leaves the registry, so routes live only as long as

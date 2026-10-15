@@ -133,6 +133,7 @@ pub(super) async fn register(
             table,
             user_fields,
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout,
         })
         .await

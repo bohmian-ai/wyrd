@@ -20,7 +20,7 @@ use skald_workflow::{
 };
 use wyrd_spec::card::workflow::{ExternalGatewayBindingConfig, LlmRoute, WorkflowSpec};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::CredentialBindingName;
+use wyrd_spec::ids::{CardUid, CredentialBindingName};
 use wyrd_utils::secret::read_secret_ref;
 
 use super::PublicWyrdGatewayCaller;
@@ -73,6 +73,8 @@ impl SelectedRoutes {
     ///
     /// When a step uses `wyrd_gateway`, `gateway` serves it through the
     /// public ingress; without one Skald refuses the run before dispatch.
+    /// `card_uid` is the registered Workflow Card those calls name as their
+    /// Card subject, with no application Run; `None` names no Card.
     /// Each selected binding present in `config` has its secret headers
     /// resolved now, in binding-name order; bindings no route selects are
     /// never read. Preparing dependencies dispatches no model call.
@@ -91,6 +93,7 @@ impl SelectedRoutes {
         native: ProviderRegistry,
         config: &LocalWorkflowConfig,
         gateway: Option<WyrdClient>,
+        card_uid: Option<&CardUid>,
     ) -> Result<WorkflowExecutionDependencies, WyrdError> {
         let mut bindings = ExternalGatewayBindings::new();
         for name in &self.external {
@@ -102,9 +105,9 @@ impl SelectedRoutes {
             WorkflowExecutionDependencies::new(native).with_external_gateways(bindings);
         Ok(match gateway.filter(|_| self.wyrd_gateway) {
             Some(client) => dependencies
-                .with_wyrd_gateway(
-                    Arc::new(PublicWyrdGatewayCaller::new(client)) as Arc<dyn WyrdGatewayCaller>
-                ),
+                .with_wyrd_gateway(Arc::new(
+                    PublicWyrdGatewayCaller::new(client).with_subject(None, card_uid),
+                ) as Arc<dyn WyrdGatewayCaller>),
             None => dependencies,
         })
     }

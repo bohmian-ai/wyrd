@@ -1357,7 +1357,11 @@ async fn assert_builtins_are_v3(fixture: &PromotionIntegrationFixture) {
     for definition in builtin_tables() {
         fixture
             .catalog
-            .ensure_builtin(fixture.tenant, definition)
+            .ensure_builtin(
+                fixture.tenant,
+                definition,
+                wyrd_spec::auth::Attribution::unresolved(),
+            )
             .await
             .expect("every built-in provisions");
         let namespace = BifrostNamespace::from_domain_namespace(definition.namespace)

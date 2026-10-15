@@ -36,7 +36,8 @@ CREATE TABLE wyrd.cards (
     labels                JSONB       NOT NULL DEFAULT '{}'::jsonb,
     annotations           JSONB       NOT NULL DEFAULT '{}'::jsonb,
     status                TEXT        NOT NULL DEFAULT 'active',
-    created_by            UUID,
+    sub_principal_id      UUID        NOT NULL,
+    act_principal_id      UUID        NOT NULL,
     created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -77,8 +78,8 @@ CREATE INDEX idx_cards_labels_gin
 CREATE INDEX idx_cards_annotations_gin
     ON wyrd.cards USING GIN (annotations);
 
-CREATE INDEX idx_cards_created_by
-    ON wyrd.cards (data_tenant_id, created_by);
+CREATE INDEX idx_cards_sub_principal
+    ON wyrd.cards (data_tenant_id, sub_principal_id);
 
 -- "Latest stable in line" pushdown (B3 resolve, B4 range/latest, C1 query).
 -- Partial (stable-only) matches the default query shape and stays small.

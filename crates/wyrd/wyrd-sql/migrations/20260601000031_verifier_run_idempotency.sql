@@ -4,8 +4,9 @@
 -- a retried request with the same key and body refers to the run the first
 -- request created, and reusing the key for a different body is refused. The
 -- key belongs to the run it created, so it lives on that run row rather than
--- in a separate expiring cache. Keys are scoped to the requesting principal,
--- matching Card registration, so two callers never collide on a key.
+-- in a separate expiring cache. Keys are scoped to the run's subject and
+-- actor, matching Card registration, so neither two callers nor one actor
+-- working for two subjects ever collide on a key.
 ALTER TABLE wyrd.verifier_runs
     ADD COLUMN idempotency_key TEXT,
     ADD COLUMN request_sha256  BYTEA,
@@ -17,5 +18,5 @@ ALTER TABLE wyrd.verifier_runs
     );
 
 CREATE UNIQUE INDEX verifier_runs_manual_idempotency
-    ON wyrd.verifier_runs (data_tenant_id, requested_by_principal_id, idempotency_key)
+    ON wyrd.verifier_runs (data_tenant_id, sub_principal_id, act_principal_id, idempotency_key)
     WHERE idempotency_key IS NOT NULL;

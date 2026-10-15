@@ -12,6 +12,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use serde_json::{Value, json};
 use uuid::Uuid;
+use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_sql::queries::auth::{
     delete_service_account, insert_service_account, replace_idp_user_roles,
 };
@@ -124,7 +125,7 @@ async fn decisions(
         .retained_audit_records(
             server.data_tenant_id(),
             "permission, outcome",
-            &format!("operation = '{operation}' AND audit_principal_id = '{principal}'"),
+            &format!("operation = '{operation}' AND sub_principal_id = '{principal}'"),
         )
         .await
         .expect("audit rows read")
@@ -369,7 +370,7 @@ async fn unassignable_principals_are_not_enumerable() {
         None,
         "pr-tenant-admin",
         None,
-        admin,
+        Attribution::direct(PrincipalId::new(admin)),
     )
     .await
     .expect("tenant administrator inserts");

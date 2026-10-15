@@ -345,6 +345,7 @@ mod tests {
             request_id: RequestId::now_v7(),
             // Nondelegated fixture caller: no verified `act` chain exists.
             delegation_chain: Vec::new(),
+            executed_by: None,
         }
     }
 

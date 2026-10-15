@@ -96,8 +96,8 @@ fn take_transport_decode_owner(
 
 /// Move-only context required to form one admitted row source.
 struct AdmittedRowContext {
-    /// Authenticated principal moved into the retained source.
-    principal: wyrd_runtime::Principal,
+    /// Trusted subject/actor pair moved into the retained source.
+    attribution: wyrd_spec::auth::Attribution,
     /// Card UIDs every row's `card_uid` is authorized against.
     card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
     /// Catalog fingerprint required of the projected source schema.
@@ -308,7 +308,7 @@ impl ScribeImpl {
         context: AdmittedRowContext,
     ) -> Result<AdmittedRows, ScribeError> {
         let AdmittedRowContext {
-            principal,
+            attribution,
             card_scope,
             expected_schema_fingerprint,
             request_id,
@@ -322,7 +322,7 @@ impl ScribeImpl {
             IngressPayload::ArrowIpc(bytes) => {
                 Ok(AdmittedRows::Native(Box::new(NativeAdmittedRows {
                     bytes,
-                    principal,
+                    attribution,
                     card_scope,
                     expected_schema_fingerprint,
                     request_id,
@@ -341,7 +341,7 @@ impl ScribeImpl {
                     .decode(
                         IngressPayload::Canonical(canonical),
                         crate::scribe::execution_lanes::IngressDecodeInputs {
-                            principal,
+                            attribution,
                             card_scope,
                             expected_schema_fingerprint,
                             request_id,
@@ -545,7 +545,7 @@ impl ScribeImpl {
                     card_scope: frame
                         .attributed_cards
                         .or_else(|| frame.principal.card_ref_scope().map(CardRefScope::uids)),
-                    principal: frame.principal,
+                    attribution: frame.attribution,
                     expected_schema_fingerprint,
                     request_id: frame.request_id,
                     batch_id: frame.batch_id,
@@ -858,7 +858,7 @@ mod tests {
     use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
-    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_spec::request_id::RequestId;
 
     /// After its first `PostgreSQL` read the admission clock answers from its
@@ -1009,6 +1009,7 @@ mod tests {
         ScribeIngressFrame {
             attributed_cards: None,
             authenticated_tenant: tenant,
+            attribution: Attribution::direct(principal.id),
             principal: principal.clone(),
             table: TableRef::new(BifrostNamespace::Bifrost, "decoded_size_bound"),
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(schema.as_ref())),

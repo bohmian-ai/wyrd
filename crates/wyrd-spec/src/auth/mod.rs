@@ -1,6 +1,7 @@
 //! Authentication request and response contracts.
 
 mod admin;
+mod attribution;
 mod card_scope;
 mod device;
 mod human_connection;
@@ -20,6 +21,7 @@ pub use admin::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
     IssuerTokenPolicy, TrustedIssuerView, WorkloadBindingView,
 };
+pub use attribution::Attribution;
 pub use card_scope::CardScope;
 pub use device::{DeviceAuthorization, DeviceAuthorizationRequest, TokenRevocationRequest};
 pub use human_connection::{

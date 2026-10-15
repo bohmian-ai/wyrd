@@ -475,8 +475,8 @@ impl Observe<'_> {
         let state = &self.run.state;
         let bound = state.bound_verifier(&self.run.subject, verifier)?;
         let request = ExecuteVerificationRequest {
-            verifier_uid: bound.verifier_uid,
-            subject_card_uid: bound.subject_uid,
+            verifier_card_uid: bound.verifier_card_uid,
+            card_uid: bound.card_uid,
             input: verify::direct_input(bound.implementation, input, media)?,
             run_id: Some(self.run.run_id.clone()),
         };

@@ -17,7 +17,10 @@ CREATE TABLE vala.bifrost_tables (
     registered_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     origin              TEXT,
-    actor               TEXT,
+    -- Verified subject and actor that registered the table; platform-provisioned
+    -- built-ins carry the reserved platform sentinel pair. Updates keep it.
+    sub_principal_id    UUID    NOT NULL,
+    act_principal_id    UUID    NOT NULL,
     PRIMARY KEY (data_tenant_id, table_uid),
     UNIQUE (data_tenant_id, fqn)
 );

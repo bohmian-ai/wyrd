@@ -40,9 +40,10 @@ use wyrd_crypt::SealingKeyring;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
-    AbsoluteUrl, ClaimMappingPayload, ConnectionActivate, ConnectionInput, ConnectionTestResponse,
-    ConnectionTester, HumanClientAuth, HumanConnectionState, HumanConnectionView,
-    HumanConnectionsResponse, IssuerUrl, LoginInitiation, PrincipalId, PrincipalKindTag, Sha256Hex,
+    AbsoluteUrl, Attribution, ClaimMappingPayload, ConnectionActivate, ConnectionInput,
+    ConnectionTestResponse, ConnectionTester, HumanClientAuth, HumanConnectionState,
+    HumanConnectionView, HumanConnectionsResponse, IssuerUrl, LoginInitiation, PrincipalId,
+    PrincipalKindTag, Sha256Hex,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
@@ -456,7 +457,7 @@ impl HumanConnections {
             ..principal_event(
                 request_id,
                 CANDIDATE_TESTED_OPERATION,
-                tester.principal_id,
+                Attribution::direct(tester.principal_id),
                 tester.principal_kind,
                 None,
                 if allowed {
@@ -875,8 +876,9 @@ async fn recovery_key_authorizes(
     let allowed = permissions.contains(&required);
     let recovery = AuditEvent {
         card_ref: row.card_ref.map(|card_ref| card_ref.0),
-        principal_id: PrincipalId::new(row.principal_id),
-        principal_kind: principal_kind_tag(&row.principal_kind),
+        sub_principal_id: PrincipalId::new(row.principal_id),
+        sub_principal_kind: principal_kind_tag(&row.principal_kind),
+        act_principal_id: PrincipalId::new(row.principal_id),
         credential_id: Some(row.api_key_id),
         permission: required.to_string(),
         outcome: if allowed {

@@ -362,6 +362,7 @@ async fn register_table(cluster: &WyrdTestCluster, tenant: DataTenantId, name: &
             table: TableRef::new(BifrostNamespace::Datasets, name),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await

@@ -32,7 +32,7 @@ pub enum AuditProjectionError {
 /// Projects `event`, decided at `decided_at`, into one `audit_log` row.
 ///
 /// Column order follows [`AuditLogTable::arrow_fields`]. The detail is its
-/// canonical JSON encoded as a Variant, the outcome and principal kind their
+/// canonical JSON encoded as a Variant, the outcome and subject kind their
 /// stable snake-case tags, and the decision instant is the `created_at` time
 /// column, so a retained row partitions by when the boundary decided rather
 /// than when it was written.
@@ -57,8 +57,9 @@ pub fn project_audit_event(
         text(Some(event.operation.clone())),
         text(Some(event.resource.clone())),
         text(event.card_ref.as_ref().map(ToString::to_string)),
-        text(Some(event.principal_id.to_string())),
-        text(Some(event.principal_kind.as_str().to_owned())),
+        text(Some(event.sub_principal_id.to_string())),
+        text(Some(event.sub_principal_kind.as_str().to_owned())),
+        text(Some(event.act_principal_id.to_string())),
         text(Some(event.permission.clone())),
         text(Some(
             match event.outcome {
@@ -84,7 +85,7 @@ mod tests {
     use chrono::TimeZone;
     use uuid::Uuid;
     use wyrd_queue::variant::variant_cell_to_json;
-    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+    use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
 
@@ -99,7 +100,7 @@ mod tests {
             "auth.token.exchange".to_owned(),
             "principal:x".to_owned(),
             None,
-            PrincipalId::new(Uuid::now_v7()),
+            Attribution::direct(PrincipalId::new(Uuid::now_v7())),
             PrincipalKindTag::System,
             "auth.token.exchange".to_owned(),
             AuditOutcome::Denied,
@@ -126,25 +127,27 @@ mod tests {
         let row = project_audit_event(&event, decided_at).expect("valid projection");
 
         assert_eq!(row.num_rows(), 1);
-        assert_eq!(row.num_columns(), 12);
+        assert_eq!(row.num_columns(), 13);
         let text = |index: usize| {
             row.column(index)
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("text column")
         };
-        assert_eq!(row.schema().field(10).name(), CREDENTIAL_ID);
-        assert_eq!(text(10).value(0), credential.to_string());
+        assert_eq!(row.schema().field(11).name(), CREDENTIAL_ID);
+        assert_eq!(text(11).value(0), credential.to_string());
+        assert_eq!(text(5).value(0), event.sub_principal_id.to_string());
         assert_eq!(text(6).value(0), "system");
-        assert_eq!(text(8).value(0), "denied");
+        assert_eq!(text(7).value(0), event.act_principal_id.to_string());
+        assert_eq!(text(9).value(0), "denied");
         assert!(text(1).is_null(0), "no trace id projects null");
-        assert!(row.column(9).is_null(0), "no detail projects null");
+        assert!(row.column(10).is_null(0), "no detail projects null");
         let time = row
-            .column(11)
+            .column(12)
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
             .expect("created_at column");
-        assert_eq!(row.schema().field(11).name(), CREATED_AT);
+        assert_eq!(row.schema().field(12).name(), CREATED_AT);
         assert_eq!(time.value(0), decided_at.timestamp_micros());
     }
 
@@ -170,7 +173,7 @@ mod tests {
         let row = project_audit_event(&event, Utc::now()).expect("valid projection");
 
         assert_eq!(
-            variant_cell_to_json(row.column(9).as_ref(), 0).expect("decodes"),
+            variant_cell_to_json(row.column(10).as_ref(), 0).expect("decodes"),
             serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical JSON")
         );
     }

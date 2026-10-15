@@ -13,6 +13,7 @@ use sqlx::{AssertSqlSafe, PgPool};
 use url::Url;
 use vala_sql::ValaPostgres;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::pool::build_pool;
 use wyrd_sql::row_types::auth::HumanConnectionBinding;
@@ -252,7 +253,7 @@ impl PgFixture {
     /// Returns [`SqlError`] when the tenant insert fails.
     pub async fn seed_additional_tenant(&self, slug: &str) -> Result<DataTenantId, SqlError> {
         let data_tenant_id = DataTenantId::new_v7();
-        seed_tenant(&self.operator_pool, data_tenant_id, slug).await?;
+        seed_tenant(&self.operator_pool, &self.wyrd, data_tenant_id, slug).await?;
         Ok(data_tenant_id)
     }
 
@@ -277,7 +278,7 @@ impl PgFixture {
         data_tenant_id: DataTenantId,
         slug: &str,
     ) -> Result<(), SqlError> {
-        seed_tenant(&self.operator_pool, data_tenant_id, slug).await
+        seed_tenant(&self.operator_pool, &self.wyrd, data_tenant_id, slug).await
     }
 
     /// Clone the fixture-owned pool connected to this database as the cluster
@@ -314,7 +315,13 @@ impl PgFixture {
         let handles = test_db.connect_handles().await?;
         let catalog_dsn = test_db.resolved_dsns()?.catalog();
         let assertion_pool = test_db.superuser_pool().await?;
-        seed_tenant(&handles.operator_pool, data_tenant_id, &tenant_slug).await?;
+        seed_tenant(
+            &handles.operator_pool,
+            &handles.wyrd,
+            data_tenant_id,
+            &tenant_slug,
+        )
+        .await?;
 
         Ok(Self {
             operator_pool: handles.operator_pool,
@@ -652,12 +659,15 @@ fn unique_database_name() -> String {
     raw.chars().take(63).collect()
 }
 
-/// Insert one platform tenant through the fixture's operator capability.
+/// Insert one platform tenant through the fixture's operator capability and
+/// provision its SYSTEM principal, as tenant provisioning does in production.
 ///
 /// # Errors
-/// Returns [`SqlError`] when Postgres rejects the tenant insert.
+/// Returns [`SqlError`] when Postgres rejects the tenant insert or the SYSTEM
+/// provisioning.
 async fn seed_tenant(
     operator_pool: &OperatorPool,
+    wyrd: &WyrdPostgres,
     data_tenant_id: DataTenantId,
     tenant_slug: &str,
 ) -> Result<(), SqlError> {
@@ -671,8 +681,10 @@ async fn seed_tenant(
     .execute(operator_pool.pool())
     .await
     .map_err(SqlError::from)?;
-
-    Ok(())
+    let mut conn = wyrd.tenant_conn(data_tenant_id).await?;
+    wyrd_sql::queries::auth::provision_system_principal(&mut conn, Attribution::unresolved())
+        .await?;
+    conn.commit().await
 }
 
 #[cfg(test)]
@@ -698,6 +710,15 @@ mod pg_tests {
 
         assert_required_schemas(&fixture).await;
         assert_single_tenant(&fixture).await;
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        assert!(
+            wyrd_sql::queries::auth::system_principal_id(&mut conn)
+                .await
+                .expect("SYSTEM reads")
+                .is_some(),
+            "the seeded tenant has an active SYSTEM principal"
+        );
+        drop(conn);
         assert_seeded_tenant(&fixture, fixture.tenant_slug()).await;
         assert_current_tenant_bound(&fixture).await;
         assert_bare_app_pool_fails_loudly(&fixture).await;

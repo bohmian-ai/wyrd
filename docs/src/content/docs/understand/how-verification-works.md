@@ -160,10 +160,11 @@ Every completed check, real time or runtime, writes one row to `vala.verificatio
 | Column | Identifies |
 | --- | --- |
 | `result_id` | This result |
-| `card_uid` | The Verifier that judged |
+| `card_uid` | The Card that was judged. Every judge model call the check makes is recorded in `vala.gateway.calls` with this Card as its `card_uid` |
+| `verifier_card_uid` | The Verifier that judged |
 | `verifier_version` | Its exact version |
-| `subject_card_uid` | The Card that was judged. Every judge model call the check makes is recorded in `vala.gateway.calls` with this Card as its `card_uid` |
-| `requested_by_principal_id` | Who acted: the caller of a real-time or manual check, or the tenant's system principal for work Wyrd starts itself (a scheduled window or an observation-triggered check). What started internal work is recorded only as references: `run_id`, `subject_card_uid`, `source_record_id`, and the binding |
+| `sub_principal_id` | Who the check was for: the caller of a real-time or manual check (the delegating principal when an agent acts for someone), or the binding owner for work Wyrd starts itself (a scheduled window or an observation-triggered check) |
+| `act_principal_id` | Who performed it. A real-time check records its caller (the agent, when one acts for someone). A check Wyrd runs from its queue (a manual run, a scheduled window, or an observation-triggered check) records the tenant's system principal; the manual run's own record keeps the requesting actor. What started internal work is recorded only as references: `run_id`, `card_uid`, `source_record_id`, and the binding |
 | `owner_card_uid`, `binding_id` | The binding that ran it. Both are null for a real-time call |
 | `run_id` | Your application's run: the run that recorded the observation, or the run that called `verify`. Null for a scheduled drift window |
 | `source_record_id` | For eval, the `record_id` of the observation it judged |

@@ -2,8 +2,8 @@
 //!
 //! A claim's final objects all share one Variant layout, chosen before the
 //! writer opens. [`ClaimVariantSample`] reads the claim's local, unshredded
-//! runs twice: pass 1 reads only `principal_id` to count each writer's rows,
-//! pass 2 reads `principal_id` and the Variant columns and offers every row to
+//! runs twice: pass 1 reads only `sub_principal_id` to count each subject's rows,
+//! pass 2 reads `sub_principal_id` and the Variant columns and offers every row to
 //! the fork's [`VariantSampler`], which keeps a row when its seeded hash falls
 //! under its stratum's Cochran rate. Only counters are held, never rows.
 //!
@@ -18,7 +18,7 @@ use arrow::datatypes::{DataType, Schema};
 use iceberg::writer::file_writer::variant_shredding::{VariantLayout, VariantSampler};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use wyrd_spec::vala::PRINCIPAL_ID;
+use wyrd_spec::vala::SUB_PRINCIPAL_ID;
 
 use crate::contracts::ScribeError;
 use crate::scribe::assembly::StagingClaimId;
@@ -50,12 +50,12 @@ impl<'a> ClaimVariantSample<'a> {
     /// Chooses the claim's Variant layout from its stratified sample.
     ///
     /// A schema without a Variant column returns the unshredded layout without
-    /// reading a run. A schema without `principal_id` samples one stratum.
+    /// reading a run. A schema without `sub_principal_id` samples one stratum.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when a run cannot be opened or decoded,
-    /// a `principal_id` is null or not a string, or a Variant column cannot be
+    /// a `sub_principal_id` is null or not a string, or a Variant column cannot be
     /// sampled.
     pub fn layout(&self) -> Result<VariantLayout, ScribeError> {
         let policy = crate::parquet::BIFROST_VARIANT_SHREDDING;
@@ -64,9 +64,9 @@ impl<'a> ClaimVariantSample<'a> {
         }
         let principal = self
             .schema
-            .index_of(PRINCIPAL_ID)
+            .index_of(SUB_PRINCIPAL_ID)
             .ok()
-            .map(|_| PRINCIPAL_ID);
+            .map(|_| SUB_PRINCIPAL_ID);
         let mut strata: HashMap<String, usize> = HashMap::new();
         let mut stratum_rows: Vec<usize> = Vec::new();
         self.scan(principal.as_slice(), |batch| {
@@ -169,7 +169,7 @@ impl<'a> ClaimVariantSample<'a> {
     }
 }
 
-/// Returns `batch`'s `principal_id` column as UTF-8 strings.
+/// Returns `batch`'s `sub_principal_id` column as UTF-8 strings.
 ///
 /// # Errors
 ///
@@ -188,14 +188,14 @@ fn principals(batch: &RecordBatch, column: &str) -> Result<arrow::array::StringA
         })
 }
 
-/// Unwraps one server-injected `principal_id`, which is never null.
+/// Unwraps one server-injected `sub_principal_id`, which is never null.
 ///
 /// # Errors
 ///
 /// Returns [`ScribeError::Internal`] when the value is null.
 fn required_principal(value: Option<&str>) -> Result<&str, ScribeError> {
     value.ok_or_else(|| ScribeError::Internal {
-        detail: format!("staged run holds a null `{PRINCIPAL_ID}`"),
+        detail: format!("staged run holds a null `{SUB_PRINCIPAL_ID}`"),
     })
 }
 
@@ -207,10 +207,10 @@ mod tests {
     use arrow::array::{ArrayRef, StringArray};
     use arrow::datatypes::Field;
 
-    /// Logical schema of the fixture runs: `principal_id` and Variant `v`.
+    /// Logical schema of the fixture runs: `sub_principal_id` and Variant `v`.
     fn sample_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
-            Field::new(PRINCIPAL_ID, DataType::Utf8, false),
+            Field::new(SUB_PRINCIPAL_ID, DataType::Utf8, false),
             wyrd_types::variant::variant_field("v", true),
         ]))
     }
@@ -321,7 +321,7 @@ mod tests {
     /// A schema with no Variant column samples nothing and stays unshredded.
     #[test]
     fn no_variant_column_reads_no_run() {
-        let schema = Schema::new(vec![Field::new(PRINCIPAL_ID, DataType::Utf8, false)]);
+        let schema = Schema::new(vec![Field::new(SUB_PRINCIPAL_ID, DataType::Utf8, false)]);
         let claim = StagingClaimId::from_hex(&"2a".repeat(32)).expect("claim id");
         let missing = [PathBuf::from("/nonexistent/run.parquet")];
         let layout = ClaimVariantSample::new(claim, &missing, &schema)

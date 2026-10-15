@@ -125,11 +125,11 @@ async fn submit_partial_resolved_model(
     tenant: DataTenantId,
 ) -> Result<(uuid::Uuid, WyrdError), Box<dyn std::error::Error>> {
     let call_id = uuid::Uuid::now_v7();
+    let principal = uuid::Uuid::now_v7().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let row = json!({
         "schema_version": 1,
         "call_id": call_id.to_string(),
-        "caller_principal_id": uuid::Uuid::now_v7().to_string(),
         "operation": "chat_completions",
         "ingress_dialect": "openai",
         "requested_model": {"provider": "openai", "model": "gpt-4o"},
@@ -171,8 +171,8 @@ async fn submit_partial_resolved_model(
             batch_id: uuid::Uuid::now_v7().to_string(),
             request_id: RequestId::now_v7().as_str().to_owned(),
             arrow_ipc: writer.into_inner()?.into(),
-            verifier: None,
-            principal_id: String::new(),
+            sub_principal_id: principal.clone(),
+            act_principal_id: principal,
         })
         .await
         .err()

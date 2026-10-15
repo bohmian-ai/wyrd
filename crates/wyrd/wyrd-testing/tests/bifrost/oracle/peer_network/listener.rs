@@ -540,7 +540,9 @@ async fn a_frame_above_the_tonic_default_is_acknowledged_and_retained(
         operation.clone(),
         "r".repeat(resource_bytes),
         None,
-        wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+        wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(
+            uuid::Uuid::now_v7(),
+        )),
         wyrd_spec::auth::PrincipalKindTag::Service,
         operation.clone(),
         wyrd_spec::vala::api::AuditOutcome::Allowed,
@@ -558,8 +560,8 @@ async fn a_frame_above_the_tonic_default_is_acknowledged_and_retained(
         batch_id: uuid::Uuid::now_v7().to_string(),
         request_id: event.request_id.as_str().to_owned(),
         arrow_ipc: writer.into_inner()?.into(),
-        verifier: None,
-        principal_id: String::new(),
+        sub_principal_id: wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL.to_string(),
+        act_principal_id: wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL.to_string(),
     };
     let encoded = wyrd_tonic::prost::Message::encoded_len(&request);
     let ceiling = vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES;

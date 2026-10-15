@@ -3,9 +3,10 @@
 //! Every audited operation (register/install, query, RBAC deny, administration)
 //! stages one `AuditEvent` on the process Scribe outbox
 //! ([`crate::scribe_outbox::ScribeOutbox`], held as `AppState::scribe_outbox`).
-//! The attribution is derived from the resolved [`Caller`]:
-//! `principal_id`/`principal_kind`/`card_ref` come straight off the `Principal`
-//! and `request_id` off the caller.
+//! The attribution is derived from the resolved [`Caller`]: the
+//! `sub_principal_id`/`act_principal_id` pair is [`Caller::attribution`],
+//! `sub_principal_kind`/`card_ref` come straight off the `Principal`, and
+//! `request_id` off the caller.
 //!
 //! Permissions block; audits do not. The permission check completes before the
 //! operation proceeds or refuses, and its decision is staged as soon as it is
@@ -16,7 +17,7 @@
 //! graceful-shutdown deadline.
 
 use wyrd_runtime::Permission;
-use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
+use wyrd_spec::auth::{Attribution, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
@@ -44,8 +45,9 @@ pub fn audit_event(
         operation: operation.to_owned(),
         resource: resource.to_owned(),
         card_ref: caller.principal.card_ref().cloned(),
-        principal_id: caller.principal.id,
-        principal_kind: caller.principal.kind.tag(),
+        sub_principal_id: caller.attribution().sub_principal_id,
+        sub_principal_kind: caller.principal.kind.tag(),
+        act_principal_id: caller.attribution().act_principal_id,
         credential_id: caller.principal.credential_id,
         permission: permission.to_owned(),
         outcome,
@@ -74,7 +76,8 @@ fn delegation_detail(caller: &Caller) -> Option<AuditDetail> {
 }
 
 /// Build an [`AuditEvent`] for a pre-authentication attempt, attributed to
-/// [`PLATFORM_AUDIT_PRINCIPAL`] (a reserved well-known service actor). Used
+/// the unresolved-identity pair ([`wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL`], a reserved
+/// well-known service marker, as both subject and actor). Used
 /// when no `Caller` is available — e.g. an Oracle peer or tail request refused
 /// before a principal resolves.
 ///
@@ -93,8 +96,9 @@ pub fn audit_event_unauthenticated(
         operation: operation.to_owned(),
         resource: resource.to_owned(),
         card_ref: None,
-        principal_id: PLATFORM_AUDIT_PRINCIPAL,
-        principal_kind: PrincipalKindTag::Service,
+        sub_principal_id: Attribution::unresolved().sub_principal_id,
+        sub_principal_kind: PrincipalKindTag::Service,
+        act_principal_id: Attribution::unresolved().act_principal_id,
         credential_id: None,
         permission: permission.to_owned(),
         outcome,

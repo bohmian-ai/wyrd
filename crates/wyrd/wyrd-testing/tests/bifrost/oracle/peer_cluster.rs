@@ -535,6 +535,7 @@ impl PeerCluster {
                 table: table_ref(table),
                 user_fields,
                 tenant: self.tenant(),
+                attribution: wyrd_spec::auth::Attribution::unresolved(),
                 physical_layout,
             })
             .await?;

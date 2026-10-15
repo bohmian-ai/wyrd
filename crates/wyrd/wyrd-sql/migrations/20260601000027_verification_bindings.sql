@@ -58,8 +58,8 @@ CREATE TABLE wyrd.verification_bindings (
     owner_card_kind         TEXT        NOT NULL
         CHECK (owner_card_kind IN ('Service','Agent')),
     subject_occurrence_key  TEXT        NOT NULL,
-    subject_card_uid        UUID        NOT NULL,
-    verifier_uid            UUID        NOT NULL,
+    card_uid                UUID        NOT NULL,
+    verifier_card_uid       UUID        NOT NULL,
     trigger_uid             UUID,
     trigger_digest          TEXT,
     operators               JSONB       NOT NULL DEFAULT '[]'::jsonb,
@@ -71,7 +71,7 @@ CREATE TABLE wyrd.verification_bindings (
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (data_tenant_id, binding_id),
     CONSTRAINT verification_bindings_natural_key UNIQUE
-        (data_tenant_id, owner_card_uid, subject_occurrence_key, verifier_uid),
+        (data_tenant_id, owner_card_uid, subject_occurrence_key, verifier_card_uid),
     FOREIGN KEY (data_tenant_id, owner_card_uid)
         REFERENCES wyrd.cards(data_tenant_id, card_uid),
     CHECK ((trigger_uid IS NULL) <> (trigger_digest IS NULL)),

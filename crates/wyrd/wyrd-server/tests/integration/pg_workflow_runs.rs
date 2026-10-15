@@ -750,7 +750,7 @@ impl Fixture {
         self.server
             .retained_audit_records(
                 tenant,
-                "audit_principal_id, permission, outcome, resource, detail",
+                "sub_principal_id, permission, outcome, resource, detail",
                 &format!("operation = '{operation}'"),
             )
             .await

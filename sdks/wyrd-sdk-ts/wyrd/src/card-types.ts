@@ -448,7 +448,7 @@ export interface BifrostTableDescription {
    *
    * Exactly nullable `card_uid: Utf8` then nullable `run_id: Utf8`, each with the field id its physical column holds.
    *
-   * Card correlation is optional, so a writer may omit `card_uid` entirely; the server then stores the row with its authenticated `principal_id` and a null `card_uid`. A supplied UID is stored only once the server has confirmed the writer may correlate to that Card.
+   * Card correlation is optional, so a writer may omit `card_uid` entirely; the server then stores the row with its authenticated subject/actor pair and a null `card_uid`. A supplied UID is stored only once the server has confirmed the writer may correlate to that Card.
    */
   readonly correlation_fields: readonly FieldSpec2[];
   /**

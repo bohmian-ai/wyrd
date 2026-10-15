@@ -39,7 +39,7 @@ pub const DEFAULT_INACTIVITY_TIMEOUT_SECONDS: i64 = 86_400;
 const PROJECT_BINDING_SQL: &str = r"
     INSERT INTO wyrd.verification_bindings (
         binding_id, data_tenant_id, owner_card_uid, owner_card_kind,
-        subject_occurrence_key, subject_card_uid, verifier_uid,
+        subject_occurrence_key, card_uid, verifier_card_uid,
         trigger_uid, trigger_digest, operators, activation,
         schedule_cron, schedule_tz
     ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
@@ -299,10 +299,10 @@ pub struct NewBinding {
     /// Service-level or standalone-Agent binding; never null, so the natural
     /// key is total.
     pub subject_occurrence_key: String,
-    /// Exact verified subject: the owner itself or the component's Card.
-    pub subject_card_uid: CardUid,
+    /// Exact Card verified: the owner itself or the component's Card.
+    pub card_uid: CardUid,
     /// Exact bound Verifier version.
-    pub verifier_uid: CardUid,
+    pub verifier_card_uid: CardUid,
     /// Effective Trigger.
     pub trigger: FrozenTarget,
     /// Effective `on_failure` Operators in authored order.
@@ -348,8 +348,8 @@ pub async fn project_bindings(
             .bind(owner_card_uid.as_uuid())
             .bind(owner_kind.wire_name())
             .bind(binding.subject_occurrence_key.as_str())
-            .bind(binding.subject_card_uid.as_uuid())
-            .bind(binding.verifier_uid.as_uuid())
+            .bind(binding.card_uid.as_uuid())
+            .bind(binding.verifier_card_uid.as_uuid())
             .bind(trigger_uid)
             .bind(trigger_digest)
             .bind(Json(&binding.operators))

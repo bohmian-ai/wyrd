@@ -19,7 +19,7 @@ use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims};
 use wyrd_runtime::audit::AuditStage;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::platform::credentials::platform_credential_by_id;
 use wyrd_sql::queries::platform::identity::{
@@ -290,7 +290,7 @@ impl PlatformSessions {
         let mut event = auth_event(
             request_id,
             TOKEN_EXCHANGE_OPERATION,
-            principal_id,
+            Attribution::direct(principal_id),
             principal_kind,
             None,
             AuditOutcome::Allowed,
@@ -520,11 +520,11 @@ mod pg_tests {
             .into_iter()
             .filter(|(tenant, event)| {
                 *tenant == DataTenantId::SYSTEM_OWNER
-                    && event.principal_id == PrincipalId::new(principal)
+                    && event.sub_principal_id == PrincipalId::new(principal)
             })
             .map(|(_, event)| {
                 (
-                    event.principal_kind.as_str().to_owned(),
+                    event.sub_principal_kind.as_str().to_owned(),
                     event.credential_id,
                 )
             })

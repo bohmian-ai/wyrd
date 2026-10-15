@@ -1,7 +1,10 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use wyrd_runtime::{DelegationStep, Principal};
+use wyrd_runtime::{
+    AcceptedAuthority, DelegationStep, Principal, PrincipalId, delegated_attribution,
+};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::request_id::RequestId;
 
 use crate::components::auth::{AuthenticatedPrincipal, token_extract};
@@ -28,6 +31,14 @@ pub struct Caller {
     /// [`Self::principal`]. It is only ever populated from a verifier result,
     /// never from tool arguments, request bodies, or arbitrary headers.
     pub delegation_chain: Vec<DelegationStep>,
+    /// The tenant SYSTEM principal when Wyrd itself executes work this
+    /// caller's request caused, such as a Verifier's judge calls; `None` when
+    /// the caller performs the work.
+    ///
+    /// Changes only the recorded actor. Authority stays [`Self::principal`]
+    /// and the chain stays its audit history, so handing execution to SYSTEM
+    /// neither widens nor erases the accepted delegated restrictions.
+    pub executed_by: Option<PrincipalId>,
 }
 
 impl Caller {
@@ -49,7 +60,47 @@ impl Caller {
             principal,
             request_id,
             delegation_chain,
+            executed_by: None,
         }
+    }
+
+    /// The caller deferred work runs as: the `authority` its run accepted,
+    /// executed by Wyrd as `system`, the tenant SYSTEM principal.
+    ///
+    /// The effective principal and delegation chain are exactly the stored
+    /// ones, so a queued Verifier's judge calls are checked against what was
+    /// accepted and record its subject with SYSTEM as actor.
+    #[must_use]
+    pub fn accepted(authority: &AcceptedAuthority, system: PrincipalId) -> Self {
+        Self {
+            data_tenant_id: authority.principal.tenant_id,
+            principal: authority.principal.clone(),
+            request_id: RequestId::now_v7(),
+            delegation_chain: authority.delegation_chain.clone(),
+            executed_by: Some(system),
+        }
+    }
+
+    /// The same accepted authority, executed by Wyrd as `system`, the tenant
+    /// SYSTEM principal: work the caller's request caused keeps its subject
+    /// and authority and records SYSTEM as its actor.
+    #[must_use]
+    pub fn executed_by_system(mut self, system: PrincipalId) -> Self {
+        self.executed_by = Some(system);
+        self
+    }
+
+    /// Who this caller's work is for and who performs it.
+    ///
+    /// The subject is the effective principal. The actor is the SYSTEM
+    /// executor when Wyrd performs the work, otherwise the verified chain's
+    /// current (outermost, last-flattened) actor, otherwise the principal
+    /// itself.
+    #[must_use]
+    pub fn attribution(&self) -> Attribution {
+        let verified = delegated_attribution(&self.principal, &self.delegation_chain);
+        self.executed_by
+            .map_or(verified, |actor| verified.executed_by(actor))
     }
 }
 

@@ -117,9 +117,9 @@ pub enum VerificationRunTarget {
     /// It has no owner, binding, Trigger, or Operator and never dispatches.
     Verifier {
         /// Exact Verifier Card version.
-        verifier_uid: CardUid,
-        /// Exact subject Card whose observations are analyzed.
-        subject_card_uid: CardUid,
+        verifier_card_uid: CardUid,
+        /// Exact Card verified, whose observations are analyzed.
+        card_uid: CardUid,
     },
 }
 
@@ -322,10 +322,10 @@ pub struct VerificationBindingStatus {
     pub binding_id: BindingId,
     /// Exact owner Service or standalone Agent Card version.
     pub owner_card_uid: CardUid,
-    /// Exact verified subject Card.
-    pub subject_card_uid: CardUid,
+    /// Exact Card the binding verifies.
+    pub card_uid: CardUid,
     /// Exact bound Verifier Card version.
-    pub verifier_uid: CardUid,
+    pub verifier_card_uid: CardUid,
     /// Whether the owner's Card-bound principal is runtime-active, so
     /// scheduled or observation work may be admitted now.
     pub active: bool,
@@ -366,12 +366,13 @@ pub struct VerificationRunStatus {
     pub run_id: VerificationRunId,
     /// Execution state.
     pub status: VerificationExecutionStatus,
-    /// The run's actor: the authenticated caller of a manual run, or the
-    /// tenant SYSTEM principal of internal work (a scheduled or
-    /// observation-triggered run), whose origin is recorded only as
-    /// references; null for internal work of a tenant without a SYSTEM
-    /// principal.
-    pub requested_by_principal_id: Option<PrincipalId>,
+    /// Who the run serves: the authenticated subject of a manual run, or the
+    /// binding owner of a scheduled or observation-triggered run.
+    pub sub_principal_id: PrincipalId,
+    /// Who accepted the run: a manual request's current actor (the subject
+    /// itself, or the delegate acting for it), or the tenant SYSTEM principal
+    /// for work Wyrd starts itself.
+    pub act_principal_id: PrincipalId,
     /// Canonical result of a completed run.
     pub result_id: Option<VerificationResultId>,
     /// Last execution error of a retrying or terminal run.
@@ -534,9 +535,9 @@ pub enum DirectVerificationInput {
 #[serde(deny_unknown_fields)]
 pub struct ExecuteVerificationRequest {
     /// Exact Verifier Card version to execute.
-    pub verifier_uid: CardUid,
-    /// Exact subject Card the judgment is about.
-    pub subject_card_uid: CardUid,
+    pub verifier_card_uid: CardUid,
+    /// Exact Card the judgment is about.
+    pub card_uid: CardUid,
     /// The supplied input.
     pub input: DirectVerificationInput,
     /// The caller's application Run the judgment belongs to, recorded as the

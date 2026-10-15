@@ -388,3 +388,38 @@ uses the complete original base-to-candidate range. No material decision is
 pending; if a genuinely new approved-behavior conflict appears, identify it
 concretely rather than seeking approval for reversible implementation choices.
 This packet authorizes no merge, push or deployment.
+
+## R3 implementation evidence
+
+Base of this remediation: `3ed5d90ff`. Commits: `06315231d` (packet),
+`74850ae4f` (FIND-16), `19f4eef2c` (FIND-13), `9bf38c400` and `e93870e3d`
+(FIND-17), `386421c01` and `390dcba45` (formatting only). Native artifacts were
+rebuilt from the final tree with `mise run ts:build`, `mise run ts:build:testing`
+and `mise run py:setup` before the final runs.
+
+| Criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| R3-AC-01, R3-AC-02 (FIND-001-16) | `skald-spec/src/authoring.rs`: `AuthoredPrompt::portable_request` reserves every authored `${media:name}` token from all turns (text, plain content and bindings) via `PortableMessage::reserve_media_names`. `PortableMessage::lower` gives each literal the first `__wyrd_media_<n>` name not reserved, then reserves it. Binder, grammar and kind checks are unchanged. | New `authoring::tests::portable_literals_never_alias_authored_media` covers OpenAI, Anthropic and Google. It mixes an authored `__wyrd_media_0` before and after literals, repeats it in a later turn, adds a `${media:__wyrd_media_1}` token in text, a Document binding beside an Image literal (wrong kind refused), and a same-name `${__wyrd_media_0}` text variable. It also checks authored JSON equality. RED before the fix: `left: []` vs `["__wyrd_media_0", "__wyrd_media_1"]` (authored names consumed). GREEN after, and the whole `wyrd-skald-spec` lib passes (95/95). P1: `mise exec -- cargo nextest run --locked -p wyrd-skald-spec --lib -E 'test(=authoring::tests::portable_media_bindings_keep_their_kind) \| test(=authoring::tests::portable_content_settings_and_schema) \| test(=authoring::tests::portable_literals_never_alias_authored_media) \| test(=authoring::tests::media_sources_are_validated)'` passes 4/4. | PASS |
+| R3-AC-03, R3-AC-04 (FIND-001-13, FIND-001-16) | `fixtures/cards/register_and_hydrate/portable-prompt.yaml` and `inline-prompt-agent.yaml` now carry text, `${media:photo}` (image), a base64 image literal and `${media:__wyrd_media_0}` (document). The TS journey asserts sorted `mediaVariables` (`["__wyrd_media_0","photo"]` for both portable forms, `[]` for native). Updated authored expectations: TS `PORTABLE_SPEC`, Python `PORTABLE_SPEC` (now also asserting `prompt.prompt.media_variables`), and the Rust SDK `portable_spec()`. No production projection change was needed. | Verification-only for the projection, which was already correct. Mutation: rebuilding the TS natives from the pre-fix compiler (`74850ae4f^`) fails P2 with `expected [ 'photo' ] to deeply equal [ '__wyrd_media_0', 'photo' ]`, so the journey catches the FIND-16 collision across the client/server boundary. P2 (`... vitest run tests/integration/register-and-hydrate.test.ts -t '^prompt forms round trip as authored$'`) passes, and so does P3 (`... pytest -q -m integration tests/integration/test_register_and_hydrate.py::test_prompt_forms_round_trip_as_authored`). Rust consumer `mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-ai --test integration --run-ignored all -E 'test(=register_and_hydrate::prompt_forms_round_trip_as_authored)'` passes. | PASS |
+| R3-AC-05, R3-AC-06 (FIND-001-17, owner-directed) | `skald-agent/src/agent.rs`: `Agent` gains `authored_run_config: Option<AgentRunConfigSpec>` and `verified_by`, both set only by `from_card`, which every Card, wire and YAML loader, plus Python `model_validate_json`/`from_yaml`, routes through. `to_spec` exports `verified_by` and `run_config_spec()`. Per field, that exports the authored value while the current value still equals what the authored value resolved to; otherwise it exports the current value. So builder, Python `with_run_config` and direct `run_config` edits persist without disturbing other authored fields. Runtime defaults (`run_config_from_agent_run_config_spec`) and the reverse conversion are unchanged. Agents built in code have `authored_run_config: None` and export as before. | P4 `agent_journey::journey_author_save_load_run` is extended over omitted, partial (`timeout_ms`), explicit-default (`max_iterations: 10`, `tool_concurrency_cap: 8`) and nondefault configs, each with a nonempty `verified_by`. It checks `to_spec`/`to_card`/`to_wire` spec and canonical hash, YAML save and reload, identity, Prompt ref, route, runtime `RunConfig`, a builder edit (persists through reload; other fields and bindings stay; hash changes) and a direct field edit. RED on pre-fix `agent.rs`: omitted config exported `max_iterations: Some(10), tool_concurrency_cap: Some(8)` and `verified_by: []`. GREEN after; the whole `wyrd-skald-agent` package passes (115/115). P5 `test_journey_to_card_round_trip` is extended with the same four configs plus a binding through `model_validate_json`, `to_card`, `model_dump_json`, YAML save/reload and an in-place `with_run_config` edit; it passes. Python spec-dict equality stands in for hash equality, since JCS hashing of equal JSON is equal. P6 child `local_development::cli_gateway_agents` now asserts the complete downloaded spec and the registered `spec_hash` after load and after the run, and the parent runs it before and after restart. P6 (`... node scripts/check_ts_package.mjs ... test_local_development.py::test_installed_cli_gateway_setup`) passes. Mutation: with pre-fix `agent.rs`, P6 fails at the first `run_rust(agent_env, "local_development::cli_gateway_agents")` with nextest exit 100 (test failure). The wrapper truncated the panic text. | PASS |
+
+Static checks on the final tree: `mise run fmt` (applied, committed),
+`mise run lints`, `mise run ts:format:check`, `mise run ts:lints`,
+`mise run ts:typecheck`, `mise run py:format` (applied, committed),
+`mise run py:lints` and `git diff --check` all exit 0. No public Python
+signature, stub, generated contract, SQL, wire schema, dependency or docs-site
+file changed, so `py:typecheck`, `codegen:check`, `check:deps` and `docs:check`
+were not selected.
+
+Non-goals stayed excluded: no new public prefix, random names, binder change,
+per-provider or per-SDK guard, new accessor, endpoint, harness, loader or Card
+store; runtime defaults, the reverse conversion and judge/invoke callers
+(`observe/invoke.rs`, `vala-eval` judge, which build Agents without
+`from_card`) are unchanged. The write set is the ten files listed by
+`git diff --stat 3ed5d90ff..HEAD -- ':!changes'` plus this packet.
+
+Limits: Python P5 has no separate pre-fix RED, because the Rust RED covers the
+shared owner it calls. The P6 mutation's panic text was truncated by
+`check_ts_package.mjs`, so its RED is recorded as the child's nextest
+test-failure exit. FIND-001-17 is included by owner instruction, as recorded
+above.

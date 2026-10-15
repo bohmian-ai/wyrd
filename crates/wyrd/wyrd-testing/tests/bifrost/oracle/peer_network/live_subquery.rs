@@ -2,8 +2,8 @@
 //!
 //! A selective scalar subquery reaches the remote Scribe as a literal bound,
 //! so the fragment returns only qualifying rows; a scalar subquery over two
-//! rows is refused; and a common join over two remote live tables returns its
-//! exact rows.
+//! rows is refused; and a common join over two remote live tables, and a
+//! correlated lookup on a grouped key, return their exact rows.
 
 use std::sync::Arc;
 
@@ -124,6 +124,15 @@ struct Joined {
     id: i64,
     /// The pick row's id.
     pick: i64,
+}
+
+/// One result row of a correlated scalar lookup.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+struct Lookup {
+    /// The outer event's id.
+    id: i64,
+    /// The looked-up id, absent when no row matched.
+    picked: Option<i64>,
 }
 
 /// `event_time >= H1 AND event_time = (SELECT max(event_time) FROM pick)`
@@ -302,9 +311,14 @@ async fn prove_remote_two_row_scalar_subquery_is_refused() -> Result<(), PeerJou
 /// A join of two tables whose rows are all live on a remote Scribe returns
 /// exactly the matching pair.
 ///
+/// A correlated scalar lookup on the grouped, required `id` returns one row
+/// per outer row: grouping makes `id` unique and the compared CASE uses only
+/// the outer row, so DataFusion proves the lookup is a singleton. The last
+/// event looks up `id + 1`, which no row has, and returns no value.
+///
 /// # Panics
 ///
-/// Panics when the query fails or returns other rows.
+/// Panics when either query fails or returns other rows.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn remote_live_join_returns_its_rows() {
@@ -320,22 +334,58 @@ async fn remote_live_join_returns_its_rows() {
 /// Returns the setup failure or a message naming the wrong rows.
 async fn prove_remote_live_join_returns_its_rows() -> Result<(), PeerJourneyError> {
     let tables = Box::pin(seed()).await?;
-    let rows: Vec<Joined> = query(
-        &tables,
-        &format!(
-            "SELECT e.id, p.id AS pick FROM vala.bifrost.{events} e \
-             JOIN vala.bifrost.{pick} p ON e.event_time = p.event_time",
-            events = tables.events,
-            pick = tables.pick,
-        ),
-    )
-    .await?;
+    let api_key = tables
+        .cluster
+        .provision_public_api_key("live-subquery")
+        .await?;
+    let client = public_client(tables.cluster.server(COORDINATOR)?, &api_key)?;
+    let bifrost = wyrd_client::Bifrost::query_only(&client);
+    let rows: Vec<Joined> = bifrost
+        .sql_as(
+            &format!(
+                "SELECT e.id, p.id AS pick FROM vala.bifrost.{events} e \
+                 JOIN vala.bifrost.{pick} p ON e.event_time = p.event_time",
+                events = tables.events,
+                pick = tables.pick,
+            ),
+            &[],
+        )
+        .await?;
     let expected = vec![Joined {
         id: LiveTables::id(PICKED.0, PICKED.1),
         pick: 0,
     }];
     if rows != expected {
         return Err(format!("the join returned {rows:?}, not {expected:?}").into());
+    }
+    let (picked, last) = (
+        LiveTables::id(PICKED.0, PICKED.1),
+        LiveTables::id(HOURS - 1, ROWS_PER_HOUR - 1),
+    );
+    let lookups: Vec<Lookup> = bifrost
+        .sql_as(
+            &format!(
+                "SELECT o.id, (SELECT g.id FROM (SELECT i.id, COUNT(*) n \
+             FROM vala.bifrost.{events} i GROUP BY i.id) g \
+             WHERE g.id = CASE WHEN o.id > 0 THEN o.id + 1 ELSE -o.id END) AS picked \
+             FROM vala.bifrost.{events} o WHERE o.id IN ({picked}, {last}) ORDER BY o.id",
+                events = tables.events,
+            ),
+            &[],
+        )
+        .await?;
+    let expected = vec![
+        Lookup {
+            id: picked,
+            picked: Some(picked + 1),
+        },
+        Lookup {
+            id: last,
+            picked: None,
+        },
+    ];
+    if lookups != expected {
+        return Err(format!("the lookup returned {lookups:?}, not {expected:?}").into());
     }
     tables.cluster.shutdown().await?;
     Ok(())

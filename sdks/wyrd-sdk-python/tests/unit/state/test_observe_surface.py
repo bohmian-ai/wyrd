@@ -9,6 +9,7 @@ import asyncio
 import importlib
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -826,6 +827,66 @@ def test_managed_telemetry_lifecycle(
     assert active.is_recording()
     active.end()
     assert trace.get_tracer_provider() is provider
+
+
+class _HeldExporter(InMemorySpanExporter):
+    """An in-memory exporter whose exports wait until the test releases them."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def export(self, spans: Any) -> Any:
+        self.entered.set()
+        self.release.wait()
+        return super().export(spans)
+
+
+@pytest.mark.usefixtures("unset_global_provider")
+def test_managed_telemetry_flush_deadline(
+    client_state: WyrdState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held stock export times out within the bound; spans and the drain keep working."""
+    exporter = _HeldExporter()
+    monkeypatch.setattr(wyrd.otel, "span_exporter", lambda client: exporter)
+    monkeypatch.setattr(wyrd.otel, "_FLUSH_TIMEOUT_MILLIS", 200)
+    # Frees the held export if the flush ignores its bound, so a regression fails, not hangs.
+    fallback = threading.Timer(5, exporter.release.set)
+    fallback.start()
+    client_state.start_telemetry()
+    provider = trace.get_tracer_provider()
+    assert isinstance(provider, TracerProvider)
+    tracer = provider.get_tracer("framework")
+    active = tracer.start_span("active")
+    tracer.start_span("before").end()
+    run = client_state.run()
+
+    for _ in range(2):  # a repeated flush waits on the held attempt rather than adding one
+        started = time.monotonic()
+        with pytest.raises(wyrd.WyrdError) as failed:
+            client_state.flush()
+        assert time.monotonic() - started < 2
+        assert failed.value.code == "WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT"
+        assert failed.value.details["native_code"] == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+        assert exporter.entered.is_set()
+        assert not exporter.release.is_set()
+        with run:
+            tracer.start_span("during").end()
+    flushing = [t for t in threading.enumerate() if t.name == "wyrd-telemetry-flush"]
+    assert len(flushing) == 1
+
+    exporter.release.set()
+    fallback.cancel()
+    flushing[0].join(5)
+    client_state.shutdown()
+    assert active.is_recording()
+    active.end()
+    assert trace.get_tracer_provider() is provider
+    assert provider.force_flush()
+    exported = {span.name: span for span in exporter.get_finished_spans()}
+    assert set(exported) == {"before", "during", "active"}
+    assert dict(exported["during"].attributes or {})["wyrd.run_id"] == run.run_id
 
 
 def test_application_provider_is_never_flushed_by_state(

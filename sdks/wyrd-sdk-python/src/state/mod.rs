@@ -89,7 +89,8 @@ pub struct PyWyrdState {
     models: BTreeMap<String, Py<ModelCard>>,
     /// Loaded Data holders by exact `CardRef`.
     data: BTreeMap<String, Py<DataCard>>,
-    /// The tracer provider `start_telemetry` installed, flushed by `shutdown`.
+    /// The `wyrd.otel._ManagedTelemetry` handle over the tracer provider
+    /// `start_telemetry` installed, flushed by `flush` and `shutdown`.
     telemetry: OnceLock<Py<PyAny>>,
 }
 
@@ -261,8 +262,8 @@ impl PyWyrdState {
     /// Export completed spans from the provider `start_telemetry` installed,
     /// then drain every producer of this state's writer without closing it.
     ///
-    /// The provider flush runs first, within the OpenTelemetry SDK's configured
-    /// export bound, and leaves active spans active. The native drain is
+    /// The provider flush runs first, waiting at most the OpenTelemetry SDK's
+    /// default flush bound, and leaves active spans active. The native drain is
     /// attempted even when the provider flush fails. An application's own
     /// provider is never touched.
     ///
@@ -499,7 +500,8 @@ impl PyWyrdState {
 impl PyWyrdState {
     /// Flush completed spans from the provider `start_telemetry` installed.
     ///
-    /// Calls the SDK provider's `force_flush` with its configured bound. A
+    /// Calls the managed handle's `force_flush`, which waits at most the SDK's
+    /// default flush bound even when the stock processor ignores it. A
     /// `False` result or `TimeoutError` is a timeout; any other exception is a
     /// failure described only by its type name, never its message. Returns
     /// `None` when no managed provider exists or the flush succeeded.

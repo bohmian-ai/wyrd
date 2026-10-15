@@ -21,6 +21,7 @@ application passes to ``agents.set_trace_processors``; Wyrd never registers it.
 from __future__ import annotations
 
 import threading
+from concurrent.futures import Future
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, cast
 
@@ -208,12 +209,58 @@ def _endpoint(client: WyrdClient, signal: str) -> str:
     return f"{client.server_url.rstrip('/')}/v1/{signal}"
 
 
+_FLUSH_TIMEOUT_MILLIS = 30000
+"""How long a state waits for its managed provider to flush: the SDK's ``force_flush`` default."""
+
+
+class _ManagedTelemetry:
+    """The tracer provider a state installed, flushed within a real bound.
+
+    The stock batch processor ignores ``force_flush``'s timeout and exports
+    synchronously, so the flush runs on a daemon thread and the caller waits at
+    most ``_FLUSH_TIMEOUT_MILLIS``. A flush that overruns finishes in the
+    background; until it does, later flushes wait on it instead of starting
+    another, so at most one runs per provider.
+    """
+
+    def __init__(self, provider: Any) -> None:
+        self.provider = provider
+        self._lock = threading.Lock()
+        self._attempt: Future[bool] | None = None
+
+    def force_flush(self) -> bool:
+        """Flush the provider, raising ``TimeoutError`` when the bound expires first.
+
+        Any other failure of the provider's own flush is re-raised unchanged.
+        """
+        with self._lock:
+            if self._attempt is None or self._attempt.done():
+                self._attempt = Future()
+                threading.Thread(
+                    target=self._flush,
+                    args=(self._attempt,),
+                    name="wyrd-telemetry-flush",
+                    daemon=True,
+                ).start()
+            attempt = self._attempt
+        # Since Python 3.11 a timed-out wait raises the builtin TimeoutError.
+        return attempt.result(_FLUSH_TIMEOUT_MILLIS / 1000)
+
+    def _flush(self, attempt: Future[bool]) -> None:
+        """Run the provider's flush and settle ``attempt`` with its outcome."""
+        try:
+            attempt.set_result(self.provider.force_flush(_FLUSH_TIMEOUT_MILLIS))
+        except BaseException as error:  # settled on the caller's thread
+            attempt.set_exception(error)
+
+
 def _start_telemetry(client: WyrdClient) -> Any:
     """Install the global tracer provider exporting spans as ``client``, and
     the W3C trace-context propagator for outbound context.
 
-    Returns the installed provider, which the calling state keeps so a repeated
-    start is idempotent and its shutdown flushes it. Returns ``None`` when a
+    Returns the installed provider wrapped for bounded flushing, which the
+    calling state keeps so a repeated start is idempotent and its shutdown
+    flushes it. Returns ``None`` when a
     global provider is already installed; the caller refuses with the catalog
     error.
 
@@ -239,7 +286,7 @@ def _start_telemetry(client: WyrdClient) -> Any:
         provider.shutdown()
         return None
     set_global_textmap(TraceContextTextMapPropagator())
-    return provider
+    return _ManagedTelemetry(provider)
 
 
 def span_exporter(client: WyrdClient) -> OTLPSpanExporter:

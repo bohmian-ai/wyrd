@@ -14,19 +14,20 @@ use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatResponse, OpenAiToolCall, OpenAiToolFunctionCall,
 };
-use skald_spec::{ProviderName, ProviderResponse};
+use skald_spec::{MediaRef, ProviderName, ProviderResponse};
 use skald_tool::{AgentTool, ToolError, ToolRegistry};
 use tokio::time::Instant;
 use vala_eval::blocks::{
     ActionExecutor, AgentCardResolver, AgentExecutor, AgentToolset, BlockCall, BlockError,
-    CallInput, CallValue, CheckExecutor, Position, PromptCardResolver, ToolSession,
+    CallInput, CallValue, CheckExecutor, EvidenceReader, Position, PromptCardResolver, ToolSession,
 };
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::blocks::{Action, AgentCall, Check};
+use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_spec::verification::execution::CallProvenance;
+use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
 
 /// Refuses every registry lookup; the tests author Agents inline.
 struct NoRegistry;
@@ -366,27 +367,110 @@ async fn step_agent_refuses_unknown_tool() {
     assert!(matches!(error, BlockError::Terminal { .. }), "{error}");
 }
 
-/// A check Agent returns the closed Verdict.
+/// A pinned five-page `deck` slot: page citations into it are valid when
+/// the slot is reachable.
+struct PinnedDeck;
+
+#[async_trait]
+impl EvidenceReader for PinnedDeck {
+    /// No native media is bound in these tests.
+    ///
+    /// # Errors
+    /// Always [`BlockError::Terminal`].
+    async fn media(&self, _evidence: &InputDeclaration) -> Result<MediaRef, BlockError> {
+        Err(BlockError::Terminal {
+            reason: "no media".to_owned(),
+        })
+    }
+
+    /// Keep reachable `deck` page citations within its five pages.
+    ///
+    /// # Errors
+    /// Never fails.
+    async fn cited(
+        &self,
+        reachable: &BTreeSet<SlotName>,
+        citations: Vec<Citation>,
+    ) -> Result<Vec<Citation>, BlockError> {
+        Ok(citations
+            .into_iter()
+            .filter(|citation| {
+                citation.slot.as_str() == "deck"
+                    && reachable.contains(&citation.slot)
+                    && matches!(citation.locator, Locator::Page(1..=5))
+            })
+            .collect())
+    }
+}
+
+/// One JSON input derived from the `deck` slot.
+fn from_deck(value: Value) -> BTreeMap<String, CallInput> {
+    BTreeMap::from([(
+        "response".to_owned(),
+        CallInput {
+            value: CallValue::Json(value),
+            sources: BTreeSet::from([SlotName::new("deck").expect("slot")]),
+        },
+    )])
+}
+
+/// A step's cited findings bound into a tool-less check keep their valid
+/// citations; fabricated and unreachable ones are dropped, and a pass left
+/// with none, or with no evidence reader, is inconclusive.
 ///
 /// # Panics
-/// Panics when the Verdict differs.
+/// Panics when an invalid citation survives or an uncited pass stands.
 #[tokio::test(flavor = "multi_thread")]
-async fn check_agent_returns_verdict() {
-    let answer = json!({
-        "outcome": "passed",
-        "reason": "grounded",
+async fn check_agent_keeps_only_valid_citations() {
+    let findings = json!({
+        "finding": "refunds take 30 days",
         "citations": [{"slot": "deck", "locator": {"page": 3}}]
     });
-    let executor = executor(vec![openai_text_response(&answer.to_string())]);
-    let output = check(
-        &executor,
-        &agent(verdict_prompt(), &[]),
-        input("response", json!("ok")),
-    )
-    .await
-    .expect("the check runs");
+    let answer = |citations: Value| {
+        openai_text_response(
+            &json!({"outcome": "passed", "reason": "grounded", "citations": citations}).to_string(),
+        )
+    };
+    let pinned = executor(vec![
+        openai_text_response(&findings.to_string()),
+        answer(json!([
+            {"slot": "deck", "locator": {"page": 3}},
+            {"slot": "deck", "locator": {"page": 9}},
+            {"slot": "policy", "locator": {"page": 1}}
+        ])),
+        answer(json!([{"slot": "deck", "locator": {"page": 9}}])),
+    ])
+    .with_evidence(Arc::new(PinnedDeck));
+    let judge = agent(verdict_prompt(), &[]);
+
+    let step = step(&pinned, &judge, from_deck(json!("deck text")))
+        .await
+        .expect("the step runs");
+    let output = check(&pinned, &judge, from_deck(step.output.clone()))
+        .await
+        .expect("the check runs");
     assert_eq!(output.verdict.outcome, VerificationVerdict::Passed);
-    assert_eq!(output.verdict.citations.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&output.verdict.citations).expect("citations"),
+        step.output["citations"]
+    );
+
+    let fabricated = check(&pinned, &judge, from_deck(step.output))
+        .await
+        .expect("the check runs");
+    assert_eq!(
+        fabricated.verdict.outcome,
+        VerificationVerdict::Inconclusive
+    );
+    assert!(fabricated.verdict.citations.is_empty());
+
+    let unread = executor(vec![answer(
+        json!([{"slot": "deck", "locator": {"page": 3}}]),
+    )]);
+    let output = check(&unread, &judge, from_deck(json!("x")))
+        .await
+        .expect("the check runs");
+    assert_eq!(output.verdict.outcome, VerificationVerdict::Inconclusive);
 }
 
 /// A check Agent answer outside the Verdict schema is terminal.

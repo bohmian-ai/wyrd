@@ -24,9 +24,11 @@ use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
 use skald_spec::{MediaRef, ResponseType};
 use wyrd_spec::card::agent::{AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::blocks::{Action, AgentCall, Check};
+use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::vala::eval::TaskId;
-use wyrd_spec::verification::execution::{CallProvenance, InputDeclaration, Verdict};
+use wyrd_spec::verification::VerificationVerdict;
+use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Verdict};
 
 use super::tools::{AgentToolset, finished};
 use super::{
@@ -70,6 +72,18 @@ pub trait EvidenceReader: Send + Sync {
     /// mismatched, oversized, or non-native evidence and
     /// [`BlockError::Retryable`] for a transient storage failure.
     async fn media(&self, evidence: &InputDeclaration) -> Result<MediaRef, BlockError>;
+
+    /// The subset of `citations` whose slot is in `reachable` and whose
+    /// locator names a location in that slot's pinned original evidence.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Retryable`] when evidence cannot be read now;
+    /// evidence that can never be read leaves its citations invalid.
+    async fn cited(
+        &self,
+        reachable: &BTreeSet<SlotName>,
+        citations: Vec<Citation>,
+    ) -> Result<Vec<Citation>, BlockError>;
 }
 
 /// Runs Agent step actions and Agent requirement checks.
@@ -369,6 +383,9 @@ impl ActionExecutor for AgentExecutor {
 impl CheckExecutor for AgentExecutor {
     /// Run a tool-less Agent check and return its Verdict.
     ///
+    /// Only citations into original evidence reachable through the call's
+    /// bindings survive; a pass left without one becomes inconclusive.
+    ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a non-Agent check, a step-position
     /// call, or an answer that is not a Verdict, plus [`Self::invoke`]
@@ -384,12 +401,28 @@ impl CheckExecutor for AgentExecutor {
         let answer = invoked
             .structured
             .ok_or_else(|| terminal("the check Agent returned no structured Verdict"))?;
-        let verdict =
+        let mut verdict =
             serde_json::from_value::<Verdict>(Value::Object(answer)).map_err(|error| {
                 BlockError::Terminal {
                     reason: format!("the check Agent's answer is not a Verdict: {error}"),
                 }
             })?;
+        let reachable: BTreeSet<SlotName> = call
+            .inputs
+            .values()
+            .flat_map(|input| input.sources.iter().cloned())
+            .collect();
+        let citations = std::mem::take(&mut verdict.citations);
+        if let Some(reader) = &self.evidence {
+            verdict.citations = reader.cited(&reachable, citations).await?;
+        }
+        if verdict.outcome == VerificationVerdict::Passed && verdict.citations.is_empty() {
+            verdict.outcome = VerificationVerdict::Inconclusive;
+            verdict.reason = format!(
+                "no valid original-evidence citation supports this pass: {}",
+                verdict.reason
+            );
+        }
         Ok(CheckOutput {
             verdict,
             actual: None,

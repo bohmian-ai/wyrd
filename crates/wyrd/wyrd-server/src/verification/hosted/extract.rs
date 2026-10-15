@@ -464,7 +464,8 @@ pub fn zip_guard(bytes: &[u8], limits: &HostedLimits) -> Result<(), BlockError> 
 ///
 /// PDF pages and PPTX slides are page and slide units; DOCX and XLSX text
 /// fields are JSON-pointer units into the canonical output; JSON leaves are
-/// JSON-pointer units; text formats and CSV are one-line units of `source`.
+/// JSON-pointer units into the input document itself; text formats and CSV
+/// are one-line units of `source`.
 #[must_use]
 pub fn units(output: &ExtractOutput, source: &[u8]) -> Vec<(Locator, String)> {
     match output {
@@ -487,10 +488,15 @@ pub fn units(output: &ExtractOutput, source: &[u8]) -> Vec<(Locator, String)> {
                 )
             })
             .collect(),
-        ExtractOutput::Docx { .. } | ExtractOutput::Xlsx { .. } | ExtractOutput::Json { .. } => {
+        ExtractOutput::Docx { .. } | ExtractOutput::Xlsx { .. } => {
             let mut units = Vec::new();
             let canonical = serde_json::to_value(output).unwrap_or(Value::Null);
-            leaves(&canonical, String::new(), &mut units);
+            leaves(&canonical, String::new(), true, &mut units);
+            units
+        }
+        ExtractOutput::Json { value } => {
+            let mut units = Vec::new();
+            leaves(value, String::new(), false, &mut units);
             units
         }
         ExtractOutput::Csv { .. }
@@ -513,23 +519,46 @@ pub fn units(output: &ExtractOutput, source: &[u8]) -> Vec<(Locator, String)> {
     }
 }
 
-/// Collect the text-bearing leaves under `value` as JSON-pointer units,
-/// skipping the `format` and `kind` discriminants and DOCX styles.
-fn leaves(value: &Value, pointer: String, units: &mut Vec<(Locator, String)>) {
+/// Whether `locator` names a location in `units`.
+///
+/// Pages and slides must be present; a line range must lie within the line
+/// units; a JSON pointer must name a leaf or a container of leaves; a region
+/// must sit on a present page.
+#[must_use]
+pub fn locates(units: &[(Locator, String)], locator: &Locator) -> bool {
+    match locator {
+        Locator::Page(_) | Locator::Slide(_) => units.iter().any(|(unit, _)| unit == locator),
+        Locator::Region { page, .. } => units.iter().any(|(unit, _)| *unit == Locator::Page(*page)),
+        Locator::Lines { start, end } => {
+            *start >= 1
+                && start <= end
+                && units
+                    .iter()
+                    .any(|(unit, _)| *unit == Locator::Lines { start: *end, end: *end })
+        }
+        Locator::JsonPointer(pointer) => units.iter().any(|(unit, _)| {
+            matches!(unit, Locator::JsonPointer(leaf)
+                if leaf == pointer || leaf.strip_prefix(pointer.as_str()).is_some_and(|rest| rest.starts_with('/')))
+        }),
+    }
+}
+
+/// Collect the text-bearing leaves under `value` as JSON-pointer units;
+/// with `canonical`, skip the `format` and `kind` discriminants and DOCX
+/// styles of extracted output.
+fn leaves(value: &Value, pointer: String, canonical: bool, units: &mut Vec<(Locator, String)>) {
     match value {
         Value::Object(map) => {
             for (key, child) in map {
-                if !matches!(key.as_str(), "format" | "kind" | "style")
-                    || pointer.starts_with("/value")
-                {
+                if !canonical || !matches!(key.as_str(), "format" | "kind" | "style") {
                     let escaped = key.replace('~', "~0").replace('/', "~1");
-                    leaves(child, format!("{pointer}/{escaped}"), units);
+                    leaves(child, format!("{pointer}/{escaped}"), canonical, units);
                 }
             }
         }
         Value::Array(items) => {
             for (index, child) in items.iter().enumerate() {
-                leaves(child, format!("{pointer}/{index}"), units);
+                leaves(child, format!("{pointer}/{index}"), canonical, units);
             }
         }
         Value::Null => {}

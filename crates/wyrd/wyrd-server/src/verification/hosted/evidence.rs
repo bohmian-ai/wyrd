@@ -1,6 +1,7 @@
 //! Pinned original evidence read from the execution tenant's storage.
 //!
-//! [`TenantEvidence`] is the one byte reader for file evidence. It reads
+//! [`TenantEvidence`] is the one byte reader for file evidence and the one
+//! citation validator over an execution's pinned input slots. It reads
 //! `<tenant>/evidence/sha256/<digest>` bounded by the declared length and the
 //! file limit, and returns bytes only when their length, SHA-256, and sniffed
 //! format all match the declaration, so a mismatched file can never feed a
@@ -8,6 +9,7 @@
 //! it; it is also the Agent executor's [`EvidenceReader`] and the `extract`
 //! action's [`ActionExecutor`].
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -19,37 +21,83 @@ use vala_eval::blocks::{
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::blocks::Action;
-use wyrd_spec::verification::execution::{CallProvenance, InputDeclaration};
+use wyrd_spec::ids::SlotName;
+use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
 use wyrd_storage::error::StorageError;
 use wyrd_storage::handle::StorageHandle;
 use wyrd_storage::tenant_path;
 
 use super::HostedLimits;
-use super::extract::{EXTRACT_VERSION, Extraction};
+use super::extract::{EXTRACT_VERSION, Extraction, locates, units};
 
-/// Reads one tenant's pinned file evidence.
+/// Reads one execution's pinned evidence from its tenant's storage.
 pub struct TenantEvidence {
     /// The server's storage handle.
     storage: Arc<StorageHandle>,
     /// Tenant whose evidence namespace every read uses.
     tenant: DataTenantId,
+    /// The execution's pinned input declarations, the only citable sources.
+    slots: BTreeMap<SlotName, InputDeclaration>,
     /// File limits in force.
     limits: HostedLimits,
 }
 
 impl TenantEvidence {
-    /// A reader of `tenant`'s evidence in `storage` under `limits`.
+    /// A reader of `tenant`'s evidence in `storage` whose citable sources
+    /// are the execution's pinned `slots`, under `limits`.
     #[must_use]
     pub const fn new(
         storage: Arc<StorageHandle>,
         tenant: DataTenantId,
+        slots: BTreeMap<SlotName, InputDeclaration>,
         limits: HostedLimits,
     ) -> Self {
         Self {
             storage,
             tenant,
+            slots,
             limits,
         }
+    }
+
+    /// The located units of pinned slot `declaration`, or `None` when it
+    /// has none: inline JSON leaves, extracted file units, or for a native
+    /// image the single page a region may cite.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Retryable`] when the evidence cannot be read
+    /// now; a terminal read or extraction failure yields `None`.
+    async fn located(
+        &self,
+        declaration: &InputDeclaration,
+    ) -> Result<Option<Vec<(Locator, String)>>, BlockError> {
+        if let InputDeclaration::Json { value } = declaration {
+            return Ok(Some(units(
+                &wyrd_spec::card::blocks::extract::ExtractOutput::Json {
+                    value: value.clone(),
+                },
+                b"",
+            )));
+        }
+        let (bytes, format) = match self.read(declaration).await {
+            Ok(read) => read,
+            Err(BlockError::Terminal { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if format.native_kind() == Some(skald_spec::MediaKind::Image) {
+            return Ok(Some(vec![(Locator::Page(1), String::new())]));
+        }
+        let limits = self.limits;
+        let extracted = tokio::task::spawn_blocking(move || {
+            Extraction::new(&limits)
+                .run(&bytes, format)
+                .map(|output| units(&output, &bytes))
+        })
+        .await
+        .map_err(|error| BlockError::Retryable {
+            reason: format!("citation extraction stopped: {error}"),
+        })?;
+        Ok(extracted.ok())
     }
 
     /// The verified bytes and format of file `evidence`.
@@ -146,6 +194,41 @@ impl EvidenceReader for TenantEvidence {
             },
         })
     }
+
+    /// Keep each citation whose slot is reachable and pinned and whose
+    /// locator names a location in that slot's extraction; each cited slot
+    /// is read and extracted once per call.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Retryable`] when cited evidence cannot be read
+    /// now.
+    async fn cited(
+        &self,
+        reachable: &BTreeSet<SlotName>,
+        citations: Vec<Citation>,
+    ) -> Result<Vec<Citation>, BlockError> {
+        let mut located: BTreeMap<SlotName, Option<Vec<(Locator, String)>>> = BTreeMap::new();
+        let mut valid = Vec::new();
+        for citation in citations {
+            let Some(declaration) = self
+                .slots
+                .get(&citation.slot)
+                .filter(|_| reachable.contains(&citation.slot))
+            else {
+                continue;
+            };
+            if !located.contains_key(&citation.slot) {
+                let units = self.located(declaration).await?;
+                located.insert(citation.slot.clone(), units);
+            }
+            if let Some(Some(units)) = located.get(&citation.slot)
+                && locates(units, &citation.locator)
+            {
+                valid.push(citation);
+            }
+        }
+        Ok(valid)
+    }
 }
 
 #[async_trait]
@@ -231,8 +314,6 @@ fn terminal(reason: &str) -> BlockError {
 mod tests {
     //! Pinned evidence reads accept only exact, matching files.
 
-    use std::collections::BTreeMap;
-
     use vala_eval::blocks::{CallInput, Position};
     use wyrd_spec::vala::eval::TaskId;
     use wyrd_storage::local::LocalSigner;
@@ -253,7 +334,7 @@ mod tests {
             .expect("the evidence writes");
         (
             root,
-            TenantEvidence::new(storage, tenant, HostedLimits::default()),
+            TenantEvidence::new(storage, tenant, BTreeMap::new(), HostedLimits::default()),
             sha256,
         )
     }
@@ -389,6 +470,99 @@ mod tests {
             ActionExecutor::execute(&evidence, call(CallValue::Json(serde_json::json!(1))))
                 .await
                 .is_err()
+        );
+    }
+
+    /// Only reachable, pinned slots with existing locations stay cited:
+    /// PDF pages and regions, text lines, JSON pointers into inline JSON,
+    /// and canonical DOCX pointers.
+    ///
+    /// # Panics
+    /// Panics when a fabricated or unreachable citation survives.
+    #[tokio::test]
+    async fn citations_must_locate_reachable_evidence() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let storage = Arc::new(StorageHandle::new(
+            LocalSigner::new(root.path().to_path_buf()).expect("local signer"),
+        ));
+        let tenant = DataTenantId::new_v7();
+        let mut slots = BTreeMap::new();
+        for (slot, bytes, format) in [
+            (
+                "deck",
+                super::super::extract::tests::pdf(&["one", "two"]),
+                MediaFormat::Pdf,
+            ),
+            (
+                "memo",
+                super::super::extract::tests::docx(),
+                MediaFormat::Docx,
+            ),
+            ("notes", b"alpha\nbeta\ngamma".to_vec(), MediaFormat::Text),
+        ] {
+            let sha256 = Sha256Hex::digest(&bytes);
+            storage
+                .put_object(&tenant_path::evidence(tenant, &sha256), bytes.clone())
+                .await
+                .expect("the evidence writes");
+            slots.insert(
+                SlotName::new(slot).expect("slot"),
+                file(sha256, bytes.len() as u64, format),
+            );
+        }
+        slots.insert(
+            SlotName::new("facts").expect("slot"),
+            InputDeclaration::Json {
+                value: serde_json::json!({"rows": [{"days": 30}]}),
+            },
+        );
+        let evidence = TenantEvidence::new(storage, tenant, slots, HostedLimits::default());
+        let cite = |slot: &str, locator: Locator| Citation {
+            slot: SlotName::new(slot).expect("slot"),
+            locator,
+        };
+        let valid = vec![
+            cite("deck", Locator::Page(2)),
+            cite(
+                "deck",
+                Locator::Region {
+                    page: 1,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                },
+            ),
+            cite("notes", Locator::Lines { start: 2, end: 3 }),
+            cite("facts", Locator::JsonPointer("/rows/0/days".to_owned())),
+            cite("facts", Locator::JsonPointer("/rows/0".to_owned())),
+            cite("memo", Locator::JsonPointer("/blocks/0/text".to_owned())),
+        ];
+        let invalid = vec![
+            cite("deck", Locator::Page(3)),
+            cite("deck", Locator::Slide(1)),
+            cite("notes", Locator::Lines { start: 3, end: 4 }),
+            cite("notes", Locator::Lines { start: 0, end: 1 }),
+            cite("facts", Locator::JsonPointer("/rows/1".to_owned())),
+            cite("facts", Locator::JsonPointer("/ro".to_owned())),
+            cite("memo", Locator::JsonPointer("/format".to_owned())),
+            cite("ghost", Locator::Page(1)),
+        ];
+        let reachable: BTreeSet<SlotName> = ["deck", "memo", "notes", "facts", "ghost"]
+            .into_iter()
+            .map(|slot| SlotName::new(slot).expect("slot"))
+            .collect();
+        let mut all = valid.clone();
+        all.extend(invalid);
+        assert_eq!(evidence.cited(&reachable, all).await.expect("cited"), valid);
+
+        let only_notes = BTreeSet::from([SlotName::new("notes").expect("slot")]);
+        assert!(
+            evidence
+                .cited(&only_notes, vec![cite("deck", Locator::Page(1))])
+                .await
+                .expect("cited")
+                .is_empty()
         );
     }
 }

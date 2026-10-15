@@ -86,7 +86,7 @@ fn workspace_reads_and_searches_located_units() {
     );
     assert_eq!(
         workspace.read("/inputs/data.json", 0).expect("json")["units"][0]["locator"],
-        loc(Locator::JsonPointer("/value/total".to_owned()))
+        loc(Locator::JsonPointer("/total".to_owned()))
     );
     assert!(
         workspace
@@ -238,7 +238,12 @@ async fn workspace_cleans_up_on_drop() {
         max_workspaces: 1,
         ..HostedLimits::default()
     };
-    let evidence = TenantEvidence::new(storage, wyrd_spec::DataTenantId::new_v7(), limits);
+    let evidence = TenantEvidence::new(
+        storage,
+        wyrd_spec::DataTenantId::new_v7(),
+        BTreeMap::new(),
+        limits,
+    );
     let workspaces = Workspaces::new(limits);
     let files = BTreeMap::from([(
         "/inputs/a.json".to_owned(),

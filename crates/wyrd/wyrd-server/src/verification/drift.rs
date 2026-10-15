@@ -892,7 +892,8 @@ impl Reader<'_> {
                 terminal(super::runner::SYSTEM_PRINCIPAL_MISSING, error.to_string())
             }
             error => retry(DRIFT_QUERY_FAILED, error.to_string()),
-        })?;
+        })?
+        .serving(&self.run.authority.principal);
         Ok((!authority
             .context()
             .principal

@@ -40,9 +40,9 @@ use wyrd_sql::queries::verifier_runs::VerifierRunQueue;
 
 use crate::state::AppState;
 
-#[cfg(feature = "test-support")]
 use self::authority::BackgroundAuthority;
 use self::drift::DriftEngine;
+#[cfg(feature = "test-support")]
 use self::fault::PublicationFault;
 use self::fitter::BaselineFitter;
 use self::health::{RuntimeCapability, VerificationHealth};

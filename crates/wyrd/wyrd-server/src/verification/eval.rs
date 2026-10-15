@@ -34,7 +34,7 @@ use vala_eval::{
 };
 use wyrd_client::bifrost::rows::{SPAN_COLUMNS, bytes, column, span_record, text};
 use wyrd_queue::variant::variant_cell_to_json;
-use wyrd_runtime::principal::PrincipalId;
+use wyrd_runtime::principal::{Principal, PrincipalId};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::eval::EvalSpec;
@@ -152,6 +152,7 @@ impl EvalEngine {
                     &self.state,
                     tenant,
                     run.system_principal,
+                    &run.authority.principal,
                     telemetry.waits(),
                 )
                 .await
@@ -554,8 +555,8 @@ struct BifrostReader {
 
 impl BifrostReader {
     /// Bind a reader for `tenant` to the SYSTEM read authority over
-    /// [`eval_input_tables`], recording the authority resolution and every
-    /// later query on `waits`.
+    /// [`eval_input_tables`], serving the run's `subject`, recording the
+    /// authority resolution and every later query on `waits`.
     ///
     /// # Errors
     /// Returns every [`SystemReadAuthority::resolve`] failure; no read is
@@ -564,6 +565,7 @@ impl BifrostReader {
         state: &AppState,
         tenant: DataTenantId,
         principal: Option<PrincipalId>,
+        subject: &Principal,
         waits: WaitSink,
     ) -> Result<Self, SystemReadAuthorityError> {
         let authority = waits
@@ -577,7 +579,7 @@ impl BifrostReader {
         Ok(Self {
             caller: ScheduledQueryCaller::new(
                 state.clone(),
-                authority.into_context(),
+                authority.serving(subject).into_context(),
                 CancellationToken::new(),
             ),
             waits,

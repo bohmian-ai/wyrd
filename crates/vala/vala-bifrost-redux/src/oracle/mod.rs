@@ -171,6 +171,26 @@ pub struct AuthorizedQueryContext {
     /// original encoding.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delegation_chain: Vec<DelegationStep>,
+    /// The subject a server-owned read serves, when [`Self::principal`]
+    /// performs it for someone else: a Verifier's tokenless input read runs as
+    /// the tenant SYSTEM principal for its run's subject.
+    ///
+    /// Attribution only, like [`Self::delegation_chain`]: the read decision
+    /// records this subject with the principal as actor, while Oracle still
+    /// authorizes against [`Self::principal`] alone. Omitted from the wire
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_subject: Option<ServedSubject>,
+}
+
+/// The subject a server-owned read is performed for; see
+/// [`AuthorizedQueryContext::served_subject`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServedSubject {
+    /// The subject's principal id, recorded as `sub_principal_id`.
+    pub id: wyrd_spec::auth::PrincipalId,
+    /// The subject's kind, recorded as `sub_principal_kind`.
+    pub kind: wyrd_spec::auth::PrincipalKindTag,
 }
 
 /// Classifies only parent-contract-eligible live-tail loss as degraded.
@@ -210,6 +230,7 @@ impl AuthorizedQueryContext {
             auth_method,
             permission,
             delegation_chain: Vec::new(),
+            served_subject: None,
         })
     }
 
@@ -223,6 +244,15 @@ impl AuthorizedQueryContext {
     #[must_use]
     pub fn with_delegation_chain(mut self, delegation_chain: Vec<DelegationStep>) -> Self {
         self.delegation_chain = delegation_chain;
+        self
+    }
+
+    /// Records that this context's principal reads for `subject`.
+    ///
+    /// Attribution only; see [`Self::served_subject`].
+    #[must_use]
+    pub const fn serving(mut self, subject: ServedSubject) -> Self {
+        self.served_subject = Some(subject);
         self
     }
 }
@@ -688,7 +718,9 @@ impl<T: AuditStage> OracleAudit for T {
 /// Builds the scrubbed event shared by read decisions and security violations.
 ///
 /// The event names the credential the principal authenticated with, when it
-/// has one, exactly as HTTP audit does.
+/// has one, exactly as HTTP audit does. A read served for another subject
+/// records that subject with the principal as actor; any other read records
+/// the principal's verified delegation pair.
 fn query_audit_event(
     context: &AuthorizedQueryContext,
     operation: &str,
@@ -701,8 +733,13 @@ fn query_audit_event(
         operation.to_owned(),
         "bifrost.query".to_owned(),
         context.principal.card_ref().cloned(),
-        wyrd_runtime::delegated_attribution(&context.principal, &context.delegation_chain),
-        context.principal.kind.tag(),
+        context.served_subject.map_or_else(
+            || wyrd_runtime::delegated_attribution(&context.principal, &context.delegation_chain),
+            |served| wyrd_spec::auth::Attribution::new(served.id, context.principal.id),
+        ),
+        context
+            .served_subject
+            .map_or_else(|| context.principal.kind.tag(), |served| served.kind),
         context.permission.to_string(),
         outcome,
     )
@@ -4062,6 +4099,66 @@ mod tests {
             Permission::bifrost_query_read(),
         )
         .expect("the fixture principal forms a query context")
+    }
+
+    /// A read served for another subject records that subject and its kind
+    /// with the reading principal as actor; any other read records the
+    /// principal's own direct pair. Both encodings survive the forwarding
+    /// envelope.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a decision records another pair or kind, or a context does
+    /// not round-trip.
+    #[test]
+    fn served_reads_record_the_subject_with_the_reader_as_actor() {
+        let direct = payload_context(&[]);
+        let event = query_audit_event(
+            &direct,
+            "bifrost.query.read_decision",
+            AuditOutcome::Allowed,
+            AuditDetail::OracleAdmissionRecovery {
+                expired_lease_count: 0,
+                active_lease_count: 0,
+                interactive_slots: 0,
+                analytical_slots: 0,
+                total_slots: 0,
+            },
+        );
+        assert_eq!(event.sub_principal_id, direct.principal.id);
+        assert_eq!(event.act_principal_id, direct.principal.id);
+
+        let subject = ServedSubject {
+            id: wyrd_runtime::PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: wyrd_spec::auth::PrincipalKindTag::Service,
+        };
+        let served = payload_context(&[]).serving(subject);
+        let event = query_audit_event(
+            &served,
+            "bifrost.query.read_decision",
+            AuditOutcome::Allowed,
+            AuditDetail::OracleAdmissionRecovery {
+                expired_lease_count: 0,
+                active_lease_count: 0,
+                interactive_slots: 0,
+                analytical_slots: 0,
+                total_slots: 0,
+            },
+        );
+        assert_eq!(event.sub_principal_id, subject.id);
+        assert_eq!(event.act_principal_id, served.principal.id);
+        assert_eq!(event.sub_principal_kind, subject.kind);
+
+        for context in [direct, served] {
+            let wire = serde_json::to_value(&context).expect("context serializes");
+            assert_eq!(
+                wire.get("served_subject").is_some(),
+                context.served_subject.is_some()
+            );
+            let back: AuthorizedQueryContext =
+                serde_json::from_value(wire).expect("context deserializes");
+            assert_eq!(back, context);
+        }
     }
 
     /// A catalogued error keeps its code and fields locally and across peers.

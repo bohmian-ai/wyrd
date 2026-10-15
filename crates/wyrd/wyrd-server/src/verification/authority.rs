@@ -8,12 +8,15 @@
 //! tables the run reads. No token is minted or verified; Oracle's table
 //! authorization enforces and audits every read under it like any caller's.
 //!
+//! Each read is recorded for the run's subject with SYSTEM as actor through
+//! [`SystemReadAuthority::serving`]; that pair never authorizes anything.
+//!
 //! LLM judge calls are not reads: they run under the run's accepted authority
 //! with SYSTEM as actor. [`BackgroundAuthority`] resolves that authority for
 //! the runs Wyrd starts itself.
 
 use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
-use vala_bifrost_redux::oracle::AuthorizedQueryContext;
+use vala_bifrost_redux::oracle::{AuthorizedQueryContext, ServedSubject};
 use vala_sql::queries::olap_catalog::get_by_fqn;
 use wyrd_auth::issuance::{IssuanceError, TenantTokenIssuer};
 use wyrd_runtime::permission::PermissionSet;
@@ -158,6 +161,21 @@ impl SystemReadAuthority {
         row.map(|row| uuid::Uuid::from_slice(&row.table_uid))
             .transpose()
             .map_err(|error| unavailable(&error))
+    }
+
+    /// Record every read under this authority as served for `subject`, the
+    /// run's accepted subject, with SYSTEM as actor.
+    ///
+    /// Attribution only: the reads stay authorized by the SYSTEM principal's
+    /// narrow table grants, never by `subject`'s permissions.
+    #[must_use]
+    pub fn serving(self, subject: &Principal) -> Self {
+        Self {
+            context: self.context.serving(ServedSubject {
+                id: subject.id,
+                kind: subject.kind.tag(),
+            }),
+        }
     }
 
     /// The SYSTEM principal's authorized query context.

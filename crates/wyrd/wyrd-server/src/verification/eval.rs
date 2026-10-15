@@ -24,11 +24,11 @@ use tracing::Instrument as _;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 
+use vala_eval::blocks::BlockError;
 use vala_eval::orchestrator::{
     AgentCardResolver, MediaResolver, OrchestratorError, PromptCardResolver, ScenarioScoring,
     SkaldJudgeInvoker,
 };
-use vala_eval::blocks::BlockError;
 use vala_eval::sampling::RecordSample;
 use vala_eval::{
     EvalExecError, EvalReport, InMemoryTraceSource, JudgeError, JudgeInvoker, MediaBindings,

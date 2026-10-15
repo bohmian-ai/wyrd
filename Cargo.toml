@@ -139,6 +139,13 @@ chrono-tz = "0.10"
 croner = { version = "4", default-features = false, features = ["chrono"] }
 dashmap = "6.1"
 flate2 = "1.*"
+# Verifier extraction and workspace archives; server-hosted runtime only.
+calamine = { version = "0.36", default-features = false }
+csv = "1.4"
+lopdf = { version = "0.45", default-features = false }
+quick-xml = "0.41"
+tar = { version = "0.4", default-features = false }
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 zstd = "0.13"
 walkdir = "2.*"
 sha2 = "0.10"

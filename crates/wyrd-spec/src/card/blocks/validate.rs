@@ -1576,8 +1576,10 @@ mod tests {
     }
 
     /// Self- and mutually-referencing schemas finish validating through both
-    /// input slots and resolved Agent outputs, while finite recursive
-    /// schemas keep refusing known-missing fields.
+    /// input slots and resolved Agent outputs, finite recursive schemas keep
+    /// refusing known-missing fields, and a field declared only by an exact
+    /// `^name$` pattern is referenceable from a slot and from inline or
+    /// resolver-supplied Agent output while its absent siblings are refused.
     ///
     /// # Panics
     /// Panics when a cyclic schema is refused or a finite one admits a
@@ -1630,6 +1632,84 @@ mod tests {
             rule(&path("inputs.answer.child.child.nope")),
             "missing_field"
         );
+        let literal = json!({
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "patternProperties": {"^score$": {"type": "object", "properties": {"value": {"type": "number"}}, "additionalProperties": false}},
+            "additionalProperties": false
+        });
+        let body = with(review(), "/inputs/answer/schema", literal.clone());
+        let path =
+            |selector: &str| with(body.clone(), "/requirements/0/check/path", json!(selector));
+        for selector in ["inputs.answer.score", "inputs.answer.score.value"] {
+            parse(&path(selector))
+                .validate()
+                .unwrap_or_else(|error| panic!("{selector}: {error:?}"));
+        }
+        for selector in ["inputs.answer.points", "inputs.answer.score.nope"] {
+            assert_eq!(rule(&path(selector)), "missing_field", "{selector}");
+        }
+        let open = with(
+            body.clone(),
+            "/inputs/answer/schema/patternProperties/^p.*$",
+            json!({"type": "number"}),
+        );
+        parse(&with(
+            open,
+            "/requirements/0/check/path",
+            json!("inputs.answer.points"),
+        ))
+        .validate()
+        .expect("a non-literal pattern leaves the field unknown");
+        let step = |agent: Value, selector: &str| {
+            let body = with(review(), "/steps/1/action/agent", agent);
+            with(body, "/steps/1/requirements/0/check/path", json!(selector))
+        };
+        let inline = |selector: &str| {
+            step(
+                agent(
+                    &["fs.read"],
+                    json!("Review {{outline}}"),
+                    Some(literal.clone()),
+                ),
+                selector,
+            )
+        };
+        parse(&inline("steps.findings.output.score.value"))
+            .validate()
+            .expect("an inline Agent's literal-pattern output field");
+        assert_eq!(
+            rule(&inline("steps.findings.output.points")),
+            "missing_field"
+        );
+        let resolved: crate::card::agent::AgentSpec = serde_json::from_value(agent(
+            &["fs.read"],
+            json!("Review {{outline}}"),
+            Some(literal),
+        ))
+        .expect("Agent");
+        let prompt = resolved.prompt.as_inline().expect("inline Prompt");
+        let card =
+            json!({"kind": "Agent", "space": "support", "name": "reviewer", "version": "1.0.0"});
+        for (selector, valid) in [
+            ("steps.findings.output.score.value", true),
+            ("steps.findings.output.points", false),
+        ] {
+            let spec = parse(&step(card.clone(), selector));
+            let outcome = spec.validate_with(|agent| {
+                Some(match agent.as_inline() {
+                    Some(inline) => super::ResolvedAgent {
+                        agent: inline,
+                        prompt: inline.prompt.as_inline()?,
+                    },
+                    None => super::ResolvedAgent {
+                        agent: &resolved,
+                        prompt,
+                    },
+                })
+            });
+            assert_eq!(outcome.is_ok(), valid, "{selector}: {outcome:?}");
+        }
     }
 
     /// Schedule bindings map every required samples slot by exact names.

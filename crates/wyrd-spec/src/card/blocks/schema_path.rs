@@ -16,8 +16,10 @@ const BUDGET: usize = 1024;
 /// Returns `false` only when `path` provably selects nothing under `schema`.
 ///
 /// `root` resolves local `#/...` `$ref` pointers. `oneOf`/`anyOf` admit the
-/// path when any branch does. Anything the walk cannot decide — an unknown
-/// keyword, an open object, a missing `type`, an unresolved pointer, or an
+/// path when any branch does. A field declared by `properties` or by an
+/// exactly anchored literal-name pattern such as `^score$` is followed into
+/// its declaration. Anything the walk cannot decide — an unknown
+/// keyword, an open object, any other pattern property, a missing `type`, an unresolved pointer, or an
 /// exhausted budget — is admitted so unknown shapes stay usable and fall back
 /// to missing-value handling at execution.
 pub(super) fn admits(root: &Value, schema: &Value, path: &[PathSegment]) -> bool {
@@ -86,6 +88,16 @@ impl Walk {
             PathSegment::Field(name) => {
                 if let Some(property) = schema.get("properties").and_then(|props| props.get(name)) {
                     return self.admits(root, property, rest);
+                }
+                let patterns = schema.get("patternProperties").and_then(Value::as_object);
+                for (pattern, property) in patterns.into_iter().flatten() {
+                    match literal_name(pattern) {
+                        Some(literal) if literal == name => {
+                            return self.admits(root, property, rest);
+                        }
+                        Some(_) => {}
+                        None => return true,
+                    }
                 }
                 if excludes_type(schema, "object") {
                     return false;

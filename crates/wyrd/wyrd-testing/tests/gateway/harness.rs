@@ -62,7 +62,7 @@ pub(crate) const PROVIDER_KEY: &str = "sk-native-upstream";
 const INVOKED_PROVIDERS: [&str; 4] = ["openai", "anthropic", "gemini", "acme"];
 
 /// Role name carrying exactly those invoke permissions.
-const INVOKER_ROLE: &str = "gateway_invoker";
+pub(crate) const INVOKER_ROLE: &str = "gateway_invoker";
 
 /// One bound server, its mock upstream, and the callers a journey uses.
 pub(crate) struct Journey {
@@ -174,9 +174,19 @@ impl Journey {
     /// # Panics
     /// Panics when the request cannot be sent.
     pub(crate) async fn try_put(&self, route: &str, body: Value) -> Response {
+        self.try_put_as(&self.admin, route, body).await
+    }
+
+    /// Puts one administration document at `route` as the administrator whose
+    /// access token is `admin`, in that token's tenant, and returns the
+    /// answer, refusal included.
+    ///
+    /// # Panics
+    /// Panics when the request cannot be sent.
+    async fn try_put_as(&self, admin: &str, route: &str, body: Value) -> Response {
         self.http
             .put(format!("{}/v1/admin/gateway/{route}", self.base))
-            .header("x-wyrd-access-token", format!("Bearer {}", self.admin))
+            .header("x-wyrd-access-token", format!("Bearer {admin}"))
             .json(&body)
             .send()
             .await
@@ -188,7 +198,16 @@ impl Journey {
     /// # Panics
     /// Panics when the request fails or is refused.
     pub(crate) async fn put(&self, route: &str, body: Value) {
-        let response = self.try_put(route, body).await;
+        self.put_as(&self.admin, route, body).await;
+    }
+
+    /// Puts one administration document at `route` as the administrator whose
+    /// access token is `admin`, in that token's tenant.
+    ///
+    /// # Panics
+    /// Panics when the request fails or is refused.
+    async fn put_as(&self, admin: &str, route: &str, body: Value) {
+        let response = self.try_put_as(admin, route, body).await;
         let status = response.status();
         assert!(
             status.is_success(),
@@ -200,6 +219,13 @@ impl Journey {
     /// Submits [`PROVIDER_KEY`] as the tenant's managed credential for
     /// `provider` and stores one built-in deployment of `model`
     /// authenticated by `header`, the order a tenant administrator follows.
+    ///
+    /// The two writes are separate requests, not one transaction: a panic
+    /// or cancellation after the first leaves the credential stored without
+    /// its deployment.
+    ///
+    /// # Panics
+    /// Panics when either request fails to send or is refused.
     pub(crate) async fn deploy(
         &self,
         provider: &str,
@@ -207,9 +233,32 @@ impl Journey {
         model: &str,
         capabilities: &[&str],
     ) {
+        self.deploy_as(&self.admin, provider, header, model, capabilities)
+            .await;
+    }
+
+    /// Deploys like [`Self::deploy`] as the administrator whose access token
+    /// is `admin`, so the credential and deployment belong to that token's
+    /// tenant.
+    ///
+    /// The credential is stored before the deployment in a separate request,
+    /// so a panic or cancellation between them leaves the credential without
+    /// its deployment; nothing is rolled back.
+    ///
+    /// # Panics
+    /// Panics when either request fails to send or is refused.
+    pub(crate) async fn deploy_as(
+        &self,
+        admin: &str,
+        provider: &str,
+        header: &str,
+        model: &str,
+        capabilities: &[&str],
+    ) {
         let credential = format!("{provider}-key");
         let name = model.replace('.', "-");
-        self.put(
+        self.put_as(
+            admin,
             &format!("provider-credentials/{credential}"),
             json!({
                 "name": credential,
@@ -223,7 +272,8 @@ impl Journey {
         } else {
             json!({"api_key_header": {"header": header, "credential": credential}})
         };
-        self.put(
+        self.put_as(
+            admin,
             &format!("provider-deployments/{name}"),
             json!({
                 "name": name,

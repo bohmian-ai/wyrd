@@ -106,7 +106,11 @@ not a passive integration or inventory product.
     have no card identity, are not registered standalone, and cannot be
     referenced from outside their parent. To reuse a child, register it as a
     card and reference it with `Ref::Ref(CardRef)`. Durable-only slots use
-    `Ref`.
+    `Ref`. One exception: registration materializes a registered Agent's
+    inline Prompt as its own Prompt Card named `<agent-name>-prompt` in the
+    Agent's space, versioned on its own registry line, and persists the Agent
+    with that Card's exact UID-bearing reference. Identical inline content in
+    differently named Agents is never shared.
 18. **Auth and Policy are two distinct planes.** Emit is **not** a third
     plane: a deployed service's observation/ingest writes are ordinary
     Auth-plane routes, authorized by the same JWT and a
@@ -412,7 +416,8 @@ OpenAI-compatible endpoint is an `open_ai_chat_completion` request with
 body with `provider: vertex`. Gateway routes ignore `provider` and select the
 upstream themselves. Standalone Prompt Cards may still be authored with the
 declarative `provider`/`model`/`messages` shorthand, which compiles to this
-envelope; an Agent's inline Prompt is the native envelope itself.
+envelope; an Agent's inline Prompt is authored as the native envelope itself
+and registers as the Agent's own Prompt Card (doctrine 17).
 
 ### Agent
 Agent contract: prompt + tools + run config. Tool names resolve through the
@@ -425,6 +430,16 @@ spec:
   run_config: AgentRunConfigSpec # max_iterations, tool_concurrency_cap, session_recent_limit, timeout_ms
   verified_by: [VerificationBinding]
 ```
+Every registered Agent persists `prompt` as an exact Prompt Card reference:
+Path and Sibling forms resolve to the authored Prompt Card, and an inline body
+registers as `<agent-name>-prompt` (doctrine 17). Hydrated state therefore
+always contains the Agent's Prompt Card without a separate Service component;
+a hydrated Agent's `prompt()` returns that Prompt Card, whose `ref` is its
+exact identity, and `prompt_ref` / `promptRef` is the stored reference.
+Generic state lookup (`state[alias]` / `get` in Python, `get` in Rust and
+TypeScript) returns the kind-appropriate hydrated Card. A bundle whose Agent
+Prompt has no registered identity is `WYRD_SDK_400_INVALID_STATE_BUNDLE`;
+re-register and rehydrate it.
 
 ### Workflow
 DAG of steps invoking other cards.
@@ -1874,7 +1889,7 @@ is available only at `InlineableRef<T>` slots.
 | `Data`         | **Yes** (unless used purely as inline eval scenarios, which v1 does not support — `dataset` is `DatasetRef`-only) | Carries dataset bytes; lineage anchor. |
 | `Experiment`   | **Yes** | Carries run history. |
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
-| `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`. |
+| `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`; registration materializes it as `<agent-name>-prompt`. |
 | `Agent`        | Optional | Light. Spec-only; `apply` registers it. `LlmJudgeTask.judge_ref` is `InlineableRef<AgentSpec>`. |
 | `Verifier`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Workflow`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
 
@@ -1897,7 +1912,7 @@ prompt: { kind: Prompt, name: triage, version: "1.0.0", space: prod }
 # Local full Card envelope, resolved relative to the containing file.
 prompt: ./prompts/triage.yaml
 
-# Inline native Prompt body: no independent Card identity.
+# Inline native Prompt body: registers as the Agent's `<agent-name>-prompt` Card.
 prompt:
   model: example-model
   request:
@@ -1927,8 +1942,10 @@ components:
 inherits the containing authored context. Local loading never registers. Apply
 registers path-loaded Cards in the same composite request, projects paths to
 Sibling references, and preserves external refs even at matching identities.
-Inline bodies remain embedded. Only resolved Ref/Sibling and inline bodies
-cross registration; durable persistence contains no Path or Sibling.
+Inline bodies remain embedded, except a registered Agent's inline Prompt,
+which registration materializes as its own Prompt Card and replaces with that
+Card's exact reference (doctrine 17). Only resolved Ref/Sibling and inline
+bodies cross registration; durable persistence contains no Path or Sibling.
 
 ### Reference-slot inventory
 

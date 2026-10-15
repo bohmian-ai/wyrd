@@ -1655,10 +1655,12 @@ fn stamped_observation(
     )
 }
 
-/// The principal ID of every retained Oracle read decision `tenant` made as
-/// a System principal, in decision order, once its audit has published.
+/// The actor principal ID of every retained Oracle read decision `tenant`
+/// made on Wyrd's behalf, in decision order, once its audit has published.
 ///
-/// Only continuous Eval reads as the System principal; the journey's own
+/// Continuous Eval reads serve the binding owner as subject with the tenant
+/// System principal as actor, and a directly resolved System read authority
+/// is both; either way the actor is the System principal. The journey's own
 /// inspection reads run as users and are excluded.
 ///
 /// # Errors
@@ -1671,8 +1673,8 @@ async fn system_reads(
     Ok(server
         .retained_audit_records(
             tenant,
-            "sub_principal_id",
-            "operation = 'bifrost.query.read_decision' AND sub_principal_kind = 'system'",
+            "act_principal_id",
+            "operation = 'bifrost.query.read_decision' AND sub_principal_kind <> 'user'",
         )
         .await?
         .into_iter()

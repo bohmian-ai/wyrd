@@ -46,8 +46,8 @@ pub use register::{
     CardArtifactManifestRow, CardRegistrationOperationRow, NewCardRow, NewRegistrationOperation,
     RegisteredCardRow, commit_registration_operation, insert_artifact_manifest_rows,
     insert_card_row, insert_registration_operation, lookup_existing_operation,
-    lookup_expired_operation, lookup_operation_by_id, manifest_rows_for_init,
-    mark_manifest_upload_initialized, registration_request_hash, select_card_uids_by_ref_batch,
+    lookup_expired_operation, manifest_rows_for_init, mark_manifest_upload_initialized,
+    registration_request_hash, select_card_uids_by_ref_batch,
 };
 pub use relationships::{
     inbound_relationships, persist_outbound_relationships, recheck_active_card_refs,

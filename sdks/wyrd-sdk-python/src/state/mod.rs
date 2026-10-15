@@ -22,7 +22,7 @@ use wyrd_spec::envelope::{Card, CardKind, Metadata};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::query::MetadataQuery;
-use wyrd_spec::reference::{CardRef, InlineableRef};
+use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
     CardLifecycleStatus, CardRegistrationOutcome, CardSummary, ListCardsRequest, ListCardsResponse,
     RegistrationOutcomeKind, RegistrationReceipt,
@@ -368,6 +368,32 @@ impl PyWyrdState {
     /// resolved to its persistent envelope.
     fn card(&self, py: Python<'_>, alias: &str) -> CardPyResult<Py<PyCardEnvelope>> {
         envelope_inner(&self.inner, &self.envelopes, py, alias, None)
+    }
+    /// Return the hydrated Card selected by alias in its kind's holder.
+    ///
+    /// Agents, Prompts, Models and Data return the holders their typed
+    /// accessors return; every other kind returns its `CardEnvelope`. A local
+    /// read of already hydrated holders that performs no IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns unknown-alias or invalid-state errors.
+    fn get(&self, py: Python<'_>, alias: &str) -> CardPyResult<Py<PyAny>> {
+        Ok(match self.inner.card_ref(alias)?.kind {
+            CardKind::Agent => self.agent(py, alias)?.into_any(),
+            CardKind::Prompt => self.prompt(py, alias)?.into_any(),
+            CardKind::Model => self.model(py, alias)?.into_any(),
+            CardKind::Data => self.data(py, alias)?.into_any(),
+            _ => self.card(py, alias)?.into_any(),
+        })
+    }
+    /// Return the hydrated Card selected by alias, exactly as `get` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns unknown-alias or invalid-state errors.
+    fn __getitem__(&self, py: Python<'_>, alias: &str) -> CardPyResult<Py<PyAny>> {
+        self.get(py, alias)
     }
     /// Return an exact `CardRef` selected by alias.
     ///
@@ -1141,40 +1167,38 @@ impl PythonStateHydrator<'_> {
     }
 }
 
-/// Construct each exact Agent Card and resolve only referenced prompts.
-/// Inline prompt payloads remain untouched.
+/// Construct each exact Agent Card and attach the Prompt Card it pins.
 ///
 /// # Errors
 ///
-/// Returns agent conversion, prompt hydration, or Python-allocation errors.
+/// Returns agent conversion, prompt resolution, or Python-allocation errors.
 impl PythonStateHydrator<'_> {
-    /// Construct and hydrate every exact Agent holder.
+    /// Construct every exact Agent holder and attach the already hydrated
+    /// Prompt holder its registered Prompt reference names, so
+    /// `agent.prompt()` and an explicit Prompt alias share one holder.
     ///
     /// # Errors
     ///
-    /// Returns agent conversion, prompt resolution, hydration, or allocation errors.
-    fn hydrate_agents(&self, py: Python<'_>) -> CardPyResult<BTreeMap<String, Py<PyAgentCard>>> {
+    /// Returns agent conversion, prompt resolution, or allocation errors.
+    fn hydrate_agents(
+        &self,
+        py: Python<'_>,
+        prompts: &BTreeMap<String, Py<PromptCard>>,
+    ) -> CardPyResult<BTreeMap<String, Py<PyAgentCard>>> {
         let state = self.state;
         let mut values = BTreeMap::new();
         for (key, envelope) in state.cards_of_kind(CardKind::Agent) {
             let mut card = PyAgentCard::from_card(py, envelope.clone()).map_err(|_| {
                 runtime_hydration_error(state, key, "prompt", "agent holder construction failed")
             })?;
-            let alias = primary_alias(state, key)?;
-            if !matches!(card.native().spec.prompt, InlineableRef::Inline(_)) {
-                let prompt = state.agent_prompt(alias).map_err(|_| {
-                    runtime_hydration_error(state, key, "prompt", "agent prompt resolution failed")
-                })?;
-                card.hydrate_resolved_prompt(py, prompt.clone())
-                    .map_err(|_| {
-                        runtime_hydration_error(
-                            state,
-                            key,
-                            "prompt",
-                            "agent prompt hydration failed",
-                        )
-                    })?;
-            }
+            let prompt_key = state
+                .agent(primary_alias(state, key)?)?
+                .prompt_ref()
+                .to_string();
+            let prompt = prompts.get(&prompt_key).ok_or_else(|| {
+                runtime_hydration_error(state, key, "prompt", "agent prompt holder is missing")
+            })?;
+            card.attach_prompt_card(prompt.clone_ref(py));
             values.insert(
                 key.to_owned(),
                 Py::new(py, card).map_err(|_| {

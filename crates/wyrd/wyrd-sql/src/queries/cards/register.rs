@@ -212,35 +212,6 @@ pub async fn lookup_expired_operation(
     .map_err(registry_db_error)
 }
 
-/// Find a committed registration operation by its server-minted identifier.
-///
-/// Reads the operation `operation_id` names in the transaction's tenant,
-/// whatever its status or attribution; forced RLS hides every other tenant's
-/// operation. The read joins the caller's transaction and writes nothing.
-///
-/// Returns `None` when the tenant has no such operation.
-///
-/// # Errors
-/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE`, with the database detail logged
-/// and redacted, when the read fails.
-pub async fn lookup_operation_by_id(
-    conn: &mut TenantConn<'_>,
-    operation_id: RegistrationOperationId,
-) -> Result<Option<CardRegistrationOperationRow>, WyrdError> {
-    sqlx::query_as::<_, CardRegistrationOperationRow>(
-        r"SELECT operation_id, data_tenant_id, sub_principal_id, act_principal_id,
-                  idempotency_key,
-                  request_hash, stored_response, status,
-                  created_at, updated_at
-             FROM wyrd.card_registration_operations
-            WHERE operation_id = $1",
-    )
-    .bind(operation_id.as_uuid())
-    .fetch_optional(&mut **conn.transaction())
-    .await
-    .map_err(registry_db_error)
-}
-
 /// Reserve an idempotency key before any card, manifest, or audit write.
 ///
 /// Inserts a `pending` operation keyed by tenant, subject, actor, and

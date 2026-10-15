@@ -15,7 +15,6 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use skald_spec::Prompt;
 use wyrd_cards::data::DataCard;
 use wyrd_cards::model::ModelCard;
 use wyrd_cards::prompt::PromptCard;
@@ -84,6 +83,95 @@ impl fmt::Debug for TypedCards {
             .field("workflows", &self.workflows.keys().collect::<Vec<_>>())
             .finish()
     }
+}
+
+impl TypedCards {
+    /// Pair the Agent at `key` with the exact Prompt Card its spec pins.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_400_INVALID_STATE_BUNDLE` when no Agent is indexed at
+    /// `key`, or its Prompt is inline, an unresolved path, or names no Prompt
+    /// Card in this graph.
+    fn agent(&self, key: &str) -> Result<HydratedAgent<'_>, WyrdError> {
+        let card = self.agents.get(key).ok_or_else(|| {
+            state_bundle_error(
+                "validated typed Card map is missing its exact CardRef entry",
+                json!({ "card_ref_key": key, "expected_kind": CardKind::Agent.wire_name() }),
+            )
+        })?;
+        let prompt_ref = card.spec.prompt.as_card_ref().ok_or_else(|| {
+            state_bundle_error(
+                "Agent Prompt has no registered Prompt Card identity; re-register and rehydrate",
+                json!({ "card_ref_key": key }),
+            )
+        })?;
+        let prompt = self.prompts.get(&prompt_ref.to_string()).ok_or_else(|| {
+            state_bundle_error(
+                "Agent prompt target is missing or is not a Prompt Card",
+                json!({ "card_ref_key": key, "card_ref": prompt_ref }),
+            )
+        })?;
+        Ok(HydratedAgent {
+            card,
+            prompt_ref,
+            prompt,
+        })
+    }
+}
+
+/// A hydrated Agent Card paired with the exact Prompt Card it pins.
+///
+/// Borrowed from the immutable state index: [`HydratedAgent::prompt`] is a
+/// local read of the registered Prompt Card the Agent's `prompt` reference
+/// names, never a registry call. State construction guarantees every Agent
+/// resolves, so a view exists only for a complete relationship.
+#[derive(Clone, Copy)]
+pub struct HydratedAgent<'a> {
+    /// The declarative Agent Card holder.
+    card: &'a AgentCard,
+    /// The exact UID-bearing reference the Agent pins as its Prompt.
+    prompt_ref: &'a CardRef,
+    /// The registered Prompt Card `prompt_ref` names in this graph.
+    prompt: &'a PromptCard,
+}
+
+impl<'a> HydratedAgent<'a> {
+    /// Return the declarative Agent Card holder.
+    #[must_use]
+    pub fn card(&self) -> &'a AgentCard {
+        self.card
+    }
+
+    /// Return the hydrated Prompt Card this Agent pins.
+    #[must_use]
+    pub fn prompt(&self) -> &'a PromptCard {
+        self.prompt
+    }
+
+    /// Return the exact Prompt reference stored in the Agent's spec.
+    #[must_use]
+    pub fn prompt_ref(&self) -> &'a CardRef {
+        self.prompt_ref
+    }
+}
+
+/// A Card resolved by alias, in the holder its kind's typed accessor returns.
+///
+/// Kinds without a dedicated holder are served as their stored envelope.
+#[derive(Clone, Copy)]
+pub enum HydratedCard<'a> {
+    /// An Agent paired with its Prompt Card.
+    Agent(HydratedAgent<'a>),
+    /// A Prompt Card holder.
+    Prompt(&'a PromptCard),
+    /// A Model Card holder.
+    Model(&'a ModelCard),
+    /// A Data Card holder.
+    Data(&'a DataCard),
+    /// A Workflow Card holder.
+    Workflow(&'a WorkflowCard),
+    /// Any other kind's stored envelope.
+    Envelope(&'a Card),
 }
 
 impl HydratedArtifact {
@@ -856,7 +944,7 @@ impl WyrdState {
         self.artifact_dir_by_key(key)
     }
 
-    /// Resolve an alias to a native Agent Card holder.
+    /// Resolve an alias to its hydrated Agent Card and pinned Prompt Card.
     ///
     /// # Arguments
     /// * `alias` - The bundle alias of an Agent Card.
@@ -866,13 +954,33 @@ impl WyrdState {
     /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
     /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a validated typed index is
     /// internally inconsistent.
-    pub fn agent(&self, alias: &str) -> Result<&AgentCard, WyrdError> {
+    pub fn agent(&self, alias: &str) -> Result<HydratedAgent<'_>, WyrdError> {
         let key = self.typed_key(alias, &CardKind::Agent)?;
-        self.index
-            .typed
-            .agents
-            .get(key)
-            .ok_or_else(|| typed_map_invariant(alias, key, &CardKind::Agent))
+        self.index.typed.agent(key)
+    }
+
+    /// Resolve an alias to the kind-appropriate hydrated Card.
+    ///
+    /// Agents, Prompts, Models, Data and Workflows return the same holder their
+    /// typed accessor returns; every other kind returns its stored envelope.
+    /// The lookup is a local index read with no IO.
+    ///
+    /// # Arguments
+    /// * `alias` - The bundle alias to resolve.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias or
+    /// `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a validated index is
+    /// internally inconsistent.
+    pub fn get(&self, alias: &str) -> Result<HydratedCard<'_>, WyrdError> {
+        Ok(match self.card_ref(alias)?.kind {
+            CardKind::Agent => HydratedCard::Agent(self.agent(alias)?),
+            CardKind::Prompt => HydratedCard::Prompt(self.prompt(alias)?),
+            CardKind::Model => HydratedCard::Model(self.model(alias)?),
+            CardKind::Data => HydratedCard::Data(self.data(alias)?),
+            CardKind::Workflow => HydratedCard::Workflow(self.workflow(alias)?),
+            _ => HydratedCard::Envelope(self.card(alias)?),
+        })
     }
 
     /// Resolve an alias to a native Prompt Card holder.
@@ -969,47 +1077,6 @@ impl WyrdState {
             Spec::Verifier(spec) => Some(spec),
             _ => None,
         })
-    }
-
-    /// Resolve an Agent's inline or exact Prompt Card prompt without creating a
-    /// Skald runtime Agent or resolving runtime-local tools.
-    ///
-    /// # Arguments
-    /// * `alias` - The bundle alias of an Agent Card whose Prompt is resolved.
-    ///
-    /// # Errors
-    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
-    /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias is not an Agent,
-    /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a prompt target is absent,
-    /// not a Prompt Card, or remains an authored path.
-    #[cfg(feature = "internal")]
-    pub fn agent_prompt(&self, alias: &str) -> Result<&Prompt, WyrdError> {
-        self.resolve_agent_prompt(alias)
-    }
-
-    /// Resolve an Agent's inline or exact Prompt Card prompt; the crate-wide
-    /// owner behind [`Self::agent_prompt`] and `Run::invoke`.
-    ///
-    /// # Errors
-    /// As [`Self::agent_prompt`].
-    pub(crate) fn resolve_agent_prompt(&self, alias: &str) -> Result<&Prompt, WyrdError> {
-        let agent = self.agent(alias)?;
-        match &agent.spec.prompt {
-            wyrd_spec::reference::InlineableRef::Inline(prompt) => Ok(prompt.as_ref()),
-            wyrd_spec::reference::InlineableRef::Ref(card_ref)
-            | wyrd_spec::reference::InlineableRef::Sibling { sibling: card_ref } => {
-                let key = card_ref.to_string();
-                self.index
-                    .typed
-                    .prompts
-                    .get(&key)
-                    .map(|card| &card.metadata.prompt)
-                    .ok_or_else(|| invalid_agent_prompt_target(alias, card_ref, &self.index))
-            }
-            wyrd_spec::reference::InlineableRef::Path(path) => {
-                Err(unresolved_prompt_path(alias, path))
-            }
-        }
     }
 
     /// Resolve an alias to a typed-holder key and enforce its exact Card kind.
@@ -1569,6 +1636,9 @@ fn hydrate_typed_cards(cards: &BTreeMap<String, Card>) -> Result<TypedCards, Wyr
             _ => {}
         }
     }
+    for key in typed.agents.keys() {
+        typed.agent(key)?;
+    }
     Ok(typed)
 }
 
@@ -1590,44 +1660,6 @@ fn typed_hydration_error(card: &Card, source: &WyrdError) -> WyrdError {
             "reason": source.to_string(),
         }),
     }
-}
-
-/// Report a missing or non-Prompt target in an Agent prompt slot.
-///
-/// The helper remains free because it only formats deterministic details from
-/// its arguments; the graph-owning lookup remains on `WyrdState`.
-#[must_use]
-fn invalid_agent_prompt_target(
-    alias: &str,
-    card_ref: &CardRef,
-    graph: &HydratedStateIndex,
-) -> WyrdError {
-    let key = card_ref.to_string();
-    let actual_kind = graph
-        .cards_by_ref
-        .get(&key)
-        .map(|card| card.kind.wire_name());
-    state_bundle_error(
-        "Agent prompt target is missing or is not a Prompt Card",
-        json!({
-            "alias": alias,
-            "card_ref": card_ref,
-            "actual_kind": actual_kind,
-        }),
-    )
-}
-
-/// Report an authored prompt path that should have been resolved before state
-/// construction.
-///
-/// # Panics
-/// This helper never panics; paths are copied into structured error details.
-#[must_use]
-fn unresolved_prompt_path(alias: &str, path: &Path) -> WyrdError {
-    state_bundle_error(
-        "Agent prompt retains an unresolved path reference",
-        json!({ "alias": alias, "path": path }),
-    )
 }
 
 /// Report a typed map omission after graph validation and holder construction.
@@ -2201,7 +2233,7 @@ pub(crate) mod tests {
         HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
     };
 
-    use super::WyrdState;
+    use super::{HydratedCard, WyrdState};
     use wyrd_spec::error::WyrdError;
 
     /// Deterministic payload metadata used to materialize a hydrated artifact
@@ -2357,7 +2389,6 @@ pub(crate) mod tests {
         pub(crate) fn with_typed_cards() -> Self {
             let mut bundle = Self::complete_service();
             let prompt_ref = test_ref(CardKind::Prompt, "triage", 4);
-            let inline_prompt_ref = test_ref(CardKind::Agent, "inline", 5);
             let agent_ref = test_ref(CardKind::Agent, "triage", 6);
             let data_ref = test_ref(CardKind::Data, "training", 7);
             let eval_ref = test_ref(CardKind::Verifier, "quality", 8);
@@ -2380,21 +2411,6 @@ pub(crate) mod tests {
                     &agent_ref,
                     CardKind::Agent,
                     registered_agent_spec(&prompt_ref),
-                ),
-                &[],
-            );
-            bundle.add_card(
-                "agent_inline",
-                card(
-                    &inline_prompt_ref,
-                    CardKind::Agent,
-                    Spec::Agent(AgentSpec {
-                        prompt: InlineableRef::Inline(Box::new(prompt("inline"))),
-                        tool_names: Vec::new(),
-                        run_config: AgentRunConfigSpec::default(),
-                        verified_by: Vec::new(),
-                    }),
-                    Relationships::default(),
                 ),
                 &[],
             );
@@ -2453,7 +2469,6 @@ pub(crate) mod tests {
                     service_component("triage_prompt", &prompt_ref),
                     service_component("training_data", &data_ref),
                     service_component("agent_triage", &agent_ref),
-                    service_component("agent_inline", &inline_prompt_ref),
                     service_component("runtime_workflow", &workflow_ref),
                 ]);
                 spec.verified_by.extend([
@@ -3043,7 +3058,11 @@ pub(crate) mod tests {
             "training"
         );
         assert_eq!(
-            state.agent("agent_triage").expect("agent resolves").name,
+            state
+                .agent("agent_triage")
+                .expect("agent resolves")
+                .card()
+                .name,
             "triage"
         );
         assert_eq!(
@@ -3119,16 +3138,15 @@ pub(crate) mod tests {
         let agent_ref = test_ref(CardKind::Agent, "tooled", 11);
         bundle.add_card(
             "agent_tooled",
-            card(
+            canonical_card(
                 &agent_ref,
                 CardKind::Agent,
                 Spec::Agent(AgentSpec {
-                    prompt: InlineableRef::Inline(Box::new(prompt("tooled"))),
+                    prompt: InlineableRef::Ref(test_ref(CardKind::Prompt, "triage", 4)),
                     tool_names: vec!["search".to_owned()],
                     run_config: AgentRunConfigSpec::default(),
                     verified_by: Vec::new(),
                 }),
-                Relationships::default(),
             ),
             &[],
         );
@@ -3150,67 +3168,92 @@ pub(crate) mod tests {
         assert_eq!(refused.code(), "WYRD_AGENT_422_VALIDATION", "{refused}");
     }
 
-    /// Prove inline Agent prompts are borrowed directly from the Agent spec.
+    /// Prove an old bundle whose Agent Prompt is still inline, and so has no
+    /// registered Prompt Card identity, is refused as an invalid bundle rather
+    /// than given a fabricated identity.
     ///
     /// # Panics
-    /// Panics if the typed fixture cannot load or the inline prompt assertion fails.
+    /// Panics if the inline-only fixture loads or fails with another code.
     #[test]
-    fn agent_prompt_resolves_inline_prompt() {
+    fn agent_with_inline_prompt_is_an_invalid_bundle() {
         let bundle = TestBundle::with_typed_cards();
-        let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
-        assert_eq!(
-            state.agent_prompt("agent_inline").expect("inline prompt"),
-            &prompt("inline")
-        );
-    }
-
-    /// Prove an exact Prompt Card reference resolves through the graph key.
-    ///
-    /// # Panics
-    /// Panics if the fixture cannot load or the referenced prompt cannot be resolved.
-    #[test]
-    fn agent_prompt_resolves_exact_prompt_card() {
-        let bundle = TestBundle::with_typed_cards();
-        let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
-        assert_eq!(
-            state
-                .agent_prompt("agent_triage")
-                .expect("referenced prompt"),
-            &state
-                .prompt("triage_prompt")
-                .expect("prompt resolves")
-                .metadata
-                .prompt
-        );
-    }
-
-    /// Prove a loader-resolved sibling identity uses the full `CardRef` key when
-    /// the durable bundle has converted the request-time form to a reference.
-    ///
-    /// # Panics
-    /// Panics if the rewritten bundle cannot load or the sibling prompt cannot resolve.
-    #[test]
-    fn agent_prompt_resolves_sibling_prompt_card() {
-        let bundle = TestBundle::with_typed_cards();
-        let prompt_ref = test_ref(CardKind::Prompt, "triage", 4);
         let agent_ref = test_ref(CardKind::Agent, "triage", 6);
         bundle.rewrite_card(&agent_ref, |card| {
             if let Spec::Agent(spec) = &mut card.spec {
-                spec.prompt = InlineableRef::Ref(prompt_ref.clone());
+                spec.prompt = InlineableRef::Inline(Box::new(prompt("inline")));
             }
         });
         bundle.write();
-        let state = WyrdState::from_path(bundle.path()).expect("resolved sibling loads");
-        assert_eq!(
-            state
-                .agent_prompt("agent_triage")
-                .expect("sibling prompt resolves"),
-            &state
-                .prompt("triage_prompt")
-                .expect("prompt resolves")
-                .metadata
-                .prompt
+        assert_error(
+            WyrdState::from_path(bundle.path()),
+            "WYRD_SDK_400_INVALID_STATE_BUNDLE",
+            "card_ref_key",
         );
+    }
+
+    /// Prove a hydrated Agent navigates to the same Prompt Card holder its
+    /// explicit alias returns, and exposes the exact reference it pins.
+    ///
+    /// # Panics
+    /// Panics if the fixture cannot load or the navigation differs.
+    #[test]
+    fn agent_prompt_returns_the_aliased_prompt_card() {
+        let bundle = TestBundle::with_typed_cards();
+        let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
+        let agent = state.agent("agent_triage").expect("agent resolves");
+        assert!(std::ptr::eq(
+            agent.prompt(),
+            state.prompt("triage_prompt").expect("prompt resolves")
+        ));
+        assert_eq!(
+            agent.prompt_ref(),
+            state
+                .card_ref("triage_prompt")
+                .expect("prompt ref resolves")
+        );
+    }
+
+    /// Prove generic lookup returns each kind's typed holder, the envelope for
+    /// kinds without one, and the strict unknown-alias refusal.
+    ///
+    /// # Panics
+    /// Panics if the fixture cannot load or a lookup returns another variant.
+    #[test]
+    fn get_returns_the_kind_appropriate_hydrated_card() {
+        let bundle = TestBundle::with_typed_cards();
+        let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
+        let Ok(HydratedCard::Agent(agent)) = state.get("agent_triage") else {
+            panic!("agent alias returns an Agent");
+        };
+        assert!(std::ptr::eq(
+            agent.prompt(),
+            state.prompt("triage_prompt").expect("prompt resolves")
+        ));
+        assert!(matches!(
+            state.get("triage_prompt"),
+            Ok(HydratedCard::Prompt(_))
+        ));
+        assert!(matches!(state.get("model"), Ok(HydratedCard::Model(_))));
+        assert!(matches!(
+            state.get("training_data"),
+            Ok(HydratedCard::Data(_))
+        ));
+        assert!(matches!(
+            state.get("runtime_workflow"),
+            Ok(HydratedCard::Workflow(_))
+        ));
+        assert!(matches!(
+            state.get("quality_eval"),
+            Ok(HydratedCard::Envelope(card)) if card.kind == CardKind::Verifier
+        ));
+        let Err(unknown) = state.get("missing") else {
+            panic!("unknown alias is refused");
+        };
+        assert_eq!(unknown.code(), "WYRD_SDK_404_UNKNOWN_ALIAS");
+        let Err(mismatch) = state.agent("triage_prompt") else {
+            panic!("typed mismatch is refused");
+        };
+        assert_eq!(mismatch.code(), "WYRD_SDK_400_CARD_KIND_MISMATCH");
     }
 
     /// Prove an Agent prompt target absent from the validated graph fails as an
@@ -3237,10 +3280,10 @@ pub(crate) mod tests {
     }
 
     /// Prove an Agent prompt target with another kind fails closed at bundle
-    /// validation rather than being coerced into a Prompt holder.
+    /// load rather than being coerced into a Prompt holder.
     ///
     /// # Panics
-    /// Panics if loading, wrong-kind rejection, or its error details violate the contract.
+    /// Panics if the wrong-kind fixture loads or fails with another code.
     #[test]
     fn agent_prompt_rejects_non_prompt_target() {
         let bundle = TestBundle::with_typed_cards();
@@ -3252,12 +3295,11 @@ pub(crate) mod tests {
             }
         });
         bundle.write();
-        let state = WyrdState::from_path(bundle.path()).expect("known non-Prompt target loads");
-        let error = state
-            .agent_prompt("agent_triage")
-            .expect_err("non-Prompt target must fail closed");
-        assert_eq!(error.code(), "WYRD_SDK_400_INVALID_STATE_BUNDLE");
-        assert!(!problem_details(&error)["card_ref"].is_null());
+        assert_error(
+            WyrdState::from_path(bundle.path()),
+            "WYRD_SDK_400_INVALID_STATE_BUNDLE",
+            "card_ref",
+        );
     }
 
     /// Prove native holders retain only declarative metadata while verified

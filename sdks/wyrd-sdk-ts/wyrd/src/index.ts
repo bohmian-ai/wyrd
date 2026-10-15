@@ -2490,6 +2490,23 @@ export class Run {
   }
 }
 
+/** A hydrated Prompt Card: its stored envelope and exact registered identity. */
+export interface PromptCard extends RegisteredPromptCard {
+  /** The exact reference, carrying the registered version and UID. */
+  readonly ref: CardRef;
+}
+
+/** A hydrated Agent Card, navigable to the registered Prompt Card it pins. */
+export interface AgentCard extends RegisteredAgentCard {
+  /** The exact Prompt reference the Agent's spec stores. */
+  readonly promptRef: CardRef;
+  /** The hydrated Prompt Card this Agent pins; a local read. */
+  prompt(): PromptCard;
+}
+
+/** A Card {@link WyrdState.get} returns, discriminated by `kind`. */
+export type HydratedCard = AgentCard | PromptCard | Exclude<RegisteredCard, RegisteredAgentCard | RegisteredPromptCard>;
+
 /**
  * The fields of an Agents SDK span's data the processor reads. Declared here,
  * not imported, so the package's types never require the optional
@@ -2839,25 +2856,57 @@ export class WyrdState {
   }
 
   /**
-   * The Agent Card an alias names.
+   * The hydrated Card an alias names, discriminated by `kind`.
    *
-   * @param alias - A bundle alias of an Agent Card.
-   * @returns The envelope.
-   * @throws {@link WyrdError} as {@link WyrdState.verifier}.
+   * Agents and Prompts are their hydrated {@link AgentCard} and
+   * {@link PromptCard}; every other kind is its stored envelope. A local read.
+   *
+   * @param alias - A bundle alias.
+   * @returns The hydrated Card; narrow it by `kind`.
+   * @throws {@link WyrdError} `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias.
    */
-  agent(alias: string): RegisteredAgentCard {
-    return lifecycleValue<RegisteredAgentCard>(this.#native.agent(alias));
+  get(alias: string): HydratedCard {
+    const card = this.card(alias);
+    if (card.kind === "Agent") {
+      return this.agent(alias);
+    }
+    if (card.kind === "Prompt") {
+      return this.prompt(alias);
+    }
+    return card;
   }
 
   /**
-   * The Prompt Card an alias names.
+   * The hydrated Agent Card an alias names.
    *
-   * @param alias - A bundle alias of a Prompt Card.
-   * @returns The envelope.
+   * @param alias - A bundle alias of an Agent Card.
+   * @returns The envelope, navigable to its Prompt Card by `prompt()`.
    * @throws {@link WyrdError} as {@link WyrdState.verifier}.
    */
-  prompt(alias: string): RegisteredPromptCard {
-    return lifecycleValue<RegisteredPromptCard>(this.#native.prompt(alias));
+  agent(alias: string): AgentCard {
+    const {
+      card,
+      prompt_ref: promptRef,
+      prompt,
+    } = lifecycleValue<{
+      card: RegisteredAgentCard;
+      prompt_ref: CardRef;
+      prompt: RegisteredPromptCard;
+    }>(this.#native.agent(alias));
+    const promptCard: PromptCard = { ...prompt, ref: promptRef };
+    return { ...card, promptRef, prompt: () => promptCard };
+  }
+
+  /**
+   * The hydrated Prompt Card an alias names.
+   *
+   * @param alias - A bundle alias of a Prompt Card.
+   * @returns The envelope with its exact identity at `ref`.
+   * @throws {@link WyrdError} as {@link WyrdState.verifier}.
+   */
+  prompt(alias: string): PromptCard {
+    const prompt = lifecycleValue<RegisteredPromptCard>(this.#native.prompt(alias));
+    return { ...prompt, ref: this.cardRef(alias) };
   }
 
   /**

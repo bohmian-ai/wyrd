@@ -1094,7 +1094,7 @@ async fn read_correlation(
     client: &wyrd_client::WyrdClient,
     table: &str,
 ) -> Vec<(i64, Option<String>, String)> {
-    let sql = format!("SELECT value, card_uid, principal_id FROM {table} ORDER BY value");
+    let sql = format!("SELECT value, card_uid, sub_principal_id FROM {table} ORDER BY value");
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             params: Vec::new(),
@@ -1118,9 +1118,9 @@ async fn read_correlation(
             .and_then(|column| column.as_any().downcast_ref::<arrow::array::StringArray>())
             .expect("card_uid is Utf8");
         let principals = batch
-            .column_by_name("principal_id")
+            .column_by_name("sub_principal_id")
             .and_then(|column| column.as_any().downcast_ref::<arrow::array::StringArray>())
-            .expect("principal_id is Utf8");
+            .expect("sub_principal_id is Utf8");
         for row in 0..batch.num_rows() {
             rows.push((
                 values.value(row),

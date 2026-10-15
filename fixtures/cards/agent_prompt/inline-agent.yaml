@@ -1,0 +1,22 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: inline-agent
+  version: 1.0.0
+  space: default
+spec:
+  prompt:
+    request:
+      provider: gemini_generate_content
+      body:
+        contents:
+          - role: user
+            parts:
+              - text: Inline triage
+    model: gpt-4o
+    variables: []
+    media_variables: []
+    response_type: text
+  run_config:
+    max_iterations: 2
+    timeout_ms: 1000

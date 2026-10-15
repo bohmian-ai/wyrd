@@ -1,6 +1,6 @@
 ---
 id: SPEC-sub-act-attribution
-revision: 4
+revision: 5
 status: approved
 ---
 
@@ -29,6 +29,11 @@ intersection, SYSTEM execution, non-null storage, and the column names here
 are Wyrd policy, not requirements imposed by that RFC.
 
 ## Approval
+
+Revision 5 settles review TASK-001-518a5d8b8 (FIND-TASK-001-1 and
+FIND-TASK-001-3). Its decisions were accepted by the human owner on
+2026-10-15: "I agree with your recommendation", and the revision text was
+approved the same day: "Yes".
 
 Revision 4, including realtime propagation and further delegation, was approved
 by the human owner on 2026-10-14: "$wyrd-plan approved. create a task for this
@@ -86,7 +91,9 @@ a client can never supply either one.
 | Server span copied to the tenant's `vala.traces.spans` (verify-attribution REQ-007) | the emitting operation's `sub` | the emitting operation's `act` (SYSTEM for judge execution) |
 | Card, service account, API key, operator connection, or Bifrost table registration | caller, or A under delegation | caller, or B under delegation |
 | Platform authorization decision | authenticated platform subject | authenticated platform actor, or subject for direct work |
-| Authentication refusal with no verified identity | existing PLATFORM_AUDIT_PRINCIPAL sentinel | same sentinel |
+| Tenant provisioning by an authenticated platform operator: the tenant's SYSTEM principal and built-in tables | platform operator's subject | platform operator's actor |
+| Creation with no verified caller: SYSTEM bootstrap, startup built-in reconciliation, reserved audit-owner tables, defining SQL backfill, dev-fixture seeding | existing `PLATFORM_AUDIT_PRINCIPAL` sentinel | same sentinel |
+| Audited credential-exchange refusal with no verified identity | existing `PLATFORM_AUDIT_PRINCIPAL` sentinel | same sentinel |
 
 - The binding owner's principal is the principal projected for the binding's
   `owner_card_uid` Service or Agent Card.
@@ -306,16 +313,26 @@ an unbounded repository-wide rename is not an implementation decision.
 - Platform decisions remain in the reserved platform audit tenant. Their
   payload identities are platform principals; they are not rewritten into
   tenant principals to satisfy storage stamping.
-- Audit records without a verified identity use the existing
-  `PLATFORM_AUDIT_PRINCIPAL` Service sentinel for both fields, with existing
-  failure detail indicating unresolved identity. Replace the nil-principal
-  convention; never trust identity claims from a rejected token. The sentinel
-  is an explicit unavailable-identity marker, not SYSTEM and not a principal
-  whose permissions may authorize work.
+- The existing `PLATFORM_AUDIT_PRINCIPAL` Service sentinel is the single
+  no-verified-caller marker. It fills both fields on audited decisions without
+  a verified identity, with existing failure detail indicating unresolved
+  identity, and on creation rows that no verified caller caused (REQ-002).
+  Replace the nil-principal convention; never trust identity claims from a
+  rejected token. The sentinel is not SYSTEM, is not a principal whose
+  permissions may authorize work, and is never derived from a database login
+  or a guessed administrator.
+- A request refused before any principal resolves records no audit decision:
+  an absent credential, a malformed bearer token, or a bearer token that fails
+  signature or claim verification. Its rejection response is unchanged, and
+  it stays visible through request metrics and logs. Credential-exchange
+  refusals the existing audit path records (API-key, workload `jwt_bearer`,
+  and token exchange) keep recording, with the sentinel pair whenever no
+  verified identity exists.
 - Existing internal transport sentinels for audit and gateway capture remain
   transport identities only. They never overwrite verified payload attribution.
-  Tenant payload IDs resolve within their tenant; platform and unresolved
-  sentinel audit records are explicit exceptions to tenant-principal lookup.
+  Tenant payload IDs resolve within their tenant. Explicit exceptions to
+  tenant-principal lookup: platform audit records, sentinel records, and the
+  platform operator pair on tenant-provisioning creation rows.
 - Preserve the single non-blocking Scribe outbox path, allowed and denied
   decision coverage, and logged/counted audit loss. No new audit transport,
   synchronous persistence requirement, or permission for sentinels is added.
@@ -339,11 +356,15 @@ an unbounded repository-wide rename is not an implementation decision.
 - Resolve it through server-owned tenant identity; never mint a SYSTEM token.
 - `wyrd-dev-fixtures` tenant seeding creates it, like production provisioning
   does.
+- SYSTEM's own creation pair follows REQ-002: the authenticated platform
+  operator when provisioning has one, otherwise the no-verified-caller
+  sentinel. SYSTEM never records itself as its creator. Eager provisioning
+  and startup reconciliation keep their current lifecycle and availability.
 
 ## Invariants
 
 - **INV-001** `sub_principal_id` and `act_principal_id` are server-derived from
-  verified identity, the binding owner, or the explicit unresolved-audit
+  verified identity, the binding owner, or the explicit no-verified-caller
   sentinel in REQ-010; never from unverified client input, headers, or row values.
 - **INV-002** SYSTEM never appears as `sub`. SYSTEM appears as `act` only for
   Wyrd-owned execution, including judge work inside a caller-requested run.
@@ -357,7 +378,8 @@ an unbounded repository-wide rename is not an implementation decision.
 - **INV-006** Attribution IDs are not permission grants. A trusted pair cannot
   substitute for the accepted effective authority or Card/resource checks.
 - **INV-007** Creation attribution and accepted run authority are immutable
-  for that entity/operation; reads and retries cannot rewrite either.
+  for that entity/operation; reads, retries, and startup reconciliation cannot
+  rewrite either.
 
 ## Expensive-to-reverse decisions
 
@@ -446,15 +468,18 @@ superseded by verify-attribution D3.
 | AC-012 | A delegated direct verify (B for A) whose judge model A may invoke but B may not is refused at the judge's gateway call; the judge call's `sub` is A. | Rust journey |
 | AC-013 | A delegated queued manual verify survives worker reclaim/restart with A as subject, SYSTEM as judge actor, and the originally narrowed authority; a later subject-only permission lookup cannot authorize its denied model. Grant edits/token expiry do not widen or replace accepted authority. | durable queue integration and Rust journey |
 | AC-014 | Registration and manual verification idempotency distinguish same actor/different subject and same subject/different actor. Exact replay reuses the operation; changed input conflicts; replay never rewrites accepted attribution or authority. Independent background bindings sharing SYSTEM never collapse; Workflow ownership semantics remain unchanged. | owning integration tests and Rust journey |
-| AC-015 | Platform audit preserves the platform caller in the payload under the reserved audit tenant. Invalid/absent credentials use the existing unavailable-identity sentinel pair, never nil or unverified token claims. Allowed/denied auditing and non-blocking audit failure behavior remain intact. | HTTP/MCP authorization journeys and focused audit tests |
+| AC-015 | Platform audit preserves the platform caller in the payload under the reserved audit tenant. Audited credential-exchange refusals without a verified identity use the sentinel pair, never nil or unverified token claims. A request with an absent, malformed, or unverifiable bearer token is refused with its existing response and records no audit decision. Allowed/denied auditing and non-blocking audit failure behavior remain intact. | HTTP/MCP authorization journeys and focused audit tests |
 | AC-016 | Every inventory writer and read projection uses the pair, including HTTP/gRPC Scribe ingest, registration/create paths, denied decisions, and tenant server spans. Managed sampling uses subject identity; Variant payload policy remains unchanged. | schema/owner inventory, integration coverage and SDK journeys |
 | AC-017 | Missing/inactive binding owner or SYSTEM fails acceptance observably without foreign-tenant fallback; accepted authority cannot be swapped during claim or retry. Tokenless input reads retain their existing narrow capability with run-subject/SYSTEM attribution; Operator authority rechecks remain intact. | binding/queue integration and cross-tenant Rust negative journey |
 | AC-018 | Realtime request → Verifier → judge → gateway retains A as subject at every hop. Direct and delegated success record A/SYSTEM for judge gateway work and bill A. If either the subject or originating actor lacks model permission, gateway refuses even when the other permits it; further delegation cannot regain excluded permissions. Missing trusted authority fails closed rather than using ambient credentials. | Rust SDK → real server → gateway journey, including delegated negative flows; focused trusted-context boundary tests |
+| AC-019 | Tenant provisioning by an authenticated platform operator records that operator's pair on the tenant's SYSTEM principal and built-in tables. SYSTEM bootstrap, startup reconciliation, reserved audit-owner tables, defining SQL backfill, and dev-fixture seeding record the sentinel pair. SYSTEM is never its own creator, and retries and reconciliation keep the first pair. | tenant-provisioning and catalog integration tests |
 
 ## Open decisions
 
-None. Revision 4's authority lifetime, idempotency scope, unresolved audit
-identity, and propagation/delegation decisions are approved.
+None. Revision 4's authority lifetime, idempotency scope, and
+propagation/delegation decisions are approved. Revision 5's creation
+provenance and unauthenticated-refusal decisions were accepted by the human
+owner on 2026-10-15.
 
 ## Implementation task
 
@@ -478,6 +503,12 @@ extends existing owners rather than introducing another attribution pipeline.
   internal input-read authority; requires verify-attribution r3. Adds
   AC-013–AC-018 and explicit realtime propagation/further-delegation rules,
   plus one implementation task. Explicitly approved by the human owner.
+- r5 (2026-10-15, approved): settles review TASK-001-518a5d8b8. Creation without
+  a verified caller records the no-verified-caller sentinel; authenticated
+  tenant provisioning records the platform operator as an explicit
+  tenant-lookup exception; SYSTEM is never its own creator (REQ-002, REQ-007,
+  REQ-010, INV-001, INV-007, AC-019). Requests refused before any principal
+  resolves are not audited (REQ-010, AC-015).
 
 ## Authority
 

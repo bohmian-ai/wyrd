@@ -248,6 +248,8 @@ fn excludes_type(schema: &Value, wanted: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    //! Known-missing selector detection over local schemas.
+
     use serde_json::json;
 
     use super::*;

@@ -185,6 +185,8 @@ impl ExtractOutput {
 
 #[cfg(test)]
 mod tests {
+    //! Canonical extraction output examples, schema selection, and refusals.
+
     use serde_json::json;
 
     use super::*;

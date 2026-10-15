@@ -539,6 +539,8 @@ where
 
 #[cfg(test)]
 mod blocks_tests {
+    //! Reference visiting over staged Verifier building blocks.
+
     use serde_json::json;
 
     use super::{SlotValue, Visit};

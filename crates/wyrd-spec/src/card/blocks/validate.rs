@@ -130,6 +130,10 @@ impl VerifierSpec {
 
     /// Maps every step-requirement ID to its step, refusing any block ID
     /// used twice across steps and requirements.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] with rule `duplicate_id` for the first
+    /// ID used by two blocks.
     fn requirement_owners(&self) -> Result<HashMap<&TaskId, &TaskId>, WyrdError> {
         let mut seen = BTreeSet::new();
         let mut owners = HashMap::new();
@@ -193,6 +197,10 @@ where
     F: Fn(&'a InlineableRef<AgentSpec>) -> Option<ResolvedAgent<'a>>,
 {
     /// Runs every rule in authoring order.
+    ///
+    /// # Errors
+    /// Returns the first refusal any rule produces, in authoring order: slots,
+    /// evidence mode, pass rate, step shapes, planning, then requirements.
     fn run(mut self) -> Result<(), WyrdError> {
         let spec = self.spec;
         for (slot, input) in &spec.inputs {
@@ -229,6 +237,10 @@ where
 
     /// Refuses mixing samples with other slots, Run with Window checks, and
     /// steps in a Window Verifier.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] with rule `mixed_evidence` for mixed
+    /// slot or check evidence, or `window_steps` for steps in a window Verifier.
     fn validate_evidence_mode(&self) -> Result<(), WyrdError> {
         let spec = self.spec;
         let samples = spec
@@ -277,6 +289,11 @@ where
     }
 
     /// Validates one step's budgets, action, and `when` before planning.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] with rule `step_budget`,
+    /// `unknown_reference`, `extract_source`, or `extract_format`, or any refusal
+    /// of the step's `when`, references, operator, Agent, or code action.
     fn validate_step_shape(&self, step: &'a Step, path: &str) -> Result<(), WyrdError> {
         if step.timeout_seconds == Some(0) {
             return Err(invalid(
@@ -340,6 +357,11 @@ where
     }
 
     /// Validates one requirement check in its position.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] with rule `assert_selector` or
+    /// `trace_source`, or any refusal of the check's references, operator,
+    /// Agent, code, or drift binding.
     fn validate_requirement(
         &self,
         requirement: &'a Requirement,
@@ -386,6 +408,10 @@ where
     }
 
     /// Validates a drift check's slot binding, spec, and measurement names.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] with rule `drift_source` or
+    /// `drift_features`, or the drift spec's own error.
     fn validate_drift(&self, drift: &DriftCheck, path: &str) -> Result<(), WyrdError> {
         let Some(InputSlot::Samples { features, .. }) = self.whole_slot(&drift.on) else {
             return Err(invalid(
@@ -415,6 +441,10 @@ where
     }
 
     /// Validates a code call's source, entrypoint, and inputs.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] with rule `code_source` or
+    /// `code_entrypoint`, or any refusal of an input reference.
     fn validate_code(
         &self,
         call: &CodeCall,
@@ -453,6 +483,12 @@ where
 
     /// Validates an Agent call: kind, references, workspace, and — when the
     /// Agent resolves — placeholders, media formats, tools, and schema.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] with rule `agent_kind`,
+    /// `check_agent_workspace`, `workspace_path`, `agent_tools`,
+    /// `check_agent_tools`, or `check_agent_schema`, or any refusal of a
+    /// reference or placeholder binding.
     fn validate_agent(
         &self,
         call: &'a AgentCall,
@@ -547,6 +583,10 @@ where
     /// Requires Agent inputs to match the Prompt placeholders exactly, media
     /// placeholders to bind provider-native media slots, and text
     /// placeholders not to bind media slots.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] with rule `agent_inputs`,
+    /// `native_media`, or `media_as_text`.
     fn validate_placeholders(
         &self,
         call: &AgentCall,
@@ -620,6 +660,11 @@ where
     }
 
     /// Validates one reference in its position.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] with rule `wildcard_position`,
+    /// `unknown_reference`, `missing_field`, `requirement_position`,
+    /// `verdict_position`, or `step_position`.
     fn validate_reference(
         &self,
         reference: &Reference,
@@ -733,6 +778,11 @@ fn verdict_schema() -> Value {
 }
 
 /// Validates one slot's own constraints.
+///
+/// # Errors
+/// Returns [`WyrdError::Validation`] with rule `slot` for an empty media
+/// format list, a zero `max_bytes`, a samples slot without measurements, or a
+/// non-schema JSON `schema`.
 fn validate_slot(slot: &SlotName, input: &InputSlot) -> Result<(), WyrdError> {
     let path = format!("inputs.{slot}");
     match input {
@@ -773,6 +823,10 @@ fn validate_slot(slot: &SlotName, input: &InputSlot) -> Result<(), WyrdError> {
 }
 
 /// Validates an operator, keeping its message under this Verifier path.
+///
+/// # Errors
+/// Returns [`WyrdError::Validation`] with rule `operator` carrying the
+/// operator's own refusal.
 fn validate_operator(
     operator: &crate::vala::eval::ComparisonOperator,
     path: &str,
@@ -858,6 +912,9 @@ impl VerifierSpec {
 
 #[cfg(test)]
 mod tests {
+    //! Registration refusals and acceptances for authored Verifiers, driven
+    //! through the public `validate` entry points with JSON fixtures.
+
     use serde_json::{Value, json};
 
     use super::super::{ScheduledInput, VerifierSpec};

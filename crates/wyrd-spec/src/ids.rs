@@ -530,6 +530,8 @@ pub enum IdError {
 
 #[cfg(test)]
 mod tests {
+    //! Identifier grammar acceptance and refusal.
+
     use super::*;
 
     /// Slot names use the identifier grammar so every SDK can pass them as

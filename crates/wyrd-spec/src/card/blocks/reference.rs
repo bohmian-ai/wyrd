@@ -176,6 +176,8 @@ impl Reference {
 
 /// Cursor over reference text.
 struct Tokens<'a> {
+    /// The text not yet consumed; each method advances it only on success
+    /// of the token it reads.
     rest: &'a str,
 }
 
@@ -228,6 +230,8 @@ impl<'a> Tokens<'a> {
 }
 
 impl fmt::Display for Reference {
+    /// Writes the canonical reference text, which [`Reference::parse`]
+    /// reads back to an equal value.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.root {
             ReferenceRoot::Input(slot) => write!(f, "inputs.{slot}")?,
@@ -264,20 +268,35 @@ impl fmt::Display for Reference {
 }
 
 impl FromStr for Reference {
+    /// Why the text is not a reference.
     type Err = ReferenceError;
 
+    /// Parses reference text; see [`Reference::parse`].
+    ///
+    /// # Errors
+    /// Returns [`ReferenceError`] for an unknown root, malformed selector, or
+    /// a child selector on a root that has no children.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         Self::parse(text)
     }
 }
 
 impl Serialize for Reference {
+    /// Writes the reference as its canonical text.
+    ///
+    /// # Errors
+    /// Returns the serializer's error.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(self)
     }
 }
 
 impl<'de> Deserialize<'de> for Reference {
+    /// Reads reference text and parses it.
+    ///
+    /// # Errors
+    /// Returns a custom error when the value is not a string or the text is
+    /// not a valid reference.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
         Self::parse(&text).map_err(serde::de::Error::custom)
@@ -285,10 +304,13 @@ impl<'de> Deserialize<'de> for Reference {
 }
 
 impl schemars::JsonSchema for Reference {
+    /// Names the reference schema in generated definitions.
     fn schema_name() -> String {
         "Reference".to_owned()
     }
 
+    /// Describes a reference as a string, documenting the accepted roots
+    /// and selectors.
     fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
         use schemars::schema::{InstanceType, Metadata, SchemaObject};
 
@@ -312,6 +334,8 @@ impl schemars::JsonSchema for Reference {
 
 #[cfg(test)]
 mod tests {
+    //! Reference text parsing, printing, and serde refusals.
+
     use super::*;
 
     /// Every approved root and selector form parses and prints back unchanged.

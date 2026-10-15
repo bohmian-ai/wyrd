@@ -157,6 +157,8 @@ pub trait CheckExecutor: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    //! Executor seam calls and the tool-record handoff into step results.
+
     use std::sync::Arc;
     use std::time::Duration;
 

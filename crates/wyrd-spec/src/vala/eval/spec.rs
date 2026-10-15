@@ -179,6 +179,12 @@ impl From<EvalSpecError> for WyrdError {
     }
 }
 
+/// Validates the comparison operator every eval task kind carries, through
+/// the operator's own rules shared with Verifier block checks.
+///
+/// # Errors
+/// Returns [`WyrdError::Validation`] when the operator's parameters are
+/// invalid, such as an uncompilable regex pattern.
 fn validate_task_operator(task: &EvalTask) -> Result<(), WyrdError> {
     let operator = match task {
         EvalTask::Assertion(t) => &t.operator,

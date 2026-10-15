@@ -180,7 +180,10 @@ pub enum MediaFormat {
 /// Error returned when a string names no [`MediaFormat`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("unknown media format `{0}`")]
-pub struct UnknownMediaFormat(pub String);
+pub struct UnknownMediaFormat(
+    /// The input as given, before trimming or lowercasing.
+    pub String,
+);
 
 impl MediaFormat {
     /// Every format, in declaration order.
@@ -297,12 +300,14 @@ impl MediaFormat {
 }
 
 impl std::fmt::Display for MediaFormat {
+    /// Writes the canonical wire token.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
 impl std::str::FromStr for MediaFormat {
+    /// The unrecognized input.
     type Err = UnknownMediaFormat;
 
     /// Parses a canonical token, extension alias, or MIME type.
@@ -331,12 +336,22 @@ impl std::str::FromStr for MediaFormat {
 }
 
 impl Serialize for MediaFormat {
+    /// Writes the canonical wire token.
+    ///
+    /// # Errors
+    /// Returns the serializer's error.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
     }
 }
 
 impl<'de> Deserialize<'de> for MediaFormat {
+    /// Reads a string and parses it as a token, extension alias, or MIME
+    /// type, so authored aliases normalize to the canonical format.
+    ///
+    /// # Errors
+    /// Returns a custom error when the value is not a string or names no
+    /// known format.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
         value.parse().map_err(serde::de::Error::custom)
@@ -345,10 +360,13 @@ impl<'de> Deserialize<'de> for MediaFormat {
 
 #[cfg(feature = "schemars")]
 impl schemars::JsonSchema for MediaFormat {
+    /// Names the format schema in generated definitions.
     fn schema_name() -> String {
         "MediaFormat".to_owned()
     }
 
+    /// Describes the format as one of the canonical tokens; aliases are
+    /// accepted on input but never generated.
     fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
         use schemars::schema::{InstanceType, SchemaObject};
 
@@ -368,6 +386,8 @@ impl schemars::JsonSchema for MediaFormat {
 
 #[cfg(test)]
 mod tests {
+    //! Media format token parsing, native kinds, and wire projections.
+
     use super::*;
 
     /// Tokens, extension aliases, and MIME types parse case-insensitively to

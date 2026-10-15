@@ -396,6 +396,8 @@ impl From<&WyrdError> for VerificationError {
 
 #[cfg(test)]
 mod tests {
+    //! Wire round trips and refusals for the Verifier execution contracts.
+
     use serde_json::json;
 
     use super::*;

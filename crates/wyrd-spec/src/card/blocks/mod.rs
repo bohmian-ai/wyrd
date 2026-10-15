@@ -332,6 +332,12 @@ pub struct DriftCheck {
 }
 
 impl Serialize for DriftCheck {
+    /// Writes the drift spec's fields with `on` beside them as its reference
+    /// text, the flattened wire form authors write.
+    ///
+    /// # Errors
+    /// Returns the serializer's error, or a custom error when the drift spec
+    /// does not serialize to JSON.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut value = serde_json::to_value(&self.spec).map_err(serde::ser::Error::custom)?;
         if let Value::Object(fields) = &mut value {
@@ -342,6 +348,14 @@ impl Serialize for DriftCheck {
 }
 
 impl<'de> Deserialize<'de> for DriftCheck {
+    /// Splits the required `on` reference out of the flattened object and
+    /// decodes the remaining fields as a [`DriftSpec`], which keeps its own
+    /// unknown-field refusal.
+    ///
+    /// # Errors
+    /// Returns a missing-field error when `on` is absent, and a custom error
+    /// when `on` is not a valid reference or the remaining fields are not a
+    /// valid drift spec.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let mut value = Value::deserialize(deserializer)?;
         let on = value

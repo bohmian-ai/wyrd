@@ -37,7 +37,7 @@ A Prompt Card's `provider` is a third, separate thing. It says which request for
 
 - The `wyrd` CLI and PostgreSQL, as in [Set up Wyrd](/get-started/setup/).
 - An Anthropic API key in the `ANTHROPIC_API_KEY` environment variable of the shell you run step 2 in.
-- For the first request in step 5: Python with `pip install 'wyrd-ai[gateway]'`.
+- For the first request in step 6: Python with `pip install 'wyrd-ai[gateway]'`.
 
 ## Set up one provider
 
@@ -84,7 +84,19 @@ A Prompt Card's `provider` is a third, separate thing. It says which request for
 
    `get` prints the deployment you just applied. Applying the same file again changes nothing.
 
-5. Make the first request. The Anthropic SDK sends it to Wyrd instead of Anthropic, and `wyrd.http_auth` swaps the placeholder `api_key` for your Wyrd access token:
+5. Turn on call recording. A new tenant records nothing until it has a capture policy, and a call made before this step is never recorded. Save this as `capture-policy.json` and apply it:
+
+   ```json
+   { "mode": "metadata", "payload_fields": [] }
+   ```
+
+   ```bash
+   wyrd gateway capture-policy put --file capture-policy.json
+   ```
+
+   `metadata` records who called which deployment and model, the outcome, and token usage. An empty `payload_fields` keeps prompts and replies out of the record.
+
+6. Make the first request. The Anthropic SDK sends it to Wyrd instead of Anthropic, and `wyrd.http_auth` swaps the placeholder `api_key` for your Wyrd access token:
 
    ```python
    import anthropic
@@ -107,7 +119,7 @@ A Prompt Card's `provider` is a third, separate thing. It says which request for
 
    The script prints the model's reply. Anthropic received `claude-sonnet-4-5` with the stored key in `x-api-key`. It never saw your Wyrd token.
 
-6. Confirm Wyrd recorded the call:
+7. Confirm Wyrd recorded the call:
 
    ```python
    from wyrd.bifrost import Bifrost
@@ -121,7 +133,7 @@ A Prompt Card's `provider` is a third, separate thing. It says which request for
 
    The newest row has `requested_model` `{'deployment': 'claude-prod', 'model': 'claude-sonnet-4-5'}` and `outcome` `succeeded`. Rows show up a few seconds after the call. If the result is empty right away, wait and query again before you go looking for a bug.
 
-Calling from another framework or language? [Make gateway requests from a framework](/connect/call-wyrd-from-a-stock-client/) has the OpenAI, Anthropic, Google GenAI, OpenAI Agents SDK, and Pydantic AI versions of step 5.
+Calling from another framework or language? [Make gateway requests from a framework](/connect/call-wyrd-from-a-stock-client/) has the OpenAI, Anthropic, Google GenAI, OpenAI Agents SDK, and Pydantic AI versions of step 6.
 
 ## Add more providers
 

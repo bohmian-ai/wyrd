@@ -14,6 +14,7 @@ The transport is `wyrd.http_auth` in Python, an `httpx.Auth` that also works as 
 ## Prerequisites
 
 - A deployment for each model you call. The examples use `openai-prod`, `claude-prod`, and `gemini-team` from [Set up the LLM gateway](/connect/set-up-the-llm-gateway/). Swap in your own deployment names.
+- The capture policy from [step 5 of the setup](/connect/set-up-the-llm-gateway/#set-up-one-provider), if you want calls recorded. Without it the calls still run, but nothing lands in `vala.gateway.calls`.
 - A Wyrd credential the client can find: the config `wyrd server dev` saves, `WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or a saved `wyrd auth login`.
 - Python: `pip install 'wyrd-ai[gateway]'`, plus the SDK or framework you use. These examples were checked with `openai` 3.14, `anthropic` 1.6, `google-genai` 2.30, `openai-agents` 0.23, and `pydantic-ai-slim` 2.56.
 - TypeScript: `npm install wyrd-ai`, plus `openai` or `@anthropic-ai/sdk`.
@@ -180,7 +181,7 @@ print(result.output)
 
 ## Check that the call was recorded
 
-Each call lands in `vala.gateway.calls`, attributed to the Wyrd principal that made it:
+With the capture policy applied, each call lands in `vala.gateway.calls`, attributed to the Wyrd principal that made it:
 
 ```python
 from wyrd.bifrost import Bifrost
@@ -192,7 +193,7 @@ rows = Bifrost().sql(
 print(rows)
 ```
 
-Rows appear a few seconds after the call. An empty result right after a call usually means it isn't published yet, so query again.
+Rows appear a few seconds after the call. An empty result right after a call usually means it isn't published yet, so query again. If it stays empty, check that the capture policy is applied with `wyrd gateway capture-policy get`.
 
 ## When the gateway refuses
 

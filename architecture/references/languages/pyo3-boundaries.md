@@ -170,7 +170,7 @@ New Python-visible Rust functions/classes must be wired through
 extension topology distinct from the public Python
 package:
 
-- `agent` (from `skald-agent` + `skald-workflow`)
+- `agent` (from `skald-agent`)
 - `cards` (from `wyrd-cards`, including native `data`, `model`, and `prompt`
   children used to assemble public projections)
 - `tool` (from `skald-tool`)

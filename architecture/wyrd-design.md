@@ -22,10 +22,10 @@ drift, not permission for code and documentation to diverge.
 
 - [Doctrine](#doctrine) — 21 design principles
 - [Client model](#client-model) — language-agnostic protocol and first-class SDKs
-- [Kind catalog](#kind-catalog) — 15 registrable kinds + External discriminator
+- [Kind catalog](#kind-catalog) — 14 registrable kinds + External discriminator
 - [Per-kind specs](#per-kind-specs) — field shapes per kind
   - [Data](#data) · [Model](#model) · [Artifact](#artifact) · [Experiment](#experiment)
-  - [Prompt](#prompt) · [Agent](#agent) · [Workflow](#workflow) · [Mcp](#mcp)
+  - [Prompt](#prompt) · [Agent](#agent) · [Mcp](#mcp)
   - [Service](#service) · [Policy](#policy) · [Audit](#audit)
   - [Verifier](#verifier) · [Source](#source) · [Bifrost](#bifrost)
   - [Trigger](#trigger) · [Operator](#operator)
@@ -98,7 +98,7 @@ not a passive integration or inventory product.
     Experiment carry durable artifact bytes and MUST be pre-registered before
     anything else can point at them — they're the lineage anchors. Every other
     kind (Prompt, Agent, Verifier, Policy, Trigger, Operator, Source, Mcp,
-    Workflow, Audit, Service) is spec-only: `wyrd apply -f file.yaml` reads
+    Audit, Service) is spec-only: `wyrd apply -f file.yaml` reads
     and registers in one move. No separate storage step, no programmatic
     registration prerequisite.
 17. **Light cards may inline in place of a `CardRef`.** Wherever a spec slot
@@ -117,8 +117,8 @@ not a passive integration or inventory product.
     through the transitive card-ref graph declared in that card's spec. A card
     enters the scope only if its kind is an observation target — a kind a client
     (`wyrd.observer`, Bifrost, drift, eval) attributes records to: `Data`,
-    `Model`, `Experiment`, `Prompt`, `Agent`, `Workflow`, `Service`, `Mcp`,
-    `Artifact`, `Source`. `Verifier` and control-plane kinds (`Policy`,
+    `Model`, `Experiment`, `Prompt`, `Agent`, `Service`, `Mcp`, `Artifact`,
+    `Source`. `Verifier` and control-plane kinds (`Policy`,
     `Audit`, `Operator`, `Trigger`) may be referenced for governance or
     verification but never enter the emit scope. Service principals start from their Service card and
     therefore include declared `Service.components`; Agent principals start from
@@ -317,7 +317,7 @@ and ingest clients or implement their own HTTP or gRPC transports.
 
 ## Kind catalog
 
-Wyrd registers 15 native Card kinds. `CardKind::External` is a non-registrable
+Wyrd registers 14 native Card kinds. `CardKind::External` is a non-registrable
 discriminator used when reading foreign or unknown kind metadata. The foreign
 payload remains opaque and source-specific; it is not a Wyrd Card. There is no
 `ExternalSpec` and no External Card registration path.
@@ -325,7 +325,7 @@ payload remains opaque and source-specific; it is not a Wyrd Card. There is no
 | Domain        | Kinds |
 |---------------|-------|
 | Data plane    | Data, Model, Artifact, Experiment |
-| Agent plane   | Prompt, Agent, Workflow, Mcp |
+| Agent plane   | Prompt, Agent, Mcp |
 | Composition   | Service |
 | Governance    | Policy, Audit |
 | Observability | Verifier, Source |
@@ -425,120 +425,6 @@ spec:
   run_config: AgentRunConfigSpec # max_iterations, tool_concurrency_cap, session_recent_limit, timeout_ms
   verified_by: [VerificationBinding]
 ```
-
-### Workflow
-DAG of steps invoking other cards.
-```yaml
-spec:
-  description?: string
-  inputs: { string: ParameterValue }
-  llm_route?: LlmRoute             # native (default) | wyrd_gateway | ext_gateway
-  steps: [WorkflowStep]            # id, action, depends_on, inputs, llm_route?, fallback?, timeout_seconds?, retry?
-  outputs: { string: WorkflowBinding }
-  governance?: Governance
-  details: { string: NonSecretValue }
-```
-
-Data flow is explicit. A step's `inputs` bind exact sources (`input.<name>`,
-`steps.<id>.output.text`, a structured-output path) to declared Prompt
-variables, `depends_on` alone orders steps, and the Workflow's `outputs` name
-every result a run returns. Nothing is forwarded implicitly and there is no
-last-step result. Local and server runs return the same `WorkflowRun`
-snapshot, addressed by output name and step ID.
-
-A step's `llm_route` overrides the Workflow's. `native` uses the local
-process's provider registry and the Prompt's destination; server execution
-refuses it at submission with `WYRD_WORKFLOW_422_SERVER_NATIVE_UNSUPPORTED`. `wyrd_gateway` calls
-the governed Wyrd gateway with the caller's identity: locally through the
-public protocol ingress (Chat Completions, Responses, Anthropic Messages, or
-Gemini GenerateContent; a Vertex Prompt is refused before dispatch because
-the public ingress serves no Vertex dialect), and on the server in process,
-where Vertex is served. `ext_gateway` is execution-local: the process running
-the step sends the native body directly to the named binding's origin. A
-local run reads that binding from the `[workflow.external_gateway_bindings]`
-section of the shared client `config.toml`, whose secret headers are secret
-references resolved at run start for the selected bindings only; a server run
-uses the tenant-assigned server binding. An `ext_gateway` call never passes
-through the Wyrd gateway, and a binding of another protocol or with an
-unreadable secret is refused before any dispatch. Loading and registration
-never read a binding or secret.
-
-Workflow is a declarative Card, not a principal. It owns no credential, role,
-or authority; invocation uses the caller's identity. WyrdState remains a
-Service-root hydrated state and is not required for standalone Workflow loading.
-
-Clients expose `Workflow.from_path(path)` (Python), `Workflow.fromPath(path)`
-(TypeScript), and async `Workflow::from_path(path)` (Rust), including hydration.
-Fully local paths/inline bodies require no registry or credential; external
-Agent/Prompt refs and their transitive dependencies automatically use lazy
-existing default client configuration. Loading never registers, executes, or
-resolves execution secrets. Missing/denied/inactive dependencies fail before
-execution. Registered loading is `cards.workflow.load` (Python/TypeScript) or
-`cards.workflow().load` (Rust), selecting an exact named version or UID and
-following locked relationships. No loaded dependency floats to a newer version.
-
-The shared client composes existing wyrd-loader, Cards hydration, and Skald
-resolved validation/execution. Its thin Workflow facade adds the client IO
-boundary without duplicating graph state, traversal, parsing, validation, or
-runtime logic. Language SDKs project that facade; no public loader or hydrator
-is required. Shared local execution configuration serves SDKs and CLI, while
-Skald remains independent of registry IO and server tenancy.
-
-A `wyrd_gateway` step calls the existing authenticated public gateway ingress.
-Its per-step fallback travels in the optional `wyrd-gateway-fallback` request
-header: unpadded base64url over the JCS UTF-8 serialization of a
-`GatewayFallbackOverride`, at most 8 KiB encoded and 4 KiB decoded. The ingress
-authenticates the caller before parsing the header, refuses a repeated,
-malformed, oversized, empty, duplicated, or self-listing value with
-`WYRD_GATEWAY_400_INVALID_REQUEST` naming `fallback` before any dispatch, and
-consumes the header without forwarding it to a provider. Without the header,
-tenant fallback policy applies unchanged, so unmodified clients behave as
-before.
-
-A server-hosted Workflow run is an accepted job. The authenticated,
-`workflows:run`-authorized, audited submission pins the exact active graph and
-captures token-free execution authority: the caller's principal attribution
-and scopes, bounded to that run's pinned graph and total deadline. Neither a
-bearer token nor a secret is retained. Token expiry and later grant or
-credential changes neither cancel nor widen an accepted run. Later HTTP
-create/replay, get, and cancel requests authenticate and authorize afresh,
-and replay never replaces run authority. Within the run, Cards reads, Bifrost
-queries, and gateway calls still make and audit their own live per-call
-decisions under the captured authority and current owner admission rules.
-A step's gateway call records the captured caller as its subject and actor
-(A/B under delegation), the Workflow Card as `card_uid`, and a null `run_id`:
-a Workflow run id is not an application Run. A registered Workflow loaded
-and run locally sends its Card as the requested gateway Card, which the
-existing gateway Card check admits only for a caller whose Card scope includes
-it or a caller bound to no Card; an out-of-scope Card-bound caller is refused
-with `WYRD_VALA_403_BIFROST_CARD_SCOPE` before any provider call.
-Runs are process-local; restart loses them.
-
-The server bounds runs before acceptance: step count, dependency edges,
-resolved graph bytes, decoded input bytes, and a complete-snapshot budget
-from which it reserves room for a payload-free terminal snapshot of every
-declared step, including bounded run and step error projections. A graph whose terminal snapshot cannot fit is
-refused at submission. An oversized step result fails its step, and a
-transition whose full snapshot would exceed the budget discards the provider
-payload and fails the run, so no terminal transition lacks room for its
-statuses or errors. Active and retained runs have global and per-tenant
-ceilings; terminal runs are queryable for 24 hours or until oldest-first
-eviction. Shutdown cancels and drains active runs. A multi-replica
-deployment must route a run's create, get, and cancel requests to the replica
-that owns it; any other replica answers not found.
-
-Workflow surfaces are scoped by capability. Rust, Python, and TypeScript load
-and run authored files and registered Workflows locally. Server-run
-submission, status, and cancellation ship only through the Rust
-`wyrd_client::Workflows` handle, the `/v1/workflow-runs` HTTP resource, and
-the CLI. MCP has no Workflow surface. `wyrd workflow run` takes exactly one
-source (`--file`, `--uid`, or `--space`/`--name`/`--version`) and
-`--execution local|server`; a file runs only locally. `wyrd workflow`
-commands take no `--server` option; the endpoint comes from the ambient client
-configuration. Server execution prints
-the accepted run ID and waits unless `--detach`; an interrupted wait leaves
-the run running and never cancels or resubmits it. `wyrd workflow status` and
-`wyrd workflow cancel` act on server runs.
 
 ### Mcp
 MCP server registration. The server enumerates its own tools at runtime; we do
@@ -749,6 +635,15 @@ intersection of the actor's and the subject's; `act` is attribution only. The ap
 the application and is never read or written by the SDK or by Wyrd.
 `Wyrd-Caller-Identity` is rejected legacy — do not reintroduce.
 
+A public gateway ingress request may carry a per-request fallback in the
+optional `wyrd-gateway-fallback` header: unpadded base64url over the JCS UTF-8
+serialization of a `GatewayFallbackOverride`, at most 8 KiB encoded and 4 KiB
+decoded. The ingress authenticates the caller before parsing the header,
+refuses a repeated, malformed, oversized, empty, duplicated, or self-listing
+value with `WYRD_GATEWAY_400_INVALID_REQUEST` naming `fallback` before any
+dispatch, and consumes the header without forwarding it to a provider. Without
+the header, tenant fallback policy applies unchanged.
+
 ```
 POST /charge HTTP/1.1
 Host: billing-svc.acme.svc.cluster.local
@@ -924,7 +819,7 @@ Consequences, stated so they stop drifting:
   **observation-target** cards reachable through the transitive card-ref graph
   declared in that card's spec. A card is in scope only if its kind is an
   observation target (`Data`, `Model`, `Experiment`, `Prompt`, `Agent`,
-  `Workflow`, `Service`, `Mcp`, `Artifact`, `Source`); `Verifier` and
+  `Service`, `Mcp`, `Artifact`, `Source`); `Verifier` and
   control-plane kinds (`Policy`, `Audit`, `Operator`, `Trigger`) never enter the
   emit scope. Service cards contribute `Service.components`; other reachable
   specs contribute their declared card refs according to the shared card-ref
@@ -1111,7 +1006,7 @@ typed refs is a versioned breaking change that adds variants.
 | Variant           | Source-card fields                                                          |
 |-------------------|-----------------------------------------------------------------------------|
 | `Verification`    | `Service.components[].verified_by[].verifier`, `Service.verified_by[].verifier`, `Agent.verified_by[].verifier` |
-| `Component`       | `Service.components[].ref`, `Workflow.steps[].target`                       |
+| `Component`       | `Service.components[].ref`                                                  |
 | `Artifact`        | `Data.card_refs[]`, `Model.card_refs[]`                                     |
 | `Prompt`          | `Agent.prompt`                                                              |
 | `Dataset`         | `Verifier.implementation.spec.dataset` (eval)                               |
@@ -1119,7 +1014,6 @@ typed refs is a versioned breaking change that adds variants.
 | `Baseline`        | `Verifier.implementation.spec.signal.baseline_ref` (drift)                  |
 | `Trigger`         | `*.verified_by[].runs_on`                                                   |
 | `Operator`        | `*.verified_by[].on_failure[]`                                              |
-| `Workflow`  | `Operator.workflow_ref`                                           |
 | `Hook`      | `Operator.pre_invoke`, `Operator.post_invoke`                     |
 
 For `Service.components[].verified_by`, derived edges retain the exact
@@ -1600,8 +1494,8 @@ External pushes are deliberately not an activation — Rule 7 ("Wyrd reads, it
 does not push") means external data enters through a `Source`.
 
 ### Operator
-A failure reaction. Performs exactly one action — a typed notification, a
-generic HTTP call, or a Workflow dispatch. Operator is a pure side-effect
+A failure reaction. Performs exactly one action — a typed notification or a
+generic HTTP call. Operator is a pure side-effect
 template with no `pre_invoke` / `post_invoke` hooks and no subscription of its
 own: it runs only as an `on_failure` entry of a verification binding. A
 referenced Operator Card and an inline `on_failure` mapping use the same
@@ -1609,7 +1503,7 @@ flattened `OperatorSpec` shape.
 ```yaml
 spec:
   description?: string
-  kind: notify | http | workflow  # flattened OperatorAction discriminator
+  kind: notify | http             # flattened OperatorAction discriminator
   # ...variant fields below
   budget?: { max_wall_seconds?: u32, max_tool_calls?: u32 }
 ```
@@ -1620,7 +1514,6 @@ spec:
 |------------|---------------------------------------------------------------------------------------|-------------------------------------------------------------------------------|
 | `Notify`   | `channel: NotifyChannel` (closed tagged union — typed vendor shape)                  | Sends the notification through the vendor-specific adapter the server owns.   |
 | `Http`     | `method`, `url`, `headers?`, `body?`, `auth?`, `timeout_seconds?`, `expect_status?` | Builds and sends the HTTP request.                                            |
-| `Workflow` | `workflow_ref: Ref` (→ Workflow)                                                      | Not yet executable. Registerable as an Operator Card, but registration rejects it in `on_failure`. |
 
 **Dispatch.** Only a completed, binding-created Verifier run with a `failed`
 verdict creates Operator work: one durable dispatch per configured
@@ -1865,7 +1758,7 @@ is available only at `InlineableRef<T>` slots.
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
 | `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`. |
 | `Agent`        | Optional | Light. Spec-only; `apply` registers it. `LlmJudgeTask.judge_ref` is `InlineableRef<AgentSpec>`. |
-| `Verifier`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Workflow`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
+| `Verifier`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
 
 A single YAML file may contain many `---`-separated card documents — `wyrd
 apply -f eval-suite.yaml` registers all of them in dependency order. The Agent
@@ -1930,8 +1823,6 @@ relationship tests all project from it:
   `Service.verified_by` — each binding's `verifier`, `runs_on`, and
   `on_failure[]`
 - `Agent.prompt`
-- `Workflow.steps[].target`
-- `Operator.workflow_ref`
 - Verifier implementation refs: Eval `dataset` and
   `EvalTask::LlmJudge.judge_ref`; Drift `signal.baseline_ref`
 - Heavy anchors: `Model`/`Data`/`Experiment` `*_refs`, `Artifact` refs
@@ -2100,17 +1991,16 @@ foreign-card content pinning are not supported workflows.
 | Data    | `card_refs`, `splits`                 | Verifier Drift `signal.baseline_ref`, Verifier Eval `dataset`, `Experiment.target_refs` |
 | Model   | `card_refs`                           | `Service.components.ref`, `Experiment.target_refs` |
 | Agent   | `prompt`, `tool_names`, `verified_by` | `Service.components.ref`, Agent prompts (sub-agent calls), Verifier Eval `LlmJudge.judge_ref` |
-| Workflow| `steps.*.target`                     | `Service.components.ref`, `Operator.workflow_ref` |
 | Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |
 | Verifier| Drift `signal.baseline_ref`; Eval `dataset`, `tasks[].LlmJudge.judge_ref` | `*.verified_by[].verifier` |
 | Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
 | Service | `components[].ref`, `components[].verified_by`, `verified_by` | — |
 | Policy  | `rules`                              | `Service.components.ref` |
 | Trigger | `schedule` or `observations_ready` activation | `*.verified_by[].runs_on` |
-| Operator| `action` (`workflow_ref` \| typed `channel` shape \| tenant connection) | `*.verified_by[].on_failure` |
+| Operator| `action` (typed `channel` shape \| tenant connection) | `*.verified_by[].on_failure` |
 | Source  | `kind` (bucket), `connection` (vendor + `*_env`) | Verifier Eval `source_ref` |
 
-`Service.components` accepts: Agent, Prompt, Model, Workflow, Mcp, Policy. No
+`Service.components` accepts: Agent, Prompt, Model, Mcp, Policy. No
 other kinds are runtime-aliased into a Service.
 
 ---

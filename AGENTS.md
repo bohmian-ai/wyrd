@@ -82,10 +82,10 @@ Locked cross-cutting decisions that any contributor must honor:
 - Every registered AI system component is a `Card` with the shared envelope:
   `apiVersion: wyrd/v1`, top-level `metadata`, `kind`, `spec`,
   server-derived `relationships`, and server-managed `status`. There is no
-  outer `kind: Card` wrapper. The v1 doctrine has 15 registrable native kinds:
-  `Data`, `Model`, `Artifact`, `Experiment`, `Prompt`, `Agent`,
-  `Workflow`, `Mcp`, `Service`, `Policy`, `Audit`, `Verifier`, `Source`,
-  `Trigger`, and `Operator`. Drift and Eval are typed `Verifier`
+  outer `kind: Card` wrapper. The v1 doctrine has 14 registrable native kinds:
+  `Data`, `Model`, `Artifact`, `Experiment`, `Prompt`, `Agent`, `Mcp`,
+  `Service`, `Policy`, `Audit`, `Verifier`, `Source`, `Trigger`, and
+  `Operator`. Drift and Eval are typed `Verifier`
   implementations, not Card kinds. `CardKind::External` is a non-registrable
   discriminator for foreign schema descriptors; it has no `ExternalSpec`.
 - `Tool` is a Skald/runtime registry concept, not a Card kind.

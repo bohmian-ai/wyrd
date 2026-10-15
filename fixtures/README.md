@@ -17,7 +17,7 @@ A story uses the same file and test names in every SDK: `<story>.rs`,
 | `verify_in_real_time` | `latency_baseline/latency-baseline.yaml`, `verify_in_real_time/latency-model.yaml`, `verify_in_real_time/assistant.yaml`; `verify_in_real_time/unfitted-assistant.yaml` binds `tier-drift`, whose baseline never fits | `agent_answer_passes_its_verifier`, `agent_answer_fails_its_verifier`, `judged_answer_passes_the_llm_judge`, `model_latency_like_the_baseline_passes_its_verifier`, `model_latency_drift_is_judged_failed`, `verify_before_baseline_ready_is_refused`, `unbound_verifier_fails_locally`, `input_of_the_wrong_shape_fails_locally`, `caller_without_evals_run_is_refused`, `another_tenant_cannot_verify_the_assistant`, `verify_records_no_observation` |
 | `scheduled_drift_alerts_operator` | create http connection `on-call-hooks` on the local receiver's origin, then `latency_baseline/latency-baseline.yaml`, `scheduled_drift_alerts_operator/latency-watch.yaml` | `failed_schedule_alerts_its_operator_on_the_connection_origin`, `path_only_operator_without_connection_is_refused` |
 | `query_bifrost` | no Cards | `parameterized_sql_returns_the_callers_rows`, `bound_sql_text_is_treated_as_data`, `unwritten_builtin_table_reads_as_empty`, `stream_yields_arrow_batches_and_a_terminal`, `caller_without_bifrost_read_is_refused` |
-| `gateway_inference` | `gateway_inference/ask.yaml`; `ask-external.yaml` names the registered `ask-agent`; the example Workflow is `examples/workflows/code-review` | `openai_client_calls_the_gateway_with_an_access_token`, `caller_without_gateway_invoke_is_refused`, `cli_issues_a_card_scoped_key_and_writes_a_provider_credential`, `loaded_workflow_calls_the_gateway_through_its_loading_client`, `example_workflow_runs_through_the_wyrd_gateway`, `applying_a_workflow_calls_no_model`, `registered_example_runs_through_the_gateway` |
+| `gateway_inference` | `gateway_inference/ask-agent.yaml` with its `ask-prompt.yaml`; `ask-service.yaml` composes that Agent | `openai_client_calls_the_gateway_with_an_access_token`, `caller_without_gateway_invoke_is_refused`, `cli_issues_a_card_scoped_key_and_writes_a_provider_credential` |
 | `gateway_jev` | `gateway_jev/reviewer.yaml`, after the `jev/jev-latest` deployment; its `reply-quality` Verifier judges with `jev-judge-prompt.yaml` | `native_systemone_answers_relay_intact`, `invalid_jev_questions_are_refused_before_jev`, `chat_completions_pass_typed_jev_requests_through`, `jev_refusals_map_to_stable_errors`, `jev_judge_passes_a_helpful_polite_reply`, `jev_judge_fails_an_unhelpful_rude_reply`, `jev_judge_judges_a_reply_with_quotes_and_newlines`, `jev_judge_refusal_is_a_typed_error_without_retry` |
 | `gateway_admin` | no Cards | `cli_written_credential_reads_back_through_the_gateway`, `deployment_round_trips`, `deployment_without_capabilities_is_refused`, `credential_in_use_cannot_be_deleted`, `deleting_a_credential_twice_succeeds`, `capture_policy_round_trips`, `gateway_reader_cannot_delete_a_deployment` |
 | `operator_connections` | no Cards | `admin_manages_redacted_connections`, `writer_is_refused`, `reader_cannot_disable_a_connection`, `other_tenant_sees_nothing` |
@@ -38,20 +38,6 @@ A journey that exercises a language's own surface (the installed `wyrd`
 executable, Python framework integrations and async iterators, OTel log and
 metric signals, Arrow conversions) lives outside these story files and is
 not mirrored.
-
-`workflow_loading/` Cards live in the `workflow-loading` space and are
-derived from `examples/workflows/code-review`. Their Prompts send the
-example's Chat messages to the built-in `mock` provider, which answers with
-the rendered user message, so a run's outputs show which Prompt body ran.
-
-| Directory | What it is | What the journeys prove with it |
-|---|---|---|
-| `team/` | `security-reviewer` and `correctness-reviewer` Agents with their Prompts (`registered ... review`), registered first | The registered Cards that other fixtures reference |
-| `team-v2/` | `security-reviewer@2.0.0`, whose Prompt answers `v2 security review` | A newer version never floats into a pinned Workflow |
-| `mixed/` | Workflow `code-review`: security and correctness are registry refs, the final reviewer is a local file | Authored refs resolve through the registry; this file is applied, reloaded, and run |
-| `shadowed/workflow.yaml` | Workflow `shadowed-review`: a local `security-reviewer@1.0.0` plus a step referencing the registered `security-reviewer@1.0.0` | A local sibling never satisfies a registry ref with the same identity |
-| `shadowed/local-workflow.yaml` | Workflow `local-review`: the same directory's three local Agents only | A wholly local Workflow loads and runs with no server |
-| `retired/` | Workflow `retired-review`, whose local security Agent references Prompt `retired-prompt@1.0.0`, which the journey registers and then deletes | A deleted registry Card is refused |
 
 Refusals load one deliberately broken Card from `invalid/`:
 

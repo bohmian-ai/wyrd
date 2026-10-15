@@ -208,10 +208,15 @@ test("judge call is attributed to the run and card", async ({ server, state }) =
   const calls = (
     await (
       await Bifrost.connect()
-    ).sql("SELECT caller_principal_id, card_uid FROM vala.gateway.calls WHERE run_id = $1", [run.runId])
+    ).sql("SELECT sub_principal_id, act_principal_id, card_uid FROM vala.gateway.calls WHERE run_id = $1", [
+      run.runId,
+    ])
   ).toArrow();
   const issued = await cli.issueKey({ kind: "Service", name: "assistant", version: "1.0.0", space: "default" });
-  expect(columnValues(calls.getChild("caller_principal_id"))).toEqual([issued.principal_id]);
+  expect(columnValues(calls.getChild("sub_principal_id"))).toEqual([issued.principal_id]);
+  const [actor] = columnValues(calls.getChild("act_principal_id"));
+  expect(actor).not.toBeNull();
+  expect(actor).not.toEqual(issued.principal_id);
   expect(columnValues(calls.getChild("card_uid"))).toEqual([judgment.subject.uid]);
 });
 

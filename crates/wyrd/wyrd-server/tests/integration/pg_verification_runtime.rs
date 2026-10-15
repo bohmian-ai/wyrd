@@ -3047,8 +3047,10 @@ struct TenantSpan {
     parent_span_id: String,
     /// Span name.
     name: String,
-    /// Principal Scribe stamped on the row.
-    principal_id: String,
+    /// Subject Scribe stamped on the row.
+    sub_principal_id: String,
+    /// Actor Scribe stamped on the row; the subject for a direct request.
+    act_principal_id: String,
     /// Attribute keys the tenant copy kept.
     attributes: Vec<String>,
 }
@@ -3144,7 +3146,7 @@ async fn tenant_spans(
     let mut spans: Vec<TenantSpan> = server
         .retained_span_records(
             tenant,
-            "encode(span_id, 'hex'), encode(parent_span_id, 'hex'), name, principal_id, attributes",
+            "encode(span_id, 'hex'), encode(parent_span_id, 'hex'), name, sub_principal_id, act_principal_id, attributes",
             &format!("trace_id = X'{trace}'"),
         )
         .await
@@ -3155,9 +3157,10 @@ async fn tenant_spans(
                 Some(span_id),
                 Some(parent_span_id),
                 Some(name),
-                Some(principal_id),
+                Some(sub_principal_id),
+                Some(act_principal_id),
                 attributes,
-            ] = <[Option<String>; 5]>::try_from(row).expect("five projected columns")
+            ] = <[Option<String>; 6]>::try_from(row).expect("six projected columns")
             else {
                 panic!("a tenant span row is missing a column");
             };
@@ -3171,7 +3174,8 @@ async fn tenant_spans(
                 span_id,
                 parent_span_id,
                 name,
-                principal_id,
+                sub_principal_id,
+                act_principal_id,
                 attributes,
             }
         })
@@ -3225,7 +3229,8 @@ fn assert_tenant_copy(
                     && exported.name == span.name),
             "the tenant copy keeps the operator's ids and parent: {span:#?}"
         );
-        assert_eq!(span.principal_id, principal.to_string(), "{span:#?}");
+        assert_eq!(span.sub_principal_id, principal.to_string(), "{span:#?}");
+        assert_eq!(span.act_principal_id, principal.to_string(), "{span:#?}");
         for key in &span.attributes {
             assert!(
                 key.starts_with("wyrd.")
@@ -3343,7 +3348,8 @@ async fn operator_rejected_requests_still_reach_a_continuing_tenant() {
     assert!(
         tenant_copy.iter().any(|span| span.name == "request"
             && span.parent_span_id == "00f067aa0ba902b7"
-            && span.principal_id == principal.to_string()),
+            && span.sub_principal_id == principal.to_string()
+            && span.act_principal_id == principal.to_string()),
         "the sampled caller still receives its tenant copy: {tenant_copy:#?}"
     );
     assert_eq!(tenant_spans(&server, tenant, unsampled).await, Vec::new());

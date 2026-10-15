@@ -125,10 +125,18 @@ impl CorrelationPolicy {
     /// are server-built content there rather than stamped correlation.
     #[must_use]
     pub fn reserves(self, name: &str) -> bool {
-        name.starts_with(RESERVED_PREFIX)
-            || self
-                .managed_columns()
-                .any(|column| column.field.name == name)
+        name.starts_with(RESERVED_PREFIX) || self.stamps(name)
+    }
+
+    /// Report whether a table under this policy stamps the managed column
+    /// `name`, so a row's own value of it is replaced rather than kept.
+    ///
+    /// A `None` table stamps only the ingestion time; its identity columns,
+    /// such as the audit log's subject/actor pair, are content.
+    #[must_use]
+    pub fn stamps(self, name: &str) -> bool {
+        self.managed_columns()
+            .any(|column| column.field.name == name)
     }
 }
 
@@ -244,6 +252,21 @@ mod tests {
     fn none_policy_appends_only_the_ingestion_time() {
         let fields = ensure_managed_columns(vec![], CorrelationPolicy::None);
         assert_eq!(field_names(&fields), vec![WYRD_INGESTED_AT]);
+    }
+
+    /// A `None` table keeps its own subject/actor pair as content and stamps
+    /// only the ingestion time; an observation table stamps both.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either policy stamps a different set of columns.
+    #[test]
+    fn none_policy_keeps_its_own_identity_columns() {
+        for name in [SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID, CARD_UID, RUN_ID] {
+            assert!(!CorrelationPolicy::None.stamps(name), "{name}");
+            assert!(CorrelationPolicy::Observation.stamps(name), "{name}");
+        }
+        assert!(CorrelationPolicy::None.stamps(WYRD_INGESTED_AT));
     }
 
     /// Caller-declared fields remain ahead of every server-managed field.

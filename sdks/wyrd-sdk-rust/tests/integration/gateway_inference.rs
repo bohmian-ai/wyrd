@@ -386,18 +386,20 @@ struct CallId {
     call_id: String,
 }
 
-/// One `vala.gateway.calls` row's requesting principal and attribution.
+/// One `vala.gateway.calls` row's subject/actor pair and attribution.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
 struct CallAttribution {
+    /// The principal the call was for.
+    sub_principal_id: String,
     /// The principal that made the call.
-    caller_principal_id: String,
+    act_principal_id: String,
     /// The application Run the call is attributed to.
     run_id: Option<String>,
     /// The Card UID the call is attributed to.
     card_uid: Option<String>,
 }
 
-/// Every call records its principal plus whichever of `wyrd-run-id` and
+/// Every direct call records its caller as both subject and actor plus whichever of `wyrd-run-id` and
 /// `wyrd-card-uid` it carried: neither, the Card alone, the Run alone, or
 /// both, each absent one as null. The caller holds `ask-agent`'s own
 /// card-scoped key, whose scope admits that Card.
@@ -447,14 +449,15 @@ async fn gateway_call_records_whichever_attribution_it_carries() {
         .await
         .expect("Bifrost connects")
         .sql_as(
-            "SELECT caller_principal_id, run_id, card_uid FROM vala.gateway.calls",
+            "SELECT sub_principal_id, act_principal_id, run_id, card_uid FROM vala.gateway.calls",
             &[],
         )
         .await
         .expect("calls read back");
     calls.sort();
     let call = |run_id: Option<&str>, card_uid: Option<&str>| CallAttribution {
-        caller_principal_id: id.to_string(),
+        sub_principal_id: id.to_string(),
+        act_principal_id: id.to_string(),
         run_id: run_id.map(str::to_owned),
         card_uid: card_uid.map(str::to_owned),
     };

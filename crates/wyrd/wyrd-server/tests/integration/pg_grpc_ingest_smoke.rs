@@ -864,7 +864,7 @@ fn verification_result_ipc(card_uid: &str) -> Vec<u8> {
     let columns: Vec<ArrayRef> = fields
         .iter()
         .map(|field| match (field.name().as_str(), field.data_type()) {
-            ("result_id" | "subject_card_uid", _) => {
+            ("result_id" | "verifier_card_uid", _) => {
                 Arc::new(StringArray::from(vec![uuid::Uuid::now_v7().to_string()])) as ArrayRef
             }
             ("implementation", _) => Arc::new(StringArray::from(vec!["drift"])),

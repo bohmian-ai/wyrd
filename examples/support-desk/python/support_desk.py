@@ -70,7 +70,7 @@ class Served:
 class VerdictCount(BaseModel):
     """One verdict count row."""
 
-    card_uid: str
+    verifier_card_uid: str
     verdict: str
     n: int
 
@@ -152,14 +152,14 @@ def wait_for_verdicts(client: WyrdClient, desk: Desk, timeout: float) -> dict[st
     deadline = time.monotonic() + timeout
     while True:
         rows = bifrost.sql(
-            "SELECT card_uid, verdict, COUNT(*) AS n FROM vala.verification.results "
-            "WHERE subject_card_uid = $1 GROUP BY card_uid, verdict",
+            "SELECT verifier_card_uid, verdict, COUNT(*) AS n FROM vala.verification.results "
+            "WHERE card_uid = $1 GROUP BY verifier_card_uid, verdict",
             [desk.uid("support-agent")],
             model=VerdictCount,
         )
         verdicts: dict[str, tuple[int, int]] = {}
         for row in rows:
-            if name := names.get(row.card_uid):
+            if name := names.get(row.verifier_card_uid):
                 passed, failed = verdicts.get(name, (0, 0))
                 verdicts[name] = (
                     (passed + row.n, failed)

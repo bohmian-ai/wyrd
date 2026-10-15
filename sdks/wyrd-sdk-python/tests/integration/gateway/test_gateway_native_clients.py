@@ -130,10 +130,10 @@ def test_anthropic_calls_are_recorded_with_their_usage(
     rows = calls(
         server,
         "ingress_dialect = 'anthropic_messages'",
-        "caller_principal_id, usage, streaming, outcome",
+        "sub_principal_id, usage, streaming, outcome",
     )
 
-    assert len({row["caller_principal_id"] for row in rows} - {None}) == 1
+    assert len({row["sub_principal_id"] for row in rows} - {None}) == 1
     assert sorted(row["streaming"] for row in rows) == [False, True]
     assert {row["outcome"] for row in rows} == {"succeeded"}
     assert usage(rows) == {("input_tokens", "5"), ("output_tokens", "3")}
@@ -198,10 +198,10 @@ def test_gemini_calls_are_recorded_with_their_usage(
     rows = calls(
         server,
         "ingress_dialect = 'gemini_generate_content'",
-        "caller_principal_id, usage, streaming, outcome",
+        "sub_principal_id, usage, streaming, outcome",
     )
 
-    assert len({row["caller_principal_id"] for row in rows} - {None}) == 1
+    assert len({row["sub_principal_id"] for row in rows} - {None}) == 1
     assert sorted(row["streaming"] for row in rows) == [False, True]
     assert {row["outcome"] for row in rows} == {"succeeded"}
     assert usage(rows) == {("input_tokens", "7"), ("output_tokens", "2")}

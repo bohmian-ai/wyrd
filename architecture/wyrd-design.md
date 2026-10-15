@@ -1645,7 +1645,7 @@ Exact field schema lives in OpenAPI.
 
 | Implementation | Template fields |
 |---|---|
-| any | `dispatch_id`, `run_id`, `result_id`, `binding_id`, `verifier_ref`, `verifier_uid`, `subject_ref`, `subject_uid`, `verdict`, `completed_at`, `summary` |
+| any | `dispatch_id`, `run_id`, `result_id`, `binding_id`, `verifier_ref`, `verifier_card_uid`, `subject_ref`, `subject_uid`, `verdict`, `completed_at`, `summary` |
 | `drift` | `drift.drifted_features`, `drift.total_features` |
 | `eval` | `eval.passed_tasks`, `eval.failed_tasks`, `eval.total_tasks`, `eval.pass_rate_percent` (rounded down; `0` with no tasks) |
 

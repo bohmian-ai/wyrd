@@ -474,7 +474,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         )
         .into());
     }
-    for column in ["binding_id", "verifier_uid", "result_id"] {
+    for column in ["binding_id", "verifier_card_uid", "result_id"] {
         if query_texts(
             oracle,
             tenant,

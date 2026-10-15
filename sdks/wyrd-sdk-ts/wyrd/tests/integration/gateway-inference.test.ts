@@ -308,7 +308,7 @@ test("gateway call records a lone run or card", async ({ server, ask }) => {
   const calls = (
     await (
       await Bifrost.connect()
-    ).sql("SELECT run_id, card_uid FROM vala.gateway.calls WHERE caller_principal_id = $1 ORDER BY run_id", [
+    ).sql("SELECT run_id, card_uid FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY run_id", [
       issued.principal_id,
     ])
   ).toArrow();

@@ -2605,7 +2605,7 @@ async fn direct_task_judgment_records_one_correlated_result() -> Result<(), Serv
         ("execution_status", Some("completed".to_owned())),
         ("verdict", Some("failed".to_owned())),
         ("verifier_version", Some("1.0.0".to_owned())),
-        ("subject_card_uid", subject),
+        ("card_uid", subject),
         ("owner_card_uid", None),
         ("binding_id", None),
         ("trigger_identity", None),
@@ -2659,7 +2659,7 @@ async fn direct_task_judgment_records_one_correlated_result() -> Result<(), Serv
 /// captures call metadata, and the judge call is attributed from the run's context: the captured gateway call
 /// carries the observed subject Card as `card_uid` and the observation's
 /// application Run as `run_id`, and the run's result joins its judge call on
-/// `subject_card_uid` = `card_uid`.
+/// `card_uid`.
 ///
 /// # Errors
 /// Returns server, registration, SDK lifetime, storage, runtime, or query
@@ -2759,7 +2759,7 @@ async fn observation_judge_call_records_card_and_run_and_joins_its_result()
             tenant,
             format!(
                 "SELECT c.run_id FROM vala.verification.results r \
-                   JOIN vala.gateway.calls c ON c.card_uid = r.subject_card_uid \
+                   JOIN vala.gateway.calls c ON c.card_uid = r.card_uid \
                   WHERE r.result_id = '{result}'"
             ),
         )

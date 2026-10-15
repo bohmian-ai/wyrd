@@ -83,15 +83,16 @@ def test_judge_call_is_attributed_to_the_run_and_card(
     wyrd_server.flush_bifrost()
 
     calls = bifrost.sql(
-        "SELECT caller_principal_id, card_uid FROM vala.gateway.calls WHERE run_id = $1",
+        "SELECT sub_principal_id, act_principal_id, card_uid FROM vala.gateway.calls "
+        "WHERE run_id = $1",
         [run.run_id],
     ).to_arrow()
     principal = cli.issue_key(
         kind="Service", name="assistant", version="1.0.0", space="default"
     ).principal_id
-    assert calls.to_pylist() == [
-        {"caller_principal_id": principal, "card_uid": str(judgment.subject.uid)}
-    ]
+    [call] = calls.to_pylist()
+    assert (call["sub_principal_id"], call["card_uid"]) == (principal, str(judgment.subject.uid))
+    assert call["act_principal_id"] not in (None, principal)
 
 
 def test_traced_verify_joins_the_callers_trace(

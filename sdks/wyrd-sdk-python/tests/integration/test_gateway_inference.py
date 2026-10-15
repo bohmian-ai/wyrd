@@ -126,7 +126,7 @@ def test_gateway_call_records_a_lone_run_or_card(server: WyrdTestServer, admin: 
 
     server.flush_bifrost()
     calls = Bifrost(client=admin).sql(
-        "SELECT run_id, card_uid FROM vala.gateway.calls WHERE caller_principal_id = $1 ORDER BY run_id",
+        "SELECT run_id, card_uid FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY run_id",
         [str(issued.principal_id)],
     )
     assert calls.to_arrow().to_pylist() == [

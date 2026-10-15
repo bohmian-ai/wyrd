@@ -77,8 +77,9 @@ pub(crate) fn decode<T: DeserializeOwned>(
 /// secret write from here. Reads, deployments, policies, and invocation stay.
 #[pyclass(module = "wyrd._wyrd.gateway", name = "Gateway")]
 pub struct PyGateway {
-    /// Shared Rust administration handle every method delegates to.
-    inner: wyrd_client::Gateway,
+    /// The one native connection every call delegates to, connected on the
+    /// first server operation (or by `connect`).
+    inner: crate::client::LazyConnection<wyrd_client::Gateway>,
 }
 
 impl PyGateway {
@@ -121,28 +122,63 @@ impl PyGateway {
     }
 }
 
+impl PyGateway {
+    /// Return the connected native handle, connecting it on first use.
+    ///
+    /// # Errors
+    /// Returns the stable configuration, credential, or refused-exchange
+    /// error of the shared Rust `connect`.
+    fn handle(&self, py: Python<'_>) -> WyrdPyResult<&wyrd_client::Gateway> {
+        Ok(self.inner.get(py, |client| async move {
+            match client {
+                Some(client) => wyrd_client::Gateway::connect_with(&client).await,
+                None => wyrd_client::Gateway::connect().await,
+            }
+        })?)
+    }
+}
+
 #[pymethods]
 impl PyGateway {
-    /// Builds a gateway administration handle acting as `client`.
+    /// Build a gateway administration handle acting as `client`, performing no IO.
     ///
-    /// Omitted, the client resolves from the ambient chain. No network call
-    /// happens here.
+    /// The client, or the ambient chain when `client` is omitted, resolves
+    /// and connects once on the first server operation, exactly as `connect`
+    /// does; until then nothing is read from the environment or the network.
+    ///
+    /// # Arguments
+    /// * `client` - The `WyrdClient` every call is sent as, or `None` for the
+    ///   ambient chain.
+    #[new]
+    #[pyo3(signature = (client=None))]
+    fn __new__(client: Option<PyRef<'_, crate::client::PyWyrdClient>>) -> Self {
+        Self {
+            inner: crate::client::LazyConnection::new(client.as_deref()),
+        }
+    }
+
+    /// Connect a gateway administration handle acting as `client` now.
+    ///
+    /// Resolves the client (the ambient chain when omitted) and completes any
+    /// credential exchange it requires before returning; a supplied bearer
+    /// or fresh cached token is reused without a request.
     ///
     /// # Arguments
     /// * `client` - The `WyrdClient` every call is sent as, or `None` for the
     ///   ambient chain.
     ///
     /// # Errors
-    ///
-    /// Raises `WyrdError` with `WYRD_CLIENT_401_NO_CREDENTIALS` when no
-    /// credential resolves, or a transport error when the client cannot build.
-    #[new]
+    /// Raises `WyrdError` with the stable configuration, credential, or
+    /// refused-exchange error.
+    #[staticmethod]
     #[pyo3(signature = (client=None))]
-    fn __new__(client: Option<PyRef<'_, crate::client::PyWyrdClient>>) -> WyrdPyResult<Self> {
-        let client = crate::client::PyWyrdClient::resolve(client.as_deref())?;
-        Ok(Self {
-            inner: wyrd_client::Gateway::with_client(client),
-        })
+    fn connect(
+        py: Python<'_>,
+        client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
+    ) -> WyrdPyResult<Self> {
+        let handle = Self::__new__(client);
+        handle.handle(py)?;
+        Ok(handle)
     }
 
     /// Reads one redacted provider credential.
@@ -153,7 +189,7 @@ impl PyGateway {
     /// not-found, or availability error.
     fn credential(&self, py: Python<'_>, name: &str) -> WyrdPyResult<Py<PyAny>> {
         let name = Self::credential_name(name)?;
-        Self::run(py, self.inner.credential(&name))
+        Self::run(py, self.handle(py)?.credential(&name))
     }
 
     /// Lists redacted provider credentials ordered by name.
@@ -162,7 +198,7 @@ impl PyGateway {
     ///
     /// Raises `WyrdError` for the server's permission or availability error.
     fn credentials(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Self::run(py, self.inner.credentials())
+        Self::run(py, self.handle(py)?.credentials())
     }
 
     /// Creates or replaces a provider deployment.
@@ -177,7 +213,7 @@ impl PyGateway {
         deployment: &Bound<'_, PyAny>,
     ) -> WyrdPyResult<Py<PyAny>> {
         let deployment = decode("deployment", deployment)?;
-        Self::run(py, self.inner.put_deployment(&deployment))
+        Self::run(py, self.handle(py)?.put_deployment(&deployment))
     }
 
     /// Reads one provider deployment.
@@ -188,7 +224,7 @@ impl PyGateway {
     /// not-found, or availability error.
     fn deployment(&self, py: Python<'_>, name: &str) -> WyrdPyResult<Py<PyAny>> {
         let name = Self::deployment_name(name)?;
-        Self::run(py, self.inner.deployment(&name))
+        Self::run(py, self.handle(py)?.deployment(&name))
     }
 
     /// Lists provider deployments ordered by name.
@@ -197,7 +233,7 @@ impl PyGateway {
     ///
     /// Raises `WyrdError` for the server's permission or availability error.
     fn deployments(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Self::run(py, self.inner.deployments())
+        Self::run(py, self.handle(py)?.deployments())
     }
 
     /// Deletes a provider deployment; an absent name succeeds.
@@ -208,7 +244,7 @@ impl PyGateway {
     /// availability error.
     fn delete_deployment(&self, py: Python<'_>, name: &str) -> WyrdPyResult<Py<PyAny>> {
         let name = Self::deployment_name(name)?;
-        Self::run(py, self.inner.delete_deployment(&name))
+        Self::run(py, self.handle(py)?.delete_deployment(&name))
     }
 
     /// Replaces the tenant fallback policy.
@@ -223,7 +259,7 @@ impl PyGateway {
         policy: &Bound<'_, PyAny>,
     ) -> WyrdPyResult<Py<PyAny>> {
         let policy = decode("policy", policy)?;
-        Self::run(py, self.inner.put_fallback_policy(&policy))
+        Self::run(py, self.handle(py)?.put_fallback_policy(&policy))
     }
 
     /// Reads the tenant fallback policy.
@@ -232,7 +268,7 @@ impl PyGateway {
     ///
     /// Raises `WyrdError` for the server's permission or availability error.
     fn fallback_policy(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Self::run(py, self.inner.fallback_policy())
+        Self::run(py, self.handle(py)?.fallback_policy())
     }
 
     /// Restores the default fallback policy.
@@ -241,7 +277,7 @@ impl PyGateway {
     ///
     /// Raises `WyrdError` for the server's permission or availability error.
     fn delete_fallback_policy(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Self::run(py, self.inner.delete_fallback_policy())
+        Self::run(py, self.handle(py)?.delete_fallback_policy())
     }
 
     /// Replaces the tenant governance policy.
@@ -257,7 +293,7 @@ impl PyGateway {
         policy: &Bound<'_, PyAny>,
     ) -> WyrdPyResult<Py<PyAny>> {
         let policy = decode("policy", policy)?;
-        Self::run(py, self.inner.put_governance_policy(&policy))
+        Self::run(py, self.handle(py)?.put_governance_policy(&policy))
     }
 
     /// Reads the tenant governance policy.
@@ -266,7 +302,7 @@ impl PyGateway {
     ///
     /// Raises `WyrdError` for the server's permission or availability error.
     fn governance_policy(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Self::run(py, self.inner.governance_policy())
+        Self::run(py, self.handle(py)?.governance_policy())
     }
 
     /// Restores the default governance policy.
@@ -275,7 +311,7 @@ impl PyGateway {
     ///
     /// Raises `WyrdError` for the server's permission or availability error.
     fn delete_governance_policy(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Self::run(py, self.inner.delete_governance_policy())
+        Self::run(py, self.handle(py)?.delete_governance_policy())
     }
 
     /// Replaces the tenant capture policy and returns its versioned view.
@@ -290,7 +326,7 @@ impl PyGateway {
         policy: &Bound<'_, PyAny>,
     ) -> WyrdPyResult<Py<PyAny>> {
         let policy = decode("policy", policy)?;
-        Self::run(py, self.inner.put_capture_policy(&policy))
+        Self::run(py, self.handle(py)?.put_capture_policy(&policy))
     }
 
     /// Reads the tenant capture policy.
@@ -299,7 +335,7 @@ impl PyGateway {
     ///
     /// Raises `WyrdError` for the server's permission or availability error.
     fn capture_policy(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Self::run(py, self.inner.capture_policy())
+        Self::run(py, self.handle(py)?.capture_policy())
     }
 }
 

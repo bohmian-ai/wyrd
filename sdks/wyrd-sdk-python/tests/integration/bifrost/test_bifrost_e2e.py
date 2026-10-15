@@ -88,7 +88,7 @@ def test_no_resolvable_credential_raises(
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path))
     with pytest.raises(WyrdError) as raised:
-        Bifrost()
+        Bifrost.connect()
     assert raised.value.code == "WYRD_CLIENT_401_NO_CREDENTIALS"
 
 

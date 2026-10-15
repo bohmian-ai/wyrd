@@ -1652,33 +1652,66 @@ impl PyRegistrationReceipt {
 pub struct PyCards {
     /// Shared authenticated registry handle; typed views clone it cheaply so
     /// they reuse the same transport and tenant context.
-    inner: Cards,
+    inner: crate::client::LazyConnection<Cards>,
+}
+
+impl PyCards {
+    /// Return the connected registry handle, connecting it on first use.
+    ///
+    /// # Errors
+    /// Returns the stable configuration, credential, or refused-exchange
+    /// error of the shared Rust `Cards::connect`.
+    fn cards(&self, py: Python<'_>) -> CardPyResult<&Cards> {
+        Ok(self
+            .inner
+            .get(py, |client| async move {
+                match client {
+                    Some(client) => Cards::connect_with(&client).await,
+                    None => Cards::connect().await,
+                }
+            })
+            .map_err(WyrdPyError::from)?)
+    }
 }
 
 #[pymethods]
 impl PyCards {
-    /// Construct a tenant-scoped Card client acting as `client`.
+    /// Build a tenant-scoped Card client acting as `client`, performing no IO.
     ///
-    /// Omitted, the client resolves from the ambient chain exactly as Rust
-    /// `Cards::from_env` does. The handle is cheap to clone and the
-    /// kind-specific properties retain this same connection context. No
-    /// network call or token exchange happens here.
+    /// The client, or the ambient chain when `client` is omitted, resolves
+    /// and connects once on the first server operation, exactly as `connect`
+    /// does. The kind-specific properties share that one connection.
+    ///
+    /// # Arguments
+    /// * `client` - The `WyrdClient` every registry call is sent as, or `None`
+    ///   for the ambient chain.
+    #[new]
+    #[pyo3(signature = (client=None))]
+    fn __new__(client: Option<PyRef<'_, PyWyrdClient>>) -> Self {
+        Self {
+            inner: crate::client::LazyConnection::new(client.as_deref()),
+        }
+    }
+
+    /// Connect a tenant-scoped Card client acting as `client` now.
+    ///
+    /// Resolves the client (the ambient chain when omitted) and completes any
+    /// credential exchange it requires before returning; a supplied bearer
+    /// or fresh cached token is reused without a request.
     ///
     /// # Arguments
     /// * `client` - The `WyrdClient` every registry call is sent as, or `None`
     ///   for the ambient chain.
     ///
     /// # Errors
-    /// Returns a Wyrd error when the ambient configuration, credential, or
-    /// saved-login selection cannot be resolved.
-    #[new]
+    /// Returns the stable configuration, credential, or refused-exchange
+    /// error.
+    #[staticmethod]
     #[pyo3(signature = (client=None))]
-    fn __new__(client: Option<PyRef<'_, PyWyrdClient>>) -> CardPyResult<Self> {
-        PyWyrdClient::resolve(client.as_deref())
-            .map(|client| Self {
-                inner: Cards::with_client(client),
-            })
-            .map_err(WyrdPyError::from)
+    fn connect(py: Python<'_>, client: Option<PyRef<'_, PyWyrdClient>>) -> CardPyResult<Self> {
+        let handle = Self::__new__(client);
+        handle.cards(py)?;
+        Ok(handle)
     }
 
     /// Return the typed view for `DataCard` operations.
@@ -1686,11 +1719,15 @@ impl PyCards {
     /// Use `cards.data.get`, `cards.data.register`, `cards.data.list`,
     /// `cards.data.resolve_latest`, and `cards.data.delete`. The view uses the
     /// parent client's connection and tenant context.
+    ///
+    /// # Errors
+    /// Returns the stable connection error when this handle's first
+    /// connection fails.
     #[getter]
-    fn data(&self) -> PyDataCardRegistry {
-        PyDataCardRegistry {
-            inner: self.inner.clone(),
-        }
+    fn data(&self, py: Python<'_>) -> CardPyResult<PyDataCardRegistry> {
+        Ok(PyDataCardRegistry {
+            inner: self.cards(py)?.clone(),
+        })
     }
 
     /// Return the typed view for `ModelCard` operations.
@@ -1698,11 +1735,15 @@ impl PyCards {
     /// Use `cards.model.get`, `cards.model.register`, `cards.model.list`,
     /// `cards.model.resolve_latest`, and `cards.model.delete`. The view uses
     /// the parent client's connection and tenant context.
+    ///
+    /// # Errors
+    /// Returns the stable connection error when this handle's first
+    /// connection fails.
     #[getter]
-    fn model(&self) -> PyModelCardRegistry {
-        PyModelCardRegistry {
-            inner: self.inner.clone(),
-        }
+    fn model(&self, py: Python<'_>) -> CardPyResult<PyModelCardRegistry> {
+        Ok(PyModelCardRegistry {
+            inner: self.cards(py)?.clone(),
+        })
     }
 
     /// Return the typed view for `PromptCard` operations.
@@ -1710,11 +1751,15 @@ impl PyCards {
     /// Use `cards.prompt.get`, `cards.prompt.register`, `cards.prompt.list`,
     /// `cards.prompt.resolve_latest`, and `cards.prompt.delete`. Prompt cards
     /// have no separate artifact hydration step.
+    ///
+    /// # Errors
+    /// Returns the stable connection error when this handle's first
+    /// connection fails.
     #[getter]
-    fn prompt(&self) -> PyPromptCardRegistry {
-        PyPromptCardRegistry {
-            inner: self.inner.clone(),
-        }
+    fn prompt(&self, py: Python<'_>) -> CardPyResult<PyPromptCardRegistry> {
+        Ok(PyPromptCardRegistry {
+            inner: self.cards(py)?.clone(),
+        })
     }
 
     /// Return the typed view for loading registered Workflows.
@@ -1722,11 +1767,15 @@ impl PyCards {
     /// Use `cards.workflow.load` to read a registered Workflow and its locked
     /// Agent and Prompt closure into a runnable `wyrd.agent.Workflow`. The view
     /// uses the parent client's connection and tenant context.
+    ///
+    /// # Errors
+    /// Returns the stable connection error when this handle's first
+    /// connection fails.
     #[getter]
-    fn workflow(&self) -> PyWorkflowCards {
-        PyWorkflowCards {
-            inner: self.inner.clone(),
-        }
+    fn workflow(&self, py: Python<'_>) -> CardPyResult<PyWorkflowCards> {
+        Ok(PyWorkflowCards {
+            inner: self.cards(py)?.clone(),
+        })
     }
 
     /// Register a caller-owned `DataCard`, `ModelCard`, or `PromptCard`.
@@ -1760,7 +1809,7 @@ impl PyCards {
         version_bump: Option<&Bound<'_, PyAny>>,
         save_args: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<PyRegistrationReceipt> {
-        PythonCardRegistry::new(&self.inner).register(py, card, version_bump, save_args)
+        PythonCardRegistry::new(self.cards(py)?).register(py, card, version_bump, save_args)
     }
 
     /// Register a declarative Card from a local Card file or bundle directory.
@@ -1784,7 +1833,7 @@ impl PyCards {
         py: Python<'_>,
         path: PathBuf,
     ) -> CardPyResult<PyRegistrationReceipt> {
-        crate::trace::block_on(py, self.inner.register_from_path(&path))
+        crate::trace::block_on(py, self.cards(py)?.register_from_path(&path))
             .map(PyRegistrationReceipt::from)
             .map_err(WyrdPyError::from)
     }
@@ -1810,7 +1859,7 @@ impl PyCards {
         let requested = card_ref.0.clone();
         let selector = CardSelector::exact(requested.clone());
         let card =
-            crate::trace::block_on(py, self.inner.get(selector)).map_err(WyrdPyError::from)?;
+            crate::trace::block_on(py, self.cards(py)?.get(selector)).map_err(WyrdPyError::from)?;
         let card_ref = CardRef {
             uid: card.metadata.uid.clone().or(requested.uid),
             ..requested
@@ -1844,7 +1893,7 @@ impl PyCards {
         let kind = kind.map(parse_kind).transpose()?;
         list_registry(
             py,
-            &self.inner,
+            self.cards(py)?,
             kind,
             RegistryListQuery::from_kwargs(kwargs)?,
         )
@@ -1868,7 +1917,7 @@ impl PyCards {
         space: &str,
         name: &str,
     ) -> CardPyResult<CardRefPy> {
-        resolve_latest_registry(py, &self.inner, parse_kind(kind)?, space, name)
+        resolve_latest_registry(py, self.cards(py)?, parse_kind(kind)?, space, name)
     }
 
     /// Delete one registered Card, of any kind, by exact reference.
@@ -1884,7 +1933,7 @@ impl PyCards {
     #[pyo3(signature = (card_ref))]
     fn delete(&self, py: Python<'_>, card_ref: PyRef<'_, CardRefPy>) -> CardPyResult<()> {
         let selector = CardSelector::exact(card_ref.0.clone());
-        crate::trace::block_on(py, self.inner.delete(selector)).map_err(WyrdPyError::from)
+        crate::trace::block_on(py, self.cards(py)?.delete(selector)).map_err(WyrdPyError::from)
     }
 
     /// Download a registered Card's reachable graph as a local bundle.
@@ -1917,7 +1966,7 @@ impl PyCards {
         } else {
             HydrationMode::Complete
         };
-        crate::trace::block_on(py, self.inner.hydrate(selector, &destination, mode))
+        crate::trace::block_on(py, self.cards(py)?.hydrate(selector, &destination, mode))
             .map(PyHydrationSummary::from)
             .map_err(WyrdPyError::from)
     }

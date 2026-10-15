@@ -4,11 +4,15 @@
 //! and [`PyWyrdClient::on_behalf_of`] calls the Rust RFC 8693 exchange. Token
 //! exchange, caching, renewal, and errors stay in the Rust owner.
 
+use std::future::Future;
+use std::sync::{Mutex, OnceLock, PoisonError};
+
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use secrecy::SecretString;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::client_from_options;
+use wyrd_client::transport::trace::with_caller_trace;
 use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::error::WyrdError;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
@@ -36,6 +40,15 @@ impl PyWyrdClient {
         &self.inner
     }
 
+    /// Clone the optional client a handle constructor received, so the handle
+    /// can connect as it later without holding the Python object.
+    ///
+    /// # Arguments
+    /// * `client` - The caller's explicit client, or `None` for the ambient chain.
+    pub(crate) fn native(client: Option<&Self>) -> Option<WyrdClient> {
+        client.map(|client| client.inner.clone())
+    }
+
     /// Resolve the client a server-facing surface acts as.
     ///
     /// Every public Python surface that calls the server takes one optional
@@ -56,6 +69,73 @@ impl PyWyrdClient {
             Some(client) => Ok(client.inner.clone()),
             None => WyrdClient::from_global().map_err(WyrdError::from),
         }
+    }
+}
+
+/// A Python handle's one native connection.
+///
+/// The constructor keeps only the optional client, so constructing a handle
+/// performs no IO. The first server operation runs the shared Rust `connect`
+/// (or `connect_with` for a supplied client) once and every later operation
+/// reuses that connected handle; a failed attempt stores nothing, so the next
+/// operation retries with the same arguments. The eager Python `connect`
+/// factories build this and initialize it immediately, so eager and lazy
+/// handles share one connection path.
+pub(crate) struct LazyConnection<T> {
+    /// The client the caller supplied, used as given; `None` resolves the
+    /// ambient chain inside the shared Rust `connect`.
+    client: Option<WyrdClient>,
+    /// The connected native handle, set once.
+    handle: OnceLock<T>,
+    /// Serializes first connections so concurrent first operations connect
+    /// once; taken only with the GIL released.
+    gate: Mutex<()>,
+}
+
+impl<T: Send + Sync> LazyConnection<T> {
+    /// Retain `client` without resolving or connecting anything.
+    ///
+    /// # Arguments
+    /// * `client` - The caller's explicit client, or `None` for the ambient chain.
+    pub(crate) fn new(client: Option<&PyWyrdClient>) -> Self {
+        Self {
+            client: PyWyrdClient::native(client),
+            handle: OnceLock::new(),
+            gate: Mutex::new(()),
+        }
+    }
+
+    /// Return the connected handle, connecting it with `connect` on first use.
+    ///
+    /// `connect` receives the retained client and runs on the shared runtime
+    /// with the GIL released, under the caller's active trace context.
+    ///
+    /// # Arguments
+    /// * `py` - The attached interpreter, released while connecting.
+    /// * `connect` - The shared Rust connection for this handle kind.
+    ///
+    /// # Errors
+    /// Returns `connect`'s error unchanged; nothing is stored, so a later call
+    /// connects again.
+    pub(crate) fn get<E, F, Fut>(&self, py: Python<'_>, connect: F) -> Result<&T, E>
+    where
+        E: Send,
+        F: FnOnce(Option<WyrdClient>) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
+    {
+        if let Some(handle) = self.handle.get() {
+            return Ok(handle);
+        }
+        let caller = crate::trace::active_trace_context(py);
+        py.detach(|| {
+            let _gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(handle) = self.handle.get() {
+                return Ok(handle);
+            }
+            let handle = wyrd_runtime::runtime()
+                .block_on(with_caller_trace(caller, connect(self.client.clone())))?;
+            Ok(self.handle.get_or_init(|| handle))
+        })
     }
 }
 

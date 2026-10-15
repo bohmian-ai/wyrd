@@ -125,16 +125,35 @@ class Principals:
     """
 
     def __init__(self, client: WyrdClient | None = None) -> None:
-        """Build a handle; no network call happens here.
+        """Build a handle; no IO or credential resolution happens here.
+
+        The first server operation connects exactly as ``connect`` does, once
+        per handle, and raises its errors.
+
+        Args:
+            client: the ``WyrdClient`` to act as, sharing its transport and
+                token cache. Omitted, the ambient client resolves from
+                ``[client]`` in the Wyrd ``config.toml``, then the
+                environment, then the saved ``wyrd auth login``.
+
+        """
+        ...
+    @staticmethod
+    def connect(client: WyrdClient | None = None) -> Principals:
+        """Build a handle and connect it now.
+
+        Resolves the client and completes any credential exchange it needs; a
+        bearer token or fresh cached token makes no request.
 
         Args:
             client: the ``WyrdClient`` to act as. Omitted, the ambient client
-                resolves from ``[client]`` in the Wyrd ``config.toml``, then
-                the environment, then the saved ``wyrd auth login``.
+                resolves as for the constructor.
 
         Raises:
-            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no ambient
-                credential resolves, or a client configuration error.
+            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no credential
+                resolves; ``WYRD_CLIENT_400_CONFIG_INVALID`` for an unreadable
+                ``config.toml``; the server's error for a refused credential
+                exchange.
 
         """
         ...

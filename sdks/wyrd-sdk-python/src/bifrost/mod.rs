@@ -27,6 +27,7 @@ use futures_util::future::{AbortHandle, Abortable};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use wyrd_client::bifrost::Bifrost as NativeBifrost;
+use wyrd_client::bifrost::BifrostOptions;
 use wyrd_client::bifrost::QueryResult;
 use wyrd_client::bifrost::TableConfig;
 use wyrd_spec::error::WyrdError;
@@ -527,22 +528,75 @@ impl PyQueryTerminal {
 /// Python-facing [`NativeBifrost`]: query any authorized table, write to the
 /// active one.
 ///
-/// Construction dials the ingest channel, so it performs IO. Its one identity
-/// argument is an optional `WyrdClient`; omitted, the ambient chain resolves
-/// exactly once.
+/// Construction performs no IO: it retains the optional `WyrdClient`, the
+/// initial write target, and the byte budget, and the first operation
+/// connects through the shared Rust `Bifrost::connect` exactly once. The
+/// `connect` factory connects immediately.
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "Bifrost")]
 pub struct Bifrost {
-    /// The one native client both public Python facades drive.
-    handle: NativeBifrost,
+    /// The one native client both public Python facades drive, connected on
+    /// first use.
+    handle: crate::client::LazyConnection<NativeBifrost>,
+    /// The initial write target the connection binds.
+    table: Option<TableConfig>,
+    /// The handle-wide ingestion byte budget the connection applies.
+    client_byte_limit_bytes: Option<usize>,
+}
+
+impl Bifrost {
+    /// Return the connected native client, connecting it on first use.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` with the stable configuration, credential, refused
+    /// exchange, byte-budget, or ingest-dial error of the shared Rust
+    /// `Bifrost::connect`.
+    fn handle(&self, py: Python<'_>) -> WyrdPyResult<&NativeBifrost> {
+        let options = BifrostOptions {
+            table: self.table.clone(),
+            queue: wyrd_queue::QueueConfig::with_client_byte_limit(self.client_byte_limit_bytes),
+        };
+        self.handle
+            .get(py, |client| async move {
+                match client {
+                    Some(client) => NativeBifrost::connect_with(&client, options).await,
+                    None => NativeBifrost::connect(options).await,
+                }
+            })
+            .map_err(client_error)
+    }
 }
 
 #[pymethods]
 impl Bifrost {
-    /// Connects one client, optionally already bound to a write target.
+    /// Retains one client's arguments without IO, optionally bound to a write
+    /// target.
     ///
     /// The supplied `WyrdClient`, plain or delegated, is used as is; omitted,
-    /// the ambient chain resolves once. `client_byte_limit_bytes` overrides
-    /// the handle-wide ingestion byte budget (256 MiB by default).
+    /// the ambient chain resolves on the first operation.
+    /// `client_byte_limit_bytes` overrides the handle-wide ingestion byte
+    /// budget (256 MiB by default).
+    ///
+    /// # Arguments
+    /// * `table` - The active write target, or `None` for a query-only client.
+    /// * `client` - The `WyrdClient` every call is sent as, or `None` for the
+    ///   ambient chain.
+    /// * `client_byte_limit_bytes` - The handle-wide ingestion byte budget.
+    #[new]
+    #[pyo3(signature = (table=None, client=None, client_byte_limit_bytes=None))]
+    fn __new__(
+        table: Option<PyTableConfig>,
+        client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
+        client_byte_limit_bytes: Option<usize>,
+    ) -> Self {
+        Self {
+            handle: crate::client::LazyConnection::new(client.as_deref()),
+            table: table.map(|table| table.inner),
+            client_byte_limit_bytes,
+        }
+    }
+
+    /// Connects one client now, optionally already bound to a write target.
     ///
     /// # Arguments
     /// * `table` - The active write target, or `None` for a query-only client.
@@ -554,28 +608,35 @@ impl Bifrost {
     ///
     /// Raises `WyrdError` carrying `WYRD_CLIENT_400_CONFIG_INVALID` when the
     /// byte budget cannot seal one message, `WYRD_CLIENT_401_NO_CREDENTIALS`
-    /// when nothing in the chain resolves a credential, and the catalog code
-    /// for a failure to dial the ingest channel.
-    #[new]
+    /// when nothing in the chain resolves a credential, the server's error for
+    /// a refused credential exchange, and the catalog code for a failure to
+    /// dial the ingest channel.
+    #[staticmethod]
     #[pyo3(signature = (table=None, client=None, client_byte_limit_bytes=None))]
-    fn __new__(
+    fn connect(
         py: Python<'_>,
         table: Option<PyTableConfig>,
         client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
         client_byte_limit_bytes: Option<usize>,
     ) -> WyrdPyResult<Self> {
-        let client = crate::client::PyWyrdClient::resolve(client.as_deref())?;
-        let table = table.map(|table| table.inner);
-        let handle = crate::trace::block_on(
-            py,
-            NativeBifrost::connect_with_config(
-                &client,
-                table,
-                wyrd_queue::QueueConfig::with_client_byte_limit(client_byte_limit_bytes),
-            ),
-        )
-        .map_err(client_error)?;
-        Ok(Self { handle })
+        let bifrost = Self::__new__(table, client, client_byte_limit_bytes);
+        bifrost.handle(py)?;
+        Ok(bifrost)
+    }
+
+    /// Lists the compact entries of every table the caller may read.
+    ///
+    /// Each entry is the server's `BifrostTableEntry` as a dict, without
+    /// schema; `describe_table` fetches one table's schema on demand.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` for connection, authorization, or transport
+    /// failures.
+    fn list_tables(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        let tables =
+            crate::trace::block_on(py, self.handle(py)?.list_tables()).map_err(client_error)?;
+        to_python_json(py, serde_json::to_value(tables))
     }
 
     /// Creates the active table, answering `"created"` or `"already_exists"`.
@@ -586,15 +647,21 @@ impl Bifrost {
     /// exists with different columns, or for transport and authorization
     /// failures.
     fn register(&self, py: Python<'_>) -> WyrdPyResult<&'static str> {
-        let outcome = crate::trace::block_on(py, self.handle.register()).map_err(client_error)?;
+        let outcome =
+            crate::trace::block_on(py, self.handle(py)?.register()).map_err(client_error)?;
         Ok(wyrd_client::bifrost::register_outcome_name(outcome))
     }
 
     /// Binds `table` as the write target, returning the previous binding.
-    fn use_table(&self, table: PyTableConfig) -> Option<PyTableConfig> {
-        self.handle
+    fn use_table(
+        &self,
+        py: Python<'_>,
+        table: PyTableConfig,
+    ) -> WyrdPyResult<Option<PyTableConfig>> {
+        Ok(self
+            .handle(py)?
             .use_table(table.inner)
-            .map(|inner| PyTableConfig { inner })
+            .map(|inner| PyTableConfig { inner }))
     }
 
     /// Binds an already-registered table by name, describing it first.
@@ -603,14 +670,18 @@ impl Bifrost {
     ///
     /// As [`PyTableConfig::describe`].
     fn use_table_by_name(&self, py: Python<'_>, table: &str) -> WyrdPyResult<()> {
-        crate::trace::block_on(py, self.handle.use_table_by_name(table)).map_err(client_error)?;
+        crate::trace::block_on(py, self.handle(py)?.use_table_by_name(table))
+            .map_err(client_error)?;
         Ok(())
     }
 
     /// The active write binding, if any.
     #[getter]
-    fn table(&self) -> Option<PyTableConfig> {
-        self.handle.table().map(|inner| PyTableConfig { inner })
+    fn table(&self, py: Python<'_>) -> WyrdPyResult<Option<PyTableConfig>> {
+        Ok(self
+            .handle(py)?
+            .table()
+            .map(|inner| PyTableConfig { inner }))
     }
 
     /// Enqueues one JSON row into the active table.
@@ -627,12 +698,14 @@ impl Bifrost {
     #[pyo3(signature = (row, card_uid=None, run_id=None))]
     fn insert(
         &self,
+        py: Python<'_>,
         row: &str,
         card_uid: Option<&str>,
         run_id: Option<String>,
     ) -> WyrdPyResult<()> {
         let correlation = correlation(card_uid, run_id)?;
-        crate::trace::traced(|| self.handle.insert(row.as_bytes().to_vec(), correlation))
+        let bifrost = self.handle(py)?;
+        crate::trace::traced(|| bifrost.insert(row.as_bytes().to_vec(), correlation))
             .map_err(client_error)?;
         Ok(())
     }
@@ -654,7 +727,8 @@ impl Bifrost {
     #[pyo3(signature = (table, batch_ipc))]
     fn write_batch(&self, py: Python<'_>, table: &str, batch_ipc: &[u8]) -> WyrdPyResult<()> {
         let batch = decode_batch_ipc(batch_ipc)?;
-        crate::trace::block_on(py, self.handle.write_batch(table, &batch)).map_err(client_error)?;
+        crate::trace::block_on(py, self.handle(py)?.write_batch(table, &batch))
+            .map_err(client_error)?;
         Ok(())
     }
 
@@ -665,7 +739,7 @@ impl Bifrost {
     /// Raises `WyrdError` carrying the first producer or sink failure after
     /// every producer has been attempted.
     fn flush(&self, py: Python<'_>) -> WyrdPyResult<()> {
-        crate::trace::block_on(py, self.handle.flush()).map_err(client_error)?;
+        crate::trace::block_on(py, self.handle(py)?.flush()).map_err(client_error)?;
         Ok(())
     }
 
@@ -675,7 +749,7 @@ impl Bifrost {
     ///
     /// As [`Bifrost::flush`].
     fn shutdown(&self, py: Python<'_>) -> WyrdPyResult<()> {
-        crate::trace::block_on(py, self.handle.shutdown()).map_err(client_error)?;
+        crate::trace::block_on(py, self.handle(py)?.shutdown()).map_err(client_error)?;
         Ok(())
     }
 
@@ -698,8 +772,8 @@ impl Bifrost {
         params: Option<Vec<Bound<'_, PyAny>>>,
     ) -> WyrdPyResult<PyQueryResult> {
         let params = query_params(params)?;
-        let inner =
-            crate::trace::block_on(py, self.handle.sql(query, &params)).map_err(client_error)?;
+        let inner = crate::trace::block_on(py, self.handle(py)?.sql(query, &params))
+            .map_err(client_error)?;
         Ok(PyQueryResult { inner })
     }
 
@@ -731,7 +805,7 @@ impl Bifrost {
             deadline_ms,
         };
         let stream =
-            crate::trace::block_on(py, self.handle.query(&request)).map_err(client_error)?;
+            crate::trace::block_on(py, self.handle(py)?.query(&request)).map_err(client_error)?;
         let request_id = stream.request_id().as_str().to_owned();
         Ok(PyBifrostQueryStream {
             request_id,
@@ -748,7 +822,8 @@ impl Bifrost {
     ///
     /// Raises `WyrdError` for transport or server failures.
     fn running(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        let queries = crate::trace::block_on(py, self.handle.running()).map_err(client_error)?;
+        let queries =
+            crate::trace::block_on(py, self.handle(py)?.running()).map_err(client_error)?;
         to_python_json(py, serde_json::to_value(queries))
     }
 
@@ -759,8 +834,8 @@ impl Bifrost {
     /// Raises `WyrdError` for malformed IDs, transport, or server failures.
     fn status(&self, py: Python<'_>, request_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let request_id = parse_query_request_id(request_id).map_err(client_error)?;
-        let summary =
-            crate::trace::block_on(py, self.handle.status(&request_id)).map_err(client_error)?;
+        let summary = crate::trace::block_on(py, self.handle(py)?.status(&request_id))
+            .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(summary))
     }
 
@@ -771,8 +846,8 @@ impl Bifrost {
     /// As [`Bifrost::status`].
     fn cancel(&self, py: Python<'_>, request_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let request_id = parse_query_request_id(request_id).map_err(client_error)?;
-        let response =
-            crate::trace::block_on(py, self.handle.cancel(&request_id)).map_err(client_error)?;
+        let response = crate::trace::block_on(py, self.handle(py)?.cancel(&request_id))
+            .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(response))
     }
 
@@ -788,7 +863,7 @@ impl Bifrost {
     /// `trace_id`, and `WyrdError` for query, transport, or decode failures.
     fn trace_timeline(&self, py: Python<'_>, trace_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let trace_id = TraceId::from_hex(trace_id).map_err(WyrdPyError::from)?;
-        let spans = crate::trace::block_on(py, self.handle.trace_timeline(trace_id))
+        let spans = crate::trace::block_on(py, self.handle(py)?.trace_timeline(trace_id))
             .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(spans))
     }
@@ -804,8 +879,9 @@ impl Bifrost {
         namespace: &str,
         name: &str,
     ) -> WyrdPyResult<Py<PyAny>> {
-        let description = crate::trace::block_on(py, self.handle.describe_table(namespace, name))
-            .map_err(client_error)?;
+        let description =
+            crate::trace::block_on(py, self.handle(py)?.describe_table(namespace, name))
+                .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(description))
     }
 
@@ -813,14 +889,14 @@ impl Bifrost {
     ///
     /// Always zero for [`Bifrost::insert`], which refuses rather than drops.
     #[getter]
-    fn dropped(&self) -> u64 {
-        self.handle.dropped()
+    fn dropped(&self, py: Python<'_>) -> WyrdPyResult<u64> {
+        Ok(self.handle(py)?.dropped())
     }
 
     /// Number of distinct table producers currently pooled.
     #[getter]
-    fn producer_count(&self) -> usize {
-        self.handle.producer_count()
+    fn producer_count(&self, py: Python<'_>) -> WyrdPyResult<usize> {
+        Ok(self.handle(py)?.producer_count())
     }
 }
 
@@ -1226,10 +1302,12 @@ impl PyBifrostQueryStream {
 /// Raises `WyrdError` carrying `WYRD_SPEC_400_VALIDATION` for schema text that
 /// is not JSON or an invalid Card UID, and the shared mapper's
 /// `WYRD_VALA_400_SCHEMA_PARSE` for a schema with no mappable columns, the
-/// same code `TableConfig.from_json_schema` raises.
+/// same code `TableConfig.from_json_schema` raises, and the connection error
+/// of a handle connecting on this first use.
 #[pyfunction]
 #[pyo3(signature = (bifrost, table, schema, row, card_uid=None, run_id=None))]
 fn record(
+    py: Python<'_>,
     bifrost: &Bound<'_, Bifrost>,
     table: &str,
     schema: &str,
@@ -1241,8 +1319,9 @@ fn record(
         serde_json::from_str(schema).map_err(|error| invalid_argument("schema", error))?;
     let schema = wyrd_types::json_schema_to_arrow(&schema_value)
         .map_err(|error| client_error(error.into()))?;
+    let bifrost = bifrost.borrow();
     wyrd_client::bifrost::observe::record(
-        &bifrost.borrow().handle,
+        bifrost.handle(py)?,
         table,
         &std::sync::Arc::new(schema),
         row.as_bytes().to_vec(),

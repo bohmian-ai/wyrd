@@ -51,5 +51,31 @@ fixtures.
    | `gemini-team` | `POST /v1beta/models/gemini-team/gemini-2.5-flash:generateContent` | in the path |
    | `judge-pool` | `POST /v1/systemone` | `judge-pool/jev-latest` |
 
+5. Register one Agent per provider from `agents/`, download them, and run
+   each downloaded Agent through its deployment. Each Agent's
+   `execution_route` names its deployment; its Prompt keeps the provider and
+   the model the upstream receives (`acme/gpt-4o-agent`, `claude-haiku-4-5`,
+   `tuned/gemini-2.5-pro`, `jev-judge`).
+
+   ```bash
+   wyrd apply agents/service.yaml
+   wyrd get --kind Service --name gateway-agents --version 1.0.0 --space default \
+     --output-dir gateway-agents
+   ```
+
+   ```python
+   from wyrd.client import WyrdClient
+   from wyrd.state import WyrdState
+
+   state = WyrdState.from_path("gateway-agents", WyrdClient())
+   for alias in ("openai", "anthropic", "google", "jev"):
+       run = state.run(alias)
+       print(alias, run.invoke({"question": "Is Wyrd running?"}))
+   ```
+
+   Every call is retained in `vala.gateway.calls` under its `run_id` and the
+   Agent's `card_uid`. The Jev Agent returns its `answers` as JSON text and
+   takes no tools.
+
 `wyrd gateway credential revoke <name>` stops every deployment using that
 credential until it is put again.

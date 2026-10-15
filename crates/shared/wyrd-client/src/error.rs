@@ -227,6 +227,9 @@ pub fn from_grpc_status(status: &wyrd_tonic::tonic::Status) -> WyrdError {
 /// `details` carry — every server producer (the HTTP problem document, the
 /// gRPC problem header, and the query terminal) serializes it — so every
 /// catalog Bifrost variant keeps its code and fields without a per-code arm.
+/// A fieldless Bifrost variant is rebuilt from its code alone, so a transport
+/// that carries only the code, such as a gateway refusal in a provider's
+/// error envelope, keeps it too.
 ///
 /// Reconstruction goes through [`WyrdError::from_code`], which covers the whole
 /// catalog (every `{ message, details }` variant), so a `404`/`403`/`429`
@@ -250,6 +253,9 @@ pub(crate) fn code_to_wyrd_error(
     {
         return WyrdError::Vala { error };
     }
+    if let Some(error) = BifrostError::from_unit_code(code) {
+        return WyrdError::Vala { error };
+    }
     if let Some(reconstructed) = WyrdError::from_code(code, message.clone(), details.clone()) {
         return reconstructed;
     }
@@ -264,8 +270,25 @@ pub(crate) fn code_to_wyrd_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{BifrostError, WyrdClientError, from_problem_json};
+    use super::{BifrostError, WyrdClientError, code_to_wyrd_error, from_problem_json};
     use wyrd_spec::error::{WyrdError, WyrdStorageError};
+
+    /// A fieldless Bifrost code with no `details`, as a gateway refusal in a
+    /// provider error envelope carries it, rebuilds its exact variant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the code collapses onto an upstream failure.
+    #[test]
+    fn fieldless_bifrost_code_reconstructs_without_details() {
+        let received = code_to_wyrd_error(
+            "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+            "Wyrd gateway answered HTTP 403".to_owned(),
+            serde_json::json!({}),
+        );
+        assert_eq!(received.code(), "WYRD_VALA_403_BIFROST_CARD_SCOPE");
+        assert_eq!(received.status(), 403);
+    }
 
     #[test]
     fn known_code_reconstructs_correct_variant() {

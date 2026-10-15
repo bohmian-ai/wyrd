@@ -1,0 +1,23 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: jev-agent
+  version: 1.0.0
+  space: default
+spec:
+  prompt:
+    provider: jev
+    model: jev-judge
+    format: system_one
+    body:
+      state: ${question}
+      questions:
+        helpful:
+          type: noul
+          instructions: Is it helpful?
+  execution_route:
+    kind: wyrd_gateway
+    deployment: judge-pool
+  tool_names: []
+  run_config:
+    max_iterations: 1

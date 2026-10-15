@@ -20,7 +20,7 @@ Approved by the human owner on 2026-10-14. r2 replaces r1 (REQ-008 of
 SPEC-example-journey-fixes r6) by owner direction: one self-evident name per
 concept, methods on the client, Wyrd's own header, and no per-framework
 helpers. The long-lived API key fallback for clients with no hook is
-SPEC-gateway-api-key-fallback.
+SPEC-gateway-api-key-auth.
 
 r3 is approved by the human owner on 2026-10-14: retain `wyrd.gateway`
 and its existing administration API; remove only the standalone auth helpers.

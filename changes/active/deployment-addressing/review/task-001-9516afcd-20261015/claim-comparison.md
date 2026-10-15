@@ -1,0 +1,17 @@
+# Discovery claim comparison
+
+Complete nine independent discovery reports received. They used the same fixed source and map, not one another’s new conclusions. No intended verdict supplied.
+
+| Shared cause / obligation | Discovery source claims | Comparison / validation needed |
+|---|---|---|
+| FIND-001-5 schema language validity | BREV-5, INVREV-R2-01, REP-R2-001, MAINT-R2-001, P-SDK-01 | Partial schema keyword walker may accept malformed standard keywords. Agreement is corroboration only; validator must trace all accepted schema locations and choose existing offline standards mechanism. |
+| FIND-001-8 literal model effective request | BREV-8, P-SDK-03 | Direct public native constructor validates separate canonical model, then scans/renders request-body model. Other reports close normal authored/builder paths; not contradictory for this narrower sibling. Independently validate reachability. |
+| FIND-001-3 local Vertex boundary | P-SDK-02 | Unique report traces direct Rust Agent + PublicCaller bypass of Run-only guard through admitted Vertex adapter. Others close observed invocation; independently validate reachable local/server distinction. |
+| FIND-001-13 derived TS introspection | BREV-13 open versus invariant/data/domain close under R1 no-new-accessor instruction | Material authority conflict: approved REQ008/AC004 requires all three SDKs, private R1 instruction says no new accessor. Fresh focused followup required to select task correction vs public/spec decision, trace existing owners/projections. |
+| Owner-directed FIND-001-14 actual Agent loader | INVREV-R2-02, MAINT-R2-002, R2-SYS-001, P-SDK-04 open versus behavior/data scope closes hydrated invocation | Material path/proof conflict: WyrdState + Run.invoke constructs fresh Agent and reapplies route, public Python Agent gateway binding unavailable. Fresh focused followup required to distinguish true approved loader boundary from private Python-specific mechanics and choose existing supported host seam without inventing API. Original owner-directed provenance preserved. |
+| Docs capture-policy prerequisite (new ID if validated) | P-SDK-05 | Unset policy disables capture while published fresh setup promises rows. Compare actual command/setup versus tests, validate minimal existing policy prerequisite. |
+| Docs retained framework evidence and narrow visual proof | Behavior verification notes, all-domain visual limits | Existing framework tests may omit correlated evidence query; browser tool unavailable for rendered checks. No layout defect inferred. Validator must reconcile required proof with source rather than equate absence of inspection with broken layout. Batch documentation corrections with bounded behavioral corrections. |
+
+Security, tenancy/data, batch concurrency and admitted provider attribution reports propose no independent open defect in their boundaries. Rustdoc gate source inventory is reported corrected; no style-only round proposed. Historic compile-only/missing RED is recorded honestly, no retroactive failure manufactured. Card-scope403 is valid representative denial for owner14, not mislabeled RBAC proof. Current TS connect is synchronous; no finding.
+
+Followup required specifically for SDK projection/Agent-loader authority and existing-owner integration conflicts above; no extra pass for agreement or count. Every proposed claim, including unique ones and followup, goes to independent Ponytail validation.

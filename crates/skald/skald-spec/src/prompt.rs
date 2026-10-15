@@ -325,8 +325,10 @@ impl Prompt {
     /// # Errors
     ///
     /// Returns [`SkaldError::PromptInvalid`] for field `model` when the model
-    /// is not literal configuration (see [`check_model`]) and at the output
-    /// schema's native body path when that schema is invalid for its
+    /// is not literal configuration (see [`check_model`]), for field
+    /// `body.model` when a Chat, Responses, Anthropic, or Jev body carries a
+    /// model other than `model` (so rendering can never retarget the call),
+    /// and at the output schema's native body path when that schema is invalid for its
     /// destination (see [`check_output_schema`]),
     /// [`SkaldError::MediaInSystemMessage`] when system content holds a
     /// `${media:name}` placeholder, and a serialization error when the request
@@ -334,6 +336,19 @@ impl Prompt {
     pub fn new(request: ProviderRequest, model: impl Into<String>) -> SkaldResult<Self> {
         let model = model.into();
         check_model(&model)?;
+        let body_model = match &request {
+            ProviderRequest::OpenAiChatCompletion(request) => Some(&request.model),
+            ProviderRequest::OpenAiResponses(request) => Some(&request.model),
+            ProviderRequest::AnthropicMessage(request) => Some(&request.model),
+            ProviderRequest::JevSystemOne(request) => Some(&request.model),
+            _ => None,
+        };
+        if body_model.is_some_and(|body_model| *body_model != model) {
+            return Err(invalid(
+                "body.model",
+                "the request body model must equal the Prompt's literal model",
+            ));
+        }
         let response_type = response_type_of(&request);
         if let ResponseType::JsonSchema { schema, .. } = &response_type {
             let (field, object_root) = output_schema_field(&request);
@@ -1535,13 +1550,16 @@ mod prompt_media {
     use crate::wire::openai_chat::{OpenAiContentPart, OpenAiMessageContent};
     use crate::{MediaKind, MediaRef, Prompt, ProviderName, ProviderRequest, SkaldError};
 
-    /// Builds a Prompt over `request` with a fixed literal model.
+    /// Builds a Prompt over `request` whose literal model is the body's own
+    /// model, or `model` for a model-less GenerateContent body.
     ///
     /// # Panics
     ///
-    /// Panics when the request is not a valid Prompt.
+    /// Panics when the request cannot be serialized or is not a valid Prompt.
     fn prompt(request: ProviderRequest) -> Prompt {
-        Prompt::new(request, "model").expect("prompt is valid")
+        let body = serde_json::to_value(&request).expect("request json");
+        let model = body["body"]["model"].as_str().unwrap_or("model").to_owned();
+        Prompt::new(request, model).expect("prompt is valid")
     }
 
     /// An OpenAI Chat Prompt with a system turn and one user turn carrying
@@ -1606,7 +1624,8 @@ mod prompt_media {
         let mut request = common::openai_chat_request();
         request.messages[0].content =
             Some(OpenAiMessageContent::Text("system ${media:x}".to_owned()));
-        let err = Prompt::new(ProviderRequest::OpenAiChatCompletion(request), "model").unwrap_err();
+        let err =
+            Prompt::new(ProviderRequest::OpenAiChatCompletion(request), "gpt-4o").unwrap_err();
         assert_eq!(
             err,
             SkaldError::MediaInSystemMessage {

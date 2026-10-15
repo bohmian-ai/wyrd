@@ -1145,7 +1145,10 @@ mod tests {
     /// Proves the model is literal configuration in both forms: placeholder
     /// grammars and control characters are refused before variable
     /// derivation, so rendering can never rewrite the target, while content
-    /// variables still render and a slash model stays exact.
+    /// variables still render and a slash model stays exact. Direct native
+    /// construction refuses a Chat, Responses, Anthropic, or Jev body whose
+    /// model is templated or differs from the canonical model, accepts a
+    /// matching slash model, and keeps model-less GenerateContent.
     ///
     /// # Panics
     ///
@@ -1172,6 +1175,43 @@ mod tests {
             crate::Prompt::new(crate::ProviderRequest::OpenAiChatCompletion(crate::common::openai_chat_request()), "${target}"),
             Err(SkaldError::PromptInvalid { field, .. }) if field == "model"
         ));
+
+        let with_model = |model: &str| {
+            let mut chat = crate::common::openai_chat_request();
+            chat.model = model.to_owned();
+            let mut responses = crate::common::openai_responses_request();
+            responses.model = model.to_owned();
+            let mut anthropic = crate::common::anthropic_request();
+            anthropic.model = model.to_owned();
+            let mut jev = crate::common::jev_request();
+            jev.model = model.to_owned();
+            [
+                ProviderRequest::OpenAiChatCompletion(chat),
+                ProviderRequest::OpenAiResponses(responses),
+                ProviderRequest::AnthropicMessage(anthropic),
+                ProviderRequest::JevSystemOne(jev),
+            ]
+        };
+        for body_model in ["{{target}}", "${target}", "other-model"] {
+            for request in with_model(body_model) {
+                assert!(
+                    matches!(
+                        crate::Prompt::new(request.clone(), "org/model-1"),
+                        Err(SkaldError::PromptInvalid { ref field, .. }) if field == "body.model"
+                    ),
+                    "{body_model:?} body model in {request:?}"
+                );
+            }
+        }
+        for request in with_model("org/model-1") {
+            let prompt = crate::Prompt::new(request, "org/model-1").expect("a matching body model");
+            assert!(!prompt.variables.contains(&"target".to_owned()));
+        }
+        crate::Prompt::new(
+            ProviderRequest::GeminiGenerateContent(crate::common::google_request()),
+            "gemini-2.5-pro",
+        )
+        .expect("model-less GenerateContent keeps its canonical model");
 
         for body in [portable("org/model-1"), native("org/model-1")] {
             let prompt = compile(body).expect("a slash literal compiles");

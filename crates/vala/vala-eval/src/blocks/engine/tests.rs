@@ -206,8 +206,8 @@ fn code_action(inputs: Value) -> Value {
 }
 
 /// A scripted Verdict.
-fn verdict(outcome: VerificationVerdict, citations: Value) -> Result<CheckOutput, BlockError> {
-    Ok(CheckOutput {
+fn verdict(outcome: VerificationVerdict, citations: Value) -> CheckOutput {
+    CheckOutput {
         verdict: Verdict {
             outcome,
             reason: "scripted".to_owned(),
@@ -216,7 +216,7 @@ fn verdict(outcome: VerificationVerdict, citations: Value) -> Result<CheckOutput
         actual: None,
         detail: None,
         provenance: None,
-    })
+    }
 }
 
 /// A no-step Verifier judges declared inputs: a failed assertion is a
@@ -424,13 +424,13 @@ async fn dependents_wait_for_upstream_step_requirements() {
         checks: HashMap::from([
             (
                 "draft-ok",
-                verdict(VerificationVerdict::Passed, cited.clone()),
+                Ok(verdict(VerificationVerdict::Passed, cited.clone())),
             ),
             (
                 "review-ok",
-                verdict(VerificationVerdict::Passed, cited.clone()),
+                Ok(verdict(VerificationVerdict::Passed, cited.clone())),
             ),
-            ("final", verdict(VerificationVerdict::Passed, cited)),
+            ("final", Ok(verdict(VerificationVerdict::Passed, cited))),
         ]),
         ..Script::default()
     });
@@ -911,17 +911,26 @@ async fn hosted_check_passes_need_reachable_citations() {
         checks: HashMap::from([
             (
                 "cited",
-                verdict(VerificationVerdict::Passed, answer.clone()),
+                Ok(verdict(VerificationVerdict::Passed, answer.clone())),
             ),
-            ("uncited", verdict(VerificationVerdict::Passed, json!([]))),
-            ("elsewhere", verdict(VerificationVerdict::Passed, policy)),
+            (
+                "uncited",
+                Ok(verdict(VerificationVerdict::Passed, json!([]))),
+            ),
+            (
+                "elsewhere",
+                Ok(verdict(VerificationVerdict::Passed, policy)),
+            ),
             (
                 "errored",
                 Err(BlockError::Terminal {
                     reason: "invalid verdict".to_owned(),
                 }),
             ),
-            ("rejected", verdict(VerificationVerdict::Failed, json!([]))),
+            (
+                "rejected",
+                Ok(verdict(VerificationVerdict::Failed, json!([]))),
+            ),
         ]),
         ..Script::default()
     });
@@ -945,4 +954,147 @@ async fn hosted_check_passes_need_reachable_citations() {
     assert_eq!(requirement(&outcome, "cited").citations.len(), 1);
     assert!(requirement(&outcome, "elsewhere").citations.is_empty());
     assert_eq!(requirement(&outcome, "errored").reason, "invalid verdict");
+}
+
+/// A one-column numeric sample batch.
+fn samples(
+    column: &str,
+    values: impl IntoIterator<Item = f64>,
+) -> arrow::record_batch::RecordBatch {
+    use arrow::array::Float64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    let schema = Schema::new(vec![Field::new(column, DataType::Float64, true)]);
+    let values: Float64Array = values.into_iter().collect::<Vec<_>>().into();
+    arrow::record_batch::RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values)])
+        .expect("sample batch")
+}
+
+/// A drift requirement over `inputs.<slot>` with the given method fields.
+fn drift_requirement(id: &str, slot: &str, method: Value) -> Value {
+    let mut check = json!({"kind": "drift", "on": format!("inputs.{slot}"), "condition": {"kind": "Statistical"}});
+    check
+        .as_object_mut()
+        .expect("object")
+        .extend(method.as_object().expect("object").clone());
+    json!({"id": id, "statement": id, "check": check})
+}
+
+/// Drift requirements score through `vala-drift`: Custom compares the
+/// window mean, PSI scores against fitted state and keeps the report as
+/// detail, and missing samples, unready baselines, and too few rows are
+/// inconclusive with the scorer's reason, all with drift provenance.
+///
+/// # Panics
+/// Panics when a drift outcome, detail, or provenance differs.
+#[tokio::test(start_paused = true)]
+async fn drift_requirements_score_through_vala_drift() {
+    let custom = |id: &str, baseline: f64| {
+        drift_requirement(
+            id,
+            "latency",
+            json!({"method": "Custom", "signal": {"kind": "Metric", "name": "ms"},
+            "profile": {"kind": "Custom", "metric_name": "ms", "baseline_value": baseline, "alert_threshold": 5.0}}),
+        )
+    };
+    let psi = |id: &str, slot: &str| {
+        drift_requirement(
+            id,
+            slot,
+            json!({"method": "Psi",
+            "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "space": "risk", "name": "train", "version": "1.0.0"}, "features": ["x"]},
+            "profile": {"kind": "Psi", "binning_strategy": {"kind": "EqualWidth", "n_bins": 4}, "threshold": {"kind": "Fixed", "value": 0.2}}}),
+        )
+    };
+    let spec = verifier(json!({
+        "inputs": {
+            "latency": {"type": "samples", "features": ["ms"]},
+            "shifted": {"type": "samples", "features": ["x"]},
+            "few": {"type": "samples", "features": ["x"]},
+            "unrecorded": {"type": "samples", "features": ["x"]}
+        },
+        "requirements": [
+            custom("steady", 100.0), custom("slow", 50.0),
+            psi("psi-shift", "shifted"), psi("psi-unready", "shifted"), psi("psi-few", "few"), psi("psi-none", "unrecorded")
+        ]
+    }));
+    let check = |id: &str| match &spec
+        .requirements
+        .iter()
+        .find(|r| r.id.as_str() == id)
+        .expect("requirement")
+        .check
+    {
+        Check::Drift(check) => check.spec.clone(),
+        other => panic!("not a drift check: {other:?}"),
+    };
+    let baseline = vala_drift::fit_baseline(
+        &samples("x", (0..200).map(|i| f64::from(i % 100))),
+        &check("psi-shift"),
+    )
+    .expect("fitted baseline");
+    let drift = DriftChecks::new(
+        None,
+        BTreeMap::from([
+            (TaskId::new("psi-shift").expect("id"), baseline.clone()),
+            (TaskId::new("psi-few").expect("id"), baseline),
+        ]),
+        BTreeMap::from([
+            (
+                SlotName::new("latency").expect("slot"),
+                samples("ms", [99.0, 101.0, 100.0]),
+            ),
+            (
+                SlotName::new("shifted").expect("slot"),
+                samples("x", (0..200).map(|i| f64::from(75 + i % 25))),
+            ),
+            (
+                SlotName::new("few").expect("slot"),
+                samples("x", (0..10).map(f64::from)),
+            ),
+        ]),
+    );
+    let script = Arc::new(Script::default());
+    let outcome = engine(&script, InMemoryTraceSource::new(), 4)
+        .with_drift(drift)
+        .run(
+            Arc::clone(&spec),
+            BTreeMap::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .expect("outcome");
+    assert_eq!(
+        outcomes(&outcome),
+        BTreeMap::from([
+            ("steady", RequirementOutcome::Passed),
+            ("slow", RequirementOutcome::Failed),
+            ("psi-shift", RequirementOutcome::Failed),
+            ("psi-unready", RequirementOutcome::Inconclusive),
+            ("psi-few", RequirementOutcome::Inconclusive),
+            ("psi-none", RequirementOutcome::Inconclusive),
+        ])
+    );
+    let shifted = requirement(&outcome, "psi-shift");
+    assert!(
+        matches!(shifted.detail, Some(RequirementDetail::Drift(_))),
+        "{shifted:?}"
+    );
+    assert!(
+        requirement(&outcome, "psi-unready")
+            .reason
+            .contains("not ready")
+    );
+    assert!(
+        requirement(&outcome, "psi-none")
+            .reason
+            .contains("no samples")
+    );
+    assert!(
+        outcome
+            .requirements
+            .iter()
+            .all(|r| r.provenance == Some(CallProvenance::Drift { window: None })),
+        "every drift result names its window"
+    );
+    assert!(script.calls().is_empty());
 }

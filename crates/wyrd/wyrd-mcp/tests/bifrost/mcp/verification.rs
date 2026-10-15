@@ -1032,7 +1032,7 @@ mod pg_tests {
         let fixture = register_fixture(&cards).await?;
         let judged = Box::pin(cards.register_from_path(Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../fixtures/cards/verify_in_real_time/answer-is-judged.yaml"
+            "/../../../fixtures/cards/verify_in_real_time/answer-judged.yaml"
         ))))
         .await?;
         server

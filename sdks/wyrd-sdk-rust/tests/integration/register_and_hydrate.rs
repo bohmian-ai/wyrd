@@ -420,8 +420,10 @@ async fn refused_cli_command_raises_its_catalog_code() {
 
 /// An inline Prompt registers as its own `<agent>-prompt` Card that replay
 /// reuses, changed content versions while older Agents stay pinned, and
-/// another Agent never shares; path and CardRef Prompts keep their authored
-/// identity, and the generated Prompt hydrates without a Service component.
+/// another Agent never shares; an independently authored line of the same
+/// name and another tenant keep their own Cards; path and CardRef Prompts
+/// keep their authored identity, and the generated Prompt hydrates without a
+/// Service component.
 ///
 /// # Panics
 /// Panics when a registration, read, or hydration differs.
@@ -452,6 +454,44 @@ async fn agent_prompt_registration_identity() {
     assert_eq!(persisted_prompt(&cards, &agent).await, prompt);
     assert_eq!(other_prompt.name.as_str(), "second-agent-prompt");
     assert_ne!(other_prompt.uid, prompt.uid);
+
+    let authored = dir.path().join("clash-agent-prompt.yaml");
+    std::fs::write(
+        &authored,
+        "apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: clash-agent-prompt
+  version: 1.0.0
+  space: default
+spec:
+  provider: openai
+  model: gpt-4o
+  messages: [Authored independently.]
+",
+    )
+    .expect("authored prompt writes");
+    let independent = cards
+        .register_from_path(&authored)
+        .await
+        .expect("authored prompt registers");
+    let (_, clash) = register_inline(&cards, dir.path(), "clash-agent", "Answer briefly.").await;
+    assert_ne!(clash.version, independent.root.version);
+    assert_ne!(clash.uid, independent.root.uid);
+
+    let tenant = Cards::with_client(
+        deployment.client(&deployment.other_tenant_admin("prompt-tenant").await),
+    );
+    let (_, foreign) = register_inline(&tenant, dir.path(), "first-agent", "Answer briefly.").await;
+    assert_ne!(foreign.uid, prompt.uid);
+    assert_eq!(
+        cards
+            .get(CardSelector::exact(foreign))
+            .await
+            .expect_err("another tenant's Prompt is invisible")
+            .code(),
+        "WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE"
+    );
 
     let desk = register_prompt_desk(&cards).await;
     let authored = registered(&desk, "desk-prompt");

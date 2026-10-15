@@ -29,6 +29,7 @@ use wyrd_spec::graph::{
 };
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, scope_child_card_refs};
 use wyrd_spec::registry::{
     ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardRegistrationOutcome,
@@ -1574,8 +1575,8 @@ fn inline_prompt_submission(
             bump: None,
             space: agent.metadata.space.clone(),
             uid: None,
-            labels: Default::default(),
-            annotations: Default::default(),
+            labels: Labels::new(),
+            annotations: Annotations::new(),
             spec_hash: None,
             artifact_hash: None,
             origin: None,

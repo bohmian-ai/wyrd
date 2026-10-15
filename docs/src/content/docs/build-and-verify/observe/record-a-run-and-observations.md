@@ -165,7 +165,7 @@ Install the SDK's OpenTelemetry support with your framework:
 | Pydantic AI | `pip install 'wyrd-ai[otel]' 'pydantic-ai-slim[openai]'` |
 | Google ADK | `pip install 'wyrd-ai[otel]' google-adk` |
 | OpenAI Agents SDK, Python | `pip install 'wyrd-ai[otel,agents]'` |
-| OpenAI Agents SDK, TypeScript | `npm install wyrd-ai @openai/agents zod @opentelemetry/api @opentelemetry/sdk-trace-base @opentelemetry/exporter-trace-otlp-proto @opentelemetry/context-async-hooks @opentelemetry/core` |
+| OpenAI Agents SDK, TypeScript | `npm install wyrd-ai @openai/agents zod @opentelemetry/api @opentelemetry/sdk-trace-base @opentelemetry/exporter-trace-otlp-proto @opentelemetry/exporter-logs-otlp-proto @opentelemetry/exporter-metrics-otlp-proto @opentelemetry/context-async-hooks @opentelemetry/core` |
 
 The framework calls its model provider with the provider's own key, such as `OPENAI_API_KEY` for OpenAI models or `GOOGLE_API_KEY` for Gemini, read from the environment. Never give it `WYRD_API_KEY`: the Wyrd credential only sends spans and observations to Wyrd.
 

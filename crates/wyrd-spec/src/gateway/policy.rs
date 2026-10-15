@@ -12,7 +12,7 @@ use super::{
     CurrencyCode, GatewayContractError, GatewayDecimal, GatewayOperation, ModelRef, validate_text,
 };
 use crate::auth::PrincipalId;
-use crate::ids::{ProviderId, RoleName};
+use crate::ids::{ProviderDeploymentName, RoleName};
 
 /// Where one fallback rule applies.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
@@ -237,12 +237,12 @@ pub enum GatewayLimitSubject {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayPolicyTarget {
-    /// Every provider and model.
+    /// Every deployment and model.
     All,
-    /// One provider.
-    Provider {
-        /// Provider identity.
-        provider: ProviderId,
+    /// Every model of one deployment.
+    Deployment {
+        /// Deployment name.
+        deployment: ProviderDeploymentName,
     },
     /// One exact model.
     Model {
@@ -580,8 +580,8 @@ mod tests {
     use serde_json::{Value, json};
 
     /// Builds a `ModelRef` JSON document.
-    fn model(provider: &str, name: &str) -> serde_json::Value {
-        json!({"provider": provider, "model": name})
+    fn model(deployment: &str, name: &str) -> serde_json::Value {
+        json!({"deployment": deployment, "model": name})
     }
 
     /// Proves fallback duplicates, empties, and self-reference fail, while the
@@ -635,7 +635,7 @@ mod tests {
         let value = fallback.to_header_value().expect("encodes");
         assert_eq!(
             URL_SAFE_NO_PAD.decode(&value).expect("base64url"),
-            br#"{"candidates":[{"model":"claude","provider":"anthropic"}]}"#
+            br#"{"candidates":[{"deployment":"anthropic","model":"claude"}]}"#
         );
         assert_eq!(
             GatewayFallbackOverride::from_header_value(value.as_bytes(), &requested),

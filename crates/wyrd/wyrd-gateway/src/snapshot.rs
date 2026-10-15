@@ -12,7 +12,8 @@ use wyrd_spec::gateway::{
     ProviderAdapter, ProviderCredentialState, ProviderDeployment,
 };
 use wyrd_spec::ids::{
-    CredentialBindingName, ProviderCredentialName, ProviderId, SecretBackendName,
+    CredentialBindingName, ProviderCredentialName, ProviderDeploymentName, ProviderId,
+    SecretBackendName,
 };
 use wyrd_spec::security::SecretRef;
 
@@ -32,6 +33,14 @@ pub struct GatewayTenantSnapshot {
 }
 
 impl GatewayTenantSnapshot {
+    /// Finds the deployment named `name`, if the tenant has one.
+    #[must_use]
+    pub fn deployment(&self, name: &ProviderDeploymentName) -> Option<&ProviderDeployment> {
+        self.deployments
+            .iter()
+            .find(|deployment| &deployment.name == name)
+    }
+
     /// Finds the credential named `name`, if the tenant has one.
     #[must_use]
     pub fn credential(&self, name: &ProviderCredentialName) -> Option<&GatewayCredentialSnapshot> {

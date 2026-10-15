@@ -144,7 +144,7 @@ pub enum Resource {
     /// permission rather than by role-specific resources.
     BifrostPeer,
     /// Gateway administration (provider credentials, deployments, policies)
-    /// and provider/model invocation.
+    /// and deployment/model invocation.
     Gateway,
     /// Captured gateway request and response payload fields.
     GatewayPayload,
@@ -740,7 +740,7 @@ impl Permission {
         }
     }
 
-    /// Invoke the gateway for the provider or model named by `access`.
+    /// Invoke the gateway for the deployment or model named by `access`.
     #[must_use]
     pub const fn gateway_invoke(access: GatewayAccess) -> Self {
         Self {
@@ -750,10 +750,11 @@ impl Permission {
         }
     }
 
-    /// Invoke the gateway for every configured provider and model.
+    /// Invoke the gateway for every `open` deployment and its models.
     ///
     /// The unscoped grant the built-in `workload` Role carries; a narrower
-    /// custom Role uses [`Self::gateway_invoke`] with one provider or model.
+    /// custom Role uses [`Self::gateway_invoke`] with one deployment or model,
+    /// which is also the only grant reaching a `granted` deployment.
     #[must_use]
     pub const fn gateway_invoke_any() -> Self {
         Self {
@@ -890,6 +891,18 @@ impl PermissionSet {
     #[must_use]
     pub fn contains(&self, required: &Permission) -> bool {
         self.0.iter().any(|permission| permission.covers(required))
+    }
+
+    /// True if a grant naming specific objects, not [`PermissionScope::All`],
+    /// covers `required`.
+    ///
+    /// A `granted` gateway deployment admits only such a grant, so the
+    /// unscoped invoke grant of the built-in Roles never reaches it.
+    #[must_use]
+    pub fn contains_object_scoped(&self, required: &Permission) -> bool {
+        self.0.iter().any(|permission| {
+            permission.scope != PermissionScope::All && permission.covers(required)
+        })
     }
 
     /// True when the set grants `action` on `resource` under *any* object scope.
@@ -1197,21 +1210,33 @@ mod tests {
         assert_eq!(round_trip, permissions);
     }
 
-    /// Proves gateway grants round-trip their approved wire names, a provider
-    /// invoke grant covers that provider's models only, and a gateway object
-    /// scope is refused anywhere but gateway invoke.
+    /// Proves gateway grants round-trip their approved wire names, a
+    /// deployment invoke grant covers that deployment's models only, only an
+    /// object-scoped grant counts as scoped, and a gateway object scope is
+    /// refused anywhere but gateway invoke.
     #[test]
     fn gateway_permissions_are_typed_and_scope_checked() {
         use super::GatewayAccess;
-        use wyrd_spec::ids::{ModelId, ProviderId};
-        let openai = ProviderId::new("openai").expect("valid provider");
-        let provider = GatewayAccess::Provider {
-            provider: openai.clone(),
+        use wyrd_spec::ids::{ModelId, ProviderDeploymentName};
+        let openai = ProviderDeploymentName::new("openai").expect("valid deployment");
+        let provider = GatewayAccess::Deployment {
+            deployment: openai.clone(),
         };
         let model = |name: &str| GatewayAccess::Model {
-            provider: openai.clone(),
+            deployment: openai.clone(),
             model: ModelId::new(name).expect("valid model"),
         };
+        let required = Permission::gateway_invoke(model("gpt-4o"));
+        assert!(PermissionSet::from_iter([Permission::gateway_invoke_any()]).contains(&required));
+        assert!(
+            !PermissionSet::from_iter([Permission::gateway_invoke_any()])
+                .contains_object_scoped(&required),
+            "the unscoped grant is not a grant of the deployment"
+        );
+        assert!(
+            PermissionSet::from_iter([Permission::gateway_invoke(provider.clone())])
+                .contains_object_scoped(&required)
+        );
 
         assert_eq!(
             Permission::gateway_payload_read().to_string(),
@@ -1238,7 +1263,7 @@ mod tests {
             json!({
                 "resource": "gateway",
                 "action": "invoke",
-                "scope": {"gateway": {"model": {"provider": "openai", "model": "gpt-4o"}}}
+                "scope": {"gateway": {"model": {"deployment": "openai", "model": "gpt-4o"}}}
             })
         );
         for (resource, action) in [("gateway", "read"), ("cards", "invoke")] {
@@ -1246,7 +1271,7 @@ mod tests {
                 serde_json::from_value::<Permission>(json!({
                     "resource": resource,
                     "action": action,
-                    "scope": {"gateway": {"provider": {"provider": "openai"}}}
+                    "scope": {"gateway": {"deployment": {"deployment": "openai"}}}
                 }))
                 .is_err(),
                 "{resource}:{action}"

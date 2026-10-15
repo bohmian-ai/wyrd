@@ -116,7 +116,10 @@ impl CredentialResolver {
         if credential.state == ProviderCredentialState::Revoked {
             return Err(CredentialError::Revoked);
         }
-        if credential.provider != deployment.model.provider {
+        if !deployment
+            .adapter
+            .accepts_credential_provider(&credential.provider)
+        {
             return Err(CredentialError::ProviderMismatch);
         }
         // A managed secret carries no operator binding: the submitting tenant
@@ -205,16 +208,13 @@ mod tests {
     /// Tenant every fixture assignment belongs to.
     const TENANT: DataTenantId = DataTenantId::SYSTEM_OWNER;
 
-    /// Builds a bearer deployment of `provider/model` with `adapter`,
-    /// referencing credential `primary`.
-    fn deployment(provider: &str, adapter: &Value) -> ProviderDeployment {
+    /// Builds bearer deployment `primary` with `adapter`, referencing
+    /// credential `primary`.
+    fn deployment(adapter: &Value) -> ProviderDeployment {
         serde_json::from_value(json!({
             "name": "primary",
-            "model": {"provider": provider, "model": "m"},
             "adapter": adapter,
             "auth": {"bearer": {"credential": "primary"}},
-            "capabilities": ["chat_completions"],
-            "routing_weight": 1,
         }))
         .expect("deployment decodes")
     }
@@ -338,7 +338,7 @@ mod tests {
         let token = secret_file("hvs.test");
         let resolver = resolver(&[("vault", &vault.uri())], &token);
         let file = secret_file("sk-file");
-        let openai = deployment("openai", &json!("openai"));
+        let openai = deployment(&json!("openai"));
         let active = ProviderCredentialState::Active;
         let owned = || Some(assignment(TENANT, "openai", None));
 
@@ -364,10 +364,7 @@ mod tests {
 
         let other_tenant = DataTenantId::new_v7();
         let compatible = |host: &str| {
-            deployment(
-                "deepseek",
-                &json!({"openai_compatible": {"base_url": format!("https://{host}/v1")}}),
-            )
+            deployment(&json!({"openai_compatible": {"base_url": format!("https://{host}/v1")}}))
         };
         let compat_assignment =
             || Some(assignment(TENANT, "deepseek", Some("API.deepseek.example")));
@@ -438,7 +435,7 @@ mod tests {
         let token = secret_file("hvs.test");
         let resolver = resolver(&[("down", "http://127.0.0.1:9")], &token);
         let file = secret_file("sk-file");
-        let openai = deployment("openai", &json!("openai"));
+        let openai = deployment(&json!("openai"));
         let active = ProviderCredentialState::Active;
         let owned = || Some(assignment(TENANT, "openai", None));
         let env_file = || environment(Some(file_ref(&file)));

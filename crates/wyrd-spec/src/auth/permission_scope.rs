@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::ids::{CardUid, ModelId, ProviderId};
+use crate::ids::{CardUid, ModelId, ProviderDeploymentName};
 
 /// Longest accepted catalog or schema identifier segment.
 const MAX_IDENTIFIER_LEN: usize = 63;
@@ -46,30 +46,31 @@ pub enum PermissionScope {
     All,
     /// One Bifrost schema or table.
     Bifrost(BifrostPermissionScope),
-    /// One gateway provider or exact provider/model pair.
+    /// One gateway deployment or exact deployment/model pair.
     Gateway(GatewayAccess),
     /// One Verifier Card, by its exact UID.
     Verifier(CardUid),
 }
 
-/// The gateway provider objects one invoke grant reaches.
+/// The gateway deployment objects one invoke grant reaches.
 ///
-/// A provider grant covers every tenant-enabled model of that provider; a
-/// model grant covers only the exact provider/model pair. Identities are the
-/// same typed values deployment resolution uses.
+/// A deployment grant covers every model that deployment permits; a model
+/// grant covers only the exact deployment/model pair. Identities are the same
+/// typed values call addressing uses. Unlike the unscoped `all` grant, either
+/// variant also reaches a `granted` deployment.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayAccess {
-    /// Every model served by one provider.
-    Provider {
-        /// Covered provider.
-        provider: ProviderId,
+    /// Every model one deployment permits.
+    Deployment {
+        /// Covered deployment.
+        deployment: ProviderDeploymentName,
     },
-    /// One exact provider-native model.
+    /// One exact model addressed through one deployment.
     Model {
-        /// Provider serving the model.
-        provider: ProviderId,
+        /// Deployment serving the model.
+        deployment: ProviderDeploymentName,
         /// Provider-native model identifier.
         model: ModelId,
     },
@@ -81,14 +82,17 @@ impl GatewayAccess {
     pub fn covers(&self, required: &Self) -> bool {
         match (self, required) {
             (
-                Self::Provider { provider },
-                Self::Provider { provider: required }
+                Self::Deployment { deployment },
+                Self::Deployment {
+                    deployment: required,
+                }
                 | Self::Model {
-                    provider: required, ..
+                    deployment: required,
+                    ..
                 },
-            ) => provider == required,
+            ) => deployment == required,
             (Self::Model { .. }, Self::Model { .. }) => self == required,
-            (Self::Model { .. }, Self::Provider { .. }) => false,
+            (Self::Model { .. }, Self::Deployment { .. }) => false,
         }
     }
 }
@@ -160,7 +164,7 @@ impl PermissionScope {
         matches!(self, Self::Bifrost(_))
     }
 
-    /// True when this scope names a gateway provider or model.
+    /// True when this scope names a gateway deployment or model.
     #[must_use]
     pub const fn is_gateway(&self) -> bool {
         matches!(self, Self::Gateway(_))
@@ -371,20 +375,20 @@ mod tests {
         );
     }
 
-    /// Proves a provider grant covers that provider's models and a model grant
-    /// covers only its exact pair, with the approved wire projection.
+    /// Proves a deployment grant covers that deployment's models and a model
+    /// grant covers only its exact pair, with the approved wire projection.
     #[test]
-    fn gateway_scope_covers_provider_models_and_exact_pairs() {
+    fn gateway_scope_covers_deployment_models_and_exact_pairs() {
         use super::GatewayAccess;
-        use crate::ids::{ModelId, ProviderId};
+        use crate::ids::{ModelId, ProviderDeploymentName};
         let provider = |name: &str| {
-            PermissionScope::Gateway(GatewayAccess::Provider {
-                provider: ProviderId::new(name).expect("valid provider"),
+            PermissionScope::Gateway(GatewayAccess::Deployment {
+                deployment: ProviderDeploymentName::new(name).expect("valid deployment"),
             })
         };
         let model = |name: &str, model: &str| {
             PermissionScope::Gateway(GatewayAccess::Model {
-                provider: ProviderId::new(name).expect("valid provider"),
+                deployment: ProviderDeploymentName::new(name).expect("valid deployment"),
                 model: ModelId::new(model).expect("valid model"),
             })
         };
@@ -401,13 +405,20 @@ mod tests {
         assert!(PermissionScope::All.covers(&model("openai", "gpt-4o")));
         assert_eq!(
             serde_json::to_value(model("openai", "gpt-4o")).expect("scope serializes"),
-            serde_json::json!({"gateway": {"model": {"provider": "openai", "model": "gpt-4o"}}})
+            serde_json::json!({"gateway": {"model": {"deployment": "openai", "model": "gpt-4o"}}})
         );
         assert!(
             serde_json::from_value::<PermissionScope>(
-                serde_json::json!({"gateway": {"provider": {"provider": "OpenAI"}}})
+                serde_json::json!({"gateway": {"deployment": {"deployment": "OpenAI"}}})
             )
             .is_err()
+        );
+        assert!(
+            serde_json::from_value::<PermissionScope>(
+                serde_json::json!({"gateway": {"provider": {"provider": "openai"}}})
+            )
+            .is_err(),
+            "the retired provider scope does not decode"
         );
     }
 

@@ -1,10 +1,9 @@
 //! Bounded attempt execution over an admitted call plan.
 //!
-//! [`GatewayEngine::execute`] walks candidates in plan order. For each
-//! candidate it drops deployments this replica recently saw fail, then
-//! applies the plan's deterministic call-keyed weighted order to the healthy
-//! set, so an unhealthy deployment's share is split by weight. Every attempt resolves its credential first and
-//! drops the plaintext when the attempt ends. The caller deadline and
+//! [`GatewayEngine::execute`] walks candidates in plan order, skipping a
+//! candidate whose deployment this replica recently saw fail. Every attempt
+//! resolves its credential first and drops the plaintext when the attempt
+//! ends. The caller deadline and
 //! cancellation bound the whole call, including credential work.
 //!
 //! Retry and fallback rules:
@@ -35,14 +34,14 @@ use wyrd_spec::gateway::{
     GatewayCallId, GatewayCallOutcome, GatewayOperation, GatewayUsageAmount, ModelRef,
     ProviderDeployment,
 };
-use wyrd_spec::ids::ProviderDeploymentName;
+use wyrd_spec::ids::{ModelId, ProviderDeploymentName};
 
 use skald_providers::MediaAnswer;
 
 use crate::adapter::{BatchAction, IngressDialect, MediaRequest};
 use crate::credential::{CredentialResolver, ProviderSecret};
 use crate::health::DeploymentHealth;
-use crate::routing::{CallPlan, PlannedCandidate, weighted_order};
+use crate::routing::{CallPlan, PlannedCandidate};
 use crate::snapshot::GatewayTenantSnapshot;
 
 /// One upstream attempt handed to the provider dispatch seam.
@@ -58,6 +57,8 @@ pub struct ProviderAttempt<'a> {
     pub ingress: IngressDialect,
     /// Deployment to call.
     pub deployment: &'a ProviderDeployment,
+    /// Model identifier forwarded to the deployment unchanged.
+    pub model: &'a ModelId,
     /// Resolved credential, when the deployment authenticates.
     pub credential: Option<&'a ProviderSecret>,
     /// Operation request body.
@@ -467,115 +468,92 @@ impl GatewayEngine {
                 | GatewayOperation::Embeddings
         );
         for candidate in &input.plan.candidates {
-            let healthy = self.healthy(&input, candidate);
-            for deployment in weighted_order(&healthy, input.plan.call_id) {
-                if Instant::now() >= input.deadline {
-                    return finish(GatewayCallOutcome::TimedOut, attempts, None, None, None);
+            let deployment = &candidate.deployment;
+            if !self.health.is_healthy(input.tenant, &deployment.name) {
+                continue;
+            }
+            if Instant::now() >= input.deadline {
+                return finish(GatewayCallOutcome::TimedOut, attempts, None, None, None);
+            }
+            if input.cancel.is_cancelled() {
+                return finish(GatewayCallOutcome::Cancelled, attempts, None, None, None);
+            }
+            let ordinal = NonZeroU32::new(u32::try_from(attempts.len() + 1).unwrap_or(u32::MAX))
+                .unwrap_or(NonZeroU32::MIN);
+            let dispatched = AtomicBool::new(false);
+            let started_at = Utc::now();
+            let span = attempt_span(ordinal, candidate);
+            let result = tokio::select! {
+                biased;
+                () = input.cancel.cancelled() => Err(GatewayCallOutcome::Cancelled),
+                () = tokio::time::sleep_until(input.deadline) => Err(GatewayCallOutcome::TimedOut),
+                result = self
+                    .attempt(&input, candidate, ordinal, &dispatched)
+                    .instrument(span.clone()) => Ok(result),
+            };
+            let record = |outcome, billable, usage| AttemptRecord {
+                ordinal,
+                deployment: deployment.name.clone(),
+                model: candidate.model.clone(),
+                outcome,
+                billable,
+                usage,
+                started_at,
+                terminal_at: Utc::now(),
+            };
+            let (class, usage) = match result {
+                Err(outcome) => {
+                    record_interrupted(&span, outcome);
+                    attempts.push(record(
+                        outcome,
+                        dispatched.load(Ordering::Relaxed),
+                        AttemptUsage::default(),
+                    ));
+                    return finish(outcome, attempts, None, None, None);
                 }
-                if input.cancel.is_cancelled() {
-                    return finish(GatewayCallOutcome::Cancelled, attempts, None, None, None);
-                }
-                let ordinal =
-                    NonZeroU32::new(u32::try_from(attempts.len() + 1).unwrap_or(u32::MAX))
-                        .unwrap_or(NonZeroU32::MIN);
-                let dispatched = AtomicBool::new(false);
-                let started_at = Utc::now();
-                let span = attempt_span(ordinal, deployment);
-                let result = tokio::select! {
-                    biased;
-                    () = input.cancel.cancelled() => Err(GatewayCallOutcome::Cancelled),
-                    () = tokio::time::sleep_until(input.deadline) => Err(GatewayCallOutcome::TimedOut),
-                    result = self
-                        .attempt(&input, deployment, ordinal, &dispatched)
-                        .instrument(span.clone()) => Ok(result),
-                };
-                let record = |outcome, billable, usage| AttemptRecord {
-                    ordinal,
-                    deployment: deployment.name.clone(),
-                    model: candidate.model.clone(),
-                    outcome,
-                    billable,
+                Ok(AttemptResult::Completed {
+                    body,
                     usage,
-                    started_at,
-                    terminal_at: Utc::now(),
-                };
-                let (class, usage) = match result {
-                    Err(outcome) => {
-                        record_interrupted(&span, outcome);
-                        attempts.push(record(
-                            outcome,
-                            dispatched.load(Ordering::Relaxed),
-                            AttemptUsage::default(),
-                        ));
-                        return finish(outcome, attempts, None, None, None);
+                    capture,
+                }) => {
+                    if !body.is_stream() {
+                        span.record("outcome", outcome_name(GatewayCallOutcome::Succeeded));
                     }
-                    Ok(AttemptResult::Completed {
-                        body,
-                        usage,
-                        capture,
-                    }) => {
-                        if !body.is_stream() {
-                            span.record("outcome", outcome_name(GatewayCallOutcome::Succeeded));
-                        }
-                        attempts.push(record(GatewayCallOutcome::Succeeded, true, usage));
-                        return finish(
-                            GatewayCallOutcome::Succeeded,
-                            attempts,
-                            Some((body, candidate.model.clone(), capture)),
-                            None,
-                            Some(span),
-                        );
-                    }
-                    Ok(AttemptResult::Failed { class, usage }) => {
-                        refusal = None;
-                        (class, usage)
-                    }
-                    Ok(AttemptResult::Refused {
-                        class,
-                        status,
-                        body,
-                        usage,
-                    }) => {
-                        refusal = Some(ProviderRefusal { status, body });
-                        (class, usage)
-                    }
-                };
-                record_failure(&span, class);
-                attempts.push(record(
-                    GatewayCallOutcome::Failed,
-                    class != FailureClass::BeforeDispatch,
-                    usage,
-                ));
-                match self.after_failure(input.tenant, deployment, class, retry_safe) {
-                    Next::Continue => {}
-                    Next::Stop(outcome) => return finish(outcome, attempts, None, refusal, None),
+                    attempts.push(record(GatewayCallOutcome::Succeeded, true, usage));
+                    return finish(
+                        GatewayCallOutcome::Succeeded,
+                        attempts,
+                        Some((body, candidate.model.clone(), capture)),
+                        None,
+                        Some(span),
+                    );
                 }
+                Ok(AttemptResult::Failed { class, usage }) => {
+                    refusal = None;
+                    (class, usage)
+                }
+                Ok(AttemptResult::Refused {
+                    class,
+                    status,
+                    body,
+                    usage,
+                }) => {
+                    refusal = Some(ProviderRefusal { status, body });
+                    (class, usage)
+                }
+            };
+            record_failure(&span, class);
+            attempts.push(record(
+                GatewayCallOutcome::Failed,
+                class != FailureClass::BeforeDispatch,
+                usage,
+            ));
+            match self.after_failure(input.tenant, deployment, class, retry_safe) {
+                Next::Continue => {}
+                Next::Stop(outcome) => return finish(outcome, attempts, None, refusal, None),
             }
         }
         finish(GatewayCallOutcome::Failed, attempts, None, refusal, None)
-    }
-
-    /// Returns the healthy snapshot deployments serving `candidate`.
-    ///
-    /// Keeps snapshot order, which is the name order weighted selection
-    /// expects.
-    fn healthy<'a>(
-        &self,
-        input: &CallInput<'a>,
-        candidate: &PlannedCandidate,
-    ) -> Vec<&'a ProviderDeployment> {
-        input
-            .snapshot
-            .deployments
-            .iter()
-            .filter(|deployment| {
-                candidate
-                    .deployments
-                    .iter()
-                    .any(|planned| planned.name == deployment.name)
-                    && self.health.is_healthy(input.tenant, &deployment.name)
-            })
-            .collect()
     }
 
     /// Resolves the credential and dispatches one attempt.
@@ -589,10 +567,11 @@ impl GatewayEngine {
     async fn attempt(
         &self,
         input: &CallInput<'_>,
-        deployment: &ProviderDeployment,
+        candidate: &PlannedCandidate,
         ordinal: NonZeroU32,
         dispatched: &AtomicBool,
     ) -> AttemptResult {
+        let deployment = &candidate.deployment;
         let credential = match self
             .resolver
             .resolve(input.tenant, input.snapshot, deployment)
@@ -620,6 +599,7 @@ impl GatewayEngine {
                 operation: input.plan.operation,
                 ingress: input.ingress,
                 deployment,
+                model: &candidate.model.model,
                 credential: credential.as_ref(),
                 body: input.body,
                 media: input.media,
@@ -684,18 +664,22 @@ fn finish(
     }
 }
 
-/// Opens the `gateway.attempt` span of attempt `ordinal` on `deployment`.
+/// Opens the `gateway.attempt` span of attempt `ordinal` on `candidate`.
 ///
 /// Its `outcome`, `failure_class`, and `error.code` fields start empty and are
 /// recorded once the attempt, or for streams its relay, reaches a terminal
 /// result.
-fn attempt_span(ordinal: NonZeroU32, deployment: &ProviderDeployment) -> tracing::Span {
+fn attempt_span(ordinal: NonZeroU32, candidate: &PlannedCandidate) -> tracing::Span {
+    let deployment = &candidate.deployment;
     tracing::info_span!(
         "gateway.attempt",
         attempt_ordinal = ordinal.get(),
         deployment = deployment.name.as_str(),
-        gen_ai.provider.name = deployment.model.provider.as_str(),
-        gen_ai.request.model = deployment.model.model.as_str(),
+        gen_ai.provider.name = deployment
+            .adapter
+            .builtin_provider()
+            .unwrap_or("openai_compatible"),
+        gen_ai.request.model = candidate.model.model.as_str(),
         outcome = tracing::field::Empty,
         failure_class = tracing::field::Empty,
         error.code = tracing::field::Empty,
@@ -831,24 +815,22 @@ mod tests {
         }
     }
 
-    /// Deployment `name` of `model` authenticating with `credential`.
-    fn deployment(name: &str, model: &str, credential: Option<&str>) -> ProviderDeployment {
+    /// Deployment `name` authenticating with `credential`.
+    fn deployment(name: &str, credential: Option<&str>) -> ProviderDeployment {
         let auth = credential.map_or(json!("none"), |c| json!({"bearer": {"credential": c}}));
         serde_json::from_value(json!({
             "name": name,
-            "model": ModelRef::from_projection(model).expect("model"),
             "adapter": {"openai_compatible": {"base_url": "https://acme.example/v1"}},
             "auth": auth,
             "capabilities": ["chat_completions", "images"],
-            "routing_weight": 1,
         }))
         .expect("deployment")
     }
 
-    /// Snapshot with unauthenticated deployments `dep-a1` and `dep-a2` of
-    /// `acme/a` and `dep-b1` of `acme/b`, which uses the `bound` credential
-    /// assigned to the system tenant and `acme.example`; `acme/a` falls back
-    /// globally to `acme/b`.
+    /// Snapshot with unauthenticated deployments `dep-a1` and `dep-a2` and
+    /// `dep-b1`, which uses the `bound` credential assigned to the system
+    /// tenant and `acme.example`; `dep-a1/a` falls back globally to
+    /// `dep-a2/a` then `dep-b1/b`.
     ///
     /// The binding reads `CARGO_PKG_NAME`, which the test runner always sets,
     /// so the resolved plaintext is `wyrd-gateway` without mutating the
@@ -857,9 +839,9 @@ mod tests {
         let acme = ProviderId::new("acme").expect("provider");
         GatewayTenantSnapshot {
             deployments: vec![
-                deployment("dep-a1", "acme/a", None),
-                deployment("dep-a2", "acme/a", None),
-                deployment("dep-b1", "acme/b", Some("bound")),
+                deployment("dep-a1", None),
+                deployment("dep-a2", None),
+                deployment("dep-b1", Some("bound")),
             ],
             credentials: vec![GatewayCredentialSnapshot {
                 name: ProviderCredentialName::new("bound").expect("name"),
@@ -878,7 +860,8 @@ mod tests {
                 }),
             }],
             fallback: serde_json::from_value(json!({"rules": [{"scope": "global", "candidates": [
-                ModelRef::from_projection("acme/b").expect("model")
+                ModelRef::from_projection("dep-a2/a").expect("model"),
+                ModelRef::from_projection("dep-b1/b").expect("model"),
             ]}]}))
             .expect("fallback"),
             governance: wyrd_spec::gateway::GatewayGovernancePolicy::default(),
@@ -898,8 +881,7 @@ mod tests {
         )
     }
 
-    /// Runs `operation` against `snap` with a call id whose first `acme/a`
-    /// deployment is `dep-a1`.
+    /// Runs `operation` for `dep-a1/a` against `snap`.
     async fn run(
         engine: &GatewayEngine,
         snap: &GatewayTenantSnapshot,
@@ -912,10 +894,9 @@ mod tests {
             snap,
             call,
             operation,
-            ModelRef::from_projection("acme/a").expect("model"),
+            ModelRef::from_projection("dep-a1/a").expect("model"),
             None,
         );
-        assert_eq!(plan.candidates[0].deployments[0].name.as_str(), "dep-a1");
         engine
             .execute(CallInput {
                 tenant: DataTenantId::SYSTEM_OWNER,
@@ -965,7 +946,7 @@ mod tests {
         )
         .await;
         assert_eq!(first.outcome, GatewayCallOutcome::Succeeded);
-        assert_eq!(first.resolved, ModelRef::from_projection("acme/b").ok());
+        assert_eq!(first.resolved, ModelRef::from_projection("dep-b1/b").ok());
         assert_eq!(
             attempt_outcomes(&first),
             [
@@ -992,62 +973,12 @@ mod tests {
         );
     }
 
-    /// Weighted selection runs over the healthy deployments only, so an
-    /// unhealthy member's share is split by weight instead of passing wholly to
-    /// its ring successor.
-    #[tokio::test]
-    async fn weighted_selection_skips_unhealthy_deployments_before_weighting() {
-        const CALLS: u128 = 300;
-        let mut snap = snapshot();
-        snap.deployments
-            .insert(2, deployment("dep-a3", "acme/a", None));
-        let dispatch = Recording::new((0..CALLS).map(|_| Some(completed())).collect());
-        let engine = engine(Arc::clone(&dispatch));
-        let unhealthy = ProviderDeploymentName::new("dep-a1").expect("name");
-        engine
-            .health
-            .mark_unhealthy(DataTenantId::SYSTEM_OWNER, &unhealthy);
-        let cancel = CancellationToken::new();
-        for low in 0..CALLS {
-            let call = GatewayCallId::from_uuid(uuid::Uuid::from_u128((7_u128 << 76) | low));
-            let plan = CallPlan::new(
-                &snap,
-                call,
-                GatewayOperation::ChatCompletions,
-                ModelRef::from_projection("acme/a").expect("model"),
-                None,
-            );
-            let execution = engine
-                .execute(CallInput {
-                    tenant: DataTenantId::SYSTEM_OWNER,
-                    snapshot: &snap,
-                    plan: &plan,
-                    body: &json!({}),
-                    ingress: IngressDialect::OpenAi,
-                    batch: None,
-                    media: None,
-                    stream: false,
-                    capture: false,
-                    deadline: Instant::now() + Duration::from_secs(5),
-                    cancel: &cancel,
-                })
-                .await;
-            assert_eq!(execution.outcome, GatewayCallOutcome::Succeeded);
-        }
-        let served = dispatch.deployments();
-        let share = |name: &str| served.iter().filter(|d| d.as_str() == name).count();
-        assert_eq!(
-            (share("dep-a1"), share("dep-a2"), share("dep-a3")),
-            (0, 150, 150)
-        );
-    }
-
     /// A credential failure never dispatches and falls through; non-idempotent
     /// upstream failures, rejections, and post-output failures never retry.
     #[tokio::test]
     async fn unsafe_failures_never_retry_and_credentials_fail_closed() {
         let mut snap = snapshot();
-        snap.deployments[0] = deployment("dep-a1", "acme/a", Some("missing"));
+        snap.deployments[0] = deployment("dep-a1", Some("missing"));
         let dispatch = Recording::new(vec![Some(completed())]);
         let credential = run(
             &engine(Arc::clone(&dispatch)),

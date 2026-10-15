@@ -1,13 +1,12 @@
 //! Provider deployment, adapter, and upstream authentication contracts.
 
 use std::collections::BTreeSet;
-use std::num::NonZeroU32;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::{BUILTIN_PROVIDER_IDS, GatewayContractError, GatewayOperation, ModelRef};
+use super::{BUILTIN_PROVIDER_IDS, GatewayContractError, GatewayOperation};
 use crate::auth::AbsoluteUrl;
-use crate::ids::{ProviderCredentialName, ProviderDeploymentName};
+use crate::ids::{ModelId, ProviderCredentialName, ProviderDeploymentName, ProviderId};
 
 /// Header names an upstream API-key header may never use.
 ///
@@ -41,9 +40,10 @@ const RESERVED_HEADER_PREFIXES: [&str; 4] = ["proxy-", "x-forwarded-", "sec-", "
 
 /// Upstream protocol family a deployment speaks.
 ///
-/// The four built-in variants use Skald's typed provider protocols and require
-/// their reserved provider identity. `OpenAiCompatible` uses the standard
-/// OpenAI routes under `base_url` for any non-reserved provider.
+/// The built-in variants use Skald's typed provider protocols and authenticate
+/// with a credential of their reserved provider identity. `OpenAiCompatible`
+/// uses the standard OpenAI routes under `base_url` with a credential of any
+/// non-reserved provider identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum ProviderAdapter {
@@ -76,8 +76,8 @@ pub enum ProviderAdapter {
 }
 
 impl ProviderAdapter {
-    /// Reserved provider identity a built-in adapter requires, or `None` for
-    /// `OpenAiCompatible`.
+    /// Reserved credential-provider identity a built-in adapter requires, or
+    /// `None` for `OpenAiCompatible`.
     #[must_use]
     pub const fn builtin_provider(&self) -> Option<&'static str> {
         match self {
@@ -87,6 +87,19 @@ impl ProviderAdapter {
             Self::Vertex { .. } => Some("vertex"),
             Self::Jev => Some("jev"),
             Self::OpenAiCompatible { .. } => None,
+        }
+    }
+
+    /// Whether a credential of `provider` may authenticate this adapter.
+    ///
+    /// A built-in adapter accepts only its reserved provider identity, and
+    /// `OpenAiCompatible` only a non-reserved one. The deployment name never
+    /// takes part, so naming a deployment cannot widen credential matching.
+    #[must_use]
+    pub fn accepts_credential_provider(&self, provider: &ProviderId) -> bool {
+        match self.builtin_provider() {
+            Some(reserved) => reserved == provider.as_str(),
+            None => !BUILTIN_PROVIDER_IDS.contains(&provider.as_str()),
         }
     }
 
@@ -251,156 +264,193 @@ impl<'de> Deserialize<'de> for ProviderAuthHeader {
     }
 }
 
-/// One tenant-authorized upstream model target.
+/// Who may invoke a deployment beyond its administrators.
 ///
-/// The name is an administration identifier only; inference callers select a
-/// [`ModelRef`], never a deployment. The same shape is the `PUT` body and the
+/// Neither value permits anonymous inference: every call still needs a
+/// `gateway:invoke` grant of its effective subject. `Open` admits the
+/// unscoped `all` grant; `Granted` admits only a grant naming the deployment
+/// or one of its exact models.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentAccess {
+    /// Any subject holding a covering `gateway:invoke` grant, including `all`.
+    #[default]
+    Open,
+    /// Only subjects holding a deployment- or model-scoped grant covering it.
+    Granted,
+}
+
+/// One named tenant inference target.
+///
+/// Callers address it as `<name>/<model>`; the name selects exactly this
+/// adapter and credential binding. The same shape is the `PUT` body and the
 /// redacted read view because it carries no secret material.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ProviderDeployment {
-    /// Tenant-unique deployment name.
+    /// Tenant-unique deployment name, the first segment of every address.
     pub name: ProviderDeploymentName,
-    /// Exact model this deployment serves.
-    pub model: ModelRef,
     /// Upstream protocol family.
     pub adapter: ProviderAdapter,
     /// Upstream authentication.
     pub auth: ProviderAuth,
-    /// Explicitly declared operations; never inferred by probing.
-    pub capabilities: BTreeSet<GatewayOperation>,
-    /// Positive weight among deployments serving the same model.
-    #[cfg_attr(feature = "server", schema(value_type = u32, minimum = 1))]
-    pub routing_weight: NonZeroU32,
+    /// Models callers may address; absent applies no Wyrd allowlist, which
+    /// promises neither upstream entitlement nor model existence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<ModelId>>,
+    /// Operations narrowing what the adapter serves; absent permits every
+    /// adapter-supported operation. Never inferred by probing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<BTreeSet<GatewayOperation>>,
+    /// Who may invoke the deployment.
+    #[serde(default)]
+    pub access: DeploymentAccess,
 }
 
 impl ProviderDeployment {
-    /// Rejects a deployment whose adapter, provider, or capabilities disagree.
+    /// Rejects a deployment whose model allowlist or capabilities are invalid.
     ///
-    /// Built-in adapters require their reserved provider identity and
-    /// `OpenAiCompatible` requires a non-reserved one. At least one capability
-    /// must be declared, and every declared capability must be one the adapter
-    /// [serves](ProviderAdapter::serves). Credential tenancy and provider matching are enforced
-    /// by the server against persisted credentials.
+    /// A present `models` list must be nonempty and unique, and a present
+    /// `capabilities` set nonempty with every operation one the adapter
+    /// [serves](ProviderAdapter::serves). Credential existence, tenancy, and
+    /// provider matching are enforced by the server against persisted
+    /// credentials.
     ///
     /// # Errors
     ///
-    /// Returns [`GatewayContractError`] naming `model.provider` or
-    /// `capabilities` for the violated rule.
+    /// Returns [`GatewayContractError`] naming `models` or `capabilities` for
+    /// the violated rule.
     pub fn validate(&self) -> Result<(), GatewayContractError> {
-        let provider = self.model.provider.as_str();
-        match self.adapter.builtin_provider() {
-            Some(reserved) if reserved != provider => {
+        if let Some(models) = &self.models {
+            if models.is_empty() {
                 return Err(GatewayContractError::new(
-                    "model.provider",
-                    "a built-in adapter requires its reserved provider identity",
+                    "models",
+                    "must be omitted or list at least one model",
                 ));
             }
-            None if BUILTIN_PROVIDER_IDS.contains(&provider) => {
+            if models.iter().collect::<BTreeSet<_>>().len() != models.len() {
                 return Err(GatewayContractError::new(
-                    "model.provider",
-                    "an openai_compatible adapter cannot use a reserved provider identity",
+                    "models",
+                    "must not list a model twice",
                 ));
             }
-            _ => {}
         }
-        if self.capabilities.is_empty() {
-            return Err(GatewayContractError::new(
-                "capabilities",
-                "at least one operation must be declared",
-            ));
-        }
-        if self
-            .capabilities
-            .iter()
-            .any(|operation| !self.adapter.serves(*operation))
-        {
-            return Err(GatewayContractError::new(
-                "capabilities",
-                "declares an operation the adapter does not serve",
-            ));
+        if let Some(capabilities) = &self.capabilities {
+            if capabilities.is_empty() {
+                return Err(GatewayContractError::new(
+                    "capabilities",
+                    "must be omitted or declare at least one operation",
+                ));
+            }
+            if capabilities
+                .iter()
+                .any(|operation| !self.adapter.serves(*operation))
+            {
+                return Err(GatewayContractError::new(
+                    "capabilities",
+                    "declares an operation the adapter does not serve",
+                ));
+            }
         }
         Ok(())
+    }
+
+    /// Whether the deployment serves `operation`: its adapter carries it and
+    /// any declared capabilities include it.
+    #[must_use]
+    pub fn serves(&self, operation: GatewayOperation) -> bool {
+        self.adapter.serves(operation)
+            && self
+                .capabilities
+                .as_ref()
+                .is_none_or(|capabilities| capabilities.contains(&operation))
+    }
+
+    /// Whether callers may address `model` on this deployment: true unless
+    /// a declared allowlist omits it.
+    #[must_use]
+    pub fn permits(&self, model: &ModelId) -> bool {
+        self.models
+            .as_ref()
+            .is_none_or(|models| models.contains(model))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderAuthHeader, ProviderDeployment};
+    use super::{DeploymentAccess, ProviderAuthHeader, ProviderDeployment};
+    use crate::gateway::GatewayOperation;
+    use crate::ids::{ModelId, ProviderId};
     use serde_json::json;
 
-    /// Builds one deployment JSON document for `provider` and `adapter`.
-    fn deployment(provider: &str, adapter: serde_json::Value) -> serde_json::Value {
-        json!({
-            "name": "primary",
-            "model": {"provider": provider, "model": "model/v1"},
-            "adapter": adapter,
-            "auth": {"api_key_header": {"header": "X-Api-Key", "credential": "deepseek-key"}},
-            "capabilities": ["embeddings", "chat_completions"],
-            "routing_weight": 3,
-        })
+    /// Decodes one deployment document.
+    fn decode(value: serde_json::Value) -> ProviderDeployment {
+        serde_json::from_value(value).expect("deployment decodes")
     }
 
-    /// Proves the exact wire shape round-trips and header names normalize.
+    /// Proves the minimal shape defaults to open, unrestricted, and every
+    /// adapter operation, and the full shape round-trips exactly.
     #[test]
-    fn deployment_round_trips_exact_shape() {
-        let value = deployment(
-            "deepseek",
-            json!({"openai_compatible": {"base_url": "https://api.deepseek.example/v1"}}),
-        );
-        let parsed: ProviderDeployment = serde_json::from_value(value).expect("decodes");
-        parsed.validate().expect("valid");
+    fn deployment_round_trips_minimal_and_full_shapes() {
+        let minimal = decode(json!({
+            "name": "openai-primary",
+            "adapter": "openai",
+            "auth": {"bearer": {"credential": "openai-key"}},
+        }));
+        minimal.validate().expect("valid");
+        assert_eq!(minimal.access, DeploymentAccess::Open);
+        assert!(minimal.permits(&ModelId::new("any/model").expect("model")));
+        assert!(minimal.serves(GatewayOperation::Embeddings));
         assert_eq!(
-            serde_json::to_value(&parsed).expect("encodes"),
+            serde_json::to_value(&minimal).expect("encodes"),
             json!({
-                "name": "primary",
-                "model": {"provider": "deepseek", "model": "model/v1"},
-                "adapter": {"openai_compatible": {"base_url": "https://api.deepseek.example/v1"}},
-                "auth": {"api_key_header": {"header": "x-api-key", "credential": "deepseek-key"}},
-                "capabilities": ["chat_completions", "embeddings"],
-                "routing_weight": 3,
+                "name": "openai-primary",
+                "adapter": "openai",
+                "auth": {"bearer": {"credential": "openai-key"}},
+                "access": "open",
             })
         );
+        let full = json!({
+            "name": "support-gateway",
+            "adapter": {"openai_compatible": {"base_url": "https://gateway.example/v1"}},
+            "auth": {"api_key_header": {"header": "x-api-key", "credential": "external-key"}},
+            "models": ["gpt-4o", "org/model-v3"],
+            "capabilities": ["chat_completions"],
+            "access": "granted",
+        });
+        let parsed = decode(full.clone());
+        parsed.validate().expect("valid");
+        assert_eq!(serde_json::to_value(&parsed).expect("encodes"), full);
+        assert!(parsed.permits(&ModelId::new("org/model-v3").expect("model")));
+        assert!(!parsed.permits(&ModelId::new("gpt-4.1").expect("model")));
+        assert!(!parsed.serves(GatewayOperation::Embeddings));
     }
 
-    /// Proves reserved providers bind to their adapters in both directions.
-    #[test]
-    fn adapter_provider_reservation_is_enforced() {
-        let builtin_mismatch: ProviderDeployment =
-            serde_json::from_value(deployment("deepseek", json!("openai"))).expect("decodes");
-        assert!(builtin_mismatch.validate().is_err());
-        let compatible_reserved: ProviderDeployment = serde_json::from_value(deployment(
-            "openai",
-            json!({"openai_compatible": {"base_url": "https://example.com"}}),
-        ))
-        .expect("decodes");
-        assert!(compatible_reserved.validate().is_err());
-        let mut vertex = deployment(
-            "vertex",
-            json!({"vertex": {"project": "proj-1", "location": "us-central1"}}),
-        );
-        vertex["capabilities"] = json!(["chat_completions"]);
-        let vertex: ProviderDeployment = serde_json::from_value(vertex).expect("decodes");
-        vertex
-            .validate()
-            .expect("vertex binds to its reserved provider");
-    }
-
-    /// Proves invalid shapes fail at decode: zero weight, unknown adapter,
-    /// unknown fields, and reserved headers.
+    /// Proves the removed single-model and weight fields, unknown adapters,
+    /// unknown fields, and reserved headers fail at decode.
     #[test]
     fn invalid_shapes_fail_at_decode() {
-        let mut zero = deployment("openai", json!("openai"));
-        zero["routing_weight"] = json!(0);
-        assert!(serde_json::from_value::<ProviderDeployment>(zero).is_err());
-        assert!(
-            serde_json::from_value::<ProviderDeployment>(deployment("openai", json!("bedrock")))
-                .is_err()
-        );
-        let mut extra = deployment("openai", json!("openai"));
-        extra["status"] = json!("active");
-        assert!(serde_json::from_value::<ProviderDeployment>(extra).is_err());
+        let base = json!({"name": "primary", "adapter": "openai", "auth": "none"});
+        for (field, value) in [
+            ("model", json!({"provider": "openai", "model": "gpt-4o"})),
+            ("routing_weight", json!(1)),
+            ("status", json!("active")),
+            ("access", json!("public")),
+        ] {
+            let mut document = base.clone();
+            document[field] = value;
+            assert!(
+                serde_json::from_value::<ProviderDeployment>(document).is_err(),
+                "{field}"
+            );
+        }
+        let mut bedrock = base;
+        bedrock["adapter"] = json!("bedrock");
+        assert!(serde_json::from_value::<ProviderDeployment>(bedrock).is_err());
         for reserved in [
             "Authorization",
             "X-Forwarded-For",
@@ -410,70 +460,75 @@ mod tests {
         ] {
             assert!(ProviderAuthHeader::new(reserved).is_err(), "{reserved}");
         }
-        let mut empty = deployment("openai", json!("openai"));
-        empty["capabilities"] = json!([]);
-        let empty: ProviderDeployment = serde_json::from_value(empty).expect("decodes");
-        assert!(empty.validate().is_err());
     }
 
-    /// Proves a deployment cannot declare an operation its adapter does not
-    /// serve, so tenant capability declarations stay truthful.
+    /// Proves present allowlists and capability sets must be nonempty, unique,
+    /// and served by the adapter.
     ///
     /// # Panics
     ///
-    /// Panics when an unserved declaration validates or a served one fails.
+    /// Panics when an invalid list validates or a valid one fails.
     #[test]
-    fn capabilities_must_be_served_by_the_adapter() {
-        let mut stale = deployment("anthropic", json!("anthropic"));
-        stale["capabilities"] = json!(["chat_completions", "embeddings"]);
-        let stale: ProviderDeployment = serde_json::from_value(stale).expect("decodes");
+    fn allowlists_and_capabilities_are_validated() {
+        let with = |field: &str, value: serde_json::Value, adapter: serde_json::Value| {
+            let mut document = json!({"name": "primary", "adapter": adapter, "auth": "none"});
+            document[field] = value;
+            decode(document).validate().map_err(|error| error.field)
+        };
         assert_eq!(
-            stale
-                .validate()
-                .expect_err("anthropic serves no embeddings")
-                .field,
-            "capabilities"
+            with("models", json!([]), json!("openai")),
+            Err("models".to_owned())
         );
-        let mut served = deployment("openai", json!("openai"));
-        served["capabilities"] = json!([
-            "chat_completions",
-            "responses",
-            "embeddings",
-            "images",
-            "audio",
-            "batches"
-        ]);
-        let served: ProviderDeployment = serde_json::from_value(served).expect("decodes");
-        served
-            .validate()
-            .expect("openai serves every OpenAI operation");
-        let mut systemone = deployment("openai", json!("openai"));
-        systemone["capabilities"] = json!(["system_one"]);
-        let systemone: ProviderDeployment = serde_json::from_value(systemone).expect("decodes");
-        assert!(
-            systemone.validate().is_err(),
+        assert_eq!(
+            with("models", json!(["gpt-4o", "gpt-4o"]), json!("openai")),
+            Err("models".to_owned())
+        );
+        assert_eq!(
+            with("capabilities", json!([]), json!("openai")),
+            Err("capabilities".to_owned())
+        );
+        assert_eq!(
+            with("capabilities", json!(["embeddings"]), json!("anthropic")),
+            Err("capabilities".to_owned()),
+            "anthropic serves no embeddings"
+        );
+        assert_eq!(
+            with("capabilities", json!(["system_one"]), json!("openai")),
+            Err("capabilities".to_owned()),
             "only Jev serves systemone questions"
         );
-        let mut jev = deployment("jev", json!("jev"));
-        jev["auth"] = json!({"bearer": {"credential": "jev-key"}});
-        jev["capabilities"] = json!(["system_one", "chat_completions"]);
-        let jev_valid: ProviderDeployment = serde_json::from_value(jev.clone()).expect("decodes");
-        jev_valid
-            .validate()
-            .expect("jev serves systemone and pass-through chat");
-        for unserved in ["embeddings", "responses", "batches"] {
-            jev["capabilities"] = json!(["system_one", unserved]);
-            let jev: ProviderDeployment = serde_json::from_value(jev.clone()).expect("decodes");
-            assert!(jev.validate().is_err(), "jev does not serve {unserved}");
-        }
-        let jev_compatible: ProviderDeployment = serde_json::from_value(deployment(
-            "jev",
-            json!({"openai_compatible": {"base_url": "https://api.typesafe.ai"}}),
-        ))
-        .expect("decodes");
-        assert!(
-            jev_compatible.validate().is_err(),
-            "the jev provider is reserved for the Jev adapter"
+        assert_eq!(
+            with(
+                "capabilities",
+                json!(["system_one", "chat_completions"]),
+                json!("jev")
+            ),
+            Ok(())
         );
+        let jev = decode(json!({"name": "jev", "adapter": "jev", "auth": "none"}));
+        assert!(jev.serves(GatewayOperation::SystemOne));
+        assert!(!jev.serves(GatewayOperation::Embeddings));
+    }
+
+    /// Proves credential-provider matching follows the adapter, never the
+    /// deployment name: built-ins need their reserved identity and
+    /// compatible adapters a non-reserved one.
+    #[test]
+    fn credential_provider_follows_the_adapter() {
+        let provider = |name: &str| ProviderId::new(name).expect("provider");
+        let adapter = |value: serde_json::Value| {
+            decode(json!({"name": "anything", "adapter": value, "auth": "none"})).adapter
+        };
+        let openai = adapter(json!("openai"));
+        assert!(openai.accepts_credential_provider(&provider("openai")));
+        assert!(!openai.accepts_credential_provider(&provider("external")));
+        let vertex = adapter(json!({"vertex": {"project": "proj-1", "location": "us-central1"}}));
+        assert!(vertex.accepts_credential_provider(&provider("vertex")));
+        let compatible =
+            adapter(json!({"openai_compatible": {"base_url": "https://example.com/v1"}}));
+        assert!(compatible.accepts_credential_provider(&provider("external")));
+        for reserved in ["openai", "jev", "gemini"] {
+            assert!(!compatible.accepts_credential_provider(&provider(reserved)));
+        }
     }
 }

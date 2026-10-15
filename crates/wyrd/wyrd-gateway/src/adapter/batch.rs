@@ -1,7 +1,7 @@
 //! Batches lifecycle actions and batch input files.
 //!
 //! A batch input file is `OpenAI` batch JSONL whose lines all target one
-//! endpoint and name one exact `<provider>/<model>` projection, so a batch is
+//! endpoint and name one exact `<deployment>/<model>` projection, so a batch is
 //! authorized, routed, and accounted as a call to that model. Upload rewrites
 //! every line's model to the serving deployment's native identifier.
 
@@ -90,10 +90,10 @@ impl BatchInput {
                 .ok_or_else(|| invalid(".body", "must be a JSON object"))?
                 .get("model")
                 .and_then(Value::as_str)
-                .ok_or_else(|| invalid(".body.model", "must be <provider>/<model>"))
+                .ok_or_else(|| invalid(".body.model", "must be <deployment>/<model>"))
                 .and_then(|model| {
                     ModelRef::from_projection(model)
-                        .map_err(|_| invalid(".body.model", "must be <provider>/<model>"))
+                        .map_err(|_| invalid(".body.model", "must be <deployment>/<model>"))
                 })?;
             match &shape {
                 None => shape = Some((url.to_owned(), model)),

@@ -37,10 +37,15 @@ async fn agent_run_via_umbrella_imports() {
     ));
 }
 
+/// The native OpenAI Chat Prompt the umbrella Agent tests inline.
+///
+/// # Panics
+/// Panics when the static request is not a valid Prompt.
 fn prompt() -> skald_spec::Prompt {
     skald_spec::Prompt::new(openai_request(), "gpt-4o-mini").expect("static prompt is valid")
 }
 
+/// The OpenAI Chat request with one user turn behind [`prompt`].
 fn openai_request() -> ProviderRequest {
     ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
         model: "gpt-4o-mini".to_owned(),

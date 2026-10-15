@@ -32,6 +32,12 @@ struct StaticAgentResolver {
 
 #[async_trait]
 impl AgentCardResolver for StaticAgentResolver {
+    /// Returns a native-route, one-iteration Agent spec with the fixture Prompt
+    /// inline, counting each call when a counter is attached so tests can prove
+    /// the invoker caches its judge.
+    ///
+    /// # Errors
+    /// Never fails.
     async fn resolve(&self, _agent_ref: &CardRef) -> Result<AgentSpec, JudgeError> {
         if let Some(calls) = &self.calls {
             calls.fetch_add(1, Ordering::Relaxed);
@@ -78,6 +84,8 @@ fn sibling_judge_agent_ref() -> InlineableRef<AgentSpec> {
     }
 }
 
+/// An inline native-route, one-iteration judge Agent over `prompt`, which
+/// the invoker uses as authored without resolving a reference.
 fn inline_agent_ref(prompt: skald_prompt::Prompt) -> InlineableRef<AgentSpec> {
     InlineableRef::Inline(Box::new(AgentSpec {
         prompt: InlineableRef::Inline(Box::new(prompt.into_native())),

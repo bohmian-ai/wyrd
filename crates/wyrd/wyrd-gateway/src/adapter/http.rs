@@ -638,6 +638,16 @@ impl Client {
 
 #[async_trait]
 impl ProviderDispatch for HttpProviderDispatch {
+    /// Sends one admitted attempt to its deployment over HTTP.
+    ///
+    /// The body is first prepared for the deployment's adapter; an
+    /// unrepresentable request is rejected and an unusable endpoint, auth, or
+    /// credential fails before dispatch, neither reaching the network. A
+    /// streaming call returns translated frames, a Batches action its lifecycle
+    /// answer, speech its audio stream, and other media its content unchanged;
+    /// any other answer is decoded and, on an OpenAI ingress, translated back to
+    /// the caller's dialect. Every outcome, including upstream failures, is an
+    /// [`AttemptResult`] for the engine to account and retry.
     async fn dispatch(&self, attempt: ProviderAttempt<'_>) -> AttemptResult {
         let deployment = attempt.deployment;
         let failed = |class| AttemptResult::Failed {

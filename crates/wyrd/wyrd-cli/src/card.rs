@@ -742,6 +742,11 @@ impl OptionalVersionSelector for CardSelector {
     }
 }
 
+/// Parses a `--kind` argument by its wire name.
+///
+/// # Errors
+/// Returns an invalid-argument error for a name that is not a known Card
+/// kind.
 fn parse_kind(value: &str) -> Result<CardKind, WyrdCliError> {
     CardKind::from_wire_name(value).ok_or_else(|| {
         invalid_argument(

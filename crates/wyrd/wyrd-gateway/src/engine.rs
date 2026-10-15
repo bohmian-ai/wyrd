@@ -828,6 +828,9 @@ mod tests {
     }
 
     /// Deployment `name` authenticating with `credential`.
+    ///
+    /// # Panics
+    /// Panics when the fixture is not a valid deployment.
     fn deployment(name: &str, credential: Option<&str>) -> ProviderDeployment {
         let auth = credential.map_or(json!("none"), |c| json!({"bearer": {"credential": c}}));
         serde_json::from_value(json!({
@@ -847,6 +850,9 @@ mod tests {
     /// The binding reads `CARGO_PKG_NAME`, which the test runner always sets,
     /// so the resolved plaintext is `wyrd-gateway` without mutating the
     /// process environment.
+    ///
+    /// # Panics
+    /// Panics when a static identifier, deployment, or policy is invalid.
     fn snapshot() -> GatewayTenantSnapshot {
         let acme = ProviderId::new("acme").expect("provider");
         GatewayTenantSnapshot {
@@ -894,6 +900,9 @@ mod tests {
     }
 
     /// Runs `operation` for `dep-a1/a` against `snap`.
+    ///
+    /// # Panics
+    /// Panics when the static address is invalid.
     async fn run(
         engine: &GatewayEngine,
         snap: &GatewayTenantSnapshot,
@@ -938,6 +947,10 @@ mod tests {
     /// Upstream failures of an idempotent call move through deployments and
     /// then cross to the fallback model with its resolved credential; the
     /// failed deployment is avoided by the next call.
+    ///
+    /// # Panics
+    /// Panics when the engine dispatches another sequence of attempts or
+    /// returns another outcome.
     #[tokio::test]
     async fn idempotent_failures_fall_back_and_avoid_unhealthy_deployments() {
         let snap = snapshot();
@@ -987,6 +1000,10 @@ mod tests {
 
     /// A credential failure never dispatches and falls through; non-idempotent
     /// upstream failures, rejections, and post-output failures never retry.
+    ///
+    /// # Panics
+    /// Panics when an unsafe failure retries, a missing credential dispatches,
+    /// or the engine returns another outcome.
     #[tokio::test]
     async fn unsafe_failures_never_retry_and_credentials_fail_closed() {
         let mut snap = snapshot();

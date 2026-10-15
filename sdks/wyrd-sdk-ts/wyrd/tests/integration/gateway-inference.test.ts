@@ -11,6 +11,7 @@ import { z } from "zod";
 import {
   Cards,
   Gateway,
+  Principals,
   type ProviderDeployment,
   type RegistrationReceipt,
   Workflow,
@@ -19,7 +20,7 @@ import {
 } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
-import { fixture, registered, revokedApiKey, serverTest } from "../support/server.js";
+import { fixture, registered, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -223,7 +224,13 @@ test("stock anthropic client authenticates with httpAuth alone", async ({ provid
 // The status of the refusal is not pinned: only that the client's own token
 // exchange rejected the request, so no gateway call was made.
 test("revoked api key is refused by the token exchange, before the gateway", async ({ provider, ask: _ }) => {
-  vi.stubEnv("WYRD_API_KEY", await revokedApiKey("revoked-gateway-caller"));
+  const principals = Principals.connect();
+  const { principal_id, credential } = await principals.createServicePrincipal({
+    name: "revoked-gateway-caller",
+    roles: [],
+  });
+  await principals.revokePrincipal(principal_id, { principal_kind: "service", reason: "journey revokes this key" });
+  vi.stubEnv("WYRD_API_KEY", credential);
   const client = new OpenAI({
     baseURL: `${process.env.WYRD_SERVER_URL}/v1`,
     apiKey: "wyrd",

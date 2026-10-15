@@ -460,6 +460,17 @@ impl Prompt {
             .unwrap_or_else(|| self.request.provider())
     }
 
+    /// The media kind a portable `${media:name}` binding requires, from its
+    /// image or document block; `None` for an unknown name or a native
+    /// placeholder, which carries no kind.
+    #[must_use]
+    pub fn media_kind(&self, name: &str) -> Option<MediaKind> {
+        self.media_kinds
+            .iter()
+            .find(|(bound, _)| bound == name)
+            .map(|(_, kind)| *kind)
+    }
+
     /// Whether every answer to this Prompt is a structured JSON object.
     ///
     /// True when the Prompt declares a JSON-schema response, or when its

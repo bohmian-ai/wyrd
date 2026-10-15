@@ -602,6 +602,18 @@ where
                             ),
                         ));
                     }
+                    if let Some(block) = prompt.media_kind(name.as_str())
+                        && let Some(format) =
+                            formats.iter().find(|f| f.native_kind() != Some(block))
+                    {
+                        return Err(invalid(
+                            "native_media",
+                            path,
+                            format!(
+                                "{format} cannot fill the {block:?} block bound to media placeholder {name}"
+                            ),
+                        ));
+                    }
                 }
                 (true, None) => {
                     return Err(invalid(
@@ -1256,6 +1268,17 @@ mod tests {
             ),
             (
                 with("/inputs/policy/formats", json!(["pdf", "docx"])),
+                "native_media",
+            ),
+            (
+                with(
+                    "/requirements/2/check/agent",
+                    agent(
+                        &[],
+                        json!([{"type": "image", "source": "${media:policy}"}, {"type": "text", "text": "{{claim}} {{answer}} {{findings}}"}]),
+                        Some(verdict_schema()),
+                    ),
+                ),
                 "native_media",
             ),
             (

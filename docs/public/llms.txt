@@ -6,7 +6,6 @@
 
 - [Wyrd docs](https://bohmian-ai.github.io/wyrd/): the docs home, with a link to each published section.
 
-## Machine-readable schemas
+## Machine-readable reference
 
-- [llms-full.txt](https://bohmian-ai.github.io/wyrd/llms-full.txt): this index plus the JSON Schema of every Card kind.
-- [Card and API JSON Schemas](https://github.com/bohmian-ai/wyrd/tree/main/crates/wyrd-spec/schemas): the source schemas generated from `wyrd-spec`.
+- [llms-full.txt](https://bohmian-ai.github.io/wyrd/llms-full.txt): this index as the full machine-readable reference.

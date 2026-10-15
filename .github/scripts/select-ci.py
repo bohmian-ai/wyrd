@@ -37,7 +37,9 @@ from collections import deque
 GLOBAL = re.compile(r"^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|mise\.toml|\.github/)")
 # Paths that select no verification of their own.
 UNVERIFIED = re.compile(r"^(changes/|architecture/|[^/]+\.md$)")
-DOCS = re.compile(r"^(docs/|openapi\.yaml|crates/wyrd-spec/schemas/|examples/)")
+# The docs diagram test reads the wyrd-spec contract bundle, so contract
+# sources are docs inputs as well as Rust packages.
+DOCS = re.compile(r"^(docs/|openapi\.yaml|crates/wyrd-spec/(src|examples)/|examples/)")
 # UI also covers the generated token targets so the token drift check fires on a
 # hand-edit to any of them. The UI is bundled beside the server binary, not
 # compiled into it, so it does not select the server's Rust closure.

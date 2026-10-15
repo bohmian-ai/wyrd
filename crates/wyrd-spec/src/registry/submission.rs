@@ -105,6 +105,7 @@ pub struct CardRegistrationOutcome {
     /// BLAKE3 hex hash of the JCS-canonical resolved spec.
     pub spec_hash: String,
     /// BLAKE3 hex hash of the sorted artifact manifest, when present.
+    #[serde(default)]
     pub artifact_hash: Option<String>,
     /// Server-managed lifecycle state.
     pub status: CardLifecycleStatus,
@@ -113,6 +114,7 @@ pub struct CardRegistrationOutcome {
     /// URI of the durable card blob once written.
     #[schemars(with = "Option<String>")]
     #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
+    #[serde(default)]
     pub card_blob_uri: Option<Url>,
 }
 

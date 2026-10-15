@@ -1,10 +1,6 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
-
 from typing import Literal
 
-#### end of imports ####
+from ._http_auth import HttpAuth
 
 class WyrdClient:
     """Authenticated Wyrd client that can act for another principal.
@@ -72,6 +68,24 @@ class WyrdClient:
 
         Raises:
             WyrdError: the server's stable code when it refuses the credential.
+        """
+        ...
+
+    @property
+    def http_auth(self) -> HttpAuth:
+        """An ``httpx.Auth`` / ``httpx2.Auth`` that authenticates to Wyrd as this client.
+
+        Hand it to any stock client built on ``httpx`` or ``httpx2``: the
+        OpenAI and Anthropic SDKs through ``http_client=httpx2.Client(auth=...)``,
+        google-genai, or an MCP client against ``/mcp``. Each request drops
+        ``Authorization``, ``x-api-key``, and ``x-goog-api-key``, which on a
+        client wired to Wyrd hold only a placeholder provider key, and carries
+        ``X-Wyrd-Access-Token: Bearer <token>`` from ``access_token()``, asked
+        for on that request. The async flow renews off the event loop.
+
+        Raises:
+            ImportError: ``httpx`` or ``httpx2`` is missing; install
+                ``wyrd[gateway]``.
         """
         ...
 

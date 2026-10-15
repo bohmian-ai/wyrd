@@ -1,6 +1,6 @@
 import { expect, test, vi } from "vitest";
 
-import { Gateway, WyrdClient, gatewayFetch } from "wyrd-ai";
+import { Gateway, WyrdClient } from "wyrd-ai";
 
 /** Sits where a number is required, so a serde message would quote it verbatim. */
 const SENTINEL = "sk-live-typescript-surface-sentinel";
@@ -43,21 +43,34 @@ test("rejects a malformed body without echoing it", async () => {
   expect(JSON.stringify(error) + String(error)).not.toContain(SENTINEL);
 });
 
-test("gatewayFetch sends a fresh access token on every request", async () => {
+// The token is read per request so a long-lived client survives expiry, and
+// the placeholder provider keys are dropped so the gateway sees one credential.
+test("httpAuth replaces provider key headers with a fresh access token on every request", async () => {
+  const client = options.client;
   let minted = 0;
-  const client = { accessToken: async () => `token-${++minted}` } as unknown as WyrdClient;
-  const sent: (string | null)[] = [];
+  vi.spyOn(client, "accessToken").mockImplementation(async () => `token-${++minted}`);
+  const sent: Record<string, string>[] = [];
   vi.stubGlobal("fetch", async (_input: string | URL | Request, init?: RequestInit) => {
-    sent.push(new Headers(init?.headers).get("authorization"));
+    sent.push(Object.fromEntries(new Headers(init?.headers)));
     return new Response("{}");
   });
   try {
-    const gateway = gatewayFetch(client);
-    await gateway("http://gateway/v1/models", { headers: { accept: "application/json" } });
-    await gateway("http://gateway/v1/models");
+    await client.httpAuth("http://wyrd/v1/chat/completions", {
+      headers: {
+        authorization: "Bearer wyrd",
+        "x-api-key": "wyrd",
+        "x-goog-api-key": "wyrd",
+        accept: "application/json",
+      },
+    });
+    await client.httpAuth(new Request("http://wyrd/mcp", { headers: { authorization: "Bearer wyrd" } }));
   } finally {
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   }
 
-  expect(sent).toEqual(["Bearer token-1", "Bearer token-2"]);
+  expect(sent).toEqual([
+    { accept: "application/json", "x-wyrd-access-token": "Bearer token-1" },
+    { "x-wyrd-access-token": "Bearer token-2" },
+  ]);
 });

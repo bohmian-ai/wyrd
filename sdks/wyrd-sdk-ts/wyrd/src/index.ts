@@ -3,7 +3,59 @@ import { createRequire } from "node:module";
 
 import type { WyrdErrorCode } from "./error-codes.js";
 import type {
+  BifrostTableDescription as TableDescription,
+  BifrostTableEntry as TableEntry,
+  CancelRunningQueryResponse,
   CardRef,
+  CardRegistrationOutcome,
+  CardSummary,
+  CompactionTypeWire as CompactionType,
+  CreateOperatorConnectionRequest,
+  CreateServicePrincipalRequest,
+  CreateServicePrincipalResponse,
+  CredentialListResponse as CredentialList,
+  CredentialMetadata,
+  DataTypeSpec,
+  FallbackRule,
+  FallbackScope,
+  FieldSpec2 as FieldDescription,
+  GatewayBudget,
+  GatewayCaptureMode,
+  GatewayCapturePolicy,
+  GatewayCapturePolicyWrite,
+  GatewayFallbackPolicy,
+  GatewayGovernancePolicy,
+  GatewayLimit,
+  GatewayLimitSubject,
+  GatewayModelPricing,
+  GatewayOperation,
+  GatewayPolicySubject,
+  GatewayPolicyTarget,
+  GatewayPriceRate,
+  HttpAuthScheme,
+  HttpConnectionAuth,
+  IssuedCredential,
+  JsonValue,
+  Judgment as JudgmentWire,
+  ListCardsRequest,
+  ListCardsResponse,
+  ModelRef,
+  OperatorConnectionStatus,
+  OperatorConnectionView,
+  PhysicalLayoutWire as PhysicalLayout,
+  PrincipalKindTag as PrincipalKind,
+  PrincipalPage,
+  PrincipalQuery,
+  PrincipalRoles,
+  PrincipalSummary,
+  ProviderAdapter,
+  ProviderAuth,
+  ProviderCredentialSourceView,
+  ProviderCredentialView,
+  ProviderDeployment,
+  QueryClass,
+  QueryParam,
+  QueryTerminalFrame as QueryTerminal,
   RegisteredAgentCard,
   RegisteredCard,
   RegisteredDataCard,
@@ -12,6 +64,21 @@ import type {
   RegisteredServiceCard,
   RegisteredVerifierCard,
   RegisteredWorkflowCard,
+  RegistrationReceipt,
+  RevokePrincipalRequest,
+  RoleAssignment,
+  RoleAssignmentChange,
+  RoleSource,
+  RunningQueryLifecycleState,
+  RunningQuerySummary,
+  SortKeyWire as SortKey,
+  TokenAudience,
+  UpdateOperatorConnectionRequest,
+  WorkflowRun,
+  WorkflowRunError,
+  WorkflowRunStatus,
+  WorkflowStepResult,
+  WorkflowStepStatus,
 } from "./card-types.js";
 
 import type { NativeBifrostQueryStream, NativeLifecycleResult, NativeQueryStep } from "../index.cjs";
@@ -44,157 +111,95 @@ type NativeRun = import("../index.cjs").NativeRun;
 type NativeRunOpen = import("../index.cjs").NativeRunOpen;
 type NativeTableConfig = import("../index.cjs").NativeTableConfig;
 
-/**
- * One positional SQL bind value: `params[i]` binds placeholder `$(i + 1)`.
- *
- * Values travel as typed data beside the SQL text and are never interpolated
- * into it. A safe integer binds as an integer and any other number as a float.
- */
-export type QueryParam = null | boolean | number | string;
-
-/**
- * One column's logical type: a scalar variant name, or a single-key object for
- * a parameterized form. `List`, `Struct`, and `Map` carry full field
- * declarations, which is what makes the contract recursive. `Map` carries its
- * non-nullable `key` and its `value` declarations.
- */
-export type DataTypeSpec =
-  | string
-  | { readonly FixedSizeBinary: Readonly<Record<string, number>> }
-  | { readonly Timestamp: Readonly<Record<string, string | null>> }
-  | { readonly Time32: Readonly<Record<string, string>> }
-  | { readonly Time64: Readonly<Record<string, string>> }
-  | { readonly Decimal128: Readonly<Record<string, number>> }
-  | { readonly List: FieldDescription }
-  | { readonly Struct: readonly FieldDescription[] }
-  | { readonly Map: { readonly key: FieldDescription; readonly value: FieldDescription } };
-
-/**
- * One column declaration in a table description, exactly as stored.
- *
- * `metadata` carries the Arrow field metadata the physical schema holds,
- * including the stable `PARQUET:field_id`. The server omits it when empty.
- */
-export interface FieldDescription {
-  readonly name: string;
-  readonly data_type: DataTypeSpec;
-  readonly nullable: boolean;
-  readonly metadata?: Readonly<Record<string, string>>;
-}
-
-/** The lightweight table identity shared by the list and describe routes. */
-export interface TableEntry {
-  readonly namespace: string;
-  readonly name: string;
-  readonly table_uid: string;
-  readonly status: string;
-  readonly fingerprint: string;
-  readonly registered_at: string;
-  readonly updated_at: string;
-}
-
-/** One resolved sort key of a table's physical layout. */
-export interface SortKey {
-  readonly column: string;
-  readonly direction: string;
-  readonly null_order: string;
-}
-
-/**
- * A table's server-resolved partitioning, sort order, and Bloom columns.
- *
- * `partition_granularity` applies to `time_column`, which is `wyrd_ingested_at`
- * unless the table declared its own.
- */
-export interface PhysicalLayout {
-  readonly partition_granularity: string;
-  readonly time_column: string;
-  readonly sort_keys: readonly SortKey[];
-  readonly bloom_columns: readonly string[];
-}
-
-/**
- * The server's projection of one registered table's stored physical schema.
- *
- * A writer declares `user_fields` and supplies `correlation_fields`.
- * `canonical_physical_fingerprint` is present only
- * for a canonical signal table; `compaction_target_file_size_bytes` only when
- * the table declared an explicit Forge compaction file target, and
- * `compaction_type` only when it declared an explicit compaction type.
- */
-export interface TableDescription {
-  readonly entry: TableEntry;
-  readonly user_fields: readonly FieldDescription[];
-  readonly correlation_fields: readonly FieldDescription[];
-  readonly canonical_physical_fingerprint?: string;
-  readonly physical_layout: PhysicalLayout;
-  readonly compaction_target_file_size_bytes?: number;
-  readonly compaction_type?: CompactionType;
-}
-
-/**
- * The physical compaction strategy a table asks Forge to apply, in its wire
- * spelling. Omitted, Forge compacts the table `small-files`; a copy-on-write table
- * compacts `full` whatever it declares.
- */
-export type CompactionType = "auto" | "full" | "small-files" | "files-with-delete";
-
+/** Aggregate participant progress of one active query, in the SDK's camelCase projection. */
 export interface RunningQueryProgress {
   readonly completedParticipants: number;
   readonly totalParticipants: number;
 }
 
+/** One active query visible to the tenant, projected from the `RunningQuerySummary` wire contract. */
 export interface RunningQuery {
   readonly requestId: string;
-  readonly queryClass: "interactive" | "analytical";
+  readonly queryClass: QueryClass;
   readonly startedAt: string;
   readonly deadline: string;
-  readonly state: "admitted" | "running" | "cancelling";
+  readonly state: RunningQueryLifecycleState;
   readonly progress: RunningQueryProgress;
   readonly cancellationRequested: boolean;
 }
 
+/** Idempotent cancellation result, projected from the `CancelRunningQueryResponse` wire contract. */
 export interface CancelRunningQueryResult {
   readonly requestId: string;
   readonly cancellationStarted: boolean;
 }
 
-interface RunningQueryWire {
-  readonly request_id: string;
-  readonly query_class: "interactive" | "analytical";
-  readonly started_at: string;
-  readonly deadline: string;
-  readonly state: "admitted" | "running" | "cancelling";
-  readonly progress: {
-    readonly completed_participants: number;
-    readonly total_participants: number;
-  };
-  readonly cancellation_requested: boolean;
-}
-
-interface CancelRunningQueryWire {
-  readonly request_id: string;
-  readonly cancellation_started: boolean;
-}
-
-export interface QueryTerminal {
-  outcome: "success" | "degraded" | "failed";
-  row_count: number;
-  warnings: unknown[];
-  source_completion: unknown[];
-  error?: unknown;
-  /**
-   * Arrow IPC end-of-stream delta closing the query's single IPC stream.
-   *
-   * Present and non-empty for a successful or degraded query, and empty for a
-   * failed one, which never closes its stream. A caller distinguishing a
-   * complete result from a truncated one reads this rather than inferring
-   * completeness from an absent batch.
-   */
-  arrow_ipc_eos: number[];
-}
-
 export type { WyrdErrorCode } from "./error-codes.js";
+/** Wire contracts generated from the `wyrd-spec` Rust types, under their SDK names. */
+export type {
+  CardRegistrationOutcome,
+  CardSummary,
+  CompactionType,
+  CreateOperatorConnectionRequest,
+  CreateServicePrincipalRequest,
+  CreateServicePrincipalResponse,
+  CredentialList,
+  CredentialMetadata,
+  DataTypeSpec,
+  FallbackRule,
+  FallbackScope,
+  FieldDescription,
+  GatewayBudget,
+  GatewayCaptureMode,
+  GatewayCapturePolicy,
+  GatewayCapturePolicyWrite,
+  GatewayFallbackPolicy,
+  GatewayGovernancePolicy,
+  GatewayLimit,
+  GatewayLimitSubject,
+  GatewayModelPricing,
+  GatewayOperation,
+  GatewayPolicySubject,
+  GatewayPolicyTarget,
+  GatewayPriceRate,
+  HttpAuthScheme,
+  HttpConnectionAuth,
+  IssuedCredential,
+  JsonValue,
+  ListCardsRequest,
+  ListCardsResponse,
+  ModelRef,
+  OperatorConnectionStatus,
+  OperatorConnectionView,
+  PhysicalLayout,
+  PrincipalKind,
+  PrincipalPage,
+  PrincipalQuery,
+  PrincipalRoles,
+  PrincipalSummary,
+  ProviderAdapter,
+  ProviderAuth,
+  ProviderCredentialSourceView,
+  ProviderCredentialView,
+  ProviderDeployment,
+  QueryParam,
+  QueryTerminal,
+  RegistrationReceipt,
+  RevokePrincipalRequest,
+  RoleAssignment,
+  RoleAssignmentChange,
+  RoleSource,
+  SortKey,
+  TableDescription,
+  TableEntry,
+  TokenAudience,
+  UpdateOperatorConnectionRequest,
+  WorkflowRun,
+  WorkflowRunError,
+  WorkflowRunStatus,
+  WorkflowStepResult,
+  WorkflowStepStatus,
+};
 export type {
   AgentSpec,
   CardKind,
@@ -354,7 +359,7 @@ function nativeHandle<T>(value: T | null | undefined, error: NativeErrorMetadata
   return value;
 }
 
-function runningQuery(wire: RunningQueryWire): RunningQuery {
+function runningQuery(wire: RunningQuerySummary): RunningQuery {
   return {
     requestId: wire.request_id,
     queryClass: wire.query_class,
@@ -526,7 +531,7 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
  * instant is accepted.
  */
 export interface TableLayout {
-  partitionGranularity?: "hour" | "day";
+  partitionGranularity?: PhysicalLayout["partition_granularity"];
   timeColumn?: string;
   sortKeys?: readonly SortKey[];
   bloomColumns?: readonly string[];
@@ -1293,7 +1298,7 @@ export class Bifrost {
    * @throws {@link WyrdError} for a transport or authorization failure.
    */
   async running(): Promise<RunningQuery[]> {
-    return lifecycleValue<RunningQueryWire[]>(await this.#native.running()).map(runningQuery);
+    return lifecycleValue<RunningQuerySummary[]>(await this.#native.running()).map(runningQuery);
   }
 
   /**
@@ -1305,7 +1310,7 @@ export class Bifrost {
    * transport or authorization failure.
    */
   async status(requestId: string): Promise<RunningQuery> {
-    return runningQuery(lifecycleValue<RunningQueryWire>(await this.#native.status(requestId)));
+    return runningQuery(lifecycleValue<RunningQuerySummary>(await this.#native.status(requestId)));
   }
 
   /**
@@ -1317,7 +1322,7 @@ export class Bifrost {
    * transport or authorization failure.
    */
   async cancel(requestId: string): Promise<CancelRunningQueryResult> {
-    const wire = lifecycleValue<CancelRunningQueryWire>(await this.#native.cancel(requestId));
+    const wire = lifecycleValue<CancelRunningQueryResponse>(await this.#native.cancel(requestId));
     return {
       requestId: wire.request_id,
       cancellationStarted: wire.cancellation_started,
@@ -1336,54 +1341,6 @@ export class Bifrost {
   async describeTable(namespace: string, name: string): Promise<TableDescription> {
     return lifecycleValue<TableDescription>(await this.#native.describeTable(namespace, name));
   }
-}
-
-/** Server outcome for one Card in a composite registration. */
-export interface CardRegistrationOutcome {
-  readonly card_ref: CardRef;
-  readonly spec_hash: string;
-  readonly artifact_hash: string | null;
-  readonly status: string;
-  readonly outcome: string;
-  readonly card_blob_uri: string | null;
-}
-
-/** Registration receipt: the graph root plus dependency-first outcomes. */
-export interface RegistrationReceipt {
-  readonly root: CardRef;
-  readonly outcomes: readonly CardRegistrationOutcome[];
-}
-
-/** Metadata-only Card list filters. */
-export interface ListCardsRequest {
-  readonly kind?: string;
-  readonly space?: string;
-  readonly name?: string;
-  readonly version_range?: string;
-  readonly status?: string;
-  readonly filter?: string;
-  readonly include_prerelease?: boolean;
-  readonly limit?: number;
-  readonly cursor?: string;
-}
-
-/** One metadata-only Card summary. */
-export interface CardSummary {
-  readonly card_uid: string;
-  readonly kind: string;
-  readonly space: string;
-  readonly name: string;
-  readonly version: string;
-  readonly spec_hash: string;
-  readonly artifact_hash: string | null;
-  readonly status: string;
-  readonly [key: string]: unknown;
-}
-
-/** One page of Card summaries. */
-export interface ListCardsResponse {
-  readonly items: readonly CardSummary[];
-  readonly next_cursor: string | null;
 }
 
 /** Machine-readable result of a published hydration. */
@@ -1409,9 +1366,6 @@ export interface HydratedArtifact {
 function cardRefText(ref: CardRef | string): string {
   return typeof ref === "string" ? ref : JSON.stringify(ref);
 }
-
-/** Audience a delegated token is bound to. */
-export type TokenAudience = "wyrd" | "bifrost";
 
 /**
  * Record one telemetry observation, fire-and-forget.
@@ -1550,6 +1504,29 @@ export class WyrdClient {
   async accessToken(): Promise<string> {
     const result = await this.#native.accessToken();
     return nativeHandle(result.token, result.error);
+  }
+
+  /**
+   * A `fetch` that authenticates every request to Wyrd as this client.
+   *
+   * Hand it to any client that takes a `fetch`: a provider SDK pointed at the
+   * gateway, `new OpenAI({ baseURL, apiKey: "wyrd", fetch: wyrd.httpAuth })`,
+   * or an MCP transport against `/mcp`. Each request drops `authorization`,
+   * `x-api-key`, and `x-goog-api-key`, which on a client wired to Wyrd hold
+   * only a placeholder provider key, and carries this client's current access
+   * token as `X-Wyrd-Access-Token: Bearer <token>`. The token is read per
+   * request, so a long-lived client keeps working after any one token expires.
+   *
+   * @returns The authenticating `fetch`; a request rejects with the client's
+   * {@link WyrdError} when the credential is missing or refused.
+   */
+  get httpAuth(): typeof fetch {
+    return async (input, init) => {
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      for (const name of ["authorization", "x-api-key", "x-goog-api-key"]) headers.delete(name);
+      headers.set("x-wyrd-access-token", `Bearer ${await this.accessToken()}`);
+      return fetch(input, { ...init, headers });
+    };
   }
 
   /**
@@ -1752,67 +1729,6 @@ export class WorkflowCards {
   }
 }
 
-/** Any value JSON can carry: Workflow inputs, outputs, and error details. */
-export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
-
-/** Lifecycle status of a Workflow run. */
-export type WorkflowRunStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled" | "timed_out";
-
-/** Lifecycle status of one Workflow step. */
-export type WorkflowStepStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled" | "unstarted";
-
-/** Catalog error recorded on a failed run or step. */
-export interface WorkflowRunError {
-  /** Stable Wyrd error code. */
-  readonly code: string;
-  /** Safe diagnostic message. */
-  readonly message: string;
-  /** Safe structured details. */
-  readonly details: JsonValue;
-  /** Operator-facing remediation. */
-  readonly remediation: string;
-}
-
-/** Result of one Workflow step. */
-export interface WorkflowStepResult {
-  /** Step lifecycle status. */
-  readonly status: WorkflowStepStatus;
-  /** Final text output, present only for a succeeded step. */
-  readonly text: string | null;
-  /** Structured output, present only for a succeeded step. */
-  readonly structured_output: JsonValue | null;
-  /** Number of attempts begun. */
-  readonly attempts: number;
-  /** RFC 3339 first attempt start time, `null` if the step never started. */
-  readonly started_at: string | null;
-  /** RFC 3339 terminal time, `null` while the step is active. */
-  readonly ended_at: string | null;
-  /** Terminal error, present only for a failed step. */
-  readonly error: WorkflowRunError | null;
-}
-
-/** Snapshot of one Workflow run. */
-export interface WorkflowRun {
-  /** Run identity. */
-  readonly run_id: string;
-  /** Pinned Workflow Card, `null` for an unregistered local run. */
-  readonly workflow: CardRef | null;
-  /** Run lifecycle status. */
-  readonly status: WorkflowRunStatus;
-  /** Declared outputs, populated only for a succeeded run. */
-  readonly outputs: Record<string, JsonValue>;
-  /** Step results keyed by step ID. */
-  readonly steps: Record<string, WorkflowStepResult>;
-  /** RFC 3339 creation time. */
-  readonly created_at: string;
-  /** RFC 3339 start time, `null` before the run starts. */
-  readonly started_at: string | null;
-  /** RFC 3339 terminal time, `null` while the run is active. */
-  readonly ended_at: string | null;
-  /** Primary error for a `failed` or `timed_out` run. */
-  readonly error: WorkflowRunError | null;
-}
-
 /**
  * Runnable Workflow loaded from an authored file or from the registry.
  *
@@ -1914,131 +1830,13 @@ export class Workflow {
 }
 
 /** The judgment of one direct verification, returned by {@link Observe.verify}. */
-export interface Judgment {
+export interface Judgment extends JudgmentWire {
   /** Whether the expectations held: true only for a `passed` verdict. */
   readonly passed: boolean;
-  /** Transient identity found only in this response, the audit row, and the trace. */
-  readonly execution_id: string;
-  readonly verifier: CardRef;
-  readonly subject: CardRef;
-  readonly kind:
-    | "drift_psi"
-    | "drift_spc"
-    | "drift_custom"
-    | "eval_assertion"
-    | "eval_llm_judge"
-    | "eval_other"
-    | "task_assertion"
-    | "task_llm_judge"
-    | "unknown";
-  readonly verdict: "passed" | "failed" | "inconclusive";
-  readonly summary: string;
-  /** Count-only rollup of a Drift or Eval judgment; absent for a task Verifier. */
-  readonly counts?:
-    | { readonly implementation: "drift"; readonly drifted_features: number; readonly total_features: number }
-    | {
-        readonly implementation: "eval";
-        readonly passed_tasks: number;
-        readonly failed_tasks: number;
-        readonly total_tasks: number;
-        readonly pass_rate_percent: number;
-      };
-  /** `{ drift: DriftReport }`, `{ eval: { results, skipped } }`, or `{ task: { result } }`. */
-  readonly detail: { readonly drift: unknown } | { readonly eval: unknown } | { readonly task: unknown };
 }
 
 /** The provider an Operator connection authenticates to. */
-export type OperatorProvider = "slack" | "pager_duty" | "http";
-
-/** A connection's lifecycle state; Operators naming a disabled one fail closed. */
-export type OperatorConnectionStatus = "active" | "disabled";
-
-/** Write-only HTTP connection credential, tagged by `scheme`. */
-export type HttpConnectionAuth =
-  | { readonly scheme: "bearer"; readonly token: string }
-  | {
-      readonly scheme: "basic";
-      readonly username: string;
-      readonly password: string;
-    }
-  | {
-      readonly scheme: "header";
-      readonly name: string;
-      readonly value: string;
-    };
-
-/** Redacted HTTP auth metadata a view returns; the credential is never read back. */
-export type HttpAuthScheme =
-  | { readonly scheme: "bearer" }
-  | { readonly scheme: "basic" }
-  | { readonly scheme: "header"; readonly name: string };
-
-/** A connection create request: provider config plus its secret. */
-export type CreateOperatorConnectionRequest =
-  | {
-      readonly provider: "slack";
-      readonly name: string;
-      readonly workspace_id: string;
-      readonly bot_token: string;
-    }
-  | {
-      readonly provider: "pager_duty";
-      readonly name: string;
-      readonly integration_key: string;
-    }
-  | {
-      readonly provider: "http";
-      readonly name: string;
-      readonly origin: string;
-      readonly auth: HttpConnectionAuth;
-    };
-
-/**
- * A connection update: the same provider, with any config, status, or secret
- * field to replace; omitted fields are preserved.
- */
-export type UpdateOperatorConnectionRequest =
-  | {
-      readonly provider: "slack";
-      readonly workspace_id?: string;
-      readonly bot_token?: string;
-      readonly status?: OperatorConnectionStatus;
-    }
-  | {
-      readonly provider: "pager_duty";
-      readonly integration_key?: string;
-      readonly status?: OperatorConnectionStatus;
-    }
-  | {
-      readonly provider: "http";
-      readonly origin?: string;
-      readonly auth?: HttpConnectionAuth;
-      readonly status?: OperatorConnectionStatus;
-    };
-
-/** Fields every connection view carries regardless of provider. */
-interface OperatorConnectionViewBase {
-  readonly connection_id: string;
-  readonly name: string;
-  readonly status: OperatorConnectionStatus;
-  readonly created_at: string;
-  readonly updated_at: string;
-}
-
-/**
- * A connection's redacted metadata with provider config flattened alongside
- * it; no view ever carries a secret.
- */
-export type OperatorConnectionView = OperatorConnectionViewBase &
-  (
-    | { readonly provider: "slack"; readonly workspace_id: string }
-    | { readonly provider: "pager_duty" }
-    | {
-        readonly provider: "http";
-        readonly origin: string;
-        readonly auth: HttpAuthScheme;
-      }
-  );
+export type OperatorProvider = OperatorConnectionView["provider"];
 
 /**
  * Tenant-scoped Operator connection client over the shared Rust handle.
@@ -2125,90 +1923,6 @@ export class OperatorConnections {
     return lifecycleValue<OperatorConnectionView>(await this.#native.disable(connectionId));
   }
 }
-
-/** The kind of an assignable principal. */
-export type PrincipalKind = "user" | "service" | "agent";
-
-/** Where a Role assignment comes from: login's identity provider, or a direct grant. */
-export type RoleSource = "idp" | "direct";
-
-/** One Role a principal holds and its source. */
-export type RoleAssignment = { readonly role: string; readonly source: RoleSource };
-
-/** A principal's Role assignments, ordered by Role and then source. */
-export type PrincipalRoles = {
-  readonly principal_id: string;
-  readonly kind: PrincipalKind;
-  readonly roles: readonly RoleAssignment[];
-};
-
-/**
- * The outcome of a direct grant or revoke: `changed` is false when the
- * assignment already matched, and `roles` is the complete resulting set.
- */
-export type RoleAssignmentChange = PrincipalRoles & {
-  readonly role: string;
-  readonly changed: boolean;
-};
-
-/**
- * One assignable principal; users carry `email`, Services and Agents `name`,
- * and Card-bound Services and Agents `card_ref`. `card_ref` is null for users
- * and unbound Services.
- */
-export type PrincipalSummary = {
-  readonly principal_id: string;
-  readonly kind: PrincipalKind;
-  readonly status: "active" | "suspended";
-  readonly email: string | null;
-  readonly name: string | null;
-  readonly card_ref: CardRef | null;
-};
-
-/** One page of principals; `next` is the following page's `after`, or null on the last page. */
-export type PrincipalPage = {
-  readonly principals: readonly PrincipalSummary[];
-  readonly next: string | null;
-};
-
-/** Exact-match discovery filters and keyset position. */
-export type PrincipalQuery = {
-  readonly kind?: PrincipalKind;
-  readonly email?: string;
-  readonly name?: string;
-  /** Page size from 1 to 200; omitted, 100. */
-  readonly limit?: number;
-  readonly after?: string;
-};
-
-/** Create an unbound Service principal holding `roles`. */
-export type CreateServicePrincipalRequest = {
-  readonly name: string;
-  readonly roles: readonly string[];
-  readonly description?: string;
-};
-
-/** The created principal and its first plaintext credential, returned once. */
-export type CreateServicePrincipalResponse = { readonly principal_id: string; readonly credential: string };
-
-/** A newly issued credential and its plaintext secret, returned once. */
-export type IssuedCredential = { readonly id: string; readonly credential: string };
-
-/** Credential metadata; the secret is never returned. */
-export type CredentialMetadata = {
-  readonly id: string;
-  readonly prefix: string;
-  readonly created_at: string;
-  readonly expires_at: string | null;
-  readonly revoked_at: string | null;
-  readonly last_used_at: string | null;
-};
-
-/** A principal's credentials. */
-export type CredentialList = { readonly credentials: readonly CredentialMetadata[] };
-
-/** Revoke a principal of `principal_kind` for an audited `reason`. */
-export type RevokePrincipalRequest = { readonly principal_kind: PrincipalKind; readonly reason: string };
 
 /**
  * Tenant principal client over the shared Rust handle: Service principals,
@@ -2963,201 +2677,6 @@ export class WyrdState {
     await this.#telemetry?.forceFlush();
     lifecycleValue<null>(await this.#native.shutdown());
   }
-}
-
-/** Provider model identity, `{provider, model}`. */
-export interface ModelRef {
-  readonly provider: string;
-  readonly model: string;
-}
-
-/**
- * Gateway operation a deployment may serve. `system_one` is Jev's
- * `POST /v1/systemone` question answering, served only by the `jev` adapter.
- */
-export type GatewayOperation =
-  | "chat_completions"
-  | "responses"
-  | "embeddings"
-  | "images"
-  | "audio"
-  | "batches"
-  | "system_one";
-
-/**
- * Redacted credential source. A tenant-submitted managed secret projects to
- * the bare discriminator. There is no write counterpart to this type: the SDK
- * reads provider credentials and never mutates one. Submitting, rotating,
- * revoking, and deleting a credential are CLI and scoped MCP administration
- * paths, because a name-only revoke or delete cannot be told apart from one
- * aimed at a managed secret.
- */
-export type ProviderCredentialSourceView =
-  | { readonly environment: { readonly binding: string } }
-  | {
-      readonly external_secret: {
-        readonly backend: string;
-        readonly reference: string;
-      };
-    }
-  | "managed_secret";
-
-/** Redacted provider credential as returned by every read and write. */
-export interface ProviderCredentialView {
-  readonly name: string;
-  readonly provider: string;
-  readonly source: ProviderCredentialSourceView;
-  readonly state: "active" | "revoked";
-  readonly created_at: string;
-  readonly updated_at: string;
-  readonly rotated_at: string | null;
-  readonly revoked_at: string | null;
-}
-
-/**
- * Provider wire adapter; built-in adapters require their reserved provider.
- * `jev` serves `system_one`, typed `{model, state, questions}` requests
- * answered by typed `answers`, and a `chat_completions` pass-through whose last
- * user message is the JSON text of `{state, questions}` and whose answer
- * content is Jev's answer as JSON.
- */
-export type ProviderAdapter =
-  | "openai"
-  | "anthropic"
-  | "gemini"
-  | "jev"
-  | {
-      readonly vertex: { readonly project: string; readonly location: string };
-    }
-  | { readonly openai_compatible: { readonly base_url: string } };
-
-/** How a deployment authenticates to its provider. */
-export type ProviderAuth =
-  | "none"
-  | { readonly bearer: { readonly credential: string } }
-  | {
-      readonly api_key_header: {
-        readonly header: string;
-        readonly credential: string;
-      };
-    };
-
-/** One named provider deployment. */
-export interface ProviderDeployment {
-  readonly name: string;
-  readonly model: ModelRef;
-  readonly adapter: ProviderAdapter;
-  readonly auth: ProviderAuth;
-  readonly capabilities: readonly GatewayOperation[];
-  readonly routing_weight: number;
-}
-
-/** Scope a fallback rule applies to. */
-export type FallbackScope =
-  | "global"
-  | { readonly operation: { readonly operation: GatewayOperation } }
-  | { readonly model: { readonly model: ModelRef } };
-
-/** Ordered fallback candidates for one scope. */
-export interface FallbackRule {
-  readonly scope: FallbackScope;
-  readonly candidates: readonly ModelRef[];
-}
-
-/** Tenant fallback policy; the default has no rules. */
-export interface GatewayFallbackPolicy {
-  readonly rules: readonly FallbackRule[];
-}
-
-/** Subject a budget applies to. */
-export type GatewayPolicySubject =
-  | "tenant"
-  | { readonly principal: { readonly principal_id: string } }
-  | { readonly role: { readonly role_name: string } };
-
-/** Subject a rate limit applies to. */
-export type GatewayLimitSubject = "tenant" | { readonly principal: { readonly principal_id: string } };
-
-/** Provider or model a limit targets. */
-export type GatewayPolicyTarget =
-  | "all"
-  | { readonly provider: { readonly provider: string } }
-  | { readonly model: { readonly model: ModelRef } };
-
-/** One rate limit; at least one ceiling is set. */
-export interface GatewayLimit {
-  readonly subject: GatewayLimitSubject;
-  readonly target: GatewayPolicyTarget;
-  readonly requests_per_minute: number | null;
-  readonly tokens_per_minute: number | null;
-  readonly concurrent_calls: number | null;
-}
-
-/** One spend budget; `amount` is a non-negative decimal string. */
-export interface GatewayBudget {
-  readonly subject: GatewayPolicySubject;
-  readonly period: "calendar_day_utc" | "calendar_month_utc";
-  readonly amount: string;
-  readonly currency: string;
-}
-
-/** One priced usage dimension; `price` is a decimal string. */
-export interface GatewayPriceRate {
-  readonly dimension: string;
-  readonly unit: string;
-  readonly price: string;
-}
-
-/** One versioned model price list. */
-export interface GatewayModelPricing {
-  readonly model: ModelRef;
-  readonly version: string;
-  readonly currency: string;
-  readonly effective_at: string;
-  readonly active: boolean;
-  readonly rates: readonly GatewayPriceRate[];
-}
-
-/** Tenant governance policy: limits, budgets, pricing, unknown-cost handling. */
-export interface GatewayGovernancePolicy {
-  readonly limits: readonly GatewayLimit[];
-  readonly budgets: readonly GatewayBudget[];
-  readonly pricing: readonly GatewayModelPricing[];
-  readonly unknown_cost: "reject" | "allow_unpriced";
-}
-
-/** Capture mode for gateway calls. */
-export type GatewayCaptureMode = "disabled" | "metadata" | "payload";
-
-/** Capture policy write; payload fields are required only in payload mode. */
-export interface GatewayCapturePolicyWrite {
-  readonly mode: GatewayCaptureMode;
-  readonly payload_fields: readonly ("request" | "response")[];
-}
-
-/** Versioned capture policy as stored by the server. */
-export interface GatewayCapturePolicy extends GatewayCapturePolicyWrite {
-  readonly version: number;
-}
-
-/**
- * A `fetch` that authenticates every request to the Wyrd Gateway as `client`.
- *
- * Hand it to a stock client, such as
- * `new OpenAI({ baseURL: \`${client.serverUrl}/v1\`, apiKey: "wyrd", fetch: gatewayFetch(client) })`.
- * Each request asks `client` for its current access token and sends it as
- * `Authorization: Bearer <token>`, so a long-lived client keeps working after
- * any one access token expires.
- *
- * @param client - The client whose access token every request carries.
- * @returns The authenticating `fetch`.
- */
-export function gatewayFetch(client: WyrdClient): typeof fetch {
-  return async (input, init) => {
-    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
-    headers.set("authorization", `Bearer ${await client.accessToken()}`);
-    return fetch(input, { ...init, headers });
-  };
 }
 
 /**

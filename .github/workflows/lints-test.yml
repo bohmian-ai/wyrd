@@ -261,15 +261,12 @@ jobs:
     # The full gate's gate:checks shard already runs docs:check.
     if: needs.changes.outputs.full_gate != 'true' && needs.changes.outputs.docs == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
-      - name: Set up mise
-        uses: jdx/mise-action@v5
-        with:
-          install: true
-          cache: true
+      # docs:test builds the wyrd-spec contract bundle for the diagram check.
+      - uses: ./.github/actions/setup-rust-ci
 
       - name: Install uv and Python
         uses: astral-sh/setup-uv@v10.3.0

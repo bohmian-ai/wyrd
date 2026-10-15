@@ -7,7 +7,7 @@ import OpenAI from "openai";
 import { expect } from "vitest";
 import { z } from "zod";
 
-import { Bifrost, Cards, Gateway, type Run, type WyrdClient, WyrdState, gatewayFetch } from "wyrd-ai";
+import { Bifrost, Cards, Gateway, type Run, type WyrdClient, WyrdState } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import { fixture } from "./server.js";
@@ -99,7 +99,7 @@ export async function invoke(client: WyrdClient): Promise<string> {
   const gateway = new OpenAI({
     baseURL: `${client.serverUrl}/v1`,
     apiKey: "wyrd",
-    fetch: gatewayFetch(client),
+    fetch: client.httpAuth,
     maxRetries: 0,
   });
   const completion = await gateway.chat.completions.create({

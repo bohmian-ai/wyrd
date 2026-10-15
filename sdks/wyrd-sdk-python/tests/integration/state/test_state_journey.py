@@ -81,7 +81,7 @@ def trusted(cards: Cards, models: dict[str, CardRef]) -> dict[str, str]:
     """The trusted artifact hash of each executable Model alias, read from the registry, not the download."""
     hashes: dict[str, str] = {}
     for alias, ref in models.items():
-        artifact_hash = cards.get(ref).metadata.artifact_hash
+        artifact_hash = cards.get(ref).metadata.get("artifact_hash")
         assert artifact_hash, f"the registry derived no artifact hash for {alias}"
         hashes[alias] = artifact_hash
     return hashes

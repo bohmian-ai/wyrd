@@ -52,6 +52,7 @@ pub struct AssertionResult {
     pub operator: ComparisonOperator,
     /// Optional human-readable detail, such as a regex mismatch position.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<String>")]
     pub message: Option<String>,
     /// Topological stage, 0-indexed, within the execution plan.
     ///

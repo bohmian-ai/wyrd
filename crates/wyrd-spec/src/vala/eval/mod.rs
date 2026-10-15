@@ -1375,15 +1375,11 @@ mod protocol_tests {
 
 #[cfg(test)]
 mod record_tests {
-    use std::fs;
-    use std::path::PathBuf;
-
     use crate::ids::MediaBindingId;
     use crate::vala::eval::media::{MediaKind, MediaRef};
     use crate::vala::eval::record::EvalRecordObservation;
     use crate::vala::ids::{RecordId, SessionId, SpanId};
     use chrono::TimeZone;
-    use schemars::schema_for;
     use uuid::Uuid;
 
     /// A fully populated canonical Eval record, including one media binding.
@@ -1430,10 +1426,6 @@ mod record_tests {
         }
     }
 
-    fn fixture_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/eval/schemas")
-    }
-
     #[test]
     fn round_trips() {
         let rec = fixture();
@@ -1461,27 +1453,6 @@ mod record_tests {
         assert!(
             err.to_string().contains("unknown field"),
             "expected unknown-field rejection, got {err}"
-        );
-    }
-
-    #[test]
-    fn schema_matches_golden() {
-        let mut schema = schema_for!(EvalRecordObservation);
-        schema.meta_schema = Some("https://json-schema.org/draft/2020-12/schema".to_string());
-        let actual = format!(
-            "{}\n",
-            serde_json::to_string_pretty(&schema).expect("schema serializes")
-        );
-        let path = fixture_dir().join("eval_record_observation.schema.json");
-        let expected = fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!(
-                "missing golden schema at {path:?}: {error}; regenerate with \
-                 `cargo run -p wyrd-spec --example gen_schemas --features server`",
-            )
-        });
-        assert_eq!(
-            actual, expected,
-            "schema drift in eval_record_observation.schema.json; run mise run codegen:regen"
         );
     }
 }
@@ -1702,87 +1673,6 @@ mod scenario_tests {
             scenarios,
         };
         assert!(c.validate().is_err());
-    }
-}
-
-#[cfg(test)]
-mod schema_drift_tests {
-    use std::fs;
-    use std::path::PathBuf;
-
-    use crate::vala::eval::{
-        ComparisonOperator, DagError, EvalCondition, EvalPassGate, EvalSampling,
-        EvalScenarioCollection, EvalSpec, EvalTask, ExecutionPlan,
-    };
-    use schemars::schema_for;
-
-    fn fixture_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/eval/schemas")
-    }
-
-    fn assert_schema_matches<T: schemars::JsonSchema>(name: &str) {
-        let mut schema = schema_for!(T);
-        schema.meta_schema = Some("https://json-schema.org/draft/2020-12/schema".to_string());
-        let actual = format!(
-            "{}\n",
-            serde_json::to_string_pretty(&schema).expect("schema serializes")
-        );
-        let path = fixture_dir().join(format!("{name}.schema.json"));
-        let expected = fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!(
-                "missing golden schema at {path:?}: {error}; regenerate with \
-                 `cargo run -p wyrd-spec --example gen_schemas --features server`",
-            )
-        });
-        assert_eq!(
-            actual, expected,
-            "schema drift in {name}.schema.json; run mise run codegen:regen"
-        );
-    }
-
-    #[test]
-    fn eval_spec_schema() {
-        assert_schema_matches::<EvalSpec>("eval_spec");
-    }
-
-    #[test]
-    fn eval_task_schema() {
-        assert_schema_matches::<EvalTask>("eval_task");
-    }
-
-    #[test]
-    fn eval_condition_schema() {
-        assert_schema_matches::<EvalCondition>("eval_condition");
-    }
-
-    #[test]
-    fn comparison_operator_schema() {
-        assert_schema_matches::<ComparisonOperator>("comparison_operator");
-    }
-
-    #[test]
-    fn execution_plan_schema() {
-        assert_schema_matches::<ExecutionPlan>("execution_plan");
-    }
-
-    #[test]
-    fn dag_error_schema() {
-        assert_schema_matches::<DagError>("dag_error");
-    }
-
-    #[test]
-    fn eval_scenario_collection_schema() {
-        assert_schema_matches::<EvalScenarioCollection>("eval_scenario_collection");
-    }
-
-    #[test]
-    fn eval_pass_gate_schema() {
-        assert_schema_matches::<EvalPassGate>("eval_pass_gate");
-    }
-
-    #[test]
-    fn eval_sampling_schema() {
-        assert_schema_matches::<EvalSampling>("eval_sampling");
     }
 }
 

@@ -186,5 +186,5 @@ depend on the private
 `wyrd._wyrd.cards.*` registration tree.
 
 Do not stop after adding `#[pyclass]`; registration, Python package
-exports, generated stubs, and Python tests are all part of the public API
+exports, authored stubs, and Python tests are all part of the public API
 surface (see [Python API and stubs](python-api-and-stubs.md)).

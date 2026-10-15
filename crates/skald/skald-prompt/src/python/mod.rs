@@ -35,7 +35,7 @@
 )]
 #![allow(
     missing_docs,
-    reason = "the Python-facing docs of these PyO3 wrappers live in the generated stubs"
+    reason = "the Python-facing docs of these PyO3 wrappers live in the authored Python stubs"
 )]
 
 use pyo3::prelude::*;

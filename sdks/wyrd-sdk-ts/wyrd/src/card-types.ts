@@ -372,7 +372,7 @@ export interface AssertionResult {
   /**
    * Optional human-readable detail, such as a regex mismatch position.
    */
-  readonly message?: string | null;
+  readonly message?: string;
   /**
    * Operator the task declared.
    */
@@ -430,19 +430,19 @@ export interface BifrostTableDescription {
    *
    * [`BifrostTableEntry::fingerprint`] keeps its user-schema meaning for every table; this is the separate whole-physical-schema identity, and it is omitted for a dynamically registered table.
    */
-  readonly canonical_physical_fingerprint?: string | null;
+  readonly canonical_physical_fingerprint?: string;
   /**
    * The table's explicit Forge compaction file target, in bytes.
    *
    * Present only when the table stores its own `write.target-file-size-bytes`; omitted means Forge compacts it toward the deployment default.
    */
-  readonly compaction_target_file_size_bytes?: number | null;
+  readonly compaction_target_file_size_bytes?: number;
   /**
    * The table's explicit Forge compaction type.
    *
    * Present only when the table stores its own `wyrd.forge.compaction.type`; omitted means Forge compacts it `small-files`.
    */
-  readonly compaction_type?: CompactionTypeWire | null;
+  readonly compaction_type?: CompactionTypeWire;
   /**
    * The correlation inputs a writer supplies alongside its user fields.
    *
@@ -569,11 +569,11 @@ export interface CardRegistrationOutcome {
   /**
    * BLAKE3 hex hash of the sorted artifact manifest, when present.
    */
-  readonly artifact_hash?: string | null;
+  readonly artifact_hash: string | null;
   /**
    * URI of the durable card blob once written.
    */
-  readonly card_blob_uri?: string | null;
+  readonly card_blob_uri: string | null;
   /**
    * Server-resolved card identity.
    */
@@ -613,7 +613,7 @@ export interface CardSummary {
   /**
    * Optional BLAKE3-hex artifact hash.
    */
-  readonly artifact_hash?: string | null;
+  readonly artifact_hash: string | null;
   /**
    * Card UID.
    */
@@ -841,7 +841,7 @@ export interface CredentialMetadata {
   /**
    * Expiry, when bounded.
    */
-  readonly expires_at?: string | null;
+  readonly expires_at: string | null;
   /**
    * Credential id.
    */
@@ -849,7 +849,7 @@ export interface CredentialMetadata {
   /**
    * Last successful use.
    */
-  readonly last_used_at?: string | null;
+  readonly last_used_at: string | null;
   /**
    * Non-secret lookup prefix.
    */
@@ -857,7 +857,7 @@ export interface CredentialMetadata {
   /**
    * Revocation time, when revoked.
    */
-  readonly revoked_at?: string | null;
+  readonly revoked_at: string | null;
 }
 
 /**
@@ -1211,7 +1211,7 @@ export interface DataTypeSpecTimestampTimestamp {
   /**
    * IANA timezone string, or `None` for timezone-naive.
    */
-  readonly tz?: string | null;
+  readonly tz: string | null;
   /**
    * Precision.
    */
@@ -1845,11 +1845,11 @@ export interface FeatureDriftReport {
   /**
    * PSI score, total SPC chart signals, or absolute Custom delta; absent when the feature is inconclusive.
    */
-  readonly score?: number | null;
+  readonly score: number | null;
   /**
    * The threshold `score` was compared against; absent when the feature is inconclusive.
    */
-  readonly threshold?: number | null;
+  readonly threshold: number | null;
   /**
    * The feature's verdict.
    */
@@ -2864,7 +2864,7 @@ export interface Judgment {
   /**
    * Count-only rollup of a Drift or Eval judgment; absent for a task Verifier, whose one check is fully described by `verdict`.
    */
-  readonly counts?: VerifierCounts | null;
+  readonly counts?: VerifierCounts;
   /**
    * The engine report.
    */
@@ -2981,7 +2981,7 @@ export interface ListCardsResponse {
   /**
    * Opaque continuation cursor.
    */
-  readonly next_cursor?: string | null;
+  readonly next_cursor: string | null;
 }
 
 /**
@@ -4351,7 +4351,7 @@ export interface PhysicalLayoutWire {
    *
    * Omitted on a request, the time column is `wyrd_ingested_at`. The canonical form in a description and the control row always names it.
    */
-  readonly time_column?: string | null;
+  readonly time_column?: string;
 }
 
 /**
@@ -4382,7 +4382,7 @@ export interface PrincipalPage {
   /**
    * Cursor for the next page, present only when one may exist.
    */
-  readonly next?: string | null;
+  readonly next: string | null;
   /**
    * Principals ordered by id, which is UUIDv7 and therefore creation order.
    */
@@ -4447,11 +4447,11 @@ export interface PrincipalSummary {
   /**
    * Bound Card, for Card-bound services and agents.
    */
-  readonly card_ref?: CardRef | null;
+  readonly card_ref: CardRef | null;
   /**
    * Email, for users.
    */
-  readonly email?: string | null;
+  readonly email: string | null;
   /**
    * `user`, `service`, or `agent`.
    */
@@ -4459,7 +4459,7 @@ export interface PrincipalSummary {
   /**
    * Principal name, for services and agents.
    */
-  readonly name?: string | null;
+  readonly name: string | null;
   /**
    * Durable principal id.
    */
@@ -4692,11 +4692,11 @@ export interface ProviderCredentialView {
   /**
    * Revocation time, if revoked.
    */
-  readonly revoked_at?: string | null;
+  readonly revoked_at: string | null;
   /**
    * Last active replacement time, if ever rotated.
    */
-  readonly rotated_at?: string | null;
+  readonly rotated_at: string | null;
   /**
    * Redacted source.
    */
@@ -4959,7 +4959,7 @@ export interface QueryTerminalFrame {
    *
    * Required for [`QueryTerminalOutcome::Failed`] and absent otherwise. It is the same problem, code and details included, the query would have returned had it failed before the first frame, so a caller reads one error whatever the row on which the failure happened. A failure with no catalog identity is `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
    */
-  readonly error?: WyrdProblem | null;
+  readonly error: WyrdProblem | null;
   /**
    * Stream outcome.
    */
@@ -5868,7 +5868,7 @@ export interface SkippedTask {
   /**
    * The skipped upstream task that caused a `dependency_skipped` skip.
    */
-  readonly upstream_task_id?: TaskId | null;
+  readonly upstream_task_id?: TaskId;
 }
 
 /**
@@ -6652,11 +6652,11 @@ export interface WorkflowRun {
   /**
    * Terminal time.
    */
-  readonly ended_at?: string | null;
+  readonly ended_at: string | null;
   /**
    * Primary run error for `failed` and `timed_out` runs.
    */
-  readonly error?: WorkflowRunError | null;
+  readonly error: WorkflowRunError | null;
   /**
    * Declared outputs, populated only for a succeeded run.
    */
@@ -6668,7 +6668,7 @@ export interface WorkflowRun {
   /**
    * Start time.
    */
-  readonly started_at?: string | null;
+  readonly started_at: string | null;
   /**
    * Run lifecycle status.
    */
@@ -6680,7 +6680,7 @@ export interface WorkflowRun {
   /**
    * Pinned Workflow Card, absent only for an unregistered local run.
    */
-  readonly workflow?: CardRef | null;
+  readonly workflow: CardRef | null;
 }
 
 /**
@@ -6723,15 +6723,15 @@ export interface WorkflowStepResult {
   /**
    * Terminal time.
    */
-  readonly ended_at?: string | null;
+  readonly ended_at: string | null;
   /**
    * Terminal error, present only for a failed step.
    */
-  readonly error?: WorkflowRunError | null;
+  readonly error: WorkflowRunError | null;
   /**
    * First attempt start time.
    */
-  readonly started_at?: string | null;
+  readonly started_at: string | null;
   /**
    * Step lifecycle status.
    */
@@ -6739,11 +6739,11 @@ export interface WorkflowStepResult {
   /**
    * Structured output, retained only for a succeeded step.
    */
-  readonly structured_output?: JsonValue;
+  readonly structured_output: JsonValue;
   /**
    * Final text output, retained only for a succeeded step.
    */
-  readonly text?: string | null;
+  readonly text: string | null;
 }
 
 /**

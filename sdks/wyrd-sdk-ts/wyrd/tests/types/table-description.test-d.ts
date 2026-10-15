@@ -9,4 +9,11 @@ type DataType = TableDescription["user_fields"][number]["data_type"];
 expectTypeOf<Extract<DataType, { List: unknown }>["List"]["data_type"]>().toEqualTypeOf<DataType>();
 expectTypeOf<Extract<DataType, { Struct: unknown }>["Struct"][number]["name"]>().toEqualTypeOf<string>();
 expectTypeOf<TableDescription["physical_layout"]["sort_keys"][number]["column"]>().toEqualTypeOf<string>();
-expectTypeOf<TableDescription["canonical_physical_fingerprint"]>().toEqualTypeOf<string | null | undefined>();
+// Fields Rust skips when unset are optional and never null.
+expectTypeOf<TableDescription["canonical_physical_fingerprint"]>().toEqualTypeOf<string | undefined>();
+expectTypeOf<TableDescription["physical_layout"]["time_column"]>().toEqualTypeOf<string | undefined>();
+expectTypeOf<TableDescription["user_fields"][number]["metadata"]>().toEqualTypeOf<
+  Readonly<Record<string, string>> | undefined
+>();
+// An unskipped Option inside a variant is always present.
+expectTypeOf<Extract<DataType, { Timestamp: unknown }>["Timestamp"]["tz"]>().toEqualTypeOf<string | null>();

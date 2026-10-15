@@ -61,10 +61,13 @@ pub struct CredentialMetadata {
     /// Creation time, RFC 3339.
     pub created_at: String,
     /// Expiry, when bounded.
+    #[serde(default)]
     pub expires_at: Option<String>,
     /// Revocation time, when revoked.
+    #[serde(default)]
     pub revoked_at: Option<String>,
     /// Last successful use.
+    #[serde(default)]
     pub last_used_at: Option<String>,
 }
 
@@ -229,10 +232,13 @@ pub struct PrincipalSummary {
     /// Lifecycle status.
     pub status: PrincipalStatus,
     /// Email, for users.
+    #[serde(default)]
     pub email: Option<String>,
     /// Principal name, for services and agents.
+    #[serde(default)]
     pub name: Option<String>,
     /// Bound Card, for Card-bound services and agents.
+    #[serde(default)]
     pub card_ref: Option<CardRef>,
 }
 
@@ -244,6 +250,7 @@ pub struct PrincipalPage {
     /// Principals ordered by id, which is UUIDv7 and therefore creation order.
     pub principals: Vec<PrincipalSummary>,
     /// Cursor for the next page, present only when one may exist.
+    #[serde(default)]
     pub next: Option<PrincipalId>,
 }
 

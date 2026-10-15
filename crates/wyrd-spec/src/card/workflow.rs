@@ -776,16 +776,21 @@ pub struct WorkflowStepResult {
     /// Step lifecycle status.
     pub status: WorkflowStepStatus,
     /// Final text output, retained only for a succeeded step.
+    #[serde(default)]
     pub text: Option<String>,
     /// Structured output, retained only for a succeeded step.
+    #[serde(default)]
     pub structured_output: Option<serde_json::Value>,
     /// Number of attempts begun.
     pub attempts: u32,
     /// First attempt start time.
+    #[serde(default)]
     pub started_at: Option<DateTime<Utc>>,
     /// Terminal time.
+    #[serde(default)]
     pub ended_at: Option<DateTime<Utc>>,
     /// Terminal error, present only for a failed step.
+    #[serde(default)]
     pub error: Option<WorkflowRunError>,
 }
 
@@ -812,6 +817,7 @@ pub struct WorkflowRun {
     /// Run identity.
     pub run_id: WorkflowRunId,
     /// Pinned Workflow Card, absent only for an unregistered local run.
+    #[serde(default)]
     pub workflow: Option<CardRef>,
     /// Run lifecycle status.
     pub status: WorkflowRunStatus,
@@ -824,10 +830,13 @@ pub struct WorkflowRun {
     /// Creation time.
     pub created_at: DateTime<Utc>,
     /// Start time.
+    #[serde(default)]
     pub started_at: Option<DateTime<Utc>>,
     /// Terminal time.
+    #[serde(default)]
     pub ended_at: Option<DateTime<Utc>>,
     /// Primary run error for `failed` and `timed_out` runs.
+    #[serde(default)]
     pub error: Option<WorkflowRunError>,
 }
 

@@ -3,9 +3,12 @@ import { expectTypeOf } from "vitest";
 
 import type {
   CardKind,
+  CardRegistrationOutcome,
   CardSummary,
   CardTypes,
   DriftBaselineState,
+  Judgment,
+  PrincipalSummary,
   RegisteredCard,
   RegisteredVerifierCard,
   TypedCardKind,
@@ -41,3 +44,9 @@ expectTypeOf<CardSummary["created_at"]>().toEqualTypeOf<string>();
 expectTypeOf<CardSummary["updated_at"]>().toEqualTypeOf<string>();
 expectTypeOf<CardSummary["kind"]>().toEqualTypeOf<CardKind>();
 expectTypeOf<CardSummary["status"]>().toEqualTypeOf<CardTypes.CardLifecycleStatus>();
+
+// Response Options Rust always serializes are required and nullable; skipped ones are optional and non-null.
+expectTypeOf<CardSummary["artifact_hash"]>().toEqualTypeOf<string | null>();
+expectTypeOf<CardRegistrationOutcome["card_blob_uri"]>().toEqualTypeOf<string | null>();
+expectTypeOf<PrincipalSummary["email"]>().toEqualTypeOf<string | null>();
+expectTypeOf<Judgment["counts"]>().toEqualTypeOf<CardTypes.VerifierCounts | undefined>();

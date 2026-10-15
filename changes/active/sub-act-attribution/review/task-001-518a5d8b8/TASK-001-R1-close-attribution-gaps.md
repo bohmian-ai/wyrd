@@ -468,7 +468,7 @@ one Cargo invocation at a time.
 | Finding | Source | Proof | Result |
 |---|---|---|---|
 | FIND-TASK-001-1 | `wyrd-sql/migrations/20260601000028_system_principal.sql` (`provision_system_principal(creator_sub, creator_act)`; backfill passes the sentinel twice); `queries/auth/service_accounts.rs::provision_system_principal(conn, Attribution)`; `components/platform/provisioning.rs` forwards the operator pair to SYSTEM and `BuiltinTables::ensure_tenant`; `builtins.rs` reconcile and `bifrost_catalog.rs::ensure_builtin` take the creator; fixtures pass `Attribution::unresolved()`; rustdoc on `PLATFORM_AUDIT_PRINCIPAL`/`Attribution::unresolved` | P1 `wyrd-server --test integration platform_admin_e2e::new_and_existing_tenants_receive_every_builtin`; P2 `wyrd-sql --test integration pg_migration::pg_tests::system_creation_uses_explicit_creator_or_sentinel` | RED → GREEN |
-| FIND-TASK-001-2 | Not committed; see SPEC_REVISION_REQUIRED below | P3 at HEAD (unchanged tests) | BLOCKED on decision |
+| FIND-TASK-001-2 | Spec r6 (`785d8293e`). `workflow/mod.rs`: `Workflow.card_uid`, set by `WorkflowCards::load` from `CardGraphHydrator::load_workflow` (`cards/hydrate/workflow.rs`, root `metadata.uid`). `workflow/local.rs::SelectedRoutes::dependencies` reuses `PublicWyrdGatewayCaller::with_subject(None, card_uid)`. Gateway Card authorization is unchanged. `architecture/wyrd-design.md` documents the local rule (`5fabbfef1`) | P3 and P15 below | RED → GREEN |
 | FIND-TASK-001-3 | Superseded by approved r5 REQ-010/AC-015: requests refused before any principal resolves record no audit decision; no code change | P11 `audit_retention::subject_actor_decisions_preserve_trusted_identity` keeps the no-token/malformed/bad-signature refusals unaudited and authenticated decisions paired | PASS (regression) |
 | FIND-TASK-001-4 | `verification/observations.rs` `ObservationRunSink::write`: `#[tracing::instrument(name = "verification.observation_runs")]` and one `warn!` per binding refused for a missing owner or SYSTEM (tenant, binding, owner Card, owner); `ObservationBinding.owner_card_uid` public | P4 `eval_verification::background_owner_subject_system_actor` (suspended C, deleted D, foreign-tenant E, then SYSTEM deleted: all five refused, run count stays 2, healthy owners unchanged) | RED → GREEN |
 | FIND-TASK-001-5 | `wyrd-spec/vala/audit_detail.rs` `CredentialIssuance.delegation_chain` (skip when empty); `wyrd-auth/issue_api_key.rs::IssueApiKey::audit` uses `delegated_attribution` + `audit_delegation_chain`; `auth/routes.rs` passes the verified chain | P5 `audit_retention::issued_key_audit_keeps_delegation` | RED → GREEN |
@@ -505,6 +505,17 @@ What the verification-only proofs assert:
   - B's fresh token reaches the model on `/v1/chat/completions`.
   - The retained denied `gateway.invoke` decision is A/SYSTEM with chain [B].
 
+### FIND-TASK-001-2 proofs
+
+- P3 (Rust, `wyrd-ai --test integration -P journey`):
+  - `loaded_workflow_calls_the_gateway_through_its_loading_client`: tenant administrator A (no bound Card) direct, then B for A. Both calls read back with `(run_id, card_uid) == (None, Workflow UID)`. The Card-bound `journey_admin`, whose scope excludes the Workflow, is refused with `WYRD_VALA_403_BIFROST_CARD_SCOPE` and the upstream count stays 2.
+  - RED: the UID assertion (left (None, None), right (None, Some(uid))) before the change. Without the change, the out-of-scope run succeeds, so the refusal assertion also fails.
+  - GREEN, with `hosted_workflow_calls_record_the_caller_and_the_workflow_card`, `registered_example_runs_through_the_gateway` and `example_workflow_runs_through_the_wyrd_gateway`: 4 passed, 100 skipped.
+- P15: the shared owner also serves Python and TypeScript. Their loaded-Workflow journeys now run as the tenant administrator key that `wyrd setup` issues, which is unbound.
+  - Python, after `mise run py:setup`: `pytest -q -m integration` with `test_gateway_inference.py::test_loaded_workflow_calls_the_gateway_through_its_loading_client`, `::test_registered_example_runs_through_the_gateway` and `::test_example_workflow_runs_through_the_wyrd_gateway`. 3 passed.
+  - TypeScript, after `mise run ts:build` and `mise run ts:build:testing`: `vitest run tests/integration/gateway-inference.test.ts -t 'loaded workflow calls the gateway through its loading client|registered example runs through the gateway'`. 2 passed, 13 skipped.
+- F2 checks: `mise run fmt`, `lints`, `py:format`, `py:lints`, `ts:format`, `ts:lints` and `docs:check`, plus `git diff --check`, all exit 0.
+
 ### Existing proofs at the candidate
 
 - P3 (`wyrd-ai`) `gateway_inference::loaded_workflow_calls_the_gateway_through_its_loading_client` and `hosted_workflow_calls_record_the_caller_and_the_workflow_card`: 2 passed, 102 skipped.
@@ -534,7 +545,7 @@ in `74d647656`, and P4 was re-run green afterwards.
   - Symptom: the run was claimed about 31s after the runtime started (`WYRD_LOG=info,wyrd_server::verification=debug`).
   - Cause: the documented `VerificationFixture::make_binding_due` contract, under which the occurrence fires 30s past the cursor. This is not a defect.
 
-### FIND-TASK-001-2 — SPEC_REVISION_REQUIRED
+### FIND-TASK-001-2 — spec revision (resolved by r6)
 
 Prepared change (not committed):
 
@@ -556,3 +567,9 @@ GREEN attempt: `loaded_workflow_calls_the_gateway_through_its_loading_client` an
 - **Fix site.** Gateway Card authorization, which this task and INV-006 forbid widening. The only alternative accepts that such callers can no longer run registered Workflows locally.
 
 Either way the outcome changes approved behavior, so the human must decide.
+
+**Decision (2026-10-15).** The human owner said: "yes accept. the 2 scenarios make sense. only principals that are allowed to run the workflow can (either in scope or have general approval)". Spec r6 records it (REQ-004, AC-011).
+
+- Gateway authorization is not widened (INV-006).
+- The journeys now run as callers allowed to run the Workflow.
+- The Card-bound out-of-scope refusal is now asserted.

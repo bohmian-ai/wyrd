@@ -1,6 +1,6 @@
 ---
 id: SPEC-deployment-addressing
-revision: 5
+revision: 6
 status: approved
 ---
 
@@ -24,7 +24,14 @@ content share Rust validation, rendering, and request construction.
 
 ## Revision and approval
 
-**Revision 5 is approved.** The owner explicitly approved the written r5
+**Revision 6 is approved.** During TASK-001 review the owner explicitly chose
+"Reject unrepresentable exchanges (recommended)" on 2026-10-15. This narrow
+amendment requires refusal without issuing a token when the exact shared
+delegation authority cannot be represented by the existing scopes. Successful
+exchanges retain exact intersection; no new scope or silent attenuation is
+introduced. All other revision 5 decisions remain approved.
+
+The owner explicitly approved the written r5
 revision on 2026-10-15 ("yes approve") after requesting one implementation
 task. Approval covers the concrete requirements below; it does not claim
 implementation readiness or completed verification. The
@@ -172,6 +179,19 @@ listing/access. Administrative listings retain their own permission checks.
 
 Authority is the effective subject, including existing accepted bounded
 verification-run authority. Delegation retains its permission intersection.
+Preserve explicit deployment/model grants alongside `all` during role merging:
+`all` alone does not subsume their authority over `granted` deployments. A
+successful delegated token carries the exact behavioral intersection of both
+parties, including wildcard resource/action grants. If that complete
+intersection cannot be represented by the existing token scopes, reject the
+exchange with a structured authorization error and issue no token. Do not
+widen authority, silently drop common permissions, or reject a representable
+result merely because an input contains both broad and explicit grants.
+For example, `all` intersected with a deployment-only grant can mean that
+deployment only while it is `open`; the current scopes cannot express that
+conditional authority, so the exchange is refused. Do not freeze today's
+deployment access configuration into broader explicit grants. Retain existing
+issuance/audit owners and stage the refusal through the nonblocking outbox.
 Actor/`executed_by` attribution never widens access; SYSTEM attribution grants
 no authority. Every permission evaluation stages its allowed/denied decision
 on the existing nonblocking process Scribe outbox. Audit failure never refuses
@@ -947,7 +967,11 @@ for implementation, generated artifacts, and documentation to diverge.
 - AC-002 Journeys plus coverage-table tests prove all/open/granted and exact
   model grants; requested-target denial; denied fallback exclusion; subject
   versus actor/SYSTEM; tenant-separated model/batch visibility. Rejected calls
-  make no upstream request.
+  make no upstream request. Prove explicit grants survive merging with `all`,
+  successful delegation preserves the exact shared authority, and an
+  unrepresentable complete intersection refuses token exchange without issuing
+  a token or making an upstream request. Cover both subject/actor directions
+  and mixed inputs whose complete intersection remains representable.
 - AC-003 External deployment journeys prove forwarding the model identifier
   unchanged, resolved-target authorization/pricing/evidence, revocation, redaction,
   destination screening, and absence of forwarded Wyrd credentials.
@@ -1029,7 +1053,8 @@ focused commands for tests they name and use repository environment wrappers.
 
 ## Open material decisions and approval boundary
 
-None. The owner approved written revision 5 on 2026-10-15, including the
+None. The owner approved revision 6's rejection of unrepresentable delegation
+exchanges on 2026-10-15. The previously approved revision 5 includes the
 portable content/settings representation and support matrix, required Agent
 route and explicit pre-run override, batch deployment input/output/failure
 behavior, complete Workflow-removal scope, and dev/tenant/four-provider
@@ -1048,6 +1073,7 @@ waive architecture reconciliation, test evidence, or independent review.
 | 3 | Draft 2026-10-15; model renaming removed by owner direction | Send the Prompt model unchanged; remove deployment model mapping, associated persistence and evidence requirements |
 | 4 | Draft 2026-10-15; revised by owner direction | Portable text/image/document core and eight settings; explicit runtime route overrides; required route/schema name retained; full Workflow removal; local Vertex gateway work deferred |
 | 5 | Approved 2026-10-15 by explicit owner confirmation | Existing deployment put accepts one object or a list; unchanged credential upload/injection; real dev-start/tenant/four-provider setup journey |
+| 6 | Approved 2026-10-15: "Reject unrepresentable exchanges (recommended)" | Preserve explicit grants beside all; issue delegated tokens only for exactly representable shared authority; otherwise refuse without a token, new scopes, or silent attenuation |
 
 Governing sources:
 
@@ -1067,5 +1093,6 @@ Governing sources:
   UX reference: `bohmian-ai/wyrd-example-ts`, README and `test/ask.test.ts`
   (inspected locally); its old addressed Prompt examples are not adopted.
 
-This revision edits only this specification. Architecture/code/schema updates
-and replacement tasks follow approval under their owning workflows.
+Revision 6 records the approved delegation refusal and reconciles its governing
+architecture wording. Implementation and generated-contract corrections belong
+to the review-produced remediation task; approval does not claim they are done.

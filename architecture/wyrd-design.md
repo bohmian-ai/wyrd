@@ -218,7 +218,10 @@ not a passive integration or inventory product.
     carries both sides of an invoke. Service B obtains it with
     `WyrdClient::on_behalf_of(A token, audience)`, presenting A's token as
     `subject_token` and its own as `actor_token`; its permissions are the
-    intersection of both. On cross-service calls the SDK puts that delegated
+    exact intersection of both. If the existing scopes cannot represent the
+    complete intersection, exchange is refused without issuing a token;
+    permissions are never widened or silently dropped to make issuance work.
+    On cross-service calls the SDK puts that delegated
     Wyrd JWT in the `X-Wyrd-Access-Token` header. The application's own
     `Authorization` header is never touched. `Wyrd-Caller-Identity` is
     rejected legacy — do not reintroduce. Both subject and actor identities
@@ -684,7 +687,11 @@ principal. `/mcp`, `/v1` management, and Bifrost do not gain it. The JWT
 Wyrd token: its top-level `principal` identifies the subject being acted
 for, and its `act` chain identifies the actor(s) acting for it, the
 outermost being the calling Service or Agent. Its `permissions` are the
-intersection of the actor's and the subject's; `act` is attribution only. The application's own `Authorization` header belongs to
+exact intersection of the actor's and the subject's; `act` is attribution only.
+An exchange whose complete intersection cannot be represented by the existing
+token scopes is refused before signing, without silent attenuation or new
+authority. Mixed broad and explicit input grants alone are not a refusal:
+the complete result must be unrepresentable. The application's own `Authorization` header belongs to
 the application and is never read or written by the SDK or by Wyrd.
 `Wyrd-Caller-Identity` is rejected legacy — do not reintroduce.
 

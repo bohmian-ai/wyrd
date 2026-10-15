@@ -893,7 +893,7 @@ impl Reader<'_> {
             }
             error => retry(DRIFT_QUERY_FAILED, error.to_string()),
         })?
-        .serving(&self.run.authority.principal);
+        .serving(&self.run.authority);
         Ok((!authority
             .context()
             .principal

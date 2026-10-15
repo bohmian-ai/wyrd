@@ -8,8 +8,9 @@
 //! tables the run reads. No token is minted or verified; Oracle's table
 //! authorization enforces and audits every read under it like any caller's.
 //!
-//! Each read is recorded for the run's subject with SYSTEM as actor through
-//! [`SystemReadAuthority::serving`]; that pair never authorizes anything.
+//! Each read is recorded for the run's subject with SYSTEM as actor, and the
+//! run's accepted delegation chain as history, through
+//! [`SystemReadAuthority::serving`]; neither authorizes anything.
 //!
 //! LLM judge calls are not reads: they run under the run's accepted authority
 //! with SYSTEM as actor. [`BackgroundAuthority`] resolves that authority for
@@ -163,18 +164,24 @@ impl SystemReadAuthority {
             .map_err(|error| unavailable(&error))
     }
 
-    /// Record every read under this authority as served for `subject`, the
-    /// run's accepted subject, with SYSTEM as actor.
+    /// Record every read under this authority as served for the run's
+    /// accepted subject, with SYSTEM as actor and the accepted
+    /// initiator-first delegation chain as its history.
     ///
     /// Attribution only: the reads stay authorized by the SYSTEM principal's
-    /// narrow table grants, never by `subject`'s permissions.
+    /// narrow table grants, never by the subject's permissions or the chain.
+    /// The chain rides on the query context, so a read forwarded to a peer
+    /// Oracle records the same history.
     #[must_use]
-    pub fn serving(self, subject: &Principal) -> Self {
+    pub fn serving(self, accepted: &AcceptedAuthority) -> Self {
         Self {
-            context: self.context.serving(ServedSubject {
-                id: subject.id,
-                kind: subject.kind.tag(),
-            }),
+            context: self
+                .context
+                .serving(ServedSubject {
+                    id: accepted.principal.id,
+                    kind: accepted.principal.kind.tag(),
+                })
+                .with_delegation_chain(accepted.delegation_chain.clone()),
         }
     }
 
@@ -250,6 +257,93 @@ impl BackgroundAuthority {
                 tracing::info!(%owner, %error, "binding owner has no authority; background run not accepted");
                 Ok(None)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wyrd_runtime::{DelegationStep, PrincipalRef};
+
+    use super::*;
+
+    /// Serving an accepted delegated authority adds its subject and history
+    /// to the SYSTEM read context and nothing else (FIND-TASK-001-6).
+    ///
+    /// The Drift and Eval readers both build their context through
+    /// [`SystemReadAuthority::serving`]. The served context keeps SYSTEM as
+    /// its principal with exactly its one table grant, records User A as the
+    /// served subject and `[B]` as the chain, and keeps both across the JSON
+    /// form a forwarded read's envelope carries.
+    ///
+    /// # Panics
+    /// Panics when the context cannot be built or serialized, or when the
+    /// served context's principal, grants, subject, or chain differ.
+    #[test]
+    fn serving_keeps_accepted_history_without_widening() {
+        let tenant = DataTenantId::new_v7();
+        let principal = |kind| {
+            Principal::new(
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                kind,
+                tenant,
+                Vec::new(),
+                PermissionSet::default(),
+            )
+        };
+        let grant = Permission {
+            resource: wyrd_runtime::Resource::BifrostQuery,
+            action: Action::Read,
+            scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
+                catalog: "vala".to_owned(),
+                schema: "eval".to_owned(),
+                table_uid: uuid::Uuid::now_v7(),
+            })),
+        };
+        let system = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::System {
+                card_ref_scope: CardRefScope::default(),
+            },
+            tenant,
+            Vec::new(),
+            PermissionSet::from_iter([grant]),
+        );
+        let context = AuthorizedQueryContext::try_new(
+            system.clone(),
+            tenant,
+            RequestId::now_v7(),
+            None,
+            AuthMethod::Internal,
+            Permission::bifrost_query_read(),
+        )
+        .expect("the SYSTEM principal is in the tenant");
+        let (a, b) = (
+            principal(PrincipalKind::User),
+            principal(PrincipalKind::User),
+        );
+        let chain = vec![DelegationStep {
+            principal: PrincipalRef::from_principal(&b),
+        }];
+        let accepted = AcceptedAuthority::new(&a, &chain);
+
+        let served = SystemReadAuthority { context }
+            .serving(&accepted)
+            .into_context();
+        let forwarded: AuthorizedQueryContext =
+            serde_json::from_value(serde_json::to_value(&served).expect("the context serializes"))
+                .expect("the context deserializes");
+
+        for context in [&served, &forwarded] {
+            assert_eq!(context.principal, system, "SYSTEM keeps only its grant");
+            assert_eq!(
+                context.served_subject,
+                Some(ServedSubject {
+                    id: a.id,
+                    kind: a.kind.tag(),
+                })
+            );
+            assert_eq!(context.delegation_chain, chain);
         }
     }
 }

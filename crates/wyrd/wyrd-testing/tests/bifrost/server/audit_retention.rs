@@ -271,7 +271,10 @@ async fn subject_actor_decisions_preserve_trusted_identity() -> Result<(), Serve
 }
 
 /// The value of the first `field` anywhere inside `value`, depth first.
-fn find_field<'a>(value: &'a serde_json::Value, field: &str) -> Option<&'a serde_json::Value> {
+pub(super) fn find_field<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
     match value {
         serde_json::Value::Object(map) => map
             .get(field)

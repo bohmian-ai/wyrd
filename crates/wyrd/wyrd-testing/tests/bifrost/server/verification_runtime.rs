@@ -2985,3 +2985,123 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
     server.shutdown().await?;
     Ok(())
 }
+
+/// A delegated run's SYSTEM input reads keep the accepted delegation history
+/// (REQ-008/010, AC-017, FIND-TASK-001-6).
+///
+/// Service B, acting for User A, starts a manual Drift run over the public
+/// route. The real Drift engine reads the registered observation table under
+/// the tenant SYSTEM read authority. Every retained read decision of that run
+/// is recorded for A with SYSTEM as actor and carries exactly the accepted
+/// chain `[B]`; the history is attribution only, so the run still completes
+/// under SYSTEM's table grant alone.
+///
+/// # Errors
+/// Returns server, exchange, route, runtime, or query errors, or a
+/// description of the first expectation that does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::builder().start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let (subject, _) = seed.service("history-subject").await?;
+    let verifier = seed
+        .custom_drift_verifier("history-drift", "score", 1.0, 0.5)
+        .await?;
+    server
+        .ensure_builtin_table_for_test(tenant, "drift", "observations")
+        .await?;
+    server
+        .seed_role(
+            QUEUED_RUNNER,
+            &[Permission::card_read(), Permission::verifier_run_any()],
+        )
+        .await?;
+    let a = server.bootstrap_user("history-a", &[QUEUED_RUNNER]).await?;
+    let b = server
+        .bootstrap_service("history-b", &[QUEUED_RUNNER])
+        .await?;
+    let a_token = a.jwt().ok_or("A bootstraps a user")?.to_owned();
+    let delegated = super::query::client_for(&server, b.api_key().ok_or("B carries an API key")?)?
+        .on_behalf_of(
+            secrecy::SecretString::from(a_token),
+            wyrd_spec::auth::TokenAudience::Wyrd,
+        )
+        .await?;
+    let now = Utc::now();
+    let started: Value = delegated
+        .request_json(
+            reqwest::Method::POST,
+            "/v1/verification/runs",
+            Some(&json!({
+                "target": { "kind": "verifier", "verifier_card_uid": verifier, "card_uid": subject },
+                "input": { "kind": "drift_window",
+                    "start": now - chrono::Duration::hours(1), "end": now }
+            })),
+        )
+        .await?;
+    let run_id = started["run_id"].as_str().ok_or("the run has an ID")?;
+    let run = seed
+        .runs()
+        .await?
+        .into_iter()
+        .find(|run| run.to_string() == run_id)
+        .ok_or("the accepted run is queued")?;
+
+    let runtime = VerificationRuntime::builder(server.state())
+        .build()
+        .ok_or("the runtime did not compose")?;
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let row = loop {
+        let row = seed.run(run).await?;
+        if !["pending", "running", "retrying"].contains(&row.status.as_str()) {
+            break row;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("the Drift run never settled: {row:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    if row.status != "completed" {
+        return Err(format!("the delegated Drift run settled {row:?}").into());
+    }
+
+    server.await_audit_retained().await?;
+    let (a_id, b_id) = (a.id().to_string(), b.id().to_string());
+    let reads = server
+        .retained_audit_records(
+            tenant,
+            "act_principal_id, detail",
+            &format!("operation = 'bifrost.query.read_decision' AND sub_principal_id = '{a_id}'"),
+        )
+        .await?;
+    if reads.is_empty() {
+        return Err("the run's input read retained no decision for A".into());
+    }
+    let system = seed.system_principal().to_string();
+    for read in &reads {
+        let detail: Value =
+            serde_json::from_str(read[1].as_deref().ok_or("the decision has a detail")?)?;
+        let chain: Vec<&str> = super::audit_retention::find_field(&detail, "delegation_chain")
+            .and_then(Value::as_array)
+            .map(|steps| {
+                steps
+                    .iter()
+                    .filter_map(|step| step["principal_id"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if read[0].as_deref() != Some(system.as_str()) || chain != [b_id.as_str()] {
+            return Err(
+                format!("expected an A/SYSTEM read with chain [{b_id}], read {read:?}").into(),
+            );
+        }
+    }
+    server.shutdown().await?;
+    Ok(())
+}

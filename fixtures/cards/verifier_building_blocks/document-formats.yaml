@@ -1,0 +1,22 @@
+# Extracts one document of any of the nine extractable formats; a downstream
+# requirement consumes the extract output.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: document-formats
+  version: 1.0.0
+  space: default
+spec:
+  description: A document of any extractable format is read into its locked extract output.
+  inputs:
+    document:
+      type: media
+      formats: [pdf, pptx, docx, xlsx, csv, json, text, markdown, html]
+      max_bytes: 65536
+  steps:
+    - id: read
+      action: {kind: extract, from: inputs.document}
+  requirements:
+    - id: extracted
+      statement: The document was extracted
+      check: {kind: assert, path: steps.read.output.format, operator: is_not_null}

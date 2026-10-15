@@ -20,8 +20,6 @@ spec:
     - alias: agent
       ref: ./support-agent.yaml
       verified_by:
-        - verifier: ./answer-quality.yaml
-          runs_on: {kind: observations_ready}
-        - verifier: ./no-refund-promise.yaml
+        - verifier: ./policy-check.yaml
     - alias: prompt
       ref: ./support-prompt.yaml

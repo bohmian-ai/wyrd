@@ -10,14 +10,17 @@
 //! [`Deployment::client`] and passes it to the SDK or CLI call explicitly.
 
 use std::path::{Path, PathBuf};
-use wyrd_ai::bifrost::BifrostOptions;
+use std::time::Duration;
+use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
 
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_ai::cards::{CardRef, CardSelector, Cards, HydrationMode, RegistrationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::config::ClientConfig;
+use wyrd_ai::observe::VerificationExecution;
 use wyrd_ai::transport::{GrpcConfig, HttpConfig};
-use wyrd_ai::{Bifrost, SpanRecord, TraceId, WyrdClient};
+use wyrd_ai::{Bifrost, ExecutionId, SpanRecord, TraceId, VerificationResult, WyrdClient};
+use wyrd_spec::ids::BindingId;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
@@ -247,6 +250,79 @@ impl Deployment {
             .trace_timeline(TraceId::from_hex(trace).expect("trace id"))
             .await
             .expect("the timeline reads")
+    }
+
+    /// The one verification binding `owner` declares, read from its served
+    /// status.
+    ///
+    /// # Panics
+    /// Panics when the read fails or `owner` declares no binding.
+    pub async fn binding(&self, owner: &CardRef) -> BindingId {
+        self.cards()
+            .await
+            .get(CardSelector::exact(owner.clone()))
+            .await
+            .expect("the owner reads")
+            .status
+            .and_then(|status| status.verification)
+            .expect("the owner serves verification status")
+            .binding_ids
+            .into_iter()
+            .next()
+            .expect("the owner has one binding")
+    }
+
+    /// The first retained result of `binding`, read back as the
+    /// administrator: publish captured rows until `vala.verification.results`
+    /// names one, then wait for that execution's typed result by its ID.
+    ///
+    /// # Panics
+    /// Panics when no result is retained within `timeout`, a read fails, or
+    /// the execution settles without a result.
+    pub async fn scheduled_result(
+        &self,
+        binding: &BindingId,
+        timeout: Duration,
+    ) -> VerificationResult {
+        /// One `vala.verification.results` row's execution identity.
+        #[derive(serde::Deserialize)]
+        struct Retained {
+            /// The execution the result belongs to.
+            result_id: String,
+        }
+        let admin = self.admin();
+        let bifrost = Bifrost::connect_with(&admin, BifrostOptions::default())
+            .await
+            .expect("Bifrost connects");
+        let deadline = tokio::time::Instant::now() + timeout;
+        let id = loop {
+            self.server.flush_bifrost().await.expect("rows publish");
+            let rows: Vec<Retained> = bifrost
+                .sql_as(
+                    "SELECT result_id FROM vala.verification.results WHERE binding_id = $1",
+                    &[QueryParam::String(binding.to_string())],
+                )
+                .await
+                .expect("results read back");
+            if let Some(row) = rows.into_iter().next() {
+                break row.result_id;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "binding {binding} retained no result within {timeout:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        VerificationExecution::connect_with(
+            id.parse::<ExecutionId>()
+                .expect("result ID is an execution ID"),
+            &admin,
+        )
+        .await
+        .expect("the execution handle connects")
+        .wait(timeout)
+        .await
+        .expect("the retained result reads")
     }
 
     /// Stop the server.

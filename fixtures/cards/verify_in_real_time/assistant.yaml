@@ -10,13 +10,8 @@ spec:
     - alias: agent
       ref: ./assistant-agent.yaml
       verified_by:
-        - verifier: ./answer-is-yes.yaml
-          runs_on: {kind: observations_ready}
-        - verifier: ./answer-is-judged.yaml
-          runs_on: {kind: observations_ready}
         - verifier: ./answer-check.yaml
-        - verifier: ./answer-graded.yaml
-        - verifier: ./answer-judged-off-route.yaml
+        - verifier: ./answer-judged.yaml
     - alias: model
       ref:
         kind: Model
@@ -26,3 +21,5 @@ spec:
       verified_by:
         - verifier: ./latency-drift.yaml
           runs_on: {kind: schedule, cron: "0 0 * * *"}
+          inputs:
+            latency: {features: [latency]}

@@ -9324,6 +9324,7 @@ dependencies = [
  "wyrd-auth-verify",
  "wyrd-cli",
  "wyrd-client",
+ "wyrd-skald-spec",
  "wyrd-spec",
  "wyrd-testing",
 ]

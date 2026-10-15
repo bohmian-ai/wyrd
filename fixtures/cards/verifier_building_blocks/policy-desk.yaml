@@ -1,0 +1,13 @@
+# The subject of the building-block coverage story: a Service verified by
+# one Verifier that uses every action and Run check kind, and one that
+# extracts each of the nine extractable formats.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: policy-desk
+  version: 1.0.0
+  space: default
+spec:
+  verified_by:
+    - verifier: ./policy-review.yaml
+    - verifier: ./document-formats.yaml

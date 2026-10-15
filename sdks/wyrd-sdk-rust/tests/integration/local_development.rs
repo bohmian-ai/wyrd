@@ -10,7 +10,7 @@
 use std::collections::{BTreeSet, HashMap};
 use wyrd_ai::bifrost::BifrostOptions;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use wiremock::matchers::{method, path};
@@ -27,24 +27,10 @@ use wyrd_ai::observe::Run;
 use wyrd_ai::operator_connections::SecretBearer;
 use wyrd_ai::otel::{Telemetry, start_telemetry};
 use wyrd_ai::state::WyrdState;
-use wyrd_ai::{Bifrost, Gateway, VerifierKind, WyrdClient};
+use wyrd_ai::{Bifrost, Gateway, VerificationVerdict, WyrdClient};
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
 use crate::support::{Deployment, hydrate, register};
-
-/// The drift features the Run observes on its Model.
-#[derive(Serialize)]
-struct Features {
-    /// A numeric series.
-    latency: f64,
-}
-
-/// The answer the Run verifies on its Agent.
-#[derive(Serialize)]
-struct Answer {
-    /// The answer text `answer-is-yes` expects.
-    answer: &'static str,
-}
 
 /// One evidence row: which Card it is attributed to.
 #[derive(Debug, Deserialize)]
@@ -131,17 +117,18 @@ pub async fn work(deployment: &Deployment, client: &WyrdClient) -> Worked {
     run.for_card("model")
         .expect("model view")
         .observe()
-        .drift(&Features { latency: 12.5 }, None)
-        .expect("drift emits");
-    let judgment = run
+        .submit("latency-drift", json!({ "latency": 12.5 }))
+        .await
+        .expect("the latency is submitted");
+    let result = run
         .for_card("agent")
         .expect("agent view")
         .observe()
-        .verify("answer-is-yes", &Answer { answer: "yes" })
+        .verify("answer-check", json!("yes"))
         .await
         .expect("the answer is judged");
-    assert!(judgment.passed());
-    assert_eq!(judgment.kind, VerifierKind::EvalAssertion);
+    assert_eq!(result.outcome.verdict, VerificationVerdict::Passed);
+    assert_eq!(result.verifier.name.as_str(), "answer-check");
 
     let agent_ref = state.card_ref("agent").expect("agent resolves");
     let agent_uid = agent_ref

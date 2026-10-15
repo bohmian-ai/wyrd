@@ -1,0 +1,37 @@
+# A tool-less judge: it sees only the claim, the answer, and the policy
+# findings, and returns a Verdict citing the policy page it relied on.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: policy-judge
+  version: 1.0.0
+  space: support
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  run_config: {max_iterations: 1}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "Claim: {{claim}}. Answer: {{answer}}. Policy findings: {{findings}}. Cite the policy page."
+    response_format:
+      type: object
+      properties:
+        outcome: {type: string, enum: [passed, failed, inconclusive]}
+        reason: {type: string}
+        citations:
+          type: array
+          items:
+            type: object
+            properties:
+              slot: {type: string}
+              locator:
+                type: object
+                properties: {page: {type: integer}}
+                required: [page]
+                additionalProperties: false
+            required: [slot, locator]
+            additionalProperties: false
+      required: [outcome, reason, citations]
+      additionalProperties: false

@@ -1,0 +1,19 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: answer-judged
+  version: 1.0.0
+  space: default
+spec:
+  description: A tool-less judge Agent decides whether the answer agrees, citing it.
+  inputs:
+    answer: {type: json}
+  requirements:
+    - id: agrees
+      statement: The answer agrees with the customer
+      check:
+        kind: agent
+        agent: ./judge-agent.yaml
+        inputs:
+          claim: requirement.statement
+          answer: inputs.answer

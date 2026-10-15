@@ -1,9 +1,10 @@
 //! The canonical support desk, run from the checked-in example against a
-//! real server: deploy the declared table and Agent, answer 100 requests in
-//! correlated Agent Runs, wait for continuous and real-time verdicts, and
+//! real server: deploy the declared table and Agent, judge one answer
+//! immediately, answer 100 requests in correlated Agent Runs that each submit
+//! a background policy check, resume every check by its execution ID, and
 //! explain one passing and one failing request through MCP.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::time::Duration;
 use wyrd_ai::bifrost::BifrostOptions;
 
@@ -15,7 +16,7 @@ use wyrd_ai::gateway::{
     ProviderDeploymentName,
 };
 use wyrd_ai::state::WyrdState;
-use wyrd_ai::{Bifrost, Gateway};
+use wyrd_ai::{Bifrost, Gateway, RequirementOutcome, VerificationVerdict};
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::local_development::configure_gateway;
@@ -25,7 +26,7 @@ use crate::support::{Deployment, fixture};
 #[path = "../../../../examples/support-desk/rust/support_desk.rs"]
 mod example;
 
-use example::{REQUESTS, deploy, explain, question, serve, wait_for_verdicts};
+use example::{REQUESTS, check, deploy, explain, question, serve, wait_for_verdicts};
 
 /// How long the story waits for every verdict.
 const WAIT: Duration = Duration::from_mins(3);
@@ -55,9 +56,10 @@ async fn answer(upstream: &MockServer, marker: &str, content: &str, priority: u8
 
 /// The support desk refuses to deploy while only another provider's `gpt-4o`
 /// is deployed, then deploys, refuses a conflicting table and an
-/// under-privileged caller, answers every request, earns 100 `answer-quality`
-/// passes and 90 `no-refund-promise` passes with 10 failures, and explains a
-/// passing and a failing request from joined evidence.
+/// under-privileged caller, fails a refund promise immediately, answers every
+/// request, resumes each background `policy-check` by ID to 90 passes and 10
+/// refund-promise failures that the judge, citing the policy, still passes,
+/// and explains a passing and a failing request from joined evidence.
 ///
 /// # Panics
 /// Panics when a step fails or any count, refusal, or joined value differs.
@@ -67,8 +69,15 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
     let upstream = MockServer::start().await;
     answer(
         &upstream,
-        "Grade the support answer",
-        r#"{"passed":true}"#,
+        "list its refund rules",
+        r#"{"findings":[{"rule":"Refunds of up to 100 dollars are approved within 30 days.","page":1}]}"#,
+        1,
+    )
+    .await;
+    answer(
+        &upstream,
+        "Claim:",
+        r#"{"outcome":"passed","reason":"consistent with the policy","citations":[{"slot":"policy","locator":{"page":1}}]}"#,
         1,
     )
     .await;
@@ -168,28 +177,55 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
         "the refusal precedes upstream IO"
     );
 
+    let promise = check(&desk, "You have a guaranteed refund.")
+        .await
+        .expect("the answer is judged now");
+    assert_eq!(promise.outcome.verdict, VerificationVerdict::Failed);
+    let outcomes: Vec<(&str, RequirementOutcome)> = promise
+        .outcome
+        .requirements
+        .iter()
+        .map(|requirement| (requirement.id.as_str(), requirement.outcome))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            ("no-refund-promise", RequirementOutcome::Failed),
+            ("follows-policy", RequirementOutcome::Passed),
+        ]
+    );
+    let judged = promise
+        .outcome
+        .requirements
+        .iter()
+        .find(|requirement| requirement.id.as_str() == "follows-policy")
+        .expect("the judge requirement is reported");
+    assert_eq!(
+        serde_json::to_value(&judged.citations).expect("citations serialize"),
+        json!([{ "slot": "policy", "locator": { "page": 1 } }])
+    );
+
     let served = serve(&desk).await.expect("every request is served");
     assert_eq!(served.len(), REQUESTS);
-    for (index, request) in served.iter().enumerate() {
+    let results = wait_for_verdicts(&admin, &served, WAIT)
+        .await
+        .expect("every answer is judged");
+    for (index, result) in results.iter().enumerate() {
+        let expected = if question(index).contains("refund") {
+            VerificationVerdict::Failed
+        } else {
+            VerificationVerdict::Passed
+        };
+        assert_eq!(result.outcome.verdict, expected, "{index}");
         assert_eq!(
-            request.passed,
-            !question(index).contains("refund"),
+            result.run_id.as_ref().map(ToString::to_string).as_deref(),
+            Some(served[index].run_id.as_str()),
             "{index}"
         );
     }
-    let verdicts = wait_for_verdicts(&admin, &desk, WAIT)
-        .await
-        .expect("every answer is judged");
-    assert_eq!(
-        verdicts,
-        BTreeMap::from([
-            ("answer-quality".to_owned(), (100, 0)),
-            ("no-refund-promise".to_owned(), (90, 10)),
-        ])
-    );
 
     let agent = desk.uid("support-agent");
-    for (index, realtime) in [(1, "passed"), (0, "failed")] {
+    for (index, verdict) in [(1, "passed"), (0, "failed")] {
         let explained = explain(&admin, &served[index].run_id)
             .await
             .expect("the Run's evidence joins");
@@ -197,8 +233,7 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
         assert_eq!(explained["ticket_id"], format!("T-{index}").as_str());
         assert_eq!(explained["span"], "support-desk.request");
         assert_eq!(explained["call_card_uid"], agent.as_str());
-        assert_eq!(explained["continuous"], "passed");
-        assert_eq!(explained["realtime"], realtime, "{explained:?}");
+        assert_eq!(explained["verdict"], verdict, "{explained:?}");
     }
     deployment.shutdown().await;
 }

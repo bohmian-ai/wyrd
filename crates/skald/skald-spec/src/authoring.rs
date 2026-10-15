@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 
 use crate::error::{SkaldError, SkaldResult};
 use crate::media::{MediaKind, MediaRef, MediaSource};
-use crate::prompt::{Prompt, check_model, media_placeholder_regex};
+use crate::prompt::{Prompt, check_model, check_output_schema, media_placeholder_regex};
 use crate::request::{ProviderName, ProviderRequest};
 use crate::wire::anthropic_messages::{
     AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest, AnthropicMessagesSettings,
@@ -339,6 +339,13 @@ impl AuthoredPrompt {
                 ));
             }
         };
+        if let Some(schema) = &self.response_format {
+            check_output_schema(
+                schema,
+                "response_format",
+                format == PromptFormat::ChatCompletion,
+            )?;
+        }
         let turns = self
             .messages
             .iter()
@@ -777,8 +784,9 @@ fn format_label(format: PromptFormat) -> String {
     }
 }
 
-/// Builds the field-specific authoring refusal.
-fn invalid(field: &str, message: &str) -> SkaldError {
+/// Builds the field-specific authoring refusal shared by the compiler and the
+/// Prompt construction checks.
+pub(crate) fn invalid(field: &str, message: &str) -> SkaldError {
     SkaldError::PromptInvalid {
         field: field.to_owned(),
         message: message.to_owned(),
@@ -1046,6 +1054,124 @@ mod tests {
             let rendered = serde_json::to_value(&rendered).expect("request json");
             assert_eq!(rendered["body"]["model"], "org/model-1");
         }
+    }
+
+    /// Proves output schemas are validated before compilation in both forms:
+    /// invalid type names, non-string `required`, and non-object
+    /// `properties` are refused at their exact field, at any depth;
+    /// strict OpenAI output refuses a non-object root that Anthropic,
+    /// GenerateContent, and non-strict native OpenAI accept; and valid nested
+    /// schemas, references, type unions, and native options keep their
+    /// authored bytes.
+    #[test]
+    fn output_schemas_are_validated() {
+        let portable = |provider: &str, schema: Value| {
+            json!({"provider": provider, "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                                                               "settings": {"max_output_tokens": 8}, "response_format": schema})
+        };
+        let object = |properties: Value| json!({"type": "object", "properties": properties});
+        for (schema, field) in [
+            (
+                object(json!({"a": {"type": "not-a-json-schema-type"}})),
+                "response_format.properties.a.type",
+            ),
+            (
+                object(json!({"a": {"type": ["string", 3]}})),
+                "response_format.properties.a.type",
+            ),
+            (
+                json!({"type": "object", "required": "a"}),
+                "response_format.required",
+            ),
+            (
+                json!({"type": "object", "required": ["a", 1]}),
+                "response_format.required",
+            ),
+            (
+                json!({"type": "object", "properties": []}),
+                "response_format.properties",
+            ),
+            (
+                object(json!({"a": {"type": "array", "items": 3}})),
+                "response_format.properties.a.items",
+            ),
+            (
+                object(json!({"a": {"anyOf": {"type": "string"}}})),
+                "response_format.properties.a.anyOf",
+            ),
+        ] {
+            for provider in ["openai", "anthropic", "google"] {
+                assert_eq!(
+                    refused(portable(provider, schema.clone())),
+                    field,
+                    "{provider} {schema}"
+                );
+            }
+        }
+
+        let nested = json!({
+            "type": "object",
+            "properties": {
+                "items": {"type": "array", "items": {"$ref": "#/$defs/item"}},
+                "note": {"type": ["string", "null"], "description": "free text"},
+            },
+            "required": ["items", "note"],
+            "additionalProperties": false,
+            "$defs": {"item": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}},
+        });
+        for (provider, path) in [
+            ("openai", "/response_format/json_schema/schema"),
+            ("anthropic", "/output_config/format/schema"),
+            ("google", "/generation_config/response_schema"),
+        ] {
+            let compiled =
+                body(&compile(portable(provider, nested.clone())).expect("nested schema compiles"));
+            assert_eq!(
+                compiled.pointer(path),
+                Some(&nested),
+                "{provider} keeps the schema bytes"
+            );
+        }
+
+        let list = json!({"type": "array", "items": {"type": "string"}});
+        assert_eq!(
+            refused(portable("openai", list.clone())),
+            "response_format.type",
+            "strict chat_completion output needs an object root"
+        );
+        for provider in ["anthropic", "google"] {
+            compile(portable(provider, list.clone())).expect("a list root compiles off OpenAI");
+        }
+        let inline = object(json!({"ids": {"type": "array", "items": {"type": "integer"}}}));
+
+        let native = |format: Value| {
+            json!({"provider": "openai", "model": "gpt-4o", "format": "chat_completion",
+            "body": {"messages": [{"role": "user", "content": "hi"}], "x_custom": 1,
+                     "response_format": {"type": "json_schema", "json_schema": {"name": "answer", "strict": false, "schema": format}}}})
+        };
+        assert_eq!(
+            refused(native(object(json!({"a": {"type": "text"}})))),
+            "body.response_format.json_schema.schema.properties.a.type"
+        );
+        let prompt = compile(native(inline.clone())).expect("valid native schema compiles");
+        assert_eq!(
+            body(&prompt)["response_format"]["json_schema"]["name"],
+            "answer"
+        );
+        assert_eq!(
+            body(&prompt)["response_format"]["json_schema"]["strict"],
+            false
+        );
+        assert_eq!(body(&prompt)["x_custom"], 1);
+        compile(native(list)).expect("non-strict native output accepts a list root");
+        assert_eq!(
+            refused(
+                json!({"provider": "vertex", "model": "gemini", "format": "generate_content",
+                "body": {"contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                         "generation_config": {"response_schema": object(json!({"a": {"required": [1]}}))}}})
+            ),
+            "body.generation_config.response_schema.properties.a.required"
+        );
     }
 
     /// Proves the native form: model inserted at compile and refused in the

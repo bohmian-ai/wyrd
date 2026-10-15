@@ -5,7 +5,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::authoring::AuthoredPrompt;
+use crate::authoring::{AuthoredPrompt, invalid};
 use crate::error::{SkaldError, SkaldResult};
 use crate::media::{MediaKind, MediaRef, MediaSource};
 use crate::request::{ProviderName, ProviderRequest};
@@ -190,10 +190,147 @@ pub fn check_model(model: &str) -> SkaldResult<()> {
     } else {
         return Ok(());
     };
-    Err(SkaldError::PromptInvalid {
-        field: "model".to_owned(),
-        message: message.to_owned(),
-    })
+    Err(invalid("model", message))
+}
+
+/// JSON Schema primitive type names an output schema may declare.
+const SCHEMA_TYPES: [&str; 7] = [
+    "array", "boolean", "integer", "null", "number", "object", "string",
+];
+
+/// Refuses an output schema that is not structurally valid JSON Schema or
+/// that uses a feature its destination statically cannot carry.
+///
+/// The walk is pure and never resolves references or fetches anything. It
+/// checks `type` names, `required` string arrays, `properties`/`$defs`
+/// object maps, and recurses through every nested subschema keyword. When
+/// `object_root` is set (OpenAI strict structured output, which every
+/// portable OpenAI schema uses) the root must declare `type: object`. Valid
+/// schemas are never rewritten.
+///
+/// # Errors
+///
+/// Returns [`SkaldError::PromptInvalid`] whose field is `field` extended with
+/// the dotted path to the first offending keyword.
+pub(crate) fn check_output_schema(
+    schema: &serde_json::Map<String, Value>,
+    field: &str,
+    object_root: bool,
+) -> SkaldResult<()> {
+    if object_root && schema.get("type").and_then(Value::as_str) != Some("object") {
+        return Err(invalid(
+            &format!("{field}.type"),
+            "strict OpenAI structured output requires a root `type: object` schema",
+        ));
+    }
+    check_schema(schema, field)
+}
+
+/// Walks one object schema for [`check_output_schema`].
+///
+/// # Errors
+///
+/// Returns [`SkaldError::PromptInvalid`] at the dotted path of the first
+/// invalid `type`, `required`, schema map, schema list, subschema, or `enum`.
+fn check_schema(schema: &serde_json::Map<String, Value>, field: &str) -> SkaldResult<()> {
+    // ponytail: structural checks only; swap in a JSON Schema meta-validator
+    // if skald-spec ever earns that dependency.
+    for (keyword, value) in schema {
+        let at = format!("{field}.{keyword}");
+        match keyword.as_str() {
+            "type" => {
+                let valid = |name: &Value| {
+                    name.as_str()
+                        .is_some_and(|name| SCHEMA_TYPES.contains(&name))
+                };
+                let ok = match value {
+                    Value::Array(names) => !names.is_empty() && names.iter().all(valid),
+                    name => valid(name),
+                };
+                if !ok {
+                    return Err(invalid(
+                        &at,
+                        "type is one JSON Schema type name, or a nonempty array of them",
+                    ));
+                }
+            }
+            "required" => {
+                if !value
+                    .as_array()
+                    .is_some_and(|names| names.iter().all(Value::is_string))
+                {
+                    return Err(invalid(&at, "required is an array of property names"));
+                }
+            }
+            "properties" | "$defs" | "definitions" | "patternProperties" => {
+                let Some(map) = value.as_object() else {
+                    return Err(invalid(&at, "expected an object mapping names to schemas"));
+                };
+                for (name, subschema) in map {
+                    check_subschema(subschema, &format!("{at}.{name}"))?;
+                }
+            }
+            "anyOf" | "oneOf" | "allOf" | "prefixItems" => {
+                let Some(list) = value.as_array().filter(|list| !list.is_empty()) else {
+                    return Err(invalid(&at, "expected a nonempty array of schemas"));
+                };
+                for (index, subschema) in list.iter().enumerate() {
+                    check_subschema(subschema, &format!("{at}.{index}"))?;
+                }
+            }
+            "items" | "additionalProperties" | "not" | "contains" | "propertyNames" => {
+                check_subschema(value, &at)?;
+            }
+            "enum" if !value.is_array() => {
+                return Err(invalid(&at, "enum is an array of values"));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Checks one nested subschema: a boolean schema, or an object schema walked
+/// by [`check_schema`].
+///
+/// # Errors
+///
+/// Returns [`SkaldError::PromptInvalid`] at `field` for any other JSON value,
+/// and the nested refusal of an invalid object schema.
+fn check_subschema(schema: &Value, field: &str) -> SkaldResult<()> {
+    match schema {
+        Value::Bool(_) => Ok(()),
+        Value::Object(schema) => check_schema(schema, field),
+        _ => Err(invalid(field, "expected a JSON Schema object or boolean")),
+    }
+}
+
+/// Native body path of a request's output schema, and whether its
+/// destination requires an object root (OpenAI with `strict: true`).
+///
+/// Only the four kinds [`response_type_of`] derives schemas from reach here.
+fn output_schema_field(request: &ProviderRequest) -> (&'static str, bool) {
+    use crate::wire::openai_chat::OpenAiResponseFormat;
+    use crate::wire::openai_responses::OpenAiTextResponseFormat;
+
+    match request {
+        ProviderRequest::OpenAiChatCompletion(request) => (
+            "body.response_format.json_schema.schema",
+            matches!(&request.response_format, Some(OpenAiResponseFormat::JsonSchema { json_schema }) if json_schema.strict == Some(true)),
+        ),
+        ProviderRequest::OpenAiResponses(request) => (
+            "body.text.format.schema",
+            matches!(
+                request.text.as_ref().and_then(|text| text.format.as_ref()),
+                Some(OpenAiTextResponseFormat::JsonSchema {
+                    strict: Some(true),
+                    ..
+                })
+            ),
+        ),
+        ProviderRequest::AnthropicMessage(_) => ("body.output_config.format.schema", false),
+        _ => ("body.generation_config.response_schema", false),
+    }
 }
 
 /// Split a text leaf into plain text and `${media:name}` placeholder segments.
@@ -232,7 +369,9 @@ impl Prompt {
     /// # Errors
     ///
     /// Returns [`SkaldError::PromptInvalid`] for field `model` when the model
-    /// is not literal configuration (see [`check_model`]),
+    /// is not literal configuration (see [`check_model`]) and at the output
+    /// schema's native body path when that schema is invalid for its
+    /// destination (see [`check_output_schema`]),
     /// [`SkaldError::MediaInSystemMessage`] when system content holds a
     /// `${media:name}` placeholder, and a serialization error when the request
     /// cannot be serialized to scan its `${name}` / `{{name}}` variables.
@@ -240,6 +379,13 @@ impl Prompt {
         let model = model.into();
         check_model(&model)?;
         let response_type = response_type_of(&request);
+        if let ResponseType::JsonSchema { schema, .. } = &response_type {
+            let (field, object_root) = output_schema_field(&request);
+            let schema = schema
+                .as_object()
+                .ok_or_else(|| invalid(field, "an output schema is a JSON object"))?;
+            check_output_schema(schema, field, object_root)?;
+        }
         let mut prompt = Self {
             request,
             model,

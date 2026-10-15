@@ -463,6 +463,57 @@ mod builder_tests {
         assert_eq!(prompt.native().variables, vec!["question"]);
     }
 
+    /// Proves builder finalization shares the authored output-schema rule:
+    /// an invalid type and a non-object strict OpenAI root are refused at
+    /// their native body path before any dispatch, while GenerateContent keeps
+    /// a list root unchanged.
+    #[test]
+    fn builders_refuse_invalid_output_schemas() {
+        let field = |error: crate::PromptBuilderError| match error {
+            crate::PromptBuilderError::Skald(skald_spec::SkaldError::PromptInvalid {
+                field,
+                ..
+            }) => field,
+            other => panic!("expected a field refusal, got {other:?}"),
+        };
+        let bad = ResponseFormat::json_schema("answer", json!({"type": "text"})).unwrap();
+        let error = openai_chat(
+            "gpt-4o",
+            OpenAiChatOptions {
+                messages: vec!["hi".to_owned()],
+                output: Some(bad),
+                ..OpenAiChatOptions::default()
+            },
+        )
+        .expect_err("invalid type is refused");
+        assert_eq!(field(error), "body.response_format.json_schema.schema.type");
+
+        let list = json!({"type": "array", "items": {"type": "string"}});
+        let error = openai_responses(
+            "gpt-4.1",
+            OpenAiResponsesOptions {
+                messages: vec!["hi".to_owned()],
+                output: Some(ResponseFormat::json_schema("answer", list.clone()).unwrap()),
+                ..OpenAiResponsesOptions::default()
+            },
+        )
+        .expect_err("strict responses output needs an object root");
+        assert_eq!(field(error), "body.text.format.schema.type");
+        let prompt = gemini(
+            "gemini-2.5-pro",
+            GeminiOptions {
+                messages: vec!["hi".to_owned()],
+                output: Some(ResponseFormat::json_schema("answer", list.clone()).unwrap()),
+                ..GeminiOptions::default()
+            },
+        )
+        .expect("generate_content accepts a list root");
+        assert!(matches!(
+            &prompt.native().response_type,
+            ResponseType::JsonSchema { schema, .. } if *schema == list
+        ));
+    }
+
     #[test]
     fn openai_responses_emits_native_text_format() {
         let prompt = openai_responses(

@@ -7,6 +7,7 @@
 use crate::card::agent::AgentSpec;
 use crate::card::artifact::ArtifactSpec;
 use crate::card::audit::AuditSpec;
+use crate::card::blocks::{self, Action, AgentCall, Check, CodeCall, CodeSource, Requirement};
 use crate::card::data::{DataInterface, DataSpec, SplitStrategy};
 use crate::card::drift::{DriftSignal, DriftSpec};
 use crate::card::eval::EvalSpec;
@@ -352,6 +353,74 @@ impl Visit for VerifierSpec {
     }
 }
 
+impl Visit for blocks::VerifierSpec {
+    /// Visit every Agent, code Artifact, and drift baseline reference in the
+    /// Verifier's steps and requirements.
+    fn visit<F>(&mut self, f: &mut F)
+    where
+        F: FnMut(SlotEntry<'_>),
+    {
+        for (i, step) in self.steps.iter_mut().enumerate() {
+            let prefix = format!("spec.steps[{i}].action");
+            match &mut step.action {
+                Action::Extract { .. } => {}
+                Action::Agent(call) => visit_agent_call(call, &prefix, f),
+                Action::Code(call) => visit_code_call(call, &prefix, f),
+            }
+            visit_requirements(
+                &mut step.requirements,
+                &format!("spec.steps[{i}].requirements"),
+                f,
+            );
+        }
+        visit_requirements(&mut self.requirements, "spec.requirements", f);
+    }
+}
+
+/// Visit the reference slots of each requirement check under `prefix`.
+fn visit_requirements<F>(requirements: &mut [Requirement], prefix: &str, f: &mut F)
+where
+    F: FnMut(SlotEntry<'_>),
+{
+    for (i, requirement) in requirements.iter_mut().enumerate() {
+        let prefix = format!("{prefix}[{i}].check");
+        match &mut requirement.check {
+            Check::Agent(call) => visit_agent_call(call, &prefix, f),
+            Check::Code(call) => visit_code_call(call, &prefix, f),
+            Check::Drift(drift) => drift.spec.visit_at(&prefix, f),
+            Check::Assert { .. } | Check::Trace(_) => {}
+        }
+    }
+}
+
+/// Visit one Agent call's Agent slot and, when inline, the Agent's own slots.
+fn visit_agent_call<F>(call: &mut AgentCall, prefix: &str, f: &mut F)
+where
+    F: FnMut(SlotEntry<'_>),
+{
+    let path = format!("{prefix}.agent");
+    f(SlotEntry {
+        path: path.clone(),
+        value: SlotValue::InlineableAgent(&mut call.agent),
+    });
+    if let InlineableRef::Inline(agent) = &mut call.agent {
+        visit_agent(agent, &path, f);
+    }
+}
+
+/// Visit one code call's Artifact source slot.
+fn visit_code_call<F>(call: &mut CodeCall, prefix: &str, f: &mut F)
+where
+    F: FnMut(SlotEntry<'_>),
+{
+    if let CodeSource::Artifact { card, .. } = &mut call.source {
+        f(SlotEntry {
+            path: format!("{prefix}.source.artifact.card"),
+            value: SlotValue::Durable(card),
+        });
+    }
+}
+
 impl Visit for ServiceSpec {
     /// Visit component identities, component verification bindings, and Service bindings.
     fn visit<F>(&mut self, f: &mut F)
@@ -466,6 +535,61 @@ where
         value: SlotValue::InlineablePrompt(&mut agent.prompt),
     });
     visit_verified_by(&mut agent.verified_by, &format!("{prefix}.verified_by"), f);
+}
+
+#[cfg(test)]
+mod blocks_tests {
+    use serde_json::json;
+
+    use super::{SlotValue, Visit};
+    use crate::card::blocks::VerifierSpec;
+
+    /// The staged Verifier yields every Agent, Artifact, Prompt, and
+    /// baseline slot at its authored path.
+    ///
+    /// # Panics
+    /// Panics when a slot is missing or yielded at the wrong path.
+    #[test]
+    fn blocks_verifier_yields_every_reference_slot() {
+        let agent =
+            json!({"kind": "Agent", "space": "support", "name": "judge", "version": "1.0.0"});
+        let inline = json!({
+            "prompt": {"kind": "Prompt", "space": "support", "name": "judge-prompt", "version": "1.0.0"},
+            "execution_route": {"kind": "wyrd_gateway", "deployment": "openai-primary"}
+        });
+        let mut spec: VerifierSpec = serde_json::from_value(json!({
+            "steps": [{"id": "a", "action": {"kind": "agent", "agent": inline},
+                "requirements": [{"id": "b", "statement": "s", "check": {"kind": "code", "entrypoint": "f",
+                    "source": {"artifact": {"card": {"kind": "Artifact", "space": "support", "name": "checks", "version": "1.0.0"}}}}}]}],
+            "requirements": [
+                {"id": "c", "statement": "s", "check": {"kind": "agent", "agent": agent}},
+                {"id": "d", "statement": "s", "check": {"kind": "drift", "on": "inputs.x", "method": "Spc",
+                    "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "space": "risk", "name": "train", "version": "1.0.0"}, "features": ["x"]},
+                    "condition": {"kind": "Statistical"}}}
+            ]
+        }))
+        .expect("staged Verifier");
+        let mut paths = Vec::new();
+        spec.visit(&mut |entry| {
+            let kind = match entry.value {
+                SlotValue::Durable(_) => "durable",
+                SlotValue::InlineablePrompt(_) => "prompt",
+                SlotValue::InlineableAgent(_) => "agent",
+                SlotValue::InlineableTrigger(_) | SlotValue::InlineableOperator(_) => "other",
+            };
+            paths.push(format!("{kind} {}", entry.path));
+        });
+        assert_eq!(
+            paths,
+            [
+                "agent spec.steps[0].action.agent",
+                "prompt spec.steps[0].action.agent.prompt",
+                "durable spec.steps[0].requirements[0].check.source.artifact.card",
+                "agent spec.requirements[0].check.agent",
+                "durable spec.requirements[1].check.signal.Distribution.baseline_ref",
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

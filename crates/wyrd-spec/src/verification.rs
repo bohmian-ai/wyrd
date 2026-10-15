@@ -10,6 +10,8 @@
 //! copied here. Direct execution is the one exception: it returns its judgment
 //! inline and persists nothing but its audit decision.
 
+pub mod execution;
+
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, Utc};

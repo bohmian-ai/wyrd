@@ -3590,7 +3590,7 @@ impl WyrdError {
     /// lifecycle and observation variant, must be listed here so its body is
     /// built from one place; the wrapped `Storage` and `Vala` errors render
     /// their own `Display` text and serialized value instead.
-    fn message_details(&self) -> (Cow<'_, str>, serde_json::Value) {
+    pub(crate) fn message_details(&self) -> (Cow<'_, str>, serde_json::Value) {
         match self {
             Self::Validation { message, details }
             | Self::LoaderIo { message, details }

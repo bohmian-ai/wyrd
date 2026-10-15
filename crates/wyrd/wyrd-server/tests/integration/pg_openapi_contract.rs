@@ -1249,7 +1249,7 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
             .as_array()
             .expect("typed spec alternatives")
             .len(),
-        15,
+        14,
         "one typed spec per registrable native Card kind"
     );
 

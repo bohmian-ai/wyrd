@@ -765,7 +765,7 @@ mod pg_tests {
     ///
     /// # Panics
     /// Panics when an alias is unresolved, a CardRef is not versioned, a UID is
-    /// absent or empty, or aliases do not cover ten unique Cards.
+    /// absent or empty, or aliases do not cover nine unique Cards.
     fn assert_all_refs_are_uid_pinned(state: &WyrdState) {
         let aliases = state.aliases().collect::<Vec<_>>();
         let mut refs = BTreeSet::new();
@@ -776,7 +776,7 @@ mod pg_tests {
             assert!(!uid.to_string().is_empty());
             refs.insert(card_ref.to_string());
         }
-        assert_eq!(refs.len(), 10);
+        assert_eq!(refs.len(), 9);
     }
 
     /// Assert no loaded Card retains an authored or unresolved path reference.
@@ -1323,7 +1323,7 @@ mod pg_tests {
         .await
         .expect("CLI get succeeds");
         assert_eq!(summary["mode"], "complete");
-        assert_eq!(summary["card_count"], 10);
+        assert_eq!(summary["card_count"], 9);
         assert_eq!(summary["downloaded_artifact_count"], 3);
 
         drop(cards);

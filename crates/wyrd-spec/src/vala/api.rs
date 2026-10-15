@@ -127,6 +127,7 @@ pub struct BifrostTableDescription {
     /// every table; this is the separate whole-physical-schema identity, and it
     /// is omitted for a dynamically registered table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<String>")]
     pub canonical_physical_fingerprint: Option<String>,
     /// The server-resolved canonical physical layout, fully populated.
     pub physical_layout: PhysicalLayoutWire,
@@ -136,12 +137,14 @@ pub struct BifrostTableDescription {
     /// `write.target-file-size-bytes`; omitted means Forge compacts it toward
     /// the deployment default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<u64>")]
     pub compaction_target_file_size_bytes: Option<u64>,
     /// The table's explicit Forge compaction type.
     ///
     /// Present only when the table stores its own `wyrd.forge.compaction.type`;
     /// omitted means Forge compacts it `small-files`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<CompactionTypeWire>")]
     pub compaction_type: Option<CompactionTypeWire>,
 }
 
@@ -233,6 +236,7 @@ pub enum DataTypeSpec {
         /// Precision.
         unit: TimeUnit,
         /// IANA timezone string, or `None` for timezone-naive.
+        #[serde(default)]
         tz: Option<String>,
     },
     /// Time-of-day at second/millisecond precision.
@@ -415,6 +419,7 @@ pub struct PhysicalLayoutWire {
     /// Omitted on a request, the time column is `wyrd_ingested_at`. The
     /// canonical form in a description and the control row always names it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<String>")]
     pub time_column: Option<String>,
     /// Ordered sort keys; at most four may be declared.
     #[serde(default)]
@@ -913,6 +918,7 @@ pub struct QueryTerminalFrame {
     /// returned had it failed before the first frame, so a caller reads one
     /// error whatever the row on which the failure happened. A failure with
     /// no catalog identity is `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
+    #[serde(default)]
     pub error: Option<Box<WyrdProblem>>,
     /// Arrow IPC end-of-stream delta closing the query's single IPC stream.
     ///

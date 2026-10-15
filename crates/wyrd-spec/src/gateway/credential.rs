@@ -203,8 +203,10 @@ pub struct ProviderCredentialView {
     /// Last mutation time.
     pub updated_at: DateTime<Utc>,
     /// Last active replacement time, if ever rotated.
+    #[serde(default)]
     pub rotated_at: Option<DateTime<Utc>>,
     /// Revocation time, if revoked.
+    #[serde(default)]
     pub revoked_at: Option<DateTime<Utc>>,
 }
 

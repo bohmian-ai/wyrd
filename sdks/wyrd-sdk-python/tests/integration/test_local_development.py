@@ -217,7 +217,7 @@ def test_cli_bootstrap_saved_config(cli_bootstrap_client: WyrdClient) -> None:
     """A fresh Python runtime writes and reads using only the CLI's saved files."""
     cards = Cards(cli_bootstrap_client)
     refs = register(cards, "cards/gateway_inference/ask-prompt.yaml")
-    assert cards.get(refs["ask-prompt"]).metadata.name == "ask-prompt"
+    assert cards.get(refs["ask-prompt"]).metadata["name"] == "ask-prompt"
 
 
 def local_listener() -> str:

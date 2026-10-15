@@ -169,7 +169,7 @@ Locked cross-cutting decisions that any contributor must honor:
   may remain as an optional-feature migration boundary during this integration;
   only `wyrd-sdk-python` enables it. Its long-term home is the Python SDK.
 - `sdks/wyrd-sdk-rust`: thin first-class Rust package over `wyrd-client`.
-- `sdks/wyrd-sdk-python`: Python package, PyO3 aggregation, generated stubs,
+- `sdks/wyrd-sdk-python`: Python package, PyO3 aggregation, authored stubs,
   and Python-facing tests over `wyrd-client`.
 - `sdks/wyrd-sdk-ts`: TypeScript package, declarations, Node binding root, and
   TypeScript-facing tests over `wyrd-client`.
@@ -327,12 +327,18 @@ For any Python-visible change, verify all layers:
    as approved migration state.
 3. Native submodule registration exists under `sdks/wyrd-sdk-python/src`.
 4. Python package exports exist under `sdks/wyrd-sdk-python/python/wyrd`.
-5. Generated stubs (`.pyi`) regenerate cleanly via `mise run codegen:check`.
+5. The package-local `.pyi` stubs declare the native API, and pure-Python
+   definitions are declared once inline and re-exported by those stubs; both
+   pass `mise run py:lints` (which validates stub docs, exports, and layout)
+   and `mise run py:typecheck`.
 6. Python tests import from public `wyrd` modules, not private extension
    paths, unless the private path is the intended contract.
 
-Do not hand-edit generated stubs. Update source annotations or the generator,
-then run codegen.
+The package-local `.pyi` files are the authored source of Python native typing;
+edit them directly in the same change as the native API. Typechecking does not
+prove native signature parity, so keep runtime and export tests. Generated
+artifacts elsewhere stay source-driven: change their source or generator and
+let `mise run codegen:check` verify them.
 
 ## 9. Server And Contract Rules
 
@@ -486,7 +492,7 @@ not use a positional filter that can pass after selecting no test.
   repository-managed setup wrapper when the test needs it.
 - Python package change: run `mise run py:test:unit`; add
   `mise run py:typecheck` when stubs, exports, or public Python typing changed.
-- Contract, schema, or stub generation change: run `mise run codegen:check`.
+- Contract or generated-output change: run `mise run codegen:check`.
   MCP behavior changes also run the owning MCP tests; the codegen lane does not
   independently prove the runtime MCP tool catalog. The OpenAPI document is
   served at runtime from `GET /openapi.json`, composed from the same

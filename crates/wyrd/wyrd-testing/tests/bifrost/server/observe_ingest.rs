@@ -11,7 +11,7 @@ use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode};
-use wyrd_client::observe::{EvalObservationOptions, Run};
+use wyrd_client::observe::{Run, Submission};
 use wyrd_client::state::WyrdState;
 use wyrd_client::{Bifrost, QueueConfig, WyrdClient};
 use wyrd_testing::Bootstrap;
@@ -177,7 +177,11 @@ fn features(count: u16, prefix: &str, value: impl Fn(u16) -> f64) -> Value {
     )
 }
 
-/// Emit one drift observation, flushing and resubmitting it on `QUEUE_FULL`.
+/// The Window Verifier bound to the observed Model whose `samples` slot
+/// records Drift observations through `observe.submit`.
+const DRIFT_VERIFIER: &str = "observed-drift";
+
+/// Submit one drift observation, flushing and resubmitting it on `QUEUE_FULL`.
 ///
 /// Admission is all-or-none per observation, so a refused observation
 /// admitted no row and resubmitting it after the flush duplicates nothing.
@@ -187,8 +191,13 @@ fn features(count: u16, prefix: &str, value: impl Fn(u16) -> f64) -> Value {
 /// fails.
 async fn emit_with_resubmit(state: &WyrdState, view: &Run, features: &Value) {
     loop {
-        match view.observe().drift(features, None) {
-            Ok(()) => return,
+        match view
+            .observe()
+            .submit(DRIFT_VERIFIER, features.clone())
+            .await
+        {
+            Ok(Submission::Recorded) => return,
+            Ok(Submission::Queued(_)) => panic!("Window samples are recorded, never queued"),
             Err(error) if error.code() == "WYRD_CLIENT_429_QUEUE_FULL" => {
                 state.flush().await.expect("a flush frees the budget");
             }
@@ -214,8 +223,8 @@ fn assert_exactly_once(groups: &[RecordCount], observations: u16, features: u16)
     );
 }
 
-/// Every Drift and Eval observation stores the client clock reading of its
-/// emit call as its declared `created_at` time axis, not Scribe's receipt
+/// Every Drift observation stores the client clock reading of its
+/// submit call as its declared `created_at` time axis, not Scribe's receipt
 /// instant.
 ///
 /// Scribe's receipt clock runs one day ahead for the whole emit-to-ingest
@@ -238,31 +247,18 @@ async fn observations_store_the_client_emit_time() {
     let before = chrono::Utc::now().timestamp_micros();
     model
         .observe()
-        .drift(&json!({ "latency": 12.5, "tier": "gold" }), None)
-        .expect("drift emits");
-    model
-        .observe()
-        .eval(
-            &json!({ "answer": "yes" }),
-            EvalObservationOptions::default(),
-        )
-        .expect("eval emits");
+        .submit(DRIFT_VERIFIER, json!({ "latency": 12.5, "tier": "gold" }))
+        .await
+        .expect("drift records");
     let after = chrono::Utc::now().timestamp_micros();
-    let mut emitted: Vec<EventTime> = observed
+    let emitted: Vec<EventTime> = observed
         .drain_and_read(
             "SELECT CAST(created_at AS BIGINT) AS event_time FROM vala.drift.observations",
         )
         .await;
     scribe.shift_receipt_clock_for_test(Duration::ZERO);
-    emitted.extend(
-        observed
-            .read::<EventTime>(
-                "SELECT CAST(created_at AS BIGINT) AS event_time FROM vala.eval.observations",
-            )
-            .await,
-    );
 
-    assert_eq!(emitted.len(), 3, "two drift rows, one eval");
+    assert_eq!(emitted.len(), 2, "two drift rows");
     for row in &emitted {
         assert!(
             (before..=after).contains(&row.event_time),

@@ -579,8 +579,8 @@ impl WyrdState {
     /// Connect this state's one Bifrost writer as the state's client.
     ///
     /// The client is the one the state was created with, else the ambient
-    /// one [`WyrdState::from_path`] describes. Startup describes both fixed
-    /// observation tables before reporting success, so a run can never
+    /// one [`WyrdState::from_path`] describes. Startup describes the fixed Drift
+    /// observation table before reporting success, so a run can never
     /// enqueue against a missing, unauthorized, or incompatible system table.
     ///
     /// # Errors
@@ -808,7 +808,7 @@ impl WyrdState {
         self.bifrost.claim()?.complete(bifrost).await
     }
 
-    /// The started writer and its two described fixed tables.
+    /// The started writer and its described fixed Drift table.
     ///
     /// # Errors
     /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup and

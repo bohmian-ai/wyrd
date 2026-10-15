@@ -1,5 +1,5 @@
 //! Server-free proof of the observation surface: one Bifrost lifetime, immutable
-//! Card-scoped views, and the two fixed projections.
+//! Card-scoped views, Verifier execution, and the Drift projection.
 //!
 //! The fixed-table describe bodies are built from the canonical
 //! `vala-bifrost-redux` table definitions rather than a hand-copied column list,
@@ -13,21 +13,18 @@ use arrow_schema::{DataType, Field, Schema};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use vala_bifrost_redux::tables::{DomainTable, DriftObservationsTable, EvalObservationsTable};
+use vala_bifrost_redux::tables::{DomainTable, DriftObservationsTable};
 use wyrd_queue::{ClientByteGuard, MockSink, QueueConfig};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     BifrostTableDescription, BifrostTableEntry, FieldSpec, PARQUET_FIELD_ID_KEY,
 };
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_spec::vala::eval::media::{MediaKind, MediaRef};
-use wyrd_spec::vala::ids::{SessionId, SpanId, TraceId};
+use wyrd_spec::vala::ids::SessionId;
 
 use crate::bifrost::Bifrost;
 use crate::observe::lifecycle::BifrostLifecycle;
-use crate::observe::{
-    DRIFT_OBSERVATIONS_TABLE, EVAL_OBSERVATIONS_TABLE, EvalObservationOptions, drift, eval,
-};
+use crate::observe::{DRIFT_OBSERVATIONS_TABLE, drift};
 use crate::state::WyrdState;
 use crate::state::tests::TestBundle;
 
@@ -220,24 +217,14 @@ fn route_key(fqn: &str) -> String {
 
 /// The describe bodies a healthy startup sees, from the canonical definitions.
 fn fixed_table_bodies() -> HashMap<String, String> {
-    [
-        (
-            route_key(DRIFT_OBSERVATIONS_TABLE),
-            serde_json::to_string(&description(
-                DRIFT_OBSERVATIONS_TABLE,
-                DriftObservationsTable::arrow_fields(),
-            ))
-            .expect("drift description serializes"),
-        ),
-        (
-            route_key(EVAL_OBSERVATIONS_TABLE),
-            serde_json::to_string(&description(
-                EVAL_OBSERVATIONS_TABLE,
-                EvalObservationsTable::arrow_fields(),
-            ))
-            .expect("eval description serializes"),
-        ),
-    ]
+    [(
+        route_key(DRIFT_OBSERVATIONS_TABLE),
+        serde_json::to_string(&description(
+            DRIFT_OBSERVATIONS_TABLE,
+            DriftObservationsTable::arrow_fields(),
+        ))
+        .expect("drift description serializes"),
+    )]
     .into()
 }
 
@@ -309,32 +296,25 @@ async fn start_over(state: &WyrdState, server: &DescribeServer) -> Result<(), Wy
 
 // ── Scenario 1: one Bifrost lifetime per state ──────────────────────────────
 
-/// Startup describes both fixed tables exactly once and then serves every run.
+/// Startup describes the fixed Drift table exactly once and then serves
+/// every run.
 #[tokio::test]
-async fn startup_describes_both_fixed_tables_once() {
+async fn startup_describes_the_fixed_table_once() {
     let server = DescribeServer::start(fixed_table_bodies());
     let (_bundle, state) = state_fixture();
 
     start_over(&state, &server).await.expect("startup succeeds");
 
     assert_eq!(server.calls(DRIFT_OBSERVATIONS_TABLE), 1);
-    assert_eq!(server.calls(EVAL_OBSERVATIONS_TABLE), 1);
     let run = state.run();
-    run.observe()
-        .drift(&json!({ "age": 42 }), None)
-        .expect("drift enqueues");
-    run.observe()
-        .eval(
-            &json!({ "answer": "yes" }),
-            EvalObservationOptions::default(),
-        )
-        .expect("eval enqueues");
+    for _ in 0..2 {
+        run.observe()
+            .drift_value(&json!({ "age": 42 }), None)
+            .expect("drift enqueues");
+    }
     assert_eq!(
-        (
-            server.calls(DRIFT_OBSERVATIONS_TABLE),
-            server.calls(EVAL_OBSERVATIONS_TABLE)
-        ),
-        (1, 1),
+        server.calls(DRIFT_OBSERVATIONS_TABLE),
+        1,
         "an observation never re-describes its fixed table"
     );
 }
@@ -343,7 +323,7 @@ async fn startup_describes_both_fixed_tables_once() {
 #[tokio::test]
 async fn missing_fixed_table_fails_startup() {
     let mut bodies = fixed_table_bodies();
-    bodies.remove(&route_key(EVAL_OBSERVATIONS_TABLE));
+    bodies.remove(&route_key(DRIFT_OBSERVATIONS_TABLE));
     let server = DescribeServer::start(bodies);
     let (_bundle, state) = state_fixture();
 
@@ -354,7 +334,7 @@ async fn missing_fixed_table_fails_startup() {
     let refusal = state
         .run()
         .observe()
-        .drift(&json!({ "age": 42 }), None)
+        .drift_value(&json!({ "age": 42 }), None)
         .expect_err("a failed startup leaves no writer");
     assert_eq!(refusal.code(), "WYRD_SDK_400_BIFROST_NOT_STARTED");
 }
@@ -408,9 +388,9 @@ async fn incompatible_fixed_table_fails_startup() {
 #[tokio::test]
 async fn failed_startup_may_be_retried() {
     let mut bodies = fixed_table_bodies();
-    let eval_body = bodies
-        .remove(&route_key(EVAL_OBSERVATIONS_TABLE))
-        .expect("fixture has an eval body");
+    let drift_body = bodies
+        .remove(&route_key(DRIFT_OBSERVATIONS_TABLE))
+        .expect("fixture has a drift body");
     let server = DescribeServer::start(bodies);
     let (_bundle, state) = state_fixture();
 
@@ -421,7 +401,7 @@ async fn failed_startup_may_be_retried() {
         .bodies
         .lock()
         .expect("body lock")
-        .insert(route_key(EVAL_OBSERVATIONS_TABLE), eval_body);
+        .insert(route_key(DRIFT_OBSERVATIONS_TABLE), drift_body);
     start_over(&state, &server)
         .await
         .expect("a released claim lets startup retry");
@@ -457,7 +437,7 @@ async fn shutdown_closes_the_state_permanently() {
 
     let refusal = run
         .observe()
-        .drift(&json!({ "age": 42 }), None)
+        .drift_value(&json!({ "age": 42 }), None)
         .expect_err("a closed state refuses writes");
     assert_eq!(refusal.code(), "WYRD_SDK_409_BIFROST_CLOSED");
     let restart = start_over(&state, &server)
@@ -480,7 +460,7 @@ async fn shutdown_without_startup_closes_permanently() {
     let refusal = state
         .run()
         .observe()
-        .drift(&json!({ "age": 42 }), None)
+        .drift_value(&json!({ "age": 42 }), None)
         .expect_err("a closed state refuses writes");
     assert_eq!(refusal.code(), "WYRD_SDK_409_BIFROST_CLOSED");
 }
@@ -547,7 +527,7 @@ async fn ambiguous_shutdown_retries_the_same_batch_on_the_same_state() {
     state
         .run()
         .observe()
-        .drift(&json!({ "age": 42 }), None)
+        .drift_value(&json!({ "age": 42 }), None)
         .expect("one row enqueues");
     sink.fail_next(1);
 
@@ -591,7 +571,7 @@ async fn ambiguous_shutdown_retries_the_same_batch_on_the_same_state() {
     let refusal = state
         .run()
         .observe()
-        .drift(&json!({ "age": 42 }), None)
+        .drift_value(&json!({ "age": 42 }), None)
         .expect_err("a closed state refuses writes");
     assert_eq!(refusal.code(), "WYRD_SDK_409_BIFROST_CLOSED");
     let restart = start_over(&state, &server)
@@ -1289,124 +1269,6 @@ fn drift_refuses_unsupported_inputs() {
     }
 }
 
-/// Foreign JSON integer literals beyond 64-bit range are refused from the text,
-/// while in-range integers, large float literals, and non-object roots are left
-/// to the feature-map checks.
-///
-/// # Panics
-/// Panics when an out-of-range literal is admitted or a valid one is refused.
-#[test]
-fn drift_json_refuses_integer_literals_beyond_64_bits() {
-    for text in [
-        "{\"count\": 18446744073709551616}",
-        "{\"count\": -18446744073709551616}",
-        "{\"count\": 1180591620717411303424}",
-    ] {
-        let error = drift::check_integer_literals(text)
-            .expect_err(&format!("{text} must be refused before parsing"));
-        assert_eq!(error.code(), "WYRD_SDK_400_INVALID_OBSERVATION", "{text}");
-    }
-    for text in [
-        "{\"count\": 3, \"latency\": 1.5e20, \"big\": 9223372036854775808}",
-        "[1, 2]",
-    ] {
-        drift::check_integer_literals(text).expect("left to the feature-map checks");
-    }
-}
-
-/// A non-finite float cannot even reach JSON, so it is refused at the door.
-#[test]
-fn drift_refuses_non_finite_floats() {
-    /// A typed Drift input whose only feature is a float the test sets to NaN.
-    #[derive(serde::Serialize)]
-    struct Features {
-        /// The feature under test; holds a non-finite value.
-        score: f64,
-    }
-    let (_bundle, state) = state_fixture();
-    let error = state
-        .run()
-        .observe()
-        .drift(&Features { score: f64::NAN }, None)
-        .expect_err("NaN is not a Float64 projection");
-    assert_eq!(error.code(), "WYRD_SDK_400_INVALID_OBSERVATION");
-}
-
-// ── Scenario 4: the Eval projection ────────────────────────────────────────
-
-/// The fixed row preserves context, session, media, and trace identity.
-#[test]
-fn eval_projects_context_media_and_trace_identity() {
-    let trace_id = TraceId::from_hex("0102030405060708090a0b0c0d0e0f10").expect("trace hex");
-    let span_id = SpanId::from_hex("1112131415161718").expect("span hex");
-    let record = eval::observation(
-        json!({ "question": "why?", "answer": "because" }),
-        EvalObservationOptions {
-            session_id: Some(SessionId(uuid::Uuid::nil())),
-            media: vec![MediaRef {
-                id: "screenshot".parse().expect("binding id"),
-                kind: MediaKind::Image,
-                uri: "s3://bucket/shot.png".to_owned(),
-                media_type: Some("image/png".to_owned()),
-            }],
-            trace_id: Some(trace_id),
-            span_id: Some(span_id),
-        },
-    )
-    .expect("the canonical record builds");
-    let row = row_value(&eval::row(&record).expect("projection succeeds"));
-
-    assert_eq!(row["trace_id"], json!("0102030405060708090a0b0c0d0e0f10"));
-    assert_eq!(row["span_id"], json!("1112131415161718"));
-    assert_eq!(row["session_id"], json!(uuid::Uuid::nil().to_string()));
-    assert_eq!(
-        row["context"],
-        json!({ "question": "why?", "answer": "because" }),
-        "context stays a JSON value for its Variant column"
-    );
-    let media = &row["media"];
-    assert_eq!(media[0]["id"], json!("screenshot"));
-    assert_eq!(media[0]["uri"], json!("s3://bucket/shot.png"));
-    assert_eq!(
-        row.as_object().expect("row is an object").len(),
-        7,
-        "a row carries exactly the fixed user columns"
-    );
-    assert!(
-        row.get("eval_ref").is_none() && row.get("run_id").is_none(),
-        "the row names neither a Verifier nor a duplicate run id"
-    );
-}
-
-/// No active span and no explicit ids leaves both trace fields absent.
-#[test]
-fn eval_without_a_span_omits_trace_identity() {
-    let record = eval::observation(
-        json!({ "answer": "yes" }),
-        EvalObservationOptions::default(),
-    )
-    .expect("record builds");
-    assert!(record.trace_id.is_none() && record.span_id.is_none());
-    let row = row_value(&eval::row(&record).expect("projection succeeds"));
-    assert_eq!(row["trace_id"], Value::Null);
-    assert_eq!(row["span_id"], Value::Null);
-    assert_eq!(row["media"], Value::Null);
-}
-
-/// A span without its trace is refused before enqueue.
-#[test]
-fn eval_refuses_a_span_without_its_trace() {
-    let error = eval::observation(
-        json!({ "answer": "yes" }),
-        EvalObservationOptions {
-            span_id: Some(SpanId::from_hex("1112131415161718").expect("span hex")),
-            ..EvalObservationOptions::default()
-        },
-    )
-    .expect_err("a span id is only meaningful inside its trace");
-    assert_eq!(error.code(), "WYRD_SPEC_400_VALIDATION");
-}
-
 // ── Scenario 5: the generic record path ────────────────────────────────────
 
 /// The first call describes the table once; later calls reuse its schema.
@@ -1502,7 +1364,7 @@ async fn record_refuses_reserved_and_system_tables() {
 
     for table in [
         DRIFT_OBSERVATIONS_TABLE,
-        EVAL_OBSERVATIONS_TABLE,
+        "vala.eval.observations",
         "vala.system.audit_log",
         "vala.traces.spans",
         "vala.verification.results",

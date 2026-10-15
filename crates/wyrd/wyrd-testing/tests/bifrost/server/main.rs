@@ -5,7 +5,6 @@
 #![recursion_limit = "256"]
 
 mod audit_retention;
-mod eval_verification;
 mod observe_ingest;
 mod owner_inspection;
 mod query;

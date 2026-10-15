@@ -16,7 +16,6 @@
 //! into three projections.
 
 pub mod drift;
-pub mod eval;
 mod execution;
 mod invoke;
 pub mod lifecycle;
@@ -38,10 +37,8 @@ use crate::bifrost::{Correlation, WriterTable};
 use crate::state::{BoundVerifier, WyrdState};
 use verify::{Projected, Target};
 
-#[cfg(feature = "test-support")]
-pub use eval::EvalObservationOptions;
 pub use execution::VerificationExecution;
-pub use lifecycle::{DRIFT_OBSERVATIONS_TABLE, EVAL_OBSERVATIONS_TABLE};
+pub use lifecycle::DRIFT_OBSERVATIONS_TABLE;
 pub use verify::{ArtifactRef, File, Input, Inputs, Submission};
 
 /// The only namespace `observe.record` may write.
@@ -207,49 +204,6 @@ pub struct Observe<'a> {
 }
 
 impl Observe<'_> {
-    /// Emit one Drift observation from a `Serialize` feature object.
-    ///
-    /// # Arguments
-    /// * `features` - One flat object of supported scalar feature values.
-    /// * `session_id` - The session the observation belongs to, or `None`.
-    ///
-    /// # Errors
-    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
-    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown,
-    /// `WYRD_SDK_400_INVALID_OBSERVATION` when the input is not a flat object of
-    /// supported scalars, and `WYRD_CLIENT_429_QUEUE_FULL` when the producer is
-    /// saturated.
-    #[cfg(feature = "test-support")]
-    pub fn drift<T: Serialize>(
-        &self,
-        features: &T,
-        session_id: Option<SessionId>,
-    ) -> Result<(), WyrdError> {
-        self.drift_value(&to_value(features, "drift features")?, session_id)
-    }
-
-    /// Emit one Drift observation from a foreign runtime's JSON text.
-    ///
-    /// The Python and TypeScript boundaries hold a JSON document, not a Rust
-    /// type, and reach the same projection through this door.
-    ///
-    /// An integer literal beyond 64-bit range is refused from the text before
-    /// parsing would round it to a float.
-    ///
-    /// # Arguments
-    /// * `json` - One flat JSON object of supported scalar feature values.
-    /// * `session_id` - The session the observation belongs to, or `None`.
-    ///
-    /// # Errors
-    /// As [`Observe::drift`], plus an invalid-observation error when `json` is
-    /// not valid JSON or carries an integer literal beyond exact `Float64`
-    /// range.
-    #[cfg(all(feature = "internal", feature = "test-support"))]
-    pub fn drift_json(&self, json: &str, session_id: Option<SessionId>) -> Result<(), WyrdError> {
-        drift::check_integer_literals(json)?;
-        self.drift_value(&parse_json(json, "drift features")?, session_id)
-    }
-
     /// Project and enqueue one Drift observation.
     ///
     /// Input validation runs before the lifecycle lookup so a malformed feature
@@ -271,57 +225,6 @@ impl Observe<'_> {
         started.bifrost.insert_observation(
             &started.drift,
             drift::rows(&record)?,
-            self.run.correlation(),
-        )?;
-        Ok(())
-    }
-
-    /// Emit one Eval observation from a `Serialize` context value.
-    ///
-    /// # Arguments
-    /// * `context` - The context object the Eval observation records.
-    /// * `options` - The optional trace correlation, session, and media.
-    ///
-    /// # Errors
-    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
-    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, a validation error when
-    /// `span_id` is supplied without `trace_id`,
-    /// `WYRD_SDK_400_INVALID_OBSERVATION` when the context or media cannot be
-    /// encoded, and `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
-    #[cfg(feature = "test-support")]
-    pub fn eval<T: Serialize>(
-        &self,
-        context: &T,
-        options: EvalObservationOptions,
-    ) -> Result<(), WyrdError> {
-        self.eval_value(to_value(context, "eval context")?, options)
-    }
-
-    /// Emit one Eval observation from a foreign runtime's JSON text.
-    ///
-    /// # Arguments
-    /// * `json` - The context object as JSON text.
-    /// * `options` - The optional trace correlation, session, and media.
-    ///
-    /// # Errors
-    /// As [`Observe::eval`], plus an invalid-observation error when `json` is
-    /// not valid JSON.
-    #[cfg(all(feature = "internal", feature = "test-support"))]
-    pub fn eval_json(&self, json: &str, options: EvalObservationOptions) -> Result<(), WyrdError> {
-        self.eval_value(parse_json(json, "eval context")?, options)
-    }
-
-    /// Project and enqueue one Eval observation.
-    ///
-    /// # Errors
-    /// As [`Observe::eval`].
-    #[cfg(feature = "test-support")]
-    fn eval_value(&self, context: Value, options: EvalObservationOptions) -> Result<(), WyrdError> {
-        let record = eval::observation(context, options)?;
-        let started = self.run.state.started_bifrost()?;
-        started.bifrost.insert_observation(
-            &started.eval,
-            vec![eval::row(&record)?],
             self.run.correlation(),
         )?;
         Ok(())

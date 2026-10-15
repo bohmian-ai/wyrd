@@ -176,8 +176,8 @@ test("hydrated agent prompt card navigation", async ({ cards }) => {
 const PORTABLE_SPEC = {
   provider: "anthropic",
   model: "claude-sonnet-4-5",
-  system: "You answer for ${team}.",
-  messages: [{ role: "user", content: "${question}" }],
+  system: `You answer for \${team}.`,
+  messages: [{ role: "user", content: `\${question}` }],
   settings: { temperature: 0.2, max_output_tokens: 256 },
   response_format: {
     type: "object",

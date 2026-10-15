@@ -38,6 +38,7 @@ mod pg_tests {
     use wyrd_client::state::WyrdState;
     use wyrd_client::transport::credential::ResolvedCredential;
     use wyrd_runtime::Permission;
+    use wyrd_spec::auth::TokenAudience;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::registry::{GetCardResponse, ListCardsResponse};
@@ -961,6 +962,9 @@ mod pg_tests {
     /// Span id of the caller span the continuity journey sends.
     const CALLER_SPAN: &str = "b7ad6b7169203331";
 
+    /// Trace id of the caller span the delegated continuity call sends.
+    const DELEGATED_TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
     /// Spans the judged execution opens beneath its request span.
     const DESCENDANTS: [&str; 4] = [
         "verification.judge",
@@ -971,22 +975,15 @@ mod pg_tests {
 
     /// Start a bound server whose gateway answers `gpt-4o` judge calls from a
     /// local provider that passes every answer, register the judge Eval
-    /// Verifier and a Service to judge, and return a credential for that
-    /// Service that may run Verifiers and invoke the judge model.
+    /// Verifier and a Service to judge, and return that Service's principal,
+    /// which may run Verifiers and invoke the judge model.
     ///
     /// # Errors
     ///
     /// Returns provider, server, registration, deployment, or bootstrap
     /// failures.
-    async fn judging_server() -> Result<
-        (
-            WyrdTestServer,
-            wiremock::MockServer,
-            ResolvedCredential,
-            JsonValue,
-        ),
-        McpJourneyError,
-    > {
+    async fn judging_server()
+    -> Result<(WyrdTestServer, wiremock::MockServer, Bootstrap, JsonValue), McpJourneyError> {
         let judge = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
@@ -1028,7 +1025,7 @@ mod pg_tests {
             "card_uid": fixture.service_uid,
             "input": { "kind": "eval_record", "context": { "answer": "yes" } },
         });
-        Ok((server, judge, api_key(&agent)?, request))
+        Ok((server, judge, agent, request))
     }
 
     /// Execute `request` once over a fresh MCP connection sending `headers`,
@@ -1069,21 +1066,43 @@ mod pg_tests {
     /// that request span. A call with a malformed `traceparent` and
     /// `tracestate` still succeeds, on a new trace.
     ///
+    /// Each retained span names the verified pair (AC-010/015): the Service
+    /// A's request is A/A and B's request for A on its own trace is A/B,
+    /// while the judge's gateway spans beneath either keep A as subject
+    /// under one system actor that is neither A nor B.
+    ///
     /// # Errors
     ///
-    /// Returns telemetry, server, fixture, MCP transport, or tool-call
-    /// failures.
+    /// Returns telemetry, server, fixture, exchange, MCP transport, tool-call,
+    /// or retained-span query failures.
     ///
     /// # Panics
     ///
-    /// Panics when a verdict, the request span's parentage, or a descendant
-    /// span's ancestry differs from the expectation.
+    /// Panics when a verdict, the request span's parentage, a descendant
+    /// span's ancestry, or a retained pair differs from the expectation.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn verification_tool_continues_trace_context() -> Result<(), McpJourneyError> {
         let (_telemetry, traces) =
             wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())?;
-        let (server, _judge, credential, request) = judging_server().await?;
+        let (server, _judge, agent, request) = judging_server().await?;
+        let credential = api_key(&agent)?;
+        let actor = server
+            .bootstrap_service("mcp-traced-actor", &["editor", "mcp_judge_invoker"])
+            .await?;
+        let jwt = async |principal: &Bootstrap| -> Result<String, McpJourneyError> {
+            let key = principal
+                .api_key()
+                .ok_or("a service bootstraps with a machine key")?;
+            Ok(server.exchange_api_key(key).await?)
+        };
+        let delegated = server
+            .delegate(
+                &jwt(&agent).await?,
+                &jwt(&actor).await?,
+                TokenAudience::Wyrd,
+            )
+            .await?;
         let checkpoint = traces.checkpoint();
         let parent = format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01");
         execute_traced(
@@ -1100,6 +1119,27 @@ mod pg_tests {
             [("traceparent", "00-not-a-trace-01"), ("tracestate", "@@")],
         )
         .await?;
+        execute_traced(
+            &server,
+            ResolvedCredential::BearerToken(delegated.into()),
+            &request,
+            [
+                (
+                    "traceparent",
+                    &format!("00-{DELEGATED_TRACE}-{CALLER_SPAN}-01"),
+                ),
+                ("tracestate", "wyrd=caller"),
+            ],
+        )
+        .await?;
+        server.flush_bifrost().await?;
+        let stamped = server
+            .retained_span_records(
+                server.data_tenant_id(),
+                "encode(span_id, 'hex'), sub_principal_id, act_principal_id",
+                &format!("trace_id IN (X'{CALLER_TRACE}', X'{DELEGATED_TRACE}')"),
+            )
+            .await?;
         server.shutdown().await?;
 
         let spans = traces.finished_since(checkpoint);
@@ -1146,6 +1186,50 @@ mod pg_tests {
                 .filter(|span| span.name == "verification.judge")
                 .any(|span| span.trace_id != CALLER_TRACE),
             "the malformed call is judged on a new trace: {spans:#?}"
+        );
+
+        let pairs = |trace: &str, judged: bool| {
+            spans
+                .iter()
+                .filter(|span| {
+                    span.trace_id == trace
+                        && if judged {
+                            span.name.contains("gateway.")
+                        } else {
+                            span.name == "request"
+                        }
+                })
+                .filter_map(|span| {
+                    stamped
+                        .iter()
+                        .find(|row| row[0].as_deref() == Some(span.span_id.as_str()))
+                        .map(|row| (row[1].clone(), row[2].clone()))
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let (a, b) = (Some(agent.id().to_string()), Some(actor.id().to_string()));
+        assert_eq!(
+            pairs(CALLER_TRACE, false),
+            [(a.clone(), a.clone())].into(),
+            "A's request is A/A"
+        );
+        assert_eq!(
+            pairs(DELEGATED_TRACE, false),
+            [(a.clone(), b.clone())].into(),
+            "B's request for A is A/B"
+        );
+        let judge = pairs(CALLER_TRACE, true);
+        assert_eq!(
+            judge,
+            pairs(DELEGATED_TRACE, true),
+            "both judges' gateway calls share one pair"
+        );
+        assert!(
+            judge.len() == 1
+                && judge
+                    .iter()
+                    .all(|(sub, act)| *sub == a && act.is_some() && *act != a && *act != b),
+            "the judge's gateway calls keep A as subject under the system actor: {judge:?}"
         );
         Ok(())
     }

@@ -158,9 +158,26 @@ The Python `with` block tags every OpenTelemetry span started inside it with the
 
 Agent frameworks describe each run as OpenTelemetry spans: the agent, every model call with its model and token counts, and every tool call. Send them to Wyrd and run the agent inside a run, and its spans land in `vala.traces.spans` with the run's `run_id` and the Card's `card_uid`, next to the run's observations.
 
-In Python, install the `otel` extra, and `agents` for the OpenAI Agents SDK: `pip install 'wyrd-ai[otel,agents]'`. In TypeScript, install `@opentelemetry/api`, `@opentelemetry/sdk-trace-base`, `@opentelemetry/exporter-trace-otlp-proto`, `@opentelemetry/context-async-hooks`, and `@opentelemetry/core`.
+Install the SDK's OpenTelemetry support with your framework:
 
-Call `start_telemetry()` (`startTelemetry()`) once at startup, before you build any agent. It installs the global tracer provider, exporting as the state's client: the same `WYRD_SERVER_URL` and credential as everything else, with a fresh access token on every export. Then set up your framework:
+| Framework | Install |
+| --- | --- |
+| Pydantic AI | `pip install 'wyrd-ai[otel]' 'pydantic-ai-slim[openai]'` |
+| Google ADK | `pip install 'wyrd-ai[otel]' google-adk` |
+| OpenAI Agents SDK, Python | `pip install 'wyrd-ai[otel,agents]'` |
+| OpenAI Agents SDK, TypeScript | `npm install wyrd-ai @openai/agents zod @opentelemetry/api @opentelemetry/sdk-trace-base @opentelemetry/exporter-trace-otlp-proto @opentelemetry/context-async-hooks @opentelemetry/core` |
+
+The framework calls its model provider with the provider's own key, such as `OPENAI_API_KEY` for OpenAI models or `GOOGLE_API_KEY` for Gemini, read from the environment. Never give it `WYRD_API_KEY`: the Wyrd credential only sends spans and observations to Wyrd.
+
+Each recipe below starts from the `state` loaded in [step 2](#2-load-it-and-start-bifrost). Call `start_telemetry()` (`startTelemetry()`) once at startup, before you build any agent. It installs the global tracer provider, exporting as the state's client: the same `WYRD_SERVER_URL` and credential as everything else, with a fresh access token on every export. Then build the agent. Each `answer` returns the reply and the run's `run_id`, which [reads the spans back](#read-the-agents-spans-back).
+
+The Python recipes share one tool:
+
+```python
+def lookup_order(order_id: str) -> str:
+    """Return an order's shipping status."""
+    return f"Order {order_id} shipped yesterday."
+```
 
 **Pydantic AI** emits spans itself. Turn its instrumentation on without message content:
 
@@ -170,9 +187,13 @@ from pydantic_ai.models.instrumented import InstrumentationSettings
 
 state.start_telemetry()
 Agent.instrument_all(InstrumentationSettings(include_content=False))
+agent = Agent("openai:gpt-4o", tools=[lookup_order])
 
-with state.run("agent"):
-    result = await agent.run(question)
+
+async def answer(question: str) -> tuple[str, str]:
+    with state.run("agent") as run:
+        result = await agent.run(question)
+    return result.output, run.run_id
 ```
 
 `include_content=False` drops prompts, completions, tool arguments, and tool results. Pydantic AI still records each tool's name, description, and JSON schema in `gen_ai.tool.definitions` and `model_request_parameters`.
@@ -180,40 +201,69 @@ with state.run("agent"):
 **Google ADK** emits spans itself, under the instrumentation scope `gcp.vertex.agent`. It records message content in its spans by default; set `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false` in the process environment, and leave `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` unset.
 
 ```python
-state.start_telemetry()
+from google.adk.agents import LlmAgent
+from google.adk.runners import InMemoryRunner
+from google.genai import types
 
-with state.run("agent"):
-    async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=message):
-        ...
+state.start_telemetry()
+agent = LlmAgent(name="assistant", model="gemini-2.5-flash", tools=[lookup_order])
+runner = InMemoryRunner(agent=agent)
+
+
+async def answer(question: str) -> tuple[str, str]:
+    session = await runner.session_service.create_session(app_name=runner.app_name, user_id="support")
+    message = types.Content(role="user", parts=[types.Part(text=question)])
+    reply = ""
+    with state.run("agent") as run:
+        async for event in runner.run_async(user_id="support", session_id=session.id, new_message=message):
+            if event.is_final_response() and event.content and event.content.parts:
+                reply = event.content.parts[0].text or ""
+    return reply, run.run_id
 ```
 
-**The OpenAI Agents SDK** records its own traces rather than OpenTelemetry spans. Give it `WyrdAgentsTraceProcessor`, and each agent, tool, handoff, and model call becomes a span named by the OpenTelemetry GenAI conventions, such as `invoke_agent assistant`, `execute_tool lookup`, and `chat gpt-4o`. The processor records names, models, token counts, and an error status, never inputs or outputs. Wyrd never installs it for you.
+**The OpenAI Agents SDK** records its own traces rather than OpenTelemetry spans. Give it `WyrdAgentsTraceProcessor`, and each agent, tool, handoff, and model call becomes a span named by the OpenTelemetry GenAI conventions, such as `invoke_agent assistant`, `execute_tool lookup_order`, and `chat gpt-4o`. The processor records names, models, token counts, and an error status, never inputs or outputs. Wyrd never installs it for you.
 
 <LangTabs langs={['python', 'typescript']}>
 <LangTab lang="python">
 
 ```python
-from agents import Runner, set_trace_processors
+from agents import Agent, Runner, function_tool, set_trace_processors
 from wyrd.otel import WyrdAgentsTraceProcessor
 
 state.start_telemetry()
 set_trace_processors([WyrdAgentsTraceProcessor()])
+agent = Agent(name="assistant", model="gpt-4o", tools=[function_tool(lookup_order)])
 
-with state.run("agent"):
-    result = await Runner.run(agent, question)
+
+async def answer(question: str) -> tuple[str, str]:
+    with state.run("agent") as run:
+        result = await Runner.run(agent, question)
+    return str(result.final_output), run.run_id
 ```
 
 </LangTab>
 <LangTab lang="typescript">
 
 ```typescript
-import { run, setTraceProcessors } from "@openai/agents";
+import { Agent, run, setTraceProcessors, tool } from "@openai/agents";
+import { z } from "zod";
 import { WyrdAgentsTraceProcessor } from "wyrd-ai";
 
 await state.startTelemetry();
 setTraceProcessors([new WyrdAgentsTraceProcessor()]);
+const lookupOrder = tool({
+  name: "lookup_order",
+  description: "Return an order's shipping status.",
+  parameters: z.object({ orderId: z.string() }),
+  execute: async ({ orderId }) => `Order ${orderId} shipped yesterday.`,
+});
+const agent = new Agent({ name: "assistant", model: "gpt-4o", tools: [lookupOrder] });
 
-const result = await state.run("agent").scope(() => run(agent, question));
+async function answer(question: string): Promise<[string, string]> {
+  const agentRun = state.run("agent");
+  const result = await agentRun.scope(() => run(agent, question));
+  return [String(result.finalOutput), agentRun.runId];
+}
 ```
 
 </LangTab>
@@ -226,6 +276,45 @@ A span started inside the run keeps the run even when it finishes after the bloc
 None of this needs the AI Gateway. To send the model calls through it as well, give the framework's OpenAI client `http_auth` (`httpAuth`), as in [Call Wyrd from a stock client](/connect/call-wyrd-from-a-stock-client/#openai).
 
 These recipes are tested with Pydantic AI 2.56, Google ADK 2.12, OpenAI Agents SDK 0.23 for Python, and OpenAI Agents SDK 0.20 for TypeScript.
+
+#### Read the agent's spans back
+
+Ask a question, flush, and read the run's spans back with the same ambient credential:
+
+<LangTabs langs={['python', 'typescript']}>
+<LangTab lang="python">
+
+```python
+import asyncio
+
+from wyrd.bifrost import Bifrost
+
+reply, run_id = asyncio.run(answer("Where is order 1234?"))
+state.flush()
+spans = Bifrost().sql(
+    "SELECT name, gen_ai_usage_input_tokens, gen_ai_usage_output_tokens FROM vala.traces.spans WHERE run_id = $1",
+    [run_id],
+)
+```
+
+</LangTab>
+<LangTab lang="typescript">
+
+```typescript
+import { Bifrost } from "wyrd-ai";
+
+const [reply, runId] = await answer("Where is order 1234?");
+await state.flush();
+const spans = await (await Bifrost.connect()).sql(
+  "SELECT name, gen_ai_usage_input_tokens, gen_ai_usage_output_tokens FROM vala.traces.spans WHERE run_id = $1",
+  [runId],
+);
+```
+
+</LangTab>
+</LangTabs>
+
+`flush` exports the spans and drains the writer, and leaves both open, so the agent keeps working afterward. As with any row, spans become queryable a short time after `flush` returns.
 
 #### Keep your own tracer provider
 

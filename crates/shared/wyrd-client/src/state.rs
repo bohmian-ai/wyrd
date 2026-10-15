@@ -3952,6 +3952,12 @@ pub(crate) mod tests {
 
     /// A provider failure is primary and keeps the drain's code as secondary
     /// detail; a provider success passes the drain's own result through.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a settlement that must fail succeeds, when a failed
+    /// settlement is not the expected timeout or failure variant, or when a
+    /// code, `native_code` detail, or passed-through drain result differs.
     #[test]
     fn telemetry_flush_failure_settles_with_the_native_drain() {
         use super::TelemetryFlushFailure;

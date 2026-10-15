@@ -11,6 +11,7 @@ use skald_spec::Prompt as PromptSpec;
 use skald_tool::{AgentTool, ToolError, ToolResolver};
 use wyrd_spec::{
     AgentCard, AgentRunConfigSpec, AgentSpec, CardMetadata, ExecutionRoute,
+    card::verifier::VerificationBinding,
     envelope::CardKind,
     error::WyrdError,
     metadata::{Annotations, Labels},
@@ -182,6 +183,16 @@ pub struct Agent {
     pub prompt: Arc<Prompt>,
     /// Loop execution settings.
     pub run_config: RunConfig,
+    /// Run configuration exactly as the loaded Agent Card authored it, with
+    /// omitted fields still omitted; `None` for an Agent built in code.
+    ///
+    /// [`Self::to_spec`] exports each field from here while
+    /// [`Self::run_config`] still holds the value this resolved to, so an
+    /// untouched loaded Agent keeps its authored spec and hash.
+    pub(crate) authored_run_config: Option<AgentRunConfigSpec>,
+    /// Verification bindings the loaded Agent Card declared, exported
+    /// unchanged and never resolved or run by the Agent.
+    pub(crate) verified_by: Vec<VerificationBinding>,
     /// Per-agent runtime-local tool cache.
     pub(crate) tools: Vec<Arc<dyn AgentTool>>,
     /// Session memory backend for this agent.
@@ -669,6 +680,10 @@ impl Agent {
 
     /// Reconstruct an agent from a typed Agent Card envelope.
     ///
+    /// The Card's run configuration resolves to runtime defaults for
+    /// execution, while the authored form and verification bindings are kept
+    /// so [`Self::to_spec`] exports the Card's spec unchanged.
+    ///
     /// # Errors
     /// Returns prompt resolution or tool resolution errors.
     pub fn from_card(
@@ -695,6 +710,8 @@ impl Agent {
             annotations: card.annotations,
         };
         agent.tool_names = card.spec.tool_names;
+        agent.authored_run_config = Some(card.spec.run_config);
+        agent.verified_by = card.spec.verified_by;
         Ok(agent)
     }
 
@@ -767,6 +784,8 @@ impl Agent {
             id,
             prompt,
             run_config: RunConfig::default(),
+            authored_run_config: None,
+            verified_by: Vec::new(),
             tools: Vec::new(),
             session: Arc::new(NoSession),
             journal: Arc::new(NoopJournal),
@@ -780,14 +799,58 @@ impl Agent {
     }
 
     /// Project this agent into its pure durable [`AgentSpec`] body.
+    ///
+    /// A loaded Agent exports its Card's verification bindings and, through
+    /// [`Self::run_config_spec`], its authored run configuration; an Agent
+    /// built in code exports its current configuration and no bindings.
     #[must_use]
     pub fn to_spec(&self) -> AgentSpec {
         AgentSpec {
             prompt: self.prompt_ref.clone(),
             execution_route: self.execution_route.clone(),
             tool_names: self.tool_names.clone(),
-            run_config: agent_run_config_spec_from_run_config(&self.run_config),
-            verified_by: Vec::new(),
+            run_config: self.run_config_spec(),
+            verified_by: self.verified_by.clone(),
+        }
+    }
+
+    /// Projects [`Self::run_config`] into its durable spec form.
+    ///
+    /// For a loaded Agent, a field whose current value still equals what the
+    /// authored field resolved to exports as authored, so an omitted default
+    /// stays omitted and an explicit one stays explicit. A field changed
+    /// since load, through [`Self::with_run_config`] or the public field,
+    /// exports its current value. Comparing per field keeps unrelated
+    /// authored values when only one setting is edited.
+    fn run_config_spec(&self) -> AgentRunConfigSpec {
+        /// Keeps the authored value unless the current one moved off what
+        /// that authored value resolved to.
+        fn keep<T: PartialEq>(authored: Option<T>, loaded: Option<T>, current: Option<T>) -> Option<T> {
+            if current == loaded { authored } else { current }
+        }
+        let current = agent_run_config_spec_from_run_config(&self.run_config);
+        let Some(authored) = &self.authored_run_config else {
+            return current;
+        };
+        let loaded =
+            agent_run_config_spec_from_run_config(&run_config_from_agent_run_config_spec(authored));
+        AgentRunConfigSpec {
+            max_iterations: keep(
+                authored.max_iterations,
+                loaded.max_iterations,
+                current.max_iterations,
+            ),
+            tool_concurrency_cap: keep(
+                authored.tool_concurrency_cap,
+                loaded.tool_concurrency_cap,
+                current.tool_concurrency_cap,
+            ),
+            session_recent_limit: keep(
+                authored.session_recent_limit,
+                loaded.session_recent_limit,
+                current.session_recent_limit,
+            ),
+            timeout_ms: keep(authored.timeout_ms, loaded.timeout_ms, current.timeout_ms),
         }
     }
 

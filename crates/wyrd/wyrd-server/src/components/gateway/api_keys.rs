@@ -206,7 +206,7 @@ mod tests {
             let now = start + Duration::from_secs(elapsed);
             assert_eq!(cached(&cache, "wyrd_sk_a", now).as_deref(), Some("jwt-a"));
         }
-        let just_before = start + TOKEN_REUSE - Duration::from_millis(1);
+        let just_before = start + Duration::from_millis(59_999);
         assert_eq!(
             cached(&cache, "wyrd_sk_a", just_before).as_deref(),
             Some("jwt-a")
@@ -226,7 +226,12 @@ mod tests {
         );
         let ten = start + Duration::from_secs(10);
         assert_eq!(
-            cached(&cache, "wyrd_sk_short", ten - Duration::from_millis(1)).as_deref(),
+            cached(
+                &cache,
+                "wyrd_sk_short",
+                start + Duration::from_millis(9_999)
+            )
+            .as_deref(),
             Some("jwt-short")
         );
         assert_eq!(cached(&cache, "wyrd_sk_short", ten), None);

@@ -834,7 +834,7 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
     let cold_decisions = decisions(&journey, &cold_id).await;
     assert_eq!(
         exchanges(&cold_decisions),
-        [caller_principal.clone()],
+        std::slice::from_ref(&caller_principal),
         "the miss stages the key's one exchange decision: {cold_decisions:?}"
     );
     assert!(

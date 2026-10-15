@@ -52,6 +52,10 @@ pub struct Prompt {
     /// describes the request; absent after construction from a request or a
     /// binding, when the native form is derived from the request instead.
     pub(crate) authored: Option<Box<AuthoredPrompt>>,
+    /// Media kind each portable `${media:name}` binding requires, derived
+    /// from its image or document block at compile time. Native placeholders
+    /// carry no kind and are absent; the list survives text and media binds.
+    pub(crate) media_kinds: Vec<(String, MediaKind)>,
 }
 
 /// Prompts are equal when they serialize to the same authored form; a
@@ -394,6 +398,7 @@ impl Prompt {
             response_type,
             provider: None,
             authored: None,
+            media_kinds: Vec::new(),
         };
         prompt.normalize_media_placeholders_mut()?;
         prompt.variables = extract_text_variables(&prompt.request)?;
@@ -520,8 +525,26 @@ impl Prompt {
     ///
     /// The replacement preserves the request provider shape and inserts native
     /// media blocks such as `OpenAiContentPart::ImageUrl`,
-    /// `AnthropicContentBlock::Document`, or `GooglePart::InlineData`.
+    /// `AnthropicContentBlock::Document`, or `GooglePart::InlineData`. A
+    /// portable binding's declared kind is checked first, so a refusal leaves
+    /// the request unchanged; native placeholders accept either kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::InvalidMediaType`] when `media` is not the kind
+    /// the portable block for `name` declares,
+    /// [`SkaldError::MediaPlaceholderNotFound`] when the request has no such
+    /// placeholder or no media-capable shape, and the per-provider media
+    /// errors for a source or MIME type the provider refuses.
     pub fn bind_media_mut(&mut self, name: &str, media: &MediaRef) -> SkaldResult<()> {
+        if let Some((_, expected)) = self.media_kinds.iter().find(|(bound, _)| bound == name)
+            && *expected != media.kind
+        {
+            return Err(SkaldError::InvalidMediaType(format!(
+                "media `{name}` is declared as {expected:?} but was bound as {:?}",
+                media.kind
+            )));
+        }
         self.normalize_media_placeholders_mut()?;
         let provider = self.provider();
         match &mut self.request {
@@ -1701,6 +1724,7 @@ mod prompt_render {
             response_type: ResponseType::Text,
             provider: None,
             authored: None,
+            media_kinds: Vec::new(),
         }
     }
 

@@ -215,9 +215,10 @@ impl AuthoredPrompt {
     pub fn compile(&self) -> SkaldResult<Prompt> {
         check_model(&self.model)?;
         let mut literals = Vec::new();
+        let mut media_kinds = Vec::new();
         let request = match (self.format, &self.body) {
             (Some(format), Some(body)) => self.native_request(format, body)?,
-            (None, None) => self.portable_request(&mut literals)?,
+            (None, None) => self.portable_request(&mut literals, &mut media_kinds)?,
             (Some(_), None) => return Err(invalid("body", "native `format` requires a `body`")),
             (None, Some(_)) => return Err(invalid("format", "native `body` requires a `format`")),
         };
@@ -226,6 +227,7 @@ impl AuthoredPrompt {
         for (name, media) in &literals {
             prompt.bind_media_mut(name, media)?;
         }
+        prompt.media_kinds = media_kinds;
         prompt.authored = Some(Box::new(self.clone()));
         Ok(prompt)
     }
@@ -323,10 +325,18 @@ impl AuthoredPrompt {
     /// Lowers portable content to the provider's default format.
     ///
     /// Literal media sources are recorded in `literals` under generated
-    /// placeholder names for [`compile`](Self::compile) to bind.
+    /// placeholder names for [`compile`](Self::compile) to bind, and each
+    /// binding's block kind in `media_kinds`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::PromptInvalid`] for a jev provider, an invalid
+    /// output schema, a turn [`PortableMessage::lower`] refuses, no nonempty
+    /// content, or a setting the destination refuses.
     fn portable_request(
         &self,
         literals: &mut Vec<(String, MediaRef)>,
+        media_kinds: &mut Vec<(String, MediaKind)>,
     ) -> SkaldResult<ProviderRequest> {
         let format = match &self.provider {
             ProviderName::OpenAi | ProviderName::Custom(_) => PromptFormat::ChatCompletion,
@@ -350,7 +360,7 @@ impl AuthoredPrompt {
             .messages
             .iter()
             .flatten()
-            .map(|message| message.lower(literals))
+            .map(|message| message.lower(literals, media_kinds))
             .collect::<SkaldResult<Vec<_>>>()?;
         let has_content = self.system.as_deref().is_some_and(|text| !text.is_empty())
             || turns
@@ -388,8 +398,19 @@ impl AuthoredPrompt {
 }
 
 impl PortableMessage {
-    /// Lowers this turn to ordered text parts, recording literal media.
-    fn lower(&self, literals: &mut Vec<(String, MediaRef)>) -> SkaldResult<Turn> {
+    /// Lowers this turn to ordered text parts, recording literal media and
+    /// each binding's block kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::PromptInvalid`] for media in an assistant turn,
+    /// a binding that is not exactly one `${media:name}` placeholder, or one
+    /// binding name declared as both image and document.
+    fn lower(
+        &self,
+        literals: &mut Vec<(String, MediaRef)>,
+        media_kinds: &mut Vec<(String, MediaKind)>,
+    ) -> SkaldResult<Turn> {
         let blocks = match &self.content {
             PortableContent::Text(text) => {
                 return Ok(Turn {
@@ -418,17 +439,28 @@ impl PortableMessage {
             }
             parts.push(match source {
                 BlockSource::Binding(binding) => {
-                    let whole = media_placeholder_regex()
-                        .find(binding)
-                        .is_some_and(|found| found.as_str() == binding);
-                    if !whole {
+                    let Some(name) = media_placeholder_regex()
+                        .captures(binding)
+                        .filter(|found| &found[0] == binding)
+                        .map(|found| found[1].to_owned())
+                    else {
                         return Err(invalid(
                             "messages.content.source",
                             "a media binding is exactly one `${media:name}` placeholder",
                         ));
+                    };
+                    match media_kinds.iter().find(|(declared, _)| *declared == name) {
+                        Some((_, declared)) if *declared != kind => {
+                            return Err(invalid(
+                                "messages.content.source",
+                                &format!(
+                                    "media binding `{name}` is declared as both image and document"
+                                ),
+                            ));
+                        }
+                        Some(_) => {}
+                        None => media_kinds.push((name, kind)),
                     }
-                    // ponytail: a binding's MediaRef kind is not checked against
-                    // its block kind; carry the kind into Prompt if a mismatch bites.
                     binding.clone()
                 }
                 BlockSource::Media(source) => {
@@ -1172,6 +1204,84 @@ mod tests {
             ),
             "body.generation_config.response_schema.properties.a.required"
         );
+    }
+
+    /// Proves a portable binding keeps its block's media kind: binding the
+    /// other kind is refused in both directions before the request changes,
+    /// one name declared as both kinds is refused, matching bindings keep
+    /// their order, and native untyped placeholders accept either kind.
+    #[test]
+    fn portable_media_bindings_keep_their_kind() {
+        use crate::MediaRef;
+
+        let authored = |provider: &str, blocks: Value| {
+            json!({"provider": provider, "model": "m",
+            "settings": {"max_output_tokens": 8}, "messages": [{"role": "user", "content": blocks}]})
+        };
+        let image = MediaRef::image_base64("image/png", "iVBORw0KGgo=");
+        let document = MediaRef::document_base64("application/pdf", "JVBERi0=");
+        for provider in ["openai", "anthropic", "google"] {
+            let blocks = json!([
+                {"type": "image", "source": "${media:photo}"},
+                {"type": "text", "text": "and"},
+                {"type": "document", "source": "${media:report}"},
+                {"type": "image", "source": "${media:photo}"},
+            ]);
+            let mut prompt = compile(authored(provider, blocks)).expect("portable media compiles");
+            let before = prompt.request.clone();
+            for (name, media) in [("photo", &document), ("report", &image)] {
+                assert!(
+                    matches!(
+                        prompt.bind_media_mut(name, media),
+                        Err(SkaldError::InvalidMediaType(_))
+                    ),
+                    "{provider}: {name} refuses the other kind"
+                );
+                assert_eq!(
+                    prompt.request, before,
+                    "{provider}: refusal leaves the request untouched"
+                );
+            }
+            prompt
+                .bind_media_mut("photo", &image)
+                .expect("matching image binds");
+            prompt
+                .bind_media_mut("report", &document)
+                .expect("matching document binds");
+            let text = serde_json::to_string(&prompt.request).expect("request json");
+            let (first, report, last) = (
+                text.find("iVBORw0KGgo=").expect("image bound"),
+                text.find("JVBERi0=").expect("document bound"),
+                text.rfind("iVBORw0KGgo=").expect("image bound twice"),
+            );
+            assert!(
+                first < report && report < last,
+                "{provider}: order is retained"
+            );
+
+            let conflict = json!([
+                {"type": "image", "source": "${media:x}"},
+                {"type": "document", "source": "${media:x}"},
+            ]);
+            assert_eq!(
+                refused(authored(provider, conflict)),
+                "messages.content.source",
+                "{provider}: one name cannot be both kinds"
+            );
+        }
+
+        let mut native = compile(
+            json!({"provider": "openai", "model": "m", "format": "chat_completion",
+            "body": {"messages": [{"role": "user", "content": "see ${media:x}"}]}}),
+        )
+        .expect("native compiles");
+        native
+            .clone()
+            .bind_media_mut("x", &image)
+            .expect("untyped binds an image");
+        native
+            .bind_media_mut("x", &document)
+            .expect("untyped binds a document");
     }
 
     /// Proves the native form: model inserted at compile and refused in the

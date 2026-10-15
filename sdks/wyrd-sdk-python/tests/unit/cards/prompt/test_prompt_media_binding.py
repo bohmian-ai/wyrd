@@ -1,5 +1,7 @@
 """``${media:name}`` placeholders bind independently of text variables."""
 
+import json
+
 import pytest
 from wyrd.prompt import MediaRef, Prompt, WyrdError
 
@@ -57,6 +59,39 @@ def test_bind_media_missing_placeholder_raises_exact_code() -> None:
         prompt.bind_media("missing", LOGO)
 
     assert error.value.code == "WYRD_PROMPT_422_UNDECLARED_MEDIA_PLACEHOLDER"
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "google"])
+def test_portable_binding_refuses_the_other_media_kind(provider: str) -> None:
+    prompt = Prompt.model_validate_json(
+        json.dumps(
+            {
+                "provider": provider,
+                "model": "model-1",
+                "settings": {"max_output_tokens": 8},
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": "${media:photo}"},
+                            {"type": "document", "source": "${media:report}"},
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+    image = MediaRef.image_base64("image/png", "iVBORw0KGgo=")
+    document = MediaRef.document_base64("application/pdf", "JVBERi0=")
+
+    for name, media in [("photo", document), ("report", image)]:
+        with pytest.raises(WyrdError) as error:
+            prompt.bind_media_mut(name, media)
+        assert error.value.code == "WYRD_PROMPT_400_INVALID_MEDIA_TYPE"
+    assert prompt.media_variables == ["photo", "report"]
+
+    bound = prompt.bind_media("photo", image).bind_media("report", document)
+    assert bound.media_variables == []
 
 
 def test_render_with_unbound_media_raises_missing_media_variable() -> None:

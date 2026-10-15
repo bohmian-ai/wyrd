@@ -298,16 +298,16 @@ impl<'a> GatewayInvocation<'a> {
         request: GatewayCallRequest,
     ) -> Result<GatewayCallResponse, WyrdError> {
         Ok(self
-            .run(caller, request, false, &self.state.shutdown_token)
+            .run(caller, request, &self.state.shutdown_token)
             .await?)
     }
 
     /// Runs one governed call exactly as [`Self::invoke`] does, reporting with
     /// each error whether a provider may have received the request.
     ///
-    /// `authorized` skips the invoke decision when the caller already took and
-    /// audited it for the requested model. The call's cancellation is a child
-    /// of `cancel`, so an owner that keeps this future alive can still cancel
+    /// The invoke decision is always taken against the snapshot that routes
+    /// the call, even when the caller decided earlier against an older one.
+    /// The call's cancellation is a child of `cancel`, so an owner that keeps this future alive can still cancel
     /// the call and observe its dispatch evidence; `invoke` passes the server
     /// shutdown token.
     ///
@@ -350,11 +350,10 @@ impl<'a> GatewayInvocation<'a> {
         &self,
         caller: &Caller,
         request: GatewayCallRequest,
-        authorized: bool,
         cancel: &CancellationToken,
     ) -> Result<GatewayCallResponse, CallFailure> {
         let operation = operation_name(request.operation);
-        let result = self.govern(caller, request, authorized, cancel).await;
+        let result = self.govern(caller, request, cancel).await;
         if let Err(failure) = &result {
             let span = tracing::Span::current();
             if !failure.settled {
@@ -397,12 +396,11 @@ impl<'a> GatewayInvocation<'a> {
         &self,
         caller: &Caller,
         request: GatewayCallRequest,
-        authorized: bool,
         cancel: &CancellationToken,
     ) -> Result<GatewayCallResponse, CallFailure> {
         let received = Instant::now();
         let (ingress, stream) = (request.ingress, request.stream);
-        let (call, plan, admission) = self.admit_call(caller, request, authorized).await?;
+        let (call, plan, admission) = self.admit_call(caller, request).await?;
         let cancel = cancel.child_token();
         let cancel_on_drop = cancel.clone().drop_guard();
         let (head, answer) = oneshot::channel();
@@ -455,7 +453,6 @@ impl<'a> GatewayInvocation<'a> {
         &self,
         caller: &Caller,
         mut request: GatewayCallRequest,
-        authorized: bool,
     ) -> Result<(AdmittedCall, CallPlan, Admission), CallFailure> {
         let call_id = GatewayCallId::new_v7();
         tracing::Span::current().record("call_id", tracing::field::display(call_id.as_uuid()));
@@ -481,10 +478,8 @@ impl<'a> GatewayInvocation<'a> {
         let snapshot = GatewayAdministration::new(self.state)
             .snapshot(tenant)
             .await?;
-        if !authorized {
-            self.decide(caller, OPERATION, &request.model, &snapshot)
-                .map_err(permission_deny_reason_to_wyrd)?;
-        }
+        self.decide(caller, OPERATION, &request.model, &snapshot)
+            .map_err(permission_deny_reason_to_wyrd)?;
         let subject = match request.subject.take() {
             Some(GatewayCallAttribution::Requested(subject)) => {
                 Some(self.attribute(caller, subject).await?)

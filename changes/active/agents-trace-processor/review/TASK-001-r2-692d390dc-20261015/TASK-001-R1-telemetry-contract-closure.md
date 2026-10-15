@@ -309,3 +309,51 @@ execution evidence rather than rewriting the independent verdict or approved
 spec. Report exact RED/GREEN commands/counts, static results and any blocked
 material discovery. Re-review the complete cumulative candidate against TASK-001
 and all six stable FIND IDs; implementation alone is not task-review PASS.
+
+## Implementation Evidence
+
+Start point `692d390dc`; remediation commits `1e1de55c2`, `400e386d5`,
+`a7245b4f0`, `40479945c`, `dd8eda316`, `79525e8b1` (review packet recorded in
+`60354f0d4`).
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-001-1 | `wyrd/src/index.ts`: the `@openai/agents-core` import and `implements TracingProcessor` are gone; private structural `AgentsSpanData`/`AgentsUsage`/`AgentsSpan`/`AgentsTrace` declare only the fields read, and the mapper filters values through `suppliedAttributes`. `scripts/check_ts_package.mjs` type-checks a clean consumer of `Bifrost`, `TableConfig`, `WyrdClient`, `WyrdState`, and `WyrdAgentsTraceProcessor` with `--skipLibCheck false` and no optional peers. `tests/unit/telemetry.test.ts` asserts `new WyrdAgentsTraceProcessor() satisfies TracingProcessor` against the installed Agents SDK | RED C1: `dist/index.d.ts(1,76): error TS2307: Cannot find module '@openai/agents-core'`. GREEN C1 exit 0; C3 1 passed; `ts:typecheck` exit 0 (covers the integration `setTraceProcessors([new WyrdAgentsTraceProcessor()])`) | PASS |
+| FIND-TASK-001-2 | `record-a-run-and-observations.md`: install table per framework (TS peers plus `@openai/agents zod`); provider keys stay separate from `WYRD_API_KEY`; every recipe builds from the step 2 `state` with `start_telemetry` first, a shared `lookup_order` tool, a constructed model/agent, and ADK runner/session/message; each `answer` returns the reply and `run_id`; a new "Read the agent's spans back" subsection flushes and queries `vala.traces.spans` through ambient `Bifrost`. Frontmatter, `draft: true`, LangTabs, and internal links are unchanged | `docs:generate` exit 0 (no regenerated drift); `docs:check` exit 0. Constructions were checked against `app.py` builders and the installed packages (`Event.is_final_response`, `function_tool`, `tool`/zod) | PASS |
+| FIND-TASK-001-3 | Python `app.py` gains a managed `live` scenario: `start_bifrost`; a span held open; turn plus drift observation; public `state.flush()`; a report line; then a wait on stdin. After the parent reads back it runs a second turn and observation, ends the held span, calls `state.shutdown()`, runs another turn, and calls `force_flush` on the global provider. `test_managed_framework_telemetry` drives it with `Popen` and reads the first turn's spans and drift back before continuing. TS `managed framework telemetry` runs the same sequence in-process. Owned-provider journeys are unchanged | C6 3 passed (pydantic_ai, google_adk, openai_agents); C7 1 passed. Mutation probe (managed flush made a no-op, then restored): C6 `[pydantic_ai]` failed at the first live readback (`not enough values to unpack (expected 1, got 0)`) | PASS |
+| FIND-TASK-001-4 | `python/wyrd/otel.py` `_gen_ai` reads `ResponseSpanData.usage` first and falls back to `response.usage` per count, keeping zero | RED C4 failed at the new `dict(finished["chat"].attributes)` assertion; GREEN C4 1 passed. The new case is the real `ResponseSpanData()` with `response=None` and late `usage={"input_tokens": 7, "output_tokens": 0}`: exact counts, no model, no content | PASS |
+| FIND-TASK-001-5 | `python/wyrd/otel.py` `_ManagedTelemetry` wraps the installed provider (the binding calls its `force_flush` unchanged). It runs the provider's `force_flush(_FLUSH_TIMEOUT_MILLIS)` (the SDK's 30000 default) on one daemon thread named `wyrd-telemetry-flush`, settles a `concurrent.futures.Future`, and waits at most that bound; the timeout raises builtin `TimeoutError`, which the binding maps to 504 before the native drain. Until a running attempt finishes, later calls wait on it rather than starting another. Rust docs in `src/state/mod.rs` were updated; there is no behavior or stub change | RED C5 (`test_managed_telemetry_flush_deadline`, real `BatchSpanProcessor` with an Event-held exporter, 200 ms test bound): the flush took 5.0 s (until a fallback timer released it). GREEN: two flushes each return 504 with `native_code` `WYRD_SDK_400_BIFROST_NOT_STARTED` in under 2 s while the export is still held. A correlated span ends during the hold. Exactly one flush thread runs. After release, `shutdown` succeeds, the active span exports, and the global provider survives. C5 9 passed with the existing lifecycle and owned-correlation cases | PASS |
+| FIND-TASK-001-6 | `startTelemetry` rechecks `#telemetry` after `await import("./otel.js")` and before the synchronous installer | RED C2: second overlapping call raised `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS`; GREEN C2 1 passed (overlapping calls, one provider; other-state refusal and losing-provider cleanup assertions unchanged) | PASS |
+
+### Commands
+
+- C1 `mise exec -- node scripts/check_ts_package.mjs` (after `mise run ts:build`)
+- C2, C3 exact vitest selectors from this task; `mise run ts:typecheck`, `ts:format:check`, `ts:lints`, `ts:test:unit` (71 passed)
+- C4, plus C5 with the new `test_managed_telemetry_flush_deadline` selector added beside the two named ones (9 passed)
+- C6, C7 exact wrapped selectors from this task
+- `mise run py:format:check`, `py:lints`, `py:typecheck`, `py:test:unit` (611 passed), `fmt`, `lints`
+- `mise run docs:generate`, `mise run docs:check`
+- `git diff --check` over the remediation range: clean
+
+### Deviations and limits
+
+- C5's real-processor deadline proof is a new top-level test beside
+  `test_managed_telemetry_lifecycle`. That test is parametrized over replaced
+  `force_flush` results, which cannot host a held stock export.
+- When a later flush joins a still-running attempt, it reports that attempt's
+  outcome. Spans ended after that attempt began are exported by the next
+  flush; nothing is queued or retried.
+- Each `test_managed_telemetry_lifecycle` case spends about 7 s in teardown,
+  exporting its leftover span to the unreachable unit endpoint. Timing at the
+  start point is the same, so this change did not cause it.
+- The documented Python exporter refusal limitation, TS Chat Completions usage,
+  and already-active TS span behavior are unchanged, as the task directs.
+
+### Non-goals and diff audit
+
+The diff covers 10 files, all within the task's scope: the TS SDK source and
+tests, the TS package checker, Python `otel.py` and its tests, the Python
+framework journey app and test, Rust doc comments, and the observe docs page.
+It makes no server, protocol, storage, schema, dependency, Cargo feature,
+public API, or error catalog change, and adds no framework detection, adapter,
+queue, or retry engine.

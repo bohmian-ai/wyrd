@@ -55,6 +55,7 @@ def test_service_action_timeline_is_one_connected_tree(
     assistant_key: str,
     fresh_tracer_provider: None,
     metadata_capture: None,
+    bifrost: Bifrost,
 ) -> None:
     Bifrost(TableConfig(Action, ACTIONS)).register()
     service = WyrdClient(credential=assistant_key)
@@ -145,8 +146,7 @@ def test_service_action_timeline_is_one_connected_tree(
     ), attempts
     stamped = {
         row["span_id"]: (row["sub_principal_id"], row["act_principal_id"])
-        for row in Bifrost(client=client_of(wyrd_server))
-        .sql(
+        for row in bifrost.sql(
             "SELECT encode(span_id, 'hex') AS span_id, sub_principal_id, act_principal_id "
             f"FROM vala.traces.spans WHERE trace_id = X'{trace_id}'"
         )

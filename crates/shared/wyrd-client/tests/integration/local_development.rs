@@ -16,6 +16,7 @@ use wyrd_client::bifrost::{Bifrost, BifrostOptions};
 use wyrd_client::state::WyrdState;
 use wyrd_client::{PublicWyrdGatewayCaller, WyrdClient};
 use wyrd_spec::ExecutionRoute;
+use wyrd_spec::envelope::Spec;
 use wyrd_spec::vala::api::QueryParam;
 
 /// `examples/gateway-setup/agents` alias (its Prompt provider) → deployment,
@@ -56,6 +57,9 @@ struct Retained {
 /// The bundle's exact pinned Prompt is registered under its exact registered
 /// ref so `Agent::from_card` resolves it; the route, identity, and Prompt
 /// provider and model are the loader's alone, so a field it drops fails here.
+/// The loaded Agent exports the downloaded spec exactly, with the registered
+/// spec hash, before and after it runs; the parent journey runs this child
+/// again after a server restart.
 ///
 /// # Panics
 /// Panics when the saved deployment, bundle, loader, gateway call, or the
@@ -88,17 +92,19 @@ async fn cli_gateway_agents() {
             .expect("loaded identity");
         assert_eq!(&card_ref, state.card_ref(alias).expect("alias"), "{alias}");
         assert_eq!(agent.id(), hydrated.card().name, "{alias}");
-        let loaded = agent.to_card().expect("loaded card");
         let downloaded = hydrated.card();
-        assert_eq!(
-            (loaded.card_ref().expect("loaded ref"), &loaded.spec.prompt),
-            (card_ref.clone(), &downloaded.spec.prompt),
-            "{alias}"
-        );
-        assert_eq!(
-            loaded.spec.execution_route, downloaded.spec.execution_route,
-            "{alias}"
-        );
+        let registered_hash = state.card(alias).expect("alias").metadata.spec_hash.clone();
+        let assert_exports_downloaded = |agent: &Agent, when: &str| {
+            let loaded = agent.to_card().expect("loaded card");
+            assert_eq!(loaded.card_ref().expect("loaded ref"), card_ref, "{alias} {when}");
+            assert_eq!(loaded.spec, downloaded.spec, "{alias} {when}");
+            assert_eq!(
+                Some(Spec::Agent(loaded.spec).canonical_hash().expect("spec hashes")),
+                registered_hash,
+                "{alias} {when}"
+            );
+        };
+        assert_exports_downloaded(&agent, "after load");
         let native = agent.prompt().native();
         assert_eq!(
             (native.provider().as_str(), native.model.as_str()),
@@ -118,6 +124,7 @@ async fn cli_gateway_agents() {
             .await
             .unwrap_or_else(|error| panic!("{alias} runs: {error}"));
         assert_eq!(ran.output, answer, "{alias}");
+        assert_exports_downloaded(&agent, "after the run");
         runs.insert(
             run.run_id().as_str().to_owned(),
             Retained {

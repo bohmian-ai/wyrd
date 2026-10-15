@@ -2998,3 +2998,256 @@ async fn background_owner_subject_system_actor() -> Result<(), ServerJourneyErro
     server.shutdown().await?;
     Ok(())
 }
+
+/// Role granting what a realtime verification needs besides the judge model:
+/// Card reads and running any Verifier.
+const RUNNER_ROLE: &str = "realtime_runner";
+
+/// Add a media-free judge Prompt, Task and Eval Verifiers that call it, and a
+/// Service binding both to [`write_graph`]'s Agent for direct use only, and
+/// return the Service path.
+///
+/// # Panics
+/// Panics when the judge prompt cannot be built or a file cannot be written.
+fn write_realtime_graph(root: &Path) -> PathBuf {
+    write_graph(root);
+    let judge = skald_prompt::openai_chat(
+        "gpt-test",
+        skald_prompt::OpenAiChatOptions {
+            messages: vec!["Grade the answer ${answer}.".to_owned()],
+            variables: vec!["answer".to_owned()],
+            output: Some(
+                skald_prompt::ResponseFormat::json_schema(
+                    "judge_result",
+                    json!({
+                        "type": "object",
+                        "properties": { "passed": { "type": "boolean" } },
+                        "required": ["passed"],
+                        "additionalProperties": false
+                    }),
+                )
+                .expect("the judge response format builds"),
+            ),
+            ..skald_prompt::OpenAiChatOptions::default()
+        },
+    )
+    .expect("the judge prompt builds");
+    let prompt = json!({
+        "apiVersion": "wyrd/v1",
+        "kind": "Prompt",
+        "metadata": { "name": "realtime-judge-prompt", "version": "1.0.0", "space": "default" },
+        "spec": judge.into_native(),
+    });
+    let check = "kind: llm_judge, id: judge, judge_ref: {prompt: ./realtime-judge-prompt.json, tool_names: [], run_config: {max_iterations: 1}}, context_path: $.answer, operator: equals, expected: {passed: true}, max_retries: 0";
+    let files = [
+        ("realtime-judge-prompt.json", prompt.to_string()),
+        (
+            "realtime-task.yaml",
+            format!(
+                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: realtime-task\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: task\n    spec: {{{check}}}\n"
+            ),
+        ),
+        (
+            "realtime-eval.yaml",
+            verifier(
+                "realtime-eval",
+                &format!("      pass_gate: {{kind: all_pass}}\n      tasks:\n        judge: {{{check}}}\n"),
+            ),
+        ),
+        (
+            "realtime.yaml",
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: realtime-service\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: agent\n      ref: ./agent.yaml\n      verified_by:\n        - verifier: ./realtime-task.yaml\n        - verifier: ./realtime-eval.yaml\n".to_owned(),
+        ),
+    ];
+    for (name, body) in files {
+        std::fs::write(root.join(name), body).expect("fixture file writes");
+    }
+    root.join("realtime.yaml")
+}
+
+/// Judge `{answer: yes}` with `verifier` over `bundle` through `client`.
+///
+/// # Errors
+/// Returns the bundle load error or the server's refusal.
+async fn verify_as(
+    client: &WyrdClient,
+    bundle: &Path,
+    verifier: &str,
+) -> Result<wyrd_spec::verification::Judgment, ServerJourneyError> {
+    let state = WyrdState::from_path_with_client(bundle, client.clone())?;
+    Ok(state
+        .run()
+        .for_card("agent")?
+        .observe()
+        .verify(verifier, &json!({ "answer": "yes" }))
+        .await?)
+}
+
+/// A realtime verification keeps its subject and accepted authority all the
+/// way to the gateway (AC-003/004/012/018).
+///
+/// Subject A is Card-bound and holds exactly the runner and judge roles.
+/// Actor B holds the same; actor C holds only the runner role. Directly, and
+/// as B for A, the Task and Eval judges pass: acceptance is audited as A/A
+/// and A/B, and so are the results; each judge decision and gateway call
+/// records A/SYSTEM. As C for A, the judge falls outside the delegated intersection
+/// and is refused before any provider request; once A loses the judge role,
+/// B for A is refused the same way. The provider sees only the permitted
+/// calls.
+///
+/// # Errors
+/// Returns server, registration, exchange, verification, or query errors, or
+/// a description of the first pair or refusal that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn realtime_subject_actor_authority() -> Result<(), ServerJourneyError> {
+    let root = tempfile::tempdir()?;
+    let service = write_realtime_graph(root.path());
+    let bundle = root.path().join("bundle");
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl_realtime", "object": "chat.completion", "created": 1_700_000_000,
+            "model": "gpt-test",
+            "choices": [{ "index": 0, "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+        })))
+        .mount(&provider)
+        .await;
+    let server = Box::pin(gateway_server(&provider)).await?;
+    let tenant = server.data_tenant_id();
+    let system = VerificationFixture::provision(server.state().postgres.wyrd(), tenant)
+        .await?
+        .system_principal();
+    server
+        .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
+        .await?;
+    server
+        .seed_role(
+            RUNNER_ROLE,
+            &[
+                wyrd_runtime::Permission::card_read(),
+                wyrd_runtime::Permission::verifier_run_any(),
+            ],
+        )
+        .await?;
+    let admin = connect(&server, server.tenant_admin_key().await?.expose_secret());
+    wyrd_client::gateway::Gateway::with_client(admin.clone())
+        .put_capture_policy(&wyrd_spec::gateway::GatewayCapturePolicyWrite {
+            mode: wyrd_spec::gateway::GatewayCaptureMode::Metadata,
+            payload_fields: std::collections::BTreeSet::new(),
+        })
+        .await?;
+    let receipt = register(&admin, &service, &bundle).await;
+    let a = server
+        .credential_registered_service(&receipt.root, &[RUNNER_ROLE, JUDGE_ROLE])
+        .await?;
+    server
+        .revoke_role(&a, wyrd_runtime::builtin_roles::DEFAULT_CARD_ROLE)
+        .await?;
+    let b = server
+        .bootstrap_service("realtime-actor", &[RUNNER_ROLE, JUDGE_ROLE])
+        .await?;
+    let c = server
+        .bootstrap_service("realtime-narrow-actor", &[RUNNER_ROLE])
+        .await?;
+    let key = |principal: &Bootstrap| {
+        principal
+            .api_key()
+            .map(|key| key.expose_secret().to_owned())
+            .ok_or("a machine principal carries an API key")
+    };
+    let on_behalf = async |actor: &Bootstrap| -> Result<WyrdClient, ServerJourneyError> {
+        let subject = server
+            .exchange_api_key(a.api_key().ok_or("A carries an API key")?)
+            .await?;
+        Ok(connect(&server, &key(actor)?)
+            .on_behalf_of(
+                secrecy::SecretString::from(subject),
+                wyrd_spec::auth::TokenAudience::Wyrd,
+            )
+            .await?)
+    };
+    let direct = connect(&server, &key(&a)?);
+    let as_b = on_behalf(&b).await?;
+    for client in [&direct, &as_b] {
+        for verifier in ["realtime-task", "realtime-eval"] {
+            let judged = verify_as(client, &bundle, verifier).await?;
+            if judged.verdict != wyrd_spec::verification::VerificationVerdict::Passed {
+                return Err(format!("{verifier} did not pass: {judged:?}").into());
+            }
+        }
+    }
+    let refused = |outcome: Result<wyrd_spec::verification::Judgment, ServerJourneyError>| {
+        outcome.is_err_and(|error| {
+            error
+                .to_string()
+                .contains("WYRD_VERIFICATION_502_DEPENDENCY_FAILED")
+        })
+    };
+    if !refused(verify_as(&on_behalf(&c).await?, &bundle, "realtime-eval").await) {
+        return Err("C for A judged outside C's authority".into());
+    }
+    server.revoke_role(&a, JUDGE_ROLE).await?;
+    if !refused(verify_as(&on_behalf(&b).await?, &bundle, "realtime-eval").await) {
+        return Err("B for A judged outside A's authority".into());
+    }
+    let requests = provider.received_requests().await.unwrap_or_default().len();
+    if requests != 4 {
+        return Err(
+            format!("the provider saw {requests} judge requests, not the 4 permitted").into(),
+        );
+    }
+    server.flush_bifrost().await?;
+
+    let (a, b, c) = (a.id(), b.id(), c.id());
+    let rows = async |sql: &str| texts(&query(&server, tenant, sql.to_owned()).await?);
+    let accepted = rows(
+        "SELECT DISTINCT concat(sub_principal_id, '|', act_principal_id, '|', outcome) AS d \
+           FROM vala.system.audit_log WHERE operation = 'verification.execute' ORDER BY d",
+    )
+    .await?;
+    let mut expected = vec![
+        Some(format!("{a}|{a}|allowed")),
+        Some(format!("{a}|{b}|allowed")),
+        Some(format!("{a}|{c}|allowed")),
+    ];
+    expected.sort();
+    if accepted != expected {
+        return Err(format!("expected acceptance pairs {expected:?}, read {accepted:?}").into());
+    }
+    let judged = rows(
+        "SELECT DISTINCT concat(sub_principal_id, '|', act_principal_id, '|', outcome) AS d \
+           FROM vala.system.audit_log WHERE operation = 'gateway.invoke' ORDER BY d",
+    )
+    .await?;
+    let mut expected = vec![
+        Some(format!("{a}|{system}|allowed")),
+        Some(format!("{a}|{system}|denied")),
+    ];
+    expected.sort();
+    if judged != expected {
+        return Err(
+            format!("expected A/SYSTEM judge decisions {expected:?}, read {judged:?}").into(),
+        );
+    }
+    let mut accepted_pairs = vec![Some(format!("{a}|{a}")), Some(format!("{a}|{b}"))];
+    accepted_pairs.sort();
+    for (table, expected) in [
+        ("vala.gateway.calls", vec![Some(format!("{a}|{system}"))]),
+        ("vala.verification.results", accepted_pairs),
+    ] {
+        let pairs = rows(&format!(
+            "SELECT DISTINCT concat(sub_principal_id, '|', act_principal_id) AS p \
+               FROM {table} ORDER BY p"
+        ))
+        .await?;
+        if pairs != expected {
+            return Err(format!("{table}: expected {expected:?}, read {pairs:?}").into());
+        }
+    }
+    server.shutdown().await?;
+    Ok(())
+}

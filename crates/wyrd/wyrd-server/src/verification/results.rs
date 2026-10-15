@@ -5,9 +5,9 @@
 //! `vala.eval.result_items`, taken from the tables' own declarations so the
 //! payload can never drift from the registered contract. Every batch also
 //! carries the two correlation columns Scribe admits from a native payload:
-//! `card_uid` (the Verifier, authorized against the frame principal's Verifier scope)
-//! and `run_id` (the application Run judged, null when none, as for scheduled
-//! Drift).
+//! `card_uid` (the Card verified; the Verifier is the authored
+//! `verifier_card_uid`) and `run_id` (the application Run judged, null when
+//! none, as for scheduled Drift).
 
 use std::collections::HashMap;
 use std::sync::Arc;

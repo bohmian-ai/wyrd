@@ -26,6 +26,7 @@ EXPECTED_ALIASES = (
     "agent_triage",
     "default-Agent-triage-1.0.0",
     "default-Data-training-1.0.0",
+    "default-Prompt-inline-prompt-0.1.0",
     "default-Prompt-triage-prompt-1.0.0",
     "default-Verifier-model-drift-1.0.0",
     "default-Verifier-quality-1.0.0",
@@ -117,8 +118,8 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
         )
     assert state.model("model_primary") is not state.model("model_shadow")
     pd.testing.assert_frame_equal(state.data("default-Data-training-1.0.0").data, TRAINING_DATA)
-    assert state.agent("agent_triage").prompt is not None
-    assert state.agent("agent_inline").prompt is not None
+    assert state.agent("agent_triage").prompt().ref == state.card_ref("triage_prompt")
+    assert state.agent("agent_inline").prompt().ref.name == "inline-prompt"
     assert state.prompt("triage_prompt") is state.prompt("default-Prompt-triage-prompt-1.0.0")
     assert state.prompt("triage_prompt") is state.prompt("shared_prompt")
     quality = state.verifier("default-Verifier-quality-1.0.0")

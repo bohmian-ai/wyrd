@@ -5,7 +5,7 @@ pub use wyrd_spec::card::agent::AgentCard;
 #[cfg(feature = "python")]
 use {
     crate::card_ref::CardRefPy,
-    crate::prompt::PromptReference,
+    crate::prompt::{PromptCard, PromptReference},
     chrono::Utc,
     pyo3::prelude::*,
     pyo3::pyclass::{PyTraverseError, PyVisit},
@@ -17,40 +17,38 @@ use {
     wyrd_spec::metadata::{
         AnnotationKey, AnnotationValue, Annotations, LabelKey, LabelValue, Labels, MetadataError,
     },
-    wyrd_spec::reference::InlineableRef,
 };
 
 /// Python adapter around the canonical native [`AgentCard`].
 ///
 /// The native card remains the only owner of durable identity and spec state.
-/// This adapter adds typed Python projections for the prompt reference and the
-/// resolved runtime prompt without duplicating envelope conversion.
+/// This adapter adds typed Python projections for the prompt reference and,
+/// once hydrated through state, the registered Prompt Card it pins, without
+/// duplicating envelope conversion.
 #[cfg(feature = "python")]
 #[pyclass(module = "wyrd.cards.agent", name = "AgentCard", skip_from_py_object)]
 pub struct PyAgentCard {
     inner: AgentCard,
     prompt_ref: Option<Py<PromptReference>>,
-    prompt: Option<Py<skald_prompt::Prompt>>,
+    prompt: Option<Py<PromptCard>>,
 }
 
 #[cfg(feature = "python")]
 impl PyAgentCard {
     /// Build the Python adapter from a canonical native Agent Card.
     ///
-    /// Inline prompts are projected immediately. Card-backed prompts remain
-    /// unresolved until a service runtime supplies the corresponding Prompt
-    /// Card.
+    /// The Prompt Card stays unattached until state hydration supplies the
+    /// registered Prompt Card the Agent pins.
     ///
     /// # Errors
-    /// Returns a Python allocation error when a prompt projection cannot be
-    /// created.
+    /// Returns a Python allocation error when the prompt reference projection
+    /// cannot be created.
     pub fn from_native(py: Python<'_>, inner: AgentCard) -> CardPyResult<Self> {
-        let prompt = inline_runtime_prompt(py, &inner.spec.prompt)?;
         let prompt_ref = Py::new(py, PromptReference::from_native(inner.spec.prompt.clone()))?;
         Ok(Self {
             inner,
             prompt_ref: Some(prompt_ref),
-            prompt,
+            prompt: None,
         })
     }
 
@@ -75,20 +73,13 @@ impl PyAgentCard {
         &self.inner
     }
 
-    /// Attach a resolved runtime prompt to a card-backed prompt reference.
+    /// Attach the hydrated Prompt Card this Agent's registered reference
+    /// names.
     ///
-    /// This is the local hydration seam used by service runtime owners. It does
-    /// not alter the durable prompt reference stored in the Agent spec.
-    ///
-    /// # Errors
-    /// Returns a Python allocation error.
-    pub fn hydrate_resolved_prompt(
-        &mut self,
-        py: Python<'_>,
-        prompt: skald_spec::Prompt,
-    ) -> CardPyResult<()> {
-        self.prompt = Some(Py::new(py, skald_prompt::Prompt::from_native(prompt))?);
-        Ok(())
+    /// This is the local hydration seam state construction uses. It does not
+    /// alter the durable prompt reference stored in the Agent spec.
+    pub fn attach_prompt_card(&mut self, prompt: Py<PromptCard>) {
+        self.prompt = Some(prompt);
     }
 }
 
@@ -151,10 +142,23 @@ impl PyAgentCard {
             .ok_or_else(|| WyrdPyError::validation("AgentCard prompt reference was cleared"))
     }
 
-    /// Return the resolved runtime prompt when available.
-    #[getter]
-    pub fn prompt(&self, py: Python<'_>) -> Option<Py<skald_prompt::Prompt>> {
-        self.prompt.as_ref().map(|prompt| prompt.clone_ref(py))
+    /// Return the hydrated Prompt Card this Agent pins.
+    ///
+    /// A local read of the holder state attached during `WyrdState`
+    /// hydration; it performs no IO or registration.
+    ///
+    /// # Errors
+    /// Returns a validation error when this Agent was not hydrated through
+    /// `WyrdState`; an authored inline prompt is read through `prompt_ref`.
+    pub fn prompt(&self, py: Python<'_>) -> CardPyResult<Py<PromptCard>> {
+        self.prompt
+            .as_ref()
+            .map(|prompt| prompt.clone_ref(py))
+            .ok_or_else(|| {
+                WyrdPyError::validation(
+                    "AgentCard has no hydrated Prompt Card; load it through WyrdState",
+                )
+            })
     }
 
     /// Return this Agent Card as a Python dictionary.
@@ -283,20 +287,6 @@ impl PyAgentCard {
     fn __clear__(&mut self) {
         self.prompt_ref = None;
         self.prompt = None;
-    }
-}
-
-#[cfg(feature = "python")]
-fn inline_runtime_prompt(
-    py: Python<'_>,
-    prompt_ref: &InlineableRef<skald_spec::Prompt>,
-) -> CardPyResult<Option<Py<skald_prompt::Prompt>>> {
-    match prompt_ref {
-        InlineableRef::Inline(prompt) => Ok(Some(Py::new(
-            py,
-            skald_prompt::Prompt::from_native((**prompt).clone()),
-        )?)),
-        InlineableRef::Ref(_) | InlineableRef::Sibling { .. } | InlineableRef::Path(_) => Ok(None),
     }
 }
 

@@ -1,6 +1,7 @@
 """Offline holder hydration and loader-configuration contracts."""
 
 import gc
+import shutil
 import weakref
 from collections import UserDict
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 import wyrd
 from wyrd.cards import DataLoadArgs, ModelLoadArgs
 from wyrd.model import ModelCard
+from wyrd.prompt import PromptCard
 from wyrd.state import WyrdState
 
 from .support import TinyDataInterface, TinyModelInterface
@@ -54,18 +56,30 @@ def test_promptcard_exposes_typed_prompt(state: WyrdState) -> None:
     assert state.prompt("triage_prompt").prompt.model == "gpt-4o"
 
 
-def test_agentcard_resolves_inline_prompt(state: WyrdState) -> None:
-    """Inline Agent prompt bodies hydrate into a typed prompt without a registry."""
-    prompt = state.agent("agent_inline").prompt
-    assert prompt is not None
-    assert prompt.model == "gpt-4o"
+def test_agentcard_navigates_to_its_registered_prompt_card(state: WyrdState) -> None:
+    """An Agent returns the hydrated Prompt Card its reference pins, with its exact identity."""
+    prompt = state.agent("agent_triage").prompt()
+    assert isinstance(prompt, PromptCard)
+    assert (
+        prompt.ref
+        == state.agent("agent_triage").prompt_ref.card_ref
+        == state.card_ref("triage_prompt")
+    )
+    assert prompt.prompt.model == "gpt-4o"
 
 
-def test_agentcard_resolves_registered_prompt(state: WyrdState) -> None:
-    """Referenced Agent prompt bodies resolve through the local graph."""
-    prompt = state.agent("agent_triage").prompt
-    assert prompt is not None
-    assert prompt.model == "gpt-4o"
+def test_agent_with_an_inline_only_prompt_is_an_invalid_bundle(
+    complete_bundle: Path,
+    interfaces: dict[str, TinyModelInterface | TinyDataInterface],
+    tmp_path: Path,
+) -> None:
+    """A bundle whose Agent embeds its Prompt without a registered identity is refused."""
+    bundle = tmp_path / "inline-only-agent"
+    shutil.copytree(complete_bundle, bundle)
+    shutil.copytree(complete_bundle.parent / "inline-only-agent", bundle, dirs_exist_ok=True)
+    with pytest.raises(wyrd.WyrdError) as caught:
+        WyrdState.from_path(bundle, interfaces=interfaces)
+    assert caught.value.code == "WYRD_SDK_400_INVALID_STATE_BUNDLE"
 
 
 def test_builtin_model_without_a_trusted_hash_is_refused_before_load(

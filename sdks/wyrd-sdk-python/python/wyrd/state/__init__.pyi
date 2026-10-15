@@ -1,6 +1,6 @@
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeAlias
 
 from ..bifrost import TableConfig
 from ..cards import AgentCard, CardKind, CardRef, DataLoadArgs, ModelLoadArgs
@@ -75,6 +75,13 @@ class CardEnvelope:
             WyrdError: If the retained native envelope cannot be serialized.
         """
         ...
+
+HydratedCard: TypeAlias = AgentCard | PromptCard | ModelCard | DataCard | CardEnvelope
+"""A Card ``WyrdState.get`` returns, in its kind's hydrated holder.
+
+Narrow it with ``isinstance``; kinds without a typed holder are a
+``CardEnvelope``.
+"""
 
 class HydratedArtifact:
     """Read-only path and integrity metadata for one verified local artifact.
@@ -288,6 +295,38 @@ class WyrdState:
         """
         ...
 
+    def get(self, alias: str) -> HydratedCard:
+        """Return the hydrated Card selected by ``alias`` in its kind's holder.
+
+        Agents, Prompts, Models and Data return the holders their typed
+        accessors return; every other kind returns its ``CardEnvelope``. The
+        lookup is strict and performs no IO.
+
+        Args:
+            alias: A friendly alias from this bundle.
+
+        Returns:
+            The hydrated Card; narrow it with ``isinstance``.
+
+        Raises:
+            WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when no Card has the alias.
+        """
+        ...
+
+    def __getitem__(self, alias: str) -> HydratedCard:
+        """Return the hydrated Card selected by ``alias``, as ``get`` does.
+
+        Args:
+            alias: A friendly alias from this bundle.
+
+        Returns:
+            The hydrated Card; narrow it with ``isinstance``.
+
+        Raises:
+            WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when no Card has the alias.
+        """
+        ...
+
     def card_ref(self, alias: str) -> CardRef:
         """Return the exact CardRef selected by ``alias``.
 
@@ -331,7 +370,7 @@ class WyrdState:
         ...
 
     def agent(self, alias: str) -> AgentCard:
-        """Return the Agent holder with its inline or resolved typed prompt.
+        """Return the Agent holder, navigable to its Prompt Card by ``prompt()``.
 
         Args:
             alias: A friendly alias of an Agent Card.

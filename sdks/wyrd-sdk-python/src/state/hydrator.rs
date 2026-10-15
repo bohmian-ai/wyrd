@@ -78,10 +78,11 @@ impl<'state> PythonStateHydrator<'state> {
     /// local to this call, so an error publishes no partial state.
     pub(super) fn hydrate(self, py: Python<'_>) -> CardPyResult<HydratedPythonCards> {
         self.validate_executable_artifacts()?;
+        let prompts = self.hydrate_prompts(py)?;
         Ok(HydratedPythonCards {
             envelopes: self.hydrate_envelopes(py)?,
-            prompts: self.hydrate_prompts(py)?,
-            agents: self.hydrate_agents(py)?,
+            agents: self.hydrate_agents(py, &prompts)?,
+            prompts,
             models: self.hydrate_models(py)?,
             data: self.hydrate_data(py)?,
         })

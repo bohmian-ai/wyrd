@@ -393,26 +393,30 @@ spec:
 ```
 
 ### Prompt
-Provider-native request envelope, the serialized Skald `Prompt`.
+A Prompt is authored once, in exactly one of two forms, and is stored,
+hashed, returned, and hydrated in that form. Variables, media variables, and
+the response type are derived, never authored.
 ```yaml
+# Portable form: compiled by the shared Skald compiler for its provider.
 spec:
+  provider: ProviderName           # openai | anthropic | google | vertex | jev | <custom>
   model: string
-  provider?: ProviderName          # destination; absent = the request schema's default provider
-  request:
-    provider: <wire schema>        # open_ai_chat_completion | open_ai_responses | anthropic_messages | gemini_generate_content | ...
-    body: { ... }                  # that schema's native request body
-  variables: [string]
-  response_type: text | json
+  system?: string
+  messages: [{ role: user | assistant, content: string | [ContentBlock] }]
+  settings?: PortableSettings      # temperature, top_p, max_output_tokens, top_k, stop_sequences, seed, presence_penalty, frequency_penalty
+  response_format?: JsonSchema
+# Native form: one protocol body passed through unchanged.
+spec:
+  provider: ProviderName
+  model: string
+  format: chat_completion | responses | messages | generate_content | system_one
+  body: { ... }                    # that protocol's request body, extension options preserved
 ```
 
-`request.provider` names a wire schema, never a destination; each schema has
-one variant. `provider` names where native dispatch sends it, so a custom
-OpenAI-compatible endpoint is an `open_ai_chat_completion` request with
-`provider: {custom: <name>}`, and a Vertex Prompt is a Gemini GenerateContent
-body with `provider: vertex`. Gateway routes ignore `provider` and select the
-upstream themselves. Standalone Prompt Cards may still be authored with the
-declarative `provider`/`model`/`messages` shorthand, which compiles to this
-envelope; an Agent's inline Prompt is the native envelope itself.
+`provider` names the Prompt's protocol family and the native destination; a
+custom name is an OpenAI-compatible Chat provider. It never names a gateway
+deployment: the Agent's `execution_route` chooses where the call executes.
+An Agent's inline Prompt takes the same two forms.
 
 ### Agent
 Agent contract: prompt + tools + run config. Tool names resolve through the
@@ -421,10 +425,19 @@ per-tool blocks, and hook gates live on `Policy`, not here.
 ```yaml
 spec:
   prompt: InlineableRef<Prompt>  # Ref (→ Prompt), authored Path, or inline Prompt
+  execution_route: ExecutionRoute # required: {kind: native} | {kind: wyrd_gateway, deployment: <name>}
   tool_names: [string]
   run_config: AgentRunConfigSpec # max_iterations, tool_concurrency_cap, session_recent_limit, timeout_ms
   verified_by: [VerificationBinding]
 ```
+
+`native` calls the Prompt's provider with the executing host's own provider
+configuration; server-controlled execution refuses it. `wyrd_gateway` sends
+every model call of the bounded tool loop to `<deployment>/<Prompt model>`
+through the caller's tenant gateway, with ordinary authorization, capture,
+and audit; the deployment is never derived from the Prompt provider. An
+invocation may supply a whole replacement route for that invocation only;
+it never changes the Card, its hash, or a concurrent invocation.
 
 ### Workflow
 DAG of steps invoking other cards.
@@ -1886,16 +1899,11 @@ prompt: { kind: Prompt, name: triage, version: "1.0.0", space: prod }
 # Local full Card envelope, resolved relative to the containing file.
 prompt: ./prompts/triage.yaml
 
-# Inline native Prompt body: no independent Card identity.
+# Inline portable Prompt: no independent Card identity.
 prompt:
+  provider: openai
   model: example-model
-  request:
-    provider: open_ai_chat_completion
-    body:
-      model: example-model
-      messages: [{role: user, content: "Hello"}]
-  variables: []
-  response_type: text
+  messages: [{role: user, content: "Hello"}]
 ```
 
 The owning spec may itself name a field `ref`; this does not introduce a

@@ -1553,6 +1553,29 @@ export class WyrdClient {
   }
 
   /**
+   * A `fetch` that authenticates every request to Wyrd as this client.
+   *
+   * Hand it to any client that takes a `fetch`: a provider SDK pointed at the
+   * gateway, `new OpenAI({ baseURL, apiKey: "wyrd", fetch: wyrd.httpAuth })`,
+   * or an MCP transport against `/mcp`. Each request drops `authorization`,
+   * `x-api-key`, and `x-goog-api-key`, which on a client wired to Wyrd hold
+   * only a placeholder provider key, and carries this client's current access
+   * token as `X-Wyrd-Access-Token: Bearer <token>`. The token is read per
+   * request, so a long-lived client keeps working after any one token expires.
+   *
+   * @returns The authenticating `fetch`; a request rejects with the client's
+   * {@link WyrdError} when the credential is missing or refused.
+   */
+  get httpAuth(): typeof fetch {
+    return async (input, init) => {
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      for (const name of ["authorization", "x-api-key", "x-goog-api-key"]) headers.delete(name);
+      headers.set("x-wyrd-access-token", `Bearer ${await this.accessToken()}`);
+      return fetch(input, { ...init, headers });
+    };
+  }
+
+  /**
    * Return a client that acts for the holder of `subjectToken` (RFC 8693).
    *
    * This client's credential is the actor. The issued token's subject is the
@@ -3138,55 +3161,6 @@ export interface GatewayCapturePolicyWrite {
 /** Versioned capture policy as stored by the server. */
 export interface GatewayCapturePolicy extends GatewayCapturePolicyWrite {
   readonly version: number;
-}
-
-/**
- * The current Wyrd access token, as a source a stock client asks on every call.
- *
- * Hand it to the OpenAI SDK as its key:
- * `new OpenAI({ baseURL: \`${process.env.WYRD_SERVER_URL}/v1\`, apiKey: accessTokenSource() })`.
- * The client resolves once, here, so every call shares one token cache; each
- * call then asks it for its current access token, which the client exchanges,
- * caches, and renews, so a long-lived stock client keeps working after any one
- * token expires.
- *
- * @param options - The client to authenticate as; omitted, the ambient client.
- * @returns A function resolving the current access token on each call.
- * @throws {WyrdError} `WYRD_CLIENT_401_NO_CREDENTIALS` when no ambient
- * credential resolves; the returned function rejects with the client's
- * exchange error when the credential is refused.
- */
-export function accessTokenSource(options: ClientOptions = {}): () => Promise<string> {
-  const client = clientOf(options);
-  return () => client.accessToken();
-}
-
-/**
- * A `fetch` that authenticates every request to Wyrd.
- *
- * Hand it to any client that takes a `fetch`, such as the Agents SDK
- * `new MCPServerStreamableHttp({ url: \`${process.env.WYRD_SERVER_URL}/mcp\`, fetch: wyrdFetch() })`.
- * The client resolves once, here; each request carries its current access
- * token as `X-Wyrd-Access-Token: Bearer <token>`, which every Wyrd route and
- * the gateway accept.
- *
- * The gateway refuses a request carrying more than one credential header, so
- * do not pair this with an OpenAI `apiKey`; use {@link accessTokenSource} as
- * the key instead.
- *
- * @param options - The client to authenticate as; omitted, the ambient client.
- * @returns The authenticating `fetch`.
- * @throws {WyrdError} `WYRD_CLIENT_401_NO_CREDENTIALS` when no ambient
- * credential resolves; a request rejects with the client's exchange error
- * when the credential is refused.
- */
-export function wyrdFetch(options: ClientOptions = {}): typeof fetch {
-  const client = clientOf(options);
-  return async (input, init) => {
-    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
-    headers.set("x-wyrd-access-token", `Bearer ${await client.accessToken()}`);
-    return fetch(input, { ...init, headers });
-  };
 }
 
 /**

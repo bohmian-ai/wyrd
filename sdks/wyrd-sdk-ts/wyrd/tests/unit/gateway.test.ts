@@ -1,6 +1,6 @@
 import { expect, test, vi } from "vitest";
 
-import { Gateway, WyrdClient, accessTokenSource, wyrdFetch } from "wyrd-ai";
+import { Gateway, WyrdClient } from "wyrd-ai";
 
 /** Sits where a number is required, so a serde message would quote it verbatim. */
 const SENTINEL = "sk-live-typescript-surface-sentinel";
@@ -43,47 +43,29 @@ test("rejects a malformed body without echoing it", async () => {
   expect(JSON.stringify(error) + String(error)).not.toContain(SENTINEL);
 });
 
-/** Make the ambient client one that mints a new token on each ask, counting how often it is resolved. */
-function mintingAmbientClient(): { connects: () => number } {
+// The token is read per request so a long-lived client survives expiry, and
+// the placeholder provider keys are dropped so the gateway sees one credential.
+test("httpAuth replaces provider key headers with a fresh access token on every request", async () => {
+  const client = options.client;
   let minted = 0;
-  const client = { accessToken: async () => `token-${++minted}` } as unknown as WyrdClient;
-  const connect = vi.spyOn(WyrdClient, "connect").mockReturnValue(client);
-  return { connects: () => connect.mock.calls.length };
-}
-
-test("accessTokenSource resolves the ambient client once and asks it on every call", async () => {
-  const ambient = mintingAmbientClient();
-  try {
-    const source = accessTokenSource();
-
-    expect([await source(), await source()]).toEqual(["token-1", "token-2"]);
-    expect(ambient.connects()).toBe(1);
-  } finally {
-    vi.restoreAllMocks();
-  }
-});
-
-test("wyrdFetch resolves the ambient client once and sends a fresh access token on every request", async () => {
-  const ambient = mintingAmbientClient();
-  const sent: (string | null)[][] = [];
+  vi.spyOn(client, "accessToken").mockImplementation(async () => `token-${++minted}`);
+  const sent: Record<string, string>[] = [];
   vi.stubGlobal("fetch", async (_input: string | URL | Request, init?: RequestInit) => {
-    const headers = new Headers(init?.headers);
-    sent.push([headers.get("x-wyrd-access-token"), headers.get("accept")]);
+    sent.push(Object.fromEntries(new Headers(init?.headers)));
     return new Response("{}");
   });
   try {
-    const authenticated = wyrdFetch();
-    await authenticated("http://wyrd/mcp", { headers: { accept: "application/json" } });
-    await authenticated("http://wyrd/mcp");
-
-    expect(ambient.connects()).toBe(1);
+    await client.httpAuth("http://wyrd/v1/chat/completions", {
+      headers: { authorization: "Bearer wyrd", "x-api-key": "wyrd", "x-goog-api-key": "wyrd", accept: "application/json" },
+    });
+    await client.httpAuth(new Request("http://wyrd/mcp", { headers: { authorization: "Bearer wyrd" } }));
   } finally {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   }
 
   expect(sent).toEqual([
-    ["Bearer token-1", "application/json"],
-    ["Bearer token-2", null],
+    { accept: "application/json", "x-wyrd-access-token": "Bearer token-1" },
+    { "x-wyrd-access-token": "Bearer token-2" },
   ]);
 });

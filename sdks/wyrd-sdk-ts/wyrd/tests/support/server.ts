@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { type CardRef, type RegistrationReceipt, wyrdFetch } from "wyrd-ai";
+import { type CardRef, type RegistrationReceipt, WyrdClient } from "wyrd-ai";
 import { type NativeWyrdTestServer, startTestServer } from "@wyrd/testing";
 import { test as base, vi } from "vitest";
 
@@ -115,10 +115,11 @@ export function serverTest(options: ServerOptions = {}) {
  * The API key of a fresh service principal named `name` that the ambient
  * administrator has already revoked, so exchanging it is refused.
  *
- * Both calls go through {@link wyrdFetch}, as an operator's script would.
+ * Both calls go through the ambient client's `httpAuth`, as an operator's
+ * script would.
  */
 export async function revokedApiKey(name: string): Promise<string> {
-  const admin = wyrdFetch();
+  const admin = WyrdClient.connect().httpAuth;
   const json = { "content-type": "application/json" };
   const created = await admin(`${process.env.WYRD_SERVER_URL}/v1/principals`, {
     method: "POST",

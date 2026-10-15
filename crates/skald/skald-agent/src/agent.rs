@@ -825,7 +825,11 @@ impl Agent {
     fn run_config_spec(&self) -> AgentRunConfigSpec {
         /// Keeps the authored value unless the current one moved off what
         /// that authored value resolved to.
-        fn keep<T: PartialEq>(authored: Option<T>, loaded: Option<T>, current: Option<T>) -> Option<T> {
+        fn keep<T: PartialEq>(
+            authored: Option<T>,
+            loaded: Option<T>,
+            current: Option<T>,
+        ) -> Option<T> {
             if current == loaded { authored } else { current }
         }
         let current = agent_run_config_spec_from_run_config(&self.run_config);

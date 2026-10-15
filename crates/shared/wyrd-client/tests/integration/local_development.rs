@@ -96,10 +96,18 @@ async fn cli_gateway_agents() {
         let registered_hash = state.card(alias).expect("alias").metadata.spec_hash.clone();
         let assert_exports_downloaded = |agent: &Agent, when: &str| {
             let loaded = agent.to_card().expect("loaded card");
-            assert_eq!(loaded.card_ref().expect("loaded ref"), card_ref, "{alias} {when}");
+            assert_eq!(
+                loaded.card_ref().expect("loaded ref"),
+                card_ref,
+                "{alias} {when}"
+            );
             assert_eq!(loaded.spec, downloaded.spec, "{alias} {when}");
             assert_eq!(
-                Some(Spec::Agent(loaded.spec).canonical_hash().expect("spec hashes")),
+                Some(
+                    Spec::Agent(loaded.spec)
+                        .canonical_hash()
+                        .expect("spec hashes")
+                ),
                 registered_hash,
                 "{alias} {when}"
             );

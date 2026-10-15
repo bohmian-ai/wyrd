@@ -127,17 +127,36 @@ fn spec_hash(spec: &AgentSpec) -> String {
 ///
 /// # Panics
 /// Panics when any load, export, save, or equality check fails.
-fn assert_loaded_export_is_faithful(card: &AgentCard, tools: &ToolRegistry, path: &std::path::Path) {
+fn assert_loaded_export_is_faithful(
+    card: &AgentCard,
+    tools: &ToolRegistry,
+    path: &std::path::Path,
+) {
     let expected = spec_hash(&card.spec);
     let loaded =
         Agent::from_card(card.clone(), tools, default_prompt_resolver()).expect("card loads");
     let config = &card.spec.run_config;
-    assert_eq!(loaded.run_config, run_config_from_agent_run_config_spec(config));
-    assert_eq!(loaded.to_spec(), card.spec, "{config:?} exports as authored");
+    assert_eq!(
+        loaded.run_config,
+        run_config_from_agent_run_config_spec(config)
+    );
+    assert_eq!(
+        loaded.to_spec(),
+        card.spec,
+        "{config:?} exports as authored"
+    );
     let exported = loaded.to_card().expect("exports");
     assert_eq!(exported.spec, card.spec, "{config:?} to_card");
-    assert_eq!(spec_hash(&exported.spec), expected, "{config:?} to_card hash");
-    assert_eq!(loaded.to_wire().expect("wire").spec, card.spec, "{config:?} to_wire");
+    assert_eq!(
+        spec_hash(&exported.spec),
+        expected,
+        "{config:?} to_card hash"
+    );
+    assert_eq!(
+        loaded.to_wire().expect("wire").spec,
+        card.spec,
+        "{config:?} to_wire"
+    );
     assert_eq!(
         (exported.name.as_str(), exported.version.as_str()),
         (card.name.as_str(), card.version.as_str())
@@ -154,14 +173,30 @@ fn assert_loaded_export_is_faithful(card: &AgentCard, tools: &ToolRegistry, path
         ..reloaded.run_config.clone()
     });
     let spec = edited.to_spec();
-    assert_eq!(spec.run_config.max_iterations, Some(4), "{config:?} builder edit");
     assert_eq!(
-        (spec.run_config.tool_concurrency_cap, spec.run_config.session_recent_limit, spec.run_config.timeout_ms),
-        (config.tool_concurrency_cap, config.session_recent_limit, config.timeout_ms),
+        spec.run_config.max_iterations,
+        Some(4),
+        "{config:?} builder edit"
+    );
+    assert_eq!(
+        (
+            spec.run_config.tool_concurrency_cap,
+            spec.run_config.session_recent_limit,
+            spec.run_config.timeout_ms
+        ),
+        (
+            config.tool_concurrency_cap,
+            config.session_recent_limit,
+            config.timeout_ms
+        ),
         "{config:?} unedited fields stay authored"
     );
     assert_eq!(spec.verified_by, card.spec.verified_by);
-    assert_ne!(spec_hash(&spec), expected, "{config:?} an edit changes the hash");
+    assert_ne!(
+        spec_hash(&spec),
+        expected,
+        "{config:?} an edit changes the hash"
+    );
     edited.save(path).expect("edited saves");
     let edited = Agent::from_yaml_path(path, tools, default_prompt_resolver()).expect("reloads");
     assert_eq!(edited.to_spec(), spec, "{config:?} the edit persists");

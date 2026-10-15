@@ -1578,20 +1578,20 @@ mod tests {
         };
         for provider in ["openai", "anthropic", "google"] {
             let authored = json!({"provider": provider, "model": "m",
-                "settings": {"max_output_tokens": 8},
-                "messages": [
-                    {"role": "user", "content": [
-                        {"type": "image", "source": fixed},
-                        {"type": "image", "source": "${media:__wyrd_media_0}"},
-                        {"type": "text", "text": "and"},
-                    ]},
-                    {"role": "assistant", "content": "ok"},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": "again ${media:__wyrd_media_1}"},
-                        {"type": "image", "source": "${media:__wyrd_media_0}"},
-                        {"type": "image", "source": later},
-                    ]},
-                ]});
+            "settings": {"max_output_tokens": 8},
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "image", "source": fixed},
+                    {"type": "image", "source": "${media:__wyrd_media_0}"},
+                    {"type": "text", "text": "and"},
+                ]},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "again ${media:__wyrd_media_1}"},
+                    {"type": "image", "source": "${media:__wyrd_media_0}"},
+                    {"type": "image", "source": later},
+                ]},
+            ]});
             let mut prompt = compile(authored.clone()).expect("mixed media compiles");
             assert_eq!(
                 serde_json::to_value(&prompt).expect("authored json"),
@@ -1623,8 +1623,8 @@ mod tests {
             prompt
                 .bind_media_mut("__wyrd_media_1", &report)
                 .expect("text token binds");
-            let text = serde_json::to_string(&prompt.render(&[]).expect("renders"))
-                .expect("request json");
+            let text =
+                serde_json::to_string(&prompt.render(&[]).expect("renders")).expect("request json");
             let at = |needle: &str| text.find(needle).expect(needle);
             assert!(
                 at("RklYRUQ=") < at("Q0FMTEVS")
@@ -1635,11 +1635,11 @@ mod tests {
             );
 
             let document = compile(json!({"provider": provider, "model": "m",
-                "settings": {"max_output_tokens": 8},
-                "messages": [{"role": "user", "content": [
-                    {"type": "document", "source": "${media:__wyrd_media_0}"},
-                    {"type": "image", "source": fixed},
-                ]}]}))
+            "settings": {"max_output_tokens": 8},
+            "messages": [{"role": "user", "content": [
+                {"type": "document", "source": "${media:__wyrd_media_0}"},
+                {"type": "image", "source": fixed},
+            ]}]}))
             .expect("document binding beside an image literal compiles");
             assert_eq!(
                 document.media_variables,
@@ -1658,11 +1658,11 @@ mod tests {
                 .expect("document binds");
 
             let variable = compile(json!({"provider": provider, "model": "m",
-                "settings": {"max_output_tokens": 8},
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": "say ${__wyrd_media_0}"},
-                    {"type": "image", "source": fixed},
-                ]}]}))
+            "settings": {"max_output_tokens": 8},
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "say ${__wyrd_media_0}"},
+                {"type": "image", "source": fixed},
+            ]}]}))
             .expect("text variable beside a literal compiles");
             assert_eq!(variable.variables, ["__wyrd_media_0"], "{provider}");
             assert!(variable.media_variables.is_empty(), "{provider}");

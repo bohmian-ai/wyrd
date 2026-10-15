@@ -19,7 +19,9 @@ use wyrd_spec::vala::ids::RunId;
 use crate::batch_builder::{PreparedRows, RowPreflight};
 use crate::config::QueueConfig;
 use crate::error::WyrdQueueError;
-use crate::queue::{Entry, FlushOutcome, InFlight, OwnedBatch, RecordQueue, Row, Settled};
+use crate::queue::{
+    Entry, FlushOutcome, InFlight, OwnedBatch, RecordQueue, Row, Settled, context_bytes,
+};
 use crate::sink::BatchSink;
 
 /// Running producer state.
@@ -529,7 +531,9 @@ impl Producer {
     ///
     /// `trace` is the PRODUCER span the record was enqueued under. Every row
     /// keeps it, and the frame its rows seal into carries it, bounded and
-    /// deduplicated, so the server's ingest span can link back to it.
+    /// deduplicated, so the server's ingest span can link back to it. Its
+    /// string bytes are part of the record's reservation, so admission
+    /// refuses a record whose context would pass the budget.
     ///
     /// # Errors
     ///
@@ -545,9 +549,10 @@ impl Producer {
     ) -> Result<(), WyrdQueueError> {
         let (batch, charge) = prepared.into_parts();
         let count = batch.num_rows();
+        let reserved = charge + trace.as_ref().map_or(0, context_bytes);
         let trace = trace.map(Arc::new);
-        let admitted = self.admission_check(charge).and_then(|()| {
-            let guard = Arc::new(self.budget.reserve(charge)?);
+        let admitted = self.admission_check(reserved).and_then(|()| {
+            let guard = Arc::new(self.budget.reserve(reserved)?);
             let bytes = charge / count.max(1);
             Ok(Entry::Rows(
                 (0..count)
@@ -1015,6 +1020,7 @@ mod tests {
     use tokio::sync::Notify;
     use wyrd_spec::ids::CardUid;
     use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::trace::TraceContext;
     use wyrd_spec::vala::BifrostError;
 
     use super::{ClientByteBudget, ProducerMetrics};
@@ -1325,6 +1331,85 @@ mod tests {
             (0, 0, 0)
         );
         producer.shutdown().expect("settled producer shutdown");
+    }
+
+    /// Producer contexts are charged to the one client budget: a second
+    /// record's context is refused before the ceiling, the context a sealed
+    /// batch selected stays charged while ambiguity retains it, and terminal
+    /// settlement returns every byte.
+    ///
+    /// The context is sized from the record's own charge so one charged
+    /// record, and its seal, fit the budget while two records cannot, and so
+    /// it outweighs the record's frame. A long linger leaves sealing to the
+    /// explicit flush.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a context is admitted past the ceiling, the retained retry
+    /// is not charged its context, or any byte outlives settlement.
+    #[test]
+    fn producer_context_bytes_stay_bounded_through_ambiguous_retry() {
+        let config = QueueConfig {
+            max_message_bytes: 16 * 1024,
+            client_byte_limit_bytes: 32 * 1024,
+            linger_ms: 60_000,
+            ..QueueConfig::default()
+        };
+        let budget = ClientByteBudget::for_config(&config);
+        let sink = Arc::new(MockSink::new());
+        sink.fail_next(usize::MAX);
+        let producer = Producer::with_budget(
+            "vala.bifrost.context_bytes",
+            schema(),
+            sink.clone(),
+            config,
+            budget.clone(),
+        )
+        .expect("producer starts");
+        let record = charge(&rows(1));
+        let state_len = (budget.admission_limit() - record) / 2 - 48;
+        let context = |byte: char| TraceContext {
+            trace_id: byte.to_string().repeat(32),
+            span_id: byte.to_string().repeat(16),
+            trace_flags: 1,
+            trace_state: format!("k={}", byte.to_string().repeat(state_len - 2)),
+        };
+        let first = context('a');
+        let context_bytes = crate::queue::context_bytes(&first);
+
+        producer
+            .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None, Some(first))
+            .expect("one charged context fits");
+        assert!(matches!(
+            producer.enqueue(br#"{"id":2}"#.to_vec(), Some(card()), None, Some(context('b'))),
+            Err(WyrdQueueError::Backpressure)
+        ));
+        assert!(budget.used_bytes() <= budget.admission_limit());
+
+        assert!(producer.flush().is_err(), "the send is ambiguous");
+        let retained = budget.metrics();
+        assert_eq!(retained.retry_entries, 1);
+        assert!(
+            retained.owned_bytes > context_bytes,
+            "the retained retry stays charged its frame and context"
+        );
+
+        sink.terminal_next(1);
+        sink.fail_next(0);
+        wait_until("the retry settles terminally", || {
+            budget.metrics().retry_entries == 0
+        });
+        let _ = producer.shutdown();
+        let settled = budget.metrics();
+        assert_eq!(
+            (
+                settled.owned_bytes,
+                settled.live_batches,
+                settled.retry_entries
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(received_rows(&sink), 0);
     }
 
     /// Preserves one exact owner when the queue deadline cancels a borrow.

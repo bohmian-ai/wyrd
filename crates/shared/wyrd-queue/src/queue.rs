@@ -41,7 +41,8 @@ pub struct Row {
     pub(crate) batch: RecordBatch,
     /// This row's even share of its record's charge, the staging seal weight.
     pub(crate) bytes: usize,
-    /// The record's one handle-wide reservation.
+    /// The record's one handle-wide reservation, covering its rows and its
+    /// producer context.
     pub(crate) _guard: Arc<ClientByteGuard>,
     /// The PRODUCER span the record was admitted under, shared by its rows.
     pub(crate) trace: Option<Arc<TraceContext>>,
@@ -530,8 +531,9 @@ impl RecordQueue {
     /// Seals all staged rows onto the back of the outbox without awaiting the sink.
     ///
     /// Rows are chunked so each chunk's JSON stays within the message
-    /// ceiling. Each chunk reserves a frame of the message ceiling from the
-    /// sealing headroom before encoding, then shrinks it to the encoded size.
+    /// ceiling. Each chunk reserves a frame of the message ceiling plus its
+    /// selected producer contexts from the sealing headroom before encoding,
+    /// then shrinks it to the encoded size plus those contexts.
     /// A chunk that cannot be framed is bisected so every encodable row still
     /// seals; a single row that cannot be framed is settled as lost. Rows
     /// already sealed stay in the outbox even when a later chunk fails.
@@ -557,7 +559,12 @@ impl RecordQueue {
             chunks.push_back(chunk);
         }
         while let Some(mut chunk) = chunks.pop_front() {
-            let frame_guard = match self.budget.reserve_sealing(self.config.max_message_bytes) {
+            let producer_traces = producer_traces(&chunk);
+            let trace_bytes = producer_traces.iter().map(context_bytes).sum::<usize>();
+            let frame_guard = match self
+                .budget
+                .reserve_sealing(self.config.max_message_bytes + trace_bytes)
+            {
                 Ok(guard) => guard,
                 Err(error) => {
                     chunk.extend(chunks.into_iter().flatten());
@@ -582,14 +589,14 @@ impl RecordQueue {
                     return Err(error);
                 }
             };
-            let frame_guard = frame_guard.resize(frame.len()).attach_batch();
+            let frame_guard = frame_guard.resize(frame.len() + trace_bytes).attach_batch();
             let batch = SealedBatch {
                 table: self.table.clone(),
                 batch_id: Uuid::now_v7().into_bytes(),
                 frame: OwnedIpcBytes::new(frame, frame_guard),
                 rows: chunk.len() as u64,
                 request_id: None,
-                producer_traces: producer_traces(&chunk),
+                producer_traces,
             };
             drop(chunk);
             self.outbox().push_back(batch);
@@ -660,6 +667,12 @@ pub(crate) fn retry_backoff(batch_id: [u8; 16], attempt: u32) -> Duration {
         mixed = mixed.wrapping_mul(0x100_0000_01b3);
     }
     Duration::from_millis(floor + mixed % (ceiling - floor + 1))
+}
+
+/// The heap bytes one producer context owns, charged to the client budget
+/// for as long as a row or sealed batch retains it.
+pub(crate) fn context_bytes(trace: &TraceContext) -> usize {
+    trace.trace_id.len() + trace.span_id.len() + trace.trace_state.len()
 }
 
 /// The first [`MAX_PRODUCER_TRACES`] distinct producer contexts of `rows`,

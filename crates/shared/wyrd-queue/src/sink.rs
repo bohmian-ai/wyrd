@@ -110,7 +110,8 @@ pub struct SealedBatch<G> {
     /// The PRODUCER spans whose rows this frame carries: the first
     /// [`crate::MAX_PRODUCER_TRACES`] distinct contexts in row-admission
     /// order. Fixed at seal, so every attempt of the batch sends the same
-    /// contexts; empty when no row was admitted under one.
+    /// contexts; empty when no row was admitted under one. Their string
+    /// bytes are charged to the frame's reservation until settlement.
     pub producer_traces: Vec<TraceContext>,
 }
 

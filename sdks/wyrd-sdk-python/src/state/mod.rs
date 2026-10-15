@@ -2,11 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::PyTimeoutError;
 use pyo3::prelude::*;
+use pyo3::sync::MutexExt;
 use pyo3::types::{PyAny, PyDict, PyMapping, PyModule, PyTuple};
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
@@ -92,6 +93,10 @@ pub struct PyWyrdState {
     /// The `wyrd.otel._ManagedTelemetry` handle over the tracer provider
     /// `start_telemetry` installed, flushed by `flush` and `shutdown`.
     telemetry: OnceLock<Py<PyAny>>,
+    /// Serializes `start_telemetry`'s check, install, and publication, so a
+    /// concurrent call on this state waits for the first instead of losing
+    /// the global install to it. Traversal and readers use `telemetry` alone.
+    telemetry_setup: Mutex<()>,
 }
 
 #[pymethods]
@@ -163,6 +168,7 @@ impl PyWyrdState {
             models: hydrated.models,
             data: hydrated.data,
             telemetry: OnceLock::new(),
+            telemetry_setup: Mutex::new(()),
         })
     }
 
@@ -172,7 +178,9 @@ impl PyWyrdState {
     /// Delegates to `wyrd.otel._start_telemetry`: the stock OTLP/HTTP span
     /// exporter refreshes the client's token on every export, and spans
     /// started inside `with state.run(...)` carry that Run and Card. A second
-    /// call is idempotent; `shutdown` flushes only this provider.
+    /// call is idempotent, including one made while the first is installing,
+    /// which waits for it; `shutdown` flushes only this provider. A failed
+    /// call installs nothing and can be retried.
     ///
     /// # Errors
     ///
@@ -181,6 +189,15 @@ impl PyWyrdState {
     /// `otel` extra when it is not installed, and the credential error when
     /// the state's client cannot resolve.
     fn start_telemetry(&self, py: Python<'_>) -> PyResult<()> {
+        if self.telemetry.get().is_some() {
+            return Ok(());
+        }
+        // Detaches while waiting so the running setup can take the GIL. The
+        // gate guards no data, so a poisoned lock is still usable.
+        let _setup = self
+            .telemetry_setup
+            .lock_py_attached(py)
+            .unwrap_or_else(PoisonError::into_inner);
         if self.telemetry.get().is_some() {
             return Ok(());
         }

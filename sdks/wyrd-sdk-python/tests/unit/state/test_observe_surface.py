@@ -646,7 +646,7 @@ def _second_state(complete_bundle: Path, interfaces: dict[str, Any]) -> WyrdStat
 
 
 @pytest.mark.usefixtures("unset_global_provider")
-@pytest.mark.parametrize("case", ["repeat", "other_state", "application", "lost_race"])
+@pytest.mark.parametrize("case", ["repeat", "overlap", "other_state", "application", "lost_race"])
 def test_telemetry_setup(
     case: str,
     client_state: WyrdState,
@@ -661,6 +661,39 @@ def test_telemetry_setup(
         client_state.start_telemetry()
         assert trace.get_tracer_provider() is installed
         assert isinstance(installed, TracerProvider)
+        return
+    if case == "overlap":
+        # The first call holds setup open until the second call enters setup
+        # too, or, once setup is serialized, until a short wait passes.
+        install = wyrd.otel._start_telemetry
+        entered: list[object] = []
+        second = threading.Event()
+
+        def installing(client: Any) -> Any:
+            entered.append(client)
+            if len(entered) == 1:
+                second.wait(1)
+            else:
+                second.set()
+            return install(client)
+
+        monkeypatch.setattr(wyrd.otel, "_start_telemetry", installing)
+        failures: list[BaseException] = []
+
+        def start() -> None:
+            try:
+                client_state.start_telemetry()
+            except BaseException as failure:
+                failures.append(failure)
+
+        threads = [threading.Thread(target=start) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        assert failures == []
+        assert len(entered) == 1
+        assert isinstance(trace.get_tracer_provider(), TracerProvider)
         return
     if case == "other_state":
         _second_state(complete_bundle, interfaces).start_telemetry()
@@ -681,12 +714,16 @@ def test_telemetry_setup(
         assert len(released) == 1
 
 
+@pytest.mark.usefixtures("unset_global_provider")
 def test_telemetry_setup_names_the_otel_extra_without_the_sdk(client_state: WyrdState) -> None:
     """Managed setup without the OpenTelemetry SDK names the extra that installs it."""
     with pytest.MonkeyPatch.context() as patch:
         patch.setitem(sys.modules, "opentelemetry.sdk.trace", None)
         with pytest.raises(ImportError, match=r"wyrd-ai\[otel\]"):
             client_state.start_telemetry()
+    # The failure is not remembered: once the SDK imports, setup succeeds.
+    client_state.start_telemetry()
+    assert isinstance(trace.get_tracer_provider(), TracerProvider)
 
 
 class _FailOnce:
@@ -829,6 +866,65 @@ def test_managed_telemetry_lifecycle(
     assert trace.get_tracer_provider() is provider
 
 
+def _stale_flush(
+    state: WyrdState, provider: TracerProvider, tracer: Any, exporter: Any, method: str
+) -> None:
+    """Call ``state.<method>`` while an earlier flush has drained but not settled.
+
+    The earlier flush runs on its own thread and is held after the provider's
+    flush returns. The call under test ends span ``late-<method>`` first, and
+    the earlier flush is released only once that call's thread is waiting.
+    """
+    drained, settle = threading.Event(), threading.Event()
+    flush = provider.force_flush
+
+    def held(timeout_millis: int = 30000) -> bool:
+        flushed = flush(timeout_millis)
+        if not settle.is_set():
+            drained.set()
+            settle.wait(5)
+        return flushed
+
+    earlier = threading.Thread(target=lambda: _ignore_errors(state.flush))
+    caller = threading.get_ident()
+
+    def release_when_waiting() -> None:
+        while not settle.is_set():
+            frame = sys._current_frames().get(caller)
+            if frame is not None and frame.f_code.co_name == "wait":
+                settle.set()
+            time.sleep(0.001)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(provider, "force_flush", held)
+        patch.setattr(wyrd.otel, "_FLUSH_TIMEOUT_MILLIS", 5000)
+        try:
+            earlier.start()
+            assert drained.wait(5)
+            tracer.start_span(f"late-{method}").end()
+            watcher = threading.Thread(target=release_when_waiting, daemon=True)
+            watcher.start()
+            if method == "flush":
+                with pytest.raises(wyrd.WyrdError) as failed:
+                    state.flush()
+                assert failed.value.code == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+            else:
+                state.shutdown()
+            exported = {span.name for span in exporter.get_finished_spans()}
+            assert f"late-{method}" in exported
+        finally:
+            settle.set()
+            earlier.join(5)
+
+
+def _ignore_errors(call: Any) -> None:
+    """Run ``call``, discarding the Wyrd error a Bifrost-less flush raises."""
+    try:
+        call()
+    except wyrd.WyrdError:
+        pass
+
+
 class _HeldExporter(InMemorySpanExporter):
     """An in-memory exporter whose exports wait until the test releases them."""
 
@@ -879,13 +975,18 @@ def test_managed_telemetry_flush_deadline(
     exporter.release.set()
     fallback.cancel()
     flushing[0].join(5)
-    client_state.shutdown()
+
+    # An earlier flush has drained the queue but not yet settled when a later
+    # call enters with a newly ended span: the later call must flush again.
+    for method in ("flush", "shutdown"):
+        _stale_flush(client_state, provider, tracer, exporter, method)
+    assert active.is_recording()
     assert active.is_recording()
     active.end()
     assert trace.get_tracer_provider() is provider
     assert provider.force_flush()
     exported = {span.name: span for span in exporter.get_finished_spans()}
-    assert set(exported) == {"before", "during", "active"}
+    assert set(exported) == {"before", "during", "late-flush", "late-shutdown", "active"}
     assert dict(exported["during"].attributes or {})["wyrd.run_id"] == run.run_id
 
 

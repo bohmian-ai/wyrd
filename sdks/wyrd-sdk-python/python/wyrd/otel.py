@@ -21,7 +21,8 @@ application passes to ``agents.set_trace_processors``; Wyrd never registers it.
 from __future__ import annotations
 
 import threading
-from concurrent.futures import Future
+import time
+from concurrent.futures import Future, wait
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, cast
 
@@ -219,32 +220,45 @@ class _ManagedTelemetry:
     The stock batch processor ignores ``force_flush``'s timeout and exports
     synchronously, so the flush runs on a daemon thread and the caller waits at
     most ``_FLUSH_TIMEOUT_MILLIS``. A flush that overruns finishes in the
-    background; until it does, later flushes wait on it instead of starting
-    another, so at most one runs per provider.
+    background. At most one runs per provider: a call that finds an earlier
+    flush still running waits for it, then starts its own, because the earlier
+    one may have drained the queue before this call's spans ended. Both waits
+    share the call's one deadline.
     """
 
     def __init__(self, provider: Any) -> None:
         self.provider = provider
         self._lock = threading.Lock()
         self._attempt: Future[bool] | None = None
+        # How many flushes have started; one numbered after a call's entry covers it.
+        self._started = 0
 
     def force_flush(self) -> bool:
         """Flush the provider, raising ``TimeoutError`` when the bound expires first.
 
         Any other failure of the provider's own flush is re-raised unchanged.
         """
+        deadline = time.monotonic() + _FLUSH_TIMEOUT_MILLIS / 1000
         with self._lock:
-            if self._attempt is None or self._attempt.done():
-                self._attempt = Future()
-                threading.Thread(
-                    target=self._flush,
-                    args=(self._attempt,),
-                    name="wyrd-telemetry-flush",
-                    daemon=True,
-                ).start()
-            attempt = self._attempt
-        # Since Python 3.11 a timed-out wait raises the builtin TimeoutError.
-        return attempt.result(_FLUSH_TIMEOUT_MILLIS / 1000)
+            entered = self._started
+        while True:
+            with self._lock:
+                if self._attempt is None or self._attempt.done():
+                    self._started += 1
+                    self._attempt = Future()
+                    threading.Thread(
+                        target=self._flush,
+                        args=(self._attempt,),
+                        name="wyrd-telemetry-flush",
+                        daemon=True,
+                    ).start()
+                attempt, covers = self._attempt, self._started > entered
+            remaining = max(0.0, deadline - time.monotonic())
+            if covers:
+                # Since Python 3.11 a timed-out wait raises the builtin TimeoutError.
+                return attempt.result(remaining)
+            if not wait([attempt], remaining).done:
+                raise TimeoutError("an earlier flush did not finish in time")
 
     def _flush(self, attempt: Future[bool]) -> None:
         """Run the provider's flush and settle ``attempt`` with its outcome."""

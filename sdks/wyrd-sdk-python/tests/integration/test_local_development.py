@@ -36,7 +36,7 @@ from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
 from wyrd.errors import WyrdError
-from wyrd.gateway import Gateway, GatewayAuth
+from wyrd.gateway import Gateway
 from wyrd.observe import Run
 from wyrd.state import WyrdState
 from wyrd.testing import UnmigratedDatabase, WyrdTestServer, cli
@@ -144,7 +144,7 @@ def invoke(client: WyrdClient) -> str:
     gateway = openai.OpenAI(
         base_url=f"{client.server_url}/v1",
         api_key="wyrd",
-        http_client=openai.DefaultHttpxClient(auth=GatewayAuth(client)),
+        http_client=openai.DefaultHttpxClient(auth=client.http_auth),
         max_retries=0,
     )
     completion = gateway.chat.completions.create(

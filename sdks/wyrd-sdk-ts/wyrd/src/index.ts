@@ -1525,6 +1525,29 @@ export class WyrdClient {
   }
 
   /**
+   * A `fetch` that authenticates every request to Wyrd as this client.
+   *
+   * Hand it to any client that takes a `fetch`: a provider SDK pointed at the
+   * gateway, `new OpenAI({ baseURL, apiKey: "wyrd", fetch: wyrd.httpAuth })`,
+   * or an MCP transport against `/mcp`. Each request drops `authorization`,
+   * `x-api-key`, and `x-goog-api-key`, which on a client wired to Wyrd hold
+   * only a placeholder provider key, and carries this client's current access
+   * token as `X-Wyrd-Access-Token: Bearer <token>`. The token is read per
+   * request, so a long-lived client keeps working after any one token expires.
+   *
+   * @returns The authenticating `fetch`; a request rejects with the client's
+   * {@link WyrdError} when the credential is missing or refused.
+   */
+  get httpAuth(): typeof fetch {
+    return async (input, init) => {
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      for (const name of ["authorization", "x-api-key", "x-goog-api-key"]) headers.delete(name);
+      headers.set("x-wyrd-access-token", `Bearer ${await this.accessToken()}`);
+      return fetch(input, { ...init, headers });
+    };
+  }
+
+  /**
    * Return a client that acts for the holder of `subjectToken` (RFC 8693).
    *
    * This client's credential is the actor. The issued token's subject is the
@@ -2711,26 +2734,6 @@ export class WyrdState {
     await this.#telemetry?.forceFlush();
     lifecycleValue<null>(await this.#native.shutdown());
   }
-}
-
-/**
- * A `fetch` that authenticates every request to the Wyrd Gateway as `client`.
- *
- * Hand it to a stock client, such as
- * `new OpenAI({ baseURL: \`${client.serverUrl}/v1\`, apiKey: "wyrd", fetch: gatewayFetch(client) })`.
- * Each request asks `client` for its current access token and sends it as
- * `Authorization: Bearer <token>`, so a long-lived client keeps working after
- * any one access token expires.
- *
- * @param client - The client whose access token every request carries.
- * @returns The authenticating `fetch`.
- */
-export function gatewayFetch(client: WyrdClient): typeof fetch {
-  return async (input, init) => {
-    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
-    headers.set("authorization", `Bearer ${await client.accessToken()}`);
-    return fetch(input, { ...init, headers });
-  };
 }
 
 /**

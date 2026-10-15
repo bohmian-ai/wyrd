@@ -121,6 +121,24 @@ impl PyWyrdClient {
             .map_err(WyrdPyError::from)
     }
 
+    /// Return an `httpx.Auth` / `httpx2.Auth` that authenticates every
+    /// request to Wyrd as this client.
+    ///
+    /// The flows live in `wyrd.client._http_auth.HttpAuth`, which holds this
+    /// client and asks `access_token` on each request, so token caching and
+    /// renewal stay in Rust. Being a getter, it exists on every client,
+    /// including one returned by `on_behalf_of`.
+    ///
+    /// # Errors
+    /// Raises `ImportError` naming the `gateway` extra when `httpx` or
+    /// `httpx2` is not installed.
+    #[getter]
+    fn http_auth<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        PyModule::import(slf.py(), "wyrd.client._http_auth")?
+            .getattr("HttpAuth")?
+            .call1((slf,))
+    }
+
     /// Return a client that acts for the holder of `subject_token`.
     ///
     /// This client's credential is the actor. The first RFC 8693 exchange runs

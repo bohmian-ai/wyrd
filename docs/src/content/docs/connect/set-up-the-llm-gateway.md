@@ -84,7 +84,7 @@ A Prompt Card's `provider` is a third, separate thing. It says which request for
 
    `get` prints the deployment you just applied. Applying the same file again changes nothing.
 
-5. Turn on call recording. A new tenant records nothing until it has a capture policy, and a call made before this step is never recorded. Save this as `capture-policy.json` and apply it:
+5. Turn on call recording. A new tenant's capture policy is `disabled`, so it records nothing. Wyrd doesn't backfill, so a call made before this step is never recorded. Save this as `capture-policy.json` and apply it:
 
    ```json
    { "mode": "metadata", "payload_fields": [] }
@@ -94,7 +94,7 @@ A Prompt Card's `provider` is a third, separate thing. It says which request for
    wyrd gateway capture-policy put --file capture-policy.json
    ```
 
-   `metadata` records who called which deployment and model, the outcome, and token usage. An empty `payload_fields` keeps prompts and replies out of the record.
+   `metadata` records each call's caller, deployment, model, outcome, and token usage, but never the prompt or the reply, and its `payload_fields` must stay empty. We recommend starting here. `payload` mode also stores the redacted request or response, which usually carries user data; turn it on only when you need the content.
 
 6. Make the first request. The Anthropic SDK sends it to Wyrd instead of Anthropic, and `wyrd.http_auth` swaps the placeholder `api_key` for your Wyrd access token:
 
@@ -131,7 +131,7 @@ A Prompt Card's `provider` is a third, separate thing. It says which request for
    print(rows)
    ```
 
-   The newest row has `requested_model` `{'deployment': 'claude-prod', 'model': 'claude-sonnet-4-5'}` and `outcome` `succeeded`. Rows show up a few seconds after the call. If the result is empty right away, wait and query again before you go looking for a bug.
+   The newest row has `requested_model` `{'deployment': 'claude-prod', 'model': 'claude-sonnet-4-5'}` and `outcome` `succeeded`. Rows show up a few seconds after the call. If the result is empty right away, wait and query again. If it stays empty, run `wyrd gateway capture-policy get`: a `disabled` mode means step 5 didn't apply, and calls made before it won't appear.
 
 Calling from another framework or language? [Make gateway requests from a framework](/connect/call-wyrd-from-a-stock-client/) has the OpenAI, Anthropic, Google GenAI, OpenAI Agents SDK, and Pydantic AI versions of step 6.
 

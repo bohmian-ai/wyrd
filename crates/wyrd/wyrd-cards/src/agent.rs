@@ -30,6 +30,13 @@ use {
 pub struct PyAgentCard {
     inner: AgentCard,
     prompt_ref: Option<Py<PromptReference>>,
+    /// Registered Prompt Card this Agent pins, shared with the state alias.
+    ///
+    /// `None` until `WyrdState` hydration calls `attach_prompt_card` with the
+    /// same holder it exposes for the Prompt's own alias; a card built from a
+    /// native value or envelope stays unattached, and `prompt()` refuses
+    /// it. The GC traverses this holder, and `__clear__` resets it to `None` to
+    /// break reference cycles, after which `prompt()` refuses again.
     prompt: Option<Py<PromptCard>>,
 }
 

@@ -4026,6 +4026,11 @@ async fn service_declared_tables_are_ensured_before_activation() {
 }
 
 /// Build an auto-versioned Agent registration whose Prompt is authored inline.
+///
+/// # Panics
+/// Panics through [`native_prompt`] when the declarative Prompt fixture does
+/// not compile, or through [`request_with_body`] when the HTTP request cannot
+/// be built.
 fn inline_agent_request(name: &str, message: &str, idempotency_key: &str) -> Request<Body> {
     request_with_body(
         idempotency_key,
@@ -4043,6 +4048,11 @@ fn inline_agent_request(name: &str, message: &str, idempotency_key: &str) -> Req
 
 /// Compile a one-message declarative Prompt into the native inline body an
 /// Agent's `prompt` slot carries.
+///
+/// # Panics
+/// Panics when the fixed `openai`/`gpt-4o` declarative fixture no longer
+/// deserializes as a `PromptSpec`, or its compiled native Prompt does not
+/// serialize back to JSON.
 fn native_prompt(message: &str) -> Value {
     let spec: wyrd_spec::card::prompt::PromptSpec = serde_json::from_value(json!({
         "provider": "openai",
@@ -4054,6 +4064,10 @@ fn native_prompt(message: &str) -> Value {
 }
 
 /// Register one inline Agent and return its response body after asserting success.
+///
+/// # Panics
+/// Panics when the in-process server does not answer, the response body is not
+/// JSON, the status is not `201 Created`, or building the request panics.
 async fn register_inline_agent(
     server: &WyrdTestServer,
     jwt: &str,
@@ -4072,6 +4086,9 @@ async fn register_inline_agent(
 }
 
 /// Return the response outcome registered for one Card kind.
+///
+/// # Panics
+/// Panics when the body carries no `outcomes` array or no outcome of `kind`.
 fn outcome_for<'a>(body: &'a Value, kind: &str) -> &'a Value {
     body["outcomes"]
         .as_array()
@@ -4082,6 +4099,11 @@ fn outcome_for<'a>(body: &'a Value, kind: &str) -> &'a Value {
 }
 
 /// Read the exact Prompt reference a persisted Agent version pins.
+///
+/// # Panics
+/// Panics when the outcome has no deserializable `card_ref.uid`, the tenant
+/// connection or read transaction fails, no live Card has that UID, the stored
+/// Card is not an Agent, or its Prompt is still inline instead of a reference.
 async fn persisted_agent_prompt(server: &WyrdTestServer, agent: &Value) -> CardRef {
     let uid: CardUid = serde_json::from_value(agent["card_ref"]["uid"].clone())
         .expect("agent outcome carries a uid");
@@ -4105,6 +4127,12 @@ async fn persisted_agent_prompt(server: &WyrdTestServer, agent: &Value) -> CardR
 #[tokio::test(flavor = "current_thread")]
 /// An inline Agent Prompt registers as its own `<agent>-prompt` Card on its
 /// own version line, and the Agent pins that exact UID-bearing reference.
+///
+/// # Panics
+/// Panics when the server cannot start or shut down, the editor or viewer cannot
+/// bootstrap, a tenant query fails, or any outcome, stored pin, edge count,
+/// replay, version change, derived-name refusal, or authorization refusal
+/// differs from the registered-Prompt contract.
 async fn inline_agent_prompt_materializes() {
     let server = WyrdTestServer::start_in_process()
         .await
@@ -4217,6 +4245,9 @@ async fn inline_agent_prompt_materializes() {
 /// Build one exact-pinned Agent submission whose Prompt is authored inline.
 ///
 /// `tool_names` lets a caller change a non-Prompt Agent field under the same pin.
+///
+/// # Panics
+/// Panics through [`native_prompt`] when the inline Prompt fixture does not compile.
 fn pinned_inline_agent(name: &str, version: &str, message: &str, tool_names: &[&str]) -> Value {
     json!({
         "apiVersion": "wyrd/v1",
@@ -4529,7 +4560,7 @@ async fn inline_agent_prompt_reuses_transaction_selection() {
         .iter()
         .map(|outcome| &outcome["card_ref"]["version"])
         .collect();
-    versions.sort_by_key(|version| version.to_string());
+    versions.sort_by_key(ToString::to_string);
     assert_eq!(versions, [&json!("0.1.0"), &json!("0.1.1")], "{split}");
 
     let (status, clash) = submit(

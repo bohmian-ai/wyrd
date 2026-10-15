@@ -277,3 +277,78 @@ or diagnosed with the unavailable material authority; do not investigate blame.
 
 The current generated-stub rules are superseded only as described by REQ-009;
 updating those authority files is part of this task, not an optional exception.
+
+## Execution Evidence
+
+Status: `IMPLEMENTED`. Commits on `split/codegen-single-source`: e4210b940,
+ef77a81d5, 31f1124a7, 91869d6a4, 76267ce6f, df57d38fa, plus this evidence.
+
+### Reuse-map revalidation
+
+- Contract bundle: `gen_schemas.rs` keeps its owner; `contracts` prints one
+  transient `{roots, definitions}` document from the existing derives.
+  Consumers pipe it (TS lowerer) or read it from a temp file through
+  `WYRD_CONTRACTS` (docs diagram test). Nothing is committed.
+- Gateway MCP: existing `mcp::principals::schema_of` is reused for the five
+  request types.
+- Python `Cards.get`: the existing `PyCardEnvelope` is returned. Identity is
+  enforced by the existing `wyrd_client` `assert_selector_identity`
+  (`crates/shared/wyrd-client/src/cards/reads/get.rs`), and
+  `hydrate_envelopes` keeps its nonempty-alias validation.
+- TS: the existing lowerer (renamed `scripts/gen_ts_types.py`) now emits only
+  TS. `HydrationSummary`/`HydratedArtifact` stay handwritten because
+  `wyrd-client` owns them and `wyrd-spec` cannot depend on it.
+
+### RED/GREEN
+
+The journey was renamed to
+`tests/integration/test_register_and_hydrate.py::test_cards_get_returns_every_kind_as_envelope`.
+
+- RED (before the Rust change):
+  `AssertionError: assert False ... isinstance(RegisteredDataCard(...), CardEnvelope)`.
+- GREEN: `1 passed`, with:
+
+```bash
+mise run py:setup
+mise exec -- env WYRD_LOG=info scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q tests/integration/test_register_and_hydrate.py::test_cards_get_returns_every_kind_as_envelope'
+```
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-001 | Schema/fixture trees and snapshot tests removed; `crates/wyrd-spec/schemas/` holds only `ui_problem_examples.json` | `codegen:check`; tree audit | PASS |
+| AC-002 | `mcp/gateway.rs` descriptors use `schema_of::<T>()` for the five request types | exact `gateway_catalog_annotates_every_administration_operation` (1 passed) | PASS |
+| AC-003 | llms appendices/links, `generate_card_docs.py` and the schema inventory removed; the diagram test reads `WYRD_CONTRACTS` | `docs:check` | PASS |
+| AC-004 | `PyCards::get` returns `PyCardEnvelope`, `aliases == ()`; hydration validation is unchanged | exact journey above (RED→GREEN); `py:test:integration` 222 passed (py-stubs run) | PASS |
+| AC-005 | `_card_types.py`, `stubs/` and `assemble_stubs.py` deleted; pure-Python definitions live once in private modules re-exported by the stubs; `output_to_json_schema` removed, `tool` kept | `py:lints` (ruff + `scripts/check_stubs.py`), `py:typecheck`, `py:test:unit` 592 passed | PASS |
+| AC-006 | `card-types.ts` generated from Rust roots; `index.ts` re-exports under the existing public names; `CardSummary` gains timestamps/enums | `ts:typecheck`, `ts:test:unit` 66 passed, `ts:napi:check` | PASS |
+| AC-007 | — | `lints`, `py:lints`, `ts:lints`, `py:typecheck`, `ts:typecheck` | PASS |
+| AC-008 | mise/CI/docs/authority files updated; `codegen:regen` writes no `.pyi` | `codegen:check`, `check:ci-selection`, `fmt:check`, `py:format:check`, `ts:format:check`, `git diff --check`, reference audit | PASS |
+
+The reference audit (`git grep`) found no remaining references to the
+deleted schema paths, `generate_card_docs`, `gen_card_types`,
+`codegen:stubs`, `assemble_stubs`, `wyrd/stubs`, `_card_types` or
+`output_to_json_schema` outside `changes/`.
+
+Root Python tools touched (`.github/scripts/select-ci.py`,
+`docs/scripts/generate_{api_docs,llms_txt}.py`, `scripts/gen_ts_types.py`)
+pass `ruff check` and `ruff format --check`. Ruff formatting was applied to
+files that previously did not comply.
+
+### Non-goals and limits
+
+- No dependencies, features, routes, compatibility aliases or lint
+  weakening were added.
+- The UI examples, error-code generation, N-API generation and theme-token
+  checks are preserved.
+- The TS response fields that are `Option` and not schema-defaulted lower
+  to `?: T | null`, because the schema cannot tell skipped fields from null
+  ones. Fields the server always sends stay required.
+- The `CardTypes` namespace exposes `FieldSpec2` (a schemars collision
+  suffix, like the existing `HuggingfaceMeta2`/`TorchMeta2`); the public
+  name is `FieldDescription`.
+- `test:local-dev:journey` passes (4 Rust plus 5 installed-CLI journeys,
+  which cover `test_cli_bootstrap_saved_config`).
+- `WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA` and `PYDANTIC_REQUIRED` stay in
+  the catalog because other owners reference them.

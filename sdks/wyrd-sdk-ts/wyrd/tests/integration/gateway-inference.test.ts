@@ -221,6 +221,26 @@ test("stock anthropic client authenticates with httpAuth alone", async ({ provid
   expect(upstream).toMatchObject({ path: "/v1/messages", headers: { "x-api-key": PROVIDER_KEY } });
 });
 
+// No transport hook and no Wyrd call: the static key from the environment
+// is the client's own API key, and the gateway exchanges it for the caller.
+test("stock openai client authenticates with a Wyrd API key", async ({ provider, ask: _ }) => {
+  const apiKey = process.env.WYRD_API_KEY ?? "";
+  const client = new OpenAI({ baseURL: `${process.env.WYRD_SERVER_URL}/v1`, apiKey, maxRetries: 0 });
+  const before = provider.received.length;
+
+  expect(apiKey).toMatch(/^wyrd_sk_/);
+  for (let turn = 0; turn < 2; turn++) {
+    const reply = await client.chat.completions.create(ASK);
+    expect(reply.choices[0]?.message.content).toBe("hi");
+  }
+  const upstream = provider.received.slice(before);
+  expect(upstream).toHaveLength(2);
+  for (const call of upstream) {
+    expect(call.headers).toMatchObject({ authorization: `Bearer ${PROVIDER_KEY}` });
+    expect(Object.values(call.headers).join(" ")).not.toContain(apiKey);
+  }
+});
+
 // The status of the refusal is not pinned: only that the client's own token
 // exchange rejected the request, so no gateway call was made.
 test("revoked api key is refused by the token exchange, before the gateway", async ({ provider, ask: _ }) => {

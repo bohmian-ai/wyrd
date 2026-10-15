@@ -1,6 +1,6 @@
 ---
 id: SPEC-sub-act-attribution
-revision: 5
+revision: 6
 status: approved
 ---
 
@@ -29,6 +29,11 @@ intersection, SYSTEM execution, non-null storage, and the column names here
 are Wyrd policy, not requirements imposed by that RFC.
 
 ## Approval
+
+Revision 6 settles FIND-TASK-001-2's local Workflow Card authorization. The
+human owner approved it on 2026-10-15: "yes accept. the 2 scenarios make sense.
+only principals that are allowed to run the workflow can (either in scope or
+have general approval)".
 
 Revision 5 settles review TASK-001-518a5d8b8 (FIND-TASK-001-1 and
 FIND-TASK-001-3). Its decisions were accepted by the human owner on
@@ -232,6 +237,14 @@ permission algebra, or propagation service is required.
   null `run_id`. A Workflow run id is not an application Run; the step call
   correlates to its Workflow run through the trace and the
   `wyrd.workflow.run_id` span attribute.
+- A locally loaded registered Workflow's gateway calls name its Card UID as
+  the requested Card subject, and the server checks it with the existing
+  gateway Card check. A caller whose Card scope includes the Workflow, or one
+  with general approval (bound to no Card: users, tenant administrators,
+  Card-free services), may run it. A Card-bound caller whose scope excludes
+  the Workflow is refused with `WYRD_VALA_403_BIFROST_CARD_SCOPE` before any
+  provider call. Hosted runs are unchanged. This does not widen the check
+  (INV-006).
 
 ### REQ-005 Schemas
 
@@ -464,7 +477,7 @@ superseded by verify-attribution D3.
 | AC-008 | A tenant seeded by `wyrd-dev-fixtures` has an active SYSTEM principal. | integration test |
 | AC-009 | The smallest task set covering the actual write set passes, including real gateway SDK journeys (`test:gateway:gate` alone excludes them), all affected first-class language journeys, schema/codegen, SQL tenancy, and dependency boundaries. Avoid rerunning component lanes already covered by a selected aggregate. | scoped lane output and coverage mapping |
 | AC-010 | A sampled, client-traced direct verify writes request-operation tenant spans with caller/caller, or A/B under delegation; judge-operation spans carry original subject/SYSTEM. The verify-attribution action-timeline journeys still pass, and Eval and observation results join their judge calls on `card_uid`. | Rust journey; the existing action-timeline journeys in Rust, Python and TypeScript |
-| AC-011 | A Workflow step's model call records caller/caller for direct work and A/B under delegation, `card_uid` = the Workflow Card, and null `run_id`. | Rust journey |
+| AC-011 | A Workflow step's model call records caller/caller for direct work and A/B under delegation, `card_uid` = the Workflow Card, and null `run_id`, for hosted and locally loaded registered Workflows. A Card-bound caller outside the Workflow's Card scope is refused locally with `WYRD_VALA_403_BIFROST_CARD_SCOPE` and no provider call. | Rust journey |
 | AC-012 | A delegated direct verify (B for A) whose judge model A may invoke but B may not is refused at the judge's gateway call; the judge call's `sub` is A. | Rust journey |
 | AC-013 | A delegated queued manual verify survives worker reclaim/restart with A as subject, SYSTEM as judge actor, and the originally narrowed authority; a later subject-only permission lookup cannot authorize its denied model. Grant edits/token expiry do not widen or replace accepted authority. | durable queue integration and Rust journey |
 | AC-014 | Registration and manual verification idempotency distinguish same actor/different subject and same subject/different actor. Exact replay reuses the operation; changed input conflicts; replay never rewrites accepted attribution or authority. Independent background bindings sharing SYSTEM never collapse; Workflow ownership semantics remain unchanged. | owning integration tests and Rust journey |
@@ -479,7 +492,8 @@ superseded by verify-attribution D3.
 None. Revision 4's authority lifetime, idempotency scope, and
 propagation/delegation decisions are approved. Revision 5's creation
 provenance and unauthenticated-refusal decisions were accepted by the human
-owner on 2026-10-15.
+owner on 2026-10-15. Revision 6's local Workflow Card decision was approved
+the same day.
 
 ## Implementation task
 
@@ -509,6 +523,9 @@ extends existing owners rather than introducing another attribution pipeline.
   tenant-lookup exception; SYSTEM is never its own creator (REQ-002, REQ-007,
   REQ-010, INV-001, INV-007, AC-019). Requests refused before any principal
   resolves are not audited (REQ-010, AC-015).
+- r6 (2026-10-15, approved): settles FIND-TASK-001-2. A locally loaded
+  registered Workflow's gateway calls carry its Card; only callers in its
+  Card scope or with general approval may run it (REQ-004, AC-011).
 
 ## Authority
 

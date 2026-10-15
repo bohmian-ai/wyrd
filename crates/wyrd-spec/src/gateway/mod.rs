@@ -156,6 +156,9 @@ impl ModelRef {
 
 impl fmt::Display for ModelRef {
     /// Renders the canonical `<deployment>/<model>` address.
+    ///
+    /// # Errors
+    /// Returns the formatter's error.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.deployment, self.model)
     }
@@ -317,6 +320,9 @@ mod tests {
 
     /// Proves the address splits on the first slash only, preserving the
     /// complete model suffix.
+    ///
+    /// # Panics
+    /// Panics when the projection does not parse or splits elsewhere.
     #[test]
     fn model_projection_splits_on_first_slash() {
         let model =

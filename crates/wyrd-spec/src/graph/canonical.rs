@@ -124,6 +124,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// Project resolved references into deterministic server-owned relationships.
+    ///
+    /// # Panics
+    /// Panics when the fixture spec is invalid or other relationships are
+    /// projected.
     #[test]
     fn relationships_project_uid_bearing_refs() {
         let spec = Spec::from_kind_and_value(

@@ -56,6 +56,12 @@ impl PromptSpec {
 }
 
 impl<'de> Deserialize<'de> for PromptSpec {
+    /// Decodes the authored Prompt form, which compiles it, then applies the
+    /// Prompt Card validation `PromptSpec::new` applies.
+    ///
+    /// # Errors
+    /// Returns the deserializer's error when the authored form does not decode
+    /// or compile, or a placeholder is outside the parameter-name grammar.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,

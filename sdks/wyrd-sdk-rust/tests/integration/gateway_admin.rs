@@ -7,9 +7,10 @@ use std::collections::BTreeSet;
 use wyrd_ai::cli;
 use wyrd_ai::gateway::{
     CredentialBindingName, DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite,
-    GatewayOperation, GatewayPayloadField, ProviderAdapter, ProviderAuth, ProviderCredentialName,
-    ProviderCredentialState, ProviderCredentialView, ProviderCredentialWrite,
-    ProviderCredentialWriteSource, ProviderDeployment, ProviderDeploymentName, ProviderId,
+    GatewayOperation, GatewayPayloadField, ModelId, ProviderAdapter, ProviderAuth,
+    ProviderCredentialName, ProviderCredentialState, ProviderCredentialView,
+    ProviderCredentialWrite, ProviderCredentialWriteSource, ProviderDeployment,
+    ProviderDeploymentName, ProviderId,
 };
 use wyrd_ai::{Gateway, WyrdClient};
 use wyrd_testing::server::TEST_GATEWAY_CREDENTIAL_BINDING;
@@ -282,4 +283,293 @@ async fn gateway_reader_cannot_delete_a_deployment() {
 
     assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
     deployment.shutdown().await;
+}
+
+/// Upstream key of the open deployment in the access journey.
+const OPEN_KEY: &str = "sk-open-upstream";
+/// Upstream key of the granted deployment in the access journey.
+const DEDICATED_KEY: &str = "sk-dedicated-upstream";
+/// Message the access journey's upstream refuses retryably.
+const REFUSED: &str = "refuse-me";
+
+/// The access journey's server, its mock upstream, and the open
+/// `openai-primary` and granted `openai-dedicated` deployments that both
+/// permit only `gpt-4o`.
+struct AccessJourney {
+    /// The real server.
+    deployment: Deployment,
+    /// The upstream both deployments reach, told apart by their keys.
+    upstream: wiremock::MockServer,
+}
+
+impl AccessJourney {
+    /// Starts the upstream and server, writes one managed credential per
+    /// deployment, and puts both deployments.
+    ///
+    /// The upstream answers every Chat Completions call, except that it
+    /// refuses a call saying [`REFUSED`] with a retryable `503`.
+    ///
+    /// # Panics
+    /// Panics when a setup step fails.
+    async fn start() -> Self {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let upstream = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(REFUSED))
+            .respond_with(ResponseTemplate::new(503).set_body_json(
+                serde_json::json!({"error": {"message": "busy", "type": "server_error"}}),
+            ))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "gpt-4o",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+        let deployment = Deployment::start_with(
+            wyrd_testing::server::WyrdTestServer::builder().with_gateway_provider_root_for_test(
+                upstream.uri().parse().expect("upstream URL parses"),
+            ),
+        )
+        .await;
+        let gateway = Gateway::with_client(deployment.admin());
+        for (name, key, access) in [
+            ("openai-primary", OPEN_KEY, DeploymentAccess::Open),
+            ("openai-dedicated", DEDICATED_KEY, DeploymentAccess::Granted),
+        ] {
+            cli::put_provider_credential(
+                &ProviderCredentialWrite {
+                    name: credential(name),
+                    provider: ProviderId::new("openai").expect("provider"),
+                    source: ProviderCredentialWriteSource::ManagedSecret {
+                        secret: wyrd_ai::operator_connections::SecretBearer::new(key.to_owned()),
+                    },
+                },
+                Some(deployment.admin()),
+            )
+            .await
+            .expect("the CLI writes the credential");
+            gateway
+                .put_deployment(&ProviderDeployment {
+                    models: Some(vec![ModelId::new("gpt-4o").expect("model")]),
+                    access,
+                    ..self::deployment(name, name)
+                })
+                .await
+                .expect("deployment puts");
+        }
+        Self {
+            deployment,
+            upstream,
+        }
+    }
+
+    /// A client of a fresh Service principal `name` holding exactly the
+    /// `gateway:invoke` grant scoped by `scope`.
+    ///
+    /// # Panics
+    /// Panics when the grant does not parse or the principal cannot seed.
+    async fn invoker(&self, name: &str, scope: serde_json::Value) -> WyrdClient {
+        let key = self
+            .deployment
+            .granted_key(
+                name,
+                &[serde_json::json!({"resource": "gateway", "action": "invoke", "scope": scope})],
+            )
+            .await;
+        self.deployment.client(&key)
+    }
+
+    /// Sends one Chat Completions call saying `hi` and addressing `model` as
+    /// `client`, the way an OpenAI client does, and returns its status and
+    /// Wyrd error code.
+    ///
+    /// # Panics
+    /// Panics when no token mints or the gateway does not answer with JSON.
+    async fn chat(&self, client: &WyrdClient, model: &str) -> (u16, Option<String>) {
+        self.say(client, model, "hi").await
+    }
+
+    /// [`Self::chat`] saying `content`.
+    ///
+    /// # Panics
+    /// Panics when no token mints or the gateway does not answer with JSON.
+    async fn say(&self, client: &WyrdClient, model: &str, content: &str) -> (u16, Option<String>) {
+        let token = client.access_token().await.expect("access token mints");
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", self.base()))
+            .bearer_auth(token.expose())
+            .json(&serde_json::json!({
+                "model": model,
+                "max_completion_tokens": 8,
+                "messages": [{"role": "user", "content": content}],
+            }))
+            .send()
+            .await
+            .expect("the gateway answers");
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response.json().await.expect("the reply is JSON");
+        (status, body["error"]["code"].as_str().map(str::to_owned))
+    }
+
+    /// The model addresses `/v1/models` lists to `client`.
+    ///
+    /// # Panics
+    /// Panics when no token mints or the listing fails.
+    async fn models(&self, client: &WyrdClient) -> Vec<String> {
+        let token = client.access_token().await.expect("access token mints");
+        let listing: serde_json::Value = reqwest::Client::new()
+            .get(format!("{}/v1/models", self.base()))
+            .bearer_auth(token.expose())
+            .send()
+            .await
+            .expect("the gateway answers")
+            .json()
+            .await
+            .expect("the listing is JSON");
+        listing["data"]
+            .as_array()
+            .expect("the listing has data")
+            .iter()
+            .map(|model| model["id"].as_str().expect("model id").to_owned())
+            .collect()
+    }
+
+    /// The upstream key of every provider call so far, in arrival order.
+    ///
+    /// # Panics
+    /// Panics when request recording is off.
+    async fn upstream_keys(&self) -> Vec<String> {
+        self.upstream
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .iter()
+            .filter_map(|request| request.headers.get("authorization"))
+            .map(|value| value.to_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// The bound server's base URL.
+    ///
+    /// # Panics
+    /// Panics when the server is not bound.
+    fn base(&self) -> &str {
+        self.deployment
+            .server()
+            .base_url()
+            .expect("bound server has a URL")
+    }
+}
+
+/// `all` reaches only the open deployment, deployment and exact-model grants
+/// reach the granted one, a denied target is refused before provider IO and
+/// never rescued by a fallback, a denied fallback is skipped, a model outside
+/// the allowlist is unavailable, and `/v1/models` lists only what each
+/// caller may invoke.
+///
+/// # Panics
+/// Panics when a status, error code, listing, or upstream call differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn deployment_invocation_access_and_visibility() {
+    let journey = AccessJourney::start().await;
+    let everyone = journey
+        .invoker("all_invoker", serde_json::json!("all"))
+        .await;
+    let dedicated = journey
+        .invoker(
+            "dedicated_invoker",
+            serde_json::json!({"gateway": {"deployment": {"deployment": "openai-dedicated"}}}),
+        )
+        .await;
+    let exact = journey
+        .invoker(
+            "exact_invoker",
+            serde_json::json!({"gateway": {"model": {"deployment": "openai-dedicated", "model": "gpt-4o"}}}),
+        )
+        .await;
+    let open = format!("Bearer {OPEN_KEY}");
+    let granted = format!("Bearer {DEDICATED_KEY}");
+    Gateway::with_client(journey.deployment.admin())
+        .put_fallback_policy(
+            &serde_json::from_value(serde_json::json!({"rules": [
+                {"scope": {"model": {"model": {"deployment": "openai-primary", "model": "gpt-4o"}}},
+                 "candidates": [{"deployment": "openai-dedicated", "model": "gpt-4o"}]},
+                {"scope": {"model": {"model": {"deployment": "openai-dedicated", "model": "gpt-4o"}}},
+                 "candidates": [{"deployment": "openai-primary", "model": "gpt-4o"}]},
+            ]}))
+            .expect("fallback policy parses"),
+        )
+        .await
+        .expect("fallback policy puts");
+
+    assert_eq!(
+        journey.chat(&everyone, "openai-primary/gpt-4o").await,
+        (200, None)
+    );
+    let denied = Some("WYRD_PERMISSION_403_DENIED_RBAC".to_owned());
+    assert_eq!(
+        journey.chat(&everyone, "openai-dedicated/gpt-4o").await,
+        (403, denied.clone()),
+        "`all` never reaches a granted deployment, even with an open fallback"
+    );
+    assert_eq!(
+        journey.chat(&dedicated, "openai-primary/gpt-4o").await,
+        (403, denied.clone()),
+        "a deployment grant covers only its deployment"
+    );
+    assert_eq!(
+        journey.chat(&dedicated, "openai-dedicated/gpt-4o").await,
+        (200, None)
+    );
+    assert_eq!(
+        journey.chat(&exact, "openai-dedicated/gpt-4o").await,
+        (200, None)
+    );
+    assert_eq!(
+        journey
+            .chat(&dedicated, "openai-dedicated/gpt-4o-mini")
+            .await
+            .0,
+        404,
+        "a model outside the deployment's allowlist is unavailable"
+    );
+    assert_eq!(
+        journey.upstream_keys().await,
+        [open.clone(), granted.clone(), granted],
+        "no refused call reaches a provider"
+    );
+    // `all` does not cover the granted fallback of a retryably refused
+    // call, so the fallback is skipped rather than dispatched.
+    assert_eq!(
+        journey
+            .say(&everyone, "openai-primary/gpt-4o", REFUSED)
+            .await
+            .0,
+        503,
+        "with its only fallback denied, the provider's refusal is the answer"
+    );
+    assert_eq!(
+        journey.upstream_keys().await.last(),
+        Some(&open),
+        "the denied fallback is never dispatched"
+    );
+
+    assert_eq!(journey.models(&everyone).await, ["openai-primary/gpt-4o"]);
+    assert_eq!(
+        journey.models(&dedicated).await,
+        ["openai-dedicated/gpt-4o"]
+    );
+    assert_eq!(journey.models(&exact).await, ["openai-dedicated/gpt-4o"]);
+    journey.deployment.shutdown().await;
 }

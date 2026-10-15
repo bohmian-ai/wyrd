@@ -155,12 +155,32 @@ impl Deployment {
             .uid
             .as_ref()
             .expect("registered Verifier has a UID");
-        let grant = serde_json::from_value(serde_json::json!({
-            "resource": "verifier", "action": "run", "scope": { "verifier": uid }
-        }))
-        .expect("the scoped permission parses");
+        self.granted_key(
+            name,
+            &[serde_json::json!({
+                "resource": "verifier", "action": "run", "scope": { "verifier": uid }
+            })],
+        )
+        .await
+    }
+
+    /// Seed role `name` with exactly `grants`, each a serialized scoped
+    /// permission such as `{"resource": "gateway", "action": "invoke",
+    /// "scope": "all"}`, bootstrap a Service principal of the same name
+    /// holding only it, and return its key.
+    ///
+    /// # Panics
+    /// Panics when a grant does not parse or the role or principal cannot be
+    /// seeded.
+    pub async fn granted_key(&self, name: &str, grants: &[serde_json::Value]) -> String {
+        let grants = grants
+            .iter()
+            .map(|grant| {
+                serde_json::from_value(grant.clone()).expect("the scoped permission parses")
+            })
+            .collect::<Vec<_>>();
         self.server
-            .seed_role(name, &[grant])
+            .seed_role(name, &grants)
             .await
             .expect("role seeds");
         self.key(name, &[name]).await

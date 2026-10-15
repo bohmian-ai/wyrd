@@ -56,7 +56,12 @@ test("httpAuth replaces provider key headers with a fresh access token on every 
   });
   try {
     await client.httpAuth("http://wyrd/v1/chat/completions", {
-      headers: { authorization: "Bearer wyrd", "x-api-key": "wyrd", "x-goog-api-key": "wyrd", accept: "application/json" },
+      headers: {
+        authorization: "Bearer wyrd",
+        "x-api-key": "wyrd",
+        "x-goog-api-key": "wyrd",
+        accept: "application/json",
+      },
     });
     await client.httpAuth(new Request("http://wyrd/mcp", { headers: { authorization: "Bearer wyrd" } }));
   } finally {

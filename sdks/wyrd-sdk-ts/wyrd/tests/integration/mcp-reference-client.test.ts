@@ -1,9 +1,13 @@
 /**
  * Server conformance journey through the official MCP SDK, the reference
- * client: it drives Wyrd's `/mcp` and does not exercise `wyrd-sdk-ts`.
+ * client, plus the OpenAI Agents SDK's MCP server: both reach Wyrd's `/mcp`
+ * authenticated only by `WyrdClient.httpAuth`.
  */
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { MCPServerStreamableHttp } from "@openai/agents-core";
 import { expect, vi } from "vitest";
+
+import { WyrdClient } from "wyrd-ai";
 
 import { serverTest } from "../support/server.js";
 
@@ -16,7 +20,7 @@ test("the official MCP SDK lists the full catalog and validates a structured rea
   const client = new Client({ name: "wyrd-ts-journey", version: "1.0.0" }, { versionNegotiation: { mode: "auto" } });
   await client.connect(
     new StreamableHTTPClientTransport(new URL("/mcp", server.baseUrl), {
-      requestInit: { headers: { "x-wyrd-access-token": `Bearer ${server.token}` } },
+      fetch: WyrdClient.connect().httpAuth,
     }),
   );
   try {
@@ -35,5 +39,21 @@ test("the official MCP SDK lists the full catalog and validates a structured rea
     expect(guide.structuredContent).toMatchObject({ topic: "overview" });
   } finally {
     await client.close();
+  }
+});
+
+test("the OpenAI Agents SDK reaches /mcp and calls a read tool", async ({ server }) => {
+  const mcp = new MCPServerStreamableHttp({
+    name: "wyrd",
+    url: new URL("/mcp", server.baseUrl).href,
+    fetch: WyrdClient.connect().httpAuth,
+  });
+  await mcp.connect();
+  try {
+    expect((await mcp.listTools()).map((tool) => tool.name)).toContain("wyrd.guide");
+    const guide = await mcp.callTool("wyrd.guide", { topic: "overview" });
+    expect(JSON.stringify(guide)).toContain("overview");
+  } finally {
+    await mcp.close();
   }
 });

@@ -1,6 +1,7 @@
 /**
  * Stock OpenTelemetry OTLP/HTTP protobuf exporters that authenticate as a
- * {@link WyrdClient}.
+ * {@link WyrdClient}, and the Run-correlation span processor for
+ * application-owned tracer providers.
  *
  * Each factory builds the stock exporter for one signal, pointed at the
  * client's server, whose headers ask the client for its current access token
@@ -64,6 +65,26 @@ const runCorrelation: SpanProcessor = {
 };
 
 /**
+ * The span processor that stamps `wyrd.card_uid` and `wyrd.run_id` from the
+ * innermost {@link Run.scope} onto every span started inside it.
+ *
+ * Put it once in an application-owned provider's construction-time
+ * `spanProcessors`, beside {@link spanExporter} or any other exporter; the
+ * provider keeps its own sampler, resource, and lifecycle. It holds no state
+ * and creates no provider or exporter; `WyrdState.startTelemetry` installs the
+ * same processor on its managed provider.
+ *
+ * ```ts
+ * const provider = new NodeTracerProvider({
+ *   spanProcessors: [runCorrelationProcessor(), new BatchSpanProcessor(spanExporter(client))],
+ * });
+ * ```
+ */
+export function runCorrelationProcessor(): SpanProcessor {
+  return runCorrelation;
+}
+
+/**
  * @internal `WyrdState.startTelemetry`: install the global tracer provider
  * exporting through {@link spanExporter} and stamping `Run.scope`, Node's
  * `AsyncLocalStorage` context manager, and the W3C trace-context propagator,
@@ -77,6 +98,8 @@ export function startTelemetry(client: WyrdClient): BasicTracerProvider | undefi
     spanProcessors: [runCorrelation, new BatchSpanProcessor(spanExporter(client))],
   });
   if (!trace.setGlobalTracerProvider(provider)) {
+    // Refused: release this provider's processors and leave the registered one untouched.
+    void provider.shutdown().catch(() => {});
     return undefined;
   }
   context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());

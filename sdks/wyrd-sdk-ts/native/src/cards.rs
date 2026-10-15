@@ -14,7 +14,7 @@ use napi_derive::napi;
 use wyrd_client::cards::{CardKind, CardSelector, Cards, HydrationMode, ListCardsRequest};
 use wyrd_client::observe::eval::parse_session_id;
 use wyrd_client::observe::{EvalObservationOptions, Run};
-use wyrd_client::state::WyrdState;
+use wyrd_client::state::{TelemetryFlushFailure, WyrdState};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefParseError};
@@ -289,6 +289,25 @@ pub fn telemetry_provider_exists() -> NativeWyrdError {
         message: "an OpenTelemetry tracer provider is already installed".to_owned(),
         details: serde_json::json!({}),
     })
+}
+
+/// The catalog error `WyrdState.flush` and `WyrdState.shutdown` throw when the
+/// tracer provider `startTelemetry` installed did not flush, built by the
+/// shared [`TelemetryFlushFailure`] so Python and TypeScript report the same
+/// code and details. `cause` is payload-free; `native_code` is the stable code
+/// of a native drain that also failed.
+#[napi]
+pub fn telemetry_flush_error(
+    timed_out: bool,
+    cause: String,
+    native_code: Option<String>,
+) -> NativeWyrdError {
+    let failure = if timed_out {
+        TelemetryFlushFailure::timeout(cause)
+    } else {
+        TelemetryFlushFailure::failed(cause)
+    };
+    NativeWyrdError::from_wyrd(&failure.into_error(native_code.as_deref()))
 }
 
 #[napi]

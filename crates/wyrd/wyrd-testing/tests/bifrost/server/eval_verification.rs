@@ -3213,7 +3213,10 @@ async fn verify_as(
 /// as B for A, the Task and Eval judges pass: acceptance is audited as A/A
 /// and A/B, and so are the results; each judge decision and gateway call
 /// records A/SYSTEM. As C for A, the judge falls outside the delegated intersection
-/// and is refused before any provider request; once A loses the judge role,
+/// and is refused before any provider request. Actor D holds both roles but
+/// acts for the already delegated C-for-A token: the accepted chain is
+/// `[C, D]`, acceptance is audited as A/D with that history, and the judge C
+/// excluded at the earlier hop stays refused. Once A loses the judge role,
 /// B for A is refused the same way. The provider sees only the permitted
 /// calls.
 ///
@@ -3275,6 +3278,9 @@ async fn realtime_subject_actor_authority() -> Result<(), ServerJourneyError> {
     let c = server
         .bootstrap_service("realtime-narrow-actor", &[RUNNER_ROLE])
         .await?;
+    let d = server
+        .bootstrap_service("realtime-second-actor", &[RUNNER_ROLE, JUDGE_ROLE])
+        .await?;
     let key = |principal: &Bootstrap| {
         principal
             .api_key()
@@ -3312,6 +3318,27 @@ async fn realtime_subject_actor_authority() -> Result<(), ServerJourneyError> {
     if !refused(verify_as(&on_behalf(&c).await?, &bundle, "realtime-eval").await) {
         return Err("C for A judged outside C's authority".into());
     }
+    let exchange = async |principal: &Bootstrap| -> Result<String, ServerJourneyError> {
+        Ok(server
+            .exchange_api_key(principal.api_key().ok_or("a machine carries an API key")?)
+            .await?)
+    };
+    let c_for_a = server
+        .delegate(
+            &exchange(&a).await?,
+            &exchange(&c).await?,
+            wyrd_spec::auth::TokenAudience::Wyrd,
+        )
+        .await?;
+    let d_for_c_for_a = connect(&server, &key(&d)?)
+        .on_behalf_of(
+            secrecy::SecretString::from(c_for_a),
+            wyrd_spec::auth::TokenAudience::Wyrd,
+        )
+        .await?;
+    if !refused(verify_as(&d_for_c_for_a, &bundle, "realtime-eval").await) {
+        return Err("D for C for A judged outside C's authority".into());
+    }
     server.revoke_role(&a, JUDGE_ROLE).await?;
     if !refused(verify_as(&on_behalf(&b).await?, &bundle, "realtime-eval").await) {
         return Err("B for A judged outside A's authority".into());
@@ -3324,7 +3351,7 @@ async fn realtime_subject_actor_authority() -> Result<(), ServerJourneyError> {
     }
     server.flush_bifrost().await?;
 
-    let (a, b, c) = (a.id(), b.id(), c.id());
+    let (a, b, c, d) = (a.id(), b.id(), c.id(), d.id());
     let rows = async |sql: &str| texts(&query(&server, tenant, sql.to_owned()).await?);
     let accepted = rows(
         "SELECT DISTINCT concat(sub_principal_id, '|', act_principal_id, '|', outcome) AS d \
@@ -3335,10 +3362,35 @@ async fn realtime_subject_actor_authority() -> Result<(), ServerJourneyError> {
         Some(format!("{a}|{a}|allowed")),
         Some(format!("{a}|{b}|allowed")),
         Some(format!("{a}|{c}|allowed")),
+        Some(format!("{a}|{d}|allowed")),
     ];
     expected.sort();
     if accepted != expected {
         return Err(format!("expected acceptance pairs {expected:?}, read {accepted:?}").into());
+    }
+    let history = server
+        .retained_audit_records(
+            tenant,
+            "detail",
+            &format!("operation = 'verification.execute' AND act_principal_id = '{d}'"),
+        )
+        .await?;
+    let ordered = |detail: &str| {
+        detail
+            .find(&c.to_string())
+            .zip(detail.find(&d.to_string()))
+            .is_some_and(|(c, d)| c < d)
+    };
+    if history.is_empty()
+        || !history
+            .iter()
+            .flatten()
+            .flatten()
+            .all(|detail| ordered(detail))
+    {
+        return Err(
+            format!("expected A/D acceptance with history [C, D], read {history:?}").into(),
+        );
     }
     let judged = rows(
         "SELECT DISTINCT concat(sub_principal_id, '|', act_principal_id, '|', outcome) AS d \

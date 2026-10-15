@@ -838,16 +838,17 @@ mod pg_tests {
         conn.commit().await.expect("tenant A commits");
 
         let mut conn = fixture.tenant_conn_for(tenant_b).await.expect("B opens");
-        assert_eq!(
-            system_principal_id(&mut conn)
-                .await
-                .expect("B lookup succeeds"),
-            None,
-            "tenant A's writer is invisible to tenant B"
-        );
+        let seeded_b_writer = system_principal_id(&mut conn)
+            .await
+            .expect("B lookup succeeds")
+            .expect("a seeded tenant has its own writer");
         let tenant_b_writer = provision_system_principal(&mut conn)
             .await
-            .expect("B provisions its own writer");
+            .expect("B provisioning succeeds");
+        assert_eq!(
+            tenant_b_writer, seeded_b_writer,
+            "B keeps its seeded writer"
+        );
         assert_ne!(tenant_b_writer, first, "each tenant owns a distinct writer");
     }
 
@@ -981,9 +982,19 @@ mod pg_tests {
             .await
             .expect("writer rows read")
         };
+        // Seeding provisions a writer as production does; remove it so the
+        // tenant looks like one that predates the upgrade.
+        sqlx::query(
+            "DELETE FROM wyrd.auth_service_accounts \
+              WHERE data_tenant_id = $1 AND principal_kind = 'system'",
+        )
+        .bind(tenant.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("seeded writer removes");
         assert!(
             read_writers().await.is_empty(),
-            "a tenant seeded after migration starts without a writer"
+            "the pre-upgrade tenant starts without a writer"
         );
 
         let mut backfilled = Vec::new();

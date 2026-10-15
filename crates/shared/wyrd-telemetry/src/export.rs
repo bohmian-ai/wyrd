@@ -1247,6 +1247,9 @@ mod tests {
     }
 
     /// The catalog admits behavior spans and excludes attempts and internals.
+    ///
+    /// # Panics
+    /// Panics when a span name is misclassified by the catalog.
     #[test]
     fn catalog_names_only_behavior_spans() {
         for name in [

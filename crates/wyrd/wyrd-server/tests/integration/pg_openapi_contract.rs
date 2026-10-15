@@ -129,6 +129,9 @@ fn catalog_status(code: &str) -> Option<u16> {
 /// platform connection configuration, which discovers the issuer before
 /// storing it, publishes that discovery's
 /// `503 WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` as problem+json.
+///
+/// # Panics
+/// Panics when the test server fails or the document lacks an expected shape.
 #[tokio::test]
 async fn the_served_document_describes_the_composed_surface() {
     let server = WyrdTestServer::start_in_process()
@@ -826,6 +829,9 @@ async fn gateway_operations_publish_problem_json_refusals() {
 /// The Responses request contract admits every input item form the gateway
 /// decodes, including easy input messages and content-part tool results, and
 /// refuses malformed items.
+///
+/// # Panics
+/// Panics when the test server fails or the document lacks an expected contract.
 #[tokio::test]
 async fn gateway_ingress_publishes_typed_contracts() {
     let server = WyrdTestServer::start_in_process()

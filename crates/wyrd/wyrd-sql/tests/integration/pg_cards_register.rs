@@ -20,6 +20,9 @@ use wyrd_sql::queries::cards::{
 use wyrd_sql::row_types::cards::CardStatus;
 
 /// Build one resolved Prompt card fixture.
+///
+/// # Panics
+/// Panics when the static Card fixture does not deserialize.
 fn prompt_card(name: &str) -> Card {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
@@ -663,6 +666,9 @@ async fn manifest_upload_liveness_is_decided_by_postgres() {
 }
 
 /// Persist a UID-bearing outbound edge atomically with its source Card row.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn relationship_rows_preserve_exact_target_identity() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -927,6 +933,9 @@ async fn relationship_recheck_blocks_target_lifecycle_race() {
 }
 
 /// Exact delete blocks visible inbound references, preserves tenant parity, and retries idempotently.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
     let fixture = PgFixture::start().await.expect("fixture starts");

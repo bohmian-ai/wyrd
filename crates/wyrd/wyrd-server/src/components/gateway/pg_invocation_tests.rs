@@ -276,6 +276,9 @@ fn request(requested: &str, bound: Option<(u64, u64)>, timeout: Duration) -> Gat
 /// `dep-b/b`, pricing of 2 and 8 per million input and output tokens for
 /// `dep-a/a` and `dep-b/b`, and the given limits, budgets, and unknown-cost
 /// policy.
+///
+/// # Panics
+/// Panics when a fixture document does not decode or a store write fails.
 async fn configure(
     state: &AppState,
     tenant: DataTenantId,
@@ -367,6 +370,9 @@ async fn entries(
 }
 
 /// Appends a raw ledger document as `kind`, returning whether it was new.
+///
+/// # Panics
+/// Panics when the tenant connection, append, or commit fails.
 async fn append_raw(
     fixture: &PgFixture,
     tenant: DataTenantId,
@@ -757,6 +763,9 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
 /// is authorized and audited before dispatch, an unauthorized fallback is
 /// skipped and audited, fallback preserves requested and resolved identity,
 /// and billed failed and successful attempts are priced in the ledger.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -898,6 +907,9 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
 /// and reservation on one replica refuse admission on the other before any
 /// dispatch, settlement releases the unused reservation, and an unbounded
 /// call is rejected where a budget applies.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn gateway_admission_holds_limits_and_budgets_across_replicas() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -991,6 +1003,9 @@ async fn gateway_admission_holds_limits_and_budgets_across_replicas() {
 /// The ledger fences replays, admission reconciles an abandoned expired
 /// reservation at its full reserved cost, and a deadline-exceeded call records
 /// a billable attempt with unknown usage and settles at the reservation.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn gateway_ledger_fences_replays_and_settles_unknown_cost() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1095,6 +1110,9 @@ async fn gateway_ledger_fences_replays_and_settles_unknown_cost() {
 /// A reservation covers every billable `(candidate, deployment)` attempt, a
 /// longer period's reservation sharing the day's start never counts against the
 /// day budget, and a call that bills nothing releases its whole reservation.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn gateway_budget_reservations_cover_attempts_in_exact_periods() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1173,6 +1191,9 @@ async fn gateway_budget_reservations_cover_attempts_in_exact_periods() {
 /// A token limit holds the call's bounded token exposure at admission so a
 /// concurrent call cannot oversubscribe it, rejects unbounded exposure, and
 /// settles actual tokens into the admission window even after that minute.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -3276,6 +3297,9 @@ async fn drain_gateway(state: &AppState) {
 /// `Disabled` submits nothing, `Metadata` writes one row plus one span per
 /// attempt under the admitting request, and a pod reaching no Scribe drops
 /// capture while the call still answers and accounts.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_capture_follows_policy_and_never_affects_the_call() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -4096,6 +4120,9 @@ async fn gateway_capture_work_ends_at_the_call_deadline() {
 /// Proves capture follows the policy admitted with each call: disabling
 /// capture while a `Metadata` call is in flight still captures that call, and
 /// only calls admitted afterwards go uncaptured.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_capture_policy_change_affects_only_later_admissions() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -5541,6 +5568,9 @@ impl FallbackIngress {
     }
 
     /// Calls this ingress's handler for model `a` with `headers`.
+    ///
+    /// # Panics
+    /// Panics when this ingress address names no deployment.
     async fn call(
         self,
         state: &AppState,

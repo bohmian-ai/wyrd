@@ -721,6 +721,11 @@ mod tests {
         }
     }
 
+    /// A `default` space Prompt submission `name` pinned to `1.0.0` with a
+    /// minimal portable spec.
+    ///
+    /// # Panics
+    /// Panics when a static identity field is invalid.
     fn submission(name: &str) -> CardSubmission {
         CardSubmission {
             api_version: ApiVersion::v1(),
@@ -775,6 +780,12 @@ mod tests {
         .expect("test_setup: sibling service spec is valid")
     }
 
+    /// An Agent's sibling Prompt reference inside the submission set is
+    /// accepted and collects no external reference to resolve.
+    ///
+    /// # Panics
+    /// Panics when a fixture is invalid, validation refuses the sibling, or an
+    /// external reference is collected.
     #[test]
     fn sibling_prompt_reference_is_not_external() {
         let prompt = prompt_ref("child");

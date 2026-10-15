@@ -1026,6 +1026,9 @@ pub(crate) mod tests {
 
     /// Terminal facts of one succeeded single-attempt chat call under `policy`
     /// whose request and response both carry the secret canary.
+    ///
+    /// # Panics
+    /// Panics when a static fixture value is invalid or metadata does not project.
     pub(crate) fn facts(policy: GatewayCapturePolicy) -> CallFacts {
         let model = ModelRef::from_projection("dep-a/a").expect("model");
         let now = Utc::now();
@@ -1074,6 +1077,9 @@ pub(crate) mod tests {
 
     /// Proves `Metadata` writes a row with null payload and correlation
     /// columns plus one linked attempt span whose trace id is the call id.
+    ///
+    /// # Panics
+    /// Panics when a fixture fails to build or an assertion fails.
     #[test]
     fn metadata_capture_projects_row_and_linked_spans() {
         let capture = CallCapture::from_facts(facts(policy(GatewayCaptureMode::Metadata, &[])))
@@ -1106,6 +1112,9 @@ pub(crate) mod tests {
     /// deployment name: two differently named deployments on one adapter
     /// share a provider, the fallback names its own, and the deployment and
     /// requested model stay in their own attributes.
+    ///
+    /// # Panics
+    /// Panics when a fixture fails to build or an assertion fails.
     #[test]
     fn attempt_spans_name_the_admitted_adapter_provider() {
         let mut facts = facts(policy(GatewayCaptureMode::Metadata, &[]));
@@ -1160,6 +1169,9 @@ pub(crate) mod tests {
     /// DataFusion `get_field` returns a child without its parent's nulls, so
     /// `resolved_model['deployment']` reads SQL null only when the child slot
     /// itself is null; the nullable children keep that null through Parquet.
+    ///
+    /// # Panics
+    /// Panics when projection, batch building, a column downcast, or an assertion fails.
     #[test]
     fn unresolved_call_nulls_resolved_model_children() {
         let mut facts = facts(policy(GatewayCaptureMode::Metadata, &[]));

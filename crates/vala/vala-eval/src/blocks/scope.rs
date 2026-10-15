@@ -1,13 +1,14 @@
 //! The execution scope Verifier references resolve against.
 //!
-//! The scope holds the original evidence declarations, each settled step's
-//! status and output, and each settled step requirement's verdict. The driver
+//! The scope reads the original evidence declarations and the shared
+//! [`RunLedger`] of the stage walk, which holds each settled step's status
+//! and output and each settled step requirement's verdict. The driver
 //! resolves every binding a block declares here before handing the block to
 //! an executor, so executors only ever see values. A value that cannot be
 //! supplied resolves to [`Missing`], which keeps the cause of the gap so an
 //! intentional skip is never confused with a failure.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -15,9 +16,12 @@ use wyrd_spec::card::blocks::VerifierSpec;
 use wyrd_spec::card::blocks::{PathSegment, Reference, ReferenceRoot, Requirement, VerdictField};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::vala::eval::TaskId;
-use wyrd_spec::verification::execution::{InputDeclaration, RequirementOutcome, StepStatus};
+use wyrd_spec::verification::execution::{
+    InputDeclaration, RequirementOutcome, RequirementResult, StepResult, StepStatus,
+};
 
 use super::{CallInput, CallValue};
+use crate::executor::RunLedger;
 
 /// Why a value is missing. Ordered so the stronger cause is the greater:
 /// when causes mix, failure wins.
@@ -98,51 +102,59 @@ impl Settled {
     }
 }
 
-/// The scope document of one execution, mutated only by the driver between
-/// stages.
+/// One settled Verifier block in the shared [`RunLedger`].
+#[derive(Debug)]
+pub(super) enum Done {
+    /// A step: its reported result and the state later blocks read.
+    Step {
+        /// The reported step result.
+        result: StepResult,
+        /// The state `steps.<id>` references read.
+        state: Settled,
+    },
+    /// A judged requirement, as reported.
+    Requirement(RequirementResult),
+}
+
+/// The scope document of one stage: the original evidence plus every block
+/// earlier stages settled. Read-only; the stage walk owns the ledger.
 pub(super) struct Scope<'a> {
     /// The executing Verifier, for slot declarations.
     spec: &'a VerifierSpec,
     /// The pinned original evidence by slot.
     evidence: &'a BTreeMap<SlotName, InputDeclaration>,
-    /// Settled steps.
-    steps: HashMap<TaskId, Settled>,
-    /// Settled step-requirement verdicts: outcome and reason.
-    verdicts: HashMap<TaskId, (RequirementOutcome, String)>,
+    /// Blocks settled by earlier stages.
+    ledger: &'a RunLedger<Done>,
 }
 
 impl<'a> Scope<'a> {
-    /// An empty scope over the original evidence.
+    /// The scope over the original evidence and the blocks in `ledger`.
     pub(super) fn new(
         spec: &'a VerifierSpec,
         evidence: &'a BTreeMap<SlotName, InputDeclaration>,
+        ledger: &'a RunLedger<Done>,
     ) -> Self {
         Self {
             spec,
             evidence,
-            steps: HashMap::new(),
-            verdicts: HashMap::new(),
+            ledger,
         }
-    }
-
-    /// Record a step's final state.
-    pub(super) fn settle(&mut self, step: TaskId, settled: Settled) {
-        self.steps.insert(step, settled);
     }
 
     /// Returns a settled step's state.
     pub(super) fn step(&self, step: &TaskId) -> Option<&Settled> {
-        self.steps.get(step)
+        match self.ledger.get(step) {
+            Some(Done::Step { state, .. }) => Some(state),
+            _ => None,
+        }
     }
 
-    /// Record a step requirement's verdict for later actions and `when`.
-    pub(super) fn record_verdict(
-        &mut self,
-        requirement: TaskId,
-        outcome: RequirementOutcome,
-        reason: String,
-    ) {
-        self.verdicts.insert(requirement, (outcome, reason));
+    /// Returns a settled step requirement's verdict.
+    fn verdict(&self, requirement: &TaskId) -> Option<&RequirementResult> {
+        match self.ledger.get(requirement) {
+            Some(Done::Requirement(result)) => Some(result),
+            _ => None,
+        }
     }
 
     /// Resolve every named binding, returning the values or the strongest
@@ -214,7 +226,7 @@ impl<'a> Scope<'a> {
                     ))),
                 }
             }
-            ReferenceRoot::StepOutput(step) => match self.steps.get(step) {
+            ReferenceRoot::StepOutput(step) => match self.step(step) {
                 Some(Settled::Succeeded { output, sources }) => select(output, &reference.path)
                     .map(|value| json_input(value, sources.clone()))
                     .ok_or_else(unresolved),
@@ -229,7 +241,7 @@ impl<'a> Scope<'a> {
                 None => Err(unresolved()),
             },
             ReferenceRoot::StepStatus(step) => {
-                let settled = self.steps.get(step).ok_or_else(unresolved)?;
+                let settled = self.step(step).ok_or_else(unresolved)?;
                 Ok(json_input(wire(&settled.status()), BTreeSet::new()))
             }
             ReferenceRoot::StepVerdict {
@@ -237,10 +249,10 @@ impl<'a> Scope<'a> {
                 field,
                 ..
             } => {
-                let (outcome, reason) = self.verdicts.get(id).ok_or_else(unresolved)?;
+                let verdict = self.verdict(id).ok_or_else(unresolved)?;
                 let value = match field {
-                    VerdictField::Outcome => wire(outcome),
-                    VerdictField::Reason => Value::String(reason.clone()),
+                    VerdictField::Outcome => wire(&verdict.outcome),
+                    VerdictField::Reason => Value::String(verdict.reason.clone()),
                 };
                 Ok(json_input(value, BTreeSet::new()))
             }

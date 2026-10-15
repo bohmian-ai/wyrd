@@ -24,15 +24,13 @@ use std::time::Duration;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
-use tracing::Instrument as _;
 
 use wyrd_spec::card::blocks::{Action, Check, Decide, Requirement, Step, TraceCheck, VerifierSpec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::vala::eval::result::EvalContextCapture;
-use wyrd_spec::vala::eval::{ExecutionPlan, TaskId};
+use wyrd_spec::vala::eval::{ExecutionPlan, Stage, TaskId};
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{
     CallProvenance, Citation, InputDeclaration, RequirementDetail, RequirementOutcome,
@@ -40,13 +38,14 @@ use wyrd_spec::verification::execution::{
 };
 
 use super::drift::DriftChecks;
-use super::scope::{Cause, Missing, Scope, Settled};
+use super::scope::{Cause, Done, Missing, Scope, Settled};
 use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
     CheckOutput, Position,
 };
 use crate::context::extract_jsonpath_from;
 use crate::error::EvalExecError;
+use crate::executor::{Prepared, RunLedger, walk};
 use crate::operators;
 use crate::results::capture_actual;
 use crate::tasks::assertion::{Compared, evaluate_item_mode, evaluate_single};
@@ -120,11 +119,16 @@ impl VerificationEngine {
     /// requirements by step, then whole-Verifier requirements in declaration
     /// order), every step in plan order, and the evidence unchanged.
     ///
+    /// The deadline is checked before any work and again before the verdict
+    /// is published, so work that completes without suspending, such as an
+    /// empty Verifier, never reports a verdict outside its budget; pending
+    /// work is cancelled when the deadline passes.
+    ///
     /// # Errors
     /// Returns [`EngineError::Plan`] for an unplannable graph,
-    /// [`EngineError::DeadlineExceeded`] when `deadline` passes first,
-    /// [`EngineError::Capture`] when an actual value cannot be hashed, and
-    /// [`EngineError::Join`] when a block task panics.
+    /// [`EngineError::DeadlineExceeded`] when `deadline` is reached before
+    /// the verdict, [`EngineError::Capture`] when an actual value cannot be
+    /// hashed, and [`EngineError::Join`] when a block task panics.
     ///
     /// # Cancellation
     /// Dropping the future, or the deadline expiring, aborts every running
@@ -136,114 +140,168 @@ impl VerificationEngine {
         evidence: BTreeMap<SlotName, InputDeclaration>,
         deadline: Instant,
     ) -> Result<VerificationOutcome, EngineError> {
+        let expired = || Instant::now() >= deadline;
+        if expired() {
+            return Err(EngineError::DeadlineExceeded);
+        }
         let plan = spec.plan().map_err(EngineError::Plan)?;
-        let (steps, requirements) =
-            timeout_at(deadline, self.drive(&spec, &plan, &evidence, deadline))
-                .await
-                .map_err(|_| EngineError::DeadlineExceeded)??;
+        let ledger = timeout_at(deadline, self.drive(&spec, &plan, &evidence, deadline))
+            .await
+            .map_err(|_| EngineError::DeadlineExceeded)??;
+        let (mut steps, mut requirements) = (Vec::new(), Vec::new());
+        for (_, done) in ledger {
+            match done {
+                Done::Step { result, .. } => steps.push(result),
+                Done::Requirement(result) => requirements.push(result),
+            }
+        }
+        let verdict = decide(
+            spec.decide,
+            requirements.iter().map(|result| result.outcome),
+        );
+        if expired() {
+            return Err(EngineError::DeadlineExceeded);
+        }
         Ok(VerificationOutcome {
-            verdict: decide(
-                spec.decide,
-                requirements.iter().map(|result| result.outcome),
-            ),
+            verdict,
             requirements,
             steps,
             evidence,
         })
     }
 
-    /// Run every stage, then the whole-Verifier requirements.
+    /// Walk every plan stage's steps, then that stage's step requirements,
+    /// then the whole-Verifier requirements, through the shared stage walk.
+    ///
+    /// `plan` must be `spec.plan()`, so every planned id names a declared
+    /// step; requirement ids are globally unique, so steps and requirements
+    /// share one ledger.
     ///
     /// # Errors
     /// Returns [`EngineError::Capture`] or [`EngineError::Join`].
+    ///
+    /// # Panics
+    /// Panics when `plan` names a step `spec` does not declare.
     async fn drive(
         &self,
         spec: &Arc<VerifierSpec>,
         plan: &ExecutionPlan,
         evidence: &BTreeMap<SlotName, InputDeclaration>,
         deadline: Instant,
-    ) -> Result<(Vec<StepResult>, Vec<RequirementResult>), EngineError> {
-        let positions: HashMap<&TaskId, usize> = spec
-            .steps
-            .iter()
-            .enumerate()
-            .map(|(index, step)| (&step.id, index))
-            .collect();
-        let mut scope = Scope::new(spec, evidence);
-        let mut steps = Vec::with_capacity(spec.steps.len());
-        let mut requirements = Vec::new();
-        for stage in &plan.stages {
-            let stage: Vec<usize> = stage
-                .tasks
-                .iter()
-                .map(|id| {
-                    *positions
-                        .get(id)
-                        .expect("the plan names only declared steps")
-                })
-                .collect();
-            for (index, result, settled) in self.run_steps(spec, &scope, &stage, deadline).await? {
-                scope.settle(spec.steps[index].id.clone(), settled);
-                steps.push(result);
-            }
-            let keys = stage.iter().flat_map(|&index| {
-                (0..spec.steps[index].requirements.len()).map(move |at| (Some(index), at))
-            });
-            for result in self.run_requirements(spec, &scope, keys, deadline).await? {
-                scope.record_verdict(result.id.clone(), result.outcome, result.reason.clone());
-                requirements.push(result);
+    ) -> Result<RunLedger<Done>, EngineError> {
+        let mut blocks: HashMap<&TaskId, Block> = HashMap::new();
+        for (index, step) in spec.steps.iter().enumerate() {
+            blocks.insert(&step.id, Block::Step(index));
+            for (at, requirement) in step.requirements.iter().enumerate() {
+                blocks.insert(&requirement.id, Block::Requirement((Some(index), at)));
             }
         }
-        let keys = (0..spec.requirements.len()).map(|at| (None, at));
-        requirements.extend(self.run_requirements(spec, &scope, keys, deadline).await?);
-        Ok((steps, requirements))
+        for (at, requirement) in spec.requirements.iter().enumerate() {
+            blocks.insert(&requirement.id, Block::Requirement((None, at)));
+        }
+        let mut stages = Vec::with_capacity(plan.stages.len() * 2 + 1);
+        for stage in &plan.stages {
+            stages.push(stage.clone());
+            stages.push(requirement_stage(stage.tasks.iter().flat_map(
+                |id| match blocks.get(id) {
+                    Some(Block::Step(index)) => spec.steps[*index].requirements.as_slice(),
+                    _ => panic!("the plan names only declared steps"),
+                },
+            )));
+        }
+        stages.push(requirement_stage(spec.requirements.iter()));
+        walk(
+            &stages,
+            |ledger: &RunLedger<Done>, stage| {
+                let scope = Scope::new(spec, evidence, ledger);
+                stage
+                    .tasks
+                    .iter()
+                    .map(|id| match blocks.get(id) {
+                        Some(Block::Step(index)) => Ok(self.step(spec, &scope, *index, deadline)),
+                        Some(Block::Requirement(key)) => {
+                            self.requirement(spec, &scope, *key, deadline)
+                        }
+                        None => panic!("the plan names only declared steps"),
+                    })
+                    .collect()
+            },
+            |error| EngineError::Join(error.to_string()),
+        )
+        .await
     }
 
-    /// Run one stage's steps concurrently, returning each step's result and
-    /// settled state in stage order.
-    ///
-    /// # Errors
-    /// Returns [`EngineError::Join`] when a step task panics.
-    async fn run_steps(
+    /// Prepare one step: a step whose bindings or `when` leave a gap is
+    /// skipped with that gap, otherwise its action runs under the
+    /// concurrency bound.
+    fn step(
         &self,
         spec: &Arc<VerifierSpec>,
         scope: &Scope<'_>,
-        stage: &[usize],
+        index: usize,
         deadline: Instant,
-    ) -> Result<Vec<(usize, StepResult, Settled)>, EngineError> {
-        let mut settled = HashMap::new();
-        let mut running = JoinSet::new();
-        for &index in stage {
-            let step = &spec.steps[index];
-            match prepare(scope, step) {
-                Err(gap) => {
-                    settled.insert(index, skipped(step, gap));
-                }
-                Ok(bindings) => {
-                    let engine = self.clone();
-                    let spec = Arc::clone(spec);
-                    running.spawn(
-                        async move {
-                            let step = &spec.steps[index];
-                            let attempted = engine.attempt(step, &bindings, deadline).await;
-                            (index, attempted.settle(step, bindings.sources()))
-                        }
-                        .instrument(tracing::Span::current()),
-                    );
-                }
+    ) -> Prepared<Done, EngineError> {
+        let step = &spec.steps[index];
+        match prepare(scope, step) {
+            Err(gap) => Prepared::Settled(skipped(step, gap)),
+            Ok(bindings) => {
+                let engine = self.clone();
+                let spec = Arc::clone(spec);
+                Prepared::Run(Box::pin(async move {
+                    let step = &spec.steps[index];
+                    let attempted = engine.attempt(step, &bindings, deadline).await;
+                    Ok(attempted.settle(step, bindings.sources()))
+                }))
             }
         }
-        while let Some(joined) = running.join_next().await {
-            let (index, done) = joined.map_err(|error| EngineError::Join(error.to_string()))?;
-            settled.insert(index, done);
+    }
+
+    /// Prepare one requirement at `key`.
+    ///
+    /// Its evidence gaps are the containing step's missing output, if any,
+    /// and every explicit binding gap; the strongest cause wins, so a failed
+    /// binding is never hidden behind an intentionally skipped owner. A
+    /// requirement with a gap takes the gap's outcome without calling its
+    /// check; otherwise the check runs under the concurrency bound.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Capture`] when an actual value cannot be
+    /// hashed.
+    fn requirement(
+        &self,
+        spec: &Arc<VerifierSpec>,
+        scope: &Scope<'_>,
+        key: Key,
+        deadline: Instant,
+    ) -> Result<Prepared<Done, EngineError>, EngineError> {
+        let requirement = requirement_at(spec, key);
+        let owner = key
+            .0
+            .and_then(|index| match scope.step(&spec.steps[index].id) {
+                Some(Settled::NoOutput { gap, .. }) => Some(gap.clone()),
+                _ => None,
+            });
+        let (gap, inputs) = match check_bindings(scope, requirement) {
+            Ok(inputs) => (owner, Some(inputs)),
+            Err(gap) => (Missing::strongest(owner.into_iter().chain([gap])), None),
+        };
+        match (gap, inputs) {
+            (None, Some(inputs)) => {
+                let engine = self.clone();
+                let spec = Arc::clone(spec);
+                Ok(Prepared::Run(Box::pin(async move {
+                    let requirement = requirement_at(&spec, key);
+                    let step = key.0.map(|index| &spec.steps[index].id);
+                    let judged = engine.judge(requirement, step, inputs, deadline).await;
+                    judged.report(&spec, key)
+                })))
+            }
+            (gap, _) => {
+                Judged::missing(gap.unwrap_or_else(|| Missing::failed("a binding did not resolve")))
+                    .report(spec, key)
+                    .map(Prepared::Settled)
+            }
         }
-        Ok(stage
-            .iter()
-            .filter_map(|index| {
-                let (result, state) = settled.remove(index)?;
-                Some((*index, result, state))
-            })
-            .collect())
     }
 
     /// Run one step's action, retrying retryable failures and per-attempt
@@ -294,77 +352,6 @@ impl VerificationEngine {
                 }
             }
         }
-    }
-
-    /// Judge the requirements at `keys`, concurrently, returning results in
-    /// key order.
-    ///
-    /// A requirement of a step without output, or whose bindings cannot be
-    /// supplied, takes the gap's outcome without calling its check.
-    ///
-    /// # Errors
-    /// Returns [`EngineError::Join`] when a check task panics and
-    /// [`EngineError::Capture`] when an actual value cannot be hashed.
-    async fn run_requirements(
-        &self,
-        spec: &Arc<VerifierSpec>,
-        scope: &Scope<'_>,
-        keys: impl Iterator<Item = (Option<usize>, usize)>,
-        deadline: Instant,
-    ) -> Result<Vec<RequirementResult>, EngineError> {
-        let keys: Vec<_> = keys.collect();
-        let mut judged = HashMap::new();
-        let mut running = JoinSet::new();
-        for &key in &keys {
-            let requirement = requirement_at(spec, key);
-            let blocked = key
-                .0
-                .and_then(|index| match scope.step(&spec.steps[index].id) {
-                    Some(Settled::NoOutput { gap, .. }) => Some(gap.clone()),
-                    _ => None,
-                });
-            match blocked.map_or_else(|| check_bindings(scope, requirement), Err) {
-                Err(gap) => {
-                    judged.insert(key, Judged::missing(gap));
-                }
-                Ok(inputs) => {
-                    let engine = self.clone();
-                    let spec = Arc::clone(spec);
-                    running.spawn(
-                        async move {
-                            let requirement = requirement_at(&spec, key);
-                            let step = key.0.map(|index| &spec.steps[index].id);
-                            let judged = engine.judge(requirement, step, inputs, deadline).await;
-                            (key, judged)
-                        }
-                        .instrument(tracing::Span::current()),
-                    );
-                }
-            }
-        }
-        while let Some(joined) = running.join_next().await {
-            let (key, done) = joined.map_err(|error| EngineError::Join(error.to_string()))?;
-            judged.insert(key, done);
-        }
-        let capture = spec.context_capture.unwrap_or(EvalContextCapture::Full);
-        keys.into_iter()
-            .filter_map(|key| Some((key, judged.remove(&key)?)))
-            .map(|(key, done)| {
-                let requirement = requirement_at(spec, key);
-                Ok(RequirementResult {
-                    id: requirement.id.clone(),
-                    step: key.0.map(|index| spec.steps[index].id.clone()),
-                    statement: requirement.statement.clone(),
-                    outcome: done.outcome,
-                    reason: done.reason,
-                    actual: capture_actual(done.actual, capture)?,
-                    citations: done.citations,
-                    detail: done.detail,
-                    check: requirement.check.clone(),
-                    provenance: done.provenance,
-                })
-            })
-            .collect()
     }
 
     /// Run one requirement's check over its resolved bindings.
@@ -547,8 +534,33 @@ fn check_bindings(
     }
 }
 
+/// Where a Verifier block is declared.
+#[derive(Clone, Copy)]
+enum Block {
+    /// The step at this index of `steps`.
+    Step(usize),
+    /// The requirement at this key.
+    Requirement(Key),
+}
+
+/// A requirement's declaration: the index of its containing step, or `None`
+/// for a whole-Verifier requirement, and its index in that list.
+type Key = (Option<usize>, usize);
+
+/// The stage judging `requirements`, in their declaration order.
+///
+/// Its index is unused: Verifier blocks never read their stage index.
+fn requirement_stage<'r>(requirements: impl Iterator<Item = &'r Requirement>) -> Stage {
+    Stage {
+        index: 0,
+        tasks: requirements
+            .map(|requirement| requirement.id.clone())
+            .collect(),
+    }
+}
+
 /// The result and settled state of a step that did not run.
-fn skipped(step: &Step, gap: Missing) -> (StepResult, Settled) {
+fn skipped(step: &Step, gap: Missing) -> Done {
     let result = StepResult {
         id: step.id.clone(),
         status: StepStatus::Skipped,
@@ -559,11 +571,11 @@ fn skipped(step: &Step, gap: Missing) -> (StepResult, Settled) {
         provenance: None,
         tool_calls: Vec::new(),
     };
-    let settled = Settled::NoOutput {
+    let state = Settled::NoOutput {
         status: StepStatus::Skipped,
         gap,
     };
-    (result, settled)
+    Done::Step { result, state }
 }
 
 /// The final attempt of one step action.
@@ -578,9 +590,9 @@ struct Attempted {
 
 impl Attempted {
     /// The step's result and the state later blocks read.
-    fn settle(self, step: &Step, sources: BTreeSet<SlotName>) -> (StepResult, Settled) {
+    fn settle(self, step: &Step, sources: BTreeSet<SlotName>) -> Done {
         let duration_ms = u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX);
-        match self.result {
+        let (result, state) = match self.result {
             Ok(output) => (
                 StepResult {
                     id: step.id.clone(),
@@ -613,7 +625,8 @@ impl Attempted {
                     gap: Missing::failed(reason),
                 },
             ),
-        }
+        };
+        Done::Step { result, state }
     }
 }
 
@@ -634,6 +647,32 @@ struct Judged {
 }
 
 impl Judged {
+    /// The reported result of the requirement at `key`, its actual value
+    /// captured under the Verifier's context-capture mode.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Capture`] when the actual value cannot be
+    /// hashed.
+    ///
+    /// # Panics
+    /// Panics when `key` does not name a requirement of `spec`.
+    fn report(self, spec: &VerifierSpec, key: Key) -> Result<Done, EngineError> {
+        let requirement = requirement_at(spec, key);
+        let capture = spec.context_capture.unwrap_or(EvalContextCapture::Full);
+        Ok(Done::Requirement(RequirementResult {
+            id: requirement.id.clone(),
+            step: key.0.map(|index| spec.steps[index].id.clone()),
+            statement: requirement.statement.clone(),
+            outcome: self.outcome,
+            reason: self.reason,
+            actual: capture_actual(self.actual, capture)?,
+            citations: self.citations,
+            detail: self.detail,
+            check: requirement.check.clone(),
+            provenance: self.provenance,
+        }))
+    }
+
     /// The outcome of evidence that could not be supplied.
     fn missing(gap: Missing) -> Self {
         Self::bare(gap.cause.outcome(), gap.reason)
@@ -715,7 +754,11 @@ impl Judged {
 }
 
 /// The requirement at `key`: a step's requirement, or a whole-Verifier one.
-fn requirement_at(spec: &VerifierSpec, (step, at): (Option<usize>, usize)) -> &Requirement {
+///
+/// # Panics
+/// Panics when `key` does not index a declared requirement; keys come only
+/// from `spec`'s own declarations.
+fn requirement_at(spec: &VerifierSpec, (step, at): Key) -> &Requirement {
     match step {
         Some(index) => &spec.steps[index].requirements[at],
         None => &spec.requirements[at],

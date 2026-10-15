@@ -632,6 +632,101 @@ async fn skip_causes_propagate_and_failure_wins() {
     assert_eq!(outcome.verdict, VerificationVerdict::Inconclusive);
 }
 
+/// A requirement on an intentionally skipped step still sees its explicit
+/// evidence gaps: reading a failed ancestor's output or an omitted required
+/// slot is inconclusive with the failure's reason, never a quiet
+/// not-applicable that lets `all` pass, while a requirement with no other
+/// gap keeps the owner's skip. No check runs on missing evidence.
+///
+/// # Panics
+/// Panics when an outcome, reason, verdict, or check call differs.
+#[tokio::test(start_paused = true)]
+async fn skipped_owner_keeps_failed_check_evidence() {
+    let assert_present = |id: &str, path: &str| json!({"id": id, "statement": id, "check": {"kind": "assert", "path": path, "operator": "is_not_null"}});
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}, "note": {"type": "json"}},
+        "steps": [
+            {"id": "broken", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "gated", "depends_on": ["broken"],
+             "when": {"path": "inputs.answer.draft", "operator": "equals", "expected": true},
+             "action": code_action(json!({"x": "inputs.answer"})),
+             "requirements": [
+                 {"id": "reads-broken", "statement": "reads-broken", "check": code_check(json!({"x": "steps.broken.output"}))},
+                 assert_present("reads-missing", "inputs.note"),
+                 assert_present("pure-skip", "inputs.answer")
+             ]}
+        ],
+        "requirements": [assert_present("independent", "inputs.answer")]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([(
+            "broken",
+            Behavior::Attempts(
+                vec![BlockError::Terminal {
+                    reason: "provider rejected".to_owned(),
+                }],
+                json!({}),
+            ),
+        )]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&script, InMemoryTraceSource::new(), 4),
+        &spec,
+        json!({"answer": {"draft": false}}),
+    )
+    .await
+    .expect("outcome");
+    assert_eq!(
+        outcomes(&outcome),
+        BTreeMap::from([
+            ("reads-broken", RequirementOutcome::Inconclusive),
+            ("reads-missing", RequirementOutcome::Inconclusive),
+            ("pure-skip", RequirementOutcome::NotApplicable),
+            ("independent", RequirementOutcome::Passed),
+        ])
+    );
+    assert!(
+        requirement(&outcome, "reads-broken")
+            .reason
+            .contains("provider rejected")
+    );
+    assert!(
+        requirement(&outcome, "reads-missing")
+            .reason
+            .contains("`note` was not supplied")
+    );
+    assert!(
+        !script.calls().iter().any(|call| call.starts_with("check:")),
+        "no check runs on missing evidence: {:?}",
+        script.calls()
+    );
+    assert_eq!(outcome.verdict, VerificationVerdict::Inconclusive);
+}
+
+/// An elapsed deadline refuses work that would complete without
+/// suspending, such as an empty Verifier or one whose only requirement
+/// lacks evidence, instead of publishing a verdict outside the budget.
+///
+/// # Panics
+/// Panics when an elapsed-deadline execution returns a verdict.
+#[tokio::test(start_paused = true)]
+async fn elapsed_deadline_refuses_ready_work() {
+    let script = Arc::new(Script::default());
+    let engine = engine(&script, InMemoryTraceSource::new(), 1);
+    let missing = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "requirements": [{"id": "r", "statement": "r", "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}}]
+    }));
+    for spec in [verifier(json!({})), missing] {
+        let result = engine.run(spec, BTreeMap::new(), Instant::now()).await;
+        assert!(
+            matches!(result, Err(EngineError::DeadlineExceeded)),
+            "{result:?}"
+        );
+    }
+}
+
 /// A missing required slot is inconclusive, an omitted optional slot is
 /// `null` for an explicit null assertion, and a child of an omitted slot or
 /// an absent output field is missing rather than `null`.

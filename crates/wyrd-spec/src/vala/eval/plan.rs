@@ -108,15 +108,38 @@ impl From<DagError> for WyrdError {
 /// dependency, [`DagError::SelfLoop`] when a task depends on itself, and
 /// [`DagError::Cycle`] when the remaining dependency graph has a cycle.
 pub fn validate_dag(tasks: &BTreeMap<TaskId, EvalTask>) -> Result<ExecutionPlan, DagError> {
-    let mut in_degree: HashMap<&TaskId, u32> = HashMap::with_capacity(tasks.len());
-    let mut adj: HashMap<&TaskId, Vec<&TaskId>> = HashMap::with_capacity(tasks.len());
-    for id in tasks.keys() {
+    plan_stages(tasks.iter().map(|(id, task)| (id, task.depends_on())))
+}
+
+/// Plans dependency stages for any graph of uniquely named nodes.
+///
+/// Each item names one node and the nodes it depends on. Nodes are emitted
+/// in dependency-layer order with each stage sorted lexicographically. The
+/// caller guarantees node ids are unique; a repeated id replaces the earlier
+/// node's position in the graph.
+///
+/// # Errors
+/// Returns [`DagError::MissingDependency`] when a node references an absent
+/// dependency, [`DagError::SelfLoop`] when a node depends on itself, and
+/// [`DagError::Cycle`] when the remaining dependency graph has a cycle.
+pub fn plan_stages<'a, I, D>(nodes: I) -> Result<ExecutionPlan, DagError>
+where
+    I: IntoIterator<Item = (&'a TaskId, D)>,
+    D: IntoIterator<Item = &'a TaskId>,
+{
+    let nodes: Vec<(&TaskId, Vec<&TaskId>)> = nodes
+        .into_iter()
+        .map(|(id, deps)| (id, deps.into_iter().collect()))
+        .collect();
+    let mut in_degree: HashMap<&TaskId, u32> = HashMap::with_capacity(nodes.len());
+    let mut adj: HashMap<&TaskId, Vec<&TaskId>> = HashMap::with_capacity(nodes.len());
+    for (id, _) in &nodes {
         in_degree.insert(id, 0);
         adj.insert(id, Vec::new());
     }
 
-    for (id, task) in tasks {
-        for dep in task.depends_on() {
+    for &(id, ref deps) in &nodes {
+        for &dep in deps {
             if dep == id {
                 return Err(DagError::SelfLoop { task: id.clone() });
             }
@@ -170,7 +193,7 @@ pub fn validate_dag(tasks: &BTreeMap<TaskId, EvalTask>) -> Result<ExecutionPlan,
         ready = next_ready;
     }
 
-    if emitted == tasks.len() {
+    if emitted == in_degree.len() {
         return Ok(ExecutionPlan {
             stages: plan,
             task_count: emitted,

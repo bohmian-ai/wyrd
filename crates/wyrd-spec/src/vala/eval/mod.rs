@@ -66,7 +66,7 @@ pub use ids::{
 pub use llm_judge::LlmJudgeTask;
 pub use media::MediaRef;
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
-pub use plan::{DagError, ExecutionPlan, Stage, validate_dag};
+pub use plan::{DagError, ExecutionPlan, Stage, plan_stages, validate_dag};
 pub use protocol::{
     AgentTurnSubmission, ConversationTurn, MAX_HISTORY_TURNS, ProtocolError, SimulatedUserMode,
     SimulatedUserTurn, TurnDirective, TurnRole, UserTurnSubmission,

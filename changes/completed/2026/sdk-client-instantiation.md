@@ -91,6 +91,7 @@ compact, authorized table discovery in all three SDKs.
 - Delegated-connect attribution is asserted from retained audit rows
   (`sub_principal_id` is the subject, `act_principal_id` the actor), following
   the merged `sub-act-attribution` change.
+
 ## Acceptance closure
 
 | Criterion | Evidence |

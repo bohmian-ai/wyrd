@@ -83,7 +83,7 @@ pub(super) fn may_administer(caller: &Caller) -> bool {
 /// # Panics
 /// Panics when the derived schema is not a JSON object, which the `JsonSchema`
 /// derive cannot produce for a struct.
-fn schema_of<T: JsonSchema>() -> Arc<JsonMap<String, JsonValue>> {
+pub(super) fn schema_of<T: JsonSchema>() -> Arc<JsonMap<String, JsonValue>> {
     let root = SchemaGenerator::default().into_root_schema_for::<T>();
     let JsonValue::Object(schema) = serde_json::to_value(root).expect("a derived schema is JSON")
     else {

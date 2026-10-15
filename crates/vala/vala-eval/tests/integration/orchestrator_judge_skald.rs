@@ -9,9 +9,9 @@ use orchestrator_support::{
     judge_ref, registry_returning_text, registry_returning_texts, structured_prompt,
 };
 use serde_json::{Value, json};
+use skald_agent::{WyrdGatewayCall, WyrdGatewayCaller};
 use skald_providers::{ProviderError, ProviderStream};
 use skald_runtime::{Provider, ProviderRegistry};
-use skald_agent::{WyrdGatewayCall, WyrdGatewayCaller};
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 use tokio_util::sync::CancellationToken;
 use vala_eval::orchestrator::{
@@ -630,7 +630,11 @@ async fn judge_routes_its_context_cannot_serve_are_refused() {
     let server = invoker_with_registry(Arc::new(ProviderRegistry::new()))
         .with_wyrd_gateway(Arc::new(UnreachableGateway));
     let native = server
-        .invoke(&judge_agent_ref(), json!({"response": "DONE"}), &MediaBindings::new())
+        .invoke(
+            &judge_agent_ref(),
+            json!({"response": "DONE"}),
+            &MediaBindings::new(),
+        )
         .await
         .expect_err("a server judge refuses a native route");
     assert!(

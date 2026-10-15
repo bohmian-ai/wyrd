@@ -468,7 +468,7 @@ Status: `IMPLEMENTED`. Commits `a0b932ef6`, `67805c933`, `3e6179915`,
 | REQ-013; AC-009 — managed flush before native drain, drain on failure, two catalog errors | `crates/wyrd-spec/src/error.rs` (`WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT`, `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`); `crates/shared/wyrd-client/src/state.rs::TelemetryFlushFailure` shared by `sdks/wyrd-sdk-python/src/state/mod.rs` and `sdks/wyrd-sdk-ts/native/src/cards.rs::telemetry_flush_error`; TS `WyrdState.flush/shutdown` | U3 `test_managed_telemetry_lifecycle` 7 passed; T3 1 passed; J1/J2/K1/K2 read back after flush; K4 asserts the 503 on a refused export | PASS |
 | REQ-014; AC-010/011 — fidelity, scope, privacy, sampling | Start-time Run identity, enclosing-context parenting, `include_content=False` and `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false` recipes | J3 `test_framework_execution_edges` 3 passed (model failure, tool failure, stream completed after scope exit, nested, concurrent, uncorrelated); J4 3 passed (always_off sampler, SECRET sentinels absent); K3/K4 1 passed each | PASS |
 | REQ-015; AC-012 — docsite recipes match journeys | Observe `record-a-run-and-observations.md` sections "Trace an agent framework" and "Keep your own tracer provider", error rows, readback; Connect/Understand cross-links; `wyrd-ai[otel]` install name in quickstart and `otel.py`; `architecture/wyrd-design.md` managed flush contract. Draft flags preserved | `mise run docs:generate` (no drift), `mise run docs:check` exit 0 | PASS |
-| REQ-016; AC-003 — exact journeys collected with dependencies, no masked integrations | `mise.toml`: `py:test:mcp-frameworks:inner` and `test:bifrost:journey:python:inner` run `tests/integration/otel/frameworks` under `--group mcp-frameworks`; `test:bifrost:journey:typescript:inner` lists `agents-trace-processor.test.ts`; `pyproject.toml` norecursedirs keeps the default lane free of frameworks | Default `tests/integration` collects 0 framework tests; the group dirs collect 19; every J/K selector reports a positive pass count | PASS |
+| REQ-016; AC-003 — exact journeys collected with dependencies, no masked integrations | The frameworks are ordinary `dev` dependencies (`requires-python >=3.11`), so `py:test:integration` collects every framework journey; the separate `py:test:mcp-frameworks` lane is deleted. `test:bifrost:journey:python:inner` lists `tests/integration/otel/frameworks`; `test:bifrost:journey:typescript:inner` lists `agents-trace-processor.test.ts` | `py:test:integration` collects 19 framework tests and passes (266 passed at `0aa031452`); every J/K selector reports a positive pass count | PASS |
 | REQ-017; AC-013 — ambient clients, stock auth transport, fresh per-export tokens | Exporters call the shared client's `access_token` on every export; journeys set only `WYRD_API_KEY` and an isolated `WYRD_CONFIG_HOME`; the gateway path uses the existing `http_auth`/`httpAuth` | U5 1 passed, T5 1 passed; J5 1 passed (the upstream sees only `Bearer sk-local-upstream` and no `x-wyrd` headers; a run with no credential fails with the actionable `WyrdError`); K5 1 passed (`WYRD_CLIENT_401_NO_CREDENTIALS`); R1 2 passed, R2 1 passed | PASS |
 | INV-001 — tenant and auth boundaries | No server change; relies on the server's per-span Card-scope rejection | J4/K4: a viewer key persists nothing; an other-tenant credential cannot attribute spans to this tenant's Card, and this tenant reads nothing | PASS |
 | INV-002 — one managed provider, no global replacement | Collision refusal `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` retained | U1, T1 | PASS |
@@ -480,6 +480,7 @@ Status: `IMPLEMENTED`. Commits `a0b932ef6`, `67805c933`, `3e6179915`,
 Static and owner lanes, all exit 0:
 - `mise run fmt`, `lints`
 - `py:format:check`, `py:lints`, `py:typecheck`, `py:test:unit` (610 passed at `aeaa22cbc`)
+- `py:test:integration` (266 passed at `0aa031452`)
 - `ts:format:check`, `ts:lints`, `ts:typecheck`, `ts:test:unit` (71 passed), `ts:pack:check`
 - `ts:napi:check`, run because the native export `telemetry_flush_error` was added
 - `codegen:check`, `check:deps`
@@ -487,14 +488,13 @@ Static and owner lanes, all exit 0:
 - `git diff --check`
 
 Focused selectors U1–U5, T1–T5, R1, R2 and K1–K5 ran exactly as listed above.
-J1–J5 ran with the listed wrapper and `--group mcp-frameworks`, at the actual
-path `tests/integration/otel/frameworks/test_framework_telemetry.py::<name>`.
+J1–J5 ran with the listed wrapper, without `--group` now that the frameworks
+are `dev` dependencies, at the actual path `tests/integration/otel/frameworks/test_framework_telemetry.py::<name>`.
 
 ### Deviations and material limits
 
 - **Selector path.** J1–J5 live in `tests/integration/otel/frameworks/` rather
-  than `tests/integration/otel/`. That directory is excluded from the default
-  integration lane, so the lane never imports the optional frameworks. Each app
+  than `tests/integration/otel/`, because they need a helper app. Each app
   runs in its own subprocess for two reasons: OTEL allows one global provider
   per process, and ADK binds its tracer at import.
 - **RED evidence.** Unit scenarios U1–U5/T1–T5 were written alongside the fix,
@@ -515,6 +515,11 @@ path `tests/integration/otel/frameworks/test_framework_telemetry.py::<name>`.
 - **Removed proof.** `tests/integration/otel/test_agents_trace_processor.py`
   used a custom model with manual generation spans. It was deleted and is
   superseded by J1–J5.
+
+- **Lane and Python floor (follow-up).** At the owner's direction, the
+  framework packages moved into `dev`, `py:test:mcp-frameworks` was deleted, and
+  the package floor rose to Python 3.11 (`abi3-py311`) because Pydantic AI and
+  ADK require it. ty now checks both framework test folders.
 
 ### Non-goals and diff audit
 

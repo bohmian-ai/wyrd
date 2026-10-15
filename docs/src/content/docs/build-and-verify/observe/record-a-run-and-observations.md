@@ -154,9 +154,40 @@ The Python `with` block tags every OpenTelemetry span started inside it with the
 
 `drift` and `eval` return once the row is queued, and add almost no time to a request. `record` is async in Rust and TypeScript because the first call for a table looks it up on the server.
 
-### Trace an OpenAI Agents SDK agent
+### Trace an agent framework
 
-The OpenAI Agents SDK records its own traces rather than OpenTelemetry spans. Give it `WyrdAgentsTraceProcessor`, and each agent, tool, handoff, and model call becomes an OpenTelemetry span. Model calls carry `gen_ai.request.model` and token counts. Wyrd never installs the processor for you. Run the agent inside the run's scope after `start_telemetry()` (`startTelemetry()` in TypeScript), and its spans land in `vala.traces.spans` with the run's `run_id`.
+Agent frameworks describe each run as OpenTelemetry spans: the agent, every model call with its model and token counts, and every tool call. Send them to Wyrd and run the agent inside a run, and its spans land in `vala.traces.spans` with the run's `run_id` and the Card's `card_uid`, next to the run's observations.
+
+In Python, install the `otel` extra, and `agents` for the OpenAI Agents SDK: `pip install 'wyrd-ai[otel,agents]'`. In TypeScript, install `@opentelemetry/api`, `@opentelemetry/sdk-trace-base`, `@opentelemetry/exporter-trace-otlp-proto`, `@opentelemetry/context-async-hooks`, and `@opentelemetry/core`.
+
+Call `start_telemetry()` (`startTelemetry()`) once at startup, before you build any agent. It installs the global tracer provider, exporting as the state's client: the same `WYRD_SERVER_URL` and credential as everything else, with a fresh access token on every export. Then set up your framework:
+
+**Pydantic AI** emits spans itself. Turn its instrumentation on without message content:
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai.models.instrumented import InstrumentationSettings
+
+state.start_telemetry()
+Agent.instrument_all(InstrumentationSettings(include_content=False))
+
+with state.run("agent"):
+    result = await agent.run(question)
+```
+
+`include_content=False` drops prompts, completions, tool arguments, and tool results. Pydantic AI still records each tool's name, description, and JSON schema in `gen_ai.tool.definitions` and `model_request_parameters`.
+
+**Google ADK** emits spans itself, under the instrumentation scope `gcp.vertex.agent`. It records message content in its spans by default; set `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false` in the process environment, and leave `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` unset.
+
+```python
+state.start_telemetry()
+
+with state.run("agent"):
+    async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=message):
+        ...
+```
+
+**The OpenAI Agents SDK** records its own traces rather than OpenTelemetry spans. Give it `WyrdAgentsTraceProcessor`, and each agent, tool, handoff, and model call becomes a span named by the OpenTelemetry GenAI conventions, such as `invoke_agent assistant`, `execute_tool lookup`, and `chat gpt-4o`. The processor records names, models, token counts, and an error status, never inputs or outputs. Wyrd never installs it for you.
 
 <LangTabs langs={['python', 'typescript']}>
 <LangTab lang="python">
@@ -169,7 +200,7 @@ state.start_telemetry()
 set_trace_processors([WyrdAgentsTraceProcessor()])
 
 with state.run("agent"):
-    result = Runner.run_sync(agent, question)
+    result = await Runner.run(agent, question)
 ```
 
 </LangTab>
@@ -188,7 +219,57 @@ const result = await state.run("agent").scope(() => run(agent, question));
 </LangTab>
 </LangTabs>
 
-`set_trace_processors` replaces the SDK's default exporter to OpenAI; use `add_trace_processor` (`addTraceProcessor`) to keep it. Install `wyrd[agents]` in Python.
+`set_trace_processors` replaces the SDK's default exporter to OpenAI; use `add_trace_processor` (`addTraceProcessor`) to keep it. In TypeScript, `OpenAIChatCompletionsModel` reports no token counts on its spans; `OpenAIResponsesModel` does.
+
+A span started inside the run keeps the run even when it finishes after the block exits, such as a streamed response you consume later. Nested and concurrent runs each keep their own `run_id`, and spans outside any run export without one.
+
+None of this needs the AI Gateway. To send the model calls through it as well, give the framework's OpenAI client `http_auth` (`httpAuth`), as in [Call Wyrd from a stock client](/connect/call-wyrd-from-a-stock-client/#openai).
+
+These recipes are tested with Pydantic AI 2.56, Google ADK 2.12, OpenAI Agents SDK 0.23 for Python, and OpenAI Agents SDK 0.20 for TypeScript.
+
+#### Keep your own tracer provider
+
+If your application already installs a tracer provider, `start_telemetry` refuses with `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS`. Add Wyrd's exporter and run correlation to your provider instead:
+
+<LangTabs langs={['python', 'typescript']}>
+<LangTab lang="python">
+
+```python
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from wyrd import WyrdClient
+from wyrd.otel import install_run_correlation, span_exporter
+
+provider = TracerProvider()
+provider.add_span_processor(BatchSpanProcessor(span_exporter(WyrdClient())))
+install_run_correlation(provider)
+trace.set_tracer_provider(provider)
+```
+
+</LangTab>
+<LangTab lang="typescript">
+
+```typescript
+import { context, trace } from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
+import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { WyrdClient } from "wyrd-ai";
+import { runCorrelationProcessor, spanExporter } from "wyrd-ai/otel";
+
+const provider = new BasicTracerProvider({
+  spanProcessors: [runCorrelationProcessor(), new BatchSpanProcessor(spanExporter(WyrdClient.connect()))],
+});
+trace.setGlobalTracerProvider(provider);
+context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
+```
+
+</LangTab>
+</LangTabs>
+
+You own this provider: `shutdown` on the state never flushes it, so shut it down yourself at exit.
+
+Either provider samples by the standard `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` variables; a span the sampler drops is never exported. The server stores a span only when the credential may attribute it: a span naming a Card outside the credential's scope or tenant is rejected on its own, and the rest of the export is stored.
 
 ## 4. Shut down cleanly
 
@@ -220,7 +301,7 @@ await state.shutdown();
 </LangTab>
 </LangTabs>
 
-`shutdown` sends everything still queued and returns once the server has it. A process killed without it can lose its last rows. `flush` does the same without closing the writer, for tests and batch jobs.
+`shutdown` sends everything still queued and returns once the server has it. A process killed without it can lose its last rows. `flush` does the same without closing the writer, for tests and batch jobs. With `start_telemetry`, both first flush the tracer provider it installed, and still drain the writer if that flush fails.
 
 ## 5. Read a run back
 
@@ -268,6 +349,16 @@ const rows = await bifrost.sql(
 </LangTab>
 </LangTabs>
 
+The agent's spans read back the same way, by run:
+
+```sql
+SELECT name, gen_ai_request_model, gen_ai_usage_input_tokens, gen_ai_usage_output_tokens
+FROM vala.traces.spans
+WHERE run_id = $1
+```
+
+`Bifrost().trace_timeline(trace_id)` (`traceTimeline` in TypeScript) returns one trace's spans with their parent ids, status, and attributes.
+
 The ticket row has `card_uid` set to the `support-agent` version that ran. The eval row in `vala.eval.observations` and the gateway call in `vala.gateway.calls` carry the same `run_id`, so one join reads the whole request back. Rows become queryable a short time after `flush` returns. An empty result right after a flush is not proof they are missing; retry first.
 
 ## What can go wrong
@@ -282,5 +373,8 @@ The ticket row has `card_uid` set to the `support-agent` version that ran. The e
 | `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND` | At `record` | The table was never registered | Declare it in `spec.tables` or register it |
 | `WYRD_VALA_403_BIFROST_CARD_SCOPE` | At `flush` or `shutdown` | The credential is bound to a different Card than the one recorded about | Use the key issued for this Service version |
 | `WYRD_PERMISSION_403_DENIED_RBAC` | At `flush` or `shutdown` | The credential lacks `bifrost_record:write` | Use a `workload` credential |
+| `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | At `start_telemetry` | The application already installed a tracer provider | [Keep your own tracer provider](#keep-your-own-tracer-provider) |
+| `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` | At `flush` or `shutdown` | The tracer provider `start_telemetry` installed did not flush in time | Check that the server is reachable. The writer still drained; `details.native_code` names its failure, if any |
+| `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` | At `flush` or `shutdown` | That provider failed to flush. In TypeScript this includes a refused span export | Check that the credential may write telemetry. `details.native_code` names any writer failure |
 
-Card-scope and permission refusals arrive at `flush` or `shutdown`, not at the `observe` call, because the server checks them when the batch lands. Call `flush` in a smoke test after deploying so a wrong key fails there instead of silently at exit.
+Card-scope and permission refusals arrive at `flush` or `shutdown`, not at the `observe` call, because the server checks them when the batch lands. The Python OpenTelemetry SDK logs a refused span export rather than failing its flush, so look for it in the log. Call `flush` in a smoke test after deploying so a wrong key fails there instead of silently at exit.

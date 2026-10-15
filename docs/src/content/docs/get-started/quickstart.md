@@ -20,7 +20,7 @@ The same example is in Python, Rust, and TypeScript. Pick one; the steps are ide
 
 | Language | Needs |
 | --- | --- |
-| Python | Python 3.10+ and `pip install "wyrd[otel]" pydantic`. The `otel` extra sends the example's trace spans to Wyrd |
+| Python | Python 3.10+ and `pip install "wyrd-ai[otel]" pydantic`. The `otel` extra sends the example's trace spans to Wyrd |
 | Rust | [mise](https://mise.jdx.dev); the repository pins the Rust version |
 | TypeScript | [mise](https://mise.jdx.dev); the repository pins Node and pnpm |
 

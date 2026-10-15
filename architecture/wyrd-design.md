@@ -678,6 +678,11 @@ reuse that client's credential resolution and refresh rather than introducing
 another authentication implementation. Applications may attach those exporters
 to their own OpenTelemetry providers. Framework instrumentation remains owned
 by the application and framework; Wyrd never discovers or patches frameworks.
+A state's `start_telemetry` installs one managed global provider; that state's
+`flush` and `shutdown` force-flush it before draining the writer, still drain
+when it fails, and report the failure as `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT`
+or `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`. An application-owned provider is
+never flushed by a state.
 
 Env vars in deployed services:
 

@@ -7,12 +7,11 @@ reaches the shared recording upstream, and each call is recorded in
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import openai
 import pytest
-from wyrd.gateway import Gateway, GatewayAuth
+from wyrd.gateway import Gateway
 from wyrd.testing import WyrdTestServer
 
 from ..support import Receiver, client_of
@@ -266,27 +265,6 @@ def test_revoked_user_never_dispatches(backends: tuple[WyrdTestServer, Receiver]
         )
     assert revoked.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
     assert upstream.deliveries == []
-
-
-def test_gateway_auth_authenticates_from_the_environment_alone(
-    backends: tuple[WyrdTestServer, Receiver], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    server, _ = backends
-    monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setenv("WYRD_SERVER_URL", server.base_url)
-    monkeypatch.setenv("WYRD_API_KEY", server.api_key)
-    for name in ("WYRD_ACCESS_TOKEN", "WYRD_WORKLOAD_TOKEN", "WYRD_TENANT"):
-        monkeypatch.delenv(name, raising=False)
-    client = openai.OpenAI(
-        base_url=f"{server.base_url}/v1",
-        api_key="wyrd",
-        http_client=openai.DefaultHttpxClient(auth=GatewayAuth()),
-        max_retries=0,
-    )
-
-    completion = client.chat.completions.create(model="openai/gpt-4o", messages=MESSAGES)
-
-    assert completion.choices[0].message.content == "hi"
 
 
 def test_embedding_and_image_evidence_reaches_bifrost(

@@ -35,14 +35,18 @@ def credentials(headers: Mapping[str, str]) -> str:
 
 def test_http_auth_on_a_client_replaces_provider_keys_with_its_access_token() -> None:
     client = WyrdClient(server_url="http://127.0.0.1:9", credential="access-token-1")
-    echo = httpx2.MockTransport(lambda request: httpx2.Response(200, text=credentials(request.headers)))
+    echo = httpx2.MockTransport(
+        lambda request: httpx2.Response(200, text=credentials(request.headers))
+    )
     with httpx2.Client(auth=client.http_auth, transport=echo, headers=PLACEHOLDERS) as http:
         sent = http.get("http://wyrd/v1/models").text
     assert sent == repr({"x-wyrd-access-token": "Bearer access-token-1"})
 
 
 def test_each_httpx_request_carries_a_fresh_token() -> None:
-    echo = httpx.MockTransport(lambda request: httpx.Response(200, text=credentials(request.headers)))
+    echo = httpx.MockTransport(
+        lambda request: httpx.Response(200, text=credentials(request.headers))
+    )
     auth = HttpAuth(cast("WyrdClient", Minting()))
     with httpx.Client(auth=auth, transport=echo, headers=PLACEHOLDERS) as http:
         sent = [http.get("http://wyrd/mcp").text for _ in range(2)]
@@ -50,11 +54,15 @@ def test_each_httpx_request_carries_a_fresh_token() -> None:
 
 
 def test_async_requests_carry_a_fresh_token() -> None:
-    echo = httpx2.MockTransport(lambda request: httpx2.Response(200, text=credentials(request.headers)))
+    echo = httpx2.MockTransport(
+        lambda request: httpx2.Response(200, text=credentials(request.headers))
+    )
 
     async def send_twice() -> list[str]:
         auth = HttpAuth(cast("WyrdClient", Minting()))
         async with httpx2.AsyncClient(auth=auth, transport=echo, headers=PLACEHOLDERS) as http:
             return [(await http.get("http://wyrd/v1/models")).text for _ in range(2)]
 
-    assert asyncio.run(send_twice()) == [repr({"x-wyrd-access-token": f"Bearer token-{n}"}) for n in (1, 2)]
+    assert asyncio.run(send_twice()) == [
+        repr({"x-wyrd-access-token": f"Bearer token-{n}"}) for n in (1, 2)
+    ]

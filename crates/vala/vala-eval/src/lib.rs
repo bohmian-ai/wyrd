@@ -41,6 +41,7 @@
 //!   shape used at external surfaces. `From<EvalExecError> for
 //!   EvalError` translates at the surface.
 
+pub mod blocks;
 pub mod compare;
 pub mod context;
 pub mod error;

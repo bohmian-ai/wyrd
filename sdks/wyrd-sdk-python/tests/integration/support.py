@@ -116,9 +116,11 @@ def timeline(server: WyrdTestServer, trace_id: str) -> list[SpanRecord]:
 
 def ancestry(spans: Sequence[SpanRecord], span: SpanRecord) -> list[SpanRecord]:
     """``span`` and each ancestor its parent ids reach within ``spans``, nearest first."""
-    by_id = {(each.trace_id, each.span_id): each for each in spans}
+    by_id = {(each["trace_id"], each["span_id"]): each for each in spans}
     chain = [span]
-    while (parent := by_id.get((chain[-1].trace_id, chain[-1].parent_span_id or ""))) is not None:
+    while (
+        parent := by_id.get((chain[-1]["trace_id"], chain[-1].get("parent_span_id") or ""))
+    ) is not None:
         chain.append(parent)
     return chain
 
@@ -151,5 +153,5 @@ def binding_ids(cards: Cards, ref: CardRef) -> list[str]:
     """The verification binding ids the server derived for ``ref``."""
     status = cards.get(ref).status
     # Status and its verification block stay empty until the server derives them.
-    assert status is not None and status.verification is not None
-    return status.verification.binding_ids
+    assert status is not None and status.get("verification") is not None
+    return status["verification"]["binding_ids"]

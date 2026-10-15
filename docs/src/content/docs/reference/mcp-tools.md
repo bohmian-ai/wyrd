@@ -14,9 +14,19 @@ The Wyrd server exposes its MCP tools over HTTP at `/mcp`. `wyrd mcp proxy` rela
 
 Every request is authenticated in the caller's tenant. Use `tools/list` for the current input and output JSON Schemas and effect annotations. Unknown fields in closed argument objects are refused. IDs and versions below are exact discovered values, not names inferred from a prompt.
 
-Read tools and `wyrd.guide` are always advertised. Principal revocation, verification execution/run creation, and Operator connection writes are advertised only to callers with their required write permission. Gateway writes remain in the catalog and enforce their explicit scopes when invoked. Advertising a tool grants no permission; naming a hidden write tool does not bypass authorization.
+Read tools and `wyrd.guide` are always advertised. Principal revocation, verification execution/run creation, Operator connection writes, and gateway writes, revocation, resets, and deletions are advertised only to callers with their required write or delete permission. Advertising a tool grants no permission; naming a hidden write tool does not bypass authorization.
 
 The tables below summarize wire shapes. Named shapes such as `ExecuteVerificationRequest` or `OperatorConnectionView` are the JSON Schemas `tools/list` returns for that tool; use them for every nested field, enum, and bound. A `{}` input means an empty argument object. Credentials and connection secrets are never returned.
+
+## Agent frameworks
+
+Wyrd serves MCP protocol revision 2026-07-28 only. Its MCP tool names contain dots and do not change. Model providers commonly accept only `^[a-zA-Z0-9_-]{1,64}$` as a function-tool name, so each framework below forwards a model-facing alias instead; its own MCP client still calls the dotted Wyrd tool and surfaces Wyrd's refusals as tool errors. These are the configurations Wyrd's framework journeys test.
+
+| Framework | Tested configuration |
+| --- | --- |
+| OpenAI Agents SDK (Python) | `mcp_config={"convert_schemas_to_strict": True, "include_server_in_tool_names": True}` forwards aliases such as `mcp_wyrd__wyrd_guide`. |
+| Pydantic AI | `MCPToolset(url, headers=...).renamed({"wyrd_guide": "wyrd.guide", ...})`, one entry per discovered tool. |
+| Google ADK | Set `ADK_ENABLE_MCP_MODERN_PROTOCOL=1` (experimental in ADK) to negotiate 2026-07-28, and `GOOGLE_API_USE_CLIENT_CERTIFICATE=false` to skip ADK's Google Cloud mTLS probe. ADK has no renaming option and declares the dotted names as they are, so override `McpToolset.get_tools` to return shallow copies whose `name` is the alias; ADK still calls each copy's original MCP tool. |
 
 ## Investigation guide
 
@@ -80,7 +90,7 @@ A token already minted from a revoked credential lapses within five minutes. The
 | --- | --- | --- | --- |
 | `operator_connections.list` | Read; `operators:read` | `{}` → `{connections}` | List redacted connection metadata |
 | `operator_connections.get` | Read; `operators:read` | `{connection_id}` → OperatorConnectionView | Read one connection |
-| `operator_connections.create` | Write; `operators:write` | CreateOperatorConnectionRequest → OperatorConnectionView | Create provider-tagged Slack, PagerDuty, or HTTP configuration |
+| `operator_connections.create` | Write; `operators:write` | `{request: CreateOperatorConnectionRequest}` → OperatorConnectionView | Create provider-tagged Slack, PagerDuty, or HTTP configuration |
 | `operator_connections.update` | Write; `operators:write` | `{connection_id, request}` → OperatorConnectionView | Patch configuration, secret, or status; provider/name remain fixed |
 | `operator_connections.disable` | Write; `operators:write` | `{connection_id}` → OperatorConnectionView | Retain the connection in disabled state |
 

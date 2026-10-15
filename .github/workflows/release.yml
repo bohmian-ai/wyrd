@@ -395,6 +395,8 @@ jobs:
       - name: Stage and pack addon and root facade
         shell: bash
         run: |
+          version=$(node -p 'require("./sdks/wyrd-sdk-ts/wyrd/package.json").version')
+          echo "TS_VERSION=$version" >> "$GITHUB_ENV"
           mkdir -p dist/addon
           cp sdks/wyrd-sdk-ts/wyrd-${{ matrix.package }}/package.json dist/addon/package.json
           addon=$(find sdks/wyrd-sdk-ts/wyrd -maxdepth 1 -name 'wyrd.*.node' -print -quit)
@@ -402,8 +404,8 @@ jobs:
           cp "$addon" "dist/addon/wyrd.${{ matrix.package }}.node"
           npm pack ./dist/addon --pack-destination "$PWD/dist" --json
           npm pack ./sdks/wyrd-sdk-ts/wyrd --pack-destination "$PWD/dist" --json
-          test -f "dist/wyrd-ai-0.0.1.tgz"
-          test -f "dist/wyrd-ai-${{ matrix.package }}-0.0.1.tgz"
+          test -f "dist/wyrd-ai-${version}.tgz"
+          test -f "dist/wyrd-ai-${{ matrix.package }}-${version}.tgz"
 
       - name: Install and smoke-test native package
         shell: bash
@@ -411,8 +413,8 @@ jobs:
           smoke=$(mktemp -d)
           trap 'rm -rf "$smoke"' EXIT
           printf '{"type":"module","private":true}\n' > "$smoke/package.json"
-          root_tgz=$(realpath "dist/wyrd-ai-0.0.1.tgz")
-          addon_tgz=$(realpath "dist/wyrd-ai-${{ matrix.package }}-0.0.1.tgz")
+          root_tgz=$(realpath "dist/wyrd-ai-${TS_VERSION}.tgz")
+          addon_tgz=$(realpath "dist/wyrd-ai-${{ matrix.package }}-${TS_VERSION}.tgz")
           # Omit the other platform optional dependencies; install the exact
           # addon built on this runner explicitly below.
           npm install --ignore-scripts --no-audit --no-fund --omit=optional \
@@ -482,7 +484,8 @@ jobs:
           for addon in dist/typescript-*/wyrd-ai-*-*.tgz; do
             npm publish "$addon" --access public
           done
-          npm publish dist/typescript-linux-x64-gnu/wyrd-ai-0.0.1.tgz --access public
+          version=$(node -p 'require("./sdks/wyrd-sdk-ts/wyrd/package.json").version')
+          npm publish "dist/typescript-linux-x64-gnu/wyrd-ai-${version}.tgz" --access public
 
   # ── Server bundles + Docker ────────────────────────────────────────────────
 

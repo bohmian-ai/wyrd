@@ -83,7 +83,7 @@ pub(super) fn may_administer(caller: &Caller) -> bool {
 /// # Panics
 /// Panics when the derived schema is not a JSON object, which the `JsonSchema`
 /// derive cannot produce for a struct.
-fn schema_of<T: JsonSchema>() -> Arc<JsonMap<String, JsonValue>> {
+pub(super) fn schema_of<T: JsonSchema>() -> Arc<JsonMap<String, JsonValue>> {
     let root = SchemaGenerator::default().into_root_schema_for::<T>();
     let JsonValue::Object(schema) = serde_json::to_value(root).expect("a derived schema is JSON")
     else {
@@ -97,6 +97,10 @@ fn schema_of<T: JsonSchema>() -> Arc<JsonMap<String, JsonValue>> {
 /// Both schemas come from the shared `wyrd-spec` DTOs the handler below
 /// deserializes and returns, so the advertised contract is the parsed one. A
 /// handwritten schema beside a separate struct is how the two drift.
+///
+/// `I` must be a struct so the input root is a plain object: MCP requires an
+/// object input, and tool-calling consumers such as OpenAI function tools
+/// reject a root union. A tagged union belongs under a named field.
 pub(super) fn tool<I, O>(
     name: &'static str,
     title: &str,
@@ -107,10 +111,7 @@ where
     I: JsonSchema,
     O: JsonSchema,
 {
-    let mut input = schema_of::<I>();
-    // Tagged enums omit the root type; MCP still requires object arguments.
-    Arc::make_mut(&mut input).insert("type".to_owned(), JsonValue::String("object".to_owned()));
-    Tool::new(name, description, input)
+    Tool::new(name, description, schema_of::<I>())
         .with_raw_output_schema(schema_of::<O>())
         .with_title(title)
         .annotate({

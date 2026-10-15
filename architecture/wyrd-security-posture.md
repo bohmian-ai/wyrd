@@ -257,7 +257,10 @@ credential.
   rate-limit `POST /auth/device`, the user-code entry form, per client address
   (RFC 8628 §5.1).
 - The deployment sealing keyring protects only stored provider and
-  workload-issuer client secrets. Wyrd stores no recoverable access token,
+  workload-issuer client secrets and gateway `managed_secret` provider keys.
+  A gateway managed secret is sealed with its tenant, name, and provider
+  inside the authenticated payload, so an envelope copied into another
+  tenant's or credential's row does not open. Wyrd stores no recoverable access token,
   refresh token, authorization code, device code, or API key.
 
 ### Delegation and federation

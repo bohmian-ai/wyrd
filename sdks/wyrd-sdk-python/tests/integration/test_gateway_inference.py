@@ -89,10 +89,10 @@ def test_gateway_span_joins_the_callers_trace(server: WyrdTestServer, admin: Wyr
 
     assert completion.choices[0].message.content == "hi"
     spans = timeline(server, trace_id)
-    attempts = [span for span in spans if span.scope.name == "wyrd.gateway"]
+    attempts = [span for span in spans if span["scope"]["name"] == "wyrd.gateway"]
     assert len(attempts) == 1, spans
-    assert ancestry(spans, attempts[0])[-1].parent_span_id == span_id
-    assert attempts[0].trace_state == "wyrd=journey"
+    assert ancestry(spans, attempts[0])[-1].get("parent_span_id") == span_id
+    assert attempts[0].get("trace_state") == "wyrd=journey"
 
 
 def test_malformed_traceparent_is_ignored_by_the_gateway(

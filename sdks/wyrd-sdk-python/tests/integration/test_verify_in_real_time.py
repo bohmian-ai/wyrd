@@ -104,11 +104,11 @@ def test_traced_verify_joins_the_callers_trace(
 
     context = caller.get_span_context()
     spans = timeline(wyrd_server, format(context.trace_id, "032x"))
-    attempts = [span for span in spans if span.scope.name == "wyrd.gateway"]
+    attempts = [span for span in spans if span["scope"]["name"] == "wyrd.gateway"]
     assert len(attempts) == 1, spans
-    assert ancestry(spans, attempts[0])[-1].parent_span_id == format(context.span_id, "016x"), [
-        (span.name, span.span_id, span.parent_span_id) for span in spans
-    ]
+    assert ancestry(spans, attempts[0])[-1].get("parent_span_id") == format(
+        context.span_id, "016x"
+    ), [(span["name"], span["span_id"], span.get("parent_span_id")) for span in spans]
 
 
 def test_sdk_requests_carry_the_active_trace(wyrd_server: WyrdTestServer) -> None:
@@ -120,8 +120,12 @@ def test_sdk_requests_carry_the_active_trace(wyrd_server: WyrdTestServer) -> Non
     context = caller.get_span_context()
     spans = timeline(wyrd_server, format(context.trace_id, "032x"))
     assert [
-        span.name for span in spans if span.parent_span_id == format(context.span_id, "016x")
-    ] == ["request"], [(span.name, span.span_id, span.parent_span_id) for span in spans]
+        span["name"]
+        for span in spans
+        if span.get("parent_span_id") == format(context.span_id, "016x")
+    ] == ["request"], [
+        (span["name"], span["span_id"], span.get("parent_span_id")) for span in spans
+    ]
 
 
 def test_model_latency_like_the_baseline_passes_its_verifier(assistant: WyrdState) -> None:

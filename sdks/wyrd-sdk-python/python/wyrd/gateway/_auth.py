@@ -25,19 +25,37 @@ class GatewayAuth(httpx.Auth, httpx2.Auth):
     ``httpx``; both run the same auth-flow protocol, so one instance serves
     either. Each request carries ``Authorization: Bearer <token>`` from
     ``client.access_token()``, asked for on that request, so a long-lived
-    client keeps working after any one access token expires.
+    client keeps working after any one access token expires. Needs the
+    ``gateway`` extra (``pip install 'wyrd[gateway]'``).
     """
 
     def __init__(self, client: WyrdClient) -> None:
+        """Authenticate as ``client``.
+
+        Args:
+            client: The client whose access token every request carries.
+        """
         self._client = client
 
     # The flows keep their bases' signatures: each base types them with its
     # own Request class, and one instance serves both.
     def sync_auth_flow(self, request):
+        """Stamp a fresh bearer token on one synchronous request.
+
+        Args:
+            request: The outgoing ``httpx`` or ``httpx2`` request.
+        """
         request.headers["Authorization"] = f"Bearer {self._client.access_token()}"
         yield request
 
     async def async_auth_flow(self, request):
+        """Stamp a fresh bearer token on one asynchronous request.
+
+        The token is fetched in a worker thread so the event loop never blocks.
+
+        Args:
+            request: The outgoing ``httpx`` or ``httpx2`` request.
+        """
         token = await asyncio.to_thread(self._client.access_token)
         request.headers["Authorization"] = f"Bearer {token}"
         yield request

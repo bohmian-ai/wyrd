@@ -41,7 +41,7 @@ class Action(BaseModel):
 
 def outline(spans: Sequence[SpanRecord]) -> str:
     """One ``scope kind name`` line per span, for a readable assertion message."""
-    return "\n".join(f"{span.scope.name} {span.kind} {span.name}" for span in spans)
+    return "\n".join(f"{span['scope']['name']} {span['kind']} {span['name']}" for span in spans)
 
 
 def holds_in_order(names: Sequence[str], steps: Sequence[Callable[[str], bool]]) -> bool:
@@ -90,33 +90,35 @@ def test_service_action_timeline_is_one_connected_tree(
 
     trace_id = format(action.get_span_context().trace_id, "032x")
     read = timeline(wyrd_server, trace_id)
-    starts = [span.start_time for span in read]
+    starts = [span["start_time"] for span in read]
     assert starts == sorted(starts), read
-    spans = [span for span in read if span.trace_id == trace_id]
-    linked = [span for span in read if span.trace_id != trace_id]
-    roots = [span for span in spans if span.parent_span_id is None]
-    assert [(root.name, root.scope.name) for root in roots] == [("service.action", SERVICE_SCOPE)]
+    spans = [span for span in read if span["trace_id"] == trace_id]
+    linked = [span for span in read if span["trace_id"] != trace_id]
+    roots = [span for span in spans if span.get("parent_span_id") is None]
+    assert [(root["name"], root["scope"]["name"]) for root in roots] == [
+        ("service.action", SERVICE_SCOPE)
+    ]
     for span in spans:
-        assert ancestry(spans, span)[-1] == roots[0], span.name
-    assert any(span.name == "answer" for span in spans)
+        assert ancestry(spans, span)[-1] == roots[0], span["name"]
+    assert any(span["name"] == "answer" for span in spans)
     producers = [
-        span for span in spans if span.kind == "producer" and span.name == "bifrost.enqueue"
+        span for span in spans if span["kind"] == "producer" and span["name"] == "bifrost.enqueue"
     ]
     assert len(producers) >= 2, outline(spans)
     for producer in producers:
         assert any(
-            consumer.name == "bifrost.gate.write"
-            and consumer.kind == "consumer"
+            consumer["name"] == "bifrost.gate.write"
+            and consumer["kind"] == "consumer"
             and any(
-                (link.trace_id, link.span_id) == (producer.trace_id, producer.span_id)
-                for link in consumer.links
+                (link["trace_id"], link["span_id"]) == (producer["trace_id"], producer["span_id"])
+                for link in consumer.get("links", [])
             )
             for consumer in linked
         ), outline(linked)
     attempts = [
-        [each.name for each in ancestry(spans, span)]
+        [each["name"] for each in ancestry(spans, span)]
         for span in spans
-        if span.scope.name == GATEWAY_SCOPE
+        if span["scope"]["name"] == GATEWAY_SCOPE
     ]
     assert len(attempts) == 2, attempts
     assert any(

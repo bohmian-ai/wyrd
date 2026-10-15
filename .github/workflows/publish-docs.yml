@@ -13,9 +13,6 @@ on:
     branches: [main]
     paths:
       - docs/**
-      # Generators read JSON schemas from wyrd-spec, so schema edits can change
-      # the generated card/api pages and llms.txt.
-      - crates/wyrd-spec/schemas/**
       - .github/workflows/publish-docs.yml
   workflow_dispatch:
 
@@ -63,8 +60,8 @@ jobs:
       - name: Install docs dependencies
         run: mise run docs:install
 
-      # Regenerate schema-derived pages and llms.txt so the deployed site is
-      # never stale relative to the schemas at this commit.
+      # Regenerate the API pages and llms indexes so the deployed site is never
+      # stale relative to the content tree at this commit.
       - name: Generate docs
         run: mise run docs:generate
 

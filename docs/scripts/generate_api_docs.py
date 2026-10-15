@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Refresh published API reference pages from repository metadata.
 
-Like generate_card_docs.py, this only rewrites pages that already exist in the
-content tree; publishing a page means adding its file.
+This only rewrites pages that already exist in the content tree; publishing a
+page means adding its file.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
@@ -21,8 +20,6 @@ def md_escape(value: str) -> str:
 
 
 DOCS_ROOT = Path(__file__).resolve().parents[1]
-REPO_ROOT = DOCS_ROOT.parent
-SCHEMA_DIR = REPO_ROOT / "crates" / "wyrd-spec" / "schemas"
 OUT_DIR = DOCS_ROOT / "src" / "content" / "docs" / "api"
 
 
@@ -64,44 +61,6 @@ def render_openapi() -> str:
         "Every operation declares its authentication, typed request and response",
         "bodies, `application/problem+json` error media type, and the stable Wyrd",
         "error codes it can return.",
-        "",
-    ]
-    return "\n".join(lines)
-
-
-def render_schemas() -> str:
-    schema_files = sorted(SCHEMA_DIR.glob("*.json"))
-    schema_dir = SCHEMA_DIR.relative_to(REPO_ROOT)
-    # Emit data rows (filename + type title); the shared DataTable component owns
-    # the presentation. The directory prefix is stated once in the intro, so rows
-    # carry only the filename.
-    columns = [
-        {"header": "Schema", "role": "name"},
-        {"header": "Title", "role": "type"},
-    ]
-    rows = []
-    for schema_path in schema_files:
-        try:
-            schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            schema = {}
-        title = schema.get("title") or schema_path.stem
-        rows.append([schema_path.name, str(title)])
-
-    lines = [
-        "---",
-        "title: Schemas",
-        "description: Generated inventory of Wyrd JSON Schemas.",
-        "pillar: wyrd",
-        "section: Reference",
-        "order: 23",
-        "---",
-        "",
-        "# Schemas",
-        "",
-        f"These schemas are generated from the Wyrd spec crate and checked into the repository under `{schema_dir}/` for clients, docs, and agents. `architecture/wyrd-design.md` remains the design authority; this inventory may include implementation drift while contracts are being reconciled.",
-        "",
-        f"<DataTable columns={{{json.dumps(columns)}}} rows={{{json.dumps(rows)}}} />",
         "",
     ]
     return "\n".join(lines)
@@ -224,11 +183,12 @@ def render_errors() -> str:
 
 
 def main() -> None:
-    pages = {"openapi.md": render_openapi, "schemas.md": render_schemas, "errors.md": render_errors}
+    pages = {"openapi.md": render_openapi, "errors.md": render_errors}
     for name, render in pages.items():
         page = OUT_DIR / name
         if page.exists():
             page.write_text(render(), encoding="utf-8")
+
 
 if __name__ == "__main__":
     main()

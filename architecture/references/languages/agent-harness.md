@@ -68,11 +68,15 @@ contract.
 Generated artifacts are part of the harness. Keep generation commands
 stable and fail on drift:
 
-- `mise run codegen:check` — fail on drift for JSON schemas, language
-  declarations, and public Python stubs
+- `mise run codegen:check` — fail on drift for TypeScript wire types and error
+  codes, UI problem examples, and theme tokens
 - `mise run codegen:regen` — regenerate every artifact owned by the
   code-generation lane from source
-- `mise run codegen:stubs` — regenerate Python stubs
+
+JSON Schemas are derived from `wyrd-spec` types at runtime (MCP `tools/list`,
+the served OpenAPI document) or transiently by the generator; none is
+committed. Python `.pyi` stubs are authored typing, validated by
+`mise run py:lints` and `mise run py:typecheck`.
 
 The OpenAPI document is not a generated artifact: `utoipa` builds it from the
 server's handlers and the server serves it at `GET /openapi.json`, so OpenAPI
@@ -80,7 +84,7 @@ changes are proved against the served document by the assembled-server
 contract suite (`crates/wyrd/wyrd-server/tests/integration/pg_openapi_contract.rs`, run by
 `mise run test:principals:integration`) rather than by a drift snapshot.
 
-If a schema, stub, or declaration is wrong, fix the source or generator
+If a schema or generated declaration is wrong, fix the source or generator
 instead of editing the artifact. Runtime MCP catalogs are verified by their
 owning MCP contract and behavior tests; do not infer MCP coverage from the
 code-generation lane.

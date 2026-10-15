@@ -13,42 +13,6 @@ needs its data or model in memory; ``get(..., eager_load=True)`` does both in
 one call.
 """
 
-from typing import Protocol
-
-from .._card_types import (
-    AgentSpec,
-    DataSpec,
-    DriftBaselineState,
-    DriftBaselineStatus,
-    ModelSpec,
-    OperatorSpec,
-    PromptSpec,
-    RegisteredAgentCard,
-    RegisteredArtifactCard,
-    RegisteredAuditCard,
-    RegisteredCard,
-    RegisteredDataCard,
-    RegisteredExperimentCard,
-    RegisteredMcpCard,
-    RegisteredModelCard,
-    RegisteredOperatorCard,
-    RegisteredPolicyCard,
-    RegisteredPromptCard,
-    RegisteredServiceCard,
-    RegisteredSourceCard,
-    RegisteredTriggerCard,
-    RegisteredUntypedCard,
-    RegisteredVerifierCard,
-    RegisteredWorkflowCard,
-    ServiceSpec,
-    TriggerSpec,
-    TypedCardKind,
-    VerificationStatus,
-    VerifierSpec,
-)
-from .._card_types import Metadata as CardMetadata
-from .._card_types import Relationships as CardRelationships
-from .._card_types import Status as CardStatus
 from .._wyrd.cards import (
     CardKind,
     CardList,
@@ -69,25 +33,7 @@ from .._wyrd.cards import (
     WorkflowCards,
 )
 from .._wyrd.cards.agent import AgentCard
-
-
-class Card(Protocol):
-    """Shared authoring capability implemented by native card holders.
-
-    ``DataCard``, ``ModelCard``, and ``PromptCard`` are the registerable
-    implementations; pass one to ``Cards.register``. Do not construct
-    ``Card`` directly.
-    """
-
-    space: str
-    name: str
-    version: str
-    uid: str
-
-    def _to_card_envelope_json(self) -> str:
-        """Return the holder's single Wyrd envelope conversion."""
-        ...
-
+from ._card import Card
 
 __all__ = [
     "AgentCard",
@@ -109,36 +55,4 @@ __all__ = [
     "RegistrationOutcome",
     "RegistrationReceipt",
     "HydrationSummary",
-    "AgentSpec",
-    "CardMetadata",
-    "CardRelationships",
-    "CardStatus",
-    "DataSpec",
-    "DriftBaselineState",
-    "DriftBaselineStatus",
-    "ModelSpec",
-    "OperatorSpec",
-    "PromptSpec",
-    "RegisteredAgentCard",
-    "RegisteredCard",
-    "RegisteredDataCard",
-    "RegisteredModelCard",
-    "RegisteredOperatorCard",
-    "RegisteredPromptCard",
-    "RegisteredServiceCard",
-    "RegisteredTriggerCard",
-    "RegisteredUntypedCard",
-    "RegisteredVerifierCard",
-    "RegisteredArtifactCard",
-    "RegisteredAuditCard",
-    "RegisteredExperimentCard",
-    "RegisteredMcpCard",
-    "RegisteredPolicyCard",
-    "RegisteredSourceCard",
-    "RegisteredWorkflowCard",
-    "ServiceSpec",
-    "TriggerSpec",
-    "TypedCardKind",
-    "VerificationStatus",
-    "VerifierSpec",
 ]

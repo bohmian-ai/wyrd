@@ -31,11 +31,12 @@ use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::{
     AttemptRecord, AttemptResult, AttemptUsage, CallExecution, CallPlan, CredentialResolver,
-    DeploymentHealth, FailureClass, GatewayCost, GatewayEngine, IngressDialect, ManagedSecretKeys,
-    MediaAnswer, ProviderAttempt, ProviderDispatch, ProviderSecret, ResponseBody, ResponseCapture,
+    DeploymentHealth, FailureClass, GatewayCost, GatewayEngine, IngressDialect, MediaAnswer,
+    ProviderAttempt, ProviderDispatch, ProviderSecret, ResponseBody, ResponseCapture,
 };
 use wyrd_runtime::{
     Action, Permission, PermissionSet, Principal, PrincipalId, PrincipalKind, Resource, RoleRef,
@@ -63,7 +64,7 @@ use super::capture::object_path;
 use super::capture::recording::RecordingScribe;
 use super::ledger::{GatewayLedger, LedgerCall};
 use super::pg_administration_tests::{
-    admin, audit_decisions, await_lock_waiters, keyring, managed_keys, test_state,
+    admin, audit_decisions, await_lock_waiters, sealing_keyring, test_state,
 };
 use super::{GatewayAdministration, GatewayCallRequest, GatewayCallResponse, GatewayInvocation};
 use crate::components::auth::Caller;
@@ -483,26 +484,64 @@ impl ProviderDispatch for RecordingKeys {
     }
 }
 
-/// Builds one replica whose administration and resolver share `keys`, the
-/// shape a restarted or additional process has when it loads the same
-/// configured tenant keyrings.
+/// Builds one replica whose administration and resolver share the deployment
+/// sealing `keyring`, the shape a restarted or additional process has when it
+/// boots with the same `WYRD_SEALING_KEY_FILE`.
 ///
 /// # Panics
 ///
 /// Panics when the replica's application state cannot be built on `fixture`.
 async fn managed_replica(
     fixture: &PgFixture,
-    keys: Arc<ManagedSecretKeys>,
+    keyring: Option<Arc<SealingKeyring>>,
     dispatch: Arc<dyn ProviderDispatch>,
 ) -> AppState {
-    test_state(fixture)
-        .await
-        .with_gateway_secret_keys(Arc::clone(&keys))
-        .with_gateway_engine(GatewayEngine::new(
-            CredentialResolver::new(std::collections::BTreeMap::new(), keys),
-            DeploymentHealth::default(),
-            dispatch,
-        ))
+    let mut state = test_state(fixture).await;
+    state.auth.sealing_key = keyring.clone();
+    state.with_gateway_engine(GatewayEngine::new(
+        CredentialResolver::new(std::collections::BTreeMap::new(), keyring),
+        DeploymentHealth::default(),
+        dispatch,
+    ))
+}
+
+/// Reads `tenant`'s stored `managed` envelope through that tenant's own
+/// row-level-secured connection.
+///
+/// # Panics
+///
+/// Panics when the tenant connection, the row query, or its commit fails.
+async fn managed_envelope(fixture: &PgFixture, tenant: DataTenantId) -> Vec<u8> {
+    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
+    let sealed = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT secret_ciphertext FROM wyrd.gateway_provider_credentials WHERE name = 'managed'",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("managed envelope");
+    conn.commit().await.expect("read commits");
+    sealed
+}
+
+/// Overwrites `tenant`'s stored `managed` envelope with `sealed` through that
+/// tenant's own connection, as a database-level copy attack would.
+///
+/// # Panics
+///
+/// Panics when the tenant connection, the update, or its commit fails, or
+/// when no `managed` row exists.
+async fn replace_managed_envelope(fixture: &PgFixture, tenant: DataTenantId, sealed: &[u8]) {
+    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
+    let updated = sqlx::query(
+        "UPDATE wyrd.gateway_provider_credentials SET secret_ciphertext = $1 \
+         WHERE name = 'managed'",
+    )
+    .bind(sealed)
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("envelope replaced");
+    assert_eq!(updated.rows_affected(), 1, "the managed row exists");
+    conn.commit().await.expect("replace commits");
 }
 
 /// Submits `secret` as `tenant`'s managed credential and points the only
@@ -575,17 +614,35 @@ async fn invoke_managed(
         .await
 }
 
-/// Managed credentials resolve per tenant from the locally configured
-/// keyring: two tenants send their own key upstream, a restarted replica and
-/// a rotated active version keep resolving committed envelopes, and missing,
-/// incorrect, or revoked authority fails with the stable 503-class error
-/// before any dispatch.
+/// Asserts that invoking `acme/a` in `tenant` on `state` is refused with the
+/// stable, redacted upstream-unavailable error.
 ///
 /// # Panics
 ///
-/// Panics when a tenant's own key does not reach dispatch, when a refusal
-/// dispatches, or when a refusal is not the redacted upstream-unavailable
-/// error.
+/// Panics when the call succeeds or fails with any other error.
+async fn assert_refused(state: &AppState, tenant: DataTenantId, reason: &str) {
+    let refused = invoke_managed(state, tenant)
+        .await
+        .expect_err("key authority is unusable");
+    assert!(
+        matches!(refused, WyrdError::GatewayUpstreamUnavailable { .. }),
+        "{reason}: {refused:?}"
+    );
+}
+
+/// Managed credentials are sealed with the deployment sealing keyring and stay
+/// tenant-bound: two tenants send their own key upstream, a restarted replica
+/// with the same key keeps resolving, the production boot rewrap moves every
+/// envelope onto a rotated write key, and an envelope copied into another
+/// tenant's row, a keyless deployment, a key retired before rewrap, or a
+/// revoked credential all fail with the stable 503-class error before any
+/// dispatch.
+///
+/// # Panics
+///
+/// Panics when a tenant's own key does not reach dispatch, when the rewrap
+/// leaves an envelope on the old key, when a refusal dispatches, or when a
+/// refusal is not the redacted upstream-unavailable error.
 #[tokio::test]
 async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotation() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -596,9 +653,8 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
         .expect("second tenant");
     let tenants = [first, second];
     let dispatch = RecordingKeys::shared();
-    let live = managed_keys(&tenants, "v1", &["v0", "v1"]);
 
-    let state = managed_replica(&fixture, Arc::clone(&live), dispatch.clone()).await;
+    let state = managed_replica(&fixture, Some(sealing_keyring(1)), dispatch.clone()).await;
     configure_managed(&state, first, "sk-first-tenant").await;
     configure_managed(&state, second, "sk-second-tenant").await;
     for tenant in tenants {
@@ -610,91 +666,94 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
         "each tenant's own key, and only it, reaches dispatch"
     );
 
-    // A restarted replica loading the same keyrings resolves committed values.
-    let restarted = managed_replica(
-        &fixture,
-        managed_keys(&tenants, "v1", &["v0", "v1"]),
-        dispatch.clone(),
-    )
-    .await;
+    // A restarted replica booting with the same sealing key resolves
+    // committed values.
+    let restarted = managed_replica(&fixture, Some(sealing_keyring(1)), dispatch.clone()).await;
     invoke_managed(&restarted, first).await.expect("restart");
     assert_eq!(dispatch.seen().len(), 3);
 
-    // Rotating the active version keeps the retained version readable, and a
-    // resubmission moves the credential onto the new active version.
-    let rotated = managed_replica(
-        &fixture,
-        managed_keys(&tenants, "v2", &["v1", "v2"]),
-        dispatch.clone(),
+    // Rotation follows the deployment procedure: the new write key with the
+    // old one retained still resolves, while a replica holding only the new
+    // key refuses until the boot rewrap has resealed every envelope.
+    let rotation = Arc::new(
+        SealingKeyring::new(SecretKey::from_bytes([2; 32]))
+            .with_retained(SecretKey::from_bytes([1; 32])),
+    );
+    let rotated = managed_replica(&fixture, Some(Arc::clone(&rotation)), dispatch.clone()).await;
+    invoke_managed(&rotated, first).await.expect("retained key");
+    let retired = managed_replica(&fixture, Some(sealing_keyring(2)), dispatch.clone()).await;
+    assert_refused(&retired, first, "the old key was retired before rewrap").await;
+    assert_eq!(dispatch.seen().len(), 4, "the refusal did not dispatch");
+
+    let committed = managed_envelope(&fixture, first).await;
+    crate::boot::rewrap_sealed_secrets(
+        Some(fixture.operator_pool().clone()),
+        Some(Arc::clone(&rotation)),
     )
-    .await;
-    invoke_managed(&rotated, first).await.expect("retained");
-    configure_managed(&rotated, first, "sk-first-rotated").await;
-    invoke_managed(&rotated, first).await.expect("resealed");
+    .await
+    .expect("boot rewrap");
+    assert_ne!(
+        managed_envelope(&fixture, first).await,
+        committed,
+        "the rewrap resealed the stored envelope"
+    );
+    // A replica booting with only the new key after the rewrap opens every
+    // envelope. It is a fresh process, as in the rollout: the retired replica
+    // above keeps its process-local cooldown from the refusal it just served.
+    let rewrapped = managed_replica(&fixture, Some(sealing_keyring(2)), dispatch.clone()).await;
+    for tenant in tenants {
+        invoke_managed(&rewrapped, tenant)
+            .await
+            .expect("a rewrapped envelope opens under the new key alone");
+    }
     assert_eq!(
         dispatch.seen()[3..],
-        ["sk-first-tenant", "sk-first-rotated"]
+        ["sk-first-tenant", "sk-first-tenant", "sk-second-tenant"]
     );
 
-    // Every failure of key authority refuses before dispatch.
+    // Every tenant shares the deployment keyring, yet an envelope copied into
+    // another tenant's row never opens there, and a keyless deployment opens
+    // nothing.
     let dispatched = dispatch.seen().len();
-    let unconfigured = managed_replica(&fixture, Arc::default(), dispatch.clone()).await;
-    let retired = managed_replica(
-        &fixture,
-        managed_keys(&tenants, "v0", &["v0"]),
-        dispatch.clone(),
+    let foreign = managed_envelope(&fixture, second).await;
+    replace_managed_envelope(&fixture, first, &foreign).await;
+    assert_refused(&rewrapped, first, "another tenant's envelope opened").await;
+    let unconfigured = managed_replica(&fixture, None, dispatch.clone()).await;
+    assert_refused(
+        &unconfigured,
+        second,
+        "a keyless deployment opened a secret",
     )
     .await;
-    let foreign = managed_replica(
-        &fixture,
-        Arc::new(ManagedSecretKeys::new(
-            [(first, keyring(second, "v2", &["v2"]))]
-                .into_iter()
-                .collect(),
-        )),
-        dispatch.clone(),
-    )
-    .await;
-    for (refusing, reason) in [
-        (&unconfigured, "no keyring is configured for the tenant"),
-        (&retired, "the sealing version was retired too early"),
-        (&foreign, "the keyring holds another tenant's material"),
-    ] {
-        let refused = invoke_managed(refusing, first)
-            .await
-            .expect_err("key authority is unusable");
-        assert!(
-            matches!(refused, WyrdError::GatewayUpstreamUnavailable { .. }),
-            "{reason}: {refused:?}"
-        );
-    }
-
-    // Revocation is equally terminal for a managed credential.
-    GatewayAdministration::new(&state)
-        .revoke_credential(
-            &admin(first),
-            &ProviderCredentialName::new("managed").expect("credential name"),
-        )
-        .await
-        .expect("revoke");
-    let revoked = invoke_managed(&state, first)
-        .await
-        .expect_err("a revoked credential never resolves");
-    assert!(
-        matches!(revoked, WyrdError::GatewayUpstreamUnavailable { .. }),
-        "{revoked:?}"
-    );
     assert_eq!(
         dispatch.seen().len(),
         dispatched,
         "no refusal reached the provider"
     );
+    invoke_managed(&rewrapped, second)
+        .await
+        .expect("the copied-from tenant still resolves its own key");
+
+    // Revocation is equally terminal for a managed credential.
+    GatewayAdministration::new(&state)
+        .revoke_credential(
+            &admin(second),
+            &ProviderCredentialName::new("managed").expect("credential name"),
+        )
+        .await
+        .expect("revoke");
+    assert_refused(&rewrapped, second, "a revoked credential resolved").await;
+    assert_eq!(
+        dispatch.seen().len(),
+        dispatched + 1,
+        "no refusal reached the provider"
+    );
     drain_gateway(&state).await;
     drain_gateway(&restarted).await;
     drain_gateway(&rotated).await;
-    drain_gateway(&unconfigured).await;
     drain_gateway(&retired).await;
-    drain_gateway(&foreign).await;
+    drain_gateway(&rewrapped).await;
+    drain_gateway(&unconfigured).await;
 }
 
 /// Public handler and internal seam share one pipeline: the requested model
@@ -1559,7 +1618,6 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
                 },
             )]),
             secret_backends: std::collections::BTreeMap::new(),
-            ..Default::default()
         })
         .with_gateway_engine(GatewayEngine::new(
             CredentialResolver::default(),
@@ -2342,7 +2400,6 @@ async fn http_replica(fixture: &PgFixture, tenant: DataTenantId, secret: &Path) 
                 },
             )]),
             secret_backends: std::collections::BTreeMap::new(),
-            ..Default::default()
         })
         .with_gateway_engine(GatewayEngine::new(
             CredentialResolver::default(),
@@ -4158,7 +4215,6 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
                     },
                 )]),
                 secret_backends: std::collections::BTreeMap::new(),
-                ..Default::default()
             })
             .with_gateway_engine(GatewayEngine::new(
                 CredentialResolver::default(),
@@ -5358,8 +5414,7 @@ async fn public_ingress_workflow_fallback() {
         },
     )
     .expect("gateway dispatch builds");
-    let keys = super::pg_administration_tests::managed_keys(&[tenant], "v1", &["v1"]);
-    let state = managed_replica(&fixture, keys, Arc::new(dispatch)).await;
+    let state = managed_replica(&fixture, Some(sealing_keyring(1)), Arc::new(dispatch)).await;
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
     for (provider, auth, capabilities, served) in [

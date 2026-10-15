@@ -1,8 +1,0 @@
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "IssuerUrl",
-  "description": "Absolute OIDC issuer URL. Trailing slashes are normalized away.",
-  "type": "string",
-  "format": "uri",
-  "pattern": "^https://"
-}

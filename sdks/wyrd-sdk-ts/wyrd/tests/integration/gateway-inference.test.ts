@@ -2,8 +2,11 @@ import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+import { Agent, run, setTracingDisabled, tool } from "@openai/agents-core";
+import { OpenAIResponsesModel } from "@openai/agents-openai";
 import OpenAI from "openai";
 import { expect, vi } from "vitest";
+import { z } from "zod";
 
 import {
   Bifrost,
@@ -35,6 +38,58 @@ const COMPLETION = {
   usage: { prompt_tokens: 11, completion_tokens: 4, total_tokens: 15 },
 };
 
+/** Responses usage the upstream reports. */
+const RESPONSE_USAGE = {
+  input_tokens: 5,
+  output_tokens: 3,
+  total_tokens: 8,
+  input_tokens_details: { cached_tokens: 0 },
+  output_tokens_details: { reasoning_tokens: 0 },
+};
+
+/** A buffered Responses answer carrying `output`. */
+function response(output: unknown[]): unknown {
+  return {
+    id: "resp_1",
+    object: "response",
+    created_at: 1,
+    model: "gpt-4o-mini",
+    status: "completed",
+    output,
+    usage: RESPONSE_USAGE,
+  };
+}
+
+/**
+ * The upstream's Responses turn: an `echo` call until the input carries its
+ * result, then the final answer.
+ */
+function responsesTurn(body: string): unknown {
+  const answered = (JSON.parse(body) as { input: { type?: string }[] }).input.some(
+    (item) => item.type === "function_call_output",
+  );
+  return answered
+    ? response([
+        {
+          type: "message",
+          id: "msg_1",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "echoed", annotations: [] }],
+        },
+      ])
+    : response([
+        {
+          type: "function_call",
+          id: "fc_1",
+          call_id: "c1",
+          name: "echo",
+          arguments: '{"text":"hi"}',
+          status: "completed",
+        },
+      ]);
+}
+
 /** The code-review example Workflow directory; its Prompts call `gpt-5-5` through the Wyrd gateway. */
 const EXAMPLE = resolve(import.meta.dirname, "../../../../../examples/workflows/code-review");
 
@@ -61,7 +116,12 @@ function deployment(model: string): ProviderDeployment {
  * local upstream with the operator's provider key, call metadata capture, and
  * the registered `ask` Workflow.
  */
-const test = serverTest({ provider: () => ({ status: 200, body: COMPLETION }) }).extend<{
+const test = serverTest({
+  provider: ({ path, body }) => ({
+    status: 200,
+    body: path === "/v1/responses" ? responsesTurn(body) : COMPLETION,
+  }),
+}).extend<{
   ask: RegistrationReceipt;
 }>({
   ask: [
@@ -74,6 +134,7 @@ const test = serverTest({ provider: () => ({ status: 200, body: COMPLETION }) })
       const gateway = Gateway.connect();
       await gateway.putDeployment(deployment("gpt-4o"));
       await gateway.putDeployment(deployment("gpt-5-5"));
+      await gateway.putDeployment({ ...deployment("gpt-4o-mini"), capabilities: ["responses"] });
       await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });
       await use(await Cards.connect().registerFromPath(fixture("cards/gateway_inference/ask.yaml")));
     },
@@ -170,6 +231,54 @@ test("gateway call records a lone run or card", async ({ server, ask }) => {
   ).toArrow();
   expect(columnValues(calls.getChild("run_id"))).toEqual(["run-alone", null]);
   expect(columnValues(calls.getChild("card_uid"))).toEqual([null, cardUid]);
+});
+
+/** An Agents SDK agent on the Gateway's Responses API whose `echo` tool returns content parts. */
+function echoAgent(client: OpenAI): Agent {
+  setTracingDisabled(true);
+  const echo = tool({
+    name: "echo",
+    description: "Echo the text.",
+    parameters: z.object({ text: z.string() }),
+    execute: async ({ text }) => ({ type: "text" as const, text }),
+  });
+  return new Agent({
+    name: "echo-agent",
+    instructions: "Call echo.",
+    model: new OpenAIResponsesModel(client, "openai/gpt-4o-mini"),
+    tools: [echo],
+  });
+}
+
+test("agents sdk responses tool loop runs through the gateway", async ({ provider, ask: _ }) => {
+  const { client } = await openai(WyrdClient.connect());
+  const before = provider.received.length;
+
+  const result = await run(echoAgent(client), "go");
+
+  expect(result.finalOutput).toBe("echoed");
+  const upstream = provider.received.slice(before);
+  expect(upstream.map(({ path }) => path)).toEqual(["/v1/responses", "/v1/responses"]);
+  const [first, second] = upstream.map(({ body }) => JSON.parse(body) as { model: string; input: unknown[] });
+  expect(first?.model).toBe("gpt-4o-mini");
+  expect(first?.input).toEqual([{ role: "user", content: "go" }]);
+  expect(second?.input).toContainEqual({ role: "user", content: "go" });
+  expect(second?.input).toContainEqual(
+    expect.objectContaining({
+      type: "function_call_output",
+      call_id: "c1",
+      output: [{ type: "input_text", text: "hi" }],
+    }),
+  );
+});
+
+test("caller without gateway invoke cannot run an agents sdk agent", async ({ server, provider, ask: _ }) => {
+  const reader = WyrdClient.connect({ credential: server.scopedApiKey("gateway_reader", ["gateway:read"]) });
+  const { client } = await openai(reader);
+  const before = provider.received.length;
+
+  await expect(run(echoAgent(client), "go")).rejects.toMatchObject({ status: 403 });
+  expect(provider.received.slice(before)).toEqual([]);
 });
 
 test("cli issues a card scoped key and writes a provider credential", async ({ ask: _ }) => {

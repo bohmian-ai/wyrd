@@ -7,8 +7,6 @@ import types
 import typing
 from typing import Any
 
-from ._wyrd import WyrdError, build_wyrd_error
-
 _PRIMITIVES: dict[Any, dict] = {
     str: {"type": "string"},
     int: {"type": "integer"},
@@ -16,11 +14,6 @@ _PRIMITIVES: dict[Any, dict] = {
     bool: {"type": "boolean"},
     bytes: {"type": "string", "contentEncoding": "base64"},
 }
-
-
-def _wyrd_error(code: str, detail: str) -> WyrdError:
-    """Build a fully populated catalog-backed Wyrd exception."""
-    return build_wyrd_error(code, detail)
 
 
 def annotation_to_schema(annotation: Any) -> dict:
@@ -84,68 +77,4 @@ def annotation_to_schema(annotation: Any) -> dict:
         return {}
 
 
-def output_to_json_schema(
-    output: Any, *, default_name: str = "structured_output"
-) -> tuple[str, dict]:
-    """Coerce a Prompt output declaration to a named JSON Schema object.
-
-    Args:
-        output: a raw JSON Schema dict (one with a string ``"type"``), a
-            ``dict[str, type]`` whose keys all become required properties, or
-            a ``pydantic.BaseModel`` subclass.
-        default_name: the schema name returned for a dict declaration; a
-            model class is named after the class.
-
-    Returns:
-        The schema name and the JSON Schema object.
-
-    Raises:
-        WyrdError: ``WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA`` for any other
-            declaration or a non-string key; ``WYRD_PROMPT_422_PYDANTIC_REQUIRED``
-            for a class when pydantic is not installed.
-
-    """
-    if isinstance(output, dict):
-        if "type" in output and isinstance(output["type"], str):
-            return default_name, output
-        properties: dict[str, dict] = {}
-        required: list[str] = []
-        for key, annotation in output.items():
-            if not isinstance(key, str):
-                raise _wyrd_error(
-                    "WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA",
-                    f"output schema keys must be strings, got {type(key)!r}",
-                )
-            properties[key] = annotation_to_schema(annotation)
-            required.append(key)
-        return default_name, {
-            "type": "object",
-            "properties": properties,
-            "required": required,
-            "additionalProperties": False,
-        }
-
-    if isinstance(output, type):
-        try:
-            import pydantic
-        except ImportError as exc:
-            raise _wyrd_error(
-                "WYRD_PROMPT_422_PYDANTIC_REQUIRED",
-                "passing a class to Prompt(output=...) requires pydantic; "
-                "install pydantic or use dict[str, type] instead.",
-            ) from exc
-        if not issubclass(output, pydantic.BaseModel):
-            raise _wyrd_error(
-                "WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA",
-                f"output class must subclass pydantic.BaseModel, got {output!r}",
-            )
-        return output.__name__, output.model_json_schema()
-
-    raise _wyrd_error(
-        "WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA",
-        "output must be a dict[str, type], raw JSON schema dict, "
-        f"ResponseFormat, or pydantic BaseModel subclass, got {type(output)!r}",
-    )
-
-
-__all__ = ["annotation_to_schema", "output_to_json_schema"]
+__all__ = ["annotation_to_schema"]

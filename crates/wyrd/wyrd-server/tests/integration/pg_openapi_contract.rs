@@ -830,6 +830,9 @@ async fn gateway_operations_publish_problem_json_refusals() {
 /// `limit` carries the bounds the runtime enforces; payload retrieval publishes
 /// a binary string; and the Anthropic Messages and Gemini `GenerateContent`
 /// routes publish open, typed native bodies and their own error envelopes.
+/// The Responses request contract admits every input item form the gateway
+/// decodes, including easy input messages and content-part tool results, and
+/// refuses malformed items.
 #[tokio::test]
 async fn gateway_ingress_publishes_typed_contracts() {
     let server = WyrdTestServer::start_in_process()
@@ -1102,6 +1105,35 @@ async fn gateway_ingress_publishes_typed_contracts() {
         serde_json::json!("string"),
         "the Jev state is typed text"
     );
+
+    let responses_request = jsonschema::JSONSchema::compile(&serde_json::json!({
+        "$ref": reference("GatewayResponsesRequest"),
+        "components": document["components"],
+    }))
+    .expect("the served Responses request schema compiles");
+    let responses_body = |item: Value| serde_json::json!({"model": "openai/m", "input": [item]});
+    for item in [
+        serde_json::json!({"role": "user", "content": "go"}),
+        serde_json::json!({"type": "message", "role": "assistant", "content": "ok"}),
+        serde_json::json!({"role": "user", "content": [{"type": "input_text", "text": "go"}]}),
+        serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]}),
+        serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "hi"}]}),
+    ] {
+        assert!(
+            responses_request.is_valid(&responses_body(item.clone())),
+            "the Responses request contract admits {item}"
+        );
+    }
+    for item in [
+        serde_json::json!({"content": "go"}),
+        serde_json::json!({"role": "user", "content": 7}),
+        serde_json::json!({"type": "note", "role": "user", "content": "go"}),
+    ] {
+        assert!(
+            !responses_request.is_valid(&responses_body(item.clone())),
+            "the Responses request contract refuses {item}"
+        );
+    }
 
     server.shutdown().await.expect("server shuts down");
 }

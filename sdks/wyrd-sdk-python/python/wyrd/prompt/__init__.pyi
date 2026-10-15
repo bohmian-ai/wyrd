@@ -1,14 +1,8 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
-
 from collections.abc import Mapping
 from typing import Any
 
 from .._wyrd import JsonDict, PathLike, WyrdError
 from ..cards import CardRef
-
-#### end of imports ####
 
 class MediaRef:
     """Image or document content to bind into a ``${media:name}`` placeholder.
@@ -898,7 +892,16 @@ class OpenAiResponseItem:
         """Return the JSON ``arguments`` string of a ``"function_call"`` item."""
         ...
     def as_function_call_output(self) -> str:
-        """Return the ``output`` of a ``"function_call_output"`` item."""
+        """Return the ``output`` of a ``"function_call_output"`` item as text.
+
+        A content-parts output returns the concatenated text of its
+        ``input_text`` and ``output_text`` parts, with no separator; non-text
+        parts are omitted.
+
+        Raises:
+            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` when the item is
+                not a ``"function_call_output"``.
+        """
         ...
 
 class OpenAiResponsesSettings:

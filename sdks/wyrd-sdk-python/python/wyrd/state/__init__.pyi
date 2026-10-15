@@ -1,7 +1,3 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
-
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -13,8 +9,6 @@ from ..data import DataCard
 from ..model import ModelCard
 from ..observe import Run
 from ..prompt import PromptCard
-
-#### end of imports ####
 
 class CardEnvelope:
     """Complete read-only projection of one registered Card.

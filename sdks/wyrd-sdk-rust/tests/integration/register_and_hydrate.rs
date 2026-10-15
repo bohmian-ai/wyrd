@@ -54,17 +54,13 @@ metadata:
   space: default
 spec:
   prompt:
-    request:
-      provider: gemini_generate_content
-      body:
-        contents:
-          - role: user
-            parts:
-              - text: {message}
+    provider: openai
     model: gpt-4o
-    variables: []
-    media_variables: []
-    response_type: text
+    messages:
+      - role: user
+        content: {message}
+  execution_route:
+    kind: native
 "
         ),
     )
@@ -596,7 +592,9 @@ metadata:
 spec:
   provider: openai
   model: gpt-4o
-  messages: [Authored independently.]
+  messages:
+    - role: user
+      content: Authored independently.
 ",
     )
     .expect("authored prompt writes");

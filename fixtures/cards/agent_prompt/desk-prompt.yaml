@@ -7,4 +7,6 @@ metadata:
 spec:
   provider: openai
   model: gpt-4o
-  messages: [Answer the customer's question.]
+  messages:
+    - role: user
+      content: Answer the customer's question.

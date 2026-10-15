@@ -213,116 +213,52 @@ pub fn check_model(model: &str) -> SkaldResult<()> {
     Err(invalid("model", message))
 }
 
-/// JSON Schema primitive type names an output schema may declare.
-const SCHEMA_TYPES: [&str; 7] = [
-    "array", "boolean", "integer", "null", "number", "object", "string",
-];
-
-/// Refuses an output schema that is not structurally valid JSON Schema or
-/// that uses a feature its destination statically cannot carry.
+/// Refuses an output schema that is not valid JSON Schema or that uses a
+/// feature its destination statically cannot carry.
 ///
-/// The walk is pure and never resolves references or fetches anything. It
-/// checks `type` names, `required` string arrays, `properties`/`$defs`
-/// object maps, and recurses through every nested subschema keyword. When
-/// `object_root` is set (OpenAI strict structured output, which every
-/// portable OpenAI schema uses) the root must declare `type: object`. Valid
-/// schemas are never rewritten.
+/// Validity is standard meta-validation against the bundled meta-schema of
+/// the declared `$schema` draft (2020-12 when undeclared). It is offline: a
+/// custom or unknown `$schema` is refused rather than fetched, and user `$ref`
+/// targets are never resolved. When `object_root` is set (OpenAI strict
+/// structured output, which every portable OpenAI schema uses) the root must
+/// be an object schema declaring `type: object`. Valid schemas are never
+/// rewritten.
 ///
 /// # Errors
 ///
 /// Returns [`SkaldError::PromptInvalid`] whose field is `field` extended with
-/// the dotted path to the first offending keyword.
+/// the dotted path to the first offending keyword: the schema itself when it
+/// is not a JSON object, `$schema` for an unsupported meta-schema, `type` for
+/// a strict OpenAI non-object root, or the meta-validation error location.
 pub(crate) fn check_output_schema(
-    schema: &serde_json::Map<String, Value>,
+    schema: &Value,
     field: &str,
     object_root: bool,
 ) -> SkaldResult<()> {
-    if object_root && schema.get("type").and_then(Value::as_str) != Some("object") {
+    let Some(object) = schema.as_object() else {
+        return Err(invalid(field, "an output schema is a JSON object"));
+    };
+    if jsonschema::Draft::default().detect(schema) == jsonschema::Draft::Unknown {
+        return Err(invalid(
+            &format!("{field}.$schema"),
+            "only the built-in JSON Schema drafts (4, 6, 7, 2019-09, 2020-12) are supported; custom meta-schemas are never fetched",
+        ));
+    }
+    if let Err(error) = jsonschema::meta::validate(schema) {
+        let mut at = field.to_owned();
+        for segment in error.instance_path() {
+            at.push('.');
+            at.push_str(&segment.to_string());
+        }
+        return Err(invalid(&at, &error.to_string()));
+    }
+    if object_root && object.get("type").and_then(Value::as_str) != Some("object") {
         return Err(invalid(
             &format!("{field}.type"),
             "strict OpenAI structured output requires a root `type: object` schema",
         ));
     }
-    check_schema(schema, field)
-}
-
-/// Walks one object schema for [`check_output_schema`].
-///
-/// # Errors
-///
-/// Returns [`SkaldError::PromptInvalid`] at the dotted path of the first
-/// invalid `type`, `required`, schema map, schema list, subschema, or `enum`.
-fn check_schema(schema: &serde_json::Map<String, Value>, field: &str) -> SkaldResult<()> {
-    // ponytail: structural checks only; swap in a JSON Schema meta-validator
-    // if skald-spec ever earns that dependency.
-    for (keyword, value) in schema {
-        let at = format!("{field}.{keyword}");
-        match keyword.as_str() {
-            "type" => {
-                let valid = |name: &Value| {
-                    name.as_str()
-                        .is_some_and(|name| SCHEMA_TYPES.contains(&name))
-                };
-                let ok = match value {
-                    Value::Array(names) => !names.is_empty() && names.iter().all(valid),
-                    name => valid(name),
-                };
-                if !ok {
-                    return Err(invalid(
-                        &at,
-                        "type is one JSON Schema type name, or a nonempty array of them",
-                    ));
-                }
-            }
-            "required" => {
-                if !value
-                    .as_array()
-                    .is_some_and(|names| names.iter().all(Value::is_string))
-                {
-                    return Err(invalid(&at, "required is an array of property names"));
-                }
-            }
-            "properties" | "$defs" | "definitions" | "patternProperties" => {
-                let Some(map) = value.as_object() else {
-                    return Err(invalid(&at, "expected an object mapping names to schemas"));
-                };
-                for (name, subschema) in map {
-                    check_subschema(subschema, &format!("{at}.{name}"))?;
-                }
-            }
-            "anyOf" | "oneOf" | "allOf" | "prefixItems" => {
-                let Some(list) = value.as_array().filter(|list| !list.is_empty()) else {
-                    return Err(invalid(&at, "expected a nonempty array of schemas"));
-                };
-                for (index, subschema) in list.iter().enumerate() {
-                    check_subschema(subschema, &format!("{at}.{index}"))?;
-                }
-            }
-            "items" | "additionalProperties" | "not" | "contains" | "propertyNames" => {
-                check_subschema(value, &at)?;
-            }
-            "enum" if !value.is_array() => {
-                return Err(invalid(&at, "enum is an array of values"));
-            }
-            _ => {}
-        }
-    }
     Ok(())
-}
-
-/// Checks one nested subschema: a boolean schema, or an object schema walked
-/// by [`check_schema`].
-///
-/// # Errors
-///
-/// Returns [`SkaldError::PromptInvalid`] at `field` for any other JSON value,
-/// and the nested refusal of an invalid object schema.
-fn check_subschema(schema: &Value, field: &str) -> SkaldResult<()> {
-    match schema {
-        Value::Bool(_) => Ok(()),
-        Value::Object(schema) => check_schema(schema, field),
-        _ => Err(invalid(field, "expected a JSON Schema object or boolean")),
-    }
 }
 
 /// Native body path of a request's output schema, and whether its
@@ -401,9 +337,6 @@ impl Prompt {
         let response_type = response_type_of(&request);
         if let ResponseType::JsonSchema { schema, .. } = &response_type {
             let (field, object_root) = output_schema_field(&request);
-            let schema = schema
-                .as_object()
-                .ok_or_else(|| invalid(field, "an output schema is a JSON object"))?;
             check_output_schema(schema, field, object_root)?;
         }
         let mut prompt = Self {

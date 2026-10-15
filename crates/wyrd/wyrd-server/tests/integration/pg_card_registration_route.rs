@@ -4570,7 +4570,8 @@ async fn inline_agent_prompt_reuses_transaction_selection() {
 /// no operation, Card,
 /// relationship, principal, or binding. Refusal happens during decoding and
 /// never reaches storage or a provider. Cases cover a templated model,
-/// invalid output schemas in the portable and native forms, a media binding
+/// invalid output schemas in the portable and native forms (including
+/// malformed nested keywords that fail meta-validation), a media binding
 /// declared as two kinds, and invalid literal media sources.
 ///
 /// # Panics
@@ -4623,6 +4624,20 @@ async fn invalid_prompt_authoring_is_refused_before_writes() {
                    "body": {"messages": [{"role": "user", "content": "hi"}],
                             "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": {"type": "object", "properties": []}}}}}),
             "body.response_format.json_schema.schema.properties",
+        ),
+        (
+            "schema-minimum",
+            portable(
+                json!({"response_format": {"type": "object", "properties": {"n": {"type": "number", "minimum": "wrong"}}}}),
+            ),
+            "response_format.properties.n.minimum",
+        ),
+        (
+            "native-schema-defs",
+            json!({"provider": "anthropic", "model": "claude", "format": "messages",
+                   "body": {"max_tokens": 8, "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object", "$defs": {"item": {"minLength": -1}}}}}}}),
+            "body.output_config.format.schema.$defs.item.minLength",
         ),
         (
             "media-kind-conflict",

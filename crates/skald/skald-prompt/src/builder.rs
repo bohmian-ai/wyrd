@@ -503,9 +503,9 @@ mod builder_tests {
     }
 
     /// Proves builder finalization shares the authored output-schema rule:
-    /// an invalid type and a non-object strict OpenAI root are refused at
-    /// their native body path before any dispatch, while GenerateContent keeps
-    /// a list root unchanged.
+    /// an invalid type, a malformed nested keyword, and a non-object strict
+    /// OpenAI root are refused at their native body path before any
+    /// dispatch, while GenerateContent keeps a list root unchanged.
     ///
     /// # Panics
     /// Panics when an invalid schema builds, its refusal names another path or
@@ -530,6 +530,24 @@ mod builder_tests {
         )
         .expect_err("invalid type is refused");
         assert_eq!(field(error), "body.response_format.json_schema.schema.type");
+        let nested = ResponseFormat::json_schema(
+            "answer",
+            json!({"type": "object", "properties": {"n": {"type": "number", "minimum": "wrong"}}}),
+        )
+        .unwrap();
+        let error = gemini(
+            "gemini-2.5-pro",
+            GeminiOptions {
+                messages: vec!["hi".to_owned()],
+                output: Some(nested),
+                ..GeminiOptions::default()
+            },
+        )
+        .expect_err("a malformed nested keyword is refused");
+        assert_eq!(
+            field(error),
+            "body.generation_config.response_schema.properties.n.minimum"
+        );
 
         let list = json!({"type": "array", "items": {"type": "string"}});
         let error = openai_responses(

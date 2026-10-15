@@ -1,8 +1,8 @@
 # TASK-001 `httpAuth` / `http_auth` on the client, and `wyrd auth access-token`
 
-Spec: `changes/active/ambient-auth/spec.md` r2. Branch `split/ambient-auth`,
+Spec: `changes/active/ambient-auth/spec.md` r3. Branch `split/ambient-auth`,
 rebased on `origin/main` 5bcd9e487. The branch's code commit implements r1;
-this task rewrites it to r2.
+this task rewrites it to r3.
 
 ## TypeScript (`sdks/wyrd-sdk-ts/wyrd/src/index.ts`)
 
@@ -30,8 +30,10 @@ this task rewrites it to r2.
   client, including one returned by `on_behalf_of`.
 - Update `client/__init__.pyi` / the generated stub through codegen, never by
   hand.
-- Delete `python/wyrd/gateway/` (`_auth.py`, `__init__.py`, `__init__.pyi`) and
-  `python/wyrd/stubs/gateway.pyi`, and every export of `GatewayAuth`.
+- Delete only `python/wyrd/gateway/_auth.py` and every import, lazy export,
+  and stub declaration of `GatewayAuth`. Retain `wyrd.gateway`, `Gateway`,
+  and all existing public administration types and operations. Update the
+  stub source and regenerate the public stub; retain both gateway stub files.
 
 ## CLI (`crates/wyrd/wyrd-cli/src/auth/`)
 
@@ -56,6 +58,8 @@ Rewrite or replace every test using the removed names (find with
   REQ-001 changes it to 401).
 - CLI journey for `wyrd auth access-token` beside the existing auth CLI
   journeys.
+- Cover AC-008 with the existing gateway public-export tests, typed-contract
+  fixtures, and administration journeys; preserve their administration coverage.
 
 ## Docs and example
 

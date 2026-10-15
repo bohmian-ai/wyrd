@@ -1,6 +1,6 @@
 ---
 id: SPEC-ambient-auth
-revision: 2
+revision: 3
 status: approved
 ---
 
@@ -21,6 +21,9 @@ SPEC-example-journey-fixes r6) by owner direction: one self-evident name per
 concept, methods on the client, Wyrd's own header, and no per-framework
 helpers. The long-lived API key fallback for clients with no hook is
 SPEC-gateway-api-key-fallback.
+
+r3 is approved by the human owner on 2026-10-14: retain `wyrd.gateway`
+and its existing administration API; remove only the standalone auth helpers.
 
 ## Decisions
 
@@ -55,8 +58,10 @@ Python's async flow never blocks the event loop on token renewal.
 ### REQ-002 One name per concept, no standalone helpers
 
 `accessTokenSource`, the standalone `wyrdFetch`, the standalone
-`GatewayAuth`, and the `wyrd.gateway` Python module are removed with no
-alias. Nothing has shipped.
+`GatewayAuth` are removed with no alias. Nothing has shipped.
+
+The `wyrd.gateway` Python module remains, preserving `Gateway` and its
+existing public administration types and operations.
 
 ### REQ-003 Credential resolution
 
@@ -93,6 +98,8 @@ and prints only the token followed by a newline.
 - AC-006 `wyrd-example-ts` builds one `WyrdClient` and uses `httpAuth` for its
   OpenAI client and its MCP connection.
 - AC-007 Format, lints, codegen check, and the owning `mise` lanes pass.
+- AC-008 Existing `wyrd.gateway` administration imports, typed contracts,
+  and administration journeys continue to pass after `GatewayAuth` is removed.
 
 ## Open material decisions
 

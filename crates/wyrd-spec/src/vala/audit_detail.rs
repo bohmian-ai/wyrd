@@ -704,6 +704,10 @@ pub enum AuditDetail {
         api_key_id: uuid::Uuid,
         /// Credential expiry.
         expires_at: chrono::DateTime<chrono::Utc>,
+        /// Verified initiator-first delegation chain of the issuing request,
+        /// empty and omitted when the caller presented no `act` claim.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delegation_chain: Vec<AuditDelegationStep>,
     },
     /// Token exchange metadata; bearer values are never representable here.
     TokenExchange {

@@ -4,7 +4,10 @@ use chrono::Duration;
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use wyrd_runtime::audit::AuditStage;
-use wyrd_runtime::{Permission, Principal, PrincipalId};
+use wyrd_runtime::{
+    DelegationStep, Permission, Principal, PrincipalId, audit_delegation_chain,
+    delegated_attribution,
+};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, IssueKeyRequest, IssueKeyResponse, SecretBearer};
 use wyrd_spec::envelope::CardKind;
@@ -142,29 +145,34 @@ impl IssueApiKey {
 
     /// Stage the credential-issuance audit event on the process audit stage.
     ///
-    /// The event names the target card as its resource and `service_accounts`
-    /// write as its permission, and records the key id and expiry — never the
-    /// key. It is staged on `tenant`'s chain without waiting and never refuses
-    /// the issuance.
+    /// The event is attributed to the issuing request's verified pair:
+    /// `subject` and the current actor of its initiator-first
+    /// `delegation_chain`, whose full history the detail retains. It names the
+    /// target card as its resource and `service_accounts` write as its
+    /// permission, and records the key id and expiry — never the key. It is
+    /// staged on `tenant`'s chain without waiting and never refuses the
+    /// issuance.
     pub fn audit(
         &self,
         audit: &dyn AuditStage,
         tenant: DataTenantId,
         issued: &IssuedApiKey,
-        actor: &Principal,
+        subject: &Principal,
+        delegation_chain: &[DelegationStep],
         request_id: &str,
     ) {
         let mut event = auth_event(
             request_id,
             API_KEY_ISSUE_OPERATION,
-            Attribution::direct(actor.id),
-            actor.kind.tag(),
-            actor.card_ref().cloned(),
+            delegated_attribution(subject, delegation_chain),
+            subject.kind.tag(),
+            subject.card_ref().cloned(),
             AuditOutcome::Allowed,
             AuditDetail::CredentialIssuance {
                 target_principal_id: PrincipalId::new(issued.service_account_id),
                 api_key_id: issued.api_key_id,
                 expires_at: issued.response.expires_at,
+                delegation_chain: audit_delegation_chain(delegation_chain),
             },
         );
         event.resource = issued.response.card_ref.to_string();

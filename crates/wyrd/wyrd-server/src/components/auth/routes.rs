@@ -605,7 +605,8 @@ async fn issue_key(
         &*state.scribe_outbox,
         tenant,
         &issued,
-        caller.principal(),
+        &audited_caller.principal,
+        &audited_caller.delegation_chain,
         req_id,
     );
 

@@ -377,6 +377,10 @@ mod tests {
 
     /// Proves a deployment grant covers that deployment's models and a model
     /// grant covers only its exact pair, with the approved wire projection.
+    ///
+    /// # Panics
+    /// Panics when a fixture name is invalid or a scope covers another set of
+    /// models.
     #[test]
     fn gateway_scope_covers_deployment_models_and_exact_pairs() {
         use super::GatewayAccess;

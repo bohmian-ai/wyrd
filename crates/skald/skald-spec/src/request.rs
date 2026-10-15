@@ -387,6 +387,10 @@ mod round_trip {
     /// through a buffered `serde_json::Value`, the path an inline Prompt in
     /// an Agent Card takes; malformed names and the reserved `gemini` are
     /// refused.
+    ///
+    /// # Panics
+    /// Panics when a provider name does not round-trip or a refused name is
+    /// accepted.
     #[test]
     fn provider_name_yaml_reads_back_through_buffered_json() {
         assert_eq!(
@@ -436,6 +440,9 @@ mod round_trip {
 
     /// Stores such as Postgres `jsonb` reorder keys, so the body may precede
     /// its tag; a raw body must still read back unchanged.
+    ///
+    /// # Panics
+    /// Panics when the reordered request does not parse or its body changes.
     #[test]
     fn raw_v1_request_reads_back_when_body_precedes_tag() {
         let reparsed: ProviderRequest = serde_json::from_str(

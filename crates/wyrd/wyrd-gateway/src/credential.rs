@@ -210,6 +210,9 @@ mod tests {
 
     /// Builds bearer deployment `primary` with `adapter`, referencing
     /// credential `primary`.
+    ///
+    /// # Panics
+    /// Panics when the fixture is not a valid deployment.
     fn deployment(adapter: &Value) -> ProviderDeployment {
         serde_json::from_value(json!({
             "name": "primary",
@@ -325,6 +328,10 @@ mod tests {
     /// only within their tenant/provider/host assignment; an unassigned,
     /// cross-tenant, wrong-provider, wrong-host, or unconfigured source is
     /// unconfigured.
+    ///
+    /// # Panics
+    /// Panics when a fixture cannot be created, an assigned source does not
+    /// resolve, or an unassigned one resolves.
     #[tokio::test]
     async fn credential_sources_resolve_within_assignments() {
         let vault = MockServer::start().await;
@@ -430,6 +437,10 @@ mod tests {
     /// Unreadable, permissive, non-regular, and unreachable sources are
     /// unavailable; revoked, mismatched, and missing credentials fail closed;
     /// and a resolved secret's debug output is redacted.
+    ///
+    /// # Panics
+    /// Panics when a fixture cannot be created, a failing source resolves, or a
+    /// secret's debug output is not redacted.
     #[tokio::test]
     async fn credential_sources_fail_closed() {
         let token = secret_file("hvs.test");

@@ -742,6 +742,11 @@ fn fixed_tool(name: &str, output: Value) -> Arc<dyn AgentTool> {
     })
 }
 
+/// The resolved OpenAI Chat Prompt with one system message that the session
+/// journal tests run.
+///
+/// # Panics
+/// Panics when the static request does not build a Prompt.
 fn test_prompt() -> Arc<Prompt> {
     let request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
         model: "gpt-4o".to_owned(),

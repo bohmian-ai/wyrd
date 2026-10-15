@@ -260,6 +260,12 @@ mod tests {
         assert_eq!(error.code, "WYRD_LOADER_400_PATH_ESCAPE");
     }
 
+    /// Directory discovery does not descend into a symlinked directory, so a
+    /// Card reachable through a link is not loaded twice.
+    ///
+    /// # Panics
+    /// Panics when the fixture directory or symlink cannot be created, the path
+    /// does not parse, or the linked Card is loaded again.
     #[cfg(unix)]
     #[test]
     fn path_discovery_does_not_follow_symlink_directories() {

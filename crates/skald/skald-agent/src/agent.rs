@@ -211,6 +211,12 @@ pub struct Agent {
 }
 
 impl fmt::Debug for Agent {
+    /// Formats the Agent's identity, Prompt model, run config, tool names,
+    /// and execution route, omitting the Prompt body, callbacks, session, and
+    /// gateway caller.
+    ///
+    /// # Errors
+    /// Returns the formatter's error.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Agent")
@@ -746,6 +752,9 @@ impl Agent {
         Self::from_resolved_arc_parts(id, prompt_ref, Arc::new(prompt))
     }
 
+    /// Builds an Agent with identity `id` over an already resolved shared
+    /// Prompt and its authored reference; every other field takes its default,
+    /// including the native execution route and no gateway caller.
     fn from_resolved_arc_parts(
         id: String,
         prompt_ref: InlineableRef<PromptSpec>,

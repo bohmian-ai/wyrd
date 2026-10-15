@@ -592,6 +592,8 @@ mod error_mapper_tests {
         );
     }
 
+    /// One instance of every public error variant, used to prove each renders
+    /// as problem JSON with its catalog status.
     fn sample_errors() -> Vec<WyrdError> {
         macro_rules! sample {
             ($($variant:ident),+ $(,)?) => {

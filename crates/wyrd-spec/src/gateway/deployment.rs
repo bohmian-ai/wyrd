@@ -388,12 +388,19 @@ mod tests {
     use serde_json::json;
 
     /// Decodes one deployment document.
+    ///
+    /// # Panics
+    /// Panics when `value` is not a valid deployment.
     fn decode(value: serde_json::Value) -> ProviderDeployment {
         serde_json::from_value(value).expect("deployment decodes")
     }
 
     /// Proves the minimal shape defaults to open, unrestricted, and every
     /// adapter operation, and the full shape round-trips exactly.
+    ///
+    /// # Panics
+    /// Panics when a shape does not decode, defaults otherwise, or does not
+    /// round-trip.
     #[test]
     fn deployment_round_trips_minimal_and_full_shapes() {
         let minimal = decode(json!({
@@ -432,6 +439,9 @@ mod tests {
 
     /// Proves the removed single-model and weight fields, unknown adapters,
     /// unknown fields, and reserved headers fail at decode.
+    ///
+    /// # Panics
+    /// Panics when an invalid shape decodes.
     #[test]
     fn invalid_shapes_fail_at_decode() {
         let base = json!({"name": "primary", "adapter": "openai", "auth": "none"});
@@ -513,6 +523,9 @@ mod tests {
     /// Proves credential-provider matching follows the adapter, never the
     /// deployment name: built-ins need their reserved identity and
     /// compatible adapters a non-reserved one.
+    ///
+    /// # Panics
+    /// Panics when a fixture is invalid or matching follows another rule.
     #[test]
     fn credential_provider_follows_the_adapter() {
         let provider = |name: &str| ProviderId::new(name).expect("provider");

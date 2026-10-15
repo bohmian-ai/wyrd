@@ -11,6 +11,11 @@ use skald_spec::{
 };
 use skald_tool::ToolDef;
 
+/// A resolved OpenAI Chat Prompt for `model` with one system message, shared
+/// by the Agent field tests.
+///
+/// # Panics
+/// Panics when the static request does not build a Prompt.
 fn test_prompt(model: &str) -> Arc<Prompt> {
     let request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
         model: model.to_owned(),

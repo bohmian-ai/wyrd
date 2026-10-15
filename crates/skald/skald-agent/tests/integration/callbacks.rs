@@ -468,6 +468,9 @@ fn callback_abort<T>() -> CallbackOutcome<T> {
 }
 
 /// An OpenAI Chat Completions Prompt for `gpt-4o` with one system turn.
+///
+/// # Panics
+/// Panics when the static request does not build a Prompt.
 pub(crate) fn test_prompt() -> Arc<Prompt> {
     let request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
         model: "gpt-4o".to_owned(),

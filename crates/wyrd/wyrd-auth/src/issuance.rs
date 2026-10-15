@@ -301,6 +301,11 @@ pub enum IssuanceError {
 }
 
 impl From<IssuanceError> for WyrdError {
+    /// Maps each issuance refusal to its public catalog error: inactive
+    /// principals and tenants to revoked credentials, an unrepresentable
+    /// delegation to its own refusal naming the permission (no token was
+    /// issued), store failures to a retryable unavailable error, and other issue
+    /// failures to a logged internal error.
     fn from(error: IssuanceError) -> Self {
         match error {
             IssuanceError::TenantNotAdmitting | IssuanceError::PrincipalInactive => {

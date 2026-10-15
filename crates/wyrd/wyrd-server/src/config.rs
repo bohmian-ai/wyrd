@@ -5745,6 +5745,9 @@ minimum_slots = 2
     }
     /// Provider endpoint overrides parse and validate outside production and
     /// fail boot in production.
+    ///
+    /// # Panics
+    /// Panics when a fixture fails to build or an assertion fails.
     #[test]
     fn gateway_endpoint_overrides_are_refused_in_production() {
         let config =

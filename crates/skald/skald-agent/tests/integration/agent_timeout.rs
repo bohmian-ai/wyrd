@@ -320,6 +320,10 @@ async fn agent_run_chat_span_records_callback_replaced_model() {
 /// `gcp.gemini` and `gcp.vertex_ai` and the Prompt's resolved model on both
 /// `invoke_agent` and `chat`, keep the `chat` operation, omit the scalar
 /// finish-reasons attribute, and carry no payload.
+///
+/// # Panics
+/// Panics when a Prompt does not build, a run fails, or a captured span
+/// names another provider, model, or operation, or carries a payload.
 #[tokio::test]
 async fn agent_run_genai_google_provider_and_model() {
     capture();
@@ -660,6 +664,9 @@ fn fixed_tool(name: &str, output: Value) -> Arc<dyn AgentTool> {
 }
 
 /// Builds the minimal OpenAI chat Prompt every test agent runs.
+///
+/// # Panics
+/// Panics when the static request does not build a Prompt.
 fn test_prompt() -> Arc<Prompt> {
     let request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
         model: "gpt-4o".to_owned(),

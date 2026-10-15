@@ -136,6 +136,8 @@ mod prompt_io {
         ))
     }
 
+    /// The typed Prompt Card fixture renamed to `growth/lead-scoring` version
+    /// `1.2.3`, which the file round-trip tests save and load.
     fn prompt_card() -> PromptCard {
         let mut card = typed_prompt_card();
         "growth".clone_into(&mut card.space);
@@ -199,6 +201,12 @@ mod prompt_io {
         let _ = std::fs::remove_file(path);
     }
 
+    /// A YAML native Prompt Card keeps known settings and unknown provider
+    /// extension options from its body when loaded.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be written, the Card does not load as an
+    /// OpenAI Chat Prompt, or a setting or extension option is lost.
     #[test]
     fn yaml_native_prompt_card_preserves_extension_options() {
         let path = temp_path("authored_card.yaml");

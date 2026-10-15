@@ -249,6 +249,12 @@ mod tests {
     use crate::parse::parse_file;
     use tempfile::TempDir;
 
+    /// An Agent's `prompt:` path reference resolves to its sibling Prompt file,
+    /// which is loaded alongside the Agent with no diagnostics.
+    ///
+    /// # Panics
+    /// Panics when the fixtures cannot be written or parsed, resolution reports a
+    /// diagnostic, or the sibling Prompt is not loaded after the Agent.
     #[test]
     fn resolve_path_rewrites_durable_ref_and_loads_sibling() {
         let temp = TempDir::new().unwrap();
@@ -278,6 +284,12 @@ mod tests {
         assert!(matches!(cards[0].spec, wyrd_spec::envelope::Spec::Agent(_)));
     }
 
+    /// A path reference must name a single-Card file; a target with several
+    /// documents is refused.
+    ///
+    /// # Panics
+    /// Panics when the fixtures cannot be written, the load succeeds, or no
+    /// diagnostic reports the multi-Card target.
     #[test]
     fn resolve_rejects_multi_document_path_targets() {
         let temp = TempDir::new().unwrap();
@@ -302,6 +314,12 @@ mod tests {
         }));
     }
 
+    /// Path references resolve transitively (Service to Agent to Prompt) and
+    /// the loaded Cards keep that discovery order.
+    ///
+    /// # Panics
+    /// Panics when the fixtures cannot be written or parsed, resolution reports a
+    /// diagnostic, or the Cards are loaded in another order.
     #[test]
     fn resolve_loads_transitive_path_references_in_discovery_order() {
         let temp = TempDir::new().unwrap();

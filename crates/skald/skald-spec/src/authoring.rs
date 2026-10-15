@@ -897,6 +897,10 @@ pub(crate) fn invalid(field: &str, message: &str) -> SkaldError {
 
 #[cfg(test)]
 mod tests {
+    //! Authored Prompt compilation: portable and native forms compile to the
+    //! request, model, variables, and response type they describe, round-trip
+    //! as authored, and refuse invalid fields at their authored path.
+
     use serde_json::{Value, json};
 
     use crate::authoring::AuthoredPrompt;

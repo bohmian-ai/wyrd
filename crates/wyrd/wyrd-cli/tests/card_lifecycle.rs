@@ -69,6 +69,11 @@ macro_rules! run_cli_async {
     };
 }
 
+/// Writes the `cli-prompt` Prompt Card and its declared text artifact into
+/// `temp` and returns the Card's path.
+///
+/// # Panics
+/// Panics when a file cannot be written.
 fn write_prompt(temp: &TempDir) -> std::path::PathBuf {
     let artifact = b"cli-card-artifact";
     let digest = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(artifact));
@@ -85,6 +90,11 @@ fn write_prompt(temp: &TempDir) -> std::path::PathBuf {
     path
 }
 
+/// Writes a Service graph whose two Agents share one Prompt Card and one
+/// Model, each artifact-bearing, into `temp` and returns the Service path.
+///
+/// # Panics
+/// Panics when a file cannot be written.
 fn write_multi_card_service(temp: &TempDir) -> std::path::PathBuf {
     let prompt_artifact = b"shared-prompt-artifact";
     let prompt_digest =

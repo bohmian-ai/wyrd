@@ -705,6 +705,16 @@ mod pg_tests {
         Ok(id)
     }
 
+    /// Seeds a minimal Card of `target_ref`'s kind owned by `creator`; an
+    /// Agent first seeds its `<name>-prompt` Prompt Card and references it.
+    ///
+    /// # Errors
+    /// Never returns an error; the `Result` matches the fixture helpers it is
+    /// called alongside.
+    ///
+    /// # Panics
+    /// Panics when a fixture spec does not decode, seeding fails, or the kind is
+    /// not a Service, Agent, or Prompt.
     async fn insert_test_card(
         conn: &mut TenantConn<'_>,
         target_ref: &CardRef,

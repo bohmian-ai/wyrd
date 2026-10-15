@@ -141,6 +141,19 @@ pub fn registration_request_hash(
 }
 
 /// Find an operation by tenant-scoped subject, actor, and idempotency key.
+///
+/// Reads the live (pending or committed) operation that exact
+/// `attribution` pair reserved under `idempotency_key` in the transaction's
+/// tenant. A different subject or a different actor never matches, so two
+/// principals reusing one key keep separate operations. Expired operations
+/// are excluded; [`lookup_expired_operation`] reads those. The read joins the
+/// caller's transaction and writes nothing.
+///
+/// Returns `None` when that pair has no live operation for the key.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE`, with the database detail logged
+/// and redacted, when the read fails.
 pub async fn lookup_existing_operation(
     conn: &mut TenantConn<'_>,
     attribution: Attribution,
@@ -165,6 +178,17 @@ pub async fn lookup_existing_operation(
 }
 
 /// Find an expired operation so the caller receives a stable terminal error.
+///
+/// Reads the expired operation the exact `attribution` pair reserved under
+/// `idempotency_key` in the transaction's tenant, matched like
+/// [`lookup_existing_operation`]. The read joins the caller's transaction and
+/// writes nothing.
+///
+/// Returns `None` when that pair has no expired operation for the key.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE`, with the database detail logged
+/// and redacted, when the read fails.
 pub async fn lookup_expired_operation(
     conn: &mut TenantConn<'_>,
     attribution: Attribution,
@@ -189,6 +213,16 @@ pub async fn lookup_expired_operation(
 }
 
 /// Find a committed registration operation by its server-minted identifier.
+///
+/// Reads the operation `operation_id` names in the transaction's tenant,
+/// whatever its status or attribution; forced RLS hides every other tenant's
+/// operation. The read joins the caller's transaction and writes nothing.
+///
+/// Returns `None` when the tenant has no such operation.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE`, with the database detail logged
+/// and redacted, when the read fails.
 pub async fn lookup_operation_by_id(
     conn: &mut TenantConn<'_>,
     operation_id: RegistrationOperationId,
@@ -208,6 +242,21 @@ pub async fn lookup_operation_by_id(
 }
 
 /// Reserve an idempotency key before any card, manifest, or audit write.
+///
+/// Inserts a `pending` operation keyed by tenant, subject, actor, and
+/// idempotency key, recording the operation's attribution pair once. The row
+/// joins the caller's transaction, so it commits or rolls back with the
+/// registration it reserves; a cancelled or failed transaction leaves no
+/// reservation.
+///
+/// Returns `true` when this call reserved the key and `false` when the same
+/// pair already holds an operation for it, which the caller then reads and
+/// replays or refuses.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE`, with the database detail logged
+/// and redacted, when the insert fails for any reason other than that
+/// conflict.
 pub async fn insert_registration_operation(
     conn: &mut TenantConn<'_>,
     operation: NewRegistrationOperation<'_>,
@@ -232,6 +281,20 @@ pub async fn insert_registration_operation(
 }
 
 /// Insert one resolved card owned by a registration operation.
+///
+/// Writes the Card with its resolved space and pinned version, its creation
+/// pair, and the operation that owns it; a `pending` Card is stamped with its
+/// pending time and immediately due for reconciliation. The row joins the
+/// caller's transaction, so nothing is durable until the registration
+/// commits, and the creation pair is never rewritten afterwards.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the Card has no
+/// `metadata.space`, `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` when its version
+/// is not a resolved pin, the spec serialization error when its spec, labels,
+/// or annotations cannot be encoded, and `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE`, with
+/// the database detail logged and redacted, when the insert fails, including
+/// on a duplicate Card identity.
 pub async fn insert_card_row(
     conn: &mut TenantConn<'_>,
     input: NewCardRow<'_>,

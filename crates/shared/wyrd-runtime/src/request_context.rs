@@ -313,6 +313,11 @@ mod tests {
     /// Accepted authority keeps the effective principal and chain, survives a
     /// JSON round trip unchanged, never carries the accepting credential, and
     /// projects the accepting request's subject/actor pair.
+    ///
+    /// # Panics
+    /// Panics when the authority does not serialize or deserialize, or when
+    /// the round trip changes it, keeps the credential, or projects another
+    /// pair.
     #[test]
     fn accepted_authority_round_trips_without_credential() {
         let mut subject = service_principal("subject");

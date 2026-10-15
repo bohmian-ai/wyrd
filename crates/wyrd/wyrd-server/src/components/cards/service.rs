@@ -633,6 +633,23 @@ pub(crate) fn dispatches_operators(request: &CreateCardRequest) -> bool {
 }
 
 /// Return a committed response for an identical idempotency key.
+///
+/// Reads, in its own tenant transaction, the live operation the caller's
+/// exact subject/actor pair reserved under `idempotency_key`, falling back to
+/// an expired one, then commits without writing. Another pair's operation
+/// under the same key is never consulted, so replay cannot cross principals
+/// or rewrite the stored attribution.
+///
+/// Returns `None` when the pair has no operation for the key, or when its
+/// operation is still pending without a stored response; the caller then
+/// registers or waits for the winner.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_410_OPERATION_EXPIRED` for an expired operation, the
+/// `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT` when the stored request digest differs from
+/// `request_hash`, and `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` when the
+/// tenant connection, read, or commit fails or the stored response does not
+/// decode.
 async fn replay(
     state: &AppState,
     caller: &Caller,

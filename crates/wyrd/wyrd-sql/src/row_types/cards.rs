@@ -119,6 +119,17 @@ pub struct ParsedCardRow {
 impl TryFrom<CardRow> for ParsedCardRow {
     type Error = SqlError;
 
+    /// Parse a raw `wyrd.cards` row into its typed Card fields.
+    ///
+    /// Decodes the kind, space, name, version, kind-specific spec, labels,
+    /// annotations, status, and UID, and pairs the stored subject and actor
+    /// into the Card's creation [`Attribution`] unchanged. Pure: no IO.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::InvariantViolation`] when any stored value does not
+    /// decode, such as an unknown kind or status, an invalid space, name,
+    /// version, or UID, or a spec, labels, or annotations document that does
+    /// not match its type; the database then holds a row Wyrd never writes.
     fn try_from(row: CardRow) -> Result<Self, Self::Error> {
         let kind =
             CardKind::from_wire_name(&row.kind).ok_or_else(|| SqlError::InvariantViolation {

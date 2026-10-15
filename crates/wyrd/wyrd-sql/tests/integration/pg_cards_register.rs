@@ -235,6 +235,11 @@ async fn pending_operation_with_null_stored_response_decodes() {
 /// replay an identical body and refuse a different one. The A/B Card keeps
 /// A/B through deletion, and the Service principal projected by A/A keeps
 /// A/A when C/B re-registers the same Card.
+///
+/// # Panics
+/// Panics when a fixture, reservation, registration, or read fails, when a
+/// pair fails to reserve its own key or finds another pair's, or when a
+/// stored creation pair changes.
 #[tokio::test]
 async fn subject_actor_creation_and_replay() {
     let fixture = PgFixture::start().await.expect("fixture starts");

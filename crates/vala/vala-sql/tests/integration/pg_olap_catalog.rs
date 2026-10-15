@@ -80,6 +80,10 @@ mod pg_tests {
 
     /// A registration stores the verified subject/actor pair, and a repeat
     /// registration by another pair keeps the creating one.
+    ///
+    /// # Panics
+    /// Panics when the fixture, upsert, or read fails, or the stored pair is
+    /// not the creating one.
     #[tokio::test]
     async fn registration_keeps_its_creating_subject_and_actor() {
         let fixture = PgFixture::start().await.expect("fixture");

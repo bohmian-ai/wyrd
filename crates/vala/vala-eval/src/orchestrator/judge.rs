@@ -190,7 +190,7 @@ impl SkaldJudgeInvoker {
             Some(caller) => Some(Arc::new(
                 wyrd_gateway_registry(Arc::clone(caller), prompt.native()).ok_or_else(|| {
                     JudgeError::Terminal {
-                        reason: "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED: judge Prompt provider and model are not a gateway model identity".to_owned(),
+                        reason: "judge Prompt provider and model are not a gateway model identity".to_owned(),
                     }
                 })?,
             )),

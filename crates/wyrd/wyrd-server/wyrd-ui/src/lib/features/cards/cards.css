@@ -220,24 +220,6 @@
   color: var(--declare);
   background: color-mix(in srgb, var(--declare) 12%, var(--surface));
 }
-/* C-08 — the workflow stage flow strip. */
-.cards .stages {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.cards .stages .stage {
-  border: 2px solid var(--border);
-  border-radius: var(--r);
-  padding: 7px 12px;
-  background: var(--surface-2);
-  font: var(--weight-strong) 11px var(--font-mono);
-}
-.cards .stages .arrow {
-  color: var(--muted);
-}
-
 /* M-01 — below 600px the inventory table becomes labeled stacked rows and
    the kind rail and chips scroll horizontally; nothing is dropped. */
 @media (max-width: 767px) {

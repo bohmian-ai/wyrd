@@ -1,4 +1,4 @@
-"""Callers reach the Wyrd gateway with an access token, a Card-scoped key, or a loaded Workflow (AC-051, AC-053)."""
+"""Callers reach the Wyrd gateway with an access token or a Card-scoped key (AC-051, AC-053)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import secrets
 
 import openai
 import pytest
-from wyrd.agent import Workflow
 from wyrd.bifrost import Bifrost
 from wyrd.cards import CardRef, Cards
 from wyrd.client import WyrdClient
@@ -18,13 +17,7 @@ from .support import FIXTURES, Receiver, ancestry, client_of, register, timeline
 
 pytestmark = pytest.mark.integration
 
-ASK = FIXTURES / "cards/gateway_inference/ask.yaml"
-
-EXAMPLE = FIXTURES.parent / "examples/workflows/code-review"
-"""The code-review example Workflow directory; its Prompts call ``gpt-5-5`` through the Wyrd gateway."""
-
-EXAMPLE_INPUT = {"code": "diff"}
-"""A code-review input; every Prompt renders it into the request the upstream answers."""
+ASK = FIXTURES / "cards/gateway_inference/ask-agent.yaml"
 
 
 def model_calls(upstream: Receiver) -> int:
@@ -41,10 +34,9 @@ def openai_client(caller: WyrdClient) -> openai.OpenAI:
 
 @pytest.fixture
 def server(gateway_server: tuple[WyrdTestServer, Receiver]) -> WyrdTestServer:
-    """A gateway server with OpenAI chat deployments of ``gpt-4o`` and ``gpt-5-5`` capturing call metadata."""
+    """A gateway server with an OpenAI chat deployment of ``gpt-4o`` capturing call metadata."""
     server, _ = gateway_server
     deploy(server, "openai", "gpt-4o", ["chat_completions"])
-    deploy(server, "openai", "gpt-5-5", ["chat_completions"])
     Gateway(client_of(server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
     return server
 
@@ -62,14 +54,8 @@ def admin(server: WyrdTestServer) -> WyrdClient:
 
 
 @pytest.fixture
-def tenant_admin(server: WyrdTestServer) -> WyrdClient:
-    """The tenant administrator ``wyrd setup`` issues, bound to no Card, so it may run any registered Workflow."""
-    return client_of(server, server.tenant_admin_key())
-
-
-@pytest.fixture
 def ask(admin: WyrdClient) -> CardRef:
-    """The registered ``ask`` Workflow."""
+    """The registered ``ask-agent`` Agent."""
     return Cards(admin).register_from_path(ASK).root
 
 
@@ -116,7 +102,9 @@ def test_malformed_traceparent_is_ignored_by_the_gateway(
 
 
 def test_gateway_call_records_a_lone_run_or_card(server: WyrdTestServer, admin: WyrdClient) -> None:
-    card_uid = str(register(Cards(admin), "cards/gateway_inference/ask.yaml")["ask-agent"].uid)
+    card_uid = str(
+        register(Cards(admin), "cards/gateway_inference/ask-agent.yaml")["ask-agent"].uid
+    )
     issued = cli.issue_key(
         kind="Agent", name="ask-agent", version="1.0.0", space="default", client=admin
     )
@@ -177,47 +165,3 @@ def test_cli_issues_a_card_scoped_key_and_writes_a_provider_credential(
         "active",
     )
     assert "sk-managed" not in str(view)
-
-
-def test_loaded_workflow_calls_the_gateway_through_its_loading_client(
-    tenant_admin: WyrdClient, upstream: Receiver, ask: CardRef
-) -> None:
-    workflow = Cards(tenant_admin).workflow.load(ask)
-
-    run = workflow.run({"question": "hi"})
-
-    assert (run.status, run.outputs) == ("succeeded", {"answer": "hi"})
-    assert model_calls(upstream) == 1
-    assert upstream.deliveries[0].headers["authorization"] == f"Bearer {PROVIDER_KEY}"
-
-
-def test_example_workflow_runs_through_the_wyrd_gateway(
-    admin: WyrdClient, upstream: Receiver
-) -> None:
-    example = Workflow.from_path(EXAMPLE / "workflow.yaml", admin)
-
-    run = example.run(EXAMPLE_INPUT)
-
-    assert (run.status, run.outputs) == ("succeeded", {"review": "hi"})
-    assert model_calls(upstream) == 3
-
-
-def test_applying_a_workflow_calls_no_model(admin: WyrdClient, upstream: Receiver) -> None:
-    applied = cli.apply(EXAMPLE, client=admin)
-
-    assert str(applied.root).startswith("engineering/Workflow/code-review@1.0.0#")
-    assert upstream.deliveries == []
-
-
-def test_registered_example_runs_through_the_gateway(
-    admin: WyrdClient, tenant_admin: WyrdClient, upstream: Receiver
-) -> None:
-    cli.apply(EXAMPLE, client=admin)
-    registered = Cards(tenant_admin).workflow.load(
-        space="engineering", name="code-review", version="1.0.0"
-    )
-
-    run = registered.run(EXAMPLE_INPUT)
-
-    assert (run.status, run.outputs) == ("succeeded", {"review": "hi"})
-    assert model_calls(upstream) == 3

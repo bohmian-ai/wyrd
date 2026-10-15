@@ -22,13 +22,14 @@ expectTypeOf<
 >().toEqualTypeOf<DriftBaselineState>();
 
 // Deferred kinds keep an untyped spec until the kind is typed.
-expectTypeOf<"Workflow">().not.toExtend<TypedCardKind>();
+expectTypeOf<"Policy">().not.toExtend<TypedCardKind>();
 expectTypeOf({
   apiVersion: "wyrd/v1",
-  kind: "Workflow",
-  metadata: { name: "flow" },
-  spec: { steps: [] },
+  kind: "Policy",
+  metadata: { name: "policy" },
+  spec: { rules: [] },
 } as const).toExtend<RegisteredCard>();
+expectTypeOf<"Workflow">().not.toExtend<CardKind>();
 
 const undeclared: RegisteredVerifierCard = {
   apiVersion: "wyrd/v1",

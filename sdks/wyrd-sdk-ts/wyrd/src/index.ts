@@ -63,7 +63,6 @@ import type {
   RegisteredPromptCard,
   RegisteredServiceCard,
   RegisteredVerifierCard,
-  RegisteredWorkflowCard,
   RegistrationReceipt,
   RevokePrincipalRequest,
   RoleAssignment,
@@ -75,11 +74,6 @@ import type {
   SpanRecord,
   TokenAudience,
   UpdateOperatorConnectionRequest,
-  WorkflowRun,
-  WorkflowRunError,
-  WorkflowRunStatus,
-  WorkflowStepResult,
-  WorkflowStepStatus,
 } from "./card-types.js";
 
 import type { NativeBifrostQueryStream, NativeLifecycleResult, NativeQueryStep } from "../index.cjs";
@@ -88,7 +82,6 @@ const require = createRequire(import.meta.url);
 const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
 const {
   connectWyrdClient,
-  loadWorkflowFromPath,
   openWyrdState,
   storedTimestampText,
   tableConfigFromArrowIpc,
@@ -98,7 +91,6 @@ const {
   timestampKinds,
   timestampText,
   variantToValue,
-  workflowFromYaml,
 } = nativeBinding;
 type NativeBifrost = import("../index.cjs").NativeBifrost;
 type NativeCards = import("../index.cjs").NativeCards;
@@ -107,7 +99,6 @@ type NativePrincipals = import("../index.cjs").NativePrincipals;
 type NativeGateway = import("../index.cjs").NativeGateway;
 type NativeWyrdClient = import("../index.cjs").NativeWyrdClient;
 type NativeWyrdState = import("../index.cjs").NativeWyrdState;
-type NativeWorkflow = import("../index.cjs").NativeWorkflow;
 type NativeRun = import("../index.cjs").NativeRun;
 type NativeRunOpen = import("../index.cjs").NativeRunOpen;
 type NativeTableConfig = import("../index.cjs").NativeTableConfig;
@@ -195,11 +186,6 @@ export type {
   TableEntry,
   TokenAudience,
   UpdateOperatorConnectionRequest,
-  WorkflowRun,
-  WorkflowRunError,
-  WorkflowRunStatus,
-  WorkflowStepResult,
-  WorkflowStepStatus,
 };
 export type {
   AgentSpec,
@@ -222,7 +208,6 @@ export type {
   RegisteredTriggerCard,
   RegisteredUntypedCard,
   RegisteredVerifierCard,
-  RegisteredWorkflowCard,
   Relationships as CardRelationships,
   ServiceSpec,
   SpanRecord,
@@ -1683,168 +1668,6 @@ export class Cards {
   async delete(ref: CardRef | string): Promise<void> {
     lifecycleValue<null>(await this.#native.delete(cardRefText(ref)));
   }
-
-  /** Load registered Workflows through this registry client. */
-  get workflow(): WorkflowCards {
-    return WorkflowCards.fromNative(this.#native);
-  }
-}
-
-/**
- * Selects one registered Workflow: its exact `space`, `name`, and `version`,
- * or its `uid`. Mixing the two shapes is a type error and a runtime refusal.
- */
-export type WorkflowSelector =
-  | {
-      readonly space: string;
-      readonly name: string;
-      readonly version: string;
-      readonly uid?: never;
-    }
-  | {
-      readonly uid: string;
-      readonly space?: never;
-      readonly name?: never;
-      readonly version?: never;
-    };
-
-/** Registered-Workflow loading for one {@link Cards} client. */
-export class WorkflowCards {
-  readonly #native: NativeCards;
-
-  private constructor(native: NativeCards) {
-    this.#native = native;
-  }
-
-  /** @internal Built by {@link Cards.workflow}. */
-  static fromNative(native: NativeCards): WorkflowCards {
-    return new WorkflowCards(native);
-  }
-
-  /**
-   * Load one registered Workflow and the exact Card versions it pins.
-   *
-   * @example
-   * ```ts
-   * const workflow = await cards.workflow.load({
-   *   space: "reviews",
-   *   name: "code-review",
-   *   version: "1.0.0",
-   * });
-   * const same = await cards.workflow.load({ uid: workflowUid });
-   * ```
-   *
-   * @param selector - `{ space, name, version }` or `{ uid }`.
-   * @returns The loaded Workflow, ready to run.
-   * @throws {WyrdError} `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no such
-   * Workflow exists, `WYRD_PERMISSION_403_DENIED_RBAC` when the credential
-   * cannot read Cards, or `WYRD_WORKFLOW_400_INVALID_CARD_REF` for a mixed
-   * or incomplete selector or a malformed field.
-   */
-  async load(selector: WorkflowSelector): Promise<Workflow> {
-    const loaded = await this.#native.loadWorkflow(JSON.stringify(selector));
-    return Workflow.fromNative(nativeHandle(loaded.workflow, loaded.error));
-  }
-}
-
-/**
- * Runnable Workflow loaded from an authored file or from the registry.
- *
- * Loading validates the whole graph; running happens in Rust.
- */
-export class Workflow {
-  readonly #native: NativeWorkflow;
-
-  private constructor(native: NativeWorkflow) {
-    this.#native = native;
-  }
-
-  /** @internal Built by {@link Workflow.fromPath} or {@link WorkflowCards.load}. */
-  static fromNative(native: NativeWorkflow): Workflow {
-    return new Workflow(native);
-  }
-
-  /**
-   * Load an authored Workflow file and the Cards it references.
-   *
-   * Local files need no server. Registry refs are read, and gateway steps
-   * later run, as `options.client` when given, else with the ambient client
-   * configuration (`WYRD_SERVER_URL`, `WYRD_API_KEY`).
-   *
-   * @param path - The Workflow Card file.
-   * @param options - `client` to read refs and call the gateway as.
-   * @returns The loaded Workflow.
-   *
-   * @example
-   * ```ts
-   * const workflow = await Workflow.fromPath("workflows/code-review/workflow.yaml");
-   * console.log(workflow.steps);
-   * ```
-   *
-   * @throws {WyrdError} `WYRD_CLIENT_401_NO_CREDENTIALS` when the file
-   * references a registered Card and no credential is configured, or
-   * `WYRD_REGISTRY_404_CARD_NOT_FOUND` when a referenced Card is missing.
-   */
-  static async fromPath(path: string, options: ClientOptions = {}): Promise<Workflow> {
-    const loaded =
-      options.client === undefined
-        ? await loadWorkflowFromPath(path)
-        : await wyrdClientNative(options.client).loadWorkflowFromPath(path);
-    return Workflow.fromNative(nativeHandle(loaded.workflow, loaded.error));
-  }
-
-  /**
-   * Parse a Workflow from its Card envelope YAML text.
-   *
-   * Inline Agents and Prompts resolve eagerly; no file is read and no client
-   * is built, so a Workflow that refs a registered Card is loaded with
-   * {@link Workflow.fromPath}. Gateway steps use the ambient client at run time.
-   *
-   * @param yaml - The Workflow Card envelope text.
-   * @returns The parsed Workflow.
-   * @throws {@link WyrdError} when the text is not a valid Workflow Card or an
-   * inline Agent or Prompt does not resolve.
-   */
-  static fromYaml(yaml: string): Workflow {
-    const loaded = workflowFromYaml(yaml);
-    return Workflow.fromNative(nativeHandle(loaded.workflow, loaded.error));
-  }
-
-  /** The Workflow Card name, or undefined when the envelope declares none. */
-  get name(): string | undefined {
-    return this.#native.name ?? undefined;
-  }
-
-  /** The Workflow Card version, or undefined when the envelope declares none. */
-  get version(): string | undefined {
-    return this.#native.version ?? undefined;
-  }
-
-  /** The Workflow Card space, or undefined when the envelope declares none. */
-  get space(): string | undefined {
-    return this.#native.space ?? undefined;
-  }
-
-  /** Step IDs in declaration order. */
-  get steps(): string[] {
-    return this.#native.steps();
-  }
-
-  /**
-   * Run this Workflow with its declared inputs.
-   *
-   * Validation and route refusals throw before any step runs; step failures
-   * are recorded in the returned run.
-   *
-   * @param input - A string, shorthand for the declared string input named
-   * `input`, or the declared inputs by name; omitted, the defaults apply.
-   * @returns The terminal run snapshot.
-   * @throws {@link WyrdError} for an invalid input or a route refusal before
-   * any step runs.
-   */
-  async run(input: string | Record<string, JsonValue> = {}): Promise<WorkflowRun> {
-    return lifecycleValue<WorkflowRun>(await this.#native.run(JSON.stringify(input)));
-  }
 }
 
 /** The judgment of one direct verification, returned by {@link Observe.verify}. */
@@ -2581,17 +2404,6 @@ export class WyrdState {
    */
   verifier(alias: string): RegisteredVerifierCard {
     return lifecycleValue<RegisteredVerifierCard>(this.#native.verifier(alias));
-  }
-
-  /**
-   * The Workflow Card an alias names.
-   *
-   * @param alias - A bundle alias of a Workflow Card.
-   * @returns The envelope.
-   * @throws {@link WyrdError} as {@link WyrdState.verifier}.
-   */
-  workflow(alias: string): RegisteredWorkflowCard {
-    return lifecycleValue<RegisteredWorkflowCard>(this.#native.workflow(alias));
   }
 
   /**

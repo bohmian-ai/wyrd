@@ -3,12 +3,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import (
     Any,
-    Literal,
 )
 
 from .._wyrd import JsonDict, PathLike, WyrdError
 from ..cards import AgentCard
-from ..client import WyrdClient
 from ..prompt import Prompt, ProviderResponse
 from ._session import (
     NoSession,

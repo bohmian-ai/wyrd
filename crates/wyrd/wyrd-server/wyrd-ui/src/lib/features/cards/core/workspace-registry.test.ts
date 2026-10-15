@@ -8,20 +8,20 @@ const component = (() => {}) as unknown as CardWorkspaceModule['component'];
 
 test('discovery selects one module per kind', () => {
   const registry = buildRegistry({
-    'workspaces/workflow/index.ts': { workspace: { kind: 'Workflow', component } },
+    'workspaces/service/index.ts': { workspace: { kind: 'Service', component } },
     'workspaces/verifier/index.ts': { workspace: { kind: 'Verifier', component } }
   });
-  expect([...registry.keys()].sort()).toEqual(['Verifier', 'Workflow']);
+  expect([...registry.keys()].sort()).toEqual(['Service', 'Verifier']);
 });
 
 test('duplicate kind registration fails naming both module paths', () => {
   expect(() =>
     buildRegistry({
-      'workspaces/workflow/index.ts': { workspace: { kind: 'Workflow', component } },
-      'workspaces/workflow2/index.ts': { workspace: { kind: 'Workflow', component } }
+      'workspaces/verifier/index.ts': { workspace: { kind: 'Verifier', component } },
+      'workspaces/verifier2/index.ts': { workspace: { kind: 'Verifier', component } }
     })
   ).toThrowError(
-    /Duplicate Card workspace for kind Workflow: workspaces\/workflow\/index\.ts and workspaces\/workflow2\/index\.ts/
+    /Duplicate Card workspace for kind Verifier: workspaces\/verifier\/index\.ts and workspaces\/verifier2\/index\.ts/
   );
 });
 
@@ -32,8 +32,8 @@ test('a module without the workspace contract fails deterministically', () => {
 });
 
 test('the built registry holds exactly the earned presentations', () => {
-  expect([...workspaces.keys()].sort()).toEqual(['Service', 'Verifier', 'Workflow']);
+  expect([...workspaces.keys()].sort()).toEqual(['Service', 'Verifier']);
   // Only the Service workspace claims the full page below the shared header.
   expect(workspaces.get('Service')?.layout).toBe('page');
-  expect(workspaces.get('Workflow')?.layout).toBeUndefined();
+  expect(workspaces.get('Verifier')?.layout).toBeUndefined();
 });

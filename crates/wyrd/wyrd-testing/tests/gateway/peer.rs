@@ -15,6 +15,7 @@ use arrow::array::{Array, StringArray};
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::StreamWriter;
 use arrow::json::ReaderBuilder;
+use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use url::Url;
 use vala_bifrost_redux::tables::{CallsTable, DomainTable};
@@ -23,10 +24,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_runtime::Permission;
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, GatewayAccess};
+use wyrd_spec::auth::GatewayAccess;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
+use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_testing::server::WyrdTestServer;
 use wyrd_tonic::wyrd::v1::IngestCaptureRequest;
@@ -187,8 +189,8 @@ async fn submit_partial_resolved_model(
 /// policy on the oracle pod, and an ordinary caller invokes one chat
 /// completion there. The call row reaches `vala.gateway.calls` and its attempt
 /// span `vala.traces.spans` on the scribe pod through the capture-only peer
-/// RPC, both stamped with the reserved capture principal and the admitting
-/// request, and read back through the oracle pod's public query path. The
+/// RPC, both attributed to the caller as subject and actor and stamped with
+/// the admitting request, and read back through the oracle pod's public query path. The
 /// oracle pod's authorization decision for the call travels the same peer
 /// route into `vala.system.audit_log`.
 ///
@@ -232,9 +234,20 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
         .expect("invoker role seeds");
     let admin_key = api_key(gateway, "peer_admin", &["admin"]).await;
     let admin = exchange(gateway, &admin_key).await;
+    let Bootstrap::Machine {
+        id: caller_id,
+        api_key: caller_key,
+        ..
+    } = gateway
+        .bootstrap_service("peer_caller", &["gateway_invoker"])
+        .await
+        .expect("caller bootstraps")
+    else {
+        panic!("service bootstrap returned a user principal");
+    };
     let caller = exchange(
         gateway,
-        &api_key(gateway, "peer_caller", &["gateway_invoker"]).await,
+        &secrecy::SecretString::from(caller_key.expose_secret().to_owned()),
     )
     .await;
     let (partial_call, refusal) =
@@ -313,15 +326,22 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
 
     let deadline = Instant::now() + Duration::from_secs(30);
     for table in ["vala.gateway.calls", "vala.traces.spans"] {
-        let sql =
-            format!("SELECT principal_id FROM {table} WHERE wyrd_request_id = '{request_id}'");
+        let sql = format!(
+            "SELECT sub_principal_id, act_principal_id FROM {table} \
+             WHERE wyrd_request_id = '{request_id}'"
+        );
         let principals = loop {
             scribe
                 .flush_bifrost()
                 .await
                 .expect("the scribe pod flushes");
-            match strings(gateway, &admin_key, &sql, "principal_id").await {
-                Ok(rows) if !rows.is_empty() => break rows,
+            match strings(gateway, &admin_key, &sql, "sub_principal_id").await {
+                Ok(subjects) if !subjects.is_empty() => {
+                    let actors = strings(gateway, &admin_key, &sql, "act_principal_id")
+                        .await
+                        .expect("the landed capture's actor reads");
+                    break (subjects, actors);
+                }
                 outcome => assert!(
                     Instant::now() < deadline,
                     "{table} capture never landed through the peer Scribe: {outcome:?}"
@@ -329,10 +349,12 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         };
+        let caller = vec![caller_id.to_string()];
         assert_eq!(
             principals,
-            [GATEWAY_CAPTURE_PRINCIPAL.to_string()],
-            "{table} holds exactly the call's capture, stamped with the capture principal"
+            (caller.clone(), caller),
+            "{table} holds exactly the call's capture, attributed to the caller as \
+             subject and actor"
         );
     }
 

@@ -555,7 +555,7 @@ async fn decisions(journey: &Journey, request_id: &str) -> Vec<(String, String)>
         .server
         .retained_audit_records(
             journey.server.data_tenant_id(),
-            "operation, audit_principal_id",
+            "operation, sub_principal_id",
             &format!("request_id = '{request_id}'"),
         )
         .await

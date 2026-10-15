@@ -331,7 +331,8 @@ struct ResultJudgeCall {
 
 impl ResultJudgeCall {
     /// Assert `joined` is exactly one result and judge call, both for
-    /// `principal` on `run`, both performed by the same SYSTEM actor.
+    /// `principal` on `run`: the direct verify's result is performed by
+    /// `principal` itself, and the judge call inside it by SYSTEM.
     ///
     /// # Panics
     /// Panics when the rows differ.
@@ -349,7 +350,10 @@ impl ResultJudgeCall {
             (principal, principal, run, run),
             "{row:?}"
         );
-        assert_eq!(row.result_actor, row.call_actor, "{row:?}");
+        assert_eq!(
+            row.result_actor, principal,
+            "the caller performs its direct verify: {row:?}"
+        );
         assert_ne!(
             row.call_actor, principal,
             "SYSTEM performs the judgment: {row:?}"
@@ -576,7 +580,8 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
 /// joined on its call id, descends from the caller's span, and the call
 /// records the requesting principal as subject, SYSTEM as actor, and the
 /// verified Card with a null Run rather than an invented one. The result
-/// records the same pair and joins the call on that Card.
+/// records the requesting principal as both subject and actor, since the
+/// verify itself is direct work, and joins the call on that Card.
 ///
 /// # Panics
 /// Panics when the verify, flush, or read fails or the call differs.

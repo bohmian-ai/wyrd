@@ -17,7 +17,7 @@ import {
 } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
-import { columnValues, fixture, registered, serverTest } from "../support/server.js";
+import { ancestry, columnValues, fixture, registered, serverTest, timeline } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -105,23 +105,6 @@ test("openai client calls the gateway with an access token", async ({ provider, 
 });
 
 /** The gateway's model-call spans in the trace `traceId`, after publishing every captured row. */
-async function gatewaySpans(
-  server: { flushBifrost(): void },
-  traceId: string,
-): Promise<{ parent: unknown; state: unknown }> {
-  server.flushBifrost();
-  const spans = (
-    await (
-      await Bifrost.connect()
-    ).sql(
-      "SELECT encode(parent_span_id, 'hex') AS parent_span_id, trace_state FROM vala.traces.spans " +
-        "WHERE scope_name = 'wyrd.gateway' AND encode(trace_id, 'hex') = $1",
-      [traceId],
-    )
-  ).toArrow();
-  return { parent: columnValues(spans.getChild("parent_span_id")), state: columnValues(spans.getChild("trace_state")) };
-}
-
 test("gateway span joins the caller's trace", async ({ server, ask: _ }) => {
   const [traceId, spanId] = [randomBytes(16).toString("hex"), randomBytes(8).toString("hex")];
   const token = await WyrdClient.connect().accessToken();
@@ -134,7 +117,11 @@ test("gateway span joins the caller's trace", async ({ server, ask: _ }) => {
   const reply = await client.chat.completions.create(ASK);
 
   expect(reply.choices[0]?.message.content).toBe("hi");
-  expect(await gatewaySpans(server, traceId)).toEqual({ parent: [spanId], state: ["wyrd=journey"] });
+  const spans = await timeline(server, traceId);
+  const attempts = spans.filter((span) => span.scope.name === "wyrd.gateway");
+  expect(attempts).toHaveLength(1);
+  expect(ancestry(spans, attempts[0]).at(-1)?.parent_span_id).toBe(spanId);
+  expect(attempts[0].trace_state).toBe("wyrd=journey");
 });
 
 test("malformed traceparent is ignored by the gateway", async ({ server, ask: _ }) => {
@@ -149,7 +136,7 @@ test("malformed traceparent is ignored by the gateway", async ({ server, ask: _ 
   const reply = await client.chat.completions.create(ASK);
 
   expect(reply.choices[0]?.message.content).toBe("hi");
-  expect(await gatewaySpans(server, traceId)).toEqual({ parent: [], state: [] });
+  expect(await timeline(server, traceId)).toEqual([]);
 });
 
 test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {

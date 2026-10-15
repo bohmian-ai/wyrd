@@ -11,7 +11,7 @@ import { Bifrost, Cards, Gateway, type SpanRecord, TableConfig, WyrdClient, Wyrd
 import { cli } from "@wyrd/testing";
 
 import { configureGateway } from "../support/local-development.js";
-import { type RegisteredRef, columnValues, fixture, registered, serverTest } from "../support/server.js";
+import { type RegisteredRef, ancestry, columnValues, fixture, registered, serverTest, timeline } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 120_000 });
 
@@ -60,16 +60,6 @@ async function flushTelemetry(): Promise<void> {
   await (provider as unknown as { forceFlush(): Promise<void> }).forceFlush();
 }
 
-/** `span` and each ancestor its parent ids reach within `timeline`, nearest first. */
-function ancestry(timeline: readonly SpanRecord[], span: SpanRecord): SpanRecord[] {
-  const byId = new Map(timeline.map((each) => [each.span_id, each]));
-  const chain = [span];
-  for (let next = byId.get(span.parent_span_id ?? ""); next !== undefined; next = byId.get(next.parent_span_id ?? "")) {
-    chain.push(next);
-  }
-  return chain;
-}
-
 /** One `scope kind name` line per span, for a readable assertion message. */
 function outline(timeline: readonly SpanRecord[]): string {
   return timeline.map((span) => `${span.scope.name} ${span.kind} ${span.name}`).join("\n");
@@ -85,12 +75,6 @@ function holdsInOrder(names: readonly string[], steps: readonly ((name: string) 
     at += 1;
     return at <= names.length;
   });
-}
-
-/** The span tree of `traceId` as the administrator reads it after a flush. */
-async function timeline(server: { flushBifrost(): void }, traceId: string): Promise<SpanRecord[]> {
-  server.flushBifrost();
-  return (await Bifrost.connect()).traceTimeline(traceId);
 }
 
 /**

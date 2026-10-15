@@ -44,7 +44,7 @@ use crate::scribe::preprocess::{LogicalIdentity, correlation_data_identity};
 use crate::tables::{
     CallsTable, DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, TableError,
 };
-use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome, BifrostQueryRequest};
@@ -102,15 +102,17 @@ fn record_write_rejection(error: &IngestError) {
 /// OTLP is at-least-once and carries no request idempotency key, so a retried
 /// export must be recognized by what it accepted rather than by transport
 /// metadata. The identity is the SHA-256 of a domain separator, the
-/// authenticated tenant, the authenticated principal, the logical table FQN,
+/// authenticated tenant, the verified publisher's subject and current actor
+/// (the pair Scribe stamps on the rows), the logical table FQN,
 /// the canonical batch's logical Arrow digest from
 /// [`LogicalIdentity`], and the accepted correlation attribution that
 /// digest deliberately excludes ([`correlation_data_identity`]). The logical
 /// digest omits the per-request managed columns (request id, ingest time) that
 /// change across a legitimate retry, so a genuine replay still converges;
-/// binding the principal and the correlation columns keeps two authorized
-/// callers in one tenant from collapsing an identical user payload onto one
-/// fence and losing the second caller's attribution. Scoping by tenant and
+/// binding the publisher pair and the correlation columns keeps two authorized
+/// publishers in one tenant, including two actors for one subject, from
+/// collapsing an identical user payload onto one fence and losing the second
+/// publisher's attribution. Scoping by tenant and
 /// table keeps identity from correlating across either boundary.
 ///
 /// The first sixteen digest bytes are stamped with the RFC 4122 variant and
@@ -130,7 +132,7 @@ fn record_write_rejection(error: &IngestError) {
 /// its `expect` names that invariant.
 fn otlp_batch_id(
     tenant: DataTenantId,
-    principal: PrincipalId,
+    publisher: Attribution,
     table: &TableRef,
     identity: &LogicalIdentity,
 ) -> Result<Uuid, IngestError> {
@@ -140,7 +142,8 @@ fn otlp_batch_id(
     let mut digest = Sha256::new();
     digest.update(b"wyrd.otlp.batch-id.v1");
     digest.update(tenant.as_uuid().as_bytes());
-    digest.update(principal.as_uuid().as_bytes());
+    digest.update(publisher.sub_principal_id.as_uuid().as_bytes());
+    digest.update(publisher.act_principal_id.as_uuid().as_bytes());
     digest.update(table.fqn().as_bytes());
     digest.update(logical_digest);
     digest.update(correlation_digest);
@@ -933,8 +936,8 @@ impl<A: GateAudit + 'static> Gate<A> {
     /// suppression.
     ///
     /// The accepted rows are what identifies the request: [`otlp_batch_id`]
-    /// derives a deterministic `wyrd_batch_id` from the authenticated tenant
-    /// and principal, the table, and the batch's logical and correlation
+    /// derives a deterministic `wyrd_batch_id` from the authenticated tenant,
+    /// the verified subject/actor pair, the table, and the batch's logical and correlation
     /// content, so an at-least-once exporter replaying the same export reaches
     /// Scribe's durable fence and commits exactly once, while a different
     /// authenticated publisher or different accepted correlation attribution
@@ -973,7 +976,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             return Ok(());
         }
         let identity = LogicalIdentity::of(&batch).map_err(IngestError::from_scribe)?;
-        let batch_id = otlp_batch_id(auth.tenant, auth.principal.id, &table, &identity)?;
+        let batch_id = otlp_batch_id(auth.tenant, auth.attribution(), &table, &identity)?;
         let payload = IngressPayload::Canonical(
             match owner {
                 Some(owner) => CanonicalIngress::new(vec![batch], owner),
@@ -2854,7 +2857,7 @@ mod otlp_batch_id_tests {
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::vala::RUN_ID;
 
@@ -2890,9 +2893,9 @@ mod otlp_batch_id_tests {
     ///
     /// Retry suppression depends on a repeated export converging on one
     /// `wyrd_batch_id`, and on any other tenant, table, row order, payload,
-    /// authenticated principal, or accepted correlation attribution diverging
-    /// so identity never correlates across those boundaries and two authorized
-    /// publishers never collapse onto one fence. The value must also remain a
+    /// verified publisher subject or current actor, or accepted correlation
+    /// attribution diverging so identity never correlates across those
+    /// boundaries and two authorized publishers never collapse onto one fence. The value must also remain a
     /// `UUIDv7`, which is the contract the native ingest path validates.
     ///
     /// # Panics
@@ -2903,8 +2906,11 @@ mod otlp_batch_id_tests {
     fn derived_identity_is_stable_per_tenant_table_and_payload() {
         let tenant = DataTenantId::new_v7();
         let other_tenant = DataTenantId::new_v7();
-        let principal = PrincipalId::new(uuid::Uuid::now_v7());
-        let other_principal = PrincipalId::new(uuid::Uuid::now_v7());
+        let subject = PrincipalId::new(uuid::Uuid::now_v7());
+        let principal = Attribution::direct(subject);
+        let other_principal = Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7()));
+        let actor = Attribution::new(subject, PrincipalId::new(uuid::Uuid::now_v7()));
+        let other_actor = Attribution::new(subject, PrincipalId::new(uuid::Uuid::now_v7()));
         let spans = TableRef::new(BifrostNamespace::Traces, "spans");
         let records = TableRef::new(BifrostNamespace::Logs, "records");
         let id = |tenant, principal, table: &TableRef, values: &[i32], run| {
@@ -2920,6 +2926,12 @@ mod otlp_batch_id_tests {
             id(tenant, principal, &spans, &[1, 2, 3], Some("run-a")),
             "a replayed logical batch keeps one identity"
         );
+        let delegated = id(tenant, actor, &spans, &[1, 2, 3], Some("run-a"));
+        assert_eq!(
+            delegated,
+            id(tenant, actor, &spans, &[1, 2, 3], Some("run-a")),
+            "a replayed delegated batch keeps one identity"
+        );
         assert_eq!(
             baseline.get_version(),
             Some(uuid::Version::SortRand),
@@ -2928,6 +2940,7 @@ mod otlp_batch_id_tests {
         for divergent in [
             id(other_tenant, principal, &spans, &[1, 2, 3], Some("run-a")),
             id(tenant, other_principal, &spans, &[1, 2, 3], Some("run-a")),
+            delegated,
             id(tenant, principal, &records, &[1, 2, 3], Some("run-a")),
             id(tenant, principal, &spans, &[3, 2, 1], Some("run-a")),
             id(tenant, principal, &spans, &[1, 2, 4], Some("run-a")),
@@ -2936,9 +2949,14 @@ mod otlp_batch_id_tests {
         ] {
             assert_ne!(
                 baseline, divergent,
-                "a different tenant, principal, table, row order, payload, or accepted \
+                "a different tenant, publisher, table, row order, payload, or accepted \
                  correlation attribution is a different batch"
             );
         }
+        assert_ne!(
+            delegated,
+            id(tenant, other_actor, &spans, &[1, 2, 3], Some("run-a")),
+            "two current actors for one subject are different publishers"
+        );
     }
 }

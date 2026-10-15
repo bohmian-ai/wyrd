@@ -40,8 +40,8 @@ def test_journey_to_card_round_trip(tmp_path: Path) -> None:
 
     assert isinstance(card, AgentCard)
     assert (card.name, card.version) == ("planner", "0.3.0")
-    assert card.prompt is not None
-    assert card.prompt.model == "gpt-4o-mini"
+    assert card.prompt_ref.prompt is not None
+    assert card.prompt_ref.prompt.model == "gpt-4o-mini"
 
     agent.save(path)
     loaded = Agent.from_yaml(path)
@@ -64,7 +64,6 @@ def test_agent_card_json_round_trip() -> None:
     assert metadata["space"] == "research"
     assert restored.uid == card.uid
     assert restored.name == card.name
-    assert isinstance(restored.prompt, Prompt)
     assert restored.prompt_ref.kind == "inline"
     assert isinstance(restored.prompt_ref.prompt, Prompt)
     assert restored.prompt_ref.card_ref is None
@@ -81,7 +80,8 @@ def test_agent_card_preserves_unresolved_registered_prompt_reference() -> None:
         AgentCard(prompt_ref, space="research", name="planner").model_dump_json()
     )
 
-    assert restored.prompt is None
+    with pytest.raises(WyrdError):
+        restored.prompt()
     assert restored.prompt_ref.prompt is None
     assert restored.prompt_ref.card_ref is not None
     assert restored.prompt_ref.card_ref.name == "planner-prompt"

@@ -106,9 +106,9 @@ Wherever one Card points at another, you can write the reference three ways.
 | --- | --- | --- |
 | Registered Card | `ref: { kind: Model, name: churn-classifier, version: 1.4.2 }` | The Card already exists in the registry |
 | File path | `ref: ./support-agent.yaml` | The Card lives in the same folder; Wyrd registers it first |
-| Inline | `prompt: { model: ..., request: ... }` | The body only makes sense inside its parent; it gets no identity of its own |
+| Inline | `prompt: { model: ..., request: ... }` | The body only makes sense inside its parent; it gets no identity of its own, except an Agent's Prompt |
 
-A registered reference always names an exact `version`. A path is relative to the file that contains it, not to the folder you run `wyrd apply` from, and the Card in that file must set its own `metadata.version`. An inline body is written directly under the field, with no wrapper key. Inline bodies are allowed only where the field accepts them: an Agent's `prompt`, a Workflow step's agent, and a verification binding's Trigger and Operators.
+A registered reference always names an exact `version`. A path is relative to the file that contains it, not to the folder you run `wyrd apply` from, and the Card in that file must set its own `metadata.version`. An inline body is written directly under the field, with no wrapper key. Inline bodies are allowed only where the field accepts them: an Agent's `prompt`, a Workflow step's agent, and a verification binding's Trigger and Operators. An Agent's inline `prompt` is the exception to having no identity: registering the Agent also registers it as a Prompt Card named `<agent-name>-prompt`, in the Agent's space with its own version line, so `state.agent(alias).prompt()` returns it like any other Prompt Card.
 
 ## Versions are exact
 

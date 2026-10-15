@@ -9,22 +9,24 @@ metadata:
   annotations: {}
 spec:
   prompt:
-    request:
-      provider: open_ai_chat_completion
-      body:
-        model: gpt-4o
-        messages:
-        - role: user
-          content: inline
-    model: gpt-4o
-    variables: []
-    media_variables: []
-    response_type: text
+    kind: Prompt
+    name: triage
+    version: 1.0.0
+    space: default
+    uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04
   tool_names: []
   run_config: {}
   verified_by: []
 relationships:
-  outbound: []
-  outbound_refs: []
+  outbound:
+  - default/Prompt/triage@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04
+  outbound_refs:
+  - ref:
+      kind: Prompt
+      name: triage
+      version: 1.0.0
+      space: default
+      uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04
+    alias: null
   inbound: []
   inbound_refs: []

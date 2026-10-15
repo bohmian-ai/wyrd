@@ -29,6 +29,7 @@ use wyrd_spec::graph::{
 };
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, scope_child_card_refs};
 use wyrd_spec::registry::{
     ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardRegistrationOutcome,
@@ -1114,7 +1115,7 @@ impl RegistrationWriter<'_> {
         }
 
         let mut sibling_uids = HashMap::new();
-        let mut outcomes = Vec::with_capacity(plan.order.nodes.len());
+        let mut outcomes: Vec<CardRegistrationOutcome> = Vec::with_capacity(plan.order.nodes.len());
         let mut resolved_root = None;
         for node in &plan.order.nodes {
             let is_root = same_identity(&node.card_ref, &plan.root.root);
@@ -1123,6 +1124,22 @@ impl RegistrationWriter<'_> {
             let mut spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
                 .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
             bind_card_references(&mut spec, &plan.external_refs, &sibling_uids)?;
+            if let Spec::Agent(agent) = &mut spec
+                && let InlineableRef::Inline(prompt) = &agent.prompt
+            {
+                let mut prompt_submission = inline_prompt_submission(&submission, prompt)?;
+                pin_existing_inline_prompt(&mut conn, &submission, &mut prompt_submission).await?;
+                let outcome =
+                    persist_node(&mut conn, self.caller, operation_id, &mut prompt_submission)
+                        .await?;
+                agent.prompt = InlineableRef::Ref(outcome.card_ref.clone());
+                if !outcomes
+                    .iter()
+                    .any(|selected| selected.card_ref.uid == outcome.card_ref.uid)
+                {
+                    outcomes.push(outcome);
+                }
+            }
             submission.spec =
                 serde_json::to_value(&spec).map_err(WyrdError::from_spec_serialization)?;
             let outcome =
@@ -1186,6 +1203,7 @@ async fn persist_node(
     lock_version_line(conn, card.kind.clone(), &space, &card.metadata.name).await?;
     if let Some(existing) = resolve_existing(
         conn,
+        operation_id,
         &mut card,
         spec_hash.as_str(),
         artifact_hash.as_deref(),
@@ -1384,8 +1402,19 @@ fn inline_digest(body: &Spec) -> Result<FrozenTarget, WyrdError> {
 }
 
 /// Return an identical existing row or pin the fresh resolved version on the card.
+///
+/// An exact pin compares against the stored row at that identity. Auto and
+/// scoped versions resolve against the line's Active rows plus the Pending rows
+/// `operation_id` already wrote, so one composite selecting the same line twice
+/// reuses or advances its own earlier choice instead of colliding with it.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_409_SPEC_DRIFT` when the pinned row's content differs,
+/// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` without a space, and the version
+/// resolution or registry error otherwise.
 async fn resolve_existing(
     conn: &mut TenantConn<'_>,
+    operation_id: RegistrationOperationId,
     card: &mut Card,
     spec_hash: &str,
     artifact_hash: Option<&str>,
@@ -1427,6 +1456,7 @@ async fn resolve_existing(
             authored.as_ref(),
             card.metadata.bump.as_ref(),
             SubmittedCardIdentity {
+                operation_id,
                 spec_hash,
                 artifact_hash,
             },
@@ -1537,6 +1567,80 @@ fn replay_seed(
         outcomes: response.outcomes.clone(),
         artifact_manifest_paths,
     }
+}
+
+/// Build the Prompt Card submission an Agent's inline Prompt registers as.
+///
+/// The Prompt is named `<agent-name>-prompt` in the Agent's space and carries
+/// no version intent, so [`persist_node`] reuses an identical existing version
+/// or allocates the next one on the Prompt's own line. The Agent then pins the
+/// exact UID-bearing reference [`persist_node`] returns.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the derived name is not a
+/// valid Card name or the Prompt body does not serialize.
+fn inline_prompt_submission(
+    agent: &CardSubmission,
+    prompt: &skald_spec::Prompt,
+) -> Result<CardSubmission, WyrdError> {
+    let name = CardName::new(format!("{}-prompt", agent.metadata.name))
+        .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+    Ok(CardSubmission {
+        api_version: ApiVersion::v1(),
+        kind: CardKind::Prompt,
+        metadata: Metadata {
+            name,
+            version: None,
+            bump: None,
+            space: agent.metadata.space.clone(),
+            uid: None,
+            labels: Labels::new(),
+            annotations: Annotations::new(),
+            spec_hash: None,
+            artifact_hash: None,
+            origin: None,
+        },
+        spec: serde_json::to_value(prompt).map_err(WyrdError::from_spec_serialization)?,
+        artifacts: Vec::new(),
+    })
+}
+
+/// Pin a generated inline Prompt to the version an existing exact Agent pins.
+///
+/// When `agent` names an exact version that is already registered and that
+/// stored Agent pins a Prompt at the generated `<agent>-prompt` identity,
+/// `prompt` takes that exact version instead of auto-selecting from the line's
+/// latest. [`persist_node`] then reuses the stored Prompt when the inline body
+/// is unchanged or refuses with spec drift when it changed, so reapplying an
+/// unchanged exact Agent keeps its original Prompt after the line advanced.
+/// A fresh Agent version, or a stored Agent whose Prompt has another identity,
+/// leaves `prompt` on normal auto selection.
+///
+/// # Errors
+/// Returns the registry error when the existing Agent lookup fails.
+async fn pin_existing_inline_prompt(
+    conn: &mut TenantConn<'_>,
+    agent: &CardSubmission,
+    prompt: &mut CardSubmission,
+) -> Result<(), WyrdError> {
+    let (Some(version), Some(space)) = (agent.metadata.resolved_pin(), &agent.metadata.space)
+    else {
+        return Ok(());
+    };
+    let Some(existing) =
+        find_card_by_ref(conn, CardKind::Agent, space, &agent.metadata.name, version).await?
+    else {
+        return Ok(());
+    };
+    if let Spec::Agent(stored) = existing.spec
+        && let InlineableRef::Ref(pinned) = stored.prompt
+        && pinned.kind == CardKind::Prompt
+        && pinned.name == prompt.metadata.name
+        && pinned.space.as_ref() == prompt.metadata.space.as_ref()
+    {
+        prompt.metadata.version = Some(VersionSpec::Pin(pinned.version));
+    }
+    Ok(())
 }
 
 /// Decode one submission into the typed card envelope persisted by SQL.

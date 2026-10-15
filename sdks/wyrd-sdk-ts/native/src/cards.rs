@@ -413,16 +413,18 @@ impl NativeWyrdState {
         })
     }
 
-    /// Returns the stored envelope of the Agent Card an alias names.
+    /// Returns the stored envelope of the Agent Card an alias names, with
+    /// the exact Prompt reference it pins and that Prompt's stored envelope.
+    ///
+    /// The Prompt is the one the shared state's hydrated Agent resolves, so
+    /// the wrapper navigates without resolving the relationship itself.
     ///
     /// # Errors
     ///
     /// As [`NativeWyrdState::verifier`].
     #[napi]
     pub fn agent(&self, alias: String) -> Result<NativeLifecycleResult> {
-        self.read(|state| {
-            NativeLifecycleResult::outcome(state.agent(&alias).and_then(|_| state.card(&alias)))
-        })
+        self.read(|state| NativeLifecycleResult::outcome(hydrated_agent(state, &alias)))
     }
 
     /// Returns the stored envelope of the Prompt Card an alias names.
@@ -580,6 +582,31 @@ impl NativeWyrdState {
             Err(error) => Ok(NativeLifecycleResult::from_wyrd(error)),
         }
     }
+}
+
+/// Projects the Agent an alias names as its stored envelope, the exact
+/// Prompt reference it pins, and that Prompt's stored envelope.
+///
+/// # Errors
+///
+/// Returns the unknown-alias, kind-mismatch, or invalid-bundle error the
+/// shared state's Agent lookup reports, or an invalid-bundle error when the
+/// resolved Prompt has no stored envelope.
+fn hydrated_agent(state: &WyrdState, alias: &str) -> StdResult<serde_json::Value, WyrdError> {
+    let agent = state.agent(alias)?;
+    let prompt_key = agent.prompt_ref().to_string();
+    let prompt = state
+        .cards()
+        .find_map(|(key, card)| (key == prompt_key).then_some(card))
+        .ok_or_else(|| WyrdError::SdkInvalidStateBundle {
+            message: "Agent prompt target has no stored envelope".to_owned(),
+            details: serde_json::json!({ "alias": alias, "card_ref": agent.prompt_ref() }),
+        })?;
+    Ok(serde_json::json!({
+        "card": state.card(alias)?,
+        "prompt_ref": agent.prompt_ref(),
+        "prompt": prompt,
+    }))
 }
 
 /// Parses a Card reference passed as its text form or serialized JSON object.

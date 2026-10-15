@@ -90,7 +90,7 @@ def test_gemini_eager_inline_data_is_an_inline_data_part() -> None:
 
 
 def test_gemini_gs_uri_binds_as_a_file_data_part() -> None:
-    prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="gemini").bind_media(
+    prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="google").bind_media(
         "img", MediaRef.image_url("gs://bucket/logo.png", mime_type="image/png")
     )
 
@@ -98,7 +98,7 @@ def test_gemini_gs_uri_binds_as_a_file_data_part() -> None:
 
 
 def test_gemini_rejects_ordinary_https_media_uri() -> None:
-    prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="gemini")
+    prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="google")
 
     with pytest.raises(WyrdError) as error:
         prompt.bind_media("img", MediaRef.image_url(LOGO_URL, mime_type="image/png"))
@@ -114,7 +114,7 @@ def test_vertex_mirrors_gemini_media_behavior() -> None:
 
 
 def test_gemini_url_missing_mime_raises_exact_code() -> None:
-    prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="gemini")
+    prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="google")
 
     with pytest.raises(WyrdError) as error:
         prompt.bind_media("img", MediaRef.image_url("gs://bucket/logo.png"))

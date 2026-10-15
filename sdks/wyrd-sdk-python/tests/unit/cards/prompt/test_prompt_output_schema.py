@@ -76,4 +76,4 @@ def test_output_that_is_not_a_schema_is_refused(output: Any) -> None:
     with pytest.raises(WyrdError) as exc:
         Prompt(messages=["Hi."], model="gpt-test", provider="openai", output=output)
 
-    assert exc.value.code == "WYRD_PROMPT_400_DRAFT_INVALID"
+    assert exc.value.code == "WYRD_PROMPT_400_INVALID"

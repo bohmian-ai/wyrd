@@ -981,7 +981,7 @@ impl Prompt {
         }
     }
 
-    /// Return native prompt JSON as a Python dictionary.
+    /// Return the authored prompt JSON as a Python dictionary.
     pub fn model_dump(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         py_value(py, &self.inner)
     }
@@ -991,7 +991,7 @@ impl Prompt {
         Ok(serde_json::to_string(&self.inner)?)
     }
 
-    /// Build a prompt from serialized native prompt JSON.
+    /// Build a prompt from serialized authored prompt JSON.
     #[staticmethod]
     pub fn model_validate_json(data: &str) -> WyrdPyResult<Self> {
         Ok(Self::from_native(serde_json::from_str(data)?))

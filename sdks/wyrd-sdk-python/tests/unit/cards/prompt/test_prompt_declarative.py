@@ -68,9 +68,9 @@ def test_declarative_card_saves_and_loads_unchanged(tmp_path: Path, lead_scoring
     assert PromptCard.from_path(tmp_path / "saved.yaml").model_dump() == card.model_dump()
 
 
-def test_unknown_provider_is_refused(fixtures_dir: Path) -> None:
+def test_invalid_provider_name_is_refused(fixtures_dir: Path) -> None:
     with pytest.raises(WyrdError) as error:
-        PromptCard.from_path(fixtures_dir / "invalid" / "prompt" / "unknown-provider.yaml")
+        PromptCard.from_path(fixtures_dir / "invalid" / "prompt" / "invalid-provider.yaml")
 
     assert error.value.code == "WYRD_SPEC_400_VALIDATION"
 

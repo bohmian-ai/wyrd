@@ -9,3 +9,5 @@ spec:
   messages:
   - role: user
     content: How can I reset my password?
+  settings:
+    max_output_tokens: 1024

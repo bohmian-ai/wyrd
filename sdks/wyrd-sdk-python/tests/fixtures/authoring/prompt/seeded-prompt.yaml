@@ -7,8 +7,11 @@ metadata:
 spec:
   provider: openai
   model: gpt-4o
-  messages: hello
-  model_settings:
+  format: chat_completion
+  body:
+    messages:
+    - role: user
+      content: hello
     seed: 123
     future_knob:
       enabled: true

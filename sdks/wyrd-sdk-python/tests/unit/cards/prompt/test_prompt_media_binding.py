@@ -33,7 +33,7 @@ def test_openai_bound_media_becomes_an_image_url_part() -> None:
     assert content.as_parts()[1].kind == "image_url"
 
 
-@pytest.mark.parametrize("provider", ["gemini", "vertex"])
+@pytest.mark.parametrize("provider", ["google", "vertex"])
 def test_google_bound_media_becomes_an_inline_data_part(provider: str) -> None:
     prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider=provider).bind_media(
         "img", MediaRef.image_base64("image/png", "QUJD")

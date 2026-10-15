@@ -12,5 +12,5 @@ spec:
   messages:
   - role: user
     content: Summarize {{doc}}.
-  model_settings:
+  settings:
     temperature: 0.2

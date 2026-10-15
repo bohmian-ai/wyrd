@@ -92,11 +92,6 @@ def test_response_format_json_schema_sets_the_response_schema() -> None:
         ),
         pytest.param(Prompt.gemini("gemini-2.5-pro", messages="hello"), "google", id="gemini"),
         pytest.param(Prompt.vertex("gemini-2.5-pro", messages="hello"), "vertex", id="vertex"),
-        pytest.param(
-            Prompt.raw("openai", "gpt-4o", b'{"model":"gpt-4o","messages":["hello"]}'),
-            "openai",
-            id="raw",
-        ),
     ],
 )
 def test_every_provider_builder_round_trips_through_a_promptcard(

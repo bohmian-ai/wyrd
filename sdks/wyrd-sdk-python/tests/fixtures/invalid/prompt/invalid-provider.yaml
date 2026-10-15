@@ -1,9 +1,9 @@
 kind: Prompt
 metadata:
-  name: unknown-provider
+  name: invalid-provider
   version: 0.1.0
 spec:
-  provider: unknownprovider
+  provider: Not A Provider
   model: some-model
   messages:
   - role: user

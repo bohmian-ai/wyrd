@@ -122,15 +122,16 @@ impl OutboxSink for ObservationRunSink {
                 Some(owner) => self.authority.resolve(&mut conn, owner).await?,
                 None => None,
             };
-            match authority {
-                Some(authority) => authorized.push((binding, authority)),
-                None => tracing::warn!(
+            if let Some(authority) = authority {
+                authorized.push((binding, authority));
+            } else {
+                tracing::warn!(
                     %tenant,
                     binding_id = %binding.binding_id,
                     owner_card_uid = %binding.owner_card_uid,
                     owner = ?binding.owner,
                     "observation run not accepted: the binding owner or SYSTEM has no authority"
-                ),
+                );
             }
         }
         self.runs

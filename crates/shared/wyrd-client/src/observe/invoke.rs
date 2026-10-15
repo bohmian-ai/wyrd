@@ -35,7 +35,13 @@ impl Run {
     /// # Errors
     /// Returns the errors of [`Self::invoke_on`].
     pub async fn invoke(&self, variables: &[(&str, &str)]) -> Result<String, WyrdError> {
-        let route = self.state.agent(&self.alias)?.card().spec.execution_route.clone();
+        let route = self
+            .state
+            .agent(&self.alias)?
+            .card()
+            .spec
+            .execution_route
+            .clone();
         self.invoke_on(&route, variables).await
     }
 

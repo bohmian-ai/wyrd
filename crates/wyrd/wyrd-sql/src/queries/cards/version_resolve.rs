@@ -6,6 +6,7 @@ use wyrd_semver::{VersionBlock, VersionBump, VersionSpec, seed_version};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
+use wyrd_spec::registry::RegistrationOperationId;
 
 use crate::queries::cards::version_sql::push_bounds;
 use crate::tenant_conn::TenantConn;
@@ -22,7 +23,14 @@ pub enum Resolution {
 }
 
 /// Canonical identities used for artifact-aware deduplication.
+///
+/// `operation_id` names the registration transaction submitting the Card. Its
+/// own Pending rows join the Active rows eligible for dedup and next-version
+/// allocation, so repeated selection on one line inside one composite sees the
+/// versions it already chose; other operations' Pending rows stay excluded.
 pub struct SubmittedCardIdentity<'a> {
+    /// Registration operation whose Pending rows are eligible.
+    pub operation_id: RegistrationOperationId,
     /// Canonical spec hash.
     pub spec_hash: &'a str,
     /// Canonical artifact-manifest hash, when the submission is heavy.
@@ -43,12 +51,15 @@ async fn latest_stable_in_line(
     kind: CardKind,
     space: &SpaceName,
     name: &CardName,
+    operation_id: RegistrationOperationId,
     bounds: Option<&wyrd_semver::VersionBounds>,
 ) -> Result<Option<LatestInLine>, WyrdError> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT version, spec_hash, artifact_hash FROM wyrd.cards \
-         WHERE status = 'active' AND NOT version_is_prerelease AND kind = ",
+         WHERE (status = 'active' OR (status = 'pending' AND registration_operation_id = ",
     );
+    qb.push_bind(operation_id.as_uuid());
+    qb.push(")) AND NOT version_is_prerelease AND kind = ");
     qb.push_bind(kind.wire_name());
     qb.push(" AND space = ").push_bind(space.as_str());
     qb.push(" AND name = ").push_bind(name.as_str());
@@ -80,7 +91,8 @@ async fn latest_stable_in_line(
 
 /// Resolve the authored version + bump against existing rows.
 ///
-/// Hash dedup compares only against the latest stable row in the authored line.
+/// Hash dedup compares only against the latest stable row in the authored line,
+/// counting the submitting operation's own Pending rows as eligible.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` for invalid bounds, overflow,
@@ -100,7 +112,9 @@ pub async fn resolve_version(
         Some(VersionSpec::Pin(_)) => {
             unreachable!("resolve_version is only called on the auto/scope path")
         }
-        None => match latest_stable_in_line(conn, kind, space, name, None).await? {
+        None => match latest_stable_in_line(conn, kind, space, name, submitted.operation_id, None)
+            .await?
+        {
             Some(latest)
                 if latest.spec_hash == submitted.spec_hash
                     && latest.artifact_hash.as_deref() == submitted.artifact_hash =>
@@ -122,7 +136,16 @@ pub async fn resolve_version(
             let bounds = range
                 .to_bounds()
                 .map_err(|e| WyrdError::registry_invalid_version_block(e.to_string()))?;
-            match latest_stable_in_line(conn, kind, space, name, Some(&bounds)).await? {
+            match latest_stable_in_line(
+                conn,
+                kind,
+                space,
+                name,
+                submitted.operation_id,
+                Some(&bounds),
+            )
+            .await?
+            {
                 Some(latest)
                     if latest.spec_hash == submitted.spec_hash
                         && latest.artifact_hash.as_deref() == submitted.artifact_hash =>

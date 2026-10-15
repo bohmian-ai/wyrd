@@ -127,9 +127,26 @@ test("delegated connect uses the subject principal", async ({ server }) => {
   });
   const token = await WyrdClient.connect({ credential: subject }).accessToken();
   const delegated = await actor.onBehalfOf(token, { audience: "bifrost" });
+  const principals = await Principals.connect();
+  const [subjectId, actorId] = await Promise.all(
+    ["instantiation_subject", "instantiation_actor"].map(
+      async (name) => (await principals.list({ name })).principals[0]?.principal_id,
+    ),
+  );
 
-  await expect((await Bifrost.connect({ client: delegated })).listTables()).rejects.toMatchObject(DENIED);
-  await expect((await Bifrost.connect({ client: actor })).listTables()).resolves.toBeDefined();
+  const asSubject = await Bifrost.connect({ client: delegated });
+  await expect(asSubject.listTables()).rejects.toMatchObject(DENIED);
+  await asSubject.sql("SELECT COUNT(*) AS n FROM vala.system.audit_log");
+  const asActor = await Bifrost.connect({ client: actor });
+  await expect(asActor.listTables()).resolves.toBeDefined();
+
+  server.flushBifrost();
+  const decisions = await asActor.sql(
+    "SELECT detail FROM vala.system.audit_log WHERE operation = 'bifrost.query.read_decision' AND audit_principal_id = $1",
+    [subjectId ?? ""],
+    z.object({ detail: z.object({ delegation_chain: z.array(z.object({ principal_id: z.string() })) }) }),
+  );
+  expect(decisions.map((row) => row.detail.delegation_chain[0]?.principal_id)).toEqual([actorId]);
 });
 
 test("handles reuse the client cache and renew", async ({ server }) => {

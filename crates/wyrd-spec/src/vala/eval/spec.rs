@@ -13,7 +13,6 @@ use crate::error::WyrdError;
 use crate::reference::{CardRef, Ref};
 
 use super::ids::{JsonPath, TaskId};
-use super::operator::{ComparisonOperator, validate_regex_pattern};
 use super::plan::{DagError, ExecutionPlan, validate_dag};
 use super::result::{EvalContextCapture, EvalPassGate};
 use super::task::EvalTask;
@@ -187,11 +186,7 @@ fn validate_task_operator(task: &EvalTask) -> Result<(), WyrdError> {
         EvalTask::TraceAssertion(t) => &t.operator,
         EvalTask::AgentAssertion(t) => &t.operator,
     };
-    match operator {
-        ComparisonOperator::MatchesRegex { pattern }
-        | ComparisonOperator::NotMatchesRegex { pattern } => validate_regex_pattern(pattern),
-        _ => Ok(()),
-    }
+    operator.validate()
 }
 
 fn validate_task_keys(tasks: &BTreeMap<TaskId, EvalTask>) -> Result<(), WyrdError> {

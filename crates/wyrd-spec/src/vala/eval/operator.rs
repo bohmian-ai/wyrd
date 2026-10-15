@@ -35,7 +35,7 @@ use crate::error::WyrdError;
 /// regex-compilation cost in eval workers.
 pub const MAX_REGEX_PATTERN_LEN: usize = 4096;
 
-pub(super) fn validate_regex_pattern(pattern: &str) -> Result<(), WyrdError> {
+fn validate_regex_pattern(pattern: &str) -> Result<(), WyrdError> {
     if pattern.len() > MAX_REGEX_PATTERN_LEN {
         return Err(WyrdError::Validation {
             message: format!(
@@ -583,6 +583,20 @@ enum ComparisonOperatorWireSchema {
 }
 
 impl ComparisonOperator {
+    /// Validates authored operator parameters that serde cannot check.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when a regex pattern is longer than
+    /// [`MAX_REGEX_PATTERN_LEN`] or does not compile.
+    pub fn validate(&self) -> Result<(), WyrdError> {
+        match self {
+            Self::MatchesRegex { pattern } | Self::NotMatchesRegex { pattern } => {
+                validate_regex_pattern(pattern)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Stable `snake_case` discriminator for this variant.
     ///
     /// This matches the `operator` tag in the serde wire form without

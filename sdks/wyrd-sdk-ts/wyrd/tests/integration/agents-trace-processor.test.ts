@@ -3,7 +3,7 @@
 // scripted local upstream, directly or through the Wyrd gateway, and the
 // application is configured only through the environment: the server URL and
 // the `observed-service` key.
-import { context, propagation, type Span, trace } from "@opentelemetry/api";
+import { context, propagation, type ProxyTracerProvider, type Span, trace } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { Agent, run, setTraceProcessors, setTracingDisabled, tool } from "@openai/agents-core";
@@ -200,15 +200,59 @@ afterEach(() => {
   propagation.disable();
 });
 
-test("managed framework telemetry", async ({ server, provider, bundle, serviceKey }) => {
-  const state = ambientState(bundle, serviceKey);
-  await state.startTelemetry();
+/** Publish captured rows, then read Run `runId`'s drift values as the administrator. */
+async function drift(server: NativeWyrdTestServer, runId: string): Promise<number[]> {
+  server.flushBifrost();
+  const reader = await Bifrost.connect({ client: WyrdClient.connect({ credential: server.apiKey }) });
+  try {
+    const rows = await reader.sql("SELECT num_value FROM vala.drift.observations WHERE run_id = $1", [runId], Drift);
+    return rows.map((row) => row.num_value);
+  } finally {
+    await reader.shutdown();
+  }
+}
 
-  const result = await turn(state, direct(provider.url));
-  await state.shutdown();
+/** One `vala.drift.observations` value. */
+const Drift = z.object({ num_value: z.number() });
 
+/** One turn, then one drift observation through the state's native writer. */
+async function observed(state: WyrdState, ask: Ask) {
+  const result = await turn(state, ask);
+  const observation = state.run("model");
+  observation.observe.drift({ latency: 1 });
+  return { ...result, observation: observation.runId };
+}
+
+/** `result`'s spans and its drift observation both read back. */
+async function expectObserved(server: NativeWyrdTestServer, result: Awaited<ReturnType<typeof observed>>) {
   expect(result.output).toBe("done");
   expectTurn(await timeline(server, result.traceId), result.runId, result.cardUid);
+  expect(await drift(server, result.observation)).toEqual([1]);
+}
+
+test("managed framework telemetry", async ({ server, provider, bundle, serviceKey }) => {
+  const state = ambientState(bundle, serviceKey);
+  await state.startBifrost();
+  await state.startTelemetry();
+  const ask = direct(provider.url);
+  const held = trace.getTracer("framework-app").startSpan("held");
+
+  // A live flush exports and drains without closing anything: read it back first.
+  const first = await observed(state, ask);
+  await state.flush();
+  await expectObserved(server, first);
+
+  const second = await observed(state, ask);
+  held.end();
+  await state.shutdown();
+  await expectObserved(server, second);
+  expect((await timeline(server, held.spanContext().traceId)).map((span) => span.name)).toEqual(["held"]);
+
+  // After the state's shutdown, the global provider still exports.
+  const after = await turn(state, ask);
+  const global = (trace.getTracerProvider() as ProxyTracerProvider).getDelegate() as BasicTracerProvider;
+  await global.forceFlush();
+  expectTurn(await timeline(server, after.traceId), after.runId, after.cardUid);
 });
 
 test("owned provider framework telemetry", async ({ server, provider, bundle, serviceKey }) => {

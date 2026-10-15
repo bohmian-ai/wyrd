@@ -1,4 +1,3 @@
-import type { Span as AgentsSpan, SpanData, Trace, TracingProcessor } from "@openai/agents-core";
 import type { Span as OtelSpan } from "@opentelemetry/api";
 import { DataType, Table, tableFromIPC, tableToIPC, type Field, type RecordBatch, type Schema } from "apache-arrow";
 import { createRequire } from "node:module";
@@ -2492,6 +2491,42 @@ export class Run {
 }
 
 /**
+ * The fields of an Agents SDK span's data the processor reads. Declared here,
+ * not imported, so the package's types never require the optional
+ * `@openai/agents-core`; every one of its `SpanData` values is assignable.
+ */
+interface AgentsSpanData {
+  readonly type: string;
+  readonly name?: unknown;
+  readonly model?: unknown;
+  readonly usage?: AgentsUsage;
+  readonly _response?: { readonly model?: unknown; readonly usage?: AgentsUsage };
+}
+
+/** The token counts an Agents SDK model span may supply. */
+interface AgentsUsage {
+  readonly input_tokens?: unknown;
+  readonly output_tokens?: unknown;
+}
+
+/** The fields of an Agents SDK span the processor reads. */
+interface AgentsSpan {
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly parentId: string | null;
+  readonly spanData: AgentsSpanData;
+  readonly error: unknown;
+  readonly startedAt: string | null;
+  readonly endedAt: string | null;
+}
+
+/** The fields of an Agents SDK trace the processor reads. */
+interface AgentsTrace {
+  readonly traceId: string;
+  readonly name: string;
+}
+
+/**
  * An OpenAI Agents SDK trace processor that records each Agents SDK trace and
  * span as an OpenTelemetry span on the global tracer provider.
  *
@@ -2514,30 +2549,30 @@ export class Run {
  * with ERROR. Neither `shutdown` nor `forceFlush` touches the provider.
  * Without `@opentelemetry/api` installed it records nothing.
  */
-export class WyrdAgentsTraceProcessor implements TracingProcessor {
+export class WyrdAgentsTraceProcessor {
   /** The OpenTelemetry span for each open SDK trace or span, by SDK id. */
   readonly #open = new Map<string, OtelSpan>();
   /** Set by {@link WyrdAgentsTraceProcessor.shutdown}; later callbacks are ignored. */
   #closed = false;
 
   /** Start the span for `trace` in the active context. */
-  async onTraceStart(trace: Trace): Promise<void> {
+  async onTraceStart(trace: AgentsTrace): Promise<void> {
     this.#start(trace.traceId, [], trace.name, null);
   }
 
   /** End the span for `trace`. */
-  async onTraceEnd(trace: Trace): Promise<void> {
+  async onTraceEnd(trace: AgentsTrace): Promise<void> {
     this.#end(trace.traceId, undefined, null);
   }
 
   /** Start a child of `span`'s SDK parent, else its trace, else the active context. */
-  async onSpanStart(span: AgentsSpan<SpanData>): Promise<void> {
+  async onSpanStart(span: AgentsSpan): Promise<void> {
     const parents = span.parentId ? [span.parentId, span.traceId] : [span.traceId];
     this.#start(span.spanId, parents, agentsSpanName(span.spanData), span.startedAt);
   }
 
   /** Record `span`'s GenAI attributes and error status, then end it. */
-  async onSpanEnd(span: AgentsSpan<SpanData>): Promise<void> {
+  async onSpanEnd(span: AgentsSpan): Promise<void> {
     this.#end(span.spanId, span, span.endedAt);
   }
 
@@ -2573,7 +2608,7 @@ export class WyrdAgentsTraceProcessor implements TracingProcessor {
   }
 
   /** Record `span`'s final data on, and end, the open span for SDK id `id`. */
-  #end(id: string, span: AgentsSpan<SpanData> | undefined, endedAt: string | null): void {
+  #end(id: string, span: AgentsSpan | undefined, endedAt: string | null): void {
     const open = this.#open.get(id);
     if (open === undefined) {
       return;
@@ -2585,7 +2620,7 @@ export class WyrdAgentsTraceProcessor implements TracingProcessor {
         open.updateName(name);
       }
       open.setAttributes(attributes);
-      if (span.error !== null) {
+      if (span.error != null) {
         open.setAttribute("error.type", "_OTHER");
         open.setStatus({ code: 2 /* SpanStatusCode.ERROR */ });
       }
@@ -2621,8 +2656,8 @@ function agentsTime(timestamp: string | null | undefined): number | undefined {
 }
 
 /** The GenAI start-time span name for agent and tool spans, else the SDK name or type. */
-function agentsSpanName(data: SpanData): string {
-  const name = "name" in data && typeof data.name === "string" && data.name !== "" ? data.name : undefined;
+function agentsSpanName(data: AgentsSpanData): string {
+  const name = typeof data.name === "string" && data.name !== "" ? data.name : undefined;
   if (data.type === "agent" && name !== undefined) {
     return `invoke_agent ${name}`;
   }
@@ -2636,30 +2671,39 @@ function agentsSpanName(data: SpanData): string {
  * The final span name, if it changes, and the GenAI attributes `data`
  * supplies. Only identity, model, and token counts are read; content never is.
  */
-function agentsGenAi(data: SpanData): { name?: string; attributes: Record<string, string | number> } {
+function agentsGenAi(data: AgentsSpanData): { name?: string; attributes: Record<string, string | number> } {
   if (data.type === "agent") {
-    return { attributes: { "gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": data.name } };
+    return {
+      attributes: suppliedAttributes({ "gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": data.name }),
+    };
   }
   if (data.type === "function") {
-    return { attributes: { "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": data.name } };
+    return {
+      attributes: suppliedAttributes({ "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": data.name }),
+    };
   }
   const call = data.type === "generation" ? data : data.type === "response" ? data._response : undefined;
   if (call === undefined) {
     return { attributes: {} };
   }
-  const supplied = {
+  const attributes = suppliedAttributes({
     "gen_ai.operation.name": "chat",
     "gen_ai.request.model": call.model,
     "gen_ai.usage.input_tokens": call.usage?.input_tokens,
     "gen_ai.usage.output_tokens": call.usage?.output_tokens,
-  };
+  });
+  return { name: typeof call.model === "string" && call.model !== "" ? `chat ${call.model}` : "chat", attributes };
+}
+
+/** The string and number values of `supplied`; any other value is omitted. */
+function suppliedAttributes(supplied: Record<string, unknown>): Record<string, string | number> {
   const attributes: Record<string, string | number> = {};
   for (const [key, value] of Object.entries(supplied)) {
     if (typeof value === "string" || typeof value === "number") {
       attributes[key] = value;
     }
   }
-  return { name: typeof call.model === "string" && call.model !== "" ? `chat ${call.model}` : "chat", attributes };
+  return attributes;
 }
 
 /**
@@ -2884,6 +2928,10 @@ export class WyrdState {
     const native = this.#native.client();
     const client = WyrdClient.fromNative(nativeHandle(native.client, native.error));
     const { startTelemetry } = await import("./otel.js");
+    // An overlapping call on this state may have installed during the await.
+    if (this.#telemetry !== undefined) {
+      return;
+    }
     const provider = startTelemetry(client);
     if (provider === undefined) {
       throw projectedError(telemetryProviderExists());

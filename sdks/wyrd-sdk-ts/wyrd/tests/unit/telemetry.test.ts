@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
 
+import type { TracingProcessor } from "@openai/agents-core";
 import { SpanStatusCode, context, trace } from "@opentelemetry/api";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import {
@@ -49,7 +50,8 @@ afterEach(async () => {
 
 test("telemetry setup", async () => {
   const state = offlineState();
-  await state.startTelemetry();
+  // Overlapping calls on one state install a single provider.
+  await Promise.all([state.startTelemetry(), state.startTelemetry()]);
   const installed = globalProvider();
   expect(installed).toBeInstanceOf(BasicTracerProvider);
   await state.startTelemetry();
@@ -230,7 +232,8 @@ test("agents callback lifecycle", async () => {
     spanProcessors: [runCorrelationProcessor(), new SimpleSpanProcessor(exporter)],
   });
   trace.setGlobalTracerProvider(provider);
-  const processor = new WyrdAgentsTraceProcessor();
+  // The installed Agents SDK accepts the processor its declarations describe.
+  const processor = new WyrdAgentsTraceProcessor() satisfies TracingProcessor;
   type Callback = Parameters<WyrdAgentsTraceProcessor["onSpanStart"]>[0];
   const call = (span: ReturnType<typeof agentsSpan>) => span as unknown as Callback;
   const traceHandle = { traceId: "trace_1", name: "workflow" } as unknown as Parameters<

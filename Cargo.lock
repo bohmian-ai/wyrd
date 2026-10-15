@@ -1860,7 +1860,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "datafusion"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -1913,7 +1913,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1937,7 +1937,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog-listing"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1960,7 +1960,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -1987,7 +1987,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "futures",
  "log",
@@ -1997,7 +1997,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "async-compression",
@@ -2033,7 +2033,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-arrow"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -2057,7 +2057,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-csv"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2080,7 +2080,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-json"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2103,7 +2103,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-parquet"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2172,12 +2172,12 @@ dependencies = [
 [[package]]
 name = "datafusion-doc"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 
 [[package]]
 name = "datafusion-execution"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -2202,7 +2202,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2226,7 +2226,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr-common"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2237,7 +2237,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -2268,7 +2268,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "arrow-select",
@@ -2290,7 +2290,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate-common"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2301,7 +2301,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-nested"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -2325,7 +2325,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-table"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2340,7 +2340,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-variant"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "bohmian-parquet-variant",
@@ -2355,7 +2355,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2371,7 +2371,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window-common"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -2380,7 +2380,7 @@ dependencies = [
 [[package]]
 name = "datafusion-macros"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "datafusion-doc",
  "quote",
@@ -2390,7 +2390,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "chrono",
@@ -2409,7 +2409,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2433,7 +2433,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-adapter"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2447,7 +2447,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-common"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "chrono",
@@ -2465,7 +2465,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-optimizer"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2484,7 +2484,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "arrow-data",
@@ -2521,7 +2521,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "datafusion-catalog",
@@ -2547,7 +2547,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto-common"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2557,7 +2557,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto-models"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "datafusion-common",
  "datafusion-proto-common",
@@ -2567,7 +2567,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pruning"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2582,7 +2582,7 @@ dependencies = [
 [[package]]
 name = "datafusion-session"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -2597,7 +2597,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "55.1.0"
-source = "git+https://github.com/bohmian-ai/datafusion?rev=fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b#fbe115d2d86bffc15ae1b7c9ecea5e12e731e25b"
+source = "git+https://github.com/bohmian-ai/datafusion?rev=b8ec4b1d291cd8e371bb88fc76959d91e8503a1d#b8ec4b1d291cd8e371bb88fc76959d91e8503a1d"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -4820,7 +4820,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -5585,7 +5585,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -5606,7 +5606,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -8775,7 +8775,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -9215,6 +9215,7 @@ dependencies = [
  "typenum",
  "url",
  "uuid",
+ "windows-sys 0.48.0",
  "windows-sys 0.61.2",
  "zerocopy",
  "zeroize",
@@ -9432,6 +9433,7 @@ dependencies = [
  "ed25519-dalek",
  "indicatif",
  "predicates",
+ "rand 0.9.5",
  "reqwest 0.13.4",
  "rmcp",
  "rustix",
@@ -9488,6 +9490,7 @@ dependencies = [
  "indicatif",
  "oauth2",
  "opentelemetry",
+ "opentelemetry_sdk",
  "reqwest 0.13.4",
  "rustix",
  "schemars 0.8.22",
@@ -9507,6 +9510,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
  "urlencoding",
  "uuid",
  "vala-bifrost-redux",
@@ -9679,12 +9683,14 @@ dependencies = [
  "uuid",
  "vala-bifrost-redux",
  "vala-eval",
+ "wiremock",
  "workspace-hack",
  "wyrd-client",
  "wyrd-runtime",
  "wyrd-server",
  "wyrd-spec",
  "wyrd-sql",
+ "wyrd-telemetry",
  "wyrd-testing",
 ]
 
@@ -9876,6 +9882,7 @@ dependencies = [
  "num-traits",
  "oauth2",
  "object_store",
+ "opentelemetry",
  "rand 0.9.5",
  "reqwest 0.13.4",
  "rmcp",
@@ -10208,8 +10215,10 @@ dependencies = [
 name = "wyrd-telemetry"
 version = "0.1.0"
 dependencies = [
+ "http",
  "opentelemetry",
  "opentelemetry-otlp",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
  "serde",
  "serde_json",
@@ -10339,6 +10348,7 @@ dependencies = [
  "uuid",
  "workspace-hack",
  "wyrd-spec",
+ "wyrd-telemetry",
  "wyrd-tls",
  "wyrd-tonic",
 ]

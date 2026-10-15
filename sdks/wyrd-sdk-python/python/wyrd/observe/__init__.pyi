@@ -1,15 +1,10 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
 from collections.abc import Mapping, Sequence
 from types import TracebackType
 from typing import Any, Literal
 
-from ..bifrost import Bifrost, Correlation
 from ..cards import CardRef
 from ..eval import MediaRef
-
-#### end of imports ####
+from ._telemetry import record
 
 class Run:
     """One invocation, and one Card-scoped view of it.
@@ -285,39 +280,5 @@ class Observe:
                 unknown, unauthorized, or unavailable.
         """
         ...
-
-def record(
-    bifrost: Bifrost,
-    table: str,
-    schema: Mapping[str, Any] | type[Any],
-    row: Mapping[str, Any] | Any,
-    correlation: Correlation | None = None,
-) -> None:
-    """Record one telemetry observation, fire-and-forget.
-
-    Telemetry names its own ``table`` and ``schema`` per call rather than using
-    the client's active binding, so an instrumented process writes its signals
-    alongside whatever the application writes. If the producer refuses the row,
-    for example because its queue is full, the row is dropped and counted on
-    ``bifrost.dropped`` instead of raising.
-
-    Args:
-        bifrost: the ``Bifrost`` client whose producers carry the row.
-        table: the destination table name.
-        schema: the table's JSON Schema mapping, or a Pydantic model class
-            whose ``model_json_schema()`` is used.
-        row: the row as a mapping or a Pydantic model instance.
-        correlation: optional ``card_uid`` (a registered Card UID) and
-            ``run_id`` stamped on the row. Omitted, the row is uncorrelated.
-
-    Returns:
-        ``None``; a refused row is counted on ``bifrost.dropped``.
-
-    Raises:
-        WyrdError: ``WYRD_VALA_400_SCHEMA_PARSE`` for a schema with no
-            mappable columns, as ``TableConfig.from_json_schema`` raises;
-            ``WYRD_SPEC_400_VALIDATION`` for an invalid ``card_uid``.
-    """
-    ...
 
 __all__ = ["Judgment", "Observe", "Run", "record"]

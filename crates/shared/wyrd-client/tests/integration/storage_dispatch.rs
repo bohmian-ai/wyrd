@@ -347,6 +347,52 @@ async fn high_level_upload_dispatches_single_put_and_localfs() {
     assert_eq!(requests[2].target, "/v1/cards/upload/local");
 }
 
+/// A traced upload carries the caller's trace to the Wyrd API but never to the
+/// presigned storage backend, which is a foreign origin.
+#[tokio::test]
+async fn traced_upload_keeps_trace_headers_off_the_presigned_backend() {
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing::Instrument as _;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let server = TestServer::start(vec![response(200), stored_response()]).await;
+    let storage = WyrdStorageClient::new(&client(server.uri()));
+    let traced = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(
+                opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                    .build()
+                    .tracer("storage-dispatch"),
+            ),
+        ),
+    );
+    let ambient = tracing::dispatcher::with_default(&traced, || tracing::info_span!("caller"));
+    let plan = UploadPlan::SinglePut {
+        put_url: format!("{}/single", server.uri()),
+        ttl_secs: 60,
+        required_headers: Vec::new(),
+    };
+    storage
+        .upload_artifact(&UploadId::new(), &plan, b"data".to_vec(), "key")
+        .instrument(ambient)
+        .with_subscriber(traced)
+        .await
+        .expect("traced upload succeeds");
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+    let has =
+        |request: &Request, header: &str| request.headers.iter().any(|(name, _)| name == header);
+    assert_eq!(requests[0].target, "/single");
+    for header in ["traceparent", "tracestate", "authorization"] {
+        assert!(!has(&requests[0], header), "presigned PUT sent {header}");
+    }
+    assert!(
+        has(&requests[1], "traceparent"),
+        "the Wyrd API call is traced"
+    );
+}
+
 /// multipart plans mint part URLs, upload parts, and complete through the server.
 #[tokio::test]
 async fn high_level_upload_dispatches_s3_and_completes_server_upload() {

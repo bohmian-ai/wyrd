@@ -172,6 +172,7 @@ async fn submit_partial_resolved_model(
             request_id: RequestId::now_v7().as_str().to_owned(),
             arrow_ipc: writer.into_inner()?.into(),
             verifier: None,
+            principal_id: String::new(),
         })
         .await
         .err()

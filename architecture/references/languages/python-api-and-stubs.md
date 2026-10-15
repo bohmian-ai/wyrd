@@ -2,7 +2,7 @@
 
 The Python package is a first-class typed client over Wyrd server contracts
 and Rust-owned local boundary behavior. It may provide ergonomic authoring
-helpers, OTEL hooks, agent workflow integrations, generated stubs, and
+helpers, OTEL hooks, agent workflow integrations, authored stubs, and
 Python-native tests, but it must not duplicate durable server logic or
 become the source of truth for API behavior.
 
@@ -17,7 +17,8 @@ For every Python-visible change, verify all six layers:
 3. `sdks/wyrd-sdk-python/src` registers the native wrapper or exported
    class/function.
 4. Python package exports exist under `sdks/wyrd-sdk-python/python/wyrd`.
-5. Generated stubs regenerate cleanly (`mise run codegen:check`).
+5. The authored public stubs declare the change and pass `mise run py:lints`
+   and `mise run py:typecheck`.
 6. Python tests import from public `wyrd` modules, not private extension
    paths, unless the private path is the intended contract.
 
@@ -26,14 +27,21 @@ that is intentionally the public shape.
 
 ## Stub Rules
 
-- Do not hand-edit generated stubs.
-- Fix source annotations or generator behavior, then regenerate via
-  `mise run codegen:stubs`.
-- Stubs must match runtime imports.
+- The package-local `.pyi` files, including `_wyrd.pyi`, are the one authored
+  declaration of the native API. Edit them directly; there is no stub
+  generator or second stub tree.
+- Declare a pure-Python definition once, with inline annotations, in a
+  stub-less module, and re-export it from the public stub. Do not restate it.
+- Declare a shared native type once and import it where other stubs use it.
+- Stubs must match runtime imports; `__all__` in each `__init__.pyi` matches its
+  `__init__.py`.
+- Document every public class, constructor (as `__init__`), method, and
+  function with an `Args:` entry per parameter. `mise run py:lints` runs
+  `scripts/check_stubs.py` to enforce this, export parity, and package layout.
 - Public signatures should use precise types, not broad `Any`, unless the
   API truly accepts arbitrary input.
-- Type-check the stub surface with `mise run py:typecheck` after stub
-  regeneration.
+- Type-check the stub surface with `mise run py:typecheck`. Typechecking does
+  not prove native signature parity; keep runtime and export tests.
 
 ## Package Layout
 
@@ -58,7 +66,7 @@ sdks/wyrd-sdk-python/python/wyrd/
 `_wyrd` is the private extension module. Its native registration tree may use
 children such as `wyrd._wyrd.cards.data`; users import the public projections
 from top-level `wyrd.data`, `wyrd.model`, `wyrd.prompt`, and `wyrd.cards`.
-Public imports and generated stubs must agree even when native registration is
+Public imports and authored stubs must agree even when native registration is
 nested differently.
 
 `wyrd.bifrost` projects `wyrd_client::Bifrost` for table management,

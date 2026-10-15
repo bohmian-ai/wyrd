@@ -241,9 +241,9 @@ types in `Args` and `Returns`; keep them identical to the annotations, which
 the type checker uses. Use `T | None` only when `None` is accepted or returned;
 explain what it means. Keep docstring `Args`, `Returns`, and `Raises` names and
 conditions aligned with the signature and behavior. Reserve `Any` for a
-genuinely open boundary, narrow it there, and return a domain type. Generated
-`.pyi` files must reflect the source; change the source or generator, never
-the generated stub.
+genuinely open boundary, narrow it there, and return a domain type. Authored
+`.pyi` files declare the native API directly; a pure-Python definition is
+declared once inline and re-exported rather than restated in a stub.
 
 TypeScript bad: broad types and generic argument names erase the contract, and
 a comment claiming a return shape cannot restore it.

@@ -58,6 +58,8 @@ skald-spec = { workspace = true }
 skald-tool = { workspace = true }
 skald-workflow = { workspace = true }
 wyrd-telemetry = { workspace = true }
+# W3C `tracestate` parsing for inbound trace context.
+opentelemetry = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v7"] }
 base64 = { workspace = true }
 blake3 = { workspace = true }

@@ -8,7 +8,7 @@ use axum::extract::Request;
 use axum::middleware;
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnResponse, OnResponse as _, TraceLayer};
 use tracing::Span;
 use utoipa::{Modify, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
@@ -40,6 +40,7 @@ use crate::state::AppState;
 
 /// Build the HTTP router with shared server state.
 pub fn build_router(state: AppState) -> Router {
+    let tenant_spans = state.bifrost.tenant_span_sink();
     // Unprotected: /healthz and /readyz skip the fallible middleware stack so
     // they can respond even when inner layers are under pressure or broken.
     let unprotected = health_router().layer(CatchPanicLayer::custom(
@@ -140,22 +141,62 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             crate::http::middleware::metrics::track_metrics,
         ))
-        .layer(TraceLayer::new_for_http().make_span_with(request_span))
+        .layer(axum::middleware::from_fn(
+            crate::http::middleware::trace_context::attach_trace_context,
+        ))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(move |request: &Request| {
+                    request_span(request, tenant_spans.as_ref())
+                })
+                .on_response(record_response),
+        )
 }
 
-/// Opens the root span of one HTTP request.
+/// Opens the SERVER span of one HTTP request.
 ///
-/// It records the method, path, and version but never the query: a URL-borne
+/// A valid inbound `traceparent` makes the caller's span its parent, so the
+/// request and everything done on its behalf continue the caller's trace; a
+/// missing, malformed, or repeated one leaves it the root of a new trace. It
+/// records the method, path, and version but never the query: a URL-borne
 /// credential, such as a provider SDK's `?key=` that ingress refuses, is
 /// already in the request when this span opens, before any authentication
-/// runs, and must not reach logs or exported traces.
-fn request_span(request: &Request) -> Span {
-    tracing::debug_span!(
+/// runs, and must not reach logs or exported traces. It also carries the
+/// OpenTelemetry HTTP server attributes: `http.request.method`, `http.route`
+/// as the matched route template (never the raw path), and
+/// `http.response.status_code`, which [`record_response`] fills in. A
+/// continued trace stages its tenant span copies on this server's
+/// `tenant_spans` sink.
+fn request_span(
+    request: &Request,
+    tenant_spans: Option<&Arc<dyn wyrd_telemetry::TenantSpanSink>>,
+) -> Span {
+    let span = tracing::info_span!(
         "request",
+        otel.kind = "server",
         method = %request.method(),
         path = request.uri().path(),
         version = ?request.version(),
-    )
+        http.request.method = %request.method(),
+        http.route = request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(axum::extract::MatchedPath::as_str),
+        http.response.status_code = tracing::field::Empty,
+    );
+    wyrd_telemetry::serve_request(
+        &span,
+        wyrd_telemetry::inbound_context(request.headers()).as_ref(),
+        tenant_spans,
+    );
+    span
+}
+
+/// Records the response status on the request span, then logs the response
+/// as the default `TraceLayer` does.
+fn record_response(response: &axum::response::Response, latency: std::time::Duration, span: &Span) {
+    span.record("http.response.status_code", response.status().as_u16());
+    DefaultOnResponse::default().on_response(response, latency, span);
 }
 
 /// Apply the core protective edge stack to `router`: request-id propagation,

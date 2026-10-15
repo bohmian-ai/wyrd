@@ -75,8 +75,10 @@ impl Telemetry {
 /// provider whose batch exporter is [`span_exporter`], so every export asks
 /// the client for a fresh access token, plus a processor stamping spans
 /// started inside `Run::scope` with that Run and Card. Only INFO-and-above
-/// spans export, and only tracing is installed. A later call in the same
-/// process returns the installed pipeline.
+/// spans export, and only tracing is installed. The W3C trace-context
+/// propagator becomes the global propagator, so standard HTTP and gRPC
+/// instrumentation carries the caller's trace to the next service. A later
+/// call in the same process returns the installed pipeline.
 ///
 /// # Errors
 /// Returns `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` when the application
@@ -109,6 +111,9 @@ pub fn start_telemetry(state: &WyrdState) -> Result<Telemetry, WyrdError> {
         message: "a global tracing subscriber is already installed".to_owned(),
         details: json!({}),
     })?;
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
     let _ = INSTALLED.set(provider.clone());
     Ok(Telemetry { provider })
 }

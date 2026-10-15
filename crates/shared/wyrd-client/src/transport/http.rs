@@ -1,7 +1,8 @@
 //! Async `reqwest`-based HTTP transport.
 //!
 //! [`HttpTransport`] is the async HTTP client for read and admin paths. It
-//! injects bearer auth, `wyrd-request-id`, and a retry policy with
+//! injects bearer auth, `wyrd-request-id`, the caller's W3C trace context
+//! ([`crate::transport::trace`]), and a retry policy with
 //! exponential backoff. Three response-shaped helpers cover the three distinct
 //! wire shapes:
 //!
@@ -41,6 +42,7 @@ use wyrd_spec::request_id::RequestId;
 use crate::auth::{AuthError, AuthMiddleware};
 use crate::error::{WyrdClientError, from_problem_json};
 use crate::transport::config::HttpConfig;
+use crate::transport::trace;
 use reqwest::Method;
 use reqwest::StatusCode;
 use reqwest::header::InvalidHeaderValue;
@@ -236,8 +238,10 @@ impl HttpTransport {
     /// Wyrd's edge rejects an unusable credential before any service acts on
     /// the request, so a refused first attempt applied nothing.
     ///
-    /// The replay reuses the first attempt's header map — correlation id
-    /// included — and swaps only the bearer, so both HTTP requests join to one
+    /// The caller's W3C trace context is decorated alongside them, as on
+    /// every authenticated request. The replay reuses the first attempt's
+    /// header map — correlation id and trace context included — and swaps
+    /// only the bearer, so both HTTP requests join to one
     /// logical message in the server's audit and traces.
     ///
     /// `status_of` is the caller's only contribution: reading a status out of
@@ -245,7 +249,9 @@ impl HttpTransport {
     /// a `401` *means* is decided here.
     ///
     /// A caller-supplied `wyrd-request-id` is preserved; otherwise one is
-    /// minted through the same path every other request uses. Headers the
+    /// minted through the same path every other request uses. A
+    /// caller-supplied `traceparent` likewise wins over the ambient trace
+    /// context, with whatever `tracestate` the caller sent beside it. Headers the
     /// caller's own protocol needs are passed through untouched.
     ///
     /// # Arguments
@@ -276,6 +282,15 @@ impl HttpTransport {
                 HeaderValue::from_str(&self.auth.request_id(None))
                     .map_err(|error| AuthenticatedReplayError::header(&error))?,
             );
+        }
+        if !custom_headers.contains_key(&HeaderName::from_static(trace::TRACEPARENT)) {
+            for (name, value) in trace::headers() {
+                custom_headers.insert(
+                    HeaderName::from_static(name),
+                    HeaderValue::from_str(&value)
+                        .map_err(|error| AuthenticatedReplayError::header(&error))?,
+                );
+            }
         }
 
         let first = operation(custom_headers.clone()).await;
@@ -438,13 +453,7 @@ impl HttpTransport {
         let request_id = self.auth.request_id(None);
         let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
         let mut request = self
-            .client
-            .post(&url)
-            .header(
-                HEADER_WYRD_ACCESS_TOKEN,
-                format!("Bearer {}", bearer.expose()),
-            )
-            .header(HEADER_REQUEST_ID, &request_id)
+            .authenticated(Method::POST, &url, bearer.expose(), &request_id)
             .header("content-type", "application/json")
             .body(body);
         for (name, value) in headers {
@@ -536,13 +545,7 @@ impl HttpTransport {
         let url = self.authenticated_url(path)?;
         let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
         let request = self
-            .client
-            .request(method, url)
-            .header(
-                HEADER_WYRD_ACCESS_TOKEN,
-                format!("Bearer {}", bearer.expose()),
-            )
-            .header(HEADER_REQUEST_ID, self.auth.request_id(None))
+            .authenticated(method, url, bearer.expose(), &self.auth.request_id(None))
             .body(body);
         let response = request.send().await.map_err(|err| WyrdError::Internal {
             message: format!("transport error: {err}"),
@@ -623,13 +626,7 @@ impl HttpTransport {
         let url = self.authenticated_url(path)?;
         let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
         let response = self
-            .client
-            .request(method, url)
-            .header(
-                HEADER_WYRD_ACCESS_TOKEN,
-                format!("Bearer {}", bearer.expose()),
-            )
-            .header(HEADER_REQUEST_ID, self.auth.request_id(None))
+            .authenticated(method, url, bearer.expose(), &self.auth.request_id(None))
             .send()
             .await
             .map_err(|err| WyrdError::Internal {
@@ -739,13 +736,7 @@ impl HttpTransport {
             details: serde_json::json!({}),
         })?;
         let response = self
-            .client
-            .request(method, url)
-            .header(
-                HEADER_WYRD_ACCESS_TOKEN,
-                format!("Bearer {}", bearer.expose()),
-            )
-            .header(HEADER_REQUEST_ID, request_id)
+            .authenticated(method, url, bearer.expose(), request_id)
             .header("content-type", "application/json")
             .header("accept", QUERY_STREAM_CONTENT_TYPE)
             .body(payload)
@@ -906,6 +897,33 @@ impl HttpTransport {
         })
     }
 
+    /// Start a request to `url`, already resolved by
+    /// [`Self::authenticated_url`], carrying `bearer` as
+    /// `x-wyrd-access-token`, `request_id` as `wyrd-request-id`, and the
+    /// caller's trace context from [`trace::outbound`] as `traceparent` and,
+    /// when non-empty, `tracestate`.
+    ///
+    /// Every authenticated helper starts its requests here, so each request,
+    /// including each retry attempt, carries the same headers.
+    fn authenticated(
+        &self,
+        method: Method,
+        url: impl reqwest::IntoUrl,
+        bearer: &str,
+        request_id: &str,
+    ) -> reqwest::RequestBuilder {
+        let request = self
+            .client
+            .request(method, url)
+            .header(HEADER_WYRD_ACCESS_TOKEN, format!("Bearer {bearer}"))
+            .header(HEADER_REQUEST_ID, request_id);
+        trace::headers()
+            .into_iter()
+            .fold(request, |request, (name, value)| {
+                request.header(name, value)
+            })
+    }
+
     /// Resolve a path or absolute URL to a same-origin URL suitable for
     /// authenticated requests.
     ///
@@ -990,14 +1008,8 @@ impl HttpTransport {
             let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
 
             let mut req = self
-                .client
-                .request(method.clone(), url)
-                .timeout(self.request_timeout)
-                .header(
-                    HEADER_WYRD_ACCESS_TOKEN,
-                    format!("Bearer {}", bearer.expose()),
-                )
-                .header(HEADER_REQUEST_ID, request_id);
+                .authenticated(method.clone(), url, bearer.expose(), request_id)
+                .timeout(self.request_timeout);
 
             if let Some(key) = idempotency_key {
                 req = req.header(HEADER_IDEMPOTENCY_KEY, key);

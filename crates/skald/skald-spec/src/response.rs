@@ -7,6 +7,7 @@ use crate::request::ProviderName;
 use crate::wire::anthropic_messages::AnthropicMessagesResponse;
 use crate::wire::google_embeddings::GoogleBatchEmbedResponse;
 use crate::wire::google_generate::GoogleGenerateContentResponse;
+use crate::wire::jev::JevResponse;
 use crate::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatResponse, OpenAiMessageContent, OpenAiUsage,
 };
@@ -33,6 +34,8 @@ pub enum ProviderResponse {
     GoogleBatchEmbed(GoogleBatchEmbedResponse),
     /// Vertex Predict response.
     VertexPredict(VertexPredictResponse),
+    /// TypeSafe Jev `systemone` answers.
+    JevSystemOne(JevResponse),
     /// Raw provider response body that no typed variant claimed.
     RawV1(Box<RawValue>),
 }
@@ -69,6 +72,9 @@ impl<'de> Deserialize<'de> for ProviderResponse {
         if let Ok(response) = serde_json::from_value::<VertexPredictResponse>(value.clone()) {
             return Ok(Self::VertexPredict(response));
         }
+        if let Ok(response) = serde_json::from_value::<JevResponse>(value.clone()) {
+            return Ok(Self::JevSystemOne(response));
+        }
 
         RawValue::from_string(value.to_string())
             .map(Self::RawV1)
@@ -88,6 +94,7 @@ impl PartialEq for ProviderResponse {
             }
             (Self::GoogleBatchEmbed(left), Self::GoogleBatchEmbed(right)) => left == right,
             (Self::VertexPredict(left), Self::VertexPredict(right)) => left == right,
+            (Self::JevSystemOne(left), Self::JevSystemOne(right)) => left == right,
             (Self::RawV1(left), Self::RawV1(right)) => left.get() == right.get(),
             _ => false,
         }
@@ -150,6 +157,7 @@ impl ProviderResponse {
             Self::AnthropicMessage(_) => ProviderName::Anthropic,
             Self::GeminiGenerateContent(_) | Self::GoogleBatchEmbed(_) => ProviderName::Google,
             Self::VertexPredict(_) => ProviderName::Vertex,
+            Self::JevSystemOne(_) => ProviderName::Jev,
             Self::RawV1(_) => ProviderName::Custom("raw".to_owned()),
         }
     }

@@ -10,8 +10,9 @@
  * of its own. Needs the optional `@opentelemetry/exporter-*-otlp-proto` peers.
  */
 
-import { type Context, context, createContextKey, trace } from "@opentelemetry/api";
+import { type Context, context, createContextKey, propagation, trace } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
+import { W3CTraceContextPropagator } from "@opentelemetry/core";
 import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-proto";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-proto";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
@@ -64,8 +65,9 @@ const runCorrelation: SpanProcessor = {
 
 /**
  * @internal `WyrdState.startTelemetry`: install the global tracer provider
- * exporting through {@link spanExporter} and stamping `Run.scope`, plus Node's
- * `AsyncLocalStorage` context manager unless the application registered one.
+ * exporting through {@link spanExporter} and stamping `Run.scope`, Node's
+ * `AsyncLocalStorage` context manager, and the W3C trace-context propagator,
+ * unless the application registered a tracer provider.
  *
  * @returns The installed provider, or `undefined` when a global tracer
  * provider is already registered.
@@ -78,5 +80,6 @@ export function startTelemetry(client: WyrdClient): BasicTracerProvider | undefi
     return undefined;
   }
   context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
+  propagation.setGlobalPropagator(new W3CTraceContextPropagator());
   return provider;
 }

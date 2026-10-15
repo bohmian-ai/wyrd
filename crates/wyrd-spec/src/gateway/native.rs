@@ -18,6 +18,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use skald_spec::wire::jev::{JevRequest, JevResponse};
 
 /// `POST /v1/messages` request: an Anthropic Messages body whose `model` is an
 /// exact Anthropic model id.
@@ -150,12 +151,36 @@ pub struct GatewayGeminiCandidate {
     pub extra: Map<String, Value>,
 }
 
+/// `POST /v1/systemone` request: a Jev question body whose `model` is a
+/// native Jev model, such as `jev-latest`, served only by Jev deployments.
+///
+/// Unlike the open native contracts above, the Jev contract is closed: an
+/// unknown member, question form, or broken question bound is refused before
+/// any provider IO.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct GatewayJevRequest(
+    /// The Jev `systemone` body.
+    pub JevRequest,
+);
+
+/// Buffered `POST /v1/systemone` answer: Jev's resolved model, intact keyed
+/// answers, and token usage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct GatewayJevResponse(
+    /// The Jev `systemone` answer.
+    pub JevResponse,
+);
+
 #[cfg(feature = "server")]
 super::openai::openapi_schema!(
     GatewayAnthropicMessagesRequest,
     GatewayAnthropicMessage,
     GatewayGeminiGenerateContentRequest,
     GatewayGeminiGenerateContentResponse,
+    GatewayJevRequest,
+    GatewayJevResponse,
 );
 
 /// Anthropic error envelope of a gateway-originated refusal on

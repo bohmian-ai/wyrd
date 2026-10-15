@@ -185,7 +185,9 @@ async fn get_run(
 /// The body is read up to [`MAX_EXECUTE_BODY_BYTES`]; a larger body is
 /// refused before decoding. Not idempotent: a retry executes again. Body
 /// collection, authentication, and resolution are bounded by the server
-/// request timeout; the engine by the 60-second execution deadline.
+/// request timeout; the engine by the 60-second execution deadline. Its span
+/// is named in the verification catalog, so a tenant's copy of a continued
+/// trace keeps the path from the request span to the judgment unbroken.
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the body is too large or malformed, the
@@ -226,7 +228,11 @@ async fn get_run(
     ),
     tag = "Verification"
 )]
-#[tracing::instrument(skip(state, caller, body), fields(operation = "verification.execute"))]
+#[tracing::instrument(
+    name = "verification.handle",
+    skip(state, caller, body),
+    fields(operation = "verification.execute")
+)]
 async fn execute(
     State(state): State<AppState>,
     edge_timer: Option<Extension<EdgeTimer>>,

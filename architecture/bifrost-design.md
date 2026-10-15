@@ -1336,7 +1336,13 @@ across a restart; durable batch, file, and task rows answer that question.
   terminal cleanup, and `bifrost.oracle.peer.fragment{role,outcome}` spans each
   remote fragment. Work `DataFusion` spawns inherits the query span, so remote
   fragments are child work of the query that dispatched them. Each operation
-  span records exactly one `outcome`.
+  span records exactly one `outcome`. A request that continues a sampled
+  client trace keeps it: the Gate and Oracle spans join the caller's trace,
+  and the request's behavior-catalog spans are also copied to the tenant's
+  `vala.traces.spans` (see `wyrd-design.md`, Trace context). A queued write's
+  batch carries up to 32 producer trace contexts, and `bifrost.gate.write`,
+  the CONSUMER span, links each one from its start, so a batch linking a
+  sampled producer is also copied to the producer's tenant as a linked trace.
 
 ## Public surface
 
@@ -1393,7 +1399,8 @@ Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 (`vala.verification.results`, `vala.drift.result_features`,
 `vala.eval.result_items`) accept no public write at all: Gate refuses every
 principal. Only the server-internal capture writer writes them, together with
-the capture spans in `vala.traces.spans`; result batches carry a Verifier
+the capture spans in `vala.traces.spans`, and the tenant copies of server
+spans join them there through the same outbox; result batches carry a Verifier
 attribution (run, exact Verifier Card, tenant `System` principal) that Scribe
 stamps as `principal_id` and `card_uid`. A pod without Scribe submits through
 `ScribeCapturePeerService.IngestCapture` on the peer listener, which the same

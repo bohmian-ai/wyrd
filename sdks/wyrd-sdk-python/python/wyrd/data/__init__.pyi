@@ -1,7 +1,3 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
-
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Generic, Literal, overload
@@ -10,8 +6,6 @@ from typing_extensions import Self, TypeVar
 
 from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError
 from ..cards import CardRef, DataLoadArgs, JsonValue
-
-#### end of imports ####
 
 class Dim:
     """One tensor dimension: a fixed length or a named dynamic axis."""

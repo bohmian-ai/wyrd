@@ -5,8 +5,12 @@
 //! `fixtures/README.md`; nextest selects a story with
 //! `-E 'test(/^<module>::/)'`.
 
+/// One Service action read back as one connected trace timeline.
+mod action_timeline;
 mod gateway_admin;
 mod gateway_inference;
+/// TypeSafe Jev through the Gateway, natively and as a Verifier's judge.
+mod gateway_jev;
 /// The admin-key local workflow, start to finish, without a publication flush.
 mod local_development;
 mod observe_a_run;
@@ -15,6 +19,8 @@ mod otel_export;
 /// Principal discovery and Role assignment through `Principals`.
 mod principal_roles;
 mod query_bifrost;
+/// Common analytical SQL over part-published, part-live tables.
+mod query_coverage;
 mod register_and_hydrate;
 mod saved_user_auth;
 mod scheduled_drift_alerts_operator;

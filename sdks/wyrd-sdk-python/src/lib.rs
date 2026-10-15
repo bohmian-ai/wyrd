@@ -26,6 +26,8 @@ mod testing;
 #[cfg(feature = "testing")]
 mod testing_cli;
 #[cfg(feature = "python")]
+mod trace;
+#[cfg(feature = "python")]
 mod workflow;
 
 #[cfg(feature = "python")]

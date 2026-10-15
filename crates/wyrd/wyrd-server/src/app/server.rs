@@ -135,6 +135,7 @@ impl WyrdServer {
             GrpcRouterConfig {
                 reflection_enabled: config.grpc.reflection_enabled,
                 tls_identity: None,
+                tenant_spans: state.bifrost.tenant_span_sink(),
             },
         )?;
         let peer_router = match load_peer_tls(&config)? {

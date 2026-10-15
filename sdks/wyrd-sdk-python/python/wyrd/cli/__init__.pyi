@@ -1,5 +1,3 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
 """The installed ``wyrd`` executable.
 
 ``run_wyrd_cli`` is the console script. The in-process command functions are

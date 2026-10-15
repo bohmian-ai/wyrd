@@ -7,7 +7,8 @@
 //! and capture exactly as a public ingress call does. Nothing about one call
 //! is stored on the caller, so concurrent steps cannot see each other's
 //! fallback, deadline, or correlation; correlation travels only in this
-//! call's tracing span.
+//! call's tracing span. A caller built for a direct verification also carries
+//! the Card, and optional Run, its judge calls are attributed to.
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
@@ -23,7 +24,9 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{GatewayOperation, ModelRef};
 
 use super::ingress::{anthropic_usage_bound, google_usage_bound};
-use super::invocation::{GatewayCallRequest, GatewayInvocation};
+use super::invocation::{
+    GatewayCallAttribution, GatewayCallRequest, GatewayCallSubject, GatewayInvocation,
+};
 use super::routes::usage_bound;
 use crate::components::auth::Caller;
 use crate::state::AppState;
@@ -42,12 +45,29 @@ pub(crate) struct ServerWyrdGatewayCaller {
     state: AppState,
     /// Authority captured when the run was accepted.
     caller: Caller,
+    /// Run and Card every call is attributed to, already resolved by the
+    /// operation the calls serve; `None` leaves calls uncorrelated.
+    subject: Option<GatewayCallSubject>,
 }
 
 impl ServerWyrdGatewayCaller {
-    /// Bind a caller to `state`'s gateway and the run's captured `caller`.
+    /// Bind a caller to `state`'s gateway and the run's captured `caller`,
+    /// making uncorrelated calls.
     pub(crate) fn new(state: AppState, caller: Caller) -> Self {
-        Self { state, caller }
+        Self {
+            state,
+            caller,
+            subject: None,
+        }
+    }
+
+    /// Attribute every call to `subject`, a Card and optional Run the
+    /// originating operation already resolved in the caller's tenant, such as
+    /// a direct verification's subject and Run. Admission records it without
+    /// re-authorizing the Card; `None` leaves calls uncorrelated.
+    pub(crate) fn attributed(mut self, subject: Option<GatewayCallSubject>) -> Self {
+        self.subject = subject;
+        self
     }
 }
 
@@ -93,7 +113,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             operation,
             ingress,
             usage_bound: match ingress {
-                IngressDialect::OpenAi => usage_bound(operation, &body),
+                IngressDialect::OpenAi | IngressDialect::Jev => usage_bound(operation, &body),
                 IngressDialect::AnthropicMessages => anthropic_usage_bound(&body),
                 IngressDialect::GeminiGenerateContent | IngressDialect::VertexGenerateContent => {
                     google_usage_bound(&body)
@@ -107,7 +127,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             deployment: None,
             stream: false,
             timeout: call.timeout,
-            subject: None,
+            subject: self.subject.clone().map(GatewayCallAttribution::Resolved),
         };
         let outcome = GatewayInvocation::new(&self.state)
             .run(&self.caller, request, false, cancellation)
@@ -143,6 +163,8 @@ enum Answer {
     AnthropicMessages,
     /// Google `GenerateContent`, from Gemini or Vertex.
     GeminiGenerateContent,
+    /// Jev `systemone` typed answers.
+    Jev,
 }
 
 impl Answer {
@@ -159,6 +181,7 @@ impl Answer {
             Self::GeminiGenerateContent => {
                 decode(body).map(ProviderResponse::GeminiGenerateContent)
             }
+            Self::Jev => decode(body).map(ProviderResponse::JevSystemOne),
         }
     }
 }
@@ -181,7 +204,9 @@ impl NativeCall {
     /// The model always comes from `model`, never from the request body:
     /// `OpenAI` bodies carry its `<provider>/<model>` projection, Anthropic
     /// bodies its provider-native model, and Google bodies none, since the
-    /// gateway routes them by `model` alone. A Google GenerateContent body
+    /// gateway routes them by `model` alone. Jev bodies carry the
+    /// provider-native model and enter the native `systemone` route. A Google
+    /// GenerateContent body
     /// enters as Vertex when `model` names the `vertex` provider, which the
     /// Workflow derives from a Prompt whose provider is Vertex.
     ///
@@ -227,6 +252,15 @@ impl NativeCall {
                 Answer::GeminiGenerateContent,
                 encode(&body)?,
             ),
+            ProviderRequest::JevSystemOne(mut body) => {
+                body.model = model.model.to_string();
+                (
+                    GatewayOperation::SystemOne,
+                    IngressDialect::Jev,
+                    Answer::Jev,
+                    encode(&body)?,
+                )
+            }
             _ => {
                 return Err(ProviderError::bad_request(
                     PROVIDER,

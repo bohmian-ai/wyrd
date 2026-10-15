@@ -34,6 +34,13 @@ optional = true
 workspace = true
 optional = true
 
+# Inbound W3C trace context for the public listener's request span. Gated
+# behind the `server` feature so the client tier never links the process
+# telemetry pipeline.
+[dependencies.wyrd-telemetry]
+workspace = true
+optional = true
+
 # OTLP collector proto surface (server-side tonic codegen). Gated behind the
 # `server` feature so the client tier stays axum-free.
 [dependencies.opentelemetry-proto]
@@ -49,7 +56,7 @@ default = []
 # extensions. The private Bifrost peer listener authenticates a workload
 # credential against the certificate that carried it, so the server surface
 # needs the connection's verified identity, not only its bytes.
-server = ["dep:tonic-reflection", "dep:tonic-health", "tonic/server", "tonic/router", "tonic/tls-connect-info", "dep:opentelemetry-proto"]
+server = ["dep:tonic-reflection", "dep:tonic-health", "tonic/server", "tonic/router", "tonic/tls-connect-info", "dep:opentelemetry-proto", "dep:wyrd-telemetry"]
 # Marker feature: opts the generated `wyrd::v1` client stub into codegen (see
 # build.rs). No extra tonic surface needed — the client rides the default
 # `channel` transport already enabled above.

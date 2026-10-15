@@ -23,6 +23,7 @@ use wyrd_spec::verification::{
     VerificationRunTarget, VerificationVerdict, VerifierReadiness,
 };
 use wyrd_sql::TenantConn;
+use wyrd_sql::queries::auth::provision_system_principal;
 use wyrd_sql::queries::cards::{
     NewCardRow, NewRegistrationOperation, insert_card_row, insert_registration_operation,
     upsert_service_account_from_card,
@@ -391,6 +392,7 @@ fn manual_binding(requester: &Principal, binding_id: BindingId) -> RunRequest {
         requested_by: requester.id,
         target: VerificationRunTarget::Binding { binding_id },
         window: window(),
+        cause: None,
     }
 }
 
@@ -454,6 +456,7 @@ async fn manual_enqueue_freezes_binding_and_direct_identities() {
             subject_card_uid: owner.clone(),
         },
         window: window(),
+        cause: None,
     };
     let direct = enqueued(
         queue
@@ -529,6 +532,7 @@ async fn enqueue_refuses_unrunnable_targets_without_writing() {
             subject_card_uid: subject.clone(),
         },
         window: window(),
+        cause: None,
     };
 
     let cases = [
@@ -613,7 +617,14 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
     };
 
     let first = queue
-        .enqueue_manual(&mut conn, actor.id, &target, window(), Some(key(b"a")))
+        .enqueue_manual(
+            &mut conn,
+            actor.id,
+            &target,
+            window(),
+            None,
+            Some(key(b"a")),
+        )
         .await
         .expect("keyed run enqueues");
     let ManualEnqueueOutcome::Enqueued(run_id) = first else {
@@ -621,14 +632,28 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
     };
     assert_eq!(
         queue
-            .enqueue_manual(&mut conn, actor.id, &target, window(), Some(key(b"a")))
+            .enqueue_manual(
+                &mut conn,
+                actor.id,
+                &target,
+                window(),
+                None,
+                Some(key(b"a"))
+            )
             .await
             .expect("replay answers"),
         ManualEnqueueOutcome::Replayed(run_id)
     );
     assert_eq!(
         queue
-            .enqueue_manual(&mut conn, actor.id, &target, window(), Some(key(b"b")))
+            .enqueue_manual(
+                &mut conn,
+                actor.id,
+                &target,
+                window(),
+                None,
+                Some(key(b"b"))
+            )
             .await
             .expect("conflict answers"),
         ManualEnqueueOutcome::KeyReused(run_id)
@@ -643,7 +668,14 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
     assert_eq!(stored, (Some("retry-1".to_owned()), Some(b"a".to_vec())));
 
     let other_run = queue
-        .enqueue_manual(&mut conn, other.id, &target, window(), Some(key(b"a")))
+        .enqueue_manual(
+            &mut conn,
+            other.id,
+            &target,
+            window(),
+            None,
+            Some(key(b"a")),
+        )
         .await
         .expect("other requester enqueues");
     assert!(matches!(other_run, ManualEnqueueOutcome::Enqueued(id) if id != run_id));
@@ -657,7 +689,14 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
     for _ in 0..2 {
         assert_eq!(
             queue
-                .enqueue_manual(&mut conn, actor.id, &unready, window(), Some(refused_key))
+                .enqueue_manual(
+                    &mut conn,
+                    actor.id,
+                    &unready,
+                    window(),
+                    None,
+                    Some(refused_key)
+                )
                 .await
                 .expect("refusal answers"),
             ManualEnqueueOutcome::Refused(EnqueueRefusal::NotReady(
@@ -718,6 +757,9 @@ async fn observation_runs_are_unique_per_input_record() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
+    let system = provision_system_principal(&mut conn)
+        .await
+        .expect("the tenant SYSTEM principal provisions");
     let (owner, _) = register_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "eval", eval()).await;
     let binding = bind(
@@ -759,7 +801,11 @@ async fn observation_runs_are_unique_per_input_record() {
     let claimed = claim(&queue, &mut conn).await;
     assert_eq!(claimed.lease.run_id, run);
     assert_eq!(claimed.origin, RunOrigin::Observation);
-    assert_eq!(claimed.requested_by, None);
+    assert_eq!(
+        claimed.requested_by,
+        Some(PrincipalId::new(system)),
+        "an observation-triggered run records the SYSTEM actor"
+    );
     assert_eq!(
         claimed.input,
         RunInput::EvalRecord {
@@ -948,6 +994,9 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
+    let system = provision_system_principal(&mut setup)
+        .await
+        .expect("the tenant SYSTEM principal provisions");
     let (owner, principal) = register_service(&mut setup, &actor, "svc").await;
     let verifier = register_verifier(&mut setup, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut setup, &owner, &verifier, daily(), Vec::new()).await;
@@ -1012,7 +1061,11 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
     let claimed = claim(&queue, &mut conn).await;
     assert_eq!(claimed.lease.run_id, run);
     assert_eq!(claimed.origin, RunOrigin::Schedule);
-    assert_eq!(claimed.requested_by, None);
+    assert_eq!(
+        claimed.requested_by,
+        Some(PrincipalId::new(system)),
+        "a scheduled run records the SYSTEM principal it executes as"
+    );
     let RunInput::DriftWindow(occurrence) = claimed.input else {
         panic!(
             "a scheduled Drift run analyzes a window, got {:?}",
@@ -1524,6 +1577,7 @@ async fn failed_binding_runs_dispatch_each_distinct_operator_once() {
             subject_card_uid: owner.clone(),
         },
         window: window(),
+        cause: None,
     };
 
     let mut settled = Vec::new();
@@ -1762,6 +1816,9 @@ async fn observation_batches_insert_once_per_binding_and_record() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
+    let system = provision_system_principal(&mut conn)
+        .await
+        .expect("the tenant SYSTEM principal provisions");
     let assertion = register_verifier(&mut conn, &actor, "assertion", eval()).await;
     let judge = register_verifier(&mut conn, &actor, "judge", eval()).await;
     let drift = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
@@ -1851,6 +1908,18 @@ async fn observation_batches_insert_once_per_binding_and_record() {
     assert_eq!(
         ordinals(&mut conn, other_binding).await,
         numbered(&[("o-1", 1)])
+    );
+    let requesters: Vec<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT DISTINCT requested_by_principal_id FROM wyrd.verifier_runs WHERE binding_id = $1",
+    )
+    .bind(first.as_uuid())
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("requesters read");
+    assert_eq!(
+        requesters,
+        [Some(system)],
+        "every observation-triggered run records the SYSTEM actor, not the writer"
     );
 }
 

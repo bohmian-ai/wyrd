@@ -1,6 +1,6 @@
 //! Real-socket Wyrd server test harness.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Range;
@@ -67,8 +67,8 @@ use wyrd_server::boot::{build_workload_bindings, rewrap_sealed_secrets};
 use wyrd_server::components::platform::builtins::BuiltinTables;
 use wyrd_server::config::{
     BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
-    GatewayConfig, GatewayManagedSecretKeys, IssuerEntry, OperatorKeySource, OperatorKeysConfig,
-    ServeMode, ServerWorkflowConfig, WorkloadBindingEntry,
+    GatewayConfig, IssuerEntry, OperatorKeySource, OperatorKeysConfig, ServeMode,
+    ServerWorkflowConfig, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -259,9 +259,6 @@ struct WyrdTestServerInner {
     _bifrost_data_dir: Arc<TempDir>,
     /// Exclusive owner of this server's one Bifrost data root.
     bifrost_data_root: BifrostDataRoot,
-    /// Lifetime guard for the mounted managed-secret key files this server
-    /// loads its tenant keyring from.
-    _managed_secret_key_root: Arc<TempDir>,
     state: AppState,
     router: axum::Router,
     issuing_key: Arc<IssuingKey>,
@@ -1960,6 +1957,54 @@ impl WyrdTestServer {
         projection: &str,
         predicate: &str,
     ) -> Result<Vec<Vec<Option<String>>>, WyrdTestServerError> {
+        self.retained_records(
+            tenant,
+            format!(
+                "SELECT {projection} FROM {AUDIT_LOG} WHERE ({predicate}) \
+                 AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
+                 ORDER BY created_at"
+            ),
+        )
+        .await
+    }
+
+    /// Reads the tenant's retained `vala.traces.spans` rows, every selected
+    /// column projected as text, in `(start_time_unix_nano, span_id)` order.
+    ///
+    /// `projection` is the `SELECT` list and must cast each scalar column to
+    /// text, as for [`Self::retained_audit_records`]; `predicate` names the
+    /// spans under assertion.
+    ///
+    /// # Errors
+    /// Returns the authorization, query, decode, or stream failure. A tenant
+    /// that has never published spans reads as no rows.
+    pub async fn retained_span_records(
+        &self,
+        tenant: DataTenantId,
+        projection: &str,
+        predicate: &str,
+    ) -> Result<Vec<Vec<Option<String>>>, WyrdTestServerError> {
+        self.retained_records(
+            tenant,
+            format!(
+                "SELECT {projection} FROM vala.traces.spans WHERE ({predicate}) \
+                 ORDER BY start_time_unix_nano, span_id"
+            ),
+        )
+        .await
+    }
+
+    /// Runs `sql` against the tenant's retained data under the inspection
+    /// context, every selected column decoded as text or Variant JSON.
+    ///
+    /// # Errors
+    /// Returns the authorization, query, decode, or stream failure. A table
+    /// the tenant has never published reads as no rows.
+    async fn retained_records(
+        &self,
+        tenant: DataTenantId,
+        sql: String,
+    ) -> Result<Vec<Vec<Option<String>>>, WyrdTestServerError> {
         use futures_util::StreamExt as _;
         use vala_bifrost_redux::oracle::QueryIpcDecoder;
         use wyrd_spec::vala::api::QueryStreamFrame;
@@ -1975,11 +2020,7 @@ impl WyrdTestServer {
                 context,
                 wyrd_spec::vala::api::BifrostQueryRequest {
                     params: Vec::new(),
-                    sql: format!(
-                        "SELECT {projection} FROM {AUDIT_LOG} WHERE ({predicate}) \
-                         AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
-                         ORDER BY created_at"
-                    ),
+                    sql,
                     deadline_ms: Some(60_000),
                 },
             )
@@ -4141,8 +4182,9 @@ impl WyrdTestServerBuilder {
     /// Dispatch gateway calls over HTTP with every built-in adapter rooted at
     /// one local mock upstream `root`.
     ///
-    /// `OpenAI` is served under `root`'s `/v1` segment; Anthropic, Gemini, and
-    /// Vertex at `root` itself, where each provider's native paths begin.
+    /// `OpenAI` is served under `root`'s `/v1` segment; Anthropic, Gemini,
+    /// Vertex, and Jev at `root` itself, where each provider's native paths
+    /// begin.
     /// Delegates to [`Self::with_gateway_endpoints_for_test`]. Eval judges
     /// call the gateway too, so a language journey roots every model path at
     /// one local mock.
@@ -4154,7 +4196,8 @@ impl WyrdTestServerBuilder {
             openai: Some(openai),
             anthropic: Some(root.clone()),
             gemini: Some(root.clone()),
-            vertex: Some(root),
+            vertex: Some(root.clone()),
+            jev: Some(root),
         })
     }
 
@@ -4983,11 +5026,6 @@ impl WyrdTestServerBuilder {
         })
         .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        // Mounted key files the tenant keyring loads from; retained by the
-        // server so the paths stay readable for its whole lifetime.
-        let managed_secret_key_root = Arc::new(
-            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-        );
         let query_stream_fault = QueryStreamFaultController::default();
         let mut state = AppState::new(postgres, storage, bifrost_runtime, shutdown)
             .with_query_stream_fault(query_stream_fault.clone())
@@ -5005,7 +5043,6 @@ impl WyrdTestServerBuilder {
             .with_gateway(test_gateway_config(
                 fixture.data_tenant_id(),
                 self.gateway_vault_backend.clone(),
-                managed_secret_key_root.path(),
             )?);
         let start = |error: String| WyrdTestServerError::Start(error);
         // The login owners stage on the state's process Scribe outbox, so they
@@ -5026,17 +5063,10 @@ impl WyrdTestServerBuilder {
             )),
             DeploymentProfile::Development.screened_http(),
         ));
-        let gateway_secret_keys = Arc::new(
-            state
-                .gateway
-                .managed_secret_keys()
-                .map_err(|error| start(error.to_string()))?,
-        );
-        state = state.with_gateway_secret_keys(Arc::clone(&gateway_secret_keys));
         if let Some(endpoints) = self.gateway_endpoints {
             let resolver = state
                 .gateway
-                .credential_resolver(gateway_secret_keys)
+                .credential_resolver(state.auth.sealing_key.clone())
                 .map_err(|error| start(error.to_string()))?;
             state = state.with_gateway_engine(wyrd_gateway::GatewayEngine::new(
                 resolver,
@@ -5077,7 +5107,6 @@ impl WyrdTestServerBuilder {
                 storage_root,
                 _bifrost_data_dir: data_dir,
                 bifrost_data_root,
-                _managed_secret_key_root: managed_secret_key_root,
                 state,
                 router,
                 issuing_key,
@@ -5188,80 +5217,16 @@ pub const TEST_GATEWAY_GEMINI_BINDING: &str = "test-gemini-key";
 /// gateway credentials, used as a static bearer access token.
 pub const TEST_GATEWAY_VERTEX_BINDING: &str = "test-vertex-key";
 
+/// Operator binding every test server declares for Jev `Environment`
+/// gateway credentials, presented as a bearer API key.
+pub const TEST_GATEWAY_JEV_BINDING: &str = "test-jev-key";
+
 /// Environment variable every test server's operator bindings read, per
 /// resolution, as the provider key.
 pub const TEST_GATEWAY_PROVIDER_KEY_VARIABLE: &str = "WYRD_TEST_GATEWAY_PROVIDER_KEY";
 
 /// External secret backend every test server declares for gateway credentials.
 pub const TEST_GATEWAY_SECRET_BACKEND: &str = "test-vault";
-
-/// Active managed-secret key version every test server declares.
-pub const TEST_GATEWAY_MANAGED_KEY_VERSION: &str = "v1";
-
-/// Retained managed-secret key version every test server declares beside the
-/// active one, so a journey can prove that rotation keeps older envelopes
-/// readable without reconfiguring the server.
-pub const TEST_GATEWAY_RETIRED_MANAGED_KEY_VERSION: &str = "v0";
-
-/// Deterministic 32-byte managed-secret key of `tenant` at `version`.
-///
-/// Derived rather than random so a restarted server, a second replica, and a
-/// second `WyrdTestServer` over the same tenant all load identical key
-/// material — which is exactly what an operator must distribute — while two
-/// tenants never share a key.
-#[must_use]
-pub fn test_managed_secret_key(tenant: DataTenantId, version: &str) -> [u8; 32] {
-    let mut key = [0_u8; 32];
-    key[..16].copy_from_slice(tenant.as_uuid().as_bytes());
-    for (slot, byte) in key[16..].iter_mut().zip(version.bytes().cycle()) {
-        *slot = byte;
-    }
-    key
-}
-
-/// Writes `tenant`'s managed-secret keyring under `directory` and returns the
-/// operator configuration referencing those files.
-///
-/// The keys go through the ordinary mounted-file `SecretRef` path so journeys
-/// exercise the real operator configuration shape rather than a test-only
-/// injection point, and each file is written owner-only so it satisfies the
-/// same restrictive-mount rule boot enforces in production.
-///
-/// # Errors
-///
-/// Returns [`WyrdTestServerError::Start`] when a key file cannot be written.
-fn materialize_test_managed_secret_keys(
-    directory: &Path,
-    tenant: DataTenantId,
-) -> Result<GatewayManagedSecretKeys, WyrdTestServerError> {
-    let mut versions = BTreeMap::new();
-    for version in [
-        TEST_GATEWAY_MANAGED_KEY_VERSION,
-        TEST_GATEWAY_RETIRED_MANAGED_KEY_VERSION,
-    ] {
-        let path = directory.join(format!("managed-secret-{version}.key"));
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(test_managed_secret_key(tenant, version));
-        std::fs::write(&path, encoded)
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        // Boot holds a mounted wrapping key to the same owner-only rule as any
-        // other mounted secret, so the fixture writes the file an operator
-        // would mount rather than a world-readable one.
-        #[cfg(unix)]
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        versions.insert(
-            version.to_owned(),
-            wyrd_spec::security::SecretRef::File {
-                path: path.to_string_lossy().into_owned(),
-            },
-        );
-    }
-    Ok(GatewayManagedSecretKeys {
-        active: TEST_GATEWAY_MANAGED_KEY_VERSION.to_owned(),
-        versions,
-    })
-}
 
 /// Environment variable the declared test Vault backend reads its token from.
 pub const TEST_GATEWAY_VAULT_TOKEN_VARIABLE: &str = "WYRD_TEST_GATEWAY_VAULT_TOKEN";
@@ -5284,7 +5249,6 @@ pub const TEST_GATEWAY_VAULT_TOKEN_VARIABLE: &str = "WYRD_TEST_GATEWAY_VAULT_TOK
 fn test_gateway_config(
     tenant: DataTenantId,
     vault_backend: Option<(Url, String)>,
-    managed_secret_key_root: &Path,
 ) -> Result<GatewayConfig, WyrdTestServerError> {
     let invalid = |error: wyrd_spec::ids::IdError| WyrdTestServerError::Start(error.to_string());
     let assignment = |provider: &str| {
@@ -5311,6 +5275,7 @@ fn test_gateway_config(
             binding(TEST_GATEWAY_ANTHROPIC_BINDING, "anthropic")?,
             binding(TEST_GATEWAY_GEMINI_BINDING, "gemini")?,
             binding(TEST_GATEWAY_VERTEX_BINDING, "vertex")?,
+            binding(TEST_GATEWAY_JEV_BINDING, "jev")?,
         ]
         .into_iter()
         .collect(),
@@ -5336,10 +5301,6 @@ fn test_gateway_config(
                     assignment("openai")?,
                 )]),
             },
-        )]),
-        managed_secret_keys: std::collections::BTreeMap::from([(
-            tenant,
-            materialize_test_managed_secret_keys(managed_secret_key_root, tenant)?,
         )]),
     })
 }

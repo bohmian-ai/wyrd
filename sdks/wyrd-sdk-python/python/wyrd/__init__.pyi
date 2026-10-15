@@ -1,6 +1,3 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
 from . import cards, client, config, data, model, prompt, state
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError
 from .agent import (
@@ -38,8 +35,6 @@ from .prompt import (
     ResponseFormat,
 )
 from .state import CardEnvelope, HydratedArtifact, WyrdState
-
-#### end of imports ####
 
 __all__ = [
     "Agent",

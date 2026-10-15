@@ -52,6 +52,7 @@ pub struct CardSummary {
     /// BLAKE3-hex spec hash.
     pub spec_hash: String,
     /// Optional BLAKE3-hex artifact hash.
+    #[serde(default)]
     pub artifact_hash: Option<String>,
     /// Lifecycle status.
     pub status: CardLifecycleStatus,
@@ -129,6 +130,7 @@ pub struct ListCardsResponse {
     /// Page items.
     pub items: Vec<CardSummary>,
     /// Opaque continuation cursor.
+    #[serde(default)]
     pub next_cursor: Option<String>,
 }
 

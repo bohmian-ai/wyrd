@@ -58,7 +58,7 @@ use wyrd_tonic::tonic::{Code, Request, Status};
 use wyrd_tonic::tonic_health::server::health_reporter;
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_client::BifrostIngestServiceClient;
 use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
-use wyrd_tonic::wyrd::v1::{InsertBatchRequest, ListActiveStreamsRequest};
+use wyrd_tonic::wyrd::v1::{InsertBatchRequest, ListActiveStreamsRequest, ProducerTraceContext};
 
 /// Seed one additional data tenant through the composed fixture's operator.
 ///
@@ -227,6 +227,7 @@ fn empty_request() -> InsertBatchRequest {
         table: String::new(),
         arrow_ipc: Bytes::default(),
         wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+        producer_trace_contexts: Vec::new(),
     }
 }
 
@@ -391,6 +392,7 @@ async fn otlp_unauthenticated_precedes_decode() {
         GrpcRouterConfig {
             reflection_enabled: false,
             tls_identity: None,
+            tenant_spans: None,
         },
     )
     .expect("gRPC router builds");
@@ -472,6 +474,7 @@ async fn ingest_unauthenticated_is_rejected() {
         GrpcRouterConfig {
             reflection_enabled: false,
             tls_identity: None,
+            tenant_spans: None,
         },
     )
     .expect("gRPC router builds with token verifier");
@@ -526,6 +529,7 @@ async fn ingest_valid_token_is_not_rejected_as_unauthenticated() {
         GrpcRouterConfig {
             reflection_enabled: false,
             tls_identity: None,
+            tenant_spans: None,
         },
     )
     .expect("gRPC router builds with token verifier");
@@ -559,21 +563,24 @@ async fn ingest_valid_token_is_not_rejected_as_unauthenticated() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Routes valid Arrow IPC through Gate, Scribe catalog resolution, and durable WAL ACK.
+/// Seeds a fresh tenant holding logical dataset `table_name`, serves the
+/// application gRPC router, and sends it one valid Arrow batch carrying
+/// `producers` as an admin of that tenant.
+///
+/// # Errors
+/// Returns the router's refusal of the batch.
 ///
 /// # Panics
-///
-/// Panics when fixture construction, authenticated ingress, shutdown, WAL
-/// replay, or the durability assertions fail.
-#[tokio::test]
-async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
-    const TABLE_NAME: &str = "embedded_ingress_catalog";
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
+/// Panics when seeding, dataset registration, or the router fails, or the
+/// acknowledgement names another batch.
+async fn ingest_logical_batch(
+    server: &WyrdTestServer,
+    table_name: &str,
+    producers: Vec<ProducerTraceContext>,
+) -> Result<(), Status> {
     let state = server.state();
     let tenant = DataTenantId::new_v7();
-    seed_tenant(&server, tenant, "embedded-ingress-catalog").await;
+    seed_tenant(server, tenant, table_name).await;
     let mut tenant_conn = TenantConn::acquire(state.postgres.app_pool(), tenant)
         .await
         .expect("tenant role seed connection");
@@ -586,7 +593,7 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
         .expect("composed server exposes its Bifrost catalog")
         .register_dataset(
             tenant,
-            TableRef::new(BifrostNamespace::Datasets, TABLE_NAME),
+            TableRef::new(BifrostNamespace::Datasets, table_name),
             vec![Field::new("value", DataType::Int64, false)],
             None,
             CompactionRegistration::default(),
@@ -603,6 +610,7 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
         GrpcRouterConfig {
             reflection_enabled: false,
             tls_identity: None,
+            tenant_spans: None,
         },
     )
     .expect("gRPC router builds with token verifier");
@@ -612,21 +620,40 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
     tokio::spawn(async move { serve_grpc(router, bind, token).await });
 
     let mut request = Request::new(InsertBatchRequest {
-        table: format!("vala.datasets.{TABLE_NAME}"),
+        table: format!("vala.datasets.{table_name}"),
         arrow_ipc: valid_arrow_ipc().into(),
         wyrd_batch_id: batch_id.as_bytes().to_vec().into(),
+        producer_trace_contexts: producers,
     });
     request.metadata_mut().insert(
         "x-wyrd-access-token",
         format!("Bearer {jwt}").parse().expect("metadata value"),
     );
-    let response = connect_grpc(bind)
+    let response = connect_grpc(bind).await.insert_batch(request).await;
+    shutdown.cancel();
+    assert_eq!(
+        response?.into_inner().wyrd_batch_id.as_ref(),
+        batch_id.as_bytes()
+    );
+    Ok(())
+}
+
+/// Routes valid Arrow IPC through Gate, Scribe catalog resolution, and durable WAL ACK.
+///
+/// # Panics
+///
+/// Panics when fixture construction, authenticated ingress, shutdown, WAL
+/// replay, or the durability assertions fail.
+#[tokio::test]
+async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
+    const TABLE_NAME: &str = "embedded_ingress_catalog";
+    let server = WyrdTestServer::start_in_process()
         .await
-        .insert_batch(request)
+        .expect("test server starts");
+    let state = server.state();
+    ingest_logical_batch(&server, TABLE_NAME, Vec::new())
         .await
-        .expect("valid logical ingress reaches Scribe and is durably acknowledged")
-        .into_inner();
-    assert_eq!(response.wyrd_batch_id.as_ref(), batch_id.as_bytes());
+        .expect("valid logical ingress reaches Scribe and is durably acknowledged");
 
     // The ACK is returned only after the WAL fsync, so the accepted record is
     // already on disk. Replay before draining Scribe: a graceful shutdown
@@ -659,8 +686,59 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
         .scribe()
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;
-    shutdown.cancel();
 
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The Gate write span is the CONSUMER of a queued batch: it links each valid
+/// producer context the batch carries, in order, and skips a malformed one
+/// without refusing the batch's rows.
+///
+/// # Panics
+/// Panics when telemetry, the server, or ingestion fails, or the write span's
+/// links differ from the valid producer contexts.
+#[tokio::test]
+async fn batch_ingest_span_links_each_producer_context() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let producer = |trace: u8, span: u8| ProducerTraceContext {
+        trace_id: vec![trace; 16],
+        span_id: vec![span; 8],
+        trace_flags: 1,
+        trace_state: String::new(),
+    };
+    let checkpoint = traces.checkpoint();
+
+    ingest_logical_batch(
+        &server,
+        "linked_producers",
+        vec![
+            producer(0xaa, 0x01),
+            producer(0xbb, 0),
+            producer(0xcc, 0x02),
+        ],
+    )
+    .await
+    .expect("a malformed producer context never refuses the batch");
+
+    let spans = traces.finished_since(checkpoint);
+    let write = spans
+        .iter()
+        .find(|span| span.name == "bifrost.gate.write")
+        .unwrap_or_else(|| panic!("the batch is written under the Gate span: {spans:#?}"));
+    assert_eq!(write.kind, "Consumer", "{write:#?}");
+    assert_eq!(
+        write.links,
+        [
+            ("aa".repeat(16), "01".repeat(8)),
+            ("cc".repeat(16), "02".repeat(8)),
+        ],
+        "{write:#?}"
+    );
     server.shutdown().await.expect("server shuts down");
 }
 
@@ -827,6 +905,7 @@ async fn insert_as(
         table: table.to_owned(),
         arrow_ipc: arrow_ipc.into(),
         wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+        producer_trace_contexts: Vec::new(),
     });
     request.metadata_mut().insert(
         "x-wyrd-access-token",
@@ -901,6 +980,7 @@ impl ResultTableHarness {
             GrpcRouterConfig {
                 reflection_enabled: false,
                 tls_identity: None,
+                tenant_spans: None,
             },
         )
         .expect("gRPC router builds with token verifier");

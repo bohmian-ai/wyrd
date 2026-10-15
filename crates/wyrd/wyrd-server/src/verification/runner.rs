@@ -528,8 +528,9 @@ impl LeasedWork for VerifierRunner {
     /// its Verifier in the same transaction.
     ///
     /// Opens the run's `verification.attempt` span before the claim statement
-    /// and records the claimed run's scrubbed identity on it; the span then
-    /// travels with the claim to settlement.
+    /// and records the claimed run's scrubbed identity on it, linking it to
+    /// the request that enqueued a manual run; the span then travels with the
+    /// claim to settlement.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the claim or the Verifier read fails.
@@ -562,6 +563,9 @@ impl LeasedWork for VerifierRunner {
         .instrument(span.clone())
         .await?;
         Ok(claimed.map(|(run, verifier, loaded)| {
+            if let Some((trace_id, span_id)) = &run.cause {
+                wyrd_telemetry::link_remote_span(&span, trace_id, span_id, true);
+            }
             span.record("run_id", display(run.lease.run_id));
             span.record("attempt", run.attempt);
             span.record("origin", run.origin.as_str());

@@ -4,17 +4,20 @@ import { DIAGRAMS } from './index';
 import { DISPATCH_STATES, RUN_STATES, VERDICTS, runLifecycle } from './verification';
 
 // The run state machine must name exactly the states the server reports.
-function schemaEnum(file: string, definition: string): string[] {
-  const schema = JSON.parse(readFileSync(new URL(`../../../../crates/wyrd-spec/schemas/${file}`, import.meta.url), 'utf8'));
-  const def = schema.definitions[definition];
+// `mise run docs:test` prints the Rust contract bundle to a temporary file and
+// passes its path as WYRD_CONTRACTS.
+function schemaEnum(definition: string): string[] {
+  const path = process.env.WYRD_CONTRACTS;
+  if (!path) throw new Error('WYRD_CONTRACTS is unset; run the docs tests through `mise run docs:test`');
+  const def = JSON.parse(readFileSync(path, 'utf8')).definitions[definition];
   return (def.oneOf ?? [def]).flatMap((v: { enum: string[] }) => v.enum).sort();
 }
 
 describe('run lifecycle diagram', () => {
   it('matches the server status enums', () => {
-    expect([...RUN_STATES].sort()).toEqual(schemaEnum('verification_run_status.json', 'VerificationExecutionStatus'));
-    expect([...DISPATCH_STATES].sort()).toEqual(schemaEnum('verification_run_status.json', 'OperatorDispatchStatus'));
-    expect([...VERDICTS].sort()).toEqual(schemaEnum('operator_failure_context.json', 'VerificationVerdict'));
+    expect([...RUN_STATES].sort()).toEqual(schemaEnum('VerificationExecutionStatus'));
+    expect([...DISPATCH_STATES].sort()).toEqual(schemaEnum('OperatorDispatchStatus'));
+    expect([...VERDICTS].sort()).toEqual(schemaEnum('VerificationVerdict'));
   });
 
   it('draws a state for every status', () => {

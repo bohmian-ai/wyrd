@@ -498,6 +498,7 @@ fn gateway_model(provider: &ProviderName, model: &str) -> Option<ModelRef> {
         ProviderName::Anthropic => "anthropic",
         ProviderName::Google => "gemini",
         ProviderName::Vertex => "vertex",
+        ProviderName::Jev => "jev",
         ProviderName::Custom(name) => name,
     };
     Some(ModelRef {

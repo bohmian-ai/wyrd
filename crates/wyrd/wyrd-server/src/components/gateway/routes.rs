@@ -863,7 +863,11 @@ pub(crate) async fn get_capture(
 /// Tenant and principal come only from the verified caller; the body names the
 /// model and reaches the provider unchanged or through faithful translation.
 /// See [`openai_call`] for errors, buffering, and streaming.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn chat_completions(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -911,7 +915,11 @@ pub(crate) async fn chat_completions(
 /// deployments that speak the `OpenAI` Responses protocol.
 ///
 /// See [`openai_call`] for errors, buffering, and streaming.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn responses(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -952,7 +960,11 @@ pub(crate) async fn responses(
 /// unchanged; other adapters reject embeddings before dispatch.
 ///
 /// See [`openai_call`] for errors and buffering.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn embeddings(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -992,7 +1004,11 @@ pub(crate) async fn embeddings(
 ///
 /// Media calls never retry after dispatch. See [`openai_call`] for errors and
 /// buffering.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn image_generations(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -1024,7 +1040,11 @@ pub(crate) async fn image_generations(
 /// `POST /v1/images/edits`: one governed image edit from a bounded form.
 ///
 /// See [`openai_call`] for errors and buffering.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn image_edits(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -1066,7 +1086,11 @@ pub(crate) async fn image_edits(
 /// form.
 ///
 /// See [`openai_call`] for errors and buffering.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn image_variations(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -1109,7 +1133,11 @@ pub(crate) async fn image_variations(
 /// audio returns with the provider's content type.
 ///
 /// See [`openai_call`] for errors and buffering.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn audio_speech(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -1145,7 +1173,11 @@ pub(crate) async fn audio_speech(
 /// upload bounded by `limits.audio_upload_bytes`.
 ///
 /// See [`audio_form`] for streaming and [`openai_call`] for errors.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn audio_transcriptions(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -1189,7 +1221,11 @@ pub(crate) async fn audio_transcriptions(
 /// upload bounded by `limits.audio_upload_bytes`.
 ///
 /// See [`audio_form`] for streaming and [`openai_call`] for errors.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn audio_translations(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -1500,7 +1536,11 @@ pub(crate) async fn get_file(
 /// the deployment holding it.
 ///
 /// See [`GatewayBatches::file_content`] for errors.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn file_content(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -1535,7 +1575,11 @@ pub(crate) async fn file_content(
 /// deployment and the tenant.
 ///
 /// See [`GatewayBatches::delete_file`] for errors.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn delete_file(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -1575,7 +1619,11 @@ pub(crate) async fn delete_file(
 /// `POST /v1/batches`: creates a batch at most once per canonical request.
 ///
 /// See [`GatewayBatches::create`] for errors.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn create_batch(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -1643,7 +1691,11 @@ pub(crate) async fn list_batches(
 /// `GET /v1/batches/{batch_id}`: reads a batch from its deployment.
 ///
 /// See [`GatewayBatches::retrieve`] for errors.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn get_batch(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -1677,7 +1729,11 @@ pub(crate) async fn get_batch(
 /// `POST /v1/batches/{batch_id}/cancel`: cancels a batch on its deployment.
 ///
 /// See [`GatewayBatches::cancel`] for errors.
-#[tracing::instrument(skip_all, fields(operation = "gateway.invoke"))]
+#[tracing::instrument(
+    name = "gateway.invoke",
+    skip_all,
+    fields(operation = "gateway.invoke")
+)]
 pub(crate) async fn cancel_batch(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -1841,7 +1897,8 @@ pub(super) fn openai_error(error: &WyrdError) -> Response {
 /// `max_completion_tokens` (or legacy `max_tokens`) times the choice count
 /// `n`, Responses by `max_output_tokens`, and a request without that maximum
 /// is unbounded; Embeddings produce no output tokens. Other operations have no
-/// token bound here.
+/// token bound here, including Jev `systemone`, whose answers no request
+/// member bounds.
 pub(super) fn usage_bound(
     operation: GatewayOperation,
     body: &Value,
@@ -1855,7 +1912,10 @@ pub(super) fn usage_bound(
         ),
         GatewayOperation::Responses => Some(field("max_output_tokens")?),
         GatewayOperation::Embeddings => None,
-        GatewayOperation::Images | GatewayOperation::Audio | GatewayOperation::Batches => {
+        GatewayOperation::Images
+        | GatewayOperation::Audio
+        | GatewayOperation::Batches
+        | GatewayOperation::SystemOne => {
             return None;
         }
     };

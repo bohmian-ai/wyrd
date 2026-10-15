@@ -37,6 +37,7 @@ pub use wire::google_generate::{
     GoogleGenerateContentRequest, GoogleGenerateContentResponse, GoogleGenerateSettings,
     GooglePart, GoogleSafetyRating, GoogleUsageMetadata,
 };
+pub use wire::jev::{JevAnswer, JevQuestion, JevRequest, JevResponse, JevUsage};
 pub use wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatChoiceDelta, OpenAiChatLogprobs, OpenAiChatMessage,
     OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings, OpenAiChatStreamChunk,
@@ -58,6 +59,7 @@ pub(crate) mod common {
 
     use crate::wire::anthropic_messages::*;
     use crate::wire::google_generate::*;
+    use crate::wire::jev::*;
     use crate::wire::openai_chat::*;
     use crate::wire::openai_responses::*;
     use crate::wire::vertex_predict::*;
@@ -339,7 +341,39 @@ pub(crate) mod common {
             ProviderRequest::OpenAiResponses(openai_responses_request()),
             ProviderRequest::AnthropicMessage(anthropic_request()),
             ProviderRequest::GeminiGenerateContent(google_request()),
+            ProviderRequest::JevSystemOne(jev_request()),
         ]
+    }
+
+    /// A Jev request asking one question of each form about a `${reply}`
+    /// placeholder state.
+    pub(crate) fn jev_request() -> JevRequest {
+        typed(json!({
+            "model": "jev-latest",
+            "state": "${reply}",
+            "questions": {
+                "helpful": {"type": "noul", "instructions": "Does it help?"},
+                "tone": {"type": "choice", "instructions": "Tone?",
+                         "criteria": {"polite": "courteous", "rude": "curt"}},
+                "quality": {"type": "score", "instructions": "Quality?",
+                            "criteria": ["poor", "great"]}
+            }
+        }))
+    }
+
+    /// The Jev answer to [`jev_request`].
+    pub(crate) fn jev_response() -> JevResponse {
+        typed(json!({
+            "model": "jev-1.13.0",
+            "answers": {
+                "helpful": {"type": "noul", "noul": 0.9},
+                "tone": {"type": "choice", "choice": "polite", "confidence": 0.8,
+                         "probabilities": {"polite": 0.9, "rude": 0.1}},
+                "quality": {"type": "score", "score": 0.7,
+                            "legend": {"0": "poor", "1": "great"}}
+            },
+            "usage": {"input_tokens": 12, "output_tokens": 3}
+        }))
     }
 
     pub(crate) fn provider_response_variants() -> Vec<ProviderResponse> {
@@ -348,6 +382,7 @@ pub(crate) mod common {
             ProviderResponse::OpenAiResponses(openai_responses_response()),
             ProviderResponse::AnthropicMessage(anthropic_response(AnthropicStopReason::EndTurn)),
             ProviderResponse::GeminiGenerateContent(google_response(GoogleFinishReason::Stop)),
+            ProviderResponse::JevSystemOne(jev_response()),
         ]
     }
 

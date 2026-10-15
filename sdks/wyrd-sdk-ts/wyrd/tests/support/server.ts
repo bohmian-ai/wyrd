@@ -2,11 +2,27 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import type { CardRef, RegistrationReceipt } from "wyrd-ai";
+import { Bifrost, type CardRef, type RegistrationReceipt, type SpanRecord } from "wyrd-ai";
 import { type NativeWyrdTestServer, startTestServer } from "@wyrd/testing";
 import { test as base, vi } from "vitest";
 
 import { type ReceivedRequest, Receiver, type Reply } from "./http-receiver.js";
+
+/** `span` and each ancestor its parent ids reach within `timeline`, nearest first. */
+export function ancestry(timeline: readonly SpanRecord[], span: SpanRecord): SpanRecord[] {
+  const byId = new Map(timeline.map((each) => [each.span_id, each]));
+  const chain = [span];
+  for (let next = byId.get(span.parent_span_id ?? ""); next !== undefined; next = byId.get(next.parent_span_id ?? "")) {
+    chain.push(next);
+  }
+  return chain;
+}
+
+/** The span tree of `traceId` as the administrator reads it after a flush. */
+export async function timeline(server: { flushBifrost(): void }, traceId: string): Promise<SpanRecord[]> {
+  server.flushBifrost();
+  return (await Bifrost.connect()).traceTimeline(traceId);
+}
 
 /** Path of a checked-in file under the repository-root `fixtures/` tree. */
 export function fixture(path: string): string {

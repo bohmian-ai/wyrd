@@ -1,5 +1,5 @@
 //! The process's one Scribe-bound outbox: audit decisions, gateway capture,
-//! and Verifier results.
+//! Verifier results, and tenant copies of server spans.
 //!
 //! Producers stage logical [`ScribeWrite`] values on [`ScribeOutbox`] and
 //! return at once. The outbox writer hands each tenant's pending slice to
@@ -34,6 +34,7 @@ use arrow::ipc::writer::StreamWriter;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::cluster::ClusterRegistry;
@@ -43,6 +44,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::tables::audit::projection::project_audit_event;
 use vala_bifrost_redux::tables::gateway::CallsTable;
+use vala_bifrost_redux::tables::traces::project_resource_spans;
 use vala_bifrost_redux::tables::{
     AuditLogTable, DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, SpansTable,
 };
@@ -55,6 +57,7 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditEvent, NodeId};
+use wyrd_tonic::otlp::trace::v1::ResourceSpans;
 use wyrd_tonic::tonic::Code;
 use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
@@ -109,6 +112,20 @@ pub enum ScribeWrite {
         /// The exact Verifier and SYSTEM principal the rows are written under.
         attribution: VerifierAttribution,
     },
+    /// One server span's tenant copy, written under the authenticated caller
+    /// of the request it belongs to.
+    ServerSpans {
+        /// The requesting principal, which Scribe stamps as `principal_id`.
+        principal: PrincipalId,
+        /// The span as one OTLP resource span, already reduced to the fields
+        /// its tenant may see; boxed so the enum stays as small as its
+        /// pointer variants.
+        spans: Box<ResourceSpans>,
+        /// The span's share of [`TENANT_SPAN_PERMITS`], held while the copy
+        /// is staged or retried and released once it is written, consumed,
+        /// or abandoned.
+        permit: OwnedSemaphorePermit,
+    },
 }
 
 impl From<AuditEvent> for ScribeWrite {
@@ -137,8 +154,22 @@ struct Rows<'a> {
     attribution: Option<&'a VerifierAttribution>,
     /// Request the rows were admitted under, when the write has one.
     request: Option<&'a RequestId>,
+    /// Requesting principal of server-span rows; `None` otherwise.
+    principal: Option<PrincipalId>,
     /// The rows.
     batch: RecordBatch,
+}
+
+/// Projects `spans` into one canonical `vala.traces.spans` batch.
+///
+/// Gateway capture and server-span tenant copies both project their spans
+/// here. `None` when the projection fails or rejects any span, since every
+/// span of a write lands or none does.
+pub(crate) fn project_spans(spans: &ResourceSpans) -> Option<RecordBatch> {
+    project_resource_spans(std::slice::from_ref(spans), None, usize::MAX)
+        .ok()
+        .filter(|(_, outcome)| outcome.rejected_spans == 0)
+        .map(|(batch, _)| batch)
 }
 
 impl ScribeWrite {
@@ -153,6 +184,7 @@ impl ScribeWrite {
                 table: ScribeTable::AuditLog,
                 attribution: None,
                 request: None,
+                principal: None,
                 batch: project_audit_event(event, *decided_at).map_err(|_| "projection")?,
             }]),
             Self::Capture(capture) => Ok(capture
@@ -163,6 +195,7 @@ impl ScribeWrite {
                     table,
                     attribution: None,
                     request: Some(capture.request_id()),
+                    principal: None,
                     batch,
                 })
                 .collect()),
@@ -180,10 +213,20 @@ impl ScribeWrite {
                         table,
                         attribution: Some(attribution),
                         request: None,
+                        principal: None,
                         batch: batch.batch.clone(),
                     })
                 })
                 .collect(),
+            Self::ServerSpans {
+                principal, spans, ..
+            } => Ok(vec![Rows {
+                table: ScribeTable::Spans,
+                attribution: None,
+                request: None,
+                principal: Some(*principal),
+                batch: project_spans(spans).ok_or("projection")?,
+            }]),
         }
     }
 }
@@ -196,7 +239,7 @@ pub enum ScribeTable {
     AuditLog,
     /// `vala.gateway.calls`, one row per captured call.
     Calls,
-    /// `vala.traces.spans`, one span per captured attempt.
+    /// `vala.traces.spans`, one span per captured attempt or server span.
     Spans,
     /// `vala.verification.results`, one canonical summary row per judgment.
     Results,
@@ -382,8 +425,9 @@ impl ScribeRefusal {
 ///
 /// The sink and the peer service both submit through [`Self::into_frame`],
 /// so a frame is identical in-process and over the peer plane. A result
-/// table's frame carries its [`VerifierAttribution`] and an audit or capture
-/// table's carries none; the peer service refuses any other combination.
+/// table's frame carries its [`VerifierAttribution`], a server-span frame
+/// carries its requesting principal, and an audit or capture frame carries
+/// neither; the peer service refuses any other combination.
 #[derive(Debug, Clone)]
 pub(crate) struct ScribeBatch {
     /// Tenant the rows belong to.
@@ -398,6 +442,8 @@ pub(crate) struct ScribeBatch {
     pub(crate) ipc: Bytes,
     /// Verifier attribution of a result frame; `None` for audit and capture.
     pub(crate) verifier: Option<VerifierAttribution>,
+    /// Requesting principal of a server-span frame; `None` otherwise.
+    pub(crate) principal: Option<PrincipalId>,
 }
 
 impl ScribeBatch {
@@ -407,18 +453,21 @@ impl ScribeBatch {
     /// one principal Scribe admits for the system owner's audit history; a
     /// capture frame under the reserved capture principal, attributed to the
     /// UID-bearing Cards its rows name, which the gateway authorized against
-    /// the caller before the call; a result frame
+    /// the caller before the call; a server-span frame under the requesting
+    /// principal the request authenticated as, attributed to the Cards its
+    /// rows name; a result frame
     /// under the tenant SYSTEM principal whose Card scope is exactly the
     /// Verifier, from which Scribe stamps `card_uid`. The principal carries no
     /// permission: all are server-internal writes that evaluate none, and its
     /// id is what Scribe stamps as `principal_id`.
     pub(crate) fn into_frame(self) -> ScribeIngressFrame {
-        let (id, kind) = match &self.verifier {
-            None if self.table == ScribeTable::AuditLog => {
+        let (id, kind) = match (&self.verifier, self.principal) {
+            (None, Some(principal)) => (principal, PrincipalKind::User),
+            (None, None) if self.table == ScribeTable::AuditLog => {
                 (PLATFORM_AUDIT_PRINCIPAL, PrincipalKind::User)
             }
-            None => (GATEWAY_CAPTURE_PRINCIPAL, PrincipalKind::User),
-            Some(attribution) => (
+            (None, None) => (GATEWAY_CAPTURE_PRINCIPAL, PrincipalKind::User),
+            (Some(attribution), _) => (
                 attribution.principal,
                 PrincipalKind::System {
                     card_ref_scope: CardRefScope::own(&attribution.verifier),
@@ -528,6 +577,11 @@ impl ScribePeers {
                 request_id: batch.request_id.as_str().to_owned(),
                 arrow_ipc: batch.ipc.clone(),
                 verifier: batch.verifier.as_ref().map(VerifierAttribution::to_wire),
+                principal_id: batch
+                    .principal
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
             })
             .await
             .map(|_| ())
@@ -580,6 +634,56 @@ impl ScribeRoute {
                 .map_err(|error| ScribeRefusal::from_scribe(&error)),
             Self::Peer(peers) => peers.submit(batch, attempt).await,
         }
+    }
+}
+
+/// Most tenant span copies one process holds unwritten at once.
+///
+/// The outbox queue itself is unbounded; this caps only the span producer, so
+/// a sustained Scribe outage cannot grow the heap without limit while audit,
+/// capture, and result writes keep their own semantics.
+const TENANT_SPAN_PERMITS: usize = 2_048;
+
+/// Stages the tenant copies of server spans on the process Scribe outbox.
+///
+/// Telemetry hands each copy over as its span ends, already reduced to the
+/// tenant's safe fields; staging returns at once, so a slow or unavailable
+/// Scribe never reaches the request. Each staged copy holds one of
+/// [`TENANT_SPAN_PERMITS`]; when none is free the copy is dropped and counted
+/// lost instead of waiting.
+pub(crate) struct ServerSpanSink {
+    /// The process outbox every Scribe write is staged on.
+    outbox: Arc<ScribeOutbox>,
+    /// Permits for copies staged and not yet written, consumed, or abandoned.
+    permits: Arc<Semaphore>,
+}
+
+impl ServerSpanSink {
+    /// Stages copies on `outbox` under a full permit pool.
+    pub(crate) fn new(outbox: Arc<ScribeOutbox>) -> Self {
+        Self {
+            outbox,
+            permits: Arc::new(Semaphore::new(TENANT_SPAN_PERMITS)),
+        }
+    }
+}
+
+impl wyrd_telemetry::TenantSpanSink for ServerSpanSink {
+    /// Stages one copy for the route's tenant under its principal, or drops
+    /// and counts it lost when every permit is held.
+    fn stage(&self, route: wyrd_telemetry::TenantSpanRoute, span: ResourceSpans) {
+        let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+            count_lost::<ScribeSink>(1);
+            return;
+        };
+        self.outbox.stage(
+            route.tenant,
+            ScribeWrite::ServerSpans {
+                principal: route.principal,
+                spans: Box::new(span),
+                permit,
+            },
+        );
     }
 }
 
@@ -640,6 +744,8 @@ struct Frame<'a> {
     attribution: Option<&'a VerifierAttribution>,
     /// Request every row was admitted under, when they share one.
     request: Option<&'a RequestId>,
+    /// Requesting principal of server-span rows.
+    principal: Option<PrincipalId>,
     /// The rows, all of one schema.
     batches: Vec<RecordBatch>,
     /// In-memory size of `batches`.
@@ -650,11 +756,12 @@ struct Frame<'a> {
 
 impl Frame<'_> {
     /// Whether `rows` share this frame's destination, attribution, request,
-    /// and schema, so one Scribe frame can carry both.
+    /// principal, and schema, so one Scribe frame can carry both.
     fn shares(&self, rows: &Rows<'_>) -> bool {
         self.table == rows.table
             && self.attribution == rows.attribution
             && self.request == rows.request
+            && self.principal == rows.principal
             && self.batches[0].schema() == rows.batch.schema()
     }
 }
@@ -663,7 +770,7 @@ impl ScribeSink {
     /// Groups `items` into frames, in first-seen destination order.
     ///
     /// Rows join the latest frame they share a destination, attribution,
-    /// request, and schema with while it stays within `budget` bytes in
+    /// request, principal, and schema with while it stays within `budget` bytes in
     /// memory, and otherwise open a new one, so the frames of an identical slice are
     /// identical. Gateway capture carries its admitting request, which Scribe
     /// stamps as `wyrd_request_id`, so captures group per request. Result summary frames are moved after every detail frame,
@@ -705,6 +812,7 @@ impl ScribeSink {
                         table: rows.table,
                         attribution: rows.attribution,
                         request: rows.request,
+                        principal: rows.principal,
                         batches: vec![rows.batch],
                         bytes: size,
                         items: BTreeSet::from([index]),
@@ -768,8 +876,8 @@ impl ScribeSink {
 
     /// Wraps one encoded stream of `frame` under its content-derived identity.
     ///
-    /// The batch id hashes the tenant, destination, attribution, request, and
-    /// encoded rows, so a retry of the identical slice resubmits the same
+    /// The batch id hashes the tenant, destination, attribution, request,
+    /// principal, and encoded rows, so a retry of the identical slice resubmits the same
     /// identity and Scribe's batch-id dedup absorbs frames it already
     /// accepted. A frame with no originating request is admitted under a
     /// request id derived from the batch id, so it too is stable across
@@ -791,6 +899,9 @@ impl ScribeSink {
         if let Some(request) = frame.request {
             digest.update(request.as_str().as_bytes());
         }
+        if let Some(principal) = frame.principal {
+            digest.update(principal.to_string().as_bytes());
+        }
         digest.update(&ipc);
         let digest: [u8; 32] = digest.finalize().into();
         let mut bytes = [0_u8; 16];
@@ -808,6 +919,7 @@ impl ScribeSink {
             request_id,
             ipc: Bytes::from(ipc),
             verifier: frame.attribution.cloned(),
+            principal: frame.principal,
         }
     }
 }
@@ -918,9 +1030,12 @@ mod tests {
     };
     use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, IngestCaptureResponse};
 
+    use wyrd_telemetry::{TenantSpanRoute, TenantSpanSink as _};
+    use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
     use super::{
         Outbox, SCRIBE_WRITERS, ScribeOutbox, ScribePeers, ScribeRefusal, ScribeRoute, ScribeSink,
-        ScribeWrite, VerifierAttribution, frame_budget,
+        ScribeWrite, ServerSpanSink, TENANT_SPAN_PERMITS, VerifierAttribution, frame_budget,
     };
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};
@@ -973,6 +1088,7 @@ mod tests {
                 run_id: None,
                 verifier_version: "1.0.0",
                 subject_card_uid: &subject,
+                requested_by: None,
                 owner_card_uid: None,
                 binding_id: None,
                 trigger: None,
@@ -1198,6 +1314,25 @@ mod tests {
     /// Scribe to take it.
     #[tokio::test]
     async fn a_peer_route_needs_no_oracle() {
+        let outbox = outage_outbox();
+        assert!(outbox.sink().reaches_scribe());
+        let tenant = DataTenantId::new_v7();
+        outbox.stage(tenant, capture(tenant));
+        let soon = Instant::now() + Duration::from_millis(200);
+        assert_eq!(
+            outbox.settle(soon).await,
+            1,
+            "a write waits for a ready Scribe"
+        );
+    }
+
+    /// An outbox routed over the peer plane while membership names no ready
+    /// Scribe: a sustained outage in which every write stays pending.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no peer route is selected.
+    fn outage_outbox() -> Arc<ScribeOutbox> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused.invalid/none")
             .expect("lazy pool builds without connecting");
@@ -1213,16 +1348,85 @@ mod tests {
         );
         let route = ScribeRoute::select(None, &cluster, Some(&tls));
         assert!(matches!(route, Some(ScribeRoute::Peer(_))));
-        let outbox = ScribeSink::outbox(route, BIFROST_INGEST_REQUEST_LIMIT_BYTES);
-        assert!(outbox.sink().reaches_scribe());
+        ScribeSink::outbox(route, BIFROST_INGEST_REQUEST_LIMIT_BYTES)
+    }
+
+    /// One tenant span copy routed to `tenant`, and the span it carries.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed principal id does not parse.
+    fn span_copy(tenant: DataTenantId) -> (TenantSpanRoute, ResourceSpans) {
+        let span = Span {
+            trace_id: vec![1; 16],
+            span_id: vec![2; 8],
+            name: "request".to_owned(),
+            start_time_unix_nano: 1,
+            end_time_unix_nano: 2,
+            ..Span::default()
+        };
+        (
+            TenantSpanRoute {
+                tenant,
+                principal: "01900000-0000-7000-8000-000000000007"
+                    .parse()
+                    .expect("a principal id"),
+            },
+            ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![span],
+                    ..ScopeSpans::default()
+                }],
+                ..ResourceSpans::default()
+            },
+        )
+    }
+
+    /// Proves tenant span staging is capped through a sustained Scribe
+    /// outage without starving sibling writes: copies beyond the permit pool
+    /// are dropped at once, audit and capture writes still stage, and
+    /// abandoning the outbox at shutdown returns every permit. A copy
+    /// written once Scribe answers returns its permit too.
+    ///
+    /// # Panics
+    ///
+    /// Panics when staging exceeds the cap, a sibling write is refused, or a
+    /// permit is not returned.
+    #[tokio::test]
+    async fn sustained_scribe_outage_caps_tenant_spans() {
+        let outbox = outage_outbox();
+        let spans = ServerSpanSink::new(Arc::clone(&outbox));
         let tenant = DataTenantId::new_v7();
+        for _ in 0..TENANT_SPAN_PERMITS + 16 {
+            let (route, copy) = span_copy(tenant);
+            spans.stage(route, copy);
+        }
+        assert_eq!(outbox.pending(), TENANT_SPAN_PERMITS, "the cap holds");
+        assert_eq!(spans.permits.available_permits(), 0);
+        outbox.stage(tenant, decision("cards.read"));
         outbox.stage(tenant, capture(tenant));
-        let soon = Instant::now() + Duration::from_millis(200);
         assert_eq!(
-            outbox.settle(soon).await,
-            1,
-            "a write waits for a ready Scribe"
+            outbox.pending(),
+            TENANT_SPAN_PERMITS + 2,
+            "audit and capture take no span permit"
         );
+        assert_eq!(
+            outbox.shutdown(Instant::now()).await,
+            TENANT_SPAN_PERMITS + 2
+        );
+        assert_eq!(spans.permits.available_permits(), TENANT_SPAN_PERMITS);
+
+        let scribe = Arc::new(RecordingScribe::default());
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _);
+        let spans = ServerSpanSink::new(Arc::clone(&outbox));
+        let (route, copy) = span_copy(tenant);
+        spans.stage(route, copy);
+        settle(&outbox).await;
+        let received = scribe.received();
+        assert_eq!(received.len(), 1, "{received:?}");
+        assert_eq!(received[0].table, "vala.traces.spans");
+        assert_eq!(received[0].principal, route.principal);
+        assert_eq!(spans.permits.available_permits(), TENANT_SPAN_PERMITS);
     }
 
     /// A Scribe request ceiling well below the default, so a modest Eval
@@ -1279,6 +1483,7 @@ mod tests {
                 run_id: None,
                 verifier_version: "1.0.0",
                 subject_card_uid: &subject,
+                requested_by: None,
                 owner_card_uid: None,
                 binding_id: None,
                 trigger: None,

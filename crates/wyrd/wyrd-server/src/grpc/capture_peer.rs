@@ -1,5 +1,6 @@
 //! Private tonic adapter for server-internal writes submitted by a pod without
-//! Scribe: audit decisions, gateway capture, and Verifier results.
+//! Scribe: audit decisions, gateway capture, Verifier results, and tenant
+//! copies of server spans.
 //!
 //! Mounted only on the mutually authenticated peer listener of a pod that runs
 //! Scribe, so every caller already presented the cluster `wyrd-peer`
@@ -7,7 +8,8 @@
 //! request names its tenant and destination explicitly and carries no token.
 //! The service accepts only the audit log, the two capture destinations, and
 //! the three Verifier result tables, a result batch only with its Verifier
-//! attribution, and the reserved system tenant only for audit history, then
+//! attribution, a requesting principal only on a span batch, and the reserved
+//! system tenant only for audit history, then
 //! submits through the same frame the in-process Scribe outbox route uses.
 
 use std::sync::Arc;
@@ -15,6 +17,7 @@ use std::sync::Arc;
 use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::gate::IngestError;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_server::{
@@ -47,11 +50,12 @@ impl ScribeCapturePeerGrpc {
     ///
     /// # Errors
     ///
-    /// Returns `InvalidArgument` for a malformed tenant, batch, request id, or
-    /// Verifier attribution, and `PermissionDenied` for the reserved system
-    /// tenant outside audit history, any table other than the six
-    /// server-internal destinations, a result batch without attribution, or an
-    /// audit or capture batch with one.
+    /// Returns `InvalidArgument` for a malformed tenant, batch, request id,
+    /// Verifier attribution, or principal id, and `PermissionDenied` for the
+    /// reserved system tenant outside audit history, any table other than the
+    /// six server-internal destinations, a result batch without attribution,
+    /// an audit or capture batch with one, or a requesting principal on any
+    /// batch but a span batch without attribution.
     fn batch(request: IngestCaptureRequest) -> Result<ScribeBatch, Status> {
         let tenant = request
             .tenant_id
@@ -84,6 +88,17 @@ impl ScribeCapturePeerGrpc {
                 ));
             }
         };
+        let principal = match request.principal_id.as_str() {
+            "" => None,
+            _ if table != ScribeTable::Spans || verifier.is_some() => {
+                return Err(Status::permission_denied(
+                    "only a server-span batch names a requesting principal",
+                ));
+            }
+            id => Some(id.parse::<PrincipalId>().map_err(|_| {
+                Status::invalid_argument("capture principal_id is not a principal id")
+            })?),
+        };
         let batch_id = request
             .batch_id
             .parse::<uuid::Uuid>()
@@ -99,6 +114,7 @@ impl ScribeCapturePeerGrpc {
             request_id,
             ipc: request.arrow_ipc,
             verifier,
+            principal,
         })
     }
 }
@@ -151,6 +167,7 @@ mod tests {
             request_id: RequestId::now_v7().as_str().to_owned(),
             arrow_ipc: Bytes::new(),
             verifier: result.then(attribution),
+            principal_id: String::new(),
         }
     }
 
@@ -168,7 +185,9 @@ mod tests {
     /// and the three Verifier result tables with it, and refuses the reserved
     /// system tenant elsewhere, every other table, a result batch without its
     /// attribution, a capture batch with one, a reference to a non-Verifier
-    /// Card, and malformed ids, all before any Scribe work.
+    /// Card, a requesting principal on anything but a span batch, and
+    /// malformed ids, all before any Scribe work. A span batch carries its
+    /// requesting principal through.
     ///
     /// # Panics
     ///
@@ -185,7 +204,15 @@ mod tests {
             let batch = ScribeCapturePeerGrpc::batch(request(tenant, table)).expect("accepted");
             assert_eq!((batch.tenant, batch.table.fqn()), (tenant, table));
             assert!(batch.verifier.is_none());
+            assert!(batch.principal.is_none());
         }
+        let requester = uuid::Uuid::now_v7().to_string();
+        let batch = ScribeCapturePeerGrpc::batch(IngestCaptureRequest {
+            principal_id: requester.clone(),
+            ..request(tenant, "vala.traces.spans")
+        })
+        .expect("a span batch names its requesting principal");
+        assert_eq!(batch.principal.map(|id| id.to_string()), Some(requester));
         for table in [
             "vala.verification.results",
             "vala.drift.result_features",
@@ -254,6 +281,27 @@ mod tests {
                         ..attribution()
                     }),
                     ..request(tenant, "vala.eval.result_items")
+                },
+                Code::InvalidArgument,
+            ),
+            (
+                IngestCaptureRequest {
+                    principal_id: uuid::Uuid::now_v7().to_string(),
+                    ..request(tenant, "vala.gateway.calls")
+                },
+                Code::PermissionDenied,
+            ),
+            (
+                IngestCaptureRequest {
+                    principal_id: uuid::Uuid::now_v7().to_string(),
+                    ..request(tenant, "vala.verification.results")
+                },
+                Code::PermissionDenied,
+            ),
+            (
+                IngestCaptureRequest {
+                    principal_id: "not-a-principal".to_owned(),
+                    ..request(tenant, "vala.traces.spans")
                 },
                 Code::InvalidArgument,
             ),

@@ -252,3 +252,38 @@ Append truthful RED/GREEN and static proof, exact commands/counts, the implement
 candidate, affected callers/siblings and remaining limits. Re-review the complete
 cumulative original task with R1/R2/R3 afterward. Implementation does not grant
 review PASS; this review applies no fixes, staging or commits.
+
+## Implementation Evidence
+
+Start point `d088519ea`. Review packet recorded in `7d6ed3b8c`. Remediation
+commits:
+- `3e8c7f49a`: FIND-9 producer
+- `9120eba68`: FIND-12 readback and FIND-9 journey
+- `6997a2252`: FIND-10
+- `d583458c0`: FIND-11
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-001-9 | `otlp_batch_id` in `gate/mod.rs` now takes the verified `Attribution` and hashes both `sub_principal_id` and `act_principal_id`, plus the unchanged tenant, table, logical, and correlation inputs. `dispatch_canonical` passes `auth.attribution()`, the same value it forwards to Scribe. It is the only caller: traces, logs, and metrics over HTTP and gRPC all route through it. Rustdoc on both items was updated. Scribe's managed-column exclusion, the durable fence, and native explicit batch ids are unchanged | **Unit.** Unit RED: the delegated `(S,A)` id equalled the direct `(S,S)` id (`left != right` failed, `fd1b51d5-…` both sides). Unit GREEN: 1 passed. Direct and delegated repeats converge; `(S,S)`, `(S,A)`, and `(S,B)` all diverge; the existing tenant/principal/table/order/payload/run cases are retained. **Journey.** RED, with only the actor digest line removed: all delegated exports were accepted over gRPC and HTTP protobuf, but `attributed.len()` was 3, expected 5 (they collapsed onto the direct fence and dropped the actor stamps). GREEN: 1 passed | PASS |
+| FIND-TASK-001-12 | `negative.rs` `identical_exports_from_two_principals_each_keep_their_own_attribution` now selects and extracts `sub_principal_id` and `act_principal_id`, keys rows by (sub, act, run), and its rustdoc uses the current pair. Sibling sweep: `grep principal_id` over all seven `tests/bifrost/otlp/*.rs` files found no other obsolete reads. The journey was extended with existing helpers only: `token_with_permissions`, `WyrdTestServer::delegate` (`TokenAudience::Wyrd`), `export_traces_over_grpc_as`, and `post_otlp_raw`. Coverage: direct S over gRPC ×2 plus HTTP ×1; P direct; S under `ATTRIBUTION_RUN`; S→P and S→T, each over gRPC and HTTP. Assertions: exactly 5 pair/run sets, 2 direct subjects, 2 distinct delegated actors for S (one is P), both run groups, and every set holding each marker exactly once | RED (unchanged journey, traced): `Oracle SQL planning refused … No field named principal_id. Did you mean 'vala.traces.spans.sub_principal_id'?`. GREEN: 1 passed | PASS |
+| FIND-TASK-001-11 | In `app.py`, `__main__` catches the public `WyrdError`, prints `{"error": error.code}` as the last stdout line, and re-raises, so the exit stays nonzero. In `test_ambient_auth_gateway_telemetry`, the parent requires exactly `{"error": "WYRD_CLIENT_401_NO_CREDENTIALS"}` (equality, so any other code fails) instead of matching stderr text. The real isolated child, the ambient client/state path, and the gateway/upstream-key assertions are unchanged | `py:setup` rebuilt the native module after the Gate change. The exact selector passed 1 (in 4.49 s); the observed code was `WYRD_CLIENT_401_NO_CREDENTIALS` | PASS |
+| FIND-TASK-001-10 | `state::tests::telemetry_flush_failure_settles_with_the_native_drain` gains a `# Panics` section covering a must-fail settlement succeeding, an unexpected variant, and differing code, `native_code`, or drain results. Code and assertions are unchanged | Exact selector: 1 passed. `fmt` and `lints` exit 0 | PASS |
+
+### Commands
+
+- `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=gate::otlp_batch_id_tests::derived_identity_is_stable_per_tenant_table_and_payload)'`: RED, then GREEN 1 passed
+- The task's wrapped `wyrd-testing --test otlp` selector, run with `WYRD_LOG=info,vala_bifrost_redux=debug`: readback RED, actor-mutation RED, GREEN 1 passed
+- `mise run py:setup`, then the task's wrapped `test_ambient_auth_gateway_telemetry` selector: 1 passed
+- `mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=state::tests::telemetry_flush_failure_settles_with_the_native_drain)'`: 1 passed
+- `mise run fmt`, `lints`, `py:format:check`, `py:lints`, `py:typecheck`: exit 0
+- `git diff --check 7d6ed3b8c HEAD`: clean
+
+### Limits and audit
+
+- Derived OTLP ids change for every publisher, including direct ones, because
+  the actor is now hashed. A retry spanning this deploy may commit once more.
+  No migration or compatibility path was added.
+- The diff covers five files: `gate/mod.rs`, `otlp/negative.rs`,
+  `wyrd-client/src/state.rs` (rustdoc only), and the Python framework `app.py`
+  and its test. There is no schema, catalog, SDK API, dependency, Cargo
+  feature, transport, Scribe, or docs change. Findings 1–8 are untouched.

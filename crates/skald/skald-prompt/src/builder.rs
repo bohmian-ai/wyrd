@@ -441,6 +441,28 @@ mod builder_tests {
         ));
     }
 
+    /// Proves builders share the authored literal-model rule: placeholder
+    /// and control-character models are refused as the `model` field while a
+    /// slash model is kept exactly.
+    #[test]
+    fn builders_refuse_templated_models() {
+        let options = || AnthropicOptions {
+            messages: vec!["{{question}}".to_owned()],
+            ..AnthropicOptions::default()
+        };
+        for model in ["{{target}}", "${target}", "claude\t1"] {
+            let error = anthropic(model, options()).expect_err("templated model is refused");
+            assert!(
+                matches!(&error, crate::PromptBuilderError::Skald(skald_spec::SkaldError::PromptInvalid { field, .. }) if field == "model"),
+                "{model:?}: {error:?}"
+            );
+            assert!(openai_chat(model, OpenAiChatOptions::default()).is_err());
+        }
+        let prompt = anthropic("org/claude-1", options()).expect("slash model builds");
+        assert_eq!(prompt.native().model, "org/claude-1");
+        assert_eq!(prompt.native().variables, vec!["question"]);
+    }
+
     #[test]
     fn openai_responses_emits_native_text_format() {
         let prompt = openai_responses(

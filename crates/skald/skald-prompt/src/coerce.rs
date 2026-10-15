@@ -12,12 +12,22 @@ pub fn schema_object(value: &Value) -> PromptBuilderResult<Map<String, Value>> {
         .ok_or(PromptBuilderError::InvalidResponseSchema)
 }
 
-/// Returns a non-empty model string.
+/// Returns the model unchanged once it passes the shared literal-model rule.
+///
+/// Builders and the model setter route through here so runtime-built Prompts
+/// accept exactly the models authored Prompts do ([`skald_spec::prompt::check_model`]).
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::EmptyModel`] for a blank model and
+/// [`PromptBuilderError::Skald`] wrapping the `model` field refusal for
+/// control characters or placeholder syntax.
 pub fn checked_model(model: impl Into<String>) -> PromptBuilderResult<String> {
     let model = model.into();
     if model.trim().is_empty() {
         return Err(PromptBuilderError::EmptyModel);
     }
+    skald_spec::prompt::check_model(&model)?;
     Ok(model)
 }
 

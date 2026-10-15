@@ -168,6 +168,34 @@ pub fn media_placeholder_regex() -> &'static Regex {
     )
 }
 
+/// Refuses a model identifier that is not literal configuration.
+///
+/// The model names the dispatch target, so it must never be a template:
+/// a `${...}` or `{{...}}` opener would make it a render variable that
+/// [`Prompt::bind_mut`] rewrites. Every other nonempty, control-free
+/// spelling, including slash-qualified ids, is accepted verbatim; no model
+/// catalog is consulted.
+///
+/// # Errors
+///
+/// Returns [`SkaldError::PromptInvalid`] for field `model` when the model is
+/// blank, holds a control character, or holds placeholder syntax.
+pub fn check_model(model: &str) -> SkaldResult<()> {
+    let message = if model.trim().is_empty() {
+        "must be a nonempty provider model id"
+    } else if model.chars().any(char::is_control) {
+        "must not contain control characters"
+    } else if model.contains("${") || model.contains("{{") {
+        "is a literal model id; `${name}` and `{{name}}` placeholders are not allowed"
+    } else {
+        return Ok(());
+    };
+    Err(SkaldError::PromptInvalid {
+        field: "model".to_owned(),
+        message: message.to_owned(),
+    })
+}
+
 /// Split a text leaf into plain text and `${media:name}` placeholder segments.
 pub fn split_text_on_media(text: &str) -> Vec<TextSegment> {
     let mut out = Vec::new();
@@ -203,14 +231,18 @@ impl Prompt {
     ///
     /// # Errors
     ///
-    /// Returns [`SkaldError::MediaInSystemMessage`] when system content holds a
+    /// Returns [`SkaldError::PromptInvalid`] for field `model` when the model
+    /// is not literal configuration (see [`check_model`]),
+    /// [`SkaldError::MediaInSystemMessage`] when system content holds a
     /// `${media:name}` placeholder, and a serialization error when the request
     /// cannot be serialized to scan its `${name}` / `{{name}}` variables.
     pub fn new(request: ProviderRequest, model: impl Into<String>) -> SkaldResult<Self> {
+        let model = model.into();
+        check_model(&model)?;
         let response_type = response_type_of(&request);
         let mut prompt = Self {
             request,
-            model: model.into(),
+            model,
             variables: Vec::new(),
             media_variables: Vec::new(),
             response_type,

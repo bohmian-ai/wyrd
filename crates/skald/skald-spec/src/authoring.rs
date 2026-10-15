@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 
 use crate::error::{SkaldError, SkaldResult};
 use crate::media::{MediaKind, MediaRef, MediaSource};
-use crate::prompt::{Prompt, media_placeholder_regex};
+use crate::prompt::{Prompt, check_model, media_placeholder_regex};
 use crate::request::{ProviderName, ProviderRequest};
 use crate::wire::anthropic_messages::{
     AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest, AnthropicMessagesSettings,
@@ -206,15 +206,14 @@ impl AuthoredPrompt {
     ///
     /// # Errors
     ///
-    /// Returns [`SkaldError::PromptInvalid`] naming the offending field for an
-    /// empty model, a mixed or incomplete form, an invalid provider/format
+    /// Returns [`SkaldError::PromptInvalid`] naming the offending field for a
+    /// model that is not literal configuration (blank, control characters, or
+    /// placeholder syntax), a mixed or incomplete form, an invalid provider/format
     /// pair, `body.model`, an undecodable body, empty or misplaced content, a
     /// malformed binding, or an out-of-range or unsupported setting; and the
     /// media binder's error for a literal source its provider refuses.
     pub fn compile(&self) -> SkaldResult<Prompt> {
-        if self.model.trim().is_empty() {
-            return Err(invalid("model", "must be a nonempty provider model id"));
-        }
+        check_model(&self.model)?;
         let mut literals = Vec::new();
         let request = match (self.format, &self.body) {
             (Some(format), Some(body)) => self.native_request(format, body)?,
@@ -1009,6 +1008,44 @@ mod tests {
             "decode"
         );
         assert_eq!(refused(plain(json!({"variables": ["x"]}))), "decode");
+    }
+
+    /// Proves the model is literal configuration in both forms: placeholder
+    /// grammars and control characters are refused before variable
+    /// derivation, so rendering can never rewrite the target, while content
+    /// variables still render and a slash model stays exact.
+    #[test]
+    fn model_is_literal_configuration() {
+        let portable = |model: &str| json!({"provider": "openai", "model": model, "messages": [{"role": "user", "content": "{{question}}"}]});
+        let native = |model: &str| {
+            json!({"provider": "anthropic", "model": model, "format": "messages",
+                                          "body": {"max_tokens": 8, "messages": [{"role": "user", "content": [{"type": "text", "text": "{{question}}"}]}]}})
+        };
+        for model in [
+            "{{target}}",
+            "${target}",
+            "org/{{target}}",
+            "${media:x}",
+            "gpt\n4o",
+            "gpt\u{0}",
+        ] {
+            assert_eq!(refused(portable(model)), "model", "portable {model:?}");
+            assert_eq!(refused(native(model)), "model", "native {model:?}");
+        }
+        assert!(matches!(
+            crate::Prompt::new(crate::ProviderRequest::OpenAiChatCompletion(crate::common::openai_chat_request()), "${target}"),
+            Err(SkaldError::PromptInvalid { field, .. }) if field == "model"
+        ));
+
+        for body in [portable("org/model-1"), native("org/model-1")] {
+            let prompt = compile(body).expect("a slash literal compiles");
+            assert_eq!(prompt.variables, vec!["question"]);
+            let rendered = prompt
+                .render(&[("question", "why?"), ("target", "evil")])
+                .expect("content variables render");
+            let rendered = serde_json::to_value(&rendered).expect("request json");
+            assert_eq!(rendered["body"]["model"], "org/model-1");
+        }
     }
 
     /// Proves the native form: model inserted at compile and refused in the

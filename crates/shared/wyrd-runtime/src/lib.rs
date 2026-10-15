@@ -27,7 +27,8 @@ pub use principal::{
     PrincipalKind, PrincipalRef, RoleRef,
 };
 pub use request_context::{
-    DelegationStep, RequestContext, TraceParent, audit_delegation_chain, delegated_attribution,
+    AcceptedAuthority, DelegationStep, RequestContext, TraceParent, audit_delegation_chain,
+    delegated_attribution,
 };
 pub use wyrd_spec::reference::CardRefScope;
 

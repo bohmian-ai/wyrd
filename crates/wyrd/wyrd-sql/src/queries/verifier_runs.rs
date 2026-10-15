@@ -21,8 +21,10 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use sqlx::Error as SqlxError;
 use sqlx::types::{Json, Uuid};
+use wyrd_runtime::AcceptedAuthority;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::operator::{MAX_SUMMARY_CHARS, VerifierCounts};
 use wyrd_spec::ids::{
     BindingId, CardUid, OperatorDispatchId, VerificationResultId, VerificationRunId,
@@ -41,43 +43,41 @@ const EVAL_IMPLEMENTATION: &str = "eval";
 
 /// Resolve a binding target's frozen identities, readiness, and implementation.
 const RESOLVE_BINDING_SQL: &str = r"
-    SELECT b.verifier_uid, v.version AS verifier_version,
+    SELECT b.verifier_card_uid, v.version AS verifier_version,
            v.spec #>> '{implementation,kind}' AS implementation,
-           wyrd.verifier_readiness(b.verifier_uid) AS readiness,
-           b.subject_card_uid,
+           wyrd.verifier_readiness(b.verifier_card_uid) AS readiness,
+           b.card_uid,
            EXISTS (SELECT 1 FROM wyrd.cards s
-                    WHERE s.card_uid = b.subject_card_uid
+                    WHERE s.card_uid = b.card_uid
                       AND s.status IN ('active', 'deprecated')) AS subject_available,
            b.owner_card_uid, b.binding_id, b.trigger_uid, b.trigger_digest, b.operators
       FROM wyrd.verification_bindings b
-      LEFT JOIN wyrd.cards v ON v.card_uid = b.verifier_uid
+      LEFT JOIN wyrd.cards v ON v.card_uid = b.verifier_card_uid
      WHERE b.binding_id = $1
 ";
 
 /// Resolve a direct target: no owner, binding, Trigger, or Operators.
 const RESOLVE_DIRECT_SQL: &str = r"
-    SELECT p.verifier_uid, v.version AS verifier_version,
+    SELECT p.verifier_card_uid, v.version AS verifier_version,
            v.spec #>> '{implementation,kind}' AS implementation,
-           wyrd.verifier_readiness(p.verifier_uid) AS readiness,
-           $2::uuid AS subject_card_uid,
+           wyrd.verifier_readiness(p.verifier_card_uid) AS readiness,
+           $2::uuid AS card_uid,
            EXISTS (SELECT 1 FROM wyrd.cards s
                     WHERE s.card_uid = $2
                       AND s.status IN ('active', 'deprecated')) AS subject_available,
            NULL::uuid AS owner_card_uid, NULL::uuid AS binding_id,
            NULL::uuid AS trigger_uid, NULL::text AS trigger_digest,
            '[]'::jsonb AS operators
-      FROM (SELECT $1::uuid AS verifier_uid) p
-      LEFT JOIN wyrd.cards v ON v.card_uid = p.verifier_uid
+      FROM (SELECT $1::uuid AS verifier_card_uid) p
+      LEFT JOIN wyrd.cards v ON v.card_uid = p.verifier_card_uid
 ";
 
 /// Insert one run, due at PostgreSQL's statement time; a duplicate scheduled
 /// occurrence or observation record conflicts on its partial unique index and
 /// inserts nothing.
 ///
-/// `$15` is a manual run's authenticated caller. Work Wyrd starts internally,
-/// a scheduled or observation run, records the tenant's active SYSTEM
-/// principal as its actor instead, or null when the tenant has none; its
-/// origin stays recorded only as references.
+/// `$15`..`$17` are the run's subject, actor, and accepted authority, frozen
+/// from the request's [`RunAuthority`].
 ///
 /// The run becomes claimable on the same clock the claim predicate reads, so
 /// no enqueueing process can write work into the queue's future or past. An
@@ -87,24 +87,20 @@ const RESOLVE_DIRECT_SQL: &str = r"
 /// stores nothing, so a duplicate consumes no ordinal.
 const INSERT_RUN_SQL: &str = r"
     INSERT INTO wyrd.verifier_runs (
-        run_id, data_tenant_id, verifier_uid, verifier_version, subject_card_uid,
+        run_id, data_tenant_id, verifier_card_uid, verifier_version, card_uid,
         origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
         window_start, window_end, input_record_id, input_event_time,
-        requested_by_principal_id, max_attempts, next_attempt_at, created_at, updated_at,
+        sub_principal_id, act_principal_id, authority,
+        max_attempts, next_attempt_at, created_at, updated_at,
         idempotency_key, request_sha256, observation_ordinal, cause_trace_id, cause_span_id
     ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, $10,
-              $11, $12, $13, $14,
-              CASE WHEN $5 = 'manual' THEN $15::uuid ELSE (
-                  SELECT a.id FROM wyrd.auth_service_accounts a
-                   WHERE a.principal_kind = 'system' AND a.status = 'active'
-              ) END,
-              $16,
-              statement_timestamp(), statement_timestamp(), statement_timestamp(), $17, $18,
+              $11, $12, $13, $14, $15, $16, $17, $18,
+              statement_timestamp(), statement_timestamp(), statement_timestamp(), $19, $20,
               CASE WHEN $5 = 'observation' THEN (
                   SELECT COALESCE(max(observation_ordinal), 0) + 1
                     FROM wyrd.verifier_runs
                    WHERE binding_id = $7 AND origin = 'observation'
-              ) END, $19, $20)
+              ) END, $21, $22)
     ON CONFLICT DO NOTHING
     RETURNING run_id
 ";
@@ -123,7 +119,8 @@ const LOCK_OBSERVATION_BINDING_SQL: &str = r"
 ";
 
 /// Lock and list, until commit, every `observations_ready` binding whose
-/// subject and exact owner Card match a `(subject, writer)` pair of the batch.
+/// subject and exact owner Card match a `(subject, writer)` pair of the batch,
+/// with the owner's Card-bound principal.
 ///
 /// `$1` and `$2` are parallel arrays of subject Card UID and the writing
 /// principal's bound Card UID, so a record runs only the bindings its writer
@@ -133,24 +130,28 @@ const LOCK_OBSERVATION_BINDING_SQL: &str = r"
 /// the same order and one simply waits for the other instead of forming a
 /// cycle.
 const LOCK_OBSERVATION_SUBJECTS_SQL: &str = r"
-    SELECT b.binding_id, b.subject_card_uid, b.owner_card_uid
+    SELECT b.binding_id, b.card_uid, b.owner_card_uid,
+           (SELECT p.id FROM wyrd.auth_service_accounts p
+             WHERE p.card_uid = b.owner_card_uid
+               AND p.card_kind = b.owner_card_kind) AS owner_principal_id
       FROM wyrd.verification_bindings b
      WHERE b.activation = 'observations_ready'
        AND EXISTS (SELECT 1
                      FROM unnest($1::uuid[], $2::uuid[]) AS u(subject, writer)
-                    WHERE u.subject = b.subject_card_uid
+                    WHERE u.subject = b.card_uid
                       AND (u.writer IS NULL OR u.writer = b.owner_card_uid))
      ORDER BY b.binding_id
-       FOR NO KEY UPDATE
+       FOR NO KEY UPDATE OF b
 ";
 
 /// Insert one observation run per unseen `(binding, record)` of a batch in
 /// one statement, due at PostgreSQL's statement time.
 ///
 /// `$1..$4` are parallel arrays of run ID, binding, record ID, and event time
-/// in batch order. Each run records the tenant's active SYSTEM principal as
-/// its actor, or null when the tenant has none; the record's writer stays
-/// reachable only through the input record. Rows whose record already has a run of that binding, and
+/// in batch order, and `$6..$8` the binding owner's subject, the SYSTEM actor,
+/// and the owner's accepted authority for each row; the record's writer
+/// grants nothing and stays reachable only through the input record. Rows
+/// whose record already has a run of that binding, and
 /// later repeats inside the batch, are removed before numbering, so a repeat
 /// inserts nothing and consumes no ordinal. Ordinals continue each binding's
 /// maximum in batch order; the caller holds every binding's row lock from
@@ -159,16 +160,14 @@ const LOCK_OBSERVATION_SUBJECTS_SQL: &str = r"
 /// come from the locked binding and its Verifier Card.
 const INSERT_OBSERVATION_RUNS_SQL: &str = r"
     INSERT INTO wyrd.verifier_runs (
-        run_id, data_tenant_id, verifier_uid, verifier_version, subject_card_uid,
+        run_id, data_tenant_id, verifier_card_uid, verifier_version, card_uid,
         origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
-        input_record_id, input_event_time, requested_by_principal_id, max_attempts,
-        next_attempt_at, created_at, updated_at, observation_ordinal
+        input_record_id, input_event_time, sub_principal_id, act_principal_id, authority,
+        max_attempts, next_attempt_at, created_at, updated_at, observation_ordinal
     )
-    SELECT r.run_id, wyrd.current_tenant(), b.verifier_uid, v.version, b.subject_card_uid,
+    SELECT r.run_id, wyrd.current_tenant(), b.verifier_card_uid, v.version, b.card_uid,
            'observation', b.owner_card_uid, b.binding_id, b.trigger_uid, b.trigger_digest,
-           b.operators, r.record_id, r.event_time,
-           (SELECT a.id FROM wyrd.auth_service_accounts a
-             WHERE a.principal_kind = 'system' AND a.status = 'active'),
+           b.operators, r.record_id, r.event_time, r.sub, r.act, r.authority,
            $5,
            statement_timestamp(), statement_timestamp(), statement_timestamp(),
            COALESCE((SELECT max(x.observation_ordinal)
@@ -176,15 +175,17 @@ const INSERT_OBSERVATION_RUNS_SQL: &str = r"
                       WHERE x.binding_id = r.binding_id AND x.origin = 'observation'), 0)
              + row_number() OVER (PARTITION BY r.binding_id ORDER BY r.position)
       FROM (SELECT DISTINCT ON (u.binding_id, u.record_id) u.*
-              FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::timestamptz[])
-                   WITH ORDINALITY AS u(run_id, binding_id, record_id, event_time, position)
+              FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::timestamptz[],
+                          $6::uuid[], $7::uuid[], $8::jsonb[])
+                   WITH ORDINALITY
+                   AS u(run_id, binding_id, record_id, event_time, sub, act, authority, position)
              WHERE NOT EXISTS (SELECT 1 FROM wyrd.verifier_runs e
                                 WHERE e.binding_id = u.binding_id
                                   AND e.origin = 'observation'
                                   AND e.input_record_id = u.record_id)
              ORDER BY u.binding_id, u.record_id, u.position) r
       JOIN wyrd.verification_bindings b ON b.binding_id = r.binding_id
-      JOIN wyrd.cards v ON v.card_uid = b.verifier_uid
+      JOIN wyrd.cards v ON v.card_uid = b.verifier_card_uid
     ON CONFLICT DO NOTHING
 ";
 
@@ -198,28 +199,29 @@ const EXISTING_RUN_SQL: &str = r"
          OR (origin = 'observation' AND input_record_id = $4))
 ";
 
-/// Serialize concurrent manual requests that share one requester and key.
+/// Serialize concurrent manual requests that share one subject, actor, and key.
 ///
 /// Transaction-scoped, so it releases on commit or rollback; the class keeps
 /// these locks apart from every other advisory lock in the database.
 const LOCK_REQUEST_KEY_SQL: &str = r"
-    SELECT pg_advisory_xact_lock($1, hashtext($2::text || '/' || $3))
+    SELECT pg_advisory_xact_lock($1, hashtext($2::text || '/' || $3::text || '/' || $4))
 ";
 
 /// Advisory lock class of [`LOCK_REQUEST_KEY_SQL`].
 const REQUEST_KEY_LOCK_CLASS: i32 = 0x0C_A2_D0_31;
 
-/// Find the manual run a requester already created under one key.
+/// Find the manual run one subject and actor already created under one key.
 const KEYED_RUN_SQL: &str = r"
     SELECT run_id, request_sha256
       FROM wyrd.verifier_runs
-     WHERE requested_by_principal_id = $1
-       AND idempotency_key = $2
+     WHERE sub_principal_id = $1
+       AND act_principal_id = $2
+       AND idempotency_key = $3
 ";
 
 /// Read the Verifier and subject Card of one binding.
 const BINDING_TARGET_SQL: &str = r"
-    SELECT verifier_uid, subject_card_uid
+    SELECT verifier_card_uid, card_uid
       FROM wyrd.verification_bindings
      WHERE binding_id = $1
 ";
@@ -280,10 +282,10 @@ const EXHAUST_EXPIRED_SQL: &str = r"
 /// statement time; `$2` is only the lease length in milliseconds, so a pod
 /// whose clock differs from the database can neither claim early nor hold a
 /// lease the database believes already expired. The claim also returns the
-/// tenant's active SYSTEM principal, which the run's input reads and result
-/// rows are attributed to, the exact Verifier Card's status (`NULL` when the
-/// Card is absent), and the Verifier's ready fitted Drift baseline, so no
-/// later phase opens a connection to read them.
+/// tenant's active SYSTEM principal, which executes the run, the exact
+/// Verifier Card's status (`NULL` when the Card is absent), and the
+/// Verifier's ready fitted Drift baseline, so no later phase opens a
+/// connection to read them.
 const CLAIM_RUN_SQL: &str = r"
     WITH candidate AS (
         SELECT run_id, COALESCE(next_attempt_at, lease_expires_at) AS due_at
@@ -300,10 +302,11 @@ const CLAIM_RUN_SQL: &str = r"
            next_attempt_at = NULL, updated_at = statement_timestamp()
       FROM candidate
      WHERE r.run_id = candidate.run_id
-    RETURNING r.run_id, r.verifier_uid, r.verifier_version, r.subject_card_uid,
+    RETURNING r.run_id, r.verifier_card_uid, r.verifier_version, r.card_uid,
               r.origin, r.owner_card_uid, r.binding_id, r.trigger_uid,
               r.trigger_digest, r.window_start, r.window_end, r.input_record_id,
-              r.input_event_time, r.requested_by_principal_id, r.attempts,
+              r.input_event_time, r.sub_principal_id, r.act_principal_id,
+              r.authority, r.attempts,
               r.max_attempts, r.lease_expires_at, r.observation_ordinal,
               r.cause_trace_id, r.cause_span_id,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
@@ -313,9 +316,9 @@ const CLAIM_RUN_SQL: &str = r"
               (SELECT a.id FROM wyrd.auth_service_accounts a
                 WHERE a.principal_kind = 'system' AND a.status = 'active') AS system_principal_id,
               (SELECT c.status FROM wyrd.cards c
-                WHERE c.card_uid = r.verifier_uid) AS verifier_status,
+                WHERE c.card_uid = r.verifier_card_uid) AS verifier_status,
               (SELECT b.fitted FROM wyrd.drift_baselines b
-                WHERE b.verifier_uid = r.verifier_uid AND b.state = 'ready') AS fitted_baseline
+                WHERE b.verifier_uid = r.verifier_card_uid AND b.state = 'ready') AS fitted_baseline
 ";
 
 /// Renew every listed lease still held, on the database clock.
@@ -368,9 +371,9 @@ const INSERT_DISPATCH_SQL: &str = r"
                'run_id', r.run_id,
                'result_id', r.result_id,
                'binding_id', r.binding_id,
-               'verifier_uid', r.verifier_uid,
+               'verifier_card_uid', r.verifier_card_uid,
                'verifier_ref', v.space || '/' || v.name || '@' || v.version,
-               'subject_uid', r.subject_card_uid,
+               'subject_uid', r.card_uid,
                'subject_ref', s.space || '/' || s.name || '@' || s.version,
                'verdict', 'failed',
                'completed_at', r.settled_at,
@@ -379,8 +382,8 @@ const INSERT_DISPATCH_SQL: &str = r"
            ),
            statement_timestamp(), statement_timestamp(), statement_timestamp()
       FROM wyrd.verifier_runs r
-      JOIN wyrd.cards v ON v.card_uid = r.verifier_uid
-      JOIN wyrd.cards s ON s.card_uid = r.subject_card_uid
+      JOIN wyrd.cards v ON v.card_uid = r.verifier_card_uid
+      JOIN wyrd.cards s ON s.card_uid = r.card_uid
      WHERE r.run_id = $2
     ON CONFLICT DO NOTHING
 ";
@@ -446,7 +449,7 @@ const AWAIT_TRACE_SQL: &str = r"
 
 /// Read one run's control-plane status.
 const RUN_STATUS_SQL: &str = r"
-    SELECT run_id, status, requested_by_principal_id, result_id, error
+    SELECT run_id, status, sub_principal_id, act_principal_id, result_id, error
       FROM wyrd.verifier_runs
      WHERE run_id = $1
 ";
@@ -461,8 +464,8 @@ const RUN_DISPATCHES_SQL: &str = r"
 
 /// Read a binding's frozen targets, readiness, and latest run.
 const BINDING_TARGETS_SQL: &str = r"
-    SELECT b.subject_card_uid, b.verifier_uid,
-           wyrd.verifier_readiness(b.verifier_uid) AS readiness,
+    SELECT b.card_uid, b.verifier_card_uid,
+           wyrd.verifier_readiness(b.verifier_card_uid) AS readiness,
            (SELECT r.run_id FROM wyrd.verifier_runs r
              WHERE r.binding_id = b.binding_id
              ORDER BY r.run_id DESC LIMIT 1) AS last_run_id
@@ -569,19 +572,75 @@ impl RunInput {
     }
 }
 
+/// Who one run serves, who accepted it, and the authority it executes under.
+///
+/// Frozen on the run at enqueue and never changed by claim, retry, or replay.
+/// A manual run is accepted by its authenticated request, so its pair is that
+/// request's own (A/A, or A/B when B acts for A). Work Wyrd starts itself, a
+/// scheduled or observation run, serves the binding owner under the owner's
+/// resolved authority with the tenant SYSTEM principal as actor; SYSTEM is
+/// never the subject and grants nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunAuthority {
+    /// Stored `sub_principal_id`/`act_principal_id`.
+    attribution: Attribution,
+    /// Stored server-only effective authority.
+    authority: AcceptedAuthority,
+}
+
+impl RunAuthority {
+    /// A manual run accepted by the request that carried `authority`.
+    #[must_use]
+    pub fn manual(authority: AcceptedAuthority) -> Self {
+        Self {
+            attribution: authority.attribution(),
+            authority,
+        }
+    }
+
+    /// A scheduled or observation run serving the binding owner, whose
+    /// current authority is `owner`, executed by the tenant SYSTEM `system`.
+    #[must_use]
+    pub const fn background(owner: AcceptedAuthority, system: PrincipalId) -> Self {
+        Self {
+            attribution: Attribution::new(owner.principal.id, system),
+            authority: owner,
+        }
+    }
+
+    /// The run's subject and accepting actor.
+    #[must_use]
+    pub const fn attribution(&self) -> Attribution {
+        self.attribution
+    }
+
+    /// The effective authority the run executes under.
+    #[must_use]
+    pub const fn authority(&self) -> &AcceptedAuthority {
+        &self.authority
+    }
+
+    /// The authority as its stored JSON document.
+    ///
+    /// # Errors
+    /// Returns [`SqlxError::Encode`] when the authority cannot be serialized.
+    fn document(&self) -> Result<Value, SqlxError> {
+        serde_json::to_value(&self.authority).map_err(|error| SqlxError::Encode(Box::new(error)))
+    }
+}
+
 /// A request to enqueue one run through the single shared enqueue path.
 ///
 /// Each origin carries exactly the fields it requires: only a manual request
-/// names a requester and may target a Verifier directly; scheduled and
-/// observation work always comes from a binding, with a Drift window or an
-/// Eval record respectively, and records the tenant SYSTEM principal as its
-/// actor at insert.
+/// may target a Verifier directly; scheduled and observation work always
+/// comes from a binding, with a Drift window or an Eval record respectively.
+/// Every request carries the [`RunAuthority`] frozen on its run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunRequest {
     /// An authenticated manual Drift run of a binding or a direct Verifier.
     Manual {
-        /// Authenticated caller, frozen as `requested_by_principal_id`.
-        requested_by: PrincipalId,
+        /// The accepting request's attribution and authority.
+        authority: RunAuthority,
         /// Binding or direct target.
         target: VerificationRunTarget,
         /// Validated Drift window.
@@ -596,6 +655,8 @@ pub enum RunRequest {
         binding_id: BindingId,
         /// The occurrence's fixed window.
         window: DriftWindow,
+        /// The binding owner's authority with the SYSTEM actor.
+        authority: RunAuthority,
     },
     /// One committed Eval observation for an `observations_ready` binding.
     Observation {
@@ -605,6 +666,8 @@ pub enum RunRequest {
         record_id: String,
         /// Committed observation's server event time.
         event_time: DateTime<Utc>,
+        /// The binding owner's authority with the SYSTEM actor.
+        authority: RunAuthority,
     },
 }
 
@@ -651,12 +714,12 @@ impl RunRequest {
         }
     }
 
-    /// The manual requester; `None` for scheduled and observation work,
-    /// whose SYSTEM actor the insert resolves.
-    const fn requested_by(&self) -> Option<PrincipalId> {
+    /// The attribution and authority frozen on the run.
+    const fn authority(&self) -> &RunAuthority {
         match self {
-            Self::Manual { requested_by, .. } => Some(*requested_by),
-            Self::Scheduled { .. } | Self::Observation { .. } => None,
+            Self::Manual { authority, .. }
+            | Self::Scheduled { authority, .. }
+            | Self::Observation { authority, .. } => authority,
         }
     }
 
@@ -699,7 +762,7 @@ pub enum EnqueueOutcome {
 
 /// A caller's `Idempotency-Key` for one manual request and that request's digest.
 ///
-/// The key is scoped to the requesting principal. The digest is the SHA-256 of
+/// The key is scoped to the run's subject and actor. The digest is the SHA-256 of
 /// the canonical request body; a retry must match it to be a replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestKey<'a> {
@@ -726,9 +789,10 @@ pub struct TargetCards {
 pub enum ManualEnqueueOutcome {
     /// A new pending run was created.
     Enqueued(VerificationRunId),
-    /// The requester already used this key for the same request; this is its run.
+    /// This subject and actor already used this key for the same request; this
+    /// is its run, with the attribution and authority it was accepted under.
     Replayed(VerificationRunId),
-    /// The requester already used this key for a different request; nothing
+    /// This subject and actor already used this key for a different request; nothing
     /// was created. Carries the run the key belongs to.
     KeyReused(VerificationRunId),
     /// Nothing was created.
@@ -742,10 +806,94 @@ pub enum ScheduleSkip {
     Missed,
     /// The owner principal was not runtime-active at claim time.
     Inactive,
+    /// The owner's authority or the tenant SYSTEM principal could not be
+    /// resolved, so no run was accepted; nothing falls back to another identity.
+    AuthorityUnavailable,
     /// The shared enqueue path refused the occurrence.
     Refused(EnqueueRefusal),
     /// The stored schedule no longer parses; the cursor was disarmed.
     InvalidSchedule,
+}
+
+/// What a claimed due occurrence calls for, decided before any authority is
+/// resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DueDecision {
+    /// The stored schedule no longer parses; disarm the cursor.
+    InvalidSchedule,
+    /// Advance to `next_run_at` without a run.
+    Skip {
+        /// Why no run is created.
+        skip: ScheduleSkip,
+        /// The next cursor.
+        next_run_at: DateTime<Utc>,
+    },
+    /// Run `window` under the owner's authority, then advance to `next_run_at`.
+    Run {
+        /// The occurrence's fixed window.
+        window: DriftWindow,
+        /// The owner's Card-bound principal the run serves.
+        owner: PrincipalId,
+        /// The next cursor.
+        next_run_at: DateTime<Utc>,
+    },
+}
+
+/// One due scheduled binding locked by [`VerifierRunQueue::claim_due`] until
+/// the caller's transaction ends.
+///
+/// The occurrence, owner activity, and missed-boundary rule are already
+/// decided. When the occurrence needs a run, [`Self::owner`] names the owner
+/// principal whose current authority the caller resolves, on the same
+/// transaction, before [`VerifierRunQueue::schedule_due`] settles the tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DueBinding {
+    /// The claimed binding.
+    pub binding_id: BindingId,
+    /// The stored cursor that was due.
+    pub due_at: DateTime<Utc>,
+    /// What the occurrence calls for.
+    decision: DueDecision,
+}
+
+impl DueBinding {
+    /// The owner principal a run would serve, or `None` when the occurrence
+    /// creates no run and needs no authority.
+    #[must_use]
+    pub const fn owner(&self) -> Option<PrincipalId> {
+        match self.decision {
+            DueDecision::Run { owner, .. } => Some(owner),
+            DueDecision::InvalidSchedule | DueDecision::Skip { .. } => None,
+        }
+    }
+}
+
+/// One `observations_ready` binding locked by
+/// [`VerifierRunQueue::lock_observation_bindings`] until the caller's
+/// transaction ends, whose target accepts an Eval record now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationBinding {
+    /// The binding.
+    pub binding_id: BindingId,
+    /// The Card the binding verifies.
+    card_uid: CardUid,
+    /// The binding's owner Card.
+    owner_card_uid: CardUid,
+    /// The owner's Card-bound principal the binding's runs serve; `None` when
+    /// the owner has none, so no run can be accepted.
+    pub owner: Option<PrincipalId>,
+}
+
+impl ObservationBinding {
+    /// Whether `record` activates this binding: same subject, and a writer
+    /// bound to this owner or to no Card.
+    fn matches(&self, record: &ObservationRecord) -> bool {
+        record.subject == self.card_uid
+            && record
+                .writer
+                .as_ref()
+                .is_none_or(|writer| *writer == self.owner_card_uid)
+    }
 }
 
 /// What one scheduler claim of a due binding did.
@@ -802,11 +950,11 @@ pub struct ClaimedRun {
     /// Attempt budget frozen at enqueue.
     pub max_attempts: i32,
     /// Exact Verifier Card UID.
-    pub verifier_uid: CardUid,
+    pub verifier_card_uid: CardUid,
     /// Exact Verifier Card version.
     pub verifier_version: String,
-    /// Exact verified subject Card.
-    pub subject_card_uid: CardUid,
+    /// Exact Card verified.
+    pub card_uid: CardUid,
     /// Why the run exists.
     pub origin: RunOrigin,
     /// Binding owner; `None` for a direct run.
@@ -817,11 +965,11 @@ pub struct ClaimedRun {
     pub trigger: Option<FrozenTarget>,
     /// Frozen input.
     pub input: RunInput,
-    /// The run's actor: a manual run's authenticated caller, or the tenant
-    /// SYSTEM principal of a scheduled or observation run; `None` for an
-    /// internal run of a tenant without a SYSTEM principal or one enqueued
-    /// before internal runs recorded it.
-    pub requested_by: Option<PrincipalId>,
+    /// Who the run serves and who accepted it, frozen at enqueue.
+    pub attribution: Attribution,
+    /// The effective authority accepted with the run; every judge call
+    /// executes under it, never under a later lookup of the subject.
+    pub authority: AcceptedAuthority,
     /// One-based position among the binding's observation runs, assigned once
     /// at enqueue; `None` for scheduled and manual runs. Eval's `every_nth`
     /// sampling selects on it, so every attempt reaches the same decision.
@@ -838,8 +986,8 @@ pub struct ClaimedRun {
     /// claim statement's PostgreSQL instant less `created_at`. Telemetry only.
     pub age: std::time::Duration,
     /// The tenant's active SYSTEM principal, read in the claim transaction;
-    /// `None` when the tenant has none. Result rows are attributed to it and
-    /// input reads run as it.
+    /// `None` when the tenant has none. It is the actor of every judge call,
+    /// input read, and result row of the attempt.
     pub system_principal: Option<PrincipalId>,
     /// Whether the exact Verifier Card exists and is not deleted, read in the
     /// claim transaction; a cached Verifier is used only while this holds.
@@ -1031,10 +1179,13 @@ impl VerifierRunQueue {
 
     /// Enqueue one authenticated manual Drift run, honoring its `Idempotency-Key`.
     ///
-    /// Without a key this is [`Self::enqueue`] for a manual request. With a
-    /// key it first takes a transaction-scoped advisory lock on (requester,
-    /// key) so concurrent retries serialize, then returns the run the
-    /// requester already created under that key:
+    /// The run is accepted under `authority`, the request's verified effective
+    /// principal and delegation chain, so it serves that request's subject
+    /// with its current actor as accepting actor. Without a key this is
+    /// [`Self::enqueue`] for a manual request. With a key it first takes a
+    /// transaction-scoped advisory lock on (subject, actor, key) so concurrent
+    /// retries serialize, then returns the run that subject and actor already
+    /// created under that key, unchanged:
     /// [`ManualEnqueueOutcome::Replayed`] when the request digest matches and
     /// [`ManualEnqueueOutcome::KeyReused`] when it does not. Only an unused
     /// key reaches the shared enqueue path, which stores the key and digest on
@@ -1045,25 +1196,29 @@ impl VerifierRunQueue {
     /// # Errors
     /// Returns the database error when the lock, a read, or the insert fails,
     /// or a decode error when stored identities are malformed.
-    #[tracing::instrument(skip(self, conn, target, cause, key), fields(operation = "verification.runs.enqueue_manual", keyed = key.is_some()))]
+    #[tracing::instrument(skip(self, conn, authority, target, cause, key), fields(operation = "verification.runs.enqueue_manual", keyed = key.is_some()))]
     pub async fn enqueue_manual(
         &self,
         conn: &mut TenantConn<'_>,
-        requested_by: PrincipalId,
+        authority: AcceptedAuthority,
         target: &VerificationRunTarget,
         window: DriftWindow,
         cause: Option<(TraceId, SpanId)>,
         key: Option<RequestKey<'_>>,
     ) -> Result<ManualEnqueueOutcome, SqlxError> {
+        let authority = RunAuthority::manual(authority);
+        let attribution = authority.attribution();
         if let Some(key) = key {
             sqlx::query(LOCK_REQUEST_KEY_SQL)
                 .bind(REQUEST_KEY_LOCK_CLASS)
-                .bind(requested_by.as_uuid())
+                .bind(attribution.sub_principal_id.as_uuid())
+                .bind(attribution.act_principal_id.as_uuid())
                 .bind(key.key)
                 .execute(&mut **conn.transaction())
                 .await?;
             let existing: Option<(Uuid, Option<Vec<u8>>)> = sqlx::query_as(KEYED_RUN_SQL)
-                .bind(requested_by.as_uuid())
+                .bind(attribution.sub_principal_id.as_uuid())
+                .bind(attribution.act_principal_id.as_uuid())
                 .bind(key.key)
                 .fetch_optional(&mut **conn.transaction())
                 .await?;
@@ -1077,7 +1232,7 @@ impl VerifierRunQueue {
             }
         }
         let request = RunRequest::Manual {
-            requested_by,
+            authority,
             target: target.clone(),
             window,
             cause,
@@ -1107,11 +1262,11 @@ impl VerifierRunQueue {
     ) -> Result<Option<TargetCards>, SqlxError> {
         match target {
             VerificationRunTarget::Verifier {
-                verifier_uid,
-                subject_card_uid,
+                verifier_card_uid,
+                card_uid,
             } => Ok(Some(TargetCards {
-                verifier: verifier_uid.clone(),
-                subject: subject_card_uid.clone(),
+                verifier: verifier_card_uid.clone(),
+                subject: card_uid.clone(),
             })),
             VerificationRunTarget::Binding { binding_id } => {
                 let row: Option<(Uuid, Uuid)> = sqlx::query_as(BINDING_TARGET_SQL)
@@ -1149,15 +1304,15 @@ impl VerifierRunQueue {
         let resolved: Option<ResolvedTarget> = if let RunRequest::Manual {
             target:
                 VerificationRunTarget::Verifier {
-                    verifier_uid,
-                    subject_card_uid,
+                    verifier_card_uid,
+                    card_uid,
                 },
             ..
         } = request
         {
             sqlx::query_as(RESOLVE_DIRECT_SQL)
-                .bind(verifier_uid.as_uuid())
-                .bind(subject_card_uid.as_uuid())
+                .bind(verifier_card_uid.as_uuid())
+                .bind(card_uid.as_uuid())
                 .fetch_optional(&mut **conn.transaction())
                 .await?
         } else {
@@ -1193,11 +1348,13 @@ impl VerifierRunQueue {
                 .execute(&mut **conn.transaction())
                 .await?;
         }
+        let authority = request.authority();
+        let attribution = authority.attribution();
         let inserted: Option<Uuid> = sqlx::query_scalar(INSERT_RUN_SQL)
             .bind(VerificationRunId::new_v7().as_uuid())
-            .bind(resolved.verifier_uid)
+            .bind(resolved.verifier_card_uid)
             .bind(verifier_version)
-            .bind(resolved.subject_card_uid)
+            .bind(resolved.card_uid)
             .bind(origin.as_str())
             .bind(resolved.owner_card_uid)
             .bind(resolved.binding_id)
@@ -1208,7 +1365,9 @@ impl VerifierRunQueue {
             .bind(window_end)
             .bind(record_id)
             .bind(event_time)
-            .bind(request.requested_by().map(|principal| principal.as_uuid()))
+            .bind(attribution.sub_principal_id.as_uuid())
+            .bind(attribution.act_principal_id.as_uuid())
+            .bind(authority.document()?)
             .bind(self.retry.max_attempts)
             .bind(key.map(|key| key.key))
             .bind(key.map(|key| key.request_sha256))
@@ -1237,30 +1396,27 @@ impl VerifierRunQueue {
         )?))
     }
 
-    /// Process the earliest due scheduled binding of the caller's tenant.
+    /// Lock and decide the earliest due scheduled binding of the caller's
+    /// tenant.
     ///
     /// Locks one binding whose cursor is at least [`SCHEDULE_CLAIM_DELAY`]
     /// before PostgreSQL's statement time with `FOR UPDATE SKIP LOCKED`, so
     /// concurrent schedulers never claim the same occurrence. Statement time
     /// minus that delay is the schedule clock for this tick: the occurrence
-    /// yields one run for its fixed window only when no later boundary had
-    /// reached it, its owner principal is runtime-active, and the shared
-    /// enqueue path accepts it (which enforces Verifier readiness). In every
-    /// case the cursor moves to the first boundary strictly after the schedule
-    /// clock in the same transaction, so
-    /// inactive, unready, and missed occurrences are skipped without
-    /// backfill. Returns `None` when nothing is due. The
-    /// caller commits, releasing the lock before any analysis runs, and calls
-    /// again until `None`.
+    /// calls for a run of its fixed window only when no later boundary had
+    /// reached it and its owner principal is runtime-active. Writes nothing;
+    /// [`Self::schedule_due`] settles the tick in the same transaction once
+    /// the caller has resolved the owner's authority for a
+    /// [`DueBinding::owner`]. Returns `None` when nothing is due.
     ///
     /// # Errors
-    /// Returns the database error when a read or write fails, or a decode
-    /// error when stored identities are malformed.
-    #[tracing::instrument(skip(self, conn), fields(operation = "verification.schedule.tick"))]
-    pub async fn schedule_next_due(
+    /// Returns the database error when a read fails, or a decode error when
+    /// stored identities are malformed.
+    #[tracing::instrument(skip(self, conn), fields(operation = "verification.schedule.claim"))]
+    pub async fn claim_due(
         &self,
         conn: &mut TenantConn<'_>,
-    ) -> Result<Option<ScheduleTick>, SqlxError> {
+    ) -> Result<Option<DueBinding>, SqlxError> {
         let due: Option<DueBindingRow> = sqlx::query_as(DUE_BINDING_SQL)
             .bind(SCHEDULE_CLAIM_DELAY.num_milliseconds())
             .fetch_optional(&mut **conn.transaction())
@@ -1279,54 +1435,101 @@ impl VerifierRunQueue {
             Ok(occurrence) => occurrence,
             Err(error) => {
                 tracing::error!(%binding_id, %error, "stored binding schedule cannot advance; disarming");
-                self.advance_cursor(conn, binding_id, None).await?;
-                return Ok(Some(ScheduleTick {
+                return Ok(Some(DueBinding {
                     binding_id,
                     due_at,
-                    outcome: ScheduleOutcome::Skipped(ScheduleSkip::InvalidSchedule),
-                    next_run_at: None,
+                    decision: DueDecision::InvalidSchedule,
                 }));
             }
         };
-        let outcome = self
-            .schedule_occurrence(conn, binding_id, occurrence.window)
-            .await?;
-        self.advance_cursor(conn, binding_id, Some(occurrence.next_run_at))
-            .await?;
-        Ok(Some(ScheduleTick {
+        let next_run_at = occurrence.next_run_at;
+        let skip = |skip| DueDecision::Skip { skip, next_run_at };
+        let decision = match occurrence.window {
+            None => skip(ScheduleSkip::Missed),
+            Some(window) => match binding_activity(conn, binding_id, self.inactivity)
+                .await?
+                .filter(|activity| activity.active)
+                .and_then(|activity| activity.principal_id)
+            {
+                None => skip(ScheduleSkip::Inactive),
+                Some(owner) => DueDecision::Run {
+                    window,
+                    owner,
+                    next_run_at,
+                },
+            },
+        };
+        Ok(Some(DueBinding {
             binding_id,
             due_at,
-            outcome,
-            next_run_at: Some(occurrence.next_run_at),
+            decision,
         }))
     }
 
-    /// Decide and, when eligible, enqueue one claimed occurrence.
+    /// Settle one tick claimed by [`Self::claim_due`].
+    ///
+    /// An occurrence that calls for a run is enqueued through the shared path
+    /// (which enforces Verifier readiness) under `authority`, the owner's
+    /// resolved authority with the SYSTEM actor. Without it the occurrence is
+    /// skipped as [`ScheduleSkip::AuthorityUnavailable`] rather than run under
+    /// any other identity. In every case the cursor moves to the first
+    /// boundary strictly after the schedule clock in the same transaction, so
+    /// inactive, unready, unauthorized, and missed occurrences are skipped
+    /// without backfill, and an unparseable schedule is disarmed. The caller
+    /// commits, releasing the lock before any analysis runs, and claims again
+    /// until nothing is due.
     ///
     /// # Errors
-    /// Returns the database error when the activity read or enqueue fails.
-    async fn schedule_occurrence(
+    /// Returns the database error when the enqueue or cursor write fails.
+    #[tracing::instrument(skip(self, conn, authority), fields(operation = "verification.schedule.tick", binding_id = %due.binding_id))]
+    pub async fn schedule_due(
         &self,
         conn: &mut TenantConn<'_>,
-        binding_id: BindingId,
-        window: Option<DriftWindow>,
-    ) -> Result<ScheduleOutcome, SqlxError> {
-        let Some(window) = window else {
-            return Ok(ScheduleOutcome::Skipped(ScheduleSkip::Missed));
-        };
-        let active = binding_activity(conn, binding_id, self.inactivity)
-            .await?
-            .is_some_and(|activity| activity.active);
-        if !active {
-            return Ok(ScheduleOutcome::Skipped(ScheduleSkip::Inactive));
-        }
-        let request = RunRequest::Scheduled { binding_id, window };
-        Ok(match self.enqueue(conn, &request).await? {
-            EnqueueOutcome::Enqueued(run_id) => ScheduleOutcome::Enqueued(run_id),
-            EnqueueOutcome::AlreadyEnqueued(run_id) => ScheduleOutcome::AlreadyEnqueued(run_id),
-            EnqueueOutcome::Refused(refusal) => {
-                ScheduleOutcome::Skipped(ScheduleSkip::Refused(refusal))
+        due: DueBinding,
+        authority: Option<RunAuthority>,
+    ) -> Result<ScheduleTick, SqlxError> {
+        let (outcome, next_run_at) = match due.decision {
+            DueDecision::InvalidSchedule => (
+                ScheduleOutcome::Skipped(ScheduleSkip::InvalidSchedule),
+                None,
+            ),
+            DueDecision::Skip { skip, next_run_at } => {
+                (ScheduleOutcome::Skipped(skip), Some(next_run_at))
             }
+            DueDecision::Run {
+                window,
+                next_run_at,
+                ..
+            } => {
+                let outcome = match authority {
+                    None => ScheduleOutcome::Skipped(ScheduleSkip::AuthorityUnavailable),
+                    Some(authority) => {
+                        let request = RunRequest::Scheduled {
+                            binding_id: due.binding_id,
+                            window,
+                            authority,
+                        };
+                        match self.enqueue(conn, &request).await? {
+                            EnqueueOutcome::Enqueued(run_id) => ScheduleOutcome::Enqueued(run_id),
+                            EnqueueOutcome::AlreadyEnqueued(run_id) => {
+                                ScheduleOutcome::AlreadyEnqueued(run_id)
+                            }
+                            EnqueueOutcome::Refused(refusal) => {
+                                ScheduleOutcome::Skipped(ScheduleSkip::Refused(refusal))
+                            }
+                        }
+                    }
+                };
+                (outcome, Some(next_run_at))
+            }
+        };
+        self.advance_cursor(conn, due.binding_id, next_run_at)
+            .await?;
+        Ok(ScheduleTick {
+            binding_id: due.binding_id,
+            due_at: due.due_at,
+            outcome,
+            next_run_at,
         })
     }
 
@@ -1582,9 +1785,9 @@ impl VerifierRunQueue {
         )
     }
 
-    /// Enqueue one Eval run per `observations_ready` binding the writer
-    /// activates on each record's subject, for every record of a batch, in
-    /// one insert statement.
+    /// Lock, until the caller's transaction ends, every `observations_ready`
+    /// binding a batch of committed Eval records activates and whose target
+    /// accepts an Eval record now.
     ///
     /// Called after the observations are durably committed, never inside
     /// their ingest transaction. One statement locks and lists, in binding
@@ -1593,27 +1796,24 @@ impl VerifierRunQueue {
     /// or any owner when the writer is bound to no Card. Concurrent batches
     /// touching the same bindings therefore serialize instead of
     /// deadlocking, and a Card-bound writer never activates another owner's
-    /// binding on the same subject. Each such binding whose Verifier, subject, and
-    /// implementation accept an Eval record contributes one row per matching
-    /// record; one
-    /// [`INSERT_OBSERVATION_RUNS_SQL`] then writes them all. A record that
-    /// already has a run of a binding inserts nothing, so a repeated batch is
-    /// a no-op. Bindings of other tenants are never read: the caller's tenant
-    /// transaction scopes every lookup. Returns the number of runs inserted.
+    /// binding on the same subject. A binding whose Verifier, subject, or
+    /// implementation refuses an Eval record is left out. Each returned
+    /// binding names its owner principal, whose authority the caller resolves
+    /// on the same transaction before [`Self::enqueue_observation_runs`];
+    /// the writer grants none. Bindings of other tenants are never read.
     ///
     /// # Errors
-    /// Returns the database error when the lock, a read, or the insert fails,
-    /// or a decode error when a stored identity or readiness is malformed;
-    /// nothing from the batch survives the caller's rollback.
+    /// Returns the database error when the lock or a read fails, or a decode
+    /// error when a stored identity or readiness is malformed.
     #[tracing::instrument(
         skip(self, conn, records),
-        fields(operation = "verification.runs.enqueue_observation_batch", records = records.len())
+        fields(operation = "verification.runs.lock_observation_bindings", records = records.len())
     )]
-    pub async fn enqueue_observation_batch(
+    pub async fn lock_observation_bindings(
         &self,
         conn: &mut TenantConn<'_>,
         records: &[ObservationRecord],
-    ) -> Result<u64, SqlxError> {
+    ) -> Result<Vec<ObservationBinding>, SqlxError> {
         let (subjects, writers): (Vec<Uuid>, Vec<Option<Uuid>>) = records
             .iter()
             .map(|record| {
@@ -1623,42 +1823,75 @@ impl VerifierRunQueue {
                 )
             })
             .unzip();
-        let bindings: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(LOCK_OBSERVATION_SUBJECTS_SQL)
-            .bind(subjects)
-            .bind(writers)
-            .fetch_all(&mut **conn.transaction())
-            .await?;
-        let (mut run_ids, mut binding_ids, mut record_ids, mut event_times) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for (binding, subject, writer) in bindings {
-            if !self
-                .accepts_records(conn, stored(BindingId::new(binding))?)
-                .await?
-            {
-                continue;
-            }
-            for record in records.iter().filter(|record| {
-                record.subject.as_uuid() == subject
-                    && record
-                        .writer
-                        .as_ref()
-                        .is_none_or(|bound| bound.as_uuid() == writer)
-            }) {
-                run_ids.push(VerificationRunId::new_v7().as_uuid());
-                binding_ids.push(binding);
-                record_ids.push(record.record_id.as_str());
-                event_times.push(record.event_time);
+        let rows: Vec<(Uuid, Uuid, Uuid, Option<Uuid>)> =
+            sqlx::query_as(LOCK_OBSERVATION_SUBJECTS_SQL)
+                .bind(subjects)
+                .bind(writers)
+                .fetch_all(&mut **conn.transaction())
+                .await?;
+        let mut bindings = Vec::with_capacity(rows.len());
+        for (binding, card_uid, owner_card_uid, owner) in rows {
+            let binding_id = stored(BindingId::new(binding))?;
+            if self.accepts_records(conn, binding_id).await? {
+                bindings.push(ObservationBinding {
+                    binding_id,
+                    card_uid: stored(CardUid::from_uuid(card_uid))?,
+                    owner_card_uid: stored(CardUid::from_uuid(owner_card_uid))?,
+                    owner: owner.map(PrincipalId::new),
+                });
             }
         }
-        if run_ids.is_empty() {
+        Ok(bindings)
+    }
+
+    /// Enqueue one Eval run per matching record of each locked binding, in
+    /// one insert statement.
+    ///
+    /// `bindings` pairs each binding from [`Self::lock_observation_bindings`]
+    /// with the [`RunAuthority`] its runs are accepted under; a binding the
+    /// caller could not authorize is simply absent. One
+    /// [`INSERT_OBSERVATION_RUNS_SQL`] then writes every run. A record that
+    /// already has a run of a binding inserts nothing, so a repeated batch is
+    /// a no-op. Returns the number of runs inserted.
+    ///
+    /// # Errors
+    /// Returns the database error when the insert fails, or an encode error
+    /// when an authority cannot be serialized; nothing from the batch
+    /// survives the caller's rollback.
+    #[tracing::instrument(
+        skip(self, conn, records, bindings),
+        fields(operation = "verification.runs.enqueue_observation_runs", records = records.len(), bindings = bindings.len())
+    )]
+    pub async fn enqueue_observation_runs(
+        &self,
+        conn: &mut TenantConn<'_>,
+        records: &[ObservationRecord],
+        bindings: &[(ObservationBinding, RunAuthority)],
+    ) -> Result<u64, SqlxError> {
+        let mut rows = ObservationRunRows::default();
+        for (binding, authority) in bindings {
+            let document = authority.document()?;
+            for record in records.iter().filter(|record| binding.matches(record)) {
+                rows.push(
+                    binding.binding_id,
+                    record,
+                    authority.attribution(),
+                    &document,
+                );
+            }
+        }
+        if rows.run_ids.is_empty() {
             return Ok(0);
         }
         let inserted = sqlx::query(INSERT_OBSERVATION_RUNS_SQL)
-            .bind(run_ids)
-            .bind(binding_ids)
-            .bind(record_ids)
-            .bind(event_times)
+            .bind(rows.run_ids)
+            .bind(rows.binding_ids)
+            .bind(rows.record_ids)
+            .bind(rows.event_times)
             .bind(self.retry.max_attempts)
+            .bind(rows.subs)
+            .bind(rows.acts)
+            .bind(rows.authorities)
             .execute(&mut **conn.transaction())
             .await?;
         Ok(inserted.rows_affected())
@@ -1716,7 +1949,7 @@ impl VerifierRunQueue {
 
     /// Read one run's Run GET projection.
     ///
-    /// Returns execution status, manual requester, result pointer, last error,
+    /// Returns execution status, subject and accepting actor, result pointer, last error,
     /// and every dispatch's delivery status — never the verdict. An unknown or
     /// other-tenant run is `Ok(None)`.
     ///
@@ -1742,7 +1975,8 @@ impl VerifierRunQueue {
         Ok(Some(VerificationRunStatus {
             run_id: stored(VerificationRunId::new(row.run_id))?,
             status: stored(row.status.parse())?,
-            requested_by_principal_id: row.requested_by_principal_id.map(PrincipalId::new),
+            sub_principal_id: PrincipalId::new(row.sub_principal_id),
+            act_principal_id: PrincipalId::new(row.act_principal_id),
             result_id: row
                 .result_id
                 .map(|id| stored(VerificationResultId::new(id)))
@@ -1781,8 +2015,8 @@ impl VerifierRunQueue {
         Ok(Some(VerificationBindingStatus {
             binding_id,
             owner_card_uid: activity.owner_card_uid,
-            subject_card_uid: stored(CardUid::from_uuid(subject))?,
-            verifier_uid: stored(CardUid::from_uuid(verifier))?,
+            card_uid: stored(CardUid::from_uuid(subject))?,
+            verifier_card_uid: stored(CardUid::from_uuid(verifier))?,
             active: activity.active,
             readiness: stored(readiness.parse())?,
             next_run_at: activity.next_run_at,
@@ -1879,15 +2113,15 @@ impl VerifierRunQueue {
 #[derive(sqlx::FromRow)]
 struct ResolvedTarget {
     /// Exact Verifier Card UID.
-    verifier_uid: Uuid,
+    verifier_card_uid: Uuid,
     /// Verifier Card version; absent when the Card does not exist.
     verifier_version: Option<String>,
     /// Verifier `implementation.kind`; absent when the Card does not exist.
     implementation: Option<String>,
     /// Stored [`VerifierReadiness`] name.
     readiness: String,
-    /// Exact subject Card UID.
-    subject_card_uid: Uuid,
+    /// Exact Card verified.
+    card_uid: Uuid,
     /// Whether the subject Card exists and is active.
     subject_available: bool,
     /// Binding owner; absent for a direct target.
@@ -1929,11 +2163,11 @@ struct ClaimedRunRow {
     /// Run identity.
     run_id: Uuid,
     /// Verifier Card UID.
-    verifier_uid: Uuid,
+    verifier_card_uid: Uuid,
     /// Verifier Card version.
     verifier_version: String,
-    /// Subject Card UID.
-    subject_card_uid: Uuid,
+    /// Card verified.
+    card_uid: Uuid,
     /// Stored origin.
     origin: String,
     /// Binding owner.
@@ -1952,8 +2186,12 @@ struct ClaimedRunRow {
     input_record_id: Option<String>,
     /// Eval record event time.
     input_event_time: Option<DateTime<Utc>>,
-    /// The run's actor: manual caller or internal SYSTEM principal.
-    requested_by_principal_id: Option<Uuid>,
+    /// Subject the run serves.
+    sub_principal_id: Uuid,
+    /// Actor that accepted the run.
+    act_principal_id: Uuid,
+    /// Accepted effective authority.
+    authority: Json<AcceptedAuthority>,
     /// Attempt number of this claim.
     attempts: i32,
     /// Attempt budget.
@@ -2018,9 +2256,9 @@ impl ClaimedRunRow {
             lease_expires_at: self.lease_expires_at,
             attempt: self.attempts,
             max_attempts: self.max_attempts,
-            verifier_uid: stored(CardUid::from_uuid(self.verifier_uid))?,
+            verifier_card_uid: stored(CardUid::from_uuid(self.verifier_card_uid))?,
             verifier_version: self.verifier_version,
-            subject_card_uid: stored(CardUid::from_uuid(self.subject_card_uid))?,
+            card_uid: stored(CardUid::from_uuid(self.card_uid))?,
             origin: RunOrigin::parse(&self.origin)?,
             owner_card_uid: self
                 .owner_card_uid
@@ -2032,7 +2270,11 @@ impl ClaimedRunRow {
                 .transpose()?,
             trigger,
             input,
-            requested_by: self.requested_by_principal_id.map(PrincipalId::new),
+            attribution: Attribution::new(
+                PrincipalId::new(self.sub_principal_id),
+                PrincipalId::new(self.act_principal_id),
+            ),
+            authority: self.authority.0,
             observation_ordinal: self
                 .observation_ordinal
                 .map(|ordinal| stored(u64::try_from(ordinal)))
@@ -2076,6 +2318,46 @@ struct DueBindingRow {
     schedule_clock: DateTime<Utc>,
 }
 
+/// Parallel insert arrays of [`INSERT_OBSERVATION_RUNS_SQL`], one entry per
+/// candidate run in batch order.
+#[derive(Default)]
+struct ObservationRunRows<'a> {
+    /// Fresh run IDs.
+    run_ids: Vec<Uuid>,
+    /// Bindings.
+    binding_ids: Vec<Uuid>,
+    /// Logical input record IDs.
+    record_ids: Vec<&'a str>,
+    /// Committed observation event times.
+    event_times: Vec<DateTime<Utc>>,
+    /// Subjects served.
+    subs: Vec<Uuid>,
+    /// Accepting actors.
+    acts: Vec<Uuid>,
+    /// Accepted authority documents.
+    authorities: Vec<Value>,
+}
+
+impl<'a> ObservationRunRows<'a> {
+    /// Append one run of `binding` for `record` under `attribution` and its
+    /// authority `document`.
+    fn push(
+        &mut self,
+        binding: BindingId,
+        record: &'a ObservationRecord,
+        attribution: Attribution,
+        document: &Value,
+    ) {
+        self.run_ids.push(VerificationRunId::new_v7().as_uuid());
+        self.binding_ids.push(binding.as_uuid());
+        self.record_ids.push(record.record_id.as_str());
+        self.event_times.push(record.event_time);
+        self.subs.push(attribution.sub_principal_id.as_uuid());
+        self.acts.push(attribution.act_principal_id.as_uuid());
+        self.authorities.push(document.clone());
+    }
+}
+
 /// A run status row from [`RUN_STATUS_SQL`].
 #[derive(sqlx::FromRow)]
 struct RunStatusRow {
@@ -2083,8 +2365,10 @@ struct RunStatusRow {
     run_id: Uuid,
     /// Stored execution status.
     status: String,
-    /// The run's actor: manual caller or internal SYSTEM principal.
-    requested_by_principal_id: Option<Uuid>,
+    /// Subject the run serves.
+    sub_principal_id: Uuid,
+    /// Actor that accepted the run.
+    act_principal_id: Uuid,
     /// Result pointer.
     result_id: Option<Uuid>,
     /// Last execution error.

@@ -72,8 +72,8 @@ fn actor(fixture: &PgFixture) -> Principal {
 fn schedule_binding(occurrence: &str, verifier: &CardUid) -> NewBinding {
     NewBinding {
         subject_occurrence_key: occurrence.to_owned(),
-        subject_card_uid: uid(),
-        verifier_uid: verifier.clone(),
+        card_uid: uid(),
+        verifier_card_uid: verifier.clone(),
         trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
         operators: vec![FrozenTarget::Uid(uid())],
         activation: BindingActivation::Schedule {
@@ -743,7 +743,7 @@ async fn insert_raw_binding(conn: &mut TenantConn<'_>, binding: Uuid, owner: Uui
     sqlx::query(
         "INSERT INTO wyrd.verification_bindings \
             (binding_id, data_tenant_id, owner_card_uid, owner_card_kind, \
-             subject_occurrence_key, subject_card_uid, verifier_uid, trigger_digest, activation) \
+             subject_occurrence_key, card_uid, verifier_card_uid, trigger_digest, activation) \
          VALUES ($1, wyrd.current_tenant(), $2, 'Service', $3, $2, $4, 'sha256:t', \
                  'observations_ready')",
     )

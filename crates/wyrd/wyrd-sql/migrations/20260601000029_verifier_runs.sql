@@ -37,10 +37,19 @@ $$;
 -- ---------------------------------------------------------------------------
 -- Verifier runs
 -- ---------------------------------------------------------------------------
--- Identity: a binding-created run (schedule or observation origin, or a
--- manual binding run) freezes its owner, binding, effective Trigger, and
--- Operators; a direct manual run stores all of them as NULL/empty. Every
--- manual run, and only a manual run, freezes its authenticated requester.
+-- Identity: `card_uid` is the Card verified and `verifier_card_uid` the
+-- Verifier judging it. A binding-created run (schedule or observation origin,
+-- or a manual binding run) freezes its owner, binding, effective Trigger, and
+-- Operators; a direct manual run stores all of them as NULL/empty.
+-- Attribution and authority: every run records who it serves
+-- (`sub_principal_id`) and who accepted it (`act_principal_id`) beside the
+-- verified effective `authority` it executes under, all frozen at enqueue. A
+-- manual run takes them from its authenticated request (A/A, or A/B when B
+-- acts for A); a scheduled or observation run takes the binding owner's
+-- principal and current authority with the tenant SYSTEM principal as actor.
+-- The authority snapshot holds no credential and is never projected to a view.
+-- A manual run also records the span of the request that enqueued it, so its
+-- execution, which runs later in a trace of its own, links to its cause.
 -- Input: a Drift window [window_start, window_end) or an Eval record plus its
 -- committed server event time — never both.
 -- Execution: pending/retrying rows are due at next_attempt_at; a running row
@@ -50,9 +59,9 @@ CREATE TABLE wyrd.verifier_runs (
     run_id                    UUID        NOT NULL PRIMARY KEY,
     data_tenant_id            UUID        NOT NULL
         REFERENCES platform.tenants(data_tenant_id),
-    verifier_uid              UUID        NOT NULL,
+    verifier_card_uid         UUID        NOT NULL,
     verifier_version          TEXT        NOT NULL,
-    subject_card_uid          UUID        NOT NULL,
+    card_uid                  UUID        NOT NULL,
     origin                    TEXT        NOT NULL
         CHECK (origin IN ('schedule','manual','observation')),
     owner_card_uid            UUID,
@@ -64,7 +73,11 @@ CREATE TABLE wyrd.verifier_runs (
     window_end                TIMESTAMPTZ,
     input_record_id           TEXT,
     input_event_time          TIMESTAMPTZ,
-    requested_by_principal_id UUID,
+    sub_principal_id          UUID        NOT NULL,
+    act_principal_id          UUID        NOT NULL,
+    authority                 JSONB       NOT NULL,
+    cause_trace_id            BYTEA,
+    cause_span_id             BYTEA,
     status                    TEXT        NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending','running','retrying','completed',
                           'cancelled','timed_out','errored')),
@@ -79,9 +92,9 @@ CREATE TABLE wyrd.verifier_runs (
     updated_at                TIMESTAMPTZ NOT NULL,
     settled_at                TIMESTAMPTZ,
     UNIQUE (data_tenant_id, run_id),
-    FOREIGN KEY (data_tenant_id, verifier_uid)
+    FOREIGN KEY (data_tenant_id, verifier_card_uid)
         REFERENCES wyrd.cards(data_tenant_id, card_uid),
-    FOREIGN KEY (data_tenant_id, subject_card_uid)
+    FOREIGN KEY (data_tenant_id, card_uid)
         REFERENCES wyrd.cards(data_tenant_id, card_uid),
     FOREIGN KEY (data_tenant_id, binding_id)
         REFERENCES wyrd.verification_bindings(data_tenant_id, binding_id),
@@ -95,9 +108,15 @@ CREATE TABLE wyrd.verifier_runs (
         OR (binding_id IS NULL AND trigger_uid IS NULL AND trigger_digest IS NULL
             AND operators = '[]'::jsonb)
     ),
-    -- Only manual runs have a requester; only manual runs may be direct.
-    CHECK ((origin = 'manual') = (requested_by_principal_id IS NOT NULL)),
+    -- Only manual runs may be direct.
     CHECK (origin = 'manual' OR binding_id IS NOT NULL),
+    CHECK (jsonb_typeof(authority) = 'object'),
+    -- Only a manual run has an enqueuing request span.
+    CHECK (
+        (cause_trace_id IS NULL AND cause_span_id IS NULL)
+        OR (origin = 'manual' AND octet_length(cause_trace_id) = 16
+            AND octet_length(cause_span_id) = 8)
+    ),
     -- Exactly one input shape; observation runs and only they use a record.
     CHECK (
         (window_start IS NOT NULL AND window_end IS NOT NULL AND window_start < window_end

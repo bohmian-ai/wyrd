@@ -1129,7 +1129,9 @@ mod tests {
         drop(rows);
         assert_eq!(
             budget.used_bytes(),
-            kept.iter().map(|kept| context_bytes(kept.context())).sum::<usize>(),
+            kept.iter()
+                .map(|kept| context_bytes(kept.context()))
+                .sum::<usize>(),
             "only the selected contexts stay charged once their rows release"
         );
     }

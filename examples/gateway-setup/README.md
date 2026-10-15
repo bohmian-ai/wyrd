@@ -77,5 +77,6 @@ fixtures.
    Agent's `card_uid`. The Jev Agent returns its `answers` as JSON text and
    takes no tools.
 
-`wyrd gateway credential revoke <name>` stops every deployment using that
-credential until it is put again.
+`wyrd gateway credential revoke <name>` is permanent: every deployment using
+that credential stops serving, and the name cannot be put again. To recover,
+put the key under a new name and point the deployment's `auth.credential` at it.

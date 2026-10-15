@@ -21,12 +21,13 @@ pub const PLATFORM_AUDIT_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::f
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x79, 0x72, 0x64, 0x01,
 ]));
 
-/// Reserved principal stamped on the rows gateway capture writes into Bifrost.
+/// Reserved gateway-capture principal that no token may name.
 ///
 /// Capture is a server-internal write: `wyrd-server` submits it straight to
-/// Scribe without a token, permission check, or audit decision. Like
-/// [`PLATFORM_AUDIT_PRINCIPAL`], this sentinel never appears in a token;
-/// issuers refuse to mint it and verifiers reject any token naming it.
+/// Scribe without a token, permission check, or audit decision, and each
+/// captured row carries the verified pair the call ran under. Like
+/// [`PLATFORM_AUDIT_PRINCIPAL`], this id never appears in a token; issuers
+/// refuse to mint it and verifiers reject any token naming it.
 pub const GATEWAY_CAPTURE_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::from_bytes([
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x79, 0x72, 0x64, 0x02,
 ]));

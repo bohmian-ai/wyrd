@@ -57,12 +57,24 @@ def test_journey_to_card_round_trip(tmp_path: Path) -> None:
     assert loaded_card.model_dump() == card.model_dump()
 
     envelope = json.loads(agent.model_dump_json())
-    binding = {"verifier": {"kind": "Verifier", "name": "answers-grounded", "version": "1.0.0", "space": "default"}}
+    binding = {
+        "verifier": {
+            "kind": "Verifier",
+            "name": "answers-grounded",
+            "version": "1.0.0",
+            "space": "default",
+        }
+    }
     for run_config in (
         {},
         {"timeout_ms": 5000},
         {"max_iterations": 10, "tool_concurrency_cap": 8},
-        {"max_iterations": 3, "tool_concurrency_cap": 2, "session_recent_limit": 20, "timeout_ms": 9000},
+        {
+            "max_iterations": 3,
+            "tool_concurrency_cap": 2,
+            "session_recent_limit": 20,
+            "timeout_ms": 9000,
+        },
     ):
         authored = {**envelope["spec"], "verified_by": [binding]}
         authored.pop("run_config", None)

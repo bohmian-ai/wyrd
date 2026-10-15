@@ -209,7 +209,10 @@ PORTABLE_SPEC = {
             "content": [
                 {"type": "text", "text": "${question}"},
                 {"type": "image", "source": "${media:photo}"},
-                {"type": "image", "source": {"type": "base64", "mime_type": "image/png", "data": "iVBORw0KGgo="}},
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "mime_type": "image/png", "data": "iVBORw0KGgo="},
+                },
                 {"type": "document", "source": "${media:__wyrd_media_0}"},
             ],
         }

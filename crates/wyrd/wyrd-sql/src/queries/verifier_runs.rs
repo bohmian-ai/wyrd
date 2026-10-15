@@ -2140,10 +2140,6 @@ pub(crate) fn settlement(rows_affected: u64) -> Settlement {
     }
 }
 
-/// Decode a stored value, surfacing a malformed one as [`SqlxError::Decode`].
-///
-/// # Errors
-/// Returns [`SqlxError::Decode`] wrapping `value`'s error.
 /// Convert stored identifier bytes into the fixed-width array of `N` bytes.
 ///
 /// # Errors
@@ -2155,6 +2151,10 @@ fn fixed_width<const N: usize>(bytes: Vec<u8>) -> Result<[u8; N], SqlxError> {
         .map_err(|_| SqlxError::Decode(format!("a stored identifier is not {N} bytes").into()))
 }
 
+/// Decode a stored value, surfacing a malformed one as [`SqlxError::Decode`].
+///
+/// # Errors
+/// Returns [`SqlxError::Decode`] wrapping `value`'s error.
 pub(crate) fn stored<T, E>(value: Result<T, E>) -> Result<T, SqlxError>
 where
     E: StdError + Send + Sync + 'static,

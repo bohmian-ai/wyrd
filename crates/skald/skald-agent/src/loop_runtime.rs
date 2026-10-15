@@ -181,7 +181,8 @@ impl Agent {
     /// explicit Prompt's model. A `wyrd_gateway` execution route sends every
     /// model call to `<deployment>/<prompt model>` through the Agent's gateway
     /// caller; otherwise the Agent's provider override, when set, replaces
-    /// `providers`.
+    /// `providers`. A Jev `systemone` Prompt has no loop: it is dispatched
+    /// once by [`Self::call_once`].
     ///
     /// Timeout, cancellation, and terminal-journal behavior match
     /// [`Self::run_with`]: the optional run timeout bounds the loop, the
@@ -193,7 +194,8 @@ impl Agent {
     /// Returns [`AgentError::InvalidArgument`] before any IO when a
     /// `wyrd_gateway` route has no gateway caller or a non-gateway model,
     /// [`AgentError::JournalAppendFailed`] when a non-terminal journal
-    /// append fails, [`AgentError::Prompt`] when rendering fails,
+    /// append fails, [`AgentError::Prompt`] when rendering fails or a Jev
+    /// Agent has tools,
     /// [`AgentError::ProviderMismatch`] when `prompt` targets another provider,
     /// loop-shape, provider, tool, and structured-output failures, an
     /// exhausted iteration budget, or [`AgentError::Timeout`].
@@ -234,6 +236,11 @@ impl Agent {
                         prompt_provider: request_provider,
                     });
                 }
+                if matches!(rendered, ProviderRequest::JevSystemOne(_)) {
+                    return self
+                        .call_once(providers, rendered, &prompt.native().model)
+                        .await;
+                }
                 let seed_messages = extract_messages(&self.id, &rendered)?;
                 self.run_loop(
                     providers,
@@ -264,6 +271,70 @@ impl Agent {
         }
         .instrument(span)
         .await
+    }
+
+    /// Dispatches a rendered Jev `systemone` `request` once, with no tool
+    /// loop, journaling the call and its result as iteration 0.
+    ///
+    /// The run's output is the JSON of the keyed answers, and the typed
+    /// answer is its final response. `model` labels the `chat` span when the
+    /// request names none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Prompt`] when the Agent has tools, which Jev
+    /// cannot call, [`AgentError::JournalAppendFailed`] when a journal append
+    /// fails, and [`AgentError::Provider`] when dispatch fails.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: string-keyed Jev answers always serialize.
+    async fn call_once(
+        &self,
+        providers: &ProviderRegistry,
+        request: ProviderRequest,
+        model: &str,
+    ) -> AgentResult<AgentRun> {
+        if !self.tools.is_empty() {
+            return Err(AgentError::Prompt {
+                agent: self.id.clone(),
+                detail: "a Jev systemone Agent cannot call tools".to_owned(),
+            });
+        }
+        self.append_model_journal_call(0, &request).await?;
+        let provider = self.prompt.native().provider();
+        let chat = chat_span(&provider, &request, model);
+        let response = dispatch(providers, provider, request)
+            .instrument(chat.clone())
+            .await;
+        let finish_reason = match &response {
+            Ok(response) => response_finish_reason(response),
+            Err(error) => {
+                record_error(&chat, error.code());
+                format!("provider_error:{error}")
+            }
+        };
+        self.append_model_journal_result(0, finish_reason, response.is_err())
+            .await?;
+        let response = response.map_err(AgentError::Provider)?;
+        let output = match &response {
+            ProviderResponse::JevSystemOne(answer) => {
+                serde_json::to_string(&answer.answers).expect("Jev answers are string-keyed JSON")
+            }
+            _ => String::new(),
+        };
+        Ok(AgentRun {
+            output,
+            final_response: Some(Arc::new(response)),
+            iterations: 1,
+            finish_reason: FinishReason::ModelStopped,
+            conversation: Conversation::new(),
+            error: None,
+            errors: Vec::new(),
+            structured_output: None,
+            #[cfg(feature = "python")]
+            parsed: None,
+        })
     }
 
     /// Runs the bounded model/tool loop inside the caller's `invoke_agent` span.

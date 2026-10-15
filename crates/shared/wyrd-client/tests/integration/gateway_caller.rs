@@ -526,12 +526,29 @@ async fn public_gateway_call_context_and_errors() {
         1,
     )
     .await;
+    // Google deployments are named, not inferred: one is named `vertex`, and
+    // a slash-bearing model suffix stays one encoded path segment.
+    for route in [
+        "/v1beta/models/gemini/gemini-a:generateContent",
+        "/v1beta/models/vertex/tuned%2Fgemini-a:generateContent",
+    ] {
+        mount(
+            &server,
+            "POST",
+            route,
+            ResponseTemplate::new(200).set_body_json(json!({
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}}]
+            })),
+            1,
+        )
+        .await;
+    }
     mount(
         &server,
         "POST",
-        "/v1beta/models/gemini-a:generateContent",
+        "/v1/systemone",
         ResponseTemplate::new(200).set_body_json(json!({
-            "candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}}]
+            "model": "jev-1", "answers": {"ok": {"type": "noul", "noul": 0.9}}
         })),
         1,
     )
@@ -576,6 +593,28 @@ async fn public_gateway_call_context_and_errors() {
             .await,
         Ok(ProviderResponse::GeminiGenerateContent(_))
     ));
+    assert!(matches!(
+        caller
+            .call(
+                gateway_call(gemini.clone(), "vertex/tuned/gemini-a", deadline),
+                &token
+            )
+            .await,
+        Ok(ProviderResponse::GeminiGenerateContent(_))
+    ));
+    let jev = ProviderRequest::JevSystemOne(
+        serde_json::from_value(json!({
+            "model": "body-model", "state": "hi",
+            "questions": {"ok": {"type": "noul", "instructions": "Is it ok?"}}
+        }))
+        .expect("jev"),
+    );
+    assert!(matches!(
+        caller
+            .call(gateway_call(jev, "jev/jev-latest", deadline), &token)
+            .await,
+        Ok(ProviderResponse::JevSystemOne(_))
+    ));
     let models: Vec<Value> = received(&server)
         .await
         .iter()
@@ -585,20 +624,17 @@ async fn public_gateway_call_context_and_errors() {
         .collect();
     assert_eq!(
         models,
-        vec![json!("openai/gpt-r"), json!("claude-a"), Value::Null]
+        vec![
+            json!("openai/gpt-r"),
+            json!("anthropic/claude-a"),
+            Value::Null,
+            Value::Null,
+            json!("jev/jev-latest"),
+        ]
     );
 
-    // Vertex and an already cancelled run stop before any request; a slow
-    // answer times out at the call's own deadline.
-    let vertex = ProviderRequest::GeminiGenerateContent(
-        serde_json::from_value(json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}))
-            .expect("vertex"),
-    );
-    let refused = caller
-        .call(gateway_call(vertex, "vertex/gemini-a", deadline), &token)
-        .await
-        .expect_err("Vertex is refused locally");
-    assert_eq!(refused.code(), "SKALD_PROVIDERS_400_BAD_REQUEST");
+    // An already cancelled run stops before any request; a slow answer times
+    // out at the call's own deadline.
     let cancelled = CancellationToken::new();
     cancelled.cancel();
     let stopped = caller
@@ -609,7 +645,7 @@ async fn public_gateway_call_context_and_errors() {
         .await
         .expect_err("a cancelled run stops the call");
     assert_eq!(stopped.code(), "SKALD_PROVIDERS_408_TIMEOUT");
-    assert_eq!(received(&server).await.len(), 3, "nothing else was sent");
+    assert_eq!(received(&server).await.len(), 5, "nothing else was sent");
     let slow = MockServer::start().await;
     mount(
         &slow,
@@ -722,7 +758,7 @@ async fn public_gateway_call_context_and_errors() {
     );
     let google = refusal(
         504,
-        "/v1beta/models/gemini-a:generateContent",
+        "/v1beta/models/gemini/gemini-a:generateContent",
         json!({"error": {
             "code": 504, "message": "echoed prompt sk-canary", "status": "DEADLINE_EXCEEDED",
             "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
@@ -738,6 +774,34 @@ async fn public_gateway_call_context_and_errors() {
     assert_eq!(
         refused,
         catalog_problem("WYRD_GATEWAY_504_DEADLINE_EXCEEDED", 504, None)
+    );
+    let jev = refusal(
+        404,
+        "/v1/systemone",
+        json!({"error": {
+            "message": "echoed prompt sk-canary", "type": "invalid_request_error",
+            "param": "model", "code": "WYRD_GATEWAY_404_MODEL_UNAVAILABLE"
+        }}),
+    )
+    .await;
+    let jev_request = ProviderRequest::JevSystemOne(
+        serde_json::from_value(json!({
+            "model": "body-model", "state": "hi",
+            "questions": {"ok": {"type": "noul", "instructions": "Is it ok?"}}
+        }))
+        .expect("jev"),
+    );
+    let refused = problem(
+        PublicWyrdGatewayCaller::new(client(&jev.uri()))
+            .call(
+                gateway_call(jev_request, "jev/jev-latest", deadline),
+                &token,
+            )
+            .await,
+    );
+    assert_eq!(
+        refused,
+        catalog_problem("WYRD_GATEWAY_404_MODEL_UNAVAILABLE", 404, Some("model"))
     );
 
     // A relayed provider refusal without a Wyrd code keeps no upstream text.

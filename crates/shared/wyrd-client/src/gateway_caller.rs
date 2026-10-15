@@ -87,7 +87,7 @@ impl WyrdGatewayCaller for PublicWyrdGatewayCaller {
     ///
     /// # Errors
     /// Returns [`ProviderError::BadRequest`] for a dialect the public gateway
-    /// does not serve (including Vertex) or an unencodable request;
+    /// does not serve or an unencodable request;
     /// [`ProviderError::Timeout`] when the call's time runs out or it is
     /// cancelled; [`ProviderError::Connect`] for a transport
     /// failure; [`ProviderError::RemoteProblem`] for a refusal or an
@@ -149,6 +149,8 @@ enum Ingress {
     AnthropicMessages,
     /// Gemini `GenerateContent` under `/v1beta/models`.
     GeminiGenerateContent,
+    /// Jev `systemone` at `/v1/systemone`, refusing in the `OpenAI` envelope.
+    Jev,
 }
 
 impl Ingress {
@@ -165,6 +167,7 @@ impl Ingress {
             Self::GeminiGenerateContent => {
                 decode(body).map(ProviderResponse::GeminiGenerateContent)
             }
+            Self::Jev => decode(body).map(ProviderResponse::JevSystemOne),
         }
     }
 
@@ -178,7 +181,7 @@ impl Ingress {
     /// fixed message, so no upstream text is retained.
     fn problem(self, status: StatusCode, body: &[u8]) -> RemoteProblem {
         let (code, field) = match self {
-            Self::OpenAiChat | Self::OpenAiResponses => {
+            Self::OpenAiChat | Self::OpenAiResponses | Self::Jev => {
                 serde_json::from_slice::<OpenAiErrorEnvelope>(body)
                     .ok()
                     .map(|envelope| (envelope.error.code, envelope.error.param))
@@ -242,13 +245,14 @@ impl NativeCall {
     /// Project `request` for `model` onto its public ingress.
     ///
     /// The model always comes from `model`, never from the request body:
-    /// `OpenAI` bodies carry its `<provider>/<model>` projection, Anthropic
-    /// bodies its provider-native model, and Gemini puts it in the path.
+    /// `OpenAI`, Anthropic, and Jev bodies carry the full
+    /// `<deployment>/<model>` address, and Gemini puts the deployment and the
+    /// percent-encoded model in the path. The deployment's adapter, never its
+    /// name, decides which provider serves the call.
     ///
     /// # Errors
     /// Returns [`ProviderError::BadRequest`] for a dialect the public gateway
-    /// does not serve, including a GenerateContent body for a `vertex` model,
-    /// or a body that does not serialize.
+    /// does not serve or a body that does not serialize.
     fn project(request: ProviderRequest, model: &ModelRef) -> Result<Self, ProviderError> {
         let (ingress, path, body) = match request {
             ProviderRequest::OpenAiChatCompletion(mut body) => {
@@ -268,24 +272,25 @@ impl NativeCall {
                 )
             }
             ProviderRequest::AnthropicMessage(mut body) => {
-                body.model = model.model.to_string();
+                body.model = model.to_string();
                 (
                     Ingress::AnthropicMessages,
                     "/v1/messages".to_owned(),
                     encode(&body)?,
                 )
             }
-            ProviderRequest::GeminiGenerateContent(body)
-                if model.deployment.as_str() != "vertex" =>
-            {
-                (
-                    Ingress::GeminiGenerateContent,
-                    format!(
-                        "/v1beta/models/{}:generateContent",
-                        urlencoding::encode(model.model.as_str())
-                    ),
-                    encode(&body)?,
-                )
+            ProviderRequest::GeminiGenerateContent(body) => (
+                Ingress::GeminiGenerateContent,
+                format!(
+                    "/v1beta/models/{}/{}:generateContent",
+                    urlencoding::encode(model.deployment.as_str()),
+                    urlencoding::encode(model.model.as_str())
+                ),
+                encode(&body)?,
+            ),
+            ProviderRequest::JevSystemOne(mut body) => {
+                body.model = model.to_string();
+                (Ingress::Jev, "/v1/systemone".to_owned(), encode(&body)?)
             }
             _ => {
                 return Err(ProviderError::bad_request(

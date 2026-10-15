@@ -1,0 +1,21 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: claude-agent
+  version: 1.0.0
+  space: default
+spec:
+  prompt:
+    provider: anthropic
+    model: claude-sonnet-4-5
+    messages:
+    - role: user
+      content: ${question}
+    settings:
+      max_output_tokens: 16
+  execution_route:
+    kind: wyrd_gateway
+    deployment: claude-prod
+  tool_names: []
+  run_config:
+    max_iterations: 1

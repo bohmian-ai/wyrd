@@ -1,0 +1,17 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: gateway-agents
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: openai
+      ref: ./openai-agent.yaml
+    - alias: anthropic
+      ref: ./claude-agent.yaml
+    - alias: google
+      ref: ./gemini-agent.yaml
+    - alias: jev
+      ref: ./jev-agent.yaml

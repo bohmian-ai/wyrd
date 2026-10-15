@@ -96,7 +96,7 @@ async function infer(deployment: keyof typeof INFERENCES): Promise<{ status: num
 
 /**
  * Every deployment the installed CLI wrote answers once through the saved
- * deployment, and the retained calls name each resolved deployment with the
+ * deployment, and its retained Run-less calls name each resolved deployment with the
  * caller's model unchanged.
  */
 bootstrapTest.skipIf(!process.env.WYRD_LOCAL_DEV_CONFIG_HOME)("cli_gateway_setup", async () => {
@@ -110,7 +110,7 @@ bootstrapTest.skipIf(!process.env.WYRD_LOCAL_DEV_CONFIG_HOME)("cli_gateway_setup
     const retained = async () =>
       (
         await bifrost.sql(
-          "SELECT DISTINCT resolved_deployment, requested_model['model'] AS model FROM vala.gateway.calls WHERE outcome = 'succeeded' ORDER BY resolved_deployment",
+          "SELECT DISTINCT resolved_deployment, requested_model['model'] AS model FROM vala.gateway.calls WHERE outcome = 'succeeded' AND run_id IS NULL ORDER BY resolved_deployment",
         )
       )
         .toArrow()

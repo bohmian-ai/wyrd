@@ -8,7 +8,7 @@ draft: true
 status: partial
 ---
 
-You will run `support-desk`, a small customer-support agent, against the local server from [Set up Wyrd](/get-started/setup/). It answers 100 customer questions through `gpt-4o`. Wyrd checks every answer two ways: a rule your code calls before the answer goes out, and an LLM judge the server runs on its own. At the end you have a verdict for every answer, each tied to the exact agent version that produced it, and you can query the evidence with SQL.
+You will run `support-desk`, a small customer-support agent, against the local server from [Set up Wyrd](/get-started/setup/). It answers 100 customer questions through `gpt-4o`. Wyrd checks every answer two ways: a rule your code calls before the answer goes out, and a judge Agent the server runs in the background. At the end you have a verdict for every answer, each tied to the exact agent version that produced it, and you can query the evidence with SQL.
 
 The same example is in Python, Rust, and TypeScript. Pick one; the steps are identical.
 
@@ -69,7 +69,7 @@ The Service declaration is the contract. It names the agent, the table it record
 
 The two bindings differ in one line:
 
-- `answer-quality` has `runs_on: {kind: observations_ready}`. Every time the agent records an eval observation, the server runs this LLM judge on it. Your code never waits on it.
+- `answer-quality` is judged in the background. Your code calls `submit` on each answer and moves on; the server queues the execution, and a tool-less judge Agent decides whether the answer is helpful and on-policy.
 - `no-refund-promise` has no `runs_on`, so the server never runs it. Your code calls it on each answer before replying. It is an assertion: the answer must not contain `guaranteed refund`.
 
 [How verification works](/understand/how-verification-works/) covers both paths in depth.
@@ -129,7 +129,7 @@ Each answer is one pass through this loop:
 </LangTab>
 </LangTabs>
 
-A run is one request handled by one exact Card version. Inside it the agent answers through the gateway, the ticket goes to your table, and `eval` records the answer for `answer-quality`. Then `verify` asks `no-refund-promise` for a verdict and gets it back in the same call.
+A run is one request handled by one exact Card version. Inside it the agent answers through the gateway, the ticket goes to your table, and `submit` queues `answer-quality` on the answer. Then `verify` asks `no-refund-promise` for a verdict and gets it back in the same call.
 
 ## 5. Read the verdicts
 
@@ -137,9 +137,9 @@ When every answer is judged, the program prints verdict counts per Verifier as `
 
 <Aside type="caution" title="Unverified">Output is captured on the first verified run.</Aside>
 
-Don't expect any failures from `no-refund-promise`. `gpt-4o` almost never writes the words "guaranteed refund", so it passes every answer. The repository's journey tests use a scripted model that does promise refunds, and there 10 of 100 answers fail. The check is the same; only the model changed. `answer-quality` is an LLM judging an LLM, so its count can differ from run to run.
+Don't expect any failures from `no-refund-promise`. `gpt-4o` almost never writes the words "guaranteed refund", so it passes every answer. The repository's journey tests use a scripted model that does promise refunds, and there 10 of 100 answers fail. The check is the same; only the model changed. `answer-quality` is a model judging a model, so its count can differ from run to run.
 
-After the counts, the program prints one row of evidence per explained answer. That row joins five tables on the run ID: the eval observation, the ticket, the trace span, the gateway call, and both verdicts:
+After the counts, the program prints one row of evidence per explained answer. That row joins four tables on the run ID: the ticket, the trace span, the gateway call, and both verdicts:
 
 <Aside type="caution" title="Unverified">Output is captured on the first verified run.</Aside>
 
@@ -153,7 +153,7 @@ wyrd query --sql "SELECT card_uid, binding_id IS NOT NULL AS server_run, verdict
   GROUP BY card_uid, binding_id IS NOT NULL, verdict"
 ```
 
-Each line of output is one JSON object. `card_uid` is the Verifier that judged. `server_run` is true for verdicts the server produced by running `answer-quality` on its trigger, and false for your code's real-time `verify` calls. [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/#query-the-evidence) shows the joins from a verdict back to what ran.
+Each line of output is one JSON object. `card_uid` is the Verifier that judged. Every verdict here came from your code, so `server_run` is false: `binding_id` is set only on verdicts a schedule produced. [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/#query-the-evidence) shows the joins from a verdict back to what ran.
 
 <Aside type="caution" title="Unverified">Output is captured on the first verified run.</Aside>
 

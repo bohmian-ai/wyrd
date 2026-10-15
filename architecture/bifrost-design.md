@@ -75,7 +75,7 @@ it as `time_column` on its physical layout, and omitting it selects
 transform, the default first sort key (descending), hot and published time
 bounds, and `COUNT(*)`. Built-in tables declare their own: OTLP spans
 `start_time_unix_nano`, OTLP logs and metrics `time_unix_nano`, gateway and
-agent traces `started_at`, Drift and Eval observations and
+agent traces `started_at`, Drift observations and
 `vala.system.audit_log` `created_at`, and `vala.verification.results`
 `ended_at`. Every caller-supplied `wyrd_*` column is reserved and refused.
 
@@ -228,11 +228,16 @@ typed columns:
   `http_response_status_code`, `url_full`, and the `exception_*` columns of the
   span's last `exception` event on spans; the record's own `exception_*`
   attributes and `body_text` (the body when it is a string) on logs.
-- `vala.verification.results` replaces its JSON `details` text with two
-  nullable Structs: `drift_report` (`method`, Variant `features`, `verdict`) and
-  `eval_summary` (task counts, `pass_rate`, `duration_ms`). A scored result sets
-  exactly the one its implementation owns.
-- Every nullable built-in Struct — `drift_report`, `eval_summary`, the
+- `vala.verification.results` carries the generic outcome of one execution:
+  execution, Run, Verifier, subject, and binding identity, the verdict, and the
+  requirement, step, evidence, and provenance breakdown as Variant. The
+  nullable Struct `drift_report` (`method`, Variant `features`, `verdict`) is
+  set when the Verifier has a drift check.
+- `vala.verification.execution_inputs` holds each execution's pinned input
+  declarations (JSON values, file digests, Artifact and trace references) and
+  its server-owned `queue_execution` marker: false for `verify`, true for
+  `submit`. Only a `true` record activates queued work.
+- Every nullable built-in Struct — `drift_report`, the
   `vala.metrics.points` bucket sets, and `vala.gateway.calls`
   `resolved_model` — has nullable children, because a required Parquet leaf
   under a null parent reads back as another row's value through a field
@@ -241,8 +246,8 @@ typed columns:
   SQL null for an absent Struct on hot and published data alike. Admission
   refuses a batch with a partial Struct before ACK with
   `WYRD_VALA_400_SCHEMA_PARSE` naming the row and child.
-- `vala.eval.observations` `context` and `media`, `vala.eval.result_items`
-  `actual` and `expected`, `vala.verification.results` `assertion_result`,
+- The `vala.verification.results` breakdown, the
+  `vala.verification.execution_inputs` declarations,
   `vala.gateway.calls` `request_payload` and `response_payload`, and
   `vala.system.audit_log` `detail` are Variant.
 
@@ -991,11 +996,11 @@ to: one row per authorized request rather than continuous high-rate ingest,
 date-range rather than recent-window queries, and retention measured in years
 rather than days.
 
-The five verification tables — `vala.drift.observations`,
-`vala.eval.observations`, `vala.verification.results`,
-`vala.drift.result_features`, and `vala.eval.result_items` — also partition by
-UTC day on each table's time column — `created_at` for observations,
-`ended_at` for results, and `wyrd_ingested_at` for result features and items —
+The four verification tables — `vala.drift.observations`,
+`vala.verification.execution_inputs`, `vala.verification.results`, and
+`vala.drift.result_features` — also partition by UTC day on each table's time
+column — `created_at` for observations, `ended_at` for results, and
+`wyrd_ingested_at` for execution inputs and result features —
 never by Verifier, subject, binding, or tenant ID. A Drift schedule window does
 not determine partition size.
 
@@ -1391,24 +1396,29 @@ The surface includes:
 - agent-facing read and write operations governed by explicit permissions.
 
 Observation namespaces such as `vala.traces`, `vala.metrics`, `vala.logs`,
-`vala.eval`, `vala.drift`, `vala.verification`, `vala.gateway`, and
+`vala.drift`, `vala.verification`, `vala.gateway`, and
 `vala.system` remain tenant-qualified Bifrost tables. Canonical SQL is their
 only read contract;
 the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
-`vala.gateway.calls` and the three verification result tables
-(`vala.verification.results`, `vala.drift.result_features`,
-`vala.eval.result_items`) accept no public write at all: Gate refuses every
+`vala.gateway.calls` and the three verification tables
+(`vala.verification.results`, `vala.verification.execution_inputs`, and
+`vala.drift.result_features`) accept no public write at all: Gate refuses every
 principal. Only the server-internal capture writer writes them, together with
 the capture spans in `vala.traces.spans`, and the tenant copies of server
 spans join them there through the same outbox; result rows carry the verified
 Card as `card_uid` and the exact Verifier Card as `verifier_card_uid`. Each
 batch carries the verified pair it was produced under, which Scribe stamps as
 `sub_principal_id` and `act_principal_id`: the call's pair for gateway
-capture, the caller's pair for a realtime result, and the run's subject with
-the tenant `System` principal as actor for a queued result. A pod without
+capture, the caller's pair for a `verify` result and its inputs, the submitting
+caller's pair for `submit` inputs, and the execution's accepted subject with
+the tenant `System` principal as actor for a queued result. A `submit`
+creates its queued `wyrd.verifier_executions` row only after Scribe
+acknowledges its `execution_inputs` batch, through the existing batched
+request outbox; staged inputs not yet acknowledged are lost on abrupt process
+death, and the execution then never becomes visible. A pod without
 Scribe submits through `ScribeCapturePeerService.IngestCapture` on the peer
 listener, which the same `wyrd-peer` mTLS admits; the request names its
 tenant and one of those five tables or `vala.system.audit_log` explicitly,

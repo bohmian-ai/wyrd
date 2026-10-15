@@ -83,14 +83,14 @@ not a passive integration or inventory product.
 12. **Tools are runtime names, not cards.** `AgentSpec.tool_names: Vec<String>`
     resolves through the runtime tool registry. MCP servers auto-register
     their tools by name; host tools register themselves. No `Tool` kind.
-13. **No event vocabulary on the wire.** "Observation" comes from Verifier implementations;
+13. **No event vocabulary on the wire.** Evidence comes from typed Verifier input slots;
     "activation" comes from the closed `TriggerSpec` activation. Free-form
     event-name strings are doctrine drift.
 14. **Host config stays off Cards.** Permission modes,
     sandboxes, isolation, effort, and per-CLI compatibility are properties of
     the host that runs the Agent, not of the Agent contract.
-15. **Verifiers are pure judgment producers.** Drift and Eval implementations describe what
-    is observed and what counts as an observation. They do not carry
+15. **Verifiers are pure judgment producers.** A Verifier declares its evidence,
+    preparation, and requirements. It does not carry
     scheduling and they do not carry dispatch. Scheduling lives on
     `Trigger.schedule`. Dispatch lives on `Operator`. There is no `Alert`
     kind — alerting is an Operator with a notification adapter.
@@ -120,7 +120,7 @@ not a passive integration or inventory product.
     the principal's own `card_ref` plus the **observation-target** cards reachable
     through the transitive card-ref graph declared in that card's spec. A card
     enters the scope only if its kind is an observation target — a kind a client
-    (`wyrd.observer`, Bifrost, drift, eval) attributes records to: `Data`,
+    (`wyrd.observer`, Bifrost, drift samples) attributes records to: `Data`,
     `Model`, `Experiment`, `Prompt`, `Agent`, `Service`, `Mcp`, `Artifact`,
     `Source`. `Verifier` and control-plane kinds (`Policy`,
     `Audit`, `Operator`, `Trigger`) may be referenced for governance or
@@ -813,19 +813,20 @@ metric enrichment is not implied.
 
 A view identifies itself by the alias it was opened with (`alias`; the root
 Service view is `root`); the state returns the exact typed `CardRef` for an
-alias. `run.observe.verify(verifier, input)` judges the view's subject in real
-time: the client resolves the named Verifier among those bound in
-`verified_by` to that subject in the hydrated graph, shapes the input for the
-Verifier's implementation (one JSON context for Eval or Task, or Drift feature
-rows), and calls
-`POST /v1/verification/execute` once, without replay, returning the typed
-`Judgment`. An unbound name (`WYRD_SDK_404_UNKNOWN_VERIFIER`) or a wrongly
-shaped input (`WYRD_SDK_400_INVALID_OBSERVATION`) fails locally before any
-network IO, and a `failed` verdict is an ordinary return. Judging records no
-observation, durable verification run, or dispatch and does not require Bifrost
-startup. Its completed result is staged through the Scribe outbox. SDKs carry
-no separate verification handle; binding and run
-operations remain server HTTP and MCP surfaces, and verification history is
+alias. `run.observe.verify(verifier, inputs)` and
+`run.observe.submit(verifier, inputs)` judge the view's subject: the client
+resolves the named Verifier among those bound in `verified_by` to that subject
+in the hydrated graph, validates named inputs against its slots, hashes and
+uploads missing files through `POST /v1/verification/evidence`, and calls
+`POST /v1/verification/execute` (once, without replay, returning the typed
+`VerificationResult`) or `POST /v1/verification/enqueue` (returning a
+`VerificationExecution` handle). `submit` on a Window Verifier records its
+samples through the drift observation path and returns `Recorded`. An unbound
+name (`WYRD_SDK_404_UNKNOWN_VERIFIER`) or an input its slots refuse
+(`WYRD_VERIFICATION_400_INPUT_INVALID`) fails locally before any network IO,
+and a `failed` verdict is an ordinary return. `VerificationExecution.connect`
+rebuilds a handle from an execution ID in any process. Binding inspection
+remains a server HTTP and MCP surface, and verification history is
 read with parameterized SQL through the Bifrost client.
 
 Every accepted row carries authenticated publisher and request identity; Card
@@ -1069,9 +1070,7 @@ typed refs is a versioned breaking change that adds variants.
 | `Component`       | `Service.components[].ref`                                                  |
 | `Artifact`        | `Data.card_refs[]`, `Model.card_refs[]`                                     |
 | `Prompt`          | `Agent.prompt`                                                              |
-| `Dataset`         | `Verifier.implementation.spec.dataset` (eval)                               |
-| `Source`          | `Verifier.implementation.spec.source_ref` (eval)                            |
-| `Baseline`        | `Verifier.implementation.spec.signal.baseline_ref` (drift)                  |
+| `Baseline`        | `Verifier.requirements[].check.signal.baseline_ref` and step requirements (drift) |
 | `Trigger`         | `*.verified_by[].runs_on`                                                   |
 | `Operator`        | `*.verified_by[].on_failure[]`                                              |
 | `Hook`      | `Operator.pre_invoke`, `Operator.post_invoke`                     |
@@ -1156,33 +1155,90 @@ Multi-party attestations are not part of the v1 Audit wire contract. Values in
 
 ### Verifier
 
-A subject-less verification declaration with exactly one typed implementation.
-`Verifier` is the only registrable verification kind: the closed
-`implementation.kind` variants are `drift`, `eval`, and `task`, and `kind: Drift` /
-`kind: Eval` registrations are rejected. Scheduling and failure reaction
-remain on the binding's Trigger and Operators.
+A subject-less, declarative verification: named evidence `inputs`, optional
+preparation `steps`, `requirements` that each produce one verdict, and a
+`decide` rule that combines them. `Verifier` is the only verification kind and
+has no authored implementation discriminator; drift and agent judging are
+check kinds, not Verifier kinds. Scheduling and failure reaction remain on the
+binding's Trigger and Operators.
 ```yaml
 spec:
   description?: string
-  implementation:
-    kind: drift | eval | task                 # closed; variant fields below
-    spec: DriftSpec | EvalSpec | TaskVerifierSpec
+  inputs: { <slot>: InputSlot }              # json | media | trace | samples
+  steps?: [Step]                             # id, action, when?, depends_on?, retries?, timeout_seconds?, requirements?
+  requirements?: [Requirement]               # id, statement, check — whole-Verifier
+  decide?: all | { pass_rate: { threshold } } # default all
 ```
 
-`task` deserializes into `TaskVerifierSpec`, not `EvalSpec`. This is the only new
-struct for the task implementation. Its `spec` is one flattened, `kind`-tagged
-`VerifierTask` enum value that reuses the existing `AssertionTask` or
-`LlmJudgeTask` payload; there is no nested `task` field, Eval task map, or
-replacement payload struct. The task uses the existing check behavior over
-direct JSON input, without Eval-only dependencies or conditions. It produces one
-judgment. Registration and binding do not grant invocation authority.
+| Slot | Evidence |
+|---|---|
+| `json` | JSON, optionally constrained by `schema` |
+| `media` | One file pinned by SHA-256, with accepted `formats` and optional lower `max_bytes` |
+| `trace` | A trace ID resolved through tenant-scoped trace reads |
+| `samples` | Named `features` (or metric names) recorded for a scheduled window |
 
-A Verifier runs only through a `verified_by` binding on a Service component,
-Service, or standalone Agent, or through an analysis-only direct invocation:
+Slots are `required` by default. A missing required slot is missing evidence,
+never a refusal: checks that need it are inconclusive.
+
+| Action | Does |
+|---|---|
+| `extract` | Reads one `media` slot into the format-discriminated extraction JSON (PDF, PPTX, DOCX, XLSX, CSV, JSON, text/Markdown/HTML). Text and structure only; no OCR or rendering |
+| `agent` | Calls an inline, file-authored, or registered Agent with `inputs` matching its Prompt placeholders, optionally over a bounded `workspace` with built-in tools |
+| `code` | Runs sandboxed Python (`runtime: python`) from inline source or an exact Artifact, with a named `entrypoint` and bound `inputs`; returns JSON |
+
+| Check | Judges |
+|---|---|
+| `assert` | A typed comparison operator over `path`, or every element of an `each` selector |
+| `trace` | Span existence, order, and attributes over a `trace` slot |
+| `agent` | A tool-less Agent returning the closed Verdict schema `{outcome, reason, citations}` |
+| `code` | Sandboxed Python returning the same Verdict schema |
+| `drift` | The existing PSI, SPC, or Custom decision over one `samples` slot, with full statistical detail |
+
+Actions read and compute; they never mutate external systems, register Cards,
+or dispatch Operators. References use `inputs.<slot>`, `steps.<id>.output`,
+`steps.<id>.status`, `steps.<id>.requirements.<rid>.outcome|reason`, and
+`requirement.id|statement`, with dotted fields and zero-based indexes; `[*]`
+appears only in `each`. Step and requirement IDs are unique across the whole
+Verifier and key results, route overrides, and fitted drift state. References
+in actions and `when` create dependencies; registration rejects cycles,
+unknown references, checks that read another requirement's verdict, and
+fields absent from a known output schema. Independent steps run concurrently;
+a step's requirements run before its dependents start.
+
+Requirement outcomes are `passed`, `failed`, `inconclusive`, or
+`not_applicable`. An intentional skip (false `when`) makes dependent
+requirements `not_applicable`; a failed or timed-out step makes them
+`inconclusive`, and failure wins when both apply. Provider, malformed-output,
+infrastructure, and missing-evidence failures inside one check are
+`inconclusive`, never `failed`. `decide` excludes only `not_applicable`;
+with none applicable the verdict is `inconclusive`. `all` returns failed on
+any failure, else inconclusive on any inconclusive, else passed. `pass_rate`
+divides passes by all applicable requirements, inconclusive included.
+
+A citation names an original input slot and a typed locator (`page`, `slide`,
+`lines`, `json_pointer`, or page `region`); workspace paths map back to their
+slots. The server validates every citation against the pinned evidence, and a
+passed Agent check without a valid citation becomes inconclusive.
+
+Verifiers judge one of two evidence modes, fixed at registration; mixing them
+is refused.
+
+| Mode | Evidence | `verify` | `submit` |
+|---|---|---|---|
+| Run | `json`, `media`, `trace` | Executes now; returns `VerificationResult` within 60 s | Stages inputs and queues one execution; returns `VerificationExecution` |
+| Window | `samples` with `drift` checks | Refused (`WYRD_VERIFICATION_422_INPUT_UNSUPPORTED`) | Records samples through the drift observation path; returns `Recorded` |
+
+A Window Verifier requires a `schedule` binding. Registration and binding do
+not grant invocation authority.
+
+A Verifier runs through a `verified_by` binding on a Service component,
+Service, or standalone Agent, or through a caller's `verify`/`submit` on a
+bound subject:
 ```yaml
 verified_by:
   - verifier: Ref                            # → Verifier (exact version)
-    runs_on?: InlineableRef<TriggerSpec>     # absent means explicit-only
+    runs_on?: InlineableRef<TriggerSpec>     # schedule; absent means caller-driven only
+    inputs?: { <samples slot>: { features: [name] } | { metric: name } }
     on_failure: [InlineableRef<OperatorSpec>] # zero or more reactions
 ```
 
@@ -1191,91 +1247,148 @@ standalone Agent, or Service component occurrence; the same Verifier, Trigger,
 and Operator Cards may be reused by any number of bindings. Registration
 UID-pins every referenced Verifier, Trigger, and Operator, and rejects
 unresolved, wrong-kind, unauthorized, and cross-tenant references, duplicate
-bindings to the same Verifier version for one subject, and `workflow` in
-`on_failure`. The runtime direction is fixed:
+bindings to the same Verifier version for one subject, `workflow` in
+`on_failure`, and a schedule binding whose `inputs` cannot fill every required
+`samples` slot. The runtime direction is fixed:
 
 ```text
-binding activation -> Verifier run -> Verification Result
+verify ───────────────► execute inline ─► VerificationResult (no dispatch)
+submit / schedule ─► queued execution ─► VerificationResult
   -> zero or more on_failure dispatches (failed verdict only)
 ```
 
-Trigger decides when; the Verifier decides the verdict; the generic runner,
-not the Drift or Eval implementation, creates dispatches; each Operator owns
-its own delivery. A Verifier run never creates another Trigger. Direct
-Verifier invocation is analysis-only and dispatches nothing.
+Trigger decides when; the Verifier decides the verdict; the generic runner
+creates dispatches; each Operator owns its own delivery. Only a `failed`
+verdict of a queued execution dispatches; `inconclusive`, execution errors,
+and `verify` never do, and a replayed submission creates no duplicate
+dispatch.
 
-Public direct and manual invocation checks `verifier:run` against the selected
-Verifier's exact Card UID. `PermissionScope::Verifier(CardUid)` names one UID;
-`All` covers every Verifier in the tenant. `evals:run` alone does not authorize
-the generic verification endpoint. Permission is checked before execution and
-the allowed or denied decision is audited. The subject Card is resolved in the
-same tenant; direct invocation does not use observation-attribution Card scope.
-A binding does not replace the invocation permission.
+`run_id` is the client's application invocation; one Run can have many
+executions. `ExecutionId` is the server-issued identity of one exact Verifier
+execution; scheduled executions have no `run_id`.
 
-The runner drains `wyrd.verifier_runs` in claim rounds. Each round considers
-every tenant with a claimable run, oldest first, with no tenant limit, and
-claims at most one run per tenant. Execution has no count limit. The shared
-resources that already admit work bound it: the Postgres pool, Oracle
-admission and memory, and the Bifrost memory budget. A run refused by one of
-them returns to the queue without consuming an attempt, and the process
-claims nothing new until one of its running runs finishes. The claim
-transaction also returns the Verifier Card's status, its spec on a cache miss,
-and any fitted Drift baseline. Parsed Verifiers are cached per process by
-tenant and Card UID in a fixed 64 MiB least-recently-used cache that is never
-shared across tenants. A deleted Verifier terminates the run `errored`.
+| Route | Contract |
+|---|---|
+| `POST /v1/verification/evidence` | Declare files by digest, length, and format; receive single-PUT plans for missing ones under the tenant's `evidence/sha256/<digest>` namespace |
+| `POST /v1/verification/execute` | Exact Verifier and subject, optional Run, named input declarations, optional route overrides → `200 VerificationResult` |
+| `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` |
+| `GET /v1/verification/executions/{execution_id}` | Status, terminal error, and result when visible |
 
-When execution completes, the runner builds the result once, with one result
-ID and event time, stages it on the process Scribe outbox attributed to the
-run's subject with the tenant SYSTEM principal as actor and to the exact
-Verifier, and settles the run at once:
-settlement never waits for Scribe. The outbox writes the result tables through
-the same in-memory path as audit and gateway capture, so a result Scribe has
-not acknowledged is lost on abrupt process death or an expired shutdown
-deadline, and that loss never changes the settled run. A realtime Verifier
-invocation stages its result the same way, attributed to its caller's
-verified pair. While a run is in flight, one
-statement per tenant renews its leases on the PostgreSQL clock once a third of
-the lease has passed. An expired lease is never revived, and a renewal that no
-longer finds a run's token cancels that run's work. A run holds a connection
-only to claim, settle, and renew. The settlement retries with backoff while
-the lease holds.
+File contents never pass through Postgres or a request body; an uploaded file
+does not become a Card. `ArtifactRef` selects a registered Artifact under its
+own authorization.
+
+Public invocation checks `verifier:run` against the selected Verifier's exact
+Card UID. `PermissionScope::Verifier(CardUid)` names one UID; `All` covers
+every Verifier in the tenant. Permission is checked before execution and the
+decision is audited. A binding does not replace the invocation permission.
+
+Neither Run entry point writes Postgres on the request path. `verify` runs
+inline and stages its pinned inputs and result on the process Scribe outbox.
+`submit` stages its inputs; only after Scribe acknowledges them does the
+batched request outbox insert the queued `wyrd.verifier_executions` row. A
+server-owned `queue_execution` marker on the input record (false for
+`verify`, true for `submit`) is the only thing that activates queued work, so
+replaying input persistence never re-executes `verify`. The batched writer
+decides `Idempotency-Key` replay and conflict per tenant, subject, actor, and
+key: a matching retry returns the same execution ID; a conflicting one settles
+`errored` with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`, never runs, and leaves
+the original unchanged. `202` therefore confirms staging only. Staged work
+can be lost on abrupt process death before acknowledgment and then never
+becomes visible; observable losses are counted, and nothing is silently
+resubmitted. `VerificationExecution.wait` polls with capped backoff, tolerates
+not-found and delayed results within its deadline, and returns only a real
+result, the terminal error, or `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`.
+
+Execution status is `pending`, `running`, `retrying`, `completed`,
+`cancelled`, `timed_out`, or `errored`, separate from the verdict. The runner
+drains `wyrd.verifier_executions` in claim rounds. Each round considers every
+tenant with claimable work, oldest first, and claims at most one execution
+per tenant. The shared resources that already admit work bound it: the
+Postgres pool, Oracle admission and memory, the Bifrost memory budget, and
+verification-runtime capacity. Work refused by one of them returns to the
+queue without consuming an attempt. The claim transaction also returns the
+Verifier Card's status, its spec on a cache miss, and any fitted drift
+baselines. Parsed Verifiers are cached per process by tenant and Card UID in
+a fixed 64 MiB least-recently-used cache that is never shared across tenants.
+A deleted Verifier terminates the execution `errored`.
+
+When execution completes, the runner builds the result once and stages it on
+the process Scribe outbox, then settles at once: settlement never waits for
+Scribe, so a completed execution can lack a retained result. Leases renew on
+the PostgreSQL clock once a third of the lease has passed; an expired lease is
+never revived, and a renewal that no longer finds the token cancels that work.
+
+A `VerificationResult` carries `execution_id`, optional `run_id`, the exact
+`verifier` and `subject`, and an `outcome` of `verdict`, `requirements`
+(`id`, `step`, `statement`, `outcome`, `reason`, `actual`, `citations`,
+`detail`, `check` provenance), `steps` (`id`, `status`, `output`, `attempts`,
+`duration_ms`, `reason`, `provenance`, `tool_calls`), and pinned `evidence`.
+Provenance records code hash and runtime, extraction version, Agent and Prompt
+versions, effective routes, drift baselines and windows, and input digests.
+`vala.verification.results` is the canonical analytical result surface and
+`vala.verification.execution_inputs` holds pinned input declarations and
+queued activation context.
 
 Every work record names who the work was for (`sub_principal_id`) and who
 performed it (`act_principal_id`). A direct caller A records A/A and a
-delegated caller B acting for A records A/B, on its request's audit, on an
-accepted manual run, and on a realtime invocation's result; a scheduled or
-observation-triggered run records its binding owner as subject. Wyrd performs
-a queued run's judge calls, input reads, and result writes, and a realtime
-invocation's judge calls, as the tenant SYSTEM principal, so they record the
-subject with SYSTEM as actor and keep the accepted delegation chain as audit
-history. SYSTEM is never a subject and authorizes nothing: judge calls are checked against the
-run's accepted authority — the caller's verified effective principal and
-delegation chain for a manual run, the owner's authority recovered at
-acceptance for a background run — and gateway spend is charged to the subject.
-The accepted authority is stored with the run without a credential and
-survives claim, retry, and restart. Creation pairs are immutable, and
-registration and manual-run replay are scoped by tenant, subject, actor, and
-key.
+delegated caller B acting for A records A/B. A queued execution stores the
+accepted authority and delegation, without credentials, through the
+acknowledgment handoff and its row, and keeps it across claim, retry, and
+restart; caller submission never switches to binding-owner or SYSTEM
+authority. A scheduled execution runs with its binding owner's accepted
+authority. Wyrd performs model calls, tool calls, input reads, and result
+writes as the tenant SYSTEM executor, recording the subject with SYSTEM as
+actor; SYSTEM is never a subject and authorizes nothing extra. Gateway spend
+is charged to the subject.
 
-#### Drift implementation
-Subject-less observation definition. The implementation is orthogonal: signal +
-condition + math. Subject identity is supplied by the publisher at
-observation time (Doctrine #3, #21). No scheduling, no dispatch.
-Scheduling is a `Trigger`; dispatch is an `Operator`.
+#### Agents, tools, and workspaces
+
+Agent owns Prompt, tools, run configuration, and `execution_route`;
+server-hosted calls require `wyrd_gateway`. Overrides are keyed by step or
+requirement ID and replace that call's route whole. A check-position Agent is
+tool-less. A step Agent may declare a `workspace` mapping read-only `/inputs`
+paths to evidence; `/work` is bounded scratch for that invocation only.
+
+`AgentSpec.tool_names` selects server-owned built-ins: `cards.list`,
+`cards.get`, `cards.get_by_ref`, `bifrost.list_tables`,
+`bifrost.describe_table`, `bifrost.query`, `fs.list`, `fs.read`, `fs.search`,
+and `code.run`. The Invoker resolves them before the first model call through
+the existing `ToolResolver`/`ToolRegistry`; an unknown name fails, and
+filesystem tools and a workspace require each other. There is no fetch tool.
+Every call first needs `{"resource":"tool","action":"invoke"}` with scope
+`all` or `{ "tool": <exact name> }`, then the called capability's own
+permission (for `bifrost.query`, read on every table it touches). Neither
+grant implies the other, and neither is inferred from `verifier:run` or the
+Agent declaration. Calls run under the execution's accepted authority; each
+decision is audited non-blocking; tool names, arguments, output digests, and
+byte counts are recorded.
+
+`code` and `code.run` run in one per-process pool of sandboxed Python worker
+processes with a separate unprivileged identity, empty credential
+environment, OS-enforced network denial, parent-serviced file access, no
+subprocesses or host packages, and a fresh interpreter session per operation.
+Pool, memory, file, archive, extraction, scratch, tool-result, and deadline
+limits are startup environment settings; slot limits only lower them.
+
+#### Drift checks
+A `drift` check flattens the existing `DriftSpec` next to `on:
+inputs.<samples slot>`. No scheduling, no dispatch: scheduling is a
+`Trigger`; dispatch is an `Operator`.
 ```yaml
-spec:
-  description?: string
+check:
+  kind: drift
+  on: inputs.<samples slot>
   method: DriftMethod            # Spc | Psi | Custom
-  signal: DriftSignal            # how the measurement enters the monitor
-  condition: DriftCondition      # when a sample becomes an emittable observation
+  signal: DriftSignal            # how the measurement enters the check
+  condition: DriftCondition      # when a sample is judged drifted
   profile: DriftProfile          # matching PSI, SPC, or Custom config
 ```
 
-**`Agent`, `External`, and Eval-score methods/signals are deliberately absent
-from this delivery.** They have no complete input, fitting, or scoring contract
-here; adding them would freeze behavior Wyrd cannot yet honor.
+**`Agent`, `External`, and Eval-score methods/signals are deliberately absent.**
+They have no complete input, fitting, or scoring contract here.
 
-`DriftSignal` is a closed enum for this implementation:
+`DriftSignal` is a closed enum:
 
 | Variant         | Carries                                          | Use |
 |-----------------|--------------------------------------------------|-----|
@@ -1293,98 +1406,16 @@ authoring; the card stores resolved bounds):
 | `Below`         | `limit: f64`                     | Sample < `limit` |
 | `Outside`       | `lower: f64`, `upper: f64`       | Sample < `lower` or > `upper` |
 
-#### Eval implementation
-Subject-less behavioral assessment definition. The implementation is orthogonal:
-**how** to judge (`tasks` DAG), **where to read observations from**
-(`source_ref`, deferred), and an optional **offline driver** (`dataset`).
-Subject identity is supplied by the publisher at observation time
-(Doctrine #3, #21). No scheduling, no dispatch, no fire condition — its
-activation is an `observations_ready` Trigger and its failure reactions are
-the binding's Operators. Eval is a single typed task workflow, not a parallel
-mode/profile split.
-```yaml
-spec:
-  description?: string
-  tasks: [EvalTask]              # evaluation workflow — DAG via depends_on
-  dataset?: DatasetRef           # → Data — offline scenario driver
-  source_ref?: CardRef           # → Source — archived or external observation input
-  sampling?: EvalSampling
-  pass_gate?: EvalPassGate
-  context_capture?: EvalContextCapture
-  workflow?: Workflow
-  governance?: Governance
-  details: { string: NonSecretValue }
-```
-
-The typed-id grammar (`TaskId`, `ScenarioId`, `JsonPath`, `SessionId`,
-`RecordId`, `TraceId`, `SpanId`) lives in `wyrd-spec::vala::eval::ids` and
-`wyrd-spec::vala::ids`. `EvalStatus` (`Pending | AwaitingTrace | Processing |
-Completed | Failed | DeadLettered`) lives in
-`wyrd-spec::vala::eval::status`.
-
-**Three modes the same shape supports** (no `eval_mode` discriminator; presence
-of refs is the mode):
-
-| `dataset` | `source_ref` | Runtime behavior |
-|---------------|--------------|------------------|
-| set           | unset        | Offline scenario driver. No shipped route runs it; a future Verifier-backed offline route owns it. There is no Eval pull protocol. |
-| unset         | set          | Online / archived (deferred — DESIGN §13). Engine reads the user's sink, filters records by publisher `card_ref`, samples records into the task workflow. |
-| set           | set          | Same tasks, both modes (online deferred — DESIGN §13). Offline gate and online monitor share one task definition. |
-| unset         | unset        | Continuous: each committed `vala.eval.observations` record activates its subject's matching `observations_ready` bindings. |
-
-**Directional flow.** A Service component binding or standalone Agent declares
-`verified_by` with an Eval-backed Verifier and the runtime emits observations
-carrying the component's `card_uid` as subject identity. Continuous evaluation
-loads the committed subject record, executes the typed task workflow, and
-persists the common Verification Result plus Eval item details.
-
-`EvalTask` is a closed tagged union. Every variant carries `id: TaskId`,
-`depends_on: Vec<TaskId>`, and `condition: Option<EvalCondition>`.
-`EvalCondition` supports AND/OR chaining bounded at depth 16.
-
-| Variant          | Variant-specific carries                                                                          | Use |
-|------------------|---------------------------------------------------------------------------------------------------|-----|
-| `Assertion`      | `context_path?: string`, `operator: ComparisonOperator`, `expected: ParameterValue`, `description?: string` | Deterministic check on a dot-path into a record |
-| `LlmJudge` (`llm_judge`) | `judge_ref: InlineableRef<AgentSpec>`, `operator: ComparisonOperator`, `expected: ParameterValue`, `max_retries: u32` | LLM judge composed as Eval → Agent → Prompt; the Agent runs one constrained structured-output turn |
-| `TraceAssertion` | `span_selector: JsonPath`, `operator: ComparisonOperator`, `expected: ParameterValue`             | OTel span selector (tokens, duration_ms, retry_count, etc.) read via `source_ref` (deferred — see DESIGN.md §13) |
-| `AgentAssertion` | `workflow_field_path: JsonPath`, `operator: ComparisonOperator`, `expected: ParameterValue`       | Tool-call / response-shape check read via `source_ref` (deferred — see DESIGN.md §13) |
-
-`ComparisonOperator` is a closed typed catalog covering numeric, string,
-collection, type, and tolerance operations. Parameterless variants
-serialize as scalar `snake_case`; parameterized variants as `kind`-tagged
-objects. The collection, type, and tolerance families are required to keep
-authors out of LLM-judge calls
-for deterministic checks ("agent only used allowed tools" → `IsSubset`, "no
-duplicate tool calls" → `UniqueValues`, "score within 10% of baseline" →
-`WithinPctTolerance`, "output is valid JSON" → `IsJson`).
-
-`EvalScenario` is the row shape carried by a `Data` card bound to
-`dataset` (not an Eval field — scenarios and datasets are the same noun):
-```yaml
-- id: string
-  initial_query: string
-  predefined_turns?: [string]      # scripted multi-turn
-  simulated_user_persona?: string  # interactive driver
-  termination_signal?: string
-  max_turns?: u32
-  expected_outcome?: string
-  tasks?: [ScenarioTask]           # scenario-local tasks (passenger view: final response)
-```
-
-`ScenarioTask` is narrower than `EvalTask` — `id`, `operator`, `expected`,
-optional `condition` — because scenario evaluation operates on `{response,
-expected_outcome}` and is always evaluated together (no DAG).
-
-Scenario-local `tasks` are the **passenger view** (judged against the agent's
-final response for that scenario); top-level `Eval.tasks` are the **mechanic
-view** (judged against intermediate workflow records / spans / tool calls).
-Both run in one pass.
+Fitted state is owned by `vala-drift`, keyed by tenant, exact Verifier, and
+requirement ID. Existing threshold, minimum-sample, baseline-readiness, and
+insufficient-data rules apply; per-feature statistics, thresholds, counts,
+flags, and window identity are in the requirement `detail`.
 
 ### Source
 Read-side reference to an external data system. **Wyrd reads, never writes.**
 
 `source` is a **read-shape bucket**, not a vendor. The top-level discriminator is
-the shape of data a consuming Verifier implementation sees — a row set, a time
+the shape of data a consuming Verifier check sees — a row set, a time
 series, blobs — so a consumer binds to the shape and never to a vendor. The
 vendor (BigQuery vs Snowflake, Prometheus vs Datadog, GCS vs S3) is a
 **connection detail nested below the bucket**. This is the same axis `object_store`
@@ -1415,10 +1446,9 @@ Each bucket carries one uniform read contract; the vendor is a nested
 | `logs`           | query → log records                   | `loki` \| `elasticsearch` \| `splunk`    |
 | `traces`         | query → spans                         | `tempo` \| `datadog_apm` \| `jaeger`     |
 
-The bucket set lines up with what Drift and Eval implementations already read:
+The bucket set lines up with what Verifier checks already read:
 `object_store`/`sql_warehouse` feed `DriftSignal::Distribution` (rows),
-`metrics` feeds `DriftSignal::Metric`, `traces` feeds
-`EvalTask::TraceAssertion`.
+`metrics` feeds `DriftSignal::Metric`, `traces` feeds `trace` checks.
 
 **Secrets never live on the Card** (Doctrine #7). Every vendor connection carries
 a `SourceAuth` whose secret material is a **named server-side env var**, resolved
@@ -1457,7 +1487,7 @@ source:
 `(kind, vendor)`. The three connection families (object/blob list-and-read, SQL
 query, HTTP query) are different drivers behind one read trait; the Card schema
 never declares strategy — `vala` chooses it from the bucket and vendor, the same
-way it chooses the Drift/Eval evaluation strategy.
+way it chooses a drift check's evaluation strategy.
 
 ### Bifrost
 
@@ -1526,29 +1556,28 @@ of bindings.
 ```yaml
 spec:
   description?: string
-  kind: schedule | observations_ready     # closed activation discriminator
+  kind: schedule                          # closed activation discriminator
   cron: string                            # schedule only
   tz?: string                             # schedule only — IANA tz name, default UTC
 ```
 
-| Activation           | Valid Verifier implementation | Creates |
-|----------------------|-------------------------------|---------|
-| `schedule`           | `drift`                       | One run per active binding per due occurrence, over that binding's subject window. |
-| `observations_ready` | `eval`                        | One run per matching active binding for each committed Eval observation of that binding's subject. |
+`schedule` is the only automatic activation. Each due occurrence creates one
+execution per active binding over that binding's subject window
+`[previous boundary, due)`, filling `samples` slots from the binding's
+`inputs` map. Missed occurrences are skipped, not backfilled. A Trigger never
+fires on its own: nothing runs merely because a Trigger Card is registered,
+and one schedule occurrence shared by two subjects creates two subject-scoped
+executions, never one mixed-subject execution.
 
-Registration rejects an activation paired with the wrong Verifier
-implementation. A Trigger never fires on its own: nothing runs merely because
-a Trigger Card is registered, and one schedule occurrence shared by two
-subjects creates two subject-scoped runs, never one mixed-subject run.
-
-Eval run creation follows Scribe's acknowledgement and never delays it.
-After the ack, the server puts one run request per committed record into an
+Queued-execution creation follows Scribe's acknowledgement and never delays
+it. After the ack, the server puts one request per submission into an
 in-process outbox. One writer drains it, one multi-row insert per tenant,
-keyed by binding and record, so a repeated request inserts nothing. The
-outbox has no count limit and never drops a request because PostgreSQL is
-slow or down: a failed write keeps its batch and retries with backoff.
-Graceful shutdown flushes the outbox. A hard kill loses only unwritten
-requests, and every loss the process observes is counted and logged.
+deciding idempotent replay and conflict in that transaction, so a repeated
+request inserts nothing. The outbox has no count limit and never drops a
+request because PostgreSQL is slow or down: a failed write keeps its batch and
+retries with backoff. Graceful shutdown flushes the outbox. A hard kill loses
+only unwritten requests, and every loss the process observes is counted and
+logged.
 
 External pushes are deliberately not an activation — Rule 7 ("Wyrd reads, it
 does not push") means external data enters through a `Source`.
@@ -1641,31 +1670,30 @@ Templating context is one bounded, immutable failure context derived from
 the failed Verification Result: dispatch, run, result, and binding IDs; the
 exact Verifier and subject Card identities; the `failed` verdict; completion
 time; a bounded result summary; and one count block for the failed run's
-Verifier implementation (`verifier`, tagged by `implementation`). It never
-carries raw observation context, media, feature rows, feature names, Eval task
-detail, or secret material, and registration rejects unknown template fields.
+Verifier's drift checks when it has any. It never
+carries raw input context, media, feature rows, feature names, step output,
+or secret material, and registration rejects unknown template fields.
 Exact field schema lives in OpenAPI.
 
-| Implementation | Template fields |
+| Applies to | Template fields |
 |---|---|
 | any | `dispatch_id`, `run_id`, `result_id`, `binding_id`, `verifier_ref`, `verifier_card_uid`, `subject_ref`, `subject_uid`, `verdict`, `completed_at`, `summary` |
-| `drift` | `drift.drifted_features`, `drift.total_features` |
-| `eval` | `eval.passed_tasks`, `eval.failed_tasks`, `eval.total_tasks`, `eval.pass_rate_percent` (rounded down; `0` with no tasks) |
+| Verifiers with a drift check | `drift.drifted_features`, `drift.total_features` |
 
 Counts render as base-10 digits and come from the same result as `summary`.
-A standalone Operator Card may use fields of either implementation; a
-binding refuses an attached Operator (inline or referenced) that uses the
-other implementation's fields, naming the binding field path.
+A binding refuses an attached Operator (inline or referenced) that uses
+`drift.*` fields for a Verifier without a drift check, naming the binding
+field path.
 
 ```yaml
-# Drift Verifier's on_failure
+# on_failure of a Verifier with a drift check
 kind: notify
 channel: { kind: slack, connection: ops-slack, channel_id: C0123456789,
            text: "{{drift.drifted_features}}/{{drift.total_features}} features drifted on {{subject_ref}} ({{verifier_ref}})" }
-# Eval Verifier's on_failure
+# on_failure of any Verifier
 kind: notify
 channel: { kind: slack, connection: ops-slack, channel_id: C0123456789,
-           text: "{{subject_ref}} passed {{eval.passed_tasks}}/{{eval.total_tasks}} tasks ({{eval.pass_rate_percent}}%)" }
+           text: "{{verifier_ref}} failed on {{subject_ref}}: {{summary}}" }
 ```
 
 ---
@@ -1813,16 +1841,16 @@ is available only at `InlineableRef<T>` slots.
 | Kind | Must pre-register? | Why |
 |------|---------------------|-----|
 | `Model`        | **Yes** | Carries weight artifacts; lineage anchor. |
-| `Data`         | **Yes** (unless used purely as inline eval scenarios, which v1 does not support — `dataset` is `DatasetRef`-only) | Carries dataset bytes; lineage anchor. |
+| `Data`         | **Yes** | Carries dataset bytes; lineage anchor. |
 | `Experiment`   | **Yes** | Carries run history. |
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
 | `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`; registration materializes it as `<agent-name>-prompt`. |
-| `Agent`        | Optional | Light. Spec-only; `apply` registers it. `LlmJudgeTask.judge_ref` is `InlineableRef<AgentSpec>`. |
+| `Agent`        | Optional | Light. Spec-only; `apply` registers it. Verifier `agent` actions and checks take `InlineableRef<AgentSpec>`. |
 | `Verifier`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
 
 A single YAML file may contain many `---`-separated card documents — `wyrd
-apply -f eval-suite.yaml` registers all of them in dependency order. The Agent
-under test, the Source it reads from, and the Verifier that judges it can all
+apply -f verification-suite.yaml` registers all of them in dependency order. The Agent
+under test, its judge Agent, and the Verifier that judges it can all
 ship in one file.
 
 ### Reference forms
@@ -1880,8 +1908,8 @@ relationship tests all project from it:
   `Service.verified_by` — each binding's `verifier`, `runs_on`, and
   `on_failure[]`
 - `Agent.prompt`
-- Verifier implementation refs: Eval `dataset` and
-  `EvalTask::LlmJudge.judge_ref`; Drift `signal.baseline_ref`
+- Verifier refs: `agent` action and check `agent`, `code` Artifact `source`,
+  and drift check `signal.baseline_ref`
 - Heavy anchors: `Model`/`Data`/`Experiment` `*_refs`, `Artifact` refs
 
  A new reference-bearing field is added to this inventory in one place; it then
@@ -2045,17 +2073,17 @@ foreign-card content pinning are not supported workflows.
 
 | Card    | Refs that authored on it             | Refs that point at it          |
 |---------|--------------------------------------|--------------------------------|
-| Data    | `card_refs`, `splits`                 | Verifier Drift `signal.baseline_ref`, Verifier Eval `dataset`, `Experiment.target_refs` |
+| Data    | `card_refs`, `splits`                 | Verifier drift check `signal.baseline_ref`, `Experiment.target_refs` |
 | Model   | `card_refs`                           | `Service.components.ref`, `Experiment.target_refs` |
-| Agent   | `prompt`, `tool_names`, `verified_by` | `Service.components.ref`, Agent prompts (sub-agent calls), Verifier Eval `LlmJudge.judge_ref` |
+| Agent   | `prompt`, `tool_names`, `verified_by` | `Service.components.ref`, Agent prompts (sub-agent calls), Verifier `agent` actions and checks |
 | Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |
-| Verifier| Drift `signal.baseline_ref`; Eval `dataset`, `tasks[].LlmJudge.judge_ref` | `*.verified_by[].verifier` |
+| Verifier| `agent` actions and checks, `code` Artifact sources, drift `signal.baseline_ref` | `*.verified_by[].verifier` |
 | Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
 | Service | `components[].ref`, `components[].verified_by`, `verified_by` | — |
 | Policy  | `rules`                              | `Service.components.ref` |
-| Trigger | `schedule` or `observations_ready` activation | `*.verified_by[].runs_on` |
+| Trigger | `schedule` activation | `*.verified_by[].runs_on` |
 | Operator| `action` (typed `channel` shape \| tenant connection) | `*.verified_by[].on_failure` |
-| Source  | `kind` (bucket), `connection` (vendor + `*_env`) | Verifier Eval `source_ref` |
+| Source  | `kind` (bucket), `connection` (vendor + `*_env`) | — |
 
 `Service.components` accepts: Agent, Prompt, Model, Mcp, Policy. No
 other kinds are runtime-aliased into a Service.
@@ -2085,8 +2113,8 @@ services/ops-copilot/
 │   ├── runbook-policy.yaml
 │   └── service-policy.yaml
 ├── observability/
-│   ├── triage-eval.yaml         # source_ref → run-archive
-│   ├── runbook-eval.yaml
+│   ├── triage-review.yaml       # agent steps and checks
+│   ├── runbook-review.yaml
 │   ├── triage-drift.yaml
 │   ├── runbook-drift.yaml
 │   └── service-latency-drift.yaml
@@ -2111,8 +2139,7 @@ The following choices constrain every implementation:
   Runtime uses the `vala` read trait keyed on `(kind, vendor)` and exposes the
   connectivity preflight as `wyrd source check <ref>`.
 
-- **Eval signal decomposition.** The Eval implementation does not carry its
-  own `signal` decomposition; its per-task pass/fail and pass gate produce the
-  Verifier's verdict directly. The input edges (`dataset` vs `source_ref`) are
-  optional refs, not a tagged enum: presence is the mode (offline driver,
-  online sink, both, or neither → continuous `vala.eval.observations`).
+- **One declarative Verifier.** A Verifier is inputs, steps, requirements,
+  and decide; drift and agent judging are check kinds, not Verifier kinds.
+  Evidence mode (Run or Window) follows from the slot and check types, so
+  `verify` and `submit` route without an authored discriminator.

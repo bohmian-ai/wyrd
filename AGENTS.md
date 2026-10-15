@@ -85,8 +85,8 @@ Locked cross-cutting decisions that any contributor must honor:
   outer `kind: Card` wrapper. The v1 doctrine has 14 registrable native kinds:
   `Data`, `Model`, `Artifact`, `Experiment`, `Prompt`, `Agent`, `Mcp`,
   `Service`, `Policy`, `Audit`, `Verifier`, `Source`, `Trigger`, and
-  `Operator`. Drift and Eval are typed `Verifier`
-  implementations, not Card kinds. `CardKind::External` is a non-registrable
+  `Operator`. Drift and Agent judging are `Verifier` check kinds,
+  not Card or Verifier kinds. `CardKind::External` is a non-registrable
   discriminator for foreign schema descriptors; it has no `ExternalSpec`.
 - `Tool` is a Skald/runtime registry concept, not a Card kind.
 - Sub-agency is an Agent-to-Agent relationship, not a `SubAgent` Card kind.

@@ -1,6 +1,6 @@
 ---
 title: Record a run and observations
-description: Load your Service's bundle, record eval observations and custom rows inside a run, and read them back by run ID.
+description: Load your Service's bundle, record custom rows and verification evidence inside a run, and read them back by run ID.
 pillar: wyrd
 section: Build and verify
 topic: Observe
@@ -88,7 +88,6 @@ def answer_question(ticket_id: str, question: str) -> str:
             "vala.datasets.tickets",
             {"ticket_id": ticket_id, "question": question, "answer": answer, "refund": "refund" in question},
         )
-        run.observe.eval({"answer": answer})
     return answer
 ```
 
@@ -97,19 +96,16 @@ def answer_question(ticket_id: str, question: str) -> str:
 
 ```rust
 use serde_json::json;
-use wyrd_ai::observe::EvalObservationOptions;
 
 async fn answer_question(state: &WyrdState, ticket_id: &str, question: &str) -> Result<String, WyrdError> {
     let run = state.run_for_card("agent")?;
     let answer = run.invoke(&[("question", question)]).await?;
-    let observe = run.observe();
-    observe
+    run.observe()
         .record(
             "vala.datasets.tickets",
             &json!({ "ticket_id": ticket_id, "question": question, "answer": answer, "refund": question.contains("refund") }),
         )
         .await?;
-    observe.eval(&json!({ "answer": answer }), EvalObservationOptions::default())?;
     Ok(answer)
 }
 ```
@@ -127,7 +123,6 @@ async function answerQuestion(ticketId: string, question: string): Promise<strin
     answer,
     refund: question.includes("refund"),
   });
-  run.observe.eval({ answer });
   return answer;
 }
 ```
@@ -137,22 +132,22 @@ async function answerQuestion(ticketId: string, question: string): Promise<strin
 
 `invoke` runs the Agent's Prompt through the AI Gateway, so the model call lands in `vala.gateway.calls` under the same run. It needs a gateway deployment for the Prompt's model. If your service calls its model itself, skip `invoke` and record what it did; the observations work the same.
 
-When one request touches several components, such as an agent and a model that scores the customer, `run.for_card(alias)` rescopes the same run to each one, so the rows still share one `run_id`. `eval` also takes a `session_id`, a UUID that groups the runs of one conversation.
+When one request touches several components, such as an agent and a model that scores the customer, `run.for_card(alias)` rescopes the same run to each one, so the rows still share one `run_id`. A `session_id`, a UUID, groups the runs of one conversation.
 
 What each call is for:
 
 | Call | Records | Use it when |
 | --- | --- | --- |
-| `observe.drift(features)` | One flat row of feature values, stored one row per feature | A [drift Verifier](/build-and-verify/verify/monitor-drift/) should compare these values with a baseline |
-| `observe.eval(context)` | One JSON record of what the agent was given and did | An [eval Verifier](/build-and-verify/verify/evaluate-agent-behavior/) should judge it |
 | `observe.record(table, row)` | One row in your own `vala.datasets` table | You want the data for your own queries |
-| `observe.verify(name, input)` | Nothing to observe; returns a verdict now | Your code needs the answer before it responds. See [Verify a request in real time](/build-and-verify/verify/verify-a-request-in-real-time/) |
+| `observe.verify(name, inputs)` | The inputs and the result; returns the verdict now | Your code needs the answer before it responds. See [Verify a request in real time](/build-and-verify/verify/verify-a-request-in-real-time/) |
+| `observe.submit(name, inputs)` | The inputs, then a queued execution; returns its handle | A slower check should judge it in the background. See [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) |
+| `observe.submit(name, samples)` on a drift Verifier | One flat row of feature values, stored one row per feature | A [drift Verifier](/build-and-verify/verify/monitor-drift/) should compare them with a baseline on its schedule |
 
 `record` needs the table to exist first. Declare it under the Service's `spec.tables` so it is created on registration, or register it with the [Bifrost client](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/#1-register-a-table).
 
 The Python `with` block tags every OpenTelemetry span started inside it with the run, so traces line up with observations. It does not flush. In TypeScript, `run.scope(fn)` does the same for spans started in `fn`; in Rust, `run.scope(future)`.
 
-`drift` and `eval` return once the row is queued, and add almost no time to a request. `record` is async in Rust and TypeScript because the first call for a table looks it up on the server.
+Drift samples return once the row is queued, and add almost no time to a request. `record` is async in Rust and TypeScript because the first call for a table looks it up on the server.
 
 ### Trace an agent framework
 
@@ -448,7 +443,7 @@ WHERE run_id = $1
 
 `Bifrost().trace_timeline(trace_id)` (`traceTimeline` in TypeScript) returns one trace's spans with their parent ids, status, and attributes.
 
-The ticket row has `card_uid` set to the `support-agent` version that ran. The eval row in `vala.eval.observations` and the gateway call in `vala.gateway.calls` carry the same `run_id`, so one join reads the whole request back. Rows become queryable a short time after `flush` returns. An empty result right after a flush is not proof they are missing; retry first.
+The ticket row has `card_uid` set to the `support-agent` version that ran. The Agent's spans in `vala.traces.spans` and the gateway call in `vala.gateway.calls` carry the same `run_id`, so one join reads the whole request back. Rows become queryable a short time after `flush` returns. An empty result right after a flush is not proof they are missing; retry first.
 
 ## What can go wrong
 

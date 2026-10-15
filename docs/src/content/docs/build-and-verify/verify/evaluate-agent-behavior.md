@@ -1,6 +1,6 @@
 ---
 title: Evaluate agent behavior
-description: Write an eval Verifier, bind it so the server judges every eval observation, and read the verdict and per-task results.
+description: Check what an agent did, not only what it said, with trace checks, Agent judges, Agent preparation steps, and Python code, and queue the review in the background.
 pillar: wyrd
 section: Build and verify
 topic: Verify
@@ -9,80 +9,159 @@ draft: true
 status: runnable
 ---
 
-Bind an eval Verifier with `observations_ready`, and the server judges every eval observation your agent records, without your code waiting on it. Here an LLM judge grades every answer the support desk gives.
+An answer can read well and still come from the wrong process: the agent skipped the policy lookup, or quoted a clause it never read. This guide builds a Verifier that checks the support agent's trace, has an Agent read the policy and cite it, and has a tool-less judge decide whether the answer follows those findings. Because the review takes longer than a request should wait, it is queued with `submit`.
 
 ## Prerequisites
 
 - The `support-desk` declaration from [Cards, versions, and relationships](/understand/cards-versions-and-relationships/), and `editor` to register it.
-- A running service that records eval observations, as in [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/).
-- For an `llm_judge` task, a judge Prompt Card whose model your server's AI Gateway can reach. `judge_ref` takes an inline judge like the one below, or a reference to an Agent Card.
+- A running service with tracing on, as in [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/).
+- An AI Gateway deployment the server can call. Server-hosted Agents run through `execution_route: { kind: wyrd_gateway, ... }`.
+- The permissions in [Agent tools and authorization](/reference/agent-tools-and-authorization/) for the tools your Agents use.
 
-## 1. Write the Verifier
+## 1. Write the Agents
 
-```yaml title="service/answer-quality.yaml"
+A preparation Agent reads the policy with a built-in tool and returns findings with citations. Its Prompt's `response_format` is the shape downstream checks read.
+
+```yaml title="service/policy-reader.yaml"
+apiVersion: wyrd/v1
+kind: Agent
+metadata: { space: support, name: policy-reader, version: 1.0.0 }
+spec:
+  execution_route: { kind: wyrd_gateway, deployment: anthropic-primary }
+  tool_names: [fs.read, fs.search]
+  run_config: { max_iterations: 8, timeout_ms: 120000 }
+  prompt:
+    provider: anthropic
+    model: claude-sonnet-5-5
+    system: The refund policy is at /inputs/policy.pdf. Read it with fs.read before answering.
+    messages:
+      - role: user
+        content: "List every policy rule that applies to this answer, with page citations: {{answer}}"
+    settings: { max_output_tokens: 2048 }
+    response_format:
+      type: object
+      properties:
+        rules:
+          type: array
+          items:
+            type: object
+            properties:
+              rule: { type: string }
+              citations: { type: array, items: { type: object } }
+            required: [rule, citations]
+      required: [rules]
+      additionalProperties: false
+```
+
+A judge in a check position has no tools and no workspace, and must return the Verdict schema:
+
+```yaml title="service/policy-judge.yaml"
+apiVersion: wyrd/v1
+kind: Agent
+metadata: { space: support, name: policy-judge, version: 1.0.0 }
+spec:
+  execution_route: { kind: wyrd_gateway, deployment: anthropic-primary }
+  run_config: { max_iterations: 1, timeout_ms: 30000 }
+  prompt:
+    provider: anthropic
+    model: claude-sonnet-5-5
+    system: Judge one claim against the evidence. Cite only the citations you were given.
+    messages:
+      - role: user
+        content: |
+          Claim: {{claim}}
+          Answer: {{answer}}
+          Policy findings: {{findings}}
+    settings: { max_output_tokens: 1024 }
+    response_format:
+      type: object
+      properties:
+        outcome: { type: string, enum: [passed, failed, inconclusive] }
+        reason: { type: string }
+        citations:
+          type: array
+          items:
+            type: object
+            properties:
+              slot: { type: string }
+              locator: { type: object }   # { page } | { slide } | { lines: { start, end } } | { json_pointer } | { region }
+            required: [slot, locator]
+      required: [outcome, reason, citations]
+      additionalProperties: false
+```
+
+## 2. Write the Verifier
+
+```yaml title="service/answer-behavior.yaml"
 apiVersion: wyrd/v1
 kind: Verifier
-metadata:
-  name: answer-quality
-  version: 1.0.0
-  space: default
+metadata: { space: support, name: answer-behavior, version: 1.0.0 }
 spec:
-  description: An LLM judge grades every observed answer.
-  implementation:
-    kind: eval
-    spec:
-      pass_gate: {kind: all_pass}
-      tasks:
-        judge:
-          kind: llm_judge
-          id: judge
-          judge_ref:
-            prompt: ./judge-prompt.yaml
-            tool_names: []
-            run_config: {max_iterations: 1}
-          context_path: $.answer
-          operator: equals
-          expected: {passed: true}
-          max_retries: 0
+  inputs:
+    answer: { type: json }
+    policy: { type: media, formats: [pdf] }
+    trace:  { type: trace }
+  steps:
+    - id: findings
+      action:
+        kind: agent
+        agent: ./policy-reader.yaml
+        inputs: { answer: inputs.answer }
+        workspace: { /inputs/policy.pdf: inputs.policy }
+      retries: 1
+      timeout_seconds: 120
+  requirements:
+    - id: looked-up-policy
+      statement: The agent called the policy lookup tool
+      check:
+        kind: trace
+        on: inputs.trace
+        span_selector: "$.spans[?(@.name == 'tool.policy_lookup')]"
+        operator: is_non_empty
+    - id: cites-a-rule
+      statement: At least one policy rule applies
+      check:
+        kind: code
+        runtime: python
+        entrypoint: judge
+        inputs: { findings: steps.findings.output }
+        source:
+          inline: |
+            def judge(findings):
+                rules = findings["rules"]
+                if not rules:
+                    return {"outcome": "failed", "reason": "no rule applies", "citations": []}
+                return {"outcome": "passed", "reason": rules[0]["rule"], "citations": rules[0]["citations"]}
+    - id: follows-policy
+      statement: The answer is consistent with every applicable policy rule
+      check:
+        kind: agent
+        agent: ./policy-judge.yaml
+        inputs:
+          claim: requirement.statement
+          answer: inputs.answer
+          findings: steps.findings.output
 ```
 
-`judge-prompt.yaml` asks the model to grade the answer and return `{"passed": true}` or `{"passed": false}` through a JSON schema, so the result compares like any other value.
+How it runs:
 
-An LLM call per answer adds up. To skip the judge on answers that already fail a cheap check, add an assertion and make the judge depend on it:
+1. `findings` copies the PDF into a fresh workspace at `/inputs/policy.pdf`. The Agent reads it with `fs.read`, which returns text with page locators, and returns its rules. Every tool name, argument, output digest, and byte count is recorded on the step.
+2. `looked-up-policy` reads the stored trace. It needs no step, so it runs while `findings` is still working.
+3. `cites-a-rule` and `follows-policy` both read `steps.findings.output`, so they wait for it. The code check runs in an isolated Python worker with no network, credentials, or host files. The judge reuses the reader's citations; the server checks each cited page exists in the pinned PDF.
+4. `decide: all` (the default) combines the three verdicts.
 
-```yaml
-      tasks:
-        not_empty:
-          kind: assertion
-          id: not_empty
-          context_path: $.answer
-          operator: is_non_empty
-        judge:
-          kind: llm_judge
-          id: judge
-          depends_on: [not_empty]
-          # ...as above
-```
+If `findings` fails after its retry, both requirements that need its output are `inconclusive`, not failed: the evidence is missing, not the subject at fault. A judge or code check that returns an invalid Verdict, or a `passed` without a valid citation, is `inconclusive`.
 
-The rules that trip people up:
+Built-in tools are resolved by name when the Agent runs; you never register a callable. [Agent tools and authorization](/reference/agent-tools-and-authorization/) lists them and the permissions each call needs. Code limits are in [Verification runtime limits](/reference/verification-runtime-limits/).
 
-- **Set `pass_gate`.** Without one, every run ends `inconclusive` and no Operator ever fires. `all_pass` requires every task to pass; `overall_pass_rate` and `per_judge_pass_rate` take a `threshold` between 0 and 1.
-- **Each task's key must equal its `id`.** Registration rejects a mismatch.
-- **`depends_on` orders tasks.** A task runs only after the tasks it depends on pass, so you do not pay for an LLM call on an answer that already failed. A task skipped because of a failed dependency appears as skipped, not passed.
-- **`context_path` is a JSONPath into the observation's context.** It must match the field names your code records.
-- **A judge's output is compared like any other value.** The judge returns a structured object; `expected: { passed: true }` passes when the judge says so.
-
-To judge only some observations, add `sampling`: `{ kind: ratio, ratio: 0.1 }`, `{ kind: every_nth, n: 10 }`, or `{ kind: deterministic_by_hash, key_path, modulus, bucket }`. A record sampling drops gets an `inconclusive` verdict.
-
-## 2. Bind it and register
+## 3. Bind it and register
 
 ```yaml title="service/support-desk.yaml (excerpt)"
 - alias: agent
   ref: ./support-agent.yaml
   verified_by:
-    - verifier: ./answer-quality.yaml
-      runs_on: {kind: observations_ready}
-      on_failure:                          # not in the example: page someone on a failed verdict
+    - verifier: ./answer-behavior.yaml
+      on_failure:
         - ./page-support-oncall.yaml
 ```
 
@@ -90,122 +169,81 @@ To judge only some observations, add `sampling`: `{ kind: ratio, ratio: 0.1 }`, 
 wyrd apply examples/support-desk/service/
 ```
 
-The binding changes the Service's content, so it needs a new Service version. `support-desk.yaml` pins `version: 1.0.0`; bump it, for example to `1.1.0`, or `wyrd apply` fails with `WYRD_REGISTRY_409_SPEC_DRIFT`. Then redeploy your service with a bundle of that version (`wyrd get ... --version <new>`); a running process keeps the bindings of the version it loaded.
+The binding changes the Service's content, so bump `metadata.version` in `support-desk.yaml` first, or `wyrd apply` fails with `WYRD_REGISTRY_409_SPEC_DRIFT`. Then redeploy with a bundle of that version; a running process keeps the bindings it loaded.
 
-## 3. Record eval observations
-
-Nothing new in your service code. Every `observe.eval` on the `agent` run becomes a run of the Verifier once Bifrost commits it:
+## 4. Queue the review
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
 ```python
+import wyrd
+
 with state.run("agent") as run:
     answer = run.invoke({"question": question})
-    run.observe.eval({"answer": answer})
+    execution = run.observe.submit(
+        "answer-behavior",
+        answer={"text": answer},
+        policy=wyrd.File("refund-policy.pdf"),
+        trace=run.trace_id,
+    )
+    save_review(ticket_id, execution.id)
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
 ```rust
+use wyrd_ai::observe::{File, Input, Inputs, Submission};
+
 let run = state.run_for_card("agent")?;
 let answer = run.invoke(&[("question", question)]).await?;
-run.observe().eval(&json!({ "answer": answer }), EvalObservationOptions::default())?;
-```
-
-</LangTab>
-<LangTab lang="typescript">
-
-```typescript
-const run = state.run("agent");
-const answer = await run.invoke({ question });
-run.observe.eval({ answer });
-```
-
-</LangTab>
-</LangTabs>
-
-An eval observation about `support-agent` runs the `observations_ready` bindings on that Agent owned by the exact Service version whose credential wrote it. Another Service that also uses `support-agent` gets no run from your observations, and neither does an older `support-desk` version. The verdict is usually ready within seconds. A Verifier with `trace_assertion` tasks waits up to 5 minutes for the run's trace to land, then errors with `eval_trace_unavailable` if it never does.
-
-## 4. Read the verdicts
-
-Join each verdict to the observation it judged through `source_record_id`, then to the per-task rows through `result_id`:
-
-<LangTabs langs={['python', 'rust', 'typescript']}>
-<LangTab lang="python">
-
-```python
-from wyrd.bifrost import Bifrost
-
-bifrost = Bifrost()
-rows = bifrost.sql(
-    """
-    SELECT r.verdict, i.task_id, i.passed, i.skip_reason, i.message
-    FROM vala.eval.observations AS o
-    JOIN vala.verification.results AS r ON r.source_record_id = o.record_id
-    JOIN vala.eval.result_items AS i ON i.result_id = r.result_id
-    WHERE o.run_id = $1
-    ORDER BY r.ended_at, i.task_id
-    """,
-    [run.run_id],
-)
-print(rows.to_pandas())
-```
-
-</LangTab>
-<LangTab lang="rust">
-
-```rust
-use wyrd_ai::{Bifrost, bifrost::{BifrostOptions, QueryParam}};
-
-let bifrost = Bifrost::connect(BifrostOptions::default()).await?;
-let rows = bifrost
-    .sql(
-        "SELECT r.verdict, i.task_id, i.passed, i.skip_reason, i.message \
-         FROM vala.eval.observations AS o \
-         JOIN vala.verification.results AS r ON r.source_record_id = o.record_id \
-         JOIN vala.eval.result_items AS i ON i.result_id = r.result_id \
-         WHERE o.run_id = $1 \
-         ORDER BY r.ended_at, i.task_id",
-        &[QueryParam::String(run.run_id().to_string())],
+let submission = run
+    .observe()
+    .submit(
+        "answer-behavior",
+        Inputs::named([
+            ("answer", Input::from(json!({ "text": answer }))),
+            ("policy", File::path("refund-policy.pdf").into()),
+            ("trace", Input::from(json!(trace_id.to_string()))),
+        ]),
     )
     .await?;
+if let Submission::Queued(execution) = submission {
+    save_review(ticket_id, execution.id());
+}
 ```
 
 </LangTab>
 <LangTab lang="typescript">
 
 ```typescript
-import { Bifrost } from "wyrd-ai";
+import { File } from "wyrd-ai";
 
-const bifrost = await Bifrost.connect();
-const rows = await bifrost.sql(
-  `SELECT r.verdict, i.task_id, i.passed, i.skip_reason, i.message
-     FROM vala.eval.observations AS o
-     JOIN vala.verification.results AS r ON r.source_record_id = o.record_id
-     JOIN vala.eval.result_items AS i ON i.result_id = r.result_id
-    WHERE o.run_id = $1
-    ORDER BY r.ended_at, i.task_id`,
-  [run.runId],
-);
+const run = state.run("agent");
+const answer = await run.invoke({ question });
+const execution = await run.observe.submit("answer-behavior", {
+  answer: { text: answer },
+  policy: File.path("refund-policy.pdf"),
+  trace: traceId,
+});
+await saveReview(ticketId, execution.id);
 ```
 
 </LangTab>
 </LangTabs>
 
-One row per task for the judged answer. To read a whole conversation, record a `session_id` with each eval observation and filter on `o.session_id` instead. A failed verdict names the task that failed in `task_id`, with `actual`, `expected`, and `message` columns explaining why. A task with a `skip_reason` did not run; it is not a pass.
-
-If no verdict appears for an observation, the run may still be pending or may have errored without producing one. [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) shows how to read the binding and run status.
+`submit` returns as soon as the evidence is staged. Read the result later, from this process or another, as in [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/). A `failed` verdict pages `page-support-oncall`; `inconclusive` and execution errors do not.
 
 ## What can go wrong
 
 | Symptom or code | Cause | Fix |
 | --- | --- | --- |
-| Every verdict is `inconclusive` | No `pass_gate`, or every task skipped | Add `pass_gate`; check that `context_path` matches the recorded fields |
-| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` at `wyrd apply` | `schedule` on an eval Verifier | Use `observations_ready` |
-| Registration error naming a task key | A task's key differs from its `id` | Make them match |
-| No result rows at all | The service runs an older Service version without the binding, or wrote no eval observations | Deploy the new version; query `vala.eval.observations` for the run |
-| `WYRD_VALA_403_BIFROST_CARD_SCOPE` at `flush` or `shutdown` | The service recorded about a Card outside its declaration | Record only on aliases in its own Service |
+| Registration refuses `policy-judge` in a check | A check-position Agent has `tool_names` or a workspace | Remove them; pass what it needs through `inputs` |
+| Registration refuses an Agent call's `inputs` | Its keys differ from the Prompt's placeholders | Make them match exactly, in both directions |
+| Registration refuses a reference | An unknown step or slot, a cycle, or a check reading another requirement's verdict | Fix the reference; only actions and `when` read verdicts |
+| `follows-policy` is `inconclusive` with a citation reason | The judge passed without a valid citation into the pinned evidence | Give the judge the reader's citations and tell it to cite them |
+| `findings` failed with a tool denial | The verification's principal lacks `tool:invoke` for that tool | Grant it; see [Agent tools and authorization](/reference/agent-tools-and-authorization/) |
+| Every requirement `inconclusive` | The trace was not yet stored, or `findings` failed | Read the step `reason`; submit after the trace is flushed |
 
-To check an answer before it goes out instead of after, call the same Verifier in [real time](/build-and-verify/verify/verify-a-request-in-real-time/).
+To check an answer before it goes out instead of after, call a Verifier in [real time](/build-and-verify/verify/verify-a-request-in-real-time/).

@@ -1,29 +1,30 @@
 # Evaluation
 
-Load for Eval-backed Verifiers, scenario execution, deterministic and
-LLM-based checks, judge quality, scoring, or evidence used by policy and
-release decisions.
+Load for Verifier requirements and checks, Agent preparation steps and
+judges, sandboxed code checks, judge quality, scoring, or evidence used by
+policy and release decisions.
 
-## Evaluation is a declared workflow
+## Evaluation is a declared Verifier
 
-Eval is a `Verifier` implementation (`implementation.kind: eval`), not a Card
-kind. The Verifier is reusable and subject-less and declares a typed DAG of
-checks; a Service component, Service, or standalone Agent binds it through
-versioned `verified_by` with an `observations_ready` Trigger. Runtime
-observation `card_uid` supplies subject identity. Each committed
-`vala.eval.observations` record activates one run per matching active binding
-of that subject, and the run records the common Verification Result plus Eval
-item details. There is no Eval pull protocol; a future offline dataset route
-must be Verifier-backed. Do not create a parallel evaluation ontology.
+A `Verifier` declares named evidence `inputs`, optional preparation `steps`
+(`extract`, `agent`, `code`), `requirements` that each produce one verdict
+through an `assert`, `trace`, `agent`, `code`, or `drift` check, and a `decide`
+rule. There is no Eval Card or Verifier kind. A Service component, Service,
+or standalone Agent binds it through versioned `verified_by`; the caller runs
+it with `verify` (inline result) or `submit` (queued execution), and a
+`schedule` Trigger runs Window Verifiers. Every execution records one
+`VerificationResult` with the requirement and step breakdown. Do not create a
+parallel evaluation ontology.
 
-Each task has a stable ID, typed comparator, input selector, expected value,
-dependencies, retry budget, and failure disposition. Validate the DAG for
-cycles, depth, fan-out, inaccessible paths, and hidden network work before
-execution. Aggregate results retain every task result and criticality; a total
-score never hides a required failed assertion or missing evidence.
+Each step and requirement has a Verifier-unique ID, explicit references to
+inputs and upstream outputs, retries, a timeout, and an optional `when`.
+Validate the step graph for cycles, unknown references, position violations,
+and known-schema fields at registration. Aggregation keeps every requirement
+outcome; `decide` never lets an average hide a failed requirement under `all`,
+and inconclusive requirements count against a `pass_rate`.
 
 Prefer deterministic assertions for equality, ranges, types, subsets, schema,
-trace facts, tool use, and workflow structure. Use an LLM judge only for a
+trace facts, tool use, and workflow structure. Use an Agent check only for a
 criterion that cannot be represented honestly by a deterministic comparator.
 
 ## Reproducible evidence
@@ -31,11 +32,11 @@ criterion that cannot be represented honestly by a deterministic comparator.
 Bind every result to:
 
 - the exact subject Card version;
-- evaluator Card/configuration and task graph;
-- dataset/source identity, selected records, ordering, and time window;
-- prompt, judge Card, provider/model version, decoding parameters, and seed
-  where applicable;
-- scenario, Run, Observation, request, trace, and attempt identities;
+- the exact Verifier Card, its steps, and requirement configuration;
+- pinned input digests, extraction version, and, for drift, window and baseline;
+- Agent and Prompt versions, effective route, provider/model version,
+  decoding parameters, code hash and runtime, and tool-call digests;
+- execution, Run, request, trace, and attempt identities;
 - retry, abstention, parse, provider, and terminal status;
 - the raw or derived evidence permitted by the configured capture and
   sensitive-data policy.
@@ -43,7 +44,7 @@ Bind every result to:
 A repeatable assertion uses deterministic ordering and seeds. A remote model
 call is not guaranteed repeatable even with a seed; record the provider's
 sampling inputs and classify the result as stochastic evidence. A changed
-dataset, rubric, judge, model, prompt, or task graph is a new evaluation input
+input, rubric, judge, model, prompt, or step graph is a new evaluation input
 and is never silently compared as the same experiment.
 
 Context capture is explicit and least-privilege. Full traces or payloads may be
@@ -51,17 +52,20 @@ needed for agent diagnosis, but they require sensitive access, bounded size,
 redaction, and retention. Missing required context yields indeterminate or data
 quality failure, never a pass.
 
-## LLM judges
+## Agent judges
 
-- Use one versioned Prompt Card per judge task with a closed output schema.
-- Require `pass`, `fail`, and `indeterminate`/`abstain` outcomes; parsing or
-  missing-evidence failure is not a negative judgment about the subject.
+- A check-position Agent is tool-less and returns the closed Verdict schema
+  `{outcome: passed | failed | inconclusive, reason, citations}`; parsing or
+  missing-evidence failure is `inconclusive`, never a negative judgment.
+- A pass needs at least one citation the server validates against pinned
+  original evidence; preparation steps pass their citations forward through
+  explicit inputs.
 - Calibrate against representative human-labelled examples. Report agreement,
   disagreement, abstention, retry, parse-failure, and subgroup behavior.
 - Test position, verbosity, reference, provider, and model-version sensitivity.
 - Keep bounded retries visible. A retry that changes a judgment is reliability
   evidence, not noise to discard.
-- Do not let a judge invoke production tools, mutate the subject, retrieve
+- Do not let a judge invoke tools, mutate the subject, retrieve
   unrestricted context, or decide deployment solely from an opaque score.
 
 Pairwise comparison is appropriate only with controlled ordering and a
@@ -78,17 +82,17 @@ quality does not prove production availability, security, latency, or drift.
 
 ## Failure modes
 
-Reject incompatible-score comparison, silent task skipping, safety-critical
-failure hidden by an average, unbounded task fan-out, provider calls without
+Reject incompatible-score comparison, silent requirement skipping, safety-critical
+failure hidden by an average, unbounded step fan-out, provider calls without
 deadlines, retries omitted from results, a judge with production mutation
 authority, and a green result with missing required traces. Exhausted,
 cancelled, indeterminate, and failed checks remain distinct terminal states.
 
 ## Stable Wyrd anchors
 
-- Eval contract: `architecture/wyrd-design.md` §Verifier (Eval implementation).
-- Eval types: `crates/wyrd-spec/src/vala/eval/`.
-- Engine: `crates/vala/vala-eval/`.
+- Verifier contract: `architecture/wyrd-design.md` §Verifier.
+- Authoring types: `crates/wyrd-spec/src/card/blocks/`.
+- Result types: `crates/wyrd-spec/src/verification/execution.rs`.
 
 ## Primary grounding
 

@@ -1607,6 +1607,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let state = test_state(&fixture)
         .await
         .with_gateway(crate::config::GatewayConfig {
+            endpoints: wyrd_gateway::BuiltinEndpoints::default(),
             credential_bindings: std::collections::BTreeMap::from([(
                 wyrd_spec::ids::CredentialBindingName::new("deepseek-file").expect("binding"),
                 crate::config::GatewayCredentialBinding {
@@ -2386,6 +2387,7 @@ async fn http_replica(fixture: &PgFixture, tenant: DataTenantId, secret: &Path) 
     test_state(fixture)
         .await
         .with_gateway(crate::config::GatewayConfig {
+            endpoints: wyrd_gateway::BuiltinEndpoints::default(),
             credential_bindings: std::collections::BTreeMap::from([(
                 wyrd_spec::ids::CredentialBindingName::new("deepseek-file").expect("binding"),
                 crate::config::GatewayCredentialBinding {
@@ -4197,6 +4199,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
         test_state(&fixture)
             .await
             .with_gateway(crate::config::GatewayConfig {
+                endpoints: wyrd_gateway::BuiltinEndpoints::default(),
                 credential_bindings: std::collections::BTreeMap::from([(
                     wyrd_spec::ids::CredentialBindingName::new("canary-file").expect("binding"),
                     crate::config::GatewayCredentialBinding {

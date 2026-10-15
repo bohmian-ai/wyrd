@@ -2485,6 +2485,12 @@ pub struct GatewayConfig {
     /// Vault KV v2 backends tenants may reference.
     #[serde(default)]
     pub secret_backends: BTreeMap<SecretBackendName, VaultBackendConfig>,
+    /// Base URL overrides of the built-in provider adapters, so a local
+    /// development server reaches local provider fixtures. Every override is
+    /// still screened by the deployment's endpoint policy, and production
+    /// refuses any override at boot.
+    #[serde(default)]
+    pub endpoints: wyrd_gateway::BuiltinEndpoints,
 }
 
 /// One operator Environment binding and its assignment.
@@ -2522,7 +2528,8 @@ pub struct VaultBackendConfig {
 impl GatewayConfig {
     /// Rejects invalid bindings and backends so the server fails boot.
     ///
-    /// Secrets must be non-empty env or file references; backend addresses
+    /// Production may not override built-in provider endpoints. Secrets must
+    /// be non-empty env or file references; backend addresses
     /// must be base URLs using `https` (or `http` outside production); mounts
     /// and prefixes must satisfy the Vault path grammar; and no assigned
     /// prefix may contain another, so each path has one owner.
@@ -2533,6 +2540,12 @@ impl GatewayConfig {
         let invalid = |field: String, reason: &str| ConfigError::Invalid {
             message: format!("{field} {reason}"),
         };
+        if production && self.endpoints != wyrd_gateway::BuiltinEndpoints::default() {
+            return Err(invalid(
+                "gateway.endpoints".to_owned(),
+                "must not override provider endpoints in production",
+            ));
+        }
         for (name, binding) in &self.credential_bindings {
             if !local_secret(&binding.secret) {
                 return Err(invalid(
@@ -5881,6 +5894,20 @@ minimum_slots = 2
                 .contains("exceeds usable slots")
         );
     }
+    /// Provider endpoint overrides parse and validate outside production and
+    /// fail boot in production.
+    #[test]
+    fn gateway_endpoint_overrides_are_refused_in_production() {
+        let config =
+            toml::from_str::<GatewayConfig>("[endpoints]\nanthropic = \"http://127.0.0.1:9000\"\n")
+                .expect("endpoint overrides parse");
+
+        config
+            .validate(false)
+            .expect("overrides allowed outside production");
+        assert!(config.validate(true).is_err());
+    }
+
     /// Gateway operator config parses binding and Vault prefix assignments,
     /// rejects production `http` addresses, overlapping prefixes, and
     /// non-local tokens, and assigns Vault references by whole path segments.

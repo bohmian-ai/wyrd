@@ -221,7 +221,7 @@ impl MediaFormat {
             Self::Doc => "doc",
             Self::Xls => "xls",
             Self::Ppt => "ppt",
-            Self::TarGz => "tar.gz",
+            Self::TarGz => "tar_gz",
             Self::Zip => "zip",
         }
     }
@@ -312,7 +312,7 @@ impl std::str::FromStr for MediaFormat {
             "txt" => Some(Self::Text),
             "md" => Some(Self::Markdown),
             "htm" => Some(Self::Html),
-            "tgz" | "application/x-gzip" | "application/x-tar+gzip" => Some(Self::TarGz),
+            "tgz" | "tar.gz" | "application/x-gzip" | "application/x-tar+gzip" => Some(Self::TarGz),
             "application/x-zip-compressed" => Some(Self::Zip),
             _ => None,
         };
@@ -382,6 +382,7 @@ mod tests {
             ("md", MediaFormat::Markdown),
             ("txt", MediaFormat::Text),
             ("tgz", MediaFormat::TarGz),
+            ("tar.gz", MediaFormat::TarGz),
             (
                 "application/vnd.openxmlformats-officedocument.presentationml.presentation",
                 MediaFormat::Pptx,
@@ -409,7 +410,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(MediaFormat::TarGz).expect("serialize"),
-            "tar.gz"
+            "tar_gz"
         );
         let parsed: MediaFormat = serde_json::from_str("\"text/markdown\"").expect("deserialize");
         assert_eq!(parsed, MediaFormat::Markdown);

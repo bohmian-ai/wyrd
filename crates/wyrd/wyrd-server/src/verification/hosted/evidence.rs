@@ -5,22 +5,27 @@
 //! file limit, and returns bytes only when their length, SHA-256, and sniffed
 //! format all match the declaration, so a mismatched file can never feed a
 //! pass. Extraction, workspaces, citations, and native media all read through
-//! it; it is also the Agent executor's [`EvidenceReader`].
+//! it; it is also the Agent executor's [`EvidenceReader`] and the `extract`
+//! action's [`ActionExecutor`].
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use skald_spec::{MediaFormat, MediaRef, MediaSource};
-use vala_eval::blocks::{BlockError, EvidenceReader};
+use vala_eval::blocks::{
+    ActionExecutor, ActionOutput, BlockCall, BlockError, CallValue, EvidenceReader,
+};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Sha256Hex;
-use wyrd_spec::verification::execution::InputDeclaration;
+use wyrd_spec::card::blocks::Action;
+use wyrd_spec::verification::execution::{CallProvenance, InputDeclaration};
 use wyrd_storage::error::StorageError;
 use wyrd_storage::handle::StorageHandle;
 use wyrd_storage::tenant_path;
 
 use super::HostedLimits;
+use super::extract::{EXTRACT_VERSION, Extraction};
 
 /// Reads one tenant's pinned file evidence.
 pub struct TenantEvidence {
@@ -143,6 +148,44 @@ impl EvidenceReader for TenantEvidence {
     }
 }
 
+#[async_trait]
+impl ActionExecutor for TenantEvidence {
+    /// Run an `extract` action: read its `from` evidence and extract it on
+    /// the blocking pool into the locked output shape.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] for a non-extract action or a `from`
+    /// that is not evidence, [`Self::read`]'s errors, extraction refusals,
+    /// and [`BlockError::Retryable`] when the blocking task fails.
+    async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
+        let Action::Extract { .. } = call.block else {
+            return Err(terminal("the extract executor runs only extract actions"));
+        };
+        let Some(CallValue::Evidence(declaration)) =
+            call.inputs.get("from").map(|input| &input.value)
+        else {
+            return Err(terminal("extract reads only media evidence"));
+        };
+        let (bytes, format) = self.read(declaration).await?;
+        let limits = self.limits;
+        let output =
+            tokio::task::spawn_blocking(move || Extraction::new(&limits).run(&bytes, format))
+                .await
+                .map_err(|error| BlockError::Retryable {
+                    reason: format!("extraction stopped: {error}"),
+                })??;
+        Ok(ActionOutput {
+            output: serde_json::to_value(output).map_err(|error| BlockError::Terminal {
+                reason: format!("extraction output does not serialize: {error}"),
+            })?,
+            provenance: Some(CallProvenance::Extract {
+                version: EXTRACT_VERSION.to_owned(),
+            }),
+            tool_calls: Vec::new(),
+        })
+    }
+}
+
 /// Whether `bytes` carry the signature of `format`.
 ///
 /// Binary formats match their magic bytes; OOXML formats must also contain
@@ -188,6 +231,10 @@ fn terminal(reason: &str) -> BlockError {
 mod tests {
     //! Pinned evidence reads accept only exact, matching files.
 
+    use std::collections::BTreeMap;
+
+    use vala_eval::blocks::{CallInput, Position};
+    use wyrd_spec::vala::eval::TaskId;
     use wyrd_storage::local::LocalSigner;
 
     use super::*;
@@ -291,6 +338,55 @@ mod tests {
         assert!(
             evidence
                 .media(&file(sha256, 3, MediaFormat::Csv))
+                .await
+                .is_err()
+        );
+    }
+
+    /// `extract` reads `from` evidence and returns the locked shape with
+    /// extractor provenance; non-evidence `from` is refused.
+    ///
+    /// # Panics
+    /// Panics when the output or provenance differs.
+    #[tokio::test]
+    async fn extract_action_returns_locked_shape() {
+        let (_root, evidence, sha256) = stored(b"a,b\n1,2").await;
+        let id = TaskId::new("pull").expect("task id");
+        let block: Action =
+            serde_json::from_value(serde_json::json!({"kind": "extract", "from": "inputs.sheet"}))
+                .expect("extract action");
+        let call = |value| BlockCall {
+            id: &id,
+            position: Position::Step,
+            block: &block,
+            inputs: BTreeMap::from([(
+                "from".to_owned(),
+                CallInput {
+                    value,
+                    sources: std::collections::BTreeSet::new(),
+                },
+            )]),
+            workspace: BTreeMap::new(),
+            deadline: tokio::time::Instant::now(),
+        };
+        let output = ActionExecutor::execute(
+            &evidence,
+            call(CallValue::Evidence(file(sha256, 7, MediaFormat::Csv))),
+        )
+        .await
+        .expect("csv extracts");
+        assert_eq!(
+            output.output,
+            serde_json::json!({"format": "csv", "rows": [["a", "b"], ["1", "2"]]})
+        );
+        assert_eq!(
+            output.provenance,
+            Some(CallProvenance::Extract {
+                version: EXTRACT_VERSION.to_owned()
+            })
+        );
+        assert!(
+            ActionExecutor::execute(&evidence, call(CallValue::Json(serde_json::json!(1))))
                 .await
                 .is_err()
         );

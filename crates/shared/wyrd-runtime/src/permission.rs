@@ -1466,12 +1466,12 @@ mod tests {
         let meet = |left: &[Permission], right: &[Permission]| {
             set(left).intersection(&set(right)).expect("representable")
         };
-        assert!(meet(&[query.clone()], &[read.clone()]).is_empty());
+        assert!(meet(std::slice::from_ref(&query), std::slice::from_ref(&read)).is_empty());
         for (left, right) in [(&global, &query), (&query, &global)] {
-            let shared = meet(&[left.clone()], &[right.clone()]);
+            let shared = meet(std::slice::from_ref(left), std::slice::from_ref(right));
             assert_eq!(shared.iter().collect::<Vec<_>>(), vec![&query]);
         }
-        let attenuated = meet(&[Permission::wildcard()], &[query.clone()]);
+        let attenuated = meet(&[Permission::wildcard()], std::slice::from_ref(&query));
         assert!(attenuated.contains(&query) && !attenuated.contains(&read));
 
         let role: Vec<Permission> =

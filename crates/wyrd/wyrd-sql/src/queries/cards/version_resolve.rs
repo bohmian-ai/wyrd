@@ -46,6 +46,22 @@ struct LatestInLine {
 // No statement_timeout on version-resolve reads: they hit idx_cards_version_latest
 // (partial, bounded index) and carry no user-supplied regex. Add one if these
 // queries are ever exposed to unconstrained inputs.
+/// Read the highest stable version on one Card line, with its content hashes.
+///
+/// The line is `kind`/`space`/`name` in the tenant bound to `conn`. Eligible
+/// rows are Active ones plus the Pending rows `operation_id` wrote earlier in
+/// this same registration transaction, so a composite selecting the line twice
+/// sees its own earlier choice; other operations' Pending rows, prereleases,
+/// and deleted rows are excluded. `bounds`, when present, restricts the read to
+/// the authored half-open version range. The read runs on the caller-owned
+/// transaction under the caller's version-line lock, writes nothing, and never
+/// commits; cancelling it leaves that transaction for the caller to finish or
+/// roll back.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` when a bound cannot be
+/// bound as a PostgreSQL `BIGINT` or the stored version does not parse, and
+/// `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` when the query fails.
 async fn latest_stable_in_line(
     conn: &mut TenantConn<'_>,
     kind: CardKind,
@@ -98,6 +114,11 @@ async fn latest_stable_in_line(
 /// Returns `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` for invalid bounds, overflow,
 /// stored-version parse failures, or a scoped bump that leaves the authored
 /// range. Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` on database errors.
+///
+/// # Panics
+/// Panics when `version` is an exact `VersionSpec::Pin`: this resolver owns
+/// only auto and scoped versions, and callers such as registration's
+/// `resolve_existing` look exact pins up directly instead.
 pub async fn resolve_version(
     conn: &mut TenantConn<'_>,
     kind: CardKind,

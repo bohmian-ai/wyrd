@@ -7,8 +7,9 @@
 //! and capture exactly as a public ingress call does. Nothing about one call
 //! is stored on the caller, so concurrent steps cannot see each other's
 //! fallback, deadline, or correlation; correlation travels only in this
-//! call's tracing span. A caller built for a direct verification also carries
-//! the Card, and optional Run, its judge calls are attributed to.
+//! call's tracing span. A hosted Workflow run's caller carries its Workflow
+//! Card and no Run; a caller built for a direct verification carries the
+//! Card, and optional Run, its judge calls are attributed to.
 
 use async_trait::async_trait;
 use axum::http::StatusCode;

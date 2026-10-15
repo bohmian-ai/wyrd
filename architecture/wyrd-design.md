@@ -491,6 +491,9 @@ create/replay, get, and cancel requests authenticate and authorize afresh,
 and replay never replaces run authority. Within the run, Cards reads, Bifrost
 queries, and gateway calls still make and audit their own live per-call
 decisions under the captured authority and current owner admission rules.
+A step's gateway call records the captured caller as its subject and actor
+(A/B under delegation), the Workflow Card as `card_uid`, and a null `run_id`:
+a Workflow run id is not an application Run.
 Runs are process-local; restart loses them.
 
 The server bounds runs before acceptance: step count, dependency edges,

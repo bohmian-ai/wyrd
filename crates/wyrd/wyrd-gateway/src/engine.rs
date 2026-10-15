@@ -341,6 +341,9 @@ pub struct AttemptRecord {
     pub deployment: ProviderDeploymentName,
     /// Model attempted.
     pub model: ModelRef,
+    /// GenAI provider of the deployment's admitted adapter, fixed at dispatch;
+    /// the same `gen_ai.provider.name` the live `gateway.attempt` span records.
+    pub provider: &'static str,
     /// Attempt outcome.
     pub outcome: GatewayCallOutcome,
     /// Whether the provider may have received the request and may bill it.
@@ -495,6 +498,7 @@ impl GatewayEngine {
                 ordinal,
                 deployment: deployment.name.clone(),
                 model: candidate.model.clone(),
+                provider: provider_name(candidate),
                 outcome,
                 billable,
                 usage,
@@ -675,15 +679,23 @@ fn attempt_span(ordinal: NonZeroU32, candidate: &PlannedCandidate) -> tracing::S
         "gateway.attempt",
         attempt_ordinal = ordinal.get(),
         deployment = deployment.name.as_str(),
-        gen_ai.provider.name = deployment
-            .adapter
-            .builtin_provider()
-            .unwrap_or("openai_compatible"),
+        gen_ai.provider.name = provider_name(candidate),
         gen_ai.request.model = candidate.model.model.as_str(),
         outcome = tracing::field::Empty,
         failure_class = tracing::field::Empty,
         error.code = tracing::field::Empty,
     )
+}
+
+/// GenAI provider name of `candidate`'s admitted adapter: its built-in
+/// provider, or `openai_compatible` for a custom OpenAI-compatible endpoint.
+/// Shared by the live attempt span and the retained [`AttemptRecord`], so
+/// both name the adapter rather than the operator-chosen deployment name.
+const fn provider_name(candidate: &PlannedCandidate) -> &'static str {
+    match candidate.deployment.adapter.builtin_provider() {
+        Some(provider) => provider,
+        None => "openai_compatible",
+    }
 }
 
 /// Closed snake-case label of `outcome`, shared by spans, metrics, and

@@ -3456,16 +3456,14 @@ const RECOVERED_TRACE: &str = "8bf92f3577b34da6a3ce929d0e0e4736";
 /// production recorder; zero before the first loss.
 ///
 /// # Panics
-/// Panics when the rendered counter value is not a number.
+/// Panics when the rendered counter value is not an integer.
 fn lost_scribe_writes(cluster: &wyrd_testing::bifrost::cluster::WyrdTestCluster) -> u64 {
     cluster
         .telemetry()
         .render()
         .lines()
         .find_map(|line| line.strip_prefix(r#"outbox_events_lost_total{outbox="scribe"} "#))
-        .map_or(0, |value| {
-            value.trim().parse::<f64>().expect("a numeric counter") as u64
-        })
+        .map_or(0, |value| value.trim().parse().expect("an integer counter"))
 }
 
 /// Durable rows `tenant` holds in `table`, from the published file list.

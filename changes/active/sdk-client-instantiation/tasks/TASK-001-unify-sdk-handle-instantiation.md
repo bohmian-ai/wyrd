@@ -639,7 +639,7 @@ Rust ambient cases through `WyrdClient::from_environment` with an injected
 | FIND-2 ambient entry points unproven | Python eager `AsyncBifrost.connect()` in the ambient journey (`c7dce6bf9`); Rust journeys via `WyrdClient::from_environment` (`fc49659ac`), which `from_global` now calls, removing the duplicate `ClientConfig::from_global` composition | R1–R3, P2 | PASS |
 | FIND-3 delegated attribution unasserted | Each language asserts retained `bifrost.query.read_decision` attributed to the subject with the actor at `delegation_chain[0]` (`c7dce6bf9`, `390576d61`, `fc49659ac`) | R4, P3, T1 | PASS |
 | FIND-4 changed-item docs | `75663dbc2`, `c7dce6bf9` | D1, `mise run lints` | PASS |
-| FIND-5 revoked login expects success | `75663dbc2` | R6 not run (identity lane) | NOT RUN |
+| FIND-5 revoked login expects success | `75663dbc2` | R6 | PASS |
 | FIND-6 saved-only Platform | spec revision 10 (`add6424eb`) | R1 Platform environment case | PASS |
 
 Commands run (managed Postgres after `mise run db:migrate:all:inner`):
@@ -651,9 +651,10 @@ Commands run (managed Postgres after `mise run db:migrate:all:inner`):
 - `pnpm exec vitest run tests/integration/sdk-client-instantiation.test.ts` — 6 passed.
 - `mise run fmt`, `mise run lints`, `py:format`, `py:lints`, `py:typecheck`, `ts:format`, `ts:lints`, `ts:typecheck`, D1 rustdoc broken-link deny, `git diff --check` — clean.
 
-Limits: R6 (`saved_user_auth::revoked_login_is_refused`) needs the Keycloak
-identity lane and was not run; the change is compile-checked only. Rust
-environment-only and saved-only cases use the injected resolver per revision
+- R6: `test:identity:journey:inner` setup (fresh Keycloak/Dex, its issuer env)
+  followed by `cargo nextest run --locked -p wyrd-ai --test integration --run-ignored=all -E 'test(=saved_user_auth::revoked_login_is_refused)'` — 1 passed.
+
+Limits: Rust environment-only and saved-only cases use the injected resolver per revision
 11, not process-environment mutation. Non-goals unchanged: no insert
 preconnection buffering, no saved platform credential source, docsite and
 README left to TASK-002.

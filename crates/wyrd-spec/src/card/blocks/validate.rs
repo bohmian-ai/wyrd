@@ -12,12 +12,12 @@ use skald_spec::{Prompt, ResponseType};
 
 use super::extract::ExtractOutput;
 use super::reference::{Reference, ReferenceRoot};
-use super::schema_path::admits;
+use super::schema_path::{admits, fits};
 use super::{
     Action, AgentCall, Check, CheckEvidence, CodeCall, CodeSource, Condition, Decide, DriftCheck,
     InputSlot, MAX_STEP_RETRIES, Requirement, ScheduledInput, Step, VerifierSpec,
 };
-use crate::card::agent::AgentSpec;
+use crate::card::agent::{AgentSpec, BuiltinTool};
 use crate::card::drift::DriftSignal;
 use crate::card::prompt::{ParameterName, is_valid_parameter_name};
 use crate::envelope::CardKind;
@@ -25,19 +25,7 @@ use crate::error::WyrdError;
 use crate::ids::{FeatureName, SlotName};
 use crate::reference::InlineableRef;
 use crate::vala::eval::{ExecutionPlan, TaskId, plan_stages};
-
-/// Built-in tools a step-position Agent may select.
-const STEP_TOOLS: [&str; 6] = [
-    "fs.list",
-    "fs.read",
-    "fs.search",
-    "code.run",
-    "cards.get",
-    "bifrost.query",
-];
-
-/// Fields a check-position Agent's response schema must require.
-const VERDICT_FIELDS: [&str; 3] = ["outcome", "reason", "citations"];
+use crate::verification::execution::Verdict;
 
 /// An Agent and its Prompt, resolved by the caller for validation.
 #[derive(Debug, Clone, Copy)]
@@ -506,17 +494,18 @@ where
         self.validate_placeholders(call, resolved.prompt, path)?;
         let tools = &resolved.agent.tool_names;
         if in_step {
-            if let Some(tool) = tools
-                .iter()
-                .find(|tool| !STEP_TOOLS.contains(&tool.as_str()))
-            {
-                return Err(invalid(
-                    "agent_tools",
-                    path,
-                    format!("{tool} is not an approved tool"),
-                ));
+            let mut builtins = Vec::with_capacity(tools.len());
+            for name in tools {
+                let Some(tool) = BuiltinTool::from_name(name) else {
+                    return Err(invalid(
+                        "agent_tools",
+                        path,
+                        format!("{name} is not a built-in tool"),
+                    ));
+                };
+                builtins.push(tool);
             }
-            let fs_tool = tools.iter().any(|tool| tool.starts_with("fs."));
+            let fs_tool = builtins.iter().any(|tool| tool.is_filesystem());
             if fs_tool && call.workspace.is_empty() {
                 return Err(invalid(
                     "agent_tools",
@@ -524,7 +513,7 @@ where
                     "filesystem tools require a workspace",
                 ));
             }
-            let workspace_tool = fs_tool || tools.iter().any(|tool| tool == "code.run");
+            let workspace_tool = fs_tool || builtins.contains(&BuiltinTool::CodeRun);
             if !call.workspace.is_empty() && !workspace_tool {
                 return Err(invalid(
                     "agent_tools",
@@ -540,20 +529,15 @@ where
                     "check Agents have no tools",
                 ));
             }
-            let required = match &resolved.prompt.response_type {
-                ResponseType::JsonSchema { schema, .. } => schema.get("required"),
-                ResponseType::Text => None,
+            let produces_verdict = match &resolved.prompt.response_type {
+                ResponseType::JsonSchema { schema, .. } => fits(schema, &verdict_schema()),
+                ResponseType::Text => false,
             };
-            let has = |field| {
-                required
-                    .and_then(Value::as_array)
-                    .is_some_and(|items| items.iter().any(|item| item == field))
-            };
-            if !VERDICT_FIELDS.iter().all(|field| has(*field)) {
+            if !produces_verdict {
                 return Err(invalid(
                     "check_agent_schema",
                     path,
-                    "check Agent response schema must require outcome, reason, and citations",
+                    "check Agent response schema must produce a Verdict: outcome passed, failed, or inconclusive; a string reason; and citations of slot and locator",
                 ));
             }
         }
@@ -737,6 +721,15 @@ where
             Action::Code(_) => None,
         }
     }
+}
+
+/// The generated JSON Schema of the typed [`Verdict`] every check returns.
+///
+/// # Panics
+/// Never in practice: a generated schema always serializes to JSON.
+fn verdict_schema() -> Value {
+    serde_json::to_value(crate::schema::schema_for::<Verdict>())
+        .expect("a generated JSON Schema serializes to JSON")
 }
 
 /// Validates one slot's own constraints.
@@ -932,18 +925,43 @@ mod tests {
         agent
     }
 
-    /// The Verdict response schema every check-position Agent returns.
+    /// A response schema that produces the typed Verdict: the three closed
+    /// outcomes, a string reason, and closed citations whose locator is one
+    /// of a subset of the typed locators.
     fn verdict_schema() -> Value {
+        let locator = |key: &str, value: Value| json!({"type": "object", "properties": {key: value}, "required": [key], "additionalProperties": false});
         json!({
             "type": "object",
             "properties": {
-                "outcome": {"type": "string"},
+                "outcome": {"type": "string", "enum": ["passed", "failed", "inconclusive"]},
                 "reason": {"type": "string"},
-                "citations": {"type": "array"}
+                "citations": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {
+                        "slot": {"type": "string"},
+                        "locator": {"anyOf": [
+                            locator("page", json!({"type": "integer"})),
+                            locator("lines", json!({"type": "object", "properties": {"start": {"type": "integer"}, "end": {"type": "integer"}}, "required": ["start", "end"], "additionalProperties": false})),
+                            locator("json_pointer", json!({"type": "string"}))
+                        ]}
+                    },
+                    "required": ["slot", "locator"],
+                    "additionalProperties": false
+                }}
             },
             "required": ["outcome", "reason", "citations"],
             "additionalProperties": false
         })
+    }
+
+    /// A tool-less whole-Verifier check Agent declaring `schema`, bound to the
+    /// `judged` requirement's inputs.
+    fn judge(schema: Value) -> Value {
+        agent(
+            &[],
+            json!([{"type": "document", "source": "${media:policy}"}, {"type": "text", "text": "{{claim}} {{answer}} {{findings}}"}]),
+            Some(schema),
+        )
     }
 
     /// A multi-step Verifier exercising every action and Run check kind.
@@ -1341,6 +1359,198 @@ mod tests {
         parse(&registered)
             .validate()
             .expect("an unresolved registered Agent is validated by its resolver");
+    }
+
+    /// Every built-in tool validates on a step Agent, with a workspace only
+    /// when a filesystem or code tool reads it; unknown names stay refused.
+    ///
+    /// # Panics
+    /// Panics when a built-in is refused or an unknown name is admitted.
+    #[test]
+    fn verifier_spec_admits_every_builtin_step_tool() {
+        use crate::card::agent::BuiltinTool;
+        for tool in BuiltinTool::ALL {
+            let mut body = with(
+                review(),
+                "/steps/1/action/agent/tool_names",
+                json!([tool.as_str()]),
+            );
+            if !tool.is_filesystem() && tool != BuiltinTool::CodeRun {
+                body = with(body, "/steps/1/action/workspace", json!({}));
+            }
+            parse(&body)
+                .validate()
+                .unwrap_or_else(|error| panic!("{}: {error:?}", tool.as_str()));
+        }
+        for name in ["cards", "bifrost.*", "fs.read/x", "FS.READ", "http.fetch"] {
+            let body = with(review(), "/steps/1/action/agent/tool_names", json!([name]));
+            assert_eq!(rule(&body), "agent_tools", "{name}");
+        }
+    }
+
+    /// Check Agents in either position, inline or resolver-supplied, must
+    /// declare a response that produces the typed Verdict; compatible
+    /// restrictions and local references are accepted.
+    ///
+    /// # Panics
+    /// Panics when a compatible schema is refused or an incompatible one is
+    /// accepted.
+    #[test]
+    fn verifier_spec_requires_check_agents_to_produce_a_verdict() {
+        let schema = |pointer: &str, value: Value| with(verdict_schema(), pointer, value);
+        let mut variant = verdict_schema();
+        variant["definitions"] =
+            json!({"Citation": verdict_schema()["properties"]["citations"]["items"].clone()});
+        variant["properties"]["citations"]["items"] = json!({"$ref": "#/definitions/Citation"});
+        variant["properties"]["outcome"] =
+            json!({"description": "verdict", "type": "string", "enum": ["failed", "passed"]});
+        variant["properties"]["reason"] = json!({"type": "string", "maxLength": 500});
+        variant["description"] = json!("A judgment");
+        for compatible in [verdict_schema(), variant, super::verdict_schema()] {
+            let body = with(
+                review(),
+                "/requirements/2/check/agent",
+                judge(compatible.clone()),
+            );
+            parse(&body)
+                .validate()
+                .unwrap_or_else(|error| panic!("{compatible}: {error:?}"));
+        }
+        let incompatible = [
+            schema("/properties/outcome", json!({"type": "integer"})),
+            schema("/properties/outcome", json!({"type": "string"})),
+            schema(
+                "/properties/outcome",
+                json!({"type": "string", "const": "yes"}),
+            ),
+            schema(
+                "/properties/outcome",
+                json!({"type": "string", "enum": ["passed", "yes"]}),
+            ),
+            schema("/properties/reason", json!({"type": "boolean"})),
+            schema("/properties/citations", json!({"type": "string"})),
+            schema("/properties/citations", json!({"type": "array"})),
+            schema("/properties/citations/items/required", json!(["slot"])),
+            schema(
+                "/properties/citations/items/properties/locator",
+                json!({"type": "object", "properties": {"page": {"type": "string"}}, "required": ["page"], "additionalProperties": false}),
+            ),
+            schema(
+                "/properties/citations/items/properties/locator",
+                json!({"type": "object", "properties": {"chapter": {"type": "integer"}}, "required": ["chapter"], "additionalProperties": false}),
+            ),
+            schema("/properties/score", json!({"type": "integer"})),
+            schema(
+                "/required",
+                json!(["outcome", "reason", "citations", "score"]),
+            ),
+            schema("/required", json!(["outcome", "reason"])),
+            schema("/additionalProperties", json!(true)),
+            schema(
+                "/properties/outcome",
+                json!({"oneOf": [{"$ref": "#/properties/outcome"}]}),
+            ),
+        ];
+        for declared in &incompatible {
+            let body = with(
+                review(),
+                "/requirements/2/check/agent",
+                judge(declared.clone()),
+            );
+            assert_eq!(rule(&body), "check_agent_schema", "{declared}");
+        }
+
+        let mut stepped = review();
+        stepped["steps"][1]["requirements"]
+            .as_array_mut()
+            .expect("step requirements")
+            .push(json!({"id": "grounded", "statement": "Findings are grounded",
+                "check": {"kind": "agent", "agent": agent(&[], json!("{{findings}}"), Some(verdict_schema())),
+                    "inputs": {"findings": "steps.findings.output"}}}));
+        parse(&stepped).validate().expect("a Verdict step check");
+        stepped["steps"][1]["requirements"][1]["check"]["agent"] =
+            agent(&[], json!("{{findings}}"), Some(incompatible[0].clone()));
+        assert_eq!(rule(&stepped), "check_agent_schema");
+
+        let card =
+            json!({"kind": "Agent", "space": "support", "name": "judge", "version": "1.0.0"});
+        let registered = with(review(), "/requirements/2/check/agent", card);
+        for (declared, valid) in [(verdict_schema(), true), (incompatible[0].clone(), false)] {
+            let resolved: crate::card::agent::AgentSpec =
+                serde_json::from_value(judge(declared)).expect("Agent");
+            let prompt = resolved.prompt.as_inline().expect("inline Prompt");
+            let spec = parse(&registered);
+            let outcome = spec.validate_with(|agent| {
+                Some(match agent.as_inline() {
+                    Some(inline) => super::ResolvedAgent {
+                        agent: inline,
+                        prompt: inline.prompt.as_inline()?,
+                    },
+                    None => super::ResolvedAgent {
+                        agent: &resolved,
+                        prompt,
+                    },
+                })
+            });
+            assert_eq!(outcome.is_ok(), valid, "{outcome:?}");
+        }
+    }
+
+    /// Self- and mutually-referencing schemas finish validating through both
+    /// input slots and resolved Agent outputs, while finite recursive
+    /// schemas keep refusing known-missing fields.
+    ///
+    /// # Panics
+    /// Panics when a cyclic schema is refused or a finite one admits a
+    /// missing field.
+    #[test]
+    fn verifier_spec_bounds_cyclic_schema_references() {
+        let cyclic = [
+            json!({"type": "object", "properties": {"x": {"oneOf": [{"$ref": "#/properties/x"}]}}}),
+            json!({"type": "object", "definitions": {"a": {"anyOf": [{"$ref": "#/definitions/b"}]}, "b": {"anyOf": [{"$ref": "#/definitions/a"}]}}, "properties": {"x": {"$ref": "#/definitions/a"}}}),
+        ];
+        for schema in &cyclic {
+            let input = with(review(), "/inputs/answer/schema", schema.clone());
+            let input = with(
+                input,
+                "/requirements/0/check/path",
+                json!("inputs.answer.x.y"),
+            );
+            parse(&input)
+                .validate()
+                .unwrap_or_else(|error| panic!("{schema}: {error:?}"));
+            let output = with(
+                review(),
+                "/steps/1/action/agent",
+                agent(
+                    &["fs.read"],
+                    json!("Review {{outline}}"),
+                    Some(schema.clone()),
+                ),
+            );
+            let output = with(
+                output,
+                "/steps/1/requirements/0/check/path",
+                json!("steps.findings.output.x.y"),
+            );
+            parse(&output)
+                .validate()
+                .unwrap_or_else(|error| panic!("{schema}: {error:?}"));
+        }
+        let tree = json!({
+            "definitions": {"node": {"type": "object", "properties": {"child": {"$ref": "#/definitions/node"}, "text": {"type": "string"}}, "additionalProperties": false}},
+            "$ref": "#/definitions/node"
+        });
+        let body = with(review(), "/inputs/answer/schema", tree);
+        let path =
+            |selector: &str| with(body.clone(), "/requirements/0/check/path", json!(selector));
+        parse(&path("inputs.answer.child.child.text"))
+            .validate()
+            .expect("finite recursion");
+        assert_eq!(
+            rule(&path("inputs.answer.child.child.nope")),
+            "missing_field"
+        );
     }
 
     /// Schedule bindings map every required samples slot by exact names.

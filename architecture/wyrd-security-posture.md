@@ -103,15 +103,31 @@ tenant, the server's own identity for continuous verification work that has no
 direct principal. It is not Card-bound or publicly manageable, has no
 credential, role grant, refresh, workload, or delegation path, and never
 appears in a token: every issuer refuses it and every verifier rejects a
-`system` claim set. It has two in-process uses. It attributes verification
-results, which the server's internal capture writer submits to Scribe like
-gateway capture, without a token or Gate; Gate refuses every public write to
-the result tables. And it carries a tokenless `bifrost_query:read` authority
-scoped by table UID to exactly one run's input tables
-(`vala.drift.observations` for Drift; `vala.eval.observations` and
-`vala.traces.spans` for Eval). Neither is a general Bifrost grant, and Oracle
-authorizes and audits every read under it like any caller's. The server never fabricates a user or other identity for its
-own reads.
+`system` claim set. It is only ever an actor, never a subject: work it
+performs records the subject it serves as `sub_principal_id` and SYSTEM as
+`act_principal_id`, and it adds no authority to that work. It has three
+in-process uses. It performs Verifier result writes, which the server's
+internal capture writer submits to Scribe like gateway capture, without a
+token or Gate; Gate refuses every public write to the result tables. It
+performs a Verifier's judge calls, which the gateway authorizes against the
+run's accepted authority, never SYSTEM's. And it carries a tokenless
+`bifrost_query:read` authority scoped by table UID to exactly one run's input
+tables (`vala.drift.observations` for Drift; `vala.eval.observations` and
+`vala.traces.spans` for Eval), recorded for the run's subject. That read
+authority is not a general Bifrost grant and is never inferred from the
+subject, and Oracle authorizes and audits every read under it like any
+caller's. The server never fabricates a user or other identity for its own
+reads.
+
+A Verifier run is accepted under one authority that execution never widens.
+A manual run keeps the caller's verified effective principal and delegation
+chain. A scheduled or observation-triggered run keeps its binding owner's
+authority, recovered from current grants in the run's tenant when the run is
+accepted; a missing, inactive, or foreign owner, or a tenant without SYSTEM,
+accepts no run and nothing falls back to the observation writer or SYSTEM.
+The accepted authority is stored server-side with no credential, survives
+claim, retry, and restart, and is not refreshed by later grant changes; every
+protected downstream action still checks its own permission against it.
 
 A tenant administrator is created once, during tenant provisioning, and is the
 tenant's headless root of trust: it holds credentials and roles, federates no
@@ -494,7 +510,8 @@ Retained audit history lives in the tenant-qualified Bifrost
 Audit frames are submitted under the platform audit principal, the one
 principal Scribe admits for the reserved system owner's audit history. A row
 carries only decision content (request, trace, operation, resource, audit Card,
-principal, permission, outcome, detail, and credential id) with
+the decision's verified subject and its kind, its actor, permission, outcome,
+detail, and credential id) with
 `created_at` set to the decision time; there is no chain, sequence, or
 publication progress, and readers order by decision time. Because the outbox
 writer evaluates no new permission, it appends no audit event and retained

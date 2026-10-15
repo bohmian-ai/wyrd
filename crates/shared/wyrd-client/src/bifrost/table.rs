@@ -456,8 +456,8 @@ impl WriterTable {
 /// Optional per-row correlation.
 ///
 /// Both fields are optional on the wire: the server stores an uncorrelated row
-/// against the authenticated `principal_id` with a null `card_uid`, so the
-/// default is a valid write rather than a degraded one.
+/// against the authenticated `sub_principal_id`/`act_principal_id` pair with a
+/// null `card_uid`, so the default is a valid write rather than a degraded one.
 #[derive(Debug, Clone, Default)]
 pub struct Correlation {
     /// The UID of the Card this row belongs to, which the server stores as

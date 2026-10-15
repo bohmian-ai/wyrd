@@ -251,7 +251,8 @@ class TableConfig:
                 is ``"first"`` or ``"last"``. Omitted or empty, the table
                 sorts by the time column descending with nulls last.
             bloom_columns: extra columns to Bloom-filter. The managed
-                ``run_id``, ``card_uid``, and ``principal_id`` columns the
+                ``run_id``, ``card_uid``, ``sub_principal_id``, and
+                ``act_principal_id`` columns the
                 table has always come first, and naming one is harmless.
                 Omitted or empty, only those managed columns are filtered.
             time_column: the non-null ``TIMESTAMP_LTZ`` or ``TIMESTAMP_NTZ``

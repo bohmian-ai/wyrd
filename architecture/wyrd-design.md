@@ -621,9 +621,10 @@ before the call's deadline; backpressure and an unavailable Scribe are retried
 with bounded backoff until then, and anything else drops the capture with a
 counted reason without changing the call. No per-tenant client, queue, or
 backlog outlives the call. The same writer submits Verifier results to the
-three result tables, attributed to the tenant's `System` principal and the
-run's exact Verifier Card, which Scribe stamps as `principal_id` and
-`card_uid`; a result batch is never dropped for time and is retried under its
+three result tables, attributed to the run's subject with the tenant's
+`System` principal as actor, which Scribe stamps as `sub_principal_id` and
+`act_principal_id`; each row names the verified Card as `card_uid` and the
+exact Verifier Card as `verifier_card_uid`; a result batch is never dropped for time and is retried under its
 own batch id until Scribe acknowledges it. Gate refuses every public write to
 `vala.gateway.calls` and the three result tables.
 `Service` and
@@ -852,11 +853,13 @@ and Run correlation are optional per-row values:
 |---|---|---|---|
 | `card_uid` | optional client assertion of the row's exact subject Card UID (the run view's selected Card); server authorizes it when present | per row | the optional Card-version anchor — *which* Card |
 | `run_id` | optional client-generated value per `.run()`, shared by every Card-scoped view of that invocation; passed through opaquely | per row | the optional Run anchor — *which* execution |
-| `principal_id` | server-stamped from the verified JWT | per request | the authenticated publisher — *who* emitted it |
+| `sub_principal_id` | server-stamped from the verified JWT | per request | the subject — *for whom* the work was done; the party a delegated token acts for |
+| `act_principal_id` | server-stamped from the verified JWT | per request | the actor — *who* emitted it; equals the subject for a direct publisher |
 | `tenant_id` | server-stamped from the verified JWT | per request | the tenancy boundary |
 | `wyrd_request_id` | the propagated `Wyrd-Request-Id` (minted at first sighting) | per request | the request spine — one request spans **many** runs and hops |
 
-Resolution rule: **tenant and `principal_id` come from the token; a present
+Resolution rule: **tenant, `sub_principal_id`, and `act_principal_id` come
+from the token; a present
 `card_uid` is client-asserted and server-authorized against the trusted signed
 scope, or, for a principal bound to no Card, against the tenant registry;
 absent Card correlation produces null `card_uid`;
@@ -887,7 +890,8 @@ Consequences, stated so they stop drifting:
 
 - **`card_uid` is optional and authorized, not trusted.** Its absence is valid
   generic telemetry and produces null `card_uid`; the authenticated publisher
-  remains available through non-null `principal_id`. When present, the server checks the asserted
+  remains available through non-null `sub_principal_id` and `act_principal_id`.
+  When present, the server checks the asserted
   `card_uid` against the principal's **card scope**. For Service and Agent
   principals, the scope is the principal's own `card_ref` plus the
   **observation-target** cards reachable through the transitive card-ref graph
@@ -921,7 +925,7 @@ Consequences, stated so they stop drifting:
   — the card is the authorized `card_uid` on the row. `run_id` is an **opaque**
   correlation id, never a composite that encodes the card.
 - **When present, `Card → Run → Observation` is the `(card_uid, run_id)` pair on
-  the row;** generic telemetry remains attributable to `principal_id`, and the
+  the row;** generic telemetry remains attributable to its subject and actor, and the
   request spine is the `wyrd_request_id` label that joins many runs across hops.
 - **The observation owns subject identity.** Under pub/sub (Doctrine #3, #21),
   the observation's `card_uid` IS its subject — no separate `subject_ref` on
@@ -1241,7 +1245,8 @@ shared across tenants. A deleted Verifier terminates the run `errored`.
 
 When execution completes, the runner builds the result once, with one result
 ID and event time, stages it on the process Scribe outbox attributed to the
-tenant SYSTEM principal and the exact Verifier, and settles the run at once:
+run's subject with the tenant SYSTEM principal as actor and to the exact
+Verifier, and settles the run at once:
 settlement never waits for Scribe. The outbox writes the result tables through
 the same in-memory path as audit and gateway capture, so a result Scribe has
 not acknowledged is lost on abrupt process death or an expired shutdown
@@ -1252,6 +1257,21 @@ the lease has passed. An expired lease is never revived, and a renewal that no
 longer finds a run's token cancels that run's work. A run holds a connection
 only to claim, settle, and renew. The settlement retries with backoff while
 the lease holds.
+
+Every work record names who the work was for (`sub_principal_id`) and who
+performed it (`act_principal_id`). A direct caller A records A/A and a
+delegated caller B acting for A records A/B; a scheduled or
+observation-triggered run records its binding owner as subject. Wyrd performs
+a run's judge calls, input reads, and result writes as the tenant SYSTEM
+principal, so they record the run's subject with SYSTEM as actor. SYSTEM is
+never a subject and authorizes nothing: judge calls are checked against the
+run's accepted authority — the caller's verified effective principal and
+delegation chain for a manual run, the owner's authority recovered at
+acceptance for a background run — and gateway spend is charged to the subject.
+The accepted authority is stored with the run without a credential and
+survives claim, retry, and restart. Creation pairs are immutable, and
+registration and manual-run replay are scoped by tenant, subject, actor, and
+key.
 
 #### Drift implementation
 Subject-less observation definition. The implementation is orthogonal: signal +

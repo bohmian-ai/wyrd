@@ -65,7 +65,8 @@ semantics.
 - Server-owned system columns survive
   WAL, staging, Parquet, Iceberg promotion, Forge rewrite, and query unchanged.
 - A Card is an optional declared subject. A Run is one client execution. Every
-  Observation retains authenticated tenant and publisher `principal_id`; when
+  Observation retains authenticated tenant and its `sub_principal_id` and
+  `act_principal_id`; when
   supplied it also retains authorized `card_ref`, resolved `card_uid`, opaque
   `run_id`, and propagated `Wyrd-Request-Id` at the contract grain defined by
   its table.

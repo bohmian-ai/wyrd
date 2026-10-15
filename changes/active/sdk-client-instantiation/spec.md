@@ -1,6 +1,6 @@
 ---
 id: SPEC-sdk-client-instantiation
-revision: 6
+revision: 7
 status: approved
 ---
 
@@ -24,6 +24,11 @@ wrong for another. This change makes `connect` the one instantiation form for
 every server-facing handle in Rust, Python, and TypeScript, with the client
 optional everywhere. Python additionally keeps its constructor, made lazy,
 because it is what most Python users write.
+
+The same Bifrost handle also exposes compact, authorized table discovery in
+all three SDKs. Callers list the tables they can query, then request a table's
+schema only when they need it. This supports both programmatic exploration and
+the query workbench without inventing a second catalog model.
 
 ## Requirements
 
@@ -99,6 +104,24 @@ because it is what most Python users write.
   name `Principals`. TypeScript exports from its package root and is
   unchanged.
 
+### Bifrost table discovery
+
+- **REQ-017** Every first-class Bifrost surface projects the existing table
+  listing operation on the connected handle: Rust async and blocking
+  `Bifrost::list_tables()`, Python `Bifrost.list_tables()` and
+  `AsyncBifrost.list_tables()`, and TypeScript `Bifrost.listTables()`. The
+  operation takes no catalog or filter argument and uses the handle's retained
+  client, authentication, tenant, and error path.
+- **REQ-018** A listing returns the server's existing authorized
+  `BifrostTableEntry` values unchanged and without schema fields. Callers use
+  the existing `describe_table` / `describeTable` operation to fetch one
+  table's schema and layout on demand. Listing never eagerly describes each
+  result and adds no client cache, aggregation, or durable behavior.
+- **REQ-019** Discovery is typed in every SDK: Rust returns the existing wire
+  struct, Python exposes `BifrostTableEntry` as a `TypedDict`, and TypeScript
+  exposes it as an interface. Their public fields match the existing wire
+  contract; no new server route or wire type is introduced.
+
 ### Documentation and agents
 
 - **REQ-012** Every docs-site page, README, example, and generated SDK reference
@@ -112,8 +135,9 @@ because it is what most Python users write.
 
 ## Invariants
 
-- **INV-001** No handle gains or loses capability, permission, or durable
-  behavior. Only how it is constructed changes.
+- **INV-001** No handle gains or loses capability except that Bifrost projects
+  the server's existing table-list operation. No permission, server behavior,
+  or durable behavior changes.
 - **INV-002** Ambient resolution stays in `wyrd-client`. No SDK implements its
   own endpoint or credential lookup; all three call the shared resolver, so the
   same configuration yields the same endpoint and credential in every language.
@@ -137,6 +161,8 @@ In scope, every public handle that calls the server:
 - `Principals`
 - `OperatorConnections`
 - `Platform` (Rust only; see D4)
+- Bifrost table discovery through the existing compact list and lazy describe
+  operations in Rust, Python, and TypeScript
 
 Out of scope:
 
@@ -158,6 +184,12 @@ Out of scope:
   `describe_with`, per D1.
 - **New handles.** Verification reads through the SDKs are a separate change.
 - TypeScript's public `fromNative` and `fromOpen` statics marked `@internal`.
+- A new catalog object, `list_catalog`, `list_schemas`, filtering, pagination,
+  client caching, or eager per-table schema fetches.
+- New Bifrost routes, wire models, permissions, audit behavior, or server-side
+  discovery behavior.
+- Query workbench UI changes. The UI may consume these SDK primitives, but its
+  implementation remains in its own change.
 
 ## Expensive-to-reverse decisions
 
@@ -167,6 +199,9 @@ Out of scope:
   changes when every existing caller sees configuration errors.
 - The architecture authority changes from "surface ergonomics may differ" to a
   fixed instantiation verb.
+- The discovery vocabulary is a flat `list_tables` / `listTables` operation
+  returning compact entries, paired with the existing lazy table description.
+  Replacing it later with a nested catalog model would change every SDK.
 
 ## Acceptance criteria
 
@@ -194,6 +229,15 @@ Out of scope:
   resolves the ambient configuration once: changing the configuration after the
   first call does not change the endpoint or principal later calls use, and
   repeated calls perform one credential exchange.
+- **AC-008** A user journey per language registers a user table, lists it and
+  the visible built-in tables through Bifrost, excludes a table belonging only
+  to another tenant, and receives the existing stable authorization error when
+  the principal lacks `bifrost_table:read`. The journey then describes the
+  user table separately and receives its declared fields.
+- **AC-009** Public-surface and generated-type tests prove the exact discovery
+  method names and typed `BifrostTableEntry` projections in Rust, Python, and
+  TypeScript. Compact list entries contain no schema, and no `list_catalog` or
+  `list_schemas` compatibility surface exists.
 
 ## Decided
 
@@ -224,9 +268,16 @@ Out of scope:
   Projecting it to Python and TypeScript is a separate change. Rejected:
   excluding it, which would leave the one Rust handle on `with_client`.
 
+- **D5. Bifrost discovery shape.** Discovery is `list_tables` in Rust and
+  Python and `listTables` in TypeScript, directly on the existing Bifrost
+  handle. It returns the existing compact `BifrostTableEntry`; callers use the
+  existing describe operation when they need schema. Rejected: `list_catalog`
+  or a nested catalog/schema abstraction, which would duplicate server nouns
+  and encourage an eager N+1 describe workflow.
+
 ## Open material decisions
 
-None. D1 through D4 are resolved; see *Decided*.
+None. D1 through D5 are resolved; see *Decided*.
 
 ## Revision history
 
@@ -238,6 +289,7 @@ None. D1 through D4 are resolved; see *Decided*.
 | 4 | draft | D3 decided: Python handles stay imported from their owning submodule; no new root exports. |
 | 5 | draft | REQ-016: the module owning `Principals` is renamed `auth` in Python and Rust. |
 | 6 | approved | D4 decided: `Platform` gets `connect` / `connect_with` and stays Rust-only. No open decisions remain. |
+| 7 | approved | Added the agreed typed Bifrost table-list projection in all three SDKs, preserving the existing compact list plus lazy describe contract and rejecting a new catalog abstraction. |
 
 ## Authority
 

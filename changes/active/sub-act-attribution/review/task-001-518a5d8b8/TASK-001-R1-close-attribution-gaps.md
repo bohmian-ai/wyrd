@@ -455,3 +455,104 @@ new immutable candidate for `$wyrd-task-review`; implementation does not mark
 its own findings closed or alter the historical verdict. Stop only if source
 requires a new material decision outside r5; ordinary private implementation
 choices and existing-owner adaptations remain implementation-owned.
+
+## Implementation evidence (TASK-001-R1)
+
+Candidate: `change/sub-act-attribution` at `74d647656` (commits `bc1d567fe`..`74d647656`
+after `02cfd7e92`). Postgres-backed selectors run through
+`scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p <crate> --test <target> [-P journey --run-ignored=all] -E 'test(=<selector>)'"`,
+one Cargo invocation at a time.
+
+### Finding → source → proof
+
+| Finding | Source | Proof | Result |
+|---|---|---|---|
+| FIND-TASK-001-1 | `wyrd-sql/migrations/20260601000028_system_principal.sql` (`provision_system_principal(creator_sub, creator_act)`; backfill passes the sentinel twice); `queries/auth/service_accounts.rs::provision_system_principal(conn, Attribution)`; `components/platform/provisioning.rs` forwards the operator pair to SYSTEM and `BuiltinTables::ensure_tenant`; `builtins.rs` reconcile and `bifrost_catalog.rs::ensure_builtin` take the creator; fixtures pass `Attribution::unresolved()`; rustdoc on `PLATFORM_AUDIT_PRINCIPAL`/`Attribution::unresolved` | P1 `wyrd-server --test integration platform_admin_e2e::new_and_existing_tenants_receive_every_builtin`; P2 `wyrd-sql --test integration pg_migration::pg_tests::system_creation_uses_explicit_creator_or_sentinel` | RED → GREEN |
+| FIND-TASK-001-2 | Not committed; see SPEC_REVISION_REQUIRED below | P3 at HEAD (unchanged tests) | BLOCKED on decision |
+| FIND-TASK-001-3 | Superseded by approved r5 REQ-010/AC-015: requests refused before any principal resolves record no audit decision; no code change | P11 `audit_retention::subject_actor_decisions_preserve_trusted_identity` keeps the no-token/malformed/bad-signature refusals unaudited and authenticated decisions paired | PASS (regression) |
+| FIND-TASK-001-4 | `verification/observations.rs` `ObservationRunSink::write`: `#[tracing::instrument(name = "verification.observation_runs")]` and one `warn!` per binding refused for a missing owner or SYSTEM (tenant, binding, owner Card, owner); `ObservationBinding.owner_card_uid` public | P4 `eval_verification::background_owner_subject_system_actor` (suspended C, deleted D, foreign-tenant E, then SYSTEM deleted: all five refused, run count stays 2, healthy owners unchanged) | RED → GREEN |
+| FIND-TASK-001-5 | `wyrd-spec/vala/audit_detail.rs` `CredentialIssuance.delegation_chain` (skip when empty); `wyrd-auth/issue_api_key.rs::IssueApiKey::audit` uses `delegated_attribution` + `audit_delegation_chain`; `auth/routes.rs` passes the verified chain | P5 `audit_retention::issued_key_audit_keeps_delegation` | RED → GREEN |
+| FIND-TASK-001-6 | `verification/authority.rs::SystemReadAuthority::serving(&AcceptedAuthority)` adds the served subject and the accepted chain via the existing `AuthorizedQueryContext::with_delegation_chain`; `drift.rs` and `eval.rs` readers pass `&run.authority`. SYSTEM principal and table-UID grants unchanged | P6 `verification_runtime::delegated_input_reads_keep_history`; supporting `wyrd-server --lib verification::authority::tests::serving_keeps_accepted_history_without_widening` (JSON forwarding form) | RED → GREEN |
+| FIND-TASK-001-7 | Tests only (behavior already correct) | P7, P8, P10 below; P9 retained | Verification-only, sensitivity shown |
+| FIND-TASK-001-8 | `wyrd-sql/queries/cards/register.rs` (five items), `row_types/cards.rs::ParsedCardRow::try_from`, `components/cards/service.rs::replay` gained `# Errors` and transaction/absent/conflict meanings; `# Panics` on the three named tests | Source comparison; `mise run fmt`, `mise run lints` | PASS |
+| FIND-TASK-001-9 | `docs/.../how-verification-works.md` results table; `architecture/wyrd-design.md` (capture pair, realtime vs queued result attribution, SYSTEM work keeps accepted chain, r5 creator/sentinel/operator-pair/first-pair and pre-identity no-audit rules); `architecture/bifrost-design.md` (IngestCapture always carries the stamped pair, audit submits the sentinel); `wyrd-spec/auth/principal_id.rs` `GATEWAY_CAPTURE_PRINCIPAL` rustdoc | Source comparison against `components/verification/service.rs::stage_result`, `gateway/capture.rs` `CallFacts.attribution`, `wyrd.v1.proto` `IngestCaptureRequest`, `grpc/capture_peer.rs`, `scribe_outbox.rs`; `mise run docs:check` | PASS |
+
+### RED / GREEN
+
+| Proof | RED (how forced) | GREEN |
+|---|---|---|
+| P2 | Pre-fix SQL stamped `candidate, candidate`: `pg_migration.rs:513` left (SYSTEM, SYSTEM) right (sentinel, sentinel) | with three `pg_admin_principals` SYSTEM tests and `migrations_apply_and_are_idempotent`: 5 passed; at HEAD: 1 passed, 105 skipped |
+| P1 | Pre-fix: `platform_admin_e2e.rs:5290` left {(system, system)} right {(root, root)} | 1 passed; at HEAD: 1 passed, 257 skipped |
+| P4 | Diagnostic removed: `Error: "expected 3 refused owners, saw {}"` | 1 passed (3.5s); after the if-let refactor: 1 passed, 46 skipped |
+| P5 | Route passing an empty chain: `audit_retention.rs:366` left (A, A) right (A, B) | 1 passed, 43 skipped; `mise run codegen:check` clean |
+| P6 | Pre-fix: `Error: "expected an A/SYSTEM read with chain [B] …"` (detail had no `delegation_chain`) | with `drift_runner_without_local_oracle_reads_through_a_peer` and P9: 3 passed, 42 skipped |
+| P6 supporting | Chain line removed: `authority.rs:346` left [] right [B] | 1 passed, 525 skipped |
+| P7 | Verification-only. Sensitivity: granting C the judge role before C-for-A is minted fails `"D for C for A judged outside C's authority"` | 1 passed, 44 skipped |
+| P8 | Verification-only | 1 passed, 45 skipped (32.7s) |
+| P10 | Verification-only. Sensitivity: granting B the model role before the initiating token is minted fails `"the reloaded authority reached the model: 200"` | 1 passed, 46 skipped (5.4s) |
+
+What the verification-only proofs assert:
+
+- P7 `eval_verification::realtime_subject_actor_authority`: D, holding the judge role, exchanges for the already delegated C-for-A token, so the chain is [C, D]. The judge is refused with `WYRD_VERIFICATION_502_DEPENDENCY_FAILED` and the provider still sees exactly 4 requests. Acceptance is audited A/D allowed, with C before D in the retained detail, and the judge decisions are A/SYSTEM only.
+- P8 `verification_runtime::scheduled_owner_authority_is_retained`: the real scheduler and Drift engine run a monthly binding.
+  - The stored run is owner/SYSTEM, its authority principal is the owner, and it has no chain.
+  - The retained input-read decisions are owner/SYSTEM.
+  - The published result is owner/SYSTEM for the binding.
+- P10 `verification_runtime::reloaded_authority_cannot_widen_gateway_access`:
+  - B-for-A queues a manual Drift run whose captured authority excludes the model.
+  - B is granted the model role. The initiating delegated token (3s access TTL, zero skew) is polled until the server answers 401.
+  - `VerifierRunQueue::claim` reloads the run, and `Caller::accepted(&claimed.authority, SYSTEM)` goes through `GatewayInvocation::invoke` with a `Resolved` subject (the call `ServerWyrdGatewayCaller` makes for judges). The call is refused and the provider receives 0 requests.
+  - B's fresh token reaches the model on `/v1/chat/completions`.
+  - The retained denied `gateway.invoke` decision is A/SYSTEM with chain [B].
+
+### Existing proofs at the candidate
+
+- P3 (`wyrd-ai`) `gateway_inference::loaded_workflow_calls_the_gateway_through_its_loading_client` and `hosted_workflow_calls_record_the_caller_and_the_workflow_card`: 2 passed, 102 skipped.
+- P9 `verification_runtime::queued_subject_authority_survives_restart`: PASS.
+- P11 `audit_retention::subject_actor_decisions_preserve_trusted_identity`: PASS.
+- P12 `wyrd-server --test integration pg_openapi_contract::verification_contract_publishes_exactly_four_typed_operations`: 1 passed, 257 skipped.
+- P13 `wyrd-ai --test integration support_desk::support_desk_answers_verifies_and_explains_every_request`: 1 passed, 103 skipped.
+- P14:
+  - After `mise run py:setup`, `pytest -q -m integration tests/integration/test_support_desk.py::test_support_desk_answers_verifies_and_explains_every_request`: 1 passed.
+  - After `mise run ts:build` and `mise run ts:build:testing`, `vitest run tests/integration/support-desk.test.ts -t '^support desk answers, verifies, and explains every request$'`: 1 passed.
+
+### Narrow checks
+
+`mise run fmt`, `mise run lints`, `mise run check:deps`,
+`mise run check:tenant-isolation`, `mise run codegen:check`, `mise run docs:check`,
+and `git diff --check` all exit 0. The first `lints` run failed with
+`clippy::single_match_else` at `verification/observations.rs:125`, which was fixed
+in `74d647656`, and P4 was re-run green afterwards.
+
+### Diagnoses
+
+- **P10, first attempt.**
+  - Symptom: `POST /v1/verification/runs` returned 403 (trace `http.route="/v1/verification/runs" http.response.status_code=403`).
+  - Cause: subject A was a Card-bound Service, and its Card scope excludes the subject Card.
+  - Fix site: the test fixture, which now uses User A as P9 does. Production is unchanged.
+- **P8 duration.**
+  - Symptom: the run was claimed about 31s after the runtime started (`WYRD_LOG=info,wyrd_server::verification=debug`).
+  - Cause: the documented `VerificationFixture::make_binding_due` contract, under which the occurrence fires 30s past the cursor. This is not a defect.
+
+### FIND-TASK-001-2 — SPEC_REVISION_REQUIRED
+
+Prepared change (not committed):
+
+- `Workflow` carries the loaded Card UID.
+- `WorkflowCards::load` sets it from `load_workflow`.
+- The local runtime sends it through `PublicWyrdGatewayCaller::with_subject(None, card_uid)`.
+
+RED: `gateway_inference.rs:639`, left (None, None) right (None, Some(uid)).
+
+GREEN attempt: `loaded_workflow_calls_the_gateway_through_its_loading_client` and `registered_example_runs_through_the_gateway` fail with `WYRD_VALA_403_BIFROST_CARD_SCOPE`. The hosted and from-path paths pass.
+
+- **Evidence.**
+  - The trace's chat span shows `error.type=WYRD_VALA_403_BIFROST_CARD_SCOPE`.
+  - In `components/gateway/invocation.rs` `attribute`, a `Requested` subject is checked against `caller.principal.card_attribution()`.
+  - A Card-bound Service resolves to `Scoped` (its own scope).
+  - The journey administrator is `bootstrap_service("journey_admin", …)`, a Card-bound Service whose scope excludes the Workflow.
+  - Hosted runs use `GatewayCallAttribution::Resolved` (`workflow/host.rs`) and skip the check.
+- **Cause.** The task assumes the Workflow is already eligible for the caller in this journey, and that assumption is false. Once the UID is sent, every Card-bound caller that loads a registered Workflow outside its scope is refused.
+- **Fix site.** Gateway Card authorization, which this task and INV-006 forbid widening. The only alternative accepts that such callers can no longer run registered Workflows locally.
+
+Either way the outcome changes approved behavior, so the human must decide.

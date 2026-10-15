@@ -1,6 +1,6 @@
 ---
 id: SPEC-verify-attribution
-revision: 2
+revision: 3
 status: approved
 ---
 
@@ -32,6 +32,12 @@ make every client SDK inject trace context. The decisions D1–D8 below turn tha
 direction into contract. Revision 2, including D1–D8, was approved by the
 human owner on 2026-10-14: "i approve". SPEC-sub-act-attribution lands after
 this change and builds on it.
+
+Revision 3 resolves a conflict between AC-002 and REQ-007 found in review:
+queued Bifrost writes reach the server with their producer contexts as
+links and no `traceparent`, so their CONSUMER span never reached the tenant.
+A linked ingest is now tenant-eligible as its own linked trace. The human
+owner approved it on 2026-10-14: "i agree. go with the recommendation".
 
 ## Required behavior
 
@@ -121,8 +127,15 @@ execution's context, not from whether a Run exists.
   of D5. It never carries SQL text, internal hosts or addresses, storage keys
   or paths, credentials, or another tenant's identifiers.
 - The tenant export works whether or not an operator endpoint is configured.
-- Spans of deferred work, of requests with no client context, and of
-  requests whose client trace is not sampled go only to the operator.
+- An authenticated Bifrost ingest whose batch links at least one sampled
+  producer context is also tenant-eligible. Its CONSUMER span and the catalog
+  spans below it are written to the requesting tenant, linked to the
+  producers. Ids, parents, and links are the operator's, as above; the
+  consumer's parent is a server span the tenant does not receive. The
+  operator copy is unchanged.
+- Spans of deferred work, of requests with no client context and no sampled
+  producer link, and of requests whose client trace is not sampled go only
+  to the operator.
 - The gateway's captured attempt spans stay the canonical attempt rows; under
   a continued trace their parent is the exported gateway call span, and no
   attempt is written twice.
@@ -226,3 +239,5 @@ None.
 - r1 (2026-10-14): approved; attribution and gateway trace linking.
 - r2 (2026-10-14): approved; server trace continuity, SDK propagation, dual
   export, trace timeline read, correlation-model wording, r1 closeout.
+- r3 (2026-10-14): approved; a linked ingest's CONSUMER span is
+  tenant-eligible as its own linked trace (AC-002 / REQ-007 conflict).

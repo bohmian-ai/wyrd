@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from opentelemetry import trace
+from wyrd import WyrdError
 from wyrd.client import WyrdClient
 from wyrd.state import WyrdState
 
@@ -380,4 +381,9 @@ def main(framework: str, setup: str, scenario: str) -> None:
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:4])
+    try:
+        main(*sys.argv[1:4])
+    except WyrdError as error:
+        # The parent asserts the public catalog code, not the message.
+        print(json.dumps({"error": error.code}))
+        raise

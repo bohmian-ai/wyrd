@@ -294,5 +294,6 @@ def test_ambient_auth_gateway_telemetry(
         timeout=120,
     )
     assert finished.returncode != 0
-    # ``WYRD_CLIENT_401_NO_CREDENTIALS``, naming every way to supply one.
-    assert "WyrdError: no credentials available; set WYRD_ACCESS_TOKEN" in finished.stderr
+    assert json.loads(finished.stdout.splitlines()[-1]) == {
+        "error": "WYRD_CLIENT_401_NO_CREDENTIALS"
+    }, finished.stderr

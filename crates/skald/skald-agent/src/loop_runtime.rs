@@ -39,8 +39,9 @@ impl Agent {
     /// The run journals `AgentStart`, seeds recent session turns, appends the
     /// user turn to the session, applies `before_agent` callbacks, renders the
     /// Agent's own Prompt, and drives the bounded loop inside one
-    /// `invoke_agent` span. The Agent's provider override, when set, replaces
-    /// `providers`.
+    /// `invoke_agent` span. A `wyrd_gateway` execution route sends every model
+    /// call through the Agent's gateway caller; otherwise the Agent's provider
+    /// override, when set, replaces `providers`.
     ///
     /// When [`RunConfig::timeout`](crate::RunConfig) is set, everything up to
     /// the loop result is bounded by it; on expiry the in-flight provider or
@@ -53,7 +54,9 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::JournalAppendFailed`] when a non-terminal journal
+    /// Returns [`AgentError::InvalidArgument`] before any IO when a
+    /// `wyrd_gateway` route has no gateway caller or a non-gateway model,
+    /// [`AgentError::JournalAppendFailed`] when a non-terminal journal
     /// append fails, session read or append failures, callback panics, Prompt
     /// rendering and loop-shape errors, provider and tool failures, structured
     /// output decode failures, an exhausted iteration budget, or
@@ -64,7 +67,10 @@ impl Agent {
         session_id: Option<SessionId>,
         input: &str,
     ) -> AgentResult<AgentRun> {
-        let providers = self.effective_providers(providers);
+        let gateway = self.route_registry(&self.prompt)?;
+        let providers = gateway
+            .as_ref()
+            .unwrap_or_else(|| self.effective_providers(providers));
         let span = self.invoke_agent_span(&self.prompt);
         async move {
             const MAX_JOURNAL_INPUT_CHARS: usize = 4096;
@@ -172,8 +178,10 @@ impl Agent {
     /// The run journals `AgentStart`, renders `prompt`, refuses a provider
     /// that differs from the Agent's own Prompt, and drives
     /// the bounded loop inside one `invoke_agent` span whose model is the
-    /// explicit Prompt's model. The Agent's provider override, when set,
-    /// replaces `providers`.
+    /// explicit Prompt's model. A `wyrd_gateway` execution route sends every
+    /// model call to `<deployment>/<prompt model>` through the Agent's gateway
+    /// caller; otherwise the Agent's provider override, when set, replaces
+    /// `providers`.
     ///
     /// Timeout, cancellation, and terminal-journal behavior match
     /// [`Self::run_with`]: the optional run timeout bounds the loop, the
@@ -182,7 +190,9 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::JournalAppendFailed`] when a non-terminal journal
+    /// Returns [`AgentError::InvalidArgument`] before any IO when a
+    /// `wyrd_gateway` route has no gateway caller or a non-gateway model,
+    /// [`AgentError::JournalAppendFailed`] when a non-terminal journal
     /// append fails, [`AgentError::Prompt`] when rendering fails,
     /// [`AgentError::ProviderMismatch`] when `prompt` targets another provider,
     /// loop-shape, provider, tool, and structured-output failures, an
@@ -193,7 +203,10 @@ impl Agent {
         prompt: &Prompt,
         vars: &[(&str, &str)],
     ) -> AgentResult<AgentRun> {
-        let providers = self.effective_providers(providers);
+        let gateway = self.route_registry(prompt)?;
+        let providers = gateway
+            .as_ref()
+            .unwrap_or_else(|| self.effective_providers(providers));
         let span = self.invoke_agent_span(prompt);
         async move {
             let result = async {

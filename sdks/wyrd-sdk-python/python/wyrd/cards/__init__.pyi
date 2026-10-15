@@ -47,6 +47,8 @@ class AgentCard:
     def __init__(
         self,
         prompt: PromptReference,
+        *,
+        execution_route: Mapping[str, str],
         space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
@@ -58,6 +60,8 @@ class AgentCard:
 
         Args:
             prompt: the inline prompt or registered Prompt Card reference.
+            execution_route: the required route, ``{"kind": "native"}`` or
+                ``{"kind": "wyrd_gateway", "deployment": <name>}``.
             space: the Card space. Omitted, the workspace ``wyrd.toml``
                 ``[kind.Agent]`` or ``[defaults]`` space applies, else
                 ``"default"``.
@@ -69,8 +73,9 @@ class AgentCard:
             annotations: free-form annotations, merged like ``labels``.
 
         Raises:
-            WyrdError: for an invalid label or annotation, or identity values
-                the Agent envelope rejects.
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a malformed
+                ``execution_route``, or for an invalid label or annotation, or
+                identity values the Agent envelope rejects.
 
         """
         ...

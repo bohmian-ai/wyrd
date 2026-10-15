@@ -13,10 +13,9 @@ use pyo3::types::{PyDict, PyList, PyMapping, PyModule, PyString, PyType};
 use wyrd_cards::card_ref::CardRefPy;
 use wyrd_client::observe::eval::parse_session_id;
 use wyrd_client::observe::{EvalObservationOptions, Observe, Run};
-use wyrd_spec::ExecutionRoute;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::verification::Judgment;
-use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject, pydict_to_json_value};
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult, execution_route_from_py, json_to_pyobject};
 
 /// One boundary validation failure naming the offending argument.
 fn invalid_argument(field: &str, reason: impl Display) -> WyrdPyError {
@@ -253,19 +252,7 @@ impl PyRun {
         route: Option<Bound<'_, PyDict>>,
     ) -> WyrdPyResult<String> {
         let route = route
-            .map(|route| {
-                serde_json::from_value::<ExecutionRoute>(pydict_to_json_value(&route)?).map_err(
-                    |error| {
-                        WyrdPyError::from(WyrdError::Validation {
-                            message: format!("route is invalid: {error}"),
-                            details: serde_json::json!({
-                                "field": "route",
-                                "reason": error.to_string(),
-                            }),
-                        })
-                    },
-                )
-            })
+            .map(|route| execution_route_from_py(&route, "route"))
             .transpose()?;
         let variables = variables.unwrap_or_default();
         let pairs: Vec<(&str, &str)> = variables

@@ -9,7 +9,7 @@ use {
     chrono::Utc,
     pyo3::prelude::*,
     pyo3::pyclass::{PyTraverseError, PyVisit},
-    pyo3::types::PyAny,
+    pyo3::types::{PyAny, PyDict},
     std::collections::BTreeMap,
     wyrd_interfaces::error::{CardPyResult, WyrdPyError},
     wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec},
@@ -17,6 +17,7 @@ use {
     wyrd_spec::metadata::{
         AnnotationKey, AnnotationValue, Annotations, LabelKey, LabelValue, Labels, MetadataError,
     },
+    wyrd_utils::py::execution_route_from_py,
 };
 
 /// Python adapter around the canonical native [`AgentCard`].
@@ -93,15 +94,23 @@ impl PyAgentCard {
 #[cfg(feature = "python")]
 #[pymethods]
 impl PyAgentCard {
-    /// Create an Agent Card from a Python `PromptReference`.
+    /// Create an Agent Card from a Python `PromptReference` and its required
+    /// execution route dict, `{"kind": "native"}` or
+    /// `{"kind": "wyrd_gateway", "deployment": <name>}`.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SPEC_400_VALIDATION` for a malformed `execution_route` or
+    /// label/annotation, and the envelope validation error for invalid
+    /// identity.
     #[new]
-    #[pyo3(signature = (prompt, space=None, name=None, version=None, uid=None, labels=None, annotations=None))]
+    #[pyo3(signature = (prompt, *, execution_route, space=None, name=None, version=None, uid=None, labels=None, annotations=None))]
     #[allow(
         clippy::too_many_arguments,
         reason = "pyo3 #[new] signature mirrors the complete Python AgentCard constructor"
     )]
     pub fn __new__(
         prompt: &Bound<'_, PromptReference>,
+        execution_route: &Bound<'_, PyDict>,
         space: Option<&str>,
         name: Option<&str>,
         version: Option<&str>,
@@ -121,7 +130,7 @@ impl PyAgentCard {
         );
         let spec = AgentSpec {
             prompt: prompt.borrow().inner.clone(),
-            execution_route: wyrd_spec::ExecutionRoute::Native {},
+            execution_route: execution_route_from_py(execution_route, "execution_route")?,
             tool_names: Vec::new(),
             run_config: AgentRunConfigSpec::default(),
             verified_by: Vec::new(),

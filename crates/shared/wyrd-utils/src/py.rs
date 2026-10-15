@@ -230,6 +230,29 @@ pub fn pydict_to_json_value(dict: &Bound<'_, PyDict>) -> PyResult<Value> {
     Ok(Value::Object(map))
 }
 
+/// Decode a Python execution-route dict, such as `{"kind": "native"}` or
+/// `{"kind": "wyrd_gateway", "deployment": "openai-primary"}`, for `field`.
+///
+/// The one decoder every Python surface that accepts an Agent route uses, so
+/// Agent construction, `Agent.run`, `AgentCard`, and `Run.invoke` refuse the
+/// same malformed shapes identically. It returns the catalog error so each
+/// Python boundary error type converts it with `?`.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` naming `field` when a value cannot be
+/// read or the dict is not one of the two route variants.
+pub fn execution_route_from_py(
+    dict: &Bound<'_, PyDict>,
+    field: &str,
+) -> Result<wyrd_spec::ExecutionRoute, SpecWyrdError> {
+    let invalid = |reason: String| SpecWyrdError::Validation {
+        message: format!("{field} is invalid: {reason}"),
+        details: serde_json::json!({ "field": field, "reason": reason }),
+    };
+    let value = pydict_to_json_value(dict).map_err(|error| invalid(error.to_string()))?;
+    serde_json::from_value(value).map_err(|error| invalid(error.to_string()))
+}
+
 /// Return the imported module's `__version__` when available.
 ///
 /// Missing modules and modules without `__version__` return `Ok(None)`.

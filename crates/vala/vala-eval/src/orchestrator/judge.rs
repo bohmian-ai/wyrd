@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 use skald_agent::{
     Agent, AgentError, WyrdGatewayCaller, agent_error_retryable,
-    run_config_from_agent_run_config_spec, wyrd_gateway_registry,
+    run_config_from_agent_run_config_spec,
 };
 use skald_prompt::Prompt;
 use skald_providers::ProviderError;
@@ -134,6 +134,23 @@ impl SkaldJudgeInvoker {
         Ok(Prompt::from_native(native))
     }
 
+    /// Resolve, validate, and cache the one judge Agent this invoker runs.
+    ///
+    /// The judge reference resolves through the Agent resolver (inline specs
+    /// are used as authored), its Prompt through the Prompt resolver, and the
+    /// result is checked to be a structured-output judge. The Agent keeps its
+    /// declared execution route: a `wyrd_gateway` route dispatches through
+    /// this invoker's gateway caller, a `native` route through the caller's
+    /// providers. The first resolved Agent is cached for the invoker's
+    /// lifetime; holding the cache lock across resolution makes concurrent
+    /// first calls resolve once.
+    ///
+    /// # Errors
+    /// Returns [`JudgeError::Terminal`] when a second, different judge
+    /// reference is requested, a path reference was not resolved by the
+    /// loader, the judge Agent or its Prompt is invalid for judging, a gateway
+    /// route has no gateway caller, or a server-controlled invoker meets a
+    /// native route; and the resolvers' own errors.
     async fn agent_for(
         &self,
         judge_ref: &InlineableRef<AgentSpec>,
@@ -190,15 +207,16 @@ impl SkaldJudgeInvoker {
             || "inline-judge".to_owned(),
             |reference| reference.name.to_string(),
         );
-        let gateway = match (&spec.execution_route, &self.gateway) {
-            (ExecutionRoute::WyrdGateway { deployment }, Some(caller)) => Some(Arc::new(
-                wyrd_gateway_registry(Arc::clone(caller), prompt.native(), deployment).ok_or_else(
-                    || JudgeError::Terminal {
-                        reason: "judge Prompt model is not a gateway model identifier".to_owned(),
-                    },
-                )?,
-            )),
-            (ExecutionRoute::Native {}, None) => None,
+        let mut agent = Agent::new(prompt)
+            .with_id(id)
+            .with_tools(std::iter::empty())
+            .with_run_config(run_config_from_agent_run_config_spec(&spec.run_config))
+            .with_execution_route(spec.execution_route.clone());
+        match (&spec.execution_route, &self.gateway) {
+            (ExecutionRoute::WyrdGateway { .. }, Some(caller)) => {
+                agent = agent.with_gateway_caller(Arc::clone(caller));
+            }
+            (ExecutionRoute::Native {}, None) => {}
             (ExecutionRoute::WyrdGateway { .. }, None) => {
                 return Err(JudgeError::Terminal {
                     reason: "judge Agent routes through the Wyrd gateway, which this invoker \
@@ -213,13 +231,6 @@ impl SkaldJudgeInvoker {
                         .to_owned(),
                 });
             }
-        };
-        let mut agent = Agent::new(prompt)
-            .with_id(id)
-            .with_tools(std::iter::empty())
-            .with_run_config(run_config_from_agent_run_config_spec(&spec.run_config));
-        if let Some(registry) = gateway {
-            agent = agent.with_provider_registry(registry);
         }
         let agent = Arc::new(agent);
         *cached = Some((judge_ref.clone(), Arc::clone(&agent)));
@@ -267,11 +278,15 @@ impl JudgeInvoker for SkaldJudgeInvoker {
             .map_err(|error| JudgeError::Terminal {
                 reason: format!("judge Prompt does not render: {error}"),
             })?;
-        let call = skald_runtime::dispatch(
-            agent.effective_providers(&self.providers),
-            prompt.native().provider(),
-            request,
-        );
+        let gateway = agent
+            .route_registry(prompt)
+            .map_err(|error| JudgeError::Terminal {
+                reason: error.to_string(),
+            })?;
+        let providers = gateway
+            .as_ref()
+            .unwrap_or_else(|| agent.effective_providers(&self.providers));
+        let call = skald_runtime::dispatch(providers, prompt.native().provider(), request);
         let response = tokio::time::timeout(self.call_deadline, call)
             .await
             .map_err(|_| JudgeError::Timeout {

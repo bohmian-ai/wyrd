@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod artifact;
 pub mod audit;
+pub mod blocks;
 pub mod common;
 pub mod data;
 pub mod drift;

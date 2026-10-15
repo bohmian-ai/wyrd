@@ -1,5 +1,5 @@
 ---
-id: SPEC-gateway-api-key-fallback
+id: SPEC-gateway-api-key-auth
 revision: 1
 status: approved
 ---

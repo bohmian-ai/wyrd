@@ -1,7 +1,7 @@
 # TASK-001 Exchange a presented API key on gateway ingress
 
-Spec: `changes/active/gateway-api-key-fallback/spec.md` r1. Branch
-`change/gateway-api-key-fallback` off `origin/main` 5bcd9e487. Independent of
+Spec: `changes/active/gateway-api-key-auth/spec.md` r1. Branch
+`change/gateway-api-key-auth` off `origin/main` 5bcd9e487. Independent of
 SPEC-ambient-auth; merge after it so the docs order reads correctly.
 
 ## Where
@@ -34,7 +34,7 @@ SPEC-ambient-auth; merge after it so the docs order reads correctly.
 
 ## Docs
 
-- Framework guide section "Fallback: a Wyrd API key" after the access-token
+- Framework guide section "Authenticate with a Wyrd API key" after the access-token
   path.
 - `architecture/wyrd-design.md`, "Cross-service delegation": one paragraph
   naming the gateway ingress exception.

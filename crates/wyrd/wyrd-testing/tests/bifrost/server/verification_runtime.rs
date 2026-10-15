@@ -3105,3 +3105,126 @@ async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> 
     server.shutdown().await?;
     Ok(())
 }
+
+/// A scheduled Drift occurrence runs for its binding owner with SYSTEM as
+/// actor from acceptance to the published result (AC-009/018,
+/// FIND-TASK-001-7).
+///
+/// A monthly Custom Drift binding of a subject Card is owned by a separate
+/// Service. Once the owner is active and the occurrence is due, the production
+/// runtime accepts it and runs the real Drift engine. The stored run pairs the
+/// owner with SYSTEM and captures the owner's recovered authority with no
+/// delegation history; its input read decision and its published result carry
+/// the same owner/SYSTEM pair.
+///
+/// # Errors
+/// Returns server, seeding, runtime, or query errors, or a description of
+/// the first expectation that does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::builder().start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let (subject, _) = seed.service("scheduled-subject").await?;
+    let (owner, owner_principal) = seed.service("scheduled-owner").await?;
+    let verifier = seed
+        .custom_drift_verifier("scheduled-drift", "score", 1.0, 0.5)
+        .await?;
+    server
+        .ensure_builtin_table_for_test(tenant, "drift", "observations")
+        .await?;
+    let binding = seed
+        .bind_schedule(&owner, &subject, &verifier, MONTHLY, Vec::new())
+        .await?;
+    seed.activate(owner_principal).await?;
+    seed.make_binding_due(binding).await?;
+
+    let runtime = VerificationRuntime::builder(server.state())
+        .build()
+        .ok_or("the runtime did not compose")?;
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let (run, row) = loop {
+        if let Some(run) = seed.runs().await?.first().copied() {
+            let row = seed.run(run).await?;
+            if !["pending", "running", "retrying"].contains(&row.status.as_str()) {
+                break (run, row);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the scheduled Drift run never settled".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    let ("completed", Some(result)) = (row.status.as_str(), row.result_id) else {
+        return Err(format!("the scheduled Drift run settled {row:?}").into());
+    };
+
+    let (owner_id, system) = (owner_principal.as_uuid(), seed.system_principal());
+    let (sub, act, authority): (uuid::Uuid, uuid::Uuid, Value) = sqlx::query_as(
+        "SELECT sub_principal_id, act_principal_id, authority FROM wyrd.verifier_runs \
+         WHERE run_id = $1",
+    )
+    .bind(run.as_uuid())
+    .fetch_one(&server.pg_fixture().superuser_pool()?)
+    .await?;
+    if (sub, act) != (owner_id, system)
+        || authority["principal"]["id"] != json!(owner_id)
+        || authority
+            .get("delegation_chain")
+            .and_then(Value::as_array)
+            .is_some_and(|chain| !chain.is_empty())
+    {
+        return Err(format!(
+            "expected the owner/SYSTEM run under the owner's own authority, read \
+             {sub}/{act} {authority}"
+        )
+        .into());
+    }
+    server.await_audit_retained().await?;
+    let reads = server
+        .retained_audit_records(
+            tenant,
+            "act_principal_id",
+            &format!(
+                "operation = 'bifrost.query.read_decision' AND sub_principal_id = '{owner_id}'"
+            ),
+        )
+        .await?;
+    if reads.is_empty()
+        || reads
+            .iter()
+            .any(|read| read[0].as_deref() != Some(system.to_string().as_str()))
+    {
+        return Err(format!("expected owner/SYSTEM input reads, read {reads:?}").into());
+    }
+
+    let unwritten = server
+        .state()
+        .scribe_outbox
+        .settle(std::time::Instant::now() + WAIT)
+        .await;
+    if unwritten != 0 {
+        return Err(format!("{unwritten} results never reached Scribe").into());
+    }
+    server.flush_bifrost().await?;
+    let rows = query_rows(
+        &server,
+        tenant,
+        format!(
+            "SELECT result_id FROM vala.verification.results WHERE result_id = '{result}' \
+             AND binding_id = '{binding}' AND {SUB_PRINCIPAL_ID} = '{owner_id}' \
+             AND {ACT_PRINCIPAL_ID} = '{system}'"
+        ),
+    )
+    .await?;
+    if rows != 1 {
+        return Err(format!("expected one owner/SYSTEM result, read {rows}").into());
+    }
+    server.shutdown().await?;
+    Ok(())
+}

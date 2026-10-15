@@ -34,7 +34,9 @@ import tomllib
 from collections import deque
 
 # Global paths configure every lane at once.
-GLOBAL = re.compile(r"^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|mise\.toml|\.github/)")
+GLOBAL = re.compile(
+    r"^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|mise\.toml|\.github/)"
+)
 # Paths that select no verification of their own.
 UNVERIFIED = re.compile(r"^(changes/|architecture/|[^/]+\.md$)")
 # The docs diagram test reads the wyrd-spec contract bundle, so contract
@@ -71,10 +73,17 @@ BIFROST_ONLY = re.compile(
     r"|sdks/wyrd-sdk-ts/wyrd/(tests/unit/bifrost-query\.test\.ts|tests/integration/query-bifrost\.test\.ts))"
 )
 # Trees whose every file must be owned by a workspace package.
-PACKAGE_TREES = re.compile(r"^(crates/|sdks/[^/]+/(src|native|native-testing)/|examples/rust/)")
+PACKAGE_TREES = re.compile(
+    r"^(crates/|sdks/[^/]+/(src|native|native-testing)/|examples/rust/)"
+)
 
 # Packages outside the four Rust families; each has a dedicated owning lane.
-LANGUAGE_PACKAGES = {"wyrd-sdk-python", "wyrd-sdk-ts", "wyrd-sdk-ts-testing", "wyrd-rust-examples"}
+LANGUAGE_PACKAGES = {
+    "wyrd-sdk-python",
+    "wyrd-sdk-ts",
+    "wyrd-sdk-ts-testing",
+    "wyrd-rust-examples",
+}
 # Packages whose ignored Bifrost journeys test:bifrost:gate runs.
 BIFROST_JOURNEY = {"vala-bifrost-redux", "wyrd-client", "wyrd-testing", "wyrd-mcp"}
 # Packages whose ignored gateway journeys test:gateway:gate runs.
@@ -82,9 +91,19 @@ GATEWAY_JOURNEY = {"wyrd-testing", "wyrd-cli", "wyrd-mcp", "wyrd-ai"}
 STORAGE_PACKAGES = {"wyrd-storage", "wyrd-server", "wyrd-sql"}
 # The identity journeys drive the server, the CLI, and every SDK's saved login.
 IDENTITY_PACKAGES = {
-    "wyrd-auth", "wyrd-auth-check", "wyrd-auth-issue", "wyrd-auth-oidc",
-    "wyrd-auth-verify", "wyrd-client", "wyrd-server", "wyrd-testing", "wyrd-cli",
-    "wyrd-ai", "wyrd-sdk-python", "wyrd-sdk-ts", "wyrd-sdk-ts-testing",
+    "wyrd-auth",
+    "wyrd-auth-check",
+    "wyrd-auth-issue",
+    "wyrd-auth-oidc",
+    "wyrd-auth-verify",
+    "wyrd-client",
+    "wyrd-server",
+    "wyrd-testing",
+    "wyrd-cli",
+    "wyrd-ai",
+    "wyrd-sdk-python",
+    "wyrd-sdk-ts",
+    "wyrd-sdk-ts-testing",
 }
 CODEGEN_PACKAGES = {"wyrd-spec", "wyrd-client", "wyrd-sdk-python"}
 RUST_CLIENT_PACKAGES = {"wyrd-client", "wyrd-ai"}
@@ -120,7 +139,10 @@ def gate_jobs(root):
     """Return one ci job per `gate:*` shard, in mise.toml's gate order."""
     with open(os.path.join(root, "mise.toml"), "rb") as manifest:
         shards = tomllib.load(manifest)["tasks"]["gate"]["depends"]
-    jobs = [{"name": shard, "lanes": shard, "cache": SHARD_CACHE.get(shard, "test")} for shard in shards]
+    jobs = [
+        {"name": shard, "lanes": shard, "cache": SHARD_CACHE.get(shard, "test")}
+        for shard in shards
+    ]
     for cache in {job["cache"] for job in jobs} - {"test"}:
         next(job for job in jobs if job["cache"] == cache)["save"] = True
     return jobs
@@ -132,18 +154,30 @@ def ci_jobs(sel, outputs):
         return [{"name": "bifrost", "lanes": "verify:bifrost", "cache": "test"}]
     jobs = []
     if sel.lanes:
-        jobs.append({"name": "lanes", "lanes": " ".join(["check", "check:deps", *sel.lanes]), "cache": "test"})
+        jobs.append(
+            {
+                "name": "lanes",
+                "lanes": " ".join(["check", "check:deps", *sel.lanes]),
+                "cache": "test",
+            }
+        )
     if sel.flags.get("identity"):
-        jobs.append({"name": "identity", "lanes": "test:identity:journey", "cache": "test"})
+        jobs.append(
+            {"name": "identity", "lanes": "test:identity:journey", "cache": "test"}
+        )
     if sel.flags.get("storage"):
-        jobs.append({"name": "storage", "lanes": "test:storage:matrix", "cache": "test"})
+        jobs.append(
+            {"name": "storage", "lanes": "test:storage:matrix", "cache": "test"}
+        )
     return jobs
 
 
 def published_crates(root):
     """Return the crates release-plz.toml opts in to crates.io publishing."""
     with open(os.path.join(root, "release-plz.toml"), "rb") as manifest:
-        return {p["name"] for p in tomllib.load(manifest)["package"] if p.get("publish")}
+        return {
+            p["name"] for p in tomllib.load(manifest)["package"] if p.get("publish")
+        }
 
 
 def read_metadata(root):
@@ -153,7 +187,10 @@ def read_metadata(root):
         return json.load(open(override, encoding="utf-8"))
     raw = subprocess.run(
         ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
-        cwd=root, check=True, capture_output=True, text=True,
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
     return json.loads(raw)
 
@@ -167,19 +204,30 @@ class Workspace:
         packages = [p for p in metadata["packages"] if p["id"] in members]
         names = {p["name"] for p in packages}
         self.dirs = sorted(
-            ((os.path.dirname(p["manifest_path"]).removeprefix(root) + "/", p["name"]) for p in packages),
-            key=lambda item: len(item[0]), reverse=True,
+            (
+                (
+                    os.path.dirname(p["manifest_path"]).removeprefix(root) + "/",
+                    p["name"],
+                )
+                for p in packages
+            ),
+            key=lambda item: len(item[0]),
+            reverse=True,
         )
         # consumers[dep] = [(consumer, kind)]; kind is None for normal edges.
         self.consumers = {name: [] for name in names}
         for package in packages:
             for dep in package["dependencies"]:
                 if dep["name"] in names and dep["name"] != package["name"]:
-                    self.consumers[dep["name"]].append((package["name"], dep.get("kind")))
+                    self.consumers[dep["name"]].append(
+                        (package["name"], dep.get("kind"))
+                    )
 
     def owner(self, path):
         """Return the package whose directory is the longest prefix of path."""
-        return next((name for directory, name in self.dirs if path.startswith(directory)), None)
+        return next(
+            (name for directory, name in self.dirs if path.startswith(directory)), None
+        )
 
     def closure(self, changed):
         """Return {package: reason} for the changed packages and their consumers.
@@ -258,9 +306,17 @@ def select(paths, root):
                 sel.full_gate(f"mixed Bifrost ({bifrost[0]}) and other Rust ({path})")
         elif PACKAGE_TREES.match(path) and not UI.match(path):
             sel.full_gate(f"{path} is not owned by a workspace package")
-        elif not (GLOBAL.match(path) or UNVERIFIED.match(path) or DOCS.match(path) or UI.match(path)
-                  or PYTHON.match(path) or TYPESCRIPT.match(path) or STORAGE.match(path)
-                  or IDENTITY.match(path) or BIFROST_ONLY.match(path)):
+        elif not (
+            GLOBAL.match(path)
+            or UNVERIFIED.match(path)
+            or DOCS.match(path)
+            or UI.match(path)
+            or PYTHON.match(path)
+            or TYPESCRIPT.match(path)
+            or STORAGE.match(path)
+            or IDENTITY.match(path)
+            or BIFROST_ONLY.match(path)
+        ):
             sel.full_gate(f"unclassified path {path}")
 
     for path in paths:
@@ -274,7 +330,9 @@ def select(paths, root):
             sel.flag("identity", f"identity environment input {path}")
 
     if bifrost_only:
-        sel.notes.append("bifrost_only: every path is owned by the Bifrost capability gate")
+        sel.notes.append(
+            "bifrost_only: every path is owned by the Bifrost capability gate"
+        )
         outputs["bifrost_only"] = "true"
         outputs["changed_packages"] = " ".join(sorted(changed))
         return sel, outputs
@@ -283,7 +341,10 @@ def select(paths, root):
     outputs["changed_packages"] = " ".join(sorted(changed))
     outputs["rust_packages"] = " ".join(sorted(affected))
     for package, reason in sorted(affected.items()):
-        sel.notes.append(f"package {package}: {reason}" + (f" ({changed[package]})" if package in changed else ""))
+        sel.notes.append(
+            f"package {package}: {reason}"
+            + (f" ({changed[package]})" if package in changed else "")
+        )
 
     for package in sorted(affected):
         family = families.get(package)
@@ -295,11 +356,19 @@ def select(paths, root):
     python = [p for p in paths if PYTHON.match(p)]
     typescript = [p for p in paths if TYPESCRIPT.match(p)]
     if "wyrd-sdk-python" in affected or python:
-        why = "wyrd-sdk-python is affected" if "wyrd-sdk-python" in affected else f"Python input {python[0]}"
+        why = (
+            "wyrd-sdk-python is affected"
+            if "wyrd-sdk-python" in affected
+            else f"Python input {python[0]}"
+        )
         sel.flag("python", why)
         sel.lane("py:test:integration", why)
     if affected.keys() & {"wyrd-sdk-ts", "wyrd-sdk-ts-testing"} or typescript:
-        why = "the TypeScript addon is affected" if not typescript else f"TypeScript input {typescript[0]}"
+        why = (
+            "the TypeScript addon is affected"
+            if not typescript
+            else f"TypeScript input {typescript[0]}"
+        )
         sel.flag("typescript", why)
         sel.lane("ts:napi:check", why)
         sel.lane("ts:test:integration", why)
@@ -331,46 +400,77 @@ def select(paths, root):
 
 
 def write_outputs(result):
-    with open(os.environ.get("GITHUB_OUTPUT", "/dev/stdout"), "a", encoding="utf-8") as out:
+    with open(
+        os.environ.get("GITHUB_OUTPUT", "/dev/stdout"), "a", encoding="utf-8"
+    ) as out:
         for name, value in result.items():
             out.write(f"{name}={value}\n")
 
 
 def main():
     root = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True,
+        ["git", "rev-parse", "--show-toplevel"],
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     if sys.argv[1] == "--gate":
         write_outputs({"ci_jobs": json.dumps(gate_jobs(root), separators=(",", ":"))})
         return
-    paths = [line.strip() for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+    paths = [
+        line.strip() for line in open(sys.argv[1], encoding="utf-8") if line.strip()
+    ]
     sel, outputs = select(paths, root)
 
     full_gate = bool(sel.full_gate_reason)
-    flags = ["docs", "ui", "python", "typescript", "rust_client", "storage", "identity",
-             "package_python", "package_typescript", "package_server", "package_crates"]
+    flags = [
+        "docs",
+        "ui",
+        "python",
+        "typescript",
+        "rust_client",
+        "storage",
+        "identity",
+        "package_python",
+        "package_typescript",
+        "package_server",
+        "package_crates",
+    ]
     result = {
         "any": str(bool(paths)).lower(),
         "full_gate": str(full_gate).lower(),
         "full_gate_reason": sel.full_gate_reason,
-        "bifrost_only": "true" if outputs.get("bifrost_only") and not full_gate else "false",
+        "bifrost_only": "true"
+        if outputs.get("bifrost_only") and not full_gate
+        else "false",
         "changed_packages": outputs["changed_packages"],
         # The full gate runs every lane over every package itself; a package
         # filter would make its family lanes test only the affected closure.
         "rust_packages": "" if full_gate else outputs["rust_packages"],
         "ci_lanes": "" if full_gate else " ".join(sel.lanes),
-        "ci_jobs": json.dumps(gate_jobs(root) if full_gate else ci_jobs(sel, outputs), separators=(",", ":")),
+        "ci_jobs": json.dumps(
+            gate_jobs(root) if full_gate else ci_jobs(sel, outputs),
+            separators=(",", ":"),
+        ),
     }
     for name in flags:
         # Unknown impact selects every platform job and the complete package matrix.
-        unknown = full_gate and (name.startswith("package_") or name in ("python", "typescript", "rust_client"))
+        unknown = full_gate and (
+            name.startswith("package_")
+            or name in ("python", "typescript", "rust_client")
+        )
         result[name] = str(unknown or bool(sel.flags.get(name))).lower()
 
     write_outputs(result)
 
-    report = ["Changed files:", *(f"- {p}" for p in paths), "", "Selection:",
-              *(f"- {note}" for note in sel.notes),
-              *(f"- {name}={value}" for name, value in result.items())]
+    report = [
+        "Changed files:",
+        *(f"- {p}" for p in paths),
+        "",
+        "Selection:",
+        *(f"- {note}" for note in sel.notes),
+        *(f"- {name}={value}" for name, value in result.items()),
+    ]
     print("\n".join(report))
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(summary, "a", encoding="utf-8") as out:

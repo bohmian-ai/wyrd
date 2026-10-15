@@ -24,7 +24,7 @@ function expectRedacted(value: unknown): void {
 
 /** The administrator's connection handle and the id of `ops-slack`. */
 const test = serverTest().extend<{ connections: OperatorConnections; slack: string }>({
-  connections: [async ({ server: _ }, use) => use(OperatorConnections.connect()), { scope: "file" }],
+  connections: [async ({ server: _ }, use) => use(await OperatorConnections.connect()), { scope: "file" }],
   slack: [async ({ connections }, use) => use((await connections.create(SLACK)).connection_id), { scope: "file" }],
 });
 

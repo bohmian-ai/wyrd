@@ -14,7 +14,7 @@ use wyrd_client::principals::{
 };
 use wyrd_spec::error::WyrdError;
 
-use crate::NativeLifecycleResult;
+use crate::{NativeLifecycleResult, NativeWyrdError};
 use crate::client::NativeWyrdClient;
 use crate::operators::decode;
 
@@ -33,17 +33,46 @@ pub struct NativePrincipals {
     principals: Principals,
 }
 
+/// Closed result of connecting one principal handle: the handle or a
+/// catalog error.
+#[napi(object, object_from_js = false)]
+pub struct NativePrincipalsConnection {
+    /// Connected handle when the connection succeeded.
+    pub handle: Option<NativePrincipals>,
+    /// Catalog failure otherwise.
+    pub error: Option<NativeWyrdError>,
+}
+
 #[napi]
 impl NativeWyrdClient {
-    /// Builds one principal handle that calls the server as this client.
+    /// Connects one principal handle that calls the server as this client.
     ///
-    /// No IO happens here; the public TypeScript `Principals.connect` passes
-    /// the caller's client or the ambient one.
+    /// Completes any credential exchange this client requires before
+    /// resolving, as `Principals::connect_with` does; the public TypeScript
+    /// `Principals.connect` passes the caller's client or the ambient one. A refused
+    /// or unreachable exchange is returned as catalog metadata.
+    ///
+    /// # Errors
+    ///
+    /// Never returns a napi error; failures are carried in the result.
     #[napi]
-    pub fn principals(&self) -> NativePrincipals {
-        NativePrincipals {
-            principals: Principals::with_client(self.client.clone()),
-        }
+    pub fn principals<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativePrincipalsConnection>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            Ok(match Principals::connect_with(&client).await {
+                Ok(principals) => NativePrincipalsConnection {
+                    handle: Some(NativePrincipals { principals }),
+                    error: None,
+                },
+                Err(error) => NativePrincipalsConnection {
+                    handle: None,
+                    error: Some(NativeWyrdError::from_wyrd(&error)),
+                },
+            })
+        })
     }
 }
 

@@ -191,7 +191,7 @@ impl NativeWyrdClient {
                 Bifrost::connect_with(
                     &client,
                     BifrostOptions {
-                        table: table,
+                        table,
                         queue: crate::queue_config(client_byte_limit_bytes),
                     },
                 )

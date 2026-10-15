@@ -150,7 +150,7 @@ const test = serverTest({
         provider: "anthropic",
         source: { environment: { binding: "test-anthropic-key" } },
       });
-      const gateway = Gateway.connect();
+      const gateway = await Gateway.connect();
       await gateway.putDeployment(deployment("gpt-4o"));
       await gateway.putDeployment({
         name: "claude-sonnet-5",
@@ -163,7 +163,7 @@ const test = serverTest({
       await gateway.putDeployment(deployment("gpt-5-5"));
       await gateway.putDeployment({ ...deployment("gpt-4o-mini"), capabilities: ["responses"] });
       await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });
-      await use(await Cards.connect().registerFromPath(fixture("cards/gateway_inference/ask.yaml")));
+      await use(await (await Cards.connect()).registerFromPath(fixture("cards/gateway_inference/ask.yaml")));
     },
     { scope: "file" },
   ],
@@ -282,7 +282,7 @@ test("stock openai client authenticates with a Wyrd API key", async ({ provider,
 // The status of the refusal is not pinned: only that the client's own token
 // exchange rejected the request, so no gateway call was made.
 test("revoked api key is refused by the token exchange, before the gateway", async ({ provider, ask: _ }) => {
-  const principals = Principals.connect();
+  const principals = await Principals.connect();
   const { principal_id, credential } = await principals.createServicePrincipal({
     name: "revoked-gateway-caller",
     roles: [],
@@ -403,7 +403,7 @@ test("cli issues a card scoped key and writes a provider credential", async ({ a
 
 test("loaded workflow calls the gateway through its loading client", async ({ provider, ask }) => {
   const before = provider.received.length;
-  const workflow = await Cards.connect().workflow.load({ uid: registered(ask).uid });
+  const workflow = await (await Cards.connect()).workflow.load({ uid: registered(ask).uid });
 
   const run = await workflow.run({ question: "hi" });
 
@@ -435,7 +435,7 @@ test("applying a workflow calls no model", async ({ provider, ask: _ }) => {
 test("registered example runs through the gateway", async ({ provider, ask: _ }) => {
   await cli.apply(EXAMPLE);
   const before = provider.received.length;
-  const registeredExample = await Cards.connect().workflow.load({
+  const registeredExample = await (await Cards.connect()).workflow.load({
     space: "engineering",
     name: "code-review",
     version: "1.0.0",

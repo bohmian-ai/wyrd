@@ -19,7 +19,7 @@ const test = serverTest().extend<{
   model: RegistrationReceipt;
   desk: RegistrationReceipt;
 }>({
-  cards: [async ({ server: _ }, use) => use(Cards.connect()), { scope: "file" }],
+  cards: [async ({ server: _ }, use) => use(await Cards.connect()), { scope: "file" }],
   model: [
     async ({ cards }, use) =>
       use(await cards.registerFromPath(fixture("cards/register_and_hydrate/support-model.yaml"))),
@@ -110,7 +110,7 @@ test("retired card kind is refused", async ({ cards }) => {
 });
 
 test("reader cannot register cards", async ({ server, desk: _ }) => {
-  const reader = Cards.connect({
+  const reader = await Cards.connect({
     client: WyrdClient.connect({ credential: server.scopedApiKey("card_reader", ["cards:read"]) }),
   });
 

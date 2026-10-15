@@ -57,7 +57,7 @@ const test = serverTest().extend<{
 }>({
   team: [
     async ({ server: _ }, use) => {
-      const cards = Cards.connect();
+      const cards = await Cards.connect();
       await use(
         refs(
           await cards.registerFromPath(workflowFixture("team/security.yaml")),
@@ -70,7 +70,7 @@ const test = serverTest().extend<{
   applied: [
     async ({ team }, use) => {
       const applied = { ...team, ...refs(await cli.apply(workflowFixture("mixed/workflow.yaml"))) };
-      await Cards.connect().registerFromPath(workflowFixture("team-v2/security.yaml"));
+      await (await Cards.connect()).registerFromPath(workflowFixture("team-v2/security.yaml"));
       await use(applied);
     },
     { scope: "file" },
@@ -152,7 +152,7 @@ test("local sibling never satisfies a registry ref", async ({ team: _ }) => {
 });
 
 test("deleted registry card is refused", async () => {
-  const cards = Cards.connect();
+  const cards = await Cards.connect();
   const retired = await cards.registerFromPath(workflowFixture("retired/retired-prompt.yaml"));
   await cards.delete(retired.root);
 
@@ -162,7 +162,7 @@ test("deleted registry card is refused", async () => {
 });
 
 test("applied workflow stays pinned to its registered cards", async ({ applied, readerKey }) => {
-  const reader = Cards.connect({ client: WyrdClient.connect({ credential: readerKey }) });
+  const reader = await Cards.connect({ client: WyrdClient.connect({ credential: readerKey }) });
   const agents = [applied["security-reviewer"], applied["correctness-reviewer"], applied["final-reviewer"]];
 
   const stored = await reader.get(applied["code-review"]);
@@ -181,7 +181,7 @@ test("applied workflow stays pinned to its registered cards", async ({ applied, 
 });
 
 test("loaded workflow runs its pinned cards", async ({ applied, readerKey }) => {
-  const reader = Cards.connect({ client: WyrdClient.connect({ credential: readerKey }) });
+  const reader = await Cards.connect({ client: WyrdClient.connect({ credential: readerKey }) });
   const workflow = applied["code-review"];
 
   for (const selector of [CODE_REVIEW, { uid: workflow.uid }]) {
@@ -198,7 +198,7 @@ test("loaded workflow runs its pinned cards", async ({ applied, readerKey }) => 
 
 // An Agent's uid names no Workflow.
 test("loading a bad selector is refused", async ({ applied, readerKey }) => {
-  const reader = Cards.connect({ client: WyrdClient.connect({ credential: readerKey }) });
+  const reader = await Cards.connect({ client: WyrdClient.connect({ credential: readerKey }) });
 
   await expect(reader.workflow.load({ uid: applied["security-reviewer"].uid })).rejects.toMatchObject({
     code: "WYRD_REGISTRY_404_CARD_NOT_FOUND",

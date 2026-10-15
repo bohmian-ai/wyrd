@@ -77,8 +77,8 @@ features = ["python", "pyo3/extension-module", "pyo3/abi3-py310"]
 testpaths = ["tests"]
 pythonpath = ["python"]
 # The agent framework journeys need the mcp-frameworks group; only
-# py:test:mcp-frameworks names their directory. The rest are pytest's defaults.
-norecursedirs = ["*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}", "mcp_frameworks"]
+# py:test:mcp-frameworks names their directories. The rest are pytest's defaults.
+norecursedirs = ["*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}", "mcp_frameworks", "frameworks"]
 markers = [
     "tensorflow: marks TensorFlow tests that run in the dedicated TensorFlow task",
     "integration: marks tests that require a live WyrdTestServer and run in the gated integration lane",
@@ -113,6 +113,7 @@ exclude = [
     "python/wyrd/**/__init__.py",
     "!python/wyrd/eval/__init__.py",
     "tests/integration/mcp_frameworks",
+    "tests/integration/otel/frameworks",
 ]
 
 [tool.ty.rules]

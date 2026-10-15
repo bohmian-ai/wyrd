@@ -12,7 +12,7 @@ import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -853,7 +853,7 @@ class _ExportHeaders(BaseHTTPRequestHandler):
         self.send_header("content-length", "0")
         self.end_headers()
 
-    def log_message(self, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         """Keep the test output quiet."""
 
 
@@ -877,7 +877,9 @@ def test_exporter_token_freshness() -> None:
     try:
         client = _RotatingClient(f"http://127.0.0.1:{server.server_address[1]}")
         provider = TracerProvider()
-        provider.add_span_processor(SimpleSpanProcessor(wyrd.otel.span_exporter(client)))  # type: ignore[arg-type]
+        provider.add_span_processor(
+            SimpleSpanProcessor(wyrd.otel.span_exporter(cast("WyrdClient", client)))
+        )
         assert client.issued == 0
         provider.get_tracer("framework").start_span("first").end()
         provider.get_tracer("framework").start_span("second").end()
@@ -935,7 +937,7 @@ def test_agents_callback_lifecycle(
 
     provider, exporter = spans
     processor = WyrdAgentsTraceProcessor()
-    trace_handle = SimpleNamespace(trace_id="trace_1", name="workflow")
+    trace_handle = cast("Any", SimpleNamespace(trace_id="trace_1", name="workflow"))
     run_a, run_b = state.run(), state.run()
 
     with provider.get_tracer("app").start_as_current_span("enclosing") as enclosing, run_a:
@@ -972,8 +974,11 @@ def test_agents_callback_lifecycle(
     response = _agents_span(
         "response",
         ResponseSpanData(
-            response=SimpleNamespace(
-                model="resp-model", usage=SimpleNamespace(input_tokens=5, output_tokens=2)
+            response=cast(
+                "Any",
+                SimpleNamespace(
+                    model="resp-model", usage=SimpleNamespace(input_tokens=5, output_tokens=2)
+                ),
             )
         ),
         parent_id="agent",
@@ -1035,11 +1040,12 @@ def test_agents_callback_lifecycle(
 
     # Shutdown ends unfinished spans with ERROR, is idempotent, and ignores late callbacks.
     exporter.clear()
-    processor.on_trace_start(SimpleNamespace(trace_id="trace_2", name="interrupted"))
+    interrupted_handle = cast("Any", SimpleNamespace(trace_id="trace_2", name="interrupted"))
+    processor.on_trace_start(interrupted_handle)
     processor.shutdown()
     processor.shutdown()
     processor.on_span_start(_agents_span("late", CustomSpanData(name="late", data={})))
-    processor.on_trace_end(SimpleNamespace(trace_id="trace_2", name="interrupted"))
+    processor.on_trace_end(interrupted_handle)
     processor.force_flush()
     (interrupted,) = exporter.get_finished_spans()
     assert interrupted.name == "interrupted"

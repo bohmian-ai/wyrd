@@ -684,7 +684,7 @@ def test_telemetry_setup_names_the_otel_extra_without_the_sdk(client_state: Wyrd
     """Managed setup without the OpenTelemetry SDK names the extra that installs it."""
     with pytest.MonkeyPatch.context() as patch:
         patch.setitem(sys.modules, "opentelemetry.sdk.trace", None)
-        with pytest.raises(ImportError, match=r"wyrd\[otel\]"):
+        with pytest.raises(ImportError, match=r"wyrd-ai\[otel\]"):
             client_state.start_telemetry()
 
 

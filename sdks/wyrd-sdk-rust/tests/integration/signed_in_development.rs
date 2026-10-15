@@ -3,6 +3,7 @@
 //! Gateway caller keep working after the original access token expires.
 
 use std::time::Duration;
+use wyrd_ai::bifrost::BifrostOptions;
 
 use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::config::ClientConfig;
@@ -85,7 +86,7 @@ async fn saved_login_completes_the_workflow_past_token_expiry() {
     let run = worked.state.run_for_card("agent").expect("agent run");
     export(&run).await;
     worked.telemetry.shutdown().expect("the later span exports");
-    let rows: Vec<Attributed> = Bifrost::connect(&client)
+    let rows: Vec<Attributed> = Bifrost::connect_with(&client, BifrostOptions::default())
         .await
         .expect("Bifrost connects")
         .sql_as(

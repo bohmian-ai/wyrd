@@ -50,31 +50,68 @@ pub(crate) fn to_python<T: Serialize>(py: Python<'_>, value: &T) -> WyrdPyResult
 /// server's redacted connection view; no call ever returns a secret.
 #[pyclass(module = "wyrd._wyrd.operators", name = "OperatorConnections")]
 pub struct OperatorConnections {
-    /// The shared native handle every call delegates to.
-    inner: NativeOperatorConnections,
+    /// The one native connection every call delegates to, connected on the
+    /// first server operation (or by `connect`).
+    inner: crate::client::LazyConnection<NativeOperatorConnections>,
+}
+
+impl OperatorConnections {
+    /// Return the connected native handle, connecting it on first use.
+    ///
+    /// # Errors
+    /// Returns the stable configuration, credential, or refused-exchange
+    /// error of the shared Rust `connect`.
+    fn handle(&self, py: Python<'_>) -> WyrdPyResult<&NativeOperatorConnections> {
+        Ok(self.inner.get(py, |client| async move {
+            match client {
+                Some(client) => NativeOperatorConnections::connect_with(&client).await,
+                None => NativeOperatorConnections::connect().await,
+            }
+        })?)
+    }
 }
 
 #[pymethods]
 impl OperatorConnections {
-    /// Build a handle acting as `client`; omitted, the client resolves from
-    /// the ambient chain.
+    /// Build a Operator connection handle acting as `client`, performing no IO.
     ///
-    /// No network call happens here.
+    /// The client, or the ambient chain when `client` is omitted, resolves
+    /// and connects once on the first server operation, exactly as `connect`
+    /// does; until then nothing is read from the environment or the network.
+    ///
+    /// # Arguments
+    /// * `client` - The `WyrdClient` every call is sent as, or `None` for the
+    ///   ambient chain.
+    #[new]
+    #[pyo3(signature = (client=None))]
+    fn __new__(client: Option<PyRef<'_, crate::client::PyWyrdClient>>) -> Self {
+        Self {
+            inner: crate::client::LazyConnection::new(client.as_deref()),
+        }
+    }
+
+    /// Connect a Operator connection handle acting as `client` now.
+    ///
+    /// Resolves the client (the ambient chain when omitted) and completes any
+    /// credential exchange it requires before returning; a supplied bearer
+    /// or fresh cached token is reused without a request.
     ///
     /// # Arguments
     /// * `client` - The `WyrdClient` every call is sent as, or `None` for the
     ///   ambient chain.
     ///
     /// # Errors
-    /// Raises `WyrdError` when the ambient server URL or credential cannot be
-    /// resolved.
-    #[new]
+    /// Raises `WyrdError` with the stable configuration, credential, or
+    /// refused-exchange error.
+    #[staticmethod]
     #[pyo3(signature = (client=None))]
-    fn __new__(client: Option<PyRef<'_, crate::client::PyWyrdClient>>) -> WyrdPyResult<Self> {
-        let client = crate::client::PyWyrdClient::resolve(client.as_deref())?;
-        Ok(Self {
-            inner: NativeOperatorConnections::with_client(client),
-        })
+    fn connect(
+        py: Python<'_>,
+        client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
+    ) -> WyrdPyResult<Self> {
+        let handle = Self::__new__(client);
+        handle.handle(py)?;
+        Ok(handle)
     }
 
     /// Create one connection from a `CreateOperatorConnectionRequest` dict.
@@ -86,7 +123,7 @@ impl OperatorConnections {
     fn create(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> WyrdPyResult<Py<PyAny>> {
         let request: CreateOperatorConnectionRequest =
             decode("request", pyobject_to_json(request)?)?;
-        let view = crate::trace::block_on(py, self.inner.create(&request))?;
+        let view = crate::trace::block_on(py, self.handle(py)?.create(&request))?;
         to_python(py, &view)
     }
 
@@ -96,7 +133,7 @@ impl OperatorConnections {
     /// Raises `WyrdError` when the caller lacks `operators:read` or the
     /// request fails.
     fn list(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        let views = crate::trace::block_on(py, self.inner.list())?;
+        let views = crate::trace::block_on(py, self.handle(py)?.list())?;
         to_python(py, &views)
     }
 
@@ -108,7 +145,7 @@ impl OperatorConnections {
     /// tenant, or the request fails.
     fn get(&self, py: Python<'_>, connection_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let id: OperatorConnectionId = decode("connection_id", Value::from(connection_id))?;
-        let view = crate::trace::block_on(py, self.inner.get(&id))?;
+        let view = crate::trace::block_on(py, self.handle(py)?.get(&id))?;
         to_python(py, &view)
     }
 
@@ -127,7 +164,7 @@ impl OperatorConnections {
         let id: OperatorConnectionId = decode("connection_id", Value::from(connection_id))?;
         let request: UpdateOperatorConnectionRequest =
             decode("request", pyobject_to_json(request)?)?;
-        let view = crate::trace::block_on(py, self.inner.update(&id, &request))?;
+        let view = crate::trace::block_on(py, self.handle(py)?.update(&id, &request))?;
         to_python(py, &view)
     }
 
@@ -139,7 +176,7 @@ impl OperatorConnections {
     /// fails.
     fn disable(&self, py: Python<'_>, connection_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let id: OperatorConnectionId = decode("connection_id", Value::from(connection_id))?;
-        let view = crate::trace::block_on(py, self.inner.disable(&id))?;
+        let view = crate::trace::block_on(py, self.handle(py)?.disable(&id))?;
         to_python(py, &view)
     }
 }

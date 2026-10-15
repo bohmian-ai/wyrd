@@ -73,7 +73,7 @@ impl PlatformEndpoint {
         .map_err(|source| WyrdCliError::Server {
             source: source.into(),
         })?;
-        Platform::with_client(&client)
+        Platform::connect_with(&client)
             .await
             .map_err(|source| WyrdCliError::Server { source })
     }

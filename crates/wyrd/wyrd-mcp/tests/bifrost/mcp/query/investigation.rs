@@ -1,6 +1,7 @@
 //! Seeded evidence read through the real MCP catalog, schema, and SQL paths.
 
 use std::path::Path;
+use wyrd_client::bifrost::BifrostOptions;
 
 use rmcp::ClientServiceExt as _;
 use rmcp::model::CallToolRequestParams;
@@ -53,7 +54,8 @@ impl EvidenceInvestigation {
     /// Seed shared telemetry and a checked-in Service; publish native fixture reports.
     ///
     /// # Errors
-    /// Returns server, registration, ingestion, publication, or MCP failures.
+    /// Returns server, credential-exchange, registration, ingestion,
+    /// publication, or MCP failures.
     pub(super) async fn start() -> Result<Self, McpJourneyError> {
         let server = WyrdTestServer::start_bound().await?;
         let signals =
@@ -64,7 +66,7 @@ impl EvidenceInvestigation {
         let key = admin.api_key().ok_or("administrator has a machine key")?;
         let credential = ResolvedCredential::ApiKey(key.expose_secret().to_owned().into());
         let http = client(&server, credential)?;
-        let cards = Cards::with_client(http.clone());
+        let cards = Cards::connect_with(&http).await?;
         let fixtures = Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../../fixtures/cards"
@@ -86,9 +88,10 @@ impl EvidenceInvestigation {
             cards.register_from_path(&fixtures.join("register_and_hydrate/no-refund-promise.yaml")),
         )
         .await?;
-        let bifrost = Bifrost::connect(&http).await?;
-        bifrost
-            .use_table(TableConfig::describe(&http, "vala.datasets.investigation_events").await?);
+        let bifrost = Bifrost::connect_with(&http, BifrostOptions::default()).await?;
+        bifrost.use_table(
+            TableConfig::describe_with(&http, "vala.datasets.investigation_events").await?,
+        );
         for id in [1, 2] {
             bifrost.insert(
                 serde_json::to_vec(&json!({ "id": id, "value": "observed" }))?,

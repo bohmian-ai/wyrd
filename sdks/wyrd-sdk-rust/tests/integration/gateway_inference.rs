@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use wyrd_ai::bifrost::BifrostOptions;
 use wyrd_ai::cards::{CardKind, RegistrationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::gateway::{
@@ -72,7 +73,9 @@ impl Inference {
         )
         .await;
         put_openai(&deployment, "openai", PROVIDER_KEY, DeploymentAccess::Open).await;
-        Gateway::with_client(deployment.admin())
+        Gateway::connect_with(&deployment.admin())
+            .await
+            .expect("handle connects")
             .put_capture_policy(&GatewayCapturePolicyWrite {
                 mode: GatewayCaptureMode::Metadata,
                 payload_fields: BTreeSet::new(),
@@ -80,7 +83,7 @@ impl Inference {
             .await
             .expect("the capture policy puts");
         let ask = register(
-            &deployment.cards(),
+            &deployment.cards().await,
             "cards/gateway_inference/ask-agent.yaml",
         )
         .await;
@@ -212,7 +215,9 @@ pub(crate) async fn put_openai(
 ) {
     let credential = format!("{name}-key");
     put_managed(deployment.admin(), "openai", &credential, secret).await;
-    Gateway::with_client(deployment.admin())
+    Gateway::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects")
         .put_deployment(&ProviderDeployment {
             name: ProviderDeploymentName::new(name).expect("deployment name"),
             adapter: ProviderAdapter::OpenAi,
@@ -347,12 +352,13 @@ async fn malformed_traceparent_is_ignored_by_the_gateway() {
         inference.deployment.timeline(CALLER_TRACE).await.is_empty(),
         "nothing joined the caller's trace"
     );
-    let calls = wyrd_ai::Bifrost::connect(&inference.deployment.admin())
-        .await
-        .expect("Bifrost connects")
-        .sql_as::<CallId>("SELECT call_id FROM vala.gateway.calls", &[])
-        .await
-        .expect("calls read back");
+    let calls =
+        wyrd_ai::Bifrost::connect_with(&inference.deployment.admin(), BifrostOptions::default())
+            .await
+            .expect("Bifrost connects")
+            .sql_as::<CallId>("SELECT call_id FROM vala.gateway.calls", &[])
+            .await
+            .expect("calls read back");
     let [call] = &calls[..] else {
         panic!("exactly one call is recorded: {calls:?}");
     };
@@ -437,15 +443,18 @@ async fn gateway_call_records_whichever_attribution_it_carries() {
         .flush_bifrost()
         .await
         .expect("rows publish");
-    let mut calls: Vec<CallAttribution> = wyrd_ai::Bifrost::connect(&inference.deployment.admin())
-        .await
-        .expect("Bifrost connects")
-        .sql_as(
-            "SELECT sub_principal_id, act_principal_id, run_id, card_uid FROM vala.gateway.calls",
-            &[],
-        )
-        .await
-        .expect("calls read back");
+    let mut calls: Vec<CallAttribution> = wyrd_ai::Bifrost::connect_with(
+        &inference.deployment.admin(),
+        BifrostOptions::default(),
+    )
+    .await
+    .expect("Bifrost connects")
+    .sql_as(
+        "SELECT sub_principal_id, act_principal_id, run_id, card_uid FROM vala.gateway.calls",
+        &[],
+    )
+    .await
+    .expect("calls read back");
     calls.sort();
     let call = |run_id: Option<&str>, card_uid: Option<&str>| CallAttribution {
         sub_principal_id: id.to_string(),
@@ -553,11 +562,11 @@ async fn cli_issues_a_card_scoped_key_and_writes_a_provider_credential() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn run_invokes_its_agent_through_the_gateway() {
     let inference = Inference::start().await;
-    let cards = inference.deployment.cards();
+    let cards = inference.deployment.cards().await;
     let service = register(&cards, "cards/gateway_inference/ask-service.yaml").await;
     let bundle = hydrate(&cards, &service.root).await;
     let state = |client: WyrdClient| {
-        WyrdState::from_path_with_client(bundle.path().join("bundle"), client)
+        WyrdState::from_path_with(bundle.path().join("bundle"), client)
             .expect("bundle loads offline")
     };
 
@@ -655,13 +664,13 @@ async fn agent_routes_and_pre_run_overrides() {
         DeploymentAccess::Granted,
     )
     .await;
-    let cards = inference.deployment.cards();
+    let cards = inference.deployment.cards().await;
     let service = register(&cards, "cards/gateway_inference/ask-service.yaml").await;
     let bundle = hydrate(&cards, &service.root).await;
     let client = inference
         .deployment
         .client(&inference.deployment.service_key(&service.root).await);
-    let state = WyrdState::from_path_with_client(bundle.path().join("bundle"), client)
+    let state = WyrdState::from_path_with(bundle.path().join("bundle"), client)
         .expect("bundle loads offline");
     let run = state.run_for_card("agent").expect("agent view resolves");
     let route = |name: &str| ExecutionRoute::WyrdGateway {
@@ -690,7 +699,12 @@ async fn agent_routes_and_pre_run_overrides() {
         ]
     );
     assert_eq!(
-        state.agent("agent").expect("agent").spec.execution_route,
+        state
+            .agent("agent")
+            .expect("agent")
+            .card()
+            .spec
+            .execution_route,
         route("openai"),
         "an override never changes the declared route"
     );
@@ -755,7 +769,9 @@ async fn external_deployment_preserves_model_and_credentials() {
     )
     .await
     .expect("the CLI writes the credential");
-    Gateway::with_client(deployment.admin())
+    Gateway::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects")
         .put_deployment(&ProviderDeployment {
             name: ProviderDeploymentName::new("support-gateway").expect("deployment name"),
             adapter: ProviderAdapter::OpenAiCompatible {
@@ -859,7 +875,9 @@ async fn put_named(
     let credential = format!("{name}-key");
     put_managed(deployment.admin(), provider, &credential, PROVIDER_KEY).await;
     let credential = ProviderCredentialName::new(&credential).expect("credential");
-    Gateway::with_client(deployment.admin())
+    Gateway::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects")
         .put_deployment(&ProviderDeployment {
             name: ProviderDeploymentName::new(name).expect("deployment name"),
             adapter,

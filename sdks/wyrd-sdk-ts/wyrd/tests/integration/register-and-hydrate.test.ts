@@ -7,7 +7,7 @@ import { expect, vi } from "vitest";
 import { Cards, type RegistrationReceipt, WyrdClient, WyrdState } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
-import { fixture, serverTest } from "../support/server.js";
+import { fixture, registered, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -19,7 +19,7 @@ const test = serverTest().extend<{
   model: RegistrationReceipt;
   desk: RegistrationReceipt;
 }>({
-  cards: [async ({ server: _ }, use) => use(Cards.connect()), { scope: "file" }],
+  cards: [async ({ server: _ }, use) => use(await Cards.connect()), { scope: "file" }],
   model: [
     async ({ cards }, use) =>
       use(await cards.registerFromPath(fixture("cards/register_and_hydrate/support-model.yaml"))),
@@ -110,7 +110,7 @@ test("retired card kind is refused", async ({ cards }) => {
 });
 
 test("reader cannot register cards", async ({ server, desk: _ }) => {
-  const reader = Cards.connect({
+  const reader = await Cards.connect({
     client: WyrdClient.connect({ credential: server.scopedApiKey("card_reader", ["cards:read"]) }),
   });
 
@@ -137,4 +137,38 @@ test("refused cli command raises its catalog code", async ({ server: _ }) => {
   await expect(
     cli.get({ kind: "Service", space: "default", name: "no-such-service", version: "1.0.0" }, bundleDir()),
   ).rejects.toMatchObject({ code: "WYRD_REGISTRY_404_CARD_NOT_FOUND" });
+});
+
+test("hydrated agent prompt card navigation", async ({ cards }) => {
+  await cards.registerFromPath(fixture("cards/agent_prompt/desk-prompt.yaml"));
+  const desk = await cards.registerFromPath(fixture("cards/agent_prompt/prompt-desk.yaml"));
+  const bundle = bundleDir();
+  await cards.hydrate(desk.root, bundle);
+  vi.stubEnv("WYRD_SERVER_URL", "http://127.0.0.1:1");
+
+  const state = WyrdState.fromPath(bundle);
+
+  const explicit = state.get("my_prompt");
+  if (explicit.kind !== "Prompt") {
+    throw new Error("my_prompt is looked up as a Prompt");
+  }
+  expect(explicit.ref).toEqual(registered(desk, "desk-prompt"));
+  expect(state.prompt("my_prompt").ref).toEqual(explicit.ref);
+  for (const [alias, prompt] of [
+    ["inline_agent", "inline-agent-prompt"],
+    ["path_agent", "desk-prompt"],
+    ["ref_agent", "desk-prompt"],
+  ] as const) {
+    const agent = state.get(alias);
+    if (agent.kind !== "Agent") {
+      throw new Error(`${alias} is looked up as an Agent`);
+    }
+    expect(agent.prompt().ref).toEqual(registered(desk, prompt));
+    expect(agent.promptRef).toEqual(registered(desk, prompt));
+    expect(agent.prompt().metadata.name).toBe(prompt);
+    expect(state.agent(alias).prompt().ref).toEqual(registered(desk, prompt));
+  }
+  expect(state.agent("path_agent").prompt().spec).toEqual(explicit.spec);
+  expect(() => state.get("missing")).toThrow(expect.objectContaining({ code: "WYRD_SDK_404_UNKNOWN_ALIAS" }));
+  expect(() => state.agent("my_prompt")).toThrow(expect.objectContaining({ code: "WYRD_SDK_400_CARD_KIND_MISMATCH" }));
 });

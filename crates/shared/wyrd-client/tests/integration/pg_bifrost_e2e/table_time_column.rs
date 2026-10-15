@@ -7,6 +7,7 @@
 //! naming a column that cannot be a time column is refused naming the field.
 
 use std::sync::Arc;
+use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -85,11 +86,16 @@ fn readings() -> RecordBatch {
 async fn connect(srv: &WyrdTestServer, fqn: &str, layout: PhysicalLayoutWire) -> Bifrost {
     let service = fqn.rsplit('.').next().unwrap_or(fqn).replace('_', "-");
     let client = service_client(srv, &service, &["admin"]).await;
-    Bifrost::connect_with_table(
+    Bifrost::connect_with(
         &client,
-        TableConfig::from_arrow(fqn, readings_schema())
-            .expect("the schema declares a table")
-            .with_layout(layout),
+        BifrostOptions {
+            table: Some(
+                TableConfig::from_arrow(fqn, readings_schema())
+                    .expect("the schema declares a table")
+                    .with_layout(layout),
+            ),
+            ..BifrostOptions::default()
+        },
     )
     .await
     .expect("the writer connects")

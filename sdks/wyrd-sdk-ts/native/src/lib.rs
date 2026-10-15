@@ -1154,6 +1154,32 @@ impl NativeBifrost {
         })
     }
 
+    /// Lists the compact entries of every table the caller may read.
+    ///
+    /// The server's authorized `BifrostTableEntry` values, unchanged and
+    /// without schemas; JavaScript describes one table with `describeTable`
+    /// only when it needs that schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the native result cannot be projected;
+    /// Wyrd control failures are returned in [`NativeLifecycleResult`].
+    #[napi]
+    pub fn list_tables<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            match client.list_tables().await {
+                Ok(entries) => NativeLifecycleResult::success(
+                    &serde_json::to_value(entries).map_err(napi_error)?,
+                ),
+                Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+            }
+        })
+    }
+
     /// Describes one registered table's stored physical schema.
     ///
     /// The description is the server's own projection: the user fields a caller

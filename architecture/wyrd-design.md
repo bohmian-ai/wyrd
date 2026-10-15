@@ -106,7 +106,11 @@ not a passive integration or inventory product.
     have no card identity, are not registered standalone, and cannot be
     referenced from outside their parent. To reuse a child, register it as a
     card and reference it with `Ref::Ref(CardRef)`. Durable-only slots use
-    `Ref`.
+    `Ref`. One exception: registration materializes a registered Agent's
+    inline Prompt as its own Prompt Card named `<agent-name>-prompt` in the
+    Agent's space, versioned on its own registry line, and persists the Agent
+    with that Card's exact UID-bearing reference. Identical inline content in
+    differently named Agents is never shared.
 18. **Auth and Policy are two distinct planes.** Emit is **not** a third
     plane: a deployed service's observation/ingest writes are ordinary
     Auth-plane routes, authorized by the same JWT and a
@@ -299,6 +303,20 @@ belongs in `wyrd-sdk-python`. Consolidating all existing Python logic there is
 the target direction, not a reason for unrelated code movement during this
 merge.
 
+Every server-facing handle shares one construction vocabulary. Rust spells
+it `connect()` for the ambient client and `connect_with(&client)` for a
+supplied one; TypeScript has only `static async connect({ client? })` behind
+a private constructor; Python has `connect(client=None)` beside an IO-free
+constructor that connects once on the handle's first server operation.
+`connect` is eager: it resolves the client and completes any credential
+exchange that client requires before returning, while a supplied bearer or a
+fresh cached token makes no request and no health probe is added. A handle
+retains that one client, with its renewable token cache, for its lifetime.
+Local loaders (`from_path` / `from_path_with`) are not connected handles and
+stay lazy. Bifrost lists the caller's tables with `list_tables` /
+`listTables`, which returns compact entries, and describes one table's schema
+on demand.
+
 Bifrost follows the same rule:
 
 ```text
@@ -416,7 +434,8 @@ spec:
 `provider` names the Prompt's protocol family and the native destination; a
 custom name is an OpenAI-compatible Chat provider. It never names a gateway
 deployment: the Agent's `execution_route` chooses where the call executes.
-An Agent's inline Prompt takes the same two forms.
+An Agent's inline Prompt takes the same two forms and registers as the
+Agent's own `<agent-name>-prompt` Prompt Card (doctrine 17).
 
 ### Agent
 Agent contract: prompt + tools + run config. Tool names resolve through the
@@ -430,6 +449,16 @@ spec:
   run_config: AgentRunConfigSpec # max_iterations, tool_concurrency_cap, session_recent_limit, timeout_ms
   verified_by: [VerificationBinding]
 ```
+Every registered Agent persists `prompt` as an exact Prompt Card reference:
+Path and Sibling forms resolve to the authored Prompt Card, and an inline body
+registers as `<agent-name>-prompt` (doctrine 17). Hydrated state therefore
+always contains the Agent's Prompt Card without a separate Service component;
+a hydrated Agent's `prompt()` returns that Prompt Card, whose `ref` is its
+exact identity, and `prompt_ref` / `promptRef` is the stored reference.
+Generic state lookup (`state[alias]` / `get` in Python, `get` in Rust and
+TypeScript) returns the kind-appropriate hydrated Card. A bundle whose Agent
+Prompt has no registered identity is `WYRD_SDK_400_INVALID_STATE_BUNDLE`;
+re-register and rehydrate it.
 
 `native` calls the Prompt's provider with the executing host's own provider
 configuration; server-controlled execution refuses it. `wyrd_gateway` sends
@@ -592,7 +621,18 @@ or signing one; the request then runs under the same authorization, audit,
 and limits as a bearer caller. A revoked key fails at its next export. `x-wyrd-access-token`
 remains valid on OTLP, and no other route accepts `x-wyrd-api-key`. An exporter
 is configured only with standard settings, for example
-`OTEL_EXPORTER_OTLP_HEADERS=x-wyrd-api-key=<key>`; no SDK exporter helper exists.
+`OTEL_EXPORTER_OTLP_HEADERS=x-wyrd-api-key=<key>`. This stock-exporter path
+requires no Wyrd SDK. Optional SDK exporter helpers configure the stock OTLP
+exporters with the shared client's current access token on each export; they
+reuse that client's credential resolution and refresh rather than introducing
+another authentication implementation. Applications may attach those exporters
+to their own OpenTelemetry providers. Framework instrumentation remains owned
+by the application and framework; Wyrd never discovers or patches frameworks.
+A state's `start_telemetry` installs one managed global provider; that state's
+`flush` and `shutdown` force-flush it before draining the writer, still drain
+when it fails, and report the failure as `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT`
+or `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`. An application-owned provider is
+never flushed by a state.
 
 Env vars in deployed services:
 
@@ -1769,7 +1809,7 @@ is available only at `InlineableRef<T>` slots.
 | `Data`         | **Yes** (unless used purely as inline eval scenarios, which v1 does not support — `dataset` is `DatasetRef`-only) | Carries dataset bytes; lineage anchor. |
 | `Experiment`   | **Yes** | Carries run history. |
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
-| `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`. |
+| `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`; registration materializes it as `<agent-name>-prompt`. |
 | `Agent`        | Optional | Light. Spec-only; `apply` registers it. `LlmJudgeTask.judge_ref` is `InlineableRef<AgentSpec>`. |
 | `Verifier`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
 
@@ -1792,7 +1832,7 @@ prompt: { kind: Prompt, name: triage, version: "1.0.0", space: prod }
 # Local full Card envelope, resolved relative to the containing file.
 prompt: ./prompts/triage.yaml
 
-# Inline portable Prompt: no independent Card identity.
+# Inline portable Prompt: registers as the Agent's `<agent-name>-prompt` Card.
 prompt:
   provider: openai
   model: example-model
@@ -1817,8 +1857,10 @@ components:
 inherits the containing authored context. Local loading never registers. Apply
 registers path-loaded Cards in the same composite request, projects paths to
 Sibling references, and preserves external refs even at matching identities.
-Inline bodies remain embedded. Only resolved Ref/Sibling and inline bodies
-cross registration; durable persistence contains no Path or Sibling.
+Inline bodies remain embedded, except a registered Agent's inline Prompt,
+which registration materializes as its own Prompt Card and replaces with that
+Card's exact reference (doctrine 17). Only resolved Ref/Sibling and inline
+bodies cross registration; durable persistence contains no Path or Sibling.
 
 ### Reference-slot inventory
 

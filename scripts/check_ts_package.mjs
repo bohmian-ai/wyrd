@@ -2,6 +2,7 @@ import { cp, lstat, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/pr
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
+import { createRequire } from "node:module";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
@@ -142,15 +143,34 @@ try {
   const { stdout: importOutput } = await exec(
     process.execPath,
     ["--input-type=module", "-e", `
-      import { Bifrost, TableConfig } from "wyrd-ai";
+      import { Bifrost, TableConfig, WyrdAgentsTraceProcessor } from "wyrd-ai";
       if (typeof Bifrost.connect !== "function") throw new Error("Bifrost facade missing");
       if (typeof TableConfig !== "function") throw new Error("TableConfig missing");
+      // The clean project installs no optional peer, so this proves the Agents SDK is optional.
+      await new WyrdAgentsTraceProcessor().onTraceStart({ traceId: "trace_1", name: "workflow" });
       const resolved = import.meta.resolve("wyrd-ai");
       if (resolved.includes(".ts")) throw new Error("published export resolves to TypeScript: " + resolved);
       console.log(resolved);
     `],
     { cwd: staging },
   );
+
+  // Type-check a consumer of the root APIs against the published declarations,
+  // still without optional peers, so no declaration requires one.
+  await writeFile(
+    join(staging, "consumer.ts"),
+    `import { Bifrost, TableConfig, WyrdAgentsTraceProcessor, WyrdClient, WyrdState } from "wyrd-ai";
+export const processor = new WyrdAgentsTraceProcessor();
+export type Root = [Bifrost, TableConfig, WyrdClient, WyrdState];
+`,
+  );
+  const tsc = createRequire(join(sdkDir, "package.json")).resolve("typescript/bin/tsc");
+  await exec(process.execPath, [
+    tsc, "--noEmit", "--strict", "--skipLibCheck", "false", "--module", "nodenext",
+    "--moduleResolution", "nodenext", "--target", "es2023", "consumer.ts",
+  ], { cwd: staging }).catch((error) => {
+    throw new Error(`clean consumer does not type-check:\n${error.stdout}`);
+  });
 
   const installedManifest = JSON.parse(
     await readFile(join(staging, "node_modules", "wyrd-ai", "package.json"), "utf8"),

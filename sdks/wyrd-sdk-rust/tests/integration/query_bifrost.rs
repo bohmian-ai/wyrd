@@ -7,6 +7,7 @@ use arrow::datatypes::Int64Type;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use wyrd_ai::bifrost::BifrostOptions;
 use wyrd_ai::bifrost::{Correlation, QueryParam, TableConfig};
 use wyrd_ai::{Bifrost, QueryTerminalOutcome, WyrdError};
 use wyrd_spec::vala::ids::RunId;
@@ -67,9 +68,15 @@ async fn live() -> (Deployment, Bifrost) {
         }),
     )
     .expect("table declares");
-    let writer = Bifrost::connect_with_table(&admin, table)
-        .await
-        .expect("writer connects");
+    let writer = Bifrost::connect_with(
+        &admin,
+        BifrostOptions {
+            table: Some(table),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("writer connects");
     writer.register().await.expect("table registers");
     let (shared, other) = (RunId::new(), RunId::new());
     for (id, value, run_id) in [
@@ -94,7 +101,9 @@ async fn live() -> (Deployment, Bifrost) {
     writer.shutdown().await.expect("writer drains");
     (
         deployment,
-        Bifrost::connect(&admin).await.expect("Bifrost connects"),
+        Bifrost::connect_with(&admin, BifrostOptions::default())
+            .await
+            .expect("Bifrost connects"),
     )
 }
 
@@ -162,7 +171,7 @@ async fn bound_sql_text_is_treated_as_data() {
 async fn unwritten_builtin_table_reads_as_empty() {
     let deployment = Deployment::start().await;
 
-    let rows: Vec<Count> = Bifrost::connect(&deployment.admin())
+    let rows: Vec<Count> = Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
         .await
         .expect("Bifrost connects")
         .sql_as("SELECT COUNT(*) AS n FROM vala.eval.result_items", &[])
@@ -219,8 +228,9 @@ async fn stream_yields_arrow_batches_and_a_terminal() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn caller_without_bifrost_read_is_refused() {
     let (deployment, _) = published().await;
-    let denied = Bifrost::connect(
+    let denied = Bifrost::connect_with(
         &deployment.client(&deployment.scoped_key("query_denied", &["cards:read"]).await),
+        BifrostOptions::default(),
     )
     .await
     .expect("Bifrost connects");
@@ -413,12 +423,13 @@ async fn unauthorized_table_refusal_reveals_no_columns() {
         .seed_role("datasets_reader", &[datasets_only])
         .await
         .expect("role seeds");
-    let reader = Bifrost::connect(
+    let reader = Bifrost::connect_with(
         &deployment.client(
             &deployment
                 .key("datasets_reader", &["datasets_reader"])
                 .await,
         ),
+        BifrostOptions::default(),
     )
     .await
     .expect("Bifrost connects");
@@ -498,9 +509,15 @@ async fn subject_actor_rows_and_reserved_columns() {
     });
     let table = TableConfig::from_json_schema(ATTRIBUTED_ROWS, &schema).expect("table declares");
     let direct = deployment.client(a_key.expose_secret());
-    let writer = Bifrost::connect_with_table(&direct, table.clone())
-        .await
-        .expect("A connects");
+    let writer = Bifrost::connect_with(
+        &direct,
+        BifrostOptions {
+            table: Some(table.clone()),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("A connects");
     writer.register().await.expect("table registers");
     writer
         .insert(br#"{"id": 1}"#.to_vec(), Correlation::default())
@@ -526,26 +543,35 @@ async fn subject_actor_rows_and_reserved_columns() {
         )
         .await
         .expect("B acts for A");
-    let writer = Bifrost::connect_with_table(&delegated, table)
-        .await
-        .expect("B for A connects");
+    let writer = Bifrost::connect_with(
+        &delegated,
+        BifrostOptions {
+            table: Some(table),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("B for A connects");
     writer
         .insert(br#"{"id": 2}"#.to_vec(), Correlation::default())
         .expect("B's row for A inserts");
     writer.shutdown().await.expect("B's writer drains");
     server.flush_bifrost().await.expect("rows publish");
 
-    let rows: Vec<AttributedRow> = Bifrost::connect(&deployment.admin())
-        .await
-        .expect("Bifrost connects")
-        .sql_as(
-            &format!(
-                "SELECT id, sub_principal_id, act_principal_id FROM {ATTRIBUTED_ROWS} ORDER BY id"
-            ),
-            &[],
-        )
-        .await
-        .expect("rows read");
+    let rows: Vec<AttributedRow> = Bifrost::connect_with(
+        &deployment.admin(),
+        BifrostOptions::default(),
+    )
+    .await
+    .expect("Bifrost connects")
+    .sql_as(
+        &format!(
+            "SELECT id, sub_principal_id, act_principal_id FROM {ATTRIBUTED_ROWS} ORDER BY id"
+        ),
+        &[],
+    )
+    .await
+    .expect("rows read");
     let (a, b) = (a.id().to_string(), b.id().to_string());
     assert_eq!(
         rows,
@@ -594,8 +620,9 @@ async fn subject_actor_rows_and_reserved_columns() {
         assert_eq!(registered.code(), RESERVED, "{column}");
     }
 
-    let foreign = Bifrost::connect(
+    let foreign = Bifrost::connect_with(
         &deployment.client(&deployment.other_tenant_admin("attribution-other").await),
+        BifrostOptions::default(),
     )
     .await
     .expect("the other tenant connects");

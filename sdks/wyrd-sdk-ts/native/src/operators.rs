@@ -18,8 +18,8 @@ use wyrd_client::operator_connections::{
 };
 use wyrd_spec::error::WyrdError;
 
-use crate::NativeLifecycleResult;
 use crate::client::NativeWyrdClient;
+use crate::{NativeLifecycleResult, NativeWyrdError};
 
 /// Decode one serialized JavaScript argument, naming only the argument and
 /// the decode category so a secret value is never echoed; shared by the
@@ -50,18 +50,46 @@ pub struct NativeOperatorConnections {
     connections: OperatorConnections,
 }
 
+/// Closed result of connecting one Operator connection handle: the handle or a
+/// catalog error.
+#[napi(object, object_from_js = false)]
+pub struct NativeOperatorConnectionsConnection {
+    /// Connected handle when the connection succeeded.
+    pub handle: Option<NativeOperatorConnections>,
+    /// Catalog failure otherwise.
+    pub error: Option<NativeWyrdError>,
+}
+
 #[napi]
 impl NativeWyrdClient {
-    /// Builds one Operator connection handle that calls the server as this
-    /// client.
+    /// Connects one Operator connection handle that calls the server as this client.
     ///
-    /// No IO happens here; the public TypeScript `OperatorConnections.connect`
-    /// passes the caller's client or the ambient one.
+    /// Completes any credential exchange this client requires before
+    /// resolving, as `OperatorConnections::connect_with` does; the public TypeScript
+    /// `OperatorConnections.connect` passes the caller's client or the ambient one. A refused
+    /// or unreachable exchange is returned as catalog metadata.
+    ///
+    /// # Errors
+    ///
+    /// Never returns a napi error; failures are carried in the result.
     #[napi]
-    pub fn operator_connections(&self) -> NativeOperatorConnections {
-        NativeOperatorConnections {
-            connections: OperatorConnections::with_client(self.client.clone()),
-        }
+    pub fn operator_connections<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeOperatorConnectionsConnection>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            Ok(match OperatorConnections::connect_with(&client).await {
+                Ok(connections) => NativeOperatorConnectionsConnection {
+                    handle: Some(NativeOperatorConnections { connections }),
+                    error: None,
+                },
+                Err(error) => NativeOperatorConnectionsConnection {
+                    handle: None,
+                    error: Some(NativeWyrdError::from_wyrd(&error)),
+                },
+            })
+        })
     }
 }
 

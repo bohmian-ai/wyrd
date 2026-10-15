@@ -9,6 +9,7 @@ from ..data import DataCard
 from ..model import ModelCard
 from ..observe import Run
 from ..prompt import PromptCard
+from ._hydrated import HydratedCard
 
 class CardEnvelope:
     """Complete read-only projection of one registered Card.
@@ -234,10 +235,16 @@ class WyrdState:
     def flush(self) -> None:
         """Drain every producer of this state's writer without closing it.
 
-        The explicit durability barrier for a test or a finite job.
+        The explicit durability barrier for a test or a finite job. A tracer
+        provider ``start_telemetry`` installed is force-flushed first; the
+        writer drains even when that flush fails.
 
         Raises:
-            WyrdError: ``WYRD_SDK_400_BIFROST_NOT_STARTED`` before startup,
+            WyrdError: ``WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT`` or
+                ``WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`` when the telemetry
+                flush timed out or failed (``details["native_code"]`` names any
+                writer failure too); otherwise
+                ``WYRD_SDK_400_BIFROST_NOT_STARTED`` before startup,
                 ``WYRD_SDK_409_BIFROST_CLOSED`` after shutdown, or the first
                 producer or sink failure.
         """
@@ -252,10 +259,16 @@ class WyrdState:
         ambiguous failure, retry ``shutdown()`` on the same state rather than
         replacing the writer. A successfully shut-down state stays closed;
         create a new ``WyrdState`` to start again. A tracer provider
-        ``start_telemetry`` installed is flushed first.
+        ``start_telemetry`` installed is force-flushed first, and the writer
+        drains even when that flush fails. An application-owned provider is
+        never flushed here; shut it down yourself.
 
         Raises:
-            WyrdError: The first producer or sink failure from the drain.
+            WyrdError: ``WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT`` or
+                ``WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`` when the telemetry
+                flush timed out or failed (``details["native_code"]`` names any
+                drain failure too); otherwise the first producer or sink
+                failure from the drain.
         """
         ...
 
@@ -282,6 +295,38 @@ class WyrdState:
 
         Returns:
             The complete read-only Card envelope.
+
+        Raises:
+            WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when no Card has the alias.
+        """
+        ...
+
+    def get(self, alias: str) -> HydratedCard:
+        """Return the hydrated Card selected by ``alias`` in its kind's holder.
+
+        Agents, Prompts, Models and Data return the holders their typed
+        accessors return; every other kind returns its ``CardEnvelope``. The
+        lookup is strict and performs no IO.
+
+        Args:
+            alias: A friendly alias from this bundle.
+
+        Returns:
+            The hydrated Card; narrow it with ``isinstance``.
+
+        Raises:
+            WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when no Card has the alias.
+        """
+        ...
+
+    def __getitem__(self, alias: str) -> HydratedCard:
+        """Return the hydrated Card selected by ``alias``, as ``get`` does.
+
+        Args:
+            alias: A friendly alias from this bundle.
+
+        Returns:
+            The hydrated Card; narrow it with ``isinstance``.
 
         Raises:
             WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when no Card has the alias.
@@ -331,7 +376,7 @@ class WyrdState:
         ...
 
     def agent(self, alias: str) -> AgentCard:
-        """Return the Agent holder with its inline or resolved typed prompt.
+        """Return the Agent holder, navigable to its Prompt Card by ``prompt()``.
 
         Args:
             alias: A friendly alias of an Agent Card.
@@ -388,4 +433,4 @@ class WyrdState:
         """
         ...
 
-__all__ = ["CardEnvelope", "HydratedArtifact", "WyrdState"]
+__all__ = ["CardEnvelope", "HydratedArtifact", "HydratedCard", "WyrdState"]

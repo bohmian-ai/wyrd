@@ -340,7 +340,8 @@ mod pg_tests {
         principals(
             &server,
             ResolvedCredential::ApiKey(admin_key.clone().into()),
-        )?
+        )
+        .await?
         .issue_credential(&reader.id().to_string().parse()?)
         .await?;
 

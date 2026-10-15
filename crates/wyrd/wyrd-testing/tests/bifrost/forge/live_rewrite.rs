@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+use wyrd_client::bifrost::BifrostOptions;
 
 use uuid::Uuid;
 
@@ -2174,11 +2175,17 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
         };
         let client = &client;
         async move {
-            wyrd_client::Bifrost::connect_with_table(client, config)
-                .await
-                .expect("the public Bifrost client connects")
-                .register()
-                .await
+            wyrd_client::Bifrost::connect_with(
+                client,
+                BifrostOptions {
+                    table: Some(config),
+                    ..BifrostOptions::default()
+                },
+            )
+            .await
+            .expect("the public Bifrost client connects")
+            .register()
+            .await
         }
     };
     assert_eq!(
@@ -2199,7 +2206,7 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
         let client = &client;
         let fqn = table.qualified.clone();
         async move {
-            wyrd_client::bifrost::TableConfig::describe(client, &fqn)
+            wyrd_client::bifrost::TableConfig::describe_with(client, &fqn)
                 .await
                 .expect("the table describes")
                 .compaction_target_file_size_bytes()
@@ -2349,12 +2356,18 @@ async fn property_less_public_table_is_compacted_by_default() {
     let config = wyrd_client::bifrost::TableConfig::from_arrow(&table.qualified, schema)
         .expect("the journey schema is a table config");
     assert_eq!(
-        wyrd_client::Bifrost::connect_with_table(&client, config)
-            .await
-            .expect("the public Bifrost client connects")
-            .register()
-            .await
-            .expect("option-less registration"),
+        wyrd_client::Bifrost::connect_with(
+            &client,
+            BifrostOptions {
+                table: Some(config),
+                ..BifrostOptions::default()
+            }
+        )
+        .await
+        .expect("the public Bifrost client connects")
+        .register()
+        .await
+        .expect("option-less registration"),
         RegisterOutcome::Created
     );
     let properties = server
@@ -2729,11 +2742,17 @@ async fn compaction_type_registers_describes_and_steers_forge_dispatch() {
         };
         let client = &client;
         async move {
-            wyrd_client::Bifrost::connect_with_table(client, config)
-                .await
-                .expect("the public Bifrost client connects")
-                .register()
-                .await
+            wyrd_client::Bifrost::connect_with(
+                client,
+                BifrostOptions {
+                    table: Some(config),
+                    ..BifrostOptions::default()
+                },
+            )
+            .await
+            .expect("the public Bifrost client connects")
+            .register()
+            .await
         }
     };
     assert_eq!(
@@ -2754,7 +2773,7 @@ async fn compaction_type_registers_describes_and_steers_forge_dispatch() {
         let client = &client;
         let fqn = table.qualified.clone();
         async move {
-            wyrd_client::bifrost::TableConfig::describe(client, &fqn)
+            wyrd_client::bifrost::TableConfig::describe_with(client, &fqn)
                 .await
                 .expect("the table describes")
                 .compaction_type()

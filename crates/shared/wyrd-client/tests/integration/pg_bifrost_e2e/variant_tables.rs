@@ -6,6 +6,7 @@
 
 mod pg_tests {
     use std::sync::Arc;
+    use wyrd_client::bifrost::BifrostOptions;
 
     use std::collections::BTreeMap;
 
@@ -109,9 +110,14 @@ mod pg_tests {
             })
             .expect("client connects");
             let table = format!("vala.datasets.events_{}", uuid::Uuid::now_v7().simple());
-            let bifrost = Bifrost::connect_with_table(
+            let bifrost = Bifrost::connect_with(
                 &client,
-                TableConfig::from_model::<Event>(&table).expect("Event declares a table"),
+                BifrostOptions {
+                    table: Some(
+                        TableConfig::from_model::<Event>(&table).expect("Event declares a table"),
+                    ),
+                    ..BifrostOptions::default()
+                },
             )
             .await
             .expect("bifrost connects");
@@ -172,7 +178,7 @@ mod pg_tests {
     async fn model_fields_become_variant_struct_and_list_columns() {
         let events = Events::start().await;
 
-        let described = TableConfig::describe(&events.client, &events.table)
+        let described = TableConfig::describe_with(&events.client, &events.table)
             .await
             .expect("table describes");
         let schema = described.user_schema();
@@ -228,9 +234,12 @@ mod pg_tests {
     async fn query_results_copy_into_another_table() {
         let events = Events::start().await;
         let archive = format!("vala.datasets.archive_{}", uuid::Uuid::now_v7().simple());
-        Bifrost::connect_with_table(
+        Bifrost::connect_with(
             &events.client,
-            TableConfig::from_model::<Event>(&archive).expect("table"),
+            BifrostOptions {
+                table: Some(TableConfig::from_model::<Event>(&archive).expect("table")),
+                ..BifrostOptions::default()
+            },
         )
         .await
         .expect("bifrost connects")
@@ -371,7 +380,7 @@ mod pg_tests {
             .expect_err("server refuses UInt64");
         assert_eq!(server.code(), "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE");
 
-        let missing = TableConfig::describe(&events.client, &table)
+        let missing = TableConfig::describe_with(&events.client, &table)
             .await
             .expect_err("no table");
         assert_eq!(code(&missing), "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND");
@@ -500,12 +509,14 @@ mod pg_tests {
         let events = Events::start().await;
         // `enqueue_batch` sends a batch unchanged; messages may carry a cell
         // past the 8 MiB Variant limit.
-        let direct = Bifrost::connect_with_config(
+        let direct = Bifrost::connect_with(
             &events.client,
-            None,
-            QueueConfig {
-                max_message_bytes: 12 * 1024 * 1024,
-                ..QueueConfig::default()
+            BifrostOptions {
+                table: None,
+                queue: QueueConfig {
+                    max_message_bytes: 12 * 1024 * 1024,
+                    ..QueueConfig::default()
+                },
             },
         )
         .await

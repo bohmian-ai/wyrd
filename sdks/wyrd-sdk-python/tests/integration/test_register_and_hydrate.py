@@ -7,9 +7,10 @@ from pathlib import Path
 
 import pytest
 from wyrd import WyrdError
-from wyrd.cards import CardKind, CardRef, Cards
+from wyrd.cards import AgentCard, CardKind, CardRef, Cards
 from wyrd.client import WyrdClient
-from wyrd.state import CardEnvelope
+from wyrd.prompt import PromptCard
+from wyrd.state import CardEnvelope, WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
 from .support import FIXTURES, binding_ids, download, hydrated, register
@@ -36,7 +37,7 @@ def test_service_graph_registers_and_hydrates(
     assert state.root_ref == support_desk["support-desk"]
     assert state.card_ref("model") == support_desk["support-model"]
     assert state.card_ref("agent") == support_desk["support-agent"]
-    assert state.agent("agent").prompt is not None
+    assert state.agent("agent").prompt().ref == support_desk["support-prompt"]
 
 
 def test_latest_version_resolves_to_the_registered_card(
@@ -161,3 +162,38 @@ def test_refused_cli_command_raises_its_catalog_code(tmp_path: Path) -> None:
             version="1.0.0",
         )
     assert refused.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
+
+
+def test_hydrated_agent_prompt_card_navigation(
+    cards: Cards, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inline, path and CardRef Agents navigate offline to their registered Prompt Cards."""
+    register(cards, "cards/agent_prompt/desk-prompt.yaml")
+    desk = register(cards, "cards/agent_prompt/prompt-desk.yaml")
+    bundle = download(cards, "prompt-desk", tmp_path)
+    monkeypatch.setenv("WYRD_SERVER_URL", "http://127.0.0.1:1")
+
+    state = WyrdState.from_path(bundle)
+
+    explicit = state["my_prompt"]
+    assert isinstance(explicit, PromptCard)
+    assert explicit.ref == state.card_ref("my_prompt") == desk["desk-prompt"]
+    for alias, prompt in (
+        ("inline_agent", "inline-agent-prompt"),
+        ("path_agent", "desk-prompt"),
+        ("ref_agent", "desk-prompt"),
+    ):
+        agent = state[alias]
+        assert isinstance(agent, AgentCard)
+        assert agent.prompt().ref == agent.prompt_ref.card_ref == desk[prompt]
+        assert state.agent(alias).prompt().ref == desk[prompt]
+    assert state.agent("path_agent").prompt().prompt.model == explicit.prompt.model == "gpt-4o"
+    with pytest.raises(WyrdError) as unknown:
+        state.get("missing")
+    assert unknown.value.code == "WYRD_SDK_404_UNKNOWN_ALIAS"
+    with pytest.raises(WyrdError) as unknown_item:
+        state["missing"]
+    assert unknown_item.value.code == "WYRD_SDK_404_UNKNOWN_ALIAS"
+    with pytest.raises(WyrdError) as mismatch:
+        state.agent("my_prompt")
+    assert mismatch.value.code == "WYRD_SDK_400_CARD_KIND_MISMATCH"

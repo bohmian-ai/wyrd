@@ -1,7 +1,7 @@
 //! First-class Rust Wyrd SDK.
 //!
 //! A thin projection of `wyrd-client`, the sole shared client implementation:
-//! client configuration, [`cards::Cards`], [`principals::Principals`],
+//! client configuration, [`cards::Cards`], [`auth::Principals`],
 //! [`platform::Platform`], [`state::WyrdState`],
 //! [`operator_connections::OperatorConnections`], and [`Bifrost`], plus the
 //! [`WyrdError`] every capability returns. This
@@ -25,14 +25,92 @@
 //!
 //! The list also holds the projection to the surface every SDK shares
 //! (REQ-210): the `wyrd_client::gateway_caller` module is left off, so the
-//! Agent gateway caller is not reachable here. The `auth` and `storage` modules
-//! are left off too: the authentication middleware and the artifact-transfer
+//! Agent gateway caller is not reachable here. The `wyrd_client::auth` and
+//! `storage` modules are left off too (this package's [`auth`] is the principal
+//! handle, `wyrd_client::principals`): the authentication middleware and the artifact-transfer
 //! client are mechanics behind [`WyrdClient`] and [`cards::Cards`]. [`transport`]
 //! carries only the endpoint and credential types [`config::ClientConfig`]
 //! names. Raw requests, writer internals, and
 //! bundle introspection on the re-exported types exist only under
 //! `wyrd-client`'s `internal` feature, which this package never enables
 //! (`check:deps` fails if it does).
+//!
+//! Every server-facing handle opens with `connect()`, which resolves the
+//! ambient client, or `connect_with(&client)`, which uses the given one; no
+//! other construction form is public, and the principal handle lives in
+//! [`auth`], not a `principals` module:
+//!
+//! ```compile_fail
+//! use wyrd_ai::principals::Principals;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::Bifrost::from_env;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::Bifrost::connect_with_table;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::Bifrost::connect_with_config;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::bifrost::blocking::Bifrost::from_env;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::bifrost::blocking::Bifrost::connect_with_table;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::bifrost::blocking::Bifrost::connect_with_config;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::cards::Cards::from_env;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::cards::Cards::with_client;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::Gateway::from_env;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::Gateway::with_client;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::auth::Principals::from_env;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::auth::Principals::with_client;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::OperatorConnections::from_env;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::OperatorConnections::with_client;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::Platform::with_client;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::state::WyrdState::from_path_with_client;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = wyrd_ai::bifrost::TableConfig::describe_from_env;
+//! ```
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
@@ -40,8 +118,12 @@
 pub use wyrd_client::{
     Bifrost, Gateway, GlobalConfig, OperatorConnections, Platform, Principals, QueueConfig,
     WyrdClient, bifrost, cards, client, config, environment, error, gateway, global_config,
-    observe, operator_connections, platform, principals, state,
+    observe, operator_connections, platform, state,
 };
+
+/// Tenant principal administration: the [`auth::Principals`] handle and its
+/// wire types.
+pub use wyrd_client::principals as auth;
 
 /// Endpoint and credential types the client configuration names.
 ///
@@ -116,17 +198,30 @@ mod tests {
     #[test]
     fn sdk_root_exposes_the_supported_surface() {
         let _ = super::Bifrost::connect;
-        let _ = super::cards::Cards::with_client;
-        let _ = super::principals::Principals::with_client;
-        let _ = super::operator_connections::OperatorConnections::with_client;
-        let _ = super::platform::Platform::with_client;
+        let _ = super::Bifrost::connect_with;
+        let _ = super::bifrost::blocking::Bifrost::connect;
+        let _ = super::bifrost::blocking::Bifrost::connect_with;
+        let _ = super::Bifrost::list_tables;
+        let _ = super::bifrost::blocking::Bifrost::list_tables;
+        let _ = super::bifrost::BifrostOptions::default;
+        let _ = super::cards::Cards::connect;
+        let _ = super::cards::Cards::connect_with;
+        let _ = super::auth::Principals::connect;
+        let _ = super::auth::Principals::connect_with;
+        let _ = super::operator_connections::OperatorConnections::connect;
+        let _ = super::operator_connections::OperatorConnections::connect_with;
+        let _ = super::platform::Platform::connect;
+        let _ = super::platform::Platform::connect_with;
+        let _ = super::Gateway::connect;
+        let _ = super::Gateway::connect_with;
         let _ = |path: &std::path::Path| super::state::WyrdState::from_path(path);
-        let _ = |path: &std::path::Path, client| {
-            super::state::WyrdState::from_path_with_client(path, client)
+        let _ =
+            |path: &std::path::Path, client| super::state::WyrdState::from_path_with(path, client);
+        let _ = |fqn: &'static str| TableConfig::describe(fqn);
+        let _ = |client: &'static super::WyrdClient, fqn: &'static str| {
+            TableConfig::describe_with(client, fqn)
         };
         let _ = super::WyrdClient::with_config;
-        let _ = super::Gateway::with_client;
-        let _ = super::Gateway::from_env;
         let _ = super::WyrdError::code;
     }
 

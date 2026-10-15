@@ -169,6 +169,9 @@ optional `space`, and optional `uid`. The server derives relationships from
 these references; users do not author a parallel lineage graph. Ref and
 InlineableRef values are untagged: identity mapping, local path string, or native
 inline body. Do not add discriminator wrappers or a second reference inventory.
+A registered Agent's inline Prompt is the one inline body that gains identity:
+registration materializes it as the Agent's own `<agent-name>-prompt` Prompt
+Card, so every hydrated Agent navigates to a registered Prompt Card.
 
 A Verifier is a reusable, subject-less peer with one typed Drift or Eval
 implementation; `Drift` and `Eval` are not Card kinds. Deployment composition

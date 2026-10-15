@@ -40,7 +40,7 @@ export interface Worked {
  */
 export async function work(client: WyrdClient): Promise<Worked> {
   await configureGateway(client);
-  const cards = Cards.connect({ client });
+  const cards = await Cards.connect({ client });
   await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
   await cards.registerFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
   const receipt = await cards.registerFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
@@ -84,7 +84,7 @@ export async function configureGateway(client: WyrdClient): Promise<void> {
     { name: "openai-key", provider: "openai", source: { managed_secret: { secret: "sk-local-upstream" } } },
     { client },
   );
-  await Gateway.connect({ client }).putDeployment({
+  await (await Gateway.connect({ client })).putDeployment({
     name: "openai",
     adapter: "openai",
     auth: { bearer: { credential: "openai-key" } },

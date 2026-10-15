@@ -32,10 +32,10 @@ const test = serverTest({ verificationRuntime: true }).extend<{
     },
     { scope: "file" },
   ],
-  cards: [async ({ server: _ }, use) => use(Cards.connect()), { scope: "file" }],
+  cards: [async ({ server: _ }, use) => use(await Cards.connect()), { scope: "file" }],
   watch: [
     async ({ hooks, cards }, use) => {
-      await OperatorConnections.connect().create({
+      await (await OperatorConnections.connect()).create({
         provider: "http",
         name: "on-call-hooks",
         origin: hooks.url,

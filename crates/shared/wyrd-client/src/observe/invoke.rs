@@ -35,7 +35,7 @@ impl Run {
     /// # Errors
     /// Returns the errors of [`Self::invoke_on`].
     pub async fn invoke(&self, variables: &[(&str, &str)]) -> Result<String, WyrdError> {
-        let route = self.state.agent(&self.alias)?.spec.execution_route.clone();
+        let route = self.state.agent(&self.alias)?.card().spec.execution_route.clone();
         self.invoke_on(&route, variables).await
     }
 
@@ -71,14 +71,15 @@ impl Run {
         route: &ExecutionRoute,
         variables: &[(&str, &str)],
     ) -> Result<String, WyrdError> {
-        let card = self.state.agent(&self.alias)?;
+        let hydrated = self.state.agent(&self.alias)?;
+        let card = hydrated.card();
         if !card.spec.tool_names.is_empty() {
             return Err(invalid_agent(
                 &self.alias,
                 "Run.invoke supports only a tool-free Agent",
             ));
         }
-        let prompt = self.state.resolve_agent_prompt(&self.alias)?;
+        let prompt = &hydrated.prompt().metadata.prompt;
         let mut agent = Agent::new(skald_prompt::Prompt::from_native(prompt.clone()))
             .with_id(card.name.clone())
             .with_tools(std::iter::empty())

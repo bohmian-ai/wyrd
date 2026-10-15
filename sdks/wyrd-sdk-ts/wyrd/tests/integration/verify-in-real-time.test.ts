@@ -107,8 +107,8 @@ const test = serverTest({ provider: () => ({ status: 200, body: JUDGE_PASSES }),
   assistant: [
     async ({ server: _ }, use) => {
       await configureGateway(WyrdClient.connect());
-      await Gateway.connect().putCapturePolicy({ mode: "metadata", payload_fields: [] });
-      const cards = Cards.connect();
+      await (await Gateway.connect()).putCapturePolicy({ mode: "metadata", payload_fields: [] });
+      const cards = await Cards.connect();
       await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
       await cards.registerFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
       const receipt = await cards.registerFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
@@ -126,7 +126,7 @@ const test = serverTest({ provider: () => ({ status: 200, body: JUDGE_PASSES }),
   assistantKey: [async ({ assistant: _ }, use) => use(await serviceKey("assistant")), { scope: "file" }],
   unfittedBundle: [
     async ({ assistant: _ }, use) => {
-      const cards = Cards.connect();
+      const cards = await Cards.connect();
       const receipt = await cards.registerFromPath(fixture("cards/verify_in_real_time/unfitted-assistant.yaml"));
       const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-unfitted-"));
       await cards.hydrate(receipt.root, bundle);
@@ -220,7 +220,7 @@ test("judge call is attributed to the run and card", async ({ server, state }) =
 
 test("traced verify joins the caller's trace", async ({ server, state }) => {
   await startTelemetry(state);
-  await Gateway.connect().putCapturePolicy({ mode: "metadata", payload_fields: [] });
+  await (await Gateway.connect()).putCapturePolicy({ mode: "metadata", payload_fields: [] });
   const caller = await trace.getTracer("journey").startActiveSpan("caller", async (span) => {
     await state.run("agent").observe.verify("answer-graded", { answer: "yes" });
     span.end();
@@ -235,7 +235,7 @@ test("traced verify joins the caller's trace", async ({ server, state }) => {
 
 test("sdk requests carry the active trace", async ({ server, state }) => {
   await startTelemetry(state);
-  const gateway = Gateway.connect();
+  const gateway = await Gateway.connect();
   const caller = await trace.getTracer("journey").startActiveSpan("caller", async (span) => {
     await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });
     span.end();

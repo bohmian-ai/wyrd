@@ -204,6 +204,7 @@ impl RuntimeServiceFixture {
         "agent_inline",
         "agent_triage",
         "default-Data-training-1.0.0",
+        "default-Prompt-inline-prompt-0.1.0",
         "default-Prompt-triage-prompt-1.0.0",
         "default-Verifier-model-drift-1.0.0",
         "default-Verifier-quality-1.0.0",
@@ -659,7 +660,7 @@ mod pg_tests {
     /// # Panics
     /// Panics when the authenticated transport cannot be assembled from the
     /// test server URL and bootstrapped bearer token.
-    fn public_cards_client(base_url: &str, jwt: &str) -> Cards {
+    async fn public_cards_client(base_url: &str, jwt: &str) -> Cards {
         let mut config = ClientConfig::default();
         config.http.base_url = base_url.to_owned();
         let auth = AuthMiddleware::new(
@@ -669,7 +670,9 @@ mod pg_tests {
         .expect("registry auth middleware builds");
         let transport = HttpTransport::new(&config.http, Arc::clone(&auth))
             .expect("registry HTTP transport builds");
-        Cards::with_client(WyrdClient::from_parts(auth, transport, config.grpc))
+        Cards::connect_with(&WyrdClient::from_parts(auth, transport, config.grpc))
+            .await
+            .expect("handle connects")
     }
 
     /// Run one CLI dispatcher invocation and decode its successful JSON body.
@@ -765,7 +768,7 @@ mod pg_tests {
     ///
     /// # Panics
     /// Panics when an alias is unresolved, a CardRef is not versioned, a UID is
-    /// absent or empty, or aliases do not cover nine unique Cards.
+    /// absent or empty, or aliases do not cover ten unique Cards.
     fn assert_all_refs_are_uid_pinned(state: &WyrdState) {
         let aliases = state.aliases().collect::<Vec<_>>();
         let mut refs = BTreeSet::new();
@@ -776,7 +779,7 @@ mod pg_tests {
             assert!(!uid.to_string().is_empty());
             refs.insert(card_ref.to_string());
         }
-        assert_eq!(refs.len(), 9);
+        assert_eq!(refs.len(), 10);
     }
 
     /// Assert no loaded Card retains an authored or unresolved path reference.
@@ -1282,7 +1285,7 @@ mod pg_tests {
             panic!("journey bootstrap returned a non-user principal");
         };
 
-        let cards = public_cards_client(&base_url, &jwt);
+        let cards = public_cards_client(&base_url, &jwt).await;
         fixture
             .register_dependencies(&cards)
             .await
@@ -1323,7 +1326,7 @@ mod pg_tests {
         .await
         .expect("CLI get succeeds");
         assert_eq!(summary["mode"], "complete");
-        assert_eq!(summary["card_count"], 9);
+        assert_eq!(summary["card_count"], 10);
         assert_eq!(summary["downloaded_artifact_count"], 3);
 
         drop(cards);
@@ -1358,6 +1361,7 @@ mod pg_tests {
             state
                 .agent("agent_triage")
                 .expect("shared agent resolves")
+                .card()
                 .name,
             "triage"
         );
@@ -1365,6 +1369,7 @@ mod pg_tests {
             state
                 .agent("agent_inline")
                 .expect("inline agent resolves")
+                .card()
                 .name,
             "inline"
         );
@@ -1372,19 +1377,19 @@ mod pg_tests {
             state.prompt("triage_prompt").expect("prompt resolves").name,
             "triage-prompt"
         );
-        assert_eq!(
+        assert!(std::ptr::eq(
             state
-                .agent_prompt("agent_triage")
-                .expect("shared prompt resolves"),
-            &state
-                .prompt("triage_prompt")
-                .expect("prompt resolves")
-                .metadata
-                .prompt
-        );
-        let inline_prompt = state
-            .agent_prompt("agent_inline")
-            .expect("inline prompt resolves");
+                .agent("agent_triage")
+                .expect("shared agent resolves")
+                .prompt(),
+            state.prompt("triage_prompt").expect("prompt resolves")
+        ));
+        let inline_card = state
+            .agent("agent_inline")
+            .expect("inline agent resolves")
+            .prompt();
+        assert_eq!(inline_card.name, "inline-prompt");
+        let inline_prompt = &inline_card.metadata.prompt;
         assert_eq!(inline_prompt.model, "gpt-4o");
         assert!(
             serde_json::to_string(&inline_prompt.request)
@@ -1554,9 +1559,9 @@ mod pg_tests {
         )
         .await
         .expect("canonical authored directory applies");
-        assert_eq!(receipt["outcomes"].as_array().map(Vec::len), Some(12));
+        assert_eq!(receipt["outcomes"].as_array().map(Vec::len), Some(13));
         wait_baseline_ready(
-            &public_cards_client(&base_url, &jwt),
+            &public_cards_client(&base_url, &jwt).await,
             json!({
                 "kind": "Verifier",
                 "name": "churn-classifier-drift",
@@ -1578,7 +1583,7 @@ mod pg_tests {
         .await
         .expect("canonical Service graph hydrates");
         assert_eq!(summary["mode"], "complete");
-        assert_eq!(summary["card_count"], 16);
+        assert_eq!(summary["card_count"], 17);
 
         let metadata: Value = serde_yaml::from_slice(
             &std::fs::read(bundle.path().join("metadata.yaml"))
@@ -1684,7 +1689,7 @@ mod pg_tests {
             panic!("denied bootstrap returned a non-user principal");
         };
 
-        let cards = public_cards_client(&base_url, &jwt);
+        let cards = public_cards_client(&base_url, &jwt).await;
         for path in [
             temp.path().join("shared-prompt.yaml"),
             temp.path().join("model.yaml"),

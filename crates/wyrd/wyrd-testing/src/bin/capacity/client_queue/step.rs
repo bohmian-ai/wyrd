@@ -187,7 +187,7 @@ impl Bench<'_> {
         let client = self
             .tenant
             .service(proxy.as_ref().map(DelayProxy::url).as_deref())?;
-        let state = WyrdState::from_path_with_client(&self.tenant.bundle, client)?;
+        let state = WyrdState::from_path_with(&self.tenant.bundle, client)?;
         state
             .start_bifrost_with_config(
                 None,

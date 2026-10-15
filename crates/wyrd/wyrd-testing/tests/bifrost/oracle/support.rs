@@ -428,10 +428,6 @@ pub(crate) async fn seed_foreign_hot_row(
         CorrelationPolicy::Observation,
     )));
     let principal = uuid::Uuid::now_v7().to_string();
-    let ingested_at = schema
-        .field_with_name(wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT)?
-        .data_type()
-        .clone();
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
@@ -440,11 +436,16 @@ pub(crate) async fn seed_foreign_hot_row(
             Arc::new(StringArray::from(vec![unused_payload(999)])),
             Arc::new(StringArray::from(vec![None::<String>])),
             Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![principal.as_str()])),
-            Arc::new(StringArray::from(vec![principal.as_str()])),
+            Arc::new(StringArray::from(vec![principal.clone()])),
+            Arc::new(StringArray::from(vec![principal])),
             Arc::new(StringArray::from(vec![RequestId::now_v7().to_string()])),
             Arc::new(
-                TimestampMicrosecondArray::from(vec![1_000_000_i64]).with_data_type(ingested_at),
+                TimestampMicrosecondArray::from(vec![1_000_000_i64]).with_data_type(
+                    schema
+                        .field_with_name(wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT)?
+                        .data_type()
+                        .clone(),
+                ),
             ),
         ],
     )?;

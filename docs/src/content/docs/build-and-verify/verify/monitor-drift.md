@@ -118,7 +118,7 @@ use wyrd_ai::cards::{CardKind, CardSelector, Cards};
 
 let selector = CardSelector::named(CardKind::Verifier, "default".parse()?, "churn-input-drift".parse()?)
     .with_version("1.0.0".parse()?);
-let verifier = Cards::from_env()?.get(selector).await?;
+let verifier = Cards::connect().await?.get(selector).await?;
 let baseline = verifier.status.and_then(|status| status.verification).and_then(|v| v.baseline);
 println!("{:?}", baseline.map(|b| b.state)); // Pending, Building, Ready, or Failed
 ```
@@ -129,7 +129,7 @@ println!("{:?}", baseline.map(|b| b.state)); // Pending, Building, Ready, or Fai
 ```typescript
 import { Cards } from "wyrd-ai";
 
-const verifier = await Cards.connect().get({
+const verifier = await (await Cards.connect()).get({
   kind: "Verifier",
   name: "churn-input-drift",
   version: "1.0.0",
@@ -211,9 +211,9 @@ print(rows.to_pandas())
 <LangTab lang="rust">
 
 ```rust
-use wyrd_ai::{Bifrost, bifrost::QueryParam};
+use wyrd_ai::{Bifrost, bifrost::{BifrostOptions, QueryParam}};
 
-let rows = Bifrost::from_env()
+let rows = Bifrost::connect(BifrostOptions::default())
     .await?
     .sql(
         "SELECT window_start, window_end, feature, score, threshold, verdict \

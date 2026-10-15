@@ -184,6 +184,19 @@ export declare class NativeBifrost {
    */
   traceTimeline(traceId: string): Promise<NativeLifecycleResult>
   /**
+   * Lists the compact entries of every table the caller may read.
+   *
+   * The server's authorized `BifrostTableEntry` values, unchanged and
+   * without schemas; JavaScript describes one table with `describeTable`
+   * only when it needs that schema.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the native result cannot be projected;
+   * Wyrd control failures are returned in [`NativeLifecycleResult`].
+   */
+  listTables(): Promise<NativeLifecycleResult>
+  /**
    * Describes one registered table's stored physical schema.
    *
    * The description is the server's own projection: the user fields a caller
@@ -691,12 +704,18 @@ export declare class NativeRun {
 /** Node-facing handle to one authenticated [`WyrdClient`]. */
 export declare class NativeWyrdClient {
   /**
-   * Builds one Card registry handle that calls the server as this client.
+   * Connects one Card registry handle that calls the server as this client.
    *
-   * No IO happens here; the public TypeScript `Cards.connect` passes the
-   * caller's client or the ambient one.
+   * Completes any credential exchange this client requires before
+   * resolving, as `Cards::connect_with` does; the public TypeScript
+   * `Cards.connect` passes the caller's client or the ambient one. A refused
+   * or unreachable exchange is returned as catalog metadata.
+   *
+   * # Errors
+   *
+   * Never returns a napi error; failures are carried in the result.
    */
-  cards(): NativeCards
+  cards(): Promise<NativeCardsConnection>
   /**
    * Loads and validates one hydrated bundle whose server calls run as this
    * client.
@@ -768,28 +787,44 @@ export declare class NativeWyrdClient {
    */
   describeTableConfig(table: string): Promise<NativeTableConfigResult>
   /**
-   * Builds one gateway administration handle that calls the server as this
-   * client.
+   * Connects one gateway administration handle that calls the server as this client.
    *
-   * No IO happens here; the public TypeScript `Gateway.connect` passes the
-   * caller's client or the ambient one.
+   * Completes any credential exchange this client requires before
+   * resolving, as `Gateway::connect_with` does; the public TypeScript
+   * `Gateway.connect` passes the caller's client or the ambient one. A refused
+   * or unreachable exchange is returned as catalog metadata.
+   *
+   * # Errors
+   *
+   * Never returns a napi error; failures are carried in the result.
    */
-  gateway(): NativeGateway
+  gateway(): Promise<NativeGatewayConnection>
   /**
-   * Builds one Operator connection handle that calls the server as this
-   * client.
+   * Connects one Operator connection handle that calls the server as this client.
    *
-   * No IO happens here; the public TypeScript `OperatorConnections.connect`
-   * passes the caller's client or the ambient one.
+   * Completes any credential exchange this client requires before
+   * resolving, as `OperatorConnections::connect_with` does; the public TypeScript
+   * `OperatorConnections.connect` passes the caller's client or the ambient one. A refused
+   * or unreachable exchange is returned as catalog metadata.
+   *
+   * # Errors
+   *
+   * Never returns a napi error; failures are carried in the result.
    */
-  operatorConnections(): NativeOperatorConnections
+  operatorConnections(): Promise<NativeOperatorConnectionsConnection>
   /**
-   * Builds one principal handle that calls the server as this client.
+   * Connects one principal handle that calls the server as this client.
    *
-   * No IO happens here; the public TypeScript `Principals.connect` passes
-   * the caller's client or the ambient one.
+   * Completes any credential exchange this client requires before
+   * resolving, as `Principals::connect_with` does; the public TypeScript
+   * `Principals.connect` passes the caller's client or the ambient one. A refused
+   * or unreachable exchange is returned as catalog metadata.
+   *
+   * # Errors
+   *
+   * Never returns a napi error; failures are carried in the result.
    */
-  principals(): NativePrincipals
+  principals(): Promise<NativePrincipalsConnection>
 }
 
 /**
@@ -863,7 +898,11 @@ export declare class NativeWyrdState {
    */
   verifier(alias: string): NativeLifecycleResult
   /**
-   * Returns the stored envelope of the Agent Card an alias names.
+   * Returns the stored envelope of the Agent Card an alias names, with
+   * the exact Prompt reference it pins and that Prompt's stored envelope.
+   *
+   * The Prompt is the one the shared state's hydrated Agent resolves, so
+   * the wrapper navigates without resolving the relationship itself.
    *
    * # Errors
    *
@@ -985,6 +1024,28 @@ export interface NativeCallerTrace {
   tracestate?: string
 }
 
+/**
+ * Closed result of connecting one Card registry handle: the handle or a
+ * catalog error.
+ */
+export interface NativeCardsConnection {
+  /** Connected handle when the connection succeeded. */
+  handle?: NativeCards
+  /** Catalog failure otherwise. */
+  error?: NativeWyrdError
+}
+
+/**
+ * Closed result of connecting one gateway administration handle: the handle or a
+ * catalog error.
+ */
+export interface NativeGatewayConnection {
+  /** Connected handle when the connection succeeded. */
+  handle?: NativeGateway
+  /** Catalog failure otherwise. */
+  error?: NativeWyrdError
+}
+
 /** Structured native result for one live-query lifecycle control. */
 export interface NativeLifecycleResult {
   /** Canonical JSON payload when the control succeeded. */
@@ -1001,6 +1062,28 @@ export interface NativeLifecycleResult {
   errorRemediation?: string
   /** Serialized JSON-safe structured details when the control failed. */
   errorDetailsJson?: string
+}
+
+/**
+ * Closed result of connecting one Operator connection handle: the handle or a
+ * catalog error.
+ */
+export interface NativeOperatorConnectionsConnection {
+  /** Connected handle when the connection succeeded. */
+  handle?: NativeOperatorConnections
+  /** Catalog failure otherwise. */
+  error?: NativeWyrdError
+}
+
+/**
+ * Closed result of connecting one principal handle: the handle or a
+ * catalog error.
+ */
+export interface NativePrincipalsConnection {
+  /** Connected handle when the connection succeeded. */
+  handle?: NativePrincipals
+  /** Catalog failure otherwise. */
+  error?: NativeWyrdError
 }
 
 /**
@@ -1206,6 +1289,15 @@ export declare function tableConfigFromArrowIpc(table: string, schemaIpc: Buffer
  * hyphenated wire spelling is returned as catalog metadata.
  */
 export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null, compactionType?: string | undefined | null): NativeTableConfigResult
+
+/**
+ * The catalog error `WyrdState.flush` and `WyrdState.shutdown` throw when the
+ * tracer provider `startTelemetry` installed did not flush, built by the
+ * shared [`TelemetryFlushFailure`] so Python and TypeScript report the same
+ * code and details. `cause` is payload-free; `native_code` is the stable code
+ * of a native drain that also failed.
+ */
+export declare function telemetryFlushError(timedOut: boolean, cause: string, nativeCode?: string | undefined | null): NativeWyrdError
 
 /**
  * The catalog refusal `WyrdState.startTelemetry` throws when a global tracer

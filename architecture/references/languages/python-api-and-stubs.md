@@ -82,6 +82,10 @@ local, non-network hydrated graph loaded from a downloaded Service bundle.
 - Preserve server/API field names for durable contract data; do not invent
   Python-only vocabulary for stored facts.
 - Avoid hidden IO in constructors, `__repr__`, or property accessors.
+- A server-facing handle's constructor retains its arguments and connects on
+  its first server operation; its `connect` staticmethod (classmethod on the
+  pure-Python Bifrost facades) connects eagerly through the same shared Rust
+  path.
 - Avoid global mutable state.
 - Use `uv run` through repo tasks when available.
 - Format with `ruff` (`mise run py:format`). Lint with `mise run py:lints`.

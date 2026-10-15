@@ -53,7 +53,7 @@ function useSavedDeployment(): void {
 bootstrapTest.skipIf(!process.env.WYRD_LOCAL_DEV_CONFIG_HOME)("cli_bootstrap_saved_config", async () => {
   useSavedDeployment();
   try {
-    const cards = Cards.connect({ client: WyrdClient.connect() });
+    const cards = await Cards.connect({ client: WyrdClient.connect() });
     const receipt = await cards.registerFromPath(fixture("cards/gateway_inference/ask-prompt.yaml"));
     expect((await cards.get(receipt.root)).metadata.name).toBe("ask-prompt");
   } finally {

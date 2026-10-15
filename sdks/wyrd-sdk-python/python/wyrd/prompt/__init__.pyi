@@ -2363,6 +2363,8 @@ class PromptCard:
         prompt: the card's prompt; assigning it replaces the stored prompt.
         model_settings: a copy of the prompt's typed settings, or ``None``
             when the request carries none.
+        ref: the card's exact ``CardRef``, carrying its registered version
+            and UID; the value ``as_card_ref()`` returns.
         content_hash: the hash of the validated ``spec`` body.
         parameters: the text variables the prompt declares.
         is_fully_bound: ``True`` when the prompt declares no text variables.
@@ -2379,6 +2381,10 @@ class PromptCard:
     model_settings: (
         OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | None
     )
+    @property
+    def ref(self) -> CardRef:
+        """Return this card's exact identity, as ``as_card_ref()`` does."""
+        ...
     content_hash: str
     parameters: list[str]
     is_fully_bound: bool

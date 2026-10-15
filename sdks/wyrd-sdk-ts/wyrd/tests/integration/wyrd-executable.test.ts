@@ -27,7 +27,7 @@ const WYRD_BIN = (() => {
 const test = serverTest().extend<{ desk: RegistrationReceipt }>({
   desk: [
     async ({ server: _ }, use) => {
-      const cards = Cards.connect();
+      const cards = await Cards.connect();
       await cards.registerFromPath(fixture("cards/register_and_hydrate/support-model.yaml"));
       await use(await cards.registerFromPath(DESK));
     },

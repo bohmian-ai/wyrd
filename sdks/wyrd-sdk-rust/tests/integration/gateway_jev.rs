@@ -10,6 +10,7 @@
 //! a bearer token, which is the whole of what such a client sends.
 
 use std::collections::BTreeSet;
+use wyrd_ai::bifrost::BifrostOptions;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -180,7 +181,9 @@ impl Jev {
         )
         .await
         .expect("the CLI writes the credential");
-        Gateway::with_client(deployment.admin())
+        Gateway::connect_with(&deployment.admin())
+            .await
+            .expect("handle connects")
             .put_deployment(&ProviderDeployment {
                 name: ProviderDeploymentName::new("jev").expect("deployment name"),
                 adapter: ProviderAdapter::Jev,
@@ -196,7 +199,9 @@ impl Jev {
             })
             .await
             .expect("deployment puts");
-        Gateway::with_client(deployment.admin())
+        Gateway::connect_with(&deployment.admin())
+            .await
+            .expect("handle connects")
             .put_capture_policy(&GatewayCapturePolicyWrite {
                 mode: GatewayCaptureMode::Metadata,
                 payload_fields: BTreeSet::new(),
@@ -275,7 +280,7 @@ impl Jev {
             .flush_bifrost()
             .await
             .expect("rows publish");
-        Bifrost::connect(&self.deployment.admin())
+        Bifrost::connect_with(&self.deployment.admin(), BifrostOptions::default())
             .await
             .expect("Bifrost connects")
             .sql_as(
@@ -296,15 +301,13 @@ impl Jev {
     /// # Panics
     /// Panics when registration, hydration, key issue, or loading fails.
     async fn reviewer(&self) -> (WyrdState, tempfile::TempDir) {
-        let cards = self.deployment.cards();
+        let cards = self.deployment.cards().await;
         let reviewer = register(&cards, "cards/gateway_jev/reviewer.yaml").await;
         let bundle = hydrate(&cards, &reviewer.root).await;
         let key = self.deployment.service_key(&reviewer.root).await;
-        let state = WyrdState::from_path_with_client(
-            bundle.path().join("bundle"),
-            self.deployment.client(&key),
-        )
-        .expect("bundle loads offline");
+        let state =
+            WyrdState::from_path_with(bundle.path().join("bundle"), self.deployment.client(&key))
+                .expect("bundle loads offline");
         (state, bundle)
     }
 }

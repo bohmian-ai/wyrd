@@ -665,6 +665,18 @@ impl PromptCard {
         self.as_card_ref().map(CardRefPy).map_err(Into::into)
     }
 
+    /// Return this Prompt Card's exact identity, carrying its registered
+    /// version and UID; the same value `as_card_ref()` returns.
+    ///
+    /// # Errors
+    /// Returns a Wyrd validation error when identity fields fail newtype
+    /// invariants.
+    #[getter]
+    #[pyo3(name = "ref")]
+    pub fn ref_py(&self) -> CardPyResult<CardRefPy> {
+        self.as_card_ref_py()
+    }
+
     /// Save this `PromptCard` envelope to a local JSON or YAML file.
     ///
     /// # Errors

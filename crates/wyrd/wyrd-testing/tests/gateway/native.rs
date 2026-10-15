@@ -5,6 +5,7 @@
 //! shared local upstream through the built-in adapters.
 
 use std::time::Duration;
+use wyrd_client::bifrost::BifrostOptions;
 
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
@@ -610,7 +611,7 @@ async fn captured_calls(
         ..wyrd_client::config::ClientConfig::default()
     })
     .expect("inspection client builds");
-    let bifrost = wyrd_client::Bifrost::connect(&client)
+    let bifrost = wyrd_client::Bifrost::connect_with(&client, BifrostOptions::default())
         .await
         .expect("inspection Bifrost connects");
     let deadline = std::time::Instant::now() + Duration::from_secs(30);

@@ -22,7 +22,7 @@ function expectRedacted(value: unknown): void {
 
 /** The administrator's connection handle and the id of `ops-slack`. */
 const test = serverTest().extend<{ connections: OperatorConnections; slack: string }>({
-  connections: [async ({ server: _ }, use) => use(OperatorConnections.connect()), { scope: "file" }],
+  connections: [async ({ server: _ }, use) => use(await OperatorConnections.connect()), { scope: "file" }],
   slack: [async ({ connections }, use) => use((await connections.create(SLACK)).connection_id), { scope: "file" }],
 });
 
@@ -44,7 +44,7 @@ test("admin manages redacted connections", async ({ connections, slack }) => {
 });
 
 test("writer is refused", async ({ server }) => {
-  const writer = OperatorConnections.connect({
+  const writer = await OperatorConnections.connect({
     client: WyrdClient.connect({ credential: server.scopedApiKey("card_writer", ["cards:read", "cards:write"]) }),
   });
 
@@ -52,7 +52,7 @@ test("writer is refused", async ({ server }) => {
 });
 
 test("other tenant sees nothing", async ({ server, slack }) => {
-  const foreign = OperatorConnections.connect({
+  const foreign = await OperatorConnections.connect({
     client: WyrdClient.connect({
       credential: server.bootstrapServiceInTenant(server.seedTenant("other-tenant"), ["admin"], "other-admin"),
     }),
@@ -63,7 +63,7 @@ test("other tenant sees nothing", async ({ server, slack }) => {
 });
 
 test("reader cannot disable a connection", async ({ server, connections, slack }) => {
-  const reader = OperatorConnections.connect({
+  const reader = await OperatorConnections.connect({
     client: WyrdClient.connect({ credential: server.scopedApiKey("operator_reader", ["operators:read"]) }),
   });
 

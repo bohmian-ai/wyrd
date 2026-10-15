@@ -82,6 +82,55 @@ wyrd list
 
 A new tenant has no Cards, so the list is empty, and the command exits 0. You did not export a key or URL; the CLI read both from the saved config. If you have `WYRD_API_KEY`, `WYRD_ACCESS_TOKEN`, or `WYRD_SERVER_URL` exported from other work, unset them first. They take precedence over the saved config.
 
+## Connect from an SDK
+
+The SDKs read the same saved config, so code needs no client, URL, or key either. Every server-facing handle (`Bifrost`, `Cards`, `Gateway`, `Principals`, `OperatorConnections`) opens with `connect`:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+```python
+from wyrd.bifrost import Bifrost
+
+bifrost = Bifrost.connect()
+print([table["name"] for table in bifrost.list_tables()])
+```
+
+</LangTab>
+<LangTab lang="rust">
+
+```rust
+use wyrd_ai::{Bifrost, bifrost::BifrostOptions};
+
+let bifrost = Bifrost::connect(BifrostOptions::default()).await?;
+for table in bifrost.list_tables().await? {
+    println!("{}.{}", table.namespace, table.name);
+}
+```
+
+</LangTab>
+<LangTab lang="typescript">
+
+```typescript
+import { Bifrost } from "wyrd-ai";
+
+const bifrost = await Bifrost.connect();
+console.log((await bifrost.listTables()).map((table) => table.name));
+```
+
+</LangTab>
+</LangTabs>
+
+Even a new tenant lists Wyrd's built-in tables. In Rust, `Cards::connect()` and the other handles take no arguments; only Bifrost takes its `BifrostOptions`.
+
+`connect` fails fast. It resolves the credential, exchanges an API key for a token, and opens Bifrost's gRPC connection before it returns. No credential anywhere raises `WYRD_CLIENT_401_NO_CREDENTIALS`, and a refused key fails at `connect`, not on your first call. A bearer token you pass directly is not checked until the first request that uses it.
+
+Each handle resolves the config once and keeps that client, so changing the environment afterward does not move an open handle. Its token still renews on its own.
+
+Python also keeps the plain constructor: `Bifrost()`, `Cards()`, and `Principals()` do no IO and connect on the first call that needs the server. The errors are the same; only the timing differs. `AsyncBifrost()` is lazy the same way, and `await AsyncBifrost.connect()` is its eager form. We use `connect` in setup scripts and smoke tests, where failing at startup is the point.
+
+Pass a client only when you need one: a test pointing at a specific server, configuration the environment cannot express, or [acting on behalf of someone](/understand/identity-and-authorization/#acting-on-behalf-of-someone). That is `client=` in Python, `{ client }` in TypeScript, and `connect_with(&client)` in Rust. A handle given a client uses it as given. The lookup order for credentials is in [How a caller proves who it is](/understand/identity-and-authorization/#how-a-caller-proves-who-it-is).
+
 ## Stop and restart
 
 Press Ctrl-C in the server terminal. The CLI stops the server and waits for it to drain. To restart, run the same command from the same directory, with the same database and config directory:

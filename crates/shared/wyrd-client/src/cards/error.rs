@@ -100,7 +100,7 @@ mod tests {
             );
             config.credential = credential.map(SecretString::from);
             WyrdClient::with_config(config)
-                .map(Cards::with_client)
+                .map(Cards::new)
                 .map_err(WyrdError::from)
         };
 

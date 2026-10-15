@@ -2,16 +2,22 @@
 import { expectTypeOf } from "vitest";
 
 import type {
+  AgentCard,
   CardKind,
+  CardRef,
   CardRegistrationOutcome,
   CardSummary,
   CardTypes,
   DriftBaselineState,
+  HydratedCard,
   Judgment,
   PrincipalSummary,
+  PromptCard,
   RegisteredCard,
+  RegisteredModelCard,
   RegisteredVerifierCard,
   TypedCardKind,
+  WyrdState,
 } from "wyrd-ai";
 
 // Narrowing a registered envelope by `kind` reaches the Verifier's typed baseline state.
@@ -51,3 +57,31 @@ expectTypeOf<CardSummary["artifact_hash"]>().toEqualTypeOf<string | null>();
 expectTypeOf<CardRegistrationOutcome["card_blob_uri"]>().toEqualTypeOf<string | null>();
 expectTypeOf<PrincipalSummary["email"]>().toEqualTypeOf<string | null>();
 expectTypeOf<Judgment["counts"]>().toEqualTypeOf<CardTypes.VerifierCounts | undefined>();
+
+// Typed state accessors return hydrated Cards whose Prompt navigation is exact.
+declare const state: WyrdState;
+expectTypeOf(state.agent("agent")).toEqualTypeOf<AgentCard>();
+expectTypeOf(state.agent("agent").prompt()).toEqualTypeOf<PromptCard>();
+expectTypeOf(state.agent("agent").prompt().ref).toEqualTypeOf<CardRef>();
+expectTypeOf(state.agent("agent").promptRef).toEqualTypeOf<CardRef>();
+expectTypeOf(state.prompt("my_prompt").ref).toEqualTypeOf<CardRef>();
+
+// Generic lookup is a kind-discriminated union, narrowed by literal kind only.
+const looked = state.get("agent");
+expectTypeOf(looked).toEqualTypeOf<HydratedCard>();
+if (looked.kind === "Agent") {
+  expectTypeOf(looked).toEqualTypeOf<AgentCard>();
+  expectTypeOf(looked.prompt().ref).toEqualTypeOf<CardRef>();
+} else if (looked.kind === "Prompt") {
+  expectTypeOf(looked).toEqualTypeOf<PromptCard>();
+} else if (looked.kind === "Model") {
+  expectTypeOf(looked).toEqualTypeOf<RegisteredModelCard>();
+}
+// @ts-expect-error an unnarrowed lookup is not an Agent.
+const unnarrowed: AgentCard = state.get("agent");
+// @ts-expect-error only an Agent navigates to its Prompt.
+state.get("agent").prompt();
+// @ts-expect-error a Prompt Card is not a string.
+const notString: string = state.agent("agent").prompt();
+void unnarrowed;
+void notString;

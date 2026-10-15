@@ -24,7 +24,7 @@ function deployment(name: string, credential: string): ProviderDeployment {
 
 /** A Gateway administration handle for the deployment's writer. */
 const test = serverTest().extend<{ gateway: Gateway }>({
-  gateway: [async ({ server: _ }, use) => use(Gateway.connect()), { scope: "file" }],
+  gateway: [async ({ server: _ }, use) => use(await Gateway.connect()), { scope: "file" }],
 });
 
 test("cli written credential reads back through the gateway", async ({ gateway }) => {
@@ -80,7 +80,7 @@ test("deployment without capabilities is refused", async ({ gateway }) => {
 test("gateway reader cannot delete a deployment", async ({ server, gateway }) => {
   await cli.putProviderCredential(environmentCredential("reader-key"));
   await gateway.putDeployment(deployment("read-only", "reader-key"));
-  const reader = Gateway.connect({
+  const reader = await Gateway.connect({
     client: WyrdClient.connect({ credential: server.scopedApiKey("gateway_reader", ["gateway:read"]) }),
   });
 

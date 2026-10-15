@@ -173,33 +173,53 @@ pub struct Cards {
 }
 
 impl Cards {
-    /// Construct a registry handle over the ambient client.
+    /// Connect a registry handle through the ambient client.
     ///
     /// The client resolves the global configuration file, then the
     /// environment, then the saved user login selected by `WYRD_TENANT`, as
-    /// [`WyrdClient::from_global`] does. No network or token exchange occurs
-    /// during construction.
+    /// [`WyrdClient::from_global`] does, and completes any credential exchange
+    /// that credential requires before returning; a presented-as-is bearer or
+    /// fresh cached token is reused without a request.
     ///
     /// # Errors
     /// Returns a Wyrd error when the global configuration cannot be read, no
-    /// credential resolves, or the saved-login selection fails.
-    pub fn from_env() -> Result<Self, WyrdError> {
-        let client = WyrdClient::from_global().map_err(WyrdError::from)?;
-        Ok(Self::with_client(client))
+    /// credential resolves, the saved-login selection fails, or a required
+    /// exchange is refused or unreachable.
+    pub async fn connect() -> Result<Self, WyrdError> {
+        Ok(Self {
+            engine: RegistryEngine::new(WyrdClient::connect_ambient().await?),
+        })
     }
 
-    /// Construct a handle that calls the server as `client`'s principal.
+    /// Build a handle over `client` without completing any exchange.
+    ///
+    /// Test-only: offline unit tests construct the registry engine here;
+    /// public callers use [`Self::connect`] or [`Self::connect_with`].
+    ///
+    /// # Arguments
+    /// * `client` - The client every call is sent through.
+    #[cfg(test)]
+    pub(crate) fn new(client: WyrdClient) -> Self {
+        Self {
+            engine: RegistryEngine::new(client),
+        }
+    }
+
+    /// Connect a handle that calls the server as `client`'s principal.
     ///
     /// Every registry read, write, and artifact transfer this handle and its
     /// clones issue shares `client`'s transport and token cache.
     ///
     /// # Arguments
-    /// * `client` - The authenticated client every call is sent through.
-    #[must_use]
-    pub fn with_client(client: WyrdClient) -> Self {
-        Self {
-            engine: RegistryEngine::new(client),
-        }
+    /// * `client` - The client every call is sent through, used as given.
+    ///
+    /// # Errors
+    /// Returns the server's stable error when the client's required exchange
+    /// is refused or unreachable.
+    pub async fn connect_with(client: &WyrdClient) -> Result<Self, WyrdError> {
+        Ok(Self {
+            engine: RegistryEngine::new(client.connected().await?),
+        })
     }
 
     /// Download and verify every server-declared artifact for one Card.
@@ -751,7 +771,7 @@ mod tests {
         std::fs::create_dir(&destination).expect("existing destination is created");
         std::fs::write(destination.join("existing.txt"), b"keep")
             .expect("existing publication is written");
-        let cards = Cards::with_client(test_client(&server));
+        let cards = Cards::new(test_client(&server));
 
         let error = cards
             .download_artifacts_to(&card_uid, &destination)
@@ -922,7 +942,7 @@ mod tests {
                 .mount(&server)
                 .await;
         }
-        let cards = Cards::with_client(test_client(&server));
+        let cards = Cards::new(test_client(&server));
 
         for (kind, _) in envelopes {
             let card_ref: CardRef = format!("retention/{}/subject@1.0.0", kind.wire_name())
@@ -1005,7 +1025,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let cards = Cards::with_client(test_client(&server));
+        let cards = Cards::new(test_client(&server));
         let parent = tempfile::tempdir().expect("test parent is created");
         let destination = parent.path().join("bundle");
         let card_ref: CardRef = "retention/Service/subject@1.0.0"

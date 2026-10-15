@@ -138,7 +138,7 @@ const test = serverTest({
         provider: "anthropic",
         source: { environment: { binding: "test-anthropic-key" } },
       });
-      const gateway = Gateway.connect();
+      const gateway = await Gateway.connect();
       await gateway.putDeployment(openaiDeployment("openai"));
       await gateway.putDeployment({
         name: "anthropic",
@@ -146,7 +146,7 @@ const test = serverTest({
         auth: { api_key_header: { header: "x-api-key", credential: "anthropic-key" } },
       });
       await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });
-      await use(await Cards.connect().registerFromPath(fixture("cards/gateway_inference/ask-agent.yaml")));
+      await use(await (await Cards.connect()).registerFromPath(fixture("cards/gateway_inference/ask-agent.yaml")));
     },
     { scope: "file" },
   ],
@@ -265,7 +265,7 @@ test("stock openai client authenticates with a Wyrd API key", async ({ provider,
 // The status of the refusal is not pinned: only that the client's own token
 // exchange rejected the request, so no gateway call was made.
 test("revoked api key is refused by the token exchange, before the gateway", async ({ provider, ask: _ }) => {
-  const principals = Principals.connect();
+  const principals = await Principals.connect();
   const { principal_id, credential } = await principals.createServicePrincipal({
     name: "revoked-gateway-caller",
     roles: [],
@@ -385,10 +385,10 @@ test("cli issues a card scoped key and writes a provider credential", async ({ a
 });
 
 test("agent prompt routes", async ({ server, provider, ask: _ }) => {
-  const gateway = Gateway.connect();
+  const gateway = await Gateway.connect();
   await gateway.putDeployment(openaiDeployment("openai-backup"));
   await gateway.putDeployment(openaiDeployment("openai-granted", "granted"));
-  const cards = Cards.connect();
+  const cards = await Cards.connect();
   const receipt = await cards.registerFromPath(fixture("cards/gateway_inference/ask-service.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-ask-"));
   await cards.hydrate(receipt.root, bundle);

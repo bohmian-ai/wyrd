@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::time::Duration;
+use wyrd_ai::bifrost::BifrostOptions;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -102,14 +103,16 @@ impl Assistant {
         )
         .await;
         configure_gateway(&deployment.admin()).await;
-        Gateway::with_client(deployment.admin())
+        Gateway::connect_with(&deployment.admin())
+            .await
+            .expect("handle connects")
             .put_capture_policy(&GatewayCapturePolicyWrite {
                 mode: GatewayCaptureMode::Metadata,
                 payload_fields: BTreeSet::new(),
             })
             .await
             .expect("the capture policy puts");
-        let cards = deployment.cards();
+        let cards = deployment.cards().await;
         register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
         register(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
         let assistant = register(&cards, "cards/verify_in_real_time/assistant.yaml").await;
@@ -151,7 +154,7 @@ impl Assistant {
     /// # Panics
     /// Panics when the bundle does not load.
     fn state_as(&self, client: WyrdClient) -> WyrdState {
-        WyrdState::from_path_with_client(self.bundle.path().join("bundle"), client)
+        WyrdState::from_path_with(self.bundle.path().join("bundle"), client)
             .expect("bundle loads offline")
     }
 
@@ -188,7 +191,7 @@ impl Assistant {
             .flush_bifrost()
             .await
             .expect("rows publish");
-        Bifrost::connect(&self.deployment.admin())
+        Bifrost::connect_with(&self.deployment.admin(), BifrostOptions::default())
             .await
             .expect("Bifrost connects")
             .sql_as(
@@ -208,7 +211,7 @@ impl Assistant {
     /// # Panics
     /// Panics when the read fails.
     async fn result_with_its_judge_calls(&self, execution_id: &str) -> Vec<ResultJudgeCall> {
-        Bifrost::connect(&self.deployment.admin())
+        Bifrost::connect_with(&self.deployment.admin(), BifrostOptions::default())
             .await
             .expect("Bifrost connects")
             .sql_as(
@@ -332,8 +335,8 @@ struct ResultJudgeCall {
 
 impl ResultJudgeCall {
     /// Assert `joined` is exactly one result and judge call, both for
-    /// `principal` on `run`: the realtime result carries the caller's own
-    /// pair, and the judge call is performed by the SYSTEM actor.
+    /// `principal` on `run`: the direct verify's result is performed by
+    /// `principal` itself, and the judge call inside it by SYSTEM.
     ///
     /// # Panics
     /// Panics when the rows differ.
@@ -351,7 +354,10 @@ impl ResultJudgeCall {
             (principal, principal, run, run),
             "{row:?}"
         );
-        assert_eq!(row.result_actor, principal, "{row:?}");
+        assert_eq!(
+            row.result_actor, principal,
+            "the caller performs its direct verify: {row:?}"
+        );
         assert_ne!(
             row.call_actor, principal,
             "SYSTEM performs the judgment: {row:?}"
@@ -645,7 +651,8 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
 /// joined on its call id, descends from the caller's span, and the call
 /// records the requesting principal as subject, SYSTEM as actor, and the
 /// verified Card with a null Run rather than an invented one. The result
-/// records the caller's own pair and joins the call on that Card.
+/// records the requesting principal as both subject and actor, since the
+/// verify itself is direct work, and joins the call on that Card.
 ///
 /// # Panics
 /// Panics when the verify, flush, or read fails or the call differs.
@@ -861,11 +868,11 @@ async fn model_latency_drift_is_judged_failed() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn verify_before_baseline_ready_is_refused() {
     let assistant = Assistant::start().await;
-    let cards = assistant.deployment.cards();
+    let cards = assistant.deployment.cards().await;
     let unfitted = register(&cards, "cards/verify_in_real_time/unfitted-assistant.yaml").await;
     let bundle = hydrate(&cards, &unfitted.root).await;
     let key = assistant.deployment.service_key(&unfitted.root).await;
-    let state = WyrdState::from_path_with_client(
+    let state = WyrdState::from_path_with(
         bundle.path().join("bundle"),
         assistant.deployment.client(&key),
     )
@@ -1050,7 +1057,7 @@ async fn verify_records_no_observation() {
         .await
         .expect("rows publish");
 
-    let observed = Bifrost::connect(&assistant.deployment.admin())
+    let observed = Bifrost::connect_with(&assistant.deployment.admin(), BifrostOptions::default())
         .await
         .expect("Bifrost connects")
         .sql(

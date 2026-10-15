@@ -1,9 +1,11 @@
 //! A team registers its support desk Service graph and hydrates it to run
 //! offline, through `Cards` and through the in-process CLI.
 
-use wyrd_ai::cards::{CardKind, CardSelector, Cards, RegistrationReceipt};
+use std::path::{Path, PathBuf};
+
+use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, RegistrationReceipt};
 use wyrd_ai::cli::{self, SelectorArgs};
-use wyrd_ai::state::WyrdState;
+use wyrd_ai::state::{HydratedCard, WyrdState};
 use wyrd_ai::{Card, Spec, VerifierImplementation};
 
 use crate::support::{Deployment, fixture, hydrate, register, registered};
@@ -19,6 +21,94 @@ const DESK: &str = "cards/register_and_hydrate/support-desk.yaml";
 async fn register_desk(cards: &Cards) -> (RegistrationReceipt, RegistrationReceipt) {
     let model = register(cards, "cards/register_and_hydrate/support-model.yaml").await;
     (model, register(cards, DESK).await)
+}
+
+/// The Service whose Agents declare their Prompt inline, by path and by
+/// CardRef, beside an explicit `my_prompt` alias of the shared Prompt.
+const PROMPT_DESK: &str = "cards/agent_prompt/prompt-desk.yaml";
+
+/// Register the authored Prompt the ref-form Agent pins, then the prompt
+/// desk, and return the desk's receipt.
+///
+/// # Panics
+/// Panics when a registration is refused.
+async fn register_prompt_desk(cards: &Cards) -> RegistrationReceipt {
+    register(cards, "cards/agent_prompt/desk-prompt.yaml").await;
+    register(cards, PROMPT_DESK).await
+}
+
+/// Write an unversioned Agent named `name` whose inline Prompt sends
+/// `message` into `dir`, and return its path.
+///
+/// # Panics
+/// Panics when the file cannot be written.
+fn inline_agent(dir: &Path, name: &str, message: &str) -> PathBuf {
+    let path = dir.join(format!("{name}-{}.yaml", message.len()));
+    std::fs::write(
+        &path,
+        format!(
+            "apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: {name}
+  space: default
+spec:
+  prompt:
+    request:
+      provider: gemini_generate_content
+      body:
+        contents:
+          - role: user
+            parts:
+              - text: {message}
+    model: gpt-4o
+    variables: []
+    media_variables: []
+    response_type: text
+"
+        ),
+    )
+    .expect("inline agent writes");
+    path
+}
+
+/// Register the inline Agent `name` sending `message` and return the exact
+/// references the receipt records for the Agent and its Prompt.
+///
+/// # Panics
+/// Panics when registration is refused or records either Card missing.
+async fn register_inline(
+    cards: &Cards,
+    dir: &Path,
+    name: &str,
+    message: &str,
+) -> (CardRef, CardRef) {
+    let receipt = cards
+        .register_from_path(inline_agent(dir, name, message))
+        .await
+        .expect("inline agent registers");
+    (
+        registered(&receipt, name),
+        registered(&receipt, &format!("{name}-prompt")),
+    )
+}
+
+/// The Prompt reference the registry persisted in Agent `agent`'s spec.
+///
+/// # Panics
+/// Panics when the Agent cannot be read or pins no Card reference.
+async fn persisted_prompt(cards: &Cards, agent: &CardRef) -> CardRef {
+    let card = cards
+        .get(CardSelector::exact(agent.clone()))
+        .await
+        .expect("agent reads");
+    let Spec::Agent(spec) = card.spec else {
+        panic!("{agent} is an Agent");
+    };
+    spec.prompt
+        .as_card_ref()
+        .expect("the persisted Agent pins a registered Prompt")
+        .clone()
 }
 
 /// The CLI selector naming `name` at 1.0.0 in the default space.
@@ -41,7 +131,7 @@ fn service_selector(name: &str) -> SelectorArgs {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn service_graph_registers_and_hydrates() {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     let (_, desk) = register_desk(&cards).await;
 
     let bundle = hydrate(&cards, &desk.root).await;
@@ -73,7 +163,7 @@ async fn service_graph_registers_and_hydrates() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn latest_version_resolves_to_the_registered_card() {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     let (_, desk) = register_desk(&cards).await;
 
     let latest = cards
@@ -107,7 +197,7 @@ async fn latest_version_resolves_to_the_registered_card() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn registering_the_graph_again_is_idempotent() {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     let (_, desk) = register_desk(&cards).await;
     let bindings = |card: Card| {
         card.status
@@ -144,7 +234,7 @@ async fn registering_the_graph_again_is_idempotent() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn cards_get_returns_every_kind_typed() {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     let baseline = register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
     let (model, desk) = register_desk(&cards).await;
 
@@ -199,7 +289,7 @@ async fn artifact_without_digest_registers() {
     let deployment = Deployment::start().await;
 
     let model = register(
-        &deployment.cards(),
+        &deployment.cards().await,
         "cards/register_and_hydrate/support-model.yaml",
     )
     .await;
@@ -220,6 +310,7 @@ async fn wrong_artifact_digest_is_refused() {
 
     let refused = deployment
         .cards()
+        .await
         .register_from_path(&fixture("invalid/wrong-artifact-digest/support-model.yaml"))
         .await
         .expect_err("a wrong digest is refused");
@@ -239,6 +330,7 @@ async fn retired_card_kind_is_refused() {
 
     let refused = deployment
         .cards()
+        .await
         .register_from_path(&fixture("invalid/retired-drift-kind.yaml"))
         .await
         .expect_err("a retired kind is refused");
@@ -255,10 +347,12 @@ async fn retired_card_kind_is_refused() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn reader_cannot_register_cards() {
     let deployment = Deployment::start().await;
-    register_desk(&deployment.cards()).await;
-    let reader = Cards::with_client(
-        deployment.client(&deployment.scoped_key("card_reader", &["cards:read"]).await),
-    );
+    register_desk(&deployment.cards().await).await;
+    let reader = Cards::connect_with(
+        &deployment.client(&deployment.scoped_key("card_reader", &["cards:read"]).await),
+    )
+    .await
+    .expect("handle connects");
 
     let refused = reader
         .register_from_path(&fixture(DESK))
@@ -278,7 +372,7 @@ async fn reader_cannot_register_cards() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn cli_apply_and_get_round_trip_the_graph() {
     let deployment = Deployment::start().await;
-    let (_, desk) = register_desk(&deployment.cards()).await;
+    let (_, desk) = register_desk(&deployment.cards().await).await;
     let dir = tempfile::tempdir().expect("bundle directory creates");
     let bundle = dir.path().join("bundle");
 
@@ -359,16 +453,12 @@ fn native_spec() -> serde_json::Value {
     })
 }
 
-/// The authored JSON of `card`'s spec, or of its inline Agent prompt.
+/// The authored JSON of `card`'s spec.
 ///
 /// # Panics
-/// Panics when the Card does not serialize or an Agent prompt is not inline.
+/// Panics when the Card does not serialize.
 fn authored_spec(card: &Card) -> serde_json::Value {
-    let card = serde_json::to_value(card).expect("Card serializes");
-    match card["kind"].as_str() {
-        Some("Agent") => card["spec"]["prompt"].clone(),
-        _ => card["spec"].clone(),
-    }
+    serde_json::to_value(card).expect("Card serializes")["spec"].clone()
 }
 
 /// The sorted variables a registered Prompt Card derives from its authored
@@ -387,7 +477,9 @@ fn derived_variables(card: &Card) -> Vec<String> {
 
 /// Portable, native, and inline-Agent Prompts register, read back, re-register
 /// idempotently, and hydrate exactly as authored with their variables derived;
-/// a Prompt carrying a removed field is refused before registration.
+/// the inline Agent Prompt registers as the Agent's own `<agent>-prompt` Card
+/// the hydrated Agent navigates to; a Prompt carrying a removed field is
+/// refused before registration.
 ///
 /// # Panics
 /// Panics when a round trip changes the authored form, a re-registration
@@ -396,39 +488,39 @@ fn derived_variables(card: &Card) -> Vec<String> {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn prompt_forms_round_trip_as_authored() {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     let fixture_path = "cards/register_and_hydrate/authored-prompts.yaml";
     let receipt = register(&cards, fixture_path).await;
     let again = register(&cards, fixture_path).await;
     let bundle = hydrate(&cards, &receipt.root).await;
     let state = WyrdState::from_path(bundle.path().join("bundle")).expect("bundle loads offline");
     let forms = [
+        ("portable-prompt", portable_spec(), vec!["question", "team"]),
+        ("native-prompt", native_spec(), vec!["ticket"]),
         (
-            "portable",
-            "portable-prompt",
+            "inline-prompt-agent-prompt",
             portable_spec(),
-            Some(vec!["question", "team"]),
+            vec!["question", "team"],
         ),
-        (
-            "native",
-            "native-prompt",
-            native_spec(),
-            Some(vec!["ticket"]),
-        ),
-        ("agent", "inline-prompt-agent", portable_spec(), None),
     ];
 
     assert_eq!(
         again.root, receipt.root,
         "the graph re-registers idempotently"
     );
-    for (alias, name, authored, variables) in forms {
+    assert_eq!(
+        state.agent("agent").expect("agent hydrates").prompt_ref(),
+        &registered(&receipt, "inline-prompt-agent-prompt"),
+        "the Agent navigates to its registered inline Prompt"
+    );
+    for (name, authored, variables) in forms {
+        let card_ref = registered(&receipt, name);
         let read = cards
-            .get(CardSelector::exact(registered(&receipt, name)))
+            .get(CardSelector::exact(card_ref.clone()))
             .await
             .expect("registered Card reads");
-        let hydrated = state.card(alias).expect("the component hydrates");
-        let derived = variables.is_some().then(|| derived_variables(&read));
+        let alias = &state.aliases_for(&card_ref).expect("the Prompt hydrates")[0];
+        let hydrated = state.card(alias).expect("the Prompt hydrates");
 
         assert_eq!(authored_spec(&read), authored, "{name} reads as authored");
         assert_eq!(
@@ -437,8 +529,8 @@ async fn prompt_forms_round_trip_as_authored() {
             "{name} hydrates as authored"
         );
         assert_eq!(
-            derived,
-            variables.map(|names| names.into_iter().map(String::from).collect::<Vec<_>>()),
+            derived_variables(&read),
+            variables.into_iter().map(String::from).collect::<Vec<_>>(),
             "{name} derives variables"
         );
         assert_eq!(
@@ -454,4 +546,172 @@ async fn prompt_forms_round_trip_as_authored() {
         .expect_err("a removed Prompt field is refused");
     assert_eq!(refused.code(), "WYRD_LOADER_400_INVALID_ENVELOPE");
     deployment.shutdown().await;
+}
+/// An inline Prompt registers as its own `<agent>-prompt` Card that replay
+/// reuses, changed content versions while older Agents stay pinned, and
+/// another Agent never shares; an independently authored line of the same
+/// name and another tenant keep their own Cards; path and CardRef Prompts
+/// keep their authored identity, and the generated Prompt hydrates without a
+/// Service component.
+///
+/// # Panics
+/// Panics when a registration, read, or hydration differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn agent_prompt_registration_identity() {
+    let deployment = Deployment::start().await;
+    let cards = deployment.cards().await;
+    let dir = tempfile::tempdir().expect("fixture directory creates");
+
+    let (agent, prompt) =
+        register_inline(&cards, dir.path(), "first-agent", "Answer briefly.").await;
+    let replay = register_inline(&cards, dir.path(), "first-agent", "Answer briefly.").await;
+    let (changed_agent, changed_prompt) =
+        register_inline(&cards, dir.path(), "first-agent", "Answer at length.").await;
+    let (_, other_prompt) =
+        register_inline(&cards, dir.path(), "second-agent", "Answer briefly.").await;
+
+    assert_eq!(prompt.kind, CardKind::Prompt);
+    assert_eq!(prompt.space, agent.space);
+    assert_eq!(persisted_prompt(&cards, &agent).await, prompt);
+    assert_eq!(replay, (agent.clone(), prompt.clone()));
+    assert_ne!(changed_prompt.version, prompt.version);
+    assert_eq!(
+        persisted_prompt(&cards, &changed_agent).await,
+        changed_prompt
+    );
+    assert_eq!(persisted_prompt(&cards, &agent).await, prompt);
+    assert_eq!(other_prompt.name.as_str(), "second-agent-prompt");
+    assert_ne!(other_prompt.uid, prompt.uid);
+
+    let authored = dir.path().join("clash-agent-prompt.yaml");
+    std::fs::write(
+        &authored,
+        "apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: clash-agent-prompt
+  version: 1.0.0
+  space: default
+spec:
+  provider: openai
+  model: gpt-4o
+  messages: [Authored independently.]
+",
+    )
+    .expect("authored prompt writes");
+    let independent = cards
+        .register_from_path(&authored)
+        .await
+        .expect("authored prompt registers");
+    let (_, clash) = register_inline(&cards, dir.path(), "clash-agent", "Answer briefly.").await;
+    assert_ne!(clash.version, independent.root.version);
+    assert_ne!(clash.uid, independent.root.uid);
+
+    let tenant = Cards::connect_with(
+        &deployment.client(&deployment.other_tenant_admin("prompt-tenant").await),
+    )
+    .await
+    .expect("handle connects");
+    let (_, foreign) = register_inline(&tenant, dir.path(), "first-agent", "Answer briefly.").await;
+    assert_ne!(foreign.uid, prompt.uid);
+    assert_eq!(
+        cards
+            .get(CardSelector::exact(foreign))
+            .await
+            .expect_err("another tenant's Prompt is invisible")
+            .code(),
+        "WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE"
+    );
+
+    let desk = register_prompt_desk(&cards).await;
+    let authored = registered(&desk, "desk-prompt");
+    let inline = registered(&desk, "inline-agent-prompt");
+    assert_eq!(authored.version.to_string(), "1.0.0");
+    for (name, expected) in [
+        ("path-agent", &authored),
+        ("ref-agent", &authored),
+        ("inline-agent", &inline),
+    ] {
+        assert_eq!(
+            &persisted_prompt(&cards, &registered(&desk, name)).await,
+            expected
+        );
+    }
+    let bundle = hydrate(&cards, &desk.root).await;
+    let state = WyrdState::from_path(bundle.path().join("bundle")).expect("bundle loads");
+    let aliases = state
+        .aliases_for(&inline)
+        .expect("the generated Prompt hydrates");
+    assert_eq!(
+        state
+            .prompt(&aliases[0])
+            .expect("the generated Prompt reads")
+            .as_card_ref()
+            .expect("prompt identity is valid"),
+        inline
+    );
+    deployment.shutdown().await;
+}
+
+/// Every Agent of the hydrated prompt desk navigates offline to its
+/// registered Prompt Card; path and CardRef forms agree with the explicit
+/// `my_prompt` alias, generic lookup returns kind-appropriate Cards, and
+/// unknown or mismatched aliases are refused with stable codes.
+///
+/// # Panics
+/// Panics when registration, hydration, a read, or a refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn hydrated_agent_prompt_card_navigation() {
+    let deployment = Deployment::start().await;
+    let cards = deployment.cards().await;
+    let desk = register_prompt_desk(&cards).await;
+    let bundle = hydrate(&cards, &desk.root).await;
+    deployment.shutdown().await;
+
+    let state = WyrdState::from_path(bundle.path().join("bundle")).expect("bundle loads offline");
+    let explicit = state.prompt("my_prompt").expect("explicit alias reads");
+    let explicit_ref = explicit.as_card_ref().expect("prompt identity is valid");
+    assert_eq!(explicit_ref, registered(&desk, "desk-prompt"));
+    for (alias, prompt) in [
+        ("inline_agent", "inline-agent-prompt"),
+        ("path_agent", "desk-prompt"),
+        ("ref_agent", "desk-prompt"),
+    ] {
+        let agent = state.agent(alias).expect("agent reads");
+        let card = agent.prompt();
+        assert_eq!(
+            card.as_card_ref().expect("prompt identity is valid"),
+            registered(&desk, prompt)
+        );
+        assert_eq!(agent.prompt_ref(), &registered(&desk, prompt));
+        let Ok(HydratedCard::Agent(generic)) = state.get(alias) else {
+            panic!("{alias} is looked up as an Agent");
+        };
+        assert!(std::ptr::eq(generic.prompt(), card));
+    }
+    assert!(std::ptr::eq(
+        state.agent("path_agent").expect("agent reads").prompt(),
+        explicit
+    ));
+    assert!(
+        matches!(state.get("my_prompt"), Ok(HydratedCard::Prompt(card)) if std::ptr::eq(card, explicit))
+    );
+    assert_eq!(
+        state
+            .get("missing")
+            .err()
+            .expect("unknown alias is refused")
+            .code(),
+        "WYRD_SDK_404_UNKNOWN_ALIAS"
+    );
+    assert_eq!(
+        state
+            .agent("my_prompt")
+            .err()
+            .expect("a Prompt is not an Agent")
+            .code(),
+        "WYRD_SDK_400_CARD_KIND_MISMATCH"
+    );
 }

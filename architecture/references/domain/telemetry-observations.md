@@ -103,7 +103,12 @@ before collecting or decoding protected payloads.
 At-least-once delivery is made safe with deterministic batch identity and a
 payload digest. Do not claim end-to-end exactly-once when object-store and Postgres
 effects cannot share a transaction. Duplicate transport attempts must converge
-to one logical row set or a typed identity conflict.
+to one logical row set or a typed identity conflict. OTLP carries no
+idempotency key, so Gate derives its batch identity from the tenant, the
+verified subject and current actor, the table, the batch's logical content, and
+its accepted Run/Card correlation. A retry from the same publisher converges;
+the same content from another publisher, including another actor for the same
+subject, is a separate batch with its own attribution.
 
 ## Failure states
 

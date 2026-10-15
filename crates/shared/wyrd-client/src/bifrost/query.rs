@@ -14,7 +14,7 @@ use wyrd_queue::WyrdQueueError;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse,
+    BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry, CancelRunningQueryResponse,
     ListRunningQueriesResponse, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome,
     RunningQuerySummary,
 };
@@ -299,6 +299,24 @@ impl QueryClient {
                 &format!("/v1/query/{request_id}"),
                 None,
             )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Lists the compact entries of every table the caller may read.
+    ///
+    /// Reads `GET /v1/bifrost/tables`: the server returns the visible built-in
+    /// and tenant tables without their schemas, so a caller describes one
+    /// table with [`Self::describe_table`] only when it needs that schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable authentication, authorization, availability, or
+    /// protocol errors.
+    pub async fn list_tables(&self) -> Result<Vec<BifrostTableEntry>, BifrostClientError> {
+        self.client
+            .http
+            .request_json::<(), _>(reqwest::Method::GET, "/v1/bifrost/tables", None)
             .await
             .map_err(Into::into)
     }

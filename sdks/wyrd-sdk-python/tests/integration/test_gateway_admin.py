@@ -83,6 +83,7 @@ def test_credential_in_use_cannot_be_deleted(gateway: Gateway) -> None:
 
     with pytest.raises(WyrdError) as conflict:
         cli.delete_provider_credential("in-use-key")
+    gateway.delete_deployment("in-use")
     assert conflict.value.code == "WYRD_GATEWAY_409_RESOURCE_CONFLICT"
 
 
@@ -101,9 +102,11 @@ def test_capture_policy_round_trips(gateway: Gateway) -> None:
     assert gateway.capture_policy()["mode"] == "disabled"
 
     capture = gateway.put_capture_policy({"mode": "payload", "payload_fields": ["request"]})
+    read_back = gateway.capture_policy()
+    gateway.put_capture_policy({"mode": "disabled", "payload_fields": []})
 
     assert (capture["mode"], capture["payload_fields"]) == ("payload", ["request"])
-    assert gateway.capture_policy() == capture
+    assert read_back == capture
 
 
 def test_gateway_reader_cannot_delete_a_deployment(
@@ -118,4 +121,5 @@ def test_gateway_reader_cannot_delete_a_deployment(
     assert reader.deployment("read-only")["name"] == "read-only"
     with pytest.raises(WyrdError) as denied:
         reader.delete_deployment("read-only")
+    gateway.delete_deployment("read-only")
     assert denied.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"

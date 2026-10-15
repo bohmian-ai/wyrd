@@ -4,7 +4,7 @@
 OTLP/HTTP protobuf exporters for one ``WyrdClient``: every export asks the
 client for its current access token and sends it as ``x-wyrd-access-token``,
 so a long-lived exporter keeps working after any one token expires. They need
-the ``otel`` extra (``pip install 'wyrd[otel]'``).
+the ``otel`` extra (``pip install 'wyrd-ai[otel]'``).
 
 ``Run.__enter__``/``__exit__`` delegate here so spans created inside
 ``with state.run(...)`` carry the record-level ``wyrd.card_uid`` and
@@ -13,13 +13,21 @@ optional and fail-open: without ``opentelemetry-api`` it is a no-op.
 
 ``WyrdState.start_telemetry`` delegates to ``_start_telemetry``, which installs
 one global SDK tracer provider exporting through ``span_exporter``.
+
+``WyrdAgentsTraceProcessor`` is an OpenAI Agents SDK trace processor the
+application passes to ``agents.set_trace_processors``; Wyrd never registers it.
 """
 
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import Future, wait
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
+    from agents.tracing import Span, Trace
     from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
     from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -34,6 +42,14 @@ except ImportError:  # optional: run correlation becomes a no-op
 else:
     _OTEL_AVAILABLE = True
 
+if TYPE_CHECKING:
+    from agents.tracing import TracingProcessor as _AgentsTracingProcessor
+else:
+    try:
+        from agents.tracing import TracingProcessor as _AgentsTracingProcessor
+    except ImportError:  # optional: the Agents SDK trace processor is then a plain object
+        _AgentsTracingProcessor = object
+
 
 _CARD_UID = "wyrd.card_uid"
 _RUN_ID = "wyrd.run_id"
@@ -43,11 +59,12 @@ _RUN_ID = "wyrd.run_id"
 # value and never detach, so no token or per-scope state exists outside it.
 _SCOPE_KEY: Any = _otel_context.create_key("wyrd.run_scope") if _OTEL_AVAILABLE else None
 
-# Private marker set on a provider object once the Wyrd processor is offered,
-# so later Run entries skip it. Best effort: a concurrent first entry may add a
-# second processor, which is harmless because the processor is stateless and
-# setting the same two attributes again is idempotent.
+# Private marker set on a provider object once it accepted the Wyrd processor,
+# so later Run entries skip it. ``_INSTALL_LOCK`` makes the check-and-add
+# atomic, so concurrent first entries register exactly one processor, and a
+# failed registration leaves no marker and can be retried.
 _MARKER = "_wyrd_run_correlation"
+_INSTALL_LOCK = threading.Lock()
 
 
 def _scope_stack(parent_context: Any = None) -> tuple[tuple[str, str], ...]:
@@ -92,28 +109,32 @@ class _RunCorrelationProcessor:
 def install_run_correlation(provider: Any = None) -> bool:
     """Register the Wyrd Run-correlation span processor on ``provider``.
 
-    ``provider`` defaults to the global tracer provider. The provider object is
-    marked before registration so repeated calls skip it. Returns ``True`` when
-    the provider is already marked or accepted the processor, ``False`` when
-    OpenTelemetry is absent, the provider lacks ``add_span_processor``, cannot
-    be marked, or raised while registering. Never raises. Pass a framework's
-    private provider once; the global provider is installed on every ``Run``
-    entry.
+    ``provider`` defaults to the global tracer provider. Returns ``True`` when
+    the provider already holds the processor or accepted it now, and ``False``
+    when OpenTelemetry is absent, the provider lacks ``add_span_processor``, or
+    it raised while registering; a ``False`` call can be retried. Never raises.
+    Install it once on an application-owned provider; the global provider is
+    installed on every ``Run`` entry.
     """
     if not _OTEL_AVAILABLE:
         return False
     try:
         if provider is None:
             provider = _otel_trace.get_tracer_provider()
-        if getattr(provider, _MARKER, False):
+        with _INSTALL_LOCK:
+            if getattr(provider, _MARKER, False):
+                return True
+            # The API provider has no ``add_span_processor``; only an SDK provider does.
+            add = getattr(provider, "add_span_processor", None)
+            if add is None:
+                return False
+            setattr(provider, _MARKER, True)
+            try:
+                add(_RunCorrelationProcessor())
+            except Exception:
+                delattr(provider, _MARKER)
+                raise
             return True
-        # The API provider has no ``add_span_processor``; only an SDK provider does.
-        add = getattr(provider, "add_span_processor", None)
-        if add is None:
-            return False
-        setattr(provider, _MARKER, True)
-        add(_RunCorrelationProcessor())
-        return True
     except Exception:  # telemetry must never fail the app
         return False
 
@@ -163,7 +184,7 @@ def _exit_run(card_uid: str, run_id: str) -> None:
 
 
 _EXPORTER_EXTRA = (
-    "Wyrd OTLP exporters need the otel extra: pip install 'wyrd[otel]' "
+    "Wyrd OTLP exporters need the otel extra: pip install 'wyrd-ai[otel]' "
     "(opentelemetry-sdk, opentelemetry-exporter-otlp-proto-http)"
 )
 
@@ -189,12 +210,71 @@ def _endpoint(client: WyrdClient, signal: str) -> str:
     return f"{client.server_url.rstrip('/')}/v1/{signal}"
 
 
+_FLUSH_TIMEOUT_MILLIS = 30000
+"""How long a state waits for its managed provider to flush: the SDK's ``force_flush`` default."""
+
+
+class _ManagedTelemetry:
+    """The tracer provider a state installed, flushed within a real bound.
+
+    The stock batch processor ignores ``force_flush``'s timeout and exports
+    synchronously, so the flush runs on a daemon thread and the caller waits at
+    most ``_FLUSH_TIMEOUT_MILLIS``. A flush that overruns finishes in the
+    background. At most one runs per provider: a call that finds an earlier
+    flush still running waits for it, then starts its own, because the earlier
+    one may have drained the queue before this call's spans ended. Both waits
+    share the call's one deadline.
+    """
+
+    def __init__(self, provider: Any) -> None:
+        self.provider = provider
+        self._lock = threading.Lock()
+        self._attempt: Future[bool] | None = None
+        # How many flushes have started; one numbered after a call's entry covers it.
+        self._started = 0
+
+    def force_flush(self) -> bool:
+        """Flush the provider, raising ``TimeoutError`` when the bound expires first.
+
+        Any other failure of the provider's own flush is re-raised unchanged.
+        """
+        deadline = time.monotonic() + _FLUSH_TIMEOUT_MILLIS / 1000
+        with self._lock:
+            entered = self._started
+        while True:
+            with self._lock:
+                if self._attempt is None or self._attempt.done():
+                    self._started += 1
+                    self._attempt = Future()
+                    threading.Thread(
+                        target=self._flush,
+                        args=(self._attempt,),
+                        name="wyrd-telemetry-flush",
+                        daemon=True,
+                    ).start()
+                attempt, covers = self._attempt, self._started > entered
+            remaining = max(0.0, deadline - time.monotonic())
+            if covers:
+                # Since Python 3.11 a timed-out wait raises the builtin TimeoutError.
+                return attempt.result(remaining)
+            if not wait([attempt], remaining).done:
+                raise TimeoutError("an earlier flush did not finish in time")
+
+    def _flush(self, attempt: Future[bool]) -> None:
+        """Run the provider's flush and settle ``attempt`` with its outcome."""
+        try:
+            attempt.set_result(self.provider.force_flush(_FLUSH_TIMEOUT_MILLIS))
+        except BaseException as error:  # settled on the caller's thread
+            attempt.set_exception(error)
+
+
 def _start_telemetry(client: WyrdClient) -> Any:
     """Install the global tracer provider exporting spans as ``client``, and
     the W3C trace-context propagator for outbound context.
 
-    Returns the installed provider, which the calling state keeps so a repeated
-    start is idempotent and its shutdown flushes it. Returns ``None`` when a
+    Returns the installed provider wrapped for bounded flushing, which the
+    calling state keeps so a repeated start is idempotent and its shutdown
+    flushes it. Returns ``None`` when a
     global provider is already installed; the caller refuses with the catalog
     error.
 
@@ -214,8 +294,13 @@ def _start_telemetry(client: WyrdClient) -> Any:
     provider.add_span_processor(BatchSpanProcessor(span_exporter(client)))
     install_run_correlation(provider)
     _otel_trace.set_tracer_provider(provider)
+    if _otel_trace.get_tracer_provider() is not provider:
+        # Another provider won the once-only global install: release this one's
+        # export thread and leave the winner untouched.
+        provider.shutdown()
+        return None
     set_global_textmap(TraceContextTextMapPropagator())
-    return provider
+    return _ManagedTelemetry(provider)
 
 
 def span_exporter(client: WyrdClient) -> OTLPSpanExporter:
@@ -264,3 +349,161 @@ def metric_exporter(client: WyrdClient) -> OTLPMetricExporter:
     except ImportError as missing:
         raise ImportError(_EXPORTER_EXTRA) from missing
     return OTLPMetricExporter(endpoint=_endpoint(client, "metrics"), session=_session(client))
+
+
+class WyrdAgentsTraceProcessor(_AgentsTracingProcessor):
+    """OpenAI Agents SDK trace processor recording each trace and span as an OTel span.
+
+    Pass it to the Agents SDK yourself: ``add_trace_processor`` keeps the SDK's
+    default OpenAI exporter alongside it, ``set_trace_processors`` replaces it.
+    Wyrd never registers it. Spans go to the global tracer provider, so they
+    export wherever the application's OpenTelemetry pipeline does.
+
+    An SDK trace becomes a span started in the current context, so it nests
+    under any enclosing OpenTelemetry span and carries the Run active when it
+    started; each SDK span becomes a child of its SDK parent, else its trace.
+    Framework timestamps are kept when valid. Agent, tool, and model spans
+    follow the GenAI conventions for operation, agent and tool name, model, and
+    token usage, read when the span ends. Prompts, completions, tool arguments
+    and results, and error messages are never recorded: an SDK error sets
+    ERROR status and ``error.type`` only.
+
+    Callbacks are thread-safe. A repeated start is ignored, as are ends with no
+    start and every callback after ``shutdown``, which ends unfinished spans
+    with ERROR. ``shutdown`` and ``force_flush`` never touch the provider.
+    Without ``opentelemetry-api`` installed it records nothing.
+    """
+
+    def __init__(self) -> None:
+        # Each open SDK trace or span's OTel span, by SDK id, guarded by ``_lock``.
+        self._open: dict[str, Any] = {}
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def on_trace_start(self, trace: Trace) -> None:
+        """Start the span for ``trace`` in the current context."""
+        self._start(trace.trace_id, (), trace.name, None)
+
+    def on_trace_end(self, trace: Trace) -> None:
+        """End the span for ``trace``."""
+        self._end(trace.trace_id, None, None)
+
+    def on_span_start(self, span: Span[Any]) -> None:
+        """Start a child of ``span``'s SDK parent, else its trace, else the current context."""
+        data = span.span_data
+        parents = (span.parent_id, span.trace_id) if span.parent_id else (span.trace_id,)
+        self._start(span.span_id, parents, _span_name(data), span.started_at)
+
+    def on_span_end(self, span: Span[Any]) -> None:
+        """Record ``span``'s GenAI attributes and error status, then end it."""
+        self._end(span.span_id, span, span.ended_at)
+
+    def shutdown(self) -> None:
+        """End every unfinished span with ERROR and ignore later callbacks."""
+        with self._lock:
+            self._closed = True
+            unfinished = list(self._open.values())
+            self._open.clear()
+        for otel_span in unfinished:
+            otel_span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR, _INTERRUPTED))
+            otel_span.end()
+
+    def force_flush(self) -> None:
+        """Nothing to flush: the application's tracer provider owns export."""
+
+    def _start(
+        self, sdk_id: str, parents: tuple[str, ...], name: str, started_at: str | None
+    ) -> None:
+        """Start the span for ``sdk_id`` under the first open SDK id in ``parents``.
+
+        The parent span is placed in the current context, so the Run scope and
+        other context values are those active at this start. With no open
+        parent the span nests under the current context's span.
+        """
+        if not _OTEL_AVAILABLE:
+            return
+        with self._lock:
+            if self._closed or sdk_id in self._open:
+                return
+            parent_span = next((self._open[p] for p in parents if p in self._open), None)
+            parent_context = _otel_context.get_current()
+            if parent_span is not None:
+                parent_context = _otel_trace.set_span_in_context(parent_span, parent_context)
+            self._open[sdk_id] = _otel_trace.get_tracer("wyrd.agents").start_span(
+                name, parent_context, start_time=_nanos(started_at)
+            )
+
+    def _end(self, sdk_id: str, span: Span[Any] | None, ended_at: str | None) -> None:
+        """Record ``span``'s final data on, and end, the open span for ``sdk_id``."""
+        with self._lock:
+            otel_span = self._open.pop(sdk_id, None)
+        if otel_span is None:
+            return
+        if span is not None:
+            name, attributes = _gen_ai(span.span_data)
+            if name is not None:
+                otel_span.update_name(name)
+            otel_span.set_attributes(attributes)
+            if span.error is not None:
+                otel_span.set_attribute("error.type", "_OTHER")
+                otel_span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
+        otel_span.end(end_time=_nanos(ended_at))
+
+
+_INTERRUPTED = "span did not finish before the trace processor shut down"
+
+
+def _nanos(timestamp: str | None) -> int | None:
+    """An SDK ISO-8601 timestamp in Unix nanoseconds, or ``None`` for callback time."""
+    if timestamp is None:
+        return None
+    try:
+        moment = datetime.fromisoformat(timestamp)
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return int(moment.timestamp() * 1_000_000) * 1_000
+
+
+def _span_name(data: Any) -> str:
+    """The GenAI start-time span name for agent and tool spans, else the SDK name or type."""
+    name = getattr(data, "name", None)
+    if data.type == "agent" and name:
+        return f"invoke_agent {name}"
+    if data.type == "function" and name:
+        return f"execute_tool {name}"
+    return name or data.type
+
+
+def _gen_ai(data: Any) -> tuple[str | None, dict[str, Any]]:
+    """The final span name, if it changes, and the GenAI attributes ``data`` supplies.
+
+    Only identity, model, and token counts are read; content fields never are.
+    """
+    if data.type == "agent":
+        return None, {"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": data.name}
+    if data.type == "function":
+        return None, {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": data.name}
+    if data.type == "generation":
+        model, usage = data.model, data.usage or {}
+        input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
+    elif data.type == "response":
+        # The SDK supplies usage even when content capture withholds the response.
+        response = data.response
+        model = getattr(response, "model", None)
+        usage, full = data.usage or {}, getattr(response, "usage", None)
+        input_tokens = usage.get("input_tokens", getattr(full, "input_tokens", None))
+        output_tokens = usage.get("output_tokens", getattr(full, "output_tokens", None))
+    else:
+        return None, {}
+    attributes = {
+        "gen_ai.operation.name": "chat",
+        "gen_ai.request.model": model,
+        "gen_ai.usage.input_tokens": input_tokens,
+        "gen_ai.usage.output_tokens": output_tokens,
+    }
+    return (
+        f"chat {model}" if model else "chat",
+        {key: value for key, value in attributes.items() if value is not None},
+    )

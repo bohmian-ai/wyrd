@@ -41,7 +41,7 @@ use wyrd_ai::cards::{CardKind, CardSelector, Cards};
 
 let selector = CardSelector::named(CardKind::Service, "default".parse()?, "support-desk".parse()?)
     .with_version("1.0.0".parse()?);
-let service = Cards::from_env()?.get(selector).await?;
+let service = Cards::connect().await?.get(selector).await?;
 let binding_ids = service.status.and_then(|status| status.verification).map(|v| v.binding_ids);
 ```
 
@@ -51,7 +51,7 @@ let binding_ids = service.status.and_then(|status| status.verification).map(|v| 
 ```typescript
 import { Cards } from "wyrd-ai";
 
-const service = await Cards.connect().get({
+const service = await (await Cards.connect()).get({
   kind: "Service",
   name: "support-desk",
   version: "1.0.0",
@@ -138,9 +138,9 @@ print(result.to_pandas(), features.to_pandas())
 <LangTab lang="rust">
 
 ```rust
-use wyrd_ai::{Bifrost, bifrost::QueryParam};
+use wyrd_ai::{Bifrost, bifrost::{BifrostOptions, QueryParam}};
 
-let bifrost = Bifrost::from_env().await?;
+let bifrost = Bifrost::connect(BifrostOptions::default()).await?;
 let id = [QueryParam::String(result_id.to_string())];
 let result = bifrost
     .sql(

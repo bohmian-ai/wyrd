@@ -45,7 +45,7 @@ print(bifrost.register())  # "created" or "already_exists"
 <LangTab lang="rust">
 
 ```rust
-use wyrd_ai::{Bifrost, bifrost::TableConfig};
+use wyrd_ai::{Bifrost, bifrost::{BifrostOptions, TableConfig}};
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 struct TicketOutcome {
@@ -55,8 +55,11 @@ struct TicketOutcome {
 }
 
 let table = TableConfig::from_model::<TicketOutcome>("vala.datasets.ticket_outcomes")?;
-let bifrost = Bifrost::from_env().await?;
-bifrost.use_table(table);
+let bifrost = Bifrost::connect(BifrostOptions {
+    table: Some(table),
+    ..BifrostOptions::default()
+})
+.await?;
 bifrost.register().await?;
 ```
 
@@ -82,7 +85,7 @@ console.log(await bifrost.register()); // "created" or "already_exists"
 </LangTab>
 </LangTabs>
 
-Registering the same schema again returns `already_exists` and changes nothing. A different schema for an existing table fails with `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`; tables cannot be altered or dropped, so pick a new name. `card_uid`, `run_id`, and names starting with `wyrd_` are reserved.
+Registering the same schema again returns `already_exists` and changes nothing. A different schema for an existing table fails with `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`; tables cannot be altered or dropped, so pick a new name. `card_uid`, `run_id`, `sub_principal_id`, `act_principal_id`, and names starting with `wyrd_` are reserved.
 
 By default the table is partitioned on `wyrd_ingested_at`, the time Bifrost received each row. If your rows carry their own event time and you will filter on it, name it as the time column. It must be a non-null timestamp:
 

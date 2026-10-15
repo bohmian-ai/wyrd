@@ -24,6 +24,8 @@ mod query_coverage;
 mod register_and_hydrate;
 mod saved_user_auth;
 mod scheduled_drift_alerts_operator;
+/// Every handle's `connect` forms against a real server.
+mod sdk_client_instantiation;
 /// The same workflow from a saved login, past access-token expiry.
 mod signed_in_development;
 mod support;

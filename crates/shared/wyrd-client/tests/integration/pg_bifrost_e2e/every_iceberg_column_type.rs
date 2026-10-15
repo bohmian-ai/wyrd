@@ -8,6 +8,7 @@
 
 use std::fs::File;
 use std::sync::Arc;
+use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::array::RecordBatch;
 use arrow::compute::{cast, concat_batches};
@@ -58,9 +59,14 @@ async fn round_trip(
     batch: &RecordBatch,
     order_by: &str,
 ) -> RecordBatch {
-    let table = Bifrost::connect_with_table(
+    let table = Bifrost::connect_with(
         client,
-        TableConfig::from_arrow(fqn, batch.schema()).expect("the fixture declares a table"),
+        BifrostOptions {
+            table: Some(
+                TableConfig::from_arrow(fqn, batch.schema()).expect("the fixture declares a table"),
+            ),
+            ..BifrostOptions::default()
+        },
     )
     .await
     .expect("the writer connects");
@@ -187,11 +193,16 @@ async fn a_narrower_declaration_is_the_table_it_describes() {
     )
     .await;
 
-    let described = Bifrost::connect_with_table(
+    let described = Bifrost::connect_with(
         &client,
-        TableConfig::describe(&client, NARROW_TYPES)
-            .await
-            .expect("the table describes"),
+        BifrostOptions {
+            table: Some(
+                TableConfig::describe_with(&client, NARROW_TYPES)
+                    .await
+                    .expect("the table describes"),
+            ),
+            ..BifrostOptions::default()
+        },
     )
     .await
     .expect("the writer connects");

@@ -119,7 +119,9 @@ async fn workflow_forwarded_query_settles_before_the_run_ends() {
 ///
 /// # Errors
 ///
-/// Returns the first claim that broke.
+/// Returns the first claim that broke, or the setup failure that prevented
+/// one, including a refused or unreachable API-key exchange when the ingress
+/// Cards handle connects to register the workflow bundle.
 #[expect(
     clippy::float_cmp,
     reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
@@ -154,7 +156,8 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
     let ingress = Ingress::new(&cluster, &api_key).await?;
     ingress.deploy().await?;
     let bundle = query_workflow()?;
-    Cards::with_client(public_client(cluster.server(INGRESS)?, &api_key)?)
+    Cards::connect_with(&public_client(cluster.server(INGRESS)?, &api_key)?)
+        .await?
         .register_from_path(&bundle.path().join("workflow.yaml"))
         .await?;
 

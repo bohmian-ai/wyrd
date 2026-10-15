@@ -12,9 +12,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::WyrdClient;
+#[cfg(feature = "internal")]
 use crate::config::ClientConfig;
+#[cfg(feature = "internal")]
 use crate::environment::Environment;
+#[cfg(feature = "internal")]
 use crate::error::WyrdClientError;
+#[cfg(feature = "internal")]
 use crate::global_config::GlobalConfig;
 use arrow::datatypes::SchemaRef;
 use arrow::json::WriterBuilder;
@@ -29,8 +33,8 @@ use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkE
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, QueryParam,
-    QueryTerminalFrame, RegisterOutcome, RegisterTableResponse, RunningQuerySummary,
+    BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry, CancelRunningQueryResponse,
+    QueryParam, QueryTerminalFrame, RegisterOutcome, RegisterTableResponse, RunningQuerySummary,
 };
 use wyrd_spec::vala::ids::TraceId;
 use wyrd_spec::vala::trace::SpanRecord;
@@ -50,6 +54,21 @@ use crate::bifrost::table::{Correlation, TableConfig, WriterTable};
 /// The catalog code a query of a tenant's span table reports before its
 /// first span export creates the table.
 const SPANS_NOT_CREATED: &str = "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND";
+
+/// Construction options for [`Bifrost::connect`] and
+/// [`Bifrost::connect_with`].
+///
+/// The default is a query-only client with the default producer queue; set
+/// `table` to bind an initial write target, or `queue` to tune the producer
+/// (for example its handle-wide byte budget).
+#[derive(Debug, Default)]
+pub struct BifrostOptions {
+    /// The initial write target, or `None` to bind one later with
+    /// [`Bifrost::use_table`].
+    pub table: Option<TableConfig>,
+    /// Producer tuning, validated before any IO.
+    pub queue: QueueConfig,
+}
 
 /// The one Bifrost client: query any authorized table, write to the active one.
 ///
@@ -83,80 +102,56 @@ pub struct Bifrost {
 }
 
 impl Bifrost {
-    /// Build a client with no arguments, resolving its own transport.
+    /// Connect a client through the ambient [`WyrdClient`].
     ///
     /// Endpoints come from the global config file, then `WYRD_GRPC_URL` /
     /// `WYRD_SERVER_URL`, then the compiled defaults, and the credential from
-    /// the `ClientConfig::resolve_credential` chain whose floor is
-    /// `~/.config/wyrd/credentials.toml` `[default].api_key`. This is
-    /// [`WyrdClient::from_global`] plus a connect; it adds no resolution of its
-    /// own, so an explicitly built client and this one reach the same place.
+    /// the `ClientConfig::resolve_credential` chain, exactly as
+    /// [`WyrdClient::from_global`] resolves them. Then this is
+    /// [`Bifrost::connect_with`] over that client.
+    ///
+    /// # Arguments
+    /// * `options` - The initial write target and producer tuning;
+    ///   [`BifrostOptions::default`] is a query-only client with the default
+    ///   queue.
     ///
     /// # Errors
     ///
     /// Returns a configuration error when the global config file cannot be
     /// read or parsed, the stable no-credentials error when the chain yields
-    /// nothing, or a transport error when the ingest channel cannot be dialled.
-    pub async fn from_env() -> Result<Self, BifrostClientError> {
-        let client = client_from_env()?;
-        Self::connect(&client).await
+    /// nothing, and otherwise as [`Bifrost::connect_with`].
+    pub async fn connect(options: BifrostOptions) -> Result<Self, BifrostClientError> {
+        let client = WyrdClient::from_global().map_err(BifrostClientError::from)?;
+        Self::connect_with(&client, options).await
     }
 
-    /// Build a query-only client over an explicitly supplied transport.
+    /// Connect a client as `client`'s principal, used as given.
     ///
-    /// `client` is an argument, not an owner: it carries the credential, the
-    /// connection pool, and the API-key-to-bearer exchange the read and write
-    /// planes already share.
-    ///
-    /// # Arguments
-    /// * `client` - The authenticated client whose credential and connection pools
-    ///   both planes share; it is borrowed, not owned.
-    ///
-    /// # Errors
-    ///
-    /// Returns a transport error when the ingest channel cannot be dialled.
-    pub async fn connect(client: &WyrdClient) -> Result<Self, BifrostClientError> {
-        Self::assemble(client, None, QueueConfig::default()).await
-    }
-
-    /// Build a client already bound to `table` for writes.
+    /// Completes any credential exchange `client` requires, then dials the
+    /// ingest channel; both planes share `client`'s credential, connection
+    /// pools, and token cache. No authentication probe is added, so a later
+    /// operation may still be refused.
     ///
     /// # Arguments
-    /// * `client` - The authenticated client whose transport both planes share.
-    /// * `table` - The table bound as the initial write target.
-    ///
-    /// # Errors
-    ///
-    /// As [`Bifrost::connect`].
-    pub async fn connect_with_table(
-        client: &WyrdClient,
-        table: TableConfig,
-    ) -> Result<Self, BifrostClientError> {
-        Self::assemble(client, Some(table), QueueConfig::default()).await
-    }
-
-    /// Build a client with explicit producer tuning.
-    ///
-    /// The tuning seam for a larger or smaller handle byte budget, a longer
-    /// linger for a deterministic journey, or a different send concurrency,
-    /// without making [`QueueConfig`] part of the ordinary constructor.
-    ///
-    /// # Arguments
-    /// * `client` - The authenticated client whose transport both planes share.
-    /// * `table` - The initial write target, or `None` to bind one later.
-    /// * `config` - Producer tuning, validated before the ingest channel is dialled.
+    /// * `client` - The client both planes act as, such as a delegated client
+    ///   from [`WyrdClient::on_behalf_of`].
+    /// * `options` - The initial write target and producer tuning.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostClientError::Queue`] carrying
-    /// `WYRD_CLIENT_400_CONFIG_INVALID` before dialling when `config` fails
-    /// [`QueueConfig::validate`], and otherwise as [`Bifrost::connect`].
-    pub async fn connect_with_config(
+    /// `WYRD_CLIENT_400_CONFIG_INVALID` before any IO when the queue tuning
+    /// fails [`QueueConfig::validate`], the server's stable error when a
+    /// required exchange is refused or unreachable, and a transport error when
+    /// the ingest channel cannot be dialled.
+    pub async fn connect_with(
         client: &WyrdClient,
-        table: Option<TableConfig>,
-        config: QueueConfig,
+        options: BifrostOptions,
     ) -> Result<Self, BifrostClientError> {
-        Self::assemble(client, table, config).await
+        let BifrostOptions { table, queue } = options;
+        queue.validate().map_err(BifrostClientError::Queue)?;
+        let client = client.connected().await?;
+        Self::assemble(&client, table, queue).await
     }
 
     /// Build a client over a caller-supplied batch sink.
@@ -217,18 +212,17 @@ impl Bifrost {
     /// The transport is the single owner of a batch's attempt budget, so the
     /// producer's send deadline is raised past that whole budget; a shorter
     /// deadline would cancel the transport and restart its attempts later.
+    /// `config` is already validated by the caller. Crate-internal transport tests call this directly so a
+    /// counted or blocked token mint stays on the send path under test.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostClientError::Queue`] when `config` fails
-    /// [`QueueConfig::validate`], and a transport error when the ingest
-    /// channel cannot be dialled.
-    async fn assemble(
+    /// Returns a transport error when the ingest channel cannot be dialled.
+    pub(crate) async fn assemble(
         client: &WyrdClient,
         table: Option<TableConfig>,
         mut config: QueueConfig,
     ) -> Result<Self, BifrostClientError> {
-        config.validate().map_err(BifrostClientError::Queue)?;
         let transport = BifrostGrpcTransport::connect(client)
             .await
             .map_err(BifrostClientError::from)?;
@@ -331,9 +325,9 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`TableConfig::describe`].
+    /// As [`TableConfig::describe_with`].
     pub async fn use_table_by_name(&self, fqn: &str) -> Result<(), BifrostClientError> {
-        let table = TableConfig::describe(self.query.client(), fqn).await?;
+        let table = TableConfig::describe_with(self.query.client(), fqn).await?;
         self.use_table(table);
         Ok(())
     }
@@ -395,7 +389,7 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// Returns the errors of [`TableConfig::describe`].
+    /// Returns the errors of [`TableConfig::describe_with`].
     ///
     /// # Cancellation
     ///
@@ -415,7 +409,7 @@ impl Bifrost {
         if let Some(table) = self.described_table(fqn) {
             return Ok(table);
         }
-        let config = TableConfig::describe(self.query.client(), fqn).await?;
+        let config = TableConfig::describe_with(self.query.client(), fqn).await?;
         let described = WriterTable::new(fqn, config.user_schema().clone());
         self.described
             .lock()
@@ -1021,6 +1015,25 @@ impl Bifrost {
         self.query.cancel(request_id).await
     }
 
+    /// List the compact entries of every table the caller may read.
+    ///
+    /// Returns the server's authorized [`BifrostTableEntry`] values unchanged:
+    /// visible built-in tables and the tenant's own, without schemas. Call
+    /// [`Bifrost::describe_table`] for one table's schema when it is needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable authentication, authorization (a principal without
+    /// `bifrost_table:read`), availability, or protocol error the server
+    /// reported.
+    ///
+    /// # Cancellation
+    ///
+    /// Abandoning the future leaves no server state behind; listing is a read.
+    pub async fn list_tables(&self) -> Result<Vec<BifrostTableEntry>, BifrostClientError> {
+        self.query.list_tables().await
+    }
+
     /// Read one registered table's server-owned description.
     ///
     /// The canonical introspection door on this client: schema, identity, and
@@ -1237,24 +1250,6 @@ pub fn register_outcome_name(outcome: RegisterOutcome) -> &'static str {
     }
 }
 
-/// Assemble the ambient [`WyrdClient`] every no-argument constructor uses.
-///
-/// Delegates to `client_from_options_in` over the process environment with
-/// nothing overridden, so
-/// [`Bifrost::from_env`] and [`crate::bifrost::TableConfig::describe_from_env`] cannot
-/// resolve their endpoints or credential differently from each other or from an
-/// explicitly-configured client.
-///
-/// # Errors
-///
-/// Returns a configuration error when the global config file exists but cannot
-/// be read or parsed, the stable no-credentials error when nothing in the chain
-/// yields a credential, or a transport error when the HTTP client cannot be
-/// built.
-pub(crate) fn client_from_env() -> Result<WyrdClient, BifrostClientError> {
-    client_from_options_in(Environment::Process, None, None, None)
-}
-
 /// Assemble a [`WyrdClient`] from optionally-overridden transport values.
 ///
 /// Every argument is optional and every omitted one falls through to the
@@ -1314,6 +1309,7 @@ pub fn client_from_options(
 /// error when the global config file cannot be read or parsed, the stable
 /// no-credentials error when nothing yields a credential, or a transport
 /// error when the HTTP client cannot be built.
+#[cfg(feature = "internal")]
 fn client_from_options_in(
     environment: Environment,
     server_url: Option<&str>,
@@ -1370,14 +1366,14 @@ impl BatchSink<ClientByteGuard> for QueryOnlySink {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "internal"))]
 mod tests {
     use super::client_from_options_in;
     use crate::environment::Environment;
 
     /// An omitted `server_url` resolves from the global config file in the
     /// Wyrd config directory, the same file [`crate::WyrdClient::from_global`]
-    /// reads, so a language `WyrdClient()` and Rust `Cards::from_env` reach the
+    /// reads, so a language `WyrdClient()` and Rust `Cards::connect` reach the
     /// same server.
     #[test]
     fn omitted_server_url_comes_from_the_global_config_file() {

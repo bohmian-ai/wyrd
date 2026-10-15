@@ -63,7 +63,7 @@ impl Observed {
                     .expect("administrator bootstraps"),
             ),
         );
-        let cards = Cards::with_client(WyrdClient::clone(&admin));
+        let cards = Cards::connect_with(&admin).await.expect("handle connects");
         Box::pin(cards.register_from_path(&fixture("observed-model.yaml")))
             .await
             .expect("the Model registers");
@@ -87,7 +87,7 @@ impl Observed {
                     .expect("the Service is credentialed"),
             ),
         );
-        let state = WyrdState::from_path_with_client(bundle.path().join("bundle"), service.clone())
+        let state = WyrdState::from_path_with(bundle.path().join("bundle"), service.clone())
             .expect("bundle loads offline");
         state
             .start_bifrost_with_config(None, queue)

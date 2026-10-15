@@ -167,14 +167,20 @@ mod pg_tests {
     impl CardInvestigation {
         /// Register the shared support desk and observed Service graphs.
         ///
+        /// Connecting the administrator's Cards handle exchanges its API key
+        /// eagerly, so a refused or unreachable exchange is returned here
+        /// before any fixture registers.
+        ///
         /// # Errors
-        /// Returns server, fixture registration, or connection failures.
+        /// Returns server start, bootstrap, client configuration, API-key
+        /// exchange or connection, fixture registration, or MCP connection
+        /// failures.
         async fn start() -> Result<Self, McpJourneyError> {
             let server = WyrdTestServer::start_bound().await?;
             let admin = server
                 .bootstrap_agent("mcp-card-discovery", &["admin"])
                 .await?;
-            let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
+            let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
             let fixtures = Path::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../../fixtures/cards"
@@ -427,6 +433,14 @@ mod pg_tests {
     ///
     /// Returns server startup, bootstrap, registration, MCP transport, or
     /// tool-call failures.
+    ///
+    /// # Panics
+    /// Panics when the administrator's Cards handle cannot connect (API-key
+    /// exchange refused or unreachable), or when an assertion fails: the
+    /// writer is not offered a required tool, the binding names another
+    /// subject or is not ready, a keyed replay or the read-back returns
+    /// another run id, the reader loses a read tool or is offered the write
+    /// tool, or the reader's write call is not the stable RBAC refusal.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn an_agent_discovers_starts_and_observes_a_manual_run() -> Result<(), McpJourneyError> {
@@ -434,7 +448,9 @@ mod pg_tests {
         let admin = server
             .bootstrap_service("mcp-run-admin", &["admin"])
             .await?;
-        let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+            .await
+            .expect("handle connects");
         let Fixture {
             service_uid,
             service_ref,
@@ -580,7 +596,7 @@ mod pg_tests {
             Some(key.as_str()),
             server.grpc_url().as_deref(),
         )?;
-        let state = WyrdState::from_path_with_client(&bundle, client)?;
+        let state = WyrdState::from_path_with(&bundle, client)?;
         state
             .start_bifrost_with_config(None, QueueConfig::default())
             .await?;
@@ -682,7 +698,9 @@ mod pg_tests {
         let admin = server
             .bootstrap_service("mcp-direct-admin", &["admin"])
             .await?;
-        let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+            .await
+            .expect("handle connects");
         let fixture = register_fixture(&cards).await?;
         emit_drifted_scores(&server, &cards, &fixture.service_ref).await?;
 
@@ -882,7 +900,9 @@ mod pg_tests {
         let admin = server
             .bootstrap_service("mcp-execute-admin", &["admin"])
             .await?;
-        let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+            .await
+            .expect("handle connects");
         let fixture = register_fixture(&cards).await?;
         let agent = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
@@ -980,8 +1000,8 @@ mod pg_tests {
     ///
     /// # Errors
     ///
-    /// Returns provider, server, registration, deployment, or bootstrap
-    /// failures.
+    /// Returns provider, server, bootstrap, client configuration, API-key
+    /// exchange or connection, registration, or deployment failures.
     async fn judging_server()
     -> Result<(WyrdTestServer, wiremock::MockServer, Bootstrap, JsonValue), McpJourneyError> {
         let judge = wiremock::MockServer::start().await;
@@ -1007,7 +1027,7 @@ mod pg_tests {
         let admin = server
             .bootstrap_service("mcp-traced-admin", &["admin"])
             .await?;
-        let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
         let fixture = register_fixture(&cards).await?;
         let judged = Box::pin(cards.register_from_path(Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),

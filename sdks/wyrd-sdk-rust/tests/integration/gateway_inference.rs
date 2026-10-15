@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use wyrd_ai::bifrost::BifrostOptions;
 
 use serde_json::{Map, Value, json};
 use wiremock::matchers::{method, path};
@@ -94,7 +95,9 @@ impl Inference {
         )
         .await;
         put_managed(deployment.admin(), "openai-key", PROVIDER_KEY).await;
-        let gateway = Gateway::with_client(deployment.admin());
+        let gateway = Gateway::connect_with(&deployment.admin())
+            .await
+            .expect("handle connects");
         for model in ["gpt-4o", "gpt-5-5"] {
             gateway
                 .put_deployment(&ProviderDeployment {
@@ -120,7 +123,11 @@ impl Inference {
             })
             .await
             .expect("the capture policy puts");
-        let ask = register(&deployment.cards(), "cards/gateway_inference/ask.yaml").await;
+        let ask = register(
+            &deployment.cards().await,
+            "cards/gateway_inference/ask.yaml",
+        )
+        .await;
         Self {
             deployment,
             upstream,
@@ -371,12 +378,13 @@ async fn malformed_traceparent_is_ignored_by_the_gateway() {
         inference.deployment.timeline(CALLER_TRACE).await.is_empty(),
         "nothing joined the caller's trace"
     );
-    let calls = wyrd_ai::Bifrost::connect(&inference.deployment.admin())
-        .await
-        .expect("Bifrost connects")
-        .sql_as::<CallId>("SELECT call_id FROM vala.gateway.calls", &[])
-        .await
-        .expect("calls read back");
+    let calls =
+        wyrd_ai::Bifrost::connect_with(&inference.deployment.admin(), BifrostOptions::default())
+            .await
+            .expect("Bifrost connects")
+            .sql_as::<CallId>("SELECT call_id FROM vala.gateway.calls", &[])
+            .await
+            .expect("calls read back");
     let [call] = &calls[..] else {
         panic!("exactly one call is recorded: {calls:?}");
     };
@@ -461,15 +469,18 @@ async fn gateway_call_records_whichever_attribution_it_carries() {
         .flush_bifrost()
         .await
         .expect("rows publish");
-    let mut calls: Vec<CallAttribution> = wyrd_ai::Bifrost::connect(&inference.deployment.admin())
-        .await
-        .expect("Bifrost connects")
-        .sql_as(
-            "SELECT sub_principal_id, act_principal_id, run_id, card_uid FROM vala.gateway.calls",
-            &[],
-        )
-        .await
-        .expect("calls read back");
+    let mut calls: Vec<CallAttribution> = wyrd_ai::Bifrost::connect_with(
+        &inference.deployment.admin(),
+        BifrostOptions::default(),
+    )
+    .await
+    .expect("Bifrost connects")
+    .sql_as(
+        "SELECT sub_principal_id, act_principal_id, run_id, card_uid FROM vala.gateway.calls",
+        &[],
+    )
+    .await
+    .expect("calls read back");
     calls.sort();
     let call = |run_id: Option<&str>, card_uid: Option<&str>| CallAttribution {
         sub_principal_id: id.to_string(),
@@ -596,16 +607,17 @@ async fn direct_then_delegated_calls(inference: &Inference) -> Vec<CallAttributi
         .flush_bifrost()
         .await
         .expect("rows publish");
-    let calls: Vec<CallAttribution> = wyrd_ai::Bifrost::connect(&inference.deployment.admin())
-        .await
-        .expect("Bifrost connects")
-        .sql_as(
-            "SELECT sub_principal_id, act_principal_id, run_id, card_uid \
-             FROM vala.gateway.calls ORDER BY started_at",
-            &[],
-        )
-        .await
-        .expect("calls read back");
+    let calls: Vec<CallAttribution> =
+        wyrd_ai::Bifrost::connect_with(&inference.deployment.admin(), BifrostOptions::default())
+            .await
+            .expect("Bifrost connects")
+            .sql_as(
+                "SELECT sub_principal_id, act_principal_id, run_id, card_uid \
+                 FROM vala.gateway.calls ORDER BY started_at",
+                &[],
+            )
+            .await
+            .expect("calls read back");
     let [direct, delegated] = &calls[..] else {
         panic!("one call per run: {calls:?}");
     };
@@ -632,7 +644,9 @@ async fn direct_then_delegated_calls(inference: &Inference) -> Vec<CallAttributi
 async fn loaded_workflow_calls_the_gateway_through_its_loading_client() {
     let inference = Inference::start().await;
     for client in subject_and_delegate(&inference).await {
-        let workflow = Cards::with_client(client)
+        let workflow = Cards::connect_with(&client)
+            .await
+            .expect("handle connects")
             .workflow()
             .load(&CardSelector::exact(inference.ask.root.clone()))
             .await
@@ -657,6 +671,7 @@ async fn loaded_workflow_calls_the_gateway_through_its_loading_client() {
     let refused = inference
         .deployment
         .cards()
+        .await
         .workflow()
         .load(&CardSelector::exact(inference.ask.root.clone()))
         .await
@@ -728,7 +743,7 @@ async fn hosted_workflow_calls_record_the_caller_and_the_workflow_card() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn example_workflow_runs_through_the_wyrd_gateway() {
     let inference = Inference::start().await;
-    let example = Workflow::from_path_with_client(
+    let example = Workflow::from_path_with(
         example().join("workflow.yaml"),
         inference.deployment.admin(),
     )
@@ -777,7 +792,9 @@ async fn registered_example_runs_through_the_gateway() {
     let applied = cli::apply(&example(), Some(inference.deployment.admin()))
         .await
         .expect("the example applies");
-    let registered = Cards::with_client(inference.tenant_admin().await)
+    let registered = Cards::connect_with(&inference.tenant_admin().await)
+        .await
+        .expect("handle connects")
         .workflow()
         .load(&CardSelector::exact(applied.root))
         .await
@@ -810,11 +827,11 @@ async fn registered_example_runs_through_the_gateway() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn run_invokes_its_agent_through_the_gateway() {
     let inference = Inference::start().await;
-    let cards = inference.deployment.cards();
+    let cards = inference.deployment.cards().await;
     let service = register(&cards, "cards/gateway_inference/ask-service.yaml").await;
     let bundle = hydrate(&cards, &service.root).await;
     let state = |client: WyrdClient| {
-        WyrdState::from_path_with_client(bundle.path().join("bundle"), client)
+        WyrdState::from_path_with(bundle.path().join("bundle"), client)
             .expect("bundle loads offline")
     };
 

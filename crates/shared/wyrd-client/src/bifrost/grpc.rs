@@ -856,7 +856,7 @@ mod tests {
         let auth = AuthMiddleware::new(&config, credential).expect("test auth builds");
         let http = HttpTransport::new(&config.http, auth.clone()).expect("test HTTP layer builds");
         let client = WyrdClient::from_parts(Arc::clone(&auth), http, config.grpc);
-        let bifrost = crate::bifrost::Bifrost::connect_with_config(
+        let bifrost = crate::bifrost::Bifrost::assemble(
             &client,
             None,
             QueueConfig {

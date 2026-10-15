@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroU32;
+use wyrd_ai::bifrost::BifrostOptions;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -116,12 +117,12 @@ pub struct Worked {
 /// Panics when any step is refused or its evidence does not read back.
 pub async fn work(deployment: &Deployment, client: &WyrdClient) -> Worked {
     configure_gateway(client).await;
-    let cards = Cards::with_client(client.clone());
+    let cards = Cards::connect_with(client).await.expect("handle connects");
     register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
     register(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
     let assistant = register(&cards, "cards/verify_in_real_time/assistant.yaml").await;
     let bundle = hydrate(&cards, &assistant.root).await;
-    let state = WyrdState::from_path_with_client(bundle.path().join("bundle"), client.clone())
+    let state = WyrdState::from_path_with(bundle.path().join("bundle"), client.clone())
         .expect("the bundle loads");
     state.start_bifrost().await.expect("Bifrost starts");
 
@@ -166,7 +167,9 @@ pub async fn work(deployment: &Deployment, client: &WyrdClient) -> Worked {
     telemetry.shutdown().expect("spans export");
     state.shutdown().await.expect("emits drain");
 
-    let bifrost = Bifrost::connect(client).await.expect("Bifrost connects");
+    let bifrost = Bifrost::connect_with(client, BifrostOptions::default())
+        .await
+        .expect("Bifrost connects");
     let model_uid = state
         .card_ref("model")
         .expect("model resolves")
@@ -219,7 +222,9 @@ pub async fn configure_gateway(client: &WyrdClient) {
     )
     .await
     .expect("the CLI writes the credential");
-    Gateway::with_client(client.clone())
+    Gateway::connect_with(client)
+        .await
+        .expect("handle connects")
         .put_deployment(&ProviderDeployment {
             name: ProviderDeploymentName::new("gpt-4o").expect("deployment name"),
             model: ModelRef {
@@ -319,13 +324,13 @@ async fn start_telemetry_refuses_the_applications_own_subscriber() {
     let client = local
         .deployment
         .client(secrecy::ExposeSecret::expose_secret(&key));
-    let cards = Cards::with_client(client.clone());
+    let cards = Cards::connect_with(&client).await.expect("handle connects");
     register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
     register(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
     let assistant = register(&cards, "cards/verify_in_real_time/assistant.yaml").await;
     let bundle = hydrate(&cards, &assistant.root).await;
-    let state = WyrdState::from_path_with_client(bundle.path().join("bundle"), client)
-        .expect("the bundle loads");
+    let state =
+        WyrdState::from_path_with(bundle.path().join("bundle"), client).expect("the bundle loads");
     tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::default())
         .expect("the application installs its own subscriber");
 
@@ -344,7 +349,7 @@ async fn start_telemetry_refuses_the_applications_own_subscriber() {
 #[ignore = "requires the installed CLI local-development fixture"]
 async fn cli_bootstrap_saved_config_connects() {
     let client = WyrdClient::from_global().expect("saved endpoint and credential");
-    let cards = Cards::with_client(client);
+    let cards = Cards::connect_with(&client).await.expect("handle connects");
     let receipt = register(&cards, "cards/gateway_inference/ask-prompt.yaml").await;
     let card = cards
         .get(wyrd_ai::cards::CardSelector::exact(receipt.root))

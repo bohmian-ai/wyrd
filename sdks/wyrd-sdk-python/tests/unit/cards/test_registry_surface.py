@@ -43,7 +43,7 @@ def test_exact_pin_and_explicit_bump_are_rejected_before_network(offline_cards: 
 def test_cards_without_a_credential_raise_the_client_catalog_error() -> None:
     """Cards reports an empty credential chain with Bifrost's client code."""
     with pytest.raises(wyrd.WyrdError) as captured:
-        Cards()
+        Cards.connect()
     assert captured.value.code == "WYRD_CLIENT_401_NO_CREDENTIALS"
     assert captured.value.status == 401
     assert captured.value.details == {}

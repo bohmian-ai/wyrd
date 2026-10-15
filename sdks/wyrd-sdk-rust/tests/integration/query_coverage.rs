@@ -4,6 +4,7 @@
 
 use serde_json::{Value, json};
 use wyrd_ai::Bifrost;
+use wyrd_ai::bifrost::BifrostOptions;
 use wyrd_ai::bifrost::{BifrostClientError, Correlation, TableConfig};
 
 use crate::support::Deployment;
@@ -107,7 +108,9 @@ async fn common_queries_answer_over_published_and_live_rows() {
     )
     .await;
 
-    let bifrost = Bifrost::connect(&admin).await.expect("Bifrost connects");
+    let bifrost = Bifrost::connect_with(&admin, BifrostOptions::default())
+        .await
+        .expect("Bifrost connects");
     let mut mismatches = Vec::new();
     for case in cases() {
         match bifrost.sql_as::<Value>(&case.sql, &[]).await {
@@ -344,9 +347,15 @@ async fn writer(
         &json!({ "type": "object", "properties": properties, "required": required }),
     )
     .expect("table declares");
-    let writer = Bifrost::connect_with_table(admin, config)
-        .await
-        .expect("writer connects");
+    let writer = Bifrost::connect_with(
+        admin,
+        BifrostOptions {
+            table: Some(config),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("writer connects");
     writer.register().await.expect("table registers");
     writer
 }

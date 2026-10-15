@@ -15,6 +15,13 @@
 use wyrd_ai::WyrdClient;
 use wyrd_ai::cards::{Cards, ListCardsRequest};
 
+/// Build the ambient client, connect `Cards` over it, and print up to ten
+/// registered Cards.
+///
+/// # Errors
+/// Returns the configuration or no-credential refusal of
+/// `WyrdClient::from_global`, the server's refusal of the credential exchange
+/// `Cards::connect_with` completes, or the list request's failure.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Assemble the ambient client. Under the hood this discovers endpoints
@@ -25,9 +32,10 @@ async fn main() -> anyhow::Result<()> {
     // No network call happens yet; the first token exchange is lazy.
     let client = WyrdClient::from_global()?;
 
-    // Send a request through a capability handle. The token is injected as
+    // Connect a capability handle: this completes the token exchange, then
+    // sends a request through it. The token is injected as
     // `x-wyrd-access-token` and a `wyrd-request-id` is attached per request.
-    let cards = Cards::with_client(client);
+    let cards = Cards::connect_with(&client).await?;
     let listed = cards
         .list(ListCardsRequest {
             kind: None,

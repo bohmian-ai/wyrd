@@ -75,31 +75,40 @@ pub struct UpdateArgs {
 /// contract, client-construction errors, and the server's stable Wyrd error
 /// when the caller is unauthorized or the request is refused.
 pub async fn dispatch(command: OperatorConnectionCommand) -> Result<ExitCode, WyrdCliError> {
-    let connections =
-        |endpoint: &TenantEndpoint| crate::client::operator_connections(endpoint.server.as_str());
     let printed = match command {
         OperatorConnectionCommand::Create(args) => {
             let request = read_body(&args.body_file)?;
-            print_json(&connections(&args.endpoint)?.create(&request).await?)
+            print_json(
+                &crate::client::operator_connections(args.endpoint.server.as_str())
+                    .await?
+                    .create(&request)
+                    .await?,
+            )
         }
-        OperatorConnectionCommand::List(endpoint) => {
-            print_json(&connections(&endpoint)?.list().await?)
-        }
+        OperatorConnectionCommand::List(endpoint) => print_json(
+            &crate::client::operator_connections(endpoint.server.as_str())
+                .await?
+                .list()
+                .await?,
+        ),
         OperatorConnectionCommand::Get(args) => print_json(
-            &connections(&args.endpoint)?
+            &crate::client::operator_connections(args.endpoint.server.as_str())
+                .await?
                 .get(&args.connection_id)
                 .await?,
         ),
         OperatorConnectionCommand::Update(args) => {
             let request = read_body(&args.body.body_file)?;
             print_json(
-                &connections(&args.body.endpoint)?
+                &crate::client::operator_connections(args.body.endpoint.server.as_str())
+                    .await?
                     .update(&args.connection_id, &request)
                     .await?,
             )
         }
         OperatorConnectionCommand::Disable(args) => print_json(
-            &connections(&args.endpoint)?
+            &crate::client::operator_connections(args.endpoint.server.as_str())
+                .await?
                 .disable(&args.connection_id)
                 .await?,
         ),

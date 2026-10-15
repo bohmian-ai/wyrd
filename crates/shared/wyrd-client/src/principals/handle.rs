@@ -35,30 +35,36 @@ impl Debug for Principals {
 }
 
 impl Principals {
-    /// Construct a handle around an already assembled client.
-    ///
-    /// # Arguments
-    /// * `client` - The authenticated client every request is sent through, as
-    ///   its principal.
-    #[must_use]
-    pub fn with_client(client: WyrdClient) -> Self {
-        Self {
-            client: Arc::new(client),
-        }
-    }
-
-    /// Construct a handle from the ambient client, as
+    /// Connect the handle through the ambient client, as
     /// [`WyrdClient::from_global`] resolves it.
     ///
-    /// No network call or token exchange happens here; the first request does
-    /// the exchange.
+    /// Completes any credential exchange the resolved credential requires
+    /// before returning; a presented-as-is bearer or fresh cached token is
+    /// reused without a request.
     ///
     /// # Errors
     /// Returns a Wyrd error when the global config file cannot be read or
-    /// parsed, or when no credential can be resolved.
-    pub fn from_env() -> Result<Self, WyrdError> {
-        let client = WyrdClient::from_global().map_err(WyrdError::from)?;
-        Ok(Self::with_client(client))
+    /// parsed, no credential can be resolved, or a required exchange is
+    /// refused or unreachable.
+    pub async fn connect() -> Result<Self, WyrdError> {
+        Ok(Self {
+            client: Arc::new(WyrdClient::connect_ambient().await?),
+        })
+    }
+
+    /// Connect the handle as `client`'s principal, used as given.
+    ///
+    /// # Arguments
+    /// * `client` - The client every request is sent through, such as a
+    ///   delegated client from [`WyrdClient::on_behalf_of`].
+    ///
+    /// # Errors
+    /// Returns the server's stable error when the client's required exchange
+    /// is refused or unreachable.
+    pub async fn connect_with(client: &WyrdClient) -> Result<Self, WyrdError> {
+        Ok(Self {
+            client: Arc::new(client.connected().await?),
+        })
     }
 
     /// Create a machine principal in the caller's tenant and receive its first

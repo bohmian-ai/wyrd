@@ -17,6 +17,8 @@ from ..client import WyrdClient
 from ..types import TIMESTAMP_TYPES, TimestampLTZ, TimestampNTZ, TimestampTZ
 
 if TYPE_CHECKING:
+    from typing_extensions import Self
+
     from . import QueryTerminal
 else:
     QueryTerminal = _native.QueryTerminal
@@ -639,9 +641,11 @@ class BifrostBatchIterator(Iterator[pyarrow.RecordBatch]):
 class _BifrostBase:
     """Everything the sync and async clients share.
 
-    Construction and the two non-IO operations live here because they are
-    identical on both facades: ``insert`` is a bounded channel send and
-    ``use_table`` is a lock swap, so neither has an ``await`` form to differ in.
+    Construction, the local binding and counters, and ``insert`` live here
+    because they are identical on both facades: ``use_table``, ``table``,
+    ``dropped``, and ``producer_count`` never connect, and ``insert`` is a
+    bounded channel send once connected, so none has an ``await`` form to
+    differ in.
     """
 
     def __init__(
@@ -650,7 +654,12 @@ class _BifrostBase:
         client: WyrdClient | None = None,
         client_byte_limit_bytes: int | None = None,
     ) -> None:
-        """Connect one client, optionally already bound to a write target.
+        """Retain one client's arguments, optionally bound to a write target.
+
+        Construction performs no IO and resolves nothing. The first server
+        operation, including the first ``insert``, connects exactly as
+        ``connect`` does, once per handle, and raises its errors. Binding and
+        reading the write target and reading the counters never connect.
 
         Args:
             table: the active write target. Omitted, the client is query-only
@@ -662,12 +671,6 @@ class _BifrostBase:
                 ``wyrd auth login``.
             client_byte_limit_bytes: the handle-wide ingestion byte budget
                 shared by every table this client writes. 256 MiB if omitted.
-
-        Raises:
-            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no ambient
-                credential resolves;
-                ``WYRD_CLIENT_400_CONFIG_INVALID`` when the byte budget is too
-                small to seal one message.
 
         """
 
@@ -681,7 +684,8 @@ class _BifrostBase:
         """Bind ``table`` as the write target, returning the previous binding.
 
         The previous table's producer stays pooled, so its buffered rows still
-        flush; a swap loses nothing.
+        flush; a swap loses nothing. Local: it never connects, and a binding
+        made before the first server operation is carried into it.
 
         Args:
             table: the new write target.
@@ -695,7 +699,7 @@ class _BifrostBase:
 
     @property
     def table(self) -> TableConfig | None:
-        """The active write binding, if any."""
+        """The active write binding, if any. Local; never connects."""
 
         native = self._native.table
         return None if native is None else TableConfig._from_native(native)
@@ -703,8 +707,10 @@ class _BifrostBase:
     def insert(self, row: Any, correlation: Correlation | None = None) -> None:
         """Enqueue one row into the active table.
 
-        Non-blocking; the row is durable after ``flush()``. A saturated queue
-        refuses here rather than dropping silently.
+        Non-blocking once connected; the row is durable after ``flush()``. A
+        saturated queue refuses here rather than dropping silently. On a
+        handle not yet connected, the first ``insert`` connects as
+        ``connect`` does, blocking the caller until it completes.
 
         Args:
             row: a Pydantic model instance, a mapping, or a JSON object string
@@ -716,7 +722,8 @@ class _BifrostBase:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an unparsable
                 ``card_uid``; ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table
                 is bound; ``WYRD_CLIENT_429_QUEUE_FULL`` when the producer
-                queue is full.
+                queue is full; or, on a handle not yet connected, the error
+                ``connect`` raises.
 
         """
 
@@ -729,13 +736,19 @@ class _BifrostBase:
 
     @property
     def dropped(self) -> int:
-        """Rows dropped by the fire-and-forget ``wyrd.observe.record`` path."""
+        """Rows dropped by the fire-and-forget ``wyrd.observe.record`` path.
+
+        Zero before the first server operation. Local; never connects.
+        """
 
         return int(self._native.dropped)
 
     @property
     def producer_count(self) -> int:
-        """Number of distinct table producers currently pooled."""
+        """Number of distinct table producers currently pooled.
+
+        Zero before the first server operation. Local; never connects.
+        """
 
         return int(self._native.producer_count)
 
@@ -746,6 +759,42 @@ class Bifrost(_BifrostBase):
     Synchronous. Use ``AsyncBifrost`` for the ``await`` surface — the same
     methods on the same native client, differing only in who drives them.
     """
+
+    @classmethod
+    def connect(
+        cls,
+        table: TableConfig | None = None,
+        client: WyrdClient | None = None,
+        client_byte_limit_bytes: int | None = None,
+    ) -> Self:
+        """Connect one client now, optionally already bound to a write target.
+
+        Takes the constructor's arguments and completes the connection the
+        first operation would otherwise perform.
+
+        Args:
+            table: the active write target, or ``None`` for a query-only
+                client.
+            client: the ``WyrdClient`` to act as. Omitted, the ambient client
+                resolves as for the constructor.
+            client_byte_limit_bytes: the handle-wide ingestion byte budget.
+                256 MiB if omitted.
+
+        Raises:
+            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no credential
+                resolves; ``WYRD_CLIENT_400_CONFIG_INVALID`` when the byte
+                budget is too small to seal one message; the server's error
+                for a refused credential exchange.
+
+        """
+
+        bifrost = cls(table, client, client_byte_limit_bytes)
+        bifrost._native = _native.Bifrost.connect(
+            table._native if table is not None else None,
+            client,
+            client_byte_limit_bytes,
+        )
+        return bifrost
 
     def register(self) -> str:
         """Create the active table; returns ``"created"`` or ``"already_exists"``.
@@ -957,6 +1006,21 @@ class Bifrost(_BifrostBase):
 
         return cast("list[SpanRecord]", self._native.trace_timeline(trace_id))
 
+    def list_tables(self) -> list[TableEntry]:
+        """List the compact entries of every table the caller may read.
+
+        Entries carry no schema; ``describe_table`` fetches one on demand.
+
+        Returns:
+            One entry per authorized table, built-ins included.
+
+        Raises:
+            WyrdError: an authorization or transport failure.
+
+        """
+
+        return cast("list[TableEntry]", self._native.list_tables())
+
     def describe_table(self, namespace: str, name: str) -> TableDescription:
         """Describe the registered ``namespace.name`` table's stored schema and layout.
 
@@ -980,9 +1044,43 @@ class AsyncBifrost(_BifrostBase):
     """The ``await`` surface over the same native client.
 
     Every blocking native call runs in a worker thread, so the event loop is
-    never blocked. ``insert`` and ``use_table`` stay synchronous because they
-    perform no IO. Each method behaves as its ``Bifrost`` counterpart.
+    never blocked. ``use_table``, ``table``, ``dropped``, and
+    ``producer_count`` stay synchronous because they never connect;
+    ``insert`` stays synchronous because it is a bounded channel send once
+    connected, so connect first with ``await AsyncBifrost.connect()`` or an
+    awaited operation to keep its first call off the event loop. Each method
+    behaves as its ``Bifrost`` counterpart.
     """
+
+    @classmethod
+    async def connect(
+        cls,
+        table: TableConfig | None = None,
+        client: WyrdClient | None = None,
+        client_byte_limit_bytes: int | None = None,
+    ) -> Self:
+        """Connect one client now in a worker thread, as ``Bifrost.connect``.
+
+        Args:
+            table: the active write target, or ``None`` for a query-only
+                client.
+            client: the ``WyrdClient`` to act as. Omitted, the ambient client
+                resolves as for the constructor.
+            client_byte_limit_bytes: the handle-wide ingestion byte budget.
+                256 MiB if omitted.
+
+        Raises:
+            WyrdError: As for ``Bifrost.connect()``.
+        """
+
+        bifrost = cls(table, client, client_byte_limit_bytes)
+        bifrost._native = await asyncio.to_thread(
+            _native.Bifrost.connect,
+            table._native if table is not None else None,
+            client,
+            client_byte_limit_bytes,
+        )
+        return bifrost
 
     async def register(self) -> str:
         """Create the active table; returns ``"created"`` or ``"already_exists"``.
@@ -1170,6 +1268,18 @@ class AsyncBifrost(_BifrostBase):
             "list[SpanRecord]",
             await asyncio.to_thread(self._native.trace_timeline, trace_id),
         )
+
+    async def list_tables(self) -> list[TableEntry]:
+        """List the compact entries of every table the caller may read.
+
+        Returns:
+            One entry per authorized table, built-ins included.
+
+        Raises:
+            WyrdError: As for ``Bifrost.list_tables()``.
+        """
+
+        return cast("list[TableEntry]", await asyncio.to_thread(self._native.list_tables))
 
     async def describe_table(self, namespace: str, name: str) -> TableDescription:
         """Describe the registered ``namespace.name`` table's stored schema and layout.

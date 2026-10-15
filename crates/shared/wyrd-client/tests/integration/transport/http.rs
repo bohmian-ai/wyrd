@@ -323,9 +323,11 @@ mod transport_behavior {
             MockResponse::status(204, ""),
         ])
         .await;
-        let principals = wyrd_client::principals::Principals::with_client(make_api_key_client(
+        let principals = wyrd_client::principals::Principals::connect_with(&make_api_key_client(
             server.base_url.clone(),
-        ));
+        ))
+        .await
+        .expect("handle connects");
         let principal = wyrd_spec::auth::PrincipalId::new(
             "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00"
                 .parse()
@@ -372,9 +374,11 @@ mod transport_behavior {
             MockResponse::status(401, unauthorized),
         ])
         .await;
-        let principals = wyrd_client::principals::Principals::with_client(make_api_key_client(
+        let principals = wyrd_client::principals::Principals::connect_with(&make_api_key_client(
             server.base_url.clone(),
-        ));
+        ))
+        .await
+        .expect("handle connects");
         let principal = wyrd_spec::auth::PrincipalId::new(
             "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00"
                 .parse()

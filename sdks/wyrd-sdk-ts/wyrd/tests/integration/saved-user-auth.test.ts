@@ -17,7 +17,7 @@ const ADMIN_TENANT = "saved-login-two";
 const PROMPT = fixture("cards/gateway_inference/ask-prompt.yaml");
 
 /** `Cards` resolved from the saved logins, with `WYRD_TENANT` the only selector. */
-function cards(tenant?: string, credential?: string): Cards {
+function cards(tenant?: string, credential?: string): Promise<Cards> {
   vi.stubEnv("WYRD_TENANT", tenant);
   return Cards.connect({ client: WyrdClient.connect({ credential }) });
 }
@@ -47,13 +47,13 @@ const test = serverTest().extend<{ sso: void; config: string }>({
 test("newest saved login is used without a selector", async ({ server, config }) => {
   server.saveHumanLogin(config, ADMIN_TENANT, "alice", "alice-password");
 
-  const receipt = await cards().registerFromPath(PROMPT);
+  const receipt = await (await cards()).registerFromPath(PROMPT);
 
   expect(receipt.root).toMatchObject({ kind: "Prompt", name: "ask-prompt" });
 });
 
 test("saved reader login is denied a write", async ({ config: _ }) => {
-  await expect(cards(READER_TENANT).registerFromPath(PROMPT)).rejects.toMatchObject({
+  await expect((await cards(READER_TENANT)).registerFromPath(PROMPT)).rejects.toMatchObject({
     code: "WYRD_PERMISSION_403_DENIED_RBAC",
   });
 });
@@ -61,7 +61,7 @@ test("saved reader login is denied a write", async ({ config: _ }) => {
 test("stale login refreshes and saves the renewal", async ({ server, config }) => {
   server.expireSavedLogin(config, READER_TENANT);
 
-  await cards(READER_TENANT).list({ kind: "Prompt" });
+  await (await cards(READER_TENANT)).list({ kind: "Prompt" });
 
   expect(server.savedLoginIsStale(config, READER_TENANT)).toBe(false);
 });
@@ -70,7 +70,7 @@ test("revoked login is refused", async ({ server, config }) => {
   server.revokeSavedLogin(config, READER_TENANT);
   server.expireSavedLogin(config, READER_TENANT);
 
-  await expect(cards(READER_TENANT).list({ kind: "Prompt" })).rejects.toMatchObject({
+  await expect(cards(READER_TENANT)).rejects.toMatchObject({
     code: "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE",
   });
 });

@@ -117,7 +117,8 @@ pub(crate) fn principal_id(value: &str) -> Result<PrincipalId, WyrdCliError> {
 /// # Errors
 /// Returns the errors documented on [`dispatch`].
 async fn create(args: CreateArgs) -> Result<ExitCode, WyrdCliError> {
-    let created = crate::client::principals(args.endpoint.server.as_str())?
+    let created = crate::client::principals(args.endpoint.server.as_str())
+        .await?
         .create_service_principal(&CreateServicePrincipalRequest {
             name: args.name,
             roles: args.roles,
@@ -138,7 +139,8 @@ async fn create(args: CreateArgs) -> Result<ExitCode, WyrdCliError> {
 /// Returns the errors documented on [`dispatch`].
 async fn issue(args: PrincipalArgs) -> Result<ExitCode, WyrdCliError> {
     let principal = principal_id(&args.principal)?;
-    let issued = crate::client::principals(args.endpoint.server.as_str())?
+    let issued = crate::client::principals(args.endpoint.server.as_str())
+        .await?
         .issue_credential(&principal)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
@@ -155,7 +157,8 @@ async fn issue(args: PrincipalArgs) -> Result<ExitCode, WyrdCliError> {
 /// Returns the errors documented on [`dispatch`].
 async fn list(args: PrincipalArgs) -> Result<ExitCode, WyrdCliError> {
     let principal = principal_id(&args.principal)?;
-    let listing = crate::client::principals(args.endpoint.server.as_str())?
+    let listing = crate::client::principals(args.endpoint.server.as_str())
+        .await?
         .list_credentials(&principal)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
@@ -183,7 +186,8 @@ async fn list(args: PrincipalArgs) -> Result<ExitCode, WyrdCliError> {
 /// Returns the errors documented on [`dispatch`].
 async fn revoke(args: RevokeCredentialArgs) -> Result<ExitCode, WyrdCliError> {
     let principal = principal_id(&args.principal)?;
-    crate::client::principals(args.endpoint.server.as_str())?
+    crate::client::principals(args.endpoint.server.as_str())
+        .await?
         .revoke_credential(&principal, args.credential_id)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;

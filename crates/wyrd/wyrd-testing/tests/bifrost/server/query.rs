@@ -6,6 +6,7 @@ use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, OracleQueryStream, QueryIpcDecoder, failed_terminal,
 };
+use wyrd_client::bifrost::BifrostOptions;
 use wyrd_client::bifrost::Correlation;
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
@@ -921,13 +922,14 @@ async fn prove_scheduled_analytical_completion(
     let entered =
         tokio::time::timeout(std::time::Duration::from_secs(10), pause.wait_paused()).await;
     // The held follower is released by the graph cancel itself, so the cancel
-    // always lands while the leader is still opening and fails that open.
+    // always lands while the leader is still opening; the open the owner fails
+    // is the same incomplete stream a cancel after the open reports.
     cancellation.cancel();
     entered?;
     let error = scheduled
         .await?
         .expect_err("an actively cancelled schedule has no outcome");
-    assert_eq!(error.code(), "WYRD_VALA_500_QUERY_EXECUTION_FAILED");
+    assert_eq!(error.code(), "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE");
     await_owners_released(cluster).await?;
     assert_eq!(
         audit_rows(ingress, tenant, "bifrost.query.read_decision").await?,
@@ -1363,9 +1365,15 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     // Native ingest: Gate refuses the delegated write before Scribe sees it,
     // and B's own client writes the same table.
     let events = "vala.datasets.delegation_events";
-    let described = wyrd_client::bifrost::TableConfig::describe(&b_client, events).await?;
-    let delegated_writer =
-        wyrd_client::Bifrost::connect_with_table(&delegated, described.clone()).await?;
+    let described = wyrd_client::bifrost::TableConfig::describe_with(&b_client, events).await?;
+    let delegated_writer = wyrd_client::Bifrost::connect_with(
+        &delegated,
+        BifrostOptions {
+            table: Some(described.clone()),
+            ..BifrostOptions::default()
+        },
+    )
+    .await?;
     delegated_writer.insert(br#"{"value": 1}"#.to_vec(), Correlation::default())?;
     let denied_write = delegated_writer
         .flush()
@@ -1379,7 +1387,14 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
             && denied_write.to_string().contains("bifrost_record:write"),
         "the delegated native write is refused for A's missing record write: {denied_write}"
     );
-    let own_writer = wyrd_client::Bifrost::connect_with_table(&b_client, described).await?;
+    let own_writer = wyrd_client::Bifrost::connect_with(
+        &b_client,
+        BifrostOptions {
+            table: Some(described),
+            ..BifrostOptions::default()
+        },
+    )
+    .await?;
     own_writer.insert(br#"{"value": 2}"#.to_vec(), Correlation::default())?;
     own_writer.flush().await?;
     server.flush_bifrost().await?;

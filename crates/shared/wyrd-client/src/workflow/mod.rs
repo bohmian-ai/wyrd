@@ -142,7 +142,7 @@ impl Workflow {
     /// Returns the errors of [`Self::from_path`], except that no client
     /// configuration error arises; a registry read refused for `client`'s
     /// principal returns that refusal.
-    pub async fn from_path_with_client(
+    pub async fn from_path_with(
         path: impl AsRef<Path>,
         client: WyrdClient,
     ) -> Result<Self, WyrdError> {
@@ -164,10 +164,12 @@ impl Workflow {
         let mut client = client;
         if !refs.is_empty() {
             let cards = match client {
-                Some(client) => Cards::with_client(client),
-                None => tokio::task::spawn_blocking(Cards::from_env)
-                    .await
-                    .map_err(|error| blocking_task_failed("workflow_cards_client", &error))??,
+                Some(client) => Cards::new(client),
+                None => Cards::new(
+                    tokio::task::spawn_blocking(WyrdClient::from_global)
+                        .await
+                        .map_err(|error| blocking_task_failed("workflow_cards_client", &error))??,
+                ),
             };
             CardGraphHydrator::new(RegistryContext::new(Arc::clone(&cards.engine)))
                 .resolve_external(&mut bodies, &refs)
@@ -211,7 +213,7 @@ impl Workflow {
     /// Run on `native` with the shared local dependencies its routes select.
     ///
     /// A step on the `wyrd_gateway` route calls the public gateway through
-    /// the client given to [`Self::from_path_with_client`] or the one that
+    /// the client given to [`Self::from_path_with`] or the one that
     /// loaded the Workflow's registered Cards, or else a client built from the
     /// shared configuration. The shared client
     /// configuration is read once, at run start, only when a step resolves to

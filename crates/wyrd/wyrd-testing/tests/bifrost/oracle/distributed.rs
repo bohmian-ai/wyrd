@@ -9,6 +9,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Fields, SchemaRef};
@@ -2672,7 +2673,8 @@ impl FilteringFixture {
             "vala.metrics.points",
         ] {
             let described =
-                wyrd_client::bifrost::TableConfig::describe(fixture.writer.client(), fqn).await?;
+                wyrd_client::bifrost::TableConfig::describe_with(fixture.writer.client(), fqn)
+                    .await?;
             schemas.push(Arc::clone(described.user_schema()));
         }
         let [spans, records, points] = schemas.as_slice() else {
@@ -2722,10 +2724,16 @@ impl FilteringFixture {
             declared_sort.clone(),
             vec![CUSTOM_BLOOM_COLUMN.to_owned()],
         ));
-        wyrd_client::Bifrost::connect_with_table(self.writer.client(), config)
-            .await?
-            .register()
-            .await?;
+        wyrd_client::Bifrost::connect_with(
+            self.writer.client(),
+            BifrostOptions {
+                table: Some(config),
+                ..BifrostOptions::default()
+            },
+        )
+        .await?
+        .register()
+        .await?;
         let resolved = wyrd_client::Bifrost::query_only(self.writer.client())
             .describe_table("vala.datasets", &self.custom)
             .await?
@@ -4232,10 +4240,16 @@ async fn binary_sort_key_page_pruning() -> Result<(), JourneyError> {
     let config =
         wyrd_client::bifrost::TableConfig::from_arrow(&fqn, timed_schema(&binary_key_schema()))?
             .with_layout(timed_layout_with(sort_keys.clone(), Vec::new()));
-    wyrd_client::Bifrost::connect_with_table(rows.client(), config)
-        .await?
-        .register()
-        .await?;
+    wyrd_client::Bifrost::connect_with(
+        rows.client(),
+        BifrostOptions {
+            table: Some(config),
+            ..BifrostOptions::default()
+        },
+    )
+    .await?
+    .register()
+    .await?;
 
     let hour =
         (chrono::Utc::now().timestamp_micros() / FILTER_HOUR_MICROS - 2) * FILTER_HOUR_MICROS;

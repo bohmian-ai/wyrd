@@ -10,6 +10,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::Schema;
@@ -92,7 +93,7 @@ async fn strings(
         credential: Some(credential.clone()),
         ..wyrd_client::config::ClientConfig::default()
     })?;
-    let result = wyrd_client::Bifrost::connect(&client)
+    let result = wyrd_client::Bifrost::connect_with(&client, BifrostOptions::default())
         .await?
         .sql(sql, &[])
         .await?;

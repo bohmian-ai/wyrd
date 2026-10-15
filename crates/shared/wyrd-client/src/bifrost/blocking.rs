@@ -9,16 +9,15 @@
 
 use crate::WyrdClient;
 use arrow::record_batch::RecordBatch;
-use wyrd_queue::QueueConfig;
 use wyrd_spec::request_id::RequestId;
 #[cfg(feature = "internal")]
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::api::{
-    BifrostTableDescription, CancelRunningQueryResponse, QueryParam, RegisterOutcome,
-    RunningQuerySummary,
+    BifrostTableDescription, BifrostTableEntry, CancelRunningQueryResponse, QueryParam,
+    RegisterOutcome, RunningQuerySummary,
 };
 
-use crate::bifrost::facade::QueryResult;
+use crate::bifrost::facade::{BifrostOptions, QueryResult};
 use crate::bifrost::query::{BifrostClientError, QueryResultStream};
 #[cfg(feature = "internal")]
 use crate::bifrost::query::{CollectedQueryLimits, CollectedQueryResult};
@@ -37,69 +36,35 @@ pub struct Bifrost {
 }
 
 impl Bifrost {
-    /// Build a client with no arguments, resolving its own transport.
-    ///
-    /// # Errors
-    ///
-    /// As [`crate::bifrost::Bifrost::from_env`].
-    pub fn from_env() -> Result<Self, BifrostClientError> {
-        Ok(Self {
-            inner: block_on(crate::bifrost::Bifrost::from_env())?,
-        })
-    }
-
-    /// Build a query-only client over an explicitly supplied transport.
+    /// Connect a client through the ambient [`WyrdClient`].
     ///
     /// # Arguments
-    /// * `client` - The authenticated client whose credential and connection pools
-    ///   both planes share; it is borrowed, not owned.
+    /// * `options` - The initial write target and producer tuning.
     ///
     /// # Errors
     ///
     /// As [`crate::bifrost::Bifrost::connect`].
-    pub fn connect(client: &WyrdClient) -> Result<Self, BifrostClientError> {
+    pub fn connect(options: BifrostOptions) -> Result<Self, BifrostClientError> {
         Ok(Self {
-            inner: block_on(crate::bifrost::Bifrost::connect(client))?,
+            inner: block_on(crate::bifrost::Bifrost::connect(options))?,
         })
     }
 
-    /// Build a client already bound to `table` for writes.
+    /// Connect a client as `client`'s principal, used as given.
     ///
     /// # Arguments
-    /// * `client` - The authenticated client whose transport both planes share.
-    /// * `table` - The table bound as the initial write target.
+    /// * `client` - The client both planes act as.
+    /// * `options` - The initial write target and producer tuning.
     ///
     /// # Errors
     ///
-    /// As [`crate::bifrost::Bifrost::connect`].
-    pub fn connect_with_table(
+    /// As [`crate::bifrost::Bifrost::connect_with`].
+    pub fn connect_with(
         client: &WyrdClient,
-        table: TableConfig,
+        options: BifrostOptions,
     ) -> Result<Self, BifrostClientError> {
         Ok(Self {
-            inner: block_on(crate::bifrost::Bifrost::connect_with_table(client, table))?,
-        })
-    }
-
-    /// Build a client with explicit producer tuning.
-    ///
-    /// # Arguments
-    /// * `client` - The authenticated client whose transport both planes share.
-    /// * `table` - The initial write target, or `None` to bind one later.
-    /// * `config` - Producer tuning, validated before the ingest channel is dialled.
-    ///
-    /// # Errors
-    ///
-    /// As [`crate::bifrost::Bifrost::connect`].
-    pub fn connect_with_config(
-        client: &WyrdClient,
-        table: Option<TableConfig>,
-        config: QueueConfig,
-    ) -> Result<Self, BifrostClientError> {
-        Ok(Self {
-            inner: block_on(crate::bifrost::Bifrost::connect_with_config(
-                client, table, config,
-            ))?,
+            inner: block_on(crate::bifrost::Bifrost::connect_with(client, options))?,
         })
     }
 
@@ -238,6 +203,15 @@ impl Bifrost {
         Ok(BlockingQueryStream {
             inner: block_on(self.inner.stream(query, params, deadline))?,
         })
+    }
+
+    /// List the compact entries of every table the caller may read.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::bifrost::Bifrost::list_tables`].
+    pub fn list_tables(&self) -> Result<Vec<BifrostTableEntry>, BifrostClientError> {
+        block_on(self.inner.list_tables())
     }
 
     /// Read one registered table's server-owned description.

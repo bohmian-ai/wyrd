@@ -188,7 +188,7 @@ impl TenantClients {
                 .await
                 .map_err(|error| format!("exchanging the executor token: {error}"))?;
             verification.push(executor);
-            let state = WyrdState::from_path_with_client(&tenant.bundle, tenant.service(url)?)?;
+            let state = WyrdState::from_path_with(&tenant.bundle, tenant.service(url)?)?;
             state
                 .start_bifrost_with_config(None, QueueConfig::default())
                 .await?;

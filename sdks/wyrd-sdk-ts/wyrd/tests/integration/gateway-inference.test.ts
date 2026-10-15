@@ -150,7 +150,7 @@ const test = serverTest({
         provider: "anthropic",
         source: { environment: { binding: "test-anthropic-key" } },
       });
-      const gateway = Gateway.connect();
+      const gateway = await Gateway.connect();
       await gateway.putDeployment(deployment("gpt-4o"));
       await gateway.putDeployment({
         name: "claude-sonnet-5",
@@ -163,7 +163,7 @@ const test = serverTest({
       await gateway.putDeployment(deployment("gpt-5-5"));
       await gateway.putDeployment({ ...deployment("gpt-4o-mini"), capabilities: ["responses"] });
       await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });
-      await use(await Cards.connect().registerFromPath(fixture("cards/gateway_inference/ask.yaml")));
+      await use(await (await Cards.connect()).registerFromPath(fixture("cards/gateway_inference/ask.yaml")));
     },
     { scope: "file" },
   ],
@@ -282,7 +282,7 @@ test("stock openai client authenticates with a Wyrd API key", async ({ provider,
 // The status of the refusal is not pinned: only that the client's own token
 // exchange rejected the request, so no gateway call was made.
 test("revoked api key is refused by the token exchange, before the gateway", async ({ provider, ask: _ }) => {
-  const principals = Principals.connect();
+  const principals = await Principals.connect();
   const { principal_id, credential } = await principals.createServicePrincipal({
     name: "revoked-gateway-caller",
     roles: [],
@@ -402,7 +402,7 @@ test("cli issues a card scoped key and writes a provider credential", async ({ a
 });
 
 /** Cards of the tenant administrator `wyrd setup` issues, who is bound to no Card and so may run any registered Workflow. */
-function tenantAdminCards(server: NativeWyrdTestServer): Cards {
+async function tenantAdminCards(server: NativeWyrdTestServer): Promise<Cards> {
   return Cards.connect({
     client: WyrdClient.connect({
       serverUrl: server.baseUrl,
@@ -414,7 +414,7 @@ function tenantAdminCards(server: NativeWyrdTestServer): Cards {
 
 test("loaded workflow calls the gateway through its loading client", async ({ server, provider, ask }) => {
   const before = provider.received.length;
-  const workflow = await tenantAdminCards(server).workflow.load({ uid: registered(ask).uid });
+  const workflow = await (await tenantAdminCards(server)).workflow.load({ uid: registered(ask).uid });
 
   const run = await workflow.run({ question: "hi" });
 
@@ -446,7 +446,7 @@ test("applying a workflow calls no model", async ({ provider, ask: _ }) => {
 test("registered example runs through the gateway", async ({ server, provider, ask: _ }) => {
   await cli.apply(EXAMPLE);
   const before = provider.received.length;
-  const registeredExample = await tenantAdminCards(server).workflow.load({
+  const registeredExample = await (await tenantAdminCards(server)).workflow.load({
     space: "engineering",
     name: "code-review",
     version: "1.0.0",

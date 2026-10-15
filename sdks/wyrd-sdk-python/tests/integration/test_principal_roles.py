@@ -10,9 +10,9 @@ from collections.abc import Iterator
 
 import pytest
 from wyrd import WyrdError
+from wyrd.auth import Principals
 from wyrd.bifrost import Bifrost
 from wyrd.cards import CardRef, Cards
-from wyrd.principals import Principals
 from wyrd.testing import WyrdTestServer, cli
 
 from .support import FIXTURES, Count, client_of, register

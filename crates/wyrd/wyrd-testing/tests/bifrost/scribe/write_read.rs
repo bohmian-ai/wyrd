@@ -137,7 +137,7 @@ async fn assert_canonical_genai_span_is_tenant_isolated(server: &wyrd_testing::W
         .await
         .expect("the canonical span ledger is provisioned for the writing tenant");
     let writer = tenant_writer(server, tenant).await;
-    let described = wyrd_client::bifrost::TableConfig::describe(writer.client(), SPANS)
+    let described = wyrd_client::bifrost::TableConfig::describe_with(writer.client(), SPANS)
         .await
         .expect("the canonical span ledger describes itself");
     let scope = unique_table("scribe_canonical");
@@ -836,7 +836,9 @@ async fn scribe_unbound_writer_card_attribution_journey() {
         ..ClientConfig::default()
     })
     .expect("the administrator's SDK client");
-    let trigger = wyrd_client::cards::Cards::with_client(client.clone())
+    let trigger = wyrd_client::cards::Cards::connect_with(&client)
+        .await
+        .expect("handle connects")
         .register_from_path(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../../fixtures/cards/scheduled_drift_alerts_operator/daily.yaml"

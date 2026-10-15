@@ -131,7 +131,7 @@ fn service_selector(name: &str) -> SelectorArgs {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn service_graph_registers_and_hydrates() {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     let (_, desk) = register_desk(&cards).await;
 
     let bundle = hydrate(&cards, &desk.root).await;
@@ -163,7 +163,7 @@ async fn service_graph_registers_and_hydrates() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn latest_version_resolves_to_the_registered_card() {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     let (_, desk) = register_desk(&cards).await;
 
     let latest = cards
@@ -197,7 +197,7 @@ async fn latest_version_resolves_to_the_registered_card() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn registering_the_graph_again_is_idempotent() {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     let (_, desk) = register_desk(&cards).await;
     let bindings = |card: Card| {
         card.status
@@ -234,7 +234,7 @@ async fn registering_the_graph_again_is_idempotent() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn cards_get_returns_every_kind_typed() {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     let baseline = register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
     let (model, desk) = register_desk(&cards).await;
 
@@ -289,7 +289,7 @@ async fn artifact_without_digest_registers() {
     let deployment = Deployment::start().await;
 
     let model = register(
-        &deployment.cards(),
+        &deployment.cards().await,
         "cards/register_and_hydrate/support-model.yaml",
     )
     .await;
@@ -310,6 +310,7 @@ async fn wrong_artifact_digest_is_refused() {
 
     let refused = deployment
         .cards()
+        .await
         .register_from_path(&fixture("invalid/wrong-artifact-digest/support-model.yaml"))
         .await
         .expect_err("a wrong digest is refused");
@@ -329,6 +330,7 @@ async fn retired_card_kind_is_refused() {
 
     let refused = deployment
         .cards()
+        .await
         .register_from_path(&fixture("invalid/retired-drift-kind.yaml"))
         .await
         .expect_err("a retired kind is refused");
@@ -345,10 +347,12 @@ async fn retired_card_kind_is_refused() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn reader_cannot_register_cards() {
     let deployment = Deployment::start().await;
-    register_desk(&deployment.cards()).await;
-    let reader = Cards::with_client(
-        deployment.client(&deployment.scoped_key("card_reader", &["cards:read"]).await),
-    );
+    register_desk(&deployment.cards().await).await;
+    let reader = Cards::connect_with(
+        &deployment.client(&deployment.scoped_key("card_reader", &["cards:read"]).await),
+    )
+    .await
+    .expect("handle connects");
 
     let refused = reader
         .register_from_path(&fixture(DESK))
@@ -368,7 +372,7 @@ async fn reader_cannot_register_cards() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn cli_apply_and_get_round_trip_the_graph() {
     let deployment = Deployment::start().await;
-    let (_, desk) = register_desk(&deployment.cards()).await;
+    let (_, desk) = register_desk(&deployment.cards().await).await;
     let dir = tempfile::tempdir().expect("bundle directory creates");
     let bundle = dir.path().join("bundle");
 
@@ -431,7 +435,7 @@ async fn refused_cli_command_raises_its_catalog_code() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn agent_prompt_registration_identity() {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     let dir = tempfile::tempdir().expect("fixture directory creates");
 
     let (agent, prompt) =
@@ -479,9 +483,11 @@ spec:
     assert_ne!(clash.version, independent.root.version);
     assert_ne!(clash.uid, independent.root.uid);
 
-    let tenant = Cards::with_client(
-        deployment.client(&deployment.other_tenant_admin("prompt-tenant").await),
-    );
+    let tenant = Cards::connect_with(
+        &deployment.client(&deployment.other_tenant_admin("prompt-tenant").await),
+    )
+    .await
+    .expect("handle connects");
     let (_, foreign) = register_inline(&tenant, dir.path(), "first-agent", "Answer briefly.").await;
     assert_ne!(foreign.uid, prompt.uid);
     assert_eq!(
@@ -534,7 +540,7 @@ spec:
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn hydrated_agent_prompt_card_navigation() {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     let desk = register_prompt_desk(&cards).await;
     let bundle = hydrate(&cards, &desk.root).await;
     deployment.shutdown().await;

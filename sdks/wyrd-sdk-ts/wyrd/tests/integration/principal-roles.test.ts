@@ -26,13 +26,13 @@ async function issue(): Promise<{ principal: string; key: string }> {
 }
 
 /** Register `AUTHORED` through a fresh client, so it carries the key's next token. */
-function author(key: string): Promise<unknown> {
-  return Cards.connect({ client: WyrdClient.connect({ credential: key }) }).registerFromPath(AUTHORED);
+async function author(key: string): Promise<unknown> {
+  return (await Cards.connect({ client: WyrdClient.connect({ credential: key }) })).registerFromPath(AUTHORED);
 }
 
 test("granted editor reaches the next token until revoked", async ({ bundle: _ }) => {
   const { principal, key } = await issue();
-  const principals = Principals.connect();
+  const principals = await Principals.connect();
 
   const [found] = (await principals.list({ kind: "service", name: "observed-service" })).principals;
   const bound: CardRef | null | undefined = found?.card_ref;
@@ -60,7 +60,7 @@ test("granted editor reaches the next token until revoked", async ({ bundle: _ }
 
 test("only a tenant admin assigns roles", async ({ bundle: _ }) => {
   const { principal, key } = await issue();
-  const own = Principals.connect({ client: WyrdClient.connect({ credential: key }) });
+  const own = await Principals.connect({ client: WyrdClient.connect({ credential: key }) });
 
   await expect(own.grantRole(principal, "editor")).rejects.toMatchObject(DENIED);
   await expect(own.revokeRole(principal, "workload")).rejects.toMatchObject(DENIED);
@@ -68,7 +68,7 @@ test("only a tenant admin assigns roles", async ({ bundle: _ }) => {
 
 test("direct and idp user assignments coexist", async ({ server }) => {
   const user = server.bootstrapUser(["viewer"], "pr-person");
-  const principals = Principals.connect();
+  const principals = await Principals.connect();
 
   const page = await principals.list({ email: "pr-person@test.wyrd" });
   expect(page.principals.map((found) => [found.principal_id, found.kind])).toEqual([[user, "user"]]);

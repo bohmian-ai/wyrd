@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::array::{AsArray, RecordBatch};
 use arrow::datatypes::{DataType, Int64Type};
@@ -502,9 +503,12 @@ impl<'a> Bench<'a> {
         writers: usize,
         stop: CancellationToken,
     ) -> Result<Measured> {
-        let writer = Bifrost::connect_with_table(
+        let writer = Bifrost::connect_with(
             self.client,
-            TableConfig::from_arrow(table, workload::schema())?,
+            BifrostOptions {
+                table: Some(TableConfig::from_arrow(table, workload::schema())?),
+                ..BifrostOptions::default()
+            },
         )
         .await?;
         writer.register().await?;

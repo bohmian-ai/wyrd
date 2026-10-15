@@ -126,9 +126,9 @@ print(rows.to_pandas())
 <LangTab lang="rust">
 
 ```rust
-use wyrd_ai::{Bifrost, bifrost::QueryParam};
+use wyrd_ai::{Bifrost, bifrost::{BifrostOptions, QueryParam}};
 
-let rows = Bifrost::from_env()
+let rows = Bifrost::connect(BifrostOptions::default())
     .await?
     .sql(
         "SELECT result_id, verdict, verifier_version FROM vala.verification.results \

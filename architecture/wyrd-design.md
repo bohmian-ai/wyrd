@@ -303,6 +303,20 @@ belongs in `wyrd-sdk-python`. Consolidating all existing Python logic there is
 the target direction, not a reason for unrelated code movement during this
 merge.
 
+Every server-facing handle shares one construction vocabulary. Rust spells
+it `connect()` for the ambient client and `connect_with(&client)` for a
+supplied one; TypeScript has only `static async connect({ client? })` behind
+a private constructor; Python has `connect(client=None)` beside an IO-free
+constructor that connects once on the handle's first server operation.
+`connect` is eager: it resolves the client and completes any credential
+exchange that client requires before returning, while a supplied bearer or a
+fresh cached token makes no request and no health probe is added. A handle
+retains that one client, with its renewable token cache, for its lifetime.
+Local loaders (`from_path` / `from_path_with`) are not connected handles and
+stay lazy. Bifrost lists the caller's tables with `list_tables` /
+`listTables`, which returns compact entries, and describes one table's schema
+on demand.
+
 Bifrost follows the same rule:
 
 ```text

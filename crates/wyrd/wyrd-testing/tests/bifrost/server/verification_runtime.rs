@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
+use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::array::{
     Array, ArrayRef, AsArray, BinaryArray, FixedSizeBinaryArray, Float64Array, Int32Array,
@@ -407,7 +408,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         Some(api_key.expose_secret()),
         scribe.grpc_url().as_deref(),
     )?;
-    Bifrost::connect(&writer)
+    Bifrost::connect_with(&writer, BifrostOptions::default())
         .await?
         .write_batch(
             "vala.drift.observations",
@@ -1967,8 +1968,16 @@ impl VariantAdmissionJourney {
             Some(api_key.expose_secret()),
             journey.gateway.server.grpc_url().as_deref(),
         )?;
-        let spans = Arc::clone(TableConfig::describe(&client, SPANS).await?.user_schema());
-        let points = Arc::clone(TableConfig::describe(&client, POINTS).await?.user_schema());
+        let spans = Arc::clone(
+            TableConfig::describe_with(&client, SPANS)
+                .await?
+                .user_schema(),
+        );
+        let points = Arc::clone(
+            TableConfig::describe_with(&client, POINTS)
+                .await?
+                .user_schema(),
+        );
         Ok(Self {
             ingest: RawIngest::connect(&client).await?,
             client,
@@ -2051,7 +2060,7 @@ impl VariantAdmissionJourney {
             too_large(format!(r#"{{"big": {big}, "other": {deep}}}"#))?,
         ];
         for (context, expected) in cases {
-            let bifrost = Bifrost::connect(&self.client).await?;
+            let bifrost = Bifrost::connect_with(&self.client, BifrostOptions::default()).await?;
             let table = bifrost.writer_table(OBSERVATIONS).await?;
             let fields = table
                 .user_schema()
@@ -2668,7 +2677,7 @@ impl TypedPayloadJourney {
             Some(api_key.expose_secret()),
             self.gateway.server.grpc_url().as_deref(),
         )?;
-        Bifrost::connect(&writer)
+        Bifrost::connect_with(&writer, BifrostOptions::default())
             .await?
             .write_batch(OBSERVATIONS, &batch)
             .await?;

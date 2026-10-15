@@ -43,6 +43,21 @@ mod pg_tests {
     use wyrd_client::cards::ListCardsRequest;
     use wyrd_client::config::ClientConfig;
 
+    /// A client assembled from a real role-less service API key authenticates
+    /// data-plane requests through `x-wyrd-access-token`, never
+    /// `Authorization`.
+    ///
+    /// The key is exchanged at the real `/auth/token` first, priming the
+    /// client's token cache, so connecting `Cards` reuses that token without
+    /// another exchange. The listing is then refused only at the permission
+    /// check (403), while the same JWT sent only as `Authorization` is
+    /// unauthenticated (401).
+    ///
+    /// # Panics
+    /// Panics when the server, bootstrap, client assembly, key exchange,
+    /// handle connection, or control request fails; when the listing
+    /// succeeds or is refused with a code other than the RBAC denial; or when
+    /// the `Authorization`-only request is not answered 401.
     #[tokio::test(flavor = "multi_thread")]
     async fn wyrd_client_authenticates_via_wyrd_access_token_header() {
         let srv = wyrd_testing::WyrdTestServer::start_bound()
@@ -83,7 +98,9 @@ mod pg_tests {
 
         // (2) Data-plane: the request carries x-wyrd-access-token, so the server
         // authenticates the principal and rejects only at the permission check.
-        let err = Cards::with_client(WyrdClient::clone(&client))
+        let err = Cards::connect_with(&client)
+            .await
+            .expect("handle connects")
             .list(ListCardsRequest {
                 kind: None,
                 space: None,

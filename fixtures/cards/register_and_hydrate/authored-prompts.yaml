@@ -13,3 +13,5 @@ spec:
       ref: ./native-prompt.yaml
     - alias: agent
       ref: ./inline-prompt-agent.yaml
+    - alias: native-agent
+      ref: ./inline-native-prompt-agent.yaml

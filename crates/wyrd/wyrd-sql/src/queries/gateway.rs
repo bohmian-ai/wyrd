@@ -856,13 +856,15 @@ const BATCH_SQL: &str = r"
      WHERE batch_id = $1
 ";
 
-/// Lists created batches newest first below an optional cursor, restricted,
-/// unless `$3` is NULL, to models of deployments `$3` or exact addresses `$4`.
+/// Lists created batches newest first below an optional cursor, restricted to
+/// models of deployments `$3`, exact addresses `$4`, or, unless `$5` is NULL,
+/// any deployment not named in `$5`.
 const BATCHES_SQL: &str = r"
     SELECT batch_id, file_id, model, deployment, upstream_batch_id, batch
       FROM wyrd.gateway_batches
      WHERE upstream_batch_id IS NOT NULL AND ($1::uuid IS NULL OR batch_id < $1)
-       AND ($3::text[] IS NULL OR split_part(model, '/', 1) = ANY($3) OR model = ANY($4::text[]))
+       AND (split_part(model, '/', 1) = ANY($3::text[]) OR model = ANY($4::text[])
+            OR ($5::text[] IS NOT NULL AND split_part(model, '/', 1) <> ALL($5::text[])))
      ORDER BY batch_id DESC
      LIMIT $2
 ";
@@ -991,9 +993,11 @@ pub async fn gateway_batch(
 /// Lists at most `limit` created batches, newest first, strictly older than
 /// the `after` cursor when given.
 ///
-/// `eligible`, when given, is the `(deployments, models)` pair of deployment
-/// names and exact `<deployment>/<model>` addresses a batch's model must match; it
-/// lets a caller prune batches it can never see inside this one bounded read.
+/// A batch is listed when its model's deployment is one of `deployments`,
+/// its model is one of the exact `<deployment>/<model>` addresses in `models`,
+/// or, when `open_except` is given, its deployment is not named there. The
+/// pruning happens before `limit`, so a caller never pages through batches it
+/// can never see inside this one bounded read.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the query.
@@ -1001,13 +1005,16 @@ pub async fn gateway_batches(
     conn: &mut TenantConn<'_>,
     after: Option<Uuid>,
     limit: i64,
-    eligible: Option<(&[String], &[String])>,
+    deployments: &[String],
+    models: &[String],
+    open_except: Option<&[String]>,
 ) -> Result<Vec<GatewayBatchRow>, Error> {
     sqlx::query_as::<_, GatewayBatchRow>(BATCHES_SQL)
         .bind(after)
         .bind(limit)
-        .bind(eligible.map(|(deployments, _)| deployments))
-        .bind(eligible.map_or(&[][..], |(_, models)| models))
+        .bind(deployments)
+        .bind(models)
+        .bind(open_except)
         .fetch_all(&mut **conn.transaction())
         .await
 }

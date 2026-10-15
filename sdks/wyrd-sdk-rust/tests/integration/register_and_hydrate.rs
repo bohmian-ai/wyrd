@@ -457,29 +457,34 @@ fn authored_spec(card: &Card) -> serde_json::Value {
     serde_json::to_value(card).expect("Card serializes")["spec"].clone()
 }
 
-/// The sorted variables a registered Prompt Card derives from its authored
-/// text.
+/// The sorted variables and response schema a Prompt Card derives from its
+/// authored text, `None` for a text response.
 ///
 /// # Panics
-/// Panics when the Card is not a Prompt.
-fn derived_variables(card: &Card) -> Vec<String> {
+/// Panics when the Card is not a Prompt or its response type does not
+/// serialize.
+fn derived(card: &Card) -> (Vec<String>, Option<serde_json::Value>) {
     let Spec::Prompt(prompt) = &card.spec else {
         panic!("the Card is a Prompt");
     };
     let mut variables = prompt.prompt.variables.clone();
     variables.sort();
-    variables
+    let response = serde_json::to_value(&prompt.prompt.response_type).expect("response serializes");
+    (variables, response["json_schema"].get("schema").cloned())
 }
 
-/// Portable, native, and inline-Agent Prompts register, read back, re-register
-/// idempotently, and hydrate exactly as authored with their variables derived;
-/// the inline Agent Prompt registers as the Agent's own `<agent>-prompt` Card
-/// the hydrated Agent navigates to; a Prompt carrying a removed field is
-/// refused before registration.
+/// Portable and native Prompts, standalone and inline in an Agent, register,
+/// read back, re-register idempotently, and hydrate exactly as authored with
+/// the same spec hash, which is the authored spec's canonical hash, and the
+/// same derived variables and response schema; each inline Agent Prompt
+/// registers as the Agent's own `<agent>-prompt` Card the hydrated Agent
+/// navigates to; a Prompt carrying a removed field is refused before
+/// registration.
 ///
 /// # Panics
-/// Panics when a round trip changes the authored form, a re-registration
-/// mints a new reference, or the removed field is accepted.
+/// Panics when a round trip changes the authored form, hash, or derived
+/// metadata, a re-registration mints a new reference, or the removed field is
+/// accepted.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn prompt_forms_round_trip_as_authored() {
@@ -490,13 +495,26 @@ async fn prompt_forms_round_trip_as_authored() {
     let again = register(&cards, fixture_path).await;
     let bundle = hydrate(&cards, &receipt.root).await;
     let state = WyrdState::from_path(bundle.path().join("bundle")).expect("bundle loads offline");
+    let answer_schema = Some(portable_spec()["response_format"].clone());
     let forms = [
-        ("portable-prompt", portable_spec(), vec!["question", "team"]),
-        ("native-prompt", native_spec(), vec!["ticket"]),
+        (
+            "portable-prompt",
+            portable_spec(),
+            vec!["question", "team"],
+            answer_schema.clone(),
+        ),
+        ("native-prompt", native_spec(), vec!["ticket"], None),
         (
             "inline-prompt-agent-prompt",
             portable_spec(),
             vec!["question", "team"],
+            answer_schema,
+        ),
+        (
+            "inline-native-prompt-agent-prompt",
+            native_spec(),
+            vec!["ticket"],
+            None,
         ),
     ];
 
@@ -504,12 +522,17 @@ async fn prompt_forms_round_trip_as_authored() {
         again.root, receipt.root,
         "the graph re-registers idempotently"
     );
-    assert_eq!(
-        state.agent("agent").expect("agent hydrates").prompt_ref(),
-        &registered(&receipt, "inline-prompt-agent-prompt"),
-        "the Agent navigates to its registered inline Prompt"
-    );
-    for (name, authored, variables) in forms {
+    for (alias, prompt) in [
+        ("agent", "inline-prompt-agent-prompt"),
+        ("native-agent", "inline-native-prompt-agent-prompt"),
+    ] {
+        assert_eq!(
+            state.agent(alias).expect("agent hydrates").prompt_ref(),
+            &registered(&receipt, prompt),
+            "{alias} navigates to its registered inline Prompt"
+        );
+    }
+    for (name, authored, variables, schema) in forms {
         let card_ref = registered(&receipt, name);
         let read = cards
             .get(CardSelector::exact(card_ref.clone()))
@@ -525,9 +548,27 @@ async fn prompt_forms_round_trip_as_authored() {
             "{name} hydrates as authored"
         );
         assert_eq!(
-            derived_variables(&read),
+            read.metadata.spec_hash,
+            Some(read.spec.canonical_hash().expect("the spec hashes")),
+            "{name} reads with its authored spec's hash"
+        );
+        assert_eq!(
+            hydrated.metadata.spec_hash, read.metadata.spec_hash,
+            "{name} hydrates with its registered hash"
+        );
+        let expected = (
             variables.into_iter().map(String::from).collect::<Vec<_>>(),
-            "{name} derives variables"
+            schema,
+        );
+        assert_eq!(
+            derived(&read),
+            expected,
+            "{name} reads its derived metadata"
+        );
+        assert_eq!(
+            derived(hydrated),
+            expected,
+            "{name} hydrates its derived metadata"
         );
         assert_eq!(
             registered(&again, name),

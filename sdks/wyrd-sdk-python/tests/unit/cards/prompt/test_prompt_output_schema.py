@@ -77,3 +77,21 @@ def test_output_that_is_not_a_schema_is_refused(output: Any) -> None:
         Prompt(messages=["Hi."], model="gpt-test", provider="openai", output=output)
 
     assert exc.value.code == "WYRD_PROMPT_400_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("output", "provider"),
+    [
+        pytest.param(
+            {"type": "object", "properties": {"a": {"type": "text"}}}, "openai", id="type"
+        ),
+        pytest.param({"type": "object", "required": "a"}, "anthropic", id="required"),
+        pytest.param({"type": "object", "properties": []}, "openai", id="properties"),
+        pytest.param({"type": "array", "items": {"type": "string"}}, "openai", id="strict-root"),
+    ],
+)
+def test_invalid_output_schema_is_refused_before_dispatch(output: Any, provider: str) -> None:
+    with pytest.raises(WyrdError) as exc:
+        Prompt(messages=["Hi."], model="model-1", provider=provider, output=output)
+
+    assert exc.value.code == "WYRD_PROMPT_400_INVALID"

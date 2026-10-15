@@ -17,6 +17,7 @@ def test_agent_cards_are_not_registerable(offline_cards: Cards) -> None:
     """The unscoped registry rejects envelope-only Agent holders locally."""
     card = AgentCard(
         PromptReference.inline(Prompt.openai_chat("gpt-4o", messages="hello")),
+        execution_route={"kind": "native"},
         space="unit",
         name="agent",
         version="0.1.0",

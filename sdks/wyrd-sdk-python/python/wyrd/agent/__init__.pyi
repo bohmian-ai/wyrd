@@ -352,6 +352,7 @@ class Agent:
         provider_api_key: str | None = ...,
         output_type: type | None = ...,
         mock_provider: MockProvider | None = ...,
+        execution_route: Mapping[str, str] | None = ...,
     ) -> None:
         """Create an Agent.
 
@@ -393,6 +394,12 @@ class Agent:
             mock_provider (MockProvider | None): Run `provider="mock"` prompts offline
                 against this provider instead of the process default registry. Cannot be
                 combined with `provider_base_url`.
+            execution_route (Mapping[str, str] | None): Route saved with the Agent Card:
+                ``{"kind": "native"}`` (the default) or
+                ``{"kind": "wyrd_gateway", "deployment": <name>}``. A local Agent has no
+                gateway caller, so running a ``wyrd_gateway`` route here is refused with
+                ``WYRD_AGENT_422_INVALID_ARGUMENT`` before any provider IO; invoke it
+                through ``wyrd.observe`` instead.
         """
         ...
 
@@ -512,6 +519,7 @@ class Agent:
         *,
         session_id: str | None = ...,
         output_type: type | None = ...,
+        execution_route: Mapping[str, str] | None = ...,
     ) -> AgentRun:
         """Run the bounded model/tool loop to completion, blocking until it ends.
 
@@ -527,6 +535,8 @@ class Agent:
                 used.
             output_type: as ``Agent(output_type=)``, for this call only; it
                 takes precedence over the Agent's and the Prompt's class.
+            execution_route: replaces the Agent's declared route whole for this
+                run only; the Agent and its Card keep their own route.
 
         Returns:
             The completed run, with its output and turns.
@@ -537,7 +547,10 @@ class Agent:
                 ``WYRD_AGENT_404_TOOL_NOT_IN_AGENT`` when the model calls an
                 unattached tool, ``WYRD_AGENT_422_STRUCTURED_DECODE`` when the
                 declared JSON output or ``output_type`` cannot be parsed,
-                ``WYRD_SESSION_500_RECENT`` or ``WYRD_SESSION_500_APPEND``.
+                ``WYRD_SESSION_500_RECENT`` or ``WYRD_SESSION_500_APPEND``;
+                ``WYRD_AGENT_422_INVALID_ARGUMENT`` before any IO for a
+                ``wyrd_gateway`` route, which a local Agent cannot serve; and
+                ``WYRD_SPEC_400_VALIDATION`` for a malformed ``execution_route``.
         """
         ...
 

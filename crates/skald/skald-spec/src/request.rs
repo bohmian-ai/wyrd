@@ -89,6 +89,7 @@ impl ProviderName {
 }
 
 impl std::str::FromStr for ProviderName {
+    /// Human-readable reason a provider name was refused.
     type Err = String;
 
     /// Parse a built-in name, or else a custom name of lowercase ASCII
@@ -132,18 +133,34 @@ impl std::str::FromStr for ProviderName {
 }
 
 impl std::fmt::Display for ProviderName {
+    /// Writes the authored spelling from [`ProviderName::as_str`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatter's error when writing fails.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
 impl Serialize for ProviderName {
+    /// Serializes the authored spelling as a string.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serializer's error.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
     }
 }
 
 impl<'de> Deserialize<'de> for ProviderName {
+    /// Decodes a string and parses it with [`ProviderName::from_str`](std::str::FromStr::from_str).
+    ///
+    /// # Errors
+    ///
+    /// Returns the deserializer's error for a non-string and a custom error
+    /// carrying the parse refusal for an invalid name.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         String::deserialize(deserializer)?
             .parse()
@@ -153,10 +170,12 @@ impl<'de> Deserialize<'de> for ProviderName {
 
 #[cfg(feature = "schemars")]
 impl schemars::JsonSchema for ProviderName {
+    /// Names the schema `ProviderName`.
     fn schema_name() -> String {
         "ProviderName".to_owned()
     }
 
+    /// Publishes the name as a plain string schema.
     fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
         String::json_schema(generator)
     }

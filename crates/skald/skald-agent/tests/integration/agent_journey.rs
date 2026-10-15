@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use skald_agent::{
     Agent, FinishReason, RunConfig, WyrdGatewayCall, WyrdGatewayCaller, clear_prompt_card_registry,
-    default_prompt_resolver, register_prompt_card, wyrd_gateway_registry,
+    default_prompt_resolver, register_prompt_card,
 };
 use skald_providers::ProviderError;
 use tokio_util::sync::CancellationToken;
@@ -287,45 +287,67 @@ impl WyrdGatewayCaller for ScriptedGateway {
     }
 }
 
-/// Two concurrent runs of one Agent definition bound to different gateway
-/// deployments keep their own route on every call of the bounded tool loop:
-/// each model call, before and after the tool, targets only its run's
-/// deployment with the Prompt's model, and neither run falls back to the
-/// host provider registry, which is empty here.
+/// A gateway Agent loaded from its Card keeps its declared route through
+/// save and load, and that route — not the host's native providers — serves
+/// every call of the bounded tool loop. A concurrent run overriding the route
+/// on a clone targets only its own deployment while the loaded Agent and its
+/// Card keep theirs, and the host's native fixture receives no call.
+///
+/// # Panics
+/// Panics when the route is lost on save/load, a run fails, a model call
+/// targets another deployment, or the native fixture is called.
 #[tokio::test]
 async fn execution_route_isolated_through_tool_loop() {
     let tool = Arc::new(RecordingTool::new(
         "lookup",
         serde_json::json!({"found": true}),
     ));
-    let prompt = callback_prompt();
-    let routed = |deployment: &str| {
-        let caller = Arc::new(ScriptedGateway {
+    let declared = wyrd_spec::ExecutionRoute::WyrdGateway {
+        deployment: ProviderDeploymentName::new("primary").expect("deployment name"),
+    };
+    let yaml = Agent::from_resolved("routed", callback_prompt())
+        .name("routed")
+        .version("1.0.0")
+        .add_tool(tool.clone())
+        .with_run_config(RunConfig {
+            max_iterations: 3,
+            ..Default::default()
+        })
+        .with_execution_route(declared.clone())
+        .to_yaml_string()
+        .expect("agent serializes");
+    let tools = ToolRegistry::new();
+    tools.register(tool.clone()).expect("tool registers");
+    let loaded =
+        Agent::from_yaml_str(&yaml, &tools, default_prompt_resolver()).expect("agent loads");
+    assert_eq!(loaded.execution_route(), &declared);
+    assert_eq!(loaded.to_yaml_string().expect("agent re-serializes"), yaml);
+
+    let gateway = |order: &str| {
+        Arc::new(ScriptedGateway {
             replies: std::sync::Mutex::new(VecDeque::from([
                 openai_tool_call_response(vec![tool_call(
                     "c1",
                     "lookup",
-                    serde_json::json!({"order": deployment}),
+                    serde_json::json!({"order": order}),
                 )]),
                 callback_text_response("done"),
             ])),
             targets: std::sync::Mutex::new(Vec::new()),
-        });
-        let deployment = ProviderDeploymentName::new(deployment).expect("deployment name");
-        let registry = wyrd_gateway_registry(caller.clone(), prompt.native(), &deployment)
-            .expect("gpt-4o is a gateway model");
-        let agent = Agent::from_resolved("routed", Arc::clone(&prompt))
-            .add_tool(tool.clone())
-            .with_run_config(RunConfig {
-                max_iterations: 3,
-                ..Default::default()
-            })
-            .with_provider_registry(Arc::new(registry));
-        (caller, agent)
+        })
     };
-    let (primary, primary_agent) = routed("primary");
-    let (backup, backup_agent) = routed("backup");
-    let host = ProviderRegistry::new();
+    let (primary, backup) = (gateway("primary"), gateway("backup"));
+    let primary_agent = loaded.clone().with_gateway_caller(primary.clone());
+    let backup_agent = loaded
+        .clone()
+        .with_execution_route(wyrd_spec::ExecutionRoute::WyrdGateway {
+            deployment: ProviderDeploymentName::new("backup").expect("deployment name"),
+        })
+        .with_gateway_caller(backup.clone());
+    let native = MockProvider::new(ProviderName::OpenAi);
+    native.push_response(callback_text_response("native"));
+    let mut host = ProviderRegistry::new();
+    host.register(Arc::new(native.clone()));
 
     let (primary_run, backup_run) = tokio::join!(
         primary_agent.run_with(&host, None, "where is my order?"),
@@ -346,4 +368,37 @@ async fn execution_route_isolated_through_tool_loop() {
     assert_eq!(targets(&primary), ["primary/gpt-4o", "primary/gpt-4o"]);
     assert_eq!(targets(&backup), ["backup/gpt-4o", "backup/gpt-4o"]);
     assert_eq!(tool.calls().len(), 2, "each run called the tool once");
+    assert_eq!(native.remaining(), 1, "the native fixture was never called");
+    assert_eq!(
+        loaded.execution_route(),
+        &declared,
+        "the override was local"
+    );
+}
+
+/// A gateway Agent with no gateway caller refuses before any IO instead of
+/// reaching the host's native provider credentials.
+///
+/// # Panics
+/// Panics when the run does not fail with `SKALD_AGENT_422_INVALID_ARGUMENT`
+/// or the native fixture is called.
+#[tokio::test]
+async fn gateway_route_without_a_caller_refuses_before_native_io() {
+    let native = MockProvider::new(ProviderName::OpenAi);
+    native.push_response(callback_text_response("native"));
+    let mut host = ProviderRegistry::new();
+    host.register(Arc::new(native.clone()));
+    let agent = Agent::from_resolved("routed", callback_prompt()).with_execution_route(
+        wyrd_spec::ExecutionRoute::WyrdGateway {
+            deployment: ProviderDeploymentName::new("primary").expect("deployment name"),
+        },
+    );
+
+    let error = agent
+        .run_with(&host, None, "hello")
+        .await
+        .expect_err("a gateway route without a caller refuses");
+
+    assert_eq!(error.code(), "SKALD_AGENT_422_INVALID_ARGUMENT");
+    assert_eq!(native.remaining(), 1, "the native fixture was never called");
 }

@@ -63,6 +63,14 @@ pub const RUN_HEADER: &str = "wyrd-run-id";
 /// to; it appears together with [`RUN_HEADER`] or not at all.
 pub const CARD_UID_HEADER: &str = "wyrd-card-uid";
 
+/// Request header naming the Prompt provider of an Agent call, such as
+/// `openai` or `google`.
+///
+/// It binds the requested deployment's adapter to the Prompt-provider
+/// compatibility matrix before any IO; fallback candidates keep ordinary
+/// conversion, and a call without it is a direct client call.
+pub const PROMPT_PROVIDER_HEADER: &str = "wyrd-prompt-provider";
+
 /// Longest accepted [`RUN_HEADER`] value, in bytes.
 pub const MAX_RUN_HEADER_BYTES: usize = 128;
 

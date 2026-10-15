@@ -274,8 +274,14 @@ credential.
 - A delegated token is bound to the `wyrd` or `bifrost` audience; a `bifrost`
   token is refused outside the Bifrost ingest and query surfaces.
 - Delegation depth is bounded, every hop is authorized, and the effective
-  permission set is the intersection of the actor's current permissions and
-  the subject's, so it can only narrow.
+  permission set is the exact intersection of the actor's current permissions
+  and the subject's, so it can only narrow. If the complete intersection cannot
+  be represented by existing token scopes, refuse exchange before signing and
+  issue no token. Do not silently discard common authority or widen a grant.
+  Preserve explicit deployment/model grants beside `all`: only those explicit
+  grants admit matching `granted` deployments. Representable mixed-grant
+  intersections remain supported. Refusal stages its authorization decision on
+  the existing nonblocking audit outbox.
 - External federation accepts tokens only from an explicitly configured
   issuer, audience, algorithm, and claim mapping. OIDC discovery does not make
   an issuer trusted.

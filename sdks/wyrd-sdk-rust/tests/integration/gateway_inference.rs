@@ -726,6 +726,161 @@ async fn agent_routes_and_pre_run_overrides() {
     inference.deployment.shutdown().await;
 }
 
+/// Agents whose Anthropic, Google, and Jev Prompts route to deployments named
+/// `claude-prod`, `vertex` (a Gemini deployment), and `judge-pool` reach
+/// their native ingress with the full address: each upstream receives the
+/// complete Prompt model, including the Google model's slash, and the Jev
+/// Agent answers in one call with its keyed answers. A Vertex Prompt routed
+/// through the public gateway, and an OpenAI Agent overridden onto the
+/// Anthropic or Gemini deployment its Prompt is not compatible with, are refused
+/// before any upstream IO.
+///
+/// # Panics
+/// Panics when a step fails or an answer, refusal, or upstream target
+/// differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn agent_routes_reach_named_native_ingress() {
+    let inference = Inference::start().await;
+    for (name, provider, adapter, header, operation) in [
+        (
+            "claude-prod",
+            "anthropic",
+            ProviderAdapter::Anthropic,
+            Some("x-api-key"),
+            GatewayOperation::ChatCompletions,
+        ),
+        (
+            "vertex",
+            "gemini",
+            ProviderAdapter::Gemini,
+            Some("x-goog-api-key"),
+            GatewayOperation::ChatCompletions,
+        ),
+        (
+            "judge-pool",
+            "jev",
+            ProviderAdapter::Jev,
+            None,
+            GatewayOperation::SystemOne,
+        ),
+    ] {
+        put_named(
+            &inference.deployment,
+            name,
+            provider,
+            adapter,
+            header,
+            operation,
+        )
+        .await;
+    }
+    for (upstream_path, reply) in [
+        (
+            "/v1/messages",
+            json!({
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-sonnet-4-5",
+                "content": [{ "type": "text", "text": "hi" }], "stop_reason": "end_turn",
+                "usage": { "input_tokens": 3, "output_tokens": 1 },
+            }),
+        ),
+        (
+            "/v1beta/models/tuned%2Fgemini-2.5-flash:generateContent",
+            json!({
+                "candidates": [{ "content": { "role": "model", "parts": [{ "text": "hi" }] }, "finishReason": "STOP" }],
+                "usageMetadata": { "promptTokenCount": 3, "candidatesTokenCount": 1, "totalTokenCount": 4 },
+            }),
+        ),
+        (
+            "/v1/systemone",
+            json!({
+                "model": "jev-latest",
+                "answers": { "helpful": { "type": "noul", "noul": 0.9 } },
+                "usage": { "input_tokens": 3, "output_tokens": 1 },
+            }),
+        ),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(upstream_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+            .mount(&inference.upstream)
+            .await;
+    }
+    let cards = inference.deployment.cards().await;
+    let service = register(&cards, "cards/gateway_inference/routed-service.yaml").await;
+    let bundle = hydrate(&cards, &service.root).await;
+    let client = inference
+        .deployment
+        .client(&inference.deployment.service_key(&service.root).await);
+    let state = WyrdState::from_path_with(bundle.path().join("bundle"), client)
+        .expect("bundle loads offline");
+    let invoke = |alias: &str| {
+        let run = state.run_for_card(alias).expect("agent view resolves");
+        async move { run.invoke(&[("question", "hi")]).await }
+    };
+
+    let vertex = invoke("vertex")
+        .await
+        .expect_err("a Vertex Prompt is refused locally");
+    assert_eq!(vertex.code(), "WYRD_AGENT_422_VALIDATION", "{vertex}");
+    assert_eq!(invoke("claude").await.expect("Claude answers"), "hi");
+    assert_eq!(invoke("gemini").await.expect("Gemini answers"), "hi");
+    let answers: Value =
+        serde_json::from_str(&invoke("jev").await.expect("Jev answers")).expect("answers JSON");
+    assert_eq!(
+        answers,
+        json!({ "helpful": { "type": "noul", "noul": 0.9 } })
+    );
+
+    let asks = register(&cards, "cards/gateway_inference/ask-service.yaml").await;
+    let asks = WyrdState::from_path_with(
+        hydrate(&cards, &asks.root).await.path().join("bundle"),
+        inference
+            .deployment
+            .client(&inference.deployment.service_key(&asks.root).await),
+    )
+    .expect("bundle loads offline");
+    let openai_agent = asks.run_for_card("agent").expect("agent view resolves");
+    for deployment in ["claude-prod", "vertex"] {
+        let route = ExecutionRoute::WyrdGateway {
+            deployment: ProviderDeploymentName::new(deployment).expect("deployment name"),
+        };
+        let refused = openai_agent
+            .invoke_on(&route, &[("question", "hi")])
+            .await
+            .expect_err("an OpenAI Prompt cannot start on a non-OpenAI adapter");
+        assert_eq!(
+            refused.code(),
+            "WYRD_GATEWAY_400_INVALID_REQUEST",
+            "{deployment}: {refused}"
+        );
+    }
+
+    let targets = inference
+        .upstream
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .iter()
+        .map(|request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            (request.url.path().to_owned(), body["model"].clone())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets,
+        vec![
+            ("/v1/messages".to_owned(), json!("claude-sonnet-4-5")),
+            (
+                "/v1beta/models/tuned%2Fgemini-2.5-flash:generateContent".to_owned(),
+                Value::Null
+            ),
+            ("/v1/systemone".to_owned(), json!("jev-latest")),
+        ]
+    );
+    inference.deployment.shutdown().await;
+}
+
 /// An external OpenAI-compatible gateway onboarded as the deployment
 /// `support-gateway` receives the addressed model unchanged, including its
 /// own slashes, authenticated by the uploaded `external` credential and never

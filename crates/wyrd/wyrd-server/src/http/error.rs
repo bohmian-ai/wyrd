@@ -620,6 +620,7 @@ mod error_mapper_tests {
             UnsupportedGrantType,
             DeviceAuthorization,
             DelegationDepthExceededIssue,
+            UnrepresentableDelegation,
             PrincipalKindCardKindMismatch,
             InvalidCardRefVersion,
             CredentialRevoked,

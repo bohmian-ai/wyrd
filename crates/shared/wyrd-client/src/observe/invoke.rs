@@ -9,9 +9,7 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use skald_agent::{
-    Agent, AgentError, run_config_from_agent_run_config_spec, wyrd_gateway_registry,
-};
+use skald_agent::{Agent, AgentError, run_config_from_agent_run_config_spec};
 use skald_providers::ProviderError;
 use skald_runtime::SkaldRuntimeError;
 use skald_spec::ProviderName;
@@ -64,10 +62,10 @@ impl Run {
     ///
     /// # Errors
     /// Returns `WYRD_SDK_400_CARD_KIND_MISMATCH` when this view is not an
-    /// Agent; `WYRD_AGENT_422_VALIDATION` when the Agent declares tools, its
-    /// Prompt model is not a gateway model identifier, or a gateway route
-    /// targets a Vertex Prompt, which the public gateway ingress does not
-    /// serve; `WYRD_SDK_400_INVALID_STATE_BUNDLE` when its Prompt is
+    /// Agent; `WYRD_AGENT_422_VALIDATION` when the Agent declares tools or a
+    /// gateway route targets a Vertex Prompt, which the public gateway ingress
+    /// does not serve; `WYRD_AGENT_422_INVALID_ARGUMENT` when its Prompt model
+    /// is not a gateway model identifier; `WYRD_SDK_400_INVALID_STATE_BUNDLE` when its Prompt is
     /// unresolved; the gateway's own stable error (such as
     /// `WYRD_PERMISSION_403_DENIED_RBAC` or `WYRD_GATEWAY_404_MODEL_UNAVAILABLE`)
     /// when it refuses the call; and the Agent runtime's error for any other
@@ -89,8 +87,9 @@ impl Run {
         let mut agent = Agent::new(skald_prompt::Prompt::from_native(prompt.clone()))
             .with_id(card.name.clone())
             .with_tools(std::iter::empty())
-            .with_run_config(run_config_from_agent_run_config_spec(&card.spec.run_config));
-        if let ExecutionRoute::WyrdGateway { deployment } = route {
+            .with_run_config(run_config_from_agent_run_config_spec(&card.spec.run_config))
+            .with_execution_route(route.clone());
+        if matches!(route, ExecutionRoute::WyrdGateway { .. }) {
             if prompt.provider() == ProviderName::Vertex {
                 return Err(invalid_agent(
                     &self.alias,
@@ -99,14 +98,7 @@ impl Run {
             }
             let caller = PublicWyrdGatewayCaller::new(self.state.client()?.clone())
                 .with_subject(Some(&self.run_id), Some(self.subject_uid()));
-            let registry =
-                wyrd_gateway_registry(Arc::new(caller), prompt, deployment).ok_or_else(|| {
-                    invalid_agent(
-                        &self.alias,
-                        "the Agent Prompt's model is not a gateway model identifier",
-                    )
-                })?;
-            agent = agent.with_provider_registry(Arc::new(registry));
+            agent = agent.with_gateway_caller(Arc::new(caller));
         }
         agent
             .run_prompt(

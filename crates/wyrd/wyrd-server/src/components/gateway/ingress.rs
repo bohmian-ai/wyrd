@@ -20,6 +20,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
+use skald_spec::ProviderName;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use wyrd_gateway::IngressDialect;
@@ -32,7 +33,8 @@ use wyrd_spec::gateway::native::{
 use wyrd_spec::gateway::openai::OpenAiErrorEnvelope;
 use wyrd_spec::gateway::{
     CARD_UID_HEADER, FALLBACK_HEADER, GatewayContractError, GatewayFallbackOverride,
-    GatewayOperation, GatewayUsageAmount, MAX_RUN_HEADER_BYTES, ModelRef, RUN_HEADER,
+    GatewayOperation, GatewayUsageAmount, MAX_RUN_HEADER_BYTES, ModelRef, PROMPT_PROVIDER_HEADER,
+    RUN_HEADER,
 };
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
@@ -284,6 +286,46 @@ pub(super) const CARD_UID_HEADER_DOC: &str = "Optional Card the call is attribut
     with WYRD_VALA_403_BIFROST_CARD_SCOPE. Every refusal precedes dispatch. The header never \
     reaches a provider.";
 
+/// OpenAPI description of the optional `wyrd-prompt-provider` request header.
+pub(super) const PROMPT_PROVIDER_HEADER_DOC: &str = "Optional Prompt provider of an Agent \
+    call: `openai`, `anthropic`, `google`, `vertex`, `jev`, or a custom provider name. The \
+    requested deployment's adapter must be compatible with it (`openai` and custom: `openai` or \
+    `openai_compatible`; `anthropic`: `anthropic`; `google`: `gemini`; `vertex`: `vertex`; \
+    `jev`: `jev`), or the call is refused before dispatch with \
+    WYRD_GATEWAY_400_INVALID_REQUEST naming `model`; fallback candidates keep ordinary \
+    conversion. A repeated or invalid value is refused naming the header. Absent means a direct \
+    client call. The header never reaches a provider.";
+
+/// Reads the optional Prompt provider of an Agent call from its
+/// `wyrd-prompt-provider` header.
+///
+/// The header is consumed here and never reaches a provider; its absence
+/// marks a direct client call that keeps ordinary protocol translation.
+///
+/// # Errors
+/// Returns `GatewayInvalidRequest` naming the header when it repeats or its
+/// value is not a provider name.
+pub(super) fn requested_prompt_provider(
+    headers: &HeaderMap,
+) -> Result<Option<ProviderName>, WyrdError> {
+    let invalid =
+        |reason| invalid_request(GatewayContractError::new(PROMPT_PROVIDER_HEADER, reason));
+    let mut values = headers.get_all(PROMPT_PROVIDER_HEADER).iter();
+    let value = values.next();
+    if values.next().is_some() {
+        return Err(invalid("must appear at most once"));
+    }
+    value
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|name| name.parse().ok())
+                .ok_or_else(|| invalid("must be a Prompt provider name"))
+        })
+        .transpose()
+}
+
 /// Reads the optional Run and Card attribution of a call from its
 /// independent `wyrd-run-id` and `wyrd-card-uid` headers.
 ///
@@ -341,7 +383,8 @@ pub(super) fn requested_subject(
     params(
         ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
-        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC),
+        ("wyrd-prompt-provider" = Option<String>, Header, description = PROMPT_PROVIDER_HEADER_DOC)
     ),
     request_body(content = GatewayAnthropicMessagesRequest, description = "Anthropic Messages request whose `model` is an exact Anthropic model id; the Wyrd access token, or a `wyrd_sk_` Wyrd API key the gateway exchanges for one, travels in `x-api-key` or an `Authorization` bearer"),
     responses(
@@ -408,6 +451,7 @@ pub(crate) async fn anthropic_messages(
                     deployment: None,
                     timeout: PUBLIC_CALL_TIMEOUT,
                     subject: requested_subject(&headers)?,
+                    prompt_provider: requested_prompt_provider(&headers)?,
                 })
             });
             match call {
@@ -428,7 +472,8 @@ pub(crate) async fn anthropic_messages(
     params(
         ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
-        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC),
+        ("wyrd-prompt-provider" = Option<String>, Header, description = PROMPT_PROVIDER_HEADER_DOC)
     ),
     request_body(content = GatewayJevRequest, description = "Jev systemone request whose `model` is an exact Jev model id, such as `jev-latest`, with keyed `noul`, `choice`, or `score` questions about `state`"),
     responses(
@@ -487,7 +532,7 @@ pub(crate) async fn jev_systemone(
 /// # Errors
 /// Returns `GatewayInvalidRequest` naming `body` or the missing member for a
 /// body that is not a Jev request, `model` for an invalid model id, and every
-/// error of [`requested_fallback`] and [`requested_subject`].
+/// error of [`requested_fallback`], [`requested_subject`], and [`requested_prompt_provider`].
 fn jev_call(
     headers: &HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
@@ -511,6 +556,7 @@ fn jev_call(
         deployment: None,
         timeout: PUBLIC_CALL_TIMEOUT,
         subject: requested_subject(headers)?,
+        prompt_provider: requested_prompt_provider(headers)?,
     })
 }
 
@@ -523,7 +569,8 @@ fn jev_call(
         ("alt" = Option<String>, Query, description = "`sse` for streamGenerateContent; `json` or absent for generateContent"),
         ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
-        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC),
+        ("wyrd-prompt-provider" = Option<String>, Header, description = PROMPT_PROVIDER_HEADER_DOC)
     ),
     request_body(content = GatewayGeminiGenerateContentRequest, description = "Gemini GenerateContent request; the Wyrd access token, or a `wyrd_sk_` Wyrd API key the gateway exchanges for one, travels in `x-goog-api-key` or an `Authorization` bearer"),
     responses(
@@ -593,8 +640,8 @@ pub(crate) async fn gemini_generate_content(
 /// `generateContent` or `streamGenerateContent`, `alt` when it repeats or the
 /// response format does not match the method, `model` for an invalid model id,
 /// `body` or the missing member for a body that is not a `GenerateContent`
-/// request, and every error of [`requested_fallback`] and
-/// [`requested_subject`].
+/// request, and every error of [`requested_fallback`], [`requested_subject`],
+/// and [`requested_prompt_provider`].
 fn gemini_call(
     target: &str,
     query: Option<&str>,
@@ -648,6 +695,7 @@ fn gemini_call(
         deployment: None,
         timeout: PUBLIC_CALL_TIMEOUT,
         subject: requested_subject(headers)?,
+        prompt_provider: requested_prompt_provider(headers)?,
     })
 }
 

@@ -268,6 +268,7 @@ fn request(requested: &str, bound: Option<(u64, u64)>, timeout: Duration) -> Gat
         }),
         timeout,
         subject: None,
+        prompt_provider: None,
     }
 }
 
@@ -1270,6 +1271,7 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
             ordinal: NonZeroU32::MIN,
             deployment: ProviderDeploymentName::new("dep-a").expect("name"),
             model: model("dep-a/a"),
+            provider: "openai",
             outcome: GatewayCallOutcome::Succeeded,
             billable: true,
             usage: usage(40, 2),
@@ -1349,6 +1351,7 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
         })
         .expect("name"),
         model: model(served),
+        provider: "openai",
         outcome: GatewayCallOutcome::Succeeded,
         billable: true,
         usage,
@@ -1689,6 +1692,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         usage_bound: None,
         timeout: Duration::from_secs(10),
         subject: None,
+        prompt_provider: None,
     };
 
     let response = GatewayInvocation::new(&state)
@@ -3034,6 +3038,211 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
     drain_gateway(&d).await;
 }
 
+/// Batch dispatch is authorized against the snapshot that routes it, not the
+/// one `create` authorized before claiming: while a database barrier holds an
+/// `all` caller's creation after its first decision, the deployment turns
+/// `granted`; the released creation is then denied and audited before any
+/// provider request and leaves no pending claim, and the identical replay of
+/// an already created batch is denied before its provider refresh. A caller
+/// whose grant names the deployment still creates through the same race.
+///
+/// # Panics
+///
+/// Panics when the fixture, provider mock, barrier, or configuration cannot
+/// be set up, or when a status, claim, audit, or provider-request assertion
+/// differs.
+#[tokio::test]
+async fn gateway_batch_dispatch_reauthorizes_against_its_routing_snapshot() {
+    let _telemetry = wyrd_telemetry::init(wyrd_telemetry::TelemetryConfig {
+        filter: "info,wyrd_server::components::gateway=debug".to_owned(),
+        ..Default::default()
+    })
+    .expect("gateway test tracing installs");
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/files"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id": "file-up-1", "object": "file", "purpose": "batch"})),
+        )
+        .mount(&upstream)
+        .await;
+    let provider_batch = |status: &str| {
+        json!({"id": "b-up-1", "object": "batch", "status": status,
+               "endpoint": "/v1/chat/completions", "input_file_id": "file-up-1"})
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/batches"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_batch("validating")))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/batches/b-up-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_batch("completed")))
+        .mount(&upstream)
+        .await;
+    let secret = tempfile::NamedTempFile::new().expect("secret file");
+    std::fs::write(secret.path(), "sk-deepseek\n").expect("secret writes");
+    let scribe = Arc::new(RecordingScribe::default());
+    let state = scribe.record(http_replica(&fixture, tenant, secret.path()).await);
+    let base_url = format!("{}/v1", upstream.uri());
+    let scoped = batch_deployment(&state, tenant, &base_url).await;
+    let open = invoker(tenant, 8, [open_access()]);
+    let admin = admin(tenant);
+    // Replaces the `deepseek` deployment with the given `access`.
+    let deploy = |access: &'static str| {
+        let (state, admin, base_url) = (&state, &admin, &base_url);
+        async move {
+            GatewayAdministration::new(state)
+                .put_deployment(
+                    admin,
+                    &ProviderDeploymentName::new("deepseek").expect("name"),
+                    serde_json::from_value(json!({
+                        "name": "deepseek",
+                        "adapter": {"openai_compatible": {"base_url": base_url}},
+                        "auth": {"bearer": {"credential": "deepseek-key"}},
+                        "capabilities": ["batches"],
+                        "access": access,
+                    }))
+                    .expect("deployment decodes"),
+                )
+                .await
+                .expect("deployment stores");
+        }
+    };
+    let line = json!({"custom_id": "a", "method": "POST", "url": "/v1/chat/completions",
+        "body": {"model": "deepseek/deepseek-chat", "messages": [{"role": "user", "content": "hi"}]}});
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("multipart/form-data; boundary=wyrd"),
+    );
+    let form = format!(
+        "--wyrd\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n--wyrd\r\nContent-Disposition: form-data; name=\"file\"; filename=\"in.jsonl\"\r\nContent-Type: application/jsonl\r\n\r\n{line}\r\n--wyrd--\r\n"
+    );
+    let uploaded = super::routes::upload_file(
+        State(state.clone()),
+        Ok(scoped.clone()),
+        headers,
+        Ok(axum::body::Bytes::from(form)),
+    )
+    .await;
+    assert_eq!(uploaded.status(), StatusCode::OK);
+    let file_id = body_json(uploaded).await["id"]
+        .as_str()
+        .expect("file id")
+        .to_owned();
+    let create = |caller: &Caller, n: &str| {
+        super::routes::create_batch(
+            State(state.clone()),
+            Ok(caller.clone()),
+            Ok(Json(json!({
+                "input_file_id": file_id, "endpoint": "/v1/chat/completions",
+                "completion_window": "24h", "metadata": {"n": n},
+            }))),
+        )
+    };
+    let pending = || async {
+        let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM wyrd.gateway_batches WHERE upstream_batch_id IS NULL",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("claims read");
+        conn.commit().await.expect("read commits");
+        count
+    };
+    let received = |verb: &'static str| {
+        let upstream = &upstream;
+        async move {
+            upstream
+                .received_requests()
+                .await
+                .expect("recording")
+                .into_iter()
+                .filter(|request| {
+                    request.url.path().starts_with("/v1/batches") && request.method.as_str() == verb
+                })
+                .count()
+        }
+    };
+    // Holds `caller`'s creation `n` on the batch table after its first
+    // decision, turns the deployment `granted`, then releases it.
+    let race = |caller: &Caller, n: &'static str| {
+        let (fixture, deploy) = (&fixture, &deploy);
+        let creation = create(caller, n);
+        async move {
+            let mut barrier = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
+            sqlx::query("LOCK TABLE wyrd.gateway_batches IN EXCLUSIVE MODE")
+                .execute(&mut **barrier.transaction())
+                .await
+                .expect("barrier locks");
+            let creation = tokio::spawn(creation);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
+                    let waiting: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM pg_locks WHERE NOT granted \
+                         AND relation = 'wyrd.gateway_batches'::regclass",
+                    )
+                    .fetch_one(&mut **conn.transaction())
+                    .await
+                    .expect("locks read");
+                    conn.commit().await.expect("read commits");
+                    if waiting > 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the authorized creation waits on its claim");
+            deploy("granted").await;
+            barrier.commit().await.expect("barrier releases");
+            let answer = creation.await.expect("creation task");
+            deploy("open").await;
+            answer
+        }
+    };
+
+    // An `all` caller creates while the deployment is open.
+    let created = create(&open, "replay").await;
+    assert_eq!(created.status(), StatusCode::OK);
+    assert_eq!(received("POST").await, 1);
+
+    // A fresh creation authorized against the open snapshot is denied and
+    // audited against the granted one before dispatch; its claim is released.
+    drain_gateway(&state).await;
+    let decisions = audit_decisions(&scribe, tenant).len();
+    let denied = race(&open, "fresh").await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(pending().await, 0, "the undispatched claim is released");
+    assert_eq!(received("POST").await, 1, "no provider batch was created");
+    drain_gateway(&state).await;
+    let invocations = audit_decisions(&scribe, tenant)[decisions..]
+        .iter()
+        .filter(|(operation, _)| operation == "gateway.invoke")
+        .map(|(_, outcome)| outcome.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(invocations, ["allowed", "denied"]);
+
+    // The completed replay is denied before its provider refresh.
+    let replayed = race(&open, "replay").await;
+    assert_eq!(replayed.status(), StatusCode::FORBIDDEN);
+    assert_eq!(received("GET").await, 0, "no provider refresh was sent");
+
+    // A deployment-scoped grant survives the same race.
+    let allowed = race(&scoped, "scoped").await;
+    let status = allowed.status();
+    assert_eq!(status, StatusCode::OK, "{}", body_json(allowed).await);
+    assert_eq!(received("POST").await, 2);
+    assert_eq!(pending().await, 0);
+    drain_gateway(&state).await;
+}
+
 /// Waits for every spawned gateway task — accounting and post-answer
 /// capture — then reopens the tracker, and settles the audit and Scribe
 /// outboxes.
@@ -4278,6 +4487,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
         usage_bound: None,
         timeout: Duration::from_secs(10),
         subject: None,
+        prompt_provider: None,
     };
     let invocation = GatewayInvocation::new(&state);
 
@@ -4618,11 +4828,14 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
     );
 }
 
-/// Batch listing reads one bounded, grant-pruned page: more batches of a
-/// model the caller cannot invoke than the largest page lie between visible
-/// batches, yet each page returns the right visible batches and `has_more`
-/// after exactly one audited decision per distinct visible model, never one
-/// for the unreachable model. A provider-wide grant sees every batch.
+/// Batch listing reads one bounded, grant-pruned page: batches of the
+/// `granted` deployment `dep-b` lie before and between the batches of `dep-a`,
+/// which no snapshot entry restricts, yet each page returns the right visible
+/// batches, a usable `last_id`, and `has_more` after exactly one audited
+/// decision per distinct listed model, never one for an unreachable model.
+/// An exact model grant and an `all` grant see only `dep-a`; `all` beside a
+/// `dep-b/b` grant and a `dep-b` deployment grant reach `dep-b` too; another
+/// tenant's batch is never listed.
 ///
 /// # Panics
 ///
@@ -4633,10 +4846,57 @@ async fn gateway_batch_listing_is_one_bounded_pruned_read() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let (state, scribe) = RecordingScribe::attach(replica(&fixture, Scripted::shared()).await);
+    GatewayAdministration::new(&state)
+        .put_deployment(
+            &admin(tenant),
+            &ProviderDeploymentName::new("dep-b").expect("name"),
+            serde_json::from_value(json!({
+                "name": "dep-b",
+                "adapter": {"openai_compatible": {"base_url": "https://acme.example/v1"}},
+                "auth": "none",
+                "capabilities": ["batches"],
+                "access": "granted",
+            }))
+            .expect("deployment decodes"),
+        )
+        .await
+        .expect("deployment stores");
+    let other = fixture
+        .seed_additional_tenant("gateway-batch-list-other")
+        .await
+        .expect("other tenant");
+    // Another tenant's newest `dep-a/a` batch 500.
+    let mut conn = fixture.tenant_conn_for(other).await.expect("tenant conn");
+    let foreign = GatewayBatchRow {
+        batch_id: Uuid::from_u128(500),
+        file_id: Uuid::from_u128(500),
+        model: "dep-a/a".to_owned(),
+        deployment: "dep".to_owned(),
+        upstream_batch_id: None,
+        batch: None,
+    };
+    assert!(
+        claim_gateway_batch(&mut conn, &foreign, "500")
+            .await
+            .expect("claim")
+    );
+    assert!(
+        record_gateway_batch(
+            &mut conn,
+            foreign.batch_id,
+            "up-500",
+            &json!({"object": "batch", "status": "completed"}),
+        )
+        .await
+        .expect("record")
+    );
+    conn.commit().await.expect("foreign batch commits");
     let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
-    // Denied batches 101..=220 lie between visible batches 300, 250 and 50.
+    // Granted batches 401..=403 precede, and 101..=220 lie between, the
+    // unrestricted batches 300, 250 and 50.
     let visible = [300_u128, 250, 50];
     for (id, served) in (101..=220)
+        .chain(401..=403)
         .map(|id| (id, "dep-b/b"))
         .chain(visible.map(|id| (id, "dep-a/a")))
     {
@@ -4699,29 +4959,53 @@ async fn gateway_batch_listing_is_one_bounded_pruned_read() {
         audit_decisions(&scribe, tenant).len()
     };
 
-    let caller = invoker(tenant, 1, [model_access("dep-a/a")]);
     let before = decisions().await;
-    let first = list(caller.clone(), None, 2).await;
-    assert_eq!(ids(&first), [public(300), public(250)], "{first}");
-    assert_eq!(first["has_more"], true);
-    assert_eq!(
-        decisions().await,
-        before + 1,
-        "one decision for dep-a/a only"
-    );
-    let second = list(caller, first["last_id"].as_str().map(str::to_owned), 2).await;
-    assert_eq!(ids(&second), [public(50)], "{second}");
-    assert_eq!(second["has_more"], false);
-    assert_eq!(decisions().await, before + 2);
-
-    let wide = list(invoker(tenant, 2, [open_access()]), None, 100).await;
-    assert_eq!(wide["data"].as_array().map(Vec::len), Some(100));
-    assert_eq!(wide["has_more"], true);
+    // An exact grant and an `all` grant page through `dep-a` alone.
+    for (n, grant) in [(1, model_access("dep-a/a")), (2, open_access())] {
+        let caller = invoker(tenant, n, [grant]);
+        let first = list(caller.clone(), None, 2).await;
+        assert_eq!(ids(&first), [public(300), public(250)], "{first}");
+        assert_eq!(first["last_id"], public(250).as_str());
+        assert_eq!(first["has_more"], true);
+        let second = list(caller, first["last_id"].as_str().map(str::to_owned), 2).await;
+        assert_eq!(ids(&second), [public(50)], "{second}");
+        assert_eq!(second["has_more"], false);
+    }
     assert_eq!(
         decisions().await,
         before + 4,
+        "one decision for dep-a/a per page"
+    );
+
+    // `all` beside an exact `dep-b/b` grant reaches the granted batches too.
+    let mixed = invoker(tenant, 3, [open_access(), model_access("dep-b/b")]);
+    let page = list(mixed, None, 5).await;
+    let expected = [403, 402, 401, 300, 250].map(public);
+    assert_eq!(ids(&page), expected, "{page}");
+    assert_eq!(page["has_more"], true);
+    assert_eq!(
+        decisions().await,
+        before + 6,
         "one decision per listed model"
     );
+
+    // A `dep-b` deployment grant reaches only `dep-b`.
+    let scoped = invoker(
+        tenant,
+        4,
+        [Permission::gateway_invoke(GatewayAccess::Deployment {
+            deployment: ProviderDeploymentName::new("dep-b").expect("name"),
+        })],
+    );
+    let page = list(scoped, None, 3).await;
+    assert_eq!(ids(&page), [403, 402, 401].map(public), "{page}");
+    assert_eq!(page["has_more"], true);
+
+    // Another tenant's newer batch never appears.
+    let page = list(invoker(tenant, 5, [open_access()]), None, 100).await;
+    assert_eq!(ids(&page), visible.map(public), "{page}");
+    assert_eq!(page["has_more"], false);
+    assert_eq!(decisions().await, before + 8);
     drain_gateway(&state).await;
 }
 
@@ -4870,12 +5154,7 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
         })
     };
     let failure = invocation
-        .run(
-            &cancelled,
-            call("held-buffered-cancel", false),
-            false,
-            &token,
-        )
+        .run(&cancelled, call("held-buffered-cancel", false), &token)
         .await
         .expect_err("a cancelled buffered call fails");
     cancelling.await.expect("cancellation task");
@@ -4910,7 +5189,7 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
         let stream_caller = caller(n);
         let token = CancellationToken::new();
         let response = invocation
-            .run(&stream_caller, call(name, true), false, &token)
+            .run(&stream_caller, call(name, true), &token)
             .await
             .expect("the held stream opens");
         let ResponseBody::Events(mut events) = response.body else {
@@ -5599,4 +5878,105 @@ async fn public_ingress_fallback_override() {
         "the header never reaches a provider"
     );
     drain_gateway(&state).await;
+}
+
+/// An Agent call through the in-process caller starts only on a deployment
+/// whose adapter its Prompt provider is compatible with: an OpenAI Prompt is
+/// refused on the Anthropic deployment before dispatch, yet the same Agent
+/// call on an OpenAI-compatible deployment still falls back to that
+/// Anthropic deployment by tenant policy, and a direct client's OpenAI call
+/// to it keeps protocol translation.
+///
+/// # Panics
+/// Panics when a setup step fails, the refusal differs, or a call is
+/// dispatched to an unexpected deployment.
+#[tokio::test]
+async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let state = replica(&fixture, dispatch.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let gateway = GatewayAdministration::new(&state);
+    let claude: ProviderDeployment = serde_json::from_value(json!({
+        "name": "claude", "adapter": "anthropic", "auth": "none",
+        "capabilities": ["chat_completions"],
+    }))
+    .expect("deployment decodes");
+    gateway
+        .put_deployment(
+            &admin(tenant),
+            &ProviderDeploymentName::new("claude").expect("name"),
+            claude,
+        )
+        .await
+        .expect("deployment stores");
+    gateway
+        .put_fallback(
+            &admin(tenant),
+            serde_json::from_value(
+                json!({"rules": [{"scope": "global", "candidates": [model("claude/m")]}]}),
+            )
+            .expect("fallback decodes"),
+        )
+        .await
+        .expect("fallback stores");
+    let caller = invoker(tenant, 1, [open_access()]);
+    let agent = super::ServerWyrdGatewayCaller::new(state.clone(), caller.clone());
+    let chat = |requested: &str| skald_agent::WyrdGatewayCall {
+        request: skald_spec::ProviderRequest::OpenAiChatCompletion(
+            serde_json::from_value(json!({"model": "m", "max_tokens": 4,
+                    "messages": [{"role": "user", "content": "hi"}]}))
+            .expect("chat request"),
+        ),
+        model: model(requested),
+        provider: skald_spec::ProviderName::OpenAi,
+        timeout: Duration::from_secs(10),
+    };
+    // Dispatch answers in the caller's dialect, as a translating adapter does.
+    let answer = || AttemptResult::Completed {
+        body: ResponseBody::Json(
+            serde_json::value::to_raw_value(&json!({
+                "id": "chatcmpl-test", "object": "chat.completion", "created": 0, "model": "m",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "ok"}}]
+            }))
+            .expect("json"),
+        ),
+        usage: usage(1, 1),
+        capture: None,
+    };
+
+    let refused =
+        skald_agent::WyrdGatewayCaller::call(&agent, chat("claude/m"), &CancellationToken::new())
+            .await
+            .expect_err("an OpenAI Prompt cannot start on an Anthropic deployment");
+    match refused {
+        skald_providers::ProviderError::RemoteProblem(problem) => {
+            assert_eq!(problem.code, "WYRD_GATEWAY_400_INVALID_REQUEST");
+        }
+        other => panic!("unexpected refusal: {other:?}"),
+    }
+    assert!(dispatch.seen().is_empty(), "the refusal precedes dispatch");
+
+    dispatch.push(Step::Return(failed(1, 0)));
+    dispatch.push(Step::Return(answer()));
+    skald_agent::WyrdGatewayCaller::call(&agent, chat("dep-a/a"), &CancellationToken::new())
+        .await
+        .expect("a compatible start falls back across adapters");
+    assert_eq!(dispatch.seen(), ["dep-a", "claude"]);
+
+    dispatch.push(Step::Return(answer()));
+    GatewayInvocation::new(&state)
+        .invoke(
+            &caller,
+            GatewayCallRequest {
+                body: json!({"model": "claude/m", "max_tokens": 4,
+                    "messages": [{"role": "user", "content": "hi"}]}),
+                ..request("claude/m", None, Duration::from_secs(10))
+            },
+        )
+        .await
+        .expect("a direct client call keeps protocol translation");
+    assert_eq!(dispatch.seen(), ["dep-a", "claude", "claude"]);
 }

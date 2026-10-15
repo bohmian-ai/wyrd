@@ -1,0 +1,17 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: routed-service
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: claude
+      ref: ./claude-agent.yaml
+    - alias: gemini
+      ref: ./gemini-agent.yaml
+    - alias: jev
+      ref: ./jev-agent.yaml
+    - alias: vertex
+      ref: ./vertex-agent.yaml

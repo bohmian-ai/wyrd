@@ -4545,3 +4545,128 @@ async fn inline_agent_prompt_reuses_transaction_selection() {
 
     server.shutdown().await.expect("test server shuts down");
 }
+
+/// Invalid authored Prompt declarations are refused by public registration
+/// before anything is persisted.
+///
+/// Each case is submitted as a standalone Prompt Card and as an inline Agent
+/// Prompt through the authenticated route. The shared Prompt compiler refuses
+/// it (a standalone refusal names the offending field), so the server stores
+/// no operation, Card,
+/// relationship, principal, or binding. Refusal happens during decoding and
+/// never reaches storage or a provider. Cases cover a templated model,
+/// invalid output schemas in the portable and native forms, a media binding
+/// declared as two kinds, and invalid literal media sources.
+///
+/// # Panics
+/// Panics when the server cannot start or shut down, the writer cannot
+/// bootstrap, a route call or count fails, a case is accepted, or its refusal
+/// does not name the offending field.
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_prompt_authoring_is_refused_before_writes() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("prompt-authoring-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let portable = |extra: Value| {
+        let mut prompt = json!({"provider": "openai", "model": "gpt-4o",
+                                "messages": [{"role": "user", "content": "hello {{name}}"}]});
+        if let (Some(prompt), Value::Object(extra)) = (prompt.as_object_mut(), extra) {
+            prompt.extend(extra);
+        }
+        prompt
+    };
+    let media =
+        |blocks: Value| portable(json!({"messages": [{"role": "user", "content": blocks}]}));
+    let cases = [
+        (
+            "templated-model",
+            portable(json!({"model": "{{target}}"})),
+            "model",
+        ),
+        (
+            "schema-type",
+            portable(
+                json!({"response_format": {"type": "object", "properties": {"a": {"type": "text"}}}}),
+            ),
+            "response_format.properties.a.type",
+        ),
+        (
+            "schema-required",
+            portable(json!({"response_format": {"type": "object", "required": "a"}})),
+            "response_format.required",
+        ),
+        (
+            "native-schema",
+            json!({"provider": "openai", "model": "gpt-4o", "format": "chat_completion",
+                   "body": {"messages": [{"role": "user", "content": "hi"}],
+                            "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": {"type": "object", "properties": []}}}}}),
+            "body.response_format.json_schema.schema.properties",
+        ),
+        (
+            "media-kind-conflict",
+            media(json!([{"type": "image", "source": "${media:x}"},
+                         {"type": "document", "source": "${media:x}"}])),
+            "messages.content.source",
+        ),
+        (
+            "media-base64",
+            media(
+                json!([{"type": "image", "source": {"type": "base64", "mime_type": "image/png", "data": "%%%"}}]),
+            ),
+            "not valid base64",
+        ),
+        (
+            "media-mime",
+            media(
+                json!([{"type": "image", "source": {"type": "base64", "mime_type": "application/pdf", "data": "JVBERi0="}}]),
+            ),
+            "does not match kind",
+        ),
+    ];
+    for (label, prompt, field) in cases {
+        let prompt_name = format!("pa-{label}-prompt");
+        let agent_name = format!("pa-{label}-agent");
+        // The inline slot decodes through the untagged `InlineableRef`, whose
+        // refusal keeps the stable code but not the inner field path.
+        let submissions = [
+            (
+                standalone_card_request("Prompt", &prompt_name, prompt.clone(), &prompt_name),
+                prompt_name.as_str(),
+                field,
+            ),
+            (
+                standalone_card_request(
+                    "Agent",
+                    &agent_name,
+                    json!({"prompt": prompt, "execution_route": {"kind": "native"}}),
+                    &agent_name,
+                ),
+                agent_name.as_str(),
+                "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
+            ),
+        ];
+        for (request, name, needle) in submissions {
+            let response = server
+                .oneshot_authenticated(&jwt, request)
+                .await
+                .expect("refused registration responds");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("response body reads");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(status.is_client_error(), "{name}: {status} {text}");
+            assert!(text.contains(needle), "{name}: {text}");
+            assert_no_registration_writes(&server, name, name).await;
+        }
+    }
+
+    server.shutdown().await.expect("test server shuts down");
+}

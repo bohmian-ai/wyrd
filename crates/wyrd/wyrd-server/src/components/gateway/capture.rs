@@ -177,8 +177,9 @@ pub struct CallCapture {
     payload: GatewayCallPayloadV1,
     /// Bytes of every object the row references, persisted before delivery.
     objects: PayloadObjects,
-    /// One span's fields per attempt, in ordinal order.
-    spans: Vec<GatewayAttemptSpanFieldsV1>,
+    /// One span's admitted-adapter provider and fields per attempt, in
+    /// ordinal order.
+    spans: Vec<(&'static str, GatewayAttemptSpanFieldsV1)>,
     /// Request that admitted the call, published with both batches.
     request_id: RequestId,
     /// Subject and actor pair both batches are stamped with.
@@ -239,7 +240,12 @@ impl CallCapture {
         let spans = facts
             .attempts
             .iter()
-            .map(|attempt| attempt_span(facts.call_id, attempt, &facts.entries))
+            .map(|attempt| {
+                (
+                    attempt.provider,
+                    attempt_span(facts.call_id, attempt, &facts.entries),
+                )
+            })
             .collect::<Vec<_>>();
         let payload = GatewayCallPayloadV1 {
             schema_version: 1,
@@ -269,7 +275,7 @@ impl CallCapture {
             payload_object_refs: objects.refs(),
         };
         payload.validate().map_err(|_| CaptureDrop::Invalid)?;
-        for span in &spans {
+        for (_, span) in &spans {
             span.validate().map_err(|_| CaptureDrop::Invalid)?;
         }
         Ok(Self {
@@ -350,6 +356,31 @@ impl CallCapture {
         RecordBatch::try_new(schema, columns).map_err(|_| CaptureDrop::Projection)
     }
 
+    /// The OTLP attempt spans [`Self::spans_batch`] projects, one per attempt
+    /// in ordinal order, each placed in the call's trace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureDrop::Projection`] when the parent context or a
+    /// span's fields cannot be encoded.
+    fn otlp_spans(&self) -> Result<Vec<Span>, CaptureDrop> {
+        let call_id = *self.payload.call_id.as_uuid().as_bytes();
+        let parent = self.trace.as_ref().map(parent_ids).transpose()?;
+        let operation = gen_ai_operation(self.operation);
+        self.spans
+            .iter()
+            .map(|(provider, fields)| {
+                let mut span = otlp_span(&call_id, operation, provider, fields)?;
+                if let Some((trace_id, span_id, state)) = &parent {
+                    span.trace_id = trace_id.to_vec();
+                    span.parent_span_id = span_id.to_vec();
+                    span.trace_state.clone_from(state);
+                }
+                Ok(span)
+            })
+            .collect()
+    }
+
     /// Builds the canonical `vala.traces.spans` batch of the attempt spans.
     ///
     /// Every span shares one trace, so they link to each other and to the row
@@ -369,22 +400,7 @@ impl CallCapture {
         if self.spans.is_empty() {
             return Ok(None);
         }
-        let call_id = *self.payload.call_id.as_uuid().as_bytes();
-        let parent = self.trace.as_ref().map(parent_ids).transpose()?;
-        let operation = gen_ai_operation(self.operation);
-        let spans = self
-            .spans
-            .iter()
-            .map(|fields| {
-                let mut span = otlp_span(&call_id, operation, fields)?;
-                if let Some((trace_id, span_id, state)) = &parent {
-                    span.trace_id = trace_id.to_vec();
-                    span.parent_span_id = span_id.to_vec();
-                    span.trace_state.clone_from(state);
-                }
-                Ok(span)
-            })
-            .collect::<Result<Vec<_>, CaptureDrop>>()?;
+        let spans = self.otlp_spans()?;
         let resource = ResourceSpans {
             resource: Some(Resource {
                 attributes: vec![attribute(
@@ -881,7 +897,8 @@ fn parent_ids(trace: &TraceContext) -> Result<([u8; 16], [u8; 8], String), Captu
 }
 
 /// One OTLP client span carrying `fields` in the trace whose id is the
-/// 16-byte `call_id`.
+/// 16-byte `call_id`, naming `provider`, the attempt's admitted adapter, as
+/// `gen_ai.provider.name`.
 ///
 /// The span id is the call id's random low eight bytes XOR the attempt
 /// ordinal: distinct across one call's attempts, and, through the call id's
@@ -893,6 +910,7 @@ fn parent_ids(trace: &TraceContext) -> Result<([u8; 16], [u8; 8], String), Captu
 fn otlp_span(
     call_id: &[u8; 16],
     operation: &str,
+    provider: &str,
     fields: &GatewayAttemptSpanFieldsV1,
 ) -> Result<Span, CaptureDrop> {
     let Value::Object(members) =
@@ -918,7 +936,7 @@ fn otlp_span(
     }
     for (key, value) in [
         ("gen_ai.operation.name", operation),
-        ("gen_ai.provider.name", fields.model.deployment.as_str()),
+        ("gen_ai.provider.name", provider),
         ("gen_ai.request.model", fields.model.model.as_str()),
     ] {
         attributes.insert(key.to_owned(), AnyValueKind::StringValue(value.to_owned()));
@@ -984,7 +1002,8 @@ pub(crate) mod tests {
     use wyrd_spec::ids::ProviderDeploymentName;
 
     use super::{
-        CallCapture, CallFacts, CaptureDrop, PayloadObjects, object_path, request_content,
+        AnyValueKind, CallCapture, CallFacts, CaptureDrop, PayloadObjects, object_path,
+        request_content,
     };
 
     /// Secret planted under credential-shaped keys; must never be persisted.
@@ -1028,6 +1047,7 @@ pub(crate) mod tests {
                 ordinal: NonZeroU32::MIN,
                 deployment: ProviderDeploymentName::new("dep-a").expect("name"),
                 model,
+                provider: "openai",
                 outcome: GatewayCallOutcome::Succeeded,
                 billable: true,
                 usage: AttemptUsage::default(),
@@ -1073,12 +1093,66 @@ pub(crate) mod tests {
         }
 
         assert_eq!(capture.spans.len(), 1);
-        assert_eq!(capture.spans[0].gateway_call_id, capture.payload.call_id);
+        assert_eq!(capture.spans[0].1.gateway_call_id, capture.payload.call_id);
         let spans = capture
             .spans_batch()
             .expect("spans project")
             .expect("one attempt yields spans");
         assert_eq!(spans.num_rows(), 1);
+    }
+
+    /// Proves each retained attempt span names its admitted adapter's
+    /// provider as `gen_ai.provider.name`, never the operator-chosen
+    /// deployment name: two differently named deployments on one adapter
+    /// share a provider, the fallback names its own, and the deployment and
+    /// requested model stay in their own attributes.
+    #[test]
+    fn attempt_spans_name_the_admitted_adapter_provider() {
+        let mut facts = facts(policy(GatewayCaptureMode::Metadata, &[]));
+        let template = facts.attempts.remove(0);
+        facts.attempts = [
+            ("openai-primary", "gpt-4o", "openai"),
+            ("openai-backup", "gpt-4o", "openai"),
+            ("claude-fallback", "claude-sonnet", "anthropic"),
+        ]
+        .into_iter()
+        .zip(1..)
+        .map(|((deployment, model, provider), ordinal)| AttemptRecord {
+            ordinal: NonZeroU32::new(ordinal).expect("ordinal"),
+            deployment: ProviderDeploymentName::new(deployment).expect("name"),
+            model: ModelRef::from_projection(&format!("{deployment}/{model}")).expect("model"),
+            provider,
+            ..template.clone()
+        })
+        .collect();
+        let capture = CallCapture::from_facts(facts).expect("metadata projects");
+        let spans = capture.otlp_spans().expect("spans project");
+        let observed = spans
+            .iter()
+            .map(|span| {
+                ["gen_ai.provider.name", "deployment", "gen_ai.request.model"].map(|key| {
+                    span.attributes
+                        .iter()
+                        .find(|attribute| attribute.key == key)
+                        .and_then(|attribute| attribute.value.as_ref())
+                        .and_then(|value| value.value.clone())
+                        .expect(key)
+                })
+            })
+            .collect::<Vec<_>>();
+        let text = |value: &str| AnyValueKind::StringValue(value.to_owned());
+        assert_eq!(
+            observed,
+            [
+                [text("openai"), text("openai-primary"), text("gpt-4o")],
+                [text("openai"), text("openai-backup"), text("gpt-4o")],
+                [
+                    text("anthropic"),
+                    text("claude-fallback"),
+                    text("claude-sonnet")
+                ],
+            ]
+        );
     }
 
     /// Proves an unresolved call nulls both `resolved_model` children.

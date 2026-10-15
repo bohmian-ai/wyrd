@@ -19,7 +19,7 @@ pub mod request_id;
 
 pub use permission::{
     Action, BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, Permission,
-    PermissionScope, PermissionScopeError, PermissionSet, Resource,
+    PermissionScope, PermissionScopeError, PermissionSet, Resource, UnrepresentableIntersection,
 };
 pub use permission_check::{PermissionCheck, PermissionDenyReason, PermissionVerdict, RbacCheck};
 pub use principal::{

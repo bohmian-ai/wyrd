@@ -10,7 +10,7 @@ use skald_prompt::Prompt;
 use skald_spec::Prompt as PromptSpec;
 use skald_tool::{AgentTool, ToolError, ToolResolver};
 use wyrd_spec::{
-    AgentCard, AgentRunConfigSpec, AgentSpec, CardMetadata,
+    AgentCard, AgentRunConfigSpec, AgentSpec, CardMetadata, ExecutionRoute,
     envelope::CardKind,
     error::WyrdError,
     metadata::{Annotations, Labels},
@@ -21,7 +21,8 @@ use crate::callbacks::{
     AfterAgentFn, AfterModelFn, AfterToolFn, BeforeAgentFn, BeforeModelFn, BeforeToolFn,
 };
 use crate::card_error::AgentCardError;
-use crate::error::AgentResult;
+use crate::error::{AgentError, AgentResult};
+use crate::gateway::{WyrdGatewayCaller, wyrd_gateway_registry};
 use crate::journal::{Journal, NoopJournal};
 use crate::run::{AgentRun, RunConfig};
 use crate::session::{NoSession, SessionMemory};
@@ -192,6 +193,14 @@ pub struct Agent {
     /// Per-agent provider registry override. When set, overrides the global
     /// default registry for this agent's runs only. Not serialized.
     pub(crate) provider_override: Option<Arc<skald_runtime::ProviderRegistry>>,
+    /// Declared execution route, projected into and read from the Card spec.
+    ///
+    /// A `wyrd_gateway` route sends every model call of every run through
+    /// [`Self::gateway_caller`]; it never falls back to native providers.
+    pub(crate) execution_route: ExecutionRoute,
+    /// Host-supplied gateway seam a `wyrd_gateway` route dispatches through.
+    /// Runtime state only, never serialized.
+    pub(crate) gateway_caller: Option<Arc<dyn WyrdGatewayCaller>>,
     /// Python class retained for structured-output instantiation.
     ///
     /// Set via `Agent(output_type=...)` or `agent.run(output_type=...)`.
@@ -211,6 +220,7 @@ impl fmt::Debug for Agent {
             .field("prompt_model", &self.prompt.native().model)
             .field("run_config", &self.run_config)
             .field("tool_names", &self.tool_names)
+            .field("execution_route", &self.execution_route)
             .finish_non_exhaustive()
     }
 }
@@ -307,6 +317,63 @@ impl Agent {
         fallback: &'a skald_runtime::ProviderRegistry,
     ) -> &'a skald_runtime::ProviderRegistry {
         self.provider_override.as_deref().unwrap_or(fallback)
+    }
+
+    /// Return a copy declaring `route` as this Agent's execution route.
+    ///
+    /// The route is durable identity: [`Self::to_spec`] projects it and
+    /// [`Self::from_card`] restores it. Applying it to a clone is how one
+    /// invocation overrides the route whole without touching the original.
+    #[must_use]
+    pub fn with_execution_route(mut self, route: ExecutionRoute) -> Self {
+        self.execution_route = route;
+        self
+    }
+
+    /// Return a copy whose `wyrd_gateway` route dispatches through `caller`.
+    ///
+    /// The caller is host-owned runtime state, never serialized; a `native`
+    /// route ignores it.
+    #[must_use]
+    pub fn with_gateway_caller(mut self, caller: Arc<dyn WyrdGatewayCaller>) -> Self {
+        self.gateway_caller = Some(caller);
+        self
+    }
+
+    /// Return the declared execution route.
+    #[must_use]
+    pub fn execution_route(&self) -> &ExecutionRoute {
+        &self.execution_route
+    }
+
+    /// Build the gateway registry one run of `prompt` must use, or `None` for
+    /// a `native` route.
+    ///
+    /// A `wyrd_gateway` route addresses `<deployment>/<prompt model>` through
+    /// the host's gateway caller, so a run never reaches native provider
+    /// credentials. This runs before any journal, session, or provider IO.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::InvalidArgument`] for `execution_route` when the
+    /// route is `wyrd_gateway` but no gateway caller is configured, or the
+    /// Prompt model is not a gateway model identifier.
+    pub fn route_registry(
+        &self,
+        prompt: &Prompt,
+    ) -> AgentResult<Option<skald_runtime::ProviderRegistry>> {
+        let ExecutionRoute::WyrdGateway { deployment } = &self.execution_route else {
+            return Ok(None);
+        };
+        let refuse = |detail: &str| AgentError::InvalidArgument {
+            name: "execution_route".to_owned(),
+            detail: format!("agent '{}' {detail}", self.id),
+        };
+        let caller = self.gateway_caller.as_ref().ok_or_else(|| {
+            refuse("routes through the Wyrd gateway, but no gateway caller is configured")
+        })?;
+        wyrd_gateway_registry(Arc::clone(caller), prompt.native(), deployment)
+            .map(Some)
+            .ok_or_else(|| refuse("has a Prompt model that is not a gateway model identifier"))
     }
 
     /// Return a copy with one runtime-local tool appended.
@@ -610,6 +677,7 @@ impl Agent {
 
         let mut agent = Self::try_from_ref(card.spec.prompt.clone(), prompt_resolver)?
             .with_id(card.name.clone())
+            .with_execution_route(card.spec.execution_route.clone())
             .with_run_config(run_config_from_agent_run_config_spec(&card.spec.run_config))
             .with_tools(tools);
         agent.meta = CardMetadata {
@@ -695,6 +763,8 @@ impl Agent {
             journal: Arc::new(NoopJournal),
             callbacks: AgentCallbacks::default(),
             provider_override: None,
+            execution_route: ExecutionRoute::Native {},
+            gateway_caller: None,
             #[cfg(feature = "python")]
             py_output_cls: None,
         }
@@ -705,7 +775,7 @@ impl Agent {
     pub fn to_spec(&self) -> AgentSpec {
         AgentSpec {
             prompt: self.prompt_ref.clone(),
-            execution_route: wyrd_spec::ExecutionRoute::Native {},
+            execution_route: self.execution_route.clone(),
             tool_names: self.tool_names.clone(),
             run_config: agent_run_config_spec_from_run_config(&self.run_config),
             verified_by: Vec::new(),

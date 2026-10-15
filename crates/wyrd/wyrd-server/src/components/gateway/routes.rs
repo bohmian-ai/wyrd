@@ -42,7 +42,8 @@ use wyrd_storage::StorageError;
 use super::batches::{BatchAnswer, GatewayBatches};
 use super::capture::object_path;
 use super::ingress::{
-    CARD_UID_HEADER_DOC, FALLBACK_HEADER_DOC, RUN_HEADER_DOC, requested_fallback, requested_subject,
+    CARD_UID_HEADER_DOC, FALLBACK_HEADER_DOC, PROMPT_PROVIDER_HEADER_DOC, RUN_HEADER_DOC,
+    requested_fallback, requested_prompt_provider, requested_subject,
 };
 use super::invocation::{
     GatewayCallRequest, GatewayCallResponse, GatewayInvocation, invalid_request,
@@ -837,7 +838,8 @@ pub(crate) async fn get_capture(
     params(
         ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
-        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC),
+        ("wyrd-prompt-provider" = Option<String>, Header, description = PROMPT_PROVIDER_HEADER_DOC)
     ),
     request_body(content = GatewayChatCompletionsRequest, description = "OpenAI-compatible chat completion request whose `model` is an exact `<provider>/<model>` projection"),
     responses(
@@ -890,7 +892,8 @@ pub(crate) async fn chat_completions(
     params(
         ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
-        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC),
+        ("wyrd-prompt-provider" = Option<String>, Header, description = PROMPT_PROVIDER_HEADER_DOC)
     ),
     request_body(content = GatewayResponsesRequest, description = "OpenAI-compatible Responses request whose `model` is an exact `<provider>/<model>` projection"),
     responses(
@@ -1371,9 +1374,10 @@ pub(crate) async fn models(
 /// every response through the `wyrd-request-id` header.
 ///
 /// `headers` are the request headers of a route that accepts the
-/// `wyrd-gateway-fallback` override and the `wyrd-run-id`/`wyrd-card-uid`
-/// attribution; routes that do not pass `None`, keeping tenant fallback
-/// policy and recording an uncorrelated call.
+/// `wyrd-gateway-fallback` override, the `wyrd-run-id`/`wyrd-card-uid`
+/// attribution, and the `wyrd-prompt-provider` Agent binding; routes that do
+/// not pass `None`, keeping tenant fallback policy and recording an
+/// uncorrelated direct call.
 async fn openai_call(
     state: &AppState,
     caller: Result<Caller, WyrdErrorResponse>,
@@ -1829,7 +1833,8 @@ async fn form_body(
 /// # Errors
 /// Returns the decoding error of `request`, `GatewayInvalidRequest` for a
 /// `model` that is not an exact projection, every error of
-/// [`requested_fallback`] and [`requested_subject`] for `headers`, and every
+/// [`requested_fallback`], [`requested_subject`], and
+/// [`requested_prompt_provider`] for `headers`, and every
 /// error of
 /// [`GatewayInvocation::invoke`].
 async fn invoke_openai(
@@ -1846,12 +1851,13 @@ async fn invoke_openai(
         .ok_or_else(|| GatewayContractError::new("model", "must be <provider>/<model>"))
         .and_then(ModelRef::from_projection)
         .map_err(invalid_request)?;
-    let (fallback, subject) = match headers {
+    let (fallback, subject, prompt_provider) = match headers {
         Some(headers) => (
             requested_fallback(headers, &model)?,
             requested_subject(headers)?,
+            requested_prompt_provider(headers)?,
         ),
-        None => (None, None),
+        None => (None, None, None),
     };
     let usage_bound = usage_bound(operation, &body);
     GatewayInvocation::new(state)
@@ -1870,6 +1876,7 @@ async fn invoke_openai(
                 usage_bound,
                 timeout: PUBLIC_CALL_TIMEOUT,
                 subject,
+                prompt_provider,
             },
         )
         .await

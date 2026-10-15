@@ -15,7 +15,7 @@ use skald_spec::{ProviderRequest, ProviderResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
 use wyrd_spec::reference::InlineableRef;
-use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult, execution_route_from_py};
 
 use crate::error::AgentError;
 use crate::{
@@ -103,6 +103,11 @@ impl Agent {
     ///     mock_provider (MockProvider | None): Offline provider for `provider="mock"`
     ///         prompts with caller-set canned responses. Cannot be combined with
     ///         `provider_base_url`.
+    ///     execution_route (dict | None): Declared route saved with the Agent Card:
+    ///         `{"kind": "native"}` (the default) or
+    ///         `{"kind": "wyrd_gateway", "deployment": <name>}`. A local Agent has no
+    ///         gateway caller, so running a `wyrd_gateway` route here is refused before
+    ///         any provider IO; run it through `wyrd.observe` instead.
     ///
     /// Returns:
     ///     Agent: New Agent ready to run.
@@ -131,7 +136,8 @@ impl Agent {
         provider_base_url = None,
         provider_api_key = None,
         output_type = None,
-        mock_provider = None
+        mock_provider = None,
+        execution_route = None
     ))]
     #[allow(
         clippy::too_many_arguments,
@@ -159,8 +165,12 @@ impl Agent {
         provider_api_key: Option<String>,
         output_type: Option<&Bound<'_, PyAny>>,
         mock_provider: Option<PyRef<'_, PyMockProvider>>,
+        execution_route: Option<Bound<'_, PyDict>>,
     ) -> WyrdPyResult<Self> {
         let mut agent = agent_from_prompt_py(prompt)?;
+        if let Some(route) = execution_route {
+            agent = agent.with_execution_route(execution_route_from_py(&route, "execution_route")?);
+        }
 
         if let Some(id) = id {
             agent = agent.with_id(id);
@@ -351,20 +361,29 @@ impl Agent {
     }
 
     /// Run the bounded tool loop and return an AgentRun value.
+    ///
+    /// `execution_route`, when given, replaces the declared route whole for
+    /// this run only; the Agent and its saved Card keep their own route.
     #[pyo3(name = "run")]
-    #[pyo3(signature = (input, *, session_id=None, output_type=None))]
+    #[pyo3(signature = (input, *, session_id=None, output_type=None, execution_route=None))]
     pub fn py_run(
         &self,
         py: Python<'_>,
         input: &Bound<'_, PyAny>,
         session_id: Option<String>,
         output_type: Option<&Bound<'_, PyAny>>,
+        execution_route: Option<Bound<'_, PyDict>>,
     ) -> WyrdPyResult<Py<PyAny>> {
         let input_str = input_to_string(input)?;
         let providers = skald_runtime::default_registry();
         let session_id = session_id.map(SessionId::new);
+        let overridden = execution_route
+            .map(|route| execution_route_from_py(&route, "execution_route"))
+            .transpose()?
+            .map(|route| self.clone().with_execution_route(route));
+        let agent = overridden.as_ref().unwrap_or(self);
         let mut run = py.detach(|| {
-            wyrd_runtime::runtime().block_on(self.run_with(
+            wyrd_runtime::runtime().block_on(agent.run_with(
                 providers.as_ref(),
                 session_id,
                 &input_str,

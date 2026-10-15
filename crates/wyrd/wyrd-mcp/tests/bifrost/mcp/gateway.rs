@@ -63,6 +63,25 @@ mod pg_tests {
     /// replacements and deletions are observed over HTTP with the same
     /// invalid-configuration and conflict problems, and a reader without
     /// gateway permission is denied reads and writes with a 403 problem.
+    ///
+    /// The administrator's `Gateway` handle carries a bearer JWT, so
+    /// connecting it performs no exchange or dial.
+    ///
+    /// # Errors
+    ///
+    /// Returns server start, user bootstrap, missing-JWT, client
+    /// configuration, gateway HTTP, argument (de)serialization, MCP transport
+    /// or tool-call, problem-decoding, or shutdown failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the bearer `Gateway` handle cannot be assembled, or when an
+    /// assertion fails: MCP credential, deployment, capture-policy, managed
+    /// submission, rotation, or replacement views differ from HTTP or from
+    /// the expected values; a tool answer repeats a submitted secret; the
+    /// invalid capture policy, in-use credential deletion, or deletions do
+    /// not return their expected problem or empty result; credentials remain
+    /// after deletion; or the reader is not denied reads and writes with 403.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed MCP journey lane"]
     async fn agent_administers_redacted_gateway_configuration() -> Result<(), McpJourneyError> {

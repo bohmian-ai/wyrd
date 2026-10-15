@@ -54,7 +54,10 @@ impl BifrostWriter {
     /// # Errors
     ///
     /// Returns the stable client error when the credential cannot be resolved,
-    /// the client cannot be built, or the gRPC transport cannot connect.
+    /// the client cannot be built, the eager credential exchange is refused or
+    /// the authorization server is unreachable, or the gRPC transport cannot
+    /// connect. The exchange runs before native Bifrost assembly, so no
+    /// producer exists when it fails.
     pub async fn connect(config: ClientConfig, card_ref: CardRef) -> Result<Self, WyrdError> {
         let client =
             WyrdClient::with_config(config).map_err(|error| harness_error(&error.to_string()))?;

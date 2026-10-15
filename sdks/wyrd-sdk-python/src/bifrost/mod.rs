@@ -726,15 +726,20 @@ impl Bifrost {
 
     /// Enqueues one JSON row into the active table.
     ///
-    /// Non-blocking: the row is durable only after [`Bifrost::flush`] or
-    /// [`Bifrost::shutdown`]. A saturated queue refuses here rather than
-    /// dropping silently.
+    /// On a handle not yet connected, the first insert connects through
+    /// [`Bifrost::handle`] as `connect` does, blocking the caller (with the
+    /// GIL released) until configuration, authentication, and the ingest dial
+    /// complete. Once connected, enqueueing is non-blocking: the row is
+    /// durable only after [`Bifrost::flush`] or [`Bifrost::shutdown`], and a
+    /// saturated queue refuses here rather than dropping silently.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` carrying `WYRD_SPEC_400_VALIDATION` for an invalid
     /// Card UID, `WYRD_VALA_412_NO_ACTIVE_TABLE` when no table is bound,
-    /// or `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
+    /// or `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated; on a
+    /// handle not yet connected, any connection error [`Bifrost::handle`]
+    /// raises.
     #[pyo3(signature = (row, card_uid=None, run_id=None))]
     fn insert(
         &self,

@@ -142,6 +142,18 @@ async fn read_ids(
 
 /// Before restart: derive gRPC from the server URL, write through HTTP and
 /// gRPC, and prove an explicit gRPC override also works.
+///
+/// Records the registered Card UID and table name in the lane's state
+/// directory for [`startup_image_verify`] after the restart.
+///
+/// # Panics
+/// Panics when the environment client or state directory is unavailable;
+/// when the server URL is not loopback or gRPC does not derive from it; when
+/// connecting a handle (including its API-key exchange), Card registration,
+/// either Bifrost connection, table registration, an insert, a flush, or a
+/// drain fails; when the table is not newly created; when the override
+/// client cannot be built; when both rows are not read back in time; or
+/// when the state file cannot be written.
 #[tokio::test]
 #[ignore = "run by scripts/server/test-startup-prod.sh against the official image"]
 async fn startup_image_write() {
@@ -227,6 +239,16 @@ async fn startup_image_write() {
 
 /// After restart: the credential, Card, artifact bytes, and acknowledged
 /// Bifrost rows written before the restart are all still readable.
+///
+/// Reads the Card UID and table name [`startup_image_write`] saved.
+///
+/// # Panics
+/// Panics when the state directory or file is missing or malformed, the
+/// saved Card UID is invalid, the environment client cannot be built,
+/// connecting a handle (including its API-key exchange), the artifact
+/// download, the Bifrost connection, or the drain fails, the downloaded
+/// artifact differs from the original bytes, or the acknowledged rows are
+/// not read back in time.
 #[tokio::test]
 #[ignore = "run by scripts/server/test-startup-prod.sh against the official image"]
 async fn startup_image_verify() {

@@ -367,6 +367,21 @@ fn heavy_registration_request(idempotency_key: &str) -> Request<Body> {
 
 #[tokio::test(flavor = "current_thread")]
 /// The native registry saga returns only a final Active receipt.
+///
+/// A Prompt with one artifact registers through `Cards` over a bearer JWT
+/// against local storage; connecting performs no exchange or dial. The
+/// registered Card then reads back through `get`, `list`, `resolve_latest`,
+/// and `load`, and Postgres holds it Active with a verified artifact
+/// manifest.
+///
+/// # Panics
+/// Panics when a workspace, Card file, loader, registration input, server,
+/// bootstrap, handle, registration, read, load, tenant connection, SQL query,
+/// or commit fails; when bootstrap returns a non-user principal; or when an
+/// assertion fails: the receipt is not one Active registered outcome with a
+/// blob URI and matching root UID, a read names another Card, the loaded
+/// artifact bytes differ, or the stored Card is not Active with a blob URI
+/// and verified manifest.
 async fn client_registration_saga_returns_active_receipt() {
     let temp = tempfile::tempdir().expect("loader workspace creates");
     let prompt_path = temp.path().join("client-prompt.yaml");

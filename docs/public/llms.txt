@@ -6,6 +6,11 @@
 
 - [Wyrd docs](https://bohmian-ai.github.io/wyrd/): the docs home, with a link to each published section.
 
+## Connect
+
+- [Set up the LLM gateway](https://bohmian-ai.github.io/wyrd/connect/set-up-the-llm-gateway/): Store a provider key with the Wyrd server, name a deployment for it, and call the model through Wyrd with your Wyrd credential.
+- [Make gateway requests from a framework](https://bohmian-ai.github.io/wyrd/connect/call-wyrd-from-a-stock-client/): Run inference through a named Wyrd gateway deployment from the OpenAI, Anthropic, and Google GenAI SDKs, the OpenAI Agents SDK, and Pydantic AI.
+
 ## Machine-readable reference
 
 - [llms-full.txt](https://bohmian-ai.github.io/wyrd/llms-full.txt): this index as the full machine-readable reference.

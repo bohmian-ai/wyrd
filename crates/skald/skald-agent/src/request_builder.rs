@@ -383,7 +383,7 @@ fn tool_result_message(
         PromptLoopSupport::OpenAiResponses => {
             MessageNum::OpenAiResponses(vec![OpenAiResponseItem::FunctionCallOutput {
                 call_id: call_id.to_owned(),
-                output: content_text,
+                output: content_text.into(),
             }])
         }
         PromptLoopSupport::OpenAiChat => {

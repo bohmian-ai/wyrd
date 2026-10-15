@@ -47,20 +47,19 @@ use wyrd_sql::queries::cards::{
     CardArtifactManifestRow, CardDeleteState, CardManifestCompletionRow, CardQuery,
     CardReconcileClaim, CardRegistrationOperationRow, ListCursor, NewCardRow,
     NewRegistrationOperation, RECONCILE_KIND_BLOB, RECONCILE_KIND_CLEANUP,
-    RECONCILE_KIND_FINALIZATION, RECONCILE_KIND_REGISTRATION, Resolution, SubmittedCardIdentity,
-    activate_card, commit_registration_operation, fail_card, find_card_by_ref,
+    RECONCILE_KIND_FINALIZATION, Resolution, SubmittedCardIdentity, activate_card,
+    commit_registration_operation, fail_card, find_card_by_ref,
     get_card_by_uid as sql_get_card_by_uid,
     get_card_for_reconciliation as sql_get_card_for_reconciliation, get_latest_card_by_range,
     inbound_relationships, insert_artifact_manifest_rows, insert_card_row,
     insert_registration_operation, list_versions, lock_card_reconciliation_lease,
     lock_pending_card_for_activation, lock_version_line, lookup_existing_operation,
-    lookup_expired_operation, lookup_operation_by_id, manifest_completion_rows,
-    manifest_rows_for_init, mark_card_reconciliation_succeeded, mark_manifest_upload_initialized,
-    mark_manifest_verified, persist_outbound_relationships, query_cards, recheck_active_card_refs,
-    record_blob_failure, record_card_blob, record_card_reconciliation_failure,
-    registration_request_hash, reschedule_card_reconciliation, resolve_version,
-    schedule_card_reconciliation, soft_delete_card_by_ref, soft_delete_card_with_kind,
-    upsert_service_account_from_card,
+    lookup_expired_operation, manifest_completion_rows, manifest_rows_for_init,
+    mark_card_reconciliation_succeeded, mark_manifest_upload_initialized, mark_manifest_verified,
+    persist_outbound_relationships, query_cards, recheck_active_card_refs, record_blob_failure,
+    record_card_blob, record_card_reconciliation_failure, registration_request_hash,
+    reschedule_card_reconciliation, resolve_version, schedule_card_reconciliation,
+    soft_delete_card_by_ref, soft_delete_card_with_kind, upsert_service_account_from_card,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::{artifact_metadata, multipart_uploads};
@@ -1784,9 +1783,6 @@ pub(crate) async fn reconcile_card_claim(
     claim: &CardReconcileClaim,
 ) -> Result<(), WyrdError> {
     let card_uid = CardUid::from_uuid(claim.card_uid).map_err(WyrdError::from_card_uid_error)?;
-    if claim.reconcile_kind == RECONCILE_KIND_REGISTRATION {
-        initialize_reconciled_uploads(state, caller, claim, &card_uid).await?;
-    }
     let completion_state = load_card_reconciliation_state(state, caller, &card_uid).await?;
     if completion_state
         .manifests
@@ -2005,49 +2001,6 @@ async fn complete_card_inner(
         },
     )
     .await
-}
-
-async fn initialize_reconciled_uploads(
-    state: &AppState,
-    caller: &Caller,
-    claim: &CardReconcileClaim,
-    card_uid: &CardUid,
-) -> Result<(), WyrdError> {
-    let operation_id = claim
-        .registration_operation_id
-        .map(RegistrationOperationId::new)
-        .ok_or_else(|| WyrdError::internal("pending Card has no registration operation"))?;
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let operation = lookup_operation_by_id(&mut conn, operation_id)
-        .await?
-        .ok_or_else(|| WyrdError::internal("Card registration operation was not found"))?;
-    conn.commit().await.map_err(registry_db_error)?;
-    let stored = operation
-        .stored_response
-        .ok_or_else(|| WyrdError::internal("Card registration operation has no replay seed"))?;
-    let seed: RegistrationReplaySeed = serde_json::from_value(stored).map_err(|error| {
-        WyrdError::internal(format!("invalid Card registration replay seed: {error}"))
-    })?;
-    let card_ref = seed
-        .outcomes
-        .iter()
-        .find(|outcome| outcome.card_ref.uid.as_ref() == Some(card_uid))
-        .map(|outcome| &outcome.card_ref)
-        .ok_or_else(|| WyrdError::internal("Card is missing from its registration replay seed"))?;
-    let paths = seed
-        .artifact_manifest_paths
-        .iter()
-        .find(|(reference, _)| reference.same_identity(card_ref))
-        .map(|(_, paths)| {
-            paths
-                .iter()
-                .map(|path| path.as_str().to_owned())
-                .collect::<Vec<String>>()
-        })
-        .unwrap_or_default();
-    initialize_card_uploads(state, caller, operation_id, card_uid, &paths)
-        .await
-        .map(|_| ())
 }
 
 async fn schedule_client_reconciliation(

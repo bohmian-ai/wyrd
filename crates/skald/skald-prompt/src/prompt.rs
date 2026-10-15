@@ -86,6 +86,11 @@ impl Prompt {
     }
 
     /// Return a copy with a native system message applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::UnsupportedRole`] when the request
+    /// format has no system slot, and the errors of [`Prompt::rederived`].
     pub fn with_system(&self, text: impl Into<String>) -> PromptBuilderResult<Self> {
         let mut prompt = self.clone();
         let text = text.into();
@@ -124,6 +129,11 @@ impl Prompt {
     }
 
     /// Return a copy with a native tool-result message appended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::UnsupportedRole`] when the request
+    /// format has no tool-result message, and the errors of [`Prompt::rederived`].
     pub fn with_tool_result(
         &self,
         tool_use_id: impl Into<String>,
@@ -183,6 +193,12 @@ impl Prompt {
         Ok(self)
     }
 
+    /// Appends one plain-text turn for `role` in the request's native shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::UnsupportedRole`] when the request
+    /// format has no conversation turns, and the errors of [`Prompt::rederived`].
     fn with_role_text(&self, role: &str, text: impl Into<String>) -> PromptBuilderResult<Self> {
         let mut prompt = self.clone();
         let text = text.into();
@@ -274,6 +290,11 @@ fn google_tool_result(name: String, content: &str) -> GoogleContent {
     }
 }
 
+/// Refuses a role edit the request format cannot carry.
+///
+/// # Errors
+///
+/// Always returns [`PromptBuilderError::UnsupportedRole`].
 fn unsupported_role(request: &ProviderRequest, role: &str) -> PromptBuilderResult<Prompt> {
     Err(PromptBuilderError::UnsupportedRole {
         provider: request.provider().to_string(),
@@ -281,6 +302,7 @@ fn unsupported_role(request: &ProviderRequest, role: &str) -> PromptBuilderResul
     })
 }
 
+/// Builds the error for a typed accessor called on another request format.
 #[cfg(feature = "python")]
 pub(crate) fn wrong_provider(
     expected: &str,
@@ -436,6 +458,11 @@ impl Prompt {
     }
 
     /// Build an `OpenAI` Chat prompt from native constructor arguments.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when an argument cannot be converted or the
+    /// builder refuses the model, output schema, or request.
     #[staticmethod]
     #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, cache=None, model_settings=None))]
     #[allow(
@@ -468,6 +495,11 @@ impl Prompt {
     }
 
     /// Build an `OpenAI` Responses prompt from native constructor arguments.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when an argument cannot be converted or the
+    /// builder refuses the model, output schema, or request.
     #[staticmethod]
     #[pyo3(signature = (model, *, instructions=None, messages=None, response_format=None, output=None, model_settings=None))]
     #[allow(
@@ -498,6 +530,11 @@ impl Prompt {
     }
 
     /// Build an Anthropic Messages prompt from native constructor arguments.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when an argument cannot be converted or the
+    /// builder refuses the model, output schema, or request.
     #[staticmethod]
     #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None))]
     #[allow(
@@ -528,6 +565,11 @@ impl Prompt {
     }
 
     /// Build a Google Gemini `GenerateContent` prompt from native constructor arguments.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when an argument cannot be converted or the
+    /// builder refuses the model, output schema, or request.
     #[staticmethod]
     #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None))]
     #[allow(
@@ -556,6 +598,11 @@ impl Prompt {
     }
 
     /// Build a Vertex `GenerateContent` prompt from native constructor arguments.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when an argument cannot be converted or the
+    /// builder refuses the model, output schema, or request.
     #[staticmethod]
     #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None))]
     #[allow(
@@ -727,6 +774,11 @@ impl Prompt {
     }
 
     /// Return a provider-native image URL part for the current prompt provider.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` for an invalid provider name or a provider with no
+    /// image URL part, and when the part cannot be converted to Python.
     #[staticmethod]
     #[pyo3(signature = (url, *, detail=None, provider="openai"))]
     pub fn image_url(
@@ -921,6 +973,11 @@ impl Prompt {
     }
 
     /// Replace the native provider request from a wrapper or JSON-like object.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when the value is not a provider request or the
+    /// shared construction boundary refuses its model or output schema.
     #[setter]
     pub fn set_request(&mut self, value: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
         let request = provider_request_from_py(value)?;
@@ -1058,6 +1115,10 @@ impl PyProviderRequest {
 
     /// Return a typed `OpenAI` Responses API request accessor.
     /// Raises `WyrdError` when the provider is not openai responses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::WrongProvider`] for another request format.
     pub fn openai_responses(&self) -> WyrdPyResult<python::PyOpenAiResponsesRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::OpenAiResponses(_) => Ok(
@@ -1069,6 +1130,10 @@ impl PyProviderRequest {
 
     /// Return a typed Anthropic Messages request accessor.
     /// Raises `WyrdError` when the provider is not anthropic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::WrongProvider`] for another request format.
     pub fn anthropic(&self) -> WyrdPyResult<python::PyAnthropicMessagesRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::AnthropicMessage(_) => Ok(
@@ -1080,6 +1145,10 @@ impl PyProviderRequest {
 
     /// Return a typed Google Gemini request accessor.
     /// Raises `WyrdError` when the provider is not google/gemini.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::WrongProvider`] for another request format.
     pub fn gemini(&self) -> WyrdPyResult<python::PyGeminiRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::GeminiGenerateContent(_) => {
@@ -1509,6 +1578,12 @@ fn append_py_content(
     append_native_json_content(prompt, role, value)
 }
 
+/// Appends one turn of native JSON content parts for `role`.
+///
+/// # Errors
+///
+/// Raises `WyrdError` when `value` does not decode as the format's content
+/// parts or the format has no conversation turns.
 #[cfg(feature = "python")]
 fn append_native_json_content(
     prompt: &Prompt,

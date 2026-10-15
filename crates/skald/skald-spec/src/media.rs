@@ -6,6 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Largest media payload, in decoded bytes, a Prompt accepts: the budget
+/// local path helpers read under and inline base64 bindings decode under.
+pub const MAX_MEDIA_FILE_BYTES: u64 = 20 * 1024 * 1024;
+
 /// Wyrd-native media reference for `${media:name}` placeholder substitution.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]

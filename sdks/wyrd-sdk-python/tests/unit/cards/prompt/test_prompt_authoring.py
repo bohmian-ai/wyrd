@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from wyrd import WyrdError
 from wyrd.prompt import (
     AnthropicSettings,
     GeminiSettings,
@@ -48,6 +49,19 @@ def test_bind_returns_new_prompt_and_bind_mut_updates_in_place() -> None:
     rendered = bound.render()
     assert isinstance(rendered, ProviderRequest)
     assert "London" in rendered.model_dump_json()
+
+
+@pytest.mark.parametrize("model", ["{{target}}", "${target}", "gpt\n4o"])
+def test_model_is_literal_and_never_a_render_variable(model: str) -> None:
+    with pytest.raises(WyrdError) as built:
+        Prompt("Hello {{name}}", model, provider="openai")
+    prompt = Prompt("Hello {{name}}", "org/model-1", provider="openai")
+    with pytest.raises(WyrdError) as assigned:
+        prompt.model = model
+
+    assert built.value.code == assigned.value.code == "WYRD_PROMPT_400_INVALID"
+    assert prompt.model == prompt.request.openai().model == "org/model-1"
+    assert prompt.variables == ["name"]
 
 
 def test_bind_media_replaces_native_media_placeholder() -> None:

@@ -166,7 +166,7 @@ description = "Run the real-server CLI Card lifecycle journey with its lifecycle
 run = "cargo test --locked -p wyrd-cli --test cli -- --nocapture --test-threads=1"
 
 [tasks."test:local-dev:journey"]
-description = "Installed CLI bootstrap and fresh saved-config Rust, Python, TypeScript, and MCP callers"
+description = "Installed CLI bootstrap, CLI gateway setup, and fresh saved-config Rust, Python, TypeScript, and MCP callers"
 depends = ["py:setup", "ts:build", "ts:build:testing"]
 run = [
   # --tests puts the dev-only workspace-hack in the graph, so these binaries
@@ -178,6 +178,7 @@ run = [
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[exit]",
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[python]",
   "scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[typescript]",
+  "scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_gateway_setup",
 ]
 
 [tasks."test:wyrdstate:journey"]

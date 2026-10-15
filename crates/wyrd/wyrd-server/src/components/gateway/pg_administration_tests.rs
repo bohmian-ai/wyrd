@@ -85,6 +85,7 @@ fn gateway_config(tenant: DataTenantId) -> GatewayConfig {
         assignment: assigned(tenant, provider),
     };
     GatewayConfig {
+        endpoints: wyrd_gateway::BuiltinEndpoints::default(),
         credential_bindings: BTreeMap::from([
             (
                 CredentialBindingName::new("openai-env").expect("binding name"),

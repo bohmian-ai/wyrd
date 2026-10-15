@@ -37,9 +37,12 @@ use skald_providers::EndpointPolicy;
 /// Base URL overrides of the built-in adapters.
 ///
 /// `None` keeps the Skald client's provider endpoint, which production uses;
-/// tests point the built-ins at local mock servers. OpenAI-compatible
-/// deployments always use their own declared base URL.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// tests and local development point the built-ins at local provider
+/// fixtures, the latter through the server's non-production
+/// `[gateway.endpoints]` configuration. OpenAI-compatible deployments always
+/// use their own declared base URL.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuiltinEndpoints {
     /// `OpenAI` API base, including its `/v1` segment.
     pub openai: Option<Url>,

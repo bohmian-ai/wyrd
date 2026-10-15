@@ -5275,6 +5275,7 @@ fn test_gateway_config(
         ))
     };
     Ok(wyrd_server::config::GatewayConfig {
+        endpoints: wyrd_gateway::BuiltinEndpoints::default(),
         credential_bindings: [
             binding(TEST_GATEWAY_CREDENTIAL_BINDING, "openai")?,
             binding(TEST_GATEWAY_ANTHROPIC_BINDING, "anthropic")?,

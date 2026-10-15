@@ -1368,7 +1368,7 @@ fn attach_config_fields(
             Arc::new(
                 wyrd_gateway::HttpProviderDispatch::new(
                     skald_providers::EndpointPolicy::new(config.deployment_profile.is_production()),
-                    wyrd_gateway::BuiltinEndpoints::default(),
+                    config.gateway.endpoints.clone(),
                 )
                 .map_err(|error| ServerBootError::GatewayTransport(error.to_string()))?,
             ),

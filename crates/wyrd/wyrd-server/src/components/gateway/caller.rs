@@ -75,8 +75,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
     /// Submit one governed model call to the in-process gateway.
     ///
     /// The request is projected before admission, so an unservable dialect
-    /// reaches no gateway decision. The call is not pre-authorized: the
-    /// gateway evaluates and audits the captured caller's invoke permission
+    /// reaches no gateway decision. The gateway evaluates and audits the captured caller's invoke permission
     /// for the requested model and every fallback candidate. Its cancellation
     /// is a child of `cancellation`; the gateway owns any settlement that
     /// continues after this future returns.
@@ -130,7 +129,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             prompt_provider: Some(call.provider),
         };
         let outcome = GatewayInvocation::new(&self.state)
-            .run(&self.caller, request, false, cancellation)
+            .run(&self.caller, request, cancellation)
             .await;
         if cancellation.is_cancelled() {
             return Err(ProviderError::timeout(PROVIDER));

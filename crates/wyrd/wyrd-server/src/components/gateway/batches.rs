@@ -26,7 +26,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::openai::{GatewayFile, GatewayFileDeleted};
-use wyrd_spec::gateway::{GatewayContractError, GatewayOperation, ModelRef};
+use wyrd_spec::gateway::{DeploymentAccess, GatewayContractError, GatewayOperation, ModelRef};
 use wyrd_spec::ids::ProviderDeploymentName;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::gateway::{
@@ -160,13 +160,14 @@ fn public_batch(row: &GatewayBatchRow, object: &Value) -> Value {
 }
 
 /// Deployment names and exact `<deployment>/<model>` addresses the caller's
-/// gateway invoke grants reach, or `None` when an `all` grant may reach every
-/// open deployment.
+/// scoped gateway invoke grants reach, and whether an `all` grant also
+/// reaches every deployment not marked `granted`.
 ///
-/// Only prunes the batch listing: a model outside both lists can never pass
-/// the audited invoke decision, which stays authoritative for the rest.
-fn invocable(caller: &Caller) -> Option<(Vec<String>, Vec<String>)> {
-    let (mut deployments, mut models) = (Vec::new(), Vec::new());
+/// Only prunes the batch listing with the reach [`GatewayInvocation::decide`]
+/// enforces: a model outside it can never pass the audited invoke decision,
+/// which stays authoritative for the rest.
+fn invocable(caller: &Caller) -> (Vec<String>, Vec<String>, bool) {
+    let (mut deployments, mut models, mut all) = (Vec::new(), Vec::new(), false);
     for permission in caller
         .principal
         .effective_permissions
@@ -177,7 +178,7 @@ fn invocable(caller: &Caller) -> Option<(Vec<String>, Vec<String>)> {
         })
     {
         match &permission.scope {
-            PermissionScope::All => return None,
+            PermissionScope::All => all = true,
             PermissionScope::Gateway(GatewayAccess::Deployment { deployment }) => {
                 deployments.push(deployment.as_str().to_owned());
             }
@@ -187,7 +188,7 @@ fn invocable(caller: &Caller) -> Option<(Vec<String>, Vec<String>)> {
             PermissionScope::Bifrost(_) | PermissionScope::Verifier(_) => {}
         }
     }
-    Some((deployments, models))
+    (deployments, models, all)
 }
 
 /// Governed Batches call of `action` for the exact `model`, pinned to
@@ -323,7 +324,6 @@ impl<'a> GatewayBatches<'a> {
             .call(
                 caller,
                 request(model, None, action, json!({ "purpose": "batch" })),
-                false,
                 &self.state.shutdown_token,
             )
             .await?;
@@ -360,11 +360,13 @@ impl<'a> GatewayBatches<'a> {
     /// Creates a batch from an OpenAI create request, at most once per
     /// canonical request.
     ///
-    /// Invoke permission for the file's model is decided and audited once,
-    /// before anything is claimed. The request's RFC 8785 canonical digest is
-    /// then claimed in tenant Postgres before the provider is called. A replay
-    /// of a created batch returns it refreshed under that decision; a replay
-    /// while the first creation is pending is refused as a conflict. Creation
+    /// Invoke permission for the file's model is decided and audited before
+    /// anything is claimed, so a denied caller claims nothing. The request's
+    /// RFC 8785 canonical digest is then claimed in tenant Postgres before the
+    /// provider is called. A replay of a created batch returns it refreshed; a
+    /// replay while the first creation is pending is refused as a conflict.
+    /// The creation or refresh call decides permission again against the
+    /// snapshot that routes it. Creation
     /// runs on the input file's deployment with the provider's file id, in
     /// tracked server work that settles the claim as [`Self::settle`]
     /// describes.
@@ -436,9 +438,7 @@ impl<'a> GatewayBatches<'a> {
         conn.commit().await.map_err(unavailable)?;
         if !claimed {
             if let Some(row) = existing.filter(|row| row.upstream_batch_id.is_some()) {
-                return self
-                    .refresh(caller, row, BatchAction::RetrieveBatch, true)
-                    .await;
+                return self.refresh(caller, row, BatchAction::RetrieveBatch).await;
             }
             return Err(WyrdError::GatewayResourceConflict {
                 message: "an identical batch creation is pending; vary metadata to create a distinct batch".to_owned(),
@@ -473,8 +473,10 @@ impl<'a> GatewayBatches<'a> {
     /// and the claim is released only when no provider can have created the
     /// batch (no attempt began dispatch, or the provider refused below `500`),
     /// kept pending when one may have, and recorded with the provider batch on
-    /// success. The invoke decision was already taken and audited by
-    /// [`Self::create`].
+    /// success. Admission decides and audits invoke permission again against
+    /// the snapshot that routes the call, so access replaced after
+    /// [`Self::create`] decided is enforced before dispatch, and its denial
+    /// releases the claim.
     ///
     /// # Errors
     /// Returns every error of [`GatewayInvocation::invoke`],
@@ -488,7 +490,7 @@ impl<'a> GatewayBatches<'a> {
         cancel: &CancellationToken,
     ) -> Result<BatchAnswer, WyrdError> {
         let tenant = caller.data_tenant_id;
-        let response = match self.call(caller, request, true, cancel).await {
+        let response = match self.call(caller, request, cancel).await {
             Ok(response) => response,
             Err(failure) => {
                 if !failure.dispatched {
@@ -522,8 +524,7 @@ impl<'a> GatewayBatches<'a> {
     /// the errors of [`Self::refresh`].
     pub async fn retrieve(&self, caller: &Caller, id: &str) -> Result<BatchAnswer, WyrdError> {
         let row = self.created(caller.data_tenant_id, id).await?;
-        self.refresh(caller, row, BatchAction::RetrieveBatch, false)
-            .await
+        self.refresh(caller, row, BatchAction::RetrieveBatch).await
     }
 
     /// Cancels a batch and stores the provider's resulting status.
@@ -533,14 +534,15 @@ impl<'a> GatewayBatches<'a> {
     /// the errors of [`Self::refresh`].
     pub async fn cancel(&self, caller: &Caller, id: &str) -> Result<BatchAnswer, WyrdError> {
         let row = self.created(caller.data_tenant_id, id).await?;
-        self.refresh(caller, row, BatchAction::CancelBatch, false)
-            .await
+        self.refresh(caller, row, BatchAction::CancelBatch).await
     }
 
     /// Lists created batches newest first with their last observed status.
     ///
     /// One tenant read returns at most `limit + 1` batches, newest first,
-    /// pruned to models the caller's invoke grants can reach; `has_more`
+    /// pruned before the limit to models the caller's invoke grants can reach
+    /// under the tenant snapshot, where an `all` grant reaches no `granted`
+    /// deployment its scoped grants do not name; `has_more`
     /// reports that an eligible batch follows the page, and `after` is the
     /// last listed batch. Invoke permission is then decided and audited once
     /// per distinct returned model under `gateway.batches.list`, and batches
@@ -571,23 +573,31 @@ impl<'a> GatewayBatches<'a> {
                 })
             })
             .transpose()?;
-        let eligible = invocable(caller);
+        let snapshot = GatewayAdministration::new(self.state)
+            .snapshot(caller.data_tenant_id)
+            .await?;
+        let (deployments, models, all) = invocable(caller);
+        let granted = all.then(|| {
+            snapshot
+                .deployments
+                .iter()
+                .filter(|deployment| deployment.access == DeploymentAccess::Granted)
+                .map(|deployment| deployment.name.as_str().to_owned())
+                .collect::<Vec<_>>()
+        });
         let mut conn = self.conn(caller.data_tenant_id).await?;
         let rows = gateway_batches(
             &mut conn,
             cursor,
             i64::from(limit) + 1,
-            eligible
-                .as_ref()
-                .map(|(deployments, models)| (deployments.as_slice(), models.as_slice())),
+            &deployments,
+            &models,
+            granted.as_deref(),
         )
         .await
         .map_err(unavailable)?;
         conn.commit().await.map_err(unavailable)?;
         let has_more = rows.len() > limit as usize;
-        let snapshot = GatewayAdministration::new(self.state)
-            .snapshot(caller.data_tenant_id)
-            .await?;
         let invocation = GatewayInvocation::new(self.state);
         let mut verdicts: BTreeMap<&str, bool> = BTreeMap::new();
         let mut data = Vec::new();
@@ -685,7 +695,6 @@ impl<'a> GatewayBatches<'a> {
                     BatchAction::FileContent(upstream),
                     json!({}),
                 ),
-                false,
                 &self.state.shutdown_token,
             )
             .await?;
@@ -714,7 +723,6 @@ impl<'a> GatewayBatches<'a> {
                     BatchAction::DeleteFile(row.upstream_file_id),
                     json!({}),
                 ),
-                false,
                 &self.state.shutdown_token,
             )
             .await?;
@@ -734,8 +742,8 @@ impl<'a> GatewayBatches<'a> {
     }
 
     /// Runs `action` on a created batch `row` and stores the provider's
-    /// resulting batch object; `authorized` reuses an invoke decision the
-    /// caller already took and audited for the batch's model.
+    /// resulting batch object; the invoke decision for the batch's model is
+    /// taken and audited by the call's admission.
     ///
     /// # Errors
     /// Returns every error of [`GatewayInvocation::invoke`],
@@ -746,7 +754,6 @@ impl<'a> GatewayBatches<'a> {
         caller: &Caller,
         row: GatewayBatchRow,
         action: fn(String) -> BatchAction,
-        authorized: bool,
     ) -> Result<BatchAnswer, WyrdError> {
         let upstream = row
             .upstream_batch_id
@@ -757,7 +764,6 @@ impl<'a> GatewayBatches<'a> {
             .call(
                 caller,
                 request(model, Some(deployment), action(upstream.clone()), json!({})),
-                authorized,
                 &self.state.shutdown_token,
             )
             .await?;
@@ -771,8 +777,8 @@ impl<'a> GatewayBatches<'a> {
     }
 
     /// Runs one governed Batches `request` through [`GatewayInvocation::run`],
-    /// skipping the invoke decision when `authorized` and cancelling with
-    /// `cancel`.
+    /// which authorizes it against the snapshot that routes it, cancelling
+    /// with `cancel`.
     ///
     /// # Errors
     /// Returns every error of [`GatewayInvocation::invoke`], with whether a
@@ -781,11 +787,10 @@ impl<'a> GatewayBatches<'a> {
         &self,
         caller: &Caller,
         request: GatewayCallRequest,
-        authorized: bool,
         cancel: &CancellationToken,
     ) -> Result<GatewayCallResponse, CallFailure> {
         GatewayInvocation::new(self.state)
-            .run(caller, request, authorized, cancel)
+            .run(caller, request, cancel)
             .await
     }
 

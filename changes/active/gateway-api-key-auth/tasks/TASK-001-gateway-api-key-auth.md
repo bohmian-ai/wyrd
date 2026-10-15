@@ -291,7 +291,7 @@ mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=component
 U2 — planned cache behavior test in the gateway owner:
 
 ```bash
-mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=components::gateway::ingress::tests::gateway_api_key_cache_is_bounded_isolated_and_expires)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=components::gateway::api_keys::tests::gateway_api_key_cache_is_bounded_isolated_and_expires)'
 ```
 
 J1 — planned lifecycle, authorization, secrecy, and tenant journey:
@@ -427,3 +427,89 @@ repository hierarchy described by the workflow reference):
   implementation ownership and material-stop rules.
 - `architecture/references/languages/testing-workflows.md`, `mise.toml`, and
   `.config/nextest.toml` — focused proof, managed environments, and journey lanes.
+
+## Implementation Evidence
+
+Status: `IMPLEMENTED` on `change/gateway-api-key-auth` (commits `c7df0f4ef`
+through `1429b2a96`), pending `$wyrd-task-review`.
+
+### Reuse revalidation
+
+- Classification lives in `GatewayIngress::authenticate` after the unchanged
+  `extract_gateway_access_token`; `GatewayCredential::classify` is the one
+  prefix decision. No second extractor or verifier.
+- Misses call the existing `TokenGrants::api_key` (now `pub(crate)`), the same
+  grant `/auth/token` dispatches: tenant parse, tenant transaction, exchange,
+  mapped errors, refusal audit, commit, and the issuer's `auth.token.exchange`
+  audit. The minted token is verified with `verify_access_token` for the Wyrd
+  audience. `api_key_principal` (OTLP) was not used because it skips minting
+  and exchange audit.
+- `components/gateway/api_keys.rs::GatewayApiKeys` is the gateway-owned cache
+  on `AppState::gateway_api_keys`: installed `lru` (count-bounded, 4096) and
+  `sha2` (SHA-256 key hash), a short `std::sync::Mutex` never held across IO,
+  modeled on `VerifierCache`. The deadline is fixed at admission as
+  `min(60s, token lifetime)`; reads never renew it; expired entries are
+  removed; only verified exchanges are inserted. A cached token that no longer
+  verifies is re-exchanged rather than refused. No dependency, feature, config,
+  migration, header, or public API was added.
+- Journeys reuse `Journey`, `refusal`, `assert_provider_credentials`,
+  `retained_audit_records`, `seed_tenant`, and the Bifrost client; the harness
+  gained only `deploy_as`/`put_as` for a second tenant's administrator.
+
+### TDD record
+
+| Scenario | RED | GREEN |
+|---|---|---|
+| 1 / U1 | Not separately captured: test and classification were added together, so the first run would have been a compile failure, which is not RED | U1 and R1 pass |
+| 2 / U2 | Same as U1; controlled `Instant`s, no sleeps | U2 passes |
+| 3 / J1 | With the API-key branch disabled (`classify` forced to access token, then restored), J1 failed at the first valid-key call: `left: 400, right: 200` (`native.rs:764`, JWT format refusal before dispatch) | J1 passes, 62.8s with the real 60s TTL |
+| 4 / J2 | Exclusions were already correct: verification-only | J2 passes; R2, R3 pass |
+| 5 / P1–P3, T1 | Production behavior was already present from Scenario 1, so these were not RED. J1's RED covers the missing fallback | All pass, run again after the final server edit |
+
+### Acceptance matrix
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-001, AC-003: only `wyrd_sk_` values select exchange; JWTs keep verification | `ingress.rs` `GatewayCredential::classify`, `authenticate` | U1, R1, R2, R3 | PASS |
+| REQ-001, INV-003: misses use the grant and stage exchange audit; hits skip only exchange audit | `api_keys.rs::authenticate` → `TokenGrants::api_key` | J1: cold request has exactly one `auth.token.exchange` for the key's principal plus a `gateway.*` decision; three hits have none plus their own `gateway.*` decision | PASS |
+| REQ-001, INV-001, AC-003: 60s hash-keyed reuse, bounded, no failure caching, no expired JWT, no cross-key reuse | `api_keys.rs` `get`/`insert`/`hash` | U2 (identical key only, 59.999s hit / 60s miss, repeated hits, 10s token lifetime, LRU eviction); J1 (reader key 403 after caller key warmed, twice) | PASS |
+| INV-001: tenant comes from the key; warmed keys cannot cross tenants | Grant's `WyrdApiKey::parse` → `tenant_conn` | J1: second-tenant key gets `404 WYRD_GATEWAY_404_MODEL_UNAVAILABLE` for tenant A's model, then 200 on its own deployment; tenant A ledger holds 6 calls, tenant B 1 | PASS |
+| INV-002: exactly-one-header rule unchanged | Extraction unchanged and runs before classification | R1; J1 (key in two headers, `?key=`, wrong native header → 400 `BAD_TOKEN_FORMAT`; none → 401) | PASS |
+| REQ-001, AC-002: malformed/revoked keys get the exchange error in each envelope; no dispatch | Grant errors rendered by `GatewayIngress::error` | J1: `wyrd_sk_not-a-key` → 401 `WYRD_AUTH_401_API_KEY_INVALID` in OpenAI, Anthropic, and Google envelopes; revoked key still served from cache right after revocation and at +50s, refused with 401 `API_KEY_INVALID` at +61s; upstream count unchanged by refusals | PASS |
+| REQ-001: raw key never in provider headers, capture, diagnostics, responses | Secret wrappers only; key retained only as a hash | J1: every upstream call carries only `PROVIDER_KEY`; no key in response/refusal bodies, any `vala.gateway.calls` cell (7 rows, metadata capture), or any captured span attribute. P1–P3/T1 assert upstream credentials | PASS |
+| REQ-001, AC-002: cached key refused at `/mcp`, `/v1` management, Bifrost | Fallback mounted only in `gateway_ingress_router` | J2: after warming the key on ingress, `POST /mcp`, `GET /v1/admin/gateway/provider-deployments`, `POST /v1/query` refuse it via `X-Wyrd-Access-Token` and `Authorization` with `WYRD_AUTH_*`; an access token passes each | PASS |
+| AC-001: stock clients with URL and key only | Test files below | P1 OpenAI (buffered and stream), P2 Anthropic `x-api-key` (message and stream), P3 Google GenAI `x-goog-api-key` (generate and stream), T1 OpenAI Node (two turns, key from `WYRD_API_KEY`) | PASS |
+| REQ-002: guide fallback and design exception | Guide section "Fallback: a static Wyrd API key"; `wyrd-design.md` "Cross-service delegation" | `docs:check` | PASS |
+| AC-004: scoped checks | — | Commands below | PASS |
+
+### Commands (final outcomes)
+
+- U1, U2, R1: exact `cargo nextest` commands above (U2 path corrected to
+  `components::gateway::api_keys::tests::…`): 3 passed.
+- J1, J2, R2, R3: exact journey commands above, run together after the final
+  server edit: 4 passed.
+- P1–P3: exact commands above, after `py:setup`: 3 passed. T1: exact command
+  above, after `ts:build` and `ts:build:testing`: 1 passed.
+- Adjacent Python stock-client files (`openai_client`, `native_clients`,
+  `client_http_auth`): 24 passed. `gateway-inference.test.ts`: 13 passed.
+- `mise run fmt`, `lints`, `py:format`, `py:lints`, `ts:format`, `ts:lints`,
+  `ts:typecheck`, `check:deps`, `check:tenant-isolation`, `docs:check`: pass.
+- Served OpenAPI request-body descriptions changed, so
+  `mise run test:principals:integration` ran: pass. No codegen input, Python
+  public typing, or SDK export changed, so `codegen:check` and
+  `py:typecheck` were not required.
+- `git diff --check`: clean.
+
+### Scope and limits
+
+- OTLP implementation, auth behavior, and tests are unchanged. The spec's
+  REQ-001 bullet lists OTLP as access-token-only, but OTLP already accepts its
+  own `x-wyrd-api-key`. The guide and design text therefore name only `/mcp`,
+  `/v1` management, and Bifrost, so they don't contradict existing behavior.
+- T1 proves buffered OpenAI calls only: this file's shared upstream answers
+  JSON. OpenAI streaming with a key is proven by P1.
+- Cache is per process. Concurrent misses for the same key each exchange and
+  each audit; nothing is held across the exchange.
+- No non-goal was implemented: no new header, query credential, grant, SDK API,
+  configuration, distributed or persistent cache, migration, adapter, route
+  alias, dependency, or feature. No unrelated files changed.

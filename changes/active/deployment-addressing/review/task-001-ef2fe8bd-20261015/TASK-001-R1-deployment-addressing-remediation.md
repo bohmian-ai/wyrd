@@ -6,8 +6,8 @@ spec: SPEC-deployment-addressing
 spec_revision: 6
 parent_task: TASK-001
 depends_on: []
-requirements: [REQ-001, REQ-002, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, AC-002, AC-004, AC-005, AC-006, AC-008, AC-009]
-remediates: [FIND-001-1, FIND-001-2, FIND-001-3, FIND-001-4, FIND-001-5, FIND-001-6, FIND-001-7, FIND-001-8, FIND-001-9, FIND-001-10, FIND-001-11, FIND-001-12, FIND-001-13]
+requirements: [REQ-001, REQ-002, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-013, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, AC-002, AC-004, AC-005, AC-006, AC-008, AC-009, AC-011, AC-012]
+remediates: [FIND-001-1, FIND-001-2, FIND-001-3, FIND-001-4, FIND-001-5, FIND-001-6, FIND-001-7, FIND-001-8, FIND-001-9, FIND-001-10, FIND-001-11, FIND-001-12, FIND-001-13, FIND-001-14]
 ---
 
 # Repair deployment addressing, Prompt validation and Agent execution
@@ -15,7 +15,7 @@ remediates: [FIND-001-1, FIND-001-2, FIND-001-3, FIND-001-4, FIND-001-5, FIND-00
 ## Authority, reviewed candidate and handoff
 
 Implement with `$wyrd-implement`. This is one remediation task for the complete
-validated finding set, not a new design exercise. No implementation, test pass,
+validated finding set and the owner-requested finding 14, not a new design exercise. No implementation, test pass,
 or finding closure is claimed by this packet.
 
 - Approved specification: `changes/active/deployment-addressing/spec.md`, revision 6.
@@ -335,6 +335,106 @@ T07 compares authored portable/native standalone and portable-inline GET/hydrati
 
 **Correction:** extend the existing register-and-hydrate owners/fixtures in each SDK with both authored forms standalone and inline materialized Prompt Cards; compare GET/hydrated authored JSON and the existing public/retained hash representation, and derived variables/response-schema introspection with no duplicate authored fields. Use the already available public representation or canonical computation in tests; this finding does not require adding a production accessor, hash field or new harness. Add only missing Rust assertions/context. **Closure:** P10 and exact focused Python/TS preservation selectors recorded after extension. No route/override matrix rerun solely for this proof gap. No storage/hash corruption is established.
 
+### FIND-001-14 — Owner-requested — MISSING: prove downloaded Agents retain and execute every provider's configuration
+
+**Provenance:** the owner explicitly requested this additional test after the
+independent review and asked that it be numbered finding 14. This is an
+approved coverage requirement, not a retroactive claim that the reviewers
+independently discovered another implementation defect. Findings 2, 3 and 13
+explain why the path needs direct end-to-end proof.
+
+**Obligations:** REQ-008–011/013, INV-004/007, AC-004/005/008/011/012.
+**Existing owners:** original TASK-001 Scenario 13/T13;
+`sdks/wyrd-sdk-python/tests/integration/test_local_development.py::test_installed_cli_gateway_setup`,
+its fresh TypeScript saved-config client driver, shared Cards registration and
+bundle download/materialization, and the existing public Agent loader/runtime.
+Use the real Python Agent runtime for the load/run stage in a fresh client
+process under the same installed-CLI journey; the TypeScript setup remains
+unchanged. Do not invent a TypeScript Agent runtime API.
+
+**Diagnosis:** direct requests after onboarding prove a deployed provider works,
+but bypass Agent registration, downloaded bundle documents, Prompt reference
+resolution and runtime Agent construction. Separate register/hydrate tests and
+manually attached provider registries do not prove that this complete user path
+keeps deployment names, route, provider and model. A regression in any handoff
+can pass setup/direct-inference checks and then change or lose the user's Agent
+configuration. This finding requires the missing combined proof, without
+claiming the path has been newly executed or that a new corruption bug was
+independently demonstrated.
+
+**Selected correction:** extend the existing installed-CLI setup journey with
+one new provider-loop stage immediately after step 5 (direct response/header/
+retained-evidence checks), then continue its existing step 6 (server restart).
+Reuse its real server, isolated database/config, tenant, uploaded credentials,
+named deployments, saved authentication and controlled provider HTTP fixtures.
+The four providers are those already onboarded: OpenAI, Anthropic, Google via
+the Gemini adapter, and Jev. This does not introduce local Vertex gateway
+support. Prompt provider is `google`, independently of the `gemini` adapter or
+deployment spelling. Choose deployment names that differ from provider names
+so a provider-name substitution cannot accidentally pass. Use distinct literal
+fixture model IDs and cover a slash-containing identifier where supported.
+Use a valid provider-specific Prompt form, including native `system_one` for
+Jev; keep existing Jev tool/streaming limits.
+
+For **each** of those four providers, perform this sequence:
+
+1. Author a Prompt with that provider and exact model, and an Agent whose
+   required `execution_route` selects that provider's named gateway deployment;
+   register through the real public Cards/CLI path with saved caller auth.
+2. Download the registered Agent bundle through the supported public bundle
+   download/materialization path, including its exact referenced Prompt Card;
+   use a fresh output directory, and do not manufacture a bundle from the
+   original authoring inputs.
+3. Load the downloaded Agent through the public **Agent** loader with the
+   bundle's normal reference resolution, rather than building a replacement
+   Agent or running the pre-download in-memory object.
+4. Assert the registered representation, downloaded documents and loaded Agent
+   retain the same exact route kind/deployment, Prompt provider/model and exact
+   Agent/Prompt identities; confirm the referenced Prompt is the registered
+   Prompt actually present in the bundle. Do not reconstruct missing fields.
+5. Supply only normal saved Wyrd connection/auth and host gateway dependencies,
+   then execute the **loaded Agent** against the controlled provider fixture.
+   Mock upstream provider HTTP responses only: Agent execution, rendering,
+   route selection, Wyrd auth/transport, gateway admission and retained evidence
+   must remain real. Do not monkeypatch Agent.run, return a fabricated model
+   answer locally, force native execution, or replace the declared route with a
+   manually attached provider registry/override to make the test pass.
+6. Assert the expected result, exact selected deployment, unchanged upstream
+   model and correct upstream credential header with no forwarded Wyrd key;
+   query normal retained evidence correlated to this Agent invocation and
+   assert requested/resolved deployment/model, not the earlier direct request.
+   A native-provider trap receives zero calls. Include a representative denied
+   loaded-Agent request with no upstream IO using existing permission fixtures.
+
+After every provider has completed that stage, **continue step 6**: restart dev
+with the same tenant/config/state and rerun those downloaded, loaded Agents
+without re-registering or re-downloading them. Assert route/provider/model and
+request/evidence remain exact, saved auth still works, tenant/key identities
+are reused, and existing upstream credentials still decrypt. Preserve current
+restart/revocation checks and normal lifecycle cleanup/timeouts. This validates
+that restart does not conceal a prior registration/load defect.
+
+**Acceptance R1-AC-14:** a single readable installed-CLI user journey runs
+setup/direct inference → register/download/load/inspect/execute all four
+provider Agents → restart/re-execute the downloaded Agents, with exact identity,
+route/provider/model, upstream auth and retained evidence assertions. Its
+provider fixtures are the only mocked inference boundary; no live keys or paid
+calls, parallel launcher, test-only bootstrap auth, or production SSRF exception.
+Retain separate focused tests from other findings where they isolate failures;
+this combined journey does not replace them or the three-SDK contract proof.
+
+**Focused execution (extend existing T13, not a new harness):**
+
+```bash
+mise exec -- scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_gateway_setup
+```
+
+Use its existing installed artifact/build prerequisites and local-dev lane
+selection; record nonempty discovery and RED/GREEN for the extended stage.
+Run that exact selector after the relevant routing/bundle fixes. This is one
+required focused journey, not authorization to repeat every journey suite.
+Update the matching gateway setup walkthrough to show the same user sequence.
+
 ## Bounded documentation inventory for FIND-001-12
 
 This inventory is part of the task, not a request to document untouched code.
@@ -410,7 +510,8 @@ regeneration proof, without artificial behavioral tests.
 10. **Batch dispatch race (FIND-001-10):** deterministic claim barrier separates early authorization from access replacement; actual create and replay refresh refuse an unauthorized new snapshot before IO. Preserve fresh-claim release, uncertain-dispatch fencing and authorized success.
 11. **Provider evidence (FIND-001-9):** retained spans report actual adapter provider separately from arbitrary deployment names, including fallback attempts; align with the existing live-span mapping without mutable post-call lookup.
 12. **Three-SDK authored preservation (FIND-001-13):** portable/native × standalone/inline all compare authored JSON, hash identity and derived introspection after GET/hydrate. Inline Prompts materialize as `<agent>-prompt` under current architecture. Add only missing assertions/cases to existing owners.
-13. **Consumer/static completion (FIND-001-12 and all changed contracts):** finish changed Rust rustdoc, Python stubs/exports, TypeScript declarations, error/schema generators and targeted docs. No checker or unrelated documentation campaign.
+13. **Installed setup through downloaded Agent execution (FIND-001-14):** after direct-request evidence, register/download/load/check/run all four provider Agents, then restart and rerun those downloaded Agents with normal auth and real gateway plumbing.
+14. **Consumer/static completion (FIND-001-12 and all changed contracts):** finish changed Rust rustdoc, Python stubs/exports, TypeScript declarations, error/schema generators and targeted docs. No checker or unrelated documentation campaign.
 
 ## Acceptance criteria and finding closure
 
@@ -429,6 +530,7 @@ regeneration proof, without artificial behavioral tests.
 | R1-AC-11 | FIND-001-11 | Shared literal/runtime media inputs enforce existing payload limits, encoding, MIME and URI constraints without fetching or dropping content. |
 | R1-AC-12 | FIND-001-12 | Changed Rust items satisfy AGENTS §16, including private/test items and applicable Errors/Panics/cancellation contracts. |
 | R1-AC-13 | FIND-001-13 | All first-class SDKs prove two-form standalone/inline authored JSON/hash preservation and derived introspection across real register/GET/hydrate. |
+| R1-AC-14 | FIND-001-14 | After direct setup proof, register/download/load/inspect/execute each provider Agent, then restart and re-execute the same downloaded Agents with unchanged route/provider/model, normal auth, correct upstream credentials and correlated retained evidence. |
 
 ## Focused commands and proof boundaries
 
@@ -529,7 +631,7 @@ consumer correction reaches UI; no visual redesign is part of this task.
 
 ## Completion record and stop conditions
 
-For each FIND-001-1–13 and R1-DOC-AC-01–03 record the source correction, exact RED/GREEN or justified
+For each FIND-001-1–14 and R1-DOC-AC-01–03 record the source correction, exact RED/GREEN or justified
 static proof, focused regression results and required owner checks. Do not
 claim a finding closed because a related selector passed without exercising
 the failing producer. Record later-commit reuse/no-op proof where appropriate.

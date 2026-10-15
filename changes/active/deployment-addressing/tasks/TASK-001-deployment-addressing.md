@@ -749,3 +749,18 @@ subtasks. Source ownership, Cargo package/target metadata, current test
 namespaces, mise test/setup bodies and the Postgres wrapper were inspected.
 No implementation, RED/GREEN, build, test, or readiness verdict is claimed by
 planning. New named tests above are planned, not executed or collected yet.
+
+## Owner-requested extension to Scenario 13 / T13
+
+After direct request/credential/evidence validation (step 5), register an Agent
+and provider/model-specific Prompt for each onboarded OpenAI, Anthropic,
+Google/Gemini and Jev deployment, download its registered bundle, load it through
+the public Agent loader, assert exact execution_route/deployment/provider/model,
+and execute the loaded Agent through the real gateway against mocked upstream
+provider HTTP responses. Then continue step 6: restart and re-execute the same
+downloaded Agents, preserving existing saved-auth/tenant/key/decryption checks.
+The full diagnosis, selected existing-owner path, assertions and exact T13
+command are FIND-001-14 / R1-AC-14 in
+`changes/active/deployment-addressing/review/task-001-ef2fe8bd-20261015/TASK-001-R1-deployment-addressing-remediation.md`.
+This is a later owner-requested coverage addition, not a claim that the earlier
+recorded T13 PASS exercised it.

@@ -222,3 +222,15 @@ The orchestrator should return SPEC_REVISION_REQUIRED naming FIND-001-1's mixed-
 Recorded T01–T17 and owner-check passes were reviewed as claims against their source assertions; they were not rerun and do not prove absent cases. No independent aggregate, served OpenAPI, MCP runtime, installed package, live provider, crash/restart or multi-pod execution was performed. Snapshot navigation initially encountered untrusted mise shims; read-only source inspection used standard tools afterward, with no trust/source modification. Cumulative scope and changed items were inspected for claim applicability; this is static source validation, not execution certification of every diff line. No absent runtime evidence is invented. The required integrated `mise run gate` remains change-review work, not an extra remediation aggregate.
 
 Skipped tests/builds and all source edits as required; material residual risk is delegated Granted escalation plus unsupported/misrouted Agent execution until corrected under approved authority.
+
+## Subsequent human-directed finding 14
+
+At the owner's explicit request, FIND-001-14 identifies additional installed-CLI
+journey coverage: after direct requests/evidence, register an Agent/Prompt for
+each of the four providers, download the registered bundle, load via Agent,
+assert route/provider/model, execute against mocked upstream HTTP, then restart
+and re-execute the same downloaded Agents. Its complete recommendation and
+focused T13 proof are in the remediation packet. This ID is human-directed,
+not retroactively independently validated; the original 13-finding validation
+and disposition crosswalk above remain unchanged. It introduces no new product
+behavior or local Vertex scope. It remains open until implemented and proved.

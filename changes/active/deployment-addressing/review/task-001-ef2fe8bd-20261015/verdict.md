@@ -1,6 +1,6 @@
 # TASK-001 review verdict
 
-**FIX_REQUIRED — FIND-001-1 through FIND-001-13.**
+**FIX_REQUIRED — FIND-001-1 through FIND-001-14 (13 independently validated findings plus owner-requested finding 14).**
 
 One decision-complete remediation task is ready for `$wyrd-implement`:
 [TASK-001-R1-deployment-addressing-remediation.md](TASK-001-R1-deployment-addressing-remediation.md).
@@ -148,7 +148,7 @@ It does not treat unrelated ordinary “workflow” vocabulary as a removal targ
 ## Verification, prior closure and handoff
 
 This is the initial completed task review; there are no prior FIND IDs to close.
-All 13 findings remain open. The approved spec amendment resolves a decision,
+All 13 independently validated findings remain open, alongside the later owner-requested FIND-001-14. The approved spec amendment resolves a decision,
 not the implementation defect. The subsequent review must preserve these IDs
 and reassess the complete original-base-to-new-candidate range, together with
 this verdict, ledger, original task and remediation evidence.
@@ -183,3 +183,15 @@ integration and `mise run docs:check`. This is explicit human-directed work,
 not a newly discovered FIND or a claim that the guides are implemented. The
 validated finding count stays 13. The earlier approval-resolution report
 assessed the packet before this addition; it is preserved unchanged.
+
+## Subsequent owner-requested finding 14
+
+The owner explicitly requested FIND-001-14: extend T13 after step 5 with real
+registration, bundle download, public Agent loading, exact route/provider/model
+assertions and mocked-upstream execution for each onboarded provider, then
+continue step 6 and re-execute those downloaded Agents after restart. The same
+remediation packet now includes the full diagnosis/recommendation, R1-AC-14 and
+exact focused command, and the original task records this later addition.
+There are 14 open items: 13 independently validated findings and this explicit
+human-directed coverage requirement. No retrospective independent validation
+or execution pass is claimed for finding 14; original reports remain intact.

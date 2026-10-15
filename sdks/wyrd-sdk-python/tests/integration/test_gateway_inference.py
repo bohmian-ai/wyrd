@@ -41,10 +41,9 @@ def openai_client(caller: WyrdClient) -> openai.OpenAI:
 
 @pytest.fixture
 def server(gateway_server: tuple[WyrdTestServer, Receiver]) -> WyrdTestServer:
-    """A gateway server with OpenAI chat deployments of ``gpt-4o`` and ``gpt-5-5`` capturing call metadata."""
+    """A gateway server with the ``openai`` deployment capturing call metadata."""
     server, _ = gateway_server
-    deploy(server, "openai", "gpt-4o", ["chat_completions"])
-    deploy(server, "openai", "gpt-5-5", ["chat_completions"])
+    deploy(server, "openai")
     Gateway(client_of(server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
     return server
 

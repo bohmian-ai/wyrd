@@ -30,17 +30,17 @@ def gateway_contract_shapes_are_typed_dicts() -> tuple[object, ...]:
     }
     deployment: ProviderDeployment = {
         "name": "vertex-flash",
-        "model": {"provider": "vertex", "model": "gemini-2.5-flash"},
         "adapter": {"vertex": {"project": "p", "location": "us-central1"}},
         "auth": {"api_key_header": {"credential": "openai-key", "header": "x-api-key"}},
+        "models": ["gemini-2.5-flash"],
         "capabilities": ["chat_completions", "embeddings"],
-        "routing_weight": 1,
+        "access": "granted",
     }
     fallback: GatewayFallbackPolicy = {
         "rules": [
             {
                 "scope": {"operation": {"operation": "responses"}},
-                "candidates": [deployment["model"]],
+                "candidates": [{"deployment": deployment["name"], "model": "gemini-2.5-flash"}],
             }
         ]
     }
@@ -48,7 +48,7 @@ def gateway_contract_shapes_are_typed_dicts() -> tuple[object, ...]:
         "limits": [
             {
                 "subject": {"principal": {"principal_id": "p1"}},
-                "target": "all",
+                "target": {"deployment": {"deployment": "vertex-flash"}},
                 "requests_per_minute": 60,
                 "tokens_per_minute": None,
                 "concurrent_calls": None,

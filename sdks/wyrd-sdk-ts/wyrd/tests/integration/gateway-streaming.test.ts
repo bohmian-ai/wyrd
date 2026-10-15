@@ -34,12 +34,10 @@ const test = serverTest({
         source: { environment: { binding: "test-provider-key" } },
       });
       await Gateway.connect().putDeployment({
-        name: "gpt-4o",
-        model: { provider: "openai", model: "gpt-4o" },
+        name: "openai",
         adapter: "openai",
         auth: { bearer: { credential: "openai-key" } },
         capabilities: ["chat_completions"],
-        routing_weight: 1,
       });
       await use();
     },

@@ -91,9 +91,8 @@ def deploy(client: WyrdClient, bundle: Path) -> Desk:
     state = WyrdState.from_path(cards.hydrate(receipt.root, bundle).destination, client)
     gateway = Gateway(client)
     gateway.put_capture_policy({"mode": "metadata", "payload_fields": []})
-    model = {"provider": PROVIDER, "model": state.card("prompt").spec["model"]}
-    if not any(d["model"] == model for d in gateway.deployments()):
-        route = f"{model['provider']}/{model['model']}"
+    if not any(d["name"] == PROVIDER for d in gateway.deployments()):
+        route = f"{PROVIDER}/{state.card('prompt').spec['model']}"
         raise LookupError(
             f"the support Agent's model {route} is not deployed; configure a gateway "
             f"provider deployment for {route} (PUT /v1/admin/gateway/provider-deployments/{{name}})"

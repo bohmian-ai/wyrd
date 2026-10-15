@@ -180,7 +180,7 @@ def caller(server: WyrdTestServer, provider: str, models: Sequence[str]) -> str:
             {
                 "resource": "gateway",
                 "action": "invoke",
-                "scope": {"gateway": {"model": {"provider": provider, "model": native}}},
+                "scope": {"gateway": {"model": {"deployment": provider, "model": native}}},
             }
             for native in models
         ],
@@ -201,9 +201,9 @@ def live_server(
     operator's own provider key as a managed secret through the CLI, declares
     the deployments that may use it, and a separate principal scoped to exactly
     those models receives the token every call below carries. ``deployments``
-    administers one deployment per ``(model, capabilities)`` pair, defaulting to
-    the provider's chat model, because an operation family is only reachable
-    through a deployment that declares it and each family needs its own model.
+    lists each ``(model, capabilities)`` pair on one deployment named
+    ``provider``, defaulting to the provider's chat model, because an operation
+    family is only reachable through a deployment that declares it.
     """
     with WyrdTestServer(mutate_env=True, live_providers=True) as server:
         name = submit(server, provider, secret)
@@ -217,16 +217,14 @@ def live_server(
             deployments or [(model(provider), ["chat_completions"])]
         )
         gateway = Gateway(WyrdClient(server_url=server.base_url, credential=server.api_key))
-        for index, (native, capabilities) in enumerate(declared):
-            deployment: ProviderDeployment = {
-                "name": f"{provider}-live-{index}",
-                "model": {"provider": provider, "model": native},
-                "adapter": provider,
-                "auth": auth,
-                "capabilities": list(capabilities),
-                "routing_weight": 1,
-            }
-            gateway.put_deployment(deployment)
+        deployment: ProviderDeployment = {
+            "name": provider,
+            "adapter": provider,
+            "auth": auth,
+            "models": [native for native, _ in declared],
+            "capabilities": list(dict.fromkeys(op for _, ops in declared for op in ops)),
+        }
+        gateway.put_deployment(deployment)
         yield server, caller(server, provider, [native for native, _ in declared])
 
 

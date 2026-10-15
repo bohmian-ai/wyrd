@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler
 from typing import Any, Literal
 
 from wyrd.bifrost import Bifrost
-from wyrd.gateway import Gateway, GatewayOperation, ProviderAdapter, ProviderAuth
+from wyrd.gateway import Gateway, ProviderAdapter, ProviderAuth
 from wyrd.testing import WyrdTestServer, cli
 
 from ..support import Delivery, Receiver, client_of
@@ -239,11 +239,11 @@ def _sse(events: list[Any]) -> str:
 def deploy(
     server: WyrdTestServer,
     provider: Literal["openai", "anthropic", "gemini", "vertex"],
-    model: str,
-    capabilities: list[GatewayOperation],
     adapter: ProviderAdapter | None = None,
 ) -> None:
-    """Store a provider's ``Environment`` credential and one built-in deployment of ``model``.
+    """Store a provider's ``Environment`` credential and its deployment named ``provider``.
+
+    Callers then address any model as ``<provider>/<model>``.
 
     The credential goes through in-process ``wyrd gateway credential put`` and
     the deployment through the public Python ``Gateway``, both as the harness
@@ -270,12 +270,9 @@ def deploy(
         adapter = provider
     gateway.put_deployment(
         {
-            "name": model.replace(".", "-"),
-            "model": {"provider": provider, "model": model},
+            "name": provider,
             "adapter": adapter,
             "auth": auth,
-            "capabilities": capabilities,
-            "routing_weight": 1,
         }
     )
 

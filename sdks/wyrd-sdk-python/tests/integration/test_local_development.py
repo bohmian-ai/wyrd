@@ -119,7 +119,7 @@ def export(run: Run) -> None:
 
 
 def configure_gateway(client: WyrdClient) -> None:
-    """Write the ``openai-key`` credential and deploy ``gpt-4o`` on it as ``client``."""
+    """Write the ``openai-key`` credential and deploy ``openai`` on it as ``client``."""
     cli.put_provider_credential(
         {
             "name": "openai-key",
@@ -130,12 +130,10 @@ def configure_gateway(client: WyrdClient) -> None:
     )
     Gateway(client).put_deployment(
         {
-            "name": "gpt-4o",
-            "model": {"provider": "openai", "model": "gpt-4o"},
+            "name": "openai",
             "adapter": "openai",
             "auth": {"bearer": {"credential": "openai-key"}},
             "capabilities": ["chat_completions"],
-            "routing_weight": 1,
         }
     )
 

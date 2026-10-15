@@ -2,6 +2,7 @@ from ..client import WyrdClient
 from ._policy import (
     ApiKeyHeaderAuth,
     BearerAuth,
+    DeploymentTarget,
     EnvironmentCredentialSource,
     ExternalSecretCredentialSource,
     FallbackRule,
@@ -34,7 +35,6 @@ from ._policy import (
     ProviderCredentialState,
     ProviderCredentialView,
     ProviderDeployment,
-    ProviderTarget,
     RoleSubject,
     UnknownCostPolicy,
     VertexAdapter,
@@ -119,7 +119,7 @@ class Gateway:
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` when the dict does not
                 decode; ``WYRD_GATEWAY_400_INVALID_CONFIGURATION`` when the
-                adapter, provider, or capabilities disagree, or the referenced
+                adapter, credential, or capabilities disagree, or the referenced
                 credential is absent, revoked, for another provider, or not
                 assigned to this tenant and endpoint.
 
@@ -319,7 +319,7 @@ __all__ = [
     "ProviderCredentialState",
     "ProviderCredentialView",
     "ProviderDeployment",
-    "ProviderTarget",
+    "DeploymentTarget",
     "RoleSubject",
     "UnknownCostPolicy",
     "VertexAdapter",

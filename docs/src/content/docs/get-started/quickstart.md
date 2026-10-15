@@ -47,17 +47,14 @@ printf '{"name":"openai-key","provider":"openai","source":{"managed_secret":{"se
   "$OPENAI_API_KEY" | wyrd gateway credential put --file -
 ```
 
-Wyrd encrypts the key with the server's sealing key, and no read returns it. Now deploy `gpt-4o` on it:
+Wyrd encrypts the key with the server's sealing key, and no read returns it. Now name an `openai` deployment on it; agents address its models as `openai/<model>`:
 
 ```bash
 wyrd gateway deployment put --file - <<'JSON'
 {
-  "name": "gpt-4o",
-  "model": { "provider": "openai", "model": "gpt-4o" },
+  "name": "openai",
   "adapter": "openai",
-  "auth": { "bearer": { "credential": "openai-key" } },
-  "capabilities": ["chat_completions"],
-  "routing_weight": 1
+  "auth": { "bearer": { "credential": "openai-key" } }
 }
 JSON
 ```

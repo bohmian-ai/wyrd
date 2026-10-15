@@ -148,12 +148,10 @@ def jev() -> Iterator[tuple[WyrdTestServer, Receiver]]:
                 )
                 Gateway(admin).put_deployment(
                     {
-                        "name": "jev-latest",
-                        "model": {"provider": "jev", "model": "jev-latest"},
+                        "name": "jev",
                         "adapter": "jev",
                         "auth": {"bearer": {"credential": "jev-key"}},
                         "capabilities": ["system_one", "chat_completions"],
-                        "routing_weight": 1,
                     }
                 )
                 Gateway(admin).put_capture_policy({"mode": "metadata", "payload_fields": []})
@@ -194,7 +192,7 @@ def test_native_systemone_answers_relay_intact(jev: tuple[WyrdTestServer, Receiv
     asked = len(upstream.deliveries)
     body = {"model": "jev-latest", "state": "Thanks!", "questions": QUESTIONS}
 
-    reply = post(server, "/v1/systemone", body)
+    reply = post(server, "/v1/systemone", {**body, "model": "jev/jev-latest"})
 
     assert (reply.status_code, reply.json()) == (200, answer(0.93, "polite"))
     (delivery,) = upstream.deliveries[asked:]
@@ -210,12 +208,12 @@ def test_invalid_jev_questions_are_refused_before_jev(
 
     for body in [
         {
-            "model": "jev-latest",
+            "model": "jev/jev-latest",
             "state": "s",
             "questions": {"q": {"type": "essay", "instructions": "x"}},
         },
-        {"model": "jev-latest", "state": {"answer": "s"}, "questions": QUESTIONS},
-        {"model": "jev-latest", "state": "s", "questions": QUESTIONS, "temperature": 0},
+        {"model": "jev/jev-latest", "state": {"answer": "s"}, "questions": QUESTIONS},
+        {"model": "jev/jev-latest", "state": "s", "questions": QUESTIONS, "temperature": 0},
     ]:
         reply = post(server, "/v1/systemone", body)
         assert (reply.status_code, reply.json()["error"]["code"]) == (
@@ -290,7 +288,9 @@ def test_jev_refusals_relay_like_other_providers(jev: tuple[WyrdTestServer, Rece
 
     def native(state: str) -> httpx.Response:
         return post(
-            server, "/v1/systemone", {"model": "jev-latest", "state": state, "questions": QUESTIONS}
+            server,
+            "/v1/systemone",
+            {"model": "jev/jev-latest", "state": state, "questions": QUESTIONS},
         )
 
     for state, status, error in [

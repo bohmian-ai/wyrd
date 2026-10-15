@@ -35,8 +35,8 @@ MESSAGES: list[Any] = [{"role": "user", "content": "hi"}]
 def backends(gateway_server: tuple[WyrdTestServer, Receiver]) -> tuple[WyrdTestServer, Receiver]:
     """A server with one OpenAI and one Anthropic chat deployment."""
     server, upstream = gateway_server
-    deploy(server, "openai", "gpt-4o", ["chat_completions"])
-    deploy(server, "anthropic", "claude-sonnet-5", ["chat_completions"])
+    deploy(server, "openai")
+    deploy(server, "anthropic")
     Gateway(client_of(server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
     return server, upstream
 
@@ -91,7 +91,9 @@ def test_anthropic_client_calls_the_gateway_with_http_auth(
         max_retries=0,
     )
 
-    message = client.messages.create(model="claude-sonnet-5", max_tokens=16, messages=MESSAGES)
+    message = client.messages.create(
+        model="anthropic/claude-sonnet-5", max_tokens=16, messages=MESSAGES
+    )
 
     (block,) = message.content
     assert isinstance(block, TextBlock)

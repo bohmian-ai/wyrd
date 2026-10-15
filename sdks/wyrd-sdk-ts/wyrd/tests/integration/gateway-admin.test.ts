@@ -16,11 +16,9 @@ function environmentCredential(name: string) {
 function deployment(name: string, credential: string): ProviderDeployment {
   return {
     name,
-    model: { provider: "openai", model: "gpt-4o" },
     adapter: "openai",
     auth: { bearer: { credential } },
     capabilities: ["chat_completions"],
-    routing_weight: 1,
   };
 }
 

@@ -7,4 +7,6 @@ metadata:
 spec:
   provider: openai
   model: gpt-4o
-  messages: [triage]
+  messages:
+  - role: user
+    content: triage

@@ -30,18 +30,19 @@ pub(crate) mod prompt_support {
     use crate::card::prompt::PromptSpec;
     use crate::envelope::{Card, CardKind, Metadata, Relationships, Spec};
     use crate::ids::CardName;
-    use serde_json::Value;
     use skald_spec::wire::anthropic_messages::{
         AnthropicCacheControl, AnthropicSystem, AnthropicSystemBlock, AnthropicToolResultContent,
     };
-    use skald_spec::wire::openai_chat::OpenAiMessageContent;
+    use skald_spec::wire::openai_chat::{
+        OpenAiJsonSchema, OpenAiMessageContent, OpenAiResponseFormat,
+    };
     use skald_spec::wire::openai_responses::{OpenAiResponseContentPart, OpenAiResponseItem};
     use skald_spec::{
         AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest,
         AnthropicMessagesSettings, GoogleContent, GoogleGenerateContentRequest,
         GoogleGenerateSettings, GooglePart, OpenAiChatMessage, OpenAiChatRequest,
         OpenAiChatSettings, OpenAiResponsesRequest, OpenAiResponsesSettings, Prompt, ProviderName,
-        ProviderRequest, ResponseType,
+        ProviderRequest,
     };
     use wyrd_semver::VersionBlock;
 
@@ -49,16 +50,11 @@ pub(crate) mod prompt_support {
         PromptSpec::new(prompt(request, variables)).expect("static prompt spec is valid")
     }
 
+    /// Builds a Prompt from `request` and asserts it derives `variables`.
     pub fn prompt(request: ProviderRequest, variables: Vec<&str>) -> Prompt {
-        Prompt {
-            request,
-            model: "test-model".to_owned(),
-            version: None,
-            variables: variables.into_iter().map(ToOwned::to_owned).collect(),
-            media_variables: Vec::new(),
-            response_type: ResponseType::Text,
-            provider: None,
-        }
+        let prompt = Prompt::new(request, "test-model").expect("static prompt is valid");
+        assert_eq!(prompt.variables, variables, "fixture variables are derived");
+        prompt
     }
 
     pub fn prompt_card(spec: PromptSpec) -> Card {
@@ -217,13 +213,20 @@ pub(crate) mod prompt_support {
         }
     }
 
-    pub fn json_schema_response_type() -> ResponseType {
-        ResponseType::JsonSchema {
-            name: "answer".to_owned(),
-            schema: serde_json::json!({
-                "type": "object",
-                "properties": { "answer": { "type": "string" } }
-            }),
+    /// OpenAI Chat structured-output field for an `answer` object.
+    pub fn json_schema_response_format() -> OpenAiResponseFormat {
+        OpenAiResponseFormat::JsonSchema {
+            json_schema: OpenAiJsonSchema {
+                name: "answer".to_owned(),
+                description: None,
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "answer": { "type": "string" } }
+                })
+                .as_object()
+                .cloned(),
+                strict: Some(true),
+            },
         }
     }
 
@@ -247,25 +250,12 @@ pub(crate) mod prompt_support {
             _ => {}
         }
     }
-
-    /// Returns the raw provider body of a `RawV1` request, or `None` for a typed request.
-    pub fn raw_body(request: &ProviderRequest) -> Option<&Value> {
-        match request {
-            ProviderRequest::RawV1 { body, .. } => Some(body),
-            _ => None,
-        }
-    }
-
-    pub fn json_object_schema() -> Value {
-        serde_json::json!({ "type": "object" })
-    }
 }
 
 #[cfg(test)]
 mod prompt_codec_tests {
-    use super::prompt_support::{prompt_card, prompt_spec, raw_body, raw_request};
+    use super::prompt_support::{prompt_card, prompt_spec};
     use crate::{CardLoadFormat, parse_card_bytes, serialize_card};
-    use skald_spec::ProviderName;
 
     #[test]
     fn parse_serialize_json_card_roundtrip() {
@@ -292,26 +282,6 @@ mod prompt_codec_tests {
     }
 
     #[test]
-    fn parse_raw_v1_preserves_body() {
-        let card = prompt_card(prompt_spec(
-            raw_request(ProviderName::Custom("acme".to_owned())),
-            Vec::new(),
-        ));
-        let original_body = match &card.spec {
-            crate::envelope::Spec::Prompt(spec) => raw_body(&spec.prompt.request),
-            _ => None,
-        };
-        let bytes = serialize_card(CardLoadFormat::Json, &card).expect("serialize");
-        let decoded = parse_card_bytes(CardLoadFormat::Json, &bytes).expect("parse");
-        let decoded_body = match &decoded.spec {
-            crate::envelope::Spec::Prompt(spec) => raw_body(&spec.prompt.request),
-            _ => None,
-        };
-
-        assert_eq!(decoded_body, original_body);
-    }
-
-    #[test]
     fn from_extension_rejects_txt() {
         let err = CardLoadFormat::from_extension(Some("txt")).expect_err("txt rejected");
 
@@ -323,9 +293,8 @@ mod prompt_codec_tests {
 mod prompt_construct_tests {
     use super::prompt_support::{
         anthropic_request, google_request, openai_chat_request, openai_responses_request,
-        prompt_spec, raw_request,
+        prompt_spec,
     };
-    use skald_spec::ProviderName;
 
     #[test]
     fn new_provider_variants_build() {
@@ -337,20 +306,6 @@ mod prompt_construct_tests {
         ] {
             let spec = prompt_spec(request, Vec::new());
             assert!(spec.parameters().is_empty());
-        }
-    }
-
-    #[test]
-    fn new_raw_v1_builds_for_every_provider_name() {
-        for provider in [
-            ProviderName::OpenAi,
-            ProviderName::Anthropic,
-            ProviderName::Google,
-            ProviderName::Vertex,
-            ProviderName::Custom("acme".to_owned()),
-        ] {
-            let spec = prompt_spec(raw_request(provider), Vec::new());
-            assert!(spec.is_fully_bound());
         }
     }
 
@@ -373,24 +328,14 @@ mod prompt_construct_tests {
 #[cfg(test)]
 mod prompt_content_hash_tests {
     use super::prompt_support::{
-        json_schema_response_type, mutate_first_text, openai_chat_request, prompt, prompt_spec,
+        json_schema_response_format, mutate_first_text, openai_chat_request, prompt, prompt_spec,
     };
     use crate::PromptSpec;
 
+    /// The hash follows the authored model and content, including a native
+    /// structured-output field.
     #[test]
-    fn hash_stable_when_version_changes() {
-        let mut prompt = prompt(openai_chat_request("hello"), Vec::new());
-        let first = PromptSpec::new(prompt.clone())
-            .expect("valid")
-            .content_hash();
-        prompt.version = Some("v3".to_owned());
-        let second = PromptSpec::new(prompt).expect("valid").content_hash();
-
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn hash_changes_on_model_request_variables_and_response_type_mutations() {
+    fn hash_changes_on_model_request_and_response_format_mutations() {
         let base_prompt = prompt(openai_chat_request("hello {{name}}"), vec!["name"]);
         let base = PromptSpec::new(base_prompt.clone())
             .expect("valid")
@@ -414,16 +359,12 @@ mod prompt_content_hash_tests {
                 .content_hash()
         );
 
-        let mut changed_vars = base_prompt.clone();
-        mutate_first_text(&mut changed_vars.request, "hello {{name}} {{city}}");
-        changed_vars.variables.push("city".to_owned());
-        assert_ne!(
-            base,
-            PromptSpec::new(changed_vars).expect("valid").content_hash()
-        );
-
         let mut changed_response = base_prompt;
-        changed_response.response_type = json_schema_response_type();
+        if let skald_spec::ProviderRequest::OpenAiChatCompletion(request) =
+            &mut changed_response.request
+        {
+            request.response_format = Some(json_schema_response_format());
+        }
         assert_ne!(
             base,
             PromptSpec::new(changed_response)
@@ -449,119 +390,69 @@ mod prompt_content_hash_tests {
 }
 
 #[cfg(test)]
-mod prompt_declarative_tests {
-    use crate::card::prompt::PromptSpec;
+mod prompt_authored_tests {
     use crate::envelope::{Card, CardKind, Spec};
     use crate::format;
     use skald_spec::{ProviderRequest, ResponseType};
-    use std::collections::BTreeMap;
 
-    use crate::envelope::Relationships;
-
-    fn declarative_yaml() -> &'static str {
-        r#"
-    apiVersion: wyrd/v1
-    kind: Prompt
-    metadata:
-      name: test-prompt
-      version: 0.1.0
-    spec:
-      provider: openai
-      model: gpt-4o
-      system: "You are {{persona}}."
-      messages:
-        - "Summarize {{doc}}."
-      model_settings:
-        temperature: 0.2
-    "#
+    /// Wraps an authored spec body in a Prompt Card YAML document.
+    fn card_yaml(spec: &str) -> String {
+        let spec = spec
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("kind: Prompt\nmetadata:\n  name: test-prompt\n  version: 0.1.0\nspec:\n{spec}\n")
     }
 
-    fn native_yaml(provider: &str, model: &str) -> String {
-        // Build via the builder and serialize, to get the native round-trip fixture
-        let prompt = skald_spec::authoring::PromptDraft {
-            provider: provider.to_owned(),
-            model: model.to_owned(),
-            operation: None,
-            system: None,
-            messages: skald_spec::authoring::DraftMessages::Many(vec!["Hello".to_owned()]),
-            model_settings: None,
-            version: None,
-        }
-        .compile()
-        .unwrap();
-
-        let spec = PromptSpec::new(prompt).unwrap();
-        let card = Card {
-            api_version: crate::api_version::ApiVersion::v1(),
-            kind: CardKind::Prompt,
-            metadata: crate::envelope::Metadata {
-                name: crate::ids::CardName::new("test").unwrap(),
-                version: Some(wyrd_semver::VersionBlock::parse("0.1.0").unwrap().into()),
-                bump: None,
-                space: None,
-                uid: None,
-                labels: BTreeMap::default(),
-                annotations: BTreeMap::default(),
-                spec_hash: None,
-                artifact_hash: None,
-                origin: None,
-            },
-            spec: Spec::Prompt(spec),
-            relationships: Relationships::default(),
-            status: None,
-        };
-        format::yaml::to_string(&card).unwrap()
+    /// Decodes a Card and returns its authored spec as JSON after re-encoding.
+    fn round_trip(yaml: &str) -> (Card, serde_json::Value) {
+        let card: Card = format::yaml::from_str(yaml).expect("card decodes");
+        let encoded = format::yaml::to_string(&card).expect("card encodes");
+        let decoded: Card = format::yaml::from_str(&encoded).expect("card re-decodes");
+        assert_eq!(decoded, card);
+        let spec = serde_json::to_value(&card).expect("card json")["spec"].clone();
+        (card, spec)
     }
 
+    /// A portable Card compiles to the provider default format and serializes
+    /// back to exactly the authored fields.
     #[test]
-    fn declarative_yaml_deserializes_as_card() {
-        let card: Card = format::yaml::from_str(declarative_yaml()).unwrap();
+    fn portable_card_round_trips_as_authored() {
+        let (card, spec) = round_trip(&card_yaml(
+            "provider: openai\nmodel: gpt-4o\nsystem: You are {{persona}}.\nmessages:\n  - role: user\n    content: Summarize {{doc}}.\nsettings:\n  temperature: 0.2",
+        ));
         assert_eq!(card.kind, CardKind::Prompt);
-        let Spec::Prompt(spec) = &card.spec else {
+        let Spec::Prompt(prompt) = &card.spec else {
             panic!("expected Prompt spec");
         };
-        assert_eq!(spec.prompt.model, "gpt-4o");
         assert!(matches!(
-            spec.prompt.request,
+            prompt.prompt.request,
             ProviderRequest::OpenAiChatCompletion(_)
         ));
-        assert!(spec.prompt.variables.contains(&"persona".to_owned()));
-        assert!(spec.prompt.variables.contains(&"doc".to_owned()));
-        assert_eq!(spec.prompt.response_type, ResponseType::Text);
-    }
-
-    #[test]
-    fn declarative_yaml_has_no_type_field() {
-        let card: Card = format::yaml::from_str(declarative_yaml()).unwrap();
-        let roundtripped = format::yaml::to_string(&card).unwrap();
-        assert!(
-            !roundtripped.contains("type: Prompt"),
-            "spec.type must not appear in serialized output"
+        assert_eq!(prompt.prompt.variables, vec!["persona", "doc"]);
+        assert_eq!(prompt.prompt.response_type, ResponseType::Text);
+        assert_eq!(
+            spec,
+            serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-4o",
+                "system": "You are {{persona}}.",
+                "messages": [{"role": "user", "content": "Summarize {{doc}}."}],
+                "settings": {"temperature": 0.2},
+            })
         );
-        assert!(roundtripped.contains("kind: Prompt"));
     }
 
+    /// A native Card keeps its format and body verbatim.
     #[test]
-    fn declarative_temperature_setting_applied() {
-        let card: Card = format::yaml::from_str(declarative_yaml()).unwrap();
-        let Spec::Prompt(spec) = &card.spec else {
-            panic!()
-        };
-        let ProviderRequest::OpenAiChatCompletion(req) = &spec.prompt.request else {
-            panic!()
-        };
-        assert_eq!(req.settings.temperature, Some(0.2));
-    }
-
-    #[test]
-    fn native_format_round_trips() {
-        let yaml_str = native_yaml("openai", "gpt-4o");
-        assert!(yaml_str.contains("kind: Prompt"));
-        assert!(!yaml_str.contains("type: Prompt"));
-        let decoded: Card = format::yaml::from_str(&yaml_str).unwrap();
-        let re_encoded = format::yaml::to_string(&decoded).unwrap();
-        let redecoded: Card = format::yaml::from_str(&re_encoded).unwrap();
-        assert_eq!(decoded, redecoded);
+    fn native_card_round_trips_as_authored() {
+        let (_, spec) = round_trip(&card_yaml(
+            "provider: anthropic\nmodel: claude-sonnet-5\nformat: messages\nbody:\n  max_tokens: 64\n  messages:\n    - role: user\n      content:\n        - type: text\n          text: Hello",
+        ));
+        assert_eq!(spec["format"], "messages");
+        assert_eq!(spec["body"]["max_tokens"], 64);
+        assert!(spec["body"].get("model").is_none());
     }
 
     /// An authored Card that omits `apiVersion` deserializes as `wyrd/v1`
@@ -572,18 +463,9 @@ mod prompt_declarative_tests {
     /// serializes without an explicit `apiVersion`.
     #[test]
     fn api_version_defaults_to_v1() {
-        let yaml = r"
-    kind: Prompt
-    metadata:
-      name: test-prompt
-      version: 0.1.0
-    spec:
-      provider: openai
-      model: gpt-4o
-      messages:
-        - Hello
-    ";
-        let card: Card = format::yaml::from_str(yaml).expect("omitted apiVersion deserializes");
+        let (card, _) = round_trip(&card_yaml(
+            "provider: openai\nmodel: gpt-4o\nmessages:\n  - role: user\n    content: Hello",
+        ));
         assert_eq!(card.api_version.as_str(), "wyrd/v1");
         assert!(
             format::yaml::to_string(&card)
@@ -592,150 +474,37 @@ mod prompt_declarative_tests {
         );
     }
 
+    /// Unknown providers and removed or derived fields are refused, never
+    /// ignored.
     #[test]
-    fn malformed_provider_raises_error_not_silent() {
-        let yaml = r"
-    kind: Prompt
-    metadata:
-      name: test-prompt
-      version: 0.1.0
-    spec:
-      provider: badprovider
-      model: gpt-4o
-      messages:
-        - Hello
-    ";
-        let result: Result<Card, _> = format::yaml::from_str(yaml);
-        assert!(result.is_err(), "unknown provider must produce an error");
-    }
-
-    #[test]
-    fn anthropic_declarative_compiles() {
-        let yaml = r"
-    apiVersion: wyrd/v1
-    kind: Prompt
-    metadata:
-      name: test-anthropic
-      version: 0.1.0
-    spec:
-      provider: anthropic
-      model: claude-3-5-sonnet-20241022
-      system: You are a helpful assistant.
-      messages:
-        - What is 2+2?
-    ";
-        let card: Card = format::yaml::from_str(yaml).unwrap();
-        let Spec::Prompt(spec) = &card.spec else {
-            panic!()
-        };
-        assert!(matches!(
-            spec.prompt.request,
-            ProviderRequest::AnthropicMessage(_)
-        ));
+    fn unknown_provider_and_removed_fields_refused() {
+        for spec in [
+            "provider: Bad Provider\nmodel: gpt-4o\nmessages:\n  - role: user\n    content: Hello",
+            "provider: openai\nmodel: gpt-4o\nmessages:\n  - Hello",
+            "provider: openai\nmodel: gpt-4o\nvariables: [x]\nmessages:\n  - role: user\n    content: Hello",
+            "provider: openai\nmodel: gpt-4o\nmodel_settings: {temperature: 1}\nmessages:\n  - role: user\n    content: Hello",
+            "provider: openai\nmodel: gpt-4o\nrequest: {}",
+        ] {
+            let result: Result<Card, _> = format::yaml::from_str(&card_yaml(spec));
+            assert!(result.is_err(), "refused: {spec}");
+        }
     }
 }
 
 #[cfg(test)]
 mod prompt_envelope_invariants_tests {
-    use super::prompt_support::{json_object_schema, openai_chat_request, prompt};
+    use super::prompt_support::{prompt, raw_request};
     use crate::PromptSpec;
-    use skald_spec::{ProviderRequest, ResponseType};
+    use skald_spec::ProviderName;
 
+    /// A raw provider body has no authored Prompt format, so it cannot become
+    /// a Prompt Card.
     #[test]
-    fn invariant_invalid_variable_name_rejected() {
-        let err = PromptSpec::new(prompt(
-            openai_chat_request("hello {{name}}"),
-            vec!["bad-name"],
-        ))
-        .expect_err("invalid name rejected");
+    fn raw_request_is_not_an_authored_prompt() {
+        let err = PromptSpec::new(prompt(raw_request(ProviderName::OpenAi), Vec::new()))
+            .expect_err("raw body refused");
 
-        assert_eq!(err.code(), "WYRD_PROMPT_400_INVALID_VARIABLE_NAME");
-    }
-
-    #[test]
-    fn invariant_duplicate_variable_rejected() {
-        let err = PromptSpec::new(prompt(
-            openai_chat_request("hello {{name}}"),
-            vec!["name", "name"],
-        ))
-        .expect_err("duplicate rejected");
-
-        assert_eq!(err.code(), "WYRD_PROMPT_409_DUPLICATE_VARIABLE");
-    }
-
-    #[test]
-    fn invariant_undeclared_placeholder_rejected() {
-        let err = PromptSpec::new(prompt(openai_chat_request("hello {{name}}"), Vec::new()))
-            .expect_err("undeclared placeholder rejected");
-
-        assert_eq!(err.code(), "WYRD_PROMPT_422_UNDECLARED_PLACEHOLDER");
-    }
-
-    #[test]
-    fn invariant_unreferenced_variable_rejected() {
-        let err = PromptSpec::new(prompt(openai_chat_request("hello"), vec!["name"]))
-            .expect_err("unreferenced variable rejected");
-
-        assert_eq!(err.code(), "WYRD_PROMPT_422_UNREFERENCED_VARIABLE");
-    }
-
-    #[test]
-    fn invariant_undeclared_media_placeholder_rejected() {
-        let err = PromptSpec::new(prompt(openai_chat_request("${media:logo}"), Vec::new()))
-            .expect_err("undeclared media placeholder rejected");
-
-        assert_eq!(err.code(), "WYRD_PROMPT_422_UNDECLARED_MEDIA_PLACEHOLDER");
-    }
-
-    #[test]
-    fn invariant_unreferenced_media_variable_rejected() {
-        let mut prompt = prompt(openai_chat_request("hello"), Vec::new());
-        prompt.media_variables = vec!["logo".to_owned()];
-        let err = PromptSpec::new(prompt).expect_err("unreferenced media variable rejected");
-
-        assert_eq!(err.code(), "WYRD_PROMPT_422_UNREFERENCED_MEDIA_VARIABLE");
-    }
-
-    #[test]
-    fn invariant_empty_model_rejected() {
-        let mut prompt = prompt(openai_chat_request("hello"), Vec::new());
-        prompt.model = "   ".to_owned();
-        let err = PromptSpec::new(prompt).expect_err("empty model rejected");
-
-        assert_eq!(err.code(), "WYRD_PROMPT_400_EMPTY_MODEL");
-    }
-
-    #[test]
-    fn invariant_non_object_json_schema_rejected() {
-        let mut prompt = prompt(openai_chat_request("hello"), Vec::new());
-        prompt.response_type = ResponseType::JsonSchema {
-            name: "bad".to_owned(),
-            schema: serde_json::json!(["not", "object"]),
-        };
-        let err = PromptSpec::new(prompt).expect_err("schema rejected");
-
-        assert_eq!(err.code(), "WYRD_PROMPT_400_INVALID_RESPONSE_SCHEMA");
-    }
-
-    #[test]
-    fn invariant_object_json_schema_accepts() {
-        let mut prompt = prompt(openai_chat_request("hello"), Vec::new());
-        prompt.response_type = ResponseType::JsonSchema {
-            name: "ok".to_owned(),
-            schema: json_object_schema(),
-        };
-
-        assert!(PromptSpec::new(prompt).is_ok());
-    }
-
-    #[test]
-    fn raw_v1_with_no_placeholders_validates() {
-        let raw = ProviderRequest::RawV1 {
-            provider: skald_spec::ProviderName::Custom("acme".to_owned()),
-            body: serde_json::json!({"x": 1}),
-        };
-
-        assert!(PromptSpec::new(prompt(raw, Vec::new())).is_ok());
+        assert_eq!(err.code(), "WYRD_PROMPT_400_INVALID");
     }
 }
 
@@ -846,9 +615,9 @@ mod prompt_promptref_tests {
 #[cfg(test)]
 mod prompt_skald_boundary_tests {
     use super::prompt_support::{
-        anthropic_with_system, openai_chat_request, prompt_card, prompt_spec, raw_request,
+        anthropic_with_system, openai_chat_request, prompt_card, prompt_spec,
     };
-    use skald_spec::{ProviderName, ProviderRequest};
+    use skald_spec::ProviderRequest;
 
     #[test]
     fn stored_anthropic_promptcard_round_trips_through_gateway_parse_path() {
@@ -861,29 +630,6 @@ mod prompt_skald_boundary_tests {
     #[test]
     fn stored_openai_promptcard_round_trips_through_gateway_parse_path() {
         assert_stored_equals_proxied(openai_chat_request("hi {{name}}"), vec![("name", "world")]);
-    }
-
-    #[test]
-    fn stored_raw_v1_promptcard_round_trips_byte_identical() {
-        let request = raw_request(ProviderName::Custom("acme".to_owned()));
-        let spec = prompt_spec(request.clone(), Vec::new());
-        let card = prompt_card(spec);
-        let bytes = serde_json::to_vec(&card).expect("card serializes");
-        let decoded: crate::envelope::Card = serde_json::from_slice(&bytes).expect("card parses");
-        let rendered = match decoded.spec {
-            crate::envelope::Spec::Prompt(spec) => spec.prompt.render(&[]).expect("renders"),
-            _ => unreachable!("prompt card"),
-        };
-        let rendered_bytes = serde_json::to_vec(&rendered).expect("request serializes");
-        let proxied: ProviderRequest =
-            serde_json::from_slice(&rendered_bytes).expect("gateway parses");
-
-        assert_eq!(rendered, proxied);
-        assert_eq!(
-            rendered_bytes,
-            serde_json::to_vec(&proxied).expect("reserializes")
-        );
-        assert_eq!(request, proxied);
     }
 
     fn assert_stored_equals_proxied(request: ProviderRequest, vars: Vec<(&str, &str)>) {

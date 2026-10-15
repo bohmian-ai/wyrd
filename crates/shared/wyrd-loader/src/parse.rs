@@ -366,6 +366,8 @@ spec:
     name: system-prompt
     version: "1.0.0"
     space: default
+  execution_route:
+    kind: native
 "#
         )
         .unwrap();
@@ -427,9 +429,9 @@ metadata:
   space: default
   version: "1.0.0"
 spec:
-  provider: anthropic
-  model: claude-sonnet-4.5
-  messages: []
+  provider: openai
+  model: gpt-5
+  system: Be brief.
 ---
 kind: Agent
 metadata:
@@ -442,6 +444,8 @@ spec:
     name: system-prompt
     version: "1.0.0"
     space: default
+  execution_route:
+    kind: native
 "#
         )
         .unwrap();
@@ -469,9 +473,9 @@ metadata:
   space: default
   version: "1.0.0"
 spec:
-  provider: anthropic
-  model: claude-sonnet-4.5
-  messages: []
+  provider: openai
+  model: gpt-5
+  system: Be brief.
 "#
         )
         .unwrap();
@@ -491,9 +495,9 @@ spec:
 apiVersion: wyrd/v1
 kind: Prompt
 spec:
-  provider: anthropic
-  model: claude-sonnet-4.5
-  messages: []
+  provider: openai
+  model: gpt-5
+  system: Be brief.
 ---
 apiVersion: wyrd/v1
 metadata:
@@ -501,9 +505,9 @@ metadata:
   space: default
   version: "1.0.0"
 spec:
-  provider: anthropic
-  model: claude-sonnet-4.5
-  messages: []
+  provider: openai
+  model: gpt-5
+  system: Be brief.
 "#
         )
         .unwrap();
@@ -531,7 +535,7 @@ spec:
         let source = workspace.path().join("agent.yaml");
         std::fs::write(
             &source,
-            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  space: default\n  version: 1.0.0\nspec:\n  prompt:\n    request:\n      provider: gemini_generate_content\n      body:\n        contents: []\n        system_instruction:\n          role: system\n          parts:\n            - text: !file runbook.txt\n    model: gemini-flash-lite\n    variables: []\n    media_variables: []\n    response_type: text\n  tool_names: []\n  run_config: {}\n",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  space: default\n  version: 1.0.0\nspec:\n  prompt:\n    provider: google\n    model: gemini-flash-lite\n    format: generate_content\n    body:\n      contents: []\n      system_instruction:\n        role: system\n        parts:\n          - text: !file runbook.txt\n  execution_route:\n    kind: native\n  tool_names: []\n  run_config: {}\n",
         )
         .unwrap();
 

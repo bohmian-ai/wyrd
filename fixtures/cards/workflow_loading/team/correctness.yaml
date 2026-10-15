@@ -3,9 +3,11 @@ kind: Agent
 metadata:
   space: workflow-loading
   name: correctness-reviewer
-  version: "1.0.0"
+  version: 1.0.0
 spec:
   prompt: prompts/correctness.yaml
+  execution_route:
+    kind: native
   tool_names: []
   run_config:
     max_iterations: 1

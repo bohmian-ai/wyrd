@@ -172,7 +172,7 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1/chat/completions",
         "/v1/messages",
         "/v1/systemone",
-        "/v1beta/models/{target}",
+        "/v1beta/models/{deployment}/{target}",
     ] {
         assert!(paths.contains_key(path), "missing {path}");
     }
@@ -1028,7 +1028,7 @@ async fn gateway_ingress_publishes_typed_contracts() {
             "AnthropicErrorEnvelope",
         ),
         (
-            "/v1beta/models/{target}",
+            "/v1beta/models/{deployment}/{target}",
             "GatewayGeminiGenerateContentRequest",
             "GatewayGeminiGenerateContentResponse",
             "GoogleErrorEnvelope",
@@ -1170,7 +1170,7 @@ async fn gateway_inference_ingress_publishes_the_fallback_header() {
         "/v1/responses",
         "/v1/messages",
         "/v1/systemone",
-        "/v1beta/models/{target}",
+        "/v1beta/models/{deployment}/{target}",
     ] {
         let header = fallback(path).unwrap_or_else(|| panic!("{path} publishes the header"));
         assert_eq!(header["in"], "header", "{path}");

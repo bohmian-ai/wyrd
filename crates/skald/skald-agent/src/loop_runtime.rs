@@ -732,7 +732,7 @@ impl Agent {
         self.journal
             .append(JournalEvent::ModelCall {
                 iteration,
-                provider: provider_label(&self.prompt.native().provider()),
+                provider: self.prompt.native().provider().to_string(),
                 model: request_model(request).unwrap_or_default().to_owned(),
             })
             .await
@@ -953,17 +953,6 @@ fn genai_provider_name(provider: &ProviderName) -> &str {
         ProviderName::Vertex => "gcp.vertex_ai",
         ProviderName::Jev => "jev",
         ProviderName::Custom(name) => name,
-    }
-}
-
-fn provider_label(provider: &ProviderName) -> String {
-    match provider {
-        ProviderName::OpenAi => "openai".to_owned(),
-        ProviderName::Anthropic => "anthropic".to_owned(),
-        ProviderName::Google => "google".to_owned(),
-        ProviderName::Vertex => "vertex".to_owned(),
-        ProviderName::Jev => "jev".to_owned(),
-        ProviderName::Custom(name) => name.clone(),
     }
 }
 

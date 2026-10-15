@@ -49,7 +49,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .to_owned(),
             ),
             messages: vec!["Research: {{topic}}".to_owned()],
-            variables: vec!["topic".to_owned()],
             ..OpenAiChatOptions::default()
         },
     )?;
@@ -62,7 +61,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .to_owned(),
             ),
             messages: vec!["Write a summary from: {{research}}".to_owned()],
-            variables: vec!["research".to_owned()],
             ..OpenAiChatOptions::default()
         },
     )?;

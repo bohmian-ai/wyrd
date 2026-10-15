@@ -25,7 +25,7 @@ fn prompt_card(name: &str) -> Card {
         "apiVersion": "wyrd/v1",
         "kind": "Prompt",
         "metadata": { "name": name, "version": "1.0.0", "space": "default" },
-        "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+        "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
         "relationships": { "outbound": [], "inbound": [] }
     }))
     .expect("card fixture must deserialize")
@@ -688,7 +688,7 @@ async fn relationship_rows_preserve_exact_target_identity() {
             "version": "1.0.0",
             "space": "default",
             "uid": target_uid
-        }}
+        }, "execution_route": {"kind": "native"}}
     }))
     .expect("agent fixture must deserialize");
 
@@ -795,7 +795,7 @@ async fn relationship_recheck_blocks_target_lifecycle_race() {
             "name": "race-target",
             "version": "1.0.0",
             "space": "default"
-        }}
+        }, "execution_route": {"kind": "native"}}
     }))
     .expect("agent fixture must deserialize");
 
@@ -963,7 +963,7 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
             "version": "1.0.0",
             "space": "default",
             "uid": target_uid
-        }}
+        }, "execution_route": {"kind": "native"}}
     }))
     .expect("source fixture deserializes");
     let target_ref = CardRef {

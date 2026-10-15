@@ -14,7 +14,10 @@ pub mod response;
 pub mod wire;
 
 pub use adapter::{ResponseAdapter, ToolCallView, UsageView};
-pub use authoring::{DraftMessages, PromptDraft};
+pub use authoring::{
+    AuthoredPrompt, BlockSource, ContentBlock, PortableContent, PortableMessage, PortableRole,
+    PortableSettings, PromptFormat,
+};
 pub use convert::{ProviderMessageConversion, convert_message_dyn};
 pub use error::{SkaldError, SkaldResult};
 pub use media::{MediaKind, MediaRef, MediaSource};

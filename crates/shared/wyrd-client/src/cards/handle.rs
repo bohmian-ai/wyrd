@@ -815,17 +815,16 @@ mod tests {
             (
                 CardKind::Prompt,
                 serde_json::json!({
+                    "provider": "openai",
                     "model": "gpt-4o",
-                    "request": {
-                        "provider": "open_ai_chat_completion",
-                        "body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
-                    }
+                    "messages": [{"role": "user", "content": "hi"}]
                 }),
             ),
             (
                 CardKind::Agent,
                 serde_json::json!({
-                    "prompt": {"kind": "Prompt", "name": "triage", "space": "retention", "version": "1.0.0"}
+                    "prompt": {"kind": "Prompt", "name": "triage", "space": "retention", "version": "1.0.0"},
+                    "execution_route": {"kind": "native"}
                 }),
             ),
             (

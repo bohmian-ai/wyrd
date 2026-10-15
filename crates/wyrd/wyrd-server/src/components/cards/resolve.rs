@@ -1090,7 +1090,7 @@ mod tests {
             spec: serde_json::json!({
                 "provider": "openai",
                 "model": "gpt-4o",
-                "messages": ["hello"]
+                "messages": [{"role": "user", "content": "hello"}]
             }),
             artifacts: Vec::new(),
         }
@@ -1124,7 +1124,10 @@ mod tests {
         let prompt = prompt_ref("child");
         let spec = Spec::from_kind_and_value(
             &CardKind::Agent,
-            serde_json::json!({"prompt": {"sibling": prompt.clone()}}),
+            serde_json::json!({
+                "prompt": {"sibling": prompt.clone()},
+                "execution_route": {"kind": "native"}
+            }),
         )
         .expect("test_setup: sibling agent spec is valid");
         let siblings = BTreeSet::from([prompt.identity_key()]);

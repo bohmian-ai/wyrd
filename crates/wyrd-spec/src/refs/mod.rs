@@ -607,11 +607,6 @@ mod completeness_tests {
                 settings: skald_spec::OpenAiChatSettings::default(),
             }),
             "gpt-test",
-            None,
-            skald_spec::ResponseType::JsonSchema {
-                name: "judge_result".to_owned(),
-                schema: json!({"type": "object"}),
-            },
         )
         .expect("fixture prompt is valid")
     }
@@ -619,6 +614,7 @@ mod completeness_tests {
     fn agent() -> AgentSpec {
         AgentSpec {
             prompt: InlineableRef::Inline(Box::new(prompt())),
+            execution_route: crate::card::agent::ExecutionRoute::Native {},
             tool_names: Vec::new(),
             run_config: AgentRunConfigSpec {
                 max_iterations: Some(1),

@@ -5,7 +5,7 @@ use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings,
     OpenAiMessageContent,
 };
-use skald_spec::{ProviderName, ProviderRequest, ProviderResponse, ResponseType};
+use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 use wyrd::agent::*;
 
 #[tokio::test]
@@ -38,8 +38,7 @@ async fn agent_run_via_umbrella_imports() {
 }
 
 fn prompt() -> skald_spec::Prompt {
-    skald_spec::Prompt::new(openai_request(), "gpt-4o-mini", None, ResponseType::Text)
-        .expect("static prompt is valid")
+    skald_spec::Prompt::new(openai_request(), "gpt-4o-mini").expect("static prompt is valid")
 }
 
 fn openai_request() -> ProviderRequest {

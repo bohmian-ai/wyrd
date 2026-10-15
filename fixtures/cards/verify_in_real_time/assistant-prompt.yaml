@@ -7,4 +7,6 @@ metadata:
 spec:
   provider: openai
   model: gpt-test
-  messages: [Answer the question.]
+  messages:
+  - role: user
+    content: Answer the question.

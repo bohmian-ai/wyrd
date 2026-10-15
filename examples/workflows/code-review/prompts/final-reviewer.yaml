@@ -3,28 +3,22 @@ kind: Prompt
 metadata:
   space: engineering
   name: final-review-prompt
-  version: "1.0.0"
+  version: 1.0.0
 spec:
+  provider: openai
   model: gpt-5-5
-  request:
-    provider: open_ai_chat_completion
-    body:
-      model: gpt-5-5
-      messages:
-        - role: system
-          content: |
-            You are the final reviewer. Validate each proposed finding against the
-            supplied code, remove duplicates and unsupported claims, and return one
-            prioritized review.
-        - role: user
-          content: |
-            Code:
-            {{code}}
+  system: |
+    You are the final reviewer. Validate each proposed finding against the
+    supplied code, remove duplicates and unsupported claims, and return one
+    prioritized review.
+  messages:
+  - role: user
+    content: |
+      Code:
+      {{code}}
 
-            Security review:
-            {{security_review}}
+      Security review:
+      {{security_review}}
 
-            Correctness review:
-            {{correctness_review}}
-  variables: [code, security_review, correctness_review]
-  response_type: text
+      Correctness review:
+      {{correctness_review}}

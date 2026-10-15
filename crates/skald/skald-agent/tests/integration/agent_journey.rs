@@ -14,7 +14,7 @@ use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings,
     OpenAiMessageContent,
 };
-use skald_spec::{ProviderName, ProviderRequest, ProviderResponse, ResponseType};
+use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 use skald_tool::{AgentTool, ToolDef, ToolRegistry};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::{CardRef, InlineableRef};
@@ -90,8 +90,8 @@ async fn custom_provider_prompt_round_trips_and_dispatches_to_its_client() {
     let mut native = test_prompt().into_native();
     native.provider = Some(ProviderName::Custom("local".to_owned()));
     let json = serde_json::to_value(&native).expect("prompt serializes");
-    assert_eq!(json["provider"], serde_json::json!({"custom": "local"}));
-    assert_eq!(json["request"]["provider"], "open_ai_chat_completion");
+    assert_eq!(json["provider"], "local");
+    assert_eq!(json["format"], "chat_completion");
     let reparsed: skald_spec::Prompt = serde_json::from_value(json).expect("prompt reads back");
     assert_eq!(reparsed, native);
 
@@ -126,14 +126,12 @@ async fn vertex_prompt_round_trips_and_dispatches_to_the_vertex_client() {
             settings: GoogleGenerateSettings::default(),
         }),
         "gemini-2.5-pro",
-        None,
-        ResponseType::Text,
     )
     .expect("static prompt is valid");
     native.provider = Some(ProviderName::Vertex);
     let json = serde_json::to_value(&native).expect("prompt serializes");
     assert_eq!(json["provider"], "vertex");
-    assert_eq!(json["request"]["provider"], "gemini_generate_content");
+    assert_eq!(json["format"], "generate_content");
     let reparsed: skald_spec::Prompt = serde_json::from_value(json).expect("prompt reads back");
     assert_eq!(reparsed, native);
 
@@ -167,8 +165,7 @@ fn temp_path(name: &str) -> std::path::PathBuf {
 
 fn test_prompt() -> Prompt {
     Prompt::from_native(
-        skald_spec::Prompt::new(openai_request(), "gpt-4o-mini", None, ResponseType::Text)
-            .expect("static prompt is valid"),
+        skald_spec::Prompt::new(openai_request(), "gpt-4o-mini").expect("static prompt is valid"),
     )
 }
 

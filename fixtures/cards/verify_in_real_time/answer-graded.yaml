@@ -13,6 +13,7 @@ spec:
       id: judge
       judge_ref:
         prompt: ./judge-prompt.yaml
+        execution_route: {kind: native}
         tool_names: []
         run_config: {max_iterations: 1}
       context_path: $.answer

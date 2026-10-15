@@ -5,6 +5,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::authoring::AuthoredPrompt;
 use crate::error::{SkaldError, SkaldResult};
 use crate::media::{MediaKind, MediaRef, MediaSource};
 use crate::request::{ProviderName, ProviderRequest};
@@ -25,32 +26,74 @@ use crate::wire::openai_responses::{
     OpenAiResponsesSettings,
 };
 
-/// Authored native prompt request plus render metadata.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+/// Runtime Prompt: the compiled provider request plus derived render metadata.
+///
+/// A Prompt serializes as, and deserializes from, its [`AuthoredPrompt`]
+/// form; decoding compiles that form. The request, variables, media
+/// variables, and response type are derived and never stored.
+#[derive(Debug, Clone)]
 pub struct Prompt {
-    /// Native provider-shaped request authored with `${variable}` or `{{variable}}` placeholders.
+    /// Native provider-shaped request with `${variable}` or `{{variable}}` placeholders.
     pub request: ProviderRequest,
-    /// Model identifier used for indexing and selection.
+    /// Provider model identifier.
     pub model: String,
-    /// Optional author-assigned prompt version.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    /// Declared text placeholder names expected by `render`.
-    #[serde(default)]
+    /// Text placeholder names `render` requires, derived from the request.
     pub variables: Vec<String>,
-    /// Declared media placeholder names expected by `bind_media`.
-    #[serde(default)]
+    /// Media placeholder names `bind_media` fills, derived from the request.
     pub media_variables: Vec<String>,
-    /// Expected response shape for runtime validation.
-    #[serde(default)]
+    /// Expected response shape, derived from the request's output field.
     pub response_type: ResponseType,
-    /// Native dispatch target, such as a custom OpenAI-compatible endpoint.
+    /// Native dispatch target, such as Vertex for a GenerateContent body.
     ///
     /// When absent, native dispatch uses the request dialect's default
     /// provider. Gateway routes select their own upstream and ignore it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderName>,
+    /// The authored form this Prompt was compiled from, when it still
+    /// describes the request; absent after construction from a request or a
+    /// binding, when the native form is derived from the request instead.
+    pub(crate) authored: Option<Box<AuthoredPrompt>>,
+}
+
+/// Prompts are equal when they serialize to the same authored form; a
+/// request with no authored form compares by request, model, and provider.
+impl PartialEq for Prompt {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.authored(), other.authored()) {
+            (Ok(mine), Ok(theirs)) => mine == theirs,
+            _ => {
+                self.request == other.request
+                    && self.model == other.model
+                    && self.provider() == other.provider()
+            }
+        }
+    }
+}
+
+impl Serialize for Prompt {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.authored()
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Prompt {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        AuthoredPrompt::deserialize(deserializer)?
+            .compile()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for Prompt {
+    fn schema_name() -> String {
+        "Prompt".to_owned()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        AuthoredPrompt::json_schema(generator)
+    }
 }
 
 /// Borrowed view of native generation settings for the active provider.
@@ -148,8 +191,9 @@ pub fn split_text_on_media(text: &str) -> Vec<TextSegment> {
 }
 
 impl Prompt {
-    /// Create a prompt, split media placeholders into isolated native text
-    /// parts, and populate `variables` / `media_variables` from the request.
+    /// Create a prompt from a request, split media placeholders into
+    /// isolated native text parts, and derive `variables`, `media_variables`,
+    /// and `response_type` from the request.
     ///
     /// The request carries only the body schema, so the created Prompt has no
     /// destination (`provider` is `None`) and native dispatch uses the
@@ -162,24 +206,49 @@ impl Prompt {
     /// Returns [`SkaldError::MediaInSystemMessage`] when system content holds a
     /// `${media:name}` placeholder, and a serialization error when the request
     /// cannot be serialized to scan its `${name}` / `{{name}}` variables.
-    pub fn new(
-        request: ProviderRequest,
-        model: impl Into<String>,
-        version: Option<String>,
-        response_type: ResponseType,
-    ) -> SkaldResult<Self> {
+    pub fn new(request: ProviderRequest, model: impl Into<String>) -> SkaldResult<Self> {
+        let response_type = response_type_of(&request);
         let mut prompt = Self {
             request,
             model: model.into(),
-            version,
             variables: Vec::new(),
             media_variables: Vec::new(),
             response_type,
             provider: None,
+            authored: None,
         };
         prompt.normalize_media_placeholders_mut()?;
         prompt.variables = extract_text_variables(&prompt.request)?;
         Ok(prompt)
+    }
+
+    /// Return the authored form this Prompt serializes as.
+    ///
+    /// This is the form it was compiled from while that form still compiles
+    /// to the current request, model, and provider; otherwise, such as after a
+    /// caller mutated the public fields, it is the native form derived from
+    /// the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::PromptInvalid`] when the request kind is not a
+    /// Prompt format, such as embeddings or a raw body.
+    pub fn authored(&self) -> SkaldResult<std::borrow::Cow<'_, AuthoredPrompt>> {
+        // ponytail: recompiles to detect public-field mutation; make the
+        // fields private if Prompt serialization ever shows up in a profile.
+        match self.authored.as_deref() {
+            Some(authored)
+                if authored.compile().is_ok_and(|compiled| {
+                    compiled.request == self.request
+                        && compiled.model == self.model
+                        && compiled.provider == self.provider
+                }) =>
+            {
+                Ok(std::borrow::Cow::Borrowed(authored))
+            }
+            _ => AuthoredPrompt::native(self.provider(), &self.model, &self.request)
+                .map(std::borrow::Cow::Owned),
+        }
     }
 
     /// Return the provider native dispatch sends this Prompt to.
@@ -256,6 +325,7 @@ impl Prompt {
         let mut request = serde_json::to_value(&self.request).map_err(SkaldError::serialize)?;
         replace_string_leaves(&mut request, vars);
         self.request = serde_json::from_value(request).map_err(SkaldError::deserialize)?;
+        self.authored = None;
         self.variables
             .retain(|name| !vars.iter().any(|(key, _)| key == name));
         Ok(())
@@ -300,6 +370,7 @@ impl Prompt {
             }
         }
         self.media_variables.retain(|declared| declared != name);
+        self.authored = None;
         Ok(())
     }
 
@@ -343,6 +414,55 @@ fn replace_string_leaves(value: &mut Value, vars: &[(&str, &str)]) {
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// Derives the expected response shape from a request's structured-output field.
+///
+/// Portable schemas carry the name `response`; Anthropic and GenerateContent
+/// declare no schema name, so they use the same one.
+fn response_type_of(request: &ProviderRequest) -> ResponseType {
+    use crate::wire::anthropic_messages::AnthropicOutputFormat;
+    use crate::wire::openai_chat::OpenAiResponseFormat;
+    use crate::wire::openai_responses::OpenAiTextResponseFormat;
+
+    let named = |name: &str, schema: Value| ResponseType::JsonSchema {
+        name: name.to_owned(),
+        schema,
+    };
+    match request {
+        ProviderRequest::OpenAiChatCompletion(request) => match &request.response_format {
+            Some(OpenAiResponseFormat::JsonSchema { json_schema }) => json_schema
+                .schema
+                .clone()
+                .map_or(ResponseType::Text, |schema| {
+                    named(&json_schema.name, Value::Object(schema))
+                }),
+            _ => ResponseType::Text,
+        },
+        ProviderRequest::OpenAiResponses(request) => {
+            match request.text.as_ref().and_then(|text| text.format.as_ref()) {
+                Some(OpenAiTextResponseFormat::JsonSchema {
+                    name,
+                    schema: Some(schema),
+                    ..
+                }) => named(name, Value::Object(schema.clone())),
+                _ => ResponseType::Text,
+            }
+        }
+        ProviderRequest::AnthropicMessage(request) => match &request.output_config {
+            Some(config) => match &config.format {
+                AnthropicOutputFormat::JsonSchema { schema } => named("response", schema.clone()),
+            },
+            None => ResponseType::Text,
+        },
+        ProviderRequest::GeminiGenerateContent(request) => request
+            .settings
+            .generation_config
+            .as_ref()
+            .and_then(|config| config.response_schema.clone())
+            .map_or(ResponseType::Text, |schema| named("response", schema)),
+        _ => ResponseType::Text,
     }
 }
 
@@ -1070,13 +1190,8 @@ mod placeholder_syntax_tests {
 
     #[test]
     fn render_binds_dollar_brace() {
-        let prompt = Prompt::new(
-            openai_request_with_user("hello ${name}"),
-            "gpt-test",
-            None,
-            ResponseType::Text,
-        )
-        .expect("prompt builds");
+        let prompt = Prompt::new(openai_request_with_user("hello ${name}"), "gpt-test")
+            .expect("prompt builds");
         let rendered = prompt.render(&[("name", "world")]).expect("renders");
         let json = serde_json::to_string(&rendered).expect("serializes");
         assert!(json.contains("hello world"));
@@ -1084,13 +1199,8 @@ mod placeholder_syntax_tests {
 
     #[test]
     fn render_binds_mustache() {
-        let prompt = Prompt::new(
-            openai_request_with_user("hello {{name}}"),
-            "gpt-test",
-            None,
-            ResponseType::Text,
-        )
-        .expect("prompt builds");
+        let prompt = Prompt::new(openai_request_with_user("hello {{name}}"), "gpt-test")
+            .expect("prompt builds");
         let rendered = prompt.render(&[("name", "world")]).expect("renders");
         let json = serde_json::to_string(&rendered).expect("serializes");
         assert!(json.contains("hello world"));
@@ -1098,13 +1208,8 @@ mod placeholder_syntax_tests {
 
     #[test]
     fn render_binds_mixed_syntax_in_one_pass() {
-        let prompt = Prompt::new(
-            openai_request_with_user("${a} or {{a}}"),
-            "gpt-test",
-            None,
-            ResponseType::Text,
-        )
-        .expect("prompt builds");
+        let prompt = Prompt::new(openai_request_with_user("${a} or {{a}}"), "gpt-test")
+            .expect("prompt builds");
         let rendered = prompt.render(&[("a", "X")]).expect("renders");
         let json = serde_json::to_string(&rendered).expect("serializes");
         assert!(json.contains("X or X"));
@@ -1113,18 +1218,14 @@ mod placeholder_syntax_tests {
 
 #[cfg(test)]
 mod prompt_media {
-    use serde_json::json;
-
     use crate::common;
     use crate::wire::anthropic_messages::{AnthropicContentBlock, AnthropicDocumentSource};
     use crate::wire::google_generate::GooglePart;
     use crate::wire::openai_chat::{OpenAiContentPart, OpenAiMessageContent};
-    use crate::{
-        MediaKind, MediaRef, Prompt, ProviderName, ProviderRequest, ResponseType, SkaldError,
-    };
+    use crate::{MediaKind, MediaRef, Prompt, ProviderName, ProviderRequest, SkaldError};
 
     fn prompt(request: ProviderRequest) -> Prompt {
-        Prompt::new(request, "model", None, ResponseType::Text).expect("prompt is valid")
+        Prompt::new(request, "model").expect("prompt is valid")
     }
 
     fn openai_prompt(text: &str) -> Prompt {
@@ -1180,13 +1281,7 @@ mod prompt_media {
         let mut request = common::openai_chat_request();
         request.messages[0].content =
             Some(OpenAiMessageContent::Text("system ${media:x}".to_owned()));
-        let err = Prompt::new(
-            ProviderRequest::OpenAiChatCompletion(request),
-            "model",
-            None,
-            ResponseType::Text,
-        )
-        .unwrap_err();
+        let err = Prompt::new(ProviderRequest::OpenAiChatCompletion(request), "model").unwrap_err();
         assert_eq!(
             err,
             SkaldError::MediaInSystemMessage {
@@ -1409,18 +1504,6 @@ mod prompt_media {
                 .contains("Ada")
         );
     }
-
-    #[test]
-    fn serde_default_accepts_prompts_without_media_variables() {
-        let value = json!({
-            "request": ProviderRequest::OpenAiChatCompletion(common::openai_chat_request()),
-            "model": "model",
-            "variables": ["name"],
-            "response_type": "text"
-        });
-        let prompt: Prompt = serde_json::from_value(value).unwrap();
-        assert!(prompt.media_variables.is_empty());
-    }
 }
 
 #[cfg(test)]
@@ -1435,11 +1518,11 @@ mod prompt_render {
         Prompt {
             request,
             model: "model".to_string(),
-            version: None,
             variables: variables.into_iter().map(str::to_string).collect(),
             media_variables: Vec::new(),
             response_type: ResponseType::Text,
             provider: None,
+            authored: None,
         }
     }
 
@@ -1541,8 +1624,6 @@ mod prompt_render {
         let prompt = Prompt::new(
             ProviderRequest::JevSystemOne(common::jev_request()),
             "jev-latest",
-            None,
-            ResponseType::Text,
         )
         .unwrap();
         assert_eq!(prompt.variables, ["reply"]);

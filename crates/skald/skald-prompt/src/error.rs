@@ -11,12 +11,9 @@ pub enum PromptBuilderError {
     /// Prompt model was empty.
     #[error("prompt model must be non-empty")]
     EmptyModel,
-    /// Provider name was not accepted by the raw passthrough builder.
+    /// Provider name was not accepted.
     #[error("unsupported provider value: {0}")]
     InvalidProvider(String),
-    /// Raw provider body was not valid UTF-8 JSON.
-    #[error("raw provider body must be valid JSON: {0}")]
-    InvalidRawJson(String),
     /// Structured-output schema was not a JSON object.
     #[error("response_format JsonSchema schema must be a JSON object")]
     InvalidResponseSchema,
@@ -69,7 +66,6 @@ impl PromptBuilderError {
         match self {
             Self::EmptyModel => "SKALD_PROMPT_400_EMPTY_MODEL",
             Self::InvalidProvider(_) => "SKALD_PROMPT_400_INVALID_PROVIDER",
-            Self::InvalidRawJson(_) => "SKALD_PROMPT_400_INVALID_RAW_JSON",
             Self::InvalidResponseSchema => "SKALD_PROMPT_400_INVALID_RESPONSE_SCHEMA",
             Self::UnsupportedRole { .. } => "SKALD_PROMPT_400_UNSUPPORTED_ROLE",
             Self::Validation(_) => "SKALD_PROMPT_422_VALIDATION",
@@ -110,20 +106,11 @@ impl From<PromptBuilderError> for wyrd_utils::py::WyrdPyError {
                 }
                 .into()
             }
-            PromptBuilderError::InvalidRawJson(source) => {
-                wyrd_spec::error::WyrdError::PromptSerializeRequest {
-                    message,
-                    details: json!({ "source": source }),
-                }
-                .into()
+            PromptBuilderError::Validation(source) => wyrd_spec::error::WyrdError::PromptInvalid {
+                message,
+                details: json!({ "field": "prompt", "source": source }),
             }
-            PromptBuilderError::Validation(source) => {
-                wyrd_spec::error::WyrdError::PromptDraftInvalid {
-                    message,
-                    details: json!({ "source": source }),
-                }
-                .into()
-            }
+            .into(),
             PromptBuilderError::UnsupportedRole { provider, role } => {
                 wyrd_spec::error::WyrdError::PromptProviderMismatch {
                     message,

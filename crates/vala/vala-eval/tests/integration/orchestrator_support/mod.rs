@@ -146,7 +146,6 @@ pub fn structured_prompt() -> Prompt {
         "gpt-test",
         OpenAiChatOptions {
             messages: vec!["Judge: {{response}}".to_owned()],
-            variables: vec!["response".to_owned()],
             output: Some(ResponseFormat::json_schema("judge_result", schema).expect("schema")),
             ..OpenAiChatOptions::default()
         },

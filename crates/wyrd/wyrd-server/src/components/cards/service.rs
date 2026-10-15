@@ -2588,7 +2588,7 @@ mod tests {
             "apiVersion": "wyrd/v1",
             "kind": "Prompt",
             "metadata": { "name": name, "version": "1.0.0", "space": "default" },
-            "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+            "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
             "artifacts": []
         })
     }
@@ -2633,7 +2633,7 @@ mod tests {
             "apiVersion": "wyrd/v1",
             "kind": "Prompt",
             "metadata": { "name": "integrity", "version": "1.0.0", "space": "default" },
-            "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] }
+            "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] }
         }))
         .expect("test_setup: blob card fixture is valid");
         let spec_hash = card
@@ -2789,7 +2789,7 @@ mod tests {
             "apiVersion": "wyrd/v1",
             "kind": "Prompt",
             "metadata": { "name": "blob", "version": "1.0.0", "space": "default" },
-            "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+            "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
             "relationships": { "outbound": [], "inbound": ["live-edge"] },
             "status": { "phase": "pending" }
         }))

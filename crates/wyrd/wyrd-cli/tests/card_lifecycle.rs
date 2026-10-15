@@ -77,7 +77,7 @@ fn write_prompt(temp: &TempDir) -> std::path::PathBuf {
     std::fs::write(
         &path,
         format!(
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: cli-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: cli-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
             artifact.len()
         ),
     )
@@ -94,7 +94,7 @@ fn write_multi_card_service(temp: &TempDir) -> std::path::PathBuf {
     std::fs::write(
         temp.path().join("shared-prompt.yaml"),
         format!(
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: shared-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\nartifacts:\n  - relative_path: shared-prompt.txt\n    sha256: {prompt_digest}\n    size_bytes: {}\n    content_type: text/plain\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: shared-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\nartifacts:\n  - relative_path: shared-prompt.txt\n    sha256: {prompt_digest}\n    size_bytes: {}\n    content_type: text/plain\n",
             prompt_artifact.len()
         ),
     )
@@ -117,7 +117,7 @@ fn write_multi_card_service(temp: &TempDir) -> std::path::PathBuf {
         std::fs::write(
             temp.path().join(format!("{name}.yaml")),
             format!(
-                "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: {prompt_name}\n  version: 1.0.0\n  space: default\nspec:\n  prompt:\n    kind: Prompt\n    name: shared-prompt\n    version: 1.0.0\n    space: default\n  run_config:\n    max_iterations: 2\n    timeout_ms: 1000\n"
+                "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: {prompt_name}\n  version: 1.0.0\n  space: default\nspec:\n  prompt:\n    kind: Prompt\n    name: shared-prompt\n    version: 1.0.0\n    space: default\n  execution_route:\n    kind: native\n  run_config:\n    max_iterations: 2\n    timeout_ms: 1000\n"
             ),
         )
         .expect("agent writes");

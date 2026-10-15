@@ -2422,71 +2422,15 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// PromptCard declared the same variable more than once.
-    #[error("[WYRD_PROMPT_409_DUPLICATE_VARIABLE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_PROMPT_409_DUPLICATE_VARIABLE",
-        status = 409,
-        title = "Duplicate variable name",
-        remediation = "Each entry in prompt.variables must be unique."
-    )]
-    PromptDuplicateVariable {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// PromptCard request referenced an undeclared placeholder.
-    #[error("[WYRD_PROMPT_422_UNDECLARED_PLACEHOLDER] {message}")]
-    #[wyrd_error(
-        code = "WYRD_PROMPT_422_UNDECLARED_PLACEHOLDER",
-        status = 422,
-        title = "Undeclared placeholder in request",
-        remediation = "Add the placeholder name to prompt.variables, or remove it from the request."
-    )]
-    PromptUndeclaredPlaceholder {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// PromptCard declared a variable that the request never references.
-    #[error("[WYRD_PROMPT_422_UNREFERENCED_VARIABLE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_PROMPT_422_UNREFERENCED_VARIABLE",
-        status = 422,
-        title = "Declared variable is never referenced",
-        remediation = "Reference the variable somewhere in the native request, or drop it from prompt.variables."
-    )]
-    PromptUnreferencedVariable {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// PromptCard request referenced an undeclared media placeholder.
     #[error("[WYRD_PROMPT_422_UNDECLARED_MEDIA_PLACEHOLDER] {message}")]
     #[wyrd_error(
         code = "WYRD_PROMPT_422_UNDECLARED_MEDIA_PLACEHOLDER",
         status = 422,
         title = "Undeclared media placeholder in request",
-        remediation = "Add the media placeholder name to prompt.media_variables, or remove it from the request."
+        remediation = "Bind only media placeholders the Prompt references as ${media:name}."
     )]
     PromptUndeclaredMediaPlaceholder {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// PromptCard declared a media variable that the request never references.
-    #[error("[WYRD_PROMPT_422_UNREFERENCED_MEDIA_VARIABLE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_PROMPT_422_UNREFERENCED_MEDIA_VARIABLE",
-        status = 422,
-        title = "Declared media variable is never referenced",
-        remediation = "Reference the media variable as ${media:name}, or drop it from prompt.media_variables."
-    )]
-    PromptUnreferencedMediaVariable {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -2786,15 +2730,16 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Declarative prompt draft failed to compile into a native prompt.
-    #[error("[WYRD_PROMPT_400_DRAFT_INVALID] {message}")]
+    /// An authored Prompt field is invalid, unsupported, or mixes the
+    /// portable and native forms.
+    #[error("[WYRD_PROMPT_400_INVALID] {message}")]
     #[wyrd_error(
-        code = "WYRD_PROMPT_400_DRAFT_INVALID",
+        code = "WYRD_PROMPT_400_INVALID",
         status = 400,
-        title = "Declarative prompt draft compile failed",
-        remediation = "Check the provider, model, messages, and model_settings fields in your prompt YAML."
+        title = "Invalid Prompt field",
+        remediation = "Fix the field named in details.field: author either portable system/messages/settings/response_format or native format/body, with provider and model once."
     )]
-    PromptDraftInvalid {
+    PromptInvalid {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -4074,11 +4019,7 @@ impl WyrdError {
             | Self::ModelCustomLoaderInvalid { message, details }
             | Self::ModelSerializerUnavailable { message, details }
             | Self::PromptInvalidVariableName { message, details }
-            | Self::PromptDuplicateVariable { message, details }
-            | Self::PromptUndeclaredPlaceholder { message, details }
-            | Self::PromptUnreferencedVariable { message, details }
             | Self::PromptUndeclaredMediaPlaceholder { message, details }
-            | Self::PromptUnreferencedMediaVariable { message, details }
             | Self::PromptMediaPlaceholderNotIsolated { message, details }
             | Self::PromptMediaInSystemMessage { message, details }
             | Self::PromptUnsupportedMediaForProvider { message, details }
@@ -4105,7 +4046,7 @@ impl WyrdError {
             | Self::PromptMissingVariable { message, details }
             | Self::PromptUnsupportedHandoff { message, details }
             | Self::PromptResponseDecode { message, details }
-            | Self::PromptDraftInvalid { message, details }
+            | Self::PromptInvalid { message, details }
             | Self::AgentValidation { message, details }
             | Self::AgentMissingName { message, details }
             | Self::AgentMissingVersion { message, details }
@@ -4558,12 +4499,12 @@ impl From<skald_spec::SkaldError> for WyrdError {
                     "source": source,
                 }),
             },
-            skald_spec::SkaldError::PromptDraftInvalid {
-                provider,
+            skald_spec::SkaldError::PromptInvalid {
+                field,
                 message: source,
-            } => Self::PromptDraftInvalid {
+            } => Self::PromptInvalid {
                 message,
-                details: serde_json::json!({ "provider": provider, "source": source }),
+                details: serde_json::json!({ "field": field, "source": source }),
             },
             other => Self::internal_from_skald(other.code(), other.to_string()),
         }

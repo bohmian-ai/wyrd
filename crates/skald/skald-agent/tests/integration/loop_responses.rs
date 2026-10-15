@@ -15,7 +15,7 @@ use skald_spec::wire::openai_responses::{
     OpenAiResponsesRequest, OpenAiResponsesResponse, OpenAiResponsesSettings, OpenAiResponsesTool,
 };
 use skald_spec::{
-    MessageNum, Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
+    MessageNum, Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse,
 };
 use skald_tool::{AgentTool, ToolError};
 
@@ -150,13 +150,8 @@ async fn agent_run_executes_openai_responses_tool_loop() {
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock.clone()));
     let prompt = Prompt::from_native(
-        SpecPrompt::new(
-            responses_request(Vec::new(), false),
-            "gpt-4o",
-            None,
-            ResponseType::Text,
-        )
-        .expect("Responses prompt builds"),
+        SpecPrompt::new(responses_request(Vec::new(), false), "gpt-4o")
+            .expect("Responses prompt builds"),
     );
     let agent = Agent::new(prompt)
         .with_id("r")
@@ -236,13 +231,8 @@ async fn responses_session_turns_seed_native_items() {
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock.clone()));
     let prompt = Prompt::from_native(
-        SpecPrompt::new(
-            responses_request(Vec::new(), false),
-            "gpt-4o",
-            None,
-            ResponseType::Text,
-        )
-        .expect("Responses prompt builds"),
+        SpecPrompt::new(responses_request(Vec::new(), false), "gpt-4o")
+            .expect("Responses prompt builds"),
     );
     let agent = Agent::new(prompt)
         .with_id("r")

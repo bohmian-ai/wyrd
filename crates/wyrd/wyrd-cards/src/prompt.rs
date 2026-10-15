@@ -848,15 +848,11 @@ fn metadata_error(error: MetadataError) -> WyrdPyError {
 /// invariant of the fixed inputs.
 #[cfg(any(feature = "python", test))]
 fn default_prompt() -> skald_spec::Prompt {
-    match skald_spec::Prompt::new(
-        skald_spec::ProviderRequest::RawV1 {
-            provider: skald_spec::ProviderName::Custom("placeholder".to_owned()),
-            body: serde_json::json!({}),
-        },
-        "placeholder",
-        None,
-        skald_spec::ResponseType::Text,
-    ) {
+    match serde_json::from_value(serde_json::json!({
+        "provider": "openai",
+        "model": "placeholder",
+        "messages": [{"role": "user", "content": "placeholder"}],
+    })) {
         Ok(prompt) => prompt,
         Err(error) => panic!("static placeholder prompt is valid: {error}"),
     }
@@ -868,15 +864,11 @@ mod tests {
 
     #[test]
     fn converts_holder_metadata_to_prompt_spec() {
-        let prompt = skald_spec::Prompt::new(
-            skald_spec::ProviderRequest::RawV1 {
-                provider: skald_spec::ProviderName::Custom("unit".to_owned()),
-                body: serde_json::json!({"messages": ["hi"]}),
-            },
-            "unit-model",
-            None,
-            skald_spec::ResponseType::Text,
-        )
+        let prompt: skald_spec::Prompt = serde_json::from_value(serde_json::json!({
+            "provider": "unit",
+            "model": "unit-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
         .expect("static prompt is valid");
 
         let card = PromptCard::from_native_prompt(prompt.clone());

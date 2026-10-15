@@ -135,7 +135,8 @@ mod tests {
                     "version": "1.0.0",
                     "space": "default",
                     "uid": "018f0000-0000-7000-8000-000000000001"
-                }
+                },
+                "execution_route": {"kind": "native"}
             }),
         )
         .expect("agent reference fixture decodes");

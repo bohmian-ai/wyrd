@@ -123,6 +123,7 @@ impl PyAgentCard {
         );
         let spec = AgentSpec {
             prompt: prompt.borrow().inner.clone(),
+            execution_route: wyrd_spec::ExecutionRoute::Native {},
             tool_names: Vec::new(),
             run_config: AgentRunConfigSpec::default(),
             verified_by: Vec::new(),

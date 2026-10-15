@@ -2862,7 +2862,7 @@ mod tests {
     /// reaches a table's durable path.
     #[test]
     fn partial_nullable_structs_are_refused() {
-        let children = Fields::from(vec![utf8("provider", true), utf8("model", true)]);
+        let children = Fields::from(vec![utf8("deployment", true), utf8("model", true)]);
         let model = |parent: Vec<bool>, child: Vec<Option<&str>>| {
             let child = Arc::new(StringArray::from(child)) as ArrayRef;
             let column = StructArray::new(

@@ -944,8 +944,6 @@ mod tests {
                 settings: skald_spec::OpenAiChatSettings::default(),
             }),
             "gpt-test",
-            None,
-            skald_spec::ResponseType::Text,
         )
         .expect("fixture prompt is valid")
     }
@@ -954,6 +952,7 @@ mod tests {
     fn nested_agent(prompt: InlineableRef<skald_spec::Prompt>) -> AgentSpec {
         AgentSpec {
             prompt,
+            execution_route: crate::card::agent::ExecutionRoute::Native {},
             tool_names: Vec::new(),
             run_config: AgentRunConfigSpec::default(),
             verified_by: Vec::new(),

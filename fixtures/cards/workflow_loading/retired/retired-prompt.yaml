@@ -3,17 +3,11 @@ kind: Prompt
 metadata:
   space: workflow-loading
   name: retired-prompt
-  version: "1.0.0"
+  version: 1.0.0
 spec:
+  provider: openai
   model: gpt-5-5
-  request:
-    provider: open_ai_chat_completion
-    body:
-      model: gpt-5-5
-      messages:
-        - role: system
-          content: You are a security reviewer.
-        - role: user
-          content: "{{code}}"
-  variables: [code]
-  response_type: text
+  system: You are a security reviewer.
+  messages:
+  - role: user
+    content: '{{code}}'

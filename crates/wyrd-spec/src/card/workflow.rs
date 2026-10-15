@@ -1337,8 +1337,6 @@ mod tests {
                 settings: skald_spec::OpenAiChatSettings::default(),
             }),
             "gpt-4o-mini",
-            None,
-            skald_spec::ResponseType::Text,
         )
         .expect("static prompt is valid")
     }
@@ -1348,6 +1346,7 @@ mod tests {
             id: id.to_owned(),
             action: WorkflowAction::Agent(InlineableRef::from(AgentSpec {
                 prompt: InlineableRef::from(prompt()),
+                execution_route: crate::card::agent::ExecutionRoute::Native {},
                 tool_names: vec![],
                 run_config: AgentRunConfigSpec::default(),
                 verified_by: Vec::new(),
@@ -1446,6 +1445,7 @@ mod tests {
                 space: Some(SpaceName::new("default").expect("static space is valid")),
                 uid: None,
             }),
+            execution_route: crate::card::agent::ExecutionRoute::Native {},
             tool_names: vec![],
             run_config: AgentRunConfigSpec::default(),
             verified_by: Vec::new(),

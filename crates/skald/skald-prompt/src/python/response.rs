@@ -12,7 +12,7 @@ use super::anthropic::PyAnthropicMessagesResponse;
 use super::google::PyGeminiResponse;
 use super::openai_chat_response::PyOpenAiChatResponse;
 use super::openai_responses::PyOpenAiResponsesResponse;
-use crate::prompt::{provider_name_to_string, wrong_provider};
+use crate::prompt::wrong_provider;
 
 /// Python `ProviderResponse`: a provider-native response with typed per-provider views.
 ///
@@ -53,7 +53,7 @@ impl PyProviderResponse {
     /// `Prompt.provider` names the dispatch destination.
     #[getter]
     pub fn provider(&self) -> String {
-        provider_name_to_string(&self.inner.provider())
+        self.inner.provider().to_string()
     }
 
     /// Return the typed `OpenAI` Chat Completions view, sharing this response.

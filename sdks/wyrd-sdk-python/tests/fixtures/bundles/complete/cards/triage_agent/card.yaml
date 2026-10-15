@@ -14,6 +14,8 @@ spec:
     version: 1.0.0
     space: default
     uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04
+  execution_route:
+    kind: native
   tool_names: []
   run_config: {}
   verified_by: []

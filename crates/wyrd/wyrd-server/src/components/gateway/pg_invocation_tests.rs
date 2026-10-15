@@ -5286,7 +5286,14 @@ impl FallbackIngress {
                 super::ingress::gemini_generate_content(
                     state,
                     caller,
-                    axum::extract::Path(format!("{requested}:generateContent")),
+                    axum::extract::Path(
+                        requested
+                            .split_once('/')
+                            .map(|(deployment, model)| {
+                                (deployment.to_owned(), format!("{model}:generateContent"))
+                            })
+                            .expect("a gateway address names its deployment"),
+                    ),
                     axum::extract::RawQuery(None),
                     headers,
                     Ok(Json(body)),

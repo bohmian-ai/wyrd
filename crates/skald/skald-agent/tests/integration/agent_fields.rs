@@ -4,7 +4,7 @@ use serde_json::json;
 use skald_agent::{Agent, RunConfig};
 use skald_prompt::Prompt;
 use skald_spec::{
-    Prompt as SpecPrompt, ProviderRequest, ResponseType,
+    Prompt as SpecPrompt, ProviderRequest,
     wire::openai_chat::{
         OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, OpenAiMessageContent,
     },
@@ -33,7 +33,7 @@ fn test_prompt(model: &str) -> Arc<Prompt> {
         settings: OpenAiChatSettings::default(),
     });
     Arc::new(Prompt::from_native(
-        SpecPrompt::new(request, model, None, ResponseType::Text).expect("test prompt builds"),
+        SpecPrompt::new(request, model).expect("test prompt builds"),
     ))
 }
 

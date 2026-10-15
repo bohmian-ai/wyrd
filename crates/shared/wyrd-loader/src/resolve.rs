@@ -256,13 +256,13 @@ mod tests {
         let target = root.join("prompt.yaml");
         std::fs::write(
             &target,
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: anthropic\n  model: claude\n  messages: []\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
         )
         .unwrap();
         let entry = root.join("agent.yaml");
         std::fs::write(
             &entry,
-            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n  execution_route:\n    kind: native\n",
         )
         .unwrap();
 
@@ -284,13 +284,13 @@ mod tests {
         let target = temp.path().join("prompts.yaml");
         std::fs::write(
             &target,
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: first\n  version: 1.0.0\n  space: default\nspec:\n  provider: anthropic\n  model: claude\n  messages: []\n---\napiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: second\n  version: 1.0.0\n  space: default\nspec:\n  provider: anthropic\n  model: claude\n  messages: []\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: first\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n---\napiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: second\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
         )
         .unwrap();
         let entry = temp.path().join("agent.yaml");
         std::fs::write(
             &entry,
-            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompts.yaml\n",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompts.yaml\n  execution_route:\n    kind: native\n",
         )
         .unwrap();
 
@@ -308,12 +308,12 @@ mod tests {
         let root = temp.path();
         std::fs::write(
             root.join("prompt.yaml"),
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: anthropic\n  model: claude\n  messages: []\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
         )
         .unwrap();
         std::fs::write(
             root.join("agent.yaml"),
-            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n  execution_route:\n    kind: native\n",
         )
         .unwrap();
         let entry = root.join("service.yaml");

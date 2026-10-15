@@ -82,7 +82,6 @@ fn write_graph(root: &Path) -> PathBuf {
         "gpt-test",
         skald_prompt::OpenAiChatOptions {
             messages: vec!["Grade the answer ${answer} against ${media:shot}.".to_owned()],
-            variables: vec!["answer".to_owned()],
             output: Some(
                 skald_prompt::ResponseFormat::json_schema(
                     "judge_result",
@@ -109,7 +108,7 @@ fn write_graph(root: &Path) -> PathBuf {
         ("judge-prompt.json", card.to_string()),
         (
             "agent-prompt.yaml",
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: eval-agent-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-test\n  messages: [answer the question]\n".to_owned(),
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: eval-agent-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-test\n  messages:\n    - role: user\n      content: answer the question\n".to_owned(),
         ),
         ("agent.yaml", agent("eval-agent")),
         ("traced-agent.yaml", agent("eval-traced-agent")),
@@ -2371,7 +2370,7 @@ fn write_owner_graph(root: &Path) -> (PathBuf, PathBuf) {
     let files = [
         (
             "agent-prompt.yaml",
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: eval-agent-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-test\n  messages: [answer the question]\n".to_owned(),
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: eval-agent-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-test\n  messages:\n    - role: user\n      content: answer the question\n".to_owned(),
         ),
         ("agent.yaml", agent("eval-shared-agent")),
         (
@@ -3137,7 +3136,6 @@ fn write_realtime_graph(root: &Path) -> PathBuf {
         "gpt-test",
         skald_prompt::OpenAiChatOptions {
             messages: vec!["Grade the answer ${answer}.".to_owned()],
-            variables: vec!["answer".to_owned()],
             output: Some(
                 skald_prompt::ResponseFormat::json_schema(
                     "judge_result",

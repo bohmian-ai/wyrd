@@ -6,5 +6,7 @@ metadata:
   space: default
 spec:
   prompt: ./observed-prompt.yaml
+  execution_route:
+    kind: native
   run_config:
     max_iterations: 1

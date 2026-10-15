@@ -17,7 +17,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         OpenAiChatOptions {
             system: Some("You are a helpful assistant.".to_owned()),
             messages: vec!["Summarise: {{topic}}".to_owned()],
-            variables: vec!["topic".to_owned()],
             ..OpenAiChatOptions::default()
         },
     )?;

@@ -965,7 +965,7 @@ mod tests {
         let path = temp.path().join("prompt.yaml");
         std::fs::write(
             &path,
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: cli-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: cli-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\n",
         )
         .expect("prompt card writes");
         let missing = temp.path().join("missing.yaml");

@@ -3,19 +3,15 @@ kind: Agent
 metadata:
   space: examples
   name: writer
-  version: "0.1.0"
+  version: 0.1.0
 spec:
   prompt:
+    provider: openai
     model: gpt-4o-mini
-    request:
-      provider: open_ai_chat_completion
-      body:
-        model: gpt-4o-mini
-        messages:
-          - role: system
-            content: You are a helpful assistant.
-          - role: user
-            content: "Summarise: {{topic}}"
-    variables: [topic]
-    response_type: text
+    system: You are a helpful assistant.
+    messages:
+    - role: user
+      content: 'Summarise: {{topic}}'
+  execution_route:
+    kind: native
   tool_names: []

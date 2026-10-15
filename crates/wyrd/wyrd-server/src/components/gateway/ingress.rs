@@ -516,9 +516,10 @@ fn jev_call(
 
 #[utoipa::path(
     post,
-    path = "/v1beta/models/{*target}",
+    path = "/v1beta/models/{deployment}/{target}",
     params(
-        ("target" = String, Path, description = "`<deployment>/<model>:generateContent`, or `<deployment>/<model>:streamGenerateContent` with `alt=sse`"),
+        ("deployment" = String, Path, description = "Named gateway deployment that uses a Google adapter"),
+        ("target" = String, Path, description = "`<model>:generateContent`, or `<model>:streamGenerateContent` with `alt=sse`"),
         ("alt" = Option<String>, Query, description = "`sse` for streamGenerateContent; `json` or absent for generateContent"),
         ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
@@ -543,7 +544,7 @@ fn jev_call(
     ),
     tag = "Gateway"
 )]
-/// `POST /v1beta/models/{model}:generateContent` and
+/// `POST /v1beta/models/{deployment}/{model}:generateContent` and
 /// `:streamGenerateContent`: one governed Gemini `GenerateContent` call.
 ///
 /// The path names a `<deployment>/<model>` address whose deployment uses
@@ -561,14 +562,19 @@ fn jev_call(
 pub(crate) async fn gemini_generate_content(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
-    Path(target): Path<String>,
+    Path((deployment, target)): Path<(String, String)>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let answer = match caller {
         Err(WyrdErrorResponse(error)) => Err(error),
-        Ok(caller) => match gemini_call(&target, query.as_deref(), &headers, request) {
+        Ok(caller) => match gemini_call(
+            &format!("{deployment}/{target}"),
+            query.as_deref(),
+            &headers,
+            request,
+        ) {
             Ok(call) => GatewayInvocation::new(&state).invoke(&caller, call).await,
             Err(error) => Err(error),
         },

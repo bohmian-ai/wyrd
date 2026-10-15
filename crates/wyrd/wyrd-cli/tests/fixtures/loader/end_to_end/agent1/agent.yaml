@@ -9,6 +9,8 @@ spec:
   # `path:` variant → registers as its own PromptCard; parent's ref is a
   # CardRef bound at register time.
   prompt: ./prompt.yaml
+  execution_route:
+    kind: native
 
   tool_names: [customer_lookup, crm_note_write]
   run_config:

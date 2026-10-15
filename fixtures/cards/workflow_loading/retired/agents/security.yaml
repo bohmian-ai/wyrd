@@ -3,12 +3,14 @@ kind: Agent
 metadata:
   space: workflow-loading
   name: security-reviewer
-  version: "1.0.0"
+  version: 1.0.0
 spec:
   prompt:
     kind: Prompt
     name: retired-prompt
-    version: "1.0.0"
+    version: 1.0.0
+  execution_route:
+    kind: native
   tool_names: []
   run_config:
     max_iterations: 1

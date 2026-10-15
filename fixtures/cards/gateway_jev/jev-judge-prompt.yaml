@@ -6,24 +6,22 @@ metadata:
   space: default
 spec:
   provider: jev
-  request:
-    provider: jev_system_one
-    body:
-      model: jev-latest
-      state: "Question: ${question}\nAnswer: ${answer}"
-      questions:
-        helpful:
-          type: noul
-          instructions: Does the reply help the customer?
-          criteria:
-            "true": it resolves or advances the request
-            "false": it ignores or deflects the request
-        tone:
-          type: choice
-          instructions: What is the tone of the reply?
-          criteria:
-            polite: courteous and respectful
-            rude: curt or dismissive
   model: jev-latest
-  variables: [question, answer]
-  media_variables: []
+  format: system_one
+  body:
+    state: |-
+      Question: ${question}
+      Answer: ${answer}
+    questions:
+      helpful:
+        type: noul
+        instructions: Does the reply help the customer?
+        criteria:
+          'true': it resolves or advances the request
+          'false': it ignores or deflects the request
+      tone:
+        type: choice
+        instructions: What is the tone of the reply?
+        criteria:
+          polite: courteous and respectful
+          rude: curt or dismissive

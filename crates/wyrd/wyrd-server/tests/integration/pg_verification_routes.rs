@@ -1328,7 +1328,6 @@ pub(crate) fn judge_check() -> Value {
         "gpt-test",
         skald_prompt::OpenAiChatOptions {
             messages: vec!["Grade the answer ${answer}.".to_owned()],
-            variables: vec!["answer".to_owned()],
             output: Some(
                 skald_prompt::ResponseFormat::json_schema(
                     "judge_result",
@@ -1347,7 +1346,7 @@ pub(crate) fn judge_check() -> Value {
     .expect("the judge prompt builds");
     json!({
         "kind": "llm_judge", "id": "judge",
-        "judge_ref": { "prompt": prompt.into_native(), "tool_names": [],
+        "judge_ref": { "prompt": prompt.into_native(), "execution_route": {"kind": "native"}, "tool_names": [],
                        "run_config": { "max_iterations": 1 } },
         "context_path": "$.answer", "operator": "equals",
         "expected": { "passed": true }, "max_retries": 0

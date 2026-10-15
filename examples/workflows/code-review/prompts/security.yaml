@@ -3,21 +3,15 @@ kind: Prompt
 metadata:
   space: engineering
   name: security-review-prompt
-  version: "1.0.0"
+  version: 1.0.0
 spec:
+  provider: openai
   model: gpt-5-5
-  request:
-    provider: open_ai_chat_completion
-    body:
-      model: gpt-5-5
-      messages:
-        - role: system
-          content: |
-            You are a security reviewer. Report only exploitable security findings.
-            For every finding, identify the affected code and a concrete failure path.
-        - role: user
-          content: |
-            Review this change:
-            {{code}}
-  variables: [code]
-  response_type: text
+  system: |
+    You are a security reviewer. Report only exploitable security findings.
+    For every finding, identify the affected code and a concrete failure path.
+  messages:
+  - role: user
+    content: |
+      Review this change:
+      {{code}}

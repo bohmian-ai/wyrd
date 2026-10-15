@@ -8,8 +8,9 @@ metadata:
 spec:
   provider: openai
   model: gpt-4o
-  system: "You are {{persona}}."
+  system: You are {{persona}}.
   messages:
-    - "Summarize {{doc}}."
+  - role: user
+    content: Summarize {{doc}}.
   model_settings:
     temperature: 0.2

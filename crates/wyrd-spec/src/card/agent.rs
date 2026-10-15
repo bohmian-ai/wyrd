@@ -7,7 +7,7 @@ use crate::api_version::ApiVersion;
 use crate::card::verifier::VerificationBinding;
 use crate::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use crate::error::WyrdError;
-use crate::ids::{CardName, CardUid, SpaceName};
+use crate::ids::{CardName, CardUid, ProviderDeploymentName, SpaceName};
 use crate::metadata::{Annotations, Labels};
 use crate::reference::{CardRef, InlineableRef};
 use wyrd_semver::VersionBlock;
@@ -30,6 +30,26 @@ pub struct AgentRunConfigSpec {
     pub timeout_ms: Option<u64>,
 }
 
+/// Where an Agent's model calls go.
+///
+/// Required on every Agent and replaceable whole for one invocation; it is
+/// never inferred from the Prompt provider or model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutionRoute {
+    /// The executing host's provider configuration named by the Prompt
+    /// provider; refused in server-controlled execution. An empty struct
+    /// variant so `deny_unknown_fields` refuses a stray `deployment`.
+    Native {},
+    /// The tenant's Wyrd gateway, addressing `<deployment>/<prompt model>`.
+    WyrdGateway {
+        /// Named gateway deployment, not an adapter or model address.
+        #[cfg_attr(feature = "server", schema(value_type = String))]
+        deployment: ProviderDeploymentName,
+    },
+}
+
 /// Agent authoring body inside a Wyrd Agent Card envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -38,6 +58,8 @@ pub struct AgentSpec {
     /// Prompt reference preserved on disk and resolved by `skald-agent`.
     #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
     pub prompt: InlineableRef<skald_spec::Prompt>,
+    /// Declared execution route; invocations may replace it whole.
+    pub execution_route: ExecutionRoute,
     /// Runtime-local tool names resolved from a local Skald tool registry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_names: Vec<String>,
@@ -261,8 +283,6 @@ mod agent_spec_tests {
                 settings: skald_spec::OpenAiChatSettings::default(),
             }),
             "gpt-4o-mini",
-            None,
-            skald_spec::ResponseType::Text,
         )
         .expect("static prompt is valid")
     }
@@ -271,6 +291,7 @@ mod agent_spec_tests {
     fn agent_spec_inline_prompt_roundtrips() {
         let spec = AgentSpec {
             prompt: InlineableRef::from(prompt()),
+            execution_route: crate::card::agent::ExecutionRoute::Native {},
             tool_names: vec!["search_docs".to_owned()],
             run_config: AgentRunConfigSpec {
                 max_iterations: Some(7),
@@ -300,6 +321,7 @@ mod agent_spec_tests {
                 space: Some("research".parse().expect("valid space")),
                 uid: None,
             }),
+            execution_route: crate::card::agent::ExecutionRoute::Native {},
             tool_names: Vec::new(),
             run_config: AgentRunConfigSpec::default(),
             verified_by: Vec::new(),
@@ -328,6 +350,7 @@ mod agent_spec_tests {
             annotations: BTreeMap::new(),
             spec: AgentSpec {
                 prompt: InlineableRef::from(prompt()),
+                execution_route: crate::card::agent::ExecutionRoute::Native {},
                 tool_names: Vec::new(),
                 run_config: AgentRunConfigSpec::default(),
                 verified_by: Vec::new(),
@@ -350,5 +373,112 @@ mod agent_spec_tests {
             serde_json::from_value(serialized).expect("agent card round trips");
         assert_eq!(restored.name, card.name);
         assert_eq!(restored.spec, card.spec);
+    }
+
+    /// T01: an Agent carries a Prompt in either authored form, inline or by
+    /// reference, plus one required execution route of exactly two shapes;
+    /// removed route spellings, route fields on a Prompt, and partial routes
+    /// are refused.
+    #[test]
+    fn agent_prompt_execution_contract() {
+        use serde_json::{Value, json};
+
+        use crate::card::agent::ExecutionRoute;
+
+        let portable = json!({
+            "provider": "openai",
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "{{question}}"}],
+            "response_format": {"type": "object", "properties": {"answer": {"type": "string"}}},
+        });
+        let native = json!({
+            "provider": "anthropic",
+            "model": "claude-sonnet-5",
+            "format": "messages",
+            "body": {"max_tokens": 64, "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]},
+        });
+        let reference = json!({"kind": "Prompt", "name": "support-answer", "version": "1.0.0", "space": "default"});
+        let gateway = json!({"kind": "wyrd_gateway", "deployment": "openai-primary"});
+        let agent = |prompt: &Value, route: Value| json!({"prompt": prompt, "execution_route": route, "run_config": {"max_iterations": 5}});
+
+        for (prompt, route) in [
+            (&portable, gateway.clone()),
+            (&native, json!({"kind": "native"})),
+            (&reference, gateway.clone()),
+        ] {
+            let authored = agent(prompt, route);
+            let spec: AgentSpec = serde_json::from_value(authored.clone()).expect("agent decodes");
+            assert_eq!(
+                serde_json::to_value(&spec).expect("agent encodes"),
+                authored,
+                "the agent serializes exactly as authored"
+            );
+        }
+        let spec: AgentSpec =
+            serde_json::from_value(agent(&portable, gateway.clone())).expect("agent decodes");
+        assert_eq!(
+            spec.execution_route,
+            ExecutionRoute::WyrdGateway {
+                deployment: "openai-primary".parse().expect("deployment name")
+            }
+        );
+        let InlineableRef::Inline(prompt) = &spec.prompt else {
+            panic!("an inline prompt stays inline");
+        };
+        assert!(matches!(
+            prompt.response_type,
+            skald_spec::ResponseType::JsonSchema { .. }
+        ));
+        assert_eq!(prompt.variables, vec!["question"]);
+
+        let refused = |authored: Value, why: &str| {
+            assert!(
+                serde_json::from_value::<AgentSpec>(authored).is_err(),
+                "{why} is refused"
+            );
+        };
+        refused(
+            json!({"prompt": portable, "run_config": {}}),
+            "a missing execution_route",
+        );
+        refused(
+            json!({"prompt": portable, "execution_route": {"kind": "native"}, "llm_route": {"kind": "native"}}),
+            "an llm_route field",
+        );
+        refused(
+            agent(
+                &portable,
+                json!({"kind": "ext_gateway", "base_url": "https://gw.example.com"}),
+            ),
+            "an ext_gateway route",
+        );
+        refused(
+            agent(
+                &portable,
+                json!({"kind": "native", "deployment": "openai-primary"}),
+            ),
+            "a native route with a deployment",
+        );
+        refused(
+            agent(&portable, json!({"kind": "wyrd_gateway"})),
+            "a gateway route without a deployment",
+        );
+        refused(
+            agent(
+                &portable,
+                json!({"kind": "wyrd_gateway", "deployment": "openai/gpt-4o"}),
+            ),
+            "a model address as a deployment",
+        );
+        let mut routed_prompt = portable.clone();
+        routed_prompt["deployment"] = json!("openai-primary");
+        refused(
+            agent(&routed_prompt, gateway.clone()),
+            "a Prompt deployment field",
+        );
+        let mut mixed = portable;
+        mixed["format"] = json!("chat_completion");
+        mixed["body"] = json!({"messages": []});
+        refused(agent(&mixed, gateway), "a mixed portable/native Prompt");
     }
 }

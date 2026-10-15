@@ -554,7 +554,7 @@ fn write_graph(directory: &Path) -> Result<()> {
     let mut files = vec![
         (
             "agent-prompt.yaml".to_owned(),
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: capacity-agent-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-test\n  messages: [answer the question]\n".to_owned(),
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: capacity-agent-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-test\n  messages:\n    - role: user\n      content: answer the question\n".to_owned(),
         ),
         ("assert-agent.yaml".to_owned(), agent("assert")),
         (
@@ -645,7 +645,6 @@ fn judge_prompt() -> Result<String> {
         "gpt-test",
         skald_prompt::OpenAiChatOptions {
             messages: vec!["Grade the answer ${answer}.".to_owned()],
-            variables: vec!["answer".to_owned()],
             output: Some(skald_prompt::ResponseFormat::json_schema(
                 "judge_result",
                 serde_json::json!({

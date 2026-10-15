@@ -248,7 +248,7 @@ mod tests {
             ),
             submission(
                 &external,
-                json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+                json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
             ),
         ])
         .expect("resolved submission builds");
@@ -271,7 +271,7 @@ mod tests {
             ),
             submission(
                 &child,
-                json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+                json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
             ),
         ])
         .expect("resolved submissions build");
@@ -306,7 +306,7 @@ mod tests {
         let card = card_ref(CardKind::Prompt, "prompt");
         let mut authored = submission(
             &card,
-            json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+            json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
         );
         authored.metadata.version = None;
 
@@ -325,11 +325,11 @@ mod tests {
         let error = build(&[
             submission(
                 &first,
-                json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+                json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
             ),
             submission(
                 &first,
-                json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+                json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
             ),
         ])
         .expect_err("duplicate identities must be rejected");

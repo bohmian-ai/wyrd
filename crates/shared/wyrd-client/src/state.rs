@@ -2098,7 +2098,7 @@ pub(crate) mod tests {
     use serde::Serialize;
     use serde_json::Value;
     use sha2::{Digest, Sha256};
-    use skald_spec::{OpenAiChatRequest, Prompt, ProviderRequest, ResponseType};
+    use skald_spec::{OpenAiChatRequest, Prompt, ProviderRequest};
     use tempfile::{TempDir, tempdir};
     use wyrd_semver::{VersionBlock, VersionSpec};
     use wyrd_spec::api_version::ApiVersion;
@@ -2312,6 +2312,7 @@ pub(crate) mod tests {
                     CardKind::Agent,
                     Spec::Agent(AgentSpec {
                         prompt: InlineableRef::Inline(Box::new(prompt("inline"))),
+                        execution_route: wyrd_spec::ExecutionRoute::Native {},
                         tool_names: Vec::new(),
                         run_config: AgentRunConfigSpec::default(),
                         verified_by: Vec::new(),
@@ -2410,6 +2411,7 @@ pub(crate) mod tests {
                         } else {
                             InlineableRef::Ref(prompt_ref)
                         },
+                        execution_route: wyrd_spec::ExecutionRoute::Native {},
                         tool_names: Vec::new(),
                         run_config: AgentRunConfigSpec::default(),
                         verified_by: Vec::new(),
@@ -2741,8 +2743,6 @@ pub(crate) mod tests {
         Prompt::new(
             ProviderRequest::OpenAiChatCompletion(request),
             "fixture-model",
-            None,
-            ResponseType::Text,
         )
         .expect("fixture prompt is valid")
     }
@@ -2759,6 +2759,7 @@ pub(crate) mod tests {
     fn registered_agent_spec(prompt_ref: &CardRef) -> Spec {
         Spec::Agent(AgentSpec {
             prompt: InlineableRef::Ref(prompt_ref.clone()),
+            execution_route: wyrd_spec::ExecutionRoute::Native {},
             tool_names: Vec::new(),
             run_config: AgentRunConfigSpec::default(),
             verified_by: Vec::new(),
@@ -3046,6 +3047,7 @@ pub(crate) mod tests {
                 CardKind::Agent,
                 Spec::Agent(AgentSpec {
                     prompt: InlineableRef::Inline(Box::new(prompt("tooled"))),
+                    execution_route: wyrd_spec::ExecutionRoute::Native {},
                     tool_names: vec!["search".to_owned()],
                     run_config: AgentRunConfigSpec::default(),
                     verified_by: Vec::new(),

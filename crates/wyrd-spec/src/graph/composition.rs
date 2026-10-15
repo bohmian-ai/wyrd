@@ -929,6 +929,7 @@ mod tests {
                         "type": "agent",
                         "target": {
                             "prompt": card_ref(CardKind::Prompt, "judge"),
+                            "execution_route": {"kind": "native"},
                             "verified_by": [binding(&card_ref(CardKind::Model, "classifier"))],
                         },
                     },
@@ -962,6 +963,7 @@ mod tests {
                                 "id": "helpful",
                                 "judge_ref": {
                                     "prompt": card_ref(CardKind::Prompt, "judge"),
+                                    "execution_route": {"kind": "native"},
                                     "verified_by": [
                                         binding(&card_ref(CardKind::Verifier, "quality"))
                                     ],
@@ -996,7 +998,10 @@ mod tests {
                     "id": "judge",
                     "action": {
                         "type": "agent",
-                        "target": { "prompt": card_ref(CardKind::Prompt, "judge") },
+                        "target": {
+                            "prompt": card_ref(CardKind::Prompt, "judge"),
+                            "execution_route": {"kind": "native"},
+                        },
                     },
                 }],
             }),

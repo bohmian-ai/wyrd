@@ -48,7 +48,7 @@ async fn seed_dependency(
         tenant,
         "Prompt",
         name,
-        json!({ "provider": "openai", "model": "gpt-4o", "messages": ["hello"] }),
+        json!({ "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] }),
         status,
     )
     .await
@@ -207,7 +207,7 @@ fn registration_request() -> Request<Body> {
                     "spec": {
                         "provider": "openai",
                         "model": "gpt-4o",
-                        "messages": ["hello"]
+                        "messages": [{"role": "user", "content": "hello"}]
                     },
                     "artifacts": []
                 }]
@@ -237,7 +237,7 @@ fn prompt_registration_request(name: &str, idempotency_key: &str) -> Request<Bod
                     "spec": {
                         "provider": "openai",
                         "model": "gpt-4o",
-                        "messages": ["hello"]
+                        "messages": [{"role": "user", "content": "hello"}]
                     },
                     "artifacts": []
                 }]
@@ -274,7 +274,7 @@ fn agent_registration_request(
                             "name": child_name,
                             "version": "1.0.0",
                             "space": "default"
-                        }
+                        }, "execution_route": {"kind": "native"}
                     },
                     "artifacts": []
                 }]
@@ -303,13 +303,13 @@ fn three_card_composite_request(idempotency_key: &str) -> Request<Body> {
                 "metadata": { "name": "composite-agent", "version": "1.0.0", "space": "default" },
                 "spec": { "prompt": {
                     "sibling": { "kind": "Prompt", "name": "composite-prompt", "version": "1.0.0", "space": "default" }
-                } },
+                }, "execution_route": {"kind": "native"} },
                 "artifacts": []
             },
             {
                 "apiVersion": "wyrd/v1", "kind": "Prompt",
                 "metadata": { "name": "composite-prompt", "version": "1.0.0", "space": "default" },
-                "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+                "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
                 "artifacts": []
             }
         ] }),
@@ -324,7 +324,7 @@ fn permuted_three_card_composite_request(idempotency_key: &str) -> Request<Body>
             {
                 "apiVersion": "wyrd/v1", "kind": "Prompt",
                 "metadata": { "name": "composite-prompt", "version": "1.0.0", "space": "default" },
-                "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+                "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
                 "artifacts": []
             },
             {
@@ -341,7 +341,7 @@ fn permuted_three_card_composite_request(idempotency_key: &str) -> Request<Body>
                 "metadata": { "name": "composite-agent", "version": "1.0.0", "space": "default" },
                 "spec": { "prompt": {
                     "sibling": { "kind": "Prompt", "name": "composite-prompt", "version": "1.0.0", "space": "default" }
-                } },
+                }, "execution_route": {"kind": "native"} },
                 "artifacts": []
             }
         ] }),
@@ -355,7 +355,7 @@ fn heavy_registration_request(idempotency_key: &str) -> Request<Body> {
         json!({ "submissions": [{
             "apiVersion": "wyrd/v1", "kind": "Prompt",
             "metadata": { "name": "heavy-prompt", "version": "1.0.0", "space": "default" },
-            "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+            "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
             "artifacts": [{
                 "relative_path": "prompt.txt",
                 "sha256": "ypeBEsobvcr6wjGzmiPcTaeG7/gUfE5yuYB3ha/uSLs=",
@@ -377,7 +377,7 @@ async fn client_registration_saga_returns_active_receipt() {
     std::fs::write(
         &prompt_path,
         format!(
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: client-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: client-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
             artifact.len()
         ),
     )
@@ -618,12 +618,12 @@ async fn registration_accepts_loader_projection_and_persists_sibling_binding() {
     let agent_path = temp.path().join("agent.yaml");
     std::fs::write(
         &prompt_path,
-        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: loader-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\n",
+        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: loader-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\n",
     )
     .expect("prompt card writes");
     std::fs::write(
         &agent_path,
-        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: loader-agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n",
+        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: loader-agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n  execution_route:\n    kind: native\n",
     )
     .expect("agent card writes");
 
@@ -850,7 +850,7 @@ fn bound_agent_request(
                 "prompt": {
                     "kind": "Prompt", "name": prompt_name,
                     "version": "1.0.0", "space": "default"
-                },
+                }, "execution_route": {"kind": "native"},
                 "verified_by": [{
                     "verifier": {
                         "kind": "Verifier", "name": verifier_name,
@@ -1170,7 +1170,7 @@ async fn referenced_binding_refusals_leave_no_writes() {
                                     "prompt": {
                                         "kind": "Prompt", "name": "binding-prompt",
                                         "version": "1.0.0", "space": "default"
-                                    },
+                                    }, "execution_route": {"kind": "native"},
                                     "verified_by": [{
                                         "verifier": {
                                             "kind": "Verifier",
@@ -1221,7 +1221,7 @@ fn agent_with_bindings(name: &str, verified_by: Value, idempotency_key: &str) ->
                 "prompt": {
                     "kind": "Prompt", "name": "vc-prompt",
                     "version": "1.0.0", "space": "default"
-                },
+                }, "execution_route": {"kind": "native"},
                 "verified_by": verified_by,
             },
             "artifacts": []
@@ -1588,13 +1588,13 @@ async fn composite_with_manifest_rejects_before_writes() {
                     {
                         "apiVersion": "wyrd/v1", "kind": "Prompt",
                         "metadata": { "name": "heavy", "version": "1.0.0", "space": "default" },
-                        "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+                        "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
                         "artifacts": [{ "relative_path": "prompt.txt", "sha256": "YQ==", "size_bytes": 1 }]
                     },
                     {
                         "apiVersion": "wyrd/v1", "kind": "Prompt",
                         "metadata": { "name": "light", "version": "1.0.0", "space": "default" },
-                        "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+                        "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
                         "artifacts": []
                     }
                 ] }),
@@ -2779,7 +2779,7 @@ fn bound_service_body(service_name: &str, runs_on: Value, second_alias: Option<&
                 "metadata": { "name": "vb-agent", "version": "1.0.0", "space": "default" },
                 "spec": { "prompt": {
                     "kind": "Prompt", "name": "vb-prompt", "version": "1.0.0", "space": "default"
-                } },
+                }, "execution_route": {"kind": "native"} },
                 "artifacts": []
             }
         ] })

@@ -10,6 +10,8 @@ spec:
     name: planner-prompt
     version: 0.3.0
     space: research
+  execution_route:
+    kind: native
   run_config:
     max_iterations: 6
     tool_concurrency_cap: 2

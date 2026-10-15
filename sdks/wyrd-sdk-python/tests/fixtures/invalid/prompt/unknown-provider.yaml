@@ -6,4 +6,5 @@ spec:
   provider: unknownprovider
   model: some-model
   messages:
-    - Hello
+  - role: user
+    content: Hello

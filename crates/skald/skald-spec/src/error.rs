@@ -112,12 +112,13 @@ pub enum SkaldError {
     /// Media path helper IO failed.
     #[error("media io error: {0}")]
     MediaIo(String),
-    /// A declarative `PromptDraft` failed to compile into a native `Prompt`.
-    #[error("prompt draft compile failed for provider {provider}: {message}")]
-    PromptDraftInvalid {
-        /// Provider name from the draft.
-        provider: String,
-        /// Compile failure message.
+    /// An authored Prompt field is invalid, unsupported, or mixed with the
+    /// other form.
+    #[error("invalid prompt field {field}: {message}")]
+    PromptInvalid {
+        /// Authored field path, such as `settings.top_k` or `body.model`.
+        field: String,
+        /// Why the field was refused.
         message: String,
     },
 }
@@ -175,7 +176,7 @@ impl SkaldError {
             Self::MediaTooLarge { .. } => "SKALD_SPEC_400_MEDIA_TOO_LARGE",
             Self::MediaInvalidExtension { .. } => "SKALD_SPEC_400_MEDIA_INVALID_EXTENSION",
             Self::MediaIo(_) => "SKALD_SPEC_500_MEDIA_IO",
-            Self::PromptDraftInvalid { .. } => "SKALD_SPEC_400_PROMPT_DRAFT_INVALID",
+            Self::PromptInvalid { .. } => "SKALD_SPEC_400_PROMPT_INVALID",
         }
     }
 }

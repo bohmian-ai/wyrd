@@ -7,7 +7,7 @@ use skald_agent::{
 use skald_prompt::Prompt;
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::{
-    ProviderName, ProviderRequest, ProviderResponse, ResponseType,
+    ProviderName, ProviderRequest, ProviderResponse,
     wire::openai_chat::{
         OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse,
         OpenAiChatSettings, OpenAiMessageContent,
@@ -35,8 +35,7 @@ fn temp_path(name: &str) -> std::path::PathBuf {
 }
 
 fn prompt() -> skald_spec::Prompt {
-    skald_spec::Prompt::new(openai_request(), "gpt-4o-mini", None, ResponseType::Text)
-        .expect("static prompt is valid")
+    skald_spec::Prompt::new(openai_request(), "gpt-4o-mini").expect("static prompt is valid")
 }
 
 fn openai_request() -> ProviderRequest {
@@ -313,6 +312,7 @@ fn unknown_runtime_local_tool_uses_wyrd_code() {
         annotations: BTreeMap::default(),
         spec: wyrd_spec::card::agent::AgentSpec {
             prompt: InlineableRef::Inline(Box::new(prompt())),
+            execution_route: wyrd_spec::ExecutionRoute::Native {},
             tool_names: vec!["missing_tool".to_owned()],
             run_config: AgentRunConfigSpec::default(),
             verified_by: Vec::new(),

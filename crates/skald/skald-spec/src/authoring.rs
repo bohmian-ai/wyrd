@@ -1,425 +1,1086 @@
-use serde::Deserialize;
-use serde_json::Value;
+//! The authored Prompt contract and its one compilation path.
+//!
+//! A Prompt is authored once, with `provider` and `model`, in one of two
+//! forms: **portable** (`system`, `messages`, `settings`, `response_format`)
+//! or **native** (`format` plus a protocol `body`). [`AuthoredPrompt`] is the
+//! durable form Cards store and hash; [`AuthoredPrompt::compile`] validates it
+//! and builds the runtime [`Prompt`], whose serialized form is again the
+//! authored form it came from.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::error::{SkaldError, SkaldResult};
-use crate::prompt::{Prompt, ResponseType};
+use crate::media::{MediaKind, MediaRef, MediaSource};
+use crate::prompt::{Prompt, media_placeholder_regex};
 use crate::request::{ProviderName, ProviderRequest};
 use crate::wire::anthropic_messages::{
-    AnthropicMessage, AnthropicMessagesRequest, AnthropicMessagesSettings, AnthropicSystem,
+    AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest, AnthropicMessagesSettings,
+    AnthropicOutputConfig, AnthropicOutputFormat, AnthropicSystem,
 };
 use crate::wire::google_generate::{
-    GoogleContent, GoogleGenerateContentRequest, GoogleGenerateSettings, GooglePart,
+    GoogleContent, GoogleGenerateContentRequest, GoogleGenerateSettings, GoogleGenerationConfig,
+    GooglePart,
 };
 use crate::wire::openai_chat::{
-    OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, OpenAiMessageContent,
-};
-use crate::wire::openai_responses::{
-    OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesRequest, OpenAiResponsesSettings,
+    OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, OpenAiContentPart, OpenAiJsonSchema,
+    OpenAiMessageContent, OpenAiResponseFormat, OpenAiStop,
 };
 
-/// Declarative prompt draft that compiles into a native `Prompt`.
+/// Schema name every portable structured-output request carries.
 ///
-/// Both the YAML authoring path and the SDK prompt constructors compile through
-/// here, ensuring one canonical assembly per provider.
-#[derive(Debug, Clone, Deserialize)]
-pub struct PromptDraft {
-    /// Provider name (e.g. `"openai"`, `"anthropic"`, `"google"`, `"vertex"`).
-    pub provider: String,
-    /// Model identifier.
+/// Deterministic so inline and standalone Prompts compile identically; the
+/// authored schema needs no separate name.
+const RESPONSE_SCHEMA_NAME: &str = "response";
+
+/// The authored Prompt: provider and model once, plus portable content or
+/// one native protocol body.
+///
+/// Decoding refuses unknown fields; [`AuthoredPrompt::compile`] refuses a
+/// mixed form, an invalid provider/format pair, and invalid settings, media,
+/// or schemas. Neither performs IO.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredPrompt {
+    /// Inference family or configured native provider; never a deployment.
+    pub provider: ProviderName,
+    /// Provider model identifier, preserved verbatim including any slash.
     pub model: String,
-    /// Optional operation override. Set to `"responses"` for the OpenAI Responses API.
-    #[serde(default)]
-    pub operation: Option<String>,
-    /// Optional system prompt / instructions.
-    #[serde(default)]
+    /// Native protocol format; present exactly when `body` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<PromptFormat>,
+    /// Native protocol content and options, excluding `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<Map<String, Value>>,
+    /// Portable system text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
-    /// User messages — a single string or a list of strings.
-    #[serde(default)]
-    pub messages: DraftMessages,
-    /// Provider-native generation settings as a JSON value.
-    #[serde(default)]
-    pub model_settings: Option<Value>,
-    /// Optional author-assigned version.
-    #[serde(default)]
-    pub version: Option<String>,
+    /// Portable ordered user and assistant turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<PortableMessage>>,
+    /// Portable generation settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<PortableSettings>,
+    /// Portable structured output: one JSON Schema object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<Map<String, Value>>,
 }
 
-/// User messages in a `PromptDraft` — a single string or a list of strings.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Native protocol formats a Prompt `body` may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PromptFormat {
+    /// OpenAI Chat Completions.
+    ChatCompletion,
+    /// OpenAI Responses.
+    Responses,
+    /// Anthropic Messages.
+    Messages,
+    /// Google and Vertex GenerateContent.
+    GenerateContent,
+    /// Jev `systemone`.
+    SystemOne,
+}
+
+/// One portable conversation turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PortableMessage {
+    /// Turn author; system text lives only in `system`.
+    pub role: PortableRole,
+    /// Text, or ordered typed content blocks.
+    pub content: PortableContent,
+}
+
+/// Author of a portable turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PortableRole {
+    /// End-user turn.
+    User,
+    /// Prior model turn.
+    Assistant,
+}
+
+/// Portable turn content.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
-pub enum DraftMessages {
-    /// No messages.
-    #[default]
-    None,
-    /// Single user message string.
-    One(String),
-    /// Multiple user message strings.
-    Many(Vec<String>),
+pub enum PortableContent {
+    /// Convenience form of one text block.
+    Text(String),
+    /// Ordered typed content blocks.
+    Blocks(Vec<ContentBlock>),
 }
 
-impl DraftMessages {
-    fn into_vec(self) -> Vec<String> {
-        match self {
-            Self::None => Vec::new(),
-            Self::One(s) => vec![s],
-            Self::Many(v) => v,
-        }
-    }
+/// One typed portable content block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContentBlock {
+    /// Text, which may hold `{{name}}` placeholders.
+    Text {
+        /// Block text.
+        text: String,
+    },
+    /// An image.
+    Image {
+        /// Literal media or one `${media:name}` binding.
+        source: BlockSource,
+    },
+    /// A document.
+    Document {
+        /// Literal media or one `${media:name}` binding.
+        source: BlockSource,
+    },
 }
 
-impl PromptDraft {
-    /// Compile this declarative draft into a native `Prompt`.
+/// Where an image or document block's media comes from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum BlockSource {
+    /// One isolated `${media:name}` placeholder bound at run time.
+    Binding(String),
+    /// Literal media, mapped through the shared media helpers.
+    Media(MediaSource),
+}
+
+/// The eight portable generation settings.
+///
+/// A setting the destination protocol cannot carry is refused, never dropped.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PortableSettings {
+    /// Sampling temperature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Nucleus sampling mass in `[0, 1]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    /// Positive output-token limit; required for Anthropic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// Positive top-k sampling limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Nonempty stop strings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
+    /// Best-effort reproducibility seed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    /// Presence penalty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+    /// Frequency penalty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+}
+
+/// One portable turn lowered to ordered text parts, media as isolated
+/// `${media:name}` placeholders the shared binder later replaces.
+struct Turn {
+    /// Turn author.
+    role: PortableRole,
+    /// Ordered text parts.
+    parts: Vec<String>,
+    /// Whether the author wrote the content as one plain string.
+    plain: bool,
+}
+
+impl AuthoredPrompt {
+    /// Validates this authored Prompt and builds its runtime [`Prompt`].
     ///
-    /// `provider` is the discriminator — not untagged guessing. A `vertex`
-    /// draft compiles to a Google GenerateContent body whose Prompt provider
-    /// is Vertex.
+    /// Native bodies get `model` inserted (except GenerateContent, whose model
+    /// lives in the URL) and decode through the typed wire owner. Portable
+    /// content lowers to the destination's typed request; literal media is
+    /// then bound through the shared media binder, so per-provider source and
+    /// MIME rules apply identically to both forms. The compiled Prompt keeps
+    /// this authored form for serialization.
     ///
     /// # Errors
     ///
-    /// Returns [`SkaldError::PromptDraftInvalid`] for an unknown provider and
-    /// the settings decode or Prompt validation error of the built request.
-    pub fn compile(self) -> SkaldResult<Prompt> {
-        let provider = provider_from_str(&self.provider);
-        let model = self.model.clone();
-        let messages = self.messages.into_vec();
-        let is_responses = self
-            .operation
-            .as_deref()
-            .is_some_and(|op| op.eq_ignore_ascii_case("responses"));
-
-        let dispatch = (provider == ProviderName::Vertex).then_some(ProviderName::Vertex);
-        let request = match provider {
-            ProviderName::OpenAi if is_responses => {
-                build_openai_responses(model.clone(), self.system, messages, self.model_settings)?
-            }
-            ProviderName::OpenAi => {
-                build_openai_chat(model.clone(), self.system, messages, self.model_settings)?
-            }
-            ProviderName::Anthropic => {
-                build_anthropic(model.clone(), self.system, messages, self.model_settings)?
-            }
-            ProviderName::Google => {
-                build_gemini(self.system, messages, self.model_settings, false)?
-            }
-            ProviderName::Vertex => build_gemini(self.system, messages, self.model_settings, true)?,
-            // Jev asks keyed questions, not messages: a Jev Prompt declares its
-            // native `request`.
-            ProviderName::Jev => {
-                return Err(SkaldError::PromptDraftInvalid {
-                    provider: "jev".to_owned(),
-                    message: "a jev Prompt declares its native `request`, not messages".to_owned(),
-                });
-            }
-            ProviderName::Custom(name) => {
-                return Err(SkaldError::PromptDraftInvalid {
-                    provider: name,
-                    message: "unknown provider for declarative compile".to_owned(),
-                });
-            }
+    /// Returns [`SkaldError::PromptInvalid`] naming the offending field for an
+    /// empty model, a mixed or incomplete form, an invalid provider/format
+    /// pair, `body.model`, an undecodable body, empty or misplaced content, a
+    /// malformed binding, or an out-of-range or unsupported setting; and the
+    /// media binder's error for a literal source its provider refuses.
+    pub fn compile(&self) -> SkaldResult<Prompt> {
+        if self.model.trim().is_empty() {
+            return Err(invalid("model", "must be a nonempty provider model id"));
+        }
+        let mut literals = Vec::new();
+        let request = match (self.format, &self.body) {
+            (Some(format), Some(body)) => self.native_request(format, body)?,
+            (None, None) => self.portable_request(&mut literals)?,
+            (Some(_), None) => return Err(invalid("body", "native `format` requires a `body`")),
+            (None, Some(_)) => return Err(invalid("format", "native `body` requires a `format`")),
         };
-
-        let mut prompt = Prompt::new(request, model, self.version, ResponseType::Text)?;
-        prompt.provider = dispatch;
+        let mut prompt = Prompt::new(request, self.model.clone())?;
+        prompt.provider = Some(self.provider.clone());
+        for (name, media) in &literals {
+            prompt.bind_media_mut(name, media)?;
+        }
+        prompt.authored = Some(Box::new(self.clone()));
         Ok(prompt)
     }
-}
 
-fn provider_from_str(value: &str) -> ProviderName {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "openai" | "open_ai" => ProviderName::OpenAi,
-        "anthropic" => ProviderName::Anthropic,
-        "google" | "gemini" => ProviderName::Google,
-        "vertex" | "vertex_ai" => ProviderName::Vertex,
-        _ => ProviderName::Custom(value.to_owned()),
+    /// Derives the native authored form of a runtime-built request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::PromptInvalid`] for a request kind no Prompt
+    /// format carries, such as embeddings or a raw body.
+    pub(crate) fn native(
+        provider: ProviderName,
+        model: &str,
+        request: &ProviderRequest,
+    ) -> SkaldResult<Self> {
+        let (format, body) = match request {
+            ProviderRequest::OpenAiChatCompletion(r) => (PromptFormat::ChatCompletion, to_body(r)?),
+            ProviderRequest::OpenAiResponses(r) => (PromptFormat::Responses, to_body(r)?),
+            ProviderRequest::AnthropicMessage(r) => (PromptFormat::Messages, to_body(r)?),
+            ProviderRequest::GeminiGenerateContent(r) => {
+                (PromptFormat::GenerateContent, to_body(r)?)
+            }
+            ProviderRequest::JevSystemOne(r) => (PromptFormat::SystemOne, to_body(r)?),
+            _ => {
+                return Err(invalid(
+                    "format",
+                    "this request kind is not a Prompt format",
+                ));
+            }
+        };
+        Ok(Self {
+            provider,
+            model: model.to_owned(),
+            format: Some(format),
+            body: Some(body),
+            system: None,
+            messages: None,
+            settings: None,
+            response_format: None,
+        })
+    }
+
+    /// Decodes the native body through the typed owner for `format`.
+    fn native_request(
+        &self,
+        format: PromptFormat,
+        body: &Map<String, Value>,
+    ) -> SkaldResult<ProviderRequest> {
+        if let Some(field) = [
+            ("system", self.system.is_some()),
+            ("messages", self.messages.is_some()),
+            ("settings", self.settings.is_some()),
+            ("response_format", self.response_format.is_some()),
+        ]
+        .into_iter()
+        .find_map(|(field, set)| set.then_some(field))
+        {
+            return Err(invalid(
+                field,
+                "portable fields cannot accompany a native `body`",
+            ));
+        }
+        check_format(&self.provider, format)?;
+        if body.contains_key("model") {
+            return Err(invalid(
+                "body.model",
+                "the model is `model`; remove it from the native body",
+            ));
+        }
+        let mut body = body.clone();
+        if format != PromptFormat::GenerateContent {
+            body.insert("model".to_owned(), Value::String(self.model.clone()));
+        }
+        let body = Value::Object(body);
+        let decoded = match format {
+            PromptFormat::ChatCompletion => {
+                serde_json::from_value(body).map(ProviderRequest::OpenAiChatCompletion)
+            }
+            PromptFormat::Responses => {
+                serde_json::from_value(body).map(ProviderRequest::OpenAiResponses)
+            }
+            PromptFormat::Messages => {
+                serde_json::from_value(body).map(ProviderRequest::AnthropicMessage)
+            }
+            PromptFormat::GenerateContent => {
+                serde_json::from_value(body).map(ProviderRequest::GeminiGenerateContent)
+            }
+            PromptFormat::SystemOne => {
+                serde_json::from_value(body).map(ProviderRequest::JevSystemOne)
+            }
+        };
+        decoded.map_err(|error| invalid("body", &error.to_string()))
+    }
+
+    /// Lowers portable content to the provider's default format.
+    ///
+    /// Literal media sources are recorded in `literals` under generated
+    /// placeholder names for [`compile`](Self::compile) to bind.
+    fn portable_request(
+        &self,
+        literals: &mut Vec<(String, MediaRef)>,
+    ) -> SkaldResult<ProviderRequest> {
+        let format = match &self.provider {
+            ProviderName::OpenAi | ProviderName::Custom(_) => PromptFormat::ChatCompletion,
+            ProviderName::Anthropic => PromptFormat::Messages,
+            ProviderName::Google | ProviderName::Vertex => PromptFormat::GenerateContent,
+            ProviderName::Jev => {
+                return Err(invalid(
+                    "format",
+                    "jev Prompts are native only; declare `format: system_one` and a `body`",
+                ));
+            }
+        };
+        let turns = self
+            .messages
+            .iter()
+            .flatten()
+            .map(|message| message.lower(literals))
+            .collect::<SkaldResult<Vec<_>>>()?;
+        let has_content = self.system.as_deref().is_some_and(|text| !text.is_empty())
+            || turns
+                .iter()
+                .any(|turn| turn.parts.iter().any(|part| !part.is_empty()));
+        if !has_content {
+            return Err(invalid(
+                "messages",
+                "a portable Prompt needs nonempty system or message content",
+            ));
+        }
+        let settings = self.settings.clone().unwrap_or_default();
+        let schema = self.response_format.clone();
+        let system = self.system.clone();
+        Ok(match format {
+            PromptFormat::Messages => ProviderRequest::AnthropicMessage(anthropic(
+                &self.model,
+                system,
+                turns,
+                &settings,
+                schema,
+            )?),
+            PromptFormat::GenerateContent => {
+                ProviderRequest::GeminiGenerateContent(google(system, turns, &settings, schema)?)
+            }
+            _ => ProviderRequest::OpenAiChatCompletion(openai_chat(
+                &self.model,
+                system,
+                turns,
+                &settings,
+                schema,
+            )?),
+        })
     }
 }
 
-fn decode_settings<T: serde::de::DeserializeOwned + Default>(
-    provider: ProviderName,
-    value: Option<Value>,
-) -> SkaldResult<T> {
-    let Some(v) = value else {
-        return Ok(T::default());
+impl PortableMessage {
+    /// Lowers this turn to ordered text parts, recording literal media.
+    fn lower(&self, literals: &mut Vec<(String, MediaRef)>) -> SkaldResult<Turn> {
+        let blocks = match &self.content {
+            PortableContent::Text(text) => {
+                return Ok(Turn {
+                    role: self.role,
+                    parts: vec![text.clone()],
+                    plain: true,
+                });
+            }
+            PortableContent::Blocks(blocks) => blocks,
+        };
+        let mut parts = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let (kind, source) = match block {
+                ContentBlock::Text { text } => {
+                    parts.push(text.clone());
+                    continue;
+                }
+                ContentBlock::Image { source } => (MediaKind::Image, source),
+                ContentBlock::Document { source } => (MediaKind::Document, source),
+            };
+            if self.role == PortableRole::Assistant {
+                return Err(invalid(
+                    "messages.content",
+                    "image and document blocks belong in user turns",
+                ));
+            }
+            parts.push(match source {
+                BlockSource::Binding(binding) => {
+                    let whole = media_placeholder_regex()
+                        .find(binding)
+                        .is_some_and(|found| found.as_str() == binding);
+                    if !whole {
+                        return Err(invalid(
+                            "messages.content.source",
+                            "a media binding is exactly one `${media:name}` placeholder",
+                        ));
+                    }
+                    // ponytail: a binding's MediaRef kind is not checked against
+                    // its block kind; carry the kind into Prompt if a mismatch bites.
+                    binding.clone()
+                }
+                BlockSource::Media(source) => {
+                    let name = format!("__wyrd_media_{}", literals.len());
+                    let placeholder = format!("${{media:{name}}}");
+                    literals.push((
+                        name,
+                        MediaRef {
+                            kind,
+                            source: source.clone(),
+                        },
+                    ));
+                    placeholder
+                }
+            });
+        }
+        Ok(Turn {
+            role: self.role,
+            parts,
+            plain: false,
+        })
+    }
+}
+
+/// Refuses a provider/format pair the provider does not speak.
+fn check_format(provider: &ProviderName, format: PromptFormat) -> SkaldResult<()> {
+    let admitted = match provider {
+        ProviderName::OpenAi => {
+            matches!(
+                format,
+                PromptFormat::ChatCompletion | PromptFormat::Responses
+            )
+        }
+        ProviderName::Anthropic => format == PromptFormat::Messages,
+        ProviderName::Google | ProviderName::Vertex => format == PromptFormat::GenerateContent,
+        ProviderName::Jev => format == PromptFormat::SystemOne,
+        // Custom capabilities are validated at use by the registered provider.
+        ProviderName::Custom(_) => true,
     };
-    serde_json::from_value(v).map_err(|e| SkaldError::SettingsDecode {
-        provider,
-        message: e.to_string(),
-    })
+    if admitted {
+        Ok(())
+    } else {
+        Err(invalid(
+            "format",
+            &format!(
+                "provider {} does not accept format {}",
+                provider,
+                format_label(format)
+            ),
+        ))
+    }
 }
 
-fn build_openai_chat(
-    model: String,
+/// Builds the portable OpenAI Chat Completions request.
+fn openai_chat(
+    model: &str,
     system: Option<String>,
-    messages: Vec<String>,
-    settings_value: Option<Value>,
-) -> SkaldResult<ProviderRequest> {
-    let settings: OpenAiChatSettings = decode_settings(ProviderName::OpenAi, settings_value)?;
-    let mut chat_messages: Vec<OpenAiChatMessage> = Vec::new();
-    if let Some(system_text) = system {
-        chat_messages.push(OpenAiChatMessage {
+    turns: Vec<Turn>,
+    settings: &PortableSettings,
+    schema: Option<Map<String, Value>>,
+) -> SkaldResult<OpenAiChatRequest> {
+    let destination = "chat_completion";
+    refuse(destination, "top_k", settings.top_k.is_some())?;
+    let stop = stops(destination, settings.stop_sequences.as_ref(), 4)?;
+    let mut messages = Vec::with_capacity(turns.len() + 1);
+    if let Some(text) = system {
+        messages.push(OpenAiChatMessage {
             role: "system".to_owned(),
-            content: Some(OpenAiMessageContent::Text(system_text)),
-            ..Default::default()
-        });
-    }
-    for text in messages {
-        chat_messages.push(OpenAiChatMessage {
-            role: "user".to_owned(),
             content: Some(OpenAiMessageContent::Text(text)),
             ..Default::default()
         });
     }
-    Ok(ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
-        model,
-        messages: chat_messages,
-        response_format: None,
+    messages.extend(turns.into_iter().map(|turn| {
+        let content = if turn.plain {
+            OpenAiMessageContent::Text(turn.parts.concat())
+        } else {
+            OpenAiMessageContent::Parts(
+                turn.parts
+                    .into_iter()
+                    .map(|text| OpenAiContentPart::Text { text })
+                    .collect(),
+            )
+        };
+        OpenAiChatMessage {
+            role: role_name(turn.role, "assistant").to_owned(),
+            content: Some(content),
+            ..Default::default()
+        }
+    }));
+    Ok(OpenAiChatRequest {
+        model: model.to_owned(),
+        messages,
+        response_format: schema.map(|schema| OpenAiResponseFormat::JsonSchema {
+            json_schema: OpenAiJsonSchema {
+                name: RESPONSE_SCHEMA_NAME.to_owned(),
+                description: None,
+                schema: Some(schema),
+                strict: Some(true),
+            },
+        }),
         stream: None,
         stream_options: None,
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
-        settings,
-    }))
+        settings: OpenAiChatSettings {
+            temperature: within(destination, "temperature", settings.temperature, 0.0, 2.0)?,
+            top_p: within(destination, "top_p", settings.top_p, 0.0, 1.0)?,
+            max_completion_tokens: positive(
+                destination,
+                "max_output_tokens",
+                settings.max_output_tokens,
+            )?,
+            stop: stop.map(OpenAiStop::Many),
+            seed: settings.seed,
+            presence_penalty: within(
+                destination,
+                "presence_penalty",
+                settings.presence_penalty,
+                -2.0,
+                2.0,
+            )?,
+            frequency_penalty: within(
+                destination,
+                "frequency_penalty",
+                settings.frequency_penalty,
+                -2.0,
+                2.0,
+            )?,
+            ..Default::default()
+        },
+    })
 }
 
-fn build_openai_responses(
-    model: String,
+/// Builds the portable Anthropic Messages request.
+fn anthropic(
+    model: &str,
     system: Option<String>,
-    messages: Vec<String>,
-    settings_value: Option<Value>,
-) -> SkaldResult<ProviderRequest> {
-    let settings: OpenAiResponsesSettings = decode_settings(ProviderName::OpenAi, settings_value)?;
-    let input = messages
-        .into_iter()
-        .map(|text| OpenAiResponseItem::Message {
-            role: "user".to_owned(),
-            content: vec![OpenAiResponseContentPart::InputText { text }],
-        })
-        .collect::<Vec<_>>()
-        .into();
-    Ok(ProviderRequest::OpenAiResponses(OpenAiResponsesRequest {
-        model,
-        input,
-        instructions: system,
-        text: None,
+    turns: Vec<Turn>,
+    settings: &PortableSettings,
+    schema: Option<Map<String, Value>>,
+) -> SkaldResult<AnthropicMessagesRequest> {
+    let destination = "messages";
+    refuse(destination, "seed", settings.seed.is_some())?;
+    refuse(
+        destination,
+        "presence_penalty",
+        settings.presence_penalty.is_some(),
+    )?;
+    refuse(
+        destination,
+        "frequency_penalty",
+        settings.frequency_penalty.is_some(),
+    )?;
+    let max_tokens = positive(destination, "max_output_tokens", settings.max_output_tokens)?
+        .ok_or_else(|| {
+            invalid(
+                "settings.max_output_tokens",
+                "anthropic requires an explicit max_output_tokens",
+            )
+        })?;
+    Ok(AnthropicMessagesRequest {
+        model: model.to_owned(),
+        messages: turns
+            .into_iter()
+            .map(|turn| AnthropicMessage {
+                role: role_name(turn.role, "assistant").to_owned(),
+                content: turn
+                    .parts
+                    .into_iter()
+                    .map(|text| AnthropicContentBlock::Text {
+                        text,
+                        cache_control: None,
+                        citations: None,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        system: system.map(AnthropicSystem::Text),
+        stream: None,
         tools: None,
         tool_choice: None,
-        parallel_tool_calls: None,
-        previous_response_id: None,
-        stream: None,
-        settings,
-    }))
-}
-
-fn build_anthropic(
-    model: String,
-    system: Option<String>,
-    messages: Vec<String>,
-    settings_value: Option<Value>,
-) -> SkaldResult<ProviderRequest> {
-    let settings: AnthropicMessagesSettings =
-        decode_settings(ProviderName::Anthropic, settings_value)?;
-    let anthropic_messages = messages
-        .into_iter()
-        .map(|text| AnthropicMessage {
-            role: "user".to_owned(),
-            content: vec![
-                crate::wire::anthropic_messages::AnthropicContentBlock::Text {
-                    text,
-                    cache_control: None,
-                    citations: None,
-                },
-            ],
-        })
-        .collect();
-    Ok(ProviderRequest::AnthropicMessage(
-        AnthropicMessagesRequest {
-            model,
-            messages: anthropic_messages,
-            system: system.map(AnthropicSystem::Text),
-            stream: None,
-            tools: None,
-            tool_choice: None,
-            output_config: None,
-            settings,
+        output_config: schema.map(|schema| AnthropicOutputConfig {
+            format: AnthropicOutputFormat::JsonSchema {
+                schema: Value::Object(schema),
+            },
+        }),
+        settings: AnthropicMessagesSettings {
+            max_tokens,
+            temperature: within(destination, "temperature", settings.temperature, 0.0, 1.0)?,
+            top_p: within(destination, "top_p", settings.top_p, 0.0, 1.0)?,
+            top_k: positive(destination, "top_k", settings.top_k)?,
+            stop_sequences: stops(destination, settings.stop_sequences.as_ref(), usize::MAX)?,
+            ..Default::default()
         },
-    ))
+    })
 }
 
-fn build_gemini(
+/// Builds the portable Google/Vertex GenerateContent request.
+fn google(
     system: Option<String>,
-    messages: Vec<String>,
-    settings_value: Option<Value>,
-    vertex_target: bool,
-) -> SkaldResult<ProviderRequest> {
-    let provider = if vertex_target {
-        ProviderName::Vertex
-    } else {
-        ProviderName::Google
+    turns: Vec<Turn>,
+    settings: &PortableSettings,
+    schema: Option<Map<String, Value>>,
+) -> SkaldResult<GoogleGenerateContentRequest> {
+    let destination = "generate_content";
+    if let Some(seed) = settings.seed
+        && i32::try_from(seed).is_err()
+    {
+        return Err(invalid(
+            "settings.seed",
+            "generate_content seeds are 32-bit integers",
+        ));
+    }
+    let text_parts = |parts: Vec<String>| {
+        parts
+            .into_iter()
+            .map(|text| GooglePart::Text { text })
+            .collect()
     };
-    let settings: GoogleGenerateSettings = decode_settings(provider, settings_value)?;
-    let contents = messages
-        .into_iter()
-        .map(|text| GoogleContent {
-            role: "user".to_owned(),
-            parts: vec![GooglePart::Text { text }],
-        })
-        .collect();
-    let request = GoogleGenerateContentRequest {
-        contents,
+    let config = GoogleGenerationConfig {
+        temperature: within(destination, "temperature", settings.temperature, 0.0, 2.0)?,
+        top_p: within(destination, "top_p", settings.top_p, 0.0, 1.0)?,
+        top_k: positive(destination, "top_k", settings.top_k)?,
+        max_output_tokens: positive(destination, "max_output_tokens", settings.max_output_tokens)?,
+        stop_sequences: stops(destination, settings.stop_sequences.as_ref(), 5)?,
+        seed: settings.seed,
+        presence_penalty: within(
+            destination,
+            "presence_penalty",
+            settings.presence_penalty,
+            -2.0,
+            2.0,
+        )?,
+        frequency_penalty: within(
+            destination,
+            "frequency_penalty",
+            settings.frequency_penalty,
+            -2.0,
+            2.0,
+        )?,
+        response_mime_type: schema.as_ref().map(|_| "application/json".to_owned()),
+        response_schema: schema.map(Value::Object),
+        ..Default::default()
+    };
+    Ok(GoogleGenerateContentRequest {
+        contents: turns
+            .into_iter()
+            .map(|turn| GoogleContent {
+                role: role_name(turn.role, "model").to_owned(),
+                parts: text_parts(turn.parts),
+            })
+            .collect(),
         system_instruction: system.map(|text| GoogleContent {
             role: "user".to_owned(),
             parts: vec![GooglePart::Text { text }],
         }),
         tools: None,
         tool_config: None,
-        settings,
+        settings: GoogleGenerateSettings {
+            generation_config: (config != GoogleGenerationConfig::default()).then_some(config),
+            ..Default::default()
+        },
+    })
+}
+
+/// Wire role for a portable turn, given the protocol's assistant role name.
+const fn role_name(role: PortableRole, assistant: &'static str) -> &'static str {
+    match role {
+        PortableRole::User => "user",
+        PortableRole::Assistant => assistant,
+    }
+}
+
+/// Refuses a setting the destination protocol cannot carry.
+fn refuse(destination: &str, setting: &str, present: bool) -> SkaldResult<()> {
+    if present {
+        Err(invalid(
+            &format!("settings.{setting}"),
+            &format!("{destination} does not support {setting}"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Passes a finite setting within `[low, high]`, narrowed to the wire's `f32`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the value is range-checked to small protocol bounds before narrowing"
+)]
+fn within(
+    destination: &str,
+    setting: &str,
+    value: Option<f64>,
+    low: f64,
+    high: f64,
+) -> SkaldResult<Option<f32>> {
+    match value {
+        Some(value) if !value.is_finite() || value < low || value > high => Err(invalid(
+            &format!("settings.{setting}"),
+            &format!("{destination} accepts {setting} in [{low}, {high}]"),
+        )),
+        value => Ok(value.map(|value| value as f32)),
+    }
+}
+
+/// Passes a positive integer setting.
+fn positive(destination: &str, setting: &str, value: Option<u32>) -> SkaldResult<Option<u32>> {
+    if value == Some(0) {
+        return Err(invalid(
+            &format!("settings.{setting}"),
+            &format!("{destination} requires a positive {setting}"),
+        ));
+    }
+    Ok(value)
+}
+
+/// Passes a nonempty list of at most `limit` nonempty stop strings.
+fn stops(
+    destination: &str,
+    value: Option<&Vec<String>>,
+    limit: usize,
+) -> SkaldResult<Option<Vec<String>>> {
+    match value {
+        Some(list)
+            if list.is_empty() || list.len() > limit || list.iter().any(String::is_empty) =>
+        {
+            Err(invalid(
+                "settings.stop_sequences",
+                &format!("{destination} accepts 1 to {limit} nonempty stop sequences"),
+            ))
+        }
+        value => Ok(value.cloned()),
+    }
+}
+
+/// Serializes a typed request as a native body without its model.
+fn to_body(request: &impl Serialize) -> SkaldResult<Map<String, Value>> {
+    let Value::Object(mut body) = serde_json::to_value(request).map_err(SkaldError::serialize)?
+    else {
+        return Err(invalid("body", "a native body is a JSON object"));
     };
-    Ok(ProviderRequest::GeminiGenerateContent(request))
+    body.remove("model");
+    Ok(body)
+}
+
+/// Authored spelling of a format for messages.
+fn format_label(format: PromptFormat) -> String {
+    match serde_json::to_value(format) {
+        Ok(Value::String(name)) => name,
+        _ => format!("{format:?}"),
+    }
+}
+
+/// Builds the field-specific authoring refusal.
+fn invalid(field: &str, message: &str) -> SkaldError {
+    SkaldError::PromptInvalid {
+        field: field.to_owned(),
+        message: message.to_owned(),
+    }
 }
 
 #[cfg(test)]
-mod authoring_compile {
-    use crate::authoring::{DraftMessages, PromptDraft};
-    use crate::{ProviderName, ProviderRequest};
+mod tests {
+    use serde_json::{Value, json};
 
-    fn draft(provider: &str, model: &str, messages: Vec<&str>) -> PromptDraft {
-        PromptDraft {
-            provider: provider.to_owned(),
-            model: model.to_owned(),
-            operation: None,
-            system: None,
-            messages: DraftMessages::Many(messages.into_iter().map(str::to_owned).collect()),
-            model_settings: None,
-            version: None,
+    use crate::authoring::AuthoredPrompt;
+    use crate::{ProviderName, ProviderRequest, ResponseType, SkaldError, SkaldResult};
+
+    /// Decodes and compiles one authored spec body; decode failures report
+    /// the field `decode`.
+    fn compile(body: Value) -> SkaldResult<crate::Prompt> {
+        serde_json::from_value::<AuthoredPrompt>(body)
+            .map_err(|error| SkaldError::PromptInvalid {
+                field: "decode".to_owned(),
+                message: error.to_string(),
+            })?
+            .compile()
+    }
+
+    /// Returns the refused field of an authored body that must not compile.
+    fn refused(body: Value) -> String {
+        match compile(body) {
+            Err(SkaldError::PromptInvalid { field, .. }) => field,
+            other => panic!("expected a field refusal, got {other:?}"),
         }
     }
 
+    /// Returns the provider-native body of a compiled Prompt.
+    fn body(prompt: &crate::Prompt) -> Value {
+        serde_json::to_value(&prompt.request).expect("request json")["body"].clone()
+    }
+
+    /// Proves portable text, image, and document blocks compile in order for
+    /// every provider format; the eight settings map or refuse per the table;
+    /// structured output takes the deterministic schema name; media bindings,
+    /// slash-containing models, and invalid shapes behave as specified.
     #[test]
-    fn compile_openai_chat() {
-        let prompt = draft("openai", "gpt-4o", vec!["Hello"])
-            .compile()
-            .expect("openai chat compiles");
-        assert_eq!(prompt.model, "gpt-4o");
+    fn portable_content_settings_and_schema() {
+        let schema = json!({"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]});
+        let document =
+            json!({"type": "base64", "mime_type": "application/pdf", "data": "JVBERi0="});
+        let authored = |provider: &str, document: &Value| {
+            json!({
+                "provider": provider,
+                "model": "org/model-1",
+                "system": "Be brief.",
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "Compare {{question}}"},
+                        {"type": "image", "source": "${media:photo}"},
+                        {"type": "document", "source": document},
+                    ]},
+                    {"role": "assistant", "content": "ok"},
+                ],
+                "settings": {"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 64, "stop_sequences": ["END"]},
+                "response_format": schema,
+            })
+        };
+
+        let openai = compile(authored("openai", &document)).expect("openai portable compiles");
+        assert_eq!(openai.model, "org/model-1", "a slash model is preserved");
+        assert_eq!(openai.variables, vec!["question"]);
+        assert_eq!(openai.media_variables, vec!["photo"]);
+        assert_eq!(
+            openai.response_type,
+            ResponseType::JsonSchema {
+                name: "response".to_owned(),
+                schema: schema.clone()
+            }
+        );
         assert!(matches!(
-            prompt.request,
+            openai.request,
             ProviderRequest::OpenAiChatCompletion(_)
         ));
-    }
+        let chat = body(&openai);
+        assert_eq!(
+            chat["messages"][0],
+            json!({"role": "system", "content": "Be brief."})
+        );
+        let parts = chat["messages"][1]["content"].as_array().expect("parts");
+        assert_eq!(
+            parts[0],
+            json!({"type": "text", "text": "Compare {{question}}"})
+        );
+        assert_eq!(parts[1], json!({"type": "text", "text": "${media:photo}"}));
+        assert_eq!(
+            parts[2]["type"], "file",
+            "the literal document is bound in place"
+        );
+        assert_eq!(
+            chat["messages"][2],
+            json!({"role": "assistant", "content": "ok"})
+        );
+        assert_eq!(chat["max_completion_tokens"], 64);
+        assert_eq!(chat["stop"], json!(["END"]));
+        assert_eq!(chat["response_format"]["json_schema"]["name"], "response");
+        assert_eq!(chat["response_format"]["json_schema"]["strict"], true);
 
-    #[test]
-    fn compile_openai_responses() {
-        let mut d = draft("openai", "gpt-4o", vec!["Hello"]);
-        d.operation = Some("responses".to_owned());
-        let prompt = d.compile().expect("openai responses compiles");
-        assert!(matches!(
-            prompt.request,
-            ProviderRequest::OpenAiResponses(_)
-        ));
-    }
+        let claude = body(&compile(authored("anthropic", &document)).expect("anthropic compiles"));
+        assert_eq!(claude["system"], "Be brief.");
+        assert_eq!(claude["max_tokens"], 64);
+        assert_eq!(claude["stop_sequences"], json!(["END"]));
+        assert_eq!(claude["output_config"]["format"]["schema"], schema);
+        assert_eq!(claude["messages"][1]["role"], "assistant");
+        let blocks = claude["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(
+            blocks.len(),
+            3,
+            "text, binding, and literal document stay in order"
+        );
+        assert_eq!(blocks[2]["type"], "document");
 
-    #[test]
-    fn compile_anthropic() {
-        let prompt = draft("anthropic", "claude-3-5-sonnet-20241022", vec!["Hello"])
-            .compile()
-            .expect("anthropic compiles");
-        assert_eq!(prompt.request.provider(), ProviderName::Anthropic);
-    }
+        let gemini = body(&compile(authored("google", &document)).expect("google compiles"));
+        assert_eq!(
+            gemini["system_instruction"]["parts"][0]["text"],
+            "Be brief."
+        );
+        assert_eq!(gemini["contents"][1]["role"], "model");
+        assert_eq!(gemini["generation_config"]["max_output_tokens"], 64);
+        assert_eq!(
+            gemini["generation_config"]["response_mime_type"],
+            "application/json"
+        );
+        assert_eq!(gemini["generation_config"]["response_schema"], schema);
+        let vertex = compile(authored("vertex", &document)).expect("vertex compiles");
+        assert_eq!(vertex.provider(), ProviderName::Vertex);
 
-    #[test]
-    fn compile_google() {
-        let prompt = draft("google", "gemini-2.0-flash-exp", vec!["Hello"])
-            .compile()
-            .expect("google compiles");
-        assert!(matches!(
-            prompt.request,
-            ProviderRequest::GeminiGenerateContent(_)
-        ));
-    }
+        // Existing per-provider source rules apply to literal media.
+        let url = json!({"type": "url", "url": "https://example.com/a.pdf"});
+        assert!(
+            compile(authored("google", &url)).is_err(),
+            "google refuses a plain url document"
+        );
 
-    #[test]
-    fn compile_vertex() {
-        let prompt = draft("vertex", "gemini-2.0-flash-exp", vec!["Hello"])
-            .compile()
-            .expect("vertex compiles");
-        assert!(matches!(
-            prompt.request,
-            ProviderRequest::GeminiGenerateContent(_)
-        ));
-        assert_eq!(prompt.provider(), ProviderName::Vertex);
-    }
+        // A setting outside the destination is refused, never dropped.
+        let with = |provider: &str, settings: Value| json!({"provider": provider, "model": "m", "messages": [{"role": "user", "content": "hi"}], "settings": settings});
+        assert_eq!(
+            refused(with("openai", json!({"top_k": 3}))),
+            "settings.top_k"
+        );
+        assert_eq!(
+            refused(with(
+                "anthropic",
+                json!({"max_output_tokens": 8, "seed": 1})
+            )),
+            "settings.seed"
+        );
+        assert_eq!(
+            refused(with("anthropic", json!({"temperature": 0.1}))),
+            "settings.max_output_tokens"
+        );
+        assert_eq!(
+            refused(with("openai", json!({"temperature": 2.5}))),
+            "settings.temperature"
+        );
+        assert_eq!(
+            refused(with("openai", json!({"top_p": 1.5}))),
+            "settings.top_p"
+        );
+        assert_eq!(
+            refused(with("google", json!({"seed": 4_294_967_296_i64}))),
+            "settings.seed"
+        );
+        assert_eq!(
+            refused(with("openai", json!({"stop_sequences": []}))),
+            "settings.stop_sequences"
+        );
+        assert_eq!(refused(with("openai", json!({"temp": 1.0}))), "decode");
+        let all = json!({"temperature": 1.0, "top_p": 0.5, "max_output_tokens": 9, "top_k": 4,
+                         "stop_sequences": ["x"], "seed": 7, "presence_penalty": 0.5, "frequency_penalty": -0.5});
+        let config = body(&compile(with("google", all)).expect("google carries all eight"))
+            ["generation_config"]
+            .clone();
+        for field in [
+            "temperature",
+            "top_p",
+            "max_output_tokens",
+            "top_k",
+            "stop_sequences",
+            "seed",
+            "presence_penalty",
+            "frequency_penalty",
+        ] {
+            assert!(
+                !config[field].is_null(),
+                "{field} maps to generation config"
+            );
+        }
 
-    #[test]
-    fn unknown_provider_returns_draft_invalid() {
-        let result = draft("llama", "llama-3.1-8b", vec!["Hello"]).compile();
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.code(), "SKALD_SPEC_400_PROMPT_DRAFT_INVALID");
-    }
-
-    #[test]
-    fn single_message_string_deserialized() {
-        let yaml = r#"
-provider: openai
-model: gpt-4o
-messages: "Just one message"
-"#;
-        let draft: PromptDraft = serde_yaml::from_str(yaml).unwrap();
-        let prompt = draft.compile().expect("single message string compiles");
-        assert!(matches!(
-            prompt.request,
-            ProviderRequest::OpenAiChatCompletion(_)
-        ));
-    }
-
-    #[test]
-    fn model_settings_temperature_decoded() {
-        let yaml = r"
-provider: openai
-model: gpt-4o
-messages:
-  - Hello
-model_settings:
-  temperature: 0.2
-";
-        let draft: PromptDraft = serde_yaml::from_str(yaml).unwrap();
-        let prompt = draft.compile().expect("settings compile");
-        let ProviderRequest::OpenAiChatCompletion(req) = &prompt.request else {
-            panic!("expected openai chat request");
+        // Shape refusals.
+        let plain = |extra: Value| {
+            let mut authored = json!({"provider": "openai", "model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            if let (Some(authored), Value::Object(extra)) = (authored.as_object_mut(), extra) {
+                authored.extend(extra);
+            }
+            authored
         };
-        assert_eq!(req.settings.temperature, Some(0.2));
+        assert_eq!(refused(plain(json!({"model": " "}))), "model");
+        assert_eq!(
+            refused(plain(
+                json!({"messages": [{"role": "user", "content": ""}]})
+            )),
+            "messages"
+        );
+        assert_eq!(refused(plain(json!({"provider": "jev"}))), "format");
+        assert_eq!(
+            refused(plain(
+                json!({"messages": [{"role": "user", "content": [{"type": "image", "source": "see ${media:x}"}]}]})
+            )),
+            "messages.content.source"
+        );
+        assert_eq!(
+            refused(plain(
+                json!({"messages": [{"role": "assistant", "content": [{"type": "image", "source": "${media:x}"}]}]})
+            )),
+            "messages.content"
+        );
+        assert_eq!(
+            refused(plain(
+                json!({"messages": [{"role": "system", "content": "x"}]})
+            )),
+            "decode"
+        );
+        assert_eq!(refused(plain(json!({"variables": ["x"]}))), "decode");
     }
 
+    /// Proves the native form: model inserted at compile and refused in the
+    /// body, provider/format pairs validated, portable fields refused beside a
+    /// body, unknown native options preserved, and the authored form
+    /// round-tripping through the runtime Prompt unchanged.
     #[test]
-    fn variables_extracted_from_template() {
-        let yaml = r#"
-provider: openai
-model: gpt-4o
-messages:
-  - "Summarize {{doc}} for {{user}}"
-"#;
-        let draft: PromptDraft = serde_yaml::from_str(yaml).unwrap();
-        let prompt = draft.compile().expect("variable extraction works");
-        assert!(prompt.variables.contains(&"doc".to_owned()));
-        assert!(prompt.variables.contains(&"user".to_owned()));
-    }
+    fn native_body_pairs_and_round_trip() {
+        let native = json!({
+            "provider": "openai",
+            "model": "gpt-4o",
+            "format": "chat_completion",
+            "body": {"messages": [{"role": "user", "content": "{{question}}"}], "temperature": 0.2, "x_custom": 1},
+        });
+        let prompt = compile(native.clone()).expect("native compiles");
+        assert_eq!(body(&prompt)["model"], "gpt-4o");
+        assert_eq!(
+            body(&prompt)["x_custom"],
+            1,
+            "unknown native options survive"
+        );
+        assert_eq!(prompt.variables, vec!["question"]);
+        assert_eq!(serde_json::to_value(&prompt).expect("prompt json"), native);
 
-    #[test]
-    fn system_message_openai_chat() {
-        let yaml = r#"
-provider: openai
-model: gpt-4o
-system: "You are {{persona}}."
-messages:
-  - "Summarize {{doc}}."
-"#;
-        let draft: PromptDraft = serde_yaml::from_str(yaml).unwrap();
-        let prompt = draft.compile().expect("system + messages compile");
-        let ProviderRequest::OpenAiChatCompletion(req) = &prompt.request else {
-            panic!("expected openai chat");
+        let with = |extra: Value| {
+            let mut authored = native.clone();
+            if let (Some(authored), Value::Object(extra)) = (authored.as_object_mut(), extra) {
+                authored.extend(extra);
+            }
+            authored
         };
-        assert_eq!(req.messages[0].role, "system");
-        assert!(prompt.variables.contains(&"persona".to_owned()));
-        assert!(prompt.variables.contains(&"doc".to_owned()));
+        assert_eq!(
+            refused(with(json!({"body": {"model": "gpt-4o", "messages": []}}))),
+            "body.model"
+        );
+        assert_eq!(refused(with(json!({"format": "messages"}))), "format");
+        assert_eq!(
+            refused(with(json!({"format": "open_ai_chat_completion"}))),
+            "decode"
+        );
+        assert_eq!(refused(with(json!({"system": "x"}))), "system");
+        assert_eq!(refused(with(json!({"format": null}))), "format");
+        assert_eq!(
+            refused(json!({"provider": "anthropic", "model": "m", "format": "messages"})),
+            "body"
+        );
+        let google = compile(json!({
+            "provider": "vertex", "model": "gemini-2.5-flash", "format": "generate_content",
+            "body": {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+        }))
+        .expect("vertex native compiles");
+        assert!(
+            body(&google).get("model").is_none(),
+            "generate_content carries model in the URL"
+        );
+        assert_eq!(google.provider(), ProviderName::Vertex);
+
+        let portable = json!({"provider": "anthropic", "model": "claude", "messages": [{"role": "user", "content": "hi"}],
+                              "settings": {"max_output_tokens": 5}});
+        let prompt = compile(portable.clone()).expect("portable compiles");
+        assert_eq!(
+            serde_json::to_value(&prompt).expect("prompt json"),
+            portable
+        );
+
+        let mut edited = prompt;
+        edited.model = "claude-next".to_owned();
+        let authored = serde_json::to_value(&edited).expect("edited prompt json");
+        assert_eq!(
+            authored["format"], "messages",
+            "a mutated Prompt serializes natively"
+        );
+        assert_eq!(authored["model"], "claude-next");
     }
 }

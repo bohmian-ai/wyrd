@@ -30,7 +30,7 @@ pub mod settings;
 
 pub use builder::{
     AnthropicOptions, GeminiOptions, OpenAiChatOptions, OpenAiResponsesOptions, VertexOptions,
-    anthropic, gemini, openai_chat, openai_responses, raw, vertex,
+    anthropic, gemini, openai_chat, openai_responses, vertex,
 };
 pub use error::{PromptBuilderError, PromptBuilderResult};
 pub use media::{MAX_MEDIA_FILE_BYTES, PyMediaRef, document_path, image_path};

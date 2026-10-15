@@ -892,7 +892,7 @@ mod tests {
             "kind": "llm_judge", "id": "j",
             "judge_ref": {"prompt": {
                 "kind": "Prompt", "name": "judge", "version": "1.0.0", "space": "default"
-            }},
+            }, "execution_route": {"kind": "wyrd_gateway", "deployment": "judge"}},
             "operator": "greater_than_or_equals", "expected": 0.5
         });
         let trace = serde_json::json!({

@@ -705,6 +705,7 @@ impl Agent {
     pub fn to_spec(&self) -> AgentSpec {
         AgentSpec {
             prompt: self.prompt_ref.clone(),
+            execution_route: wyrd_spec::ExecutionRoute::Native {},
             tool_names: self.tool_names.clone(),
             run_config: agent_run_config_spec_from_run_config(&self.run_config),
             verified_by: Vec::new(),

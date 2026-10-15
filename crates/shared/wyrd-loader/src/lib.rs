@@ -218,7 +218,7 @@ mod tests {
 
     fn prompt(name: &str, version: &str) -> String {
         format!(
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: {name}\n  space: default\n  version: \"{version}\"\nspec:\n  provider: openai\n  model: gpt-5\n  messages: []\n"
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: {name}\n  space: default\n  version: \"{version}\"\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n"
         )
     }
 

@@ -36,6 +36,7 @@ impl AgentCardResolver for StaticAgentResolver {
         }
         Ok(AgentSpec {
             prompt: InlineableRef::Inline(Box::new(self.prompt.clone().into_native())),
+            execution_route: wyrd_spec::ExecutionRoute::Native {},
             tool_names: Vec::new(),
             run_config: AgentRunConfigSpec {
                 max_iterations: Some(1),
@@ -78,6 +79,7 @@ fn sibling_judge_agent_ref() -> InlineableRef<AgentSpec> {
 fn inline_agent_ref(prompt: skald_prompt::Prompt) -> InlineableRef<AgentSpec> {
     InlineableRef::Inline(Box::new(AgentSpec {
         prompt: InlineableRef::Inline(Box::new(prompt.into_native())),
+        execution_route: wyrd_spec::ExecutionRoute::Native {},
         tool_names: Vec::new(),
         run_config: AgentRunConfigSpec {
             max_iterations: Some(1),
@@ -314,7 +316,6 @@ fn media_prompt() -> skald_prompt::Prompt {
         "gpt-test",
         skald_prompt::OpenAiChatOptions {
             messages: vec!["Judge: {{response}} ${media:shot}".to_owned()],
-            variables: vec!["response".to_owned()],
             output: Some(
                 skald_prompt::ResponseFormat::json_schema("judge_result", schema).expect("schema"),
             ),
@@ -503,8 +504,7 @@ async fn jev_judge_answers_typed_questions_with_quoted_state() {
         .expect("typed Jev request"),
     );
     let prompt = skald_prompt::Prompt::from_native(
-        skald_spec::Prompt::new(request, "jev-latest", None, skald_spec::ResponseType::Text)
-            .expect("Jev prompt"),
+        skald_spec::Prompt::new(request, "jev-latest").expect("Jev prompt"),
     );
     let invoker = SkaldJudgeInvoker::new(
         Arc::new(registry),

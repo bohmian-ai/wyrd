@@ -2831,6 +2831,38 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       ],
       "type": "object"
     },
+    "OpenAiEasyInputMessage": {
+      "description": "Easy input message: `type` may be omitted and `content` may be text.",
+      "properties": {
+        "content": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "$ref": "#/definitions/OpenAiResponseContentPart"
+              },
+              "type": "array"
+            }
+          ]
+        },
+        "role": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "message"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "role"
+      ],
+      "type": "object"
+    },
     "OpenAiEmbeddingsInput": {
       "anyOf": [
         {
@@ -2953,6 +2985,22 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
         "name"
       ],
       "type": "object"
+    },
+    "OpenAiFunctionCallOutput": {
+      "anyOf": [
+        {
+          "description": "Plain text result.",
+          "type": "string"
+        },
+        {
+          "description": "Content parts.",
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseContentPart"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged."
     },
     "OpenAiFunctionChoice": {
       "additionalProperties": false,
@@ -3497,7 +3545,12 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
               "type": "string"
             },
             "output": {
-              "type": "string"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
+                }
+              ],
+              "description": "Tool result, as text or as content parts."
             },
             "type": {
               "enum": [
@@ -3792,9 +3845,16 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
           "type": "string"
         },
         {
-          "description": "Ordered input items.",
+          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
           "items": {
-            "$ref": "#/definitions/OpenAiResponseItem"
+            "anyOf": [
+              {
+                "$ref": "#/definitions/OpenAiResponseItem"
+              },
+              {
+                "$ref": "#/definitions/OpenAiEasyInputMessage"
+              }
+            ]
           },
           "type": "array"
         }
@@ -12406,6 +12466,38 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
       ],
       "type": "object"
     },
+    "OpenAiEasyInputMessage": {
+      "description": "Easy input message: `type` may be omitted and `content` may be text.",
+      "properties": {
+        "content": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "$ref": "#/definitions/OpenAiResponseContentPart"
+              },
+              "type": "array"
+            }
+          ]
+        },
+        "role": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "message"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "role"
+      ],
+      "type": "object"
+    },
     "OpenAiEmbeddingsInput": {
       "anyOf": [
         {
@@ -12528,6 +12620,22 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
         "name"
       ],
       "type": "object"
+    },
+    "OpenAiFunctionCallOutput": {
+      "anyOf": [
+        {
+          "description": "Plain text result.",
+          "type": "string"
+        },
+        {
+          "description": "Content parts.",
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseContentPart"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged."
     },
     "OpenAiFunctionChoice": {
       "additionalProperties": false,
@@ -13072,7 +13180,12 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
               "type": "string"
             },
             "output": {
-              "type": "string"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
+                }
+              ],
+              "description": "Tool result, as text or as content parts."
             },
             "type": {
               "enum": [
@@ -13367,9 +13480,16 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
           "type": "string"
         },
         {
-          "description": "Ordered input items.",
+          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
           "items": {
-            "$ref": "#/definitions/OpenAiResponseItem"
+            "anyOf": [
+              {
+                "$ref": "#/definitions/OpenAiResponseItem"
+              },
+              {
+                "$ref": "#/definitions/OpenAiEasyInputMessage"
+              }
+            ]
           },
           "type": "array"
         }
@@ -20526,6 +20646,38 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
       ],
       "type": "object"
     },
+    "OpenAiEasyInputMessage": {
+      "description": "Easy input message: `type` may be omitted and `content` may be text.",
+      "properties": {
+        "content": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "$ref": "#/definitions/OpenAiResponseContentPart"
+              },
+              "type": "array"
+            }
+          ]
+        },
+        "role": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "message"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "role"
+      ],
+      "type": "object"
+    },
     "OpenAiEmbeddingsInput": {
       "anyOf": [
         {
@@ -20648,6 +20800,22 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
         "name"
       ],
       "type": "object"
+    },
+    "OpenAiFunctionCallOutput": {
+      "anyOf": [
+        {
+          "description": "Plain text result.",
+          "type": "string"
+        },
+        {
+          "description": "Content parts.",
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseContentPart"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged."
     },
     "OpenAiFunctionChoice": {
       "additionalProperties": false,
@@ -21192,7 +21360,12 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
               "type": "string"
             },
             "output": {
-              "type": "string"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
+                }
+              ],
+              "description": "Tool result, as text or as content parts."
             },
             "type": {
               "enum": [
@@ -21487,9 +21660,16 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
           "type": "string"
         },
         {
-          "description": "Ordered input items.",
+          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
           "items": {
-            "$ref": "#/definitions/OpenAiResponseItem"
+            "anyOf": [
+              {
+                "$ref": "#/definitions/OpenAiResponseItem"
+              },
+              {
+                "$ref": "#/definitions/OpenAiEasyInputMessage"
+              }
+            ]
           },
           "type": "array"
         }
@@ -27015,6 +27195,38 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       ],
       "type": "object"
     },
+    "OpenAiEasyInputMessage": {
+      "description": "Easy input message: `type` may be omitted and `content` may be text.",
+      "properties": {
+        "content": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "$ref": "#/definitions/OpenAiResponseContentPart"
+              },
+              "type": "array"
+            }
+          ]
+        },
+        "role": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "message"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "role"
+      ],
+      "type": "object"
+    },
     "OpenAiEmbeddingsInput": {
       "anyOf": [
         {
@@ -27137,6 +27349,22 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
         "name"
       ],
       "type": "object"
+    },
+    "OpenAiFunctionCallOutput": {
+      "anyOf": [
+        {
+          "description": "Plain text result.",
+          "type": "string"
+        },
+        {
+          "description": "Content parts.",
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseContentPart"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "A Responses tool result: text, or content parts such as `input_text`.\n\n`OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged."
     },
     "OpenAiFunctionChoice": {
       "additionalProperties": false,
@@ -27681,7 +27909,12 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
               "type": "string"
             },
             "output": {
-              "type": "string"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OpenAiFunctionCallOutput"
+                }
+              ],
+              "description": "Tool result, as text or as content parts."
             },
             "type": {
               "enum": [
@@ -27976,9 +28209,16 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "type": "string"
         },
         {
-          "description": "Ordered input items.",
+          "description": "Ordered input items. Easy input messages (`{\"role\", \"content\"}` with no `type`, or with text `content`) decode as the message item they stand for.",
           "items": {
-            "$ref": "#/definitions/OpenAiResponseItem"
+            "anyOf": [
+              {
+                "$ref": "#/definitions/OpenAiResponseItem"
+              },
+              {
+                "$ref": "#/definitions/OpenAiEasyInputMessage"
+              }
+            ]
           },
           "type": "array"
         }

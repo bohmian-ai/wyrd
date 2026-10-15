@@ -61,7 +61,7 @@ fn agent_with_prompt_overrides_prompt_reference() {
     let original = openai_prompt();
     let prompt = SpecPrompt::new(
         ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
-            model: "gpt-4o".into(),
+            model: "gpt-4o-mini".into(),
             messages: vec![],
             response_format: None,
             stream: None,

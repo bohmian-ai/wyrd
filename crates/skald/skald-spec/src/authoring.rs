@@ -361,7 +361,7 @@ impl AuthoredPrompt {
         };
         if let Some(schema) = &self.response_format {
             check_output_schema(
-                schema,
+                &Value::Object(schema.clone()),
                 "response_format",
                 format == PromptFormat::ChatCompletion,
             )?;
@@ -1145,7 +1145,10 @@ mod tests {
     /// Proves the model is literal configuration in both forms: placeholder
     /// grammars and control characters are refused before variable
     /// derivation, so rendering can never rewrite the target, while content
-    /// variables still render and a slash model stays exact.
+    /// variables still render and a slash model stays exact. Direct native
+    /// construction refuses a Chat, Responses, Anthropic, or Jev body whose
+    /// model is templated or differs from the canonical model, accepts a
+    /// matching slash model, and keeps model-less GenerateContent.
     ///
     /// # Panics
     ///
@@ -1173,6 +1176,43 @@ mod tests {
             Err(SkaldError::PromptInvalid { field, .. }) if field == "model"
         ));
 
+        let with_model = |model: &str| {
+            let mut chat = crate::common::openai_chat_request();
+            chat.model = model.to_owned();
+            let mut responses = crate::common::openai_responses_request();
+            responses.model = model.to_owned();
+            let mut anthropic = crate::common::anthropic_request();
+            anthropic.model = model.to_owned();
+            let mut jev = crate::common::jev_request();
+            jev.model = model.to_owned();
+            [
+                ProviderRequest::OpenAiChatCompletion(chat),
+                ProviderRequest::OpenAiResponses(responses),
+                ProviderRequest::AnthropicMessage(anthropic),
+                ProviderRequest::JevSystemOne(jev),
+            ]
+        };
+        for body_model in ["{{target}}", "${target}", "other-model"] {
+            for request in with_model(body_model) {
+                assert!(
+                    matches!(
+                        crate::Prompt::new(request.clone(), "org/model-1"),
+                        Err(SkaldError::PromptInvalid { ref field, .. }) if field == "body.model"
+                    ),
+                    "{body_model:?} body model in {request:?}"
+                );
+            }
+        }
+        for request in with_model("org/model-1") {
+            let prompt = crate::Prompt::new(request, "org/model-1").expect("a matching body model");
+            assert!(!prompt.variables.contains(&"target".to_owned()));
+        }
+        crate::Prompt::new(
+            ProviderRequest::GeminiGenerateContent(crate::common::google_request()),
+            "gemini-2.5-pro",
+        )
+        .expect("model-less GenerateContent keeps its canonical model");
+
         for body in [portable("org/model-1"), native("org/model-1")] {
             let prompt = compile(body).expect("a slash literal compiles");
             assert_eq!(prompt.variables, vec!["question"]);
@@ -1186,8 +1226,11 @@ mod tests {
 
     /// Proves output schemas are validated before compilation in both forms:
     /// invalid type names, non-string `required`, and non-object
-    /// `properties` are refused at their exact field, at any depth;
-    /// strict OpenAI output refuses a non-object root that Anthropic,
+    /// `properties` are refused at their exact field, at any depth; malformed
+    /// numeric, string, reference, conditional, dependent, and `$defs`
+    /// keywords fail standard meta-validation in the portable and native
+    /// forms, a declared draft is validated by its own rules, and a custom
+    /// `$schema` is refused without fetching it; strict OpenAI output refuses a non-object root that Anthropic,
     /// GenerateContent, and non-strict native OpenAI accept; and valid nested
     /// schemas, references, type unions, and native options keep their
     /// authored bytes.
@@ -1217,7 +1260,7 @@ mod tests {
             ),
             (
                 json!({"type": "object", "required": ["a", 1]}),
-                "response_format.required",
+                "response_format.required.1",
             ),
             (
                 json!({"type": "object", "properties": []}),
@@ -1239,6 +1282,81 @@ mod tests {
                     "{provider} {schema}"
                 );
             }
+        }
+
+        let anthropic_native = |schema: Value| {
+            json!({"provider": "anthropic", "model": "claude", "format": "messages",
+            "body": {"max_tokens": 8, "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                     "output_config": {"format": {"type": "json_schema", "schema": schema}}}})
+        };
+        for (schema, path) in [
+            (
+                object(json!({"n": {"type": "number", "minimum": "wrong"}})),
+                "properties.n.minimum",
+            ),
+            (object(json!({"r": {"$ref": 5}})), "properties.r.$ref"),
+            (
+                object(json!({"s": {"type": "string", "minLength": -1}})),
+                "properties.s.minLength",
+            ),
+            (
+                object(json!({"l": {"type": "array", "uniqueItems": "yes"}})),
+                "properties.l.uniqueItems",
+            ),
+            (
+                json!({"type": "object", "if": {"properties": {"a": {"const": 1}}}, "then": {"required": "a"}}),
+                "then.required",
+            ),
+            (
+                json!({"type": "object", "dependentSchemas": {"a": {"maxProperties": -2}}}),
+                "dependentSchemas.a.maxProperties",
+            ),
+            (
+                json!({"type": "object", "$defs": {"item": {"type": "object", "properties": {"x": {"maxItems": "many"}}}}}),
+                "$defs.item.properties.x.maxItems",
+            ),
+            (
+                json!({"$schema": "http://json-schema.org/draft-04/schema#", "type": "object",
+                       "properties": {"n": {"type": "number", "exclusiveMinimum": 5}}}),
+                "properties.n.exclusiveMinimum",
+            ),
+            (
+                json!({"$schema": "https://example.com/custom-meta", "type": "object"}),
+                "$schema",
+            ),
+        ] {
+            for provider in ["openai", "anthropic", "google"] {
+                assert_eq!(
+                    refused(portable(provider, schema.clone())),
+                    format!("response_format.{path}"),
+                    "{provider} {schema}"
+                );
+            }
+            assert_eq!(
+                refused(anthropic_native(schema.clone())),
+                format!("body.output_config.format.schema.{path}"),
+                "native {schema}"
+            );
+        }
+        for schema in [
+            json!({"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+                   "properties": {"n": {"type": "number", "exclusiveMinimum": 5}},
+                   "if": {"properties": {"n": {"const": 6}}}, "then": {"required": ["n"]},
+                   "dependentSchemas": {"n": {"maxProperties": 2}}}),
+            json!({"$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
+                   "properties": {"item": {"$ref": "#/definitions/item"}},
+                   "definitions": {"item": {"type": "string", "minLength": 1}}}),
+            object(json!({"n": {"type": "number", "exclusiveMinimum": 5}})),
+        ] {
+            for provider in ["openai", "anthropic", "google"] {
+                let compiled = compile(portable(provider, schema.clone()))
+                    .unwrap_or_else(|error| panic!("{provider} {schema}: {error}"));
+                assert!(
+                    matches!(&compiled.response_type, ResponseType::JsonSchema { schema: kept, .. } if *kept == schema),
+                    "{provider} keeps the authored schema"
+                );
+            }
+            compile(anthropic_native(schema.clone())).expect("valid native schema compiles");
         }
 
         let nested = json!({
@@ -1302,7 +1420,7 @@ mod tests {
                 "body": {"contents": [{"role": "user", "parts": [{"text": "hi"}]}],
                          "generation_config": {"response_schema": object(json!({"a": {"required": [1]}}))}}})
             ),
-            "body.generation_config.response_schema.properties.a.required"
+            "body.generation_config.response_schema.properties.a.required.0"
         );
     }
 

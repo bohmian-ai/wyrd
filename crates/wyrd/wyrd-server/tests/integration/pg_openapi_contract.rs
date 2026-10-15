@@ -1105,7 +1105,7 @@ async fn gateway_ingress_publishes_typed_contracts() {
         "the Jev state is typed text"
     );
 
-    let responses_request = jsonschema::JSONSchema::compile(&serde_json::json!({
+    let responses_request = jsonschema::validator_for(&serde_json::json!({
         "$ref": reference("GatewayResponsesRequest"),
         "components": document["components"],
     }))

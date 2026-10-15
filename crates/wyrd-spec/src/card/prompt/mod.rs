@@ -50,12 +50,20 @@ pub(crate) mod prompt_support {
         PromptSpec::new(prompt(request, variables)).expect("static prompt spec is valid")
     }
 
-    /// Builds a Prompt from `request` and asserts it derives `variables`.
+    /// Builds a Prompt from `request`, whose literal model is the body's own
+    /// model (`test-model` for a model-less GenerateContent body), and
+    /// asserts it derives `variables`.
     ///
     /// # Panics
-    /// Panics when `request` is not a valid Prompt or derives other variables.
+    /// Panics when `request` cannot be serialized, is not a valid Prompt, or
+    /// derives other variables.
     pub fn prompt(request: ProviderRequest, variables: Vec<&str>) -> Prompt {
-        let prompt = Prompt::new(request, "test-model").expect("static prompt is valid");
+        let body = serde_json::to_value(&request).expect("request json");
+        let model = body["body"]["model"]
+            .as_str()
+            .unwrap_or("test-model")
+            .to_owned();
+        let prompt = Prompt::new(request, model).expect("static prompt is valid");
         assert_eq!(prompt.variables, variables, "fixture variables are derived");
         prompt
     }

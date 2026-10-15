@@ -114,6 +114,11 @@ impl Agent {
     ///
     /// Raises:
     ///     WyrdError: When validation fails.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when the Prompt, a tool, a callback, the run config,
+    /// the execution route, labels or annotations, or the provider override
+    /// cannot be converted or validated.
     #[new]
     #[pyo3(signature = (
         *,
@@ -364,6 +369,11 @@ impl Agent {
     ///
     /// `execution_route`, when given, replaces the declared route whole for
     /// this run only; the Agent and its saved Card keep their own route.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when the input, route, or output type cannot be
+    /// converted, the run fails, or the structured output does not instantiate
+    /// the output type.
     #[pyo3(name = "run")]
     #[pyo3(signature = (input, *, session_id=None, output_type=None, execution_route=None))]
     pub fn py_run(

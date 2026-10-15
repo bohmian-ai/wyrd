@@ -118,6 +118,10 @@ fn lookup_call() -> OpenAiResponseItem {
 /// A Responses Agent calls a tool and the next request replays the user
 /// input, the returned reasoning item, the function call, and its output as
 /// native input items in provider order.
+///
+/// # Panics
+/// Panics when the Prompt does not build, the mock sees another request, or
+/// the run fails or ends otherwise.
 #[tokio::test]
 async fn agent_run_executes_openai_responses_tool_loop() {
     let user = message(
@@ -202,6 +206,10 @@ impl SessionMemory for PriorTurnSession {
 
 /// A Responses Agent seeds prior session turns as native Responses output
 /// messages ahead of the new user input.
+///
+/// # Panics
+/// Panics when the Prompt does not build, the mock sees another request, or
+/// the run fails.
 #[tokio::test]
 async fn responses_session_turns_seed_native_items() {
     let mock = MockProvider::new(ProviderName::OpenAi)

@@ -1039,16 +1039,27 @@ impl Prompt {
     }
 
     /// Return the authored prompt JSON as a Python dictionary.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when the authored form does not serialize or convert
+    /// to a Python value.
     pub fn model_dump(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         py_value(py, &self.inner)
     }
 
     /// Return this prompt as a JSON string.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when the authored form does not serialize.
     pub fn model_dump_json(&self) -> WyrdPyResult<String> {
         Ok(serde_json::to_string(&self.inner)?)
     }
 
     /// Build a prompt from serialized authored prompt JSON.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when `data` is not JSON or does not compile as an
+    /// authored Prompt.
     #[staticmethod]
     pub fn model_validate_json(data: &str) -> WyrdPyResult<Self> {
         Ok(Self::from_native(serde_json::from_str(data)?))

@@ -34,10 +34,17 @@ fn temp_path(name: &str) -> std::path::PathBuf {
     ))
 }
 
+/// The native OpenAI Chat Prompt the Agent Card construction tests inline
+/// into their Agent specs.
+///
+/// # Panics
+/// Panics when the static request does not build a Prompt.
 fn prompt() -> skald_spec::Prompt {
     skald_spec::Prompt::new(openai_request(), "gpt-4o-mini").expect("static prompt is valid")
 }
 
+/// The OpenAI Chat request with one user turn behind the construction
+/// tests' native Prompt.
 fn openai_request() -> ProviderRequest {
     ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
         model: "gpt-4o-mini".to_owned(),
@@ -301,6 +308,11 @@ fn card_prompt_resolution_derives_cascade_and_missing_prompt_code() {
     assert_eq!(card.cascade_children, vec![card_ref]);
 }
 
+/// An Agent Card naming a tool absent from the runtime registry is refused
+/// at construction with the Wyrd runtime-local-tool code.
+///
+/// # Panics
+/// Panics when construction succeeds or the refusal carries another code.
 #[test]
 fn unknown_runtime_local_tool_uses_wyrd_code() {
     let card = AgentCard {

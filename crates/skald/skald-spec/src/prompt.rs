@@ -701,6 +701,12 @@ fn response_type_of(request: &ProviderRequest) -> ResponseType {
     }
 }
 
+/// Collects the distinct `${name}` and `{{name}}` placeholders in the
+/// serialized request, in first-appearance order; `${media:...}` placeholders
+/// are not text variables.
+///
+/// # Errors
+/// Returns a serialization error when the request does not serialize.
 fn extract_text_variables(request: &ProviderRequest) -> SkaldResult<Vec<String>> {
     let json = serde_json::to_string(request).map_err(SkaldError::serialize)?;
     let mut out = Vec::new();
@@ -1453,6 +1459,12 @@ fn check_media_source(
     Ok(())
 }
 
+/// Refuses a blank MIME type on an inline or URI media source before it is
+/// bound into a request.
+///
+/// # Errors
+/// Returns [`SkaldError::InvalidMediaType`] when `mime_type` is empty or
+/// whitespace.
 fn validate_mime(mime_type: &str) -> SkaldResult<()> {
     if mime_type.trim().is_empty() {
         Err(SkaldError::InvalidMediaType(
@@ -1540,6 +1552,10 @@ mod placeholder_syntax_tests {
     }
 
     /// Proves `${name}` placeholders render.
+    ///
+    /// # Panics
+    /// Panics when the Prompt does not build, render, or serialize, or the
+    /// rendered request lacks the bound text.
     #[test]
     fn render_binds_dollar_brace() {
         let prompt = Prompt::new(openai_request_with_user("hello ${name}"), "gpt-test")
@@ -1550,6 +1566,10 @@ mod placeholder_syntax_tests {
     }
 
     /// Proves `{{name}}` placeholders render.
+    ///
+    /// # Panics
+    /// Panics when the Prompt does not build, render, or serialize, or the
+    /// rendered request lacks the bound text.
     #[test]
     fn render_binds_mustache() {
         let prompt = Prompt::new(openai_request_with_user("hello {{name}}"), "gpt-test")
@@ -1560,6 +1580,10 @@ mod placeholder_syntax_tests {
     }
 
     /// Proves both placeholder grammars render together in one pass.
+    ///
+    /// # Panics
+    /// Panics when the Prompt does not build, render, or serialize, or the
+    /// rendered request lacks the bound text.
     #[test]
     fn render_binds_mixed_syntax_in_one_pass() {
         let prompt = Prompt::new(openai_request_with_user("${a} or {{a}}"), "gpt-test")
@@ -1587,6 +1611,11 @@ mod prompt_media {
         Prompt::new(request, "model").expect("prompt is valid")
     }
 
+    /// An OpenAI Chat Prompt with a system turn and one user turn carrying
+    /// `text`, used to bind media placeholders in the user content.
+    ///
+    /// # Panics
+    /// Panics when the request is not a valid Prompt.
     fn openai_prompt(text: &str) -> Prompt {
         let mut request = common::openai_chat_request();
         request.messages.truncate(2);
@@ -1636,6 +1665,9 @@ mod prompt_media {
     }
 
     /// Proves a media placeholder in system content is refused at construction.
+    ///
+    /// # Panics
+    /// Panics when the Prompt builds or is refused with another error.
     #[test]
     fn media_placeholder_in_system_message_is_rejected() {
         let mut request = common::openai_chat_request();
@@ -1874,6 +1906,9 @@ mod prompt_render {
     use crate::wire::anthropic_messages::AnthropicContentBlock;
     use crate::{Prompt, ProviderRequest, ResponseType, SkaldError};
 
+    /// A Prompt assembled field by field over `request` with the given text
+    /// `variables`, bypassing construction so render tests can declare exactly
+    /// the variables they exercise.
     fn prompt(request: ProviderRequest, variables: Vec<&str>) -> Prompt {
         Prompt {
             request,

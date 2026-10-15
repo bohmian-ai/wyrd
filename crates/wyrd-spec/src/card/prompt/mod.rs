@@ -51,12 +51,20 @@ pub(crate) mod prompt_support {
     }
 
     /// Builds a Prompt from `request` and asserts it derives `variables`.
+    ///
+    /// # Panics
+    /// Panics when `request` is not a valid Prompt or derives other variables.
     pub fn prompt(request: ProviderRequest, variables: Vec<&str>) -> Prompt {
         let prompt = Prompt::new(request, "test-model").expect("static prompt is valid");
         assert_eq!(prompt.variables, variables, "fixture variables are derived");
         prompt
     }
 
+    /// The `support_prompt` version `1.0.0` Prompt Card in the `default` space
+    /// wrapping `spec`, as the boundary tests store it.
+    ///
+    /// # Panics
+    /// Panics when a static Card identity field is invalid.
     pub fn prompt_card(spec: PromptSpec) -> Card {
         Card {
             api_version: ApiVersion::v1(),
@@ -334,6 +342,10 @@ mod prompt_content_hash_tests {
 
     /// The hash follows the authored model and content, including a native
     /// structured-output field.
+    ///
+    /// # Panics
+    /// Panics when a fixture Prompt is invalid or a mutation leaves the hash
+    /// unchanged.
     #[test]
     fn hash_changes_on_model_request_and_response_format_mutations() {
         let base_prompt = prompt(openai_chat_request("hello {{name}}"), vec!["name"]);
@@ -391,6 +403,10 @@ mod prompt_content_hash_tests {
 
 #[cfg(test)]
 mod prompt_authored_tests {
+    //! Prompt Cards keep their authored portable or native spec through
+    //! YAML and JSON round trips and refuse unknown providers, removed
+    //! fields, and raw requests that are not an authored Prompt.
+
     use crate::envelope::{Card, CardKind, Spec};
     use crate::format;
     use skald_spec::{ProviderRequest, ResponseType};
@@ -406,6 +422,9 @@ mod prompt_authored_tests {
     }
 
     /// Decodes a Card and returns its authored spec as JSON after re-encoding.
+    ///
+    /// # Panics
+    /// Panics when the Card does not decode, encode, or re-decode to itself.
     fn round_trip(yaml: &str) -> (Card, serde_json::Value) {
         let card: Card = format::yaml::from_str(yaml).expect("card decodes");
         let encoded = format::yaml::to_string(&card).expect("card encodes");
@@ -417,6 +436,10 @@ mod prompt_authored_tests {
 
     /// A portable Card compiles to the provider default format and serializes
     /// back to exactly the authored fields.
+    ///
+    /// # Panics
+    /// Panics when the Card does not round-trip, compiles to another request,
+    /// variables, or response type, or serializes other fields.
     #[test]
     fn portable_card_round_trips_as_authored() {
         let (card, spec) = round_trip(&card_yaml(
@@ -445,6 +468,9 @@ mod prompt_authored_tests {
     }
 
     /// A native Card keeps its format and body verbatim.
+    ///
+    /// # Panics
+    /// Panics when the Card does not round-trip or its format or body changes.
     #[test]
     fn native_card_round_trips_as_authored() {
         let (_, spec) = round_trip(&card_yaml(
@@ -476,6 +502,9 @@ mod prompt_authored_tests {
 
     /// Unknown providers and removed or derived fields are refused, never
     /// ignored.
+    ///
+    /// # Panics
+    /// Panics when any of the refused specs decodes.
     #[test]
     fn unknown_provider_and_removed_fields_refused() {
         for spec in [
@@ -499,6 +528,9 @@ mod prompt_envelope_invariants_tests {
 
     /// A raw provider body has no authored Prompt format, so it cannot become
     /// a Prompt Card.
+    ///
+    /// # Panics
+    /// Panics when the raw body is accepted or refused with another code.
     #[test]
     fn raw_request_is_not_an_authored_prompt() {
         let err = PromptSpec::new(prompt(raw_request(ProviderName::OpenAi), Vec::new()))
@@ -619,6 +651,13 @@ mod prompt_skald_boundary_tests {
     };
     use skald_spec::ProviderRequest;
 
+    /// A stored Anthropic Prompt Card, read back from JSON and rendered,
+    /// serializes to a body the gateway parses back to the identical request
+    /// and bytes.
+    ///
+    /// # Panics
+    /// Panics when the Card does not round-trip or render, or the parsed
+    /// request or its bytes differ.
     #[test]
     fn stored_anthropic_promptcard_round_trips_through_gateway_parse_path() {
         assert_stored_equals_proxied(

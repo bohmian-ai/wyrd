@@ -214,6 +214,8 @@ mod tests {
     use wyrd_spec::envelope::Spec;
     use wyrd_spec::reference::Ref;
 
+    /// The YAML of a minimal portable Prompt Card named `name` at `version`,
+    /// written to temporary workspaces by the loader tests.
     fn prompt(name: &str, version: &str) -> String {
         format!(
             "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: {name}\n  space: default\n  version: \"{version}\"\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n"

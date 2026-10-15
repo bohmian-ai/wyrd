@@ -97,6 +97,10 @@ async fn journey_try_from_ref_resolves_card_prompt() {
 /// An OpenAI Chat Prompt naming a custom provider keeps that provider across
 /// a JSON round trip, and the Agent loop dispatches it to the client
 /// registered under that name rather than to OpenAI.
+///
+/// # Panics
+/// Panics when the Prompt does not round-trip with its custom provider or the
+/// run fails or answers from another client.
 #[tokio::test]
 async fn custom_provider_prompt_round_trips_and_dispatches_to_its_client() {
     let mut native = test_prompt().into_native();
@@ -122,6 +126,10 @@ async fn custom_provider_prompt_round_trips_and_dispatches_to_its_client() {
 /// A Vertex Prompt is a Google GenerateContent body naming the Vertex
 /// provider; it keeps that provider across a JSON round trip, and the Agent
 /// loop dispatches it to the Vertex client rather than to Google AI Studio.
+///
+/// # Panics
+/// Panics when the Prompt does not build or round-trip with the Vertex
+/// provider, or the run fails or answers from another client.
 #[tokio::test]
 async fn vertex_prompt_round_trips_and_dispatches_to_the_vertex_client() {
     let mut native = skald_spec::Prompt::new(
@@ -175,6 +183,11 @@ fn temp_path(name: &str) -> std::path::PathBuf {
     ))
 }
 
+/// The native OpenAI Chat Prompt the Agent Card journey tests save and
+/// reload.
+///
+/// # Panics
+/// Panics when the static request does not build a Prompt.
 fn test_prompt() -> Prompt {
     Prompt::from_native(
         skald_spec::Prompt::new(openai_request(), "gpt-4o-mini").expect("static prompt is valid"),
@@ -272,6 +285,9 @@ impl WyrdGatewayCaller for ScriptedGateway {
     ///
     /// # Errors
     /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when a lock is poisoned or the script has no reply left.
     async fn call(
         &self,
         call: WyrdGatewayCall,

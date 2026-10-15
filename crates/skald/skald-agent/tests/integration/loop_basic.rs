@@ -12,6 +12,11 @@ use skald_spec::{
     },
 };
 
+/// An Agent over a resolved Prompt for `request`, capped at
+/// `max_iterations`, and a provider registry holding only `mock`.
+///
+/// # Panics
+/// Panics when `request` does not build a Prompt.
 fn build_agent(
     request: ProviderRequest,
     mock: MockProvider,
@@ -184,6 +189,12 @@ async fn provider_failure_surfaces_provider_code() {
     assert_eq!(err.code(), "SKALD_AGENT_502_PROVIDER");
 }
 
+/// `run_prompt` renders the Prompt's variables and sends exactly that
+/// request, response format included, on the first turn.
+///
+/// # Panics
+/// Panics when a Prompt does not build, the mock sees another request, or
+/// the run fails or takes more than one iteration.
 #[tokio::test]
 async fn run_prompt_sends_rendered_prompt_verbatim_on_first_turn() {
     let template_request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
@@ -257,6 +268,12 @@ async fn run_prompt_sends_rendered_prompt_verbatim_on_first_turn() {
     assert_eq!(run.iterations, 1);
 }
 
+/// `run_prompt` refuses a Prompt for another provider than the Agent's with
+/// the provider-mismatch code before any dispatch.
+///
+/// # Panics
+/// Panics when the Prompt does not build, the run succeeds, or the refusal
+/// carries another code.
 #[tokio::test]
 async fn run_prompt_provider_mismatch_returns_409_provider_mismatch() {
     let agent_request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
@@ -285,6 +302,12 @@ async fn run_prompt_provider_mismatch_returns_409_provider_mismatch() {
     assert_eq!(err.code(), "SKALD_AGENT_409_PROVIDER_MISMATCH");
 }
 
+/// `run_prompt` refuses a render that leaves a declared variable unbound
+/// with the Prompt error code before any dispatch.
+///
+/// # Panics
+/// Panics when the Prompt does not build, the run succeeds, or the refusal
+/// carries another code.
 #[tokio::test]
 async fn run_prompt_missing_variable_emits_prompt_error() {
     let request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {

@@ -112,8 +112,6 @@ pub enum ServiceRuntimeKind {
     Mcp,
     /// Agent service runtime.
     Agent,
-    /// Workflow service runtime.
-    Workflow,
 }
 
 /// Service runtime placement mode.
@@ -257,7 +255,6 @@ mod runtime_tests {
             ServiceRuntimeKind::Api,
             ServiceRuntimeKind::Mcp,
             ServiceRuntimeKind::Agent,
-            ServiceRuntimeKind::Workflow,
         ]);
         let framework = prop::option::of("[a-z][a-z0-9_-]{0,12}".prop_map(String::from));
         let mode = prop::option::of(Just(ServiceRuntimeMode::InProcess));

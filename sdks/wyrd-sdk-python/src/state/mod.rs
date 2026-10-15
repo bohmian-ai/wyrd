@@ -31,7 +31,6 @@ use wyrd_client::state::WyrdState;
 use crate::bifrost::PyTableConfig;
 use crate::client::PyWyrdClient;
 use crate::observe::PyRun;
-use crate::workflow::PyWorkflow;
 
 /// Python state hydration boundary and all-or-nothing holder owner.
 mod hydrator;
@@ -424,20 +423,6 @@ impl PyWyrdState {
             py,
             alias,
             Some(CardKind::Verifier),
-        )
-    }
-    /// Return the persistent kind-checked Workflow envelope without payload reads.
-    ///
-    /// # Errors
-    ///
-    /// Returns unknown-alias, kind-mismatch, or invalid-state errors.
-    fn workflow(&self, py: Python<'_>, alias: &str) -> CardPyResult<Py<PyCardEnvelope>> {
-        envelope_inner(
-            &self.inner,
-            &self.envelopes,
-            py,
-            alias,
-            Some(CardKind::Workflow),
         )
     }
 
@@ -1717,18 +1702,6 @@ impl PyCards {
         }
     }
 
-    /// Return the typed view for loading registered Workflows.
-    ///
-    /// Use `cards.workflow.load` to read a registered Workflow and its locked
-    /// Agent and Prompt closure into a runnable `wyrd.agent.Workflow`. The view
-    /// uses the parent client's connection and tenant context.
-    #[getter]
-    fn workflow(&self) -> PyWorkflowCards {
-        PyWorkflowCards {
-            inner: self.inner.clone(),
-        }
-    }
-
     /// Register a caller-owned `DataCard`, `ModelCard`, or `PromptCard`.
     ///
     /// Registration serializes the complete Card envelope, saves `DataCard` or
@@ -2862,97 +2835,6 @@ impl PyPromptCardRegistry {
     }
 }
 
-/// Typed loading of registered Workflows.
-///
-/// Obtain this view from `Cards.workflow`. It uses the connection and tenant
-/// context from the parent `Cards` object. Callers normally do not construct
-/// this type directly.
-#[pyclass(module = "wyrd.cards", name = "WorkflowCards")]
-pub struct PyWorkflowCards {
-    /// Parent `Cards` handle clone carrying the connection and tenant context.
-    inner: Cards,
-}
-
-#[pymethods]
-impl PyWorkflowCards {
-    /// Load one registered Workflow by exact identity or by UID.
-    ///
-    /// Pass either a Workflow `CardRef` alone, `uid` alone, or all of `space`,
-    /// `name`, and `version`; a mixed or versionless selector is refused
-    /// before any read. Every Agent
-    /// and Prompt is read along the Workflow's locked relationships, so later
-    /// versions never float in. The GIL is released while loading.
-    ///
-    /// Loading only reads Cards; it registers and runs nothing. It blocks
-    /// until loading finishes, and a failure after some reads returns no
-    /// partial Workflow and writes nothing durable.
-    ///
-    /// # Arguments
-    /// * `card_ref` - Exact Workflow `CardRef`.
-    /// * `uid` - Exact server-assigned Workflow UID.
-    /// * `space` - Workflow space.
-    /// * `name` - Workflow name.
-    /// * `version` - Exact Workflow version.
-    ///
-    /// # Returns
-    /// A runnable `wyrd.agent.Workflow`.
-    ///
-    /// # Errors
-    /// Returns `WYRD_WORKFLOW_400_INVALID_CARD_REF` for a mixed or incomplete
-    /// selector or a malformed field, before any read, with `details.field`
-    /// naming the field. Otherwise returns the error of
-    /// the shared [`wyrd_client::WorkflowCards::load`]:
-    /// `WYRD_PERMISSION_403_DENIED_RBAC` when the credential cannot read
-    /// Cards, `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Workflow matches, and
-    /// the inactive-dependency and Workflow validation errors. Python raises
-    /// each as a `WyrdError` with that code.
-    #[pyo3(signature = (card_ref=None, *, uid=None, space=None, name=None, version=None))]
-    fn load(
-        &self,
-        py: Python<'_>,
-        card_ref: Option<PyRef<'_, CardRefPy>>,
-        uid: Option<&str>,
-        space: Option<&str>,
-        name: Option<&str>,
-        version: Option<&str>,
-    ) -> CardPyResult<PyWorkflow> {
-        let invalid = |field: &str, reason: String| {
-            WyrdPyError::from(WyrdError::WorkflowInvalidCardRef {
-                message: format!("invalid Workflow {field}: {reason}"),
-                details: serde_json::json!({ "field": field }),
-            })
-        };
-        let selector = match (card_ref, uid, space, name, version) {
-            (Some(card_ref), None, None, None, None) if card_ref.0.kind == CardKind::Workflow => {
-                CardSelector::exact(card_ref.0.clone())
-            }
-            (None, Some(uid), None, None, None) => CardSelector::uid(
-                CardKind::Workflow,
-                CardUid::new(uid).map_err(|error| invalid("uid", error.to_string()))?,
-            ),
-            (None, None, Some(space), Some(name), Some(version)) => CardSelector::named(
-                CardKind::Workflow,
-                SpaceName::new(space).map_err(|error| invalid("space", error.to_string()))?,
-                CardName::new(name).map_err(|error| invalid("name", error.to_string()))?,
-            )
-            .with_version(
-                VersionBlock::parse(version)
-                    .map_err(|error| invalid("version", error.to_string()))?,
-            ),
-            _ => {
-                return Err(invalid(
-                    "selector",
-                    "pass either a Workflow card_ref alone, uid alone, or space, name, and version"
-                        .to_owned(),
-                ));
-            }
-        };
-        let workflow = crate::trace::block_on(py, self.inner.workflow().load(&selector))
-            .map_err(WyrdPyError::from)?;
-        Ok(PyWorkflow::from(workflow))
-    }
-}
-
 /// Saved Python holder state awaiting native manifest construction.
 struct SavedPythonCard {
     /// Validated envelope carrying one coherent server-native version intent.
@@ -3503,7 +3385,6 @@ fn kind_from_card_kind(kind: &CardKind) -> Kind {
         CardKind::Experiment => Kind::Experiment,
         CardKind::Prompt => Kind::Prompt,
         CardKind::Agent => Kind::Agent,
-        CardKind::Workflow => Kind::Workflow,
         CardKind::Verifier => Kind::Verifier,
         CardKind::Service => Kind::Service,
         CardKind::Policy => Kind::Policy,
@@ -3608,7 +3489,6 @@ pub fn register_cards(module: &Bound<'_, PyModule>) -> CardPyResult<()> {
     module.add_class::<PyDataCardRegistry>()?;
     module.add_class::<PyModelCardRegistry>()?;
     module.add_class::<PyPromptCardRegistry>()?;
-    module.add_class::<PyWorkflowCards>()?;
     module.add_class::<PyCardSummary>()?;
     module.add_class::<PyCardList>()?;
     module.add_class::<PyRegistrationOutcome>()?;

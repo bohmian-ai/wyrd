@@ -13,13 +13,12 @@ use crate::card::eval::EvalSpec;
 use crate::card::experiment::ExperimentSpec;
 use crate::card::mcp::McpSpec;
 use crate::card::model::ModelSpec;
-use crate::card::operator::{OperatorAction, OperatorSpec};
+use crate::card::operator::OperatorSpec;
 use crate::card::service::ServiceSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::card::verifier::{
     VerificationBinding, VerifierImplementation, VerifierSpec, VerifierTask,
 };
-use crate::card::workflow::{WorkflowAction, WorkflowSpec};
 use crate::envelope::Spec;
 use crate::reference::{CardRef, InlineableRef, Ref};
 use crate::vala::eval::EvalTask;
@@ -143,15 +142,17 @@ impl ReferenceSlotVisitor {
             Spec::Data(data) => data.visit(&mut f),
             Spec::Model(model) => model.visit(&mut f),
             Spec::Experiment(experiment) => experiment.visit(&mut f),
-            Spec::Prompt(_) | Spec::Policy(_) | Spec::Trigger(_) | Spec::Source(_) => {}
+            Spec::Prompt(_)
+            | Spec::Policy(_)
+            | Spec::Trigger(_)
+            | Spec::Source(_)
+            | Spec::Operator(_) => {}
             Spec::Agent(agent) => agent.visit(&mut f),
-            Spec::Workflow(workflow) => workflow.visit(&mut f),
             Spec::Verifier(verifier) => verifier.visit(&mut f),
             Spec::Service(service) => service.visit(&mut f),
             Spec::Mcp(mcp) => mcp.visit(&mut f),
             Spec::Audit(audit) => audit.visit(&mut f),
             Spec::Artifact(artifact) => artifact.visit(&mut f),
-            Spec::Operator(operator) => operator.visit(&mut f),
         }
     }
 }
@@ -247,48 +248,6 @@ impl Visit for AgentSpec {
         F: FnMut(SlotEntry<'_>),
     {
         visit_agent(self, "spec", f);
-    }
-}
-
-impl Visit for WorkflowSpec {
-    fn visit<F>(&mut self, f: &mut F)
-    where
-        F: FnMut(SlotEntry<'_>),
-    {
-        if let Some(governance) = &mut self.governance {
-            for (index, policy_ref) in governance.policy_refs.iter_mut().enumerate() {
-                f(SlotEntry {
-                    path: format!("spec.governance.policy_refs[{index}]"),
-                    value: SlotValue::Durable(policy_ref),
-                });
-            }
-            if let Some(audit_ref) = &mut governance.audit_ref {
-                f(SlotEntry {
-                    path: "spec.governance.audit_ref".to_owned(),
-                    value: SlotValue::Durable(audit_ref),
-                });
-            }
-        }
-        if let Some(observation_hooks) = &mut self.observation_hooks {
-            for (index, route_ref) in observation_hooks.route_refs.iter_mut().enumerate() {
-                f(SlotEntry {
-                    path: format!("spec.observation_hooks.route_refs[{index}]"),
-                    value: SlotValue::Durable(route_ref),
-                });
-            }
-        }
-
-        for (step_idx, step) in self.steps.iter_mut().enumerate() {
-            let WorkflowAction::Agent(agent_ref) = &mut step.action;
-            let path = format!("spec.steps[{step_idx}].action.Agent");
-            f(SlotEntry {
-                path: path.clone(),
-                value: SlotValue::InlineableAgent(agent_ref),
-            });
-            if let InlineableRef::Inline(agent) = agent_ref {
-                visit_agent(agent, &path, f);
-            }
-        }
     }
 }
 
@@ -468,40 +427,12 @@ impl Visit for ArtifactSpec {
     }
 }
 
-impl Visit for OperatorSpec {
-    /// Visit the Workflow reference carried by a `workflow` action.
-    fn visit<F>(&mut self, f: &mut F)
-    where
-        F: FnMut(SlotEntry<'_>),
-    {
-        self.visit_at("spec", f);
-    }
-}
-
-impl OperatorSpec {
-    /// Visit this Operator's reference slots under an explicit path prefix.
-    ///
-    /// The same body is reachable as a Card `spec` and as an inline
-    /// `on_failure` mapping, so the prefix names whichever slot holds it.
-    fn visit_at<F>(&mut self, prefix: &str, f: &mut F)
-    where
-        F: FnMut(SlotEntry<'_>),
-    {
-        if let OperatorAction::Workflow { workflow_ref } = &mut self.action {
-            f(SlotEntry {
-                path: format!("{prefix}.workflow_ref"),
-                value: SlotValue::Durable(workflow_ref),
-            });
-        }
-    }
-}
-
 /// Visit one verification-binding list using the exact owning field path.
 ///
 /// Each binding yields its Verifier reference, its `runs_on` Trigger slot when
 /// one is authored, and
-/// every `on_failure` Operator slot, plus the references nested inside any
-/// inline Operator body. Inline Triggers carry no references of their own.
+/// every `on_failure` Operator slot. Inline Triggers and Operators carry no
+/// references of their own.
 fn visit_verified_by<F>(bindings: &mut [VerificationBinding], path: &str, f: &mut F)
 where
     F: FnMut(SlotEntry<'_>),
@@ -518,12 +449,8 @@ where
             });
         }
         for (operator_index, operator) in binding.on_failure.iter_mut().enumerate() {
-            let operator_path = format!("{path}[{index}].on_failure[{operator_index}]");
-            if let InlineableRef::Inline(inline) = operator {
-                inline.visit_at(&operator_path, f);
-            }
             f(SlotEntry {
-                path: operator_path,
+                path: format!("{path}[{index}].on_failure[{operator_index}]"),
                 value: SlotValue::InlineableOperator(operator),
             });
         }
@@ -552,7 +479,6 @@ mod completeness_tests {
     use crate::card::agent::{AgentRunConfigSpec, AgentSpec};
     use crate::card::artifact::ArtifactSpec;
     use crate::card::audit::AuditSpec;
-    use crate::card::common::{Governance, ObservationHooks};
     use crate::card::data::{
         ColorMode, DataInterface, DataSchema, DataSpec, DataSplit, DataStats, ImageFormat,
         ImageMeta, PandasMeta, ParquetCompression, SplitStrategy, TextMeta,
@@ -565,11 +491,10 @@ mod completeness_tests {
     use crate::card::field::FieldSpec;
     use crate::card::mcp::McpSpec;
     use crate::card::model::{ModelInterface, ModelSignature, ModelSpec, SklearnMeta, TaskType};
-    use crate::card::operator::{OperatorAction, OperatorSpec};
+    use crate::card::operator::OperatorSpec;
     use crate::card::service::{ServiceComponent, ServiceSpec};
     use crate::card::trigger::{TriggerActivation, TriggerSpec};
     use crate::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
-    use crate::card::workflow::{WorkflowAction, WorkflowSpec, WorkflowStep};
     use crate::envelope::{CardKind, Spec};
     use crate::ids::{CardName, ColumnName, SpaceName};
     use crate::reference::{CardRef, InlineableRef, Ref};
@@ -675,32 +600,6 @@ mod completeness_tests {
         }
     }
 
-    fn workflow() -> WorkflowSpec {
-        WorkflowSpec {
-            governance: Some(Governance {
-                policy_refs: vec![Ref::Ref(card_ref(CardKind::Policy, "policy"))],
-                audit_ref: Some(Ref::Ref(card_ref(CardKind::Audit, "audit"))),
-                ..Governance::default()
-            }),
-            observation_hooks: Some(ObservationHooks {
-                route_refs: vec![Ref::Ref(card_ref(CardKind::Service, "route"))],
-                ..ObservationHooks::default()
-            }),
-            steps: vec![WorkflowStep {
-                id: "agent".to_owned(),
-                action: WorkflowAction::Agent(InlineableRef::Inline(Box::new(agent()))),
-                depends_on: Vec::new(),
-                inputs: BTreeMap::new(),
-                llm_route: None,
-                fallback: None,
-                timeout_seconds: None,
-                retry: None,
-                display: BTreeMap::new(),
-            }],
-            ..WorkflowSpec::default()
-        }
-    }
-
     fn eval() -> EvalSpec {
         let task_id = TaskId::new("judge").expect("fixture task id is valid");
         let judge = LlmJudgeTask::new(
@@ -734,21 +633,33 @@ mod completeness_tests {
         }
     }
 
+    /// An inline notify Operator, which carries no reference slots.
+    ///
+    /// # Panics
+    /// Panics when the fixed notify body stops decoding as an Operator.
+    fn notify_operator() -> OperatorSpec {
+        serde_json::from_value(json!({
+            "kind": "notify",
+            "channel": {
+                "kind": "pager_duty",
+                "connection": "pagerduty",
+                "route": "team-a",
+                "severity": "critical",
+                "summary": "verification failed",
+            },
+        }))
+        .expect("fixture notify Operator decodes")
+    }
+
     /// Build one binding with a referenced Trigger, a referenced Operator, and
-    /// an inline workflow Operator so every `verified_by` slot shape is visited.
+    /// an inline Operator so every `verified_by` slot shape is visited.
     fn binding(verifier: &str) -> VerificationBinding {
         VerificationBinding {
             verifier: Ref::Ref(card_ref(CardKind::Verifier, verifier)),
             runs_on: Some(InlineableRef::Ref(card_ref(CardKind::Trigger, "hourly"))),
             on_failure: vec![
                 InlineableRef::Ref(card_ref(CardKind::Operator, "page")),
-                InlineableRef::Inline(Box::new(OperatorSpec {
-                    description: None,
-                    action: OperatorAction::Workflow {
-                        workflow_ref: Ref::Ref(card_ref(CardKind::Workflow, "remediate")),
-                    },
-                    budget: None,
-                })),
+                InlineableRef::Inline(Box::new(notify_operator())),
             ],
         }
     }
@@ -820,15 +731,8 @@ mod completeness_tests {
                 tz: None,
             },
         };
-        let mut operator = OperatorSpec {
-            description: None,
-            action: OperatorAction::Workflow {
-                workflow_ref: Ref::Ref(card_ref(CardKind::Workflow, "workflow")),
-            },
-            budget: None,
-        };
+        let mut operator = notify_operator();
         let mut drift = drift();
-        let mut workflow = workflow();
         let mut eval = eval();
         let mut image = image;
         let mut text = text;
@@ -842,7 +746,6 @@ mod completeness_tests {
             Spec::Model(model.clone()),
             Spec::Experiment(experiment.clone()),
             Spec::Agent(agent.clone()),
-            Spec::Workflow(workflow.clone()),
             Spec::Verifier(VerifierSpec {
                 description: None,
                 implementation: VerifierImplementation::Eval(eval.clone()),
@@ -860,7 +763,7 @@ mod completeness_tests {
         ] {
             count += visit_paths(spec).len();
         }
-        assert_eq!(count, 31);
+        assert_eq!(count, 24);
         assert!(visit_paths(Spec::Service(service.clone())).contains(&(
             "spec.components[0].verified_by[0].verifier".to_owned(),
             "durable"
@@ -877,7 +780,7 @@ mod completeness_tests {
             &mut experiment,
             &mut agent,
         );
-        let _ = (&mut workflow, &mut eval, &mut drift, &mut service, &mut mcp);
+        let _ = (&mut eval, &mut drift, &mut service, &mut mcp);
         let _ = (&mut audit, &mut artifact, &mut trigger, &mut operator);
     }
 
@@ -899,19 +802,6 @@ mod completeness_tests {
         }))));
         assert_eq!(actual, expected);
 
-        assert_eq!(
-            visit_paths(Spec::Workflow(workflow())),
-            vec![
-                ("spec.governance.policy_refs[0]".to_owned(), "durable"),
-                ("spec.governance.audit_ref".to_owned(), "durable"),
-                ("spec.observation_hooks.route_refs[0]".to_owned(), "durable"),
-                ("spec.steps[0].action.Agent".to_owned(), "inlineable_agent"),
-                (
-                    "spec.steps[0].action.Agent.prompt".to_owned(),
-                    "inlineable_prompt"
-                ),
-            ]
-        );
         assert_eq!(
             visit_paths(Spec::Verifier(VerifierSpec {
                 description: None,
@@ -945,7 +835,6 @@ mod completeness_tests {
                 (format!("{prefix}[0].verifier"), "durable"),
                 (format!("{prefix}[0].runs_on"), "inlineable_trigger"),
                 (format!("{prefix}[0].on_failure[0]"), "inlineable_operator"),
-                (format!("{prefix}[0].on_failure[1].workflow_ref"), "durable"),
                 (format!("{prefix}[0].on_failure[1]"), "inlineable_operator"),
             ]
         };

@@ -629,9 +629,6 @@ impl OperatorDelivery {
                 self.http(request, credential, *expect_status, timeout)
                     .await
             }
-            (OperatorAction::Workflow { .. }, _) => {
-                Attempt::terminal(OPERATOR_UNAVAILABLE, "the workflow action is not invocable")
-            }
             _ => Attempt::terminal(
                 CREDENTIAL_INVALID,
                 "the stored credential does not fit the Operator's provider",

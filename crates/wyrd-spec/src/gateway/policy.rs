@@ -85,7 +85,7 @@ impl GatewayFallbackPolicy {
     }
 }
 
-/// Per-request or per-workflow-step ordered fallback override.
+/// Per-request ordered fallback override.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -97,8 +97,8 @@ pub struct GatewayFallbackOverride {
 impl GatewayFallbackOverride {
     /// Rejects an empty or duplicated candidate list.
     ///
-    /// Workflow Card validation uses this model-independent check; the
-    /// gateway applies [`Self::validate_for`] once the requested model is known.
+    /// This is the model-independent check; the gateway applies
+    /// [`Self::validate_for`] once the requested model is known.
     ///
     /// # Errors
     ///

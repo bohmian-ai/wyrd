@@ -18,7 +18,6 @@ pub mod service;
 pub mod source;
 pub mod trigger;
 pub mod verifier;
-pub mod workflow;
 
 pub use crate::ids::{ColumnName, FeatureName, QueryName, SplitName};
 pub use common::{

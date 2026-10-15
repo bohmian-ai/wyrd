@@ -15,7 +15,7 @@
 /// Initialize Wyrd subsystems.
 ///
 /// This is idempotent: it refreshes the default provider registry from the
-/// environment. Agent and Workflow telemetry is plain `tracing`; install a
+/// environment. Agent telemetry is plain `tracing`; install a
 /// subscriber to export it.
 pub fn init() {
     skald_runtime::refresh_default_registry_from_env();
@@ -36,5 +36,4 @@ pub mod prompt {
 
 pub use skald_agent::Agent;
 pub use skald_runtime::ProviderRegistry;
-pub use skald_workflow::Workflow;
-pub use wyrd_spec::{AgentCard, WorkflowCard};
+pub use wyrd_spec::AgentCard;

@@ -811,7 +811,7 @@ Server spans export twice from one tracer provider:
   which reaches the server with its producers as links and no `traceparent`,
   reads back as a trace linked to them. The tenant copy carries only the
   behavior-span catalog — the request span, `verification.*`, `dispatch`,
-  `workflow.gateway.call`, `gateway.*` except `gateway.attempt`,
+  `agent.gateway.call`, `gateway.*` except `gateway.attempt`,
   `bifrost.gate.*`, `bifrost.oracle.query`, and OTLP ingest — and only spans
   whose ancestors up to the span that opened the copy are all catalog
   spans. It keeps only safe

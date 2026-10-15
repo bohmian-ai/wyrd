@@ -65,7 +65,7 @@ check_selection "leaf crate omits unrelated families" \
   "full_gate=false changed_packages=wyrd ci_lanes~test:wyrd ci_lanes!test:skald ci_lanes!test:vala ci_lanes!test:shared ci_lanes!test:rust" \
   "crates/wyrd/wyrd/src/lib.rs"
 check_selection "shared crate includes transitive consumers" \
-  "full_gate=false rust_packages~wyrd-skald-runtime rust_packages~wyrd-skald-agent rust_packages~wyrd-skald-workflow rust_packages~wyrd rust_packages~wyrd-server ci_lanes~test:skald ci_lanes~test:wyrd ci_lanes~test:vala" \
+  "full_gate=false rust_packages~wyrd-skald-runtime rust_packages~wyrd-skald-agent rust_packages~wyrd rust_packages~wyrd-server ci_lanes~test:skald ci_lanes~test:wyrd ci_lanes~test:vala" \
   "crates/skald/skald-cache/src/lib.rs"
 check_selection "dev-dependency consumers are tested but not propagated" \
   "full_gate=false rust_packages~wyrd-ai rust_packages~wyrd-server rust_packages!wyrd-rust-examples" \

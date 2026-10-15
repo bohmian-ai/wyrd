@@ -743,7 +743,7 @@ fn parse_kind(value: &str) -> Result<CardKind, WyrdCliError> {
         invalid_argument(
             "kind",
             value,
-            "a known Wyrd Card kind such as Model, Prompt, or Workflow",
+            "a known Wyrd Card kind such as Model, Prompt, or Agent",
         )
     })
 }

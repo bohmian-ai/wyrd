@@ -196,7 +196,6 @@ impl RuntimeServiceFixture {
         "agent-inline.yaml",
         "quality.yaml",
         "model-drift.yaml",
-        "runtime.yaml",
         "typed-service.yaml",
     ];
 
@@ -204,7 +203,6 @@ impl RuntimeServiceFixture {
     const EXPECTED_ALIASES: &[&str] = &[
         "agent_inline",
         "agent_triage",
-        "default-Agent-triage-1.0.0",
         "default-Data-training-1.0.0",
         "default-Prompt-triage-prompt-1.0.0",
         "default-Verifier-model-drift-1.0.0",
@@ -212,7 +210,6 @@ impl RuntimeServiceFixture {
         "model_primary",
         "model_shadow",
         "root",
-        "runtime_workflow",
         "shared_prompt",
         "triage_prompt",
     ];
@@ -1409,13 +1406,6 @@ mod pg_tests {
             drift.implementation,
             VerifierImplementation::Drift(_)
         ));
-        assert_eq!(
-            state
-                .workflow("runtime_workflow")
-                .expect("workflow resolves")
-                .name,
-            "runtime"
-        );
         assert_verified_artifact_bytes(&state);
         assert_all_refs_are_uid_pinned(&state);
         assert_no_unresolved_paths(&state);
@@ -2255,9 +2245,7 @@ mod pg_tests {
     /// `plan` and `apply` refuse the retired `kind: Drift` and `kind: Eval`
     /// Cards with the loader's stable envelope diagnostic and leave no Card on
     /// the server; `kind: Verifier` Cards with `implementation.kind: drift`
-    /// and `eval` apply. A standalone Workflow Operator Card applies, while a
-    /// Service binding it in `on_failure` is refused by the server with
-    /// `WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION` and is not registered.
+    /// and `eval` apply.
     ///
     /// # Panics
     /// Panics when the server fails to start or stop, a bootstrap fails, a
@@ -2345,14 +2333,6 @@ mod pg_tests {
                 "cli-eval-verifier",
                 "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-eval-verifier\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: eval\n    spec:\n      tasks: {}\n",
             ),
-            (
-                "cli-rollback",
-                "apiVersion: wyrd/v1\nkind: Workflow\nmetadata:\n  name: cli-rollback\n  version: 1.0.0\n  space: default\nspec:\n  steps:\n    - id: rollback\n      action:\n        type: agent\n        target:\n          prompt:\n            model: gpt-5-5\n            provider:\n              custom: mock\n            request:\n              provider: open_ai_chat_completion\n              body:\n                model: gpt-5-5\n                messages:\n                  - role: user\n                    content: Roll back.\n            response_type: text\n          tool_names: []\n  outputs:\n    result: steps.rollback.output.text\n",
-            ),
-            (
-                "cli-rollback-operator",
-                "apiVersion: wyrd/v1\nkind: Operator\nmetadata:\n  name: cli-rollback-operator\n  version: 1.0.0\n  space: default\nspec:\n  kind: workflow\n  workflow_ref:\n    kind: Workflow\n    name: cli-rollback\n    version: 1.0.0\n    space: default\n",
-            ),
         ] {
             let path = write_fixture(temp.path(), &format!("{name}.yaml"), contents);
             let receipt = run_cli_json(apply(&path), &jwt)
@@ -2361,29 +2341,6 @@ mod pg_tests {
             assert_eq!(receipt["root"]["name"], name, "{receipt}");
         }
 
-        let service = write_fixture(
-            temp.path(),
-            "cli-workflow-bound.yaml",
-            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: cli-workflow-bound\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: cli-custom-verifier\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: schedule\n        cron: \"0 2 * * *\"\n      on_failure:\n        - kind: Operator\n          name: cli-rollback-operator\n          version: 1.0.0\n          space: default\n",
-        );
-        let refused = run_cli_owned_with_token(apply(&service), Some(jwt.clone())).await;
-        assert!(!refused.status.success());
-        let stderr = String::from_utf8_lossy(&refused.stderr);
-        assert!(
-            stderr.contains("WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION"),
-            "binding a Workflow Operator is refused by the server: {stderr}"
-        );
-        let mut conn = server
-            .tenant_conn_for(server.data_tenant_id())
-            .await
-            .expect("tenant connection opens");
-        let bound: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM wyrd.cards WHERE name = 'cli-workflow-bound'")
-                .fetch_one(&mut **conn.transaction())
-                .await
-                .expect("card count reads");
-        conn.commit().await.expect("assertion transaction commits");
-        assert_eq!(bound, 0, "the refused Service is not registered");
         server.shutdown().await.expect("test server shuts down");
     }
 

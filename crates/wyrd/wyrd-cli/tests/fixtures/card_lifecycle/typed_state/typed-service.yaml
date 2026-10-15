@@ -36,5 +36,3 @@ spec:
       ref: ./triage-prompt.yaml
     - alias: shared_prompt
       ref: ./triage-prompt.yaml
-    - alias: runtime_workflow
-      ref: ./runtime.yaml

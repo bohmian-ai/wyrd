@@ -5389,7 +5389,7 @@ fn fallback_headers(candidates: &[ModelRef]) -> HeaderMap {
 /// Panics when the fixture, administration, a status, an envelope, or an
 /// upstream expectation fails.
 #[tokio::test]
-async fn public_ingress_workflow_fallback() {
+async fn public_ingress_fallback_override() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let upstream = MockServer::start().await;

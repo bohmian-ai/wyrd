@@ -1,7 +1,6 @@
 //! Bounded complete-result Bifrost queries for agent tools.
 //!
-//! [`BoundedQuery`] serves `bifrost.query` for both the MCP tool and the
-//! Workflow Agent tool. It parses nothing protocol-specific: it takes closed
+//! [`BoundedQuery`] serves the MCP `bifrost.query` tool. It parses nothing protocol-specific: it takes closed
 //! [`QueryArguments`], runs them through [`super::service::stream_query`]
 //! as the verified caller, and collects the stream into one
 //! `{columns, rows, terminal}` value under the caller's row and byte
@@ -27,10 +26,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError as ValaError;
 use wyrd_spec::vala::api::BifrostQueryRequest;
-use wyrd_spec::vala::api::{
-    QueryClass, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome, QueryWarning,
-    SourceCompletion,
-};
+use wyrd_spec::vala::api::{QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome};
 
 use crate::components::auth::Caller;
 use crate::oracle::RunningQueryControls;
@@ -107,56 +103,6 @@ pub(crate) fn input_schema() -> JsonValue {
             }
         },
         "required": ["sql"],
-        "additionalProperties": false
-    })
-}
-
-/// JSON Schema of the complete `{columns, rows, terminal}` value
-/// [`BoundedQuery::run`] returns.
-///
-/// It mirrors the projection exactly: one closed column descriptor per
-/// result field, each row a positional array in column order, and the
-/// terminal fields [`project_terminal`] keeps, whose shapes are derived from
-/// the `wyrd-spec` terminal types inline. Row cells are Arrow JSON values of
-/// any column type, so they carry no narrower schema.
-pub(crate) fn output_schema() -> JsonValue {
-    let mut generator = schemars::r#gen::SchemaSettings::draft07()
-        .with(|settings| settings.inline_subschemas = true)
-        .into_generator();
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "columns": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": { "type": "string" },
-                        "data_type": { "type": "string" },
-                        "nullable": { "type": "boolean" }
-                    },
-                    "required": ["name", "data_type", "nullable"],
-                    "additionalProperties": false
-                }
-            },
-            "rows": {
-                "type": "array",
-                "items": { "type": "array" }
-            },
-            "terminal": {
-                "type": "object",
-                "properties": {
-                    "outcome": generator.subschema_for::<QueryTerminalOutcome>(),
-                    "query_class": generator.subschema_for::<QueryClass>(),
-                    "row_count": generator.subschema_for::<u64>(),
-                    "warnings": generator.subschema_for::<Vec<QueryWarning>>(),
-                    "source_completion": generator.subschema_for::<Vec<SourceCompletion>>()
-                },
-                "required": ["outcome", "query_class", "row_count", "warnings", "source_completion"],
-                "additionalProperties": false
-            }
-        },
-        "required": ["columns", "rows", "terminal"],
         "additionalProperties": false
     })
 }
@@ -906,19 +852,6 @@ mod tests {
                     [2, "second", "6f6b", {"depth": 8}],
                 ]),
                 "rows are positional arrays using Arrow's own JSON encoding"
-            );
-
-            let schema = jsonschema::JSONSchema::compile(&super::output_schema())
-                .expect("the advertised output schema compiles");
-            assert!(
-                schema.is_valid(&value),
-                "the collected result matches the advertised output schema"
-            );
-            let mut widened = value.clone();
-            widened["terminal"]["error"] = serde_json::json!(null);
-            assert!(
-                !schema.is_valid(&widened),
-                "the advertised terminal is closed to fields the tool never returns"
             );
 
             let exact = serde_json::to_vec(&value)

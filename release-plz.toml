@@ -98,10 +98,6 @@ name = "wyrd-skald-tool"
 publish = true
 
 [[package]]
-name = "wyrd-skald-workflow"
-publish = true
-
-[[package]]
 name = "wyrd-spec"
 publish = true
 

@@ -148,7 +148,7 @@ async fn get_card_by_ref_http(
 
 /// Authorize, audit, and read one Card by its exact identity.
 ///
-/// Shared by HTTP, MCP, and the Workflow `cards.get` tool so all audit `cards:read`
+/// Shared by HTTP and MCP so both audit `cards:read`
 /// under the same exact-reference resource. A reference that also names a
 /// UID must name the UID of the Card at that identity.
 ///

@@ -5,11 +5,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
-use skald_agent::{Agent, AgentError, run_config_from_agent_run_config_spec};
+use skald_agent::{
+    Agent, AgentError, WyrdGatewayCaller, agent_error_retryable,
+    run_config_from_agent_run_config_spec, wyrd_gateway_registry,
+};
 use skald_prompt::Prompt;
 use skald_providers::ProviderError;
 use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
-use skald_workflow::{WyrdGatewayCaller, agent_error_retryable, wyrd_gateway_registry};
 use tokio::sync::Mutex;
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::reference::{CardRef, InlineableRef};

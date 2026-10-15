@@ -20,7 +20,6 @@ use crate::ids::{
 use crate::operator_connection::{
     HttpAuthScheme, HttpsOrigin, OperatorConnectionConfig, OperatorProvider,
 };
-use crate::reference::Ref;
 use crate::verification::VerificationVerdict;
 
 /// Server ceiling on one external delivery attempt, in seconds.
@@ -95,7 +94,6 @@ impl OperatorSpec {
             render_template(value, lookup).map_err(|reason| invalid(at, reason))
         };
         match &self.action {
-            OperatorAction::Workflow { .. } => Ok(()),
             OperatorAction::Notify {
                 channel:
                     NotifyChannel::Slack {
@@ -176,7 +174,7 @@ impl OperatorSpec {
 
 impl OperatorSpec {
     /// The provider and name of the connection this Operator's credential
-    /// authority names, or `None` for Workflow and unauthenticated HTTP.
+    /// authority names, or `None` for unauthenticated HTTP.
     #[must_use]
     pub fn connection(&self) -> Option<(OperatorProvider, &ConnectionName)> {
         match &self.action {
@@ -189,7 +187,7 @@ impl OperatorSpec {
             OperatorAction::Http {
                 auth: Some(auth), ..
             } => Some((OperatorProvider::Http, auth.connection())),
-            OperatorAction::Http { auth: None, .. } | OperatorAction::Workflow { .. } => None,
+            OperatorAction::Http { auth: None, .. } => None,
         }
     }
 
@@ -250,11 +248,6 @@ impl OperatorSpec {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperatorAction {
-    /// Dispatch a registered Workflow.
-    Workflow {
-        /// Workflow to dispatch with the trigger context.
-        workflow_ref: Ref,
-    },
     /// Send a typed notification.
     Notify {
         /// Notification destination and payload.

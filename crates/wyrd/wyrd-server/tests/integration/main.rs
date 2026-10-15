@@ -24,9 +24,7 @@ mod pg_router_smoke;
 mod pg_verification_routes;
 #[cfg(feature = "test-support")]
 mod pg_verification_runtime;
-mod pg_workflow_registration;
 #[cfg(feature = "test-support")]
-mod pg_workflow_runs;
 mod platform_admin_e2e;
 #[cfg(feature = "storage-emulator")]
 mod storage_e2e;

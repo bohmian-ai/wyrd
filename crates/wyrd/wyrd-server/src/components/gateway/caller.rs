@@ -1,24 +1,22 @@
-//! Workflow model calls through the in-process governed gateway.
+//! Agent model calls through the in-process governed gateway.
 //!
-//! [`ServerWyrdGatewayCaller`] serves `wyrd_gateway` steps of an accepted server
-//! Workflow run. It submits each native Skald request to
-//! [`GatewayInvocation::run`] as the run's captured caller, so every call
-//! takes the gateway's own invoke decision, admission, routing, accounting,
-//! and capture exactly as a public ingress call does. Nothing about one call
-//! is stored on the caller, so concurrent steps cannot see each other's
-//! fallback, deadline, or correlation; correlation travels only in this
-//! call's tracing span. A hosted Workflow run's caller carries its Workflow
-//! Card and no Run; a caller built for a direct verification carries the
-//! Card, and optional Run, its judge calls are attributed to.
+//! [`ServerWyrdGatewayCaller`] serves server-run Agent judges. It submits each
+//! native Skald request to [`GatewayInvocation::run`] as the operation's
+//! captured caller, so every call takes the gateway's own invoke decision,
+//! admission, routing, accounting, and capture exactly as a public ingress
+//! call does. Nothing about one call is stored on the caller, so concurrent
+//! calls cannot see each other's deadline. A caller built for a direct
+//! verification carries the Card, and optional Run, its judge calls are
+//! attributed to.
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use skald_agent::{WyrdGatewayCall, WyrdGatewayCaller};
 use skald_providers::{ProviderError, RemoteProblem};
 use skald_spec::{ProviderRequest, ProviderResponse};
-use skald_workflow::{WyrdGatewayCall, WyrdGatewayCaller};
 use tokio_util::sync::CancellationToken;
 use wyrd_gateway::{IngressDialect, ResponseBody};
 use wyrd_spec::error::WyrdError;
@@ -32,19 +30,19 @@ use super::routes::usage_bound;
 use crate::components::auth::Caller;
 use crate::state::AppState;
 
-/// Provider label on errors raised by in-process Workflow gateway calls.
+/// Provider label on errors raised by in-process gateway calls.
 const PROVIDER: &str = "wyrd_gateway";
 
-/// Workflow gateway caller bound to one accepted run's captured authority.
+/// Agent gateway caller bound to one operation's captured authority.
 ///
 /// `caller` is the verified identity, permission snapshot, and delegation the
-/// run was accepted with; it carries no credential, so it cannot be renewed
+/// operation was accepted with; it carries no credential, so it cannot be renewed
 /// or widened. Cloning is cheap.
 #[derive(Clone)]
 pub(crate) struct ServerWyrdGatewayCaller {
     /// Server state whose gateway pipeline serves every call.
     state: AppState,
-    /// Authority captured when the run was accepted.
+    /// Authority captured when the operation was accepted.
     caller: Caller,
     /// Run and Card every call is attributed to, already resolved by the
     /// operation the calls serve; `None` leaves calls uncorrelated.
@@ -94,15 +92,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
     /// The call's span and the gateway spans under it are routed to the
     /// tenant under the captured caller's own pair, so a judge call SYSTEM
     /// performs for the request's subject is not recorded as the request.
-    #[tracing::instrument(
-        name = "workflow.gateway.call",
-        skip_all,
-        fields(
-            wyrd.workflow.run_id = call.correlation.as_ref().map(|c| tracing::field::display(c.run_id)),
-            wyrd.workflow.step_id = call.correlation.as_ref().map(|c| c.step_id.as_str()),
-            wyrd.workflow.attempt = call.correlation.as_ref().map(|c| c.attempt),
-        )
-    )]
+    #[tracing::instrument(name = "agent.gateway.call", skip_all)]
     async fn call(
         &self,
         call: WyrdGatewayCall,
@@ -129,7 +119,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
                 }
             },
             model: call.model,
-            fallback: call.fallback,
+            fallback: None,
             body,
             media: None,
             batch: None,
@@ -217,7 +207,7 @@ impl NativeCall {
     /// provider-native model and enter the native `systemone` route. A Google
     /// GenerateContent body
     /// enters as Vertex when `model` names the `vertex` provider, which the
-    /// Workflow derives from a Prompt whose provider is Vertex.
+    /// Agent derives from a Prompt whose provider is Vertex.
     ///
     /// # Errors
     /// Returns [`ProviderError::BadRequest`] for a request dialect the

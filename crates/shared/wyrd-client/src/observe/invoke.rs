@@ -8,15 +8,16 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use skald_agent::{Agent, AgentError, run_config_from_agent_run_config_spec};
+use skald_agent::{
+    Agent, AgentError, run_config_from_agent_run_config_spec, wyrd_gateway_registry,
+};
 use skald_providers::ProviderError;
 use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
-use skald_workflow::wyrd_gateway_registry;
 use wyrd_spec::error::WyrdError;
 
 use super::Run;
 use crate::error::code_to_wyrd_error;
-use crate::workflow::PublicWyrdGatewayCaller;
+use crate::gateway_caller::PublicWyrdGatewayCaller;
 
 impl Run {
     /// Invoke this view's tool-free Agent once with string `variables` and

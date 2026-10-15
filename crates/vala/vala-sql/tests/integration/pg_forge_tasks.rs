@@ -1658,7 +1658,7 @@ mod pg_tests {
     /// # Panics
     /// Panics when any seeding statement fails.
     async fn seed_cleanup_roots(superuser: &PgPool, tenant: DataTenantId, table: &ForgeClaimTable) {
-        sqlx::query("INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,physical_layout) VALUES ($1,$2,'vala.bifrost.cleanup',decode(repeat('00',32),'hex'),'{}'::jsonb)")
+        sqlx::query("INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,physical_layout,sub_principal_id,act_principal_id) VALUES ($1,$2,'vala.bifrost.cleanup',decode(repeat('00',32),'hex'),'{}'::jsonb,'00000000-0000-7000-8000-000000000000','00000000-0000-7000-8000-000000000000')")
             .bind(tenant.as_uuid())
             .bind(table.table_uid.as_slice())
             .execute(superuser)

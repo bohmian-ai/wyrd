@@ -19,7 +19,8 @@ use std::sync::Arc;
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_verify::{TokenAudience, TokenVerifier, VerifiedToken};
-use wyrd_runtime::{DelegationStep, Principal};
+use wyrd_runtime::{DelegationStep, Principal, delegated_attribution};
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_tonic::tonic::metadata::MetadataMap;
@@ -62,7 +63,10 @@ impl AuthContext {
     pub fn from_verified(verified: VerifiedToken, metadata: &MetadataMap) -> Self {
         wyrd_telemetry::bind_tenant_route(wyrd_telemetry::TenantSpanRoute {
             tenant: verified.principal.tenant_id,
-            principal: verified.principal.id,
+            attribution: wyrd_runtime::delegated_attribution(
+                &verified.principal,
+                &verified.delegation_chain,
+            ),
         });
         Self {
             tenant: verified.principal.tenant_id,
@@ -70,6 +74,14 @@ impl AuthContext {
             request_id: read_or_mint_request_id(metadata),
             delegation_chain: verified.delegation_chain,
         }
+    }
+
+    /// The verified subject/actor pair Scribe stamps on this request's rows:
+    /// the principal as subject and the current delegated actor, or the
+    /// principal itself for direct work.
+    #[must_use]
+    pub fn attribution(&self) -> Attribution {
+        delegated_attribution(&self.principal, &self.delegation_chain)
     }
 }
 

@@ -12,8 +12,10 @@
 //!
 //! The generic [`Outbox`] owns the unbounded queue, per-tenant batching,
 //! retry with backoff, and shutdown; [`ObservationRunSink`] is its one durable
-//! call, [`VerifierRunQueue::enqueue_observation_batch`], a multi-row insert
-//! keyed by tenant, binding, and record, so a repeated write inserts nothing.
+//! write: it locks the matching bindings, resolves each binding owner's
+//! owner/SYSTEM authority through [`BackgroundAuthority`], and inserts the
+//! runs in one multi-row insert keyed by tenant, binding, and record, so a
+//! repeated write inserts nothing. The writer grants no run authority.
 //! Losses are counted in `outbox_events_lost_total{outbox="eval_run_requests"}`.
 
 use std::sync::Arc;
@@ -27,6 +29,8 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::ids::CardUid;
 use wyrd_sql::queries::verifier_runs::{ObservationRecord, VerifierRunQueue};
 use wyrd_sql::{SqlError, WyrdPostgres};
+
+use super::authority::BackgroundAuthority;
 
 /// Tenants the run-request writer inserts for at once, which bounds the Wyrd
 /// pool connections it may hold.
@@ -43,20 +47,27 @@ pub struct ObservationRunSink {
     postgres: WyrdPostgres,
     /// The shared durable run queue.
     runs: VerifierRunQueue,
+    /// Resolves the owner/SYSTEM authority each binding's runs are accepted under.
+    authority: BackgroundAuthority,
 }
 
 impl ObservationRunSink {
-    /// Starts the process run-request outbox over `postgres`.
+    /// Starts the process run-request outbox over `postgres`, accepting runs
+    /// under the authority `authority` resolves.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime, because the writer task is
     /// spawned immediately.
     #[must_use]
-    pub fn outbox(postgres: WyrdPostgres) -> Arc<ObservationRunOutbox> {
+    pub fn outbox(
+        postgres: WyrdPostgres,
+        authority: BackgroundAuthority,
+    ) -> Arc<ObservationRunOutbox> {
         Outbox::new(
             Self {
                 postgres,
                 runs: VerifierRunQueue::default(),
+                authority,
             },
             OBSERVATION_RUN_WRITER_CONNECTIONS,
         )
@@ -69,7 +80,14 @@ impl OutboxSink for ObservationRunSink {
     const NAME: &'static str = "eval_run_requests";
 
     /// Inserts one run per `observations_ready` binding the record's writer
-    /// owns on its subject in the tenant's transaction and commits it.
+    /// may activate on its subject in the tenant's transaction and commits it.
+    ///
+    /// Each binding's runs are accepted under its owner's current authority
+    /// with the tenant SYSTEM actor. A binding whose owner Card has no
+    /// principal in this tenant, or whose owner or SYSTEM cannot be resolved,
+    /// gets no run: the refusal is logged with the tenant, binding, and owner
+    /// Card, never retried, and never falls back to the writer or another
+    /// identity, while the batch's other bindings still enqueue.
     ///
     /// Repeating the write is harmless: the insert is keyed by tenant,
     /// binding, and record with `ON CONFLICT DO NOTHING`.
@@ -86,14 +104,38 @@ impl OutboxSink for ObservationRunSink {
     /// batch in `outbox_events_lost_total`. A later repeat of the same
     /// records is safe, because the tenant/binding/record key absorbs any run
     /// that did commit.
+    #[tracing::instrument(name = "verification.observation_runs", skip_all, fields(%tenant))]
     async fn write(
         &self,
         tenant: DataTenantId,
         records: &[ObservationRecord],
     ) -> Result<(), SqlError> {
         let mut conn = self.postgres.tenant_conn(tenant).await?;
+        let bindings = self
+            .runs
+            .lock_observation_bindings(&mut conn, records)
+            .await
+            .map_err(SqlError::Query)?;
+        let mut authorized = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let authority = match binding.owner {
+                Some(owner) => self.authority.resolve(&mut conn, owner).await?,
+                None => None,
+            };
+            if let Some(authority) = authority {
+                authorized.push((binding, authority));
+            } else {
+                tracing::warn!(
+                    %tenant,
+                    binding_id = %binding.binding_id,
+                    owner_card_uid = %binding.owner_card_uid,
+                    owner = ?binding.owner,
+                    "observation run not accepted: the binding owner or SYSTEM has no authority"
+                );
+            }
+        }
         self.runs
-            .enqueue_observation_batch(&mut conn, records)
+            .enqueue_observation_runs(&mut conn, records, &authorized)
             .await
             .map_err(SqlError::Query)?;
         conn.commit().await

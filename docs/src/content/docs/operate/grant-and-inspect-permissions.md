@@ -92,7 +92,7 @@ New tokens are refused at once, and tokens already issued expire within 5 minute
 Every permission check is recorded in the audit log. To see what was refused recently:
 
 ```sql
-SELECT created_at, audit_principal_id, permission, outcome
+SELECT created_at, sub_principal_id, permission, outcome
 FROM vala.system.audit_log
 WHERE outcome = 'denied'
 ORDER BY created_at DESC

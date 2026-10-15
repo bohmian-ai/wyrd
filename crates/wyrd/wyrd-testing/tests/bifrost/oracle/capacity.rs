@@ -791,6 +791,7 @@ async fn seed_fixture_table(
                 Field::new("filter_key", DataType::Utf8, false),
             ],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;

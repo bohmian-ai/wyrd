@@ -2,7 +2,7 @@
 //!
 //! Owns the shared verdict schema, its sensitive `drift_report` and
 //! `eval_summary` Struct payloads, and the Bloom columns a result lookup by id,
-//! subject, or binding prunes on.
+//! Verifier, or binding prunes on.
 
 use arrow::datatypes::{DataType, Field, Fields};
 
@@ -27,9 +27,11 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 /// completed Drift execution that could not score valid input sets none, which
 /// is recorded rather than fabricated.
 /// The managed `run_id` is the application Run judged, null when there is
-/// none, as for scheduled Drift; the managed `card_uid` is the
-/// Verifier Card; the verified subject and binding owner are separate payload
-/// columns, both null for a direct Verifier run with no binding.
+/// none, as for scheduled Drift; the managed `card_uid` is the Card verified.
+/// The Verifier Card is the `verifier_card_uid` payload column; the binding
+/// owner is `owner_card_uid`, null for a direct Verifier run with no binding.
+/// The managed `sub_principal_id`/`act_principal_id` pair records whom the run
+/// served and who executed it.
 pub struct ResultsTable;
 
 /// Typed `DriftReport` column: method, open per-feature reports, and verdict.
@@ -83,7 +85,7 @@ impl DomainTable for ResultsTable {
     const NAMESPACE: &'static str = "verification";
     /// Table segment of the fixed `vala.verification.results` FQN.
     const NAME: &'static str = "results";
-    /// The server appends and stamps the managed judged-Run `run_id`, Verifier `card_uid`, and `principal_id`.
+    /// The server appends and stamps the managed judged-Run `run_id`, verified `card_uid`, and subject/actor pair.
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     /// The implementation summaries make projecting this table require the elevated payload permission.
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
@@ -102,8 +104,7 @@ impl DomainTable for ResultsTable {
             utf8("verdict", false),
             utf8("verifier_version", false),
             utf8("owner_card_uid", true),
-            utf8("subject_card_uid", false),
-            utf8("requested_by_principal_id", true),
+            utf8("verifier_card_uid", false),
             utf8("binding_id", true),
             utf8("trigger_identity", true),
             utf8("source_record_id", true),
@@ -125,12 +126,12 @@ impl DomainTable for ResultsTable {
         ]
     }
 
-    /// Daily partitions sorted newest first, Bloom-pruned on result id, subject, and binding lookups.
+    /// Daily partitions sorted newest first, Bloom-pruned on result id, Verifier, and binding lookups.
     fn physical_layout() -> PhysicalLayoutWire {
         daily_layout(
             "ended_at",
             vec![sort_desc("ended_at")],
-            &["result_id", "subject_card_uid", "binding_id"],
+            &["result_id", "verifier_card_uid", "binding_id"],
         )
     }
 }

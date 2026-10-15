@@ -8,7 +8,7 @@ use uuid::Uuid;
 use wyrd_auth_issue::IssueError;
 use wyrd_runtime::audit::AuditStage;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -179,7 +179,7 @@ pub fn stage_scope_mint_success_audit(
     let event = auth_event(
         request_id,
         CARD_SCOPE_MINT_OPERATION,
-        PrincipalId::new(principal_id),
+        Attribution::direct(PrincipalId::new(principal_id)),
         card_principal_kind(root),
         Some(root.clone()),
         AuditOutcome::Allowed,
@@ -217,7 +217,7 @@ pub fn stage_scope_mint_failure_audit(
     let event = auth_event(
         request_id,
         CARD_SCOPE_MINT_OPERATION,
-        PLATFORM_AUDIT_PRINCIPAL,
+        Attribution::unresolved(),
         PrincipalKindTag::Service,
         Some(root.clone()),
         AuditOutcome::Denied,
@@ -493,11 +493,11 @@ mod pg_tests {
     #[tokio::test]
     async fn resolve_single_service_card_produces_own_scope() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let created_by = uuid::Uuid::new_v4();
+        let creator = uuid::Uuid::new_v4();
         let root = make_card_ref(CardKind::Service, "prod", "svc-resolve-test");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        seed_backing_card(&mut conn, &root, created_by).await;
+        seed_backing_card(&mut conn, &root, creator).await;
 
         let scope = resolve_card_ref_scope(&mut conn, &root)
             .await
@@ -513,12 +513,12 @@ mod pg_tests {
     #[tokio::test]
     async fn resolve_scope_populates_every_member_uid() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let created_by = uuid::Uuid::new_v4();
+        let creator = uuid::Uuid::new_v4();
         let root = make_card_ref(CardKind::Service, "prod", "svc-uid-root");
         let secondary = make_card_ref(CardKind::Service, "prod", "svc-uid-secondary");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        seed_backing_card(&mut conn, &secondary, created_by).await;
+        seed_backing_card(&mut conn, &secondary, creator).await;
         let root_spec = Spec::from_kind_and_value(
             &CardKind::Service,
             json!({
@@ -534,7 +534,7 @@ mod pg_tests {
             }),
         )
         .expect("root service spec decodes");
-        seed_card_with_spec(&mut conn, &root, &root_spec, created_by).await;
+        seed_card_with_spec(&mut conn, &root, &root_spec, creator).await;
 
         let expected_root_uid = get_card_by_ref(
             &mut conn,

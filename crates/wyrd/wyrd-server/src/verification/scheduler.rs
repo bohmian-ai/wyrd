@@ -2,8 +2,10 @@
 //!
 //! [`VerificationScheduler`] lists tenants with a due scheduled binding
 //! through the operator pool, then advances each tenant's due bindings one
-//! occurrence per short tenant transaction through
-//! [`VerifierRunQueue::schedule_next_due`]. The queue locks each binding with
+//! occurrence per short tenant transaction: [`VerifierRunQueue::claim_due`]
+//! decides the occurrence, [`BackgroundAuthority`] resolves the owner/SYSTEM
+//! authority a run would be accepted under, and
+//! [`VerifierRunQueue::schedule_due`] settles it. The queue locks each binding with
 //! `SKIP LOCKED` and dedupes an occurrence's run, so concurrent schedulers on
 //! many processes, duplicate ticks, and a restart mid-pass never create a
 //! second run for one occurrence.
@@ -17,6 +19,8 @@ use wyrd_sql::queries::verifier_runs::{
     QueueCounts, ScheduleOutcome, ScheduleSkip, ScheduleTick, VerifierRunQueue,
 };
 use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
+
+use super::authority::BackgroundAuthority;
 
 #[cfg(feature = "test-support")]
 use super::CapabilityCrash;
@@ -37,6 +41,8 @@ pub struct VerificationScheduler {
     operator: OperatorPool,
     /// Queue policies and transitions.
     queue: VerifierRunQueue,
+    /// Resolves the owner/SYSTEM authority each scheduled run is accepted under.
+    authority: BackgroundAuthority,
     /// Idle wait between passes.
     poll_interval: Duration,
     /// Test-only crash switch.
@@ -45,8 +51,8 @@ pub struct VerificationScheduler {
 }
 
 impl VerificationScheduler {
-    /// Build a scheduler over the Wyrd Postgres owner, the operator pool, and
-    /// the queue.
+    /// Build a scheduler over the Wyrd Postgres owner, the operator pool, the
+    /// queue, and the background authority resolver.
     ///
     /// The scheduler carries no clock: every due decision is PostgreSQL's, and
     /// `poll_interval` is only this process's idle wait between passes.
@@ -55,12 +61,14 @@ impl VerificationScheduler {
         postgres: WyrdPostgres,
         operator: OperatorPool,
         queue: VerifierRunQueue,
+        authority: BackgroundAuthority,
         poll_interval: Duration,
     ) -> Self {
         Self {
             postgres,
             operator,
             queue,
+            authority,
             poll_interval,
             #[cfg(feature = "test-support")]
             crash: None,
@@ -174,8 +182,15 @@ impl VerificationScheduler {
         for _ in 0..TICKS_PER_TENANT {
             let applied = async {
                 let mut conn = self.postgres.tenant_conn(tenant).await?;
-                let tick = self.queue.schedule_next_due(&mut conn).await?;
-                Ok::<_, SqlError>(tick.map(|tick| (conn, tick)))
+                let Some(due) = self.queue.claim_due(&mut conn).await? else {
+                    return Ok::<_, SqlError>(None);
+                };
+                let authority = match due.owner() {
+                    Some(owner) => self.authority.resolve(&mut conn, owner).await?,
+                    None => None,
+                };
+                let tick = self.queue.schedule_due(&mut conn, due, authority).await?;
+                Ok(Some((conn, tick)))
             };
             let applied = tokio::select! {
                 biased;
@@ -236,6 +251,7 @@ const fn tick_label(outcome: ScheduleOutcome) -> &'static str {
         ScheduleOutcome::AlreadyEnqueued(_) => "already_enqueued",
         ScheduleOutcome::Skipped(ScheduleSkip::Missed) => "missed",
         ScheduleOutcome::Skipped(ScheduleSkip::Inactive) => "inactive",
+        ScheduleOutcome::Skipped(ScheduleSkip::AuthorityUnavailable) => "authority_unavailable",
         ScheduleOutcome::Skipped(ScheduleSkip::Refused(_)) => "refused",
         ScheduleOutcome::Skipped(ScheduleSkip::InvalidSchedule) => "invalid_schedule",
     }

@@ -30,7 +30,7 @@ use wyrd_gateway::{
 use wyrd_runtime::principal::CardAttribution;
 use wyrd_runtime::{Permission, PermissionDenyReason, Principal};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::GatewayAccess;
+use wyrd_spec::auth::{Attribution, GatewayAccess};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
     GatewayAccountingEntryV1, GatewayCallId, GatewayCallOutcome, GatewayCaptureMode,
@@ -201,8 +201,10 @@ struct AdmittedCall {
     call_id: GatewayCallId,
     /// Verified tenant.
     tenant: DataTenantId,
-    /// Verified caller.
+    /// Verified subject.
     principal: Principal,
+    /// Subject and actor pair the call's ledger entry and capture record.
+    attribution: Attribution,
     /// Request that admitted the call, carried into its capture.
     request_id: RequestId,
     /// Immutable admitted configuration.
@@ -237,6 +239,7 @@ impl AdmittedCall {
             call_id: self.call_id,
             tenant: self.tenant,
             principal: &self.principal,
+            attribution: self.attribution,
             governance: &self.snapshot.governance,
             usage_bound: self.usage_bound.as_deref(),
             admitted_at: self.admitted_at,
@@ -500,6 +503,7 @@ impl<'a> GatewayInvocation<'a> {
             call_id,
             tenant,
             principal: caller.principal.clone(),
+            attribution: caller.attribution(),
             request_id: caller.request_id.clone(),
             snapshot,
             body: request.body,
@@ -887,7 +891,7 @@ impl<'a> GatewayInvocation<'a> {
         Some(CallFacts {
             call_id: call.call_id,
             tenant: call.tenant,
-            caller: call.principal.id,
+            attribution: call.attribution,
             request_id: call.request_id.clone(),
             operation,
             ingress,

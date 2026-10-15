@@ -7,17 +7,17 @@
 //! certificate. That admits a trusted cluster process, not a tenant: the
 //! request names its tenant and destination explicitly and carries no token.
 //! The service accepts only the audit log, the two capture destinations, and
-//! the three Verifier result tables, a result batch only with its Verifier
-//! attribution, a requesting principal only on a span batch, and the reserved
-//! system tenant only for audit history, then
-//! submits through the same frame the in-process Scribe outbox route uses.
+//! the three Verifier result tables, each with the subject and actor its rows
+//! are stamped with, and the reserved system tenant only for audit history,
+//! then submits through the same frame the in-process Scribe outbox route
+//! uses.
 
 use std::sync::Arc;
 
 use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::gate::IngestError;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_spec::request_id::RequestId;
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_server::{
@@ -25,7 +25,7 @@ use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_server::{
 };
 use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, IngestCaptureResponse};
 
-use crate::scribe_outbox::{ScribeBatch, ScribeTable, VerifierAttribution};
+use crate::scribe_outbox::{ScribeBatch, ScribeTable};
 
 /// Private gRPC adapter writing peer-submitted capture into this pod's Scribe.
 pub struct ScribeCapturePeerGrpc {
@@ -50,12 +50,10 @@ impl ScribeCapturePeerGrpc {
     ///
     /// # Errors
     ///
-    /// Returns `InvalidArgument` for a malformed tenant, batch, request id,
-    /// Verifier attribution, or principal id, and `PermissionDenied` for the
-    /// reserved system tenant outside audit history, any table other than the
-    /// six server-internal destinations, a result batch without attribution,
-    /// an audit or capture batch with one, or a requesting principal on any
-    /// batch but a span batch without attribution.
+    /// Returns `InvalidArgument` for a malformed tenant, batch, request id, or
+    /// subject or actor principal id, and `PermissionDenied` for the reserved
+    /// system tenant outside audit history or any table other than the six
+    /// server-internal destinations.
     fn batch(request: IngestCaptureRequest) -> Result<ScribeBatch, Status> {
         let tenant = request
             .tenant_id
@@ -72,33 +70,17 @@ impl ScribeCapturePeerGrpc {
                 "only audit history writes the reserved system tenant",
             ));
         }
-        let verifier = match (table.is_result(), &request.verifier) {
-            (true, Some(wire)) => {
-                Some(VerifierAttribution::from_wire(wire).map_err(Status::invalid_argument)?)
-            }
-            (false, None) => None,
-            (true, None) => {
-                return Err(Status::permission_denied(
-                    "a Verifier result batch must name its Verifier and SYSTEM principal",
-                ));
-            }
-            (false, Some(_)) => {
-                return Err(Status::permission_denied(
-                    "an audit or gateway capture batch carries no Verifier attribution",
-                ));
-            }
+        let principal = |id: &str| {
+            id.parse::<PrincipalId>().map_err(|_| {
+                Status::invalid_argument(
+                    "capture sub_principal_id or act_principal_id is not a principal id",
+                )
+            })
         };
-        let principal = match request.principal_id.as_str() {
-            "" => None,
-            _ if table != ScribeTable::Spans || verifier.is_some() => {
-                return Err(Status::permission_denied(
-                    "only a server-span batch names a requesting principal",
-                ));
-            }
-            id => Some(id.parse::<PrincipalId>().map_err(|_| {
-                Status::invalid_argument("capture principal_id is not a principal id")
-            })?),
-        };
+        let attribution = Attribution::new(
+            principal(&request.sub_principal_id)?,
+            principal(&request.act_principal_id)?,
+        );
         let batch_id = request
             .batch_id
             .parse::<uuid::Uuid>()
@@ -113,8 +95,7 @@ impl ScribeCapturePeerGrpc {
             batch_id,
             request_id,
             ipc: request.arrow_ipc,
-            verifier,
-            principal,
+            attribution,
         })
     }
 }
@@ -148,46 +129,31 @@ mod tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_tonic::tonic::{Code, Request};
+    use wyrd_tonic::wyrd::v1::IngestCaptureRequest;
     use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_server::ScribeCapturePeerService;
-    use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, VerifierResultAttribution};
 
     use super::ScribeCapturePeerGrpc;
     use crate::components::gateway::recording::RecordingScribe;
 
     /// A well-formed request for `tenant` naming `table`, attributed to a
-    /// Verifier exactly when `table` is a result table.
+    /// fresh subject and actor.
     fn request(tenant: DataTenantId, table: &str) -> IngestCaptureRequest {
-        let result = table.starts_with("vala.verification.")
-            || table.ends_with(".result_features")
-            || table.ends_with(".result_items");
         IngestCaptureRequest {
             tenant_id: tenant.to_string(),
             table: table.to_owned(),
             batch_id: uuid::Uuid::now_v7().to_string(),
             request_id: RequestId::now_v7().as_str().to_owned(),
             arrow_ipc: Bytes::new(),
-            verifier: result.then(attribution),
-            principal_id: String::new(),
-        }
-    }
-
-    /// A well-formed Verifier result attribution.
-    fn attribution() -> VerifierResultAttribution {
-        VerifierResultAttribution {
-            verifier_ref: "default/Verifier/drift-check@1.0.0".to_owned(),
-            verifier_uid: uuid::Uuid::now_v7().to_string(),
-            principal_id: uuid::Uuid::now_v7().to_string(),
+            sub_principal_id: uuid::Uuid::now_v7().to_string(),
+            act_principal_id: uuid::Uuid::now_v7().to_string(),
         }
     }
 
     /// Proves the peer service accepts exactly the audit log (for a tenant or
-    /// the system owner) and the two capture destinations without attribution
-    /// and the three Verifier result tables with it, and refuses the reserved
-    /// system tenant elsewhere, every other table, a result batch without its
-    /// attribution, a capture batch with one, a reference to a non-Verifier
-    /// Card, a requesting principal on anything but a span batch, and
-    /// malformed ids, all before any Scribe work. A span batch carries its
-    /// requesting principal through.
+    /// the system owner), the two capture destinations, and the three
+    /// Verifier result tables, each carrying the sent subject and actor
+    /// through, and refuses the reserved system tenant elsewhere, every other
+    /// table, and malformed ids, all before any Scribe work.
     ///
     /// # Panics
     ///
@@ -200,33 +166,20 @@ mod tests {
             (DataTenantId::SYSTEM_OWNER, "vala.system.audit_log"),
             (tenant, "vala.gateway.calls"),
             (tenant, "vala.traces.spans"),
-        ] {
-            let batch = ScribeCapturePeerGrpc::batch(request(tenant, table)).expect("accepted");
-            assert_eq!((batch.tenant, batch.table.fqn()), (tenant, table));
-            assert!(batch.verifier.is_none());
-            assert!(batch.principal.is_none());
-        }
-        let requester = uuid::Uuid::now_v7().to_string();
-        let batch = ScribeCapturePeerGrpc::batch(IngestCaptureRequest {
-            principal_id: requester.clone(),
-            ..request(tenant, "vala.traces.spans")
-        })
-        .expect("a span batch names its requesting principal");
-        assert_eq!(batch.principal.map(|id| id.to_string()), Some(requester));
-        for table in [
-            "vala.verification.results",
-            "vala.drift.result_features",
-            "vala.eval.result_items",
+            (tenant, "vala.verification.results"),
+            (tenant, "vala.drift.result_features"),
+            (tenant, "vala.eval.result_items"),
         ] {
             let wire = request(tenant, table);
-            let sent = wire.verifier.clone().expect("attributed");
+            let sent = (wire.sub_principal_id.clone(), wire.act_principal_id.clone());
             let batch = ScribeCapturePeerGrpc::batch(wire).expect("accepted");
             assert_eq!((batch.tenant, batch.table.fqn()), (tenant, table));
-            let attribution = batch.verifier.expect("result batches carry attribution");
-            assert_eq!(attribution.principal.to_string(), sent.principal_id);
             assert_eq!(
-                attribution.verifier.uid.map(|uid| uid.to_string()),
-                Some(sent.verifier_uid)
+                (
+                    batch.attribution.sub_principal_id.to_string(),
+                    batch.attribution.act_principal_id.to_string()
+                ),
+                sent
             );
         }
         let refusals = [
@@ -239,68 +192,20 @@ mod tests {
                 Code::PermissionDenied,
             ),
             (
-                IngestCaptureRequest {
-                    verifier: Some(attribution()),
-                    ..request(tenant, "vala.system.audit_log")
-                },
-                Code::PermissionDenied,
-            ),
-            (
                 request(tenant, "vala.drift.observations"),
                 Code::PermissionDenied,
             ),
             (request(tenant, "user.events"), Code::PermissionDenied),
             (
                 IngestCaptureRequest {
-                    verifier: None,
-                    ..request(tenant, "vala.verification.results")
-                },
-                Code::PermissionDenied,
-            ),
-            (
-                IngestCaptureRequest {
-                    verifier: Some(attribution()),
+                    sub_principal_id: String::new(),
                     ..request(tenant, "vala.gateway.calls")
-                },
-                Code::PermissionDenied,
-            ),
-            (
-                IngestCaptureRequest {
-                    verifier: Some(VerifierResultAttribution {
-                        verifier_ref: "default/Service/checkout@1.0.0".to_owned(),
-                        ..attribution()
-                    }),
-                    ..request(tenant, "vala.verification.results")
                 },
                 Code::InvalidArgument,
             ),
             (
                 IngestCaptureRequest {
-                    verifier: Some(VerifierResultAttribution {
-                        verifier_uid: String::new(),
-                        ..attribution()
-                    }),
-                    ..request(tenant, "vala.eval.result_items")
-                },
-                Code::InvalidArgument,
-            ),
-            (
-                IngestCaptureRequest {
-                    principal_id: uuid::Uuid::now_v7().to_string(),
-                    ..request(tenant, "vala.gateway.calls")
-                },
-                Code::PermissionDenied,
-            ),
-            (
-                IngestCaptureRequest {
-                    principal_id: uuid::Uuid::now_v7().to_string(),
-                    ..request(tenant, "vala.verification.results")
-                },
-                Code::PermissionDenied,
-            ),
-            (
-                IngestCaptureRequest {
-                    principal_id: "not-a-principal".to_owned(),
+                    act_principal_id: "not-a-principal".to_owned(),
                     ..request(tenant, "vala.traces.spans")
                 },
                 Code::InvalidArgument,

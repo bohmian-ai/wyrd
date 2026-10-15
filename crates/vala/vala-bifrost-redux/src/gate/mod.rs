@@ -277,8 +277,9 @@ pub trait GateAudit: Send + Sync {
 impl<T: AuditStage> GateAudit for T {
     /// Stages the decision for the caller's tenant.
     ///
-    /// The row is attributed to the verified principal — the subject a
-    /// delegated token acts for — and the credential it authenticated with,
+    /// The row is attributed to the verified subject/actor pair — the
+    /// principal a delegated token acts for and its current actor — and the
+    /// credential the principal authenticated with,
     /// when it has one, and, when the token carries a non-empty
     /// delegation chain, names its actors through the same
     /// [`AuditDetail::DelegationAttribution`] projection HTTP and Oracle audit
@@ -290,7 +291,7 @@ impl<T: AuditStage> GateAudit for T {
             "bifrost.record.write".to_owned(),
             resource.to_owned(),
             auth.principal.card_ref().cloned(),
-            auth.principal.id,
+            auth.attribution(),
             auth.principal.kind.tag(),
             "bifrost:record:write".to_owned(),
             outcome,
@@ -984,6 +985,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         scribe
             .ingest_frame(ScribeIngressFrame {
                 principal: auth.principal.clone(),
+                attribution: auth.attribution(),
                 authenticated_tenant: auth.tenant,
                 attributed_cards,
                 table,
@@ -1068,6 +1070,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             .map(|hook| (Arc::clone(hook), frame.arrow_ipc.clone()));
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
+            attribution: auth.attribution(),
             authenticated_tenant: auth.tenant,
             attributed_cards,
             table,
@@ -2364,6 +2367,7 @@ mod tests {
             auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
             permission: wyrd_runtime::Permission::bifrost_query_read(),
             delegation_chain: auth.delegation_chain,
+            served_subject: None,
         }
     }
 

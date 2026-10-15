@@ -16,7 +16,7 @@ use wyrd_sql::TenantConn;
 /// # Panics
 ///
 /// Panics if a fixture spec literal fails to decode or the seed write fails.
-pub async fn seed_backing_card(conn: &mut TenantConn<'_>, card_ref: &CardRef, created_by: Uuid) {
+pub async fn seed_backing_card(conn: &mut TenantConn<'_>, card_ref: &CardRef, creator: Uuid) {
     let spec = match &card_ref.kind {
         CardKind::Service => Spec::from_kind_and_value(&CardKind::Service, serde_json::json!({}))
             .expect("service fixture spec decodes"),
@@ -34,7 +34,7 @@ pub async fn seed_backing_card(conn: &mut TenantConn<'_>, card_ref: &CardRef, cr
         .expect("agent fixture spec decodes"),
         other => panic!("seed_backing_card: unsupported card kind {other:?}"),
     };
-    seed_card_with_spec(conn, card_ref, &spec, created_by).await;
+    seed_card_with_spec(conn, card_ref, &spec, creator).await;
 }
 
 /// Insert a card row for `card_ref` using the provided `spec`.
@@ -48,7 +48,7 @@ pub async fn seed_card_with_spec(
     conn: &mut TenantConn<'_>,
     card_ref: &CardRef,
     spec: &Spec,
-    created_by: Uuid,
+    creator: Uuid,
 ) {
     let (spec_hash, _) = spec
         .canonical_hash_with_bytes()
@@ -59,11 +59,12 @@ pub async fn seed_card_with_spec(
         r"
         INSERT INTO wyrd.cards (
             card_uid, data_tenant_id, kind, space, name, version, spec,
-            spec_hash, artifact_hash, labels, annotations, status, created_by
+            spec_hash, artifact_hash, labels, annotations, status,
+            sub_principal_id, act_principal_id
         )
         VALUES (
             $1, wyrd.current_tenant(), $2, $3, $4, $5, $6,
-            $7, NULL, '{}'::jsonb, '{}'::jsonb, 'active', $8
+            $7, NULL, '{}'::jsonb, '{}'::jsonb, 'active', $8, $8
         )
         ON CONFLICT (data_tenant_id, kind, space, name, version)
             WHERE status NOT IN ('deleted', 'failed', 'expired') DO NOTHING
@@ -82,7 +83,7 @@ pub async fn seed_card_with_spec(
     .bind(card_ref.version.as_str())
     .bind(spec_json)
     .bind(spec_hash.as_str())
-    .bind(created_by)
+    .bind(creator)
     .execute(&mut **conn.transaction())
     .await
     .expect("fixture card inserts");

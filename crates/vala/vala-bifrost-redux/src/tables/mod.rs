@@ -1236,7 +1236,7 @@ mod tests {
     use fields::{boolean, float64, int32, int64, ts_us_utc, utf8};
     use wyrd_queue::variant::VariantViolation;
     use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
-    use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
+    use wyrd_spec::vala::{ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT};
     use wyrd_types::variant::variant_field;
 
     /// The registry owns three `OTel` signal tables and no removed physical name.
@@ -1448,7 +1448,7 @@ mod tests {
                 columns: vec![
                     utf8("result_id", false),
                     utf8("owner_card_uid", true),
-                    utf8("subject_card_uid", false),
+                    utf8("verifier_card_uid", false),
                     utf8("binding_id", true),
                     ts_us_utc("window_start", false),
                     ts_us_utc("window_end", false),
@@ -1466,7 +1466,7 @@ mod tests {
                 columns: vec![
                     utf8("result_id", false),
                     utf8("owner_card_uid", true),
-                    utf8("subject_card_uid", false),
+                    utf8("verifier_card_uid", false),
                     utf8("binding_id", true),
                     utf8("source_record_id", false),
                     utf8("task_id", false),
@@ -1501,8 +1501,7 @@ mod tests {
                 utf8("verdict", false),
                 utf8("verifier_version", false),
                 utf8("owner_card_uid", true),
-                utf8("subject_card_uid", false),
-                utf8("requested_by_principal_id", true),
+                utf8("verifier_card_uid", false),
                 utf8("binding_id", true),
                 utf8("trigger_identity", true),
                 utf8("source_record_id", true),
@@ -1538,7 +1537,7 @@ mod tests {
                 ),
                 variant_field("assertion_result", true),
             ],
-            blooms: &["result_id", "subject_card_uid", "binding_id"],
+            blooms: &["result_id", "verifier_card_uid", "binding_id"],
         }
     }
 
@@ -1547,7 +1546,7 @@ mod tests {
     ///
     /// This is the `CorrelationPolicy::Observation` envelope the Bifrost design
     /// fixes for every table: nullable `run_id` and `card_uid`, the required
-    /// publisher `principal_id`, and the required request and ingestion-time
+    /// `sub_principal_id`/`act_principal_id` pair, and the required request and ingestion-time
     /// columns. The tenant is a property of
     /// the physical table and of each Parquet footer, never a row column, and
     /// Bifrost stamps no per-row position.
@@ -1555,7 +1554,8 @@ mod tests {
         vec![
             utf8(RUN_ID, true),
             utf8(CARD_UID, true),
-            utf8(PRINCIPAL_ID, false),
+            utf8(SUB_PRINCIPAL_ID, false),
+            utf8(ACT_PRINCIPAL_ID, false),
             utf8(wyrd_spec::vala::WYRD_REQUEST_ID, false),
             ts_us_utc(WYRD_INGESTED_AT, false),
         ]
@@ -1606,7 +1606,7 @@ mod tests {
             assert_eq!(
                 definition.correlation_policy,
                 CorrelationPolicy::Observation,
-                "vala.{namespace}.{name} appends run_id, card_uid, and principal_id"
+                "vala.{namespace}.{name} appends run_id, card_uid, and the subject/actor pair"
             );
 
             let layout = (definition.physical_layout)();
@@ -1704,7 +1704,8 @@ mod tests {
             ),
             Field::new(RUN_ID, DataType::Utf8, true),
             Field::new(CARD_UID, DataType::Utf8, true),
-            Field::new(PRINCIPAL_ID, DataType::Utf8, true),
+            Field::new(SUB_PRINCIPAL_ID, DataType::Utf8, true),
+            Field::new(ACT_PRINCIPAL_ID, DataType::Utf8, true),
             Field::new("customer", DataType::Utf8, true),
         ]);
         let table = "vala.datasets.dynamic";
@@ -1928,7 +1929,7 @@ mod tests {
                         sort_asc(RUN_ID),
                         sort_asc("customer"),
                         sort_asc(CARD_UID),
-                        sort_asc(PRINCIPAL_ID),
+                        sort_asc(SUB_PRINCIPAL_ID),
                     ],
                     bloom_columns: Vec::new(),
                 },

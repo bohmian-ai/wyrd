@@ -87,6 +87,7 @@ pub(crate) async fn register_table(
             table: table_ref.clone(),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await

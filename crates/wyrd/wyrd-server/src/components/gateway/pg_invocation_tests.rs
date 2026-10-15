@@ -184,6 +184,7 @@ fn invoker(
         ),
         request_id: RequestId::now_v7(),
         delegation_chain: Vec::new(),
+        executed_by: None,
     }
 }
 
@@ -1247,6 +1248,7 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
         call_id: GatewayCallId::new_v7(),
         tenant,
         principal: &caller.principal,
+        attribution: caller.attribution(),
         governance: &snapshot.governance,
         usage_bound: Some(&usage_bound),
         admitted_at,
@@ -1389,6 +1391,7 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
             call_id: GatewayCallId::new_v7(),
             tenant,
             principal: &caller.principal,
+            attribution: caller.attribution(),
             governance: &snapshot.governance,
             usage_bound: Some(&usage_bound),
             admitted_at,
@@ -3443,6 +3446,7 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
         .ensure_builtin(
             tenant,
             vala_bifrost_redux::tables::builtin_table("gateway", "calls").expect("built-in table"),
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await
         .expect("the calls table registers");
@@ -3765,6 +3769,7 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
         .ensure_builtin(
             tenant,
             vala_bifrost_redux::tables::builtin_table("gateway", "calls").expect("built-in table"),
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await
         .expect("the calls table registers");

@@ -226,6 +226,7 @@ impl ScheduledQueryCaller {
             principal: self.context.principal.clone(),
             request_id: self.context.request_id.clone(),
             delegation_chain: self.context.delegation_chain.clone(),
+            executed_by: None,
         };
         QueryAuthority::new(&self.state, &caller, "vala.query.sync", "vala.query")
             .record_object_denial(denial)

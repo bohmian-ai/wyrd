@@ -211,7 +211,7 @@ mod pg_tests {
                 .as_str()
                 .ok_or("query example has sql")?
                 .replace("<custom_table>", &self.table)
-                .replace("<subject_card_uid>", "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
+                .replace("<card_uid>", "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
                 .replace("<result_id>", "guide-absent-result")
                 .replace("<trace_id>", &trace_id);
             arguments["sql"] = json!(sql);
@@ -303,6 +303,7 @@ mod pg_tests {
                     false,
                 )],
                 tenant: foreign_tenant,
+                attribution: wyrd_spec::auth::Attribution::unresolved(),
                 physical_layout: None,
             })
             .await?;

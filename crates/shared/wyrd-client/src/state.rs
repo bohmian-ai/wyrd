@@ -348,9 +348,9 @@ const ROOT_ALIAS: &str = "root";
 #[derive(Debug)]
 pub(crate) struct BoundVerifier<'a> {
     /// The exact Verifier Card version.
-    pub(crate) verifier_uid: CardUid,
+    pub(crate) verifier_card_uid: CardUid,
     /// The exact subject Card version it judges.
-    pub(crate) subject_uid: CardUid,
+    pub(crate) card_uid: CardUid,
     /// The Verifier's Drift or Eval implementation, which fixes its input shape.
     pub(crate) implementation: &'a VerifierImplementation,
 }
@@ -639,8 +639,8 @@ impl WyrdState {
                 ));
             };
             return Ok(BoundVerifier {
-                verifier_uid: required_uid(verifier_ref)?,
-                subject_uid: required_uid(subject)?,
+                verifier_card_uid: required_uid(verifier_ref)?,
+                card_uid: required_uid(subject)?,
                 implementation: &spec.implementation,
             });
         }

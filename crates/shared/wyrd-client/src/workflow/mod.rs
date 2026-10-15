@@ -20,6 +20,7 @@ use tokio::task::JoinError;
 use wyrd_loader::LoadedTree;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 
 use crate::WyrdClient;
 use crate::cards::{CardGraphHydrator, CardSelector, Cards, RegistryContext, WorkflowBodies};
@@ -49,6 +50,10 @@ pub struct Workflow {
     /// credential for a client-less `wyrd_gateway` step; the process
     /// environment for every public constructor.
     environment: Environment,
+    /// The registered root Workflow Card's UID, which `wyrd_gateway` calls
+    /// carry as their Card subject; `None` for an authored or parsed Workflow,
+    /// which has no registered identity.
+    card_uid: Option<CardUid>,
 }
 
 impl Workflow {
@@ -174,6 +179,7 @@ impl Workflow {
             inner,
             client,
             environment: Environment::Process,
+            card_uid: None,
         })
     }
 
@@ -270,7 +276,7 @@ impl Workflow {
         .await
         .map_err(|error| blocking_task_failed("workflow_local_setup", &error))??;
         let dependencies = routes
-            .dependencies(native.clone(), &config, gateway)
+            .dependencies(native.clone(), &config, gateway, self.card_uid.as_ref())
             .await?;
         self.inner
             .run_with_options(&dependencies, input, WorkflowRunOptions::default())
@@ -433,6 +439,7 @@ impl From<SkaldWorkflow> for Workflow {
             inner,
             client: None,
             environment: Environment::Process,
+            card_uid: None,
         }
     }
 }
@@ -498,13 +505,15 @@ impl WorkflowCards<'_> {
                 details: serde_json::json!({ "field": "kind" }),
             });
         }
-        let inner = CardGraphHydrator::new(RegistryContext::new(Arc::clone(&self.cards.engine)))
-            .load_workflow(selector)
-            .await?;
+        let (inner, card_uid) =
+            CardGraphHydrator::new(RegistryContext::new(Arc::clone(&self.cards.engine)))
+                .load_workflow(selector)
+                .await?;
         Ok(Workflow {
             inner,
             client: Some(self.cards.engine.client.clone()),
             environment: Environment::Process,
+            card_uid,
         })
     }
 }
@@ -765,7 +774,7 @@ mod tests {
         config: &LocalWorkflowConfig,
     ) -> WorkflowResult<WorkflowRun> {
         let dependencies = SelectedRoutes::of(workflow.as_skald().spec())
-            .dependencies(ProviderRegistry::new(), config, None)
+            .dependencies(ProviderRegistry::new(), config, None, None)
             .await?;
         let input = serde_json::Map::from_iter([("code".to_owned(), json!("diff"))]);
         workflow
@@ -918,6 +927,7 @@ mod tests {
             inner: loaded.into_skald(),
             client: Some(bearer_client(&wyrd.uri())),
             environment: Environment::from([]),
+            card_uid: None,
         };
         let input = serde_json::Map::from_iter([("code".to_owned(), json!("diff"))]);
         let run = gateway

@@ -5,9 +5,9 @@
 //! `vala.eval.result_items`, taken from the tables' own declarations so the
 //! payload can never drift from the registered contract. Every batch also
 //! carries the two correlation columns Scribe admits from a native payload:
-//! `card_uid` (the Verifier, authorized against the frame principal's Verifier scope)
-//! and `run_id` (the application Run judged, null when none, as for scheduled
-//! Drift).
+//! `card_uid` (the Card verified; the Verifier is the authored
+//! `verifier_card_uid`) and `run_id` (the application Run judged, null when
+//! none, as for scheduled Drift).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,7 +31,6 @@ use vala_bifrost_redux::tables::{DomainTable, ResultFeaturesTable, ResultItemsTa
 use vala_drift::{DriftReport, DriftVerdict};
 use vala_eval::executor::{EvalReport, EvalWorkflowSummary, SkipReason, TaskRunOutcome};
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
-use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::UTC_TIME_ZONE;
@@ -145,13 +144,8 @@ pub struct ResultRun<'a> {
     pub run_id: Option<&'a RunId>,
     /// Exact Verifier Card version used.
     pub verifier_version: &'a str,
-    /// Verified subject Card.
-    pub subject_card_uid: &'a CardUid,
-    /// The execution's actor, stored as `requested_by_principal_id`: a
-    /// direct execution's caller, or a claimed run's frozen actor (a manual
-    /// run's caller, or the tenant SYSTEM principal of internal work);
-    /// `None` when an internal run's tenant had no SYSTEM principal.
-    pub requested_by: Option<PrincipalId>,
+    /// The Card verified, stored as the managed `card_uid`.
+    pub card_uid: &'a CardUid,
     /// Binding owner; `None` for a direct run.
     pub owner_card_uid: Option<&'a CardUid>,
     /// Binding; `None` for a direct run.
@@ -170,8 +164,7 @@ impl<'a> ResultRun<'a> {
         Self {
             run_id,
             verifier_version: &run.verifier_version,
-            subject_card_uid: &run.subject_card_uid,
-            requested_by: run.requested_by,
+            card_uid: &run.card_uid,
             owner_card_uid: run.owner_card_uid.as_ref(),
             binding_id: run.binding_id,
             trigger: run.trigger.as_ref(),
@@ -189,7 +182,7 @@ impl<'a> ResultRun<'a> {
 pub struct ResultPayloadBuilder<'a> {
     /// The run whose frozen identities and input the rows record.
     run: ResultRun<'a>,
-    /// The Verifier's UID, authorized by Scribe against the frame's Card scope.
+    /// The Verifier's UID, recorded as `verifier_card_uid`.
     verifier_uid: &'a CardUid,
     /// The new result's identity.
     result_id: VerificationResultId,
@@ -321,12 +314,8 @@ impl<'a> ResultPayloadBuilder<'a> {
             ("verifier_version", text([Some(self.run.verifier_version)])),
             ("owner_card_uid", text([self.owner()])),
             (
-                "subject_card_uid",
-                text([Some(self.run.subject_card_uid.to_string())]),
-            ),
-            (
-                "requested_by_principal_id",
-                text([self.run.requested_by.map(|principal| principal.to_string())]),
+                "verifier_card_uid",
+                text([Some(self.verifier_uid.as_str())]),
             ),
             ("binding_id", text([self.binding()])),
             ("trigger_identity", text([trigger])),
@@ -373,11 +362,8 @@ impl<'a> ResultPayloadBuilder<'a> {
                 text(std::iter::repeat_n(self.owner(), rows)),
             ),
             (
-                "subject_card_uid",
-                text(std::iter::repeat_n(
-                    Some(self.run.subject_card_uid.to_string()),
-                    rows,
-                )),
+                "verifier_card_uid",
+                text(std::iter::repeat_n(Some(self.verifier_uid.as_str()), rows)),
             ),
             (
                 "binding_id",
@@ -460,11 +446,8 @@ impl<'a> ResultPayloadBuilder<'a> {
                 text(std::iter::repeat_n(self.owner(), rows)),
             ),
             (
-                "subject_card_uid",
-                text(std::iter::repeat_n(
-                    Some(self.run.subject_card_uid.to_string()),
-                    rows,
-                )),
+                "verifier_card_uid",
+                text(std::iter::repeat_n(Some(self.verifier_uid.as_str()), rows)),
             ),
             (
                 "binding_id",
@@ -606,7 +589,7 @@ impl<'a> ResultPayloadBuilder<'a> {
             Field::new(RUN_ID, DataType::Utf8, true),
         ]);
         arrays.push(text(std::iter::repeat_n(
-            Some(self.verifier_uid.as_str()),
+            Some(self.run.card_uid.as_str()),
             rows,
         )));
         arrays.push(text(std::iter::repeat_n(
@@ -879,8 +862,7 @@ mod tests {
             ResultRun {
                 run_id: Some(&self.run_id),
                 verifier_version: "1.2.0",
-                subject_card_uid: &self.subject,
-                requested_by: None,
+                card_uid: &self.subject,
                 owner_card_uid: Some(&self.owner),
                 binding_id: Some(self.binding),
                 trigger: Some(&self.trigger),
@@ -1061,6 +1043,10 @@ mod tests {
                 );
                 assert_eq!(
                     cell(batch, CARD_UID, row).as_deref(),
+                    Some(run.subject.as_str())
+                );
+                assert_eq!(
+                    cell(batch, "verifier_card_uid", row).as_deref(),
                     Some(run.verifier.as_str())
                 );
             }
@@ -1261,13 +1247,11 @@ mod tests {
             started_at: at(11),
             duration_ms: 3,
         };
-        let requester = PrincipalId::new(uuid::Uuid::now_v7());
         let payload = ResultPayloadBuilder::new(
             ResultRun {
                 run_id: Some(&application),
                 verifier_version: "1.0.0",
-                subject_card_uid: &subject,
-                requested_by: Some(requester),
+                card_uid: &subject,
                 owner_card_uid: None,
                 binding_id: None,
                 trigger: None,
@@ -1293,14 +1277,13 @@ mod tests {
             ("execution_status", Some("completed".to_owned())),
             ("verdict", Some("failed".to_owned())),
             ("verifier_version", Some("1.0.0".to_owned())),
-            ("subject_card_uid", Some(subject.to_string())),
-            ("requested_by_principal_id", Some(requester.to_string())),
+            ("verifier_card_uid", Some(verifier.to_string())),
             ("owner_card_uid", None),
             ("binding_id", None),
             ("trigger_identity", None),
             ("source_record_id", Some(application.as_str().to_owned())),
             (RUN_ID, Some(application.as_str().to_owned())),
-            (CARD_UID, Some(verifier.to_string())),
+            (CARD_UID, Some(subject.to_string())),
         ] {
             assert_eq!(cell(row, column, 0), expected, "{column}");
         }

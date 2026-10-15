@@ -714,6 +714,7 @@ impl ScribeImpl {
             ScribeIngressFrame {
                 attributed_cards: None,
                 authenticated_tenant: frame.principal.tenant_id,
+                attribution: wyrd_spec::auth::Attribution::direct(frame.principal.id),
                 principal: frame.principal,
                 table: frame.table,
                 expected_schema_fingerprint: Some(frame.expected_schema_fingerprint),

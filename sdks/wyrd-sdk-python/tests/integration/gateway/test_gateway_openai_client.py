@@ -116,7 +116,7 @@ def test_openai_client_reaches_the_backend_through_the_server(
     rows = calls(
         server,
         "ingress_dialect = 'openai_chat_completions'",
-        "caller_principal_id, usage, streaming, outcome",
+        "sub_principal_id, usage, streaming, outcome",
     )
 
     assert (completion.choices[0].message.content, completion.choices[0].finish_reason) == (
@@ -127,7 +127,7 @@ def test_openai_client_reaches_the_backend_through_the_server(
     assert chunks[-1].usage is not None
     assert [delivery.path for delivery in upstream.deliveries] == paths
     assert_upstream_credentials(upstream, *header, token)
-    assert len({row["caller_principal_id"] for row in rows} - {None}) == 1
+    assert len({row["sub_principal_id"] for row in rows} - {None}) == 1
     assert sorted(row["streaming"] for row in rows) == [False, True]
     assert {row["outcome"] for row in rows} == {"succeeded"}
     assert usage(rows) == expected_usage
@@ -269,13 +269,13 @@ def test_each_users_usage_is_recorded_under_their_principal(
         model="anthropic/claude-sonnet-5", messages=MESSAGES, max_completion_tokens=16
     )
 
-    rows = calls(server, "outcome = 'succeeded'", "caller_principal_id, requested_model, usage")
+    rows = calls(server, "outcome = 'succeeded'", "sub_principal_id, requested_model, usage")
 
-    by_caller: dict[str, list[dict[str, Any]]] = {}
+    by_subject: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        by_caller.setdefault(row["caller_principal_id"], []).append(row)
+        by_subject.setdefault(row["sub_principal_id"], []).append(row)
     assert sorted(
-        (rows[0]["requested_model"]["provider"], usage(rows)) for rows in by_caller.values()
+        (rows[0]["requested_model"]["provider"], usage(rows)) for rows in by_subject.values()
     ) == [
         ("anthropic", {("input_tokens", "5"), ("output_tokens", "3")}),
         ("openai", {("input_tokens", "11"), ("output_tokens", "4")}),

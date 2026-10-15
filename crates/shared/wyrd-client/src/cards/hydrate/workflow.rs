@@ -17,6 +17,7 @@ use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::workflow::WorkflowCard;
 use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::{CardRef, CardRefIdentity, Ref};
 use wyrd_spec::registry::CardSubmission;
 
@@ -183,7 +184,7 @@ impl CardGraphHydrator {
     }
 
     /// Read a registered Workflow and its locked Agent and Prompt closure,
-    /// then hydrate it.
+    /// then hydrate it, returning it with the root Card's registered UID.
     ///
     /// Every Card is read by exact identity along UID-bearing relationships,
     /// so later versions never float in; artifact inventories are not read.
@@ -198,7 +199,7 @@ impl CardGraphHydrator {
     pub(crate) async fn load_workflow(
         &self,
         selector: &CardSelector,
-    ) -> Result<Workflow, WyrdError> {
+    ) -> Result<(Workflow, Option<CardUid>), WyrdError> {
         let graph = self.resolve_graph(selector, GraphScope::Runtime).await?;
         let root = graph
             .cards
@@ -213,8 +214,9 @@ impl CardGraphHydrator {
             siblings: HashMap::new(),
             registered: Vec::new(),
         };
+        let uid = root.metadata.uid.clone();
         bodies.extend_registered(graph.cards)?;
-        bodies.hydrate(WorkflowCard::from_envelope(root)?)
+        Ok((bodies.hydrate(WorkflowCard::from_envelope(root)?)?, uid))
     }
 }
 

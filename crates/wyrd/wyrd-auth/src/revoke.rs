@@ -278,7 +278,7 @@ pub(crate) mod pg_tests {
             Some(&card_ref),
             "svc-revoke-service",
             None,
-            creator,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(creator)),
         )
         .await
         .expect("service account inserts");
@@ -350,7 +350,7 @@ pub(crate) mod pg_tests {
             Some(&card_ref),
             "svc-revoke-mismatch",
             None,
-            creator,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(creator)),
         )
         .await
         .expect("service account inserts");
@@ -396,7 +396,7 @@ pub(crate) mod pg_tests {
             Some(&card_ref),
             "agent-revoke-test",
             None,
-            creator,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(creator)),
         )
         .await
         .expect("agent account inserts");
@@ -434,7 +434,7 @@ pub(crate) mod pg_tests {
                 Some(&card_ref),
                 "svc-revoke-denied",
                 None,
-                creator,
+                wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(creator)),
             )
             .await
             .expect("service account inserts");

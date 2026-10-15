@@ -6,6 +6,7 @@
 
 use serde_json::Value;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_sql::{OperatorPool, TenantConn};
 
 use crate::SqlError;
@@ -18,6 +19,9 @@ use crate::row_types::oracle_reader_authority::TableAuthorityIdentity;
 // ── vala.bifrost_tables ──────────────────────────────────────────────────────
 
 /// Insert or update a Bifrost table registration for the current tenant.
+///
+/// `attribution` is the verified subject and actor registering the table; a
+/// repeat registration keeps the stored pair.
 ///
 /// Registration also writes the table's
 /// `vala.bifrost_table_maintenance_authority` row in the same transaction, so
@@ -36,12 +40,14 @@ pub async fn upsert_table(
     fqn: &str,
     fingerprint: &[u8; 32],
     physical_layout: &Value,
+    attribution: Attribution,
 ) -> Result<(), SqlError> {
     sqlx::query(
         r"
         INSERT INTO vala.bifrost_tables
-            (data_tenant_id, table_uid, fqn, fingerprint, physical_layout, origin, actor)
-        VALUES (wyrd.current_tenant(), $1, $2, $3, $4, 'system', 'system')
+            (data_tenant_id, table_uid, fqn, fingerprint, physical_layout, origin,
+             sub_principal_id, act_principal_id)
+        VALUES (wyrd.current_tenant(), $1, $2, $3, $4, 'system', $5, $6)
         ON CONFLICT (data_tenant_id, table_uid)
         DO UPDATE SET
             fqn             = EXCLUDED.fqn,
@@ -54,6 +60,8 @@ pub async fn upsert_table(
     .bind(fqn)
     .bind(fingerprint.as_slice())
     .bind(physical_layout)
+    .bind(attribution.sub_principal_id.as_uuid())
+    .bind(attribution.act_principal_id.as_uuid())
     .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
@@ -86,7 +94,8 @@ pub async fn get_by_fqn(
     sqlx::query_as::<_, BifrostTableRow>(
         r"
         SELECT data_tenant_id, table_uid, fqn, fingerprint, status,
-               physical_layout, registered_at, updated_at, origin, actor
+               physical_layout, registered_at, updated_at, origin,
+               sub_principal_id, act_principal_id
           FROM vala.bifrost_tables
          WHERE fqn = $1
         ",
@@ -136,7 +145,8 @@ pub async fn list_tables_for_tenant(
     sqlx::query_as::<_, BifrostTableRow>(
         r"
         SELECT data_tenant_id, table_uid, fqn, fingerprint, status,
-               physical_layout, registered_at, updated_at, origin, actor
+               physical_layout, registered_at, updated_at, origin,
+               sub_principal_id, act_principal_id
           FROM vala.bifrost_tables
         ",
     )

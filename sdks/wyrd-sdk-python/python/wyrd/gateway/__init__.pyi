@@ -1,5 +1,4 @@
 from ..client import WyrdClient
-from ._auth import GatewayAuth
 from ._policy import (
     ApiKeyHeaderAuth,
     BearerAuth,
@@ -292,7 +291,6 @@ __all__ = [
     "FallbackRule",
     "FallbackScope",
     "Gateway",
-    "GatewayAuth",
     "GatewayBudget",
     "GatewayBudgetPeriod",
     "GatewayCaptureMode",

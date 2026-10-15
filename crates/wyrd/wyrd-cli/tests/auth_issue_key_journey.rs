@@ -9,7 +9,9 @@
 
 use std::time::Duration;
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Method, Request, StatusCode};
+use secrecy::ExposeSecret as _;
 use tokio::time::timeout;
 
 use crate::principal_journey::{
@@ -135,6 +137,74 @@ async fn auth_issue_key_cli_journey() {
         v1_status(&server, &subject_token).await,
         StatusCode::OK,
         "issuing a key left the principal's other credentials working"
+    );
+
+    stop_served(server, shutdown, serve_handle).await;
+}
+
+/// `wyrd auth access-token` prints exactly one token the gateway accepts.
+///
+/// The command gets only an API key in `WYRD_API_KEY`, so it must exchange it
+/// to print anything. Stdout must be the token and one newline, nothing else,
+/// because `apiKeyHelper`-style tools use it verbatim; the printed token then
+/// lists models on the gateway's `GET /v1/models`.
+///
+/// # Panics
+/// Panics when bootstrap fails, the command exits non-zero or prints anything
+/// beyond one token line, or the gateway refuses the printed token.
+#[tokio::test]
+async fn auth_access_token_cli_journey() {
+    let (server, base_url, shutdown, serve_handle) = start_served("auth access-token").await;
+    let caller = server
+        .bootstrap_service("cli-access-token-caller", &["viewer"])
+        .await
+        .expect("caller bootstraps");
+    let key = caller
+        .api_key()
+        .expect("machine principal has an api key")
+        .expose_secret()
+        .to_owned();
+
+    let output = run_cli_async_with_credential(
+        vec![
+            "auth".to_owned(),
+            "access-token".to_owned(),
+            "--server".to_owned(),
+            base_url,
+        ],
+        "WYRD_API_KEY",
+        key.clone(),
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "access-token failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("the token is UTF-8");
+    let token = stdout
+        .strip_suffix('\n')
+        .unwrap_or_else(|| panic!("access-token output ends in one newline: {stdout:?}"));
+    assert!(
+        !token.is_empty() && !token.contains(char::is_whitespace) && token != key,
+        "access-token printed one exchanged token: {stdout:?}"
+    );
+
+    let models = server
+        .oneshot_authenticated(
+            token,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/models")
+                .body(Body::empty())
+                .expect("models request builds"),
+        )
+        .await
+        .expect("models call completes");
+    assert_eq!(
+        models.status(),
+        StatusCode::OK,
+        "the gateway accepts the printed token"
     );
 
     stop_served(server, shutdown, serve_handle).await;

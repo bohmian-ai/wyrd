@@ -214,7 +214,9 @@ async fn prove_remote_scalar_subquery_ships_as_a_literal() -> Result<(), PeerJou
 ///
 /// Two inputs whose row bound DataFusion cannot prove are refused the same
 /// way: a FULL JOIN of two unmatched singletons and one row under
-/// `GROUPING SETS ((x), ())` each yield two rows.
+/// `GROUPING SETS ((x), ())` each yield two rows. So is a unique grouped key
+/// compared to a value that varies by row: `x = abs(n)` keeps the groups
+/// `(1, 1)` and `(2, 2)`.
 ///
 /// # Panics
 ///
@@ -250,6 +252,8 @@ async fn prove_remote_two_row_scalar_subquery_is_refused() -> Result<(), PeerJou
     let client = public_client(tables.cluster.server(COORDINATOR)?, &api_key)?;
     let bifrost = wyrd_client::Bifrost::query_only(&client);
     let scalar = format!("(SELECT event_time FROM vala.bifrost.{pair})");
+    let keyed = "(SELECT x FROM (SELECT x, COUNT(*) n FROM (VALUES (1), (2), (2)) t(x) \
+                 GROUP BY x) g WHERE x = abs(n))";
     for sql in [
         format!(
             "SELECT id FROM vala.bifrost.{events} WHERE event_time = {scalar}",
@@ -269,6 +273,14 @@ async fn prove_remote_two_row_scalar_subquery_is_refused() -> Result<(), PeerJou
             "SELECT id, (SELECT COUNT(*) FROM (VALUES (1)) t(x) \
              GROUP BY GROUPING SETS ((x), ())) AS picked \
              FROM vala.bifrost.{events}",
+            events = tables.events
+        ),
+        format!(
+            "SELECT id, {keyed} AS picked FROM vala.bifrost.{events}",
+            events = tables.events
+        ),
+        format!(
+            "SELECT id FROM vala.bifrost.{events} WHERE id > {keyed}",
             events = tables.events
         ),
     ] {

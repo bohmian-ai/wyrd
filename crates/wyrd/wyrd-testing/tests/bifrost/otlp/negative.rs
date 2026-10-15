@@ -393,7 +393,7 @@ mod pg_tests {
     /// principal again under a different accepted `wyrd.run_id`. The replay
     /// must converge on one fence and store one row set, while each of the
     /// other two must reach its own fence and store its own rows with its own
-    /// `principal_id` and `run_id` — otherwise an acknowledgement would have
+    /// `sub_principal_id` and `run_id` — otherwise an acknowledgement would have
     /// claimed a row that was never stored under its own attribution.
     ///
     /// # Panics
@@ -430,14 +430,14 @@ mod pg_tests {
 
         let rows = journey
             .query(&format!(
-                "SELECT trace_state, principal_id, run_id FROM {SPANS_TABLE} \
+                "SELECT trace_state, sub_principal_id, run_id FROM {SPANS_TABLE} \
                  WHERE scope_name = '{NEGATIVE_TRACE_SCOPE}'"
             ))
             .await;
         let mut attributed: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
         for batch in &rows {
             let markers = support::column::<StringArray>(batch, "trace_state");
-            let principals = support::column::<StringArray>(batch, "principal_id");
+            let principals = support::column::<StringArray>(batch, "sub_principal_id");
             let runs = support::column::<StringArray>(batch, "run_id");
             for index in 0..batch.num_rows() {
                 let run = if runs.is_null(index) {

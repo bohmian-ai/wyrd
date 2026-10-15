@@ -88,9 +88,15 @@ async fn cli_gateway_agents() {
             .expect("loaded identity");
         assert_eq!(&card_ref, state.card_ref(alias).expect("alias"), "{alias}");
         assert_eq!(agent.id(), hydrated.card().name, "{alias}");
+        let loaded = agent.to_card().expect("loaded card");
+        let downloaded = hydrated.card();
         assert_eq!(
-            agent.to_card().expect("loaded card").spec,
-            hydrated.card().spec,
+            (loaded.card_ref().expect("loaded ref"), &loaded.spec.prompt),
+            (card_ref.clone(), &downloaded.spec.prompt),
+            "{alias}"
+        );
+        assert_eq!(
+            loaded.spec.execution_route, downloaded.spec.execution_route,
             "{alias}"
         );
         let native = agent.prompt().native();

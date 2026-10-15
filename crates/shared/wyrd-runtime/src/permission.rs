@@ -301,6 +301,17 @@ impl Permission {
             && self.scope.covers(&required.scope)
     }
 
+    /// True when holding `self` makes `other` redundant in a [`PermissionSet`].
+    ///
+    /// Subsumption is [`Self::covers`] except that an `all`-scoped grant never
+    /// subsumes an explicit gateway grant: `all` reaches only `open`
+    /// deployments, while the explicit grant is the only one reaching a
+    /// `granted` deployment. Requirement matching still uses `covers`.
+    #[must_use]
+    pub fn subsumes(&self, other: &Permission) -> bool {
+        self.covers(other) && !(self.scope == PermissionScope::All && other.scope.is_gateway())
+    }
+
     /// Rejects a permission whose object scope cannot apply to its operation.
     ///
     /// Bifrost object scope is meaningful only for Bifrost query reads and
@@ -850,6 +861,17 @@ fn parse_action(value: &str) -> Result<Action, PermissionParseError> {
     })
 }
 
+/// Two permission sets whose exact shared authority no permission can state.
+///
+/// Delegation refuses on this rather than signing a token that widens either
+/// party or drops authority both hold.
+#[derive(Debug, thiserror::Error)]
+#[error("shared authority for {permission} depends on deployment access and cannot be represented")]
+pub struct UnrepresentableIntersection {
+    /// The gateway grant one side holds only through `all`.
+    pub permission: Permission,
+}
+
 /// Subsumption-aware permission collection.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -863,11 +885,14 @@ impl PermissionSet {
     }
 
     /// Insert one permission while keeping the set minimal.
+    ///
+    /// A grant is dropped only when another grant [`Permission::subsumes`] it,
+    /// so an explicit gateway grant survives beside `all` in either order.
     pub fn insert(&mut self, permission: Permission) {
-        if self.0.iter().any(|existing| existing.covers(&permission)) {
+        if self.0.iter().any(|existing| existing.subsumes(&permission)) {
             return;
         }
-        self.0.retain(|existing| !permission.covers(existing));
+        self.0.retain(|existing| !permission.subsumes(existing));
         self.0.push(permission);
     }
 
@@ -913,15 +938,30 @@ impl PermissionSet {
     /// a pair with a disjoint axis contributes nothing. A wildcard therefore
     /// yields the other grant, and a schema grant meeting a table grant in that
     /// schema yields the table grant.
-    #[must_use]
-    pub fn intersection(&self, other: &Self) -> Self {
+    ///
+    /// The one meet no scope can state is `all` against an explicit gateway
+    /// grant: `all` reaches only `open` deployments, so their shared authority
+    /// is "that deployment, only while it is open". Such a meet is accepted only
+    /// when the rest of the result already covers it — both sides also hold
+    /// `all`, or both grant the deployment explicitly; otherwise the complete
+    /// intersection is unrepresentable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnrepresentableIntersection`] naming the first gateway grant
+    /// whose shared authority depends on deployment access, so delegation can
+    /// refuse instead of widening or silently dropping it.
+    pub fn intersection(&self, other: &Self) -> Result<Self, UnrepresentableIntersection> {
         let mut meet = Self::new();
+        let mut open_only = Vec::new();
         for left in &self.0 {
             for right in &other.0 {
                 let Some(scope) = narrower(&left.scope, &right.scope, PermissionScope::covers)
                 else {
                     continue;
                 };
+                let conditional = scope.is_gateway()
+                    && (left.scope == PermissionScope::All || right.scope == PermissionScope::All);
                 for resource in meets(
                     &left.resource.members(),
                     &right.resource.members(),
@@ -937,14 +977,25 @@ impl PermissionSet {
                             action: action.clone(),
                             scope: scope.clone(),
                         };
-                        if permission.validate().is_ok() {
+                        if permission.validate().is_err() {
+                            continue;
+                        }
+                        if conditional {
+                            open_only.push(permission);
+                        } else {
                             meet.insert(permission);
                         }
                     }
                 }
             }
         }
-        meet
+        match open_only
+            .into_iter()
+            .find(|permission| !meet.contains(permission))
+        {
+            Some(permission) => Err(UnrepresentableIntersection { permission }),
+            None => Ok(meet),
+        }
     }
 
     /// Iterate over stored permissions.
@@ -1306,6 +1357,78 @@ mod tests {
         }
     }
 
+    /// Proves an explicit gateway grant survives merging beside `all` in either
+    /// order and under wildcard or `AnyOf` axes, and that delegation meets
+    /// gateway grants exactly: `all` with `all` stays `all`, explicit grants
+    /// meet to the narrower grant, a mixed pair whose explicit result the other
+    /// side also holds explicitly is representable, and `all` meeting an
+    /// explicit grant alone — "that deployment, only if open" — is refused in
+    /// both directions instead of minting the explicit grant.
+    ///
+    /// # Panics
+    /// Panics when a merge drops an explicit grant, a representable meet
+    /// differs from the exact shared authority, or an unrepresentable meet
+    /// succeeds.
+    #[test]
+    fn gateway_grants_survive_merge_and_intersect_exactly() {
+        use super::GatewayAccess;
+        use wyrd_spec::ids::{ModelId, ProviderDeploymentName};
+        let restricted = ProviderDeploymentName::new("restricted").expect("valid deployment");
+        let deployment = Permission::gateway_invoke(GatewayAccess::Deployment {
+            deployment: restricted.clone(),
+        });
+        let model = Permission::gateway_invoke(GatewayAccess::Model {
+            deployment: restricted,
+            model: ModelId::new("gpt-4o").expect("valid model"),
+        });
+        let any_resource_invoke = Permission {
+            resource: Resource::AnyOf(vec![Resource::Gateway, Resource::Cards]),
+            action: Action::Wildcard,
+            scope: PermissionScope::All,
+        };
+        for broad in [
+            Permission::gateway_invoke_any(),
+            Permission::wildcard(),
+            any_resource_invoke,
+        ] {
+            for set in [
+                PermissionSet::from_iter([broad.clone(), deployment.clone()]),
+                PermissionSet::from_iter([deployment.clone(), broad.clone()]),
+            ] {
+                assert!(set.contains_object_scoped(&model), "{broad} kept explicit");
+                assert!(set.contains(&Permission::gateway_invoke_any()));
+            }
+        }
+
+        let all = PermissionSet::from_iter([Permission::gateway_invoke_any()]);
+        let explicit = PermissionSet::from_iter([deployment.clone()]);
+        let narrow = PermissionSet::from_iter([model.clone()]);
+        assert_eq!(all.intersection(&all).expect("representable"), all);
+        assert_eq!(
+            explicit.intersection(&narrow).expect("representable"),
+            narrow
+        );
+        assert!(all.intersection(&explicit).is_err());
+        assert!(explicit.intersection(&all).is_err());
+        let wildcard = PermissionSet::from_iter([Permission::wildcard()]);
+        assert!(wildcard.intersection(&narrow).is_err());
+
+        let mixed = PermissionSet::from_iter([Permission::gateway_invoke_any(), deployment]);
+        assert_eq!(mixed.intersection(&narrow).expect("representable"), narrow);
+        assert_eq!(narrow.intersection(&mixed).expect("representable"), narrow);
+        assert_eq!(
+            mixed.intersection(&all).expect("representable"),
+            all,
+            "both hold all; only one holds the explicit grant"
+        );
+        assert!(
+            PermissionSet::from_iter([Permission::card_read()])
+                .intersection(&explicit)
+                .expect("no overlap is the representable empty result")
+                .is_empty()
+        );
+    }
+
     /// Builds the schema-scoped Bifrost query-read grant the journey seeds.
     fn logs_schema_grant() -> Permission {
         Permission {
@@ -1344,19 +1467,31 @@ mod tests {
 
         let wildcard = set(vec![Permission::wildcard()]);
         let target = set(vec![Permission::card_read(), logs_schema_grant()]);
-        assert_eq!(wildcard.intersection(&target), target);
-        assert_eq!(target.intersection(&wildcard), target);
+        assert_eq!(
+            wildcard.intersection(&target).expect("representable"),
+            target
+        );
+        assert_eq!(
+            target.intersection(&wildcard).expect("representable"),
+            target
+        );
 
         let schema = set(vec![logs_schema_grant()]);
         let table = set(vec![table_requirement("logs", uid)]);
-        assert_eq!(schema.intersection(&table), table);
-        assert_eq!(table.intersection(&schema), table);
+        assert_eq!(schema.intersection(&table).expect("representable"), table);
+        assert_eq!(table.intersection(&schema).expect("representable"), table);
 
         let other_table = set(vec![table_requirement("logs", uuid::Uuid::from_u128(0x78))]);
-        assert!(table.intersection(&other_table).is_empty());
+        assert!(
+            table
+                .intersection(&other_table)
+                .expect("representable")
+                .is_empty()
+        );
         assert!(
             set(vec![table_requirement("traces", uid)])
                 .intersection(&schema)
+                .expect("representable")
                 .is_empty()
         );
 
@@ -1371,7 +1506,7 @@ mod tests {
             scope: PermissionScope::All,
         }]);
         assert_eq!(
-            all_reads.intersection(&cards_any),
+            all_reads.intersection(&cards_any).expect("representable"),
             set(vec![Permission::card_read(), Permission::audit_read()])
         );
 
@@ -1381,6 +1516,7 @@ mod tests {
                     Permission::card_read(),
                     Permission::bifrost_record_write()
                 ]))
+                .expect("representable")
                 .is_empty()
         );
     }

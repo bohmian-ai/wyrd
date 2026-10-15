@@ -658,6 +658,21 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Token exchange refused because no token scope states the exact
+    /// authority the subject and actor share.
+    #[error("[WYRD_AUTH_403_UNREPRESENTABLE_DELEGATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_UNREPRESENTABLE_DELEGATION",
+        status = 403,
+        title = "Delegated permissions cannot be represented",
+        remediation = "The subject's and actor's shared permissions cannot be represented by token scopes, so the exchange issued no token. Exchange with grants whose exact shared authority fits the supported scopes, such as both parties holding the same explicit gateway deployment or model grant."
+    )]
+    UnrepresentableDelegation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// CardRef kind cannot back a non-human principal.
     #[error("[WYRD_AUTH_400_PRINCIPAL_KIND_CARD_KIND_MISMATCH] {message}")]
     #[wyrd_error(
@@ -3617,6 +3632,7 @@ impl WyrdError {
             | Self::RefreshReused { message, details }
             | Self::RefreshRevoked { message, details }
             | Self::DelegationDepthExceededIssue { message, details }
+            | Self::UnrepresentableDelegation { message, details }
             | Self::PrincipalKindCardKindMismatch { message, details }
             | Self::InvalidCardRefVersion { message, details }
             | Self::CredentialRevoked { message, details }
@@ -4488,6 +4504,10 @@ mod tests {
             WyrdError::DelegationDepthExceededIssue {
                 message: "delegation chain would exceed depth 5".to_owned(),
                 details: serde_json::json!({ "max": 5 }),
+            },
+            WyrdError::UnrepresentableDelegation {
+                message: "delegated permissions cannot be represented".to_owned(),
+                details: serde_json::json!({}),
             },
             WyrdError::PrincipalKindCardKindMismatch {
                 message: "model cards cannot back service accounts".to_owned(),

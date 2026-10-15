@@ -13,12 +13,16 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::trace::TraceContext;
 use wyrd_spec::vala::ids::RunId;
 
 use crate::batch_builder::{PreparedRows, RowPreflight};
 use crate::config::QueueConfig;
 use crate::error::WyrdQueueError;
-use crate::queue::{Entry, FlushOutcome, InFlight, OwnedBatch, RecordQueue, Row, Settled};
+use crate::queue::{
+    Entry, FlushOutcome, InFlight, OwnedBatch, ProducerTrace, RecordQueue, Row, Settled,
+    context_bytes,
+};
 use crate::sink::BatchSink;
 
 /// Running producer state.
@@ -473,7 +477,8 @@ impl Producer {
     ///
     /// `card_uid` is optional because Card correlation is: an omitted value
     /// becomes a null in the sealed batch's `card_uid` column, which the server
-    /// stores against the authenticated principal with no Card.
+    /// stores against the authenticated principal with no Card. `trace` is as
+    /// for [`Self::enqueue_prepared`].
     ///
     /// # Errors
     ///
@@ -483,8 +488,9 @@ impl Producer {
         json: Vec<u8>,
         card_uid: Option<CardUid>,
         run_id: Option<RunId>,
+        trace: Option<TraceContext>,
     ) -> Result<(), WyrdQueueError> {
-        self.enqueue_rows(vec![json], card_uid, run_id)
+        self.enqueue_rows(vec![json], card_uid, run_id, trace)
     }
 
     /// Prepares and admits every row of one logical record, or none of them,
@@ -504,12 +510,13 @@ impl Producer {
         rows: Vec<Vec<u8>>,
         card_uid: Option<CardUid>,
         run_id: Option<RunId>,
+        trace: Option<TraceContext>,
     ) -> Result<(), WyrdQueueError> {
         let prepared = self
             .preflight
             .prepare(&rows, card_uid.as_ref(), run_id.as_ref())?;
         drop(rows);
-        self.enqueue_prepared(prepared)
+        self.enqueue_prepared(prepared, trace)
     }
 
     /// Admits one prepared record, all or none, without waiting.
@@ -523,6 +530,13 @@ impl Producer {
     /// Sealing, framing, and sink settlement happen later and report their
     /// own errors through flush and shutdown.
     ///
+    /// `trace` is the PRODUCER span the record was enqueued under. Every row
+    /// keeps it, and the frame its rows seal into carries it, bounded and
+    /// deduplicated, so the server's ingest span can link back to it. Its
+    /// string bytes are charged at admission, so admission refuses a record
+    /// whose context would pass the budget, and that one charge moves with
+    /// the shared context to the sealed batch.
+    ///
     /// # Errors
     ///
     /// Returns [`WyrdQueueError::PayloadTooLarge`] when the record charges
@@ -530,11 +544,19 @@ impl Producer {
     /// when the producer is draining, and [`WyrdQueueError::Backpressure`]
     /// when the handle budget cannot cover the record now. Each refusal counts
     /// every row as dropped.
-    pub fn enqueue_prepared(&self, prepared: PreparedRows) -> Result<(), WyrdQueueError> {
+    pub fn enqueue_prepared(
+        &self,
+        prepared: PreparedRows,
+        trace: Option<TraceContext>,
+    ) -> Result<(), WyrdQueueError> {
         let (batch, charge) = prepared.into_parts();
         let count = batch.num_rows();
-        let admitted = self.admission_check(charge).and_then(|()| {
+        let reserved = charge + trace.as_ref().map_or(0, context_bytes);
+        let admitted = self.admission_check(reserved).and_then(|()| {
             let guard = Arc::new(self.budget.reserve(charge)?);
+            let trace = trace
+                .map(|trace| ProducerTrace::charged(&self.budget, trace).map(Arc::new))
+                .transpose()?;
             let bytes = charge / count.max(1);
             Ok(Entry::Rows(
                 (0..count)
@@ -542,6 +564,7 @@ impl Producer {
                         batch: batch.slice(row, 1),
                         bytes,
                         _guard: Arc::clone(&guard),
+                        trace: trace.clone(),
                     })
                     .collect(),
             ))
@@ -1001,6 +1024,7 @@ mod tests {
     use tokio::sync::Notify;
     use wyrd_spec::ids::CardUid;
     use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::trace::TraceContext;
     use wyrd_spec::vala::BifrostError;
 
     use super::{ClientByteBudget, ProducerMetrics};
@@ -1213,7 +1237,7 @@ mod tests {
         assert_eq!(budget.used_bytes(), 0, "idle producers hold no bytes");
         for producer in &producers {
             producer
-                .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None)
+                .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None, None)
                 .expect("each table admits its row");
         }
         for producer in &producers {
@@ -1242,7 +1266,7 @@ mod tests {
         )
         .expect("producer starts");
         producer
-            .enqueue(br#"{"id": 9}"#.to_vec(), Some(card()), None)
+            .enqueue(br#"{"id": 9}"#.to_vec(), Some(card()), None, None)
             .expect("row accepted before timeout");
         assert!(matches!(
             producer.flush(),
@@ -1290,7 +1314,7 @@ mod tests {
         )
         .expect("producer starts");
         producer
-            .enqueue(br#"{"id": 1}"#.to_vec(), Some(card()), None)
+            .enqueue(br#"{"id": 1}"#.to_vec(), Some(card()), None, None)
             .expect("row accepted");
         assert!(
             producer.flush().is_err(),
@@ -1313,6 +1337,90 @@ mod tests {
         producer.shutdown().expect("settled producer shutdown");
     }
 
+    /// Producer contexts are charged to the one client budget: a second
+    /// record's context is refused before the ceiling, the context a sealed
+    /// batch selected stays charged while ambiguity retains it, and terminal
+    /// settlement returns every byte.
+    ///
+    /// The context is sized from the record's own charge so one charged
+    /// record, and its seal, fit the budget while two records cannot, and so
+    /// it outweighs the record's frame. A long linger leaves sealing to the
+    /// explicit flush.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a context is admitted past the ceiling, the retained retry
+    /// is not charged its context, or any byte outlives settlement.
+    #[test]
+    fn producer_context_bytes_stay_bounded_through_ambiguous_retry() {
+        let config = QueueConfig {
+            max_message_bytes: 16 * 1024,
+            client_byte_limit_bytes: 32 * 1024,
+            linger_ms: 60_000,
+            ..QueueConfig::default()
+        };
+        let budget = ClientByteBudget::for_config(&config);
+        let sink = Arc::new(MockSink::new());
+        sink.fail_next(usize::MAX);
+        let producer = Producer::with_budget(
+            "vala.bifrost.context_bytes",
+            schema(),
+            sink.clone(),
+            config,
+            budget.clone(),
+        )
+        .expect("producer starts");
+        let record = charge(&rows(1));
+        let state_len = (budget.admission_limit() - record) / 2 - 48;
+        let context = |byte: char| TraceContext {
+            trace_id: byte.to_string().repeat(32),
+            span_id: byte.to_string().repeat(16),
+            trace_flags: 1,
+            trace_state: format!("k={}", byte.to_string().repeat(state_len - 2)),
+        };
+        let first = context('a');
+        let context_bytes = crate::queue::context_bytes(&first);
+
+        producer
+            .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None, Some(first))
+            .expect("one charged context fits");
+        assert!(matches!(
+            producer.enqueue(
+                br#"{"id":2}"#.to_vec(),
+                Some(card()),
+                None,
+                Some(context('b'))
+            ),
+            Err(WyrdQueueError::Backpressure)
+        ));
+        assert!(budget.used_bytes() <= budget.admission_limit());
+
+        assert!(producer.flush().is_err(), "the send is ambiguous");
+        let retained = budget.metrics();
+        assert_eq!(retained.retry_entries, 1);
+        assert!(
+            retained.owned_bytes > context_bytes,
+            "the retained retry stays charged its frame and context"
+        );
+
+        sink.terminal_next(1);
+        sink.fail_next(0);
+        wait_until("the retry settles terminally", || {
+            budget.metrics().retry_entries == 0
+        });
+        let _ = producer.shutdown();
+        let settled = budget.metrics();
+        assert_eq!(
+            (
+                settled.owned_bytes,
+                settled.live_batches,
+                settled.retry_entries
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(received_rows(&sink), 0);
+    }
+
     /// Preserves one exact owner when the queue deadline cancels a borrow.
     #[test]
     fn flush_timeout_retains_batch_until_later_ack() {
@@ -1330,7 +1438,7 @@ mod tests {
         )
         .expect("producer starts");
         producer
-            .enqueue(br#"{"id": 7}"#.to_vec(), Some(card()), None)
+            .enqueue(br#"{"id": 7}"#.to_vec(), Some(card()), None, None)
             .expect("row accepted");
         assert!(matches!(
             producer.flush(),
@@ -1371,11 +1479,11 @@ mod tests {
         )
         .expect("producer starts");
         producer
-            .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None)
+            .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None, None)
             .expect("row accepted");
         assert!(producer.shutdown().is_err(), "the first send is ambiguous");
         assert!(matches!(
-            producer.enqueue(br#"{"id":2}"#.to_vec(), Some(card()), None),
+            producer.enqueue(br#"{"id":2}"#.to_vec(), Some(card()), None, None),
             Err(WyrdQueueError::QueueFull)
         ));
         wait_until("the retained batch ACKs in the background", || {
@@ -1452,7 +1560,7 @@ mod tests {
         )
         .expect("producer starts");
         producer
-            .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None)
+            .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None, None)
             .expect("row admitted");
         attempted
             .recv()
@@ -1684,7 +1792,7 @@ mod tests {
         .expect("producer starts");
         for record in 0..2 {
             producer
-                .enqueue_rows(rows(1), Some(card()), None)
+                .enqueue_rows(rows(1), Some(card()), None, None)
                 .unwrap_or_else(|error| panic!("record {record} admitted: {error}"));
             wait_until("each record seals while a slot is free", || {
                 sink.attempted() == record + 1
@@ -1692,7 +1800,7 @@ mod tests {
         }
         for _ in 0..1_000 {
             producer
-                .enqueue_rows(rows(1), Some(card()), None)
+                .enqueue_rows(rows(1), Some(card()), None, None)
                 .expect("admission never waits on stalled sends");
         }
         wait_until("rows behind busy slots stay staged", || {
@@ -1777,7 +1885,7 @@ mod tests {
                 last.into_bytes(),
             ];
             let error = producer
-                .enqueue_rows(rows, Some(card()), None)
+                .enqueue_rows(rows, Some(card()), None, None)
                 .expect_err("the final row refuses the whole record");
             let matched = match (&error, expected) {
                 (
@@ -1815,7 +1923,10 @@ mod tests {
         drop(preflight.prepare(&rows, None, None).expect("rows prepare"));
         untouched("cancelled before hand-over");
         producer
-            .enqueue_prepared(preflight.prepare(&rows, None, None).expect("rows prepare"))
+            .enqueue_prepared(
+                preflight.prepare(&rows, None, None).expect("rows prepare"),
+                None,
+            )
             .expect("the record is admitted whole");
         assert_eq!(producer.metrics().accepted, 2);
         producer.flush().expect("the admitted record settles");
@@ -1850,7 +1961,7 @@ mod tests {
         let oversized_count = oversized.len() as u64;
         assert!(charge(&oversized) > budget.admission_limit());
         assert!(matches!(
-            producer.enqueue_rows(oversized, Some(card()), None),
+            producer.enqueue_rows(oversized, Some(card()), None, None),
             Err(WyrdQueueError::PayloadTooLarge)
         ));
         let refused = rows(9);
@@ -1859,7 +1970,7 @@ mod tests {
             .expect("test leaves room for fewer than nine rows");
         let blocked = budget.used_bytes();
         assert!(matches!(
-            producer.enqueue_rows(refused, Some(card()), None),
+            producer.enqueue_rows(refused, Some(card()), None, None),
             Err(WyrdQueueError::Backpressure)
         ));
         assert_eq!(budget.used_bytes(), blocked, "no row kept its bytes");
@@ -1871,7 +1982,7 @@ mod tests {
         );
         assert_eq!(producer.metrics().dropped, oversized_count + 9);
         producer
-            .enqueue_rows(rows(9), Some(card()), None)
+            .enqueue_rows(rows(9), Some(card()), None, None)
             .expect("a record that fits is admitted whole");
         producer.shutdown().expect("admitted rows drain");
         assert_eq!(received_rows(&sink), 9, "exactly the admitted rows publish");
@@ -1898,7 +2009,7 @@ mod tests {
         let count = batch.len() as u64;
         assert!(batch.iter().map(Vec::len).sum::<usize>() >= 2 * 1024);
         by_bytes
-            .enqueue_rows(batch, None, None)
+            .enqueue_rows(batch, None, None, None)
             .expect("record admitted");
         wait_until("staging reaching the byte ceiling seals", || {
             received_rows(&sink) == count
@@ -1914,7 +2025,7 @@ mod tests {
         )
         .expect("producer starts");
         by_linger
-            .enqueue(br#"{"id":1}"#.to_vec(), None, None)
+            .enqueue(br#"{"id":1}"#.to_vec(), None, None, None)
             .expect("row admitted");
         wait_until("an elapsed linger seals", || {
             received_rows(&sink) == count + 1
@@ -1924,8 +2035,10 @@ mod tests {
     }
 
     /// Admitted rows cannot take the sealing headroom: with the admission
-    /// ceiling exhausted, a flush still reserves its frame and publishes the
-    /// staged rows.
+    /// ceiling exhausted by a record and its sampled producer context, a
+    /// flush still reserves its frame and publishes the staged row with that
+    /// context, whose admitted charge moves to the sealed batch rather than
+    /// being reserved a second time.
     #[test]
     fn admitted_rows_cannot_take_the_sealing_headroom() {
         let config = QueueConfig {
@@ -1943,12 +2056,19 @@ mod tests {
         )
         .expect("producer starts");
         let row = rows(1);
+        let context = TraceContext {
+            trace_id: "0af7651916cd43dd8448eb211c80319c".to_owned(),
+            span_id: "b7ad6b7169203331".to_owned(),
+            trace_flags: 1,
+            trace_state: "wyrd=producer".to_owned(),
+        };
+        let reserved = charge(&row) + crate::queue::context_bytes(&context);
         let blocker = budget
-            .reserve(budget.admission_limit() - budget.used_bytes() - charge(&row))
-            .expect("test exhausts admission but for one row");
+            .reserve(budget.admission_limit() - budget.used_bytes() - reserved)
+            .expect("test exhausts admission but for one traced row");
         producer
-            .enqueue_rows(row, Some(card()), None)
-            .expect("the last admissible row is admitted");
+            .enqueue_rows(row, Some(card()), None, Some(context.clone()))
+            .expect("the last admissible traced row is admitted");
         assert!(matches!(
             budget.reserve(1),
             Err(WyrdQueueError::Backpressure)
@@ -1957,6 +2077,7 @@ mod tests {
             .flush()
             .expect("the frame comes from the sealing headroom");
         assert_eq!(received_rows(&sink), 1);
+        assert_eq!(sink.received()[0].producer_traces, vec![context]);
         drop(blocker);
         producer.shutdown().expect("nothing remains");
     }

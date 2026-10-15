@@ -74,9 +74,7 @@ impl Principals {
         request: &Bound<'_, PyAny>,
     ) -> WyrdPyResult<Py<PyAny>> {
         let request: CreateServicePrincipalRequest = decode("request", pyobject_to_json(request)?)?;
-        let created = py.detach(|| {
-            wyrd_runtime::runtime().block_on(self.inner.create_service_principal(&request))
-        })?;
+        let created = crate::trace::block_on(py, self.inner.create_service_principal(&request))?;
         to_python(py, &created)
     }
 
@@ -88,8 +86,7 @@ impl Principals {
     /// fails.
     fn issue_credential(&self, py: Python<'_>, principal_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let id = self::principal_id(principal_id)?;
-        let issued =
-            py.detach(|| wyrd_runtime::runtime().block_on(self.inner.issue_credential(&id)))?;
+        let issued = crate::trace::block_on(py, self.inner.issue_credential(&id))?;
         to_python(py, &issued)
     }
 
@@ -101,8 +98,7 @@ impl Principals {
     /// fails.
     fn list_credentials(&self, py: Python<'_>, principal_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let id = self::principal_id(principal_id)?;
-        let listed =
-            py.detach(|| wyrd_runtime::runtime().block_on(self.inner.list_credentials(&id)))?;
+        let listed = crate::trace::block_on(py, self.inner.list_credentials(&id))?;
         to_python(py, &listed)
     }
 
@@ -120,9 +116,7 @@ impl Principals {
     ) -> WyrdPyResult<()> {
         let id = self::principal_id(principal_id)?;
         let credential = decode("credential_id", Value::from(credential_id))?;
-        py.detach(|| {
-            wyrd_runtime::runtime().block_on(self.inner.revoke_credential(&id, credential))
-        })?;
+        crate::trace::block_on(py, self.inner.revoke_credential(&id, credential))?;
         Ok(())
     }
 
@@ -140,7 +134,7 @@ impl Principals {
     ) -> WyrdPyResult<()> {
         let id = self::principal_id(principal_id)?;
         let request: RevokePrincipalRequest = decode("request", pyobject_to_json(request)?)?;
-        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.revoke_principal(&id, &request)))?;
+        crate::trace::block_on(py, self.inner.revoke_principal(&id, &request))?;
         Ok(())
     }
 
@@ -166,7 +160,7 @@ impl Principals {
                 "kind": kind, "email": email, "name": name, "limit": limit, "after": after,
             }),
         )?;
-        let page = py.detach(|| wyrd_runtime::runtime().block_on(self.inner.list(&query)))?;
+        let page = crate::trace::block_on(py, self.inner.list(&query))?;
         to_python(py, &page)
     }
 
@@ -178,7 +172,7 @@ impl Principals {
     /// request fails.
     fn roles(&self, py: Python<'_>, principal_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let id = self::principal_id(principal_id)?;
-        let roles = py.detach(|| wyrd_runtime::runtime().block_on(self.inner.roles(&id)))?;
+        let roles = crate::trace::block_on(py, self.inner.roles(&id))?;
         to_python(py, &roles)
     }
 
@@ -196,8 +190,7 @@ impl Principals {
         role: &str,
     ) -> WyrdPyResult<Py<PyAny>> {
         let id = self::principal_id(principal_id)?;
-        let change =
-            py.detach(|| wyrd_runtime::runtime().block_on(self.inner.grant_role(&id, role)))?;
+        let change = crate::trace::block_on(py, self.inner.grant_role(&id, role))?;
         to_python(py, &change)
     }
 
@@ -215,8 +208,7 @@ impl Principals {
         role: &str,
     ) -> WyrdPyResult<Py<PyAny>> {
         let id = self::principal_id(principal_id)?;
-        let change =
-            py.detach(|| wyrd_runtime::runtime().block_on(self.inner.revoke_role(&id, role)))?;
+        let change = crate::trace::block_on(py, self.inner.revoke_role(&id, role))?;
         to_python(py, &change)
     }
 }

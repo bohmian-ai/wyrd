@@ -6,12 +6,14 @@
 //! - [`grpc`] — generic authed gRPC channel (gated on `transport-grpc`).
 //! - [`http`] — async `reqwest` HTTP transport (gated on `transport-http`).
 //! - [`mock`] — in-memory loopback transport for tests.
+//! - [`trace`] — the caller's W3C trace context sent on every Wyrd request.
 
 pub mod config;
 pub mod credential;
 pub mod grpc;
 pub mod http;
 pub mod mock;
+pub mod trace;
 
 /// Exponential backoff delay in milliseconds for a 0-based retry `attempt`.
 ///

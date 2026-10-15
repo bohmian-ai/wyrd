@@ -202,7 +202,8 @@ def _endpoint(client: WyrdClient, signal: str) -> str:
 
 
 def _start_telemetry(client: WyrdClient) -> Any:
-    """Install the global tracer provider exporting spans as ``client``.
+    """Install the global tracer provider exporting spans as ``client``, and
+    the W3C trace-context propagator for outbound context.
 
     Returns the installed provider, which the calling state keeps so a repeated
     start is idempotent and its shutdown flushes it. Returns ``None`` when a
@@ -213,8 +214,10 @@ def _start_telemetry(client: WyrdClient) -> Any:
         ImportError: naming the ``otel`` extra when the SDK or exporter is absent.
     """
     try:
+        from opentelemetry.propagate import set_global_textmap
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
     except ImportError as missing:
         raise ImportError(_EXPORTER_EXTRA) from missing
     if not isinstance(_otel_trace.get_tracer_provider(), _otel_trace.ProxyTracerProvider):
@@ -223,6 +226,7 @@ def _start_telemetry(client: WyrdClient) -> Any:
     provider.add_span_processor(BatchSpanProcessor(span_exporter(client)))
     install_run_correlation(provider)
     _otel_trace.set_tracer_provider(provider)
+    set_global_textmap(TraceContextTextMapPropagator())
     return provider
 
 

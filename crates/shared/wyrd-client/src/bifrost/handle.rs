@@ -193,8 +193,7 @@ impl WriterPool {
         card_uid: Option<CardUid>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
-        self.producer_for(table, schema)?
-            .enqueue(json, card_uid, run_id)
+        self.insert_rows(table, schema, vec![json], card_uid, run_id)
     }
 
     /// Enqueue every row of one logical record, or none of them, propagating
@@ -203,7 +202,9 @@ impl WriterPool {
     /// The multi-row counterpart to [`Self::insert`], for a record that
     /// projects to several rows sharing one correlation, such as a Drift
     /// observation's tall feature rows. A refusal admits no row, so the caller
-    /// may resubmit the whole record without duplicating a prefix.
+    /// may resubmit the whole record without duplicating a prefix. The record
+    /// is admitted under one PRODUCER span in the caller's trace, which the
+    /// server's ingest span links to.
     ///
     /// # Errors
     /// Returns any [`wyrd_queue::RowPreflight::prepare`] refusal of any row
@@ -220,8 +221,12 @@ impl WriterPool {
         card_uid: Option<CardUid>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
-        self.producer_for(table, schema)?
-            .enqueue_rows(rows, card_uid, run_id)
+        self.producer_for(table, schema)?.enqueue_rows(
+            rows,
+            card_uid,
+            run_id,
+            crate::transport::trace::producer(table),
+        )
     }
 
     /// Enqueue one owned Arrow batch for `table` without awaiting publication.

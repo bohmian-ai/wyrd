@@ -1,3 +1,5 @@
+/// `wyrd auth access-token`: print the ambient client's current access token.
+pub mod access_token;
 /// `wyrd auth issue-key`: mint an API key bound to a Card.
 pub mod issue_key;
 /// `wyrd auth login`, `logout`, and `status`: the saved human user login.
@@ -18,6 +20,9 @@ use crate::error::WyrdCliError;
 /// Subcommands of `wyrd auth`; each variant routes to its module's `dispatch`.
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
+    /// Print the current Wyrd access token and a newline, nothing else, for
+    /// `apiKeyHelper`-style tools and shells.
+    AccessToken(access_token::AccessTokenArgs),
     /// Issue an API key bound to a card ref (POST /auth/issue-key).
     IssueKey(issue_key::IssueKeyArgs),
     /// Sign in to a tenant through the browser and save the Wyrd user login
@@ -45,6 +50,7 @@ pub enum AuthCommand {
 /// client-construction failures, IO failures, or the server's stable Wyrd error.
 pub async fn dispatch(command: AuthCommand) -> Result<ExitCode, WyrdCliError> {
     match command {
+        AuthCommand::AccessToken(args) => access_token::dispatch(args).await,
         AuthCommand::IssueKey(args) => issue_key::dispatch(args).await,
         AuthCommand::Login(args) => login::login(args).await,
         AuthCommand::Logout(args) => login::logout(args).await,

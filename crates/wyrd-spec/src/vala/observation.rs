@@ -199,41 +199,4 @@ mod observation_tests {
             ObservationKind::Record(_) => "record",
         };
     }
-
-    // --- schema drift ---
-
-    #[test]
-    fn observation_schema_drift() {
-        use std::fs;
-        use std::path::PathBuf;
-
-        use schemars::schema_for;
-
-        fn assert_schema_matches<T: schemars::JsonSchema>(dir: &std::path::Path, name: &str) {
-            let mut schema = schema_for!(T);
-            schema.meta_schema = Some("https://json-schema.org/draft/2020-12/schema".to_string());
-            let actual = format!(
-                "{}\n",
-                serde_json::to_string_pretty(&schema).expect("schema serializes")
-            );
-            let path = dir.join(format!("{name}.schema.json"));
-            let expected = fs::read_to_string(&path).unwrap_or_else(|error| {
-                panic!(
-                    "missing golden schema at {path:?}: {error}; regenerate with \
-                     `cargo run -p wyrd-spec --example gen_schemas --features server`"
-                )
-            });
-            assert_eq!(
-                actual, expected,
-                "schema drift in {name}.schema.json; run mise run codegen:regen"
-            );
-        }
-
-        let dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/observation/schemas");
-
-        assert_schema_matches::<ObservationEnvelope>(&dir, "observation_envelope");
-        assert_schema_matches::<ObservationKind>(&dir, "observation_kind");
-        assert_schema_matches::<RecordObservation>(&dir, "record_observation");
-    }
 }

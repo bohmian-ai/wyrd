@@ -1,7 +1,3 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-### header.pyi ###
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value, missing-final-newline
 # ruff: noqa: F401
 
 from __future__ import annotations
@@ -47,7 +43,6 @@ class CardRefLike(Protocol):
         """Return the reference as a JSON-compatible ``CardRef`` mapping."""
         ...
 
-### error.pyi ###
 class WyrdError(Exception):
     """Wyrd failure carrying a stable, catalog-backed error code.
 
@@ -151,7 +146,6 @@ def build_wyrd_error(
     """
     ...
 
-### GLOBAL EXPORTS ###
 __all__ = [
     "AgentError",
     "SessionError",

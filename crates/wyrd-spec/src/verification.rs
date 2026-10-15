@@ -366,8 +366,11 @@ pub struct VerificationRunStatus {
     pub run_id: VerificationRunId,
     /// Execution state.
     pub status: VerificationExecutionStatus,
-    /// Authenticated caller of a manual run; null for scheduled and
-    /// observation-created runs.
+    /// The run's actor: the authenticated caller of a manual run, or the
+    /// tenant SYSTEM principal of internal work (a scheduled or
+    /// observation-triggered run), whose origin is recorded only as
+    /// references; null for internal work of a tenant without a SYSTEM
+    /// principal.
     pub requested_by_principal_id: Option<PrincipalId>,
     /// Canonical result of a completed run.
     pub result_id: Option<VerificationResultId>,
@@ -665,9 +668,11 @@ pub struct FeatureDriftReport {
     pub feature: FeatureName,
     /// PSI score, total SPC chart signals, or absolute Custom delta; absent
     /// when the feature is inconclusive.
+    #[serde(default)]
     pub score: Option<f64>,
     /// The threshold `score` was compared against; absent when the feature is
     /// inconclusive.
+    #[serde(default)]
     pub threshold: Option<f64>,
     /// The feature's verdict.
     pub verdict: DriftVerdict,
@@ -703,6 +708,7 @@ pub struct SkippedTask {
     /// The skipped upstream task that caused a `dependency_skipped` skip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
+    #[schemars(schema_with = "crate::schema::skipped_option::<TaskId>")]
     pub upstream_task_id: Option<TaskId>,
 }
 
@@ -739,6 +745,7 @@ pub struct Judgment {
     /// Count-only rollup of a Drift or Eval judgment; absent for a task
     /// Verifier, whose one check is fully described by `verdict`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<VerifierCounts>")]
     pub counts: Option<VerifierCounts>,
     /// The engine report.
     pub detail: VerificationExecutionDetail,

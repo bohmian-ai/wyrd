@@ -356,7 +356,7 @@ impl ScribeFragmentExecutor {
                 tracing::warn!(?error, "Scribe physical follower could not start");
                 scribe_start_error(&error)
             })?;
-        scribe.record_fragment_execution();
+        scribe.record_fragment_execution(&request.physical_plan_bytes);
         // Split now, finalize after drain: the scan counters are written during
         // execution, and the leader has no physical scan of its own to report.
         let (mut batches, scan_evidence) = execution.split();
@@ -386,7 +386,7 @@ impl ScribeFragmentExecutor {
             if fault == Some(ScribeFragmentFault::OmitFooter) {
                 return;
             }
-            scribe_owner.record_fragment_footer();
+            scribe_owner.record_fragment_footer(tally.rows());
             yield tally.complete(plan_fingerprint, scan_evidence.finalize());
         };
         Ok((schema, Box::pin(output)))

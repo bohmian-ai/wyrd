@@ -206,6 +206,18 @@ impl Bifrost {
         block_on(self.inner.sql_as(query, params))
     }
 
+    /// Read the span tree of `trace_id` as canonical span records.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::bifrost::Bifrost::trace_timeline`].
+    pub fn trace_timeline(
+        &self,
+        trace_id: wyrd_spec::vala::ids::TraceId,
+    ) -> Result<Vec<wyrd_spec::vala::trace::SpanRecord>, BifrostClientError> {
+        block_on(self.inner.trace_timeline(trace_id))
+    }
+
     /// Run one SQL SELECT and iterate its batches as they arrive.
     ///
     /// # Arguments

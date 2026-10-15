@@ -154,12 +154,15 @@ mise run ts:test:integration  # in-process WyrdTestServer client→server journe
 mise run ts:napi:check        # napi-generated index.d.ts committed
 ```
 
-### Contract, schema, OpenAPI, or stub changes
+### Contract, OpenAPI, or generated-output changes
 
 ```bash
-mise run codegen:check   # fail if JSON schema / public pyi / .d.ts drift
-mise run codegen:regen   # regenerate everything from source
+mise run codegen:check   # fail if TS wire types, error codes, UI examples, or theme tokens drift
+mise run codegen:regen   # regenerate every consumed output from source
 ```
+
+Python `.pyi` stubs are authored, not generated; prove them with
+`mise run py:lints` and `mise run py:typecheck`.
 
 The OpenAPI document is served at runtime from `GET /openapi.json` and is not
 part of that snapshot; prove an OpenAPI change against the served document
@@ -185,7 +188,7 @@ a specific change will trip:
 | `check:tenant-isolation` | Query and server code reach tenant tables only through `TenantConn`; RLS itself is proven by Postgres readiness |
 | `check:storage:drift` | Storage credential and tenancy guardrails |
 | `check:py-wheel-no-testing` | Production `wyrd-sdk-python` wheel does not expose `wyrd.testing` |
-| `codegen:check` | Generated schemas, `.pyi` stubs, TypeScript error codes, and UI theme tokens match their sources |
+| `codegen:check` | TypeScript wire types and error codes, UI problem examples, and UI theme tokens match their sources |
 
 Family test lanes take every crate under their directory, so no check is
 needed to prove each crate has a lane.

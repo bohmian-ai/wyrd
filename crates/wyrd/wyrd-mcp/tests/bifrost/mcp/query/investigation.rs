@@ -164,6 +164,7 @@ impl EvidenceInvestigation {
                 run_id: None,
                 verifier_version: &version,
                 subject_card_uid: subject_uid,
+                requested_by: None,
                 owner_card_uid: Some(subject_uid),
                 binding_id: None,
                 trigger: None,

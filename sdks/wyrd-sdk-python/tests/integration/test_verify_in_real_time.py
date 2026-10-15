@@ -8,14 +8,16 @@ its ``agent`` and a PSI Drift Verifier, fitted from the latency baseline, to its
 from pathlib import Path
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
 from wyrd import WyrdError
 from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
+from wyrd.gateway import Gateway
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer
+from wyrd.testing import WyrdTestServer, cli
 
-from .support import Count, Receiver, hydrated, register
+from .support import Count, Receiver, ancestry, client_of, hydrated, register, timeline
 
 pytestmark = pytest.mark.integration
 
@@ -70,6 +72,58 @@ def test_judged_answer_passes_the_llm_judge(assistant: WyrdState, receiver: Rece
     judgment = assistant.run("agent").observe.verify("answer-is-judged", {"answer": "yes"})
     assert judgment.verdict == "passed"
     assert len(receiver.to("/v1/chat/completions")) == asked + 1
+
+
+def test_judge_call_is_attributed_to_the_run_and_card(
+    assistant: WyrdState, wyrd_server: WyrdTestServer, bifrost: Bifrost, metadata_capture: None
+) -> None:
+    run = assistant.run("agent")
+    judgment = run.observe.verify("answer-graded", {"answer": "yes"})
+    wyrd_server.flush_bifrost()
+
+    calls = bifrost.sql(
+        "SELECT caller_principal_id, card_uid FROM vala.gateway.calls WHERE run_id = $1",
+        [run.run_id],
+    ).to_arrow()
+    principal = cli.issue_key(
+        kind="Service", name="assistant", version="1.0.0", space="default"
+    ).principal_id
+    assert calls.to_pylist() == [
+        {"caller_principal_id": principal, "card_uid": str(judgment.subject.uid)}
+    ]
+
+
+def test_traced_verify_joins_the_callers_trace(
+    assistant: WyrdState, wyrd_server: WyrdTestServer, metadata_capture: None
+) -> None:
+    tracer = TracerProvider().get_tracer("journey")
+    with tracer.start_as_current_span("caller") as caller:
+        assistant.run("agent").observe.verify("answer-graded", {"answer": "yes"})
+
+    context = caller.get_span_context()
+    spans = timeline(wyrd_server, format(context.trace_id, "032x"))
+    attempts = [span for span in spans if span["scope"]["name"] == "wyrd.gateway"]
+    assert len(attempts) == 1, spans
+    assert ancestry(spans, attempts[0])[-1].get("parent_span_id") == format(
+        context.span_id, "016x"
+    ), [(span["name"], span["span_id"], span.get("parent_span_id")) for span in spans]
+
+
+def test_sdk_requests_carry_the_active_trace(wyrd_server: WyrdTestServer) -> None:
+    gateway = Gateway(client_of(wyrd_server))
+    tracer = TracerProvider().get_tracer("journey")
+    with tracer.start_as_current_span("caller") as caller:
+        gateway.capture_policy()
+
+    context = caller.get_span_context()
+    spans = timeline(wyrd_server, format(context.trace_id, "032x"))
+    assert [
+        span["name"]
+        for span in spans
+        if span.get("parent_span_id") == format(context.span_id, "016x")
+    ] == ["request"], [
+        (span["name"], span["span_id"], span.get("parent_span_id")) for span in spans
+    ]
 
 
 def test_model_latency_like_the_baseline_passes_its_verifier(assistant: WyrdState) -> None:

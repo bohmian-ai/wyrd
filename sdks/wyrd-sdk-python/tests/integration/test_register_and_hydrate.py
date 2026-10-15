@@ -2,23 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 from wyrd import WyrdError
-from wyrd.cards import (
-    CardRef,
-    Cards,
-    RegisteredAgentCard,
-    RegisteredDataCard,
-    RegisteredModelCard,
-    RegisteredOperatorCard,
-    RegisteredPromptCard,
-    RegisteredServiceCard,
-    RegisteredTriggerCard,
-    RegisteredVerifierCard,
-)
+from wyrd.cards import CardKind, CardRef, Cards
 from wyrd.client import WyrdClient
+from wyrd.state import CardEnvelope
 from wyrd.testing import WyrdTestServer, cli
 
 from .support import FIXTURES, binding_ids, download, hydrated, register
@@ -70,44 +61,54 @@ def test_registering_the_graph_again_is_idempotent(
     assert binding_ids(cards, again.root) == bindings
 
 
-def test_cards_get_returns_every_kind_typed(cards: Cards, support_desk: dict[str, CardRef]) -> None:
+def test_cards_get_returns_every_kind_as_envelope(
+    cards: Cards, support_desk: dict[str, CardRef]
+) -> None:
     baseline = register(cards, "cards/latency_baseline/latency-baseline.yaml")["latency-baseline"]
+    refs = [
+        (CardKind.Data, baseline),
+        (CardKind.Model, support_desk["support-model"]),
+        (CardKind.Prompt, support_desk["support-prompt"]),
+        (CardKind.Agent, support_desk["support-agent"]),
+        (CardKind.Verifier, support_desk["no-refund-promise"]),
+        (CardKind.Service, support_desk["support-desk"]),
+        (CardKind.Trigger, support_desk["every-batch"]),
+        (CardKind.Operator, support_desk["notify-support"]),
+    ]
 
-    data = cards.get(baseline)
-    model = cards.get(support_desk["support-model"])
-    prompt = cards.get(support_desk["support-prompt"])
-    agent = cards.get(support_desk["support-agent"])
-    verifier = cards.get(support_desk["no-refund-promise"])
-    service = cards.get(support_desk["support-desk"])
-    trigger = cards.get(support_desk["every-batch"])
-    operator = cards.get(support_desk["notify-support"])
+    envelopes = [cards.get(ref) for _, ref in refs]
 
-    # `get` returns a typed Card per kind; checking its class narrows it to
-    # the kind-specific `spec`.
-    assert isinstance(data, RegisteredDataCard)
-    assert [column.name for column in data.spec.schema.columns] == ["latency", "tier"]
-    assert isinstance(model, RegisteredModelCard)
-    assert model.metadata.artifact_hash
-    assert isinstance(prompt, RegisteredPromptCard)
-    assert prompt.spec.model == "gpt-4o"
-    assert isinstance(agent, RegisteredAgentCard)
-    assert agent.spec.run_config is not None
-    assert agent.spec.run_config.max_iterations == 2
-    assert isinstance(verifier, RegisteredVerifierCard)
-    assert verifier.spec.implementation.kind == "eval"
-    assert isinstance(service, RegisteredServiceCard)
-    assert service.spec.service_type == "agent"
-    assert isinstance(trigger, RegisteredTriggerCard)
-    assert trigger.spec.kind == "observations_ready"
-    assert isinstance(operator, RegisteredOperatorCard)
-    assert operator.spec.kind == "http"
+    # Every kind reads back as the native envelope with its exact identity,
+    # mapping-valued content, and no graph aliases (registry reads hydrate nothing).
+    for (kind, ref), envelope in zip(refs, envelopes, strict=True):
+        assert isinstance(envelope, CardEnvelope)
+        assert envelope.card_ref == ref
+        assert envelope.kind == kind
+        assert envelope.aliases == ()
+        assert envelope.metadata["name"] == ref.name
+        assert isinstance(envelope.relationships, dict)
+        assert envelope.status is None or isinstance(envelope.status, dict)
+        dumped = envelope.model_dump()
+        assert dumped["spec"] == envelope.spec
+        assert dumped["metadata"] == envelope.metadata
+        assert json.loads(envelope.model_dump_json()) == dumped
+
+    data, model, prompt, agent, verifier, service, trigger, operator = envelopes
+    assert [column["name"] for column in data.spec["schema"]["columns"]] == ["latency", "tier"]
+    assert model.metadata["artifact_hash"]
+    assert prompt.spec["model"] == "gpt-4o"
+    assert agent.spec["run_config"]["max_iterations"] == 2
+    assert verifier.spec["implementation"]["kind"] == "eval"
+    assert service.spec["service_type"] == "agent"
+    assert trigger.spec["kind"] == "observations_ready"
+    assert operator.spec["kind"] == "http"
 
 
 def test_artifact_without_digest_registers(cards: Cards, support_desk: dict[str, CardRef]) -> None:
     """The fixture Model lists its artifact without a digest; the client computes it."""
     model = cards.get(support_desk["support-model"])
 
-    assert model.metadata.artifact_hash
+    assert model.metadata["artifact_hash"]
 
 
 def test_wrong_artifact_digest_is_refused(cards: Cards) -> None:

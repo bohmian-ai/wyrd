@@ -35,6 +35,7 @@ wyrd-queue = { workspace = true }
 wyrd-types = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-sql = { workspace = true }
+wyrd-telemetry = { workspace = true }
 wyrd-storage = { workspace = true }
 vala-sql = { workspace = true }
 

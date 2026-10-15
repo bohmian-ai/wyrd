@@ -10,7 +10,6 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tracing::Instrument as _;
 use wyrd_runtime::{CardAttribution, Permission};
-use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::card::verifier::VerifierImplementation;
 use wyrd_spec::envelope::Spec;
@@ -21,7 +20,7 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::AuditOutcome;
-use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::verification::DriftWindow;
 use wyrd_spec::verification::{
     ExecuteVerificationRequest, Judgment, StartVerificationRunRequest, VerificationBindingStatus,
@@ -38,6 +37,7 @@ use wyrd_sql::{CardStatus, ParsedCardRow, TenantConn};
 
 use crate::audit;
 use crate::components::auth::Caller;
+use crate::components::gateway::GatewayCallSubject;
 use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::http::middleware::edge_timeout::EdgeTimer;
 use crate::scribe_outbox::{ScribeWrite, VerifierAttribution};
@@ -281,7 +281,8 @@ impl<'a> VerificationControl<'a> {
     /// transaction never touches the tenant audit chain and the request never
     /// waits for the audit commit. A request carrying `key` replays the
     /// requester's earlier run for the same body and is refused for a
-    /// different one.
+    /// different one. The run stores the current span, inside this request,
+    /// as its cause, so its later execution links back to the request.
     ///
     /// # Errors
     /// Returns [`WyrdError::VerificationInvalidWindow`] for an invalid window,
@@ -358,6 +359,12 @@ impl<'a> VerificationControl<'a> {
             key: key.as_str(),
             request_sha256: &digest,
         });
+        let cause = wyrd_telemetry::current_context().and_then(|context| {
+            Some((
+                TraceId::from_hex(&context.trace_id).ok()?,
+                SpanId::from_hex(&context.span_id).ok()?,
+            ))
+        });
         let outcome = self
             .queue
             .enqueue_manual(
@@ -365,6 +372,7 @@ impl<'a> VerificationControl<'a> {
                 caller.principal.id,
                 &request.target,
                 request.input.drift_window(),
+                cause,
                 request_key,
             )
             .await
@@ -393,6 +401,9 @@ impl<'a> VerificationControl<'a> {
     /// decision is staged on [`AppState::scribe_outbox`] and the request never
     /// waits for its commit. The engine runs under [`EXECUTION_DEADLINE`] as
     /// a `direct` execution on its own telemetry; nothing else is persisted.
+    /// Every judge model call is recorded under the caller's principal and
+    /// attributed to the subject Card and to the request's Run when it names
+    /// one, so the calls join that Card's and Run's evidence.
     /// Dropping the future cancels the execution. An HTTP caller passes its
     /// [`EdgeTimer`], handed off once the target is authorized and resolved
     /// so the deadline, not the generic edge timeout, governs the engine; MCP
@@ -456,14 +467,19 @@ impl<'a> VerificationControl<'a> {
                 Phase::Engine,
                 tokio::time::timeout(
                     EXECUTION_DEADLINE,
-                    DirectExecutor::new(self.state).execute(
-                        caller,
-                        execution_id,
-                        &request.verifier_uid,
-                        &target.implementation,
-                        &request.input,
-                        &telemetry,
-                    ),
+                    DirectExecutor::new(self.state)
+                        .attributed(Some(GatewayCallSubject {
+                            run_id: request.run_id.clone(),
+                            card_uid: Some(request.subject_card_uid.clone()),
+                        }))
+                        .execute(
+                            caller,
+                            execution_id,
+                            &request.verifier_uid,
+                            &target.implementation,
+                            &request.input,
+                            &telemetry,
+                        ),
                 )
                 .instrument(tracing::info_span!("verification.engine")),
             )
@@ -483,7 +499,7 @@ impl<'a> VerificationControl<'a> {
         telemetry.finish(outcome, outcome != "completed");
         let report = result?;
         self.stage_result(
-            caller.data_tenant_id,
+            caller,
             execution_id,
             request.run_id.as_ref(),
             &target,
@@ -507,7 +523,8 @@ impl<'a> VerificationControl<'a> {
     /// The result takes the execution's identity, so the response's
     /// `execution_id` is the `result_id` of its rows. It is attributed to the
     /// tenant SYSTEM principal and the exact Verifier exactly like a queued
-    /// result, carries the caller's application Run `run_id` when supplied,
+    /// result, records `caller` as its requesting principal, carries the
+    /// caller's application Run `run_id` when supplied,
     /// and has no owner, binding, or Trigger. A Drift result records the
     /// execution interval as its window; an Eval or task result records the
     /// application Run's record (the `execution_id` when no Run is supplied)
@@ -516,7 +533,7 @@ impl<'a> VerificationControl<'a> {
     /// result is not recorded.
     fn stage_result(
         &self,
-        tenant: DataTenantId,
+        caller: &Caller,
         execution_id: VerificationExecutionId,
         run_id: Option<&RunId>,
         target: &DirectTarget,
@@ -556,6 +573,7 @@ impl<'a> VerificationControl<'a> {
                 run_id,
                 verifier_version: &verifier_version,
                 subject_card_uid: subject,
+                requested_by: Some(caller.principal.id),
                 owner_card_uid: None,
                 binding_id: None,
                 trigger: None,
@@ -569,7 +587,7 @@ impl<'a> VerificationControl<'a> {
         .build(report);
         match built {
             Ok(payload) => self.state.scribe_outbox.stage(
-                tenant,
+                caller.data_tenant_id,
                 ScribeWrite::Result {
                     payload,
                     attribution: VerifierAttribution {

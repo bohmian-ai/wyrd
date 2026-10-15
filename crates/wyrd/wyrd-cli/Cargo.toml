@@ -24,10 +24,12 @@ path = "tests/cli.rs"
 [dependencies]
 arrow = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["pem"] }
 indicatif = { workspace = true }
+rand = { workspace = true }
 reqwest = { workspace = true }
 # Stdio MCP server for the host-facing `wyrd mcp proxy`, bridged to Wyrd's
 # `/mcp` through the Streamable HTTP client `wyrd-mcp` authenticates.
@@ -72,7 +74,6 @@ rustix = { workspace = true, features = ["termios"] }
 workspace-hack.workspace = true
 assert_cmd = "2"
 axum = { workspace = true }
-base64 = { workspace = true }
 predicates = "3"
 sqlx = { workspace = true }
 tokio = { workspace = true, features = ["net", "process"] }

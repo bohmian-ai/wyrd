@@ -35,11 +35,19 @@ pub fn system_messages(prompt: &str, provider: &ProviderName) -> AgentResult<Vec
                 }],
             })])
         }
-        ProviderName::Custom(provider) => Err(AgentError::Prompt {
-            agent: provider.clone(),
-            detail: "custom providers must author the system content into the prompt directly"
-                .to_owned(),
-        }),
+        ProviderName::Jev => Err(no_system_messages("jev")),
+        ProviderName::Custom(provider) => Err(no_system_messages(provider)),
+    }
+}
+
+/// Refusal of a provider with no native system message, naming `provider`;
+/// its system content belongs in the Prompt itself.
+fn no_system_messages(provider: &str) -> AgentError {
+    AgentError::Prompt {
+        agent: provider.to_owned(),
+        detail: "this provider has no native system message; author the system content into \
+                 the prompt directly"
+            .to_owned(),
     }
 }
 

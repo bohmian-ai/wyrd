@@ -110,7 +110,7 @@ rm -rf "$orphan"
 # --- Scenario 2: cross-boundary changes and uncertainty preserve proof -------
 
 check_selection "wire contract selects codegen, SDKs, and journeys" \
-  "full_gate=false rust_client=true typescript=true python=true storage=true identity=true ci_lanes~codegen:check ci_lanes~py:test:integration ci_lanes~ts:test:integration ci_lanes~ts:napi:check ci_lanes~test:bifrost:gate ci_lanes~test:wyrd ci_lanes~test:shared" \
+  "full_gate=false rust_client=true typescript=true python=true storage=true identity=true docs=true ci_lanes~codegen:check ci_lanes~py:test:integration ci_lanes~ts:test:integration ci_lanes~ts:napi:check ci_lanes~test:bifrost:gate ci_lanes~test:wyrd ci_lanes~test:shared" \
   "crates/wyrd-spec/src/lib.rs"
 check_selection "shared client selects SDK platforms and journeys" \
   "full_gate=false rust_client=true typescript=true python=true identity=true ci_lanes~codegen:check ci_lanes~py:test:integration ci_lanes~ts:test:integration ci_lanes~test:bifrost:gate" \

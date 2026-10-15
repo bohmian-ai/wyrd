@@ -7,11 +7,12 @@
 //! [`work`] is that whole workflow for one client, so the signed-in story
 //! proves the same steps for a saved user login.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::bifrost::QueryParam;
@@ -151,6 +152,16 @@ pub async fn work(deployment: &Deployment, client: &WyrdClient) -> Worked {
     let run_id = run.run_id().to_string();
     let telemetry = start_telemetry(&state).expect("telemetry installs");
     start_telemetry(&state).expect("a second start is idempotent");
+    let mut headers = HashMap::new();
+    tracing::info_span!("outbound").in_scope(|| {
+        opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.inject_context(&tracing::Span::current().context(), &mut headers);
+        });
+    });
+    assert!(
+        headers.contains_key("traceparent"),
+        "the global propagator carries the active span: {headers:?}"
+    );
     export(&run.for_card("agent").expect("agent view")).await;
     telemetry.shutdown().expect("spans export");
     state.shutdown().await.expect("emits drain");

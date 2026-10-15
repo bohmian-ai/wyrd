@@ -8,18 +8,15 @@ llms.txt       - compact index for agents: the home page, then every sidebar
                  page, grouped and ordered exactly as the sidebar shows them.
                  Derived from the content on disk, so it never advertises a
                  route the build does not serve.
-llms-full.txt  - the same index plus the JSON Schema of every Card kind.
+llms-full.txt  - the same page index under the full-reference heading.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 
 DOCS_ROOT = Path(__file__).resolve().parents[1]
-REPO_ROOT = DOCS_ROOT.parent
-SCHEMA_DIR = REPO_ROOT / "crates" / "wyrd-spec" / "schemas"
 CONTENT_DIR = DOCS_ROOT / "src" / "content" / "docs"
 PUBLIC_DIR = DOCS_ROOT / "public"
 
@@ -29,7 +26,6 @@ PUBLIC_DIR = DOCS_ROOT / "public"
 ORIGIN = "https://bohmian-ai.github.io"
 BASE = "/wyrd"
 SITE = f"{ORIGIN}{BASE}"
-SCHEMA_URL = "https://github.com/bohmian-ai/wyrd/tree/main/crates/wyrd-spec/schemas"
 
 SUMMARY = (
     "Wyrd is open-source AI assurance and verification infrastructure. Verify AI "
@@ -38,7 +34,14 @@ SUMMARY = (
 )
 
 # Mirrors SECTIONS and TOPICS in docs/src/lib/content.ts: the sidebar order.
-SECTIONS = ["Get started", "Build and verify", "Connect", "Operate", "Understand", "Reference"]
+SECTIONS = [
+    "Get started",
+    "Build and verify",
+    "Connect",
+    "Operate",
+    "Understand",
+    "Reference",
+]
 TOPICS = ["Declare", "Observe", "Verify"]
 
 Page = tuple[str, str, str, str]  # (section, slug, title, description)
@@ -87,7 +90,11 @@ def _order(value: str | None) -> float:
 
 def in_sidebar(fm: dict[str, str]) -> bool:
     """Mirror derived-nav.ts inPrimaryNav(): no drafts, Fathom, or planned pages."""
-    return fm.get("draft") != "true" and fm.get("pillar") != "fathom" and fm.get("status") != "planned"
+    return (
+        fm.get("draft") != "true"
+        and fm.get("pillar") != "fathom"
+        and fm.get("status") != "planned"
+    )
 
 
 def sidebar_pages() -> list[Page]:
@@ -100,8 +107,15 @@ def sidebar_pages() -> list[Page]:
         if not in_sidebar(fm) or fm.get("section") not in SECTIONS:
             continue
         section, topic, slug = fm["section"], fm.get("topic"), slug_for(path)
-        key = (SECTIONS.index(section), TOPICS.index(topic) if topic in TOPICS else 0, _order(fm.get("order")), slug)
-        ranked.append((key, (section, slug, fm.get("title", slug), fm.get("description", ""))))
+        key = (
+            SECTIONS.index(section),
+            TOPICS.index(topic) if topic in TOPICS else 0,
+            _order(fm.get("order")),
+            slug,
+        )
+        ranked.append(
+            (key, (section, slug, fm.get("title", slug), fm.get("description", "")))
+        )
     return [page for _key, page in sorted(ranked)]
 
 
@@ -110,7 +124,12 @@ def url_for(slug: str) -> str:
 
 
 def render_pages_index() -> list[str]:
-    lines = ["## Home", "", f"- [Wyrd docs]({url_for('')}): the docs home, with a link to each published section.", ""]
+    lines = [
+        "## Home",
+        "",
+        f"- [Wyrd docs]({url_for('')}): the docs home, with a link to each published section.",
+        "",
+    ]
     pages = sidebar_pages()
     for section in SECTIONS:
         entries = [page for page in pages if page[0] == section]
@@ -124,19 +143,13 @@ def render_pages_index() -> list[str]:
     return lines
 
 
-def load_schema(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
 def render_llms_txt() -> str:
     lines = ["# Wyrd", "", f"> {SUMMARY}", ""]
     lines += render_pages_index()
     lines += [
-        "## Machine-readable schemas",
+        "## Machine-readable reference",
         "",
-        f"- [llms-full.txt]({SITE}/llms-full.txt): this index plus the JSON Schema of every Card kind.",
-        f"- [Card and API JSON Schemas]({SCHEMA_URL}): the source schemas generated from `wyrd-spec`.",
+        f"- [llms-full.txt]({SITE}/llms-full.txt): this index as the full machine-readable reference.",
         "",
     ]
     return "\n".join(lines)
@@ -146,28 +159,10 @@ def render_llms_full() -> str:
     lines = [
         "# Wyrd — full machine-readable reference",
         "",
-        "Generated from the docs content tree and `crates/wyrd-spec/schemas/`.",
+        "Generated from the docs content tree.",
         "",
     ]
     lines += render_pages_index()
-    lines += ["## Card schemas", ""]
-    # The CardKind enum is the authority for which kinds exist; each kind's spec
-    # schema supplies its own description.
-    for kind in sorted(load_schema(SCHEMA_DIR / "card_kind.json")["enum"]):
-        schema_file = f"{kind.lower()}_spec.json"
-        schema = load_schema(SCHEMA_DIR / schema_file)
-        lines += [
-            f"### {kind}",
-            "",
-            schema.get("description", "").split("\n\n", 1)[0],
-            "",
-            f"Schema source: crates/wyrd-spec/schemas/{schema_file}",
-            "",
-            "```json",
-            json.dumps(schema, indent=2, sort_keys=True),
-            "```",
-            "",
-        ]
     return "\n".join(lines)
 
 

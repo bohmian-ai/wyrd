@@ -14,6 +14,7 @@ mod every_iceberg_column_type;
 mod register_a_table_from_a_model;
 mod table_time_column;
 mod three_timestamp_types;
+mod trace_timeline;
 mod variant_tables;
 
 mod pg_tests {

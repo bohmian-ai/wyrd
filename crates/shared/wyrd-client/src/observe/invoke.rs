@@ -47,7 +47,7 @@ impl Run {
         }
         let prompt = self.state.resolve_agent_prompt(&self.alias)?;
         let caller = PublicWyrdGatewayCaller::new(self.state.client()?.clone())
-            .with_subject(&self.run_id, self.subject_uid());
+            .with_subject(Some(&self.run_id), Some(self.subject_uid()));
         let registry = wyrd_gateway_registry(Arc::new(caller), prompt).ok_or_else(|| {
             invalid_agent(
                 &self.alias,

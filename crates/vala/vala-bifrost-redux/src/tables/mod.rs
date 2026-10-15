@@ -1502,6 +1502,7 @@ mod tests {
                 utf8("verifier_version", false),
                 utf8("owner_card_uid", true),
                 utf8("subject_card_uid", false),
+                utf8("requested_by_principal_id", true),
                 utf8("binding_id", true),
                 utf8("trigger_identity", true),
                 utf8("source_record_id", true),

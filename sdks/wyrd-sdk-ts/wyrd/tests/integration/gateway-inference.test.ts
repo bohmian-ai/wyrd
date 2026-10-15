@@ -1,13 +1,28 @@
+import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+import { Agent, run, setTracingDisabled, tool } from "@openai/agents-core";
+import { OpenAIResponsesModel } from "@openai/agents-openai";
+import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import { expect, vi } from "vitest";
+import { z } from "zod";
 
-import { Cards, Gateway, type ProviderDeployment, type RegistrationReceipt, Workflow, WyrdClient } from "wyrd-ai";
+import {
+  Bifrost,
+  Cards,
+  Gateway,
+  Principals,
+  type ProviderDeployment,
+  type RegistrationReceipt,
+  Workflow,
+  WyrdClient,
+  WyrdError,
+} from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
-import { fixture, registered, serverTest } from "../support/server.js";
+import { ancestry, columnValues, fixture, registered, serverTest, timeline } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -24,6 +39,70 @@ const COMPLETION = {
   choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop", logprobs: null }],
   usage: { prompt_tokens: 11, completion_tokens: 4, total_tokens: 15 },
 };
+
+/** Buffered Anthropic Messages answer the upstream returns. */
+const ANTHROPIC_MESSAGE = {
+  id: "msg_1",
+  type: "message",
+  role: "assistant",
+  model: "claude-sonnet-5",
+  content: [{ type: "text", text: "hi" }],
+  stop_reason: "end_turn",
+  stop_sequence: null,
+  usage: { input_tokens: 5, output_tokens: 3 },
+};
+
+/** Responses usage the upstream reports. */
+const RESPONSE_USAGE = {
+  input_tokens: 5,
+  output_tokens: 3,
+  total_tokens: 8,
+  input_tokens_details: { cached_tokens: 0 },
+  output_tokens_details: { reasoning_tokens: 0 },
+};
+
+/** A buffered Responses answer carrying `output`. */
+function response(output: unknown[]): unknown {
+  return {
+    id: "resp_1",
+    object: "response",
+    created_at: 1,
+    model: "gpt-4o-mini",
+    status: "completed",
+    output,
+    usage: RESPONSE_USAGE,
+  };
+}
+
+/**
+ * The upstream's Responses turn: an `echo` call until the input carries its
+ * result, then the final answer.
+ */
+function responsesTurn(body: string): unknown {
+  const answered = (JSON.parse(body) as { input: { type?: string }[] }).input.some(
+    (item) => item.type === "function_call_output",
+  );
+  return answered
+    ? response([
+        {
+          type: "message",
+          id: "msg_1",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "echoed", annotations: [] }],
+        },
+      ])
+    : response([
+        {
+          type: "function_call",
+          id: "fc_1",
+          call_id: "c1",
+          name: "echo",
+          arguments: '{"text":"hi"}',
+          status: "completed",
+        },
+      ]);
+}
 
 /** The code-review example Workflow directory; its Prompts call `gpt-5-5` through the Wyrd gateway. */
 const EXAMPLE = resolve(import.meta.dirname, "../../../../../examples/workflows/code-review");
@@ -48,10 +127,15 @@ function deployment(model: string): ProviderDeployment {
 
 /**
  * A server whose `openai` deployments of `gpt-4o` and `gpt-5-5` reach the
- * local upstream with the operator's provider key, and the registered `ask`
- * Workflow.
+ * local upstream with the operator's provider key, call metadata capture, and
+ * the registered `ask` Workflow.
  */
-const test = serverTest({ provider: () => ({ status: 200, body: COMPLETION }) }).extend<{
+const test = serverTest({
+  provider: ({ path, body }) => ({
+    status: 200,
+    body: path === "/v1/responses" ? responsesTurn(body) : path === "/v1/messages" ? ANTHROPIC_MESSAGE : COMPLETION,
+  }),
+}).extend<{
   ask: RegistrationReceipt;
 }>({
   ask: [
@@ -61,9 +145,24 @@ const test = serverTest({ provider: () => ({ status: 200, body: COMPLETION }) })
         provider: "openai",
         source: { environment: { binding: "test-provider-key" } },
       });
+      await cli.putProviderCredential({
+        name: "anthropic-key",
+        provider: "anthropic",
+        source: { environment: { binding: "test-anthropic-key" } },
+      });
       const gateway = Gateway.connect();
       await gateway.putDeployment(deployment("gpt-4o"));
+      await gateway.putDeployment({
+        name: "claude-sonnet-5",
+        model: { provider: "anthropic", model: "claude-sonnet-5" },
+        adapter: "anthropic",
+        auth: { api_key_header: { header: "x-api-key", credential: "anthropic-key" } },
+        capabilities: ["chat_completions"],
+        routing_weight: 1,
+      });
       await gateway.putDeployment(deployment("gpt-5-5"));
+      await gateway.putDeployment({ ...deployment("gpt-4o-mini"), capabilities: ["responses"] });
+      await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });
       await use(await Cards.connect().registerFromPath(fixture("cards/gateway_inference/ask.yaml")));
     },
     { scope: "file" },
@@ -93,6 +192,117 @@ test("openai client calls the gateway with an access token", async ({ provider, 
   expect(Object.keys(upstream?.headers ?? {}).filter((name) => name.startsWith("x-wyrd"))).toEqual([]);
 });
 
+/** The gateway's model-call spans in the trace `traceId`, after publishing every captured row. */
+test("gateway span joins the caller's trace", async ({ server, ask: _ }) => {
+  const [traceId, spanId] = [randomBytes(16).toString("hex"), randomBytes(8).toString("hex")];
+  const token = await WyrdClient.connect().accessToken();
+  const client = new OpenAI({
+    baseURL: `${WyrdClient.connect().serverUrl}/v1`,
+    apiKey: token,
+    defaultHeaders: { traceparent: `00-${traceId}-${spanId}-01`, tracestate: "wyrd=journey" },
+  });
+
+  const reply = await client.chat.completions.create(ASK);
+
+  expect(reply.choices[0]?.message.content).toBe("hi");
+  const spans = await timeline(server, traceId);
+  const attempts = spans.filter((span) => span.scope.name === "wyrd.gateway");
+  expect(attempts).toHaveLength(1);
+  expect(ancestry(spans, attempts[0]).at(-1)?.parent_span_id).toBe(spanId);
+  expect(attempts[0].trace_state).toBe("wyrd=journey");
+});
+
+test("malformed traceparent is ignored by the gateway", async ({ server, ask: _ }) => {
+  const traceId = randomBytes(16).toString("hex");
+  const token = await WyrdClient.connect().accessToken();
+  const client = new OpenAI({
+    baseURL: `${WyrdClient.connect().serverUrl}/v1`,
+    apiKey: token,
+    defaultHeaders: { traceparent: `00-${traceId}-not-a-span-01` },
+  });
+
+  const reply = await client.chat.completions.create(ASK);
+
+  expect(reply.choices[0]?.message.content).toBe("hi");
+  expect(await timeline(server, traceId)).toEqual([]);
+});
+
+// Each client keeps a placeholder provider key; `httpAuth` drops it and sends
+// the ambient client's current access token, so the gateway sees one credential.
+test("stock openai client authenticates with httpAuth alone", async ({ provider, ask: _ }) => {
+  const wyrd = WyrdClient.connect();
+  const client = new OpenAI({ baseURL: `${wyrd.serverUrl}/v1`, apiKey: "wyrd", fetch: wyrd.httpAuth });
+  const before = provider.received.length;
+
+  for (let turn = 0; turn < 2; turn++) {
+    const reply = await client.chat.completions.create(ASK);
+    expect(reply.choices[0]?.message.content).toBe("hi");
+  }
+  for (const upstream of provider.received.slice(before)) {
+    expect(upstream.headers).toMatchObject({ authorization: `Bearer ${PROVIDER_KEY}` });
+  }
+});
+
+test("stock anthropic client authenticates with httpAuth alone", async ({ provider, ask: _ }) => {
+  const wyrd = WyrdClient.connect();
+  const client = new Anthropic({ baseURL: wyrd.serverUrl, apiKey: "wyrd", fetch: wyrd.httpAuth, maxRetries: 0 });
+  const before = provider.received.length;
+
+  const message = await client.messages.create({
+    model: "claude-sonnet-5",
+    max_tokens: 16,
+    messages: [{ role: "user", content: "hi" }],
+  });
+
+  expect(message.content).toEqual([{ type: "text", text: "hi" }]);
+  const [upstream] = provider.received.slice(before);
+  expect(upstream).toMatchObject({ path: "/v1/messages", headers: { "x-api-key": PROVIDER_KEY } });
+});
+
+// No transport hook and no Wyrd call: the static key from the environment
+// is the client's own API key, and the gateway exchanges it for the caller.
+test("stock openai client authenticates with a Wyrd API key", async ({ provider, ask: _ }) => {
+  const apiKey = process.env.WYRD_API_KEY ?? "";
+  const client = new OpenAI({ baseURL: `${process.env.WYRD_SERVER_URL}/v1`, apiKey, maxRetries: 0 });
+  const before = provider.received.length;
+
+  expect(apiKey).toMatch(/^wyrd_sk_/);
+  for (let turn = 0; turn < 2; turn++) {
+    const reply = await client.chat.completions.create(ASK);
+    expect(reply.choices[0]?.message.content).toBe("hi");
+  }
+  const upstream = provider.received.slice(before);
+  expect(upstream).toHaveLength(2);
+  for (const call of upstream) {
+    expect(call.headers).toMatchObject({ authorization: `Bearer ${PROVIDER_KEY}` });
+    expect(Object.values(call.headers).join(" ")).not.toContain(apiKey);
+  }
+});
+
+// The status of the refusal is not pinned: only that the client's own token
+// exchange rejected the request, so no gateway call was made.
+test("revoked api key is refused by the token exchange, before the gateway", async ({ provider, ask: _ }) => {
+  const principals = Principals.connect();
+  const { principal_id, credential } = await principals.createServicePrincipal({
+    name: "revoked-gateway-caller",
+    roles: [],
+  });
+  await principals.revokePrincipal(principal_id, { principal_kind: "service", reason: "journey revokes this key" });
+  vi.stubEnv("WYRD_API_KEY", credential);
+  const client = new OpenAI({
+    baseURL: `${process.env.WYRD_SERVER_URL}/v1`,
+    apiKey: "wyrd",
+    fetch: WyrdClient.connect().httpAuth,
+    maxRetries: 0,
+  });
+  const before = provider.received.length;
+
+  const refusal = await client.chat.completions.create(ASK).catch((reason: unknown) => reason);
+
+  expect((refusal as { cause?: unknown }).cause).toBeInstanceOf(WyrdError);
+  expect(provider.received.length).toBe(before);
+});
+
 test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {
   const reader = WyrdClient.connect({ credential: server.scopedApiKey("gateway_reader", ["gateway:read"]) });
   const { client } = await openai(reader);
@@ -101,6 +311,79 @@ test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {
     status: 403,
     error: { code: "WYRD_PERMISSION_403_DENIED_RBAC" },
   });
+});
+
+test("gateway call records a lone run or card", async ({ server, ask }) => {
+  const issued = await cli.issueKey({ kind: "Agent", name: "ask-agent", version: "1.0.0", space: "default" });
+  const caller = WyrdClient.connect({ credential: issued.key });
+  const client = new OpenAI({ baseURL: `${caller.serverUrl}/v1`, apiKey: "wyrd", fetch: caller.httpAuth });
+  const cardUid = registered(ask, "ask-agent").uid;
+
+  for (const headers of [{ "wyrd-run-id": "run-alone" }, { "wyrd-card-uid": cardUid }]) {
+    const reply = await client.chat.completions.create(ASK, { headers });
+    expect(reply.choices[0]?.message.content).toBe("hi");
+  }
+
+  server.flushBifrost();
+  const calls = (
+    await (
+      await Bifrost.connect()
+    ).sql("SELECT run_id, card_uid FROM vala.gateway.calls WHERE caller_principal_id = $1 ORDER BY run_id", [
+      issued.principal_id,
+    ])
+  ).toArrow();
+  expect(columnValues(calls.getChild("run_id"))).toEqual(["run-alone", null]);
+  expect(columnValues(calls.getChild("card_uid"))).toEqual([null, cardUid]);
+});
+
+/** An Agents SDK agent on the Gateway's Responses API whose `echo` tool returns content parts. */
+function echoAgent(client: OpenAI): Agent {
+  setTracingDisabled(true);
+  const echo = tool({
+    name: "echo",
+    description: "Echo the text.",
+    parameters: z.object({ text: z.string() }),
+    execute: async ({ text }) => ({ type: "text" as const, text }),
+  });
+  return new Agent({
+    name: "echo-agent",
+    instructions: "Call echo.",
+    model: new OpenAIResponsesModel(client, "openai/gpt-4o-mini"),
+    tools: [echo],
+  });
+}
+
+test("agents sdk responses tool loop runs through the gateway", async ({ provider, ask: _ }) => {
+  const { client } = await openai(WyrdClient.connect());
+  const before = provider.received.length;
+
+  const result = await run(echoAgent(client), "go");
+
+  expect(result.finalOutput).toBe("echoed");
+  const upstream = provider.received.slice(before);
+  expect(upstream.map(({ path }) => path)).toEqual(["/v1/responses", "/v1/responses"]);
+  const [first, second] = upstream.map(({ body }) => JSON.parse(body) as { model: string; input: unknown[] });
+  expect(first?.model).toBe("gpt-4o-mini");
+  expect(first?.input).toEqual([{ role: "user", content: "go" }]);
+  expect(second?.input).toContainEqual({ role: "user", content: "go" });
+  expect(second?.input).toContainEqual(
+    expect.objectContaining({
+      type: "function_call_output",
+      call_id: "c1",
+      output: [{ type: "input_text", text: "hi" }],
+    }),
+  );
+});
+
+test("caller without gateway invoke cannot run an agents sdk agent", async ({ server, provider, ask: _ }) => {
+  // Each scoped key mints a principal named for its role on this file's server,
+  // so this caller's role must differ from the earlier refused caller's.
+  const reader = WyrdClient.connect({ credential: server.scopedApiKey("agent_reader", ["gateway:read"]) });
+  const { client } = await openai(reader);
+  const before = provider.received.length;
+
+  await expect(run(echoAgent(client), "go")).rejects.toMatchObject({ status: 403 });
+  expect(provider.received.slice(before)).toEqual([]);
 });
 
 test("cli issues a card scoped key and writes a provider credential", async ({ ask: _ }) => {

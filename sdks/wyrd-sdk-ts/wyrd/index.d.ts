@@ -170,6 +170,20 @@ export declare class NativeBifrost {
    */
   cancel(requestId: string): Promise<NativeLifecycleResult>
   /**
+   * Reads one trace's span tree, plus each trace linking directly to it,
+   * as canonical span records.
+   *
+   * The id is parsed before any request, so a malformed one never reaches
+   * the server; the read itself is `Bifrost::trace_timeline`.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the spans cannot be projected; an
+   * invalid id and query or transport failures are returned in
+   * [`NativeLifecycleResult`].
+   */
+  traceTimeline(traceId: string): Promise<NativeLifecycleResult>
+  /**
    * Describes one registered table's stored physical schema.
    *
    * The description is the server's own projection: the user fields a caller
@@ -1039,6 +1053,14 @@ export interface NativeBifrostConnection {
   error?: NativeWyrdError
 }
 
+/** Node's active span as W3C `traceparent` and optional `tracestate`. */
+export interface NativeCallerTrace {
+  /** The W3C `traceparent` header value. */
+  traceparent: string
+  /** The W3C `tracestate` header value, when the span carries one. */
+  tracestate?: string
+}
+
 /** Structured native result for one live-query lifecycle control. */
 export interface NativeLifecycleResult {
   /** Canonical JSON payload when the control succeeded. */
@@ -1207,6 +1229,17 @@ export declare function openWyrdState(path: string): NativeWyrdState
  * and resolves its process exit code.
  */
 export declare function runWyrdCli(args: Array<string>): Promise<number>
+
+/**
+ * Register the callback each native call reads Node's active span through,
+ * and a queued write opens its PRODUCER span through when given the table;
+ * a later registration replaces the earlier one.
+ *
+ * # Errors
+ *
+ * Returns a napi error when the callback reference cannot be created.
+ */
+export declare function setTraceSource(source: (arg: string | undefined | null) => NativeCallerTrace | null): void
 
 /**
  * Renders one stored timestamp cell as its Bifrost timestamp type's text.

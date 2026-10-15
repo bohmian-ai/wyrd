@@ -31,6 +31,7 @@ use vala_bifrost_redux::tables::{DomainTable, ResultFeaturesTable, ResultItemsTa
 use vala_drift::{DriftReport, DriftVerdict};
 use vala_eval::executor::{EvalReport, EvalWorkflowSummary, SkipReason, TaskRunOutcome};
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::UTC_TIME_ZONE;
@@ -146,6 +147,11 @@ pub struct ResultRun<'a> {
     pub verifier_version: &'a str,
     /// Verified subject Card.
     pub subject_card_uid: &'a CardUid,
+    /// The execution's actor, stored as `requested_by_principal_id`: a
+    /// direct execution's caller, or a claimed run's frozen actor (a manual
+    /// run's caller, or the tenant SYSTEM principal of internal work);
+    /// `None` when an internal run's tenant had no SYSTEM principal.
+    pub requested_by: Option<PrincipalId>,
     /// Binding owner; `None` for a direct run.
     pub owner_card_uid: Option<&'a CardUid>,
     /// Binding; `None` for a direct run.
@@ -165,6 +171,7 @@ impl<'a> ResultRun<'a> {
             run_id,
             verifier_version: &run.verifier_version,
             subject_card_uid: &run.subject_card_uid,
+            requested_by: run.requested_by,
             owner_card_uid: run.owner_card_uid.as_ref(),
             binding_id: run.binding_id,
             trigger: run.trigger.as_ref(),
@@ -316,6 +323,10 @@ impl<'a> ResultPayloadBuilder<'a> {
             (
                 "subject_card_uid",
                 text([Some(self.run.subject_card_uid.to_string())]),
+            ),
+            (
+                "requested_by_principal_id",
+                text([self.run.requested_by.map(|principal| principal.to_string())]),
             ),
             ("binding_id", text([self.binding()])),
             ("trigger_identity", text([trigger])),
@@ -869,6 +880,7 @@ mod tests {
                 run_id: Some(&self.run_id),
                 verifier_version: "1.2.0",
                 subject_card_uid: &self.subject,
+                requested_by: None,
                 owner_card_uid: Some(&self.owner),
                 binding_id: Some(self.binding),
                 trigger: Some(&self.trigger),
@@ -1225,8 +1237,9 @@ mod tests {
     }
 
     /// A direct task judgment writes exactly one `vala.verification.results`
-    /// row and no detail row: the task verdict, exact Verifier version and
-    /// subject, null binding facts and window, the application Run's record as
+    /// row and no detail row: the task verdict, exact Verifier version,
+    /// subject, and requesting principal, null binding facts and window, the
+    /// application Run's record as
     /// source, the execution interval, and its one `AssertionResult` as details.
     #[test]
     fn direct_task_writes_one_summary_row() {
@@ -1248,11 +1261,13 @@ mod tests {
             started_at: at(11),
             duration_ms: 3,
         };
+        let requester = PrincipalId::new(uuid::Uuid::now_v7());
         let payload = ResultPayloadBuilder::new(
             ResultRun {
                 run_id: Some(&application),
                 verifier_version: "1.0.0",
                 subject_card_uid: &subject,
+                requested_by: Some(requester),
                 owner_card_uid: None,
                 binding_id: None,
                 trigger: None,
@@ -1279,6 +1294,7 @@ mod tests {
             ("verdict", Some("failed".to_owned())),
             ("verifier_version", Some("1.0.0".to_owned())),
             ("subject_card_uid", Some(subject.to_string())),
+            ("requested_by_principal_id", Some(requester.to_string())),
             ("owner_card_uid", None),
             ("binding_id", None),
             ("trigger_identity", None),

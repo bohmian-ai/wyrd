@@ -2718,3 +2718,946 @@ async fn a_refused_run_pauses_claiming_until_a_running_run_finishes() {
     assert_eq!(row.attempts, 1, "the refusal consumed no attempt");
     runtime.stop().await;
 }
+
+/// Trace id of the caller whose direct judge executions continue its trace.
+const JUDGE_CALLER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+
+/// Spans from a judge's gateway execution up to the request span, innermost
+/// first: one subtree from the verification through the gateway.
+const JUDGE_CHAIN: [&str; 8] = [
+    "gateway.execute",
+    "gateway.call",
+    "workflow.gateway.call",
+    "dispatch",
+    "verification.judge",
+    "verification.score",
+    "verification.execute",
+    "request",
+];
+
+/// A direct execution of a Task `llm_judge` and of an Eval `llm_judge`, each
+/// carrying the caller's `traceparent`, produces one subtree under its
+/// request span: the gateway execution of the judge's model call descends,
+/// span by span, through the gateway call, the judge, the score, and the
+/// verification execute span to the request span the caller parents, and its
+/// one captured attempt row sits in the caller's trace under that gateway
+/// call. The Eval case crosses the Eval executor's per-task fan-out.
+///
+/// # Panics
+/// Panics when telemetry, the mock provider, the server, or a fixture fails
+/// to start, an execution is not judged `passed`, or a chain is missing or
+/// broken.
+#[tokio::test]
+async fn eval_judge_gateway_call_descends_from_the_request_span() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl_traced", "object": "chat.completion", "created": 1_700_000_000,
+            "model": "gpt-test",
+            "choices": [{ "index": 0, "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+        })))
+        .mount(&provider)
+        .await;
+    let server = WyrdTestServer::builder()
+        .with_gateway_provider_root_for_test(provider.uri().parse().expect("mock URL parses"))
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let seed = server
+        .verification_fixture()
+        .await
+        .expect("verification fixture provisions");
+    let (subject, _) = seed
+        .service("traced-judged")
+        .await
+        .expect("subject registers");
+    let check = crate::pg_verification_routes::judge_check();
+    let task = seed
+        .verifier(
+            "traced-task-judge",
+            &serde_json::json!({ "implementation": { "kind": "task", "spec": check } }),
+        )
+        .await
+        .expect("task judge Verifier registers");
+    let eval = seed
+        .verifier(
+            "traced-eval-judge",
+            &serde_json::json!({ "implementation": { "kind": "eval", "spec": {
+                "pass_gate": { "kind": "all_pass" },
+                "tasks": { "judge": check }
+            } } }),
+        )
+        .await
+        .expect("Eval judge Verifier registers");
+    server
+        .deploy_gateway_model_for_test("gpt-test", "traced_judge_invoker")
+        .await
+        .expect("judge model deploys");
+    let wyrd_testing::Bootstrap::User { jwt: admin, .. } = server
+        .bootstrap_user("traced-judge-admin", &["admin"])
+        .await
+        .expect("admin bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let captured = server
+        .oneshot_authenticated(
+            &admin,
+            axum::http::Request::builder()
+                .method(axum::http::Method::PUT)
+                .uri("/v1/admin/gateway/capture-policy")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "mode": "metadata", "payload_fields": [] }).to_string(),
+                ))
+                .expect("capture policy request builds"),
+        )
+        .await
+        .expect("capture policy request responds");
+    assert!(captured.status().is_success(), "{}", captured.status());
+    let wyrd_testing::Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("traced-judge-writer", &["editor", "traced_judge_invoker"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let cases = [
+        (task, "task_context", "b7ad6b7169203331"),
+        (eval, "eval_record", "b7ad6b7169203332"),
+    ];
+    let checkpoint = traces.checkpoint();
+    for (verifier, kind, caller_span) in &cases {
+        let body = serde_json::json!({
+            "verifier_uid": verifier,
+            "subject_card_uid": subject,
+            "input": { "kind": kind, "context": { "answer": "yes" } },
+        });
+        let response = server
+            .oneshot_authenticated(
+                &jwt,
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/verification/execute")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header(
+                        "traceparent",
+                        format!("00-{JUDGE_CALLER_TRACE}-{caller_span}-01"),
+                    )
+                    .body(axum::body::Body::from(body.to_string()))
+                    .expect("execute request builds"),
+            )
+            .await
+            .expect("execute request responds");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("execute body reads");
+        let judged: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("execute body is JSON");
+        assert_eq!(judged["verdict"], "passed", "{kind}: {judged}");
+    }
+    server.flush_bifrost().await.expect("Scribe flushes");
+    let attempt_parents: Vec<String> = server
+        .retained_span_records(
+            seed.tenant(),
+            "encode(parent_span_id, 'hex')",
+            &format!("trace_id = X'{JUDGE_CALLER_TRACE}' AND scope_name = 'wyrd.gateway'"),
+        )
+        .await
+        .expect("captured attempts read")
+        .into_iter()
+        .map(|row| row.into_iter().flatten().collect())
+        .collect();
+    server.shutdown().await.expect("test server shuts down");
+
+    let spans: Vec<_> = traces
+        .finished_since(checkpoint)
+        .into_iter()
+        .filter(|span| span.trace_id == JUDGE_CALLER_TRACE)
+        .collect();
+    let by_id: BTreeMap<&str, &wyrd_telemetry::CapturedSpan> = spans
+        .iter()
+        .map(|span| (span.span_id.as_str(), span))
+        .collect();
+    for (_, kind, caller_span) in &cases {
+        let chain = spans
+            .iter()
+            .filter(|span| span.name == JUDGE_CHAIN[0])
+            .map(|execute| {
+                let mut chain = vec![execute];
+                while let Some(parent) = chain
+                    .last()
+                    .and_then(|span| by_id.get(span.parent_span_id.as_str()))
+                {
+                    chain.push(parent);
+                }
+                chain
+            })
+            .find(|chain| {
+                chain
+                    .last()
+                    .is_some_and(|root| root.parent_span_id == *caller_span)
+            })
+            .unwrap_or_else(|| panic!("{kind}: no gateway execution under the caller: {spans:#?}"));
+        let names: Vec<&str> = chain.iter().map(|span| span.name.as_str()).collect();
+        let mut expected = JUDGE_CHAIN.iter().peekable();
+        for name in &names {
+            expected.next_if(|step| *step == name);
+        }
+        assert!(
+            expected.peek().is_none(),
+            "{kind}: {names:?} contains {JUDGE_CHAIN:?} in order"
+        );
+        assert_eq!(names.last(), Some(&"request"), "{kind}: {names:?}");
+        let call = chain
+            .iter()
+            .find(|span| span.name == "gateway.call")
+            .expect("the chain holds the gateway call");
+        assert_eq!(
+            attempt_parents
+                .iter()
+                .filter(|parent| **parent == call.span_id)
+                .count(),
+            1,
+            "{kind}: one captured attempt under the gateway call: {attempt_parents:?}"
+        );
+    }
+}
+
+/// A manually enqueued run records the span of the request that enqueued it,
+/// and the runner's later attempt links to that span without adopting it as
+/// a parent: the attempt keeps its own trace, and the enqueuing request's
+/// trace continues the caller's `traceparent`.
+///
+/// # Panics
+/// Panics when telemetry, the server, seeding, or the runtime fails, the run
+/// is not accepted or never leaves the queue, or the attempt is parented by
+/// the request or does not link to it.
+#[tokio::test]
+async fn manual_run_links_to_its_enqueuing_request() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let harness = Harness::start().await;
+    let verifier = harness
+        .seed
+        .custom_drift_verifier("linked-drift", "score", 1.0, 0.5)
+        .await
+        .expect("profiled verifier registers");
+    let wyrd_testing::Bootstrap::User { jwt, .. } = harness
+        .server
+        .bootstrap_user("linked-run-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
+    let checkpoint = traces.checkpoint();
+    let body = serde_json::json!({
+        "target": { "kind": "verifier", "verifier_uid": verifier,
+                    "subject_card_uid": harness.subject },
+        "input": { "kind": "drift_window", "start": "2026-09-17T00:00:00Z",
+                   "end": "2026-09-17T01:00:00Z" },
+    });
+    let response = harness
+        .server
+        .oneshot_authenticated(
+            &jwt,
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/verification/runs")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    "traceparent",
+                    format!("00-{JUDGE_CALLER_TRACE}-b7ad6b7169203333-01"),
+                )
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("run request builds"),
+        )
+        .await
+        .expect("run request responds");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("run body reads");
+    let accepted: serde_json::Value = serde_json::from_slice(&bytes).expect("run body is JSON");
+    let run_id = accepted["run_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the run is accepted: {accepted}"))
+        .to_owned();
+    harness
+        .wait_run(run_id.parse().expect("the run id parses"), |row| {
+            !matches!(row.status.as_str(), "pending" | "running" | "retrying")
+        })
+        .await;
+    runtime.stop().await;
+
+    let spans = traces.finished_since(checkpoint);
+    let attempt = spans
+        .iter()
+        .find(|span| {
+            span.name == "verification.attempt" && span.attributes.get("run_id") == Some(&run_id)
+        })
+        .unwrap_or_else(|| panic!("the run's attempt is recorded: {spans:#?}"));
+    assert_ne!(attempt.trace_id, JUDGE_CALLER_TRACE, "{attempt:#?}");
+    let [(trace_id, span_id)] = attempt.links.as_slice() else {
+        panic!("the attempt links once to its cause: {attempt:#?}");
+    };
+    assert_eq!(trace_id, JUDGE_CALLER_TRACE, "{attempt:#?}");
+    let cause = spans
+        .iter()
+        .find(|span| span.trace_id == *trace_id && span.span_id == *span_id)
+        .unwrap_or_else(|| panic!("the linked span is the enqueuing request's: {spans:#?}"));
+    let request = spans
+        .iter()
+        .find(|span| span.name == "request" && span.trace_id == JUDGE_CALLER_TRACE)
+        .unwrap_or_else(|| panic!("the enqueuing request continues the caller: {spans:#?}"));
+    let mut ancestor = Some(cause);
+    while let Some(span) = ancestor
+        && span.span_id != request.span_id
+    {
+        ancestor = spans.iter().find(|parent| {
+            parent.trace_id == span.trace_id && parent.span_id == span.parent_span_id
+        });
+    }
+    assert!(
+        ancestor.is_some(),
+        "the linked span lies inside the enqueuing request: {cause:#?}"
+    );
+}
+
+/// One span a tenant reads back from its own `vala.traces.spans`.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TenantSpan {
+    /// Hex span id, equal to the operator's id for the same span.
+    span_id: String,
+    /// Hex parent span id; the caller's span for the request span.
+    parent_span_id: String,
+    /// Span name.
+    name: String,
+    /// Principal Scribe stamped on the row.
+    principal_id: String,
+    /// Attribute keys the tenant copy kept.
+    attributes: Vec<String>,
+}
+
+/// Seeds a deterministic Task Verifier and a subject in `tenant` and returns
+/// a token for a caller there, so a traced execution needs no provider.
+///
+/// # Panics
+/// Panics when the tenant, Cards, or caller cannot be provisioned.
+async fn traced_tenant(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    name: &str,
+) -> (CardUid, CardUid, wyrd_spec::auth::PrincipalId, String) {
+    server
+        .ensure_builtin_tables_for_test(tenant)
+        .await
+        .expect("tenant receives every built-in table");
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant)
+        .await
+        .expect("tenant provisions");
+    let (subject, _) = seed.service("traced").await.expect("subject registers");
+    let verifier = seed
+        .verifier(
+            "traced-assertion",
+            &serde_json::json!({ "implementation": { "kind": "task", "spec": {
+                "kind": "assertion", "id": "x_is_one", "context_path": "$.x",
+                "operator": "equals", "expected": 1
+            } } }),
+        )
+        .await
+        .expect("task Verifier registers");
+    let wyrd_testing::Bootstrap::Machine { id, api_key, .. } = server
+        .bootstrap_service_in_tenant(tenant, name, &["editor"])
+        .await
+        .expect("caller bootstraps")
+    else {
+        panic!("service bootstrap returned a user principal");
+    };
+    let jwt = server
+        .exchange_api_key(&api_key)
+        .await
+        .expect("caller key exchanges");
+    (verifier, subject, id, jwt)
+}
+
+/// Executes `verifier` against `subject` as `jwt` under `traceparent`,
+/// returning the response status once the body is read, so every span of the
+/// request has ended.
+///
+/// # Panics
+/// Panics when the request cannot be built or the body cannot be read.
+async fn traced_execute(
+    server: &WyrdTestServer,
+    jwt: Option<&str>,
+    (verifier, subject): (&CardUid, &CardUid),
+    traceparent: &str,
+) -> axum::http::StatusCode {
+    let body = serde_json::json!({
+        "verifier_uid": verifier,
+        "subject_card_uid": subject,
+        "input": { "kind": "task_context", "context": { "x": 1 } },
+    });
+    let request = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/v1/verification/execute")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header("traceparent", traceparent)
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("execute request builds");
+    let response = match jwt {
+        Some(jwt) => server.oneshot_authenticated(jwt, request).await,
+        None => server.oneshot(request).await,
+    }
+    .expect("execute request responds");
+    let status = response.status();
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("execute body reads");
+    status
+}
+
+/// Flushes Scribe and reads `tenant`'s retained spans of `trace`.
+///
+/// # Panics
+/// Panics when the flush or the read fails, or a row is malformed.
+async fn tenant_spans(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    trace: &str,
+) -> Vec<TenantSpan> {
+    server.flush_bifrost().await.expect("Scribe flushes");
+    let mut spans: Vec<TenantSpan> = server
+        .retained_span_records(
+            tenant,
+            "encode(span_id, 'hex'), encode(parent_span_id, 'hex'), name, principal_id, attributes",
+            &format!("trace_id = X'{trace}'"),
+        )
+        .await
+        .expect("tenant spans read")
+        .into_iter()
+        .map(|row| {
+            let [
+                Some(span_id),
+                Some(parent_span_id),
+                Some(name),
+                Some(principal_id),
+                attributes,
+            ] = <[Option<String>; 5]>::try_from(row).expect("five projected columns")
+            else {
+                panic!("a tenant span row is missing a column");
+            };
+            let attributes = attributes
+                .map(|json| {
+                    serde_json::from_str::<serde_json::Value>(&json).expect("attributes are JSON")
+                })
+                .and_then(|value| value.as_object().map(|map| map.keys().cloned().collect()))
+                .unwrap_or_default();
+            TenantSpan {
+                span_id,
+                parent_span_id,
+                name,
+                principal_id,
+                attributes,
+            }
+        })
+        .collect();
+    spans.sort();
+    spans
+}
+
+/// Asserts that `tenant` holds exactly the behavior spans of the request the
+/// caller span `caller` parents, each with the operator's ids and parents,
+/// stamped with `principal`, and keeping only safe attributes.
+///
+/// # Panics
+/// Panics when the tenant copy is missing a behavior span, holds a span the
+/// operator did not export or another request's span, names another
+/// principal, or keeps an attribute outside the allowlist.
+fn assert_tenant_copy(
+    tenant: &[TenantSpan],
+    operator: &[wyrd_telemetry::CapturedSpan],
+    caller: &str,
+    principal: wyrd_spec::auth::PrincipalId,
+) {
+    let names: Vec<&str> = tenant.iter().map(|span| span.name.as_str()).collect();
+    for behavior in ["request", "verification.execute"] {
+        assert!(
+            names.contains(&behavior),
+            "{behavior} reaches the tenant: {tenant:#?}"
+        );
+    }
+    let request = tenant
+        .iter()
+        .find(|span| span.name == "request")
+        .expect("the request span reaches the tenant");
+    assert_eq!(request.parent_span_id, caller, "{tenant:#?}");
+    for key in [
+        "http.request.method",
+        "http.route",
+        "http.response.status_code",
+    ] {
+        assert!(
+            request.attributes.iter().any(|kept| kept == key),
+            "the request span carries {key}: {request:#?}"
+        );
+    }
+    for span in tenant {
+        assert!(
+            operator
+                .iter()
+                .any(|exported| exported.span_id == span.span_id
+                    && exported.parent_span_id == span.parent_span_id
+                    && exported.name == span.name),
+            "the tenant copy keeps the operator's ids and parent: {span:#?}"
+        );
+        assert_eq!(span.principal_id, principal.to_string(), "{span:#?}");
+        for key in &span.attributes {
+            assert!(
+                key.starts_with("wyrd.")
+                    || key.starts_with("gen_ai.")
+                    || key.starts_with("http.")
+                    || key.starts_with("rpc.")
+                    || key == "error.type",
+                "{key} is not a tenant-safe attribute: {span:#?}"
+            );
+        }
+    }
+}
+
+/// Caller trace whose spans the export matrix asserts.
+const EXPORT_TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+/// Under an accepting operator policy, a request continuing a sampled caller
+/// trace reaches both the operator and its tenant, while one continuing an
+/// unsampled caller trace reaches the operator only.
+///
+/// # Panics
+/// Panics when telemetry, the server, or seeding fails, or either export
+/// diverges from the matrix.
+#[tokio::test]
+async fn continued_request_spans_reach_operator_and_tenant() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let server = WyrdTestServer::builder()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    let (verifier, subject, principal, jwt) = traced_tenant(&server, tenant, "traced-caller").await;
+    let unsampled = "5bf92f3577b34da6a3ce929d0e0e4736";
+    let checkpoint = traces.checkpoint();
+    for (trace, flags) in [(EXPORT_TRACE, "01"), (unsampled, "00")] {
+        let status = traced_execute(
+            &server,
+            Some(&jwt),
+            (&verifier, &subject),
+            &format!("00-{trace}-00f067aa0ba902b7-{flags}"),
+        )
+        .await;
+        assert!(status.is_success(), "{trace}: {status}");
+    }
+    let operator = traces.finished_since(checkpoint);
+    let sampled: Vec<_> = operator
+        .iter()
+        .filter(|span| span.trace_id == EXPORT_TRACE)
+        .cloned()
+        .collect();
+    assert!(
+        operator
+            .iter()
+            .any(|span| span.trace_id == unsampled && span.name == "request"),
+        "the operator exports the unsampled caller's request: {operator:#?}"
+    );
+    assert_tenant_copy(
+        &tenant_spans(&server, tenant, EXPORT_TRACE).await,
+        &sampled,
+        "00f067aa0ba902b7",
+        principal,
+    );
+    assert_eq!(
+        tenant_spans(&server, tenant, unsampled).await,
+        Vec::new(),
+        "an unsampled caller receives no tenant copy"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Under a rejecting operator policy, a request continuing a sampled caller
+/// trace still reaches its tenant but not the operator, and one continuing an
+/// unsampled caller trace reaches neither.
+///
+/// # Panics
+/// Panics when telemetry, the server, or seeding fails, or either export
+/// diverges from the matrix.
+#[tokio::test]
+async fn operator_rejected_requests_still_reach_a_continuing_tenant() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig {
+            sample_ratio: Some(0.0),
+            ..wyrd_telemetry::TelemetryConfig::default()
+        })
+        .expect("production-shaped telemetry installs");
+    let server = WyrdTestServer::builder()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    let (verifier, subject, principal, jwt) =
+        traced_tenant(&server, tenant, "rejected-caller").await;
+    let unsampled = "6bf92f3577b34da6a3ce929d0e0e4736";
+    let checkpoint = traces.checkpoint();
+    for (trace, flags) in [(EXPORT_TRACE, "01"), (unsampled, "00")] {
+        let status = traced_execute(
+            &server,
+            Some(&jwt),
+            (&verifier, &subject),
+            &format!("00-{trace}-00f067aa0ba902b7-{flags}"),
+        )
+        .await;
+        assert!(status.is_success(), "{trace}: {status}");
+    }
+    let operator = traces.finished_since(checkpoint);
+    assert!(
+        operator
+            .iter()
+            .all(|span| span.trace_id != EXPORT_TRACE && span.trace_id != unsampled),
+        "the operator policy rejects both requests: {operator:#?}"
+    );
+    let tenant_copy = tenant_spans(&server, tenant, EXPORT_TRACE).await;
+    assert!(
+        tenant_copy.iter().any(|span| span.name == "request"
+            && span.parent_span_id == "00f067aa0ba902b7"
+            && span.principal_id == principal.to_string()),
+        "the sampled caller still receives its tenant copy: {tenant_copy:#?}"
+    );
+    assert_eq!(tenant_spans(&server, tenant, unsampled).await, Vec::new());
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Two tenants continuing the same caller trace id each receive only their
+/// own request's spans, stamped with their own principal.
+///
+/// # Panics
+/// Panics when telemetry, the server, or seeding fails, or a tenant receives
+/// the other's spans.
+#[tokio::test]
+async fn same_inbound_trace_id_routes_each_tenant_separately() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let server = WyrdTestServer::builder()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let other = DataTenantId::new_v7();
+    server
+        .pg_fixture()
+        .seed_additional_tenant_with_uuid(other, "traced-other")
+        .await
+        .expect("second tenant seeds");
+    let checkpoint = traces.checkpoint();
+    let mut callers = Vec::new();
+    for (tenant, name, caller) in [
+        (server.data_tenant_id(), "first-caller", "00f067aa0ba902b1"),
+        (other, "second-caller", "00f067aa0ba902b2"),
+    ] {
+        let (verifier, subject, principal, jwt) = traced_tenant(&server, tenant, name).await;
+        let status = traced_execute(
+            &server,
+            Some(&jwt),
+            (&verifier, &subject),
+            &format!("00-{EXPORT_TRACE}-{caller}-01"),
+        )
+        .await;
+        assert!(status.is_success(), "{name}: {status}");
+        callers.push((tenant, caller, principal));
+    }
+    let operator: Vec<_> = traces
+        .finished_since(checkpoint)
+        .into_iter()
+        .filter(|span| span.trace_id == EXPORT_TRACE)
+        .collect();
+    for (tenant, caller, principal) in callers {
+        let copy = tenant_spans(&server, tenant, EXPORT_TRACE).await;
+        assert_eq!(
+            copy.iter().filter(|span| span.name == "request").count(),
+            1,
+            "each tenant receives only its own request: {copy:#?}"
+        );
+        assert_tenant_copy(&copy, &operator, caller, principal);
+    }
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A request that continues a sampled caller trace but never authenticates
+/// is exported to the operator only: no tenant receives its spans.
+///
+/// # Panics
+/// Panics when telemetry or the server fails, the request is not refused,
+/// the operator misses it, or the fixture tenant receives a copy.
+#[tokio::test]
+async fn unrouted_spans_export_only_to_the_operator() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let server = WyrdTestServer::builder()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    let (verifier, subject, _, _) = traced_tenant(&server, tenant, "unrouted-caller").await;
+    let checkpoint = traces.checkpoint();
+    let status = traced_execute(
+        &server,
+        None,
+        (&verifier, &subject),
+        &format!("00-{EXPORT_TRACE}-00f067aa0ba902b7-01"),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    let operator = traces.finished_since(checkpoint);
+    assert!(
+        operator
+            .iter()
+            .any(|span| span.trace_id == EXPORT_TRACE && span.name == "request"),
+        "the operator exports the unauthenticated request: {operator:#?}"
+    );
+    assert_eq!(
+        tenant_spans(&server, tenant, EXPORT_TRACE).await,
+        Vec::new()
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// The tenant span permits one server holds, mirroring the server's fixed
+/// per-process cap on unwritten tenant copies.
+const SPAN_PERMITS: usize = 2_048;
+
+/// The caller trace every request during the Scribe outage continues.
+const OUTAGE_TRACE: &str = "7bf92f3577b34da6a3ce929d0e0e4736";
+
+/// The caller trace of the one request after Scribe returns.
+const RECOVERED_TRACE: &str = "8bf92f3577b34da6a3ce929d0e0e4736";
+
+/// The process's count of Scribe-outbox writes lost, read from the rendered
+/// production recorder; zero before the first loss.
+///
+/// # Panics
+/// Panics when the rendered counter value is not an integer.
+fn lost_scribe_writes(cluster: &wyrd_testing::bifrost::cluster::WyrdTestCluster) -> u64 {
+    cluster
+        .telemetry()
+        .render()
+        .lines()
+        .find_map(|line| line.strip_prefix(r#"outbox_events_lost_total{outbox="scribe"} "#))
+        .map_or(0, |value| value.trim().parse().expect("an integer counter"))
+}
+
+/// Durable rows `tenant` holds in `table`, from the published file list.
+///
+/// # Panics
+/// Panics when the file list cannot be read.
+async fn published_rows(assertion: &PgPool, tenant: DataTenantId, table: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE(SUM(row_count), 0)::bigint FROM vala.file_list \
+         WHERE data_tenant_id = $1 AND namespace || '.' || table_name = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(table)
+    .fetch_one(assertion)
+    .await
+    .expect("published row count")
+}
+
+/// Calls `tools/list` on `server`'s stateless `/mcp` as `jwt`, returning the
+/// status and the response body.
+///
+/// # Panics
+/// Panics when the request cannot be built or the server does not respond.
+async fn mcp_tools_list(server: &WyrdTestServer, jwt: &str) -> (axum::http::StatusCode, String) {
+    let version = "2026-07-28";
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": { "_meta": {
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientInfo": { "name": "outage-probe", "version": "1" },
+            "io.modelcontextprotocol/clientCapabilities": {},
+        } },
+    });
+    let request = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/mcp")
+        .header(axum::http::header::HOST, "localhost")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .header("mcp-protocol-version", version)
+        .header("mcp-method", "tools/list")
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("MCP request builds");
+    let response = server
+        .oneshot_authenticated(jwt, request)
+        .await
+        .expect("MCP request responds");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("MCP body reads");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Checks `server`'s gRPC health service answers.
+///
+/// # Panics
+/// Panics when the server has no gRPC listener or the check fails.
+async fn grpc_health_answers(server: &WyrdTestServer) {
+    use wyrd_tonic::tonic_health::pb::HealthCheckRequest;
+    use wyrd_tonic::tonic_health::pb::health_client::HealthClient;
+
+    let channel = wyrd_tonic::tonic::transport::Channel::from_shared(
+        server.grpc_url().expect("the pod serves gRPC"),
+    )
+    .expect("gRPC endpoint parses")
+    .connect()
+    .await
+    .expect("gRPC connects");
+    HealthClient::new(channel)
+        .check(HealthCheckRequest::default())
+        .await
+        .expect("gRPC health answers during the outage");
+}
+
+/// A sustained Scribe outage caps an Oracle pod's unwritten tenant span
+/// copies without starving its siblings, and the same outbox recovers.
+///
+/// The role-separated cluster boots its Oracle pods while its only Scribe pod
+/// is held back, so the Oracle pod's peer route reaches no Scribe. Traced
+/// executions continue a sampled caller until the Scribe-outbox loss counter
+/// rises, proving copies past the permit pool are dropped at once; each also
+/// stages its Verifier result, and HTTP, gRPC, and MCP keep answering. Once
+/// the Scribe pod joins, that same outbox drains: exactly the permitted copies
+/// and every result publish, and one later copy is accepted with no loss.
+///
+/// # Panics
+/// Panics when the cluster or seeding fails, a request is refused, the cap
+/// does not hold, a result is lost, the outbox does not drain, or the later
+/// copy is dropped.
+#[tokio::test]
+async fn sustained_scribe_outage_caps_tenant_spans() {
+    use wyrd_testing::bifrost::cluster::{BifrostClusterSpec, WyrdTestCluster};
+
+    let spec = BifrostClusterSpec::role_separated();
+    let scribe = spec.nodes.last().expect("a Scribe node").node_id;
+    let mut cluster = WyrdTestCluster::start_spec_delayed_last(spec)
+        .await
+        .expect("the Oracle pods start without their Scribe");
+    let tenant = cluster.data_tenant_id();
+    let oracle = cluster.server(0).expect("an Oracle pod");
+    let (verifier, subject, _, jwt) = traced_tenant(oracle, tenant, "outage-caller").await;
+    let outbox = Arc::clone(&oracle.state().scribe_outbox);
+    let assertion = oracle
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+
+    let lost_before = lost_scribe_writes(&cluster);
+    let mut requests = 0_u64;
+    while lost_scribe_writes(&cluster) == lost_before {
+        assert!(
+            requests < 4 * SPAN_PERMITS as u64,
+            "the tenant span cap never dropped a copy"
+        );
+        requests += 1;
+        let status = traced_execute(
+            oracle,
+            Some(&jwt),
+            (&verifier, &subject),
+            &format!("00-{OUTAGE_TRACE}-{requests:016x}-01"),
+        )
+        .await;
+        assert!(status.is_success(), "request {requests}: {status}");
+    }
+    assert!(
+        requests > 1,
+        "the cap was reached only after earlier copies held permits"
+    );
+    grpc_health_answers(oracle).await;
+    let (status, tools) = mcp_tools_list(oracle, &jwt).await;
+    assert!(
+        status.is_success() && tools.contains(r#""tools":["#),
+        "MCP lists tools during the outage: {status} {tools}"
+    );
+
+    cluster
+        .restart_node(scribe)
+        .await
+        .expect("the Scribe pod joins");
+    assert_eq!(
+        outbox.settle(std::time::Instant::now() + WAIT).await,
+        0,
+        "the same outbox drains to the joined Scribe"
+    );
+    let scribe_pod = cluster.server_by_node(scribe).expect("the Scribe pod");
+    scribe_pod.flush_bifrost().await.expect("Scribe flushes");
+    let oracle = cluster.server(0).expect("an Oracle pod");
+    let copies = oracle
+        .retained_span_records(
+            tenant,
+            "encode(span_id, 'hex')",
+            &format!("trace_id = X'{OUTAGE_TRACE}'"),
+        )
+        .await
+        .expect("outage copies read");
+    assert_eq!(
+        copies.len(),
+        SPAN_PERMITS,
+        "exactly the permitted copies publish"
+    );
+    assert_eq!(
+        published_rows(&assertion, tenant, RESULTS).await,
+        i64::try_from(requests).expect("a small count"),
+        "every Verifier result staged during the outage publishes"
+    );
+
+    let lost_after_recovery = lost_scribe_writes(&cluster);
+    let status = traced_execute(
+        oracle,
+        Some(&jwt),
+        (&verifier, &subject),
+        &format!("00-{RECOVERED_TRACE}-00f067aa0ba902b7-01"),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    assert_eq!(outbox.settle(std::time::Instant::now() + WAIT).await, 0);
+    scribe_pod.flush_bifrost().await.expect("Scribe flushes");
+    let recovered = oracle
+        .retained_span_records(tenant, "name", &format!("trace_id = X'{RECOVERED_TRACE}'"))
+        .await
+        .expect("recovered copies read");
+    assert!(
+        recovered
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|name| name == "request"),
+        "a copy after recovery is accepted: {recovered:?}"
+    );
+    assert_eq!(lost_scribe_writes(&cluster), lost_after_recovery);
+}

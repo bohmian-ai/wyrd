@@ -7,6 +7,7 @@
 //! [`GatewayAdministration::snapshot`] hands the gateway runtime one immutable,
 //! statement-consistent view of the tenant configuration per admission.
 
+mod api_keys;
 mod batches;
 mod capture;
 pub(crate) mod ingress;
@@ -21,6 +22,7 @@ pub(crate) mod routes;
 mod service;
 mod workflow;
 
+pub(crate) use api_keys::GatewayApiKeys;
 pub use batches::{BatchAnswer, GatewayBatches};
 pub use capture::CallCapture;
 pub(crate) use capture::CaptureDrop;
@@ -29,7 +31,8 @@ pub(crate) use capture::{recording, tests as capture_tests};
 pub use ingress::gateway_ingress_router;
 pub(crate) use invocation::unconnected_engine;
 pub use invocation::{
-    GatewayCallRequest, GatewayCallResponse, GatewayCallSubject, GatewayInvocation,
+    GatewayCallAttribution, GatewayCallRequest, GatewayCallResponse, GatewayCallSubject,
+    GatewayInvocation,
 };
 pub use routes::gateway_router;
 pub use service::GatewayAdministration;

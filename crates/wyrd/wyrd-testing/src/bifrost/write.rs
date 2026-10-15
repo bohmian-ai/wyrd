@@ -26,6 +26,7 @@ use wyrd_queue::{ClientByteBudget, OwnedIpcBytes, QueueConfig, SealedBatch, Sink
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::ids::RunId;
 
 /// The client write door, wired for tests.
 ///
@@ -82,13 +83,21 @@ impl BifrostWriter {
     ///
     /// The first row for a table builds the pooled producer from `schema`;
     /// later rows reuse it, so rebinding an already-written table reuses its
-    /// producer rather than replacing it.
+    /// producer rather than replacing it. The row is correlated to this
+    /// writer's Card and, when given, to `run_id`, which the server stamps as
+    /// the row's managed `run_id`.
     ///
     /// # Errors
     ///
     /// Returns the queue-domain refusal (queue-full, reserved column, schema
     /// parse) or the table-name rejection, projected onto the stable catalog.
-    pub fn enqueue(&self, table: &str, schema: &SchemaRef, row: Vec<u8>) -> Result<(), WyrdError> {
+    pub fn enqueue(
+        &self,
+        table: &str,
+        schema: &SchemaRef,
+        row: Vec<u8>,
+        run_id: Option<&RunId>,
+    ) -> Result<(), WyrdError> {
         self.handle
             .use_table(TableConfig::from_arrow(table, schema.clone())?);
         self.handle
@@ -96,7 +105,7 @@ impl BifrostWriter {
                 row,
                 Correlation {
                     card_uid: self.card_ref.uid.clone(),
-                    run_id: None,
+                    run_id: run_id.cloned(),
                 },
             )
             .map_err(WyrdError::from)
@@ -145,7 +154,7 @@ impl BifrostWriter {
         rows: impl IntoIterator<Item = Vec<u8>>,
     ) -> Result<(), WyrdError> {
         for row in rows {
-            self.enqueue(table, schema, row)?;
+            self.enqueue(table, schema, row, None)?;
         }
         self.flush().await
     }
@@ -224,6 +233,7 @@ impl RawIngest {
             frame: OwnedIpcBytes::new(arrow_ipc, guard),
             rows: 0,
             request_id: Some(request_id.clone()),
+            producer_traces: Vec::new(),
         };
         self.transport
             .insert_batch(&batch)

@@ -47,7 +47,7 @@ printf '{"name":"openai-key","provider":"openai","source":{"managed_secret":{"se
   "$OPENAI_API_KEY" | wyrd gateway credential put --file -
 ```
 
-Wyrd encrypts the key with your tenant's keyring, and no read returns it. Now deploy `gpt-4o` on it:
+Wyrd encrypts the key with the server's sealing key, and no read returns it. Now deploy `gpt-4o` on it:
 
 ```bash
 wyrd gateway deployment put --file - <<'JSON'

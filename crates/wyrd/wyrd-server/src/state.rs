@@ -25,9 +25,9 @@ use vala_bifrost_redux::resources::{BifrostRoleResources, OracleResources, Scrib
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailService;
 
-use crate::scribe_outbox::{ScribeOutbox, ScribeSink};
+use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ServerSpanSink};
 use wyrd_auth_verify::TokenVerifier;
-use wyrd_gateway::{GatewayEngine, ManagedSecretKeys};
+use wyrd_gateway::GatewayEngine;
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
 use wyrd_tonic::tonic_health::server::HealthReporter;
@@ -35,6 +35,7 @@ use wyrd_tonic::tonic_health::server::HealthReporter;
 use crate::boot::ServerBootError;
 use crate::boot::data_root::BifrostDataRoot;
 use crate::components::auth::{ServerAuth, ServerAuthz};
+use crate::components::gateway::GatewayApiKeys;
 use crate::components::health::ReadinessSnapshot;
 use crate::components::operators::keys::OperatorKeys;
 use crate::components::workflow::WorkflowRuns;
@@ -403,6 +404,14 @@ pub struct Scribe {
     fragment_executions: Arc<AtomicU64>,
     /// Footer frames emitted by the Scribe follower owner.
     fragment_footers: Arc<AtomicU64>,
+    /// Rows every emitted footer reported, so a journey can bound what its
+    /// fragments returned.
+    #[cfg(feature = "test-support")]
+    fragment_footer_rows: Arc<AtomicU64>,
+    /// Encoded physical plan of the latest fragment this Scribe executed, so a
+    /// journey can inspect the predicate a leader shipped.
+    #[cfg(feature = "test-support")]
+    last_fragment_plan: Arc<std::sync::Mutex<Vec<u8>>>,
     /// Root-derived Scribe resource capability.
     resources: ScribeResources,
     /// Shared current-ready cluster registry.
@@ -875,6 +884,10 @@ impl Scribe {
             fragment_follower,
             fragment_executions: Arc::new(AtomicU64::new(0)),
             fragment_footers: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-support")]
+            fragment_footer_rows: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-support")]
+            last_fragment_plan: Arc::default(),
             resources,
             cluster,
             registered_role,
@@ -908,14 +921,45 @@ impl Scribe {
         &self.fragment_follower
     }
 
-    /// Records one Scribe-owned fragment execution after authenticated resolution.
-    pub(crate) fn record_fragment_execution(&self) {
+    /// Records one Scribe-owned fragment execution after authenticated
+    /// resolution; under `test-support` it also retains `physical_plan_bytes`
+    /// as the latest executed fragment plan.
+    pub(crate) fn record_fragment_execution(&self, physical_plan_bytes: &[u8]) {
         self.fragment_executions.fetch_add(1, Ordering::AcqRel);
+        #[cfg(feature = "test-support")]
+        if let Ok(mut plan) = self.last_fragment_plan.lock() {
+            physical_plan_bytes.clone_into(&mut plan);
+        }
+        #[cfg(not(feature = "test-support"))]
+        let _ = physical_plan_bytes;
     }
 
-    /// Records one footer emitted by the Scribe-owned fragment stream.
-    pub(crate) fn record_fragment_footer(&self) {
+    /// Records one footer emitted by the Scribe-owned fragment stream, which
+    /// reported `rows` delivered rows.
+    pub(crate) fn record_fragment_footer(&self, rows: u64) {
         self.fragment_footers.fetch_add(1, Ordering::AcqRel);
+        #[cfg(feature = "test-support")]
+        self.fragment_footer_rows.fetch_add(rows, Ordering::AcqRel);
+        #[cfg(not(feature = "test-support"))]
+        let _ = rows;
+    }
+
+    /// Returns the rows every footer this Scribe emitted reported, summed.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn fragment_footer_rows(&self) -> u64 {
+        self.fragment_footer_rows.load(Ordering::Acquire)
+    }
+
+    /// Returns the encoded physical plan of the latest fragment this Scribe
+    /// executed, empty before the first one or after a poisoned record.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn last_fragment_plan(&self) -> Vec<u8> {
+        self.last_fragment_plan
+            .lock()
+            .map(|plan| plan.clone())
+            .unwrap_or_default()
     }
 
     /// Returns exact Scribe follower activity for production-shaped journeys.
@@ -1528,6 +1572,12 @@ pub struct Bifrost {
     /// `None` only for the ownerless unit-test shell, whose `AppState` starts
     /// its own outbox.
     scribe_outbox: Option<Arc<ScribeOutbox>>,
+    /// This server's one tenant span sink over [`Self::scribe_outbox`], whose
+    /// permit pool caps the copies it holds unwritten; its request edges bind
+    /// it to every request they open.
+    ///
+    /// `None` only for the ownerless unit-test shell.
+    tenant_spans: Option<Arc<ServerSpanSink>>,
     /// The process membership poller every role, forwarder, and the Scribe
     /// outbox read through; stopped only after every role has drained.
     ///
@@ -1604,6 +1654,7 @@ impl Bifrost {
             test_resources: resources,
             #[cfg(feature = "test-support")]
             test_catalog: None,
+            tenant_spans: Some(Arc::new(ServerSpanSink::new(Arc::clone(&scribe_outbox)))),
             scribe_outbox: Some(scribe_outbox),
             membership_poller: Some(Arc::new(membership_poller)),
         })
@@ -1632,6 +1683,7 @@ impl Bifrost {
             test_resources: None,
             test_catalog: None,
             scribe_outbox: None,
+            tenant_spans: None,
             membership_poller: None,
         })
     }
@@ -1668,6 +1720,7 @@ impl Bifrost {
             test_resources: None,
             test_catalog: Some(catalog),
             scribe_outbox: None,
+            tenant_spans: None,
             membership_poller: None,
         })
     }
@@ -1719,6 +1772,14 @@ impl Bifrost {
     #[must_use]
     pub const fn scribe_outbox(&self) -> Option<&Arc<ScribeOutbox>> {
         self.scribe_outbox.as_ref()
+    }
+
+    /// This server's tenant span sink, which its request edges bind to every
+    /// request they open; absent only for the unit-test shell.
+    pub(crate) fn tenant_span_sink(&self) -> Option<Arc<dyn wyrd_telemetry::TenantSpanSink>> {
+        self.tenant_spans
+            .as_ref()
+            .map(|sink| Arc::clone(sink) as Arc<dyn wyrd_telemetry::TenantSpanSink>)
     }
 
     /// Borrows the one public Gate.
@@ -2149,14 +2210,11 @@ pub struct AppState {
     pub limits: LimitsConfig,
     /// Operator-declared gateway credential bindings and secret backends.
     pub gateway: Arc<GatewayConfig>,
-    /// Independently configured tenant keyrings protecting managed secrets.
-    ///
-    /// Administration seals through this handle and the credential resolver
-    /// opens through the same one, so key selection and envelope protection
-    /// have a single owner. Key material lives only here, never in Postgres.
-    pub gateway_secret_keys: Arc<ManagedSecretKeys>,
     /// Shared gateway execution engine behind every governed invocation entry.
     pub gateway_engine: Arc<GatewayEngine>,
+    /// Tokens exchanged for Wyrd API keys presented to public gateway
+    /// ingress, reused per key for at most 60 seconds.
+    pub(crate) gateway_api_keys: Arc<GatewayApiKeys>,
     /// The process's one non-blocking outbox for audit decisions, gateway
     /// capture, and Verifier results; every audited surface stages on it
     /// without waiting for the write. Drained by `BoundServer::run` before
@@ -2228,8 +2286,8 @@ impl AppState {
             )),
             limits: LimitsConfig::default(),
             gateway: Arc::default(),
-            gateway_secret_keys: Arc::default(),
             gateway_engine: Arc::new(crate::components::gateway::unconnected_engine()),
+            gateway_api_keys: Arc::default(),
             scribe_outbox,
             grpc_health: reporter,
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
@@ -2313,13 +2371,6 @@ impl AppState {
     #[must_use]
     pub fn with_gateway(mut self, gateway: GatewayConfig) -> Self {
         self.gateway = Arc::new(gateway);
-        self
-    }
-
-    /// Attach the loaded per-tenant managed-secret keyrings.
-    #[must_use]
-    pub fn with_gateway_secret_keys(mut self, keys: Arc<ManagedSecretKeys>) -> Self {
-        self.gateway_secret_keys = keys;
         self
     }
 

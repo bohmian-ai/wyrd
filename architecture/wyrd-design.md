@@ -711,8 +711,14 @@ workload assertions; human SSO never replaces or disables them.
 
 #### Cross-service delegation
 
-The API key is exchanged at `/auth/token` — never on the wire. The JWT — not the API
-key — is what travels on cross-service calls in the dedicated
+The API key is exchanged at `/auth/token` — never on the wire, with one
+exception: public gateway ingress (the OpenAI-compatible, Anthropic Messages,
+and Gemini `GenerateContent` inference routes) accepts a `wyrd_sk_` key in its
+existing credential headers for stock clients that hold only a static key. The
+server exchanges it through the same API-key grant, reuses the minted token per
+key hash for at most 60 seconds, and authorizes the call as that token's
+principal. `/mcp`, `/v1` management, and Bifrost do not gain it. The JWT
+— not the API key — is what travels on cross-service calls in the dedicated
 `X-Wyrd-Access-Token: Bearer <jwt>` header. The JWT must be a **delegated**
 Wyrd token: its top-level `principal` identifies the subject being acted
 for, and its `act` chain identifies the actor(s) acting for it, the
@@ -735,9 +741,10 @@ Content-Type: application/json
 #### Request correlator — `Wyrd-Request-Id`
 
 A Wyrd-owned, request-scoped opaque ID that joins every hop of a logical
-request. It is the sole correlator for request ancestry and audit replay —
-Wyrd does not depend on `traceparent`, mesh tracing, or any external
-propagation contract.
+request for audit and replay. It identifies one logical request; W3C trace
+context (below) orders behavior causally across requests and services.
+The two are complementary and neither replaces the other: audit and replay
+join on the request id, and the trace timeline follows `traceparent`.
 
 Contract:
 
@@ -753,6 +760,47 @@ Contract:
 
 Storage, query, and CEL surfaces must preserve this correlator and may not
 introduce a competing request identity.
+
+#### Trace context — W3C `traceparent` and `tracestate`
+
+Every Wyrd SDK sends the caller's active OpenTelemetry span as W3C
+`traceparent`/`tracestate` on each HTTP and gRPC request, and its
+`start_telemetry` installs the W3C trace-context propagator, so standard
+instrumentation carries the same trace to the next service. A queued Bifrost
+write records a `bifrost.enqueue` PRODUCER span in the caller's own tracer;
+the server's `bifrost.gate.write` CONSUMER span links each batch's producers.
+
+The server continues a valid inbound trace as the parent of its request span
+(HTTP, gRPC, MCP, and the OpenAI-compatible gateway) and ignores a malformed
+one. Verification, its LLM judges, and their gateway calls stay in that
+trace; deferred Verifier runs link to the request that enqueued them rather
+than becoming its children.
+
+Server spans export twice from one tracer provider:
+
+- The operator's configured trace backend receives every server span under
+  the server's own sampler. No client-supplied field, including the inbound
+  sampled flag and `tracestate`, changes what the operator receives.
+- A server span whose parent or one of whose links is a sampled client span
+  also writes, with its catalog descendants, to the requesting tenant's
+  `vala.traces.spans` on the process Scribe outbox, with the same trace,
+  span, and parent ids. A continued request's spans therefore form one tree
+  with the client's, and a queued write's `bifrost.gate.write` CONSUMER span,
+  which reaches the server with its producers as links and no `traceparent`,
+  reads back as a trace linked to them. The tenant copy carries only the
+  behavior-span catalog — the request span, `verification.*`, `dispatch`,
+  `workflow.gateway.call`, `gateway.*` except `gateway.attempt`,
+  `bifrost.gate.*`, `bifrost.oracle.query`, and OTLP ingest — and only spans
+  whose ancestors up to the span that opened the copy are all catalog
+  spans. It keeps only safe
+  attributes (`wyrd.*`, `gen_ai.*`, and HTTP, RPC, and error semantic
+  conventions); the tenant id is never a span attribute. The copy is
+  non-blocking and never fails the request, and it works with or without an
+  operator endpoint.
+
+`Bifrost::trace_timeline` (and its Python and TypeScript projections) reads
+one trace's spans from `vala.traces.spans`, plus traces linking directly to
+it, in start-time order, scoped to the caller's tenant.
 
 #### Observation identity — `Card → Run → Observation`
 

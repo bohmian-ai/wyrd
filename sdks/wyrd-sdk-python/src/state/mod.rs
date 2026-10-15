@@ -1662,15 +1662,14 @@ impl PyCards {
     /// Returns the stable configuration, credential, or refused-exchange
     /// error of the shared Rust `Cards::connect`.
     fn cards(&self, py: Python<'_>) -> CardPyResult<&Cards> {
-        Ok(self
-            .inner
+        self.inner
             .get(py, |client| async move {
                 match client {
                     Some(client) => Cards::connect_with(&client).await,
                     None => Cards::connect().await,
                 }
             })
-            .map_err(WyrdPyError::from)?)
+            .map_err(WyrdPyError::from)
     }
 }
 

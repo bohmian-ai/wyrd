@@ -103,7 +103,7 @@ struct Answer<'a> {
 /// gateway deployment to configure when none serves the Prompt's provider and
 /// model.
 pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Desk, Error> {
-    let cards = Cards::connect_with(&client).await?;
+    let cards = Cards::connect_with(client).await?;
     let receipt = cards
         .register_from_path(service_dir().join("support-desk.yaml"))
         .await?;
@@ -115,7 +115,7 @@ pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Desk, Error> {
         )
         .await?;
     let state = WyrdState::from_path_with(bundle, client.clone())?;
-    let gateway = Gateway::connect_with(&client).await?;
+    let gateway = Gateway::connect_with(client).await?;
     gateway
         .put_capture_policy(&GatewayCapturePolicyWrite {
             mode: GatewayCaptureMode::Metadata,

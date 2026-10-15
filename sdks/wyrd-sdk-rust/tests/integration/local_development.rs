@@ -117,7 +117,7 @@ pub struct Worked {
 /// Panics when any step is refused or its evidence does not read back.
 pub async fn work(deployment: &Deployment, client: &WyrdClient) -> Worked {
     configure_gateway(client).await;
-    let cards = Cards::connect_with(&client).await.expect("handle connects");
+    let cards = Cards::connect_with(client).await.expect("handle connects");
     register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
     register(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
     let assistant = register(&cards, "cards/verify_in_real_time/assistant.yaml").await;
@@ -222,7 +222,7 @@ pub async fn configure_gateway(client: &WyrdClient) {
     )
     .await
     .expect("the CLI writes the credential");
-    Gateway::connect_with(&client)
+    Gateway::connect_with(client)
         .await
         .expect("handle connects")
         .put_deployment(&ProviderDeployment {

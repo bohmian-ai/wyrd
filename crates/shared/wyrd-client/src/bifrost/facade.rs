@@ -12,9 +12,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::WyrdClient;
+#[cfg(feature = "internal")]
 use crate::config::ClientConfig;
+#[cfg(feature = "internal")]
 use crate::environment::Environment;
+#[cfg(feature = "internal")]
 use crate::error::WyrdClientError;
+#[cfg(feature = "internal")]
 use crate::global_config::GlobalConfig;
 use arrow::datatypes::SchemaRef;
 use arrow::json::WriterBuilder;
@@ -1305,6 +1309,7 @@ pub fn client_from_options(
 /// error when the global config file cannot be read or parsed, the stable
 /// no-credentials error when nothing yields a credential, or a transport
 /// error when the HTTP client cannot be built.
+#[cfg(feature = "internal")]
 fn client_from_options_in(
     environment: Environment,
     server_url: Option<&str>,
@@ -1361,14 +1366,14 @@ impl BatchSink<ClientByteGuard> for QueryOnlySink {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "internal"))]
 mod tests {
     use super::client_from_options_in;
     use crate::environment::Environment;
 
     /// An omitted `server_url` resolves from the global config file in the
     /// Wyrd config directory, the same file [`crate::WyrdClient::from_global`]
-    /// reads, so a language `WyrdClient()` and Rust `Cards::from_env` reach the
+    /// reads, so a language `WyrdClient()` and Rust `Cards::connect` reach the
     /// same server.
     #[test]
     fn omitted_server_url_comes_from_the_global_config_file() {

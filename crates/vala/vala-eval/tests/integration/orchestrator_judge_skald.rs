@@ -11,7 +11,9 @@ use orchestrator_support::{
 use serde_json::{Value, json};
 use skald_providers::{ProviderError, ProviderStream};
 use skald_runtime::{Provider, ProviderRegistry};
+use skald_agent::{WyrdGatewayCall, WyrdGatewayCaller};
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
+use tokio_util::sync::CancellationToken;
 use vala_eval::orchestrator::{
     AgentCardResolver, MediaResolver, PromptCardResolver, SkaldJudgeInvoker,
 };
@@ -592,4 +594,68 @@ async fn provider_refusals_follow_the_shared_retry_classification() {
             "{status}: {error:?}"
         );
     }
+}
+
+/// A gateway caller that no refused route may reach.
+struct UnreachableGateway;
+
+#[async_trait]
+impl WyrdGatewayCaller for UnreachableGateway {
+    /// Fails the test: a refused route must stop before any gateway IO.
+    ///
+    /// # Errors
+    /// Never returns.
+    ///
+    /// # Panics
+    /// Always.
+    async fn call(
+        &self,
+        _call: WyrdGatewayCall,
+        _cancellation: &CancellationToken,
+    ) -> Result<ProviderResponse, ProviderError> {
+        panic!("a refused judge route never reaches the gateway");
+    }
+}
+
+/// A judge invoker refuses, before any IO, a route its context cannot serve:
+/// server-controlled (gateway-bound) execution refuses a `native` judge
+/// route rather than reach host credentials, and a host invoker without a
+/// gateway refuses a `wyrd_gateway` route rather than fall back to native.
+///
+/// # Panics
+/// Panics when either route is not refused as terminal, or reaches a
+/// provider or the gateway.
+#[tokio::test(flavor = "multi_thread")]
+async fn judge_routes_its_context_cannot_serve_are_refused() {
+    let server = invoker_with_registry(Arc::new(ProviderRegistry::new()))
+        .with_wyrd_gateway(Arc::new(UnreachableGateway));
+    let native = server
+        .invoke(&judge_agent_ref(), json!({"response": "DONE"}), &MediaBindings::new())
+        .await
+        .expect_err("a server judge refuses a native route");
+    assert!(
+        matches!(&native, JudgeError::Terminal { reason } if reason.contains("native")),
+        "{native:?}"
+    );
+
+    let mut gateway_agent = match inline_agent_ref(structured_prompt()) {
+        InlineableRef::Inline(spec) => *spec,
+        other => panic!("an inline Agent: {other:?}"),
+    };
+    gateway_agent.execution_route = wyrd_spec::ExecutionRoute::WyrdGateway {
+        deployment: wyrd_spec::ids::ProviderDeploymentName::new("openai").expect("deployment name"),
+    };
+    let host = invoker_with_registry(Arc::new(ProviderRegistry::new()));
+    let routed = host
+        .invoke(
+            &InlineableRef::Inline(Box::new(gateway_agent)),
+            json!({"response": "DONE"}),
+            &MediaBindings::new(),
+        )
+        .await
+        .expect_err("a host judge without a gateway refuses a gateway route");
+    assert!(
+        matches!(&routed, JudgeError::Terminal { reason } if reason.contains("gateway")),
+        "{routed:?}"
+    );
 }

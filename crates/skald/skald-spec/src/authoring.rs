@@ -271,6 +271,16 @@ impl AuthoredPrompt {
     }
 
     /// Decodes the native body through the typed owner for `format`.
+    ///
+    /// The authored `model` is inserted into the body (GenerateContent keeps
+    /// it in the URL instead) and the result decodes into the matching
+    /// [`ProviderRequest`] variant; unknown native options survive decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::PromptInvalid`] for a portable field beside the
+    /// body, a provider/format pair [`check_format`] refuses, `body.model`,
+    /// or a body that does not decode as `format`.
     fn native_request(
         &self,
         format: PromptFormat,
@@ -486,6 +496,13 @@ impl PortableMessage {
 }
 
 /// Refuses a provider/format pair the provider does not speak.
+///
+/// Custom providers pass; their capabilities are validated at use.
+///
+/// # Errors
+///
+/// Returns [`SkaldError::PromptInvalid`] for field `format` when a built-in
+/// provider does not accept `format`.
 fn check_format(provider: &ProviderName, format: PromptFormat) -> SkaldResult<()> {
     let admitted = match provider {
         ProviderName::OpenAi => {
@@ -515,6 +532,15 @@ fn check_format(provider: &ProviderName, format: PromptFormat) -> SkaldResult<()
 }
 
 /// Builds the portable OpenAI Chat Completions request.
+///
+/// System text becomes the first message, plain turns stay text, block turns
+/// become ordered text parts, and a schema becomes strict `json_schema`
+/// output named [`RESPONSE_SCHEMA_NAME`].
+///
+/// # Errors
+///
+/// Returns [`SkaldError::PromptInvalid`] for `top_k`, more than four stop
+/// sequences, or an out-of-range sampling setting.
 fn openai_chat(
     model: &str,
     system: Option<String>,
@@ -596,6 +622,15 @@ fn openai_chat(
 }
 
 /// Builds the portable Anthropic Messages request.
+///
+/// Every turn becomes ordered text blocks and a schema becomes
+/// `output_config` JSON-schema output.
+///
+/// # Errors
+///
+/// Returns [`SkaldError::PromptInvalid`] for `seed`, a presence or frequency
+/// penalty, a missing or zero `max_output_tokens`, or an out-of-range
+/// sampling setting.
 fn anthropic(
     model: &str,
     system: Option<String>,
@@ -660,6 +695,15 @@ fn anthropic(
 }
 
 /// Builds the portable Google/Vertex GenerateContent request.
+///
+/// Assistant turns take the `model` role, system text becomes
+/// `system_instruction`, and a schema becomes `response_schema` with a JSON
+/// response MIME type. An all-default generation config is omitted.
+///
+/// # Errors
+///
+/// Returns [`SkaldError::PromptInvalid`] for a seed outside 32 bits, more
+/// than five stop sequences, or an out-of-range sampling setting.
 fn google(
     system: Option<String>,
     turns: Vec<Turn>,
@@ -736,6 +780,11 @@ const fn role_name(role: PortableRole, assistant: &'static str) -> &'static str 
 }
 
 /// Refuses a setting the destination protocol cannot carry.
+///
+/// # Errors
+///
+/// Returns [`SkaldError::PromptInvalid`] for `settings.<setting>` when
+/// `present` is true.
 fn refuse(destination: &str, setting: &str, present: bool) -> SkaldResult<()> {
     if present {
         Err(invalid(
@@ -748,6 +797,11 @@ fn refuse(destination: &str, setting: &str, present: bool) -> SkaldResult<()> {
 }
 
 /// Passes a finite setting within `[low, high]`, narrowed to the wire's `f32`.
+///
+/// # Errors
+///
+/// Returns [`SkaldError::PromptInvalid`] for `settings.<setting>` when the
+/// value is not finite or lies outside the range.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the value is range-checked to small protocol bounds before narrowing"
@@ -769,6 +823,11 @@ fn within(
 }
 
 /// Passes a positive integer setting.
+///
+/// # Errors
+///
+/// Returns [`SkaldError::PromptInvalid`] for `settings.<setting>` when the
+/// value is zero.
 fn positive(destination: &str, setting: &str, value: Option<u32>) -> SkaldResult<Option<u32>> {
     if value == Some(0) {
         return Err(invalid(
@@ -780,6 +839,11 @@ fn positive(destination: &str, setting: &str, value: Option<u32>) -> SkaldResult
 }
 
 /// Passes a nonempty list of at most `limit` nonempty stop strings.
+///
+/// # Errors
+///
+/// Returns [`SkaldError::PromptInvalid`] for `settings.stop_sequences` when
+/// the list is empty, longer than `limit`, or holds an empty string.
 fn stops(
     destination: &str,
     value: Option<&Vec<String>>,
@@ -799,6 +863,12 @@ fn stops(
 }
 
 /// Serializes a typed request as a native body without its model.
+///
+/// # Errors
+///
+/// Returns a serialization error when the request cannot be serialized and
+/// [`SkaldError::PromptInvalid`] for field `body` when it is not a JSON
+/// object.
 fn to_body(request: &impl Serialize) -> SkaldResult<Map<String, Value>> {
     let Value::Object(mut body) = serde_json::to_value(request).map_err(SkaldError::serialize)?
     else {
@@ -834,6 +904,11 @@ mod tests {
 
     /// Decodes and compiles one authored spec body; decode failures report
     /// the field `decode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::PromptInvalid`] with field `decode` when the body
+    /// is not an [`AuthoredPrompt`], and the compiler's own refusal otherwise.
     fn compile(body: Value) -> SkaldResult<crate::Prompt> {
         serde_json::from_value::<AuthoredPrompt>(body)
             .map_err(|error| SkaldError::PromptInvalid {
@@ -844,6 +919,11 @@ mod tests {
     }
 
     /// Returns the refused field of an authored body that must not compile.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the body compiles or fails with anything other than a
+    /// field refusal.
     fn refused(body: Value) -> String {
         match compile(body) {
             Err(SkaldError::PromptInvalid { field, .. }) => field,
@@ -852,6 +932,10 @@ mod tests {
     }
 
     /// Returns the provider-native body of a compiled Prompt.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request cannot be serialized.
     fn body(prompt: &crate::Prompt) -> Value {
         serde_json::to_value(&prompt.request).expect("request json")["body"].clone()
     }
@@ -860,6 +944,10 @@ mod tests {
     /// every provider format; the eight settings map or refuse per the table;
     /// structured output takes the deterministic schema name; media bindings,
     /// slash-containing models, and invalid shapes behave as specified.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any compile, refusal, or body assertion fails.
     #[test]
     fn portable_content_settings_and_schema() {
         let schema = json!({"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]});
@@ -1054,6 +1142,10 @@ mod tests {
     /// grammars and control characters are refused before variable
     /// derivation, so rendering can never rewrite the target, while content
     /// variables still render and a slash model stays exact.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any compile, refusal, or body assertion fails.
     #[test]
     fn model_is_literal_configuration() {
         let portable = |model: &str| json!({"provider": "openai", "model": model, "messages": [{"role": "user", "content": "{{question}}"}]});
@@ -1095,6 +1187,10 @@ mod tests {
     /// GenerateContent, and non-strict native OpenAI accept; and valid nested
     /// schemas, references, type unions, and native options keep their
     /// authored bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any compile, refusal, or body assertion fails.
     #[test]
     fn output_schemas_are_validated() {
         let portable = |provider: &str, schema: Value| {
@@ -1210,6 +1306,10 @@ mod tests {
     /// other kind is refused in both directions before the request changes,
     /// one name declared as both kinds is refused, matching bindings keep
     /// their order, and native untyped placeholders accept either kind.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any compile, refusal, or body assertion fails.
     #[test]
     fn portable_media_bindings_keep_their_kind() {
         use crate::MediaRef;
@@ -1284,10 +1384,175 @@ mod tests {
             .expect("untyped binds a document");
     }
 
+    /// Proves literal and bound media sources are validated before the
+    /// request changes: malformed or over-budget base64, MIME types that do
+    /// not match the kind or the provider, and unsupported Google file URIs
+    /// are refused, while supported sources and provider file ids bind as
+    /// written.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any compile, refusal, or body assertion fails.
+    #[test]
+    fn media_sources_are_validated() {
+        use base64::Engine;
+
+        use crate::{MediaRef, MediaSource};
+
+        let authored = |provider: &str, kind: &str, source: Value| {
+            json!({"provider": provider, "model": "m",
+            "settings": {"max_output_tokens": 8},
+            "messages": [{"role": "user", "content": [{"type": kind, "source": source}]}]})
+        };
+        let inline =
+            |mime: &str, data: &str| json!({"type": "base64", "mime_type": mime, "data": data});
+        let file = |uri: &str, mime: &str| json!({"type": "file", "uri": uri, "mime_type": mime});
+        let media_error = |result: SkaldResult<crate::Prompt>| match result {
+            Err(
+                error @ (SkaldError::InvalidMediaType(_)
+                | SkaldError::MediaTooLarge { .. }
+                | SkaldError::UnsupportedMediaForProvider { .. }),
+            ) => error.code(),
+            other => panic!("expected a media refusal, got {other:?}"),
+        };
+        let oversized = base64::engine::general_purpose::STANDARD.encode(vec![
+            0_u8;
+            usize::try_from(
+                crate::media::MAX_MEDIA_FILE_BYTES
+            )
+            .expect(
+                "budget fits"
+            ) + 1
+        ]);
+        for provider in ["openai", "anthropic", "google"] {
+            for (kind, source, code) in [
+                (
+                    "image",
+                    inline("image/png", "%%%"),
+                    "SKALD_SPEC_400_INVALID_MEDIA_TYPE",
+                ),
+                (
+                    "image",
+                    inline("application/pdf", "JVBERi0="),
+                    "SKALD_SPEC_400_INVALID_MEDIA_TYPE",
+                ),
+                (
+                    "document",
+                    inline("image/png", "iVBORw0KGgo="),
+                    "SKALD_SPEC_400_INVALID_MEDIA_TYPE",
+                ),
+                (
+                    "document",
+                    inline(" ", "JVBERi0="),
+                    "SKALD_SPEC_400_INVALID_MEDIA_TYPE",
+                ),
+                (
+                    "document",
+                    inline("pdf", "JVBERi0="),
+                    "SKALD_SPEC_400_INVALID_MEDIA_TYPE",
+                ),
+                (
+                    "document",
+                    inline("application/pdf", &oversized),
+                    "SKALD_SPEC_400_MEDIA_TOO_LARGE",
+                ),
+            ] {
+                assert_eq!(
+                    media_error(compile(authored(provider, kind, source.clone()))),
+                    code,
+                    "{provider} {kind} {source:.80}"
+                );
+            }
+        }
+        for (provider, kind, source) in [
+            ("openai", "image", inline("image/bmp", "QUJD")),
+            ("anthropic", "image", inline("image/svg+xml", "QUJD")),
+            ("anthropic", "document", inline("text/plain", "QUJD")),
+            (
+                "google",
+                "document",
+                file("https://example.com/a.pdf", "application/pdf"),
+            ),
+        ] {
+            assert!(
+                media_error(compile(authored(provider, kind, source.clone())))
+                    .starts_with("SKALD_SPEC_400"),
+                "{provider} refuses {kind} {source}"
+            );
+        }
+        for (provider, kind, source, needle) in [
+            ("google", "image", inline("image/heic", "QUJD"), "QUJD"),
+            ("google", "document", inline("text/plain", "QUJD"), "QUJD"),
+            (
+                "openai",
+                "document",
+                inline("application/pdf", "JVBERi0="),
+                "JVBERi0=",
+            ),
+            (
+                "google",
+                "document",
+                file("gs://bucket/a.pdf", "application/pdf"),
+                "gs://bucket/a.pdf",
+            ),
+            (
+                "google",
+                "document",
+                file(
+                    "https://generativelanguage.googleapis.com/v1beta/files/abc",
+                    "application/pdf",
+                ),
+                "v1beta/files/abc",
+            ),
+            (
+                "openai",
+                "document",
+                json!({"type": "file", "uri": "file-abc123"}),
+                "file-abc123",
+            ),
+            (
+                "anthropic",
+                "image",
+                json!({"type": "file", "uri": "file_011CN"}),
+                "file_011CN",
+            ),
+        ] {
+            let prompt =
+                compile(authored(provider, kind, source)).expect("supported media compiles");
+            assert!(
+                body(&prompt).to_string().contains(needle),
+                "{provider} keeps {needle}"
+            );
+        }
+
+        let mut bound = compile(authored("anthropic", "image", json!("${media:photo}")))
+            .expect("binding compiles");
+        let before = bound.request.clone();
+        let bad = MediaRef {
+            kind: crate::MediaKind::Image,
+            source: MediaSource::Base64 {
+                mime_type: "image/png".to_owned(),
+                data: "not base64!".to_owned(),
+            },
+        };
+        assert!(matches!(
+            bound.bind_media_mut("photo", &bad),
+            Err(SkaldError::InvalidMediaType(_))
+        ));
+        assert_eq!(
+            bound.request, before,
+            "a refused source leaves the request untouched"
+        );
+    }
+
     /// Proves the native form: model inserted at compile and refused in the
     /// body, provider/format pairs validated, portable fields refused beside a
     /// body, unknown native options preserved, and the authored form
     /// round-tripping through the runtime Prompt unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any compile, refusal, or body assertion fails.
     #[test]
     fn native_body_pairs_and_round_trip() {
         let native = json!({

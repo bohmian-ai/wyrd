@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::authoring::{AuthoredPrompt, invalid};
 use crate::error::{SkaldError, SkaldResult};
-use crate::media::{MediaKind, MediaRef, MediaSource};
+use crate::media::{MAX_MEDIA_FILE_BYTES, MediaKind, MediaRef, MediaSource};
 use crate::request::{ProviderName, ProviderRequest};
 use crate::wire::anthropic_messages::{
     AnthropicContentBlock, AnthropicDocumentSource, AnthropicImageSource, AnthropicMessagesRequest,
@@ -61,6 +61,8 @@ pub struct Prompt {
 /// Prompts are equal when they serialize to the same authored form; a
 /// request with no authored form compares by request, model, and provider.
 impl PartialEq for Prompt {
+    /// Compares authored forms when both derive one, falling back to the
+    /// request, model, and dispatch provider.
     fn eq(&self, other: &Self) -> bool {
         match (self.authored(), other.authored()) {
             (Ok(mine), Ok(theirs)) => mine == theirs,
@@ -74,6 +76,12 @@ impl PartialEq for Prompt {
 }
 
 impl Serialize for Prompt {
+    /// Serializes the authored form from [`Prompt::authored`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the serializer's custom error when the request kind has no
+    /// Prompt format, or the serializer's own error.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.authored()
             .map_err(serde::ser::Error::custom)?
@@ -82,6 +90,12 @@ impl Serialize for Prompt {
 }
 
 impl<'de> Deserialize<'de> for Prompt {
+    /// Decodes an [`AuthoredPrompt`] and compiles it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the deserializer's error for an undecodable authored form and
+    /// a custom error carrying the compiler refusal otherwise.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         AuthoredPrompt::deserialize(deserializer)?
             .compile()
@@ -91,10 +105,12 @@ impl<'de> Deserialize<'de> for Prompt {
 
 #[cfg(feature = "schemars")]
 impl schemars::JsonSchema for Prompt {
+    /// Names the schema `Prompt`.
     fn schema_name() -> String {
         "Prompt".to_owned()
     }
 
+    /// Publishes the authored form's schema, which is the wire form.
     fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
         AuthoredPrompt::json_schema(generator)
     }
@@ -494,6 +510,10 @@ impl Prompt {
     /// This is the reusable primitive behind higher-level prompt binding. It performs
     /// replacement inside JSON string leaves after serializing the native
     /// request, then deserializes back into the same provider-tagged variant.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Prompt::bind_mut`].
     pub fn bind(&self, vars: &[(&str, &str)]) -> SkaldResult<Self> {
         let mut prompt = self.clone();
         prompt.bind_mut(vars)?;
@@ -504,6 +524,14 @@ impl Prompt {
     ///
     /// Unlike `render`, this may bind only a subset of declared variables. Any
     /// names still present in `variables` remain required for a later render.
+    /// The model is literal (see [`check_model`]), so binding never rewrites
+    /// the dispatch target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error when the request cannot be serialized
+    /// and a deserialization error when the substituted request no longer
+    /// decodes as its provider variant.
     pub fn bind_mut(&mut self, vars: &[(&str, &str)]) -> SkaldResult<()> {
         let mut request = serde_json::to_value(&self.request).map_err(SkaldError::serialize)?;
         replace_string_leaves(&mut request, vars);
@@ -515,6 +543,10 @@ impl Prompt {
     }
 
     /// Bind a `${media:name}` placeholder to a provider-native media block.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Prompt::bind_media_mut`].
     pub fn bind_media(&self, name: &str, media: &MediaRef) -> SkaldResult<Self> {
         let mut prompt = self.clone();
         prompt.bind_media_mut(name, media)?;
@@ -534,8 +566,9 @@ impl Prompt {
     /// Returns [`SkaldError::InvalidMediaType`] when `media` is not the kind
     /// the portable block for `name` declares,
     /// [`SkaldError::MediaPlaceholderNotFound`] when the request has no such
-    /// placeholder or no media-capable shape, and the per-provider media
-    /// errors for a source or MIME type the provider refuses.
+    /// placeholder or no media-capable shape, and the source refusals of
+    /// [`check_media_source`] (checked before any part is replaced) plus the
+    /// remaining per-provider media errors.
     pub fn bind_media_mut(&mut self, name: &str, media: &MediaRef) -> SkaldResult<()> {
         if let Some((_, expected)) = self.media_kinds.iter().find(|(bound, _)| bound == name)
             && *expected != media.kind
@@ -545,8 +578,9 @@ impl Prompt {
                 media.kind
             )));
         }
-        self.normalize_media_placeholders_mut()?;
         let provider = self.provider();
+        check_media_source(&self.request, provider.clone(), name, media)?;
+        self.normalize_media_placeholders_mut()?;
         match &mut self.request {
             ProviderRequest::OpenAiChatCompletion(request) => {
                 bind_media_openai_chat(request, name, media)?;
@@ -1303,6 +1337,122 @@ fn build_google_part(media: &MediaRef, provider: ProviderName) -> SkaldResult<Go
     }
 }
 
+/// Image MIME types OpenAI and Anthropic accept as image input.
+const PORTABLE_IMAGE_TYPES: [&str; 4] = ["image/gif", "image/jpeg", "image/png", "image/webp"];
+
+/// Refuses a media source its destination cannot carry, before any request
+/// part is replaced.
+///
+/// Inline base64 must decode and stay within [`MAX_MEDIA_FILE_BYTES`]; any
+/// declared MIME type must be `type/subtype` and match the kind (`image/*`
+/// for images, anything else for documents). OpenAI and Anthropic images
+/// must be GIF, JPEG, PNG, or WebP; Anthropic inline documents must be PDF;
+/// GenerateContent file URIs must be `gs://` or Gemini File API URIs.
+/// Provider file ids are otherwise passed through unexamined. Pure: nothing
+/// is fetched or uploaded.
+///
+/// # Errors
+///
+/// Returns [`SkaldError::InvalidMediaType`] for undecodable base64 or an
+/// invalid, mismatched, or provider-unsupported MIME type,
+/// [`SkaldError::MediaTooLarge`] for an over-budget payload, and
+/// [`SkaldError::UnsupportedMediaForProvider`] for a refused Google file URI.
+fn check_media_source(
+    request: &ProviderRequest,
+    provider: ProviderName,
+    name: &str,
+    media: &MediaRef,
+) -> SkaldResult<()> {
+    use base64::Engine;
+
+    let invalid_type = |message: String| Err(SkaldError::InvalidMediaType(message));
+    let mime_type = match &media.source {
+        MediaSource::Base64 { mime_type, data } => {
+            // Text longer than any in-budget encoding is refused undecoded.
+            let encoded = data.len() as u64;
+            let size = if encoded > MAX_MEDIA_FILE_BYTES.div_ceil(3) * 4 {
+                encoded / 4 * 3
+            } else {
+                base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|_| {
+                        SkaldError::InvalidMediaType(format!(
+                            "media `{name}` data is not valid base64"
+                        ))
+                    })?
+                    .len() as u64
+            };
+            if size > MAX_MEDIA_FILE_BYTES {
+                return Err(SkaldError::MediaTooLarge {
+                    path: placeholder_token(name),
+                    size,
+                    limit: MAX_MEDIA_FILE_BYTES,
+                });
+            }
+            Some(mime_type.as_str())
+        }
+        MediaSource::Url { mime_type, .. } | MediaSource::File { mime_type, .. } => {
+            mime_type.as_deref()
+        }
+    };
+    if let Some(mime_type) = mime_type {
+        let mime = mime_type.to_ascii_lowercase();
+        let well_formed = mime.split_once('/').is_some_and(|(top, sub)| {
+            !top.is_empty()
+                && !sub.is_empty()
+                && !mime.contains(|c: char| c.is_whitespace() || c.is_control())
+        });
+        if !well_formed {
+            return invalid_type(format!(
+                "media `{name}` mime_type `{mime_type}` is not type/subtype"
+            ));
+        }
+        if mime.starts_with("image/") != (media.kind == MediaKind::Image) {
+            return invalid_type(format!(
+                "media `{name}` mime_type `{mime_type}` does not match kind {:?}",
+                media.kind
+            ));
+        }
+        let anthropic = matches!(request, ProviderRequest::AnthropicMessage(_));
+        let openai = matches!(
+            request,
+            ProviderRequest::OpenAiChatCompletion(_) | ProviderRequest::OpenAiResponses(_)
+        );
+        if media.kind == MediaKind::Image
+            && (anthropic || openai)
+            && !PORTABLE_IMAGE_TYPES.contains(&mime.as_str())
+        {
+            return invalid_type(format!(
+                "media `{name}` image type `{mime_type}` is not GIF, JPEG, PNG, or WebP"
+            ));
+        }
+        if anthropic
+            && media.kind == MediaKind::Document
+            && matches!(media.source, MediaSource::Base64 { .. })
+            && mime != "application/pdf"
+        {
+            return invalid_type(format!(
+                "media `{name}` inline Anthropic documents must be application/pdf, not `{mime_type}`"
+            ));
+        }
+    }
+    let google = matches!(request, ProviderRequest::GeminiGenerateContent(_));
+    if google && mime_type.is_none() {
+        return invalid_type(format!(
+            "media `{name}` needs an explicit mime_type for Gemini"
+        ));
+    }
+    if let (true, MediaSource::File { uri, .. }) = (google, &media.source)
+        && !(uri.starts_with("gs://") || is_gemini_file_api_url(uri))
+    {
+        return Err(SkaldError::UnsupportedMediaForProvider {
+            provider,
+            kind: media.kind,
+        });
+    }
+    Ok(())
+}
+
 fn validate_mime(mime_type: &str) -> SkaldResult<()> {
     if mime_type.trim().is_empty() {
         Err(SkaldError::InvalidMediaType(
@@ -1389,6 +1539,7 @@ mod placeholder_syntax_tests {
         assert!(vars.is_empty());
     }
 
+    /// Proves `${name}` placeholders render.
     #[test]
     fn render_binds_dollar_brace() {
         let prompt = Prompt::new(openai_request_with_user("hello ${name}"), "gpt-test")
@@ -1398,6 +1549,7 @@ mod placeholder_syntax_tests {
         assert!(json.contains("hello world"));
     }
 
+    /// Proves `{{name}}` placeholders render.
     #[test]
     fn render_binds_mustache() {
         let prompt = Prompt::new(openai_request_with_user("hello {{name}}"), "gpt-test")
@@ -1407,6 +1559,7 @@ mod placeholder_syntax_tests {
         assert!(json.contains("hello world"));
     }
 
+    /// Proves both placeholder grammars render together in one pass.
     #[test]
     fn render_binds_mixed_syntax_in_one_pass() {
         let prompt = Prompt::new(openai_request_with_user("${a} or {{a}}"), "gpt-test")
@@ -1425,6 +1578,11 @@ mod prompt_media {
     use crate::wire::openai_chat::{OpenAiContentPart, OpenAiMessageContent};
     use crate::{MediaKind, MediaRef, Prompt, ProviderName, ProviderRequest, SkaldError};
 
+    /// Builds a Prompt over `request` with a fixed literal model.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request is not a valid Prompt.
     fn prompt(request: ProviderRequest) -> Prompt {
         Prompt::new(request, "model").expect("prompt is valid")
     }
@@ -1477,6 +1635,7 @@ mod prompt_media {
         );
     }
 
+    /// Proves a media placeholder in system content is refused at construction.
     #[test]
     fn media_placeholder_in_system_message_is_rejected() {
         let mut request = common::openai_chat_request();

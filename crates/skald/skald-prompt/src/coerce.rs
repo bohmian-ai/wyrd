@@ -37,6 +37,12 @@ use {
 };
 
 /// Converts a Python provider spelling into a native provider name.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::InvalidProvider`] when the value is not a
+/// string or not a valid provider name, and the Python error when the
+/// value cannot be extracted or rendered.
 #[cfg(feature = "python")]
 pub fn provider_name_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<ProviderName> {
     if value.is_instance_of::<PyString>() {

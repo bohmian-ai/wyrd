@@ -4554,8 +4554,9 @@ async fn inline_agent_prompt_reuses_transaction_selection() {
 /// it (a standalone refusal names the offending field), so the server stores
 /// no operation, Card,
 /// relationship, principal, or binding. Refusal happens during decoding and
-/// never reaches storage or a provider. Cases cover a templated model and
-/// invalid output schemas in the portable and native forms.
+/// never reaches storage or a provider. Cases cover a templated model,
+/// invalid output schemas in the portable and native forms, a media binding
+/// declared as two kinds, and invalid literal media sources.
 ///
 /// # Panics
 /// Panics when the server cannot start or shut down, the writer cannot
@@ -4581,6 +4582,8 @@ async fn invalid_prompt_authoring_is_refused_before_writes() {
         }
         prompt
     };
+    let media =
+        |blocks: Value| portable(json!({"messages": [{"role": "user", "content": blocks}]}));
     let cases = [
         (
             "templated-model",
@@ -4605,6 +4608,26 @@ async fn invalid_prompt_authoring_is_refused_before_writes() {
                    "body": {"messages": [{"role": "user", "content": "hi"}],
                             "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": {"type": "object", "properties": []}}}}}),
             "body.response_format.json_schema.schema.properties",
+        ),
+        (
+            "media-kind-conflict",
+            media(json!([{"type": "image", "source": "${media:x}"},
+                         {"type": "document", "source": "${media:x}"}])),
+            "messages.content.source",
+        ),
+        (
+            "media-base64",
+            media(
+                json!([{"type": "image", "source": {"type": "base64", "mime_type": "image/png", "data": "%%%"}}]),
+            ),
+            "not valid base64",
+        ),
+        (
+            "media-mime",
+            media(
+                json!([{"type": "image", "source": {"type": "base64", "mime_type": "application/pdf", "data": "JVBERi0="}}]),
+            ),
+            "does not match kind",
         ),
     ];
     for (label, prompt, field) in cases {

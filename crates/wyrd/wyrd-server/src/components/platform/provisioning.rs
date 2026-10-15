@@ -285,7 +285,7 @@ impl TenantProvisioning {
             .establish_tenant_administration(conn, data_tenant_id, attribution)
             .await?;
         self.builtins
-            .ensure_tenant(data_tenant_id)
+            .ensure_tenant(data_tenant_id, attribution)
             .await
             .map_err(|error| ProvisionError::Store(error.to_string()))?;
         match mark_tenant_active(&self.operator, data_tenant_id).await {
@@ -453,7 +453,7 @@ impl TenantProvisioning {
         seed_builtin_roles_for_tenant(&mut conn, data_tenant_id)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
-        provision_system_principal(&mut conn)
+        provision_system_principal(&mut conn, attribution)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
 

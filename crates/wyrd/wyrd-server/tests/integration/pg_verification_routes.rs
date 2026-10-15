@@ -802,9 +802,12 @@ async fn system_writer_is_unreachable_through_public_principal_routes() {
         .tenant_conn_for(tenant)
         .await
         .expect("tenant connection opens");
-    let provisioned = wyrd_sql::queries::auth::provision_system_principal(&mut conn)
-        .await
-        .expect("SYSTEM writer provisions");
+    let provisioned = wyrd_sql::queries::auth::provision_system_principal(
+        &mut conn,
+        wyrd_spec::auth::Attribution::unresolved(),
+    )
+    .await
+    .expect("SYSTEM writer provisions");
     conn.commit().await.expect("provisioning commits");
     let (system, name, status, keys) = system_writer(&server, tenant).await;
     assert_eq!(system, provisioned);

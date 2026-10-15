@@ -244,15 +244,23 @@ pub async fn service_account_by_id(
 
 /// Create the tenant's internal SYSTEM writer when absent and return its id.
 ///
-/// Delegates to `wyrd.provision_system_principal()`, the single owner the
-/// upgrade migration's backfill also uses, so provisioning and backfill cannot
-/// diverge. Idempotent: every call in a tenant returns the same stable UUIDv7.
+/// Delegates to `wyrd.provision_system_principal(creator_sub, creator_act)`,
+/// the single owner the upgrade migration's backfill also uses, so
+/// provisioning and backfill cannot diverge. `creator` is the verified pair
+/// creating the row: the provisioning platform operator, or
+/// [`Attribution::unresolved`] when no caller exists. Idempotent: every call in
+/// a tenant returns the same stable UUIDv7 and keeps the first creator pair.
 /// The row joins the caller's transaction and commits with it.
 ///
 /// # Errors
 /// Returns the database error when the insert or read fails.
-pub async fn provision_system_principal(conn: &mut TenantConn<'_>) -> Result<Uuid, SqlxError> {
-    sqlx::query_scalar("SELECT wyrd.provision_system_principal()")
+pub async fn provision_system_principal(
+    conn: &mut TenantConn<'_>,
+    creator: Attribution,
+) -> Result<Uuid, SqlxError> {
+    sqlx::query_scalar("SELECT wyrd.provision_system_principal($1, $2)")
+        .bind(creator.sub_principal_id.as_uuid())
+        .bind(creator.act_principal_id.as_uuid())
         .fetch_one(&mut **conn.transaction())
         .await
 }

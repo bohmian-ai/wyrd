@@ -963,9 +963,12 @@ impl ResultTableHarness {
         seed_builtin_roles_for_tenant(&mut conn, tenant)
             .await
             .expect("built-in roles seed");
-        let system = wyrd_sql::queries::auth::provision_system_principal(&mut conn)
-            .await
-            .expect("system principal provisions");
+        let system = wyrd_sql::queries::auth::provision_system_principal(
+            &mut conn,
+            wyrd_spec::auth::Attribution::unresolved(),
+        )
+        .await
+        .expect("system principal provisions");
         conn.commit().await.expect("provisioning commits");
         server
             .ensure_builtin_table_for_test(tenant, "verification", "results")

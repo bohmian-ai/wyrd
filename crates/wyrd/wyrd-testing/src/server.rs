@@ -86,7 +86,7 @@ use wyrd_types::variant::variant_storage_type;
 use crate::bifrost::ForgeObjectStoreControl;
 use crate::bifrost::object_reads::ObjectReadProbe;
 
-use wyrd_spec::auth::{RoleSource, TokenAudience, TokenResponse};
+use wyrd_spec::auth::{Attribution, RoleSource, TokenAudience, TokenResponse};
 use wyrd_spec::card::verifier::{DriftBaselineState, DriftBaselineStatus};
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{BindingId, CardName, CardUid, SpaceName};
@@ -2715,7 +2715,7 @@ impl WyrdTestServer {
             })?;
         self.inner
             .bifrost_catalog
-            .ensure_builtin(tenant, definition)
+            .ensure_builtin(tenant, definition, Attribution::unresolved())
             .await
             .map(|_| ())
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
@@ -3145,7 +3145,9 @@ impl WyrdTestServer {
         seed_builtin_roles_for_tenant(&mut conn, tenant_id)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        provision_system_principal(&mut conn).await.map_err(sql)?;
+        provision_system_principal(&mut conn, Attribution::unresolved())
+            .await
+            .map_err(sql)?;
         conn.commit().await.map_err(sql)?;
         self.ensure_builtin_tables_for_test(tenant_id).await?;
         Ok(tenant_id)
@@ -3165,7 +3167,7 @@ impl WyrdTestServer {
         tenant: DataTenantId,
     ) -> Result<(), WyrdTestServerError> {
         BuiltinTables::new(self.bifrost_catalog())
-            .ensure_tenant(tenant)
+            .ensure_tenant(tenant, Attribution::unresolved())
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
@@ -4692,7 +4694,9 @@ impl WyrdTestServerBuilder {
         seed_builtin_roles_for_tenant(&mut conn, tenant_id)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        provision_system_principal(&mut conn).await.map_err(sql)?;
+        provision_system_principal(&mut conn, Attribution::unresolved())
+            .await
+            .map_err(sql)?;
         conn.commit().await.map_err(sql)?;
 
         let (storage_root, storage) = if let Some(handle) = self.storage_handle.take() {

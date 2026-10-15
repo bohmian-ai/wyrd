@@ -3446,6 +3446,7 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
         .ensure_builtin(
             tenant,
             vala_bifrost_redux::tables::builtin_table("gateway", "calls").expect("built-in table"),
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await
         .expect("the calls table registers");
@@ -3768,6 +3769,7 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
         .ensure_builtin(
             tenant,
             vala_bifrost_redux::tables::builtin_table("gateway", "calls").expect("built-in table"),
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await
         .expect("the calls table registers");

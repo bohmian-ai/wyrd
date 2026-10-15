@@ -138,8 +138,11 @@ impl VerificationFixture {
         wyrd_auth::seed::seed_builtin_roles_for_tenant(&mut conn, tenant)
             .await
             .map_err(|error| VerificationFixtureError::Card(error.to_string()))?;
-        let system_principal =
-            wyrd_sql::queries::auth::provision_system_principal(&mut conn).await?;
+        let system_principal = wyrd_sql::queries::auth::provision_system_principal(
+            &mut conn,
+            Attribution::unresolved(),
+        )
+        .await?;
         conn.commit().await?;
         Ok(Self {
             postgres: postgres.clone(),

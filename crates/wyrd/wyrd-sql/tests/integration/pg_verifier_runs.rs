@@ -422,7 +422,7 @@ fn owner_authority(tenant: DataTenantId, principal: PrincipalId) -> AcceptedAuth
 /// # Panics
 /// Panics when SYSTEM cannot be provisioned.
 async fn background(conn: &mut TenantConn<'_>, owner: PrincipalId) -> RunAuthority {
-    let system = provision_system_principal(conn)
+    let system = provision_system_principal(conn, Attribution::unresolved())
         .await
         .expect("system principal provisions");
     RunAuthority::background(
@@ -1195,7 +1195,7 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let system = provision_system_principal(&mut setup)
+    let system = provision_system_principal(&mut setup, Attribution::unresolved())
         .await
         .expect("the tenant SYSTEM principal provisions");
     let (owner, principal) = register_service(&mut setup, &actor, "svc").await;
@@ -2007,7 +2007,7 @@ async fn observation_batches_insert_once_per_binding_and_record() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let system = provision_system_principal(&mut conn)
+    let system = provision_system_principal(&mut conn, Attribution::unresolved())
         .await
         .expect("the tenant SYSTEM principal provisions");
     let assertion = register_verifier(&mut conn, &actor, "assertion", eval()).await;

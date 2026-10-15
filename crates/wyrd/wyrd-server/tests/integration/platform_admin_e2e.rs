@@ -5194,6 +5194,34 @@ fn every_builtin() -> std::collections::BTreeSet<String> {
         .collect()
 }
 
+/// The distinct creator pairs `query` reads in `tenant`, as `(sub, act)`.
+///
+/// `query` selects `sub_principal_id, act_principal_id` from a tenant-scoped
+/// table, so forced RLS confines it to `tenant`.
+///
+/// # Panics
+/// Panics when the tenant transaction or the read fails.
+async fn creator_pairs(
+    srv: &WyrdTestServer,
+    tenant: DataTenantId,
+    query: &'static str,
+) -> std::collections::BTreeSet<(uuid::Uuid, uuid::Uuid)> {
+    let mut conn = srv.tenant_conn_for(tenant).await.expect("tenant opens");
+    let rows: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(query)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("creator pairs read");
+    rows.into_iter().collect()
+}
+
+/// Reads the creator pair of every catalog table.
+const TABLE_CREATORS: &str =
+    "SELECT DISTINCT sub_principal_id, act_principal_id FROM vala.bifrost_tables";
+
+/// Reads the creator pair of the tenant's SYSTEM principal.
+const SYSTEM_CREATOR: &str = "SELECT sub_principal_id, act_principal_id \
+     FROM wyrd.auth_service_accounts WHERE principal_kind = 'system'";
+
 /// A tenant has every canonical built-in from the moment it is usable, and a
 /// tenant that predates the inventory receives them at the next startup.
 ///
@@ -5202,6 +5230,12 @@ fn every_builtin() -> std::collections::BTreeSet<String> {
 /// pre-existing tenant is a directory row with no tables at all — what an
 /// upgrade finds — and gains the whole inventory only through the restart's
 /// reconciliation, which must also leave the provisioned tenant unchanged.
+///
+/// Creation keeps its verified creator (AC-019): the provisioning operator's
+/// platform pair stamps the provisioned tenant's SYSTEM principal and tables,
+/// while callerless startup reconciliation stamps the no-verified-caller
+/// sentinel on the existing tenant and the reserved audit owner, and leaves the
+/// provisioned tenant's first pair in place.
 #[tokio::test]
 async fn new_and_existing_tenants_receive_every_builtin() {
     let srv = WyrdTestServer::builder()
@@ -5232,6 +5266,37 @@ async fn new_and_existing_tenants_receive_every_builtin() {
         every_builtin(),
         "a provisioned tenant has every built-in before any write or describe"
     );
+    let admins = body_json(
+        srv.oneshot(platform_request(
+            Method::GET,
+            "/platform/admins",
+            &session,
+            None,
+        ))
+        .await
+        .expect("listing responds"),
+    )
+    .await;
+    let root_id: uuid::Uuid = admins["principals"][0]["principal_id"]
+        .as_str()
+        .expect("the deployment root is listed")
+        .parse()
+        .expect("principal id parses");
+    let operator = std::collections::BTreeSet::from([(root_id, root_id)]);
+    let sentinel = std::collections::BTreeSet::from([(
+        wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL.as_uuid(),
+        wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL.as_uuid(),
+    )]);
+    assert_eq!(
+        creator_pairs(&srv, provisioned, SYSTEM_CREATOR).await,
+        operator,
+        "provisioning records its operator as SYSTEM's creator"
+    );
+    assert_eq!(
+        creator_pairs(&srv, provisioned, TABLE_CREATORS).await,
+        operator,
+        "provisioning records its operator as every built-in's creator"
+    );
 
     let existing = wyrd_spec::DataTenantId::new_v7();
     sqlx::query(
@@ -5259,5 +5324,20 @@ async fn new_and_existing_tenants_receive_every_builtin() {
         registered_builtins(&srv, provisioned).await,
         every_builtin(),
         "startup reconciliation is idempotent for an already provisioned tenant"
+    );
+    assert_eq!(
+        creator_pairs(&srv, existing, TABLE_CREATORS).await,
+        sentinel,
+        "callerless reconciliation records the no-verified-caller sentinel"
+    );
+    assert_eq!(
+        creator_pairs(&srv, DataTenantId::SYSTEM_OWNER, TABLE_CREATORS).await,
+        sentinel,
+        "the reserved audit owner's tables have no verified caller"
+    );
+    assert_eq!(
+        creator_pairs(&srv, provisioned, TABLE_CREATORS).await,
+        operator,
+        "reconciliation keeps each built-in's first creator"
     );
 }

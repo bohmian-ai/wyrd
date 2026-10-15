@@ -1463,7 +1463,11 @@ impl PromotionIntegrationFixture {
         let definition = vala_bifrost_redux::tables::builtin_table(segment, name)
             .expect("the built-in definition resolves");
         self.catalog
-            .ensure_builtin(self.tenant, definition)
+            .ensure_builtin(
+                self.tenant,
+                definition,
+                wyrd_spec::auth::Attribution::unresolved(),
+            )
             .await
             .expect("the built-in provisions");
         let binding = TenantTableBinding::resolve((self.tenant, TableRef::new(namespace, name)))

@@ -1016,7 +1016,7 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::{Permission, PermissionSet, PrincipalId};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag, RoleSource};
+    use wyrd_spec::auth::{Attribution, OAuthClientId, PrincipalKindTag, RoleSource};
     use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::CardUid;
@@ -1462,7 +1462,7 @@ mod pg_tests {
         let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let writer = provision_system_principal(&mut conn)
+        let writer = provision_system_principal(&mut conn, Attribution::unresolved())
             .await
             .expect("writer provisions");
         let subject = TokenPrincipalRef {

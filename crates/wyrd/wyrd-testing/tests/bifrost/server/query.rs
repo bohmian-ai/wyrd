@@ -1043,6 +1043,7 @@ async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
             tenant,
             vala_bifrost_redux::tables::builtin_table("logs", "records")
                 .ok_or("no canonical vala.logs.records definition")?,
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await?;
     let spans_uid = catalog
@@ -1050,6 +1051,7 @@ async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
             tenant,
             vala_bifrost_redux::tables::builtin_table("traces", "spans")
                 .ok_or("no canonical vala.traces.spans definition")?,
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await?;
 
@@ -1232,6 +1234,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
             tenant,
             vala_bifrost_redux::tables::builtin_table("traces", "spans")
                 .ok_or("no canonical vala.traces.spans definition")?,
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await?;
     await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
@@ -1716,6 +1719,7 @@ async fn prove_stream_admission_expiry() -> Result<(), ServerJourneyError> {
             tenant,
             vala_bifrost_redux::tables::builtin_table("logs", "records")
                 .ok_or("no canonical vala.logs.records definition")?,
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await?;
     await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;

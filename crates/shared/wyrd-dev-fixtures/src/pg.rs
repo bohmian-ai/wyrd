@@ -13,6 +13,7 @@ use sqlx::{AssertSqlSafe, PgPool};
 use url::Url;
 use vala_sql::ValaPostgres;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::pool::build_pool;
 use wyrd_sql::row_types::auth::HumanConnectionBinding;
@@ -681,7 +682,8 @@ async fn seed_tenant(
     .await
     .map_err(SqlError::from)?;
     let mut conn = wyrd.tenant_conn(data_tenant_id).await?;
-    wyrd_sql::queries::auth::provision_system_principal(&mut conn).await?;
+    wyrd_sql::queries::auth::provision_system_principal(&mut conn, Attribution::unresolved())
+        .await?;
     conn.commit().await
 }
 

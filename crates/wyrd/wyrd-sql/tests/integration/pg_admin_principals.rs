@@ -15,7 +15,7 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_spec::auth::{Attribution, PrincipalKindTag};
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
@@ -791,12 +791,12 @@ mod pg_tests {
             .expect("second tenant seeds");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant opens");
-        let first = provision_system_principal(&mut conn)
+        let first = provision_system_principal(&mut conn, Attribution::unresolved())
             .await
             .expect("first provisioning succeeds");
         conn.commit().await.expect("first provisioning commits");
         let mut conn = fixture.tenant_conn().await.expect("tenant reopens");
-        let second = provision_system_principal(&mut conn)
+        let second = provision_system_principal(&mut conn, Attribution::unresolved())
             .await
             .expect("repeat provisioning succeeds");
         assert_eq!(first, second, "provisioning returns the one stable id");
@@ -842,7 +842,7 @@ mod pg_tests {
             .await
             .expect("B lookup succeeds")
             .expect("a seeded tenant has its own writer");
-        let tenant_b_writer = provision_system_principal(&mut conn)
+        let tenant_b_writer = provision_system_principal(&mut conn, Attribution::unresolved())
             .await
             .expect("B provisioning succeeds");
         assert_eq!(
@@ -866,7 +866,7 @@ mod pg_tests {
         };
         let fixture = PgFixture::start().await.expect("fixture starts");
         let mut conn = fixture.tenant_conn().await.expect("tenant opens");
-        let writer = provision_system_principal(&mut conn)
+        let writer = provision_system_principal(&mut conn, Attribution::unresolved())
             .await
             .expect("provisioning succeeds");
 

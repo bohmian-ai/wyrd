@@ -1,0 +1,23 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: portable-prompt
+  version: 1.0.0
+  space: default
+spec:
+  provider: anthropic
+  model: claude-sonnet-4-5
+  system: You answer for ${team}.
+  messages:
+  - role: user
+    content: ${question}
+  settings:
+    temperature: 0.2
+    max_output_tokens: 256
+  response_format:
+    type: object
+    properties:
+      answer:
+        type: string
+    required:
+    - answer

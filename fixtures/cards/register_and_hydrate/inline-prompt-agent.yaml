@@ -1,0 +1,26 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: inline-prompt-agent
+  version: 1.0.0
+  space: default
+spec:
+  prompt:
+    provider: anthropic
+    model: claude-sonnet-4-5
+    system: You answer for ${team}.
+    messages:
+    - role: user
+      content: ${question}
+    settings:
+      temperature: 0.2
+      max_output_tokens: 256
+    response_format:
+      type: object
+      properties:
+        answer:
+          type: string
+      required:
+      - answer
+  execution_route:
+    kind: native

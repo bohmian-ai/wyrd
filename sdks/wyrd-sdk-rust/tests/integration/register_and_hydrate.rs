@@ -6,7 +6,7 @@ use wyrd_ai::cli::{self, SelectorArgs};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::{Card, Spec, VerifierImplementation};
 
-use crate::support::{Deployment, fixture, hydrate, register};
+use crate::support::{Deployment, fixture, hydrate, register, registered};
 
 /// The support desk Service the stories register.
 const DESK: &str = "cards/register_and_hydrate/support-desk.yaml";
@@ -325,5 +325,133 @@ async fn refused_cli_command_raises_its_catalog_code() {
     .expect_err("an unknown Service is refused");
 
     assert_eq!(refused.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND");
+    deployment.shutdown().await;
+}
+
+/// The portable Prompt spec `portable-prompt.yaml` and the inline Agent
+/// prompt author, as JSON.
+fn portable_spec() -> serde_json::Value {
+    serde_json::json!({
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "system": "You answer for ${team}.",
+        "messages": [{ "role": "user", "content": "${question}" }],
+        "settings": { "temperature": 0.2, "max_output_tokens": 256 },
+        "response_format": {
+            "type": "object",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"],
+        },
+    })
+}
+
+/// The native Prompt spec `native-prompt.yaml` authors, as JSON.
+fn native_spec() -> serde_json::Value {
+    serde_json::json!({
+        "provider": "openai",
+        "model": "gpt-4o",
+        "format": "chat_completion",
+        "body": {
+            "messages": [{ "role": "user", "content": "Summarize {{ticket}}." }],
+            "seed": 123,
+            "future_knob": { "enabled": true },
+        },
+    })
+}
+
+/// The authored JSON of `card`'s spec, or of its inline Agent prompt.
+///
+/// # Panics
+/// Panics when the Card does not serialize or an Agent prompt is not inline.
+fn authored_spec(card: &Card) -> serde_json::Value {
+    let card = serde_json::to_value(card).expect("Card serializes");
+    match card["kind"].as_str() {
+        Some("Agent") => card["spec"]["prompt"].clone(),
+        _ => card["spec"].clone(),
+    }
+}
+
+/// The sorted variables a registered Prompt Card derives from its authored
+/// text.
+///
+/// # Panics
+/// Panics when the Card is not a Prompt.
+fn derived_variables(card: &Card) -> Vec<String> {
+    let Spec::Prompt(prompt) = &card.spec else {
+        panic!("the Card is a Prompt");
+    };
+    let mut variables = prompt.prompt.variables.clone();
+    variables.sort();
+    variables
+}
+
+/// Portable, native, and inline-Agent Prompts register, read back, re-register
+/// idempotently, and hydrate exactly as authored with their variables derived;
+/// a Prompt carrying a removed field is refused before registration.
+///
+/// # Panics
+/// Panics when a round trip changes the authored form, a re-registration
+/// mints a new reference, or the removed field is accepted.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn prompt_forms_round_trip_as_authored() {
+    let deployment = Deployment::start().await;
+    let cards = deployment.cards();
+    let fixture_path = "cards/register_and_hydrate/authored-prompts.yaml";
+    let receipt = register(&cards, fixture_path).await;
+    let again = register(&cards, fixture_path).await;
+    let bundle = hydrate(&cards, &receipt.root).await;
+    let state = WyrdState::from_path(bundle.path().join("bundle")).expect("bundle loads offline");
+    let forms = [
+        (
+            "portable",
+            "portable-prompt",
+            portable_spec(),
+            Some(vec!["question", "team"]),
+        ),
+        (
+            "native",
+            "native-prompt",
+            native_spec(),
+            Some(vec!["ticket"]),
+        ),
+        ("agent", "inline-prompt-agent", portable_spec(), None),
+    ];
+
+    assert_eq!(
+        again.root, receipt.root,
+        "the graph re-registers idempotently"
+    );
+    for (alias, name, authored, variables) in forms {
+        let read = cards
+            .get(CardSelector::exact(registered(&receipt, name)))
+            .await
+            .expect("registered Card reads");
+        let hydrated = state.card(alias).expect("the component hydrates");
+        let derived = variables.is_some().then(|| derived_variables(&read));
+
+        assert_eq!(authored_spec(&read), authored, "{name} reads as authored");
+        assert_eq!(
+            authored_spec(hydrated),
+            authored,
+            "{name} hydrates as authored"
+        );
+        assert_eq!(
+            derived,
+            variables.map(|names| names.into_iter().map(String::from).collect::<Vec<_>>()),
+            "{name} derives variables"
+        );
+        assert_eq!(
+            registered(&again, name),
+            registered(&receipt, name),
+            "{name} keeps its reference"
+        );
+    }
+
+    let refused = cards
+        .register_from_path(&fixture("invalid/prompt-with-removed-fields.yaml"))
+        .await
+        .expect_err("a removed Prompt field is refused");
+    assert_eq!(refused.code(), "WYRD_LOADER_400_INVALID_ENVELOPE");
     deployment.shutdown().await;
 }

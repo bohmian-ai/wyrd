@@ -12,8 +12,7 @@ use napi::Result;
 use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
 use wyrd_client::cards::{CardKind, CardSelector, Cards, HydrationMode, ListCardsRequest};
-use wyrd_client::observe::eval::parse_session_id;
-use wyrd_client::observe::{EvalObservationOptions, Run};
+use wyrd_client::observe::Run;
 use wyrd_client::state::{TelemetryFlushFailure, WyrdState};
 use wyrd_spec::envelope::Card;
 use wyrd_spec::error::WyrdError;
@@ -22,6 +21,7 @@ use wyrd_spec::reference::{CardRef, CardRefParseError};
 use wyrd_spec::{ExecutionRoute, Prompt, ResponseType};
 
 use crate::client::{NativeWyrdClient, NativeWyrdClientResult};
+use crate::verification::{NativeSubmission, NativeVerifierInput};
 use crate::{NativeLifecycleResult, NativeTableConfig, NativeWyrdError};
 
 /// Tenant-scoped Card registry handle over the shared `wyrd_client` Cards.
@@ -667,7 +667,7 @@ fn hydrated_prompt(card: &Card, prompt: &Prompt) -> serde_json::Value {
 /// # Errors
 ///
 /// Returns the stable validation error when neither form parses.
-fn parse_card_ref(value: &str) -> StdResult<CardRef, WyrdError> {
+pub(crate) fn parse_card_ref(value: &str) -> StdResult<CardRef, WyrdError> {
     let parsed = if value.starts_with('{') {
         serde_json::from_str(value).map_err(|error| error.to_string())
     } else {
@@ -747,99 +747,52 @@ impl NativeRun {
         NativeRunOpen::outcome(self.run.for_card(&alias))
     }
 
-    /// Emits one Drift observation from its JSON feature object.
+    /// Executes a bound Verifier now on named slot values and returns its
+    /// result.
     ///
     /// # Errors
     ///
-    /// Returns a napi error only when the outcome cannot be projected; a
-    /// malformed feature map, the lifecycle refusals, and queue saturation are
-    /// returned in [`NativeLifecycleResult`].
-    #[napi]
-    pub fn drift(
-        &self,
-        env: Env,
-        features_json: String,
-        session_id: Option<String>,
-    ) -> Result<NativeLifecycleResult> {
-        let session = match parse_session_id(session_id.as_deref()) {
-            Ok(session) => session,
-            Err(error) => return Ok(NativeLifecycleResult::from_wyrd(&error)),
-        };
-        NativeLifecycleResult::outcome(crate::trace::traced(env, || {
-            self.run.observe().drift_json(&features_json, session)
-        }))
-    }
-
-    /// Emits one Eval observation from its JSON context and options.
-    ///
-    /// `media_json` is one JSON array of media descriptors; `trace_id` and
-    /// `span_id` are lower-case hex and fall back to the active span when both
-    /// are omitted.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error only when the outcome cannot be projected; malformed
-    /// identifiers, a span without its trace, the lifecycle refusals, and queue
-    /// saturation are returned in [`NativeLifecycleResult`].
-    #[napi]
-    pub fn eval(
-        &self,
-        env: Env,
-        context_json: String,
-        session_id: Option<String>,
-        media_json: Option<String>,
-        trace_id: Option<String>,
-        span_id: Option<String>,
-    ) -> Result<NativeLifecycleResult> {
-        let options = EvalObservationOptions::from_parts(
-            session_id.as_deref(),
-            media_json.as_deref(),
-            trace_id.as_deref(),
-            span_id.as_deref(),
-        );
-        let options = match options {
-            Ok(options) => options,
-            Err(error) => return Ok(NativeLifecycleResult::from_wyrd(&error)),
-        };
-        NativeLifecycleResult::outcome(crate::trace::traced(env, || {
-            self.run.observe().eval_json(&context_json, options)
-        }))
-    }
-
-    /// Judges this view's subject with a bound Verifier from JSON input.
-    ///
-    /// `input_json` is one Eval context object or one array of Drift feature
-    /// rows; `media_json` is one JSON array of media descriptors. One server
-    /// call, never replayed; nothing is observed, recorded, or dispatched.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error only when the outcome cannot be projected; an
-    /// unbound Verifier, input of the wrong shape, malformed media, and the
-    /// server's verification refusals are returned in
+    /// Returns a napi error only when the outcome cannot be projected; input
+    /// refusals, a Window Verifier, and the server's refusals are returned in
     /// [`NativeLifecycleResult`].
     #[napi]
     pub fn verify<'env>(
         &self,
         env: &'env Env,
         verifier: String,
-        input_json: String,
-        media_json: Option<String>,
+        inputs: Vec<NativeVerifierInput>,
     ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
         let run = self.run.clone();
         crate::trace::spawn(env, async move {
-            let media = match media_json.as_deref().map(serde_json::from_str).transpose() {
-                Ok(media) => media.unwrap_or_default(),
-                Err(error) => {
-                    return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::Validation {
-                        message: format!("media is invalid: {error}"),
-                        details: serde_json::json!({ "field": "media", "reason": error.to_string() }),
-                    }));
-                }
+            let result = match crate::verification::inputs(inputs) {
+                Ok(inputs) => Box::pin(run.observe().verify(&verifier, inputs)).await,
+                Err(error) => Err(error),
             };
-            NativeLifecycleResult::outcome(
-                Box::pin(run.observe().verify_json(&verifier, &input_json, media)).await,
-            )
+            NativeLifecycleResult::outcome(result)
+        })
+    }
+
+    /// Submits named slot values: Window samples are recorded, Run evidence
+    /// is queued for one execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be projected; input
+    /// refusals and the server's refusals are returned in [`NativeSubmission`].
+    #[napi]
+    pub fn submit<'env>(
+        &self,
+        env: &'env Env,
+        verifier: String,
+        inputs: Vec<NativeVerifierInput>,
+    ) -> napi::Result<PromiseRaw<'env, NativeSubmission>> {
+        let run = self.run.clone();
+        crate::trace::spawn(env, async move {
+            let result = match crate::verification::inputs(inputs) {
+                Ok(inputs) => Box::pin(run.observe().submit(&verifier, inputs)).await,
+                Err(error) => Err(error),
+            };
+            Ok(NativeSubmission::outcome(result))
         })
     }
 

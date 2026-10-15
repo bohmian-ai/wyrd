@@ -10,13 +10,13 @@ import type {
   CardTypes,
   DriftBaselineState,
   HydratedCard,
-  Judgment,
   PrincipalSummary,
   PromptCard,
   RegisteredCard,
   RegisteredModelCard,
   RegisteredVerifierCard,
   TypedCardKind,
+  VerificationResult,
   WyrdState,
 } from "wyrd-ai";
 
@@ -56,7 +56,7 @@ expectTypeOf<CardSummary["status"]>().toEqualTypeOf<CardTypes.CardLifecycleStatu
 expectTypeOf<CardSummary["artifact_hash"]>().toEqualTypeOf<string | null>();
 expectTypeOf<CardRegistrationOutcome["card_blob_uri"]>().toEqualTypeOf<string | null>();
 expectTypeOf<PrincipalSummary["email"]>().toEqualTypeOf<string | null>();
-expectTypeOf<Judgment["counts"]>().toEqualTypeOf<CardTypes.VerifierCounts | undefined>();
+expectTypeOf<VerificationResult["run_id"]>().toEqualTypeOf<string | null | undefined>();
 
 // Typed state accessors return hydrated Cards whose Prompt navigation is exact.
 declare const state: WyrdState;

@@ -38,7 +38,6 @@ import type {
   HttpConnectionAuth,
   IssuedCredential,
   JsonValue,
-  Judgment as JudgmentWire,
   ListCardsRequest,
   ListCardsResponse,
   ModelRef,
@@ -76,9 +75,17 @@ import type {
   SpanRecord,
   TokenAudience,
   UpdateOperatorConnectionRequest,
+  VerificationExecutionState,
+  VerificationResult,
 } from "./card-types.js";
 
-import type { NativeBifrostQueryStream, NativeLifecycleResult, NativeQueryStep } from "../index.cjs";
+import type {
+  NativeBifrostQueryStream,
+  NativeLifecycleResult,
+  NativeQueryStep,
+  NativeVerificationExecution,
+  NativeVerifierInput,
+} from "../index.cjs";
 
 const require = createRequire(import.meta.url);
 const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
@@ -219,7 +226,12 @@ export type {
   TriggerSpec,
   TypedCardKind,
   VerificationError,
+  VerificationExecutionState,
+  VerificationExecutionStatus,
+  VerificationOutcome,
+  VerificationResult,
   VerificationStatus,
+  VerificationVerdict,
   VerifierSpec,
 } from "./card-types.js";
 /** Every type generated from the `wyrd-spec` Card schema, including nested spec types. */
@@ -1692,12 +1704,6 @@ export class Cards {
   }
 }
 
-/** The judgment of one direct verification, returned by {@link Observe.verify}. */
-export interface Judgment extends JudgmentWire {
-  /** Whether the expectations held: true only for a `passed` verdict. */
-  readonly passed: boolean;
-}
-
 /** The provider an Operator connection authenticates to. */
 export type OperatorProvider = OperatorConnectionView["provider"];
 
@@ -1925,30 +1931,6 @@ export class Principals {
   }
 }
 
-/** One media item an Eval observation names for its judge Prompt. */
-export type EvalMediaRef = {
-  /** The `${media:id}` binding slot this artifact fills in the judge Prompt. */
-  readonly id: string;
-  /** The supported media kind, chosen explicitly rather than from the URI. */
-  readonly kind: "image" | "document";
-  /** Durable object-storage locator; the server reads the bytes at judge time. */
-  readonly uri: string;
-  /** IANA media type, such as `image/png`. */
-  readonly mediaType?: string;
-};
-
-/** The optional per-emission data an Eval observation may carry. */
-export type EvalOptions = {
-  /** The observed interaction's session; runs and sessions are many-to-many. */
-  readonly sessionId?: string;
-  /** Media descriptors the judge Prompt binds by `id`. */
-  readonly media?: readonly EvalMediaRef[];
-  /** Explicit lower-case hex trace identity, which wins over the active span. */
-  readonly traceId?: string;
-  /** Explicit lower-case hex span identity within `traceId`. */
-  readonly spanId?: string;
-};
-
 /** Refuse one observation input the strict serializer cannot carry exactly. */
 function invalidObservationInput(field: string, path: string, reason: string): WyrdError {
   return new WyrdError(
@@ -2050,23 +2032,6 @@ function strictJson(field: string, value: unknown): string {
 let otelApi: typeof import("@opentelemetry/api") | null | undefined;
 
 /**
- * Trace and span identity of Node's active OpenTelemetry span.
- *
- * Node's OTel context never becomes Rust's current `tracing` span across
- * N-API, so the shared Rust fallback cannot see it; this boundary reads it and
- * passes the IDs down the ordinary explicit-options path. Both IDs or neither:
- * no installed API, no active span, or an invalid context supplies nothing.
- */
-function activeSpanIds(): { readonly traceId?: string; readonly spanId?: string } {
-  const api = otel();
-  const spanContext = api?.trace.getActiveSpan()?.spanContext();
-  if (spanContext === undefined || !api?.isSpanContextValid(spanContext)) {
-    return {};
-  }
-  return { traceId: spanContext.traceId, spanId: spanContext.spanId };
-}
-
-/**
  * Node's active OpenTelemetry span as W3C `traceparent`/`tracestate`; `null`
  * when no API is installed, no span is active, or its context is invalid.
  * Every native call reads it on entry, so the Wyrd requests it sends join the
@@ -2116,50 +2081,140 @@ function otel(): typeof import("@opentelemetry/api") | null {
   return otelApi;
 }
 
-/** The closed own-key set of one {@link EvalMediaRef}. */
-const MEDIA_KEYS: ReadonlySet<string | symbol> = new Set(["id", "kind", "uri", "mediaType"]);
-
-/**
- * Project Eval media descriptors to their wire names and serialize them.
- *
- * The projection would silently drop any key outside the closed descriptor
- * shape, so each original descriptor's own keys are checked first; declared
- * fields are then read once each and the snapshot goes through
- * {@link strictJson}.
- *
- * @throws a `WYRD_SPEC_400_VALIDATION` {@link WyrdError} naming the offending
- * descriptor.
- */
-function mediaJson(media?: readonly EvalMediaRef[]): string | undefined {
-  if (media === undefined) {
-    return undefined;
-  }
-  return strictJson(
-    "media",
-    media.map((item, index) => {
-      for (const key of Reflect.ownKeys(item)) {
-        if (!MEDIA_KEYS.has(key) || !Object.prototype.propertyIsEnumerable.call(item, key)) {
-          throw invalidObservationInput(
-            "media",
-            `$[${index}]`,
-            `has a symbol, hidden, or undeclared key ${String(key)}`,
-          );
-        }
-      }
-      const { id, kind, uri, mediaType } = item;
-      return { id, kind, uri, ...(mediaType === undefined ? {} : { media_type: mediaType }) };
-    }),
-  );
+/** How a {@link File} declares its format and display name. */
+export interface FileOptions {
+  /** Canonical format name, such as `pdf`; omitted, the filename extension or the slot's only format decides. */
+  readonly format?: string;
+  /** Display name sent with the declaration; it selects no storage path. */
+  readonly filename?: string;
 }
 
 /**
- * The observation emits and the direct judgment available on one scoped
- * {@link Run}.
+ * A local file for a `media` slot. Constructing one reads nothing: `verify`
+ * and `submit` hash it, upload it only when the server lacks its digest, and
+ * pin it by SHA-256. It never becomes an Artifact Card.
+ */
+export class File {
+  private constructor(
+    /** The file on disk, when it is one. */
+    readonly path: string | undefined,
+    /** The in-memory contents, when they are. */
+    readonly bytes: Uint8Array | undefined,
+    /** Declared format and display name. */
+    readonly options: FileOptions,
+  ) {}
+
+  /** A file on disk; its name supplies the filename and default format. */
+  static path(path: string, options: FileOptions = {}): File {
+    return new File(path, undefined, options);
+  }
+
+  /** In-memory bytes; declare `format` unless the slot accepts only one. */
+  static bytes(bytes: Uint8Array, options: FileOptions = {}): File {
+    return new File(undefined, bytes, options);
+  }
+}
+
+/** A registered Artifact's file for a `media` slot, read with its own identity and authorization. */
+export class ArtifactRef {
+  constructor(
+    /** The exact Artifact Card. */
+    readonly artifact: CardRef | string,
+    /** The file inside the Artifact, when it holds several. */
+    readonly path?: string,
+  ) {}
+}
+
+/**
+ * One slot value: JSON for a `json` slot, a trace-ID string for a `trace`
+ * slot, a feature object (or one metric value) for a `samples` slot, or a
+ * {@link File} or {@link ArtifactRef} for a `media` slot.
+ */
+export type VerifierInput = JsonValue | File | ArtifactRef;
+
+/** Slot values keyed by the Verifier's input slot names. */
+export type VerifierInputs = Readonly<Record<string, VerifierInput>>;
+
+/** What `submit` did: Window samples were recorded, or Run evidence was queued. */
+export type Submission =
+  | { readonly kind: "recorded" }
+  | { readonly kind: "queued"; readonly execution: VerificationExecution };
+
+/** Project named slot values onto the native boundary, refusing values JSON cannot carry exactly. */
+function nativeInputs(inputs: VerifierInputs): NativeVerifierInput[] {
+  return Object.entries(inputs).map(([slot, value]): NativeVerifierInput => {
+    if (value instanceof File) {
+      const bytes = value.bytes && Buffer.from(value.bytes.buffer, value.bytes.byteOffset, value.bytes.byteLength);
+      return { slot, file: { path: value.path, bytes, ...value.options } };
+    }
+    if (value instanceof ArtifactRef) {
+      return { slot, artifact: cardRefText(value.artifact), artifactPath: value.path };
+    }
+    return { slot, valueJson: strictJson(`inputs.${slot}`, value) };
+  });
+}
+
+/**
+ * One queued Verifier execution, addressed by its server-issued ID.
  *
- * `drift` and `eval` are synchronous: their fixed tables were described at
- * {@link WyrdState.startBifrost}, so an emit only projects and enqueues.
- * Returning is queue admission, never a durable acknowledgement —
- * {@link WyrdState.shutdown} is the barrier.
+ * Any process can rebuild it with {@link VerificationExecution.connect}; the
+ * queue, retries, and results stay server-owned.
+ */
+export class VerificationExecution {
+  readonly #native: NativeVerificationExecution;
+
+  private constructor(native: NativeVerificationExecution) {
+    this.#native = native;
+  }
+
+  /** @internal Wrap one native execution handle. */
+  static fromNative(native: NativeVerificationExecution): VerificationExecution {
+    return new VerificationExecution(native);
+  }
+
+  /**
+   * Rebuild the handle of execution `id`, such as in another process.
+   *
+   * @param id - The execution ID `submit` returned.
+   * @param options - `client` to read as; omitted, the ambient client is resolved.
+   * @throws {@link WyrdError} for a malformed ID, or when the client cannot be
+   * resolved or its credential exchange is refused.
+   */
+  static async connect(id: string, options: ClientOptions = {}): Promise<VerificationExecution> {
+    const connection = await wyrdClientNative(clientOf(options)).verificationExecution(id);
+    return new VerificationExecution(nativeHandle(connection.execution, connection.error));
+  }
+
+  /** The execution ID. */
+  get id(): string {
+    return this.#native.id;
+  }
+
+  /**
+   * Read the execution's status, terminal error, and visible result.
+   *
+   * @throws {@link WyrdError} not-found for an execution not visible yet or at
+   * all, and the authorization or transport failure.
+   */
+  async status(): Promise<VerificationExecutionState> {
+    return lifecycleValue(await this.#native.status());
+  }
+
+  /**
+   * Poll with capped backoff until a result, the execution's own error, or
+   * `timeoutMs`. A result is never invented from a status.
+   *
+   * @throws {@link WyrdError} the settled execution's error (including an
+   * asynchronous idempotency conflict), `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`,
+   * or a non-transient read failure.
+   */
+  async wait(options: { readonly timeoutMs: number }): Promise<VerificationResult> {
+    return lifecycleValue(await this.#native.wait(options.timeoutMs));
+  }
+}
+
+/**
+ * The dataset emit and the Verifier execution available on one scoped {@link Run}.
  */
 export class Observe {
   readonly #native: NativeRun;
@@ -2171,41 +2226,6 @@ export class Observe {
   /** @internal Wrap the native run this surface emits through. */
   static fromNative(native: NativeRun): Observe {
     return new Observe(native);
-  }
-
-  /**
-   * Emit one Drift observation as one row per feature.
-   *
-   * @param features - Feature name to string, finite number, or boolean.
-   * @param options - `sessionId`, the observed interaction's session.
-   * @throws a {@link WyrdError} for a payload that is not a flat object of
-   * strings, finite numbers, or booleans, before startup, after shutdown, or
-   * when the producer is saturated.
-   */
-  drift(
-    features: Readonly<Record<string, string | number | boolean>>,
-    options: { readonly sessionId?: string } = {},
-  ): void {
-    lifecycleValue<null>(this.#native.drift(strictJson("features", features), options.sessionId));
-  }
-
-  /**
-   * Emit one Eval observation carrying its context and identity.
-   *
-   * With neither `traceId` nor `spanId` the active OpenTelemetry span supplies
-   * both; a `spanId` without its `traceId` is refused.
-   *
-   * @param context - The JSON context the Eval Verifier judges.
-   * @param options - Session, media, and explicit trace identity.
-   * @throws a {@link WyrdError} for a context or media descriptor the strict
-   * serializer refuses, a malformed identifier,
-   * before startup, after shutdown, or when the producer is saturated.
-   */
-  eval(context: unknown, options: EvalOptions = {}): void {
-    const contextJson = strictJson("context", context);
-    const media = mediaJson(options.media);
-    const identity = options.traceId === undefined && options.spanId === undefined ? activeSpanIds() : options;
-    lifecycleValue<null>(this.#native.eval(contextJson, options.sessionId, media, identity.traceId, identity.spanId));
   }
 
   /**
@@ -2224,34 +2244,40 @@ export class Observe {
   }
 
   /**
-   * Judge this view's subject with a bound Verifier and return its judgment.
+   * Execute a bound Verifier now on named slot values and return its result.
    *
-   * `verifier` names a Verifier bound in `verified_by` to this view's subject.
-   * An Eval Verifier takes one context object plus optional media; a Drift
-   * Verifier takes an array of flat feature rows. A `failed` verdict resolves
-   * normally. Nothing is observed, recorded, enqueued, or dispatched, Bifrost
-   * need not be started, and the request is never replayed. It runs as the
-   * state's client and carries Node's active OpenTelemetry span as its W3C
-   * trace context, so the server's work joins the caller's trace.
+   * `verifier` names a Verifier bound to this view's subject. Files are hashed
+   * and uploaded during the call. A `failed` verdict resolves normally; the
+   * request is never replayed.
    *
    * @param verifier - The bound Verifier's name.
-   * @param input - One Eval context object, or an array of Drift feature rows.
-   * @param options - `media`, descriptors an Eval judge Prompt binds by `id`.
-   * @returns The judgment; a `failed` verdict resolves normally.
-   * @throws a {@link WyrdError}: `WYRD_SDK_404_UNKNOWN_VERIFIER` for an
-   * unbound Verifier and `WYRD_SDK_400_INVALID_OBSERVATION` for input of the
-   * wrong shape, both before any network IO, and otherwise the server's
-   * verification refusal.
+   * @param inputs - Values keyed by input slot name.
+   * @throws a {@link WyrdError}: `WYRD_SDK_404_UNKNOWN_VERIFIER`,
+   * `WYRD_VERIFICATION_400_INPUT_INVALID`, `WYRD_VERIFICATION_413_INPUT_TOO_LARGE`,
+   * `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` for a scheduled-window Verifier,
+   * or the server's refusal.
    */
-  async verify(
-    verifier: string,
-    input: unknown,
-    options: { readonly media?: readonly EvalMediaRef[] } = {},
-  ): Promise<Judgment> {
-    const judgment = lifecycleValue<Omit<Judgment, "passed">>(
-      await this.#native.verify(verifier, strictJson("input", input), mediaJson(options.media)),
-    );
-    return { ...judgment, passed: judgment.verdict === "passed" };
+  async verify(verifier: string, inputs: VerifierInputs): Promise<VerificationResult> {
+    return lifecycleValue(await this.#native.verify(verifier, nativeInputs(inputs)));
+  }
+
+  /**
+   * Submit named slot values: Window samples are recorded for the Verifier's
+   * schedule, and Run evidence is queued for one execution. Acceptance confirms
+   * staging only; read the outcome through the execution's `wait`.
+   *
+   * @param verifier - The bound Verifier's name.
+   * @param inputs - Values keyed by input slot name.
+   * @throws a {@link WyrdError} for the input refusals of {@link Observe.verify},
+   * the Bifrost lifecycle refusals for samples, or the server's refusal.
+   */
+  async submit(verifier: string, inputs: VerifierInputs): Promise<Submission> {
+    const submission = await this.#native.submit(verifier, nativeInputs(inputs));
+    if (submission.execution == null && submission.error == null) {
+      return { kind: "recorded" };
+    }
+    const execution = nativeHandle(submission.execution, submission.error);
+    return { kind: "queued", execution: VerificationExecution.fromNative(execution) };
   }
 }
 

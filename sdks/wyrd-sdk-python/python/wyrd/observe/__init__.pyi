@@ -1,9 +1,10 @@
-from collections.abc import Mapping, Sequence
+import os
+from collections.abc import Mapping
 from types import TracebackType
 from typing import Any, Literal
 
 from ..cards import CardRef
-from ..eval import MediaRef
+from ..client import WyrdClient
 from ._telemetry import record
 
 class Run:
@@ -105,20 +106,70 @@ class Run:
         """
         ...
 
-class Judgment:
-    """One direct verification judgment, returned by :meth:`Observe.verify`.
+class File:
+    """A local file to verify, read only when ``verify`` or ``submit`` uses it.
+
+    Constructing a ``File`` performs no IO and registers nothing. During the
+    call the client hashes it with SHA-256, asks the server which digests it
+    lacks, and uploads only those straight to tenant storage. An uploaded file
+    is evidence pinned by its digest, never an Artifact Card.
+    """
+
+    def __init__(
+        self,
+        source: str | os.PathLike[str] | bytes,
+        *,
+        format: str | None = None,
+        filename: str | None = None,
+    ) -> None:
+        """Name a file at a path, or in-memory bytes.
+
+        Args:
+            source: a path, opened only during the call, or the file's bytes.
+            format: the canonical format, such as ``"pdf"`` or ``"pptx"``.
+                Omitted, it is inferred from the filename extension, else the
+                slot's single accepted format.
+            filename: a display name; defaults to the path's file name.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a ``source`` of
+                another type or an unknown ``format``.
+        """
+        ...
+
+class ArtifactRef:
+    """A registered Artifact's file, verified with its normal authorization."""
+
+    def __init__(self, artifact: CardRef, path: str | None = None) -> None:
+        """Select ``artifact``'s only file, or ``path`` within it.
+
+        Args:
+            artifact: the exact Artifact Card reference.
+            path: the file inside the Artifact, when it holds several.
+        """
+        ...
+
+class Recorded:
+    """``submit``'s answer for scheduled-window samples.
+
+    The samples were recorded; the Verifier's schedule judges the window
+    later, so there is no execution to wait for.
+    """
+
+class VerificationResult:
+    """The attributable result of one Verifier execution.
 
     A ``failed`` verdict is an ordinary return value, not an exception.
     """
 
     @property
-    def passed(self) -> bool:
-        """Whether the expectations held: true only for a ``passed`` verdict."""
+    def execution_id(self) -> str:
+        """Server-issued execution ID."""
         ...
 
     @property
-    def execution_id(self) -> str:
-        """Transient identity of this execution, shared with its audit and trace."""
+    def run_id(self) -> str | None:
+        """The caller's application Run, when there is one."""
         ...
 
     @property
@@ -132,141 +183,151 @@ class Judgment:
         ...
 
     @property
-    def kind(
-        self,
-    ) -> Literal[
-        "drift_psi",
-        "drift_spc",
-        "drift_custom",
-        "eval_assertion",
-        "eval_llm_judge",
-        "eval_other",
-        "task_assertion",
-        "task_llm_judge",
-        "unknown",
-    ]:
-        """The Verifier classification: method family and profile."""
-        ...
-
-    @property
     def verdict(self) -> Literal["passed", "failed", "inconclusive"]:
-        """The common verdict."""
+        """The ``decide`` rule applied to every applicable requirement."""
         ...
 
     @property
-    def summary(self) -> str:
-        """Bounded human-readable summary of the verdict."""
+    def requirements(self) -> list[dict[str, Any]]:
+        """Every requirement's judgment as its wire mapping, in plan order."""
         ...
 
     @property
-    def counts(self) -> dict[str, Any] | None:
-        """Count-only rollup of a Drift or Eval judgment; ``None`` for a task Verifier."""
+    def steps(self) -> list[dict[str, Any]]:
+        """Every step's result as its wire mapping, in plan order."""
         ...
 
     @property
-    def detail(self) -> dict[str, Any]:
-        """The engine report: ``{"drift": ...}``, ``{"eval": ...}``, or ``{"task": {"result": ...}}``."""
+    def evidence(self) -> dict[str, dict[str, Any]]:
+        """The pinned original evidence by slot, as wire declarations."""
+        ...
+
+class VerificationExecution:
+    """One queued Verifier execution, addressed by its server-issued ID.
+
+    Returned by ``Observe.submit`` for Run evidence, or rebuilt in any process
+    with ``connect``. The queue, retries, and results stay server-owned.
+    """
+
+    @staticmethod
+    def connect(id: str, client: WyrdClient | None = None) -> VerificationExecution:
+        """Rebuild the handle of execution ``id``.
+
+        Args:
+            id: the execution ID ``submit`` returned.
+            client: the client every status read is sent as. Omitted, the
+                ambient chain resolves as ``WyrdClient`` does.
+
+        Returns:
+            The connected handle.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an ``id`` that is not
+                an execution ID, and the client's configuration or credential
+                error.
+        """
+        ...
+
+    @property
+    def id(self) -> str:
+        """The execution ID."""
+        ...
+
+    def status(self) -> dict[str, Any]:
+        """Read the execution's status, terminal error, and visible result.
+
+        Returns:
+            The wire mapping with ``execution_id``, ``status``, and, when
+            present, ``error`` and ``result``.
+
+        Raises:
+            WyrdError: the server's not-found error before the execution is
+                visible, and its authorization or transport error.
+        """
+        ...
+
+    def wait(self, timeout: float) -> VerificationResult:
+        """Poll until the execution yields a result, fails, or ``timeout`` passes.
+
+        Polls back off from 100 ms to at most 2 s. A not-yet-visible
+        execution and a completion whose result is not visible yet keep
+        being polled; a result is never invented from a status.
+
+        Args:
+            timeout: seconds to keep polling.
+
+        Returns:
+            The execution's result.
+
+        Raises:
+            WyrdError: the execution's own error when it settled as errored,
+                cancelled, or timed out, including a delayed
+                ``WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT``;
+                ``WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`` when ``timeout``
+                passes first; ``WYRD_SPEC_400_VALIDATION`` for a negative
+                ``timeout``; and any other status-read error.
+        """
         ...
 
 class Observe:
-    """The emits and the direct judgment available on one scoped run.
+    """Verification and caller-table records on one scoped run.
 
-    Returning from an emit is queue admission, not a durable acknowledgement.
-    ``WyrdState.shutdown()`` is the durability barrier.
+    Returning from ``record`` is queue admission, not a durable
+    acknowledgement. ``WyrdState.shutdown()`` is the durability barrier.
     """
 
-    def drift(
-        self,
-        features: Mapping[str, Any] | Any,
-        *,
-        session_id: str | None = None,
-    ) -> None:
-        """Emit one Drift observation as one row per feature.
+    def verify(self, verifier: str, /, *value: Any, **inputs: Any) -> VerificationResult:
+        """Execute the bound Verifier ``verifier`` on this view's subject now.
 
-        Args:
-            features: a non-empty flat mapping with ``str`` feature-name keys,
-                a dataclass instance, or a Pydantic model instance whose
-                values are strings, integers no larger in magnitude than
-                ``2**53``, finite floats, or booleans. It is converted here,
-                before admission.
-            session_id: a UUID naming the observed interaction's session.
-                Omitted, the rows carry no session.
-
-        Raises:
-            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an input of another
-                shape, a non-``str`` key, a non-finite float, or a
-                ``session_id`` that is not a UUID;
-                ``WYRD_SDK_400_INVALID_OBSERVATION`` for an empty input, an
-                invalid feature name, or a ``None``, nested, or out-of-range
-                value; ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
-                ``WYRD_SDK_409_BIFROST_CLOSED``, or
-                ``WYRD_CLIENT_429_QUEUE_FULL``.
-        """
-        ...
-
-    def eval(
-        self,
-        context: Mapping[str, Any] | Any,
-        *,
-        session_id: str | None = None,
-        media: Sequence[MediaRef] | None = None,
-        trace_id: str | None = None,
-        span_id: str | None = None,
-    ) -> None:
-        """Emit one Eval observation carrying its context and identity.
-
-        Args:
-            context: the observed interaction the Eval judges score, as a
-                mapping with ``str`` keys, a dataclass instance, or a Pydantic
-                model instance; nested JSON values are allowed.
-            session_id: as for ``drift()``.
-            media: a ``list`` of ``wyrd.eval.MediaRef`` descriptors for the
-                judge Prompt's ``${media:id}`` slots. Omitted, none.
-            trace_id: the 32-hex-character OpenTelemetry trace id.
-            span_id: the 16-hex-character span id within ``trace_id``. When
-                both ids are omitted, Python's active OpenTelemetry span
-                supplies them if there is one.
-
-        Raises:
-            WyrdError: As ``drift()``, plus ``WYRD_SPEC_400_VALIDATION`` for a
-                ``media`` value that is not a list of valid descriptors, a
-                malformed or all-zero trace or span id, or a ``span_id``
-                without ``trace_id``.
-        """
-        ...
-
-    def verify(
-        self,
-        verifier: str,
-        input: Mapping[str, Any] | Sequence[Mapping[str, Any]] | Any,
-        *,
-        media: Sequence[MediaRef] | None = None,
-    ) -> Judgment:
-        """Judge this view's subject with a bound Verifier and return its judgment.
-
-        ``verifier`` names a Verifier bound in ``verified_by`` to this view's
-        subject. An Eval Verifier takes one context mapping, dataclass instance,
-        or Pydantic model plus optional ``media``; a Drift Verifier takes a
-        list of flat feature rows. Blocks for the one server call. Nothing is
-        observed, recorded, enqueued, or dispatched, and Bifrost need not be
-        started.
+        Pass one positional value for a single-slot Verifier, or one keyword
+        per input slot. The slot's type decides each value's form: JSON
+        values fill ``json`` slots, a 32-hex trace ID fills a ``trace`` slot,
+        and a ``File`` or ``ArtifactRef`` fills a ``media`` slot. Files are
+        hashed and uploaded during this call. Blocks for the execution.
 
         Args:
             verifier: the name of a Verifier bound to this view's subject.
-            input: one context mapping, dataclass, or Pydantic model for an
-                Eval Verifier; a list of flat feature rows for a Drift
-                Verifier.
-            media: ``MediaRef`` items for an Eval judge Prompt's media slots.
+            *value: the one value of a single-slot Verifier.
+            **inputs: values keyed by input slot name.
 
         Returns:
-            The Verifier's judgment.
+            The execution's result.
 
         Raises:
             WyrdError: ``WYRD_SDK_404_UNKNOWN_VERIFIER`` for an unbound
-                Verifier and ``WYRD_SDK_400_INVALID_OBSERVATION`` for input of
-                the wrong shape, both before any network IO, and otherwise the
-                server's verification refusal such as
-                ``WYRD_VERIFICATION_409_BASELINE_NOT_READY``.
+                Verifier; ``WYRD_SPEC_400_VALIDATION`` for both positional and
+                keyword values or a value JSON cannot represent;
+                ``WYRD_VERIFICATION_400_INPUT_INVALID`` for an unknown slot, a
+                value of the wrong kind, or an unreadable or unaccepted file;
+                ``WYRD_VERIFICATION_413_INPUT_TOO_LARGE`` for a file above its
+                slot's ``max_bytes``; ``WYRD_VERIFICATION_422_INPUT_UNSUPPORTED``
+                for a scheduled-window Verifier; otherwise the server's refusal.
+        """
+        ...
+
+    def submit(
+        self, verifier: str, /, *value: Any, **inputs: Any
+    ) -> VerificationExecution | Recorded:
+        """Submit evidence for the bound Verifier ``verifier`` without waiting.
+
+        Run evidence is staged for one queued execution and its handle is
+        returned; acceptance confirms staging only, and an idempotency
+        conflict surfaces later through ``wait``. Scheduled-window samples are
+        recorded for the Verifier's schedule and ``Recorded`` is returned.
+
+        Args:
+            verifier: the name of a Verifier bound to this view's subject.
+            *value: the one value of a single-slot Verifier.
+            **inputs: values keyed by input slot name.
+
+        Returns:
+            The queued execution, or ``Recorded`` for window samples.
+
+        Raises:
+            WyrdError: As ``verify`` for Run evidence; for window samples,
+                ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
+                ``WYRD_SDK_409_BIFROST_CLOSED``, or
+                ``WYRD_CLIENT_429_QUEUE_FULL``.
         """
         ...
 
@@ -279,15 +340,27 @@ class Observe:
 
         Args:
             table: the registered ``"vala.datasets.<name>"`` table.
-            row: the row, in any shape ``drift()`` accepts for ``features``,
-                with any JSON values.
+            row: a mapping with ``str`` keys, a dataclass instance, or a
+                Pydantic model instance, with any JSON values.
 
         Raises:
-            WyrdError: As ``drift()`` for the row's shape, lifecycle, and
-                queue, plus ``WYRD_SDK_400_INVALID_OBSERVATION`` for a table outside
-                ``vala.datasets``, and the server's error for a table that is
-                unknown, unauthorized, or unavailable.
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a row of another
+                shape, a non-``str`` key, or a non-finite float;
+                ``WYRD_SDK_400_INVALID_OBSERVATION`` for a table outside
+                ``vala.datasets``; ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
+                ``WYRD_SDK_409_BIFROST_CLOSED``, or
+                ``WYRD_CLIENT_429_QUEUE_FULL``; and the server's error for a
+                table that is unknown, unauthorized, or unavailable.
         """
         ...
 
-__all__ = ["Judgment", "Observe", "Run", "record"]
+__all__ = [
+    "ArtifactRef",
+    "File",
+    "Observe",
+    "Recorded",
+    "Run",
+    "VerificationExecution",
+    "VerificationResult",
+    "record",
+]

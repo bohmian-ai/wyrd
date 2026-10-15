@@ -104,7 +104,6 @@ convention = "google"
 include = ["python/wyrd", "scripts", "tests"]
 exclude = [
     "python/wyrd/**/__init__.py",
-    "!python/wyrd/eval/__init__.py",
 ]
 
 [tool.ty.rules]

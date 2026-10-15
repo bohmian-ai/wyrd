@@ -1,11 +1,30 @@
-"""Scoped observation emits, and fire-and-forget Vala telemetry.
+"""Scoped verification and observation, and fire-and-forget Vala telemetry.
 
-``Run``, ``Observe``, and ``Judgment`` are reached through ``WyrdState.run()``; they are not
-constructed directly. ``record`` below is the separate telemetry door that
-swallows queue-full instead of raising.
+``Run`` and ``Observe`` are reached through ``WyrdState.run()``; they are not
+constructed directly. ``File`` and ``ArtifactRef`` name evidence for
+``Observe.verify``/``Observe.submit``; ``VerificationExecution`` is a queued
+execution. ``record`` below is the separate telemetry door that swallows
+queue-full instead of raising.
 """
 
-from .._wyrd.observe import Judgment, Observe, Run
+from .._wyrd.observe import (
+    ArtifactRef,
+    File,
+    Observe,
+    Recorded,
+    Run,
+    VerificationExecution,
+    VerificationResult,
+)
 from ._telemetry import record
 
-__all__ = ["Judgment", "Observe", "Run", "record"]
+__all__ = [
+    "ArtifactRef",
+    "File",
+    "Observe",
+    "Recorded",
+    "Run",
+    "VerificationExecution",
+    "VerificationResult",
+    "record",
+]

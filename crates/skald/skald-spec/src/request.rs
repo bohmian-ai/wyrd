@@ -94,9 +94,13 @@ impl std::str::FromStr for ProviderName {
     /// Parse a built-in name, or else a custom name of lowercase ASCII
     /// letters, digits, `-`, and `_` that starts with a letter or digit.
     ///
+    /// `gemini` is the gateway's built-in Gemini provider id, so it is never a
+    /// custom name: a Gemini Prompt names `google`.
+    ///
     /// # Errors
     ///
-    /// Returns a message when a custom name is empty or uses other characters.
+    /// Returns a message when a custom name is empty, uses other characters,
+    /// or is `gemini`.
     fn from_str(name: &str) -> Result<Self, Self::Err> {
         Ok(match name {
             "openai" => Self::OpenAi,
@@ -104,6 +108,12 @@ impl std::str::FromStr for ProviderName {
             "google" => Self::Google,
             "vertex" => Self::Vertex,
             "jev" => Self::Jev,
+            "gemini" => {
+                return Err(
+                    "provider `gemini` is the gateway's built-in id; a Gemini Prompt names provider `google`"
+                        .to_owned(),
+                );
+            }
             custom
                 if custom.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
                     && custom.chars().all(|c| {
@@ -356,7 +366,8 @@ mod round_trip {
 
     /// Every provider keeps its JSON form, and its YAML form reads back
     /// through a buffered `serde_json::Value`, the path an inline Prompt in
-    /// an Agent Card takes.
+    /// an Agent Card takes; malformed names and the reserved `gemini` are
+    /// refused.
     #[test]
     fn provider_name_yaml_reads_back_through_buffered_json() {
         assert_eq!(
@@ -379,7 +390,7 @@ mod round_trip {
                 provider
             );
         }
-        for refused in ["", "Local", "a b", "-x", "a/b"] {
+        for refused in ["", "Local", "a b", "-x", "a/b", "gemini"] {
             assert!(
                 refused.parse::<ProviderName>().is_err(),
                 "{refused:?} is refused"

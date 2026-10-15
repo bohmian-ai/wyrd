@@ -1629,7 +1629,8 @@ async fn shutdown_drains_runs_that_finish_within_the_grace() {
 }
 
 /// Concurrent runtimes ticking the same due occurrence, and a runtime
-/// restarted after them, create exactly one run, and health is not degraded.
+/// restarted after them, create exactly one run, accepted for the binding
+/// owner with SYSTEM as actor, and health is not degraded.
 ///
 /// # Panics
 /// Panics when a duplicate run is created, the scheduler is not composed, or
@@ -1681,6 +1682,16 @@ async fn schedulers_create_one_run_per_occurrence_across_ticks_and_restart() {
     restarted.stop().await;
     let runs = harness.seed.runs().await.expect("runs read");
     assert_eq!(runs.len(), 1, "one run per occurrence");
+    let pair: (Uuid, Uuid) =
+        sqlx::query_as("SELECT sub_principal_id, act_principal_id FROM wyrd.verifier_runs")
+            .fetch_one(&harness.assertion)
+            .await
+            .expect("the run's pair reads");
+    assert_eq!(
+        pair,
+        (principal.as_uuid(), harness.seed.system_principal()),
+        "a scheduled run serves its owner with SYSTEM as actor"
+    );
 }
 
 /// The production bound server composes the runtime when enabled, reports it

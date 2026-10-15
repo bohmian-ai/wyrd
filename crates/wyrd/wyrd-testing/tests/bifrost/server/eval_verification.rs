@@ -2769,3 +2769,232 @@ async fn observation_judge_call_records_card_and_run_and_joins_its_result()
     server.shutdown().await?;
     Ok(())
 }
+
+/// Add Services `owner-a`, `owner-b`, and `owner-c` beside [`write_graph`]'s
+/// Cards, each binding the shared Agent to the gated LLM-judge Eval on
+/// `observations_ready`, and return their paths.
+///
+/// # Panics
+/// Panics when a fixture file cannot be written.
+fn write_background_owners(root: &Path) -> [PathBuf; 3] {
+    write_graph(root);
+    ["owner-a", "owner-b", "owner-c"].map(|name| {
+        let path = root.join(format!("{name}.yaml"));
+        std::fs::write(
+            &path,
+            format!(
+                "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: agent\n      ref: ./agent.yaml\n      verified_by:\n        - verifier: ./gated.yaml\n          runs_on: {{kind: observations_ready}}\n"
+            ),
+        )
+        .expect("fixture file writes");
+        path
+    })
+}
+
+/// Every observation run as `owner Service|sub|act`, sorted by owner.
+const RUN_PAIRS_SQL: &str = "SELECT concat(o.name, '|', r.sub_principal_id, '|', r.act_principal_id) \
+    FROM wyrd.verifier_runs r JOIN wyrd.cards o ON o.card_uid = r.owner_card_uid \
+    WHERE r.origin = 'observation' ORDER BY o.name";
+
+/// An observation-triggered run serves its binding owner with SYSTEM as
+/// actor, never the record's writer (AC-001/002/008/017).
+///
+/// Services A, B, and C bind the same Agent to the gated LLM-judge Eval. Only
+/// A's owner may invoke the judge model; B's owner authenticates, then holds
+/// no role;
+/// C's owner is suspended. An unbound administrator writes one record
+/// about the Agent. The tenant's seeded SYSTEM principal is active, so A and
+/// B each get one run, accepted as owner/SYSTEM, and C, whose owner is
+/// suspended, gets none rather than falling back to the writer or SYSTEM. A's
+/// judge call reaches the provider and its gateway call and result rows carry
+/// A's owner/SYSTEM; B's judge is refused under B's owner authority without
+/// an upstream request, so the provider sees exactly one call.
+///
+/// # Errors
+/// Returns server, registration, SDK lifetime, runtime, or query errors, or a
+/// description of the first pair or run that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn background_owner_subject_system_actor() -> Result<(), ServerJourneyError> {
+    let root = tempfile::tempdir()?;
+    let [service_a, service_b, service_c] = write_background_owners(root.path());
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl_owner", "object": "chat.completion", "created": 1_700_000_000,
+            "model": "gpt-test",
+            "choices": [{ "index": 0, "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+        })))
+        .mount(&provider)
+        .await;
+    let server = Box::pin(gateway_server(&provider)).await?;
+    let tenant = server.data_tenant_id();
+    let superuser = server.pg_fixture().superuser_pool()?;
+    // Read before the fixture provisions anything: tenant seeding alone
+    // leaves one active SYSTEM principal.
+    let seeded: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM wyrd.auth_service_accounts \
+         WHERE data_tenant_id = $1 AND principal_kind = 'system' AND status = 'active'",
+    )
+    .bind(tenant.as_uuid())
+    .fetch_optional(&superuser)
+    .await?;
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let system = seed.system_principal();
+    if seeded != Some(system) {
+        return Err(format!("the seeded tenant's SYSTEM is {seeded:?}, not {system}").into());
+    }
+    server
+        .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
+        .await?;
+    let admin = connect(&server, server.tenant_admin_key().await?.expose_secret());
+    wyrd_client::gateway::Gateway::with_client(admin.clone())
+        .put_capture_policy(&wyrd_spec::gateway::GatewayCapturePolicyWrite {
+            mode: wyrd_spec::gateway::GatewayCaptureMode::Metadata,
+            payload_fields: std::collections::BTreeSet::new(),
+        })
+        .await?;
+    let bundles = ["bundle-a", "bundle-b", "bundle-c"].map(|name| root.path().join(name));
+    let receipt_a = register(&admin, &service_a, &bundles[0]).await;
+    let receipt_b = register(&admin, &service_b, &bundles[1]).await;
+    let receipt_c = register(&admin, &service_c, &bundles[2]).await;
+    let owner_c = receipt_c.root.uid.as_ref().ok_or("C has no UID")?.as_uuid();
+    sqlx::query("UPDATE wyrd.auth_service_accounts SET status = 'suspended' WHERE card_uid = $1")
+        .bind(owner_c)
+        .execute(&superuser)
+        .await?;
+    let mut owners = Vec::new();
+    for (receipt, roles, bundle) in [
+        (&receipt_a, &[JUDGE_ROLE][..], &bundles[0]),
+        (&receipt_b, &[][..], &bundles[1]),
+    ] {
+        let Bootstrap::Machine { id, api_key, .. } = server
+            .credential_registered_service(&receipt.root, roles)
+            .await?
+        else {
+            return Err("a registered Service bootstraps a machine principal".into());
+        };
+        start_state(bundle, &connect(&server, api_key.expose_secret()))
+            .await
+            .shutdown()
+            .await?;
+        owners.push(id.to_string());
+    }
+    // B's owner keeps no role at all, so no judge model is inside its
+    // authority; the built-in workload role alone would permit invoking it.
+    sqlx::query("DELETE FROM wyrd.auth_service_account_roles WHERE service_account_id = $1")
+        .bind(uuid::Uuid::parse_str(&owners[1])?)
+        .execute(&superuser)
+        .await?;
+
+    let state = start_state(&bundles[0], &admin).await;
+    let agent = state.run().for_card("agent")?;
+    let agent_uid = agent.subject().uid.clone().ok_or("agent has no UID")?;
+    let object = format!("{tenant}/cards/{agent_uid}/shot.png");
+    server
+        .state()
+        .storage
+        .put_object(&tenant_path::validate(&object, tenant)?, IMAGE.to_vec())
+        .await?;
+    emit(
+        &agent,
+        &json!({ "answer": "yes", "marker": "owner-served" }),
+        Some(&media(&format!("file:///{object}"))),
+        None,
+    );
+    state.shutdown().await?;
+    server.flush_bifrost().await?;
+    let (stop, task) = spawn_runtime(&server);
+    let runs = settle(&seed, 2).await;
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    server.flush_bifrost().await?;
+    let runs = runs?;
+
+    let pairs: Vec<String> = sqlx::query_scalar(RUN_PAIRS_SQL)
+        .fetch_all(&superuser)
+        .await?;
+    let expected = vec![
+        format!("owner-a|{}|{system}", owners[0]),
+        format!("owner-b|{}|{system}", owners[1]),
+    ];
+    if pairs != expected {
+        return Err(format!("expected owner/SYSTEM runs {expected:?}, read {pairs:?}").into());
+    }
+    let calls = texts(
+        &query(
+            &server,
+            tenant,
+            "SELECT concat(sub_principal_id, '|', act_principal_id, '|', outcome, '|', \
+             coalesce(error_code, '')) FROM vala.gateway.calls ORDER BY outcome"
+                .to_owned(),
+        )
+        .await?,
+    )?;
+    if calls != [Some(format!("{}|{system}|succeeded|", owners[0]))] {
+        return Err(format!("expected one owner-A/SYSTEM judge call, read {calls:?}").into());
+    }
+    let decisions = texts(
+        &query(
+            &server,
+            tenant,
+            "SELECT DISTINCT concat(sub_principal_id, '|', act_principal_id, '|', outcome) AS d \
+               FROM vala.system.audit_log WHERE operation = 'gateway.invoke' ORDER BY d"
+                .to_owned(),
+        )
+        .await?,
+    )?;
+    // B's run retries its refused judge within its bounded attempts.
+    let mut expected = [
+        Some(format!("{}|{system}|allowed", owners[0])),
+        Some(format!("{}|{system}|denied", owners[1])),
+    ];
+    expected.sort();
+    if decisions != expected {
+        return Err(format!(
+            "expected owner/SYSTEM invoke decisions {expected:?}, read {decisions:?}"
+        )
+        .into());
+    }
+    let requests = provider.received_requests().await.unwrap_or_default().len();
+    if requests != 1 {
+        return Err(
+            format!("the provider saw {requests} judge requests, not owner A's one").into(),
+        );
+    }
+    let record = record_id(&server, tenant, "owner-served").await?;
+    let results = texts(
+        &query(
+            &server,
+            tenant,
+            format!(
+                "SELECT concat(verdict, '|', sub_principal_id, '|', act_principal_id) \
+                   FROM vala.verification.results WHERE source_record_id = '{record}' \
+                  ORDER BY sub_principal_id"
+            ),
+        )
+        .await?,
+    )?;
+    let passed: Vec<&Option<String>> = results
+        .iter()
+        .filter(|row| row.as_deref().is_some_and(|row| row.starts_with("passed|")))
+        .collect();
+    let owner_rows = results.iter().all(|row| {
+        row.as_deref().is_some_and(|row| {
+            owners
+                .iter()
+                .any(|owner| row.ends_with(&format!("|{owner}|{system}")))
+        })
+    });
+    if passed != [&Some(format!("passed|{}|{system}", owners[0]))] || !owner_rows {
+        return Err(format!(
+            "expected only A to pass and every result as owner/SYSTEM, read {results:?} for {runs:?}"
+        )
+        .into());
+    }
+    server.shutdown().await?;
+    Ok(())
+}

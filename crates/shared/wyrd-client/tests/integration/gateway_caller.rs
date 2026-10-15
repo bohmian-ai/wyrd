@@ -7,7 +7,7 @@ use secrecy::SecretString;
 use serde_json::{Value, json};
 use skald_agent::{WyrdGatewayCall, WyrdGatewayCaller};
 use skald_providers::{ProviderError, RemoteProblem};
-use skald_spec::{ProviderRequest, ProviderResponse};
+use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
@@ -445,7 +445,7 @@ async fn public_gateway_call_carries_the_ambient_trace_context() {
 }
 
 /// Concurrent public gateway calls keep their own deadline and model; each
-/// dialect reaches its ingress with the call's model; Vertex,
+/// dialect reaches its ingress with the call's model; Vertex Prompts,
 /// cancellation, and timeouts stop locally; native error envelopes become
 /// redacted problems keeping only status, Wyrd code, OpenAI `param`, and the
 /// code's catalog title and remediation; a `401` is sent once and renews the
@@ -641,6 +641,24 @@ async fn public_gateway_call_context_and_errors() {
             json!("jev/jev-latest"),
         ]
     );
+
+    // A Vertex Prompt is refused locally on any route, declared or
+    // overridden, before anything is sent.
+    for model in ["vertex/tuned/gemini-a", "gemini/gemini-a"] {
+        let vertex = WyrdGatewayCall {
+            provider: ProviderName::Vertex,
+            ..gateway_call(gemini.clone(), model, deadline)
+        };
+        let refused = caller
+            .call(vertex, &token)
+            .await
+            .expect_err("a local caller cannot run a Vertex Prompt");
+        assert!(
+            matches!(refused, ProviderError::BadRequest { .. }),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(received(&server).await.len(), 5, "no Vertex call was sent");
 
     // An already cancelled run stops before any request; a slow answer times
     // out at the call's own deadline.

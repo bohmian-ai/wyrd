@@ -103,17 +103,20 @@ impl Settled {
 }
 
 /// One settled Verifier block in the shared [`RunLedger`].
+///
+/// Results are boxed because they are an order of magnitude larger than the
+/// settled state, and the ledger holds every block.
 #[derive(Debug)]
 pub(super) enum Done {
     /// A step: its reported result and the state later blocks read.
     Step {
         /// The reported step result.
-        result: StepResult,
+        result: Box<StepResult>,
         /// The state `steps.<id>` references read.
         state: Settled,
     },
     /// A judged requirement, as reported.
-    Requirement(RequirementResult),
+    Requirement(Box<RequirementResult>),
 }
 
 /// The scope document of one stage: the original evidence plus every block

@@ -154,8 +154,8 @@ impl VerificationEngine {
         let (mut steps, mut requirements) = (Vec::new(), Vec::new());
         for (_, done) in ledger {
             match done {
-                Done::Step { result, .. } => steps.push(result),
-                Done::Requirement(result) => requirements.push(result),
+                Done::Step { result, .. } => steps.push(*result),
+                Done::Requirement(result) => requirements.push(*result),
             }
         }
         let verdict = decide(
@@ -584,7 +584,10 @@ fn skipped(step: &Step, gap: Missing) -> Done {
         status: StepStatus::Skipped,
         gap,
     };
-    Done::Step { result, state }
+    Done::Step {
+        result: Box::new(result),
+        state,
+    }
 }
 
 /// The final attempt of one step action.
@@ -635,7 +638,10 @@ impl Attempted {
                 },
             ),
         };
-        Done::Step { result, state }
+        Done::Step {
+            result: Box::new(result),
+            state,
+        }
     }
 }
 
@@ -668,7 +674,7 @@ impl Judged {
     fn report(self, spec: &VerifierSpec, key: Key) -> Result<Done, EngineError> {
         let requirement = requirement_at(spec, key);
         let capture = spec.context_capture.unwrap_or(EvalContextCapture::Full);
-        Ok(Done::Requirement(RequirementResult {
+        Ok(Done::Requirement(Box::new(RequirementResult {
             id: requirement.id.clone(),
             step: key.0.map(|index| spec.steps[index].id.clone()),
             statement: requirement.statement.clone(),
@@ -679,7 +685,7 @@ impl Judged {
             detail: self.detail,
             check: requirement.check.clone(),
             provenance: self.provenance,
-        }))
+        })))
     }
 
     /// The outcome of evidence that could not be supplied.

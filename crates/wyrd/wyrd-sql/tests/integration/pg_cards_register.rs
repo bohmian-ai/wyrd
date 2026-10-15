@@ -13,9 +13,9 @@ use wyrd_spec::registry::{ArtifactManifestEntry, RegistrationOperationId};
 use wyrd_sql::queries::cards::{
     NewCardRow, NewRegistrationOperation, RECONCILE_KIND_REGISTRATION, claim_card_reconciliation,
     insert_artifact_manifest_rows, insert_card_row, insert_registration_operation,
-    lookup_existing_operation, lookup_operation_by_id, manifest_completion_rows,
-    persist_outbound_relationships, recheck_active_card_refs, record_card_reconciliation_failure,
-    soft_delete_card_by_ref, soft_delete_card_with_state, upsert_service_account_from_card,
+    lookup_existing_operation, manifest_completion_rows, persist_outbound_relationships,
+    recheck_active_card_refs, record_card_reconciliation_failure, soft_delete_card_by_ref,
+    soft_delete_card_with_state, upsert_service_account_from_card,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -183,7 +183,7 @@ async fn pending_card_and_manifest_share_registration_transaction() {
 
 /// A reserved operation has no stored response until it commits; reading it
 /// back must decode the NULL `stored_response` rather than fail, because the
-/// registration replay and the startup reconciler both read pending rows.
+/// registration replay reads pending rows.
 #[tokio::test]
 async fn pending_operation_with_null_stored_response_decodes() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -207,11 +207,7 @@ async fn pending_operation_with_null_stored_response_decodes() {
         .expect("operation inserts")
     );
 
-    let by_id = lookup_operation_by_id(&mut conn, operation_id)
-        .await
-        .expect("pending operation decodes by id")
-        .expect("pending operation exists");
-    let by_key = lookup_existing_operation(
+    let row = lookup_existing_operation(
         &mut conn,
         wyrd_spec::auth::Attribution::direct(principal_id),
         "sql-pending-null-response",
@@ -220,11 +216,9 @@ async fn pending_operation_with_null_stored_response_decodes() {
     .expect("pending operation decodes by idempotency key")
     .expect("pending operation exists");
 
-    for row in [by_id, by_key] {
-        assert_eq!(row.operation_id, operation_id.as_uuid());
-        assert_eq!(row.status, "pending");
-        assert!(row.stored_response.is_none());
-    }
+    assert_eq!(row.operation_id, operation_id.as_uuid());
+    assert_eq!(row.status, "pending");
+    assert!(row.stored_response.is_none());
 }
 
 /// Registration idempotency is scoped by the full subject/actor pair, and the

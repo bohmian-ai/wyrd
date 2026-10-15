@@ -141,10 +141,12 @@ impl RunningQueryControls {
     /// whole Oracle open.
     ///
     /// # Errors
-    /// Returns the open's own error, and `QueryStreamIncomplete` when the
-    /// query's deadline passes after cancellation before the open returns;
-    /// the caller then drops the open, which releases its query guards. A
-    /// refused cancellation is not an error.
+    /// Returns the open's own error when it settles before cancellation.
+    /// Once cancellation wins, a failed open and an open still pending at the
+    /// query's deadline are both `QueryStreamIncomplete`, the error the stream
+    /// phase reports for the same cancellation; on the deadline the caller
+    /// drops the open, which releases its query guards. A refused
+    /// cancellation is not an error.
     pub async fn open_cancellable<F>(
         &self,
         open: Pin<&mut F>,
@@ -310,15 +312,20 @@ impl RunningQueryControls {
 /// Awaits `open`; if `cancel` fires first, starts `cancel_owner` once, awaits
 /// it, and then awaits the same `open`, both before `deadline`.
 ///
-/// While the deadline holds, the open is never abandoned, so its result
-/// reaches the caller. The cancellation request's own refusal is only logged,
-/// because the caller settles whatever the open returns. `open` is borrowed
+/// While the deadline holds, the open is never abandoned, so its stream
+/// reaches the caller. Cancellation is a settlement claim: once it wins, a
+/// failed open is reported as the incomplete stream the stream phase reports,
+/// whichever side of owner registration the signal landed on, because the
+/// Oracle fails a query it was asked to cancel. The cancellation request's own
+/// refusal is only logged, because the caller settles whatever the open
+/// returns. `open` is borrowed
 /// pinned and `cancel_owner` is built only once cancellation wins, so neither
 /// future is copied into this one's state.
 ///
 /// # Errors
-/// Returns the open's own error, and `QueryStreamIncomplete` when `deadline`
-/// passes after cancellation before the open returns.
+/// Returns the open's own error when it settles before cancellation, and
+/// `QueryStreamIncomplete` when, after cancellation, the open fails or
+/// `deadline` passes before it returns.
 async fn cancel_while_opening<T, C, F, O>(
     mut open: Pin<&mut F>,
     cancel_owner: impl FnOnce() -> O,
@@ -341,7 +348,13 @@ where
                 "the opening query had no cancellable owner yet"
             );
         }
-        open.await
+        open.await.map_err(|error| {
+            tracing::debug!(
+                code = error.code(),
+                "the cancelled open settled with an error"
+            );
+            WyrdError::from(BifrostError::QueryStreamIncomplete)
+        })
     })
     .await
     .map_err(|_| WyrdError::from(BifrostError::QueryStreamIncomplete))?
@@ -362,11 +375,13 @@ mod tests {
 
     /// An open that finishes first is returned without any cancellation; a
     /// cancellation during the open is requested once and the same open still
-    /// completes and is returned, even when the owner refuses the request.
+    /// completes and is returned, even when the owner refuses the request; and
+    /// an open the owner's cancellation fails is the incomplete stream.
     ///
     /// # Panics
     /// Panics if an uncancelled open requests cancellation, a cancelled open
-    /// is dropped instead of completed, or a refused request hides the open.
+    /// is dropped instead of completed, a refused request hides the open, or
+    /// a cancelled open's failure is reported as anything but incomplete.
     #[tokio::test]
     async fn cancel_while_opening_requests_cancellation_and_keeps_the_open() {
         let requested = AtomicBool::new(false);
@@ -409,6 +424,28 @@ mod tests {
         cancel.cancel();
         let opened = cancel_while_opening(pin!(async { Ok(3) }), refused, &cancel, later()).await;
         assert_eq!(opened.expect("a refused cancellation keeps the open"), 3);
+
+        // The owner found the query, so the Oracle fails the open it was
+        // asked to cancel; the caller sees the same incomplete stream it sees
+        // when the cancellation lands after the open.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (failing, open) = tokio::sync::oneshot::channel::<()>();
+        let open = pin!(async {
+            open.await.expect("the owner releases the open");
+            Err::<u32, WyrdError>(BifrostError::QueryExecutionFailed.into())
+        });
+        let owner = || async {
+            failing.send(()).expect("the open awaits the owner");
+            Ok::<(), WyrdError>(())
+        };
+        let error = cancel_while_opening(open, owner, &cancel, later())
+            .await
+            .expect_err("a cancelled open that fails is incomplete");
+        assert_eq!(
+            error.code(),
+            WyrdError::from(BifrostError::QueryStreamIncomplete).code()
+        );
     }
 
     /// A deadline far enough away that no test reaches it.

@@ -106,8 +106,8 @@ impl ScheduledQueryCaller {
     /// # Cancellation
     ///
     /// Cancelling the bound token while the stream is still opening cancels
-    /// the query at its owner and still awaits the open. Cancelling it
-    /// afterwards cancels the live stream and returns
+    /// the query at its owner and still awaits the open; cancelling it
+    /// afterwards cancels the live stream. Either way the run returns
     /// [`wyrd_spec::vala::error::BifrostError::QueryStreamIncomplete`], the
     /// same error a stream that ended without a terminal reports.
     pub async fn run(

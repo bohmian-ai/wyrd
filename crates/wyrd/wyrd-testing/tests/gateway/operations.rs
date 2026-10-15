@@ -12,10 +12,7 @@ use wiremock::{Mock, ResponseTemplate};
 
 use crate::harness::{Journey, PROVIDER_KEY, assert_provider_credentials, openai_code, refusal};
 
-/// Model every `OpenAI` deployment in these journeys serves.
-const MODEL: &str = "gpt-4o";
-
-/// Its `<provider>/<model>` projection, as a caller names it.
+/// The `<deployment>/<model>` address every call in these journeys names.
 const PROJECTION: &str = "openai/gpt-4o";
 
 /// Audio bytes the mock speech upstream returns.
@@ -171,7 +168,6 @@ async fn responses_audio_and_batches_dispatch_through_the_public_server() {
         .deploy(
             "openai",
             "authorization",
-            MODEL,
             &["chat_completions", "responses", "audio", "batches"],
         )
         .await;
@@ -426,23 +422,16 @@ async fn responses_audio_and_batches_dispatch_through_the_public_server() {
     // A chat-only adapter carries no other operation, at administration and
     // at dispatch.
     journey
-        .deploy(
-            "anthropic",
-            "x-api-key",
-            "claude-sonnet-5",
-            &["chat_completions"],
-        )
+        .deploy("anthropic", "x-api-key", &["chat_completions"])
         .await;
     let declared = journey
         .try_put(
             "provider-deployments/anthropic-embeddings",
             json!({
                 "name": "anthropic-embeddings",
-                "model": {"provider": "anthropic", "model": "claude-sonnet-5"},
                 "adapter": "anthropic",
                 "auth": {"api_key_header": {"header": "x-api-key", "credential": "anthropic-key"}},
                 "capabilities": ["embeddings"],
-                "routing_weight": 1,
             }),
         )
         .await;

@@ -637,9 +637,9 @@ impl Journey {
         )
         .await
         .expect("bound test server starts");
-        let invoke = |provider: &str| {
-            Permission::gateway_invoke(GatewayAccess::Provider {
-                provider: provider.parse().expect("provider id"),
+        let invoke = |deployment: &str| {
+            Permission::gateway_invoke(GatewayAccess::Deployment {
+                deployment: deployment.parse().expect("deployment name"),
             })
         };
         server

@@ -15,13 +15,13 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use crate::harness::{Journey, openai_code, refusal, tokens};
 
-/// Model both failover deployments serve.
-const PROJECTION: &str = "acme/m";
+/// Address the failover call requests; its fallback is `acme-second/m`.
+const PROJECTION: &str = "acme-first/m";
 
 /// Buffered Chat Completions answer the healthy deployment returns.
 fn completion() -> Value {
@@ -35,34 +35,31 @@ fn completion() -> Value {
     })
 }
 
-/// One Chat Completions request body for [`PROJECTION`].
-fn chat() -> Value {
+/// One Chat Completions request body addressing `model`.
+fn chat(model: &str) -> Value {
     json!({
-        "model": PROJECTION,
+        "model": model,
         "max_completion_tokens": 16,
         "messages": [{"role": "user", "content": "hi"}],
     })
 }
 
-/// Stores one `openai_compatible` deployment named `name` serving `model` of
-/// provider `acme`, whose routes live under `prefix` of the journey's mock
-/// upstream.
+/// Stores one `openai_compatible` deployment named `name` serving any model,
+/// whose routes live under `prefix` of the journey's mock upstream.
 ///
 /// The adapter needs no upstream credential, so the deployment authenticates
 /// with `none` and the mock records exactly what the gateway sent.
-async fn deploy_compatible(journey: &Journey, name: &str, model: &str, prefix: &str) {
+async fn deploy_compatible(journey: &Journey, name: &str, prefix: &str) {
     journey
         .put(
             &format!("provider-deployments/{name}"),
             json!({
                 "name": name,
-                "model": {"provider": "acme", "model": model},
                 "adapter": {"openai_compatible": {
                     "base_url": format!("{}{prefix}/v1", journey.upstream.uri()),
                 }},
                 "auth": "none",
                 "capabilities": ["chat_completions"],
-                "routing_weight": 1,
             }),
         )
         .await;
@@ -71,7 +68,7 @@ async fn deploy_compatible(journey: &Journey, name: &str, model: &str, prefix: &
 /// Proves deployment failover and an administered rate limit through the
 /// public server.
 ///
-/// One model is served by two deployments; the first provider exchange of the
+/// The requested deployment falls back to a sibling; the first provider exchange of the
 /// call refuses with a retryable `503`, so the call completes on the sibling
 /// deployment and the caller never sees the refusal. Both attempts are
 /// accounted, and because the refused attempt reached its provider with no
@@ -87,11 +84,10 @@ async fn deploy_compatible(journey: &Journey, name: &str, model: &str, prefix: &
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch() {
     let journey = Journey::start().await;
-    // Exactly one provider exchange refuses retryably, whichever deployment
-    // weighted selection reaches first, so failover is proven without
-    // depending on the selection order.
+    // Exactly one provider exchange refuses retryably: the requested
+    // deployment's, since it is always attempted first.
     Mock::given(method("POST"))
-        .and(path_regex(r"^/(first|second)/v1/chat/completions$"))
+        .and(path("/first/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(503).set_body_json(
                 json!({"error": {"message": "upstream busy", "type": "server_error"}}),
@@ -109,8 +105,15 @@ async fn a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch() {
             .mount(&journey.upstream)
             .await;
     }
-    deploy_compatible(&journey, "acme-first", "m", "/first").await;
-    deploy_compatible(&journey, "acme-second", "m", "/second").await;
+    deploy_compatible(&journey, "acme-first", "/first").await;
+    deploy_compatible(&journey, "acme-second", "/second").await;
+    journey
+        .put(
+            "fallback-policy",
+            json!({"rules": [{"scope": {"model": {"model": {"deployment": "acme-first", "model": "m"}}},
+                              "candidates": [{"deployment": "acme-second", "model": "m"}]}]}),
+        )
+        .await;
     // Administered before any call, so the limit counts this journey's own
     // calls: the failover call is the tenant's one admitted request.
     journey
@@ -127,7 +130,9 @@ async fn a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch() {
         .await;
     let bearer = vec![("authorization", format!("Bearer {}", journey.caller))];
 
-    let answered = journey.post("/v1/chat/completions", &bearer, &chat()).await;
+    let answered = journey
+        .post("/v1/chat/completions", &bearer, &chat(PROJECTION))
+        .await;
     assert_eq!(
         answered.status().as_u16(),
         200,
@@ -161,7 +166,9 @@ async fn a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch() {
 
     let dispatched = journey.upstream_calls().await.len();
     refusal(
-        journey.post("/v1/chat/completions", &bearer, &chat()).await,
+        journey
+            .post("/v1/chat/completions", &bearer, &chat(PROJECTION))
+            .await,
         429,
         "WYRD_GATEWAY_429_LIMIT_EXCEEDED",
         openai_code,
@@ -202,8 +209,8 @@ async fn a_cancelled_call_is_still_settled_and_the_server_keeps_serving() {
         .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
         .mount(&journey.upstream)
         .await;
-    deploy_compatible(&journey, "acme-held", "held", "/held").await;
-    deploy_compatible(&journey, "acme-prompt", "m", "/prompt").await;
+    deploy_compatible(&journey, "acme-held", "/held").await;
+    deploy_compatible(&journey, "acme-prompt", "/prompt").await;
     let bearer = vec![("authorization", format!("Bearer {}", journey.caller))];
 
     let (http, base, token) = (
@@ -215,7 +222,7 @@ async fn a_cancelled_call_is_still_settled_and_the_server_keeps_serving() {
         http.post(format!("{base}/v1/chat/completions"))
             .bearer_auth(token)
             .json(&json!({
-                "model": "acme/held",
+                "model": "acme-held/held",
                 "max_completion_tokens": 16,
                 "messages": [{"role": "user", "content": "hi"}],
             }))
@@ -240,7 +247,9 @@ async fn a_cancelled_call_is_still_settled_and_the_server_keeps_serving() {
     );
 
     // The server still serves the next caller.
-    let answered = journey.post("/v1/chat/completions", &bearer, &chat()).await;
+    let answered = journey
+        .post("/v1/chat/completions", &bearer, &chat("acme-prompt/m"))
+        .await;
     assert_eq!(
         answered.status().as_u16(),
         200,

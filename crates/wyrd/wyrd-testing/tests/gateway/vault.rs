@@ -288,14 +288,12 @@ impl VaultJourney {
         );
         let deployment = self
             .put(
-                "provider-deployments/gpt-4o",
+                "provider-deployments/openai",
                 json!({
-                    "name": "gpt-4o",
-                    "model": {"provider": "openai", "model": "gpt-4o"},
+                    "name": "openai",
                     "adapter": "openai",
                     "auth": {"bearer": {"credential": "vault-openai"}},
                     "capabilities": ["chat_completions"],
-                    "routing_weight": 1,
                 }),
             )
             .await;

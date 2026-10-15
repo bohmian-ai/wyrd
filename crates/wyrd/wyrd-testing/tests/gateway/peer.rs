@@ -223,8 +223,8 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
         "the gateway pod runs no Scribe"
     );
 
-    let invoke = [Permission::gateway_invoke(GatewayAccess::Provider {
-        provider: "openai".parse().expect("provider id"),
+    let invoke = [Permission::gateway_invoke(GatewayAccess::Deployment {
+        deployment: "openai".parse().expect("deployment name"),
     })];
     gateway
         .seed_role("gateway_invoker", &invoke)
@@ -271,14 +271,12 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
         &http,
         &base,
         &admin,
-        "provider-deployments/gpt-4o",
+        "provider-deployments/openai",
         json!({
-            "name": "gpt-4o",
-            "model": {"provider": "openai", "model": "gpt-4o"},
+            "name": "openai",
             "adapter": "openai",
             "auth": {"bearer": {"credential": "openai-key"}},
             "capabilities": ["chat_completions"],
-            "routing_weight": 1,
         }),
     )
     .await;
@@ -313,14 +311,15 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
 
     let deadline = Instant::now() + Duration::from_secs(30);
     for table in ["vala.gateway.calls", "vala.traces.spans"] {
-        let sql =
-            format!("SELECT principal_id FROM {table} WHERE wyrd_request_id = '{request_id}'");
+        let sql = format!(
+            "SELECT act_principal_id FROM {table} WHERE wyrd_request_id = '{request_id}' AND act_principal_id = sub_principal_id"
+        );
         let principals = loop {
             scribe
                 .flush_bifrost()
                 .await
                 .expect("the scribe pod flushes");
-            match strings(gateway, &admin_key, &sql, "principal_id").await {
+            match strings(gateway, &admin_key, &sql, "act_principal_id").await {
                 Ok(rows) if !rows.is_empty() => break rows,
                 outcome => assert!(
                     Instant::now() < deadline,
@@ -329,10 +328,10 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         };
-        assert_eq!(
-            principals,
-            [GATEWAY_CAPTURE_PRINCIPAL.to_string()],
-            "{table} holds exactly the call's capture, stamped with the capture principal"
+        assert!(
+            principals.len() == 1 && principals[0] != GATEWAY_CAPTURE_PRINCIPAL.to_string(),
+            "{table} holds exactly the call's capture, attributed directly to the caller \
+             rather than the capture transport principal: {principals:?}"
         );
     }
 

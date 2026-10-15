@@ -3343,9 +3343,10 @@ impl WyrdTestServer {
         conn.commit().await.map_err(sql)
     }
 
-    /// Deploy `openai/{model}` Chat Completions behind a managed `openai-key`
-    /// credential through the gateway administration routes, and seed `role`
-    /// granting gateway invoke on the `openai` provider.
+    /// Deploy `openai/{model}` Chat Completions as the `openai` deployment
+    /// behind a managed `openai-key` credential through the gateway
+    /// administration routes, and seed `role` granting gateway invoke on the
+    /// `openai` deployment.
     ///
     /// A judge or Agent Prompt naming `openai/{model}` then resolves through
     /// the gateway to the provider root the server was built with, and only a
@@ -3377,14 +3378,13 @@ impl WyrdTestServer {
                 }),
             ),
             (
-                format!("provider-deployments/{model}"),
+                "provider-deployments/openai".to_owned(),
                 serde_json::json!({
-                    "name": model,
-                    "model": { "provider": "openai", "model": model },
+                    "name": "openai",
+                    "models": [model],
                     "adapter": "openai",
                     "auth": { "bearer": { "credential": "openai-key" } },
                     "capabilities": ["chat_completions"],
-                    "routing_weight": 1,
                 }),
             ),
         ] {

@@ -90,11 +90,9 @@ mod pg_tests {
         gateway
             .put_deployment(&serde_json::from_value(serde_json::json!({
                 "name": "primary",
-                "model": {"provider": "openai", "model": "gpt-4o"},
                 "adapter": "openai",
                 "auth": {"bearer": {"credential": "primary"}},
                 "capabilities": ["chat_completions"],
-                "routing_weight": 1,
             }))?)
             .await?;
 

@@ -57,9 +57,17 @@ pub(crate) const GEMINI_TRUNCATED: &str = "data: {\"candidates\":[{\"content\":{
 /// upstream.
 pub(crate) const PROVIDER_KEY: &str = "sk-native-upstream";
 
-/// Providers the journeys deploy, and so the only ones the invoking principal
+/// Deployments the journeys deploy, and so the only ones the invoking principal
 /// is granted. It holds no administration permission at all.
-const INVOKED_PROVIDERS: [&str; 4] = ["openai", "anthropic", "gemini", "acme"];
+const INVOKED_DEPLOYMENTS: [&str; 7] = [
+    "openai",
+    "anthropic",
+    "gemini",
+    "acme-first",
+    "acme-second",
+    "acme-held",
+    "acme-prompt",
+];
 
 /// Role name carrying exactly those invoke permissions.
 pub(crate) const INVOKER_ROLE: &str = "gateway_invoker";
@@ -90,7 +98,7 @@ pub(crate) struct Journey {
 impl Journey {
     /// Boots the server against a fresh mock upstream and provisions the
     /// principals of the production sequence: a tenant administrator, an
-    /// ordinary service granted only [`INVOKED_PROVIDERS`] invoke scope, and
+    /// ordinary service granted only [`INVOKED_DEPLOYMENTS`] invoke scope, and
     /// a principal with no gateway permission at all.
     ///
     /// # Panics
@@ -100,11 +108,11 @@ impl Journey {
         let server = Box::pin(Self::builder(&upstream).start_bound())
             .await
             .expect("test server starts");
-        let invoke: Vec<Permission> = INVOKED_PROVIDERS
+        let invoke: Vec<Permission> = INVOKED_DEPLOYMENTS
             .iter()
-            .map(|provider| {
-                Permission::gateway_invoke(GatewayAccess::Provider {
-                    provider: provider.parse().expect("provider id"),
+            .map(|deployment| {
+                Permission::gateway_invoke(GatewayAccess::Deployment {
+                    deployment: deployment.parse().expect("deployment name"),
                 })
             })
             .collect();
@@ -217,8 +225,9 @@ impl Journey {
     }
 
     /// Submits [`PROVIDER_KEY`] as the tenant's managed credential for
-    /// `provider` and stores one built-in deployment of `model`
-    /// authenticated by `header`, the order a tenant administrator follows.
+    /// `provider` and stores the built-in deployment named `provider`,
+    /// serving any model and authenticated by `header`, the order a tenant
+    /// administrator follows.
     ///
     /// The two writes are separate requests, not one transaction: a panic
     /// or cancellation after the first leaves the credential stored without
@@ -226,14 +235,8 @@ impl Journey {
     ///
     /// # Panics
     /// Panics when either request fails to send or is refused.
-    pub(crate) async fn deploy(
-        &self,
-        provider: &str,
-        header: &str,
-        model: &str,
-        capabilities: &[&str],
-    ) {
-        self.deploy_as(&self.admin, provider, header, model, capabilities)
+    pub(crate) async fn deploy(&self, provider: &str, header: &str, capabilities: &[&str]) {
+        self.deploy_as(&self.admin, provider, header, capabilities)
             .await;
     }
 
@@ -252,11 +255,9 @@ impl Journey {
         admin: &str,
         provider: &str,
         header: &str,
-        model: &str,
         capabilities: &[&str],
     ) {
         let credential = format!("{provider}-key");
-        let name = model.replace('.', "-");
         self.put_as(
             admin,
             &format!("provider-credentials/{credential}"),
@@ -274,14 +275,12 @@ impl Journey {
         };
         self.put_as(
             admin,
-            &format!("provider-deployments/{name}"),
+            &format!("provider-deployments/{provider}"),
             json!({
-                "name": name,
-                "model": {"provider": provider, "model": model},
+                "name": provider,
                 "adapter": provider,
                 "auth": auth,
                 "capabilities": capabilities,
-                "routing_weight": 1,
             }),
         )
         .await;

@@ -8,7 +8,6 @@
 //! proves the same steps for a saved user login.
 
 use std::collections::{BTreeSet, HashMap};
-use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,7 +18,7 @@ use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::cards::Cards;
 use wyrd_ai::cli;
 use wyrd_ai::gateway::{
-    GatewayOperation, ModelId, ModelRef, ProviderAdapter, ProviderAuth, ProviderCredentialName,
+    DeploymentAccess, GatewayOperation, ProviderAdapter, ProviderAuth, ProviderCredentialName,
     ProviderCredentialWrite, ProviderCredentialWriteSource, ProviderDeployment,
     ProviderDeploymentName, ProviderId,
 };
@@ -202,7 +201,7 @@ pub async fn export(run: &Run) {
         .await;
 }
 
-/// Write the `openai-key` credential and deploy `gpt-4o` on it as `client`.
+/// Write the `openai-key` credential and deploy `openai` on it as `client`.
 ///
 /// # Panics
 /// Panics when the credential or deployment is refused.
@@ -221,17 +220,14 @@ pub async fn configure_gateway(client: &WyrdClient) {
     .expect("the CLI writes the credential");
     Gateway::with_client(client.clone())
         .put_deployment(&ProviderDeployment {
-            name: ProviderDeploymentName::new("gpt-4o").expect("deployment name"),
-            model: ModelRef {
-                provider: ProviderId::new("openai").expect("provider"),
-                model: ModelId::new("gpt-4o").expect("model"),
-            },
+            name: ProviderDeploymentName::new("openai").expect("deployment name"),
             adapter: ProviderAdapter::OpenAi,
             auth: ProviderAuth::Bearer {
                 credential: ProviderCredentialName::new("openai-key").expect("credential"),
             },
-            capabilities: BTreeSet::from([GatewayOperation::ChatCompletions]),
-            routing_weight: NonZeroU32::MIN,
+            models: None,
+            capabilities: Some(BTreeSet::from([GatewayOperation::ChatCompletions])),
+            access: DeploymentAccess::Open,
         })
         .await
         .expect("deployment puts");

@@ -3,12 +3,11 @@
 //! credentials only as redacted views.
 
 use std::collections::BTreeSet;
-use std::num::NonZeroU32;
 
 use wyrd_ai::cli;
 use wyrd_ai::gateway::{
-    CredentialBindingName, GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation,
-    GatewayPayloadField, ModelId, ModelRef, ProviderAdapter, ProviderAuth, ProviderCredentialName,
+    CredentialBindingName, DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite,
+    GatewayOperation, GatewayPayloadField, ProviderAdapter, ProviderAuth, ProviderCredentialName,
     ProviderCredentialState, ProviderCredentialView, ProviderCredentialWrite,
     ProviderCredentialWriteSource, ProviderDeployment, ProviderDeploymentName, ProviderId,
 };
@@ -55,16 +54,13 @@ async fn put_credential(client: WyrdClient, name: &str) -> ProviderCredentialVie
 fn deployment(name: &str, credential_name: &str) -> ProviderDeployment {
     ProviderDeployment {
         name: ProviderDeploymentName::new(name).expect("deployment name"),
-        model: ModelRef {
-            provider: ProviderId::new("openai").expect("provider"),
-            model: ModelId::new("gpt-4o").expect("model"),
-        },
         adapter: ProviderAdapter::OpenAi,
         auth: ProviderAuth::Bearer {
             credential: credential(credential_name),
         },
-        capabilities: BTreeSet::from([GatewayOperation::ChatCompletions]),
-        routing_weight: NonZeroU32::MIN,
+        models: None,
+        capabilities: Some(BTreeSet::from([GatewayOperation::ChatCompletions])),
+        access: DeploymentAccess::Open,
     }
 }
 
@@ -152,7 +148,7 @@ async fn deployment_without_capabilities_is_refused() {
 
     let refused = Gateway::with_client(deployment.admin())
         .put_deployment(&ProviderDeployment {
-            capabilities: BTreeSet::new(),
+            capabilities: Some(BTreeSet::new()),
             ..self::deployment("no-capability", "no-capability-key")
         })
         .await

@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tracing::Instrument as _;
 use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::cards::{CardSelector, Cards, HydrationMode, RegistrationReceipt};
-use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
+use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite, ModelId};
 use wyrd_ai::observe::EvalObservationOptions;
 use wyrd_ai::otel::start_telemetry;
 use wyrd_ai::state::WyrdState;
@@ -28,7 +28,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// How many requests [`serve`] answers; every tenth asks for a refund.
 pub const REQUESTS: usize = 100;
 
-/// The gateway provider the Prompt's `open_ai_chat_completion` request routes
+/// The gateway deployment the Prompt's `open_ai_chat_completion` request routes
 /// to; with the Prompt's model it is the exact deployment `deploy` requires.
 const PROVIDER: &str = "openai";
 
@@ -125,16 +125,20 @@ pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Desk, Error> {
         return Err("the `prompt` component is not a Prompt".into());
     };
     let model = &prompt.prompt.model;
-    if !gateway.deployments().await?.iter().any(|deployment| {
-        deployment.model.provider.as_str() == PROVIDER && deployment.model.model.as_str() == model
-    }) {
+    let served = ModelId::new(model)?;
+    if !gateway
+        .deployments()
+        .await?
+        .iter()
+        .any(|deployment| deployment.name.as_str() == PROVIDER && deployment.permits(&served))
+    {
         let route = format!("{PROVIDER}/{model}");
         return Err(WyrdError::GatewayModelUnavailable {
             message: format!(
-                "the support Agent's model {route} is not deployed; configure a gateway provider \
-                 deployment for {route} (PUT /v1/admin/gateway/provider-deployments/{{name}})"
+                "the support Agent's model {route} is not deployed; configure the gateway \
+                 deployment {PROVIDER} (PUT /v1/admin/gateway/provider-deployments/{PROVIDER})"
             ),
-            details: json!({ "provider": PROVIDER, "model": model }),
+            details: json!({ "deployment": PROVIDER, "model": model }),
         }
         .into());
     }

@@ -165,11 +165,9 @@ async fn gateway_commands_manage_redacted_tenant_configuration() {
         "deployment.json",
         &json!({
             "name": "primary",
-            "model": {"provider": "openai", "model": "gpt-4o"},
             "adapter": "openai",
             "auth": {"bearer": {"credential": "primary"}},
             "capabilities": ["chat_completions"],
-            "routing_weight": 1,
         }),
     );
     ok_json(&gateway(

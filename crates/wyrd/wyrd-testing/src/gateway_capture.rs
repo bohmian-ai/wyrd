@@ -119,14 +119,12 @@ impl GatewayCapture {
                 }),
             ),
             (
-                "provider-deployments/gpt-4o",
+                "provider-deployments/openai",
                 json!({
-                    "name": "gpt-4o",
-                    "model": {"provider": "openai", "model": "gpt-4o"},
+                    "name": "openai",
                     "adapter": "openai",
                     "auth": {"bearer": {"credential": "openai-key"}},
                     "capabilities": ["chat_completions"],
-                    "routing_weight": 1,
                 }),
             ),
             (

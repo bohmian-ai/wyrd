@@ -8,7 +8,6 @@
 //! what such a client sends.
 
 use std::collections::BTreeSet;
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use serde_json::{Map, Value, json};
@@ -17,7 +16,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::cards::{CardKind, CardSelector, Cards, RegistrationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::gateway::{
-    GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation, ModelId, ModelRef,
+    DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation,
     ProviderAdapter, ProviderAuth, ProviderCredentialName, ProviderCredentialWrite,
     ProviderCredentialWriteSource, ProviderDeployment, ProviderDeploymentName, ProviderId,
 };
@@ -64,8 +63,8 @@ struct Inference {
 
 impl Inference {
     /// Start the upstream and the server, write the `openai-key` credential
-    /// with the CLI as the administrator, deploy `gpt-4o` and `gpt-5-5` on
-    /// it, capture call metadata, and register `ask`.
+    /// with the CLI as the administrator, deploy the `openai`
+    /// deployment on it, capture call metadata, and register `ask`.
     ///
     /// # Panics
     /// Panics when a setup step fails.
@@ -95,24 +94,19 @@ impl Inference {
         .await;
         put_managed(deployment.admin(), "openai-key", PROVIDER_KEY).await;
         let gateway = Gateway::with_client(deployment.admin());
-        for model in ["gpt-4o", "gpt-5-5"] {
-            gateway
-                .put_deployment(&ProviderDeployment {
-                    name: ProviderDeploymentName::new(model).expect("deployment name"),
-                    model: ModelRef {
-                        provider: ProviderId::new("openai").expect("provider"),
-                        model: ModelId::new(model).expect("model"),
-                    },
-                    adapter: ProviderAdapter::OpenAi,
-                    auth: ProviderAuth::Bearer {
-                        credential: ProviderCredentialName::new("openai-key").expect("credential"),
-                    },
-                    capabilities: BTreeSet::from([GatewayOperation::ChatCompletions]),
-                    routing_weight: NonZeroU32::MIN,
-                })
-                .await
-                .expect("deployment puts");
-        }
+        gateway
+            .put_deployment(&ProviderDeployment {
+                name: ProviderDeploymentName::new("openai").expect("deployment name"),
+                adapter: ProviderAdapter::OpenAi,
+                auth: ProviderAuth::Bearer {
+                    credential: ProviderCredentialName::new("openai-key").expect("credential"),
+                },
+                models: None,
+                capabilities: Some(BTreeSet::from([GatewayOperation::ChatCompletions])),
+                access: DeploymentAccess::Open,
+            })
+            .await
+            .expect("deployment puts");
         gateway
             .put_capture_policy(&GatewayCapturePolicyWrite {
                 mode: GatewayCaptureMode::Metadata,

@@ -4,15 +4,14 @@
 //! explain one passing and one failing request through MCP.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU32;
 use std::time::Duration;
 
 use serde_json::json;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::gateway::{
-    GatewayOperation, ModelId, ModelRef, ProviderAdapter, ProviderAuth, ProviderDeployment,
-    ProviderDeploymentName, ProviderId,
+    DeploymentAccess, GatewayOperation, ProviderAdapter, ProviderAuth, ProviderDeployment,
+    ProviderDeploymentName,
 };
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::{Bifrost, Gateway};
@@ -98,20 +97,17 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
     let bundle = tempfile::tempdir().expect("bundle directory creates");
     Gateway::with_client(admin.clone())
         .put_deployment(&ProviderDeployment {
-            name: ProviderDeploymentName::new("anthropic-gpt-4o").expect("deployment name"),
-            model: ModelRef {
-                provider: ProviderId::new("anthropic").expect("provider"),
-                model: ModelId::new("gpt-4o").expect("model"),
-            },
+            name: ProviderDeploymentName::new("anthropic").expect("deployment name"),
             adapter: ProviderAdapter::Anthropic,
             auth: ProviderAuth::None,
-            capabilities: BTreeSet::from([GatewayOperation::ChatCompletions]),
-            routing_weight: NonZeroU32::MIN,
+            models: None,
+            capabilities: Some(BTreeSet::from([GatewayOperation::ChatCompletions])),
+            access: DeploymentAccess::Open,
         })
         .await
-        .expect("the same-name foreign deployment puts");
+        .expect("the foreign deployment puts");
     let Err(missing) = deploy(&admin, &bundle.path().join("refused")).await else {
-        panic!("another provider's gpt-4o does not serve the Agent");
+        panic!("a deployment with another name does not serve the Agent");
     };
     let missing = missing
         .downcast_ref::<wyrd_ai::WyrdError>()
@@ -120,7 +116,7 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
     assert!(
         missing
             .to_string()
-            .contains("configure a gateway provider deployment for openai/gpt-4o"),
+            .contains("configure the gateway deployment openai"),
         "{missing}"
     );
     configure_gateway(&admin).await;

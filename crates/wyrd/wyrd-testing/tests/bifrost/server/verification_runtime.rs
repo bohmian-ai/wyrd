@@ -3228,3 +3228,213 @@ async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyErro
     server.shutdown().await?;
     Ok(())
 }
+
+/// Access-token lifetime of [`reloaded_authority_cannot_widen_gateway_access`],
+/// short enough to observe the initiating credential expire.
+const WIDEN_ACCESS_TTL: chrono::Duration = chrono::Duration::seconds(3);
+
+/// A queued run's reloaded authority cannot reach a model its captured
+/// delegated intersection excluded (AC-013/017, FIND-TASK-001-7).
+///
+/// User A holds the runner and model roles; Service B holds only the
+/// runner role. B, acting for A, queues a manual Drift run, so the stored
+/// authority is A's narrowed by B and carries no model grant. B is then
+/// granted the model role and the initiating delegated token is let expire
+/// until the server refuses it. A fresh queue claim reloads the stored
+/// authority into the protected gateway consumer a judge uses: the model call
+/// is refused before any provider request and audited as A/SYSTEM with the
+/// accepted chain `[B]`. B's own fresh token then reaches the same model,
+/// proving the new grant permits it and only the captured intersection
+/// excluded it.
+///
+/// # Errors
+/// Returns server, exchange, route, claim, or query errors, or a description
+/// of the first expectation that does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJourneyError> {
+    const MODEL_ROLE: &str = "widen_model";
+    let provider = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl_widen", "object": "chat.completion", "created": 1_700_000_000,
+            "model": "gpt-test",
+            "choices": [{ "index": 0, "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "ok" } }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        })))
+        .mount(&provider)
+        .await;
+    let server = Box::pin(
+        WyrdTestServer::builder()
+            .with_gateway_provider_root_for_test(url::Url::parse(&provider.uri())?)
+            .with_access_ttl(WIDEN_ACCESS_TTL)
+            .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
+                allowed_clock_skew: Duration::ZERO,
+            })
+            .start_bound(),
+    )
+    .await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let (subject, _) = seed.service("widen-subject").await?;
+    let verifier = seed
+        .custom_drift_verifier("widen-drift", "score", 1.0, 0.5)
+        .await?;
+    server
+        .deploy_gateway_model_for_test("gpt-test", MODEL_ROLE)
+        .await?;
+    server
+        .seed_role(
+            QUEUED_RUNNER,
+            &[Permission::card_read(), Permission::verifier_run_any()],
+        )
+        .await?;
+    let a = server
+        .bootstrap_user("widen-a", &[QUEUED_RUNNER, MODEL_ROLE])
+        .await?;
+    let b = server
+        .bootstrap_service("widen-b", &[QUEUED_RUNNER])
+        .await?;
+    let b_token = async || -> Result<String, ServerJourneyError> {
+        Ok(server
+            .exchange_api_key(b.api_key().ok_or("B carries an API key")?)
+            .await?)
+    };
+    let initiating = server
+        .delegate(
+            a.jwt().ok_or("A bootstraps a user")?,
+            &b_token().await?,
+            wyrd_spec::auth::TokenAudience::Wyrd,
+        )
+        .await?;
+    let now = Utc::now();
+    let started = server
+        .oneshot_authenticated(
+            &initiating,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/verification/runs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&json!({
+                    "target": { "kind": "verifier", "verifier_card_uid": verifier, "card_uid": subject },
+                    "input": { "kind": "drift_window",
+                        "start": now - chrono::Duration::hours(1), "end": now }
+                }))?))?,
+        )
+        .await?;
+    if !started.status().is_success() {
+        return Err(format!("the delegated run was not accepted: {}", started.status()).into());
+    }
+
+    server.grant_role(&b, MODEL_ROLE).await?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let probe = server
+            .oneshot_authenticated(
+                &initiating,
+                axum::http::Request::builder()
+                    .uri("/v1/verification/runs")
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?;
+        if probe.status() == axum::http::StatusCode::UNAUTHORIZED {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the initiating delegated token never expired".into());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let mut conn = server.tenant_conn_for(tenant).await?;
+    let claimed = wyrd_sql::queries::verifier_runs::VerifierRunQueue::default()
+        .claim(&mut conn, chrono::Duration::minutes(1))
+        .await?
+        .ok_or("the queued run is claimable")?;
+    conn.commit().await?;
+    let system = claimed.system_principal.ok_or("the tenant has SYSTEM")?;
+    let call = |subject: Option<CardUid>| wyrd_server::components::gateway::GatewayCallRequest {
+        operation: wyrd_spec::gateway::GatewayOperation::ChatCompletions,
+        ingress: wyrd_gateway::IngressDialect::OpenAi,
+        model: wyrd_spec::gateway::ModelRef::from_projection("openai/gpt-test")
+            .expect("the model reference is valid"),
+        fallback: None,
+        body: json!({ "model": "openai/gpt-test",
+            "messages": [{ "role": "user", "content": "hi" }] }),
+        media: None,
+        batch: None,
+        deployment: None,
+        stream: false,
+        usage_bound: None,
+        timeout: Duration::from_secs(10),
+        subject: subject.map(|card_uid| {
+            wyrd_server::components::gateway::GatewayCallAttribution::Resolved(
+                wyrd_server::components::gateway::GatewayCallSubject {
+                    run_id: None,
+                    card_uid: Some(card_uid),
+                },
+            )
+        }),
+    };
+    let reloaded = wyrd_server::components::auth::Caller::accepted(&claimed.authority, system);
+    if let Ok(response) = wyrd_server::components::gateway::GatewayInvocation::new(server.state())
+        .invoke(&reloaded, call(Some(claimed.card_uid.clone())))
+        .await
+    {
+        return Err(format!(
+            "the reloaded authority reached the model: {}",
+            response.status
+        )
+        .into());
+    }
+    let reached = provider.received_requests().await.unwrap_or_default().len();
+    if reached != 0 {
+        return Err(format!("the refused call reached the provider {reached} times").into());
+    }
+
+    let fresh = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/chat/completions",
+            server.base_url().ok_or("missing HTTP URL")?
+        ))
+        .bearer_auth(b_token().await?)
+        .json(&call(None).body)
+        .send()
+        .await?;
+    if !fresh.status().is_success() {
+        return Err(format!("B's fresh token was refused: {}", fresh.status()).into());
+    }
+
+    server.await_audit_retained().await?;
+    let (a_id, b_id) = (a.id().to_string(), b.id().to_string());
+    let denied = server
+        .retained_audit_records(
+            tenant,
+            "act_principal_id, detail",
+            &format!(
+                "operation = 'gateway.invoke' AND outcome = 'denied' \
+                 AND sub_principal_id = '{a_id}'"
+            ),
+        )
+        .await?;
+    let [row] = denied.as_slice() else {
+        return Err(format!("expected one denied A/SYSTEM model decision: {denied:?}").into());
+    };
+    let detail: Value = serde_json::from_str(row[1].as_deref().ok_or("the decision has detail")?)?;
+    let chain: Vec<&str> = super::audit_retention::find_field(&detail, "delegation_chain")
+        .and_then(Value::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter_map(|step| step["principal_id"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    if row[0].as_deref() != Some(system.to_string().as_str()) || chain != [b_id.as_str()] {
+        return Err(format!("expected A/SYSTEM with chain [{b_id}], read {row:?}").into());
+    }
+    server.shutdown().await?;
+    Ok(())
+}

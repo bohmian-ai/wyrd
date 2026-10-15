@@ -619,7 +619,7 @@ runner's `1 test run` / `1 passed` line).
 | T06 | 6 | REQ-003; INV-003; AC-012 | PASS (first run hit a transient Postgres port answered by an HTTP listener, `SSLRequest: 0x48`; traced rerun passed unchanged) |
 | T07 | 7 | REQ-005–REQ-008, REQ-011; AC-004, AC-006 | PASS |
 | T08 | 8 | REQ-009–REQ-010; INV-004, INV-007; AC-002, AC-005 | PASS |
-| T09 | 8 | REQ-009–REQ-010; INV-004, INV-006–INV-007; AC-005 | PASS |
+| T09 | 8 | REQ-009–REQ-010; INV-004, INV-007; AC-005 | PASS |
 | T10 | 9 | REQ-010; AC-008 | PASS |
 | T11 | 10 | REQ-008–REQ-011; AC-002, AC-007 | PASS |
 | T12 | 11, 12 | REQ-011–REQ-012; INV-003; AC-009–AC-010 | PASS |
@@ -651,8 +651,8 @@ were added.
 INV-005 (one shared owner): Python `Run.invoke(route=...)` and TypeScript
 `run.invoke(vars, { route })` decode into the Rust `ExecutionRoute` and call
 `Run::invoke_on`. Neither adds routing logic, and a malformed route is
-`WYRD_SPEC_400_VALIDATION`. INV-006: the audit/capture outbox path is
-unchanged (source inspection), and T09 retains outbox failure behavior.
+`WYRD_SPEC_400_VALIDATION`. INV-006: the audit/capture outbox writer is
+unchanged by this task (source inspection); no new writer or queue exists.
 
 Owner checks, all exit 0: `fmt`, `lints`, `codegen:check`, `check:deps`,
 `check:tenant-isolation`, `check:py-wheel-no-testing`, `py:format`,

@@ -54,6 +54,17 @@ impl DomainTable for AuditLogTable {
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::None;
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Standard;
 
+    /// The 13 decision-content columns in contract order.
+    ///
+    /// `sub_principal_id`, `sub_principal_kind`, and `act_principal_id` are
+    /// decision content: the server writes the decision's verified
+    /// subject/actor pair into the frame, and under
+    /// [`CorrelationPolicy::None`] the catalog appends no managed
+    /// correlation columns, so Scribe never overwrites them with the outbox's
+    /// transport identity. The remaining columns name the request, operation,
+    /// resource, optional Card, permission, outcome, Variant detail,
+    /// credential, and decision instant; the catalog appends only the managed
+    /// system columns.
     fn arrow_fields() -> Vec<Field> {
         vec![
             utf8("request_id", false),
@@ -72,6 +83,13 @@ impl DomainTable for AuditLogTable {
         ]
     }
 
+    /// Daily partitions on the decision instant `created_at`, sorted newest
+    /// first, Bloom-pruned on `sub_principal_id`, `resource`, and `operation`.
+    ///
+    /// Partitioning by decision time rather than Scribe receipt keeps a
+    /// retained decision in the day it was made; the Bloom columns serve the
+    /// "who did what to which resource" audit lookups, and the catalog unions
+    /// the managed Bloom floor when it resolves the declaration.
     fn physical_layout() -> PhysicalLayoutWire {
         daily_layout(
             CREATED_AT,

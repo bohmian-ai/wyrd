@@ -3250,9 +3250,19 @@ const WIDEN_ACCESS_TTL: chrono::Duration = chrono::Duration::seconds(3);
 /// # Errors
 /// Returns server, exchange, route, claim, or query errors, or a description
 /// of the first expectation that does not hold.
+///
+/// # Panics
+/// Panics if `#[tokio::test]` cannot build its runtime, if the static
+/// `openai/gpt-test` projection stops parsing as a model reference, or if a
+/// retained audit row lacks either of the two projected columns; every
+/// behavioral expectation failure is returned as an error instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJourneyError> {
+    /// The role carrying the gateway model's invoke permission: A holds it
+    /// before acceptance, B receives it only after the run is accepted, so
+    /// the captured A∩B authority lacks it while B's fresh token, the
+    /// positive control, has it.
     const MODEL_ROLE: &str = "widen_model";
     let provider = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))

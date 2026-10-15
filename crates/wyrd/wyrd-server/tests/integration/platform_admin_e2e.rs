@@ -5236,6 +5236,13 @@ const SYSTEM_CREATOR: &str = "SELECT sub_principal_id, act_principal_id \
 /// while callerless startup reconciliation stamps the no-verified-caller
 /// sentinel on the existing tenant and the reserved audit owner, and leaves the
 /// provisioned tenant's first pair in place.
+///
+/// # Panics
+/// Panics when the server fails to start or restart, the platform root or a
+/// route fails to respond, a response lacks the tenant id or listed root
+/// principal or it does not parse, the pre-existing tenant row does not
+/// insert, a tenant read fails, or any built-in inventory or creator-pair
+/// assertion does not hold.
 #[tokio::test]
 async fn new_and_existing_tenants_receive_every_builtin() {
     let srv = WyrdTestServer::builder()

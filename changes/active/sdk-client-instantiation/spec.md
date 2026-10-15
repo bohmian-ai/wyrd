@@ -1,6 +1,6 @@
 ---
 id: SPEC-sdk-client-instantiation
-revision: 9
+revision: 10
 status: approved
 ---
 
@@ -246,6 +246,10 @@ Out of scope:
   and saved-configuration-only cases, and completes one server call. Supplying
   handle-specific options does not require supplying a client. Python's lazy
   constructors also support both no-client cases on first server use.
+  The saved-configuration-only case applies to handles whose credential has a
+  saved source: the tenant handles. `Platform` accepts only a platform bearer,
+  which has no saved source (D4), so its journey covers the environment-only
+  case and the no-credential refusal through `Platform::connect()`.
 - **AC-003** A user journey per language opens a handle with `connect` and a
   delegated client and shows the server attributes the call to the delegated
   principal (INV-003).
@@ -347,6 +351,7 @@ None. D1 through D5 are resolved; see *Decided*.
 | 7 | approved | Added the agreed typed Bifrost table-list projection in all three SDKs, preserving the existing compact list plus lazy describe contract and rejecting a new catalog abstraction. |
 | 8 | approved | User-requested repository-alignment revisions: authored Python stubs and their actual checks, current `wyrd_ai` module paths, eager exchange qualified by credential kind, retained-cache renewal, and preservation of Platform's existing session exchange. Public construction and discovery scope unchanged. |
 | 9 | approved | User clarification: client is always optional, no-client environment/saved-configuration instantiation is the common usage, and explicit clients are for testing, advanced configuration, or delegation. Require environment-only and saved-only coverage and focused docsite/README guidance. Resolver precedence and API scope unchanged. |
+| 10 | approved | User decision on review finding FIND-TASK-001-6: AC-002's saved-configuration-only case applies to handles with a saved credential source. `Platform` proves environment-only and no-credential `connect()`; no saved platform credential source is added. |
 
 ## Authority
 

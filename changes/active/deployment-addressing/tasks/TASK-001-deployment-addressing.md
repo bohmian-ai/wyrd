@@ -669,6 +669,40 @@ Vault, kind startup image, cgroup capacity, and live Slack/PagerDuty smoke.
 Each needs external infrastructure that is absent locally. The final
 integrated aggregate belongs to change review.
 
+### Post-merge evidence (main merged 2026-10-15)
+
+Main's agent-prompt change registers an Agent's inline Prompt as its own
+`<agent-name>-prompt` Prompt Card; that behavior is kept, and T07 now proves
+the inline form through the hydrated Agent's Prompt Card. Main's Workflow
+additions were removed with the rest of Workflow. Main's agent-prompt
+fixtures and server tests now author portable Prompts with execution routes.
+
+After the merge, T01–T12 and T14–T17 and the judge-route refusal test rerun
+with their exact selectors: all PASS. T13 passed before the merge and was not
+rerun. Also PASS: main's agent-prompt journeys
+(`register_and_hydrate::agent_prompt_registration_identity`,
+`register_and_hydrate::hydrated_agent_prompt_card_navigation`, the
+`pg_card_registration_route::` module, 30 tests); the Python
+register/gateway journeys (18); the TypeScript register/gateway/support-desk
+journeys (25); `py:test:unit` (621); `ts:test:unit` (73); `test:shared` (795);
+`test:wyrd` (2378); `test:cli:journey`; and the CLI `card_lifecycle` tests (19,
+which expect 10 Cards: the Workflow Card is gone and the materialized inline
+Prompt is added). Owner checks rerun clean: `fmt`, `lints`, `codegen:check`,
+`check:deps`, `docs:check`, `py:lints`, `py:typecheck`, `ts:typecheck`,
+`ts:lints`, `ts:napi:check`, `check:ci-selection`.
+
+`gemini` is refused as a custom Prompt provider and the refusal names
+`google`, proved by
+`mise exec -- cargo nextest run --locked -p wyrd-skald-spec --lib -E 'test(=request::round_trip::provider_name_yaml_reads_back_through_buffered_json)'`.
+
+The failing main release jobs are fixed on this branch:
+- crate packaging: `wyrd-telemetry` now has a version and is published,
+  because `wyrd-tonic` depends on it; the release job's `cargo package`
+  command passes locally;
+- Python wheels: the protoc download now fails on HTTP errors and retries;
+- arm server bundle: Linux arm runners get 16 GiB of swap for the fat-LTO
+  link. Only the next release run can prove this.
+
 ## Material Stop Conditions
 
 Stop affected work and route to specification authority if correctness needs:

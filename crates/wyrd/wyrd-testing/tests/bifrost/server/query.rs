@@ -1589,7 +1589,7 @@ async fn scoped_client(
 /// # Errors
 ///
 /// Returns a missing-listener or client-construction failure.
-fn client_for(
+pub(super) fn client_for(
     server: &WyrdTestServer,
     api_key: &secrecy::SecretString,
 ) -> Result<wyrd_client::WyrdClient, ServerJourneyError> {

@@ -2784,3 +2784,204 @@ impl TypedPayloadJourney {
             .collect())
     }
 }
+
+/// Role a delegated manual run needs from both its subject and actor.
+const QUEUED_RUNNER: &str = "queued_runner";
+
+/// Role only the subject holds, so a delegated run's accepted authority
+/// excludes it.
+const QUEUED_SUBJECT_ONLY: &str = "queued_subject_only";
+
+/// A delegated manual run keeps its accepted subject, actor history, and
+/// narrowed authority through a retry and a restarted runtime (AC-013/017).
+///
+/// User A holds the runner role and gateway invocation; Service B holds
+/// only the runner role. B, acting for A, starts a manual Drift run over the
+/// public route. The run is stored as A/B with an authority snapshot whose
+/// principal is A, whose delegation chain names B, and which carries no
+/// gateway grant; the run view exposes no snapshot. A's runner role is then
+/// revoked and B is granted gateway invocation. A first runtime fails the
+/// attempt retryably and stops; a newly built runtime, holding no caller
+/// state, completes it. The snapshot is byte-for-byte unchanged and the
+/// result is attributed to A with SYSTEM as actor.
+///
+/// # Errors
+/// Returns server, exchange, route, runtime, or query errors, or a
+/// description of the first identity or snapshot that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::builder().start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let (subject, _) = seed.service("queued-subject").await?;
+    let verifier = seed
+        .custom_drift_verifier("queued-drift", "score", 1.0, 0.5)
+        .await?;
+    server
+        .seed_role(
+            QUEUED_RUNNER,
+            &[Permission::card_read(), Permission::verifier_run_any()],
+        )
+        .await?;
+    server
+        .seed_role(QUEUED_SUBJECT_ONLY, &[Permission::gateway_invoke_any()])
+        .await?;
+    let a = server
+        .bootstrap_user("queued-a", &[QUEUED_RUNNER, QUEUED_SUBJECT_ONLY])
+        .await?;
+    let b = server
+        .bootstrap_service("queued-b", &[QUEUED_RUNNER])
+        .await?;
+    let Bootstrap::User { jwt: a_token, .. } = &a else {
+        return Err("A bootstraps a user".into());
+    };
+    let a_token = a_token.clone();
+    let delegated = super::query::client_for(&server, b.api_key().ok_or("B carries an API key")?)?
+        .on_behalf_of(
+            secrecy::SecretString::from(a_token),
+            wyrd_spec::auth::TokenAudience::Wyrd,
+        )
+        .await?;
+    let now = Utc::now();
+    let started: Value = delegated
+        .request_json(
+            reqwest::Method::POST,
+            "/v1/verification/runs",
+            Some(&json!({
+                "target": { "kind": "verifier", "verifier_card_uid": verifier, "card_uid": subject },
+                "input": { "kind": "drift_window",
+                    "start": now - chrono::Duration::hours(1), "end": now }
+            })),
+        )
+        .await?;
+    let run_id = started["run_id"]
+        .as_str()
+        .ok_or("the run has an ID")?
+        .to_owned();
+    let run = seed
+        .runs()
+        .await?
+        .into_iter()
+        .find(|run| run.to_string() == run_id)
+        .ok_or("the accepted run is queued")?;
+
+    let superuser = server.pg_fixture().superuser_pool()?;
+    let stored = async || -> Result<(uuid::Uuid, uuid::Uuid, Value), ServerJourneyError> {
+        Ok(sqlx::query_as(
+            "SELECT sub_principal_id, act_principal_id, authority FROM wyrd.verifier_runs \
+             WHERE run_id = $1",
+        )
+        .bind(run.as_uuid())
+        .fetch_one(&superuser)
+        .await?)
+    };
+    let (sub, act, authority) = stored().await?;
+    let (a_id, b_id) = (a.id().as_uuid(), b.id().as_uuid());
+    let snapshot = authority.to_string();
+    if (sub, act) != (a_id, b_id)
+        || authority["principal"]["id"] != json!(a_id)
+        || !authority["delegation_chain"]
+            .to_string()
+            .contains(&b_id.to_string())
+        || snapshot.contains("gateway")
+    {
+        return Err(format!(
+            "expected A/B with A's narrowed authority, read {sub}/{act} {authority}"
+        )
+        .into());
+    }
+    let view: Value = delegated
+        .request_json::<(), _>(
+            reqwest::Method::GET,
+            &format!("/v1/verification/runs/{run_id}"),
+            None,
+        )
+        .await?;
+    if view.get("authority").is_some()
+        || view["sub_principal_id"] != json!(a_id)
+        || view["act_principal_id"] != json!(b_id)
+    {
+        return Err(format!("the run view differs or exposes authority: {view}").into());
+    }
+
+    server.revoke_role(&a, QUEUED_RUNNER).await?;
+    server.grant_role(&b, QUEUED_SUBJECT_ONLY).await?;
+    let retryable = wyrd_spec::verification::VerificationError {
+        code: "test_transient".to_owned(),
+        message: "the first worker fails transiently".to_owned(),
+    };
+    let settled = async |outcome: EngineOutcome,
+                         done: &[&str]|
+           -> Result<wyrd_testing::verification::RunRow, ServerJourneyError> {
+        let script = EngineScript::default();
+        script.push_unheld(outcome);
+        let runtime = VerificationRuntime::builder(server.state())
+            .engine_script(script)
+            .build()
+            .ok_or("the runtime did not compose")?;
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(runtime.run(stop.clone()));
+        let deadline = tokio::time::Instant::now() + WAIT;
+        let row = loop {
+            let row = seed.run(run).await?;
+            if done.contains(&row.status.as_str()) {
+                break row;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("the run never reached {done:?}: {row:?}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        stop.cancel();
+        tokio::time::timeout(WAIT, task).await??;
+        Ok(row)
+    };
+    let first = settled(EngineOutcome::Retry(retryable), &["retrying"]).await?;
+    seed.make_retry_due(run).await?;
+    let report: wyrd_server::verification::engines::VerifierReport = VerifierReport::Drift(Some(
+        serde_json::from_value(json!({
+            "method": "Custom",
+            "features": { "score": { "feature": "score", "score": 0.1, "threshold": 0.5, "verdict": "NoDrift" } },
+            "verdict": "NoDrift"
+        }))?,
+    ));
+    let second = settled(EngineOutcome::Completed(report), &["completed", "errored"]).await?;
+    let (Some(result), 2, "completed") =
+        (second.result_id, second.attempts, second.status.as_str())
+    else {
+        return Err(format!(
+            "expected completion on the second attempt: {first:?} then {second:?}"
+        )
+        .into());
+    };
+    let (sub, act, after) = stored().await?;
+    if (sub, act) != (a_id, b_id) || after != authority {
+        return Err(format!("the accepted run changed: {sub}/{act} {after}").into());
+    }
+
+    let unwritten = server
+        .state()
+        .scribe_outbox
+        .settle(std::time::Instant::now() + WAIT)
+        .await;
+    if unwritten != 0 {
+        return Err(format!("{unwritten} results never reached Scribe").into());
+    }
+    server.flush_bifrost().await?;
+    let system = seed.system_principal();
+    let rows = query_rows(
+        &server,
+        tenant,
+        format!(
+            "SELECT result_id FROM vala.verification.results WHERE result_id = '{result}' \
+             AND {SUB_PRINCIPAL_ID} = '{a_id}' AND {ACT_PRINCIPAL_ID} = '{system}'"
+        ),
+    )
+    .await?;
+    if rows != 1 {
+        return Err(format!("expected one A/SYSTEM result, read {rows}").into());
+    }
+    server.shutdown().await?;
+    Ok(())
+}

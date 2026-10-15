@@ -11,13 +11,14 @@
 //! must release its resources on drop. Executors are constructed per
 //! execution with the accepted caller authority; [`Position`] decides what a
 //! call may do inside that authority, such as whether an Agent gets tools.
-//! Errors reuse [`JudgeError`]: retryable kinds spend the step's retry
-//! budget, terminal kinds make the block inconclusive at once.
+//! A [`BlockError`] is either retryable, spending the step's retry budget,
+//! or terminal, making the block inconclusive at once.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use serde_json::Value;
+use thiserror::Error;
 use tokio::time::Instant;
 
 use wyrd_spec::card::blocks::{Action, Check};
@@ -26,8 +27,6 @@ use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::verification::execution::{
     CallProvenance, InputDeclaration, RequirementDetail, ToolCallRecord, Verdict,
 };
-
-use crate::JudgeError;
 
 /// Where a block sits in the Verifier, which fixes what it may read and do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,15 +106,42 @@ pub struct CheckOutput {
     pub provenance: Option<CallProvenance>,
 }
 
+/// Why a block produced no output. Never a judgment about the subject.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum BlockError {
+    /// Transient failure, such as a provider outage, a later attempt may
+    /// clear.
+    #[error("retryable block failure: {reason}")]
+    Retryable {
+        /// Bounded, secret-free cause.
+        reason: String,
+    },
+    /// Failure another attempt cannot clear, such as malformed model output
+    /// or a provider rejection.
+    #[error("terminal block failure: {reason}")]
+    Terminal {
+        /// Bounded, secret-free cause.
+        reason: String,
+    },
+}
+
+impl BlockError {
+    /// True when the engine may spend retry budget on this error.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable { .. })
+    }
+}
+
 /// Runs data-producing step actions.
 #[async_trait]
 pub trait ActionExecutor: Send + Sync {
     /// Run one action attempt.
     ///
     /// # Errors
-    /// Returns a retryable [`JudgeError`] for a transient failure the step's
-    /// retry budget may repeat, and a terminal one otherwise.
-    async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, JudgeError>;
+    /// Returns [`BlockError::Retryable`] for a transient failure the step's
+    /// retry budget may repeat, and [`BlockError::Terminal`] otherwise.
+    async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError>;
 }
 
 /// Runs verdict-producing requirement checks.
@@ -124,9 +150,9 @@ pub trait CheckExecutor: Send + Sync {
     /// Run one check.
     ///
     /// # Errors
-    /// Returns a [`JudgeError`] when no verdict was produced; the engine
+    /// Returns a [`BlockError`] when no verdict was produced; the engine
     /// records the requirement as inconclusive with the error as reason.
-    async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, JudgeError>;
+    async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError>;
 }
 
 #[cfg(test)]
@@ -147,16 +173,16 @@ mod tests {
         /// Return the `from` JSON value, or a terminal error when absent.
         ///
         /// # Errors
-        /// Returns [`JudgeError::Terminal`] when `from` is missing or is
+        /// Returns [`BlockError::Terminal`] when `from` is missing or is
         /// evidence rather than JSON.
-        async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, JudgeError> {
+        async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
             match call.inputs.get("from").map(|input| &input.value) {
                 Some(CallValue::Json(value)) => Ok(ActionOutput {
                     output: value.clone(),
                     provenance: None,
                     tool_calls: Vec::new(),
                 }),
-                _ => Err(JudgeError::Terminal {
+                _ => Err(BlockError::Terminal {
                     reason: "from is not JSON".to_owned(),
                 }),
             }

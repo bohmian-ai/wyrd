@@ -102,6 +102,10 @@ name = "wyrd-spec"
 publish = true
 
 [[package]]
+name = "wyrd-telemetry"
+publish = true
+
+[[package]]
 name = "wyrd-tls"
 publish = true
 

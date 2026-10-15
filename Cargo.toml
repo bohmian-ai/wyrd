@@ -194,7 +194,7 @@ toml = "0.8"
 toml_edit = "0.22"
 shellexpand = "3"
 ipnetwork = "0.20"
-wyrd-telemetry = { path = "crates/shared/wyrd-telemetry" }
+wyrd-telemetry = { path = "crates/shared/wyrd-telemetry", version = "0.1.0" }
 arc-swap = "1.7"
 # Client-safe baseline (no `transport`/`server` → no axum). `wyrd-tonic` adds the
 # client `channel`/`tls` features and gates `tonic/server` behind its `server`

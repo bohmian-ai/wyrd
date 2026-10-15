@@ -19,7 +19,7 @@ use super::{
     DriftReport, DriftWindow, VerificationError, VerificationExecutionStatus, VerificationVerdict,
 };
 use crate::auth::Sha256Hex;
-use crate::card::agent::ExecutionRoute;
+use crate::card::agent::{BuiltinTool, ExecutionRoute};
 use crate::card::blocks::{Check, CodeRuntime};
 use crate::error::WyrdError;
 use crate::ids::{CardUid, ExecutionId, SlotName};
@@ -306,12 +306,23 @@ pub enum StepStatus {
 }
 
 /// One tool call an Agent action made.
+///
+/// Records what the model received, never the raw tool output: the digest
+/// and size describe the bounded output actually returned. A call that
+/// returned no output, such as one that failed, has no digest and zero
+/// returned bytes rather than a digest of nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolCallRecord {
-    /// Tool name, such as `fs.read`.
-    pub tool: String,
+    /// The built-in called.
+    pub tool: BuiltinTool,
     /// Call arguments.
     pub arguments: Value,
+    /// SHA-256 of the bounded output returned to the model; absent when the
+    /// call returned none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_sha256: Option<Sha256Hex>,
+    /// Bytes of output returned to the model; zero when it returned none.
+    pub returned_bytes: u64,
     /// Error the tool returned, when it failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -424,8 +435,10 @@ mod tests {
         }
     }
 
-    /// A result with every locator kind, drift detail, provenance, and a
-    /// skipped step keeps its documented wire form.
+    /// A result with every locator kind, drift detail, provenance, tool calls
+    /// with and without returned output, and a skipped step keeps its
+    /// documented wire form; records without a returned size, naming a
+    /// non-built-in tool, or with a non-canonical digest are refused.
     ///
     /// # Panics
     /// Panics when the documented result does not round-trip.
@@ -459,7 +472,10 @@ mod tests {
                 "steps": [{
                     "id": "structure", "status": "skipped", "attempts": 0, "duration_ms": 0,
                     "reason": "when was false",
-                    "tool_calls": [{"tool": "fs.read", "arguments": {"path": "/inputs/a.pdf"}}]
+                    "tool_calls": [
+                        {"tool": "fs.read", "arguments": {"path": "/inputs/a.pdf"}, "output_sha256": "c".repeat(64), "returned_bytes": 512},
+                        {"tool": "fs.search", "arguments": {"query": "cap"}, "returned_bytes": 0, "error": "workspace read timed out"}
+                    ]
                 }],
                 "evidence": {"contract": {"kind": "file", "sha256": "b".repeat(64), "size_bytes": 4, "format": "pdf"}}
             }
@@ -473,6 +489,16 @@ mod tests {
             )
             .is_err()
         );
+        for record in [
+            json!({"tool": "fs.read", "arguments": {}}),
+            json!({"tool": "http.fetch", "arguments": {}, "returned_bytes": 0}),
+            json!({"tool": "fs.read", "arguments": {}, "output_sha256": "C".repeat(64), "returned_bytes": 1}),
+        ] {
+            assert!(
+                serde_json::from_value::<ToolCallRecord>(record.clone()).is_err(),
+                "{record}"
+            );
+        }
     }
 
     /// A delayed idempotency conflict is reported with the existing stable

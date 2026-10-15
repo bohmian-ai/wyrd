@@ -216,4 +216,40 @@ mod tests {
         let output = executor.execute(call).await.expect("output");
         assert_eq!(output.output, json!({"slides": []}));
     }
+
+    /// A tool record an action returns is the record a step result carries:
+    /// its digest and returned byte count survive the result wire round trip.
+    ///
+    /// # Panics
+    /// Panics when the step result does not round-trip the record unchanged.
+    #[test]
+    fn action_tool_calls_carry_into_step_results() {
+        use wyrd_spec::card::agent::BuiltinTool;
+        use wyrd_spec::verification::execution::{StepResult, StepStatus};
+        let record: ToolCallRecord = serde_json::from_value(json!({
+            "tool": "fs.read", "arguments": {"path": "/inputs/a.pdf"},
+            "output_sha256": "c".repeat(64), "returned_bytes": 512
+        }))
+        .expect("record");
+        let output = ActionOutput {
+            output: json!({"cap": 24}),
+            provenance: None,
+            tool_calls: vec![record.clone()],
+        };
+        let step = StepResult {
+            id: TaskId::new("findings").expect("id"),
+            status: StepStatus::Succeeded,
+            output: Some(output.output),
+            attempts: 1,
+            duration_ms: 5,
+            reason: None,
+            provenance: output.provenance,
+            tool_calls: output.tool_calls,
+        };
+        let wire = serde_json::to_value(&step).expect("serialize");
+        let parsed: StepResult = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(parsed.tool_calls, vec![record]);
+        assert_eq!(parsed.tool_calls[0].tool, BuiltinTool::FsRead);
+        assert_eq!(parsed.tool_calls[0].returned_bytes, 512);
+    }
 }

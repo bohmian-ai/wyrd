@@ -37,7 +37,6 @@ def test_every_listed_export_resolves(module_name: str) -> None:
 @pytest.mark.parametrize(
     ("module_name", "name"),
     [
-        ("wyrd.agent", "Workflow"),
         ("wyrd.cards", "AgentCard"),
         ("wyrd.cards", "Cards"),
         ("wyrd.config", "WyrdConfig"),

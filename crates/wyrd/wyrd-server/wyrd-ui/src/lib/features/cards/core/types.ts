@@ -13,7 +13,6 @@ export const CARD_KINDS = [
   'Experiment',
   'Prompt',
   'Agent',
-  'Workflow',
   'Mcp',
   'Policy',
   'Audit',
@@ -62,15 +61,6 @@ export type CardVersionRow = { version: string; created: string; by: string; not
 
 /** One server-derived relationship, rendered as `relation — label`. */
 export type CardRelationship = { relation: string; label: string; href?: string };
-
-/** C-08 — the earned Workflow presentation payload: declaration, never results. */
-export type WorkflowPresentation = {
-  stages: string[];
-  stageNote: string;
-  io: KV[];
-  governance: KV[];
-  execution: string;
-};
 
 /** C-12 — the earned Verifier presentation payload; secrets never render. */
 export type VerifierPresentation = {
@@ -255,7 +245,7 @@ export type CardDetail = {
   versions: CardVersionRow[];
   actions: { label: string; href: string }[];
   spec: SpecSection[];
-  presentation?: WorkflowPresentation | VerifierPresentation | ServicePresentation;
+  presentation?: VerifierPresentation | ServicePresentation;
   metadata: KV[];
   relationships: CardRelationship[];
 };

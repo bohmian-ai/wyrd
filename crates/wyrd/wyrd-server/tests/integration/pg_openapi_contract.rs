@@ -20,7 +20,7 @@ use secrecy::ExposeSecret as _;
 use serde_json::Value;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::storage::ids::UploadId;
-use wyrd_testing::WyrdTestServer;
+use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// Media type RFC 9457 problem bodies are served with.
 const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
@@ -175,13 +175,6 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1beta/models/{deployment}/{target}",
     ] {
         assert!(paths.contains_key(path), "missing {path}");
-    }
-    for (path, method) in [
-        ("/v1/workflow-runs", "post"),
-        ("/v1/workflow-runs/{run_id}", "get"),
-        ("/v1/workflow-runs/{run_id}/cancel", "post"),
-    ] {
-        assert!(paths[path][method].is_object(), "missing {method} {path}");
     }
     assert!(
         !paths.contains_key("/v1/cards/{card_uid}/abort"),
@@ -1902,6 +1895,152 @@ async fn a_malformed_administrative_identifier_answers_with_a_documented_problem
             documented_description(&document, path, "get", 400)
                 .contains("WYRD_SPEC_400_VALIDATION"),
             "GET {path} lists WYRD_SPEC_400_VALIDATION on its 400"
+        );
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// T12: Agents replace the retired Workflow product on the served contract.
+///
+/// Over real HTTP against a bound server, an editor's `kind: Workflow`
+/// registration is refused as an unknown Card kind; the served document names
+/// no `/v1/workflow-runs` path, and none of the three retired operations is
+/// routable; and the same editor still registers a Prompt and then the Agent
+/// that executes it.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, the bootstrap returns a
+/// non-user principal, a request fails, or a status, body, or path assertion
+/// does not hold.
+#[tokio::test]
+async fn agent_contracts_replace_workflow() {
+    let server = WyrdTestServer::start_bound()
+        .await
+        .expect("bound server starts");
+    let base_url = server
+        .base_url()
+        .expect("bound server exposes a base URL")
+        .to_owned();
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("t12-agent-editor", &["editor"])
+        .await
+        .expect("editor bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let http = reqwest::Client::new();
+    let register = |idempotency_key: &str, submissions: Value| {
+        http.post(format!("{base_url}/v1/cards"))
+            .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+            .header("Idempotency-Key", idempotency_key)
+            .json(&serde_json::json!({ "submissions": submissions }))
+            .send()
+    };
+    let metadata =
+        |name: &str| serde_json::json!({ "name": name, "version": "1.0.0", "space": "default" });
+
+    let workflow = register(
+        "t12-workflow",
+        serde_json::json!([{
+            "apiVersion": "wyrd/v1",
+            "kind": "Workflow",
+            "metadata": metadata("t12-workflow"),
+            "spec": { "steps": [] },
+            "artifacts": []
+        }]),
+    )
+    .await
+    .expect("Workflow registration answers");
+    assert_eq!(workflow.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let refusal = workflow.text().await.expect("refusal body reads");
+    assert!(
+        refusal.contains("unknown card kind: Workflow"),
+        "Workflow is not a Card kind: {refusal}"
+    );
+
+    let document: Value = http
+        .get(format!("{base_url}/openapi.json"))
+        .send()
+        .await
+        .expect("document answers")
+        .json()
+        .await
+        .expect("document is JSON");
+    let paths = document["paths"].as_object().expect("paths object");
+    assert!(
+        paths.contains_key("/v1/cards"),
+        "the Card surface is served"
+    );
+    let retired: Vec<&String> = paths
+        .keys()
+        .filter(|path| path.starts_with("/v1/workflow"))
+        .collect();
+    assert!(
+        retired.is_empty(),
+        "no Workflow path is documented: {retired:?}"
+    );
+
+    let run = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b20";
+    for (method, path) in [
+        (reqwest::Method::POST, "/v1/workflow-runs".to_owned()),
+        (reqwest::Method::GET, format!("/v1/workflow-runs/{run}")),
+        (
+            reqwest::Method::POST,
+            format!("/v1/workflow-runs/{run}/cancel"),
+        ),
+    ] {
+        let status = http
+            .request(method.clone(), format!("{base_url}{path}"))
+            .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("retired route answers")
+            .status();
+        assert!(
+            status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path} is not routable: {status}"
+        );
+    }
+
+    let prompt = serde_json::json!({
+        "apiVersion": "wyrd/v1",
+        "kind": "Prompt",
+        "metadata": metadata("t12-prompt"),
+        "spec": {
+            "provider": "openai",
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hello" }]
+        },
+        "artifacts": []
+    });
+    let agent = serde_json::json!({
+        "apiVersion": "wyrd/v1",
+        "kind": "Agent",
+        "metadata": metadata("t12-agent"),
+        "spec": {
+            "prompt": {
+                "kind": "Prompt", "name": "t12-prompt",
+                "version": "1.0.0", "space": "default"
+            },
+            "execution_route": { "kind": "native" }
+        },
+        "artifacts": []
+    });
+    for (idempotency_key, submission, kind) in [
+        ("t12-prompt", prompt, "Prompt"),
+        ("t12-agent", agent, "Agent"),
+    ] {
+        let response = register(idempotency_key, serde_json::json!([submission]))
+            .await
+            .expect("registration answers");
+        let status = response.status();
+        let receipt: Value = response.json().await.expect("receipt is JSON");
+        assert_eq!(status, StatusCode::CREATED, "{receipt}");
+        assert_eq!(
+            receipt["outcomes"][0]["card_ref"]["kind"], kind,
+            "{receipt}"
         );
     }
 

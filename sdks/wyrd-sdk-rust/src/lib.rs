@@ -24,9 +24,8 @@
 //! behind the `testing` feature and is absent from production builds.
 //!
 //! The list also holds the projection to the surface every SDK shares
-//! (REQ-210): the `wyrd_client::workflow` module is left off, so the remote
-//! `Workflows` handle and the gateway caller are not reachable here; Workflows
-//! are YAML-authored through [`Workflow`]. The `auth` and `storage` modules
+//! (REQ-210): the `wyrd_client::gateway_caller` module is left off, so the
+//! Agent gateway caller is not reachable here. The `auth` and `storage` modules
 //! are left off too: the authentication middleware and the artifact-transfer
 //! client are mechanics behind [`WyrdClient`] and [`cards::Cards`]. [`transport`]
 //! carries only the endpoint and credential types [`config::ClientConfig`]
@@ -40,8 +39,8 @@
 
 pub use wyrd_client::{
     Bifrost, Gateway, GlobalConfig, OperatorConnections, Platform, Principals, QueueConfig,
-    Workflow, WorkflowCards, WyrdClient, bifrost, cards, client, config, environment, error,
-    gateway, global_config, observe, operator_connections, platform, principals, state,
+    WyrdClient, bifrost, cards, client, config, environment, error, gateway, global_config,
+    observe, operator_connections, platform, principals, state,
 };
 
 /// Endpoint and credential types the client configuration names.
@@ -82,10 +81,6 @@ pub use wyrd_spec::envelope::{Card, Spec};
 
 /// How a Verifier Card judges: an Eval or a Drift implementation.
 pub use wyrd_spec::card::verifier::VerifierImplementation;
-
-/// The record of one Workflow run, as [`Workflow::run`] returns it, and its
-/// final status.
-pub use wyrd_spec::card::workflow::{WorkflowRun, WorkflowRunStatus};
 
 /// The count rollup a [`Judgment`] carries.
 pub use wyrd_spec::card::operator::VerifierCounts;
@@ -128,9 +123,6 @@ mod tests {
         let _ = super::WyrdClient::with_config;
         let _ = super::Gateway::with_client;
         let _ = super::Gateway::from_env;
-        let _ = super::Workflow::from_yaml;
-        let _ = super::Workflow::steps;
-        let _ = super::cards::Cards::workflow;
         let _ = super::WyrdError::code;
     }
 

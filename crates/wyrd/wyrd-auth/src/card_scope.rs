@@ -601,7 +601,7 @@ mod pg_tests {
         // We can't easily create MAX_SCOPE_CARDS+1 Service cards with children,
         // but we can verify the pure error shape produced by too_large directly
         // and confirm resolve errors for a missing card (cap logic is unreachable
-        // without Agent/Workflow cards having scope children).
+        // without Agent cards having scope children).
         let root = make_card_ref(CardKind::Service, "prod", "svc-cap-test");
         let err = too_large("cards", MAX_SCOPE_CARDS, &root);
         let WyrdError::CardScopeTooLarge { message, details } = err else {

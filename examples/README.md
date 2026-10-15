@@ -9,6 +9,3 @@ points without searching crate internals.
   installed CLI on a local server.
 - `examples/support-desk/` is the canonical verified Service, the same story
   in Rust, Python, and TypeScript.
-- `examples/workflows/` contains language-neutral Workflow Card bundles; the
-  `code-review/` bundle is the canonical multi-file Workflow, Agent, and Prompt
-  Card example.

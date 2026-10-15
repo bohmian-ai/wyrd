@@ -1,13 +1,11 @@
-//! Workflow model calls through the public Wyrd gateway ingress.
+//! Agent model calls through the public Wyrd gateway ingress.
 //!
-//! [`PublicWyrdGatewayCaller`] serves `wyrd_gateway` Workflow routes outside
-//! the server. Each call projects its native Skald request onto the matching
-//! protocol ingress, carries its own fallback in the `wyrd-gateway-fallback`
-//! header, bounds itself by its own remaining time, and stops when the run is
+//! [`PublicWyrdGatewayCaller`] serves `wyrd_gateway` Agent routes outside the
+//! server. Each call projects its native Skald request onto the matching
+//! protocol ingress, bounds itself by its own remaining time, and stops when
 //! cancelled. Nothing about one call is stored on the caller, so concurrent
-//! steps cannot see each other's fallback, deadline, or correlation.
-//! Workflow correlation travels only in this call's tracing span; a caller
-//! given an application Run, a Card UID, or both with
+//! calls cannot see each other's deadline. A caller given an application Run,
+//! a Card UID, or both with
 //! [`PublicWyrdGatewayCaller::with_subject`] sends each one it has as its own
 //! gateway correlation header. Refusals in the
 //! protocol's native error envelope are normalized to a redacted
@@ -18,14 +16,14 @@ use bytes::Bytes;
 use reqwest::StatusCode;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use skald_agent::{WyrdGatewayCall, WyrdGatewayCaller};
 use skald_providers::{ProviderError, RemoteProblem};
 use skald_spec::{ProviderRequest, ProviderResponse};
-use skald_workflow::{WyrdGatewayCall, WyrdGatewayCaller};
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::native::{AnthropicErrorEnvelope, GoogleErrorEnvelope};
 use wyrd_spec::gateway::openai::OpenAiErrorEnvelope;
-use wyrd_spec::gateway::{CARD_UID_HEADER, FALLBACK_HEADER, ModelRef, RUN_HEADER};
+use wyrd_spec::gateway::{CARD_UID_HEADER, ModelRef, RUN_HEADER};
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::ids::RunId;
 
@@ -34,7 +32,7 @@ use crate::WyrdClient;
 /// Provider label on errors raised by public gateway calls.
 const PROVIDER: &str = "wyrd_gateway";
 
-/// Workflow gateway caller over one shared [`WyrdClient`].
+/// Agent gateway caller over one shared [`WyrdClient`].
 ///
 /// The client's authentication, token cache, and connection pool serve every
 /// call; cloning is cheap.
@@ -89,40 +87,20 @@ impl WyrdGatewayCaller for PublicWyrdGatewayCaller {
     ///
     /// # Errors
     /// Returns [`ProviderError::BadRequest`] for a dialect the public gateway
-    /// does not serve (including Vertex) or an unencodable request or
-    /// fallback; [`ProviderError::Timeout`] when the call's time runs out or
-    /// the run is cancelled; [`ProviderError::Connect`] for a transport
+    /// does not serve (including Vertex) or an unencodable request;
+    /// [`ProviderError::Timeout`] when the call's time runs out or it is
+    /// cancelled; [`ProviderError::Connect`] for a transport
     /// failure; [`ProviderError::RemoteProblem`] for a refusal or an
     /// authentication failure; and [`ProviderError::Decode`] when a success is
     /// not the dialect's native response.
-    #[tracing::instrument(
-        name = "workflow.gateway.call",
-        skip_all,
-        fields(
-            wyrd.workflow.run_id = call.correlation.as_ref().map(|c| tracing::field::display(c.run_id)),
-            wyrd.workflow.step_id = call.correlation.as_ref().map(|c| c.step_id.as_str()),
-            wyrd.workflow.attempt = call.correlation.as_ref().map(|c| c.attempt),
-        )
-    )]
+    #[tracing::instrument(name = "agent.gateway.call", skip_all)]
     async fn call(
         &self,
         call: WyrdGatewayCall,
         cancellation: &CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
         let native = NativeCall::project(call.request, &call.model)?;
-        let fallback = call
-            .fallback
-            .as_ref()
-            .map(|fallback| {
-                fallback.to_header_value().map_err(|_| {
-                    ProviderError::bad_request(PROVIDER, "fallback override does not encode")
-                })
-            })
-            .transpose()?;
-        let mut headers: Vec<(&str, &str)> = fallback
-            .iter()
-            .map(|value| (FALLBACK_HEADER, value.as_str()))
-            .collect();
+        let mut headers: Vec<(&str, &str)> = Vec::new();
         if let Some(run_id) = &self.run_id {
             headers.push((RUN_HEADER, run_id.as_str()));
         }

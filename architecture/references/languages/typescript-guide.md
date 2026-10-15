@@ -55,7 +55,7 @@ Prefer APIs that make invalid states unrepresentable:
 // Tagged union for closed sets
 export type CardKind =
   | 'Model' | 'Data' | 'Artifact' | 'Experiment'
-  | 'Prompt' | 'Agent' | 'Workflow' | 'Mcp'
+  | 'Prompt' | 'Agent' | 'Mcp'
   | 'Service' | 'Policy' | 'Audit' | 'Verifier'
   | 'Source' | 'Trigger' | 'Operator'
   | 'External';

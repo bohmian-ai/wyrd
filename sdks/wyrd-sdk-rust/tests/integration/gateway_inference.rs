@@ -1,19 +1,17 @@
 //! Callers reach a model through the Wyrd Gateway: an OpenAI-compatible
-//! client with a Wyrd access token, a registered Workflow loaded through
-//! Cards, and the code-review example run from its file. The upstream sees
-//! only the operator's provider key.
+//! client with a Wyrd access token and a hydrated Agent's Run. The upstream
+//! sees only the operator's provider key.
 //!
 //! No OpenAI Rust SDK is a dependency, so the OpenAI-compatible caller is a
 //! plain Chat Completions request with a bearer token, which is the whole of
 //! what such a client sends.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_ai::cards::{CardKind, CardSelector, Cards, RegistrationReceipt};
+use wyrd_ai::cards::{CardKind, RegistrationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::gateway::{
     DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation,
@@ -22,7 +20,7 @@ use wyrd_ai::gateway::{
     ProviderDeploymentName, ProviderId,
 };
 use wyrd_ai::operator_connections::SecretBearer;
-use wyrd_ai::{Gateway, Workflow, WorkflowRun, WorkflowRunStatus, WyrdClient};
+use wyrd_ai::{Gateway, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
 
 use wyrd_ai::state::WyrdState;
@@ -32,40 +30,20 @@ use crate::support::{Deployment, ancestry, hydrate, register, registered};
 /// The provider key the operator submits; only the upstream may see it.
 const PROVIDER_KEY: &str = "sk-native-upstream";
 
-/// The code-review example directory, whose Workflow calls `openai/gpt-5-5`
-/// through the Wyrd gateway.
-fn example() -> PathBuf {
-    PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/workflows/code-review"
-    ))
-}
-
-/// The example's checked-in run input.
-///
-/// # Panics
-/// Panics when `input.json` cannot be read or is not a JSON object.
-fn example_input() -> Map<String, Value> {
-    serde_json::from_str(
-        &std::fs::read_to_string(example().join("input.json")).expect("example input reads"),
-    )
-    .expect("example input is an object")
-}
-
 /// A Gateway in front of a local upstream that answers `hi`.
 struct Inference {
     /// The deployment.
     deployment: Deployment,
     /// The upstream every deployment reaches.
     upstream: MockServer,
-    /// The registered `ask` Workflow.
+    /// The registered `ask-agent` Agent and its Prompt.
     ask: RegistrationReceipt,
 }
 
 impl Inference {
     /// Start the upstream and the server, write the `openai-key` credential
     /// with the CLI as the administrator, deploy the `openai`
-    /// deployment on it, capture call metadata, and register `ask`.
+    /// deployment on it, capture call metadata, and register `ask-agent`.
     ///
     /// # Panics
     /// Panics when a setup step fails.
@@ -115,28 +93,16 @@ impl Inference {
             })
             .await
             .expect("the capture policy puts");
-        let ask = register(&deployment.cards(), "cards/gateway_inference/ask.yaml").await;
+        let ask = register(
+            &deployment.cards(),
+            "cards/gateway_inference/ask-agent.yaml",
+        )
+        .await;
         Self {
             deployment,
             upstream,
             ask,
         }
-    }
-
-    /// A client of the tenant administrator `wyrd setup` issues, who is bound
-    /// to no Card and so may run any registered Workflow of the tenant.
-    ///
-    /// # Panics
-    /// Panics when the key cannot be issued.
-    async fn tenant_admin(&self) -> WyrdClient {
-        let key = self
-            .deployment
-            .server()
-            .tenant_admin_key()
-            .await
-            .expect("the tenant administrator key issues");
-        self.deployment
-            .client(secrecy::ExposeSecret::expose_secret(&key))
     }
 
     /// The `authorization` header of every request the upstream received.
@@ -556,239 +522,6 @@ async fn cli_issues_a_card_scoped_key_and_writes_a_provider_credential() {
         )
     );
     assert!(!view.to_string().contains("sk-managed"), "{view}");
-    inference.deployment.shutdown().await;
-}
-
-/// The tenant administrator A's client and Service B's client acting for A.
-///
-/// # Panics
-/// Panics when A's key cannot be issued, A's token cannot mint, or B cannot act
-/// for A.
-async fn subject_and_delegate(inference: &Inference) -> [WyrdClient; 2] {
-    let admin = inference.tenant_admin().await;
-    let subject = admin.access_token().await.expect("A's token mints");
-    let delegated = inference
-        .deployment
-        .client(&inference.deployment.key("workflow_actor", &["admin"]).await)
-        .on_behalf_of(
-            secrecy::SecretString::from(subject.expose().to_owned()),
-            wyrd_spec::auth::TokenAudience::Wyrd,
-        )
-        .await
-        .expect("B acts for A");
-    [admin, delegated]
-}
-
-/// The published `vala.gateway.calls` rows, oldest first, after asserting
-/// the first is A acting for itself and the second is B acting for A.
-///
-/// # Panics
-/// Panics when the rows do not publish or read, or the pairs differ.
-async fn direct_then_delegated_calls(inference: &Inference) -> Vec<CallAttribution> {
-    inference
-        .deployment
-        .server()
-        .flush_bifrost()
-        .await
-        .expect("rows publish");
-    let calls: Vec<CallAttribution> = wyrd_ai::Bifrost::connect(&inference.deployment.admin())
-        .await
-        .expect("Bifrost connects")
-        .sql_as(
-            "SELECT sub_principal_id, act_principal_id, run_id, card_uid \
-             FROM vala.gateway.calls ORDER BY started_at",
-            &[],
-        )
-        .await
-        .expect("calls read back");
-    let [direct, delegated] = &calls[..] else {
-        panic!("one call per run: {calls:?}");
-    };
-    assert_eq!(direct.sub_principal_id, direct.act_principal_id);
-    assert_eq!(delegated.sub_principal_id, direct.sub_principal_id);
-    assert_ne!(delegated.act_principal_id, delegated.sub_principal_id);
-    calls
-}
-
-/// A registered Workflow loaded through Cards reaches the model through the
-/// Gateway with its loading client, and the upstream sees the provider key.
-///
-/// The tenant administrator A runs it directly and Service B runs it for A, so
-/// the captured calls read back as A/A and A/B, each attributed to the loaded
-/// Workflow Card with no application Run. A Service bound to a Card whose
-/// scope excludes the Workflow is refused before any provider call (AC-011).
-///
-/// # Panics
-/// Panics when the load or run fails, the outputs differ, the upstream
-/// request differs, a captured call's attribution differs, or the
-/// out-of-scope run is not refused.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn loaded_workflow_calls_the_gateway_through_its_loading_client() {
-    let inference = Inference::start().await;
-    for client in subject_and_delegate(&inference).await {
-        let workflow = Cards::with_client(client)
-            .workflow()
-            .load(&CardSelector::exact(inference.ask.root.clone()))
-            .await
-            .expect("the registered Workflow loads");
-        let run = workflow
-            .run(Map::from_iter([("question".to_owned(), Value::from("hi"))]))
-            .await
-            .expect("the run starts");
-        assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{:?}", run.error);
-        assert_eq!(json!(run.outputs), json!({ "answer": "hi" }));
-    }
-
-    assert_eq!(
-        inference.upstream_authorizations().await,
-        vec![Some(format!("Bearer {PROVIDER_KEY}")); 2]
-    );
-    let workflow = inference.ask.root.uid.as_ref().map(ToString::to_string);
-    for call in direct_then_delegated_calls(&inference).await {
-        assert_eq!((call.run_id.as_deref(), &call.card_uid), (None, &workflow));
-    }
-
-    let refused = inference
-        .deployment
-        .cards()
-        .workflow()
-        .load(&CardSelector::exact(inference.ask.root.clone()))
-        .await
-        .expect("the out-of-scope Service loads the Workflow")
-        .run(Map::from_iter([("question".to_owned(), Value::from("hi"))]))
-        .await
-        .expect("the run starts");
-    assert_eq!(refused.status, WorkflowRunStatus::Failed);
-    assert_eq!(
-        refused.error.map(|error| error.code),
-        Some("WYRD_VALA_403_BIFROST_CARD_SCOPE".to_owned())
-    );
-    assert_eq!(inference.upstream_authorizations().await.len(), 2);
-    inference.deployment.shutdown().await;
-}
-
-/// A server-hosted Workflow run's model call is the captured caller's own
-/// work on the Workflow Card (AC-011).
-///
-/// A runs the registered Workflow on the server directly and B runs it for
-/// A, so the captured calls read back as A/A and A/B, each attributed to the
-/// Workflow Card with no application Run.
-///
-/// # Panics
-/// Panics when a run fails or a captured call's attribution differs.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn hosted_workflow_calls_record_the_caller_and_the_workflow_card() {
-    let inference = Inference::start().await;
-    let request = wyrd_spec::card::workflow::CreateWorkflowRunRequest {
-        workflow: inference.ask.root.clone(),
-        input: [("question".to_owned(), Value::from("hi"))].into(),
-        timeout_seconds: None,
-    };
-    for client in subject_and_delegate(&inference).await {
-        let mut run: WorkflowRun = client
-            .submit_idempotent(reqwest::Method::POST, "/v1/workflow-runs", &request)
-            .await
-            .expect("the run is accepted");
-        while !run.status.is_terminal() {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            run = client
-                .request_json(
-                    reqwest::Method::GET,
-                    &format!("/v1/workflow-runs/{}", run.run_id),
-                    None::<&()>,
-                )
-                .await
-                .expect("the run reads");
-        }
-        assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{:?}", run.error);
-    }
-
-    let workflow = inference.ask.root.uid.as_ref().map(ToString::to_string);
-    for call in direct_then_delegated_calls(&inference).await {
-        assert_eq!((call.run_id.as_deref(), &call.card_uid), (None, &workflow));
-    }
-    inference.deployment.shutdown().await;
-}
-
-/// The code-review example runs from its file through the Wyrd gateway as
-/// the client it is loaded with: each of its three steps reaches the
-/// upstream with the provider key.
-///
-/// # Panics
-/// Panics when the load or run fails, the outputs differ, or the upstream
-/// calls differ.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn example_workflow_runs_through_the_wyrd_gateway() {
-    let inference = Inference::start().await;
-    let example = Workflow::from_path_with_client(
-        example().join("workflow.yaml"),
-        inference.deployment.admin(),
-    )
-    .await
-    .expect("the example loads");
-
-    let run = example.run(example_input()).await.expect("the run starts");
-
-    assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{:?}", run.error);
-    assert_eq!(json!(run.outputs), json!({ "review": "hi" }));
-    assert_eq!(
-        inference.upstream_authorizations().await,
-        vec![Some(format!("Bearer {PROVIDER_KEY}")); 3]
-    );
-    inference.deployment.shutdown().await;
-}
-
-/// Applying the example registers it without calling any model.
-///
-/// # Panics
-/// Panics when the apply fails or the upstream received a call.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn applying_a_workflow_calls_no_model() {
-    let inference = Inference::start().await;
-
-    let applied = cli::apply(&example(), Some(inference.deployment.admin()))
-        .await
-        .expect("the example applies");
-
-    assert_eq!(applied.root.kind, CardKind::Workflow);
-    assert_eq!(inference.upstream_authorizations().await, []);
-    inference.deployment.shutdown().await;
-}
-
-/// The applied example, loaded back through Cards by the tenant administrator,
-/// runs through the Wyrd gateway.
-///
-/// # Panics
-/// Panics when the apply, load, or run fails, the outputs differ, or the
-/// upstream calls differ.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn registered_example_runs_through_the_gateway() {
-    let inference = Inference::start().await;
-    let applied = cli::apply(&example(), Some(inference.deployment.admin()))
-        .await
-        .expect("the example applies");
-    let registered = Cards::with_client(inference.tenant_admin().await)
-        .workflow()
-        .load(&CardSelector::exact(applied.root))
-        .await
-        .expect("the registered example loads");
-
-    let run = registered
-        .run(example_input())
-        .await
-        .expect("the run starts");
-
-    assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{:?}", run.error);
-    assert_eq!(json!(run.outputs), json!({ "review": "hi" }));
-    assert_eq!(
-        inference.upstream_authorizations().await,
-        vec![Some(format!("Bearer {PROVIDER_KEY}")); 3]
-    );
     inference.deployment.shutdown().await;
 }
 

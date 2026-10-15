@@ -20,7 +20,6 @@ use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefParseError};
 
 use crate::client::{NativeWyrdClient, NativeWyrdClientResult};
-use crate::workflow::{NativeWorkflowLoad, parse_workflow_selector};
 use crate::{NativeLifecycleResult, NativeTableConfig, NativeWyrdError};
 
 /// Tenant-scoped Card registry handle over the shared `wyrd_client` Cards.
@@ -205,37 +204,6 @@ impl NativeCards {
         })
     }
 
-    /// Loads one registered Workflow and its locked Agents and Prompts.
-    ///
-    /// `selector_json` is `{ "space", "name", "version" }` or `{ "uid" }`; any
-    /// other shape, including a mix of both, is refused with
-    /// `WYRD_WORKFLOW_400_INVALID_CARD_REF` before any read. A valid selector delegates
-    /// to the shared [`wyrd_client::WorkflowCards::load`], which reads every
-    /// Card at its locked version.
-    ///
-    /// Never rejects: a failure is returned in [`NativeWorkflowLoad::error`]
-    /// with its catalog code, and the public TypeScript `cards.workflow.load`
-    /// throws it as a `WyrdError`. Loading only reads Cards. If the Node
-    /// promise is abandoned, completed reads may already have happened, but
-    /// no partial Workflow is returned and nothing durable is written.
-    #[napi]
-    pub fn load_workflow<'env>(
-        &self,
-        env: &'env Env,
-        selector_json: String,
-    ) -> napi::Result<PromiseRaw<'env, NativeWorkflowLoad>> {
-        let cards = self.cards.clone();
-        crate::trace::spawn(env, async move {
-            Ok({
-                let outcome = match parse_workflow_selector(&selector_json) {
-                    Ok(selector) => cards.workflow().load(&selector).await,
-                    Err(error) => Err(error),
-                };
-                NativeWorkflowLoad::from_outcome(outcome)
-            })
-        })
-    }
-
     /// Soft-deletes one Card by exact reference.
     ///
     /// # Errors
@@ -398,18 +366,6 @@ impl NativeWyrdState {
     pub fn verifier(&self, alias: String) -> Result<NativeLifecycleResult> {
         self.read(|state| {
             NativeLifecycleResult::outcome(state.verifier(&alias).and_then(|_| state.card(&alias)))
-        })
-    }
-
-    /// Returns the stored envelope of the Workflow Card an alias names.
-    ///
-    /// # Errors
-    ///
-    /// As [`NativeWyrdState::verifier`].
-    #[napi]
-    pub fn workflow(&self, alias: String) -> Result<NativeLifecycleResult> {
-        self.read(|state| {
-            NativeLifecycleResult::outcome(state.workflow(&alias).and_then(|_| state.card(&alias)))
         })
     }
 
@@ -604,8 +560,8 @@ fn parse_card_ref(value: &str) -> StdResult<CardRef, WyrdError> {
 /// Closed result of opening one scoped run: a run handle or a catalog error.
 ///
 /// Opening cannot be projected through [`NativeLifecycleResult`] because the run
-/// is a native class rather than a serializable value, so it follows the same
-/// handle-or-error shape as [`NativeWorkflowLoad`].
+/// is a native class rather than a serializable value, so it carries either a
+/// run handle or a catalog error.
 #[napi(object, object_from_js = false)]
 pub struct NativeRunOpen {
     /// The scoped run when the bundle and alias resolved.

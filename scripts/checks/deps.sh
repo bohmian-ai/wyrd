@@ -50,7 +50,7 @@ deny 'wyrd-server' -p wyrd-dev-fixtures --all-features
 
 # Vala's durable layer never reaches the Skald engine; skald-spec arrives only
 # through wyrd-spec.
-deny 'wyrd-skald-(agent|cache|prompt|providers|runtime|tool|workflow)' -p vala-sql --all-features
+deny 'wyrd-skald-(agent|cache|prompt|providers|runtime|tool)' -p vala-sql --all-features
 
 # Skald: the prompt boundary is runtime-free; engine crates reach Wyrd only
 # through the locked foundation crates.

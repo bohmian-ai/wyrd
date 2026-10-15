@@ -50,7 +50,7 @@ sdks/wyrd-sdk-python/python/wyrd/
 ├── __init__.py
 ├── __init__.pyi
 ├── _wyrd.pyi              # extension-module stub
-├── agent/                 # skald-agent, skald-workflow surface
+├── agent/                 # skald-agent surface
 ├── bifrost/               # wyrd-client Bifrost surface
 ├── cards/                 # CardKind, CardRef, and shared card surface
 ├── config/                # public Wyrd configuration projection

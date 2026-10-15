@@ -1,48 +1,13 @@
-"""Pure-Python Agent session memory and Workflow run snapshot types, re-exported by ``wyrd.agent``."""
+"""Pure-Python Agent session memory types, re-exported by ``wyrd.agent``."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from .._wyrd import JsonDict
     from . import SessionTurn
-
-
-class WorkflowRunError(TypedDict):
-    """Bounded primary error of a failed Workflow run or step."""
-
-    code: str
-    message: str
-    details: Any
-    remediation: str
-
-
-class WorkflowStepResult(TypedDict):
-    """One step's result in `WorkflowRun.steps`, keyed by step id."""
-
-    status: Literal["pending", "running", "succeeded", "failed", "cancelled", "unstarted"]
-    text: str | None
-    structured_output: Any
-    attempts: int
-    started_at: str | None
-    ended_at: str | None
-    error: WorkflowRunError | None
-
-
-class WorkflowRunDict(TypedDict):
-    """Complete wire-shaped snapshot returned by `WorkflowRun.to_dict`."""
-
-    run_id: str
-    workflow: dict[str, Any] | None
-    status: Literal["succeeded", "failed", "cancelled", "timed_out"]
-    outputs: dict[str, Any]
-    steps: dict[str, WorkflowStepResult]
-    created_at: str
-    started_at: str | None
-    ended_at: str | None
-    error: WorkflowRunError | None
 
 
 @runtime_checkable

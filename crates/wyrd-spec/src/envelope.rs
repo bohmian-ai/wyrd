@@ -26,7 +26,6 @@ use crate::card::service::ServiceSpec;
 use crate::card::source::SourceSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::card::verifier::{VerificationStatus, VerifierSpec};
-use crate::card::workflow::WorkflowSpec;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
@@ -238,8 +237,6 @@ pub enum Spec {
     Prompt(PromptSpec),
     /// Agent card spec.
     Agent(AgentSpec),
-    /// Workflow card spec.
-    Workflow(WorkflowSpec),
     /// Verifier card spec.
     Verifier(VerifierSpec),
     /// Service card spec.
@@ -271,7 +268,6 @@ impl utoipa::PartialSchema for Spec {
             .item(<ExperimentSpec as utoipa::PartialSchema>::schema())
             .item(<PromptSpec as utoipa::PartialSchema>::schema())
             .item(<AgentSpec as utoipa::PartialSchema>::schema())
-            .item(<WorkflowSpec as utoipa::PartialSchema>::schema())
             .item(<VerifierSpec as utoipa::PartialSchema>::schema())
             .item(<ServiceSpec as utoipa::PartialSchema>::schema())
             .item(<PolicySpec as utoipa::PartialSchema>::schema())
@@ -313,7 +309,6 @@ impl utoipa::ToSchema for Spec {
         add_schema!(ExperimentSpec);
         add_schema!(PromptSpec);
         add_schema!(AgentSpec);
-        add_schema!(WorkflowSpec);
         add_schema!(VerifierSpec);
         add_schema!(ServiceSpec);
         add_schema!(PolicySpec);
@@ -338,7 +333,6 @@ impl schemars::JsonSchema for Spec {
             generator.subschema_for::<ExperimentSpec>(),
             generator.subschema_for::<PromptSpec>(),
             generator.subschema_for::<AgentSpec>(),
-            generator.subschema_for::<WorkflowSpec>(),
             generator.subschema_for::<VerifierSpec>(),
             generator.subschema_for::<ServiceSpec>(),
             generator.subschema_for::<PolicySpec>(),
@@ -375,7 +369,6 @@ impl Spec {
             Self::Experiment(_) => CardKind::Experiment,
             Self::Prompt(_) => CardKind::Prompt,
             Self::Agent(_) => CardKind::Agent,
-            Self::Workflow(_) => CardKind::Workflow,
             Self::Verifier(_) => CardKind::Verifier,
             Self::Service(_) => CardKind::Service,
             Self::Policy(_) => CardKind::Policy,
@@ -492,8 +485,6 @@ pub enum CardKind {
     Prompt,
     /// Agent Card.
     Agent,
-    /// Workflow Card.
-    Workflow,
     /// Verifier Card.
     Verifier,
     /// Service Card.
@@ -520,9 +511,9 @@ pub enum CardKind {
 
 impl CardKind {
     /// Total v1 Card kind count including `External`.
-    pub const NATIVE_COUNT: usize = 16;
+    pub const NATIVE_COUNT: usize = 15;
     /// Registrable v1 Card kind count (excludes `External`).
-    pub const REGISTRABLE_COUNT: usize = 15;
+    pub const REGISTRABLE_COUNT: usize = 14;
 
     /// Return every native kind including [`CardKind::External`].
     #[must_use]
@@ -533,7 +524,6 @@ impl CardKind {
             Self::Experiment,
             Self::Prompt,
             Self::Agent,
-            Self::Workflow,
             Self::Verifier,
             Self::Service,
             Self::Policy,
@@ -556,7 +546,6 @@ impl CardKind {
             Self::Experiment,
             Self::Prompt,
             Self::Agent,
-            Self::Workflow,
             Self::Verifier,
             Self::Service,
             Self::Policy,
@@ -578,7 +567,6 @@ impl CardKind {
             Self::Experiment => "Experiment",
             Self::Prompt => "Prompt",
             Self::Agent => "Agent",
-            Self::Workflow => "Workflow",
             Self::Verifier => "Verifier",
             Self::Service => "Service",
             Self::Policy => "Policy",
@@ -608,7 +596,6 @@ impl CardKind {
             Self::Experiment => "Experiment",
             Self::Prompt => "Prompt",
             Self::Agent => "Agent",
-            Self::Workflow => "Workflow",
             Self::Verifier => "Verifier",
             Self::Service => "Service",
             Self::Policy => "Policy",
@@ -631,7 +618,6 @@ impl CardKind {
             | Self::Experiment
             | Self::Prompt
             | Self::Agent
-            | Self::Workflow
             | Self::Service
             | Self::Mcp
             | Self::Artifact
@@ -666,7 +652,6 @@ fn native_from_str(value: &str) -> Option<CardKind> {
         "Experiment" => CardKind::Experiment,
         "Prompt" => CardKind::Prompt,
         "Agent" => CardKind::Agent,
-        "Workflow" => CardKind::Workflow,
         "Verifier" => CardKind::Verifier,
         "Service" => CardKind::Service,
         "Policy" => CardKind::Policy,
@@ -714,7 +699,6 @@ impl Serialize for Spec {
             Self::Experiment(s) => s.serialize(serializer),
             Self::Prompt(s) => s.serialize(serializer),
             Self::Agent(s) => s.serialize(serializer),
-            Self::Workflow(s) => s.serialize(serializer),
             Self::Verifier(s) => s.serialize(serializer),
             Self::Service(s) => s.serialize(serializer),
             Self::Policy(s) => s.serialize(serializer),
@@ -785,9 +769,6 @@ fn spec_from_kind_value(kind: &CardKind, mut value: serde_json::Value) -> Result
             .map_err(|e| e.to_string()),
         CardKind::Agent => serde_json::from_value(value)
             .map(Spec::Agent)
-            .map_err(|e| e.to_string()),
-        CardKind::Workflow => serde_json::from_value(value)
-            .map(Spec::Workflow)
             .map_err(|e| e.to_string()),
         CardKind::Verifier => serde_json::from_value(value)
             .map(Spec::Verifier)

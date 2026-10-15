@@ -941,60 +941,6 @@ async fn referenced_binding_refusals_leave_no_writes() {
     seed_card(
         &server,
         tenant,
-        "Workflow",
-        "binding-rollback-workflow",
-        json!({ "steps": [] }),
-        "active",
-    )
-    .await;
-    seed_card(
-        &server,
-        tenant,
-        "Operator",
-        "binding-workflow-operator",
-        json!({
-            "kind": "workflow",
-            "workflow_ref": {
-                "kind": "Workflow", "name": "binding-rollback-workflow",
-                "version": "1.0.0", "space": "default"
-            }
-        }),
-        "active",
-    )
-    .await;
-
-    let workflow_operator = server
-        .oneshot_authenticated(
-            &jwt,
-            bound_agent_request(
-                "binding-workflow-operator-agent",
-                "binding-prompt",
-                "binding-eval-verifier",
-                "binding-observations-trigger",
-                json!([{
-                    "kind": "Operator", "name": "binding-workflow-operator",
-                    "version": "1.0.0", "space": "default"
-                }]),
-                "binding-workflow-operator-operation",
-            ),
-        )
-        .await
-        .expect("workflow-Operator registration responds");
-    assert_eq!(workflow_operator.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response_json(workflow_operator).await["code"],
-        "WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION"
-    );
-    assert_no_registration_writes(
-        &server,
-        "binding-workflow-operator-operation",
-        "binding-workflow-operator-agent",
-    )
-    .await;
-
-    seed_card(
-        &server,
-        tenant,
         "Operator",
         "binding-drift-counts-operator",
         json!({ "kind": "http", "method": "post",
@@ -1155,34 +1101,41 @@ async fn referenced_binding_refusals_leave_no_writes() {
                 "binding-nested-operation",
                 json!({ "submissions": [{
                     "apiVersion": "wyrd/v1",
-                    "kind": "Workflow",
+                    "kind": "Verifier",
                     "metadata": {
-                        "name": "binding-nested-workflow",
+                        "name": "binding-nested-judge",
                         "version": "1.0.0",
                         "space": "default"
                     },
                     "spec": {
-                        "steps": [{
-                            "id": "judge",
-                            "action": {
-                                "type": "agent",
-                                "target": {
-                                    "prompt": {
-                                        "kind": "Prompt", "name": "binding-prompt",
-                                        "version": "1.0.0", "space": "default"
-                                    }, "execution_route": {"kind": "native"},
-                                    "verified_by": [{
-                                        "verifier": {
-                                            "kind": "Verifier",
-                                            "name": "binding-eval-verifier",
-                                            "version": "1.0.0",
-                                            "space": "default"
+                        "implementation": {
+                            "kind": "eval",
+                            "spec": {
+                                "tasks": {
+                                    "helpful": {
+                                        "kind": "llm_judge",
+                                        "id": "helpful",
+                                        "judge_ref": {
+                                            "prompt": {
+                                                "kind": "Prompt", "name": "binding-prompt",
+                                                "version": "1.0.0", "space": "default"
+                                            }, "execution_route": {"kind": "native"},
+                                            "verified_by": [{
+                                                "verifier": {
+                                                    "kind": "Verifier",
+                                                    "name": "binding-eval-verifier",
+                                                    "version": "1.0.0",
+                                                    "space": "default"
+                                                },
+                                                "runs_on": { "kind": "observations_ready" },
+                                            }],
                                         },
-                                        "runs_on": { "kind": "observations_ready" },
-                                    }],
+                                        "operator": "greater_than_or_equals",
+                                        "expected": 0.5,
+                                    },
                                 },
                             },
-                        }],
+                        },
                     },
                     "artifacts": []
                 }] }),
@@ -1195,12 +1148,8 @@ async fn referenced_binding_refusals_leave_no_writes() {
         response_json(nested).await["code"],
         "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
     );
-    assert_no_registration_writes(
-        &server,
-        "binding-nested-operation",
-        "binding-nested-workflow",
-    )
-    .await;
+    assert_no_registration_writes(&server, "binding-nested-operation", "binding-nested-judge")
+        .await;
 
     server.shutdown().await.expect("test server shuts down");
 }
@@ -1247,8 +1196,7 @@ fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Re
 ///
 /// Through the public HTTP route, with real registered targets behind every
 /// reference, this proves: the retired `kind: Drift` and `kind: Eval` Cards
-/// are refused; a standalone Workflow Operator Card registers, while binding
-/// it to `on_failure` is refused; a `verifier`, `runs_on`, or `on_failure`
+/// are refused; a `verifier`, `runs_on`, or `on_failure`
 /// reference that resolves to a Card of the wrong kind is refused with its
 /// stable kind error; a repeated Verifier or Operator in one binding is
 /// refused as a duplicate; and an Operator carrying literal credential
@@ -1274,15 +1222,6 @@ async fn verifier_contract_refusals_leave_no_writes() {
     };
     let tenant = server.data_tenant_id();
     seed_dependency(&server, tenant, "vc-prompt", "active").await;
-    seed_card(
-        &server,
-        tenant,
-        "Workflow",
-        "vc-rollback-workflow",
-        json!({ "steps": [] }),
-        "active",
-    )
-    .await;
     let card_ref = |kind: &str, name: &str| json!({ "kind": kind, "name": name, "version": "1.0.0", "space": "default" });
     let register = |kind: &'static str, name: &'static str, spec: Value| {
         let server = &server;
@@ -1319,14 +1258,6 @@ async fn verifier_contract_refusals_leave_no_writes() {
                 "url": "https://hooks.example.test/verification-failed" }),
     )
     .await;
-    register(
-        "Operator",
-        "vc-workflow-operator",
-        json!({ "kind": "workflow",
-                "workflow_ref": card_ref("Workflow", "vc-rollback-workflow") }),
-    )
-    .await;
-
     let refuse = |label: &str, request: Request<Body>, status: StatusCode, code: &str| {
         let server = &server;
         let jwt = jwt.as_str();
@@ -1384,15 +1315,6 @@ async fn verifier_contract_refusals_leave_no_writes() {
     let trigger = card_ref("Trigger", "vc-observations-trigger");
     let hook = card_ref("Operator", "vc-hook");
     let cases = [
-        (
-            "workflow-operator",
-            json!([binding(
-                eval.clone(),
-                trigger.clone(),
-                json!([card_ref("Operator", "vc-workflow-operator")])
-            )]),
-            "WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION",
-        ),
         (
             "verifier-wrong-kind",
             json!([binding(trigger.clone(), trigger.clone(), json!([]))]),

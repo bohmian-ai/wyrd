@@ -296,22 +296,6 @@ export declare class NativeCards {
    */
   hydrate(cardRef: string, destination: string, metadataOnly: boolean): Promise<NativeLifecycleResult>
   /**
-   * Loads one registered Workflow and its locked Agents and Prompts.
-   *
-   * `selector_json` is `{ "space", "name", "version" }` or `{ "uid" }`; any
-   * other shape, including a mix of both, is refused with
-   * `WYRD_WORKFLOW_400_INVALID_CARD_REF` before any read. A valid selector delegates
-   * to the shared [`wyrd_client::WorkflowCards::load`], which reads every
-   * Card at its locked version.
-   *
-   * Never rejects: a failure is returned in [`NativeWorkflowLoad::error`]
-   * with its catalog code, and the public TypeScript `cards.workflow.load`
-   * throws it as a `WyrdError`. Loading only reads Cards. If the Node
-   * promise is abandoned, completed reads may already have happened, but
-   * no partial Workflow is returned and nothing durable is written.
-   */
-  loadWorkflow(selectorJson: string): Promise<NativeWorkflowLoad>
-  /**
    * Soft-deletes one Card by exact reference.
    *
    * # Errors
@@ -699,37 +683,6 @@ export declare class NativeRun {
   record(table: string, rowJson: string): Promise<NativeLifecycleResult>
 }
 
-/** Runnable Workflow loaded from a file or from the registry. */
-export declare class NativeWorkflow {
-  /** Returns the Workflow Card name, when the envelope declares one. */
-  get name(): string | null
-  /** Returns the Workflow Card version, when the envelope declares one. */
-  get version(): string | null
-  /** Returns the Workflow Card space, when the envelope declares one. */
-  get space(): string | null
-  /** Returns the step IDs in declaration order. */
-  steps(): Array<string>
-  /**
-   * Runs this Workflow with its JSON-encoded input.
-   *
-   * A JSON string is shorthand for the declared string input named
-   * `input`, a JSON object supplies declared inputs by name, and an
-   * omitted input uses the defaults. Validation, input, and route errors
-   * are returned before any step is dispatched; step failures are recorded
-   * in the returned run.
-   *
-   * # Arguments
-   *
-   * * `input_json` - The JSON string or object input, or `None`.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the run cannot be serialized; a
-   * malformed input or pre-dispatch refusal is returned in the result.
-   */
-  run(inputJson?: string | undefined | null): Promise<NativeLifecycleResult>
-}
-
 /** Node-facing handle to one authenticated [`WyrdClient`]. */
 export declare class NativeWyrdClient {
   /**
@@ -832,16 +785,6 @@ export declare class NativeWyrdClient {
    * the caller's client or the ambient one.
    */
   principals(): NativePrincipals
-  /**
-   * Load an authored Workflow file and its Cards as this client.
-   *
-   * Delegates to the shared [`Workflow::from_path_with_client`]: registry
-   * refs are read, and gateway steps later run, as this client rather than
-   * the ambient configuration. Never rejects: a load failure is returned
-   * in [`NativeWorkflowLoad::error`] with its catalog code. Cancellation
-   * behaves as for [`load_workflow_from_path`].
-   */
-  loadWorkflowFromPath(path: string): Promise<NativeWorkflowLoad>
 }
 
 /**
@@ -914,14 +857,6 @@ export declare class NativeWyrdState {
    * unknown alias and another kind are returned in the result.
    */
   verifier(alias: string): NativeLifecycleResult
-  /**
-   * Returns the stored envelope of the Workflow Card an alias names.
-   *
-   * # Errors
-   *
-   * As [`NativeWyrdState::verifier`].
-   */
-  workflow(alias: string): NativeLifecycleResult
   /**
    * Returns the stored envelope of the Agent Card an alias names.
    *
@@ -1020,22 +955,6 @@ export declare class NativeWyrdState {
  * has saved logins but none for `WYRD_TENANT`.
  */
 export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): NativeWyrdClientResult
-
-/**
- * Load an authored Workflow file and the Cards it references.
- *
- * Delegates to the shared [`Workflow::from_path`]: local files load without
- * a server, and registry refs are read through the ambient client
- * configuration (`WYRD_SERVER_URL`, `WYRD_API_KEY`). Never rejects: a load
- * failure is returned in [`NativeWorkflowLoad::error`] with its catalog
- * code, and the public TypeScript `Workflow.fromPath` throws it as a
- * `WyrdError`.
- *
- * Loading only reads files and Cards. If the Node promise is abandoned,
- * completed reads may already have happened, but no partial Workflow is
- * returned and nothing durable is written.
- */
-export declare function loadWorkflowFromPath(path: string): Promise<NativeWorkflowLoad>
 
 /** Closed result of reading one client's current bearer: a token or a catalog error. */
 export interface NativeAccessTokenResult {
@@ -1137,8 +1056,8 @@ export interface NativeQueryStep {
  * Closed result of opening one scoped run: a run handle or a catalog error.
  *
  * Opening cannot be projected through [`NativeLifecycleResult`] because the run
- * is a native class rather than a serializable value, so it follows the same
- * handle-or-error shape as [`NativeWorkflowLoad`].
+ * is a native class rather than a serializable value, so it carries either a
+ * run handle or a catalog error.
  */
 export interface NativeRunOpen {
   /** The scoped run when the bundle and alias resolved. */
@@ -1176,14 +1095,6 @@ export interface NativeTableConfigResult {
   /** The table config when it was declared or described. */
   config?: NativeTableConfig
   /** Catalog failure when declaration or description failed. */
-  error?: NativeWyrdError
-}
-
-/** Closed result of loading one Workflow: a handle or a catalog error. */
-export interface NativeWorkflowLoad {
-  /** Workflow when loading succeeded. */
-  workflow?: NativeWorkflow
-  /** Catalog failure otherwise. */
   error?: NativeWyrdError
 }
 
@@ -1346,18 +1257,3 @@ export declare function timestampText(kind: string, text: string): string | null
  * faulty server result can produce.
  */
 export declare function variantToValue(metadata: Uint8Array, value: Uint8Array): any
-
-/**
- * Parse a Workflow from its Card envelope YAML text, resolving inline
- * Agents and Prompts eagerly.
- *
- * Delegates to the shared [`Workflow::from_yaml`]: no file is read and no
- * client is built, so a Workflow that refs a registered Card is loaded with
- * [`load_workflow_from_path`] instead. Never throws: a parse or validation
- * failure is returned in [`NativeWorkflowLoad::error`] with its catalog code.
- *
- * # Arguments
- *
- * * `yaml` - The Workflow Card envelope text.
- */
-export declare function workflowFromYaml(yaml: string): NativeWorkflowLoad

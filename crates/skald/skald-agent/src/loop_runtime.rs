@@ -47,9 +47,8 @@ impl Agent {
     /// tool work is dropped and the run fails with [`AgentError::Timeout`].
     /// The terminal `AgentFinish` or `AgentError` journal append happens after
     /// that bound and is best effort: its failure is logged and never changes
-    /// the result. A caller that must bound settlement too, such as a
-    /// Workflow attempt, races this future against its own fixed deadline and
-    /// drops it. Dropping the future cancels all outstanding work; events and
+    /// the result. A caller that must bound settlement too races this future
+    /// against its own fixed deadline and drops it. Dropping the future cancels all outstanding work; events and
     /// session turns already appended stay recorded.
     ///
     /// # Errors

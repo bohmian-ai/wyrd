@@ -1,20 +1,17 @@
-//! Wire contract of the shared Workflow clients against a deterministic server.
+//! Wire contract of the public Agent gateway caller against a deterministic server.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use secrecy::SecretString;
 use serde_json::{Value, json};
+use skald_agent::{WyrdGatewayCall, WyrdGatewayCaller};
 use skald_providers::{ProviderError, RemoteProblem};
 use skald_spec::{ProviderRequest, ProviderResponse};
-use skald_workflow::{WorkflowGatewayCorrelation, WyrdGatewayCall, WyrdGatewayCaller};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio_util::sync::CancellationToken;
-use wiremock::http::Method;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 use wyrd_client::auth::AuthMiddleware;
@@ -22,15 +19,11 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
-use wyrd_client::{PublicWyrdGatewayCaller, Workflows, WyrdClient};
-use wyrd_spec::card::workflow::{CreateWorkflowRunRequest, WorkflowRunStatus};
+use wyrd_client::{PublicWyrdGatewayCaller, WyrdClient};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::gateway::{GatewayFallbackOverride, ModelRef};
-use wyrd_spec::ids::{CardUid, WorkflowRunId};
+use wyrd_spec::gateway::ModelRef;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::ids::RunId;
-
-/// Fixed run identity used by every scripted response.
-const RUN_ID: &str = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b20";
 
 /// Build a bearer-authenticated [`WyrdClient`] pointed at `base_url`.
 ///
@@ -54,45 +47,6 @@ fn client(base_url: &str) -> WyrdClient {
     )
     .expect("transport builds");
     WyrdClient::from_parts(auth, transport, config.grpc)
-}
-
-/// The fixed run identity as its typed ID.
-///
-/// # Panics
-/// Panics when [`RUN_ID`] stops parsing as a Workflow run ID.
-fn run_id() -> WorkflowRunId {
-    RUN_ID.parse().expect("fixed run id is a UUIDv7")
-}
-
-/// Route of the fixed run.
-fn run_path() -> String {
-    format!("/v1/workflow-runs/{RUN_ID}")
-}
-
-/// A direct run snapshot with `status`.
-fn run_json(status: &str) -> Value {
-    json!({
-        "run_id": RUN_ID,
-        "workflow": {"kind": "Workflow", "name": "triage", "version": "1.0.0", "space": "team"},
-        "status": status,
-        "created_at": "2026-01-01T00:00:00Z",
-        "started_at": null,
-        "ended_at": null,
-        "error": null
-    })
-}
-
-/// The create request every create case submits.
-///
-/// # Panics
-/// Panics when the fixed request document stops decoding as a create request.
-fn create_request() -> CreateWorkflowRunRequest {
-    serde_json::from_value(json!({
-        "workflow": {"kind": "Workflow", "name": "triage", "version": "1.0.0", "space": "team"},
-        "input": {"ticket": "T-1"},
-        "timeout_seconds": 30
-    }))
-    .expect("create request is valid")
 }
 
 /// Mount `response` for `verb` on `route`, answering at most `times` requests.
@@ -120,188 +74,6 @@ async fn received(server: &MockServer) -> Vec<Request> {
         .received_requests()
         .await
         .expect("request recording is enabled")
-}
-
-/// Create, get, cancel, and wait project the exact run routes and snapshots.
-///
-/// # Panics
-/// Panics when a fixture fails to build or decode, or a request, key, status,
-/// or error differs from the asserted run contract.
-#[tokio::test]
-async fn shared_workflow_client_contract() {
-    // First acceptance answers 202 and an idempotent replay 200; both decode
-    // the same direct snapshot.
-    for status in [202, 200] {
-        let server = MockServer::start().await;
-        mount(
-            &server,
-            "POST",
-            "/v1/workflow-runs",
-            ResponseTemplate::new(status).set_body_json(run_json("queued")),
-            1,
-        )
-        .await;
-        let run = Workflows::new(client(&server.uri()))
-            .create(&create_request())
-            .await
-            .expect("create succeeds");
-        assert_eq!(run.run_id, run_id());
-        assert_eq!(run.status, WorkflowRunStatus::Queued);
-        let requests = received(&server).await;
-        assert_eq!(requests.len(), 1);
-        let body: Value = serde_json::from_slice(&requests[0].body).expect("JSON body");
-        assert_eq!(
-            body,
-            serde_json::to_value(create_request()).expect("request serializes")
-        );
-        assert!(requests[0].headers.contains_key("idempotency-key"));
-    }
-
-    // A retried create replays one Idempotency-Key.
-    let server = MockServer::start().await;
-    mount(
-        &server,
-        "POST",
-        "/v1/workflow-runs",
-        ResponseTemplate::new(503),
-        1,
-    )
-    .await;
-    mount(
-        &server,
-        "POST",
-        "/v1/workflow-runs",
-        ResponseTemplate::new(202).set_body_json(run_json("queued")),
-        1,
-    )
-    .await;
-    Workflows::new(client(&server.uri()))
-        .create(&create_request())
-        .await
-        .expect("retried create succeeds");
-    let keys: Vec<_> = received(&server)
-        .await
-        .iter()
-        .map(|request| request.headers["idempotency-key"].clone())
-        .collect();
-    assert_eq!(keys.len(), 2);
-    assert_eq!(keys[0], keys[1]);
-
-    // Get and cancel use the run route and its cancel action.
-    let server = MockServer::start().await;
-    mount(
-        &server,
-        "GET",
-        &run_path(),
-        ResponseTemplate::new(200).set_body_json(run_json("running")),
-        1,
-    )
-    .await;
-    mount(
-        &server,
-        "POST",
-        &format!("{}/cancel", run_path()),
-        ResponseTemplate::new(200).set_body_json(run_json("cancelled")),
-        1,
-    )
-    .await;
-    let workflows = Workflows::new(client(&server.uri()));
-    let got = workflows.get(&run_id()).await.expect("get succeeds");
-    assert_eq!(got.status, WorkflowRunStatus::Running);
-    let cancelled = workflows.cancel(&run_id()).await.expect("cancel succeeds");
-    assert_eq!(cancelled.status, WorkflowRunStatus::Cancelled);
-
-    // Wait polls a running run until it succeeds.
-    let server = MockServer::start().await;
-    mount(
-        &server,
-        "GET",
-        &run_path(),
-        ResponseTemplate::new(200).set_body_json(run_json("running")),
-        1,
-    )
-    .await;
-    mount(
-        &server,
-        "GET",
-        &run_path(),
-        ResponseTemplate::new(200).set_body_json(run_json("succeeded")),
-        1,
-    )
-    .await;
-    let run = Workflows::new(client(&server.uri()))
-        .wait(&run_id())
-        .await
-        .expect("wait succeeds");
-    assert_eq!(run.status, WorkflowRunStatus::Succeeded);
-    assert_eq!(received(&server).await.len(), 2);
-
-    // Every unsuccessful terminal status is a returned value, not an error.
-    for (status, expected) in [
-        ("failed", WorkflowRunStatus::Failed),
-        ("cancelled", WorkflowRunStatus::Cancelled),
-        ("timed_out", WorkflowRunStatus::TimedOut),
-    ] {
-        let server = MockServer::start().await;
-        mount(
-            &server,
-            "GET",
-            &run_path(),
-            ResponseTemplate::new(200).set_body_json(run_json(status)),
-            1,
-        )
-        .await;
-        let run = Workflows::new(client(&server.uri()))
-            .wait(&run_id())
-            .await
-            .expect("terminal run is returned");
-        assert_eq!(run.status, expected);
-    }
-
-    // A canonical server error propagates with its stable code.
-    let server = MockServer::start().await;
-    mount(
-        &server,
-        "GET",
-        &run_path(),
-        ResponseTemplate::new(404).set_body_json(json!({
-            "type": "about:blank",
-            "title": "Workflow run not found",
-            "status": 404,
-            "code": "WYRD_WORKFLOW_404_RUN_NOT_FOUND",
-            "detail": "workflow run not found",
-            "details": {}
-        })),
-        1,
-    )
-    .await;
-    let error = Workflows::new(client(&server.uri()))
-        .wait(&run_id())
-        .await
-        .expect_err("missing run is refused");
-    assert_eq!(error.code(), "WYRD_WORKFLOW_404_RUN_NOT_FOUND");
-
-    // Dropping wait stops polling and never cancels or resubmits the run.
-    let server = MockServer::start().await;
-    mount(
-        &server,
-        "GET",
-        &run_path(),
-        ResponseTemplate::new(200).set_body_json(run_json("running")),
-        u64::MAX,
-    )
-    .await;
-    let workflows = Workflows::new(client(&server.uri()));
-    let outcome =
-        tokio::time::timeout(Duration::from_millis(1500), workflows.wait(&run_id())).await;
-    assert!(outcome.is_err(), "a running run keeps wait polling");
-    let requests = received(&server).await;
-    assert!(!requests.is_empty());
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.method == Method::GET && request.url.path() == run_path())
-    );
 }
 
 /// An OpenAI Chat request whose body names a model the caller must replace.
@@ -333,36 +105,15 @@ fn chat_answer() -> Value {
     })
 }
 
-/// A gateway call for `request` on `model` with `fallback` and `timeout`.
+/// A gateway call for `request` on `model` with `timeout`.
 ///
 /// # Panics
-/// Panics when `model` or the fixed run ID is not a valid identity.
-fn gateway_call(
-    request: ProviderRequest,
-    model: &str,
-    fallback: Option<GatewayFallbackOverride>,
-    timeout: Duration,
-) -> WyrdGatewayCall {
+/// Panics when `model` is not a valid identity.
+fn gateway_call(request: ProviderRequest, model: &str, timeout: Duration) -> WyrdGatewayCall {
     WyrdGatewayCall {
         request,
         model: ModelRef::from_projection(model).expect("model ref"),
-        fallback,
         timeout,
-        correlation: Some(WorkflowGatewayCorrelation {
-            run_id: run_id(),
-            step_id: "step".to_owned(),
-            attempt: 1,
-        }),
-    }
-}
-
-/// A fallback override naming `candidate`.
-///
-/// # Panics
-/// Panics when `candidate` is not a valid model projection.
-fn fallback(candidate: &str) -> GatewayFallbackOverride {
-    GatewayFallbackOverride {
-        candidates: vec![ModelRef::from_projection(candidate).expect("candidate")],
     }
 }
 
@@ -579,7 +330,7 @@ async fn public_gateway_call_carries_run_and_card_uid() {
     let run = RunId::from_string("run-1".to_owned());
     let card_uid = CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00").expect("Card UID");
     let token = CancellationToken::new();
-    let call = || gateway_call(chat_request(), "openai/gpt-a", None, Duration::from_secs(5));
+    let call = || gateway_call(chat_request(), "openai/gpt-a", Duration::from_secs(5));
     for (run, card_uid) in [
         (Some(&run), Some(&card_uid)),
         (None, None),
@@ -645,7 +396,7 @@ async fn public_gateway_call_carries_the_ambient_trace_context() {
             tracing_opentelemetry::layer().with_tracer(
                 opentelemetry_sdk::trace::SdkTracerProvider::builder()
                     .build()
-                    .tracer("workflow-transport"),
+                    .tracer("gateway-caller"),
             ),
         ),
     );
@@ -666,7 +417,7 @@ async fn public_gateway_call_carries_the_ambient_trace_context() {
     let token = CancellationToken::new();
     PublicWyrdGatewayCaller::new(client(&server.uri()))
         .call(
-            gateway_call(chat_request(), "openai/gpt-a", None, Duration::from_secs(5)),
+            gateway_call(chat_request(), "openai/gpt-a", Duration::from_secs(5)),
             &token,
         )
         .instrument(ambient)
@@ -692,8 +443,8 @@ async fn public_gateway_call_carries_the_ambient_trace_context() {
     );
 }
 
-/// Concurrent public gateway calls keep their own fallback, deadline, and
-/// model; each dialect reaches its ingress with the call's model; Vertex,
+/// Concurrent public gateway calls keep their own deadline and model; each
+/// dialect reaches its ingress with the call's model; Vertex,
 /// cancellation, and timeouts stop locally; native error envelopes become
 /// redacted problems keeping only status, Wyrd code, OpenAI `param`, and the
 /// code's catalog title and remediation; a `401` is sent once and renews the
@@ -706,7 +457,7 @@ async fn public_gateway_call_carries_the_ambient_trace_context() {
 /// asserted gateway contract.
 #[tokio::test]
 async fn public_gateway_call_context_and_errors() {
-    // Concurrent calls on one caller carry only their own fallback header.
+    // Concurrent calls on one caller each send only their own model.
     let server = MockServer::start().await;
     mount(
         &server,
@@ -720,25 +471,15 @@ async fn public_gateway_call_context_and_errors() {
     let token = CancellationToken::new();
     let (first, second, third) = tokio::join!(
         caller.call(
-            gateway_call(
-                chat_request(),
-                "openai/gpt-a",
-                Some(fallback("openai/gpt-b")),
-                Duration::from_secs(5)
-            ),
+            gateway_call(chat_request(), "openai/gpt-a", Duration::from_secs(5)),
             &token,
         ),
         caller.call(
-            gateway_call(
-                chat_request(),
-                "openai/gpt-c",
-                Some(fallback("openai/gpt-d")),
-                Duration::from_secs(9)
-            ),
+            gateway_call(chat_request(), "openai/gpt-c", Duration::from_secs(9)),
             &token,
         ),
         caller.call(
-            gateway_call(chat_request(), "openai/gpt-e", None, Duration::from_secs(5)),
+            gateway_call(chat_request(), "openai/gpt-e", Duration::from_secs(5)),
             &token,
         ),
     );
@@ -749,22 +490,16 @@ async fn public_gateway_call_context_and_errors() {
         ));
     }
     let requests = received(&server).await;
-    assert_eq!(requests.len(), 3);
-    for request in &requests {
-        let body: Value = serde_json::from_slice(&request.body).expect("JSON body");
-        assert!(request.headers.contains_key("x-wyrd-access-token"));
-        let header = request.headers.get("wyrd-gateway-fallback").map(|value| {
-            let json = URL_SAFE_NO_PAD.decode(value.as_bytes()).expect("base64url");
-            serde_json::from_slice::<GatewayFallbackOverride>(&json).expect("fallback")
-        });
-        let expected = match body["model"].as_str() {
-            Some("openai/gpt-a") => Some(fallback("openai/gpt-b")),
-            Some("openai/gpt-c") => Some(fallback("openai/gpt-d")),
-            Some("openai/gpt-e") => None,
-            other => panic!("unexpected model {other:?}"),
-        };
-        assert_eq!(header, expected);
-    }
+    let mut models: Vec<String> = requests
+        .iter()
+        .map(|request| {
+            assert!(request.headers.contains_key("x-wyrd-access-token"));
+            let body: Value = serde_json::from_slice(&request.body).expect("JSON body");
+            body["model"].as_str().expect("model").to_owned()
+        })
+        .collect();
+    models.sort();
+    assert_eq!(models, ["openai/gpt-a", "openai/gpt-c", "openai/gpt-e"]);
 
     // Every dialect reaches its ingress with the call's model.
     let server = MockServer::start().await;
@@ -819,17 +554,14 @@ async fn public_gateway_call_context_and_errors() {
     let deadline = Duration::from_secs(5);
     assert!(matches!(
         caller
-            .call(
-                gateway_call(responses, "openai/gpt-r", None, deadline),
-                &token
-            )
+            .call(gateway_call(responses, "openai/gpt-r", deadline), &token)
             .await,
         Ok(ProviderResponse::OpenAiResponses(_))
     ));
     assert!(matches!(
         caller
             .call(
-                gateway_call(anthropic, "anthropic/claude-a", None, deadline),
+                gateway_call(anthropic, "anthropic/claude-a", deadline),
                 &token
             )
             .await,
@@ -838,7 +570,7 @@ async fn public_gateway_call_context_and_errors() {
     assert!(matches!(
         caller
             .call(
-                gateway_call(gemini.clone(), "gemini/gemini-a", None, deadline),
+                gateway_call(gemini.clone(), "gemini/gemini-a", deadline),
                 &token
             )
             .await,
@@ -863,10 +595,7 @@ async fn public_gateway_call_context_and_errors() {
             .expect("vertex"),
     );
     let refused = caller
-        .call(
-            gateway_call(vertex, "vertex/gemini-a", None, deadline),
-            &token,
-        )
+        .call(gateway_call(vertex, "vertex/gemini-a", deadline), &token)
         .await
         .expect_err("Vertex is refused locally");
     assert_eq!(refused.code(), "SKALD_PROVIDERS_400_BAD_REQUEST");
@@ -874,7 +603,7 @@ async fn public_gateway_call_context_and_errors() {
     cancelled.cancel();
     let stopped = caller
         .call(
-            gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+            gateway_call(chat_request(), "openai/gpt-a", deadline),
             &cancelled,
         )
         .await
@@ -894,12 +623,7 @@ async fn public_gateway_call_context_and_errors() {
     .await;
     let timed_out = PublicWyrdGatewayCaller::new(client(&slow.uri()))
         .call(
-            gateway_call(
-                chat_request(),
-                "openai/gpt-a",
-                None,
-                Duration::from_millis(100),
-            ),
+            gateway_call(chat_request(), "openai/gpt-a", Duration::from_millis(100)),
             &token,
         )
         .await
@@ -912,7 +636,7 @@ async fn public_gateway_call_context_and_errors() {
     let pending = PublicWyrdGatewayCaller::new(client(&base_url));
     let cancellation = CancellationToken::new();
     let call = pending.call(
-        gateway_call(chat_request(), "openai/gpt-a", None, Duration::from_mins(5)),
+        gateway_call(chat_request(), "openai/gpt-a", Duration::from_mins(5)),
         &cancellation,
     );
     let cancel_once_dispatched = async {
@@ -959,7 +683,7 @@ async fn public_gateway_call_context_and_errors() {
     let refused = problem(
         PublicWyrdGatewayCaller::new(client(&openai.uri()))
             .call(
-                gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+                gateway_call(chat_request(), "openai/gpt-a", deadline),
                 &token,
             )
             .await,
@@ -987,7 +711,7 @@ async fn public_gateway_call_context_and_errors() {
     let refused = problem(
         PublicWyrdGatewayCaller::new(client(&anthropic.uri()))
             .call(
-                gateway_call(anthropic_request, "anthropic/claude-a", None, deadline),
+                gateway_call(anthropic_request, "anthropic/claude-a", deadline),
                 &token,
             )
             .await,
@@ -1008,10 +732,7 @@ async fn public_gateway_call_context_and_errors() {
     .await;
     let refused = problem(
         PublicWyrdGatewayCaller::new(client(&google.uri()))
-            .call(
-                gateway_call(gemini, "gemini/gemini-a", None, deadline),
-                &token,
-            )
+            .call(gateway_call(gemini, "gemini/gemini-a", deadline), &token)
             .await,
     );
     assert_eq!(
@@ -1038,7 +759,7 @@ async fn public_gateway_call_context_and_errors() {
         let refused = problem(
             PublicWyrdGatewayCaller::new(client(&upstream.uri()))
                 .call(
-                    gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+                    gateway_call(chat_request(), "openai/gpt-a", deadline),
                     &token,
                 )
                 .await,
@@ -1058,7 +779,7 @@ async fn public_gateway_call_context_and_errors() {
     let refused = problem(
         PublicWyrdGatewayCaller::new(client(&unauthorized.uri()))
             .call(
-                gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+                gateway_call(chat_request(), "openai/gpt-a", deadline),
                 &token,
             )
             .await,
@@ -1099,7 +820,7 @@ async fn public_gateway_call_context_and_errors() {
     let refused = problem(
         caller
             .call(
-                gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+                gateway_call(chat_request(), "openai/gpt-a", deadline),
                 &token,
             )
             .await,
@@ -1116,7 +837,7 @@ async fn public_gateway_call_context_and_errors() {
     assert!(
         caller
             .call(
-                gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+                gateway_call(chat_request(), "openai/gpt-a", deadline),
                 &token,
             )
             .await
@@ -1173,7 +894,7 @@ async fn public_gateway_call_context_and_errors() {
     let refused = problem(
         PublicWyrdGatewayCaller::new(api_key_client(&unrenewable.uri()))
             .call(
-                gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+                gateway_call(chat_request(), "openai/gpt-a", deadline),
                 &token,
             )
             .await,
@@ -1195,7 +916,7 @@ async fn public_gateway_call_context_and_errors() {
     .await;
     let outcome = PublicWyrdGatewayCaller::new(api_key_client(&base_url))
         .call(
-            gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+            gateway_call(chat_request(), "openai/gpt-a", deadline),
             &token,
         )
         .await;
@@ -1221,7 +942,7 @@ async fn public_gateway_call_context_and_errors() {
     .await;
     let outcome = PublicWyrdGatewayCaller::new(api_key_client(&base_url))
         .call(
-            gateway_call(chat_request(), "openai/gpt-a", None, Duration::from_secs(2)),
+            gateway_call(chat_request(), "openai/gpt-a", Duration::from_secs(2)),
             &token,
         )
         .await;

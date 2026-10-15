@@ -68,7 +68,6 @@ def test_rejects_invalid_version() -> None:
         "Experiment",
         "Prompt",
         "Agent",
-        "Workflow",
         "Verifier",
         "Service",
         "Policy",

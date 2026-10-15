@@ -8494,7 +8494,6 @@ dependencies = [
  "wyrd-skald-providers",
  "wyrd-skald-runtime",
  "wyrd-skald-spec",
- "wyrd-skald-workflow",
  "wyrd-spec",
  "wyrd-utils",
 ]
@@ -9244,7 +9243,6 @@ dependencies = [
  "wyrd-skald-runtime",
  "wyrd-skald-spec",
  "wyrd-skald-tool",
- "wyrd-skald-workflow",
  "wyrd-spec",
 ]
 
@@ -9527,7 +9525,6 @@ dependencies = [
  "wyrd-skald-runtime",
  "wyrd-skald-spec",
  "wyrd-skald-tool",
- "wyrd-skald-workflow",
  "wyrd-spec",
  "wyrd-testing",
  "wyrd-tls",
@@ -9755,7 +9752,6 @@ dependencies = [
  "wyrd-skald-runtime",
  "wyrd-skald-spec",
  "wyrd-skald-tool",
- "wyrd-skald-workflow",
  "wyrd-spec",
 ]
 
@@ -9788,7 +9784,6 @@ dependencies = [
  "wyrd-skald-prompt",
  "wyrd-skald-runtime",
  "wyrd-skald-tool",
- "wyrd-skald-workflow",
  "wyrd-spec",
  "wyrd-testing",
  "wyrd-types",
@@ -9929,12 +9924,12 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
+ "wyrd-skald-agent",
  "wyrd-skald-prompt",
  "wyrd-skald-providers",
  "wyrd-skald-runtime",
  "wyrd-skald-spec",
  "wyrd-skald-tool",
- "wyrd-skald-workflow",
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-storage",
@@ -9961,6 +9956,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
  "workspace-hack",
@@ -10079,39 +10075,6 @@ dependencies = [
  "wyrd-runtime",
  "wyrd-skald-spec",
  "wyrd-spec",
- "wyrd-utils",
-]
-
-[[package]]
-name = "wyrd-skald-workflow"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "futures-util",
- "http",
- "jsonschema",
- "pyo3",
- "secrecy",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
- "wiremock",
- "workspace-hack",
- "wyrd-skald-agent",
- "wyrd-skald-prompt",
- "wyrd-skald-providers",
- "wyrd-skald-runtime",
- "wyrd-skald-spec",
- "wyrd-skald-tool",
- "wyrd-spec",
- "wyrd-telemetry",
  "wyrd-utils",
 ]
 

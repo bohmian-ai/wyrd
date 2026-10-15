@@ -74,12 +74,11 @@ WIRE_ROOTS = [
     "GatewayGovernancePolicy",
     "ProviderCredentialView",
     "ProviderDeployment",
-    # Workflow runs, verification, and Operator connections.
+    # Verification and Operator connections.
     "CreateOperatorConnectionRequest",
     "Judgment",
     "OperatorConnectionView",
     "UpdateOperatorConnectionRequest",
-    "WorkflowRun",
 ]
 
 # Wire roots the SDK sends. Every definition reachable from one of these or

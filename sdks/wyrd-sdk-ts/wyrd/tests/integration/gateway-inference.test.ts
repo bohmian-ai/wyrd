@@ -1,6 +1,4 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 
 import { Agent, run, setTracingDisabled, tool } from "@openai/agents-core";
 import { OpenAIResponsesModel } from "@openai/agents-openai";
@@ -16,11 +14,10 @@ import {
   Principals,
   type ProviderDeployment,
   type RegistrationReceipt,
-  Workflow,
   WyrdClient,
   WyrdError,
 } from "wyrd-ai";
-import { cli, type NativeWyrdTestServer } from "@wyrd/testing";
+import { cli } from "@wyrd/testing";
 
 import { ancestry, columnValues, fixture, registered, serverTest, timeline } from "../support/server.js";
 
@@ -104,12 +101,6 @@ function responsesTurn(body: string): unknown {
       ]);
 }
 
-/** The code-review example Workflow directory; its Prompts call `gpt-5-5` through the Wyrd gateway. */
-const EXAMPLE = resolve(import.meta.dirname, "../../../../../examples/workflows/code-review");
-
-/** The example's own input. */
-const EXAMPLE_INPUT = JSON.parse(readFileSync(resolve(EXAMPLE, "input.json"), "utf8")) as { code: string };
-
 /** One user turn to `openai/gpt-4o`. */
 const ASK = { model: "openai/gpt-4o", max_completion_tokens: 16, messages: [{ role: "user" as const, content: "hi" }] };
 
@@ -126,9 +117,9 @@ function deployment(model: string): ProviderDeployment {
 }
 
 /**
- * A server whose `openai` deployments of `gpt-4o` and `gpt-5-5` reach the
- * local upstream with the operator's provider key, call metadata capture, and
- * the registered `ask` Workflow.
+ * A server whose `openai` deployment of `gpt-4o` reaches the local upstream
+ * with the operator's provider key, call metadata capture, and the registered
+ * `ask-agent` Agent.
  */
 const test = serverTest({
   provider: ({ path, body }) => ({
@@ -160,10 +151,9 @@ const test = serverTest({
         capabilities: ["chat_completions"],
         routing_weight: 1,
       });
-      await gateway.putDeployment(deployment("gpt-5-5"));
       await gateway.putDeployment({ ...deployment("gpt-4o-mini"), capabilities: ["responses"] });
       await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });
-      await use(await Cards.connect().registerFromPath(fixture("cards/gateway_inference/ask.yaml")));
+      await use(await Cards.connect().registerFromPath(fixture("cards/gateway_inference/ask-agent.yaml")));
     },
     { scope: "file" },
   ],
@@ -399,61 +389,4 @@ test("cli issues a card scoped key and writes a provider credential", async ({ a
   expect(issued.key.startsWith(issued.prefix)).toBe(true);
   expect(view).toMatchObject({ name: "managed-openai-key", provider: "openai", state: "active" });
   expect(JSON.stringify(view)).not.toContain("sk-managed");
-});
-
-/** Cards of the tenant administrator `wyrd setup` issues, who is bound to no Card and so may run any registered Workflow. */
-function tenantAdminCards(server: NativeWyrdTestServer): Cards {
-  return Cards.connect({
-    client: WyrdClient.connect({
-      serverUrl: server.baseUrl,
-      credential: server.tenantAdminKey(),
-      grpcUrl: server.grpcUrl,
-    }),
-  });
-}
-
-test("loaded workflow calls the gateway through its loading client", async ({ server, provider, ask }) => {
-  const before = provider.received.length;
-  const workflow = await tenantAdminCards(server).workflow.load({ uid: registered(ask).uid });
-
-  const run = await workflow.run({ question: "hi" });
-
-  expect(run).toMatchObject({ status: "succeeded", outputs: { answer: "hi" } });
-  expect(provider.received.slice(before)).toMatchObject([
-    { path: "/v1/chat/completions", headers: { authorization: `Bearer ${PROVIDER_KEY}` } },
-  ]);
-});
-
-test("example workflow runs through the wyrd gateway", async ({ provider, ask: _ }) => {
-  const before = provider.received.length;
-  const example = await Workflow.fromPath(resolve(EXAMPLE, "workflow.yaml"));
-
-  const run = await example.run(EXAMPLE_INPUT);
-
-  expect(run).toMatchObject({ status: "succeeded", outputs: { review: "hi" } });
-  expect(provider.received.slice(before)).toHaveLength(3);
-});
-
-test("applying a workflow calls no model", async ({ provider, ask: _ }) => {
-  const before = provider.received.length;
-
-  const applied = await cli.apply(EXAMPLE);
-
-  expect(applied.root).toMatchObject({ kind: "Workflow", space: "engineering", name: "code-review" });
-  expect(provider.received.slice(before)).toEqual([]);
-});
-
-test("registered example runs through the gateway", async ({ server, provider, ask: _ }) => {
-  await cli.apply(EXAMPLE);
-  const before = provider.received.length;
-  const registeredExample = await tenantAdminCards(server).workflow.load({
-    space: "engineering",
-    name: "code-review",
-    version: "1.0.0",
-  });
-
-  const run = await registeredExample.run(EXAMPLE_INPUT);
-
-  expect(run).toMatchObject({ status: "succeeded", outputs: { review: "hi" } });
-  expect(provider.received.slice(before)).toHaveLength(3);
 });

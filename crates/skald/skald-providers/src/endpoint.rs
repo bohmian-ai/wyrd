@@ -1,8 +1,7 @@
-//! Network policy for provider and external-gateway endpoints.
+//! Network policy for provider endpoints.
 //!
-//! This is the single provider/ExtGateway egress owner: the Wyrd gateway's
-//! provider dispatch, server admin endpoint validation, and Workflow external
-//! gateway calls all build their transport here. [`EndpointPolicy::admits`] screens a
+//! This is the single provider egress owner: the Wyrd gateway's provider
+//! dispatch and server admin endpoint validation build their transport here. [`EndpointPolicy::admits`] screens a
 //! base URL's scheme, port, and literal address before an attempt, and
 //! [`EndpointPolicy::transport`] builds the Skald transport whose DNS resolver
 //! screens every resolved address at connection time, so a rebinding answer

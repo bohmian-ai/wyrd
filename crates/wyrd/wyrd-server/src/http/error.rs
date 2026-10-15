@@ -687,12 +687,6 @@ mod error_mapper_tests {
             AgentCallbackReturnType,
             AgentCallbackAborted,
             AgentLoopMessageType,
-            WorkflowValidation,
-            WorkflowMissingName,
-            WorkflowMissingVersion,
-            WorkflowDuplicateStepId,
-            WorkflowMissingDependency,
-            WorkflowCycle,
         );
         errors.push(
             WyrdStorageError::ObjectNotFound {

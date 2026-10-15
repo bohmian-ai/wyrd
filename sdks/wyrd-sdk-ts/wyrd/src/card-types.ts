@@ -41,6 +41,10 @@ export interface AgentRunConfigSpec {
  */
 export interface AgentSpec {
   /**
+   * Declared execution route; invocations may replace it whole.
+   */
+  readonly execution_route: ExecutionRoute;
+  /**
    * Prompt reference preserved on disk and resolved by `skald-agent`.
    */
   readonly prompt: InlineableRef_for_Prompt;
@@ -62,268 +66,6 @@ export interface AgentSpec {
  * Validated value for free-form Card annotations.
  */
 export type AnnotationValue = string;
-
-export interface AnthropicCacheControl {
-  readonly ttl?: string | null;
-  readonly type: string;
-}
-
-export interface AnthropicCitationToggle {
-  readonly enabled: boolean;
-}
-
-/**
- * Anthropic citation block.
- */
-export type AnthropicCitationV1 = AnthropicCitationV1CharLocation | AnthropicCitationV1PageLocation | AnthropicCitationV1ContentBlockLocation | AnthropicCitationV1WebSearchResultLocation | AnthropicCitationV1SearchResultLocation;
-
-export interface AnthropicCitationV1CharLocation {
-  readonly cited_text: string;
-  readonly document_index: number;
-  readonly document_title?: string | null;
-  readonly end_char_index: number;
-  readonly start_char_index: number;
-  readonly type: "char_location";
-}
-
-export interface AnthropicCitationV1ContentBlockLocation {
-  readonly cited_text: string;
-  readonly document_index: number;
-  readonly document_title?: string | null;
-  readonly end_block_index: number;
-  readonly start_block_index: number;
-  readonly type: "content_block_location";
-}
-
-export interface AnthropicCitationV1PageLocation {
-  readonly cited_text: string;
-  readonly document_index: number;
-  readonly document_title?: string | null;
-  readonly end_page_number: number;
-  readonly start_page_number: number;
-  readonly type: "page_location";
-}
-
-export interface AnthropicCitationV1SearchResultLocation {
-  readonly cited_text: string;
-  readonly end_block_index: number;
-  readonly search_result_index: number;
-  readonly source: string;
-  readonly start_block_index: number;
-  readonly title?: string | null;
-  readonly type: "search_result_location";
-}
-
-export interface AnthropicCitationV1WebSearchResultLocation {
-  readonly cited_text: string;
-  readonly encrypted_index?: string | null;
-  readonly title?: string | null;
-  readonly type: "web_search_result_location";
-  readonly url: string;
-}
-
-export type AnthropicContentBlock = AnthropicContentBlockText | AnthropicContentBlockImage | AnthropicContentBlockDocument | AnthropicContentBlockThinking | AnthropicContentBlockRedactedThinking | AnthropicContentBlockToolUse | AnthropicContentBlockToolResult;
-
-export interface AnthropicContentBlockDocument {
-  readonly cache_control?: AnthropicCacheControl | null;
-  readonly citations?: AnthropicCitationToggle | null;
-  readonly context?: string | null;
-  readonly source: AnthropicDocumentSource;
-  readonly title?: string | null;
-  readonly type: "document";
-}
-
-export interface AnthropicContentBlockImage {
-  readonly cache_control?: AnthropicCacheControl | null;
-  readonly source: AnthropicImageSource;
-  readonly type: "image";
-}
-
-export interface AnthropicContentBlockRedactedThinking {
-  readonly data: string;
-  readonly type: "redacted_thinking";
-}
-
-export interface AnthropicContentBlockText {
-  readonly cache_control?: AnthropicCacheControl | null;
-  readonly citations?: readonly AnthropicCitationV1[] | null;
-  readonly text: string;
-  readonly type: "text";
-}
-
-export interface AnthropicContentBlockThinking {
-  readonly signature: string;
-  readonly thinking: string;
-  readonly type: "thinking";
-}
-
-export interface AnthropicContentBlockToolResult {
-  readonly cache_control?: AnthropicCacheControl | null;
-  readonly content: AnthropicToolResultContent;
-  readonly is_error?: boolean | null;
-  readonly tool_use_id: string;
-  readonly type: "tool_result";
-}
-
-export interface AnthropicContentBlockToolUse {
-  readonly id: string;
-  readonly input: JsonValue;
-  readonly name: string;
-  readonly type: "tool_use";
-}
-
-export type AnthropicDocumentSource = AnthropicDocumentSourceBase64 | AnthropicDocumentSourceUrl | AnthropicDocumentSourceFileId | AnthropicDocumentSourceText | AnthropicDocumentSourceContent;
-
-export interface AnthropicDocumentSourceBase64 {
-  readonly data: string;
-  readonly media_type: string;
-  readonly type: "base64";
-}
-
-export interface AnthropicDocumentSourceContent {
-  readonly content: readonly AnthropicContentBlock[];
-  readonly type: "content";
-}
-
-export interface AnthropicDocumentSourceFileId {
-  readonly file_id: string;
-  readonly type: "file_id";
-}
-
-export interface AnthropicDocumentSourceText {
-  readonly data: string;
-  readonly media_type: string;
-  readonly type: "text";
-}
-
-export interface AnthropicDocumentSourceUrl {
-  readonly type: "url";
-  readonly url: string;
-}
-
-export type AnthropicImageSource = AnthropicImageSourceBase64 | AnthropicImageSourceUrl | AnthropicImageSourceFileId;
-
-export interface AnthropicImageSourceBase64 {
-  readonly data: string;
-  readonly media_type: string;
-  readonly type: "base64";
-}
-
-export interface AnthropicImageSourceFileId {
-  readonly file_id: string;
-  readonly type: "file_id";
-}
-
-export interface AnthropicImageSourceUrl {
-  readonly type: "url";
-  readonly url: string;
-}
-
-/**
- * One Anthropic message.
- */
-export interface AnthropicMessage {
-  readonly content: readonly AnthropicContentBlock[];
-  readonly role: string;
-}
-
-/**
- * `POST /v1/messages`.
- */
-export interface AnthropicMessagesRequest {
-  /**
-   * Maximum output-token count. Defaults to `4096`.
-   */
-  readonly max_tokens: number;
-  readonly messages: readonly AnthropicMessage[];
-  /**
-   * Provider metadata object.
-   */
-  readonly metadata?: Readonly<Record<string, JsonValue>> | null;
-  readonly model: string;
-  /**
-   * Provider-side structured-output declaration.
-   */
-  readonly output_config?: AnthropicOutputConfig | null;
-  /**
-   * Stop sequences.
-   */
-  readonly stop_sequences?: readonly string[] | null;
-  readonly stream?: boolean | null;
-  readonly system?: AnthropicSystem | null;
-  /**
-   * Sampling temperature.
-   */
-  readonly temperature?: number | null;
-  /**
-   * Anthropic thinking configuration.
-   */
-  readonly thinking?: AnthropicThinkingConfig | null;
-  readonly tool_choice?: JsonValue;
-  readonly tools?: readonly AnthropicTool[] | null;
-  /**
-   * Top-k sampling limit.
-   */
-  readonly top_k?: number | null;
-  /**
-   * Nucleus sampling probability.
-   */
-  readonly top_p?: number | null;
-}
-
-/**
- * Anthropic `output_config` block on a `/v1/messages` request.
- */
-export interface AnthropicOutputConfig {
-  /**
-   * Declared output format.
-   */
-  readonly format: AnthropicOutputFormat;
-}
-
-/**
- * Anthropic output-format variants.
- */
-export type AnthropicOutputFormat = AnthropicOutputFormatJsonSchema;
-
-/**
- * JSON schema enforced by Anthropic at generation time.
- */
-export interface AnthropicOutputFormatJsonSchema {
-  /**
-   * JSON Schema object describing the response shape.
-   */
-  readonly schema: JsonValue;
-  readonly type: "json_schema";
-}
-
-export type AnthropicSystem = string | readonly AnthropicSystemBlock[];
-
-export type AnthropicSystemBlock = AnthropicSystemBlockText;
-
-export interface AnthropicSystemBlockText {
-  readonly cache_control?: AnthropicCacheControl | null;
-  readonly text: string;
-  readonly type: "text";
-}
-
-export interface AnthropicThinkingConfig {
-  readonly budget_tokens?: number | null;
-  readonly type: string;
-}
-
-export interface AnthropicTool {
-  readonly cache_control?: AnthropicCacheControl | null;
-  readonly description?: string | null;
-  readonly display_height_px?: number | null;
-  readonly display_number?: number | null;
-  readonly display_width_px?: number | null;
-  readonly input_schema: JsonValue;
-  readonly name: string;
-  readonly type?: string | null;
-}
-
-export type AnthropicToolResultContent = string | readonly AnthropicContentBlock[];
 
 /**
  * Canonical Wyrd API version.
@@ -504,6 +246,11 @@ export interface BifrostTableEntry {
 }
 
 /**
+ * Where an image or document block's media comes from.
+ */
+export type BlockSource = string | MediaSource;
+
+/**
  * Idempotent cancellation result for one active Oracle query.
  */
 export interface CancelRunningQueryResponse {
@@ -520,7 +267,7 @@ export interface CancelRunningQueryResponse {
 /**
  * Wyrd Card kind.
  */
-export type CardKind = "Data" | "Model" | "Experiment" | "Prompt" | "Agent" | "Workflow" | "Verifier" | "Service" | "Policy" | "Mcp" | "Audit" | "Artifact" | "Trigger" | "Operator" | "Source";
+export type CardKind = "Data" | "Model" | "Experiment" | "Prompt" | "Agent" | "Verifier" | "Service" | "Policy" | "Mcp" | "Audit" | "Artifact" | "Trigger" | "Operator" | "Source";
 
 /**
  * Server-managed lifecycle state for a Card.
@@ -720,6 +467,44 @@ export type ConditionCombinator = "and" | "or";
  * Immutable tenant-scoped Operator connection name, unique per provider.
  */
 export type ConnectionName = string;
+
+/**
+ * One typed portable content block.
+ */
+export type ContentBlock = ContentBlockText | ContentBlockImage | ContentBlockDocument;
+
+/**
+ * A document.
+ */
+export interface ContentBlockDocument {
+  /**
+   * Literal media or one `${media:name}` binding.
+   */
+  readonly source: BlockSource;
+  readonly type: "document";
+}
+
+/**
+ * An image.
+ */
+export interface ContentBlockImage {
+  /**
+   * Literal media or one `${media:name}` binding.
+   */
+  readonly source: BlockSource;
+  readonly type: "image";
+}
+
+/**
+ * Text, which may hold `{{name}}` placeholders.
+ */
+export interface ContentBlockText {
+  /**
+   * Block text.
+   */
+  readonly text: string;
+  readonly type: "text";
+}
 
 /**
  * `POST /v1/operator-connections` body.
@@ -1217,6 +1002,13 @@ export interface DataTypeSpecTimestampTimestamp {
    */
   readonly unit: TimeUnit;
 }
+
+/**
+ * Who may invoke a deployment beyond its administrators.
+ *
+ * Neither value permits anonymous inference: every call still needs a `gateway:invoke` grant of its effective subject. `Open` admits the unscoped `all` grant; `Granted` admits only a grant naming the deployment or one of its exact models.
+ */
+export type DeploymentAccess = "open" | "granted";
 
 /**
  * One dimension in a field shape.
@@ -1784,6 +1576,31 @@ export interface EvalTaskTraceAssertion {
 }
 
 /**
+ * Where an Agent's model calls go.
+ *
+ * Required on every Agent and replaceable whole for one invocation; it is never inferred from the Prompt provider or model.
+ */
+export type ExecutionRoute = ExecutionRouteNative | ExecutionRouteWyrdGateway;
+
+/**
+ * The executing host's provider configuration named by the Prompt provider; refused in server-controlled execution. An empty struct variant so `deny_unknown_fields` refuses a stray `deployment`.
+ */
+export interface ExecutionRouteNative {
+  readonly kind: "native";
+}
+
+/**
+ * The tenant's Wyrd gateway, addressing `<deployment>/<prompt model>`.
+ */
+export interface ExecutionRouteWyrdGateway {
+  /**
+   * Named gateway deployment, not an adapter or model address.
+   */
+  readonly deployment: ProviderDeploymentName;
+  readonly kind: "wyrd_gateway";
+}
+
+/**
  * Ordered fallback candidates for one scope.
  */
 export interface FallbackRule {
@@ -2130,7 +1947,21 @@ export interface GatewayPolicySubjectRoleRole {
 /**
  * Calls a limit applies to.
  */
-export type GatewayPolicyTarget = "all" | GatewayPolicyTargetProvider | GatewayPolicyTargetModel;
+export type GatewayPolicyTarget = "all" | GatewayPolicyTargetDeployment | GatewayPolicyTargetModel;
+
+/**
+ * Every model of one deployment.
+ */
+export interface GatewayPolicyTargetDeployment {
+  readonly deployment: GatewayPolicyTargetDeploymentDeployment;
+}
+
+export interface GatewayPolicyTargetDeploymentDeployment {
+  /**
+   * Deployment name.
+   */
+  readonly deployment: ProviderDeploymentName;
+}
 
 /**
  * One exact model.
@@ -2144,20 +1975,6 @@ export interface GatewayPolicyTargetModelModel {
    * Model identity.
    */
   readonly model: ModelRef;
-}
-
-/**
- * One provider.
- */
-export interface GatewayPolicyTargetProvider {
-  readonly provider: GatewayPolicyTargetProviderProvider;
-}
-
-export interface GatewayPolicyTargetProviderProvider {
-  /**
-   * Provider identity.
-   */
-  readonly provider: ProviderId;
 }
 
 /**
@@ -2176,287 +1993,6 @@ export interface GatewayPriceRate {
    * Billing unit, such as `1m_tokens`.
    */
   readonly unit: string;
-}
-
-export interface GoogleBatchEmbedRequest {
-  readonly requests: readonly GoogleEmbedRequest[];
-}
-
-export interface GoogleCodeExecutionResult {
-  readonly outcome: string;
-  readonly output: string;
-}
-
-/**
- * One Google content turn.
- */
-export interface GoogleContent {
-  readonly parts: readonly GooglePart[];
-  readonly role: string;
-}
-
-export interface GoogleEmbedContent {
-  readonly parts: readonly GoogleEmbedPart[];
-}
-
-export interface GoogleEmbedPart {
-  readonly text: string;
-}
-
-export interface GoogleEmbedRequest {
-  readonly content: GoogleEmbedContent;
-  readonly model: string;
-  readonly output_dimensionality?: number | null;
-  readonly task_type?: string | null;
-  readonly title?: string | null;
-}
-
-export interface GoogleExecutableCode {
-  readonly code: string;
-  readonly language: string;
-}
-
-export interface GoogleFileData {
-  /**
-   * File URI; decodes from `file_uri` or `fileUri`.
-   */
-  readonly file_uri: string;
-  /**
-   * Media type; decodes from `mime_type` or `mimeType`.
-   */
-  readonly mime_type: string;
-}
-
-/**
- * Function call the model requested.
- *
- * Decoding is deliberately permissive (no `deny_unknown_fields`): Gemini and Vertex add members such as call identifiers and thought signatures, which are ignored rather than failing the whole answer.
- */
-export interface GoogleFunctionCall {
-  readonly args: JsonValue;
-  readonly name: string;
-}
-
-export interface GoogleFunctionCallingConfig {
-  readonly allowed_function_names?: readonly string[] | null;
-  readonly mode: string;
-}
-
-export interface GoogleFunctionDeclaration {
-  readonly description?: string | null;
-  readonly name: string;
-  readonly parameters: JsonValue;
-}
-
-export interface GoogleFunctionResponse {
-  readonly name: string;
-  readonly response: JsonValue;
-}
-
-/**
- * `POST /v1beta/models/{model}:generateContent`.
- */
-export interface GoogleGenerateContentRequest {
-  /**
-   * Cached content resource name.
-   */
-  readonly cached_content?: string | null;
-  readonly contents: readonly GoogleContent[];
-  /**
-   * Native Google generationConfig object.
-   */
-  readonly generation_config?: GoogleGenerationConfig | null;
-  /**
-   * Provider labels object.
-   */
-  readonly labels?: Readonly<Record<string, JsonValue>> | null;
-  /**
-   * Native Google safetySettings list.
-   */
-  readonly safety_settings?: readonly GoogleSafetySetting[] | null;
-  readonly system_instruction?: GoogleContent | null;
-  readonly tool_config?: GoogleToolConfig | null;
-  readonly tools?: readonly GoogleTool[] | null;
-}
-
-export interface GoogleGenerationConfig {
-  /**
-   * Number of candidate responses.
-   */
-  readonly candidate_count?: number | null;
-  /**
-   * Frequency penalty.
-   */
-  readonly frequency_penalty?: number | null;
-  /**
-   * Maximum output-token count.
-   */
-  readonly max_output_tokens?: number | null;
-  /**
-   * Presence penalty.
-   */
-  readonly presence_penalty?: number | null;
-  /**
-   * Response MIME type.
-   */
-  readonly response_mime_type?: string | null;
-  /**
-   * Requested output modalities.
-   */
-  readonly response_modalities?: readonly string[] | null;
-  /**
-   * Response schema object.
-   */
-  readonly response_schema?: JsonValue;
-  /**
-   * Provider best-effort deterministic seed.
-   */
-  readonly seed?: number | null;
-  /**
-   * Speech configuration object.
-   */
-  readonly speech_config?: JsonValue;
-  /**
-   * Stop sequences.
-   */
-  readonly stop_sequences?: readonly string[] | null;
-  /**
-   * Sampling temperature.
-   */
-  readonly temperature?: number | null;
-  /**
-   * Gemini thinking configuration.
-   */
-  readonly thinking_config?: GoogleThinkingConfig | null;
-  /**
-   * Top-k sampling limit.
-   */
-  readonly top_k?: number | null;
-  /**
-   * Nucleus sampling probability.
-   */
-  readonly top_p?: number | null;
-}
-
-export interface GoogleInlineData {
-  readonly data: string;
-  /**
-   * Media type; decodes from `mime_type` or `mimeType`.
-   */
-  readonly mime_type: string;
-}
-
-/**
- * One content part.
- *
- * Decoding is untagged and tries variants in declaration order, so `Thought` precedes `Text`: a part carrying both `thought` and `text` is reasoning, not visible text. Structured variants accept the snake_case names Skald emits and the camelCase names Gemini and Vertex return.
- */
-export type GooglePart = GooglePartVariant1 | GooglePartText | GooglePartInlineData | GooglePartFileData | GooglePartFunctionCall | GooglePartFunctionResponse | GooglePartExecutableCode | GooglePartCodeExecutionResult;
-
-/**
- * Result of executing generated code.
- */
-export interface GooglePartCodeExecutionResult {
-  /**
-   * Result; decodes from `code_execution_result` or `codeExecutionResult`.
-   */
-  readonly code_execution_result: GoogleCodeExecutionResult;
-}
-
-/**
- * Code the model generated for execution.
- */
-export interface GooglePartExecutableCode {
-  /**
-   * Code; decodes from `executable_code` or `executableCode`.
-   */
-  readonly executable_code: GoogleExecutableCode;
-}
-
-/**
- * Media referenced by URI.
- */
-export interface GooglePartFileData {
-  /**
-   * File reference; decodes from `file_data` or `fileData`.
-   */
-  readonly file_data: GoogleFileData;
-}
-
-/**
- * Function call the model requested.
- */
-export interface GooglePartFunctionCall {
-  /**
-   * Call; decodes from `function_call` or `functionCall`.
-   */
-  readonly function_call: GoogleFunctionCall;
-}
-
-/**
- * Function result returned to the model.
- */
-export interface GooglePartFunctionResponse {
-  /**
-   * Result; decodes from `function_response` or `functionResponse`.
-   */
-  readonly function_response: GoogleFunctionResponse;
-}
-
-/**
- * Inline base64 media.
- */
-export interface GooglePartInlineData {
-  /**
-   * Media payload; decodes from `inline_data` or `inlineData`.
-   */
-  readonly inline_data: GoogleInlineData;
-}
-
-/**
- * Visible text.
- */
-export interface GooglePartText {
-  /**
-   * Text content.
-   */
-  readonly text: string;
-}
-
-/**
- * Model reasoning text.
- */
-export interface GooglePartVariant1 {
-  /**
-   * Reasoning text.
-   */
-  readonly text: string;
-  /**
-   * Reasoning marker the provider sets on thought parts.
-   */
-  readonly thought: boolean;
-}
-
-export interface GoogleSafetySetting {
-  readonly category: string;
-  readonly threshold: string;
-}
-
-export interface GoogleThinkingConfig {
-  readonly include_thoughts?: boolean | null;
-  readonly thinking_budget?: number | null;
-}
-
-export interface GoogleTool {
-  readonly code_execution?: JsonValue;
-  readonly function_declarations?: readonly GoogleFunctionDeclaration[] | null;
-  readonly google_search?: JsonValue;
-  readonly google_search_retrieval?: JsonValue;
-  readonly url_context?: JsonValue;
-}
-
-export interface GoogleToolConfig {
-  readonly function_calling_config: GoogleFunctionCallingConfig;
 }
 
 /**
@@ -2769,88 +2305,6 @@ export interface IssuedCredential {
   readonly id: string;
 }
 
-/**
- * Outcome descriptions of a `noul` question.
- */
-export interface JevNoulCriteria {
-  /**
-   * When the answer is false.
-   */
-  readonly false: string;
-  /**
-   * When the answer is true.
-   */
-  readonly true: string;
-}
-
-/**
- * One keyed Jev question, tagged by its answer form.
- */
-export type JevQuestion = JevQuestionNoul | JevQuestionChoice | JevQuestionScore;
-
-/**
- * Pick exactly one of the keyed options.
- */
-export interface JevQuestionChoice {
-  /**
-   * Option name to its description.
-   */
-  readonly criteria: Readonly<Record<string, string>>;
-  /**
-   * What to choose about the state.
-   */
-  readonly instructions: string;
-  readonly type: "choice";
-}
-
-/**
- * Yes/no question answered with a probability that it holds.
- */
-export interface JevQuestionNoul {
-  /**
-   * Optional descriptions of the true and false outcomes.
-   */
-  readonly criteria?: JevNoulCriteria | null;
-  /**
-   * What to decide about the state.
-   */
-  readonly instructions: string;
-  readonly type: "noul";
-}
-
-/**
- * Grade on an ordered scale whose levels are indexed from zero.
- */
-export interface JevQuestionScore {
-  /**
-   * Level descriptions, lowest first.
-   */
-  readonly criteria: readonly string[];
-  /**
-   * What to grade about the state.
-   */
-  readonly instructions: string;
-  readonly type: "score";
-}
-
-/**
- * `POST /v1/systemone` request body.
- */
-export interface JevRequest {
-  /**
-   * Native Jev model, such as `jev-latest`.
-   */
-  readonly model: string;
-  /**
-   * Questions keyed by the name their answer returns under.
-   */
-  readonly questions: Readonly<Record<string, JevQuestion>>;
-  /**
-   * Text the questions are about, such as an agent reply.
-   */
-  readonly state: string;
-}
-
 export type JsonPath = string;
 
 /**
@@ -3007,6 +2461,56 @@ export interface ListCardsResponse {
 }
 
 /**
+ * Concrete payload for a [`MediaRef`].
+ */
+export type MediaSource = MediaSourceUrl | MediaSourceBase64 | MediaSourceFile;
+
+/**
+ * Inline base64 payload without a `data:` prefix.
+ */
+export interface MediaSourceBase64 {
+  /**
+   * Base64 payload.
+   */
+  readonly data: string;
+  /**
+   * Required MIME type.
+   */
+  readonly mime_type: string;
+  readonly type: "base64";
+}
+
+/**
+ * Provider-managed file id or file URI.
+ */
+export interface MediaSourceFile {
+  /**
+   * Optional MIME type. Gemini and Vertex require this field.
+   */
+  readonly mime_type?: string | null;
+  readonly type: "file";
+  /**
+   * OpenAI/Anthropic file id, Gemini file API URI, or Vertex file URI.
+   */
+  readonly uri: string;
+}
+
+/**
+ * Remote URL reference. Gemini and Vertex require `mime_type` and accept only `gs://` or Gemini file API URIs.
+ */
+export interface MediaSourceUrl {
+  /**
+   * Optional MIME type.
+   */
+  readonly mime_type?: string | null;
+  readonly type: "url";
+  /**
+   * Remote URL passed to the provider.
+   */
+  readonly url: string;
+}
+
+/**
  * Card metadata common to every kind.
  *
  * `version` and `bump` capture the author's declarative intent on the register path. The server resolves both to a concrete pin before the envelope is returned to the caller:
@@ -3141,19 +2645,19 @@ export interface ModelInterfaceXgboost {
 }
 
 /**
- * One exact provider-native model selected by a caller.
+ * One exact model addressed through one named deployment.
  *
- * Typed surfaces carry the pair; the OpenAI-compatible `model` string is the canonical `<provider>/<model>` projection, split on the first `/` so a native model identifier may itself contain slashes.
+ * Typed surfaces carry the pair; the OpenAI-compatible `model` string is the canonical `<deployment>/<model>` address, split on the first `/` so a provider-native model identifier may itself contain slashes. The model half is sent upstream unchanged.
  */
 export interface ModelRef {
+  /**
+   * Deployment that serves the call.
+   */
+  readonly deployment: ProviderDeploymentName;
   /**
    * Provider-native model identifier.
    */
   readonly model: ModelId;
-  /**
-   * Provider that serves the model.
-   */
-  readonly provider: ProviderId;
 }
 
 /**
@@ -3322,670 +2826,6 @@ export interface NumpyMeta {
   readonly shape?: readonly number[];
 }
 
-export interface OpenAiAllowedTools {
-  readonly mode: OpenAiAllowedToolsMode;
-  readonly tools: readonly Readonly<Record<string, JsonValue>>[];
-}
-
-export interface OpenAiAllowedToolsChoice {
-  readonly allowed_tools: OpenAiAllowedTools;
-  readonly type: OpenAiAllowedToolsKind;
-}
-
-export type OpenAiAllowedToolsKind = "allowed_tools";
-
-export type OpenAiAllowedToolsMode = "auto" | "required";
-
-export type OpenAiAudioFormat = "wav" | "aac" | "mp3" | "flac" | "opus" | "pcm16";
-
-export type OpenAiBuiltInVoice = "alloy" | "ash" | "ballad" | "coral" | "echo" | "fable" | "nova" | "onyx" | "sage" | "shimmer" | "marin" | "cedar";
-
-export interface OpenAiChatAudio {
-  readonly format: OpenAiAudioFormat;
-  readonly voice: OpenAiVoice;
-}
-
-/**
- * One chat message on the wire.
- */
-export interface OpenAiChatMessage {
-  /**
-   * URL citations from web search, when present.
-   */
-  readonly annotations?: readonly OpenAiMessageAnnotation[];
-  /**
-   * Audio output, when present.
-   */
-  readonly audio?: OpenAiMessageAudio | null;
-  readonly content?: OpenAiMessageContent | null;
-  readonly name?: string | null;
-  readonly refusal?: string | null;
-  readonly role: string;
-  readonly tool_call_id?: string | null;
-  readonly tool_calls?: readonly OpenAiToolCall[] | null;
-}
-
-/**
- * `POST /v1/chat/completions`.
- */
-export interface OpenAiChatRequest {
-  /**
-   * Audio output settings.
-   */
-  readonly audio?: OpenAiChatAudio | null;
-  /**
-   * Frequency penalty.
-   */
-  readonly frequency_penalty?: number | null;
-  /**
-   * Token-bias map keyed by token id.
-   */
-  readonly logit_bias?: Readonly<Record<string, JsonValue>> | null;
-  /**
-   * Whether to return token log probabilities.
-   */
-  readonly logprobs?: boolean | null;
-  /**
-   * Maximum completion-token count.
-   */
-  readonly max_completion_tokens?: number | null;
-  /**
-   * Legacy maximum generated-token count.
-   */
-  readonly max_tokens?: number | null;
-  readonly messages: readonly OpenAiChatMessage[];
-  /**
-   * Provider metadata object.
-   */
-  readonly metadata?: Readonly<Record<string, JsonValue>> | null;
-  /**
-   * Requested output modalities.
-   */
-  readonly modalities?: readonly OpenAiResponseModality[] | null;
-  readonly model: string;
-  /**
-   * Number of completions to generate.
-   */
-  readonly n?: number | null;
-  readonly parallel_tool_calls?: boolean | null;
-  /**
-   * Prediction content hint.
-   */
-  readonly prediction?: OpenAiPredictionContent | null;
-  /**
-   * Presence penalty.
-   */
-  readonly presence_penalty?: number | null;
-  /**
-   * OpenAI prompt cache key.
-   */
-  readonly prompt_cache_key?: string | null;
-  /**
-   * Requested reasoning effort.
-   */
-  readonly reasoning_effort?: OpenAiReasoningEffort | null;
-  readonly response_format?: OpenAiResponseFormat | null;
-  /**
-   * Safety identifier.
-   */
-  readonly safety_identifier?: string | null;
-  /**
-   * Provider best-effort deterministic seed.
-   */
-  readonly seed?: number | null;
-  /**
-   * OpenAI service tier.
-   */
-  readonly service_tier?: string | null;
-  /**
-   * Stop sequence or sequences.
-   */
-  readonly stop?: OpenAiStop | null;
-  /**
-   * Whether the provider may store the response.
-   */
-  readonly store?: boolean | null;
-  readonly stream?: boolean | null;
-  readonly stream_options?: OpenAiStreamOptions | null;
-  /**
-   * Sampling temperature.
-   */
-  readonly temperature?: number | null;
-  readonly tool_choice?: OpenAiChatToolChoice | null;
-  readonly tools?: readonly OpenAiTool[] | null;
-  /**
-   * Number of top token log probabilities.
-   */
-  readonly top_logprobs?: number | null;
-  /**
-   * Nucleus sampling probability.
-   */
-  readonly top_p?: number | null;
-  /**
-   * Provider-visible end-user identifier.
-   */
-  readonly user?: string | null;
-}
-
-export type OpenAiChatToolChoice = OpenAiToolChoiceMode | OpenAiAllowedToolsChoice | OpenAiNamedFunctionToolChoice | OpenAiNamedCustomToolChoice;
-
-export type OpenAiContentPart = OpenAiContentPartText | OpenAiContentPartImageUrl | OpenAiContentPartInputAudio | OpenAiContentPartFile;
-
-export interface OpenAiContentPartFile {
-  readonly file: OpenAiFilePart;
-  readonly type: "file";
-}
-
-export interface OpenAiContentPartImageUrl {
-  readonly image_url: OpenAiImageUrl;
-  readonly type: "image_url";
-}
-
-export interface OpenAiContentPartInputAudio {
-  readonly input_audio: OpenAiInputAudio;
-  readonly type: "input_audio";
-}
-
-export interface OpenAiContentPartText {
-  readonly text: string;
-  readonly type: "text";
-}
-
-export interface OpenAiCustomChoice {
-  readonly name: string;
-}
-
-export interface OpenAiCustomTool {
-  readonly description?: string | null;
-  readonly format?: OpenAiCustomToolFormat | null;
-  readonly name: string;
-}
-
-export type OpenAiCustomToolFormat = OpenAiCustomToolFormatText | OpenAiCustomToolFormatGrammar;
-
-export interface OpenAiCustomToolFormatGrammar {
-  readonly grammar: OpenAiGrammar;
-  readonly type: "grammar";
-}
-
-export interface OpenAiCustomToolFormatText {
-  readonly type: "text";
-}
-
-export interface OpenAiCustomVoice {
-  readonly id: string;
-}
-
-/**
- * Easy input message: `type` may be omitted and `content` may be text.
- */
-export interface OpenAiEasyInputMessage {
-  readonly content: string | readonly OpenAiResponseContentPart[];
-  readonly role: string;
-  readonly type?: "message";
-}
-
-export type OpenAiEmbeddingsInput = string | readonly string[] | readonly number[] | readonly (readonly number[])[];
-
-export interface OpenAiEmbeddingsRequest {
-  readonly dimensions?: number | null;
-  readonly encoding_format?: string | null;
-  readonly input: OpenAiEmbeddingsInput;
-  readonly model: string;
-  readonly user?: string | null;
-}
-
-export interface OpenAiFilePart {
-  readonly file_data?: string | null;
-  readonly file_id?: string | null;
-  readonly filename?: string | null;
-}
-
-export interface OpenAiFunction {
-  readonly description?: string | null;
-  readonly name: string;
-  readonly parameters?: Readonly<Record<string, JsonValue>> | null;
-  readonly strict?: boolean | null;
-}
-
-/**
- * A Responses tool result: text, or content parts such as `input_text`.
- *
- * `OpenAI` accepts both forms, and the Agents SDK sends parts. The form the caller sent is kept so the item re-encodes unchanged.
- */
-export type OpenAiFunctionCallOutput = string | readonly OpenAiResponseContentPart[];
-
-export interface OpenAiFunctionChoice {
-  readonly name: string;
-}
-
-export interface OpenAiGrammar {
-  readonly definition: string;
-  readonly syntax: OpenAiGrammarSyntax;
-}
-
-export type OpenAiGrammarSyntax = "lark" | "regex";
-
-export interface OpenAiImageUrl {
-  readonly detail?: string | null;
-  readonly url: string;
-}
-
-export interface OpenAiInputAudio {
-  readonly data: string;
-  readonly format: string;
-}
-
-export interface OpenAiJsonSchema {
-  readonly description?: string | null;
-  readonly name: string;
-  readonly schema?: Readonly<Record<string, JsonValue>> | null;
-  readonly strict?: boolean | null;
-}
-
-/**
- * A URL citation annotation returned by web search.
- */
-export interface OpenAiMessageAnnotation {
-  readonly type: string;
-  readonly url_citation: OpenAiUrlCitation;
-}
-
-/**
- * Audio output returned by the model.
- */
-export interface OpenAiMessageAudio {
-  readonly data: string;
-  readonly expires_at: number;
-  readonly id: string;
-  readonly transcript: string;
-}
-
-export type OpenAiMessageContent = string | readonly OpenAiContentPart[];
-
-export interface OpenAiNamedCustomToolChoice {
-  readonly custom: OpenAiCustomChoice;
-  readonly type: OpenAiNamedCustomToolChoiceKind;
-}
-
-export type OpenAiNamedCustomToolChoiceKind = "custom";
-
-export interface OpenAiNamedFunctionToolChoice {
-  readonly function: OpenAiFunctionChoice;
-  readonly type: OpenAiNamedFunctionToolChoiceKind;
-}
-
-export type OpenAiNamedFunctionToolChoiceKind = "function";
-
-export interface OpenAiPredictionContent {
-  readonly content: OpenAiPredictionPayload;
-  readonly type: OpenAiPredictionKind;
-}
-
-export type OpenAiPredictionContentPart = OpenAiPredictionContentPartText;
-
-export interface OpenAiPredictionContentPartText {
-  readonly text: string;
-  readonly type: "text";
-}
-
-export type OpenAiPredictionKind = "content";
-
-export type OpenAiPredictionPayload = string | readonly OpenAiPredictionContentPart[];
-
-export interface OpenAiReasoning {
-  readonly effort?: OpenAiReasoningEffort2 | null;
-  readonly generate_summary?: OpenAiReasoningSummary | null;
-  readonly summary?: OpenAiReasoningSummary | null;
-}
-
-export type OpenAiReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
-
-export type OpenAiReasoningEffort2 = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
-
-export type OpenAiReasoningSummary = "auto" | "concise" | "detailed";
-
-/**
- * One part of a Responses reasoning item summary.
- */
-export type OpenAiReasoningSummaryPart = OpenAiReasoningSummaryPartSummaryText;
-
-/**
- * Summary text.
- */
-export interface OpenAiReasoningSummaryPartSummaryText {
-  /**
-   * Summary text content.
-   */
-  readonly text: string;
-  readonly type: "summary_text";
-}
-
-export type OpenAiResponseContentPart = OpenAiResponseContentPartInputText | OpenAiResponseContentPartOutputText | OpenAiResponseContentPartInputImage | OpenAiResponseContentPartInputFile;
-
-export interface OpenAiResponseContentPartInputFile {
-  readonly file_id: string;
-  readonly type: "input_file";
-}
-
-export interface OpenAiResponseContentPartInputImage {
-  readonly detail?: string | null;
-  readonly image_url: string;
-  readonly type: "input_image";
-}
-
-export interface OpenAiResponseContentPartInputText {
-  readonly text: string;
-  readonly type: "input_text";
-}
-
-export interface OpenAiResponseContentPartOutputText {
-  readonly text: string;
-  readonly type: "output_text";
-}
-
-export type OpenAiResponseFormat = OpenAiResponseFormatText | OpenAiResponseFormatJsonObject | OpenAiResponseFormatJsonSchema;
-
-export interface OpenAiResponseFormatJsonObject {
-  readonly type: "json_object";
-}
-
-export interface OpenAiResponseFormatJsonSchema {
-  readonly json_schema: OpenAiJsonSchema;
-  readonly type: "json_schema";
-}
-
-export interface OpenAiResponseFormatText {
-  readonly type: "text";
-}
-
-export type OpenAiResponseItem = OpenAiResponseItemMessage | OpenAiResponseItemFunctionCall | OpenAiResponseItemFunctionCallOutput | OpenAiResponseItemReasoning | OpenAiResponseItemInputFile | OpenAiResponseItemInputImage;
-
-export interface OpenAiResponseItemFunctionCall {
-  readonly arguments: string;
-  readonly call_id: string;
-  readonly name: string;
-  readonly type: "function_call";
-}
-
-export interface OpenAiResponseItemFunctionCallOutput {
-  readonly call_id: string;
-  /**
-   * Tool result, as text or as content parts.
-   */
-  readonly output: OpenAiFunctionCallOutput;
-  readonly type: "function_call_output";
-}
-
-export interface OpenAiResponseItemInputFile {
-  readonly file_id: string;
-  readonly type: "input_file";
-}
-
-export interface OpenAiResponseItemInputImage {
-  readonly detail?: string | null;
-  readonly image_url: string;
-  readonly type: "input_image";
-}
-
-export interface OpenAiResponseItemMessage {
-  readonly content: readonly OpenAiResponseContentPart[];
-  readonly role: string;
-  readonly type: "message";
-}
-
-export interface OpenAiResponseItemReasoning {
-  /**
-   * Opaque reasoning state returned when `reasoning.encrypted_content` is included, required to replay the item without stored state.
-   */
-  readonly encrypted_content?: string | null;
-  /**
-   * Provider item identity, required to replay the item statelessly.
-   */
-  readonly id?: string | null;
-  /**
-   * Reasoning summary parts, replayed as returned.
-   */
-  readonly summary?: readonly OpenAiReasoningSummaryPart[];
-  readonly type: "reasoning";
-}
-
-export type OpenAiResponseModality = "text" | "audio";
-
-export interface OpenAiResponsesAllowedToolsChoice {
-  readonly mode: OpenAiResponsesAllowedToolsMode;
-  readonly tools: readonly Readonly<Record<string, JsonValue>>[];
-  readonly type: OpenAiResponsesAllowedToolsKind;
-}
-
-export type OpenAiResponsesAllowedToolsKind = "allowed_tools";
-
-export type OpenAiResponsesAllowedToolsMode = "auto" | "required";
-
-export interface OpenAiResponsesApplyPatchToolChoice {
-  readonly type: OpenAiResponsesApplyPatchToolKind;
-}
-
-export type OpenAiResponsesApplyPatchToolKind = "apply_patch";
-
-export interface OpenAiResponsesCustomToolChoice {
-  readonly name: string;
-  readonly type: OpenAiResponsesCustomToolKind;
-}
-
-export type OpenAiResponsesCustomToolFormat = OpenAiResponsesCustomToolFormatText | OpenAiResponsesCustomToolFormatGrammar;
-
-export interface OpenAiResponsesCustomToolFormatGrammar {
-  readonly grammar: OpenAiResponsesGrammar;
-  readonly type: "grammar";
-}
-
-export interface OpenAiResponsesCustomToolFormatText {
-  readonly type: "text";
-}
-
-export type OpenAiResponsesCustomToolKind = "custom";
-
-export interface OpenAiResponsesFunctionToolChoice {
-  readonly name: string;
-  readonly type: OpenAiResponsesFunctionToolKind;
-}
-
-export type OpenAiResponsesFunctionToolKind = "function";
-
-export interface OpenAiResponsesGrammar {
-  readonly definition: string;
-  readonly syntax: OpenAiResponsesGrammarSyntax;
-}
-
-export type OpenAiResponsesGrammarSyntax = "lark" | "regex";
-
-export interface OpenAiResponsesHostedToolChoice {
-  readonly type: OpenAiResponsesHostedToolKind;
-}
-
-export type OpenAiResponsesHostedToolKind = "file_search" | "web_search_preview" | "computer" | "computer_use_preview" | "computer_use" | "web_search_preview_2025_03_11" | "image_generation" | "code_interpreter";
-
-/**
- * OpenAI Responses `input`: the text shorthand for one user message, or an ordered list of input items.
- *
- * Both forms decode and re-encode unchanged, so a relayed request keeps the form its caller sent. Editing the conversation first expands the text shorthand into the single user message it stands for.
- */
-export type OpenAiResponsesInput = string | readonly (OpenAiResponseItem | OpenAiEasyInputMessage)[];
-
-export interface OpenAiResponsesMcpToolChoice {
-  readonly name?: string | null;
-  readonly server_label: string;
-  readonly type: OpenAiResponsesMcpToolKind;
-}
-
-export type OpenAiResponsesMcpToolKind = "mcp";
-
-/**
- * `OpenAI` Responses API request body carried by a prompt or gateway call.
- *
- * `input` keeps the form the author or caller sent, either text shorthand or an item list, so the request serializes back without reshaping.
- */
-export interface OpenAiResponsesRequest {
-  /**
-   * Additional response fields to include.
-   */
-  readonly include?: readonly string[] | null;
-  /**
-   * Conversation input, in the text or item form the author or caller sent.
-   */
-  readonly input: OpenAiResponsesInput;
-  readonly instructions?: string | null;
-  /**
-   * Maximum output-token count.
-   */
-  readonly max_output_tokens?: number | null;
-  /**
-   * Provider metadata object.
-   */
-  readonly metadata?: Readonly<Record<string, JsonValue>> | null;
-  readonly model: string;
-  readonly parallel_tool_calls?: boolean | null;
-  readonly previous_response_id?: string | null;
-  /**
-   * OpenAI Responses reasoning configuration.
-   */
-  readonly reasoning?: OpenAiReasoning | null;
-  /**
-   * Whether the provider may store the response.
-   */
-  readonly store?: boolean | null;
-  readonly stream?: boolean | null;
-  /**
-   * Sampling temperature.
-   */
-  readonly temperature?: number | null;
-  readonly text?: OpenAiResponsesText | null;
-  readonly tool_choice?: OpenAiResponsesToolChoice | null;
-  readonly tools?: readonly OpenAiResponsesTool[] | null;
-  /**
-   * Nucleus sampling probability.
-   */
-  readonly top_p?: number | null;
-}
-
-export interface OpenAiResponsesShellToolChoice {
-  readonly type: OpenAiResponsesShellToolKind;
-}
-
-export type OpenAiResponsesShellToolKind = "shell";
-
-export interface OpenAiResponsesText {
-  readonly format?: OpenAiTextResponseFormat | null;
-}
-
-export type OpenAiResponsesTool = OpenAiResponsesToolFunction | OpenAiResponsesToolWebSearchPreview | OpenAiResponsesToolFileSearch | OpenAiResponsesToolCodeInterpreter | OpenAiResponsesToolImageGeneration | OpenAiResponsesToolMcp | OpenAiResponsesToolCustom;
-
-export type OpenAiResponsesToolChoice = OpenAiResponsesToolChoiceMode | OpenAiResponsesAllowedToolsChoice | OpenAiResponsesHostedToolChoice | OpenAiResponsesFunctionToolChoice | OpenAiResponsesMcpToolChoice | OpenAiResponsesCustomToolChoice | OpenAiResponsesApplyPatchToolChoice | OpenAiResponsesShellToolChoice;
-
-export type OpenAiResponsesToolChoiceMode = "none" | "auto" | "required";
-
-export interface OpenAiResponsesToolCodeInterpreter {
-  readonly type: "code_interpreter";
-}
-
-export interface OpenAiResponsesToolCustom {
-  readonly description?: string | null;
-  readonly format?: OpenAiResponsesCustomToolFormat | null;
-  readonly name: string;
-  readonly type: "custom";
-}
-
-export interface OpenAiResponsesToolFileSearch {
-  readonly type: "file_search";
-  readonly vector_store_ids: readonly string[];
-}
-
-export interface OpenAiResponsesToolFunction {
-  readonly description?: string | null;
-  readonly name: string;
-  readonly parameters?: Readonly<Record<string, JsonValue>> | null;
-  readonly strict?: boolean | null;
-  readonly type: "function";
-}
-
-export interface OpenAiResponsesToolImageGeneration {
-  readonly type: "image_generation";
-}
-
-export interface OpenAiResponsesToolMcp {
-  readonly allowed_tools?: readonly string[] | null;
-  readonly server_label: string;
-  readonly server_url: string;
-  readonly type: "mcp";
-}
-
-export interface OpenAiResponsesToolWebSearchPreview {
-  readonly type: "web_search_preview";
-}
-
-export type OpenAiStop = string | readonly string[];
-
-export interface OpenAiStreamOptions {
-  readonly include_obfuscation?: boolean | null;
-  readonly include_usage?: boolean | null;
-}
-
-export type OpenAiTextResponseFormat = OpenAiTextResponseFormatText | OpenAiTextResponseFormatJsonObject | OpenAiTextResponseFormatJsonSchema;
-
-export interface OpenAiTextResponseFormatJsonObject {
-  readonly type: "json_object";
-}
-
-export interface OpenAiTextResponseFormatJsonSchema {
-  readonly description?: string | null;
-  readonly name: string;
-  readonly schema?: Readonly<Record<string, JsonValue>> | null;
-  readonly strict?: boolean | null;
-  readonly type: "json_schema";
-}
-
-export interface OpenAiTextResponseFormatText {
-  readonly type: "text";
-}
-
-export type OpenAiTool = OpenAiToolFunction | OpenAiToolCustom;
-
-export interface OpenAiToolCall {
-  readonly function: OpenAiToolFunctionCall;
-  readonly id: string;
-  readonly type: string;
-}
-
-export type OpenAiToolChoiceMode = "none" | "auto" | "required";
-
-export interface OpenAiToolCustom {
-  readonly custom: OpenAiCustomTool;
-  readonly type: "custom";
-}
-
-export interface OpenAiToolFunction {
-  readonly function: OpenAiFunction;
-  readonly type: "function";
-}
-
-export interface OpenAiToolFunctionCall {
-  readonly arguments: string;
-  readonly name: string;
-}
-
-/**
- * Citation metadata for a web search result.
- */
-export interface OpenAiUrlCitation {
-  readonly end_index: number;
-  readonly start_index: number;
-  readonly title: string;
-  readonly url: string;
-}
-
-export type OpenAiVoice = OpenAiBuiltInVoice | OpenAiCustomVoice;
-
 /**
  * Operator execution limits.
  */
@@ -4106,7 +2946,7 @@ export interface OperatorConnectionViewSlack {
 /**
  * A server-owned side-effect template.
  */
-export type OperatorSpec = OperatorSpecWorkflow | OperatorSpecNotify | OperatorSpecHttp;
+export type OperatorSpec = OperatorSpecNotify | OperatorSpecHttp;
 
 /**
  * Perform an HTTP request.
@@ -4168,25 +3008,6 @@ export interface OperatorSpecNotify {
    */
   readonly description?: string | null;
   readonly kind: "notify";
-}
-
-/**
- * Dispatch a registered Workflow.
- */
-export interface OperatorSpecWorkflow {
-  /**
-   * Optional execution limits.
-   */
-  readonly budget?: OperatorBudget | null;
-  /**
-   * Optional human-readable purpose.
-   */
-  readonly description?: string | null;
-  readonly kind: "workflow";
-  /**
-   * Workflow to dispatch with the trigger context.
-   */
-  readonly workflow_ref: Ref;
 }
 
 /**
@@ -4391,6 +3212,70 @@ export interface PolarsMeta {
 }
 
 /**
+ * Portable turn content.
+ */
+export type PortableContent = string | readonly ContentBlock[];
+
+/**
+ * One portable conversation turn.
+ */
+export interface PortableMessage {
+  /**
+   * Text, or ordered typed content blocks.
+   */
+  readonly content: PortableContent;
+  /**
+   * Turn author; system text lives only in `system`.
+   */
+  readonly role: PortableRole;
+}
+
+/**
+ * Author of a portable turn.
+ */
+export type PortableRole = "user" | "assistant";
+
+/**
+ * The eight portable generation settings.
+ *
+ * A setting the destination protocol cannot carry is refused, never dropped.
+ */
+export interface PortableSettings {
+  /**
+   * Frequency penalty.
+   */
+  readonly frequency_penalty?: number | null;
+  /**
+   * Positive output-token limit; required for Anthropic.
+   */
+  readonly max_output_tokens?: number | null;
+  /**
+   * Presence penalty.
+   */
+  readonly presence_penalty?: number | null;
+  /**
+   * Best-effort reproducibility seed.
+   */
+  readonly seed?: number | null;
+  /**
+   * Nonempty stop strings.
+   */
+  readonly stop_sequences?: readonly string[] | null;
+  /**
+   * Sampling temperature.
+   */
+  readonly temperature?: number | null;
+  /**
+   * Positive top-k sampling limit.
+   */
+  readonly top_k?: number | null;
+  /**
+   * Nucleus sampling mass in `[0, 1]`.
+   */
+  readonly top_p?: number | null;
+}
+
+/**
  * Principal-kind discriminator without a bound card.
  *
  * Serializes as a bare snake_case string (`"global_admin"`, `"tenant_admin"`, `"user"`, `"service"`, `"agent"`, `"system"`); this is a stable wire contract for the revoke request body, token claims, and the durable `principal_kind` columns.
@@ -4493,85 +3378,94 @@ export interface PrincipalSummary {
 }
 
 /**
- * Authored native prompt request plus render metadata.
+ * The authored Prompt: provider and model once, plus portable content or one native protocol body.
+ *
+ * Decoding refuses unknown fields; [`AuthoredPrompt::compile`] refuses a mixed form, an invalid provider/format pair, and invalid settings, media, or schemas. Neither performs IO.
  */
 export interface Prompt {
   /**
-   * Declared media placeholder names expected by `bind_media`.
+   * Native protocol content and options, excluding `model`.
    */
-  readonly media_variables?: readonly string[];
+  readonly body?: Readonly<Record<string, JsonValue>> | null;
   /**
-   * Model identifier used for indexing and selection.
+   * Native protocol format; present exactly when `body` is.
+   */
+  readonly format?: PromptFormat | null;
+  /**
+   * Portable ordered user and assistant turns.
+   */
+  readonly messages?: readonly PortableMessage[] | null;
+  /**
+   * Provider model identifier, preserved verbatim including any slash.
    */
   readonly model: string;
   /**
-   * Native dispatch target, such as a custom OpenAI-compatible endpoint.
-   *
-   * When absent, native dispatch uses the request dialect's default provider. Gateway routes select their own upstream and ignore it.
+   * Inference family or configured native provider; never a deployment.
    */
-  readonly provider?: ProviderName | null;
+  readonly provider: ProviderName;
   /**
-   * Native provider-shaped request authored with `${variable}` or `{{variable}}` placeholders.
+   * Portable structured output: one JSON Schema object.
    */
-  readonly request: ProviderRequest;
+  readonly response_format?: Readonly<Record<string, JsonValue>> | null;
   /**
-   * Expected response shape for runtime validation.
+   * Portable generation settings.
    */
-  readonly response_type?: ResponseType;
+  readonly settings?: PortableSettings | null;
   /**
-   * Declared text placeholder names expected by `render`.
+   * Portable system text.
    */
-  readonly variables?: readonly string[];
-  /**
-   * Optional author-assigned prompt version.
-   */
-  readonly version?: string | null;
+  readonly system?: string | null;
 }
 
 /**
- * PromptCard spec body wrapping the native Skald prompt.
+ * Native protocol formats a Prompt `body` may take.
+ */
+export type PromptFormat = "chat_completion" | "responses" | "messages" | "generate_content" | "system_one";
+
+/**
+ * PromptCard spec body: the authored Prompt, portable or native.
  *
- * Serializes with the `prompt` fields flattened directly into the spec body (no `prompt:` nesting key on the wire). Accepts two input forms:
- *
- * - **Declarative** (`provider` present, `request` absent): a `PromptDraft` that is compiled into the native provider request. - **Native** (`request` present): the stored native `Prompt` shape, as produced by `save()`.
+ * The wire form is [`skald_spec::AuthoredPrompt`] directly in the spec body; decoding compiles it into the runtime Prompt, and serializing writes the authored form back unchanged.
  */
 export interface PromptSpec {
   /**
-   * Declared media placeholder names expected by `bind_media`.
+   * Native protocol content and options, excluding `model`.
    */
-  readonly media_variables?: readonly string[];
+  readonly body?: Readonly<Record<string, JsonValue>> | null;
   /**
-   * Model identifier used for indexing and selection.
+   * Native protocol format; present exactly when `body` is.
+   */
+  readonly format?: PromptFormat | null;
+  /**
+   * Portable ordered user and assistant turns.
+   */
+  readonly messages?: readonly PortableMessage[] | null;
+  /**
+   * Provider model identifier, preserved verbatim including any slash.
    */
   readonly model: string;
   /**
-   * Native dispatch target, such as a custom OpenAI-compatible endpoint.
-   *
-   * When absent, native dispatch uses the request dialect's default provider. Gateway routes select their own upstream and ignore it.
+   * Inference family or configured native provider; never a deployment.
    */
-  readonly provider?: ProviderName | null;
+  readonly provider: ProviderName;
   /**
-   * Native provider-shaped request authored with `${variable}` or `{{variable}}` placeholders.
+   * Portable structured output: one JSON Schema object.
    */
-  readonly request: ProviderRequest;
+  readonly response_format?: Readonly<Record<string, JsonValue>> | null;
   /**
-   * Expected response shape for runtime validation.
+   * Portable generation settings.
    */
-  readonly response_type?: ResponseType;
+  readonly settings?: PortableSettings | null;
   /**
-   * Declared text placeholder names expected by `render`.
+   * Portable system text.
    */
-  readonly variables?: readonly string[];
-  /**
-   * Optional author-assigned prompt version.
-   */
-  readonly version?: string | null;
+  readonly system?: string | null;
 }
 
 /**
  * Upstream protocol family a deployment speaks.
  *
- * The four built-in variants use Skald's typed provider protocols and require their reserved provider identity. `OpenAiCompatible` uses the standard OpenAI routes under `base_url` for any non-reserved provider.
+ * The built-in variants use Skald's typed provider protocols and authenticate with a credential of their reserved provider identity. `OpenAiCompatible` uses the standard OpenAI routes under `base_url` with a credential of any non-reserved provider identity.
  */
 export type ProviderAdapter = "openai" | "anthropic" | "gemini" | ProviderAdapterVertex | "jev" | ProviderAdapterOpenaiCompatible;
 
@@ -4734,11 +3628,15 @@ export interface ProviderCredentialView {
 }
 
 /**
- * One tenant-authorized upstream model target.
+ * One named tenant inference target.
  *
- * The name is an administration identifier only; inference callers select a [`ModelRef`], never a deployment. The same shape is the `PUT` body and the redacted read view because it carries no secret material.
+ * Callers address it as `<name>/<model>`; the name selects exactly this adapter and credential binding. The same shape is the `PUT` body and the redacted read view because it carries no secret material.
  */
 export interface ProviderDeployment {
+  /**
+   * Who may invoke the deployment.
+   */
+  readonly access?: DeploymentAccess;
   /**
    * Upstream protocol family.
    */
@@ -4748,21 +3646,17 @@ export interface ProviderDeployment {
    */
   readonly auth: ProviderAuth;
   /**
-   * Explicitly declared operations; never inferred by probing.
+   * Operations narrowing what the adapter serves; absent permits every adapter-supported operation. Never inferred by probing.
    */
-  readonly capabilities: readonly GatewayOperation[];
+  readonly capabilities?: readonly GatewayOperation[] | null;
   /**
-   * Exact model this deployment serves.
+   * Models callers may address; absent applies no Wyrd allowlist, which promises neither upstream entitlement nor model existence.
    */
-  readonly model: ModelRef;
+  readonly models?: readonly ModelId[] | null;
   /**
-   * Tenant-unique deployment name.
+   * Tenant-unique deployment name, the first segment of every address.
    */
   readonly name: ProviderDeploymentName;
-  /**
-   * Positive weight among deployments serving the same model.
-   */
-  readonly routing_weight: number;
 }
 
 /**
@@ -4775,107 +3669,7 @@ export type ProviderDeploymentName = string;
  */
 export type ProviderId = string;
 
-/**
- * Which provider a request targets.
- */
-export type ProviderName = "open_ai" | "anthropic" | "google" | "vertex" | "jev" | ProviderNameCustom;
-
-/**
- * Provider not modeled by skald-spec.
- */
-export interface ProviderNameCustom {
-  readonly custom: string;
-}
-
-/**
- * One native LLM request, tagged with the provider dialect its body speaks.
- *
- * Serialized as `{"provider": "<variant>", "body": <native provider JSON>}`. The tag selects the variant, so a body that does not match its named dialect fails to deserialize. The tag names a wire schema, not a destination: one schema served by several providers is one variant.
- */
-export type ProviderRequest = ProviderRequestOpenAiChatCompletion | ProviderRequestOpenAiResponses | ProviderRequestOpenAiEmbeddings | ProviderRequestAnthropicMessage | ProviderRequestGeminiGenerateContent | ProviderRequestGoogleBatchEmbed | ProviderRequestVertexPredict | ProviderRequestJevSystemOne | ProviderRequestRawV1;
-
-/**
- * Anthropic Messages request.
- */
-export interface ProviderRequestAnthropicMessage {
-  readonly body: AnthropicMessagesRequest;
-  readonly provider: "anthropic_message";
-}
-
-/**
- * Google GenerateContent request, sent to Gemini or, when [`Prompt::provider`](crate::Prompt::provider) is Vertex, to Vertex.
- */
-export interface ProviderRequestGeminiGenerateContent {
-  readonly body: GoogleGenerateContentRequest;
-  readonly provider: "gemini_generate_content";
-}
-
-/**
- * Google Gemini BatchEmbedContents request.
- */
-export interface ProviderRequestGoogleBatchEmbed {
-  readonly body: GoogleBatchEmbedRequest;
-  readonly provider: "google_batch_embed";
-}
-
-/**
- * TypeSafe Jev `systemone` keyed questions about a state.
- */
-export interface ProviderRequestJevSystemOne {
-  readonly body: JevRequest;
-  readonly provider: "jev_system_one";
-}
-
-/**
- * OpenAI Chat Completions request, whether it is sent to OpenAI, a gateway, or a custom OpenAI-compatible endpoint named by [`Prompt::provider`](crate::Prompt::provider).
- */
-export interface ProviderRequestOpenAiChatCompletion {
-  readonly body: OpenAiChatRequest;
-  readonly provider: "open_ai_chat_completion";
-}
-
-/**
- * OpenAI Embeddings request.
- */
-export interface ProviderRequestOpenAiEmbeddings {
-  readonly body: OpenAiEmbeddingsRequest;
-  readonly provider: "open_ai_embeddings";
-}
-
-/**
- * OpenAI Responses API request.
- */
-export interface ProviderRequestOpenAiResponses {
-  readonly body: OpenAiResponsesRequest;
-  readonly provider: "open_ai_responses";
-}
-
-/**
- * Raw provider request body that no typed variant models.
- */
-export interface ProviderRequestRawV1 {
-  readonly body: ProviderRequestRawV1Body;
-  readonly provider: "raw_v1";
-}
-
-export interface ProviderRequestRawV1Body {
-  /**
-   * Raw provider request JSON, sent as given.
-   */
-  readonly body: JsonValue;
-  /**
-   * Provider dispatch target for the raw body.
-   */
-  readonly provider: ProviderName;
-}
-
-/**
- * Vertex Predict request.
- */
-export interface ProviderRequestVertexPredict {
-  readonly body: VertexPredictRequest;
-  readonly provider: "vertex_predict";
-}
+export type ProviderName = string;
 
 /**
  * PSI numeric binning strategy.
@@ -5431,7 +4225,7 @@ export interface RegisteredTriggerCard {
 /**
  * Registered Card envelope of a kind whose spec is not typed yet.
  */
-export type RegisteredUntypedCard = RegisteredExperimentCard | RegisteredWorkflowCard | RegisteredPolicyCard | RegisteredMcpCard | RegisteredAuditCard | RegisteredArtifactCard | RegisteredSourceCard;
+export type RegisteredUntypedCard = RegisteredExperimentCard | RegisteredPolicyCard | RegisteredMcpCard | RegisteredAuditCard | RegisteredArtifactCard | RegisteredSourceCard;
 
 /**
  * Registered `Verifier` Card envelope.
@@ -5457,36 +4251,6 @@ export interface RegisteredVerifierCard {
    * Kind-specific spec payload.
    */
   readonly spec: VerifierSpec;
-  /**
-   * Optional server-derived status.
-   */
-  readonly status?: Status | null;
-}
-
-/**
- * Registered `Workflow` Card envelope; its spec is not typed yet.
- */
-export interface RegisteredWorkflowCard {
-  /**
-   * API version. Must be `wyrd/v1` for v1 Cards.
-   */
-  readonly apiVersion: ApiVersion;
-  /**
-   * Card kind discriminator.
-   */
-  readonly kind: "Workflow";
-  /**
-   * Card metadata.
-   */
-  readonly metadata: Metadata;
-  /**
-   * Server-derived relationship summary.
-   */
-  readonly relationships?: Relationships;
-  /**
-   * Kind-specific spec payload.
-   */
-  readonly spec: Readonly<Record<string, JsonValue>>;
   /**
    * Optional server-derived status.
    */
@@ -5569,29 +4333,6 @@ export interface Resource {
    * `service.version`, when emitted by the producer.
    */
   readonly service_version?: string | null;
-}
-
-/**
- * Expected response shape for a rendered prompt.
- */
-export type ResponseType = "text" | ResponseTypeJsonSchema;
-
-/**
- * JSON response validated against a named schema by the runtime.
- */
-export interface ResponseTypeJsonSchema {
-  readonly json_schema: ResponseTypeJsonSchemaJsonSchema;
-}
-
-export interface ResponseTypeJsonSchemaJsonSchema {
-  /**
-   * Schema name used in diagnostics and provider-native structured output fields.
-   */
-  readonly name: string;
-  /**
-   * JSON Schema object.
-   */
-  readonly schema: JsonValue;
 }
 
 /**
@@ -5807,7 +4548,7 @@ export interface ServiceRuntime {
 /**
  * Service runtime kind.
  */
-export type ServiceRuntimeKind = "api" | "mcp" | "agent" | "workflow";
+export type ServiceRuntimeKind = "api" | "mcp" | "agent";
 
 /**
  * Service runtime placement mode.
@@ -6843,22 +5584,6 @@ export interface VersionBumpPrePre {
  */
 export type VersionSpec = string;
 
-export interface VertexEmbedInstance {
-  readonly content: string;
-  readonly task_type?: string | null;
-  readonly title?: string | null;
-}
-
-export interface VertexEmbedParameters {
-  readonly auto_truncate?: boolean | null;
-  readonly output_dimensionality?: number | null;
-}
-
-export interface VertexPredictRequest {
-  readonly instances: readonly VertexEmbedInstance[];
-  readonly parameters?: VertexEmbedParameters | null;
-}
-
 /**
  * Author-declared workflow field map for eval task inputs and outputs.
  */
@@ -6873,116 +5598,6 @@ export interface Workflow {
  * Declared JSON shape for one workflow field.
  */
 export type WorkflowFieldType = "string" | "integer" | "float" | "boolean" | "object" | "array" | "any";
-
-/**
- * Portable Workflow run snapshot shared by local and server execution.
- */
-export interface WorkflowRun {
-  /**
-   * Creation time.
-   */
-  readonly created_at: string;
-  /**
-   * Terminal time.
-   */
-  readonly ended_at: string | null;
-  /**
-   * Primary run error for `failed` and `timed_out` runs.
-   */
-  readonly error: WorkflowRunError | null;
-  /**
-   * Declared outputs, populated only for a succeeded run.
-   */
-  readonly outputs: Readonly<Record<string, JsonValue>>;
-  /**
-   * Run identity.
-   */
-  readonly run_id: string;
-  /**
-   * Start time.
-   */
-  readonly started_at: string | null;
-  /**
-   * Run lifecycle status.
-   */
-  readonly status: WorkflowRunStatus;
-  /**
-   * Step results keyed by step ID.
-   */
-  readonly steps: Readonly<Record<string, WorkflowStepResult>>;
-  /**
-   * Pinned Workflow Card, absent only for an unregistered local run.
-   */
-  readonly workflow: CardRef | null;
-}
-
-/**
- * Terminal-snapshot projection of one derive-backed Wyrd error.
- *
- * This is not a second catalog: `code` and `remediation` come from the [`WyrdError`] catalog and `details` carries only safe fields.
- */
-export interface WorkflowRunError {
-  /**
-   * Stable Wyrd error code.
-   */
-  readonly code: string;
-  /**
-   * Safe structured details.
-   */
-  readonly details: JsonValue;
-  /**
-   * Safe diagnostic message.
-   */
-  readonly message: string;
-  /**
-   * Operator-facing remediation.
-   */
-  readonly remediation: string;
-}
-
-/**
- * Lifecycle status of a Workflow run.
- */
-export type WorkflowRunStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled" | "timed_out";
-
-/**
- * Portable result of one Workflow step.
- */
-export interface WorkflowStepResult {
-  /**
-   * Number of attempts begun.
-   */
-  readonly attempts: number;
-  /**
-   * Terminal time.
-   */
-  readonly ended_at: string | null;
-  /**
-   * Terminal error, present only for a failed step.
-   */
-  readonly error: WorkflowRunError | null;
-  /**
-   * First attempt start time.
-   */
-  readonly started_at: string | null;
-  /**
-   * Step lifecycle status.
-   */
-  readonly status: WorkflowStepStatus;
-  /**
-   * Structured output, retained only for a succeeded step.
-   */
-  readonly structured_output: JsonValue;
-  /**
-   * Final text output, retained only for a succeeded step.
-   */
-  readonly text: string | null;
-}
-
-/**
- * Lifecycle status of one Workflow step.
- */
-export type WorkflowStepStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled" | "unstarted";
 
 /**
  * RFC 9457 problem value emitted by every public Wyrd error boundary.

@@ -22,7 +22,6 @@ use wyrd_cards::prompt::PromptCard;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::agent::AgentCard;
 use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
-use wyrd_spec::card::workflow::WorkflowCard;
 use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
@@ -67,8 +66,6 @@ struct TypedCards {
     models: BTreeMap<String, ModelCard>,
     /// Data Card holders keyed by exact `CardRef`.
     data: BTreeMap<String, DataCard>,
-    /// Workflow Card holders keyed by exact `CardRef`.
-    workflows: BTreeMap<String, WorkflowCard>,
 }
 
 impl fmt::Debug for TypedCards {
@@ -81,7 +78,6 @@ impl fmt::Debug for TypedCards {
             .field("prompts", &self.prompts.keys().collect::<Vec<_>>())
             .field("models", &self.models.keys().collect::<Vec<_>>())
             .field("data", &self.data.keys().collect::<Vec<_>>())
-            .field("workflows", &self.workflows.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -932,25 +928,6 @@ impl WyrdState {
             .ok_or_else(|| typed_map_invariant(alias, key, &CardKind::Data))
     }
 
-    /// Resolve an alias to a native Workflow Card holder.
-    ///
-    /// # Arguments
-    /// * `alias` - The bundle alias of a Workflow Card.
-    ///
-    /// # Errors
-    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
-    /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
-    /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a validated typed index is
-    /// internally inconsistent.
-    pub fn workflow(&self, alias: &str) -> Result<&WorkflowCard, WyrdError> {
-        let key = self.typed_key(alias, &CardKind::Workflow)?;
-        self.index
-            .typed
-            .workflows
-            .get(key)
-            .ok_or_else(|| typed_map_invariant(alias, key, &CardKind::Workflow))
-    }
-
     /// Resolve an alias to the pure Verifier spec borrowed from its envelope.
     ///
     /// The caller matches on `implementation` to reach the Drift or Eval
@@ -1561,11 +1538,6 @@ fn hydrate_typed_cards(cards: &BTreeMap<String, Card>) -> Result<TypedCards, Wyr
                     .map_err(|error| typed_hydration_error(envelope, &error))?;
                 typed.data.insert(key.clone(), holder);
             }
-            CardKind::Workflow => {
-                let holder = WorkflowCard::from_envelope(envelope.clone())
-                    .map_err(|error| typed_hydration_error(envelope, &error))?;
-                typed.workflows.insert(key.clone(), holder);
-            }
             _ => {}
         }
     }
@@ -2114,7 +2086,6 @@ pub(crate) mod tests {
     use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
     use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
     use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
-    use wyrd_spec::card::workflow::{WorkflowAction, WorkflowSpec, WorkflowStep};
     use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
     use wyrd_spec::graph::relationships_from_spec;
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
@@ -2284,7 +2255,6 @@ pub(crate) mod tests {
             let data_ref = test_ref(CardKind::Data, "training", 7);
             let eval_ref = test_ref(CardKind::Verifier, "quality", 8);
             let drift_ref = test_ref(CardKind::Verifier, "model-drift", 9);
-            let workflow_ref = test_ref(CardKind::Workflow, "runtime", 10);
 
             bundle.add_card(
                 "triage_prompt",
@@ -2357,16 +2327,6 @@ pub(crate) mod tests {
                 ),
                 &[],
             );
-            bundle.add_card(
-                "runtime_workflow",
-                card(
-                    &workflow_ref,
-                    CardKind::Workflow,
-                    Spec::Workflow(WorkflowSpec::default()),
-                    Relationships::default(),
-                ),
-                &[],
-            );
             let root_ref = test_ref(CardKind::Service, "service", 1);
             bundle.rewrite_card(&root_ref, |card| {
                 let Spec::Service(spec) = &mut card.spec else {
@@ -2377,7 +2337,6 @@ pub(crate) mod tests {
                     service_component("training_data", &data_ref),
                     service_component("agent_triage", &agent_ref),
                     service_component("agent_inline", &inline_prompt_ref),
-                    service_component("runtime_workflow", &workflow_ref),
                 ]);
                 spec.verified_by.extend([
                     verification_binding(eval_ref, TriggerActivation::ObservationsReady {}),
@@ -2394,63 +2353,62 @@ pub(crate) mod tests {
             bundle
         }
 
-        /// Add a Workflow whose inline Agent prompt uses the supplied reference form.
+        /// Add an Eval Verifier, bound to the root Service, whose LLM judge is
+        /// an inline Agent with a prompt in the supplied reference form.
         ///
         /// # Panics
-        /// Panics if the workflow fixture cannot be rewritten or serialized.
+        /// Panics if the judge fixture cannot be built, rewritten, or serialized.
         fn with_nested_prompt(&mut self, prompt_ref: CardRef, sibling: bool) -> CardRef {
-            let workflow_ref = test_ref(CardKind::Workflow, "workflow", 4);
-            let workflow = WorkflowSpec {
-                steps: vec![WorkflowStep {
-                    id: "agent".to_owned(),
-                    action: WorkflowAction::Agent(InlineableRef::Inline(Box::new(AgentSpec {
-                        prompt: if sibling {
-                            InlineableRef::Sibling {
-                                sibling: prompt_ref,
-                            }
-                        } else {
-                            InlineableRef::Ref(prompt_ref)
-                        },
-                        execution_route: wyrd_spec::ExecutionRoute::Native {},
-                        tool_names: Vec::new(),
-                        run_config: AgentRunConfigSpec::default(),
-                        verified_by: Vec::new(),
-                    }))),
-                    depends_on: Vec::new(),
-                    inputs: BTreeMap::new(),
-                    llm_route: None,
-                    fallback: None,
-                    timeout_seconds: None,
-                    retry: None,
-                    display: BTreeMap::new(),
-                }],
-                outputs: BTreeMap::from([(
-                    "out".to_owned(),
-                    wyrd_spec::card::workflow::WorkflowBinding::new("steps.agent.output.text")
-                        .expect("fixture binding is valid"),
-                )]),
-                ..WorkflowSpec::default()
+            use wyrd_spec::vala::eval::{ComparisonOperator, EvalTask, LlmJudgeTask, TaskId};
+
+            let verifier_ref = test_ref(CardKind::Verifier, "judge", 4);
+            let task_id = TaskId::new("judge").expect("fixture task id is valid");
+            let judge = LlmJudgeTask::new(
+                task_id.clone(),
+                InlineableRef::Inline(Box::new(AgentSpec {
+                    prompt: if sibling {
+                        InlineableRef::Sibling {
+                            sibling: prompt_ref,
+                        }
+                    } else {
+                        InlineableRef::Ref(prompt_ref)
+                    },
+                    execution_route: wyrd_spec::ExecutionRoute::Native {},
+                    tool_names: Vec::new(),
+                    run_config: AgentRunConfigSpec::default(),
+                    verified_by: Vec::new(),
+                })),
+                ComparisonOperator::Equals,
+                serde_json::json!(true),
+            )
+            .expect("fixture judge is valid");
+            let eval = EvalSpec {
+                tasks: BTreeMap::from([(task_id, EvalTask::LlmJudge(judge))]),
+                ..eval_spec()
             };
             self.add_card(
-                "workflow",
-                canonical_card(&workflow_ref, CardKind::Workflow, Spec::Workflow(workflow)),
+                "judge",
+                canonical_card(
+                    &verifier_ref,
+                    CardKind::Verifier,
+                    Spec::Verifier(VerifierSpec {
+                        description: None,
+                        implementation: VerifierImplementation::Eval(eval),
+                    }),
+                ),
                 &[],
             );
             let root_ref = test_ref(CardKind::Service, "service", 1);
             self.rewrite_card(&root_ref, |card| {
                 if let Spec::Service(spec) = &mut card.spec {
-                    spec.components.push(ServiceComponent {
-                        alias: "workflow".to_owned(),
-                        card_ref: Ref::Ref(workflow_ref.clone()),
-                        verified_by: Vec::new(),
-                        source: None,
-                        config: BTreeMap::new(),
-                        credential_refs: Vec::new(),
-                    });
+                    spec.verified_by.push(verification_binding(
+                        verifier_ref.clone(),
+                        TriggerActivation::ObservationsReady {},
+                    ));
                 }
             });
             self.write();
-            workflow_ref
+            verifier_ref
         }
 
         /// Add a Card, aliases, manifest projections, and optional payloads.
@@ -2973,13 +2931,6 @@ pub(crate) mod tests {
             state.prompt("triage_prompt").expect("prompt resolves").name,
             "triage"
         );
-        assert_eq!(
-            state
-                .workflow("runtime_workflow")
-                .expect("workflow resolves")
-                .name,
-            "runtime"
-        );
         let eval = state
             .verifier("quality_eval")
             .expect("eval verifier resolves");
@@ -3277,7 +3228,6 @@ pub(crate) mod tests {
         assert_wrong_kind!(state.prompt("model"));
         assert_wrong_kind!(state.model("agent_triage"));
         assert_wrong_kind!(state.data("agent_triage"));
-        assert_wrong_kind!(state.workflow("agent_triage"));
         assert_wrong_kind!(state.verifier("agent_triage"));
     }
 
@@ -3635,17 +3585,17 @@ pub(crate) mod tests {
     /// Load the nested inline Agent when its prompt uses a durable reference.
     ///
     /// # Panics
-    /// Panics if the durable nested reference cannot load or resolve to the workflow Card.
+    /// Panics if the durable nested reference cannot load or resolve to the judge Verifier Card.
     #[test]
     fn loads_nested_inline_agent_prompt_durable_reference() {
         let target = test_ref(CardKind::Model, "model", 2);
         let mut bundle = TestBundle::complete_service();
-        let workflow_ref = bundle.with_nested_prompt(target, false);
+        let verifier_ref = bundle.with_nested_prompt(target, false);
         let state = WyrdState::from_path(bundle.path()).expect("durable nested ref loads");
 
         assert_eq!(
-            state.card_ref("workflow").expect("workflow resolves"),
-            &workflow_ref
+            state.card_ref("judge").expect("judge Verifier resolves"),
+            &verifier_ref
         );
     }
 

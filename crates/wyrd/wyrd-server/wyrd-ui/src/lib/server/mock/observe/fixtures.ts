@@ -1378,7 +1378,7 @@ export const evalDetails: Record<string, EvalDetail> = {
     evalCardHref: 'card_eval_01',
     subject: 'checkout-agent',
     subjectHref: 'card_service_04',
-    workflow: { name: 'Checkout quality workflow', version: 'card_workflow_01 v7', started: '12:41:02Z' },
+    workflow: { name: 'Checkout quality workflow', version: 'card_eval_01 v7', started: '12:41:02Z' },
     status: { label: 'Failed', tone: 'danger' },
     duration: '12.4s',
     passed: 4,

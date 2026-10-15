@@ -179,10 +179,24 @@ not a passive integration or inventory product.
     is a grant held at platform scope, not a property of a kind, and neither
     plane's credential or token is accepted by the other. Gateway capture is a
     server-internal write, not a principal that authenticates: captured rows
-    carry the reserved `GATEWAY_CAPTURE_PRINCIPAL`, which, like
-    `PLATFORM_AUDIT_PRINCIPAL`, never appears in a token. Every issuer refuses
-    it, every verifier rejects a token naming it, and it never replaces the
-    invocation caller in audit. `wyrd apply -f service.yaml` (or an Agent card) creates
+    carry the verified pair the call ran under. The reserved
+    `GATEWAY_CAPTURE_PRINCIPAL`, like `PLATFORM_AUDIT_PRINCIPAL`, never
+    appears in a token: every issuer refuses it, every verifier rejects a
+    token naming it, and it never replaces the invocation caller in audit.
+    `PLATFORM_AUDIT_PRINCIPAL` is the single no-verified-caller marker. It
+    fills both `sub_principal_id` and `act_principal_id` on an audited
+    decision with no verified identity and on a creation row no verified
+    caller caused: SYSTEM bootstrap, startup built-in reconciliation,
+    reserved audit-owner tables, the defining SQL backfill, and dev-fixture
+    seeding. It is not SYSTEM and authorizes nothing. Tenant provisioning by
+    an authenticated platform operator records that operator's platform pair
+    on the tenant's SYSTEM principal and built-in tables, an explicit
+    exception like platform audit; SYSTEM is never its own creator, and
+    retries and reconciliation keep the first pair. A request refused before
+    any principal resolves (no credential, a malformed bearer token, or one
+    failing signature or claim verification) records no audit decision; the
+    credential-exchange refusals audit records keep the sentinel pair when no
+    identity is verified. `wyrd apply -f service.yaml` (or an Agent card) creates
     or updates the principal row idempotently, keyed on
     `(tenant_id, card_kind, card_uid)`; re-apply preserves the same
     `principal_id`. No secret is returned. Credentials are issued out-of-band
@@ -613,10 +627,9 @@ credential's non-secret id.
 
 Wyrd principals are UUID-backed runtime identities that exist independently of
 any credential: issuing, rotating, revoking, or losing a credential never
-creates, destroys, or alters a principal or its role grants. The reserved
-`GATEWAY_CAPTURE_PRINCIPAL` is not a credential-bearing identity: it is the
-id Scribe stamps on rows gateway capture writes server-internally, holding no
-token, role, or grant. Each `wyrd-server` process owns one capture writer,
+creates, destroys, or alters a principal or its role grants. Gateway capture
+is a server-internal write holding no token, role, or grant; Scribe stamps
+each captured row with the verified pair the call ran under. Each `wyrd-server` process owns one capture writer,
 chosen from pod topology (`WYRD_TARGET`): it submits in-process when Scribe
 runs in the pod, and otherwise over the peer plane through a capture-only RPC
 to a live, ready Scribe. A capture is delivered when Scribe acknowledges it
@@ -624,9 +637,10 @@ before the call's deadline; backpressure and an unavailable Scribe are retried
 with bounded backoff until then, and anything else drops the capture with a
 counted reason without changing the call. No per-tenant client, queue, or
 backlog outlives the call. The same writer submits Verifier results to the
-three result tables, attributed to the run's subject with the tenant's
-`System` principal as actor, which Scribe stamps as `sub_principal_id` and
-`act_principal_id`; each row names the verified Card as `card_uid` and the
+three result tables, attributed to the pair the result was produced under —
+the caller's verified pair for a realtime invocation, and the run's subject
+with the tenant's `System` principal as actor for a queued run — which Scribe
+stamps as `sub_principal_id` and `act_principal_id`; each row names the verified Card as `card_uid` and the
 exact Verifier Card as `verifier_card_uid`; a result batch is never dropped for time and is retried under its
 own batch id until Scribe acknowledges it. Gate refuses every public write to
 `vala.gateway.calls` and the three result tables.
@@ -1254,7 +1268,8 @@ settlement never waits for Scribe. The outbox writes the result tables through
 the same in-memory path as audit and gateway capture, so a result Scribe has
 not acknowledged is lost on abrupt process death or an expired shutdown
 deadline, and that loss never changes the settled run. A realtime Verifier
-invocation stages its result the same way. While a run is in flight, one
+invocation stages its result the same way, attributed to its caller's
+verified pair. While a run is in flight, one
 statement per tenant renews its leases on the PostgreSQL clock once a third of
 the lease has passed. An expired lease is never revived, and a renewal that no
 longer finds a run's token cancels that run's work. A run holds a connection
@@ -1263,11 +1278,13 @@ the lease holds.
 
 Every work record names who the work was for (`sub_principal_id`) and who
 performed it (`act_principal_id`). A direct caller A records A/A and a
-delegated caller B acting for A records A/B; a scheduled or
+delegated caller B acting for A records A/B, on its request's audit, on an
+accepted manual run, and on a realtime invocation's result; a scheduled or
 observation-triggered run records its binding owner as subject. Wyrd performs
-a run's judge calls, input reads, and result writes as the tenant SYSTEM
-principal, so they record the run's subject with SYSTEM as actor. SYSTEM is
-never a subject and authorizes nothing: judge calls are checked against the
+a queued run's judge calls, input reads, and result writes, and a realtime
+invocation's judge calls, as the tenant SYSTEM principal, so they record the
+subject with SYSTEM as actor and keep the accepted delegation chain as audit
+history. SYSTEM is never a subject and authorizes nothing: judge calls are checked against the
 run's accepted authority — the caller's verified effective principal and
 delegation chain for a manual run, the owner's authority recovered at
 acceptance for a background run — and gateway spend is charged to the subject.

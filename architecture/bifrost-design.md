@@ -1404,13 +1404,17 @@ Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 principal. Only the server-internal capture writer writes them, together with
 the capture spans in `vala.traces.spans`, and the tenant copies of server
 spans join them there through the same outbox; result rows carry the verified
-Card as `card_uid` and the exact Verifier Card as `verifier_card_uid`, and
-their batches carry the run's subject with the tenant `System` principal as
-actor, which Scribe stamps as `sub_principal_id` and `act_principal_id`. A pod without Scribe submits through
-`ScribeCapturePeerService.IngestCapture` on the peer listener, which the same
-`wyrd-peer` mTLS admits; the request names its tenant and one of those five
-tables or `vala.system.audit_log` explicitly, carries no token, and carries an
-attribution exactly when the table is a result table. It is refused for any
+Card as `card_uid` and the exact Verifier Card as `verifier_card_uid`. Each
+batch carries the verified pair it was produced under, which Scribe stamps as
+`sub_principal_id` and `act_principal_id`: the call's pair for gateway
+capture, the caller's pair for a realtime result, and the run's subject with
+the tenant `System` principal as actor for a queued result. A pod without
+Scribe submits through `ScribeCapturePeerService.IngestCapture` on the peer
+listener, which the same `wyrd-peer` mTLS admits; the request names its
+tenant and one of those five tables or `vala.system.audit_log` explicitly,
+carries no token, and always carries that subject and actor pair. Audit rows
+carry their own identities as row content, so an audit batch submits the
+no-verified-caller sentinel pair. It is refused for any
 other table, and for the reserved system tenant unless the table is
 `vala.system.audit_log`. Sensitive-column metadata remains descriptive; table query
 permission governs every column, including GenAI fields stored on trace spans,

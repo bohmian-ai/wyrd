@@ -7,8 +7,8 @@
 //! then verifies the minted token like any presented access token.
 //!
 //! [`GatewayApiKeys`] reuses the minted token for the identical key for at
-//! most [`TOKEN_REUSE`] after the exchange, so revoking a key takes effect
-//! within that window. Entries are keyed by the SHA-256 of the complete key,
+//! most [`TOKEN_REUSE`] after the exchange began, so retiring a key takes
+//! effect within that window however late an in-flight exchange completes. Entries are keyed by the SHA-256 of the complete key,
 //! never the key itself, so no key's authority is ever reused for another. A
 //! read never renews an entry, a failed exchange is never cached, and the
 //! process keeps at most [`CAPACITY`] entries.
@@ -30,7 +30,7 @@ use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Longest a token exchanged for a presented key is reused, measured from the
-/// exchange; it bounds how long a revoked key keeps working.
+/// start of the exchange; it bounds how long a retired key keeps working.
 const TOKEN_REUSE: Duration = Duration::from_secs(60);
 
 /// Most exchanged tokens one process keeps; the least recently used entry is
@@ -41,8 +41,8 @@ const CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("capacity is non-z
 struct CachedToken {
     /// The minted Wyrd access token.
     token: SecretString,
-    /// The earlier of the exchange plus [`TOKEN_REUSE`] and the token's own
-    /// expiry; fixed at admission.
+    /// The earlier of the exchange's start plus [`TOKEN_REUSE`] and the
+    /// token's own expiry measured from that start; never moved by a read.
     deadline: Instant,
 }
 
@@ -75,8 +75,16 @@ impl GatewayApiKeys {
     /// A reusable token for the identical key is verified and used; otherwise,
     /// or when that token no longer verifies, the key is exchanged through
     /// [`TokenGrants`] under `request_id`, the minted token verified for the
-    /// Wyrd audience, and only then cached. Either way gateway authorization
-    /// still decides, and audits, every call.
+    /// Wyrd audience, and only then cached by [`Self::reuse_or_exchange`].
+    /// Either way gateway authorization still decides, and audits, every call.
+    ///
+    /// # Cancellation and retries
+    /// Dropping the future mid-exchange can leave the grant's work partly
+    /// done: its audit decision may already be staged and its use record
+    /// committed, or the commit's outcome unknown, while no token is returned
+    /// or cached. Nothing is rolled back. A later request with the same key
+    /// finds no cache entry and exchanges, and is audited, again; exchanges
+    /// are not deduplicated, so concurrent misses for one key each exchange.
     ///
     /// # Errors
     /// Returns the exchange's refusal, [`WyrdError::ApiKeyInvalid`] for every
@@ -88,6 +96,15 @@ impl GatewayApiKeys {
         api_key: &SecretString,
         request_id: &str,
     ) -> Result<AuthenticatedPrincipal, WyrdError> {
+        let exchange = async {
+            let exchanged = TokenGrants { state, request_id }
+                .api_key(&SecretBearer::new(api_key.expose_secret().to_owned()))
+                .await?;
+            Ok((
+                exchanged.access_token.into_secret_string(),
+                Duration::from_secs(exchanged.expires_in),
+            ))
+        };
         let verify = |token| {
             verify_access_token(
                 state.auth.token_verifier.as_deref(),
@@ -96,22 +113,40 @@ impl GatewayApiKeys {
             )
             .map_err(|WyrdErrorResponse(error)| error)
         };
-        if let Some(token) = self.get(api_key, Instant::now())
+        self.reuse_or_exchange(api_key, Instant::now, verify, exchange)
+            .await
+    }
+
+    /// Reuses the token cached for `api_key` when it still verifies, and
+    /// otherwise awaits `exchange` and caches its verified token.
+    ///
+    /// `clock` is read on every lookup and once before `exchange` is polled.
+    /// That pre-exchange instant is the reuse origin, so a slow exchange,
+    /// or one that commits just before the key is retired, never pushes the
+    /// entry past [`TOKEN_REUSE`] after the exchange began. A result whose
+    /// window already closed is still returned for this request but is
+    /// never reusable. `exchange` yields the minted token and its lifetime.
+    ///
+    /// # Errors
+    /// Returns the error of `exchange`, or of `verify` for the minted token.
+    async fn reuse_or_exchange<T>(
+        &self,
+        api_key: &SecretString,
+        clock: impl Fn() -> Instant,
+        verify: impl Fn(SecretString) -> Result<T, WyrdError>,
+        exchange: impl Future<Output = Result<(SecretString, Duration), WyrdError>>,
+    ) -> Result<T, WyrdError> {
+        if let Some(token) = self.get(api_key, clock())
             && let Ok(principal) = verify(token)
         {
             return Ok(principal);
         }
-        let exchanged = TokenGrants { state, request_id }
-            .api_key(&SecretBearer::new(api_key.expose_secret().to_owned()))
-            .await?;
-        let token = exchanged.access_token.into_secret_string();
+        let origin = clock();
+        let (token, lifetime) = exchange.await?;
         let principal = verify(token.clone())?;
-        self.insert(
-            api_key,
-            token,
-            Duration::from_secs(exchanged.expires_in),
-            Instant::now(),
-        );
+        if clock() < origin + TOKEN_REUSE.min(lifetime) {
+            self.insert(api_key, token, lifetime, origin);
+        }
         Ok(principal)
     }
 
@@ -140,8 +175,9 @@ impl GatewayApiKeys {
         }
     }
 
-    /// Caches `token`, exchanged for `api_key` at `now` and valid for
-    /// `lifetime`, until the earlier of [`TOKEN_REUSE`] and that lifetime.
+    /// Caches `token`, whose exchange for `api_key` began at `origin` and
+    /// which is valid for `lifetime`, until the earlier of `origin` plus
+    /// [`TOKEN_REUSE`] and `origin` plus that lifetime.
     ///
     /// Replaces any entry of the same key and evicts the least recently used
     /// entry beyond capacity.
@@ -153,9 +189,9 @@ impl GatewayApiKeys {
         api_key: &SecretString,
         token: SecretString,
         lifetime: Duration,
-        now: Instant,
+        origin: Instant,
     ) {
-        let deadline = now + TOKEN_REUSE.min(lifetime);
+        let deadline = origin + TOKEN_REUSE.min(lifetime);
         self.tokens
             .lock()
             .expect("gateway api key cache lock")
@@ -167,6 +203,7 @@ impl GatewayApiKeys {
 mod tests {
     //! Reuse, fixed expiry, per-key isolation, and bounds of exchanged tokens.
 
+    use std::cell::Cell;
     use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
 
@@ -184,6 +221,70 @@ mod tests {
         cache
             .get(&secret(key), now)
             .map(|token| token.expose_secret().to_owned())
+    }
+
+    /// A miss reuses its token only until [`TOKEN_REUSE`] after its exchange
+    /// began, however late the exchange completes.
+    ///
+    /// # Panics
+    /// Panics when a delayed exchange's token outlives that window.
+    #[tokio::test]
+    async fn delayed_exchange_keeps_its_original_reuse_deadline() {
+        let cache = GatewayApiKeys::default();
+        let start = Instant::now();
+        let now = Cell::new(start);
+        let hour = Duration::from_secs(3600);
+        let exchange = |token: &'static str, completes: Duration| {
+            let now = &now;
+            async move {
+                now.set(start + completes);
+                Ok((secret(token), hour))
+            }
+        };
+        let verify = |token: SecretString| Ok(token.expose_secret().to_owned());
+
+        let first = cache
+            .reuse_or_exchange(
+                &secret("wyrd_sk_slow"),
+                || now.get(),
+                verify,
+                exchange("jwt-slow", Duration::from_secs(2)),
+            )
+            .await
+            .expect("delayed exchange authenticates");
+        assert_eq!(first, "jwt-slow");
+        let before_deadline = start + Duration::from_millis(59_999);
+        assert_eq!(
+            cached(&cache, "wyrd_sk_slow", before_deadline).as_deref(),
+            Some("jwt-slow")
+        );
+        assert_eq!(
+            cached(&cache, "wyrd_sk_slow", start + TOKEN_REUSE),
+            None,
+            "reuse ends sixty seconds after the exchange began"
+        );
+
+        now.set(start);
+        let late = cache
+            .reuse_or_exchange(
+                &secret("wyrd_sk_late"),
+                || now.get(),
+                verify,
+                exchange("jwt-late", Duration::from_secs(61)),
+            )
+            .await
+            .expect("the late exchange still serves its own request");
+        assert_eq!(late, "jwt-late");
+        assert_eq!(
+            cache.tokens.lock().expect("cache lock").len(),
+            0,
+            "the late completion took no cache slot"
+        );
+        assert_eq!(
+            cached(&cache, "wyrd_sk_late", start + Duration::from_secs(61)),
+            None,
+            "a completion after its window admits no reusable token"
+        );
     }
 
     /// A token is reused only for its identical key, until a deadline fixed at

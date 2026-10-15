@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 from wyrd.bifrost import Bifrost, SpanRecord
 from wyrd.client import WyrdClient
 from wyrd.testing import WyrdTestServer
@@ -111,15 +112,71 @@ def assert_turn(spans: list[SpanRecord], run_id: str, card_uid: str) -> None:
     assert len({span["span_id"] for span in spans}) == len(spans)
 
 
+class Drift(BaseModel):
+    """One ``vala.drift.observations`` value."""
+
+    num_value: float
+
+
+def drift(server: WyrdTestServer, run_id: str) -> list[float]:
+    """Publish captured rows, then read Run ``run_id``'s drift values as the administrator."""
+    server.flush_bifrost()
+    rows = Bifrost(client=client_of(server)).sql(
+        "SELECT num_value FROM vala.drift.observations WHERE run_id = $1", [run_id], model=Drift
+    )
+    return [row.num_value for row in rows]
+
+
+def assert_observed(server: WyrdTestServer, turn: dict[str, Any], card_uid: str) -> None:
+    """``turn``'s spans and its drift observation both read back."""
+    assert turn["output"] == "done"
+    assert_turn(timeline(server, turn["trace_id"]), turn["run_id"], card_uid)
+    assert drift(server, turn["observation"]) == [1.0]
+
+
 @pytest.mark.parametrize("framework", FRAMEWORKS)
 def test_managed_framework_telemetry(
-    wyrd_server: WyrdTestServer, app_env: dict[str, str], framework: str
+    wyrd_server: WyrdTestServer, app_env: dict[str, str], framework: str, tmp_path: Path
 ) -> None:
-    report = launch(app_env, framework, "managed", "run")
+    with (tmp_path / "stderr").open("w") as stderr:
+        app = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tests.integration.otel.frameworks.app",
+                framework,
+                "managed",
+                "live",
+            ],
+            cwd=SDK_ROOT,
+            env=app_env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            text=True,
+        )
+        try:
+            # The app waits after its live ``state.flush``: read that work back first.
+            assert app.stdout is not None and app.stdin is not None
+            flushed = app.stdout.readline()
+            assert flushed, (tmp_path / "stderr").read_text()
+            first = json.loads(flushed)
+            card_uid = first["card_uid"]
+            assert_observed(wyrd_server, first["first"], card_uid)
+            app.stdin.write("continue\n")
+            app.stdin.flush()
+            out, _ = app.communicate(timeout=120)
+        finally:
+            app.kill()
+        assert app.returncode == 0, (tmp_path / "stderr").read_text()
+    report = json.loads(out.splitlines()[-1])
 
-    turn = report["run"]
-    assert turn["output"] == "done"
-    assert_turn(timeline(wyrd_server, turn["trace_id"]), turn["run_id"], report["card_uid"])
+    # The same state kept writing after its flush; the open span survived it.
+    assert_observed(wyrd_server, report["second"], card_uid)
+    assert [span["name"] for span in timeline(wyrd_server, report["held"])] == ["held"]
+    # After the state's shutdown, the global provider still exports.
+    after = report["after"]
+    assert_turn(timeline(wyrd_server, after["trace_id"]), after["run_id"], card_uid)
 
 
 @pytest.mark.parametrize("framework", FRAMEWORKS)

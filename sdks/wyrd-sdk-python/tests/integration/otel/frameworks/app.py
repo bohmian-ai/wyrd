@@ -15,8 +15,10 @@ application ``TracerProvider`` with ``span_exporter`` and
 ``install_run_correlation``). ``SCENARIO`` is ``run`` (one tool-calling turn
 inside an enclosing span), ``edges`` (model and tool failures, a stream that
 completes after its Run exits, nested and concurrent Runs, and an
-uncorrelated turn), or ``gateway`` (OpenAI Agents only: the model client
-reaches the Wyrd gateway with ``WyrdClient.http_auth``).
+uncorrelated turn), ``live`` (managed only: turns and observations before and
+after a live ``state.flush``, which the parent reads back in between, then a
+turn after ``state.shutdown``), or ``gateway`` (OpenAI Agents only: the model
+client reaches the Wyrd gateway with ``WyrdClient.http_auth``).
 """
 
 from __future__ import annotations
@@ -307,13 +309,45 @@ async def edges(state: WyrdState, ask: Ask) -> dict[str, Any]:
     return report
 
 
+async def live(state: WyrdState, ask: Ask) -> dict[str, Any]:
+    """Work before and after a live ``state.flush``, then after ``state.shutdown``.
+
+    Once the flush returns, the first turn and observation are printed as one
+    report line and the process waits on stdin while the parent reads them
+    back. A span stays open across the flush and ends before shutdown. After
+    shutdown, one more turn exports through the same global provider, flushed
+    by the application.
+    """
+    state.start_bifrost()
+    held = trace.get_tracer("framework-app").start_span("held")
+    first = await observed(state, ask)
+    state.flush()
+    print(json.dumps({"first": first, "card_uid": str(state.card_ref("agent").uid)}), flush=True)
+    sys.stdin.readline()
+    second = await observed(state, ask)
+    held.end()
+    state.shutdown()
+    after = (await run(state, ask))["run"]
+    provider: Any = trace.get_tracer_provider()
+    assert provider.force_flush()
+    return {"second": second, "after": after, "held": _trace_id(held)}
+
+
+async def observed(state: WyrdState, ask: Ask) -> dict[str, Any]:
+    """One turn, then one drift observation through the state's native writer."""
+    turn = (await run(state, ask))["run"]
+    observation = state.run("model")
+    observation.observe.drift({"latency": 1.0})
+    return {**turn, "observation": observation.run_id}
+
+
 def _trace_id(span: Any) -> str:
     """``span``'s W3C trace id as 32 lowercase hex digits."""
     return format(span.get_span_context().trace_id, "032x")
 
 
 def main(framework: str, setup: str, scenario: str) -> None:
-    """Install ``setup``, run ``scenario`` on ``framework``, flush, and print the report."""
+    """Install ``setup``, run ``scenario`` on ``framework``, shut down, and print the report."""
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), LocalModel)
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{upstream.server_address[1]}"
@@ -335,11 +369,12 @@ def main(framework: str, setup: str, scenario: str) -> None:
         "openai_agents": openai_agents,
     }
     ask = gateway() if scenario == "gateway" else builders[framework](url)
-    report = asyncio.run((edges if scenario == "edges" else run)(state, ask))
-    if setup == "managed":
-        state.shutdown()
-    else:
+    scenarios = {"edges": edges, "live": live}
+    report = asyncio.run(scenarios.get(scenario, run)(state, ask))
+    if setup == "owned":
         provider.shutdown()
+    elif scenario != "live":  # live shuts its state down itself
+        state.shutdown()
     report["card_uid"] = str(state.card_ref("agent").uid)
     print(json.dumps(report))
 

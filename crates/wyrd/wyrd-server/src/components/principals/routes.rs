@@ -25,10 +25,10 @@ use uuid::Uuid;
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_runtime::{Permission, RoleRef};
 use wyrd_spec::auth::{
-    CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
-    CredentialMetadata, IssuedCredential, PrincipalId, PrincipalKindTag, PrincipalPage,
-    PrincipalQuery, PrincipalRoles, PrincipalStatus, PrincipalSummary, RoleAssignment,
-    RoleAssignmentChange, RoleSource, SecretBearer,
+    Attribution, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
+    CredentialListResponse, CredentialMetadata, IssuedCredential, PrincipalId, PrincipalKindTag,
+    PrincipalPage, PrincipalQuery, PrincipalRoles, PrincipalStatus, PrincipalSummary,
+    RoleAssignment, RoleAssignmentChange, RoleSource, SecretBearer,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::vala::api::AuditOutcome;
@@ -202,7 +202,7 @@ async fn require_principal(
 async fn mint_credential(
     conn: &mut TenantConn<'_>,
     principal_id: Uuid,
-    created_by: Uuid,
+    attribution: Attribution,
 ) -> Result<IssuedCredential, WyrdErrorResponse> {
     let plaintext = WyrdApiKey::generate(conn.data_tenant_id());
     let key_hash = wyrd_auth_issue::hash_secret(plaintext.secret.expose_secret());
@@ -213,7 +213,7 @@ async fn mint_credential(
         principal_id,
         &plaintext.prefix,
         &key_hash,
-        created_by,
+        attribution,
         Some(AUTOMATION_CREDENTIAL_LIFETIME),
     )
     .await
@@ -298,7 +298,7 @@ async fn create_service_principal(
         None,
         &request.name,
         request.description.as_deref(),
-        caller.principal.id.as_uuid(),
+        caller.attribution(),
     )
     .await
     .map_err(internal)?;
@@ -309,7 +309,7 @@ async fn create_service_principal(
             .map_err(internal)?;
     }
 
-    let issued = mint_credential(&mut conn, principal_id, caller.principal.id.as_uuid()).await?;
+    let issued = mint_credential(&mut conn, principal_id, caller.attribution()).await?;
     conn.commit().await.map_err(internal)?;
 
     Ok(Json(CreateServicePrincipalResponse {
@@ -365,7 +365,7 @@ async fn issue_credential(
     )
     .await?;
     let mut conn = require_principal(conn, principal_id).await?;
-    let issued = mint_credential(&mut conn, principal_id, caller.principal.id.as_uuid()).await?;
+    let issued = mint_credential(&mut conn, principal_id, caller.attribution()).await?;
     conn.commit().await.map_err(internal)?;
     Ok(Json(issued))
 }

@@ -71,6 +71,7 @@ pub async fn seed_query_fixture(
                 .map(|field| field.as_ref().clone())
                 .collect(),
             tenant: server.data_tenant_id(),
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await
@@ -184,6 +185,7 @@ impl WyrdTestServer {
                     .map(|field| field.as_ref().clone())
                     .collect(),
                 tenant: self.data_tenant_id(),
+                attribution: wyrd_spec::auth::Attribution::unresolved(),
                 physical_layout: None,
             })
             .await

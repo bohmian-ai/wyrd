@@ -13,14 +13,15 @@ mod pg_tests {
     use std::time::Duration;
     use wyrd_dev_fixtures::pg::UnmigratedDatabase;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::storage::{StorageBackendKind, UploadId, WireProtocol};
     use wyrd_sql::pool::build_app_pool;
     use wyrd_sql::queries::auth::{
         TrustedIssuerWrite, WorkloadBindingWrite, delete_trusted_issuer, delete_workload_binding,
-        delete_workload_bindings_for_issuer, insert_user, trusted_issuer_by_url,
-        trusted_issuers_for_tenant, upsert_user_identity, user_by_id, user_id_by_identity,
-        workload_binding_by_key, workload_binding_by_subject,
+        delete_workload_bindings_for_issuer, insert_user, provision_system_principal,
+        trusted_issuer_by_url, trusted_issuers_for_tenant, upsert_user_identity, user_by_id,
+        user_id_by_identity, workload_binding_by_key, workload_binding_by_subject,
     };
     // `insert_trusted_issuer`/`insert_workload_binding` are referenced by full path
     // in `cloud_issuer_crud_write_path_conflict_and_cascade` because this test module
@@ -249,8 +250,7 @@ mod pg_tests {
             .tenant_conn(data_tenant_id)
             .await
             .expect("tenant transaction opens on the shared login");
-        sqlx::query_scalar::<_, Uuid>("SELECT wyrd.provision_system_principal()")
-            .fetch_one(&mut **conn.transaction())
+        provision_system_principal(&mut conn, Attribution::unresolved())
             .await
             .expect("tenant work runs on the shared login");
         conn.commit().await.expect("tenant work commits");
@@ -430,6 +430,129 @@ mod pg_tests {
         .await
         .expect("conflicting slug owner remains");
         assert_eq!(owner.0, conflicting_tenant.as_uuid());
+    }
+
+    /// Version immediately before the SYSTEM principal migration, whose
+    /// backfill provisions every tenant that already exists.
+    const PRE_SYSTEM_PRINCIPAL_VERSION: i64 = 20_260_601_000_027;
+
+    /// Read the creation pair of the current tenant's SYSTEM principal as
+    /// `(id, sub, act)`.
+    ///
+    /// # Panics
+    /// Panics when the tenant has no SYSTEM principal or the read fails.
+    async fn system_creation(conn: &mut TenantConn<'_>) -> (Uuid, Uuid, Uuid) {
+        sqlx::query_as(
+            "SELECT id, sub_principal_id, act_principal_id FROM wyrd.auth_service_accounts \
+              WHERE principal_kind = 'system'",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("the tenant has one SYSTEM principal")
+    }
+
+    /// SYSTEM is created by its verified creator or, with none, by the
+    /// no-verified-caller sentinel, and never by itself (spec r5 AC-019).
+    ///
+    /// The defining migration's backfill and fixture seeding have no caller,
+    /// so their SYSTEM rows carry the sentinel pair. Provisioning that names a
+    /// creator records it, a later call with another creator keeps the first
+    /// pair and id, and the platform creator is accepted although it is no
+    /// tenant principal.
+    ///
+    /// # Panics
+    /// Panics when a migration or provisioning step fails or a SYSTEM row
+    /// carries another creator pair.
+    #[tokio::test]
+    async fn system_creation_uses_explicit_creator_or_sentinel() {
+        let Some(_) = database_url() else {
+            return;
+        };
+        let sentinel = Attribution::unresolved();
+        let sentinel = (
+            sentinel.sub_principal_id.as_uuid(),
+            sentinel.act_principal_id.as_uuid(),
+        );
+
+        let database = UnmigratedDatabase::create()
+            .await
+            .expect("empty database creates");
+        let pool = database.migrator_pool();
+        {
+            let mut conn = pool.acquire().await.expect("migrator connects");
+            for statement in [
+                "CREATE SCHEMA IF NOT EXISTS platform",
+                "CREATE SCHEMA IF NOT EXISTS wyrd",
+                "SET search_path TO wyrd, platform, public",
+            ] {
+                sqlx::query(statement)
+                    .execute(&mut *conn)
+                    .await
+                    .expect("migration bootstrap runs");
+            }
+            sqlx::migrate!("./migrations")
+                .run_to(PRE_SYSTEM_PRINCIPAL_VERSION, &mut *conn)
+                .await
+                .expect("migrates through the version before SYSTEM");
+            conn.close().await.expect("bootstrap connection closes");
+        }
+        let backfilled = DataTenantId::new_v7();
+        insert_tenant(pool, backfilled, "system-backfill").await;
+        migrate_under_lease(pool)
+            .await
+            .expect("the SYSTEM migration backfills");
+        let (id, sub, act): (Uuid, Uuid, Uuid) = sqlx::query_as(
+            "SELECT id, sub_principal_id, act_principal_id FROM wyrd.auth_service_accounts \
+              WHERE principal_kind = 'system' AND data_tenant_id = $1",
+        )
+        .bind(backfilled.as_uuid())
+        .fetch_one(pool)
+        .await
+        .expect("the backfill provisions SYSTEM");
+        assert_eq!((sub, act), sentinel, "the backfill has no caller");
+        assert_ne!(sub, id, "SYSTEM never creates itself");
+
+        let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("fixture starts");
+        let mut conn = fixture.tenant_conn().await.expect("tenant opens");
+        let (_, sub, act) = system_creation(&mut conn).await;
+        assert_eq!((sub, act), sentinel, "fixture seeding has no caller");
+        drop(conn);
+
+        let tenant = DataTenantId::new_v7();
+        insert_tenant(
+            &fixture.superuser_pool().expect("owner pool"),
+            tenant,
+            &format!("system-creator-{}", tenant.as_uuid().simple()),
+        )
+        .await;
+        let operator = Attribution::new(
+            PrincipalId::new(Uuid::now_v7()),
+            PrincipalId::new(Uuid::now_v7()),
+        );
+        let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant opens");
+        let first = provision_system_principal(&mut conn, operator)
+            .await
+            .expect("provisioning names its creator");
+        conn.commit().await.expect("provisioning commits");
+        let mut conn = fixture
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant reopens");
+        let again = provision_system_principal(&mut conn, Attribution::unresolved())
+            .await
+            .expect("a retry provisions");
+        assert_eq!(again, first, "a retry returns the same SYSTEM");
+        assert_eq!(
+            system_creation(&mut conn).await,
+            (
+                first,
+                operator.sub_principal_id.as_uuid(),
+                operator.act_principal_id.as_uuid()
+            ),
+            "the first creator is kept"
+        );
     }
 
     /// Version immediately before the tenant human-connection migration.

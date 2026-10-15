@@ -1822,7 +1822,7 @@ pub enum WyrdError {
         code = "WYRD_VERIFICATION_400_INPUT_INVALID",
         status = 400,
         title = "Invalid verification input",
-        remediation = "Send { verifier_uid, subject_card_uid, input } with input.kind eval_record (a context object) or drift_samples (columns of number, string, or null values)."
+        remediation = "Send { verifier_card_uid, card_uid, input } with input.kind eval_record (a context object) or drift_samples (columns of number, string, or null values)."
     )]
     VerificationInputInvalid {
         /// Human-readable error message.

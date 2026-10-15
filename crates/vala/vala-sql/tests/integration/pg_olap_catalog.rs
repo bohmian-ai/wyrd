@@ -1,10 +1,12 @@
 mod pg_tests {
     //! PostgreSQL integration coverage for the operator-owned Bifrost roster.
 
+    use uuid::Uuid;
     use vala_sql::queries::forge_catalog_operator::list_active_tables_for_operator;
-    use vala_sql::queries::olap_catalog::upsert_table;
+    use vala_sql::queries::olap_catalog::{get_by_fqn, upsert_table};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_sql::TenantConn;
 
     /// Canonical default layout JSON stored on every registration in this file.
@@ -45,9 +47,16 @@ mod pg_tests {
             let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .expect("tenant connection");
-            upsert_table(&mut conn, &uid, fqn, &[7_u8; 32], &layout_fixture())
-                .await
-                .expect("insert registration");
+            upsert_table(
+                &mut conn,
+                &uid,
+                fqn,
+                &[7_u8; 32],
+                &layout_fixture(),
+                Attribution::unresolved(),
+            )
+            .await
+            .expect("insert registration");
             conn.commit().await.expect("commit registration");
         }
         let superuser = fixture.superuser_pool().expect("superuser");
@@ -67,5 +76,48 @@ mod pg_tests {
                     < (pair[1].data_tenant_id, &pair[1].fqn))
         );
         assert!(rows.iter().all(|row| row.status == "active"));
+    }
+
+    /// A registration stores the verified subject/actor pair, and a repeat
+    /// registration by another pair keeps the creating one.
+    ///
+    /// # Panics
+    /// Panics when the fixture, upsert, or read fails, or the stored pair is
+    /// not the creating one.
+    #[tokio::test]
+    async fn registration_keeps_its_creating_subject_and_actor() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+        let creator = Attribution::new(
+            PrincipalId::new(Uuid::now_v7()),
+            PrincipalId::new(Uuid::now_v7()),
+        );
+        let fqn = "vala.datasets.attributed";
+        for attribution in [
+            creator,
+            Attribution::direct(PrincipalId::new(Uuid::now_v7())),
+        ] {
+            upsert_table(
+                &mut conn,
+                &[9_u8; 16],
+                fqn,
+                &[7_u8; 32],
+                &layout_fixture(),
+                attribution,
+            )
+            .await
+            .expect("registration upserts");
+        }
+        let row = get_by_fqn(&mut conn, fqn)
+            .await
+            .expect("registration reads")
+            .expect("registration exists");
+        assert_eq!(
+            (row.sub_principal_id, row.act_principal_id),
+            (
+                creator.sub_principal_id.as_uuid(),
+                creator.act_principal_id.as_uuid()
+            )
+        );
     }
 }

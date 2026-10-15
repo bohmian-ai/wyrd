@@ -29,7 +29,7 @@ impl DomainTable for ResultItemsTable {
     const NAMESPACE: &'static str = "eval";
     /// Table segment of the fixed `vala.eval.result_items` FQN.
     const NAME: &'static str = "result_items";
-    /// The server appends and stamps the managed Verifier `run_id`, Verifier `card_uid`, and `principal_id`.
+    /// The server appends and stamps the managed Verifier `run_id`, verified `card_uid`, and subject/actor pair.
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     /// Captured task payloads make projecting this table require the elevated payload permission.
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
@@ -41,7 +41,7 @@ impl DomainTable for ResultItemsTable {
         vec![
             utf8("result_id", false),
             utf8("owner_card_uid", true),
-            utf8("subject_card_uid", false),
+            utf8("verifier_card_uid", false),
             utf8("binding_id", true),
             utf8("source_record_id", false),
             utf8("task_id", false),

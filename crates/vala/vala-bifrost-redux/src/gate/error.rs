@@ -54,8 +54,8 @@ pub enum IngestError {
         /// Canonical string form of the unresolvable card reference.
         card_ref: String,
     },
-    /// An authenticated write was missing a required `principal_id`.
-    #[error("principal_id cannot be stamped for authenticated write")]
+    /// An authenticated write had no verified subject/actor pair to stamp.
+    #[error("sub_principal_id and act_principal_id cannot be stamped for authenticated write")]
     PrincipalUnresolved,
     /// The principal lacks `bifrost_record:write`.
     #[error("principal lacks bifrost_record:write: {detail}")]

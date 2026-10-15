@@ -186,6 +186,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
         .expect("composed server exposes its Bifrost catalog")
         .register_dataset(
             tenant,
+            wyrd_spec::auth::Attribution::unresolved(),
             table.clone(),
             vec![Field::new("value", DataType::Int64, false)],
             None,
@@ -204,6 +205,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
         ScribeIngressFrame {
             attributed_cards: None,
             authenticated_tenant: tenant,
+            attribution: wyrd_spec::auth::Attribution::direct(principal.id),
             principal,
             table,
             expected_schema_fingerprint: Some(ReduxSchemaFingerprint::from_arrow_schema(
@@ -593,6 +595,7 @@ async fn ingest_logical_batch(
         .expect("composed server exposes its Bifrost catalog")
         .register_dataset(
             tenant,
+            wyrd_spec::auth::Attribution::unresolved(),
             TableRef::new(BifrostNamespace::Datasets, table_name),
             vec![Field::new("value", DataType::Int64, false)],
             None,
@@ -861,7 +864,7 @@ fn verification_result_ipc(card_uid: &str) -> Vec<u8> {
     let columns: Vec<ArrayRef> = fields
         .iter()
         .map(|field| match (field.name().as_str(), field.data_type()) {
-            ("result_id" | "subject_card_uid", _) => {
+            ("result_id" | "verifier_card_uid", _) => {
                 Arc::new(StringArray::from(vec![uuid::Uuid::now_v7().to_string()])) as ArrayRef
             }
             ("implementation", _) => Arc::new(StringArray::from(vec!["drift"])),
@@ -960,9 +963,12 @@ impl ResultTableHarness {
         seed_builtin_roles_for_tenant(&mut conn, tenant)
             .await
             .expect("built-in roles seed");
-        let system = wyrd_sql::queries::auth::provision_system_principal(&mut conn)
-            .await
-            .expect("system principal provisions");
+        let system = wyrd_sql::queries::auth::provision_system_principal(
+            &mut conn,
+            wyrd_spec::auth::Attribution::unresolved(),
+        )
+        .await
+        .expect("system principal provisions");
         conn.commit().await.expect("provisioning commits");
         server
             .ensure_builtin_table_for_test(tenant, "verification", "results")
@@ -1016,7 +1022,7 @@ impl ResultTableHarness {
         self.server
             .retained_audit_records(
                 self.tenant,
-                "principal_kind, resource, permission, outcome",
+                "sub_principal_kind, resource, permission, outcome",
                 "operation = 'bifrost.record.write'",
             )
             .await
@@ -1275,7 +1281,7 @@ async fn system_read_authority_reads_only_the_named_table() {
     );
 
     let predicate = format!(
-        "audit_principal_id = '{}' \
+        "sub_principal_id = '{}' \
          AND operation IN ('bifrost.query.read_decision', 'vala.query.sync')",
         harness.system
     );

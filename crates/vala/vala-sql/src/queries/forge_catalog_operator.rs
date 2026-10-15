@@ -23,7 +23,8 @@ pub async fn list_active_tables_for_operator(
     sqlx::query_as::<_, BifrostTableRow>(
         r"
         SELECT data_tenant_id, table_uid, fqn, fingerprint, status,
-               physical_layout, registered_at, updated_at, origin, actor
+               physical_layout, registered_at, updated_at, origin,
+               sub_principal_id, act_principal_id
           FROM vala.bifrost_tables
          WHERE status = 'active'
          ORDER BY data_tenant_id, fqn

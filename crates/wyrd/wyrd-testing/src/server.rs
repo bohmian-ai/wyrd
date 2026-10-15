@@ -86,7 +86,7 @@ use wyrd_types::variant::variant_storage_type;
 use crate::bifrost::ForgeObjectStoreControl;
 use crate::bifrost::object_reads::ObjectReadProbe;
 
-use wyrd_spec::auth::{RoleSource, TokenAudience, TokenResponse};
+use wyrd_spec::auth::{Attribution, RoleSource, TokenAudience, TokenResponse};
 use wyrd_spec::card::verifier::{DriftBaselineState, DriftBaselineStatus};
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{BindingId, CardName, CardUid, SpaceName};
@@ -806,7 +806,7 @@ impl From<WyrdTestServerError> for wyrd_spec::error::WyrdError {
                 wyrd_spec::error::WyrdError::VerificationBaselineNotReady {
                     message: msg,
                     details: serde_json::json!({
-                        "verifier_uid": verifier,
+                        "verifier_card_uid": verifier,
                         "baseline": last,
                     }),
                 }
@@ -1961,7 +1961,7 @@ impl WyrdTestServer {
             tenant,
             format!(
                 "SELECT {projection} FROM {AUDIT_LOG} WHERE ({predicate}) \
-                 AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
+                 AND sub_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
                  ORDER BY created_at"
             ),
         )
@@ -2093,7 +2093,7 @@ impl WyrdTestServer {
                     params: Vec::new(),
                     sql: format!(
                         "SELECT operation FROM {AUDIT_LOG} WHERE ({predicate}) \
-                 AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}'"
+                 AND sub_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}'"
                     ),
                     deadline_ms: Some(60_000),
                 })
@@ -2715,7 +2715,7 @@ impl WyrdTestServer {
             })?;
         self.inner
             .bifrost_catalog
-            .ensure_builtin(tenant, definition)
+            .ensure_builtin(tenant, definition, Attribution::unresolved())
             .await
             .map(|_| ())
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
@@ -3098,7 +3098,7 @@ impl WyrdTestServer {
             principal.id,
             &api_key.prefix,
             &key_hash,
-            creator_id,
+            wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
             Some(Duration::from_hours(8760)),
         )
         .await
@@ -3145,7 +3145,9 @@ impl WyrdTestServer {
         seed_builtin_roles_for_tenant(&mut conn, tenant_id)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        provision_system_principal(&mut conn).await.map_err(sql)?;
+        provision_system_principal(&mut conn, Attribution::unresolved())
+            .await
+            .map_err(sql)?;
         conn.commit().await.map_err(sql)?;
         self.ensure_builtin_tables_for_test(tenant_id).await?;
         Ok(tenant_id)
@@ -3165,7 +3167,7 @@ impl WyrdTestServer {
         tenant: DataTenantId,
     ) -> Result<(), WyrdTestServerError> {
         BuiltinTables::new(self.bifrost_catalog())
-            .ensure_tenant(tenant)
+            .ensure_tenant(tenant, Attribution::unresolved())
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
@@ -3269,7 +3271,7 @@ impl WyrdTestServer {
                     None,
                     "tenant-admin",
                     Some("Tenant administrative principal"),
-                    creator_id,
+                    wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
                 )
                 .await
                 .map_err(sql)?;
@@ -3283,7 +3285,7 @@ impl WyrdTestServer {
             principal_id,
             &api_key.prefix,
             &wyrd_auth_issue::hash_secret(api_key.secret.expose_secret()),
-            creator_id,
+            wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
             None,
         )
         .await
@@ -3609,7 +3611,7 @@ impl WyrdTestServer {
             Some(card_ref),
             card_ref.name.as_str(),
             None,
-            creator_id,
+            wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
         )
         .await
         .map_err(sql)?;
@@ -3695,7 +3697,7 @@ impl WyrdTestServer {
             Some(&card_ref),
             name,
             None,
-            creator_id,
+            wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
         )
         .await
         .map_err(sql)?;
@@ -3705,7 +3707,7 @@ impl WyrdTestServer {
             principal_id,
             &api_key.prefix,
             &key_hash,
-            creator_id,
+            wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
             Some(std::time::Duration::from_hours(8760)),
         )
         .await
@@ -4692,7 +4694,9 @@ impl WyrdTestServerBuilder {
         seed_builtin_roles_for_tenant(&mut conn, tenant_id)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        provision_system_principal(&mut conn).await.map_err(sql)?;
+        provision_system_principal(&mut conn, Attribution::unresolved())
+            .await
+            .map_err(sql)?;
         conn.commit().await.map_err(sql)?;
 
         let (storage_root, storage) = if let Some(handle) = self.storage_handle.take() {
@@ -5003,6 +5007,7 @@ impl WyrdTestServerBuilder {
             resources: bifrost_resources,
             cluster: cluster_registry,
             token_verifier: Arc::clone(&verifier),
+            issuing_key: Some(Arc::clone(&issuing_key)),
             peer_tls,
             config: bifrost_config,
             forge_config: forge_runtime,
@@ -5619,7 +5624,7 @@ async fn insert_fixture_card(
             labels,
             annotations,
             status,
-            created_by
+            sub_principal_id, act_principal_id
         )
         VALUES (
             $1,
@@ -5634,7 +5639,7 @@ async fn insert_fixture_card(
             '{}'::jsonb,
             '{}'::jsonb,
             'active',
-            $8
+            $8, $8
         )
         ",
     )

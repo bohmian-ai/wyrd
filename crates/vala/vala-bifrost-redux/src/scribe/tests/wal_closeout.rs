@@ -149,6 +149,7 @@ async fn ingest_as(
         scribe,
         ScribeIngressFrame {
             attributed_cards: None,
+            attribution: wyrd_spec::auth::Attribution::direct(principal.id),
             authenticated_tenant: principal.tenant_id,
             principal,
             table: TableRef::new(BifrostNamespace::Bifrost, table),
@@ -184,6 +185,7 @@ async fn ingest_value(
         scribe,
         ScribeIngressFrame {
             attributed_cards: None,
+            attribution: wyrd_spec::auth::Attribution::direct(principal.id),
             authenticated_tenant: tenant,
             principal,
             table: TableRef::new(BifrostNamespace::Bifrost, table),
@@ -219,6 +221,7 @@ async fn ingest_measured(
         scribe,
         ScribeIngressFrame {
             attributed_cards: None,
+            attribution: wyrd_spec::auth::Attribution::direct(principal.id),
             authenticated_tenant: tenant,
             principal,
             table: TableRef::new(BifrostNamespace::Bifrost, table),

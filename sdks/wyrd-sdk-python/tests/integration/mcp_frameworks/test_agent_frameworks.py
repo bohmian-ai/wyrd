@@ -71,8 +71,8 @@ HIDDEN_WRITE = "verification.execute"
 """A write tool the reader is not shown and calls anyway."""
 
 HIDDEN_WRITE_ARGUMENTS = {
-    "subject_card_uid": "01890a5d-ac96-774b-bcce-b302099a8057",
-    "verifier_uid": "01890a5d-ac96-774b-bcce-b302099a8058",
+    "card_uid": "01890a5d-ac96-774b-bcce-b302099a8057",
+    "verifier_card_uid": "01890a5d-ac96-774b-bcce-b302099a8058",
     "input": {"kind": "task_context", "context": {}},
 }
 """Well-formed ``verification.execute`` arguments, so only authorization can refuse them."""

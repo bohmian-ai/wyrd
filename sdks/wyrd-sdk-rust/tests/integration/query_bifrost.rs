@@ -4,6 +4,7 @@
 
 use arrow::array::AsArray;
 use arrow::datatypes::Int64Type;
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wyrd_ai::bifrost::{Correlation, QueryParam, TableConfig};
@@ -445,5 +446,162 @@ async fn unauthorized_table_refusal_reveals_no_columns() {
         !message.contains("verdict") && !message.contains("verdcit"),
         "{message}"
     );
+    deployment.shutdown().await;
+}
+
+/// The `vala.datasets` table the attribution story writes.
+const ATTRIBUTED_ROWS: &str = "vala.datasets.attributed_rows";
+
+/// One [`ATTRIBUTED_ROWS`] row read back with the pair Wyrd stamped on it.
+#[derive(Debug, PartialEq, Deserialize)]
+struct AttributedRow {
+    /// The row's ordinal.
+    id: i64,
+    /// Who the write was for.
+    sub_principal_id: String,
+    /// Who performed it.
+    act_principal_id: String,
+}
+
+/// Rows carry the verified subject and actor Wyrd stamps, and neither name
+/// can be declared or written by a client (AC-005/016).
+///
+/// Service A writes row 1 directly and Service B, acting for A, writes row
+/// 2; after shutdown and publication they read back as A/A and A/B. Declaring
+/// `sub_principal_id` or `act_principal_id` as a table column, inserting
+/// either as a row key, and registering either over the raw route are each
+/// refused with the reserved-column error. Another tenant's administrator
+/// cannot see the table.
+///
+/// # Panics
+/// Panics when a write, read, or refusal differs from the story.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn subject_actor_rows_and_reserved_columns() {
+    const RESERVED: &str = "WYRD_VALA_400_BIFROST_RESERVED_COLUMN";
+    let deployment = Deployment::start().await;
+    let server = deployment.server();
+    let a = server
+        .bootstrap_service("attribution_a", &["editor"])
+        .await
+        .expect("A bootstraps");
+    let b = server
+        .bootstrap_service("attribution_b", &["editor"])
+        .await
+        .expect("B bootstraps");
+    let a_key = a.api_key().expect("A has a key");
+    let b_key = b.api_key().expect("B has a key");
+    let schema = json!({
+        "type": "object",
+        "properties": { "id": { "type": "integer" } },
+        "required": ["id"],
+    });
+    let table = TableConfig::from_json_schema(ATTRIBUTED_ROWS, &schema).expect("table declares");
+    let direct = deployment.client(a_key.expose_secret());
+    let writer = Bifrost::connect_with_table(&direct, table.clone())
+        .await
+        .expect("A connects");
+    writer.register().await.expect("table registers");
+    writer
+        .insert(br#"{"id": 1}"#.to_vec(), Correlation::default())
+        .expect("A's row inserts");
+    let spoofed = writer
+        .insert(
+            br#"{"id": 3, "act_principal_id": "someone-else"}"#.to_vec(),
+            Correlation::default(),
+        )
+        .expect_err("a row key may not name the actor");
+    assert_eq!(WyrdError::from(spoofed).code(), RESERVED);
+    writer.shutdown().await.expect("A's writer drains");
+
+    let subject = server
+        .exchange_api_key(a_key)
+        .await
+        .expect("A's token exchanges");
+    let delegated = deployment
+        .client(b_key.expose_secret())
+        .on_behalf_of(
+            secrecy::SecretString::from(subject),
+            wyrd_spec::auth::TokenAudience::Bifrost,
+        )
+        .await
+        .expect("B acts for A");
+    let writer = Bifrost::connect_with_table(&delegated, table)
+        .await
+        .expect("B for A connects");
+    writer
+        .insert(br#"{"id": 2}"#.to_vec(), Correlation::default())
+        .expect("B's row for A inserts");
+    writer.shutdown().await.expect("B's writer drains");
+    server.flush_bifrost().await.expect("rows publish");
+
+    let rows: Vec<AttributedRow> = Bifrost::connect(&deployment.admin())
+        .await
+        .expect("Bifrost connects")
+        .sql_as(
+            &format!(
+                "SELECT id, sub_principal_id, act_principal_id FROM {ATTRIBUTED_ROWS} ORDER BY id"
+            ),
+            &[],
+        )
+        .await
+        .expect("rows read");
+    let (a, b) = (a.id().to_string(), b.id().to_string());
+    assert_eq!(
+        rows,
+        [
+            AttributedRow {
+                id: 1,
+                sub_principal_id: a.clone(),
+                act_principal_id: a.clone(),
+            },
+            AttributedRow {
+                id: 2,
+                sub_principal_id: a,
+                act_principal_id: b,
+            },
+        ]
+    );
+
+    for column in ["sub_principal_id", "act_principal_id"] {
+        let declared = TableConfig::from_json_schema(
+            "vala.datasets.spoofed_rows",
+            &json!({ "type": "object", "properties": { column: { "type": "string" } } }),
+        )
+        .expect_err("a managed name is not a user column");
+        assert_eq!(WyrdError::from(&declared).code(), RESERVED, "{column}");
+        let registered = deployment
+            .admin()
+            .request_json::<_, serde_json::Value>(
+                reqwest::Method::POST,
+                "/v1/bifrost/tables",
+                Some(&wyrd_spec::vala::api::RegisterTableRequest {
+                    namespace: "vala.datasets".to_owned(),
+                    name: "spoofed_rows".to_owned(),
+                    fields: vec![wyrd_spec::vala::api::FieldSpec {
+                        name: column.to_owned(),
+                        data_type: wyrd_spec::vala::api::DataTypeSpec::Utf8,
+                        nullable: true,
+                        metadata: std::collections::BTreeMap::new(),
+                    }],
+                    physical_layout: None,
+                    compaction_target_file_size_bytes: None,
+                    compaction_type: None,
+                }),
+            )
+            .await
+            .expect_err("the server refuses a managed name");
+        assert_eq!(registered.code(), RESERVED, "{column}");
+    }
+
+    let foreign = Bifrost::connect(
+        &deployment.client(&deployment.other_tenant_admin("attribution-other").await),
+    )
+    .await
+    .expect("the other tenant connects");
+    foreign
+        .sql(&format!("SELECT id FROM {ATTRIBUTED_ROWS}"), &[])
+        .await
+        .expect_err("another tenant cannot read the table");
     deployment.shutdown().await;
 }

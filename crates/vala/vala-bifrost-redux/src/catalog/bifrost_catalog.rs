@@ -19,6 +19,7 @@ use vala_sql::queries::file_list::HotFileCut;
 use vala_sql::queries::oracle_reader_authority::{CutTableRef, OracleTableCuts, TableCut};
 use vala_sql::row_types::file_list::HotFileRow;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::vala::api::{
     BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, PhysicalLayoutWire,
     RegisterOutcome, RegisterTableResponse,
@@ -112,6 +113,9 @@ pub struct CreateTableRequest {
     pub user_fields: Vec<Field>,
     /// Authenticated organization that owns the registration and physical table.
     pub tenant: DataTenantId,
+    /// Verified subject and actor registering the table, stored once on its
+    /// control row.
+    pub attribution: Attribution,
     /// Optional caller-declared physical layout.
     ///
     /// `None` means "no declaration": the catalog resolves the canonical
@@ -849,6 +853,7 @@ impl BifrostCatalog {
     pub async fn register_dataset(
         &self,
         tenant: DataTenantId,
+        attribution: Attribution,
         table: TableRef,
         user_fields: Vec<Field>,
         physical_layout: Option<PhysicalLayoutWire>,
@@ -865,6 +870,7 @@ impl BifrostCatalog {
                     table,
                     user_fields,
                     tenant,
+                    attribution,
                     physical_layout,
                 },
                 None,
@@ -886,6 +892,10 @@ impl BifrostCatalog {
     /// active tenant at startup. Ingest and describe never create one and
     /// treat a missing built-in as an unregistered table.
     /// Repeating it for an existing built-in returns the same [`TableUid`].
+    /// `attribution` is the verified creator pair: the platform operator that
+    /// provisions the tenant, or [`Attribution::unresolved`] when no caller
+    /// exists, as at startup reconciliation. Only the first registration
+    /// records it; a repeat keeps the stored pair.
     ///
     /// A built-in this node has already resolved answers from the immutable
     /// registration cache; only the first ensure per tenant and table takes the
@@ -903,6 +913,7 @@ impl BifrostCatalog {
         &self,
         tenant: DataTenantId,
         definition: &'static BuiltinTableDefinition,
+        attribution: Attribution,
     ) -> Result<TableUid, BifrostCatalogError> {
         let namespace =
             BifrostNamespace::from_domain_namespace(definition.namespace).ok_or_else(|| {
@@ -920,6 +931,7 @@ impl BifrostCatalog {
                 table: table.clone(),
                 user_fields: (definition.arrow_fields)(),
                 tenant,
+                attribution,
                 physical_layout: Some((definition.physical_layout)()),
             },
             Some((definition.schema)()),
@@ -1049,6 +1061,7 @@ impl BifrostCatalog {
             &fqn,
             &fingerprint.0,
             &layout_json,
+            request.attribution,
         )
         .await?;
         conn.commit().await?;
@@ -2364,6 +2377,7 @@ mod production_pin_tests {
             let registered = catalog
                 .register_dataset(
                     tenant,
+                    wyrd_spec::auth::Attribution::unresolved(),
                     table.clone(),
                     vec![arrow::datatypes::Field::new(
                         "value",
@@ -2416,13 +2430,13 @@ mod production_pin_tests {
             let tenant = fixture.data_tenant_id();
             let spans = crate::tables::builtin_table("traces", "spans").expect("spans is built in");
             let first = catalog
-                .ensure_builtin(tenant, spans)
+                .ensure_builtin(tenant, spans, wyrd_spec::auth::Attribution::unresolved())
                 .await
                 .expect("the first ensure registers");
             fixture.vala_postgres().pool().close().await;
 
             let again = catalog
-                .ensure_builtin(tenant, spans)
+                .ensure_builtin(tenant, spans, wyrd_spec::auth::Attribution::unresolved())
                 .await
                 .expect("the second ensure answers from the cache");
 
@@ -2458,7 +2472,11 @@ mod production_pin_tests {
             for definition in crate::tables::builtin_tables() {
                 let fqn = format!("{}.{}", definition.namespace, definition.name);
                 let created = catalog
-                    .ensure_builtin(tenant, definition)
+                    .ensure_builtin(
+                        tenant,
+                        definition,
+                        wyrd_spec::auth::Attribution::unresolved(),
+                    )
                     .await
                     .unwrap_or_else(|error| panic!("built-in {fqn} is ensured: {error}"));
                 let namespace = BifrostNamespace::from_domain_namespace(definition.namespace)
@@ -2594,6 +2612,7 @@ mod production_pin_tests {
             catalog
                 .register_dataset(
                     tenant,
+                    wyrd_spec::auth::Attribution::unresolved(),
                     table.clone(),
                     vec![arrow::datatypes::Field::new(
                         "value",
@@ -2709,6 +2728,7 @@ mod production_pin_tests {
             catalog
                 .register_dataset(
                     tenant,
+                    wyrd_spec::auth::Attribution::unresolved(),
                     table.clone(),
                     vec![arrow::datatypes::Field::new(
                         "value",

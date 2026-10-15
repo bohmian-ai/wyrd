@@ -97,6 +97,7 @@ fn caller(
         principal: auth.principal,
         request_id: auth.request_id,
         delegation_chain: auth.delegation_chain,
+        executed_by: None,
     })
 }
 

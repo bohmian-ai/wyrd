@@ -91,14 +91,13 @@ impl DomainTable for CallsTable {
 
     /// The `GatewayCallPayloadV1` fields in contract order.
     ///
-    /// Identifiers are canonical UUID strings so they join the envelope's
-    /// `principal_id`; enums are their snake-case wire names; unsigned integers
+    /// Identifiers are canonical UUID strings; attribution is the envelope's
+    /// managed subject/actor pair; enums are their snake-case wire names; unsigned integers
     /// widen to the next signed Iceberg type; decimals stay exact strings.
     fn arrow_fields() -> Vec<Field> {
         vec![
             int32("schema_version", false),
             utf8("call_id", false),
-            utf8("caller_principal_id", false),
             utf8("operation", false),
             utf8("ingress_dialect", false),
             // A `ModelRef`: its provider and provider-native model.
@@ -148,7 +147,7 @@ impl DomainTable for CallsTable {
         hourly_layout(
             "started_at",
             vec![sort_desc("started_at"), sort_asc("call_id")],
-            &["call_id", "caller_principal_id"],
+            &["call_id"],
         )
     }
 }
@@ -159,7 +158,9 @@ mod tests {
 
     use super::{CallsTable, RESOLVED_MODEL};
     use crate::tables::{DomainTable, builtin_table};
-    use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
+    use wyrd_spec::vala::{
+        ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+    };
 
     /// Pins the exact contract columns, their nullability, the two model
     /// Structs' child nullability, and the envelope.
@@ -182,7 +183,6 @@ mod tests {
             vec![
                 ("schema_version", false),
                 ("call_id", false),
-                ("caller_principal_id", false),
                 ("operation", false),
                 ("ingress_dialect", false),
                 ("requested_model", false),
@@ -204,7 +204,8 @@ mod tests {
                 ("payload_object_refs", false),
                 (RUN_ID, true),
                 (CARD_UID, true),
-                (PRINCIPAL_ID, false),
+                (SUB_PRINCIPAL_ID, false),
+                (ACT_PRINCIPAL_ID, false),
                 (WYRD_REQUEST_ID, false),
                 (WYRD_INGESTED_AT, false),
             ]

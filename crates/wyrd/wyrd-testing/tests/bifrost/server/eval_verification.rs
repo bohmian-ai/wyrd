@@ -533,7 +533,7 @@ async fn assert_unresulted(
         format!(
             "SELECT result_id FROM vala.verification.results \
              WHERE {CARD_UID} = '{}' AND source_record_id = '{}'",
-            run.verifier_uid, run.record_id
+            run.verifier_card_uid, run.record_id
         ),
     )
     .await?;
@@ -1671,8 +1671,8 @@ async fn system_reads(
     Ok(server
         .retained_audit_records(
             tenant,
-            "audit_principal_id",
-            "operation = 'bifrost.query.read_decision' AND principal_kind = 'system'",
+            "sub_principal_id",
+            "operation = 'bifrost.query.read_decision' AND sub_principal_kind = 'system'",
         )
         .await?
         .into_iter()
@@ -2157,8 +2157,8 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
     let denials = server
         .retained_audit_records(
             tenant,
-            "audit_principal_id",
-            "operation = 'vala.query.sync' AND outcome = 'denied' AND principal_kind = 'system'",
+            "sub_principal_id",
+            "operation = 'vala.query.sync' AND outcome = 'denied' AND sub_principal_kind = 'system'",
         )
         .await?;
     let expected = Some(system.to_string());
@@ -2605,7 +2605,7 @@ async fn direct_task_judgment_records_one_correlated_result() -> Result<(), Serv
         ("execution_status", Some("completed".to_owned())),
         ("verdict", Some("failed".to_owned())),
         ("verifier_version", Some("1.0.0".to_owned())),
-        ("subject_card_uid", subject),
+        ("card_uid", subject),
         ("owner_card_uid", None),
         ("binding_id", None),
         ("trigger_identity", None),
@@ -2659,7 +2659,7 @@ async fn direct_task_judgment_records_one_correlated_result() -> Result<(), Serv
 /// captures call metadata, and the judge call is attributed from the run's context: the captured gateway call
 /// carries the observed subject Card as `card_uid` and the observation's
 /// application Run as `run_id`, and the run's result joins its judge call on
-/// `subject_card_uid` = `card_uid`.
+/// `card_uid`.
 ///
 /// # Errors
 /// Returns server, registration, SDK lifetime, storage, runtime, or query
@@ -2759,13 +2759,669 @@ async fn observation_judge_call_records_card_and_run_and_joins_its_result()
             tenant,
             format!(
                 "SELECT c.run_id FROM vala.verification.results r \
-                   JOIN vala.gateway.calls c ON c.card_uid = r.subject_card_uid \
+                   JOIN vala.gateway.calls c ON c.card_uid = r.card_uid \
                   WHERE r.result_id = '{result}'"
             ),
         )
         .await?,
     )?;
     assert_eq!(joined, [Some(run_id)]);
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Add Services `owner-a` through `owner-e` beside [`write_graph`]'s Cards,
+/// each binding the shared Agent to the gated LLM-judge Eval on
+/// `observations_ready`, and return their paths.
+///
+/// # Panics
+/// Panics when a fixture file cannot be written.
+fn write_background_owners(root: &Path) -> [PathBuf; 5] {
+    write_graph(root);
+    ["owner-a", "owner-b", "owner-c", "owner-d", "owner-e"].map(|name| {
+        let path = root.join(format!("{name}.yaml"));
+        std::fs::write(
+            &path,
+            format!(
+                "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: agent\n      ref: ./agent.yaml\n      verified_by:\n        - verifier: ./gated.yaml\n          runs_on: {{kind: observations_ready}}\n"
+            ),
+        )
+        .expect("fixture file writes");
+        path
+    })
+}
+
+/// Every observation run as `owner Service|sub|act`, sorted by owner.
+const RUN_PAIRS_SQL: &str = "SELECT concat(o.name, '|', r.sub_principal_id, '|', r.act_principal_id) \
+    FROM wyrd.verifier_runs r JOIN wyrd.cards o ON o.card_uid = r.owner_card_uid \
+    WHERE r.origin = 'observation' ORDER BY o.name";
+
+/// The owner Card of every observation binding refused since `checkpoint`,
+/// waiting until `expected` distinct owners are refused.
+///
+/// The run-request sink logs each refusal inside its
+/// `verification.observation_runs` span, so the event is read from the
+/// process telemetry capture once that span ends.
+///
+/// # Errors
+/// Returns a timeout naming the refusals seen when fewer than `expected`
+/// arrive within [`WAIT`].
+async fn refused_owners(
+    capture: &wyrd_testing::bifrost::BifrostTelemetryCapture,
+    checkpoint: &wyrd_testing::bifrost::BifrostTelemetryCheckpoint,
+    expected: usize,
+) -> Result<std::collections::BTreeSet<String>, ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let refused: std::collections::BTreeSet<String> = capture
+            .spans_since(checkpoint)
+            .into_iter()
+            .filter(|span| span.name == "verification.observation_runs")
+            .flat_map(|span| span.events)
+            .filter(|event| event.name.starts_with("observation run not accepted"))
+            .filter_map(|event| event.attributes.get("owner_card_uid").cloned())
+            .collect();
+        if refused.len() >= expected {
+            return Ok(refused);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("expected {expected} refused owners, saw {refused:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// An observation-triggered run serves its binding owner with SYSTEM as
+/// actor, never the record's writer (AC-001/002/008/017).
+///
+/// Services A through E bind the same Agent to the gated LLM-judge Eval. Only
+/// A's owner may invoke the judge model; B's owner authenticates, then holds
+/// no role; C's owner is suspended; D's owner principal is gone; and E's
+/// owner principal now exists only in another tenant. An unbound
+/// administrator writes one record about the Agent. The tenant's seeded
+/// SYSTEM principal is active, so A and B each get one run, accepted as
+/// owner/SYSTEM, while C, D, and E get none rather than falling back to the
+/// writer, SYSTEM, or the foreign principal, and each refusal is logged with
+/// its binding's owner Card. A's judge call reaches the provider and its
+/// gateway call and result rows carry A's owner/SYSTEM; B's judge is refused
+/// under B's owner authority without an upstream request, so the provider
+/// sees exactly one call. Once the tenant's SYSTEM principal is removed, a
+/// second record starts no run for any binding and every binding's refusal
+/// is logged.
+///
+/// # Errors
+/// Returns server, registration, SDK lifetime, runtime, or query errors, or a
+/// description of the first pair or run that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn background_owner_subject_system_actor() -> Result<(), ServerJourneyError> {
+    let root = tempfile::tempdir()?;
+    let [service_a, service_b, service_c, service_d, service_e] =
+        write_background_owners(root.path());
+    let (_telemetry, capture) = wyrd_testing::bifrost::shared_process_telemetry_for_test()?;
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl_owner", "object": "chat.completion", "created": 1_700_000_000,
+            "model": "gpt-test",
+            "choices": [{ "index": 0, "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+        })))
+        .mount(&provider)
+        .await;
+    let server = Box::pin(gateway_server(&provider)).await?;
+    let tenant = server.data_tenant_id();
+    let superuser = server.pg_fixture().superuser_pool()?;
+    // Read before the fixture provisions anything: tenant seeding alone
+    // leaves one active SYSTEM principal.
+    let seeded: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM wyrd.auth_service_accounts \
+         WHERE data_tenant_id = $1 AND principal_kind = 'system' AND status = 'active'",
+    )
+    .bind(tenant.as_uuid())
+    .fetch_optional(&superuser)
+    .await?;
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let system = seed.system_principal();
+    if seeded != Some(system) {
+        return Err(format!("the seeded tenant's SYSTEM is {seeded:?}, not {system}").into());
+    }
+    server
+        .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
+        .await?;
+    let admin = connect(&server, server.tenant_admin_key().await?.expose_secret());
+    wyrd_client::gateway::Gateway::with_client(admin.clone())
+        .put_capture_policy(&wyrd_spec::gateway::GatewayCapturePolicyWrite {
+            mode: wyrd_spec::gateway::GatewayCaptureMode::Metadata,
+            payload_fields: std::collections::BTreeSet::new(),
+        })
+        .await?;
+    let bundles = ["bundle-a", "bundle-b", "bundle-c", "bundle-d", "bundle-e"]
+        .map(|name| root.path().join(name));
+    let receipt_a = register(&admin, &service_a, &bundles[0]).await;
+    let receipt_b = register(&admin, &service_b, &bundles[1]).await;
+    let receipt_c = register(&admin, &service_c, &bundles[2]).await;
+    let receipt_d = register(&admin, &service_d, &bundles[3]).await;
+    let receipt_e = register(&admin, &service_e, &bundles[4]).await;
+    let [owner_c, owner_d, owner_e] = [&receipt_c, &receipt_d, &receipt_e].map(|receipt| {
+        receipt
+            .root
+            .uid
+            .as_ref()
+            .map(wyrd_spec::ids::CardUid::as_uuid)
+    });
+    let (Some(owner_c), Some(owner_d), Some(owner_e)) = (owner_c, owner_d, owner_e) else {
+        return Err("a registered owner has no UID".into());
+    };
+    sqlx::query("UPDATE wyrd.auth_service_accounts SET status = 'suspended' WHERE card_uid = $1")
+        .bind(owner_c)
+        .execute(&superuser)
+        .await?;
+    sqlx::query("DELETE FROM wyrd.auth_service_accounts WHERE card_uid = $1")
+        .bind(owner_d)
+        .execute(&superuser)
+        .await?;
+    let foreign = server
+        .pg_fixture()
+        .seed_additional_tenant("foreign-owner")
+        .await?;
+    sqlx::query(
+        "WITH moved AS (DELETE FROM wyrd.auth_service_accounts WHERE card_uid = $1 RETURNING *) \
+         INSERT INTO wyrd.auth_service_accounts (id, data_tenant_id, principal_kind, card_kind, \
+             card_uid, card_ref, space, name, version, description, status, \
+             sub_principal_id, act_principal_id) \
+         SELECT id, $2, principal_kind, card_kind, card_uid, card_ref, space, name, version, \
+                description, status, sub_principal_id, act_principal_id \
+           FROM moved",
+    )
+    .bind(owner_e)
+    .bind(foreign.as_uuid())
+    .execute(&superuser)
+    .await?;
+    let mut owners = Vec::new();
+    for (receipt, roles, bundle) in [
+        (&receipt_a, &[JUDGE_ROLE][..], &bundles[0]),
+        (&receipt_b, &[][..], &bundles[1]),
+    ] {
+        let Bootstrap::Machine { id, api_key, .. } = server
+            .credential_registered_service(&receipt.root, roles)
+            .await?
+        else {
+            return Err("a registered Service bootstraps a machine principal".into());
+        };
+        start_state(bundle, &connect(&server, api_key.expose_secret()))
+            .await
+            .shutdown()
+            .await?;
+        owners.push(id.to_string());
+    }
+    // B's owner keeps no role at all, so no judge model is inside its
+    // authority; the built-in workload role alone would permit invoking it.
+    sqlx::query("DELETE FROM wyrd.auth_service_account_roles WHERE service_account_id = $1")
+        .bind(uuid::Uuid::parse_str(&owners[1])?)
+        .execute(&superuser)
+        .await?;
+
+    let checkpoint = capture.checkpoint()?;
+    let state = start_state(&bundles[0], &admin).await;
+    let agent = state.run().for_card("agent")?;
+    let agent_uid = agent.subject().uid.clone().ok_or("agent has no UID")?;
+    let object = format!("{tenant}/cards/{agent_uid}/shot.png");
+    server
+        .state()
+        .storage
+        .put_object(&tenant_path::validate(&object, tenant)?, IMAGE.to_vec())
+        .await?;
+    emit(
+        &agent,
+        &json!({ "answer": "yes", "marker": "owner-served" }),
+        Some(&media(&format!("file:///{object}"))),
+        None,
+    );
+    state.shutdown().await?;
+    server.flush_bifrost().await?;
+    let (stop, task) = spawn_runtime(&server);
+    let runs = settle(&seed, 2).await;
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    server.flush_bifrost().await?;
+    let runs = runs?;
+
+    let pairs: Vec<String> = sqlx::query_scalar(RUN_PAIRS_SQL)
+        .fetch_all(&superuser)
+        .await?;
+    let expected = vec![
+        format!("owner-a|{}|{system}", owners[0]),
+        format!("owner-b|{}|{system}", owners[1]),
+    ];
+    if pairs != expected {
+        return Err(format!("expected owner/SYSTEM runs {expected:?}, read {pairs:?}").into());
+    }
+    let calls = texts(
+        &query(
+            &server,
+            tenant,
+            "SELECT concat(sub_principal_id, '|', act_principal_id, '|', outcome, '|', \
+             coalesce(error_code, '')) FROM vala.gateway.calls ORDER BY outcome"
+                .to_owned(),
+        )
+        .await?,
+    )?;
+    if calls != [Some(format!("{}|{system}|succeeded|", owners[0]))] {
+        return Err(format!("expected one owner-A/SYSTEM judge call, read {calls:?}").into());
+    }
+    let decisions = texts(
+        &query(
+            &server,
+            tenant,
+            "SELECT DISTINCT concat(sub_principal_id, '|', act_principal_id, '|', outcome) AS d \
+               FROM vala.system.audit_log WHERE operation = 'gateway.invoke' ORDER BY d"
+                .to_owned(),
+        )
+        .await?,
+    )?;
+    // B's run retries its refused judge within its bounded attempts.
+    let mut expected = [
+        Some(format!("{}|{system}|allowed", owners[0])),
+        Some(format!("{}|{system}|denied", owners[1])),
+    ];
+    expected.sort();
+    if decisions != expected {
+        return Err(format!(
+            "expected owner/SYSTEM invoke decisions {expected:?}, read {decisions:?}"
+        )
+        .into());
+    }
+    let requests = provider.received_requests().await.unwrap_or_default().len();
+    if requests != 1 {
+        return Err(
+            format!("the provider saw {requests} judge requests, not owner A's one").into(),
+        );
+    }
+    let record = record_id(&server, tenant, "owner-served").await?;
+    let results = texts(
+        &query(
+            &server,
+            tenant,
+            format!(
+                "SELECT concat(verdict, '|', sub_principal_id, '|', act_principal_id) \
+                   FROM vala.verification.results WHERE source_record_id = '{record}' \
+                  ORDER BY sub_principal_id"
+            ),
+        )
+        .await?,
+    )?;
+    let passed: Vec<&Option<String>> = results
+        .iter()
+        .filter(|row| row.as_deref().is_some_and(|row| row.starts_with("passed|")))
+        .collect();
+    let owner_rows = results.iter().all(|row| {
+        row.as_deref().is_some_and(|row| {
+            owners
+                .iter()
+                .any(|owner| row.ends_with(&format!("|{owner}|{system}")))
+        })
+    });
+    if passed != [&Some(format!("passed|{}|{system}", owners[0]))] || !owner_rows {
+        return Err(format!(
+            "expected only A to pass and every result as owner/SYSTEM, read {results:?} for {runs:?}"
+        )
+        .into());
+    }
+    let unaccepted =
+        std::collections::BTreeSet::from([owner_c, owner_d, owner_e].map(|uid| uid.to_string()));
+    let refused = refused_owners(&capture, &checkpoint, unaccepted.len()).await?;
+    if refused != unaccepted {
+        return Err(format!("expected C, D, and E refused, read {refused:?}").into());
+    }
+
+    // Without the tenant's SYSTEM principal no binding's run can be
+    // accepted, so a second record enqueues nothing and refuses every owner.
+    sqlx::query(
+        "DELETE FROM wyrd.auth_service_accounts \
+         WHERE data_tenant_id = $1 AND principal_kind = 'system'",
+    )
+    .bind(tenant.as_uuid())
+    .execute(&superuser)
+    .await?;
+    let checkpoint = capture.checkpoint()?;
+    let state = start_state(&bundles[0], &admin).await;
+    emit(
+        &state.run().for_card("agent")?,
+        &json!({ "answer": "yes", "marker": "systemless" }),
+        None,
+        None,
+    );
+    state.shutdown().await?;
+    server.flush_bifrost().await?;
+    let mut every_owner = unaccepted;
+    for receipt in [&receipt_a, &receipt_b] {
+        every_owner.insert(
+            receipt
+                .root
+                .uid
+                .as_ref()
+                .ok_or("an owner has no UID")?
+                .to_string(),
+        );
+    }
+    let refused = refused_owners(&capture, &checkpoint, every_owner.len()).await?;
+    if refused != every_owner {
+        return Err(
+            format!("expected every owner refused without SYSTEM, read {refused:?}").into(),
+        );
+    }
+    let runs = seed.observation_runs().await?.len();
+    if runs != 2 {
+        return Err(format!("a SYSTEM-less tenant accepted runs: {runs} observation runs").into());
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Role granting what a realtime verification needs besides the judge model:
+/// Card reads and running any Verifier.
+const RUNNER_ROLE: &str = "realtime_runner";
+
+/// Add a media-free judge Prompt, Task and Eval Verifiers that call it, and a
+/// Service binding both to [`write_graph`]'s Agent for direct use only, and
+/// return the Service path.
+///
+/// # Panics
+/// Panics when the judge prompt cannot be built or a file cannot be written.
+fn write_realtime_graph(root: &Path) -> PathBuf {
+    write_graph(root);
+    let judge = skald_prompt::openai_chat(
+        "gpt-test",
+        skald_prompt::OpenAiChatOptions {
+            messages: vec!["Grade the answer ${answer}.".to_owned()],
+            variables: vec!["answer".to_owned()],
+            output: Some(
+                skald_prompt::ResponseFormat::json_schema(
+                    "judge_result",
+                    json!({
+                        "type": "object",
+                        "properties": { "passed": { "type": "boolean" } },
+                        "required": ["passed"],
+                        "additionalProperties": false
+                    }),
+                )
+                .expect("the judge response format builds"),
+            ),
+            ..skald_prompt::OpenAiChatOptions::default()
+        },
+    )
+    .expect("the judge prompt builds");
+    let prompt = json!({
+        "apiVersion": "wyrd/v1",
+        "kind": "Prompt",
+        "metadata": { "name": "realtime-judge-prompt", "version": "1.0.0", "space": "default" },
+        "spec": judge.into_native(),
+    });
+    let check = "kind: llm_judge, id: judge, judge_ref: {prompt: ./realtime-judge-prompt.json, tool_names: [], run_config: {max_iterations: 1}}, context_path: $.answer, operator: equals, expected: {passed: true}, max_retries: 0";
+    let files = [
+        ("realtime-judge-prompt.json", prompt.to_string()),
+        (
+            "realtime-task.yaml",
+            format!(
+                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: realtime-task\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: task\n    spec: {{{check}}}\n"
+            ),
+        ),
+        (
+            "realtime-eval.yaml",
+            verifier(
+                "realtime-eval",
+                &format!("      pass_gate: {{kind: all_pass}}\n      tasks:\n        judge: {{{check}}}\n"),
+            ),
+        ),
+        (
+            "realtime.yaml",
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: realtime-service\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: agent\n      ref: ./agent.yaml\n      verified_by:\n        - verifier: ./realtime-task.yaml\n        - verifier: ./realtime-eval.yaml\n".to_owned(),
+        ),
+    ];
+    for (name, body) in files {
+        std::fs::write(root.join(name), body).expect("fixture file writes");
+    }
+    root.join("realtime.yaml")
+}
+
+/// Judge `{answer: yes}` with `verifier` over `bundle` through `client`.
+///
+/// # Errors
+/// Returns the bundle load error or the server's refusal.
+async fn verify_as(
+    client: &WyrdClient,
+    bundle: &Path,
+    verifier: &str,
+) -> Result<wyrd_spec::verification::Judgment, ServerJourneyError> {
+    let state = WyrdState::from_path_with_client(bundle, client.clone())?;
+    Ok(state
+        .run()
+        .for_card("agent")?
+        .observe()
+        .verify(verifier, &json!({ "answer": "yes" }))
+        .await?)
+}
+
+/// A realtime verification keeps its subject and accepted authority all the
+/// way to the gateway (AC-003/004/012/018).
+///
+/// Subject A is Card-bound and holds exactly the runner and judge roles.
+/// Actor B holds the same; actor C holds only the runner role. Directly, and
+/// as B for A, the Task and Eval judges pass: acceptance is audited as A/A
+/// and A/B, and so are the results; each judge decision and gateway call
+/// records A/SYSTEM. As C for A, the judge falls outside the delegated intersection
+/// and is refused before any provider request. Actor D holds both roles but
+/// acts for the already delegated C-for-A token: the accepted chain is
+/// `[C, D]`, acceptance is audited as A/D with that history, and the judge C
+/// excluded at the earlier hop stays refused. Once A loses the judge role,
+/// B for A is refused the same way. The provider sees only the permitted
+/// calls.
+///
+/// # Errors
+/// Returns server, registration, exchange, verification, or query errors, or
+/// a description of the first pair or refusal that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn realtime_subject_actor_authority() -> Result<(), ServerJourneyError> {
+    let root = tempfile::tempdir()?;
+    let service = write_realtime_graph(root.path());
+    let bundle = root.path().join("bundle");
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl_realtime", "object": "chat.completion", "created": 1_700_000_000,
+            "model": "gpt-test",
+            "choices": [{ "index": 0, "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+        })))
+        .mount(&provider)
+        .await;
+    let server = Box::pin(gateway_server(&provider)).await?;
+    let tenant = server.data_tenant_id();
+    let system = VerificationFixture::provision(server.state().postgres.wyrd(), tenant)
+        .await?
+        .system_principal();
+    server
+        .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
+        .await?;
+    server
+        .seed_role(
+            RUNNER_ROLE,
+            &[
+                wyrd_runtime::Permission::card_read(),
+                wyrd_runtime::Permission::verifier_run_any(),
+            ],
+        )
+        .await?;
+    let admin = connect(&server, server.tenant_admin_key().await?.expose_secret());
+    wyrd_client::gateway::Gateway::with_client(admin.clone())
+        .put_capture_policy(&wyrd_spec::gateway::GatewayCapturePolicyWrite {
+            mode: wyrd_spec::gateway::GatewayCaptureMode::Metadata,
+            payload_fields: std::collections::BTreeSet::new(),
+        })
+        .await?;
+    let receipt = register(&admin, &service, &bundle).await;
+    let a = server
+        .credential_registered_service(&receipt.root, &[RUNNER_ROLE, JUDGE_ROLE])
+        .await?;
+    server
+        .revoke_role(&a, wyrd_runtime::builtin_roles::DEFAULT_CARD_ROLE)
+        .await?;
+    let b = server
+        .bootstrap_service("realtime-actor", &[RUNNER_ROLE, JUDGE_ROLE])
+        .await?;
+    let c = server
+        .bootstrap_service("realtime-narrow-actor", &[RUNNER_ROLE])
+        .await?;
+    let d = server
+        .bootstrap_service("realtime-second-actor", &[RUNNER_ROLE, JUDGE_ROLE])
+        .await?;
+    let key = |principal: &Bootstrap| {
+        principal
+            .api_key()
+            .map(|key| key.expose_secret().to_owned())
+            .ok_or("a machine principal carries an API key")
+    };
+    let on_behalf = async |actor: &Bootstrap| -> Result<WyrdClient, ServerJourneyError> {
+        let subject = server
+            .exchange_api_key(a.api_key().ok_or("A carries an API key")?)
+            .await?;
+        Ok(connect(&server, &key(actor)?)
+            .on_behalf_of(
+                secrecy::SecretString::from(subject),
+                wyrd_spec::auth::TokenAudience::Wyrd,
+            )
+            .await?)
+    };
+    let direct = connect(&server, &key(&a)?);
+    let as_b = on_behalf(&b).await?;
+    for client in [&direct, &as_b] {
+        for verifier in ["realtime-task", "realtime-eval"] {
+            let judged = verify_as(client, &bundle, verifier).await?;
+            if judged.verdict != wyrd_spec::verification::VerificationVerdict::Passed {
+                return Err(format!("{verifier} did not pass: {judged:?}").into());
+            }
+        }
+    }
+    let refused = |outcome: Result<wyrd_spec::verification::Judgment, ServerJourneyError>| {
+        outcome.is_err_and(|error| {
+            error
+                .to_string()
+                .contains("WYRD_VERIFICATION_502_DEPENDENCY_FAILED")
+        })
+    };
+    if !refused(verify_as(&on_behalf(&c).await?, &bundle, "realtime-eval").await) {
+        return Err("C for A judged outside C's authority".into());
+    }
+    let exchange = async |principal: &Bootstrap| -> Result<String, ServerJourneyError> {
+        Ok(server
+            .exchange_api_key(principal.api_key().ok_or("a machine carries an API key")?)
+            .await?)
+    };
+    let c_for_a = server
+        .delegate(
+            &exchange(&a).await?,
+            &exchange(&c).await?,
+            wyrd_spec::auth::TokenAudience::Wyrd,
+        )
+        .await?;
+    let d_for_c_for_a = connect(&server, &key(&d)?)
+        .on_behalf_of(
+            secrecy::SecretString::from(c_for_a),
+            wyrd_spec::auth::TokenAudience::Wyrd,
+        )
+        .await?;
+    if !refused(verify_as(&d_for_c_for_a, &bundle, "realtime-eval").await) {
+        return Err("D for C for A judged outside C's authority".into());
+    }
+    server.revoke_role(&a, JUDGE_ROLE).await?;
+    if !refused(verify_as(&on_behalf(&b).await?, &bundle, "realtime-eval").await) {
+        return Err("B for A judged outside A's authority".into());
+    }
+    let requests = provider.received_requests().await.unwrap_or_default().len();
+    if requests != 4 {
+        return Err(
+            format!("the provider saw {requests} judge requests, not the 4 permitted").into(),
+        );
+    }
+    server.flush_bifrost().await?;
+
+    let (a, b, c, d) = (a.id(), b.id(), c.id(), d.id());
+    let rows = async |sql: &str| texts(&query(&server, tenant, sql.to_owned()).await?);
+    let accepted = rows(
+        "SELECT DISTINCT concat(sub_principal_id, '|', act_principal_id, '|', outcome) AS d \
+           FROM vala.system.audit_log WHERE operation = 'verification.execute' ORDER BY d",
+    )
+    .await?;
+    let mut expected = vec![
+        Some(format!("{a}|{a}|allowed")),
+        Some(format!("{a}|{b}|allowed")),
+        Some(format!("{a}|{c}|allowed")),
+        Some(format!("{a}|{d}|allowed")),
+    ];
+    expected.sort();
+    if accepted != expected {
+        return Err(format!("expected acceptance pairs {expected:?}, read {accepted:?}").into());
+    }
+    let history = server
+        .retained_audit_records(
+            tenant,
+            "detail",
+            &format!("operation = 'verification.execute' AND act_principal_id = '{d}'"),
+        )
+        .await?;
+    let ordered = |detail: &str| {
+        detail
+            .find(&c.to_string())
+            .zip(detail.find(&d.to_string()))
+            .is_some_and(|(c, d)| c < d)
+    };
+    if history.is_empty()
+        || !history
+            .iter()
+            .flatten()
+            .flatten()
+            .all(|detail| ordered(detail))
+    {
+        return Err(
+            format!("expected A/D acceptance with history [C, D], read {history:?}").into(),
+        );
+    }
+    let judged = rows(
+        "SELECT DISTINCT concat(sub_principal_id, '|', act_principal_id, '|', outcome) AS d \
+           FROM vala.system.audit_log WHERE operation = 'gateway.invoke' ORDER BY d",
+    )
+    .await?;
+    let mut expected = vec![
+        Some(format!("{a}|{system}|allowed")),
+        Some(format!("{a}|{system}|denied")),
+    ];
+    expected.sort();
+    if judged != expected {
+        return Err(
+            format!("expected A/SYSTEM judge decisions {expected:?}, read {judged:?}").into(),
+        );
+    }
+    let mut accepted_pairs = vec![Some(format!("{a}|{a}")), Some(format!("{a}|{b}"))];
+    accepted_pairs.sort();
+    for (table, expected) in [
+        ("vala.gateway.calls", vec![Some(format!("{a}|{system}"))]),
+        ("vala.verification.results", accepted_pairs),
+    ] {
+        let pairs = rows(&format!(
+            "SELECT DISTINCT concat(sub_principal_id, '|', act_principal_id) AS p \
+               FROM {table} ORDER BY p"
+        ))
+        .await?;
+        if pairs != expected {
+            return Err(format!("{table}: expected {expected:?}, read {pairs:?}").into());
+        }
+    }
     server.shutdown().await?;
     Ok(())
 }

@@ -57,7 +57,7 @@ async fn insert_card(
         conn,
         NewRegistrationOperation {
             operation_id,
-            principal_id: actor.id,
+            attribution: wyrd_spec::auth::Attribution::direct(actor.id),
             idempotency_key: &key,
             request_hash: "request-hash",
         },
@@ -77,7 +77,7 @@ async fn insert_card(
         NewCardRow {
             card: &card,
             card_uid: CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID"),
-            principal_id: actor.id,
+            attribution: wyrd_spec::auth::Attribution::direct(actor.id),
             operation_id,
             status: CardStatus::Pending,
             spec_hash: "spec-hash",

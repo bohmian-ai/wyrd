@@ -3,6 +3,7 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::AuditDelegationStep;
@@ -47,6 +48,62 @@ impl DelegationStep {
 #[must_use]
 pub fn audit_delegation_chain(chain: &[DelegationStep]) -> Vec<AuditDelegationStep> {
     chain.iter().map(DelegationStep::audit_projection).collect()
+}
+
+/// The subject/actor pair of a verified principal and its delegation chain.
+///
+/// The subject is always the verified top-level principal. The chain is
+/// initiator-first, so its last step is the current (outermost `act`) actor;
+/// with no chain the principal acts for itself. Older actors stay history in
+/// audit detail and never become the current actor.
+#[must_use]
+pub fn delegated_attribution(principal: &Principal, chain: &[DelegationStep]) -> Attribution {
+    Attribution::new(
+        principal.id,
+        chain.last().map_or(principal.id, |step| step.principal.id),
+    )
+}
+
+/// The verified effective authority one accepted operation runs under.
+///
+/// Captured once when the server accepts deferred work, such as a queued
+/// Verifier run, and stored with it so claim, retry, and restart reuse exactly
+/// what was accepted: the effective principal (for a delegated request, the
+/// subject/actor intersection authentication already produced) and the
+/// initiator-first delegation chain kept as audit history. It is never
+/// re-derived from a bare principal ID, holds no bearer token, API key, or
+/// credential ID, and is server-only state that no run view exposes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedAuthority {
+    /// Effective principal every protected downstream call is checked against.
+    pub principal: Principal,
+    /// Verified initiator-first delegation chain; empty for direct work.
+    pub delegation_chain: Vec<DelegationStep>,
+}
+
+impl AcceptedAuthority {
+    /// Capture `principal` and its verified `chain` as accepted authority.
+    ///
+    /// Drops the credential ID: which credential authenticated the accepting
+    /// request is that request's audit fact, not part of the authority later
+    /// work runs under.
+    #[must_use]
+    pub fn new(principal: &Principal, chain: &[DelegationStep]) -> Self {
+        Self {
+            principal: Principal {
+                credential_id: None,
+                ..principal.clone()
+            },
+            delegation_chain: chain.to_vec(),
+        }
+    }
+
+    /// The subject/actor pair the accepting request carried.
+    #[must_use]
+    pub fn attribution(&self) -> Attribution {
+        delegated_attribution(&self.principal, &self.delegation_chain)
+    }
 }
 
 /// Per-request context carried through runtime boundaries.
@@ -133,7 +190,7 @@ impl TraceParent {
 
 #[cfg(test)]
 mod tests {
-    use super::{DelegationStep, RequestContext, TraceParent};
+    use super::{AcceptedAuthority, DelegationStep, RequestContext, TraceParent};
     use crate::permission::PermissionSet;
     use crate::principal::{Principal, PrincipalId, PrincipalKind, PrincipalRef};
     use chrono::Utc;
@@ -251,5 +308,40 @@ mod tests {
         assert!(!debug.contains("first"));
         assert!(!debug.contains("second"));
         assert!(!debug.contains("third"));
+    }
+
+    /// Accepted authority keeps the effective principal and chain, survives a
+    /// JSON round trip unchanged, never carries the accepting credential, and
+    /// projects the accepting request's subject/actor pair.
+    ///
+    /// # Panics
+    /// Panics when the authority does not serialize or deserialize, or when
+    /// the round trip changes it, keeps the credential, or projects another
+    /// pair.
+    #[test]
+    fn accepted_authority_round_trips_without_credential() {
+        let mut subject = service_principal("subject");
+        subject.credential_id = Some(uuid::Uuid::now_v7());
+        let actor = service_principal("actor");
+        let chain = vec![DelegationStep {
+            principal: PrincipalRef::from_principal(&actor),
+        }];
+
+        let accepted = AcceptedAuthority::new(&subject, &chain);
+        let json = serde_json::to_value(&accepted).expect("serialize accepted authority");
+        let parsed: AcceptedAuthority =
+            serde_json::from_value(json).expect("deserialize accepted authority");
+
+        assert_eq!(parsed, accepted);
+        assert_eq!(parsed.principal.credential_id, None);
+        assert_eq!(parsed.delegation_chain, chain);
+        assert_eq!(parsed.attribution().sub_principal_id, subject.id);
+        assert_eq!(parsed.attribution().act_principal_id, actor.id);
+        assert_eq!(
+            AcceptedAuthority::new(&subject, &[])
+                .attribution()
+                .act_principal_id,
+            subject.id
+        );
     }
 }

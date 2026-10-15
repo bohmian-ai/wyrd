@@ -36,7 +36,7 @@ Tables are Apache Iceberg tables of Parquet files in the object store you config
 
 Each table has a namespace and a name, such as `vala.drift.observations`. Wyrd owns every namespace except `vala.datasets`, which is yours. See [Write and query custom data with Bifrost](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/#4-find-and-describe-tables) for the full list.
 
-Every row carries managed columns Wyrd fills in: `card_uid`, `run_id`, `principal_id`, `wyrd_request_id`, and `wyrd_ingested_at`. Each table also has one time column that partitions it, so a query that filters on time reads only the files it needs.
+Every row carries managed columns Wyrd fills in: `card_uid`, `run_id`, `sub_principal_id` (who the work was for), `act_principal_id` (who performed it), `wyrd_request_id`, and `wyrd_ingested_at`. Each table also has one time column that partitions it, so a query that filters on time reads only the files it needs.
 
 ## Two ways in
 

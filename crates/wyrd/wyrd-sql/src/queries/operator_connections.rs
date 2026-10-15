@@ -17,6 +17,7 @@ use sqlx::Error as SqlxError;
 use sqlx::types::{Json, Uuid};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::{ConnectionName, OperatorConnectionId};
 use wyrd_spec::operator_connection::{
     OperatorConnectionConfig, OperatorConnectionStatus, OperatorConnectionView, OperatorProvider,
@@ -37,9 +38,10 @@ const INSERT_SQL: &str = concat!(
     "INSERT INTO wyrd.operator_connections (
          connection_id, data_tenant_id, provider, name, config, status,
          secret_ciphertext, secret_nonce, wrapped_dek, dek_nonce, key_version,
-         secret_version, created_by, updated_by, created_at, updated_at
+         secret_version, sub_principal_id, act_principal_id, updated_by, created_at,
+         updated_at
      ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, 'active', $5, $6, $7, $8, $9,
-               $10, $11, $11, statement_timestamp(), statement_timestamp())
+               $10, $11, $12, $11, statement_timestamp(), statement_timestamp())
      ON CONFLICT (data_tenant_id, provider, name) DO NOTHING
      RETURNING ",
     columns!()
@@ -149,8 +151,9 @@ pub struct NewConnection<'a> {
     pub sealed: &'a SealedSecret,
     /// First secret version; the sealed context used it.
     pub secret_version: i32,
-    /// Creating principal.
-    pub principal: PrincipalId,
+    /// Verified subject and actor creating the connection; later updates
+    /// keep it and record only `updated_by`.
+    pub attribution: Attribution,
 }
 
 /// A connection update to apply.
@@ -186,7 +189,8 @@ pub async fn insert_connection(
         .bind(new.sealed.dek_nonce.as_slice())
         .bind(new.sealed.key_version)
         .bind(new.secret_version)
-        .bind(new.principal.as_uuid())
+        .bind(new.attribution.sub_principal_id.as_uuid())
+        .bind(new.attribution.act_principal_id.as_uuid())
         .fetch_optional(&mut **conn.transaction())
         .await?;
     row.map(ConnectionRow::into_stored).transpose()

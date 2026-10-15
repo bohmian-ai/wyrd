@@ -81,7 +81,8 @@ CREATE TABLE wyrd.auth_service_accounts (
     version         TEXT NOT NULL,
     description     TEXT,
     status          TEXT NOT NULL CHECK (status IN ('active','suspended','deleted')),
-    created_by      UUID NOT NULL,
+    sub_principal_id UUID NOT NULL,
+    act_principal_id UUID NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (data_tenant_id, id),
@@ -89,7 +90,7 @@ CREATE TABLE wyrd.auth_service_accounts (
     UNIQUE (data_tenant_id, name),
     CHECK ((principal_kind = 'service' AND card_kind = 'Service')
         OR (principal_kind = 'agent'   AND card_kind = 'Agent')),
-    FOREIGN KEY (data_tenant_id, created_by)
+    FOREIGN KEY (data_tenant_id, sub_principal_id)
         REFERENCES wyrd.auth_users(data_tenant_id, id)
 );
 
@@ -166,7 +167,8 @@ CREATE TABLE wyrd.auth_api_keys (
     sa_id           UUID NOT NULL,
     prefix          TEXT NOT NULL,
     key_hash        TEXT NOT NULL,
-    created_by      UUID NOT NULL,
+    sub_principal_id UUID NOT NULL,
+    act_principal_id UUID NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_used_at    TIMESTAMPTZ,
     expires_at      TIMESTAMPTZ NOT NULL,
@@ -174,7 +176,7 @@ CREATE TABLE wyrd.auth_api_keys (
     UNIQUE (data_tenant_id, prefix),
     FOREIGN KEY (data_tenant_id, sa_id)
         REFERENCES wyrd.auth_service_accounts(data_tenant_id, id) ON DELETE CASCADE,
-    FOREIGN KEY (data_tenant_id, created_by)
+    FOREIGN KEY (data_tenant_id, sub_principal_id)
         REFERENCES wyrd.auth_users(data_tenant_id, id)
 );
 

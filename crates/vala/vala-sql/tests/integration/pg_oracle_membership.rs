@@ -457,6 +457,7 @@ mod pg_tests {
                 &format!("{NAMESPACE}.{table}"),
                 &[9_u8; 32],
                 &layout(),
+                wyrd_spec::auth::Attribution::unresolved(),
             )
             .await
             .expect("table registers");

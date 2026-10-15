@@ -145,14 +145,14 @@ export async function waitForVerdicts(client: WyrdClient, desk: Desk, timeoutMs:
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const rows = await bifrost.sql(
-      "SELECT card_uid, verdict, COUNT(*) AS n FROM vala.verification.results " +
-        "WHERE subject_card_uid = $1 GROUP BY card_uid, verdict",
+      "SELECT verifier_card_uid, verdict, COUNT(*) AS n FROM vala.verification.results " +
+        "WHERE card_uid = $1 GROUP BY verifier_card_uid, verdict",
       [uid(desk, "support-agent")],
-      { parse: (row) => row as { card_uid: string; verdict: string; n: number | bigint } },
+      { parse: (row) => row as { verifier_card_uid: string; verdict: string; n: number | bigint } },
     );
     const verdicts: Verdicts = {};
     for (const row of rows) {
-      const name = names.get(row.card_uid);
+      const name = names.get(row.verifier_card_uid);
       if (name) {
         const counts = (verdicts[name] ??= [0, 0]);
         counts[row.verdict === "passed" ? 0 : 1] += Number(row.n);

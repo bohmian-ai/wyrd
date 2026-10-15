@@ -6,7 +6,7 @@ mod context;
 mod export;
 
 pub use context::{continued_context, current_context, inbound_context, serve_request};
-pub use export::{TenantSpanRoute, TenantSpanSink, bind_tenant_route};
+pub use export::{TenantSpanRoute, TenantSpanSink, bind_operation_route, bind_tenant_route};
 
 #[cfg(feature = "test-support")]
 use std::collections::BTreeMap;

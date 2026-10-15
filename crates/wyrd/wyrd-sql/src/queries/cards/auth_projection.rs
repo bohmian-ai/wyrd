@@ -4,8 +4,9 @@
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 use wyrd_runtime::builtin_roles::DEFAULT_CARD_ROLE;
-use wyrd_runtime::principal::{Principal, PrincipalId};
+use wyrd_runtime::principal::PrincipalId;
 use wyrd_semver::{VersionBlock, VersionSpec};
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::envelope::{Card, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
@@ -17,9 +18,10 @@ use crate::tenant_conn::TenantConn;
 const UPSERT_SQL: &str = r"
 INSERT INTO wyrd.auth_service_accounts
     (id, data_tenant_id, principal_kind, card_kind, card_uid,
-     space, name, version, card_ref, description, status, created_by)
+     space, name, version, card_ref, description, status,
+     sub_principal_id, act_principal_id)
 VALUES (gen_random_uuid(), wyrd.current_tenant(), $1, $2, $3,
-        $4, $5, $6, $7, $8, 'active', $9)
+        $4, $5, $6, $7, $8, 'active', $9, $10)
 ON CONFLICT (data_tenant_id, principal_kind, card_kind, card_uid)
 DO UPDATE SET card_ref = EXCLUDED.card_ref, space = EXCLUDED.space,
     name = EXCLUDED.name, version = EXCLUDED.version,
@@ -33,8 +35,9 @@ RETURNING id, (xmax = 0) AS inserted
 /// [`DEFAULT_CARD_ROLE`] in the caller's transaction, so a key issued for the
 /// principal can emit and verify its own evidence. A re-registration only
 /// refreshes the row's Card projection: it never grants the Role again, so an
-/// administrator's revocation stands. `xmax = 0` identifies the freshly
-/// inserted row of an `INSERT ... ON CONFLICT DO UPDATE`.
+/// administrator's revocation stands, and keeps the creating `attribution`.
+/// `xmax = 0` identifies the freshly inserted row of an
+/// `INSERT ... ON CONFLICT DO UPDATE`.
 ///
 /// # Errors
 ///
@@ -46,7 +49,7 @@ pub async fn upsert_service_account_from_card(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
     card: &Card,
-    actor: &Principal,
+    attribution: Attribution,
 ) -> Result<PrincipalId, WyrdError> {
     let (principal_kind, description) = match &card.spec {
         Spec::Service(spec) => ("service", spec.description.as_deref()),
@@ -88,7 +91,8 @@ pub async fn upsert_service_account_from_card(
         .bind(version.as_str())
         .bind(card_ref_json)
         .bind(description)
-        .bind(actor.id.as_uuid())
+        .bind(attribution.sub_principal_id.as_uuid())
+        .bind(attribution.act_principal_id.as_uuid())
         .fetch_one(&mut **conn.transaction())
         .await
         .map_err(|error| {

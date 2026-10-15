@@ -8,28 +8,33 @@
 //! tables the run reads. No token is minted or verified; Oracle's table
 //! authorization enforces and audits every read under it like any caller's.
 //!
-//! LLM judge calls are not reads: [`writer_caller`] recovers the observation
-//! writer's own current authority for them, never the SYSTEM principal's.
-
-use std::sync::Arc;
+//! Each read is recorded for the run's subject with SYSTEM as actor, and the
+//! run's accepted delegation chain as history, through
+//! [`SystemReadAuthority::serving`]; neither authorizes anything.
+//!
+//! LLM judge calls are not reads: they run under the run's accepted authority
+//! with SYSTEM as actor. [`BackgroundAuthority`] resolves that authority for
+//! the runs Wyrd starts itself.
 
 use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
-use vala_bifrost_redux::oracle::AuthorizedQueryContext;
+use vala_bifrost_redux::oracle::{AuthorizedQueryContext, ServedSubject};
 use vala_sql::queries::olap_catalog::get_by_fqn;
-use wyrd_auth::issuance::IssuanceError;
+use wyrd_auth::issuance::{IssuanceError, TenantTokenIssuer};
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_runtime::{
-    Action, BifrostPermissionScope, BifrostTableScope, Permission, PermissionScope,
+    AcceptedAuthority, Action, BifrostPermissionScope, BifrostTableScope, Permission,
+    PermissionScope,
 };
 use wyrd_spec::DataTenantId;
-use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::AuthMethod;
 use wyrd_spec::vala::error::BifrostError;
+use wyrd_sql::queries::auth::service_accounts::system_principal_id;
+use wyrd_sql::queries::verifier_runs::RunAuthority;
+use wyrd_sql::{SqlError, TenantConn};
 
-use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::state::AppState;
 
 /// Why a SYSTEM read authority cannot be built for a run.
@@ -159,6 +164,27 @@ impl SystemReadAuthority {
             .map_err(|error| unavailable(&error))
     }
 
+    /// Record every read under this authority as served for the run's
+    /// accepted subject, with SYSTEM as actor and the accepted
+    /// initiator-first delegation chain as its history.
+    ///
+    /// Attribution only: the reads stay authorized by the SYSTEM principal's
+    /// narrow table grants, never by the subject's permissions or the chain.
+    /// The chain rides on the query context, so a read forwarded to a peer
+    /// Oracle records the same history.
+    #[must_use]
+    pub fn serving(self, accepted: &AcceptedAuthority) -> Self {
+        Self {
+            context: self
+                .context
+                .serving(ServedSubject {
+                    id: accepted.principal.id,
+                    kind: accepted.principal.kind.tag(),
+                })
+                .with_delegation_chain(accepted.delegation_chain.clone()),
+        }
+    }
+
     /// The SYSTEM principal's authorized query context.
     #[must_use]
     pub const fn context(&self) -> &AuthorizedQueryContext {
@@ -172,46 +198,152 @@ impl SystemReadAuthority {
     }
 }
 
-/// Recover the current authority of `principal`, the stored writer of one
-/// observation, as the caller its queued LLM judge calls run under.
+/// Resolves the authority a background Verifier run is accepted under.
 ///
-/// The writer is resolved through the tenant issuer's
-/// [`recover`](wyrd_auth::issuance::TenantTokenIssuer::recover) with its
-/// current roles, permissions, and Card scope, so the gateway authorizes,
-/// accounts, captures, and audits each judge call as that writer's own.
-/// Nothing is cached, presented, or minted.
-///
-/// # Errors
-/// Returns [`WyrdError::CredentialRevoked`] when the writer is missing or
-/// not active, [`WyrdError::Internal`] when `principal` is not a principal
-/// id or no issuer is configured, and the issuer's store-unavailable error
-/// when the tenant store cannot be read.
-pub async fn writer_caller(
-    state: &AppState,
-    tenant: DataTenantId,
-    principal: &str,
-) -> Result<Caller, WyrdError> {
-    let internal = |message: &str| WyrdError::Internal {
-        message: message.to_owned(),
-        details: serde_json::json!({}),
-    };
-    let principal = uuid::Uuid::parse_str(principal)
-        .map_err(|_| internal("the observation writer is not a principal id"))?;
-    let issuer = state
-        .auth
-        .tenant_issuer(&state.scribe_outbox)
-        .ok_or_else(|| internal("no tenant token issuer is configured"))?;
-    let mut conn = state
-        .postgres
-        .tenant_conn(tenant)
-        .await
-        .map_err(|error| WyrdError::from(IssuanceError::Store(error)))?;
-    let verified = issuer.recover(&mut conn, principal).await?;
-    conn.commit()
-        .await
-        .map_err(|error| WyrdError::from(IssuanceError::Store(error)))?;
-    Ok(Caller::from_authenticated(
-        &AuthenticatedPrincipal::from_verified(Arc::new(verified)),
-        RequestId::now_v7(),
-    ))
+/// Scheduled and observation runs serve their binding owner: at acceptance
+/// the owner's current authority is recovered through the tenant issuer's
+/// [`recover`](TenantTokenIssuer::recover), on the accepting transaction, and
+/// paired with the tenant SYSTEM principal as actor. An owner that is missing,
+/// inactive, or not admitted, or a tenant without SYSTEM, yields no authority
+/// and therefore no run; nothing falls back to another identity.
+#[derive(Clone)]
+pub struct BackgroundAuthority {
+    /// Tenant issuer that recovers the owner's current authority; `None`
+    /// when no signing key is configured, so no background run is accepted.
+    issuer: Option<TenantTokenIssuer>,
+}
+
+impl BackgroundAuthority {
+    /// Resolve background authority through `issuer`.
+    #[must_use]
+    pub const fn new(issuer: Option<TenantTokenIssuer>) -> Self {
+        Self { issuer }
+    }
+
+    /// The owner/SYSTEM authority a run serving `owner` is accepted under,
+    /// or `None` when either identity cannot be resolved in `conn`'s tenant.
+    ///
+    /// Reads SYSTEM and recovers the owner on `conn` without writing, so the
+    /// resolution commits or rolls back with the run it authorizes.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when a tenant read fails; the caller's
+    /// transaction is then unusable and the work is retried.
+    pub async fn resolve(
+        &self,
+        conn: &mut TenantConn<'_>,
+        owner: PrincipalId,
+    ) -> Result<Option<RunAuthority>, SqlError> {
+        let Some(issuer) = &self.issuer else {
+            tracing::warn!(%owner, "no tenant issuer is configured; background run not accepted");
+            return Ok(None);
+        };
+        let Some(system) = system_principal_id(conn)
+            .await
+            .map_err(SqlError::Query)?
+            .map(PrincipalId::new)
+        else {
+            tracing::warn!(%owner, "the tenant has no SYSTEM principal; background run not accepted");
+            return Ok(None);
+        };
+        match issuer.recover(conn, owner.as_uuid()).await {
+            Ok(verified) => Ok(Some(RunAuthority::background(
+                AcceptedAuthority::new(&verified.principal, &verified.delegation_chain),
+                system,
+            ))),
+            Err(IssuanceError::Store(error)) => Err(error),
+            Err(IssuanceError::Database(error)) => Err(SqlError::Query(error)),
+            Err(error) => {
+                tracing::info!(%owner, %error, "binding owner has no authority; background run not accepted");
+                Ok(None)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wyrd_runtime::{DelegationStep, PrincipalRef};
+
+    use super::*;
+
+    /// Serving an accepted delegated authority adds its subject and history
+    /// to the SYSTEM read context and nothing else (FIND-TASK-001-6).
+    ///
+    /// The Drift and Eval readers both build their context through
+    /// [`SystemReadAuthority::serving`]. The served context keeps SYSTEM as
+    /// its principal with exactly its one table grant, records User A as the
+    /// served subject and `[B]` as the chain, and keeps both across the JSON
+    /// form a forwarded read's envelope carries.
+    ///
+    /// # Panics
+    /// Panics when the context cannot be built or serialized, or when the
+    /// served context's principal, grants, subject, or chain differ.
+    #[test]
+    fn serving_keeps_accepted_history_without_widening() {
+        let tenant = DataTenantId::new_v7();
+        let principal = |kind| {
+            Principal::new(
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                kind,
+                tenant,
+                Vec::new(),
+                PermissionSet::default(),
+            )
+        };
+        let grant = Permission {
+            resource: wyrd_runtime::Resource::BifrostQuery,
+            action: Action::Read,
+            scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
+                catalog: "vala".to_owned(),
+                schema: "eval".to_owned(),
+                table_uid: uuid::Uuid::now_v7(),
+            })),
+        };
+        let system = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::System {
+                card_ref_scope: CardRefScope::default(),
+            },
+            tenant,
+            Vec::new(),
+            PermissionSet::from_iter([grant]),
+        );
+        let context = AuthorizedQueryContext::try_new(
+            system.clone(),
+            tenant,
+            RequestId::now_v7(),
+            None,
+            AuthMethod::Internal,
+            Permission::bifrost_query_read(),
+        )
+        .expect("the SYSTEM principal is in the tenant");
+        let (a, b) = (
+            principal(PrincipalKind::User),
+            principal(PrincipalKind::User),
+        );
+        let chain = vec![DelegationStep {
+            principal: PrincipalRef::from_principal(&b),
+        }];
+        let accepted = AcceptedAuthority::new(&a, &chain);
+
+        let served = SystemReadAuthority { context }
+            .serving(&accepted)
+            .into_context();
+        let forwarded: AuthorizedQueryContext =
+            serde_json::from_value(serde_json::to_value(&served).expect("the context serializes"))
+                .expect("the context deserializes");
+
+        for context in [&served, &forwarded] {
+            assert_eq!(context.principal, system, "SYSTEM keeps only its grant");
+            assert_eq!(
+                context.served_subject,
+                Some(ServedSubject {
+                    id: a.id,
+                    kind: a.kind.tag(),
+                })
+            );
+            assert_eq!(context.delegation_chain, chain);
+        }
+    }
 }

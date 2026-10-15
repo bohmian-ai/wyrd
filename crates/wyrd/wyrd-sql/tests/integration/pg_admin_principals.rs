@@ -15,7 +15,7 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_spec::auth::{Attribution, PrincipalKindTag};
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
@@ -412,7 +412,7 @@ mod pg_tests {
             None,
             "api-key-clock",
             None,
-            Uuid::now_v7(),
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(Uuid::now_v7())),
         )
         .await
         .expect("principal inserts");
@@ -426,7 +426,7 @@ mod pg_tests {
             principal,
             "wyrd_sk_active",
             &verifier("active"),
-            principal,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(principal)),
             Some(std::time::Duration::from_hours(1)),
         )
         .await
@@ -456,7 +456,7 @@ mod pg_tests {
             principal,
             "wyrd_sk_expired",
             &verifier("expired"),
-            principal,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(principal)),
             Some(std::time::Duration::ZERO),
         )
         .await
@@ -469,7 +469,7 @@ mod pg_tests {
             principal,
             "wyrd_sk_revoked",
             &verifier("revoked"),
-            principal,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(principal)),
             Some(std::time::Duration::from_hours(1)),
         )
         .await
@@ -590,7 +590,7 @@ mod pg_tests {
             None,
             "tenant-admin",
             Some("tenant root of trust"),
-            Uuid::now_v7(),
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(Uuid::now_v7())),
         )
         .await
         .expect("card-free administrative principal inserts");
@@ -627,9 +627,9 @@ mod pg_tests {
         let result = sqlx::query(
             "INSERT INTO wyrd.auth_service_accounts
                  (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref,
-                  space, name, version, status, created_by)
+                  space, name, version, status, sub_principal_id, act_principal_id)
              VALUES ($1, $2, 'tenant_admin', 'Service', $3, '{}'::jsonb,
-                     'system', 'bogus', '1.0.0', 'active', $4)",
+                     'system', 'bogus', '1.0.0', 'active', $4, $4)",
         )
         .bind(Uuid::now_v7())
         .bind(fixture.data_tenant_id().as_uuid())
@@ -686,7 +686,7 @@ mod pg_tests {
             None,
             "tenant-admin",
             None,
-            Uuid::now_v7(),
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(Uuid::now_v7())),
         )
         .await
         .expect("A principal inserts");
@@ -696,7 +696,7 @@ mod pg_tests {
             principal,
             "wyrd_sk_rlsprobe",
             &verifier("rls"),
-            principal,
+            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(principal)),
             None,
         )
         .await
@@ -791,12 +791,12 @@ mod pg_tests {
             .expect("second tenant seeds");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant opens");
-        let first = provision_system_principal(&mut conn)
+        let first = provision_system_principal(&mut conn, Attribution::unresolved())
             .await
             .expect("first provisioning succeeds");
         conn.commit().await.expect("first provisioning commits");
         let mut conn = fixture.tenant_conn().await.expect("tenant reopens");
-        let second = provision_system_principal(&mut conn)
+        let second = provision_system_principal(&mut conn, Attribution::unresolved())
             .await
             .expect("repeat provisioning succeeds");
         assert_eq!(first, second, "provisioning returns the one stable id");
@@ -838,16 +838,17 @@ mod pg_tests {
         conn.commit().await.expect("tenant A commits");
 
         let mut conn = fixture.tenant_conn_for(tenant_b).await.expect("B opens");
-        assert_eq!(
-            system_principal_id(&mut conn)
-                .await
-                .expect("B lookup succeeds"),
-            None,
-            "tenant A's writer is invisible to tenant B"
-        );
-        let tenant_b_writer = provision_system_principal(&mut conn)
+        let seeded_b_writer = system_principal_id(&mut conn)
             .await
-            .expect("B provisions its own writer");
+            .expect("B lookup succeeds")
+            .expect("a seeded tenant has its own writer");
+        let tenant_b_writer = provision_system_principal(&mut conn, Attribution::unresolved())
+            .await
+            .expect("B provisioning succeeds");
+        assert_eq!(
+            tenant_b_writer, seeded_b_writer,
+            "B keeps its seeded writer"
+        );
         assert_ne!(tenant_b_writer, first, "each tenant owns a distinct writer");
     }
 
@@ -865,7 +866,7 @@ mod pg_tests {
         };
         let fixture = PgFixture::start().await.expect("fixture starts");
         let mut conn = fixture.tenant_conn().await.expect("tenant opens");
-        let writer = provision_system_principal(&mut conn)
+        let writer = provision_system_principal(&mut conn, Attribution::unresolved())
             .await
             .expect("provisioning succeeds");
 
@@ -927,9 +928,9 @@ mod pg_tests {
             (
                 "a second writer",
                 "INSERT INTO wyrd.auth_service_accounts \
-                    (id, data_tenant_id, principal_kind, name, status, created_by) \
+                    (id, data_tenant_id, principal_kind, name, status, sub_principal_id, act_principal_id) \
                  VALUES (gen_random_uuid(), wyrd.current_tenant(), 'system', 'second', \
-                         'active', gen_random_uuid())",
+                         'active', gen_random_uuid(), gen_random_uuid())",
             ),
         ];
         for (label, statement) in refusals {
@@ -981,9 +982,19 @@ mod pg_tests {
             .await
             .expect("writer rows read")
         };
+        // Seeding provisions a writer as production does; remove it so the
+        // tenant looks like one that predates the upgrade.
+        sqlx::query(
+            "DELETE FROM wyrd.auth_service_accounts \
+              WHERE data_tenant_id = $1 AND principal_kind = 'system'",
+        )
+        .bind(tenant.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("seeded writer removes");
         assert!(
             read_writers().await.is_empty(),
-            "a tenant seeded after migration starts without a writer"
+            "the pre-upgrade tenant starts without a writer"
         );
 
         let mut backfilled = Vec::new();

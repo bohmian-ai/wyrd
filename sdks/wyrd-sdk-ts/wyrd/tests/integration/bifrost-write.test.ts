@@ -221,10 +221,14 @@ test("empty result keeps the selected schema", async ({ reader }) => {
 });
 
 /** Service B's client acting on behalf of A's inbound access token. */
-async function onBehalfOfA(a: string, b: string): Promise<Bifrost> {
+async function delegatedClient(a: string, b: string): Promise<WyrdClient> {
   const token = await WyrdClient.connect({ credential: a }).accessToken();
-  const delegated = await WyrdClient.connect({ credential: b }).onBehalfOf(token, { audience: "bifrost" });
-  return Bifrost.connect({ client: delegated });
+  return WyrdClient.connect({ credential: b }).onBehalfOf(token, { audience: "bifrost" });
+}
+
+/** A Bifrost client for {@link delegatedClient}. */
+async function onBehalfOfA(a: string, b: string): Promise<Bifrost> {
+  return Bifrost.connect({ client: await delegatedClient(a, b) });
 }
 
 test("delegated client reads with the callers authority", async ({ reader: _, a, b }) => {
@@ -248,3 +252,51 @@ test("delegated client cannot write with the services authority", async ({ a, b 
     valueBatch(arrowSchema, 42n),
   );
 });
+
+/** One row read back with the subject and actor Wyrd stamped on it. */
+const AttributedRow = z.object({ id: z.bigint(), sub_principal_id: z.string(), act_principal_id: z.string() });
+
+test.for(["sub_principal_id", "act_principal_id"])(
+  "subject actor rows and reserved columns: %s",
+  async (column, { server, reader }) => {
+    const table = `vala.datasets.attributed_${column}`;
+    const permissions = ["bifrost_query:read", "bifrost_record:write", "bifrost_table:read"];
+    const a = server.scopedApiKey(`subject_${column}`, permissions);
+    const b = server.scopedApiKey(`actor_${column}`, permissions);
+    expect(await registerValueTable(table)).toBe("created");
+
+    const clients = [
+      WyrdClient.connect({ credential: a }),
+      await delegatedClient(a, b),
+      WyrdClient.connect({ credential: b }),
+    ];
+    for (const [index, client] of clients.entries()) {
+      const writer = await Bifrost.connect({ table: TableConfig.fromJsonSchema(table, Value), client });
+      writer.insert({ value: index + 1 });
+      expect(() => writer.insert({ value: 4, [column]: "someone-else" })).toThrow(
+        expect.objectContaining({ code: "WYRD_VALA_400_BIFROST_RESERVED_COLUMN" }),
+      );
+      await writer.shutdown();
+    }
+    server.flushBifrost();
+
+    const [direct, delegated, actor] = await reader.sql(
+      `SELECT value AS id, sub_principal_id, act_principal_id FROM ${table} ORDER BY value`,
+      [],
+      AttributedRow,
+    );
+    expect(direct.sub_principal_id).toBe(direct.act_principal_id);
+    expect([delegated.sub_principal_id, delegated.act_principal_id]).toEqual([
+      direct.sub_principal_id,
+      actor.act_principal_id,
+    ]);
+    expect(actor.sub_principal_id).toBe(actor.act_principal_id);
+    expect(actor.sub_principal_id).not.toBe(direct.sub_principal_id);
+    expect(() =>
+      TableConfig.fromJsonSchema("vala.datasets.spoofed", {
+        type: "object",
+        properties: { [column]: { type: "string" } },
+      }),
+    ).toThrow(expect.objectContaining({ code: "WYRD_VALA_400_BIFROST_RESERVED_COLUMN" }));
+  },
+);

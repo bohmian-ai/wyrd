@@ -933,9 +933,9 @@ async fn declare_component_card(
         .expect("component spec hashes");
     sqlx::query(
         "INSERT INTO wyrd.cards (card_uid, data_tenant_id, kind, space, name, version, spec, \
-         spec_hash, artifact_hash, labels, annotations, status, created_by) \
+         spec_hash, artifact_hash, labels, annotations, status, sub_principal_id, act_principal_id) \
          SELECT $1, root.data_tenant_id, $2, $3, $4, $5, $6, $7, NULL, '{}'::jsonb, '{}'::jsonb, \
-         'active', root.created_by FROM wyrd.cards root WHERE root.card_uid = $8",
+         'active', root.sub_principal_id, root.act_principal_id FROM wyrd.cards root WHERE root.card_uid = $8",
     )
     .bind(
         component
@@ -973,9 +973,10 @@ async fn declare_component_card(
         .expect("the authored root Card is retired");
     sqlx::query(
         "INSERT INTO wyrd.cards (card_uid, data_tenant_id, kind, space, name, version, spec, \
-         spec_hash, artifact_hash, labels, annotations, status, created_by) \
+         spec_hash, artifact_hash, labels, annotations, status, sub_principal_id, act_principal_id) \
          SELECT $1, component.data_tenant_id, $2, $3, $4, $5, $6, $7, NULL, '{}'::jsonb, \
-         '{}'::jsonb, 'active', component.created_by FROM wyrd.cards component \
+         '{}'::jsonb, 'active', component.sub_principal_id, \
+         component.act_principal_id FROM wyrd.cards component \
          WHERE component.card_uid = $8",
     )
     .bind(root.uid.as_ref().expect("root uid is set").as_uuid())

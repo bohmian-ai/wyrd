@@ -9,6 +9,7 @@ use wyrd_auth_oidc::WorkloadBindingResolver;
 use wyrd_auth_verify::{ExternalVerifier, VerifiedExternalIdentity};
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::auth::PrincipalKindTag;
@@ -56,7 +57,7 @@ impl JwtBearer {
         assertion: SecretString,
         request_id: &str,
     ) -> Result<ExchangedToken, WyrdError> {
-        let mut audit_principal_id = Uuid::nil();
+        let mut sub_principal_id = None;
         let result = async {
             let verified = self
                 .verify_workload_assertion(tenant_id, assertion.expose_secret())
@@ -64,7 +65,7 @@ impl JwtBearer {
             let card_ref = self.resolve_workload_binding(tenant_id, &verified).await?;
             let mut conn = postgres.tenant_conn(tenant_id).await.map_err(store_error)?;
             let principal_id = bound_service_account(&mut conn, &card_ref).await?;
-            audit_principal_id = principal_id;
+            sub_principal_id = Some(principal_id);
             let exchanged = self
                 .issuer
                 .issue(&mut conn, principal_id, TenantGrant::JwtBearer, request_id)
@@ -81,7 +82,7 @@ impl JwtBearer {
         match result {
             Ok(token) => Ok(token),
             Err(error) => {
-                self.audit_workload_failure(tenant_id, audit_principal_id, request_id, &error);
+                self.audit_workload_failure(tenant_id, sub_principal_id, request_id, &error);
                 Err(error)
             }
         }
@@ -90,20 +91,23 @@ impl JwtBearer {
     /// Stage the audit of a refused workload `jwt-bearer` exchange.
     ///
     /// Stages one denied `auth.token.exchange` event with the closed failure
-    /// code on the issuer's process audit stage; `principal_id` is nil when the
-    /// service account was never resolved. Staging never waits and never
+    /// code on the issuer's process audit stage, attributed to the resolved
+    /// service account or, when none was resolved, to the unresolved-identity
+    /// sentinel pair. Staging never waits and never
     /// replaces the caller's refusal.
     fn audit_workload_failure(
         &self,
         tenant_id: DataTenantId,
-        principal_id: Uuid,
+        principal_id: Option<Uuid>,
         request_id: &str,
         error: &WyrdError,
     ) {
         let event = auth_event(
             request_id,
             TOKEN_EXCHANGE_OPERATION,
-            PrincipalId::new(principal_id),
+            principal_id.map_or_else(Attribution::unresolved, |id| {
+                Attribution::direct(PrincipalId::new(id))
+            }),
             PrincipalKindTag::Service,
             None,
             AuditOutcome::Denied,

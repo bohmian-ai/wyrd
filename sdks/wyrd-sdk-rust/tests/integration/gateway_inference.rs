@@ -17,8 +17,9 @@ use wyrd_ai::cards::{CardKind, CardSelector, Cards, RegistrationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::gateway::{
     DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation,
-    ProviderAdapter, ProviderAuth, ProviderCredentialName, ProviderCredentialWrite,
-    ProviderCredentialWriteSource, ProviderDeployment, ProviderDeploymentName, ProviderId,
+    ProviderAdapter, ProviderAuth, ProviderAuthHeader, ProviderCredentialName,
+    ProviderCredentialWrite, ProviderCredentialWriteSource, ProviderDeployment,
+    ProviderDeploymentName, ProviderId,
 };
 use wyrd_ai::operator_connections::SecretBearer;
 use wyrd_ai::{Gateway, Workflow, WorkflowRun, WorkflowRunStatus, WyrdClient};
@@ -92,7 +93,7 @@ impl Inference {
             ),
         )
         .await;
-        put_managed(deployment.admin(), "openai-key", PROVIDER_KEY).await;
+        put_managed(deployment.admin(), "openai", "openai-key", PROVIDER_KEY).await;
         let gateway = Gateway::with_client(deployment.admin());
         gateway
             .put_deployment(&ProviderDeployment {
@@ -224,16 +225,16 @@ const CALLER_STATE: &str = "wyrd=journey";
 /// Scope of the gateway's captured model-call attempt spans.
 const GATEWAY_SCOPE: &str = "wyrd.gateway";
 
-/// Write the managed provider credential `name` holding `secret` with the
+/// Write the managed `provider` credential `name` holding `secret` with the
 /// CLI as `client`, and return its redacted view as JSON.
 ///
 /// # Panics
 /// Panics when the write is refused.
-async fn put_managed(client: WyrdClient, name: &str, secret: &str) -> Value {
+async fn put_managed(client: WyrdClient, provider: &str, name: &str, secret: &str) -> Value {
     let view = cli::put_provider_credential(
         &ProviderCredentialWrite {
             name: ProviderCredentialName::new(name).expect("credential name"),
-            provider: ProviderId::new("openai").expect("provider"),
+            provider: ProviderId::new(provider).expect("provider"),
             source: ProviderCredentialWriteSource::ManagedSecret {
                 secret: SecretBearer::new(secret.to_owned()),
             },
@@ -529,7 +530,7 @@ async fn cli_issues_a_card_scoped_key_and_writes_a_provider_credential() {
     )
     .await
     .expect("the CLI issues a key");
-    let view = put_managed(admin, "managed-openai-key", "sk-managed").await;
+    let view = put_managed(admin, "openai", "managed-openai-key", "sk-managed").await;
 
     assert_eq!(
         (
@@ -1005,4 +1006,187 @@ async fn external_deployment_preserves_model_and_credentials() {
         "the refused call never reaches the gateway"
     );
     deployment.shutdown().await;
+}
+
+/// Write a `provider` credential for `name` as the administrator, then
+/// deploy `name` on `adapter` with it, sent in `header` or as a bearer
+/// token, serving `operation` for every model.
+///
+/// # Panics
+/// Panics when the credential or deployment is refused.
+async fn put_named(
+    deployment: &Deployment,
+    name: &str,
+    provider: &str,
+    adapter: ProviderAdapter,
+    header: Option<&str>,
+    operation: GatewayOperation,
+) {
+    let credential = format!("{name}-key");
+    put_managed(deployment.admin(), provider, &credential, PROVIDER_KEY).await;
+    let credential = ProviderCredentialName::new(&credential).expect("credential");
+    Gateway::with_client(deployment.admin())
+        .put_deployment(&ProviderDeployment {
+            name: ProviderDeploymentName::new(name).expect("deployment name"),
+            adapter,
+            auth: match header {
+                Some(header) => ProviderAuth::ApiKeyHeader {
+                    header: ProviderAuthHeader::new(header).expect("header"),
+                    credential,
+                },
+                None => ProviderAuth::Bearer { credential },
+            },
+            models: None,
+            capabilities: Some(BTreeSet::from([operation])),
+            access: DeploymentAccess::Open,
+        })
+        .await
+        .expect("deployment puts");
+}
+
+/// Native Anthropic, Gemini, and Jev clients reach deployments whose names
+/// are not provider names: each upstream receives the complete model, the
+/// Gemini call keeps its method on the model resource, and each reply relays.
+///
+/// # Panics
+/// Panics when a call is refused or an upstream sees a rewritten target.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn native_ingress_preserves_named_deployments() {
+    let inference = Inference::start().await;
+    for (name, provider, adapter, header, operation) in [
+        (
+            "claude-prod",
+            "anthropic",
+            ProviderAdapter::Anthropic,
+            Some("x-api-key"),
+            GatewayOperation::ChatCompletions,
+        ),
+        (
+            "gemini-team",
+            "gemini",
+            ProviderAdapter::Gemini,
+            Some("x-goog-api-key"),
+            GatewayOperation::ChatCompletions,
+        ),
+        (
+            "judge-pool",
+            "jev",
+            ProviderAdapter::Jev,
+            None,
+            GatewayOperation::SystemOne,
+        ),
+    ] {
+        put_named(
+            &inference.deployment,
+            name,
+            provider,
+            adapter,
+            header,
+            operation,
+        )
+        .await;
+    }
+    for (upstream_path, reply) in [
+        (
+            "/v1/messages",
+            json!({
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-sonnet-4-5",
+                "content": [{ "type": "text", "text": "hi" }], "stop_reason": "end_turn",
+                "usage": { "input_tokens": 3, "output_tokens": 1 },
+            }),
+        ),
+        (
+            "/v1beta/models/gemini-2.5-flash:generateContent",
+            json!({
+                "candidates": [{ "content": { "role": "model", "parts": [{ "text": "hi" }] }, "finishReason": "STOP" }],
+                "usageMetadata": { "promptTokenCount": 3, "candidatesTokenCount": 1, "totalTokenCount": 4 },
+            }),
+        ),
+        (
+            "/v1/systemone",
+            json!({
+                "model": "jev-latest",
+                "answers": { "helpful": { "type": "noul", "noul": 0.9 } },
+                "usage": { "input_tokens": 3, "output_tokens": 1 },
+            }),
+        ),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(upstream_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+            .mount(&inference.upstream)
+            .await;
+    }
+    let base = inference
+        .deployment
+        .server()
+        .base_url()
+        .expect("bound server has a URL");
+    let token = inference
+        .deployment
+        .admin()
+        .access_token()
+        .await
+        .expect("access token mints");
+    let calls = [
+        (
+            "/v1/messages",
+            json!({
+                "model": "claude-prod/claude-sonnet-4-5", "max_tokens": 16,
+                "messages": [{ "role": "user", "content": "hi" }],
+            }),
+        ),
+        (
+            "/v1beta/models/gemini-team/gemini-2.5-flash:generateContent",
+            json!({
+                "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+            }),
+        ),
+        (
+            "/v1/systemone",
+            json!({
+                "model": "judge-pool/jev-latest", "state": "hi",
+                "questions": { "helpful": { "type": "noul", "instructions": "Is it helpful?" } },
+            }),
+        ),
+    ];
+
+    for (ingress, body) in calls {
+        let response = reqwest::Client::new()
+            .post(format!("{base}{ingress}"))
+            .bearer_auth(token.expose())
+            .json(&body)
+            .send()
+            .await
+            .expect("the Gateway answers");
+        let status = response.status().as_u16();
+        let text = response.text().await.expect("the reply reads");
+        assert_eq!(status, 200, "{ingress} answers: {text}");
+    }
+
+    let received = inference
+        .upstream
+        .received_requests()
+        .await
+        .expect("request recording is on");
+    let targets = received
+        .iter()
+        .map(|request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            (request.url.path().to_owned(), body["model"].clone())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets,
+        vec![
+            ("/v1/messages".to_owned(), json!("claude-sonnet-4-5")),
+            (
+                "/v1beta/models/gemini-2.5-flash:generateContent".to_owned(),
+                Value::Null
+            ),
+            ("/v1/systemone".to_owned(), json!("jev-latest")),
+        ]
+    );
+    inference.deployment.shutdown().await;
 }

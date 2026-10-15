@@ -625,3 +625,35 @@ Non-goals remained excluded: no Platform projection to Python or TypeScript,
 no compatibility aliases, no new server route, wire type, cache, or dependency.
 
 Status: IMPLEMENTED.
+
+## Remediation evidence — review task-001-fde7d396a
+
+Spec authority: revision 10 (FIND-6, saved-only applies to tenant handles;
+`Platform` covers environment-only and no-credential) and revision 11 (FIND-2,
+Rust ambient cases through `WyrdClient::from_environment` with an injected
+`Environment`, the single resolver `connect()` uses).
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-1 local Python access connects | `c7dce6bf9`, `fc49659ac`: Bifrost `Binding` keeps the table local until first server use; `use_table/table/dropped/producer_count` infallible; `SharedCards` defers the connection across typed views | P1 unit `test_local_access_never_connects`; P2 `test_local_state_survives_the_first_connection` | PASS |
+| FIND-2 ambient entry points unproven | Python eager `AsyncBifrost.connect()` in the ambient journey (`c7dce6bf9`); Rust journeys via `WyrdClient::from_environment` (`fc49659ac`), which `from_global` now calls, removing the duplicate `ClientConfig::from_global` composition | R1–R3, P2 | PASS |
+| FIND-3 delegated attribution unasserted | Each language asserts retained `bifrost.query.read_decision` attributed to the subject with the actor at `delegation_chain[0]` (`c7dce6bf9`, `390576d61`, `fc49659ac`) | R4, P3, T1 | PASS |
+| FIND-4 changed-item docs | `75663dbc2`, `c7dce6bf9` | D1, `mise run lints` | PASS |
+| FIND-5 revoked login expects success | `75663dbc2` | R6 not run (identity lane) | NOT RUN |
+| FIND-6 saved-only Platform | spec revision 10 (`add6424eb`) | R1 Platform environment case | PASS |
+
+Commands run (managed Postgres after `mise run db:migrate:all:inner`):
+
+- `mise exec -- cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^sdk_client_instantiation::/)'` — 6 passed.
+- `mise exec -- cargo nextest run --locked -p wyrd-client --lib` — 263 passed.
+- `mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E '<the four test:local-dev:journey pg_tests::server_dev_* selectors>'` — 4 passed (touched `pg_tests.rs`).
+- `uv run python -m pytest -q tests/unit/test_sdk_client_instantiation.py` — 18 passed; `-m integration tests/integration/test_sdk_client_instantiation.py` — 8 passed.
+- `pnpm exec vitest run tests/integration/sdk-client-instantiation.test.ts` — 6 passed.
+- `mise run fmt`, `mise run lints`, `py:format`, `py:lints`, `py:typecheck`, `ts:format`, `ts:lints`, `ts:typecheck`, D1 rustdoc broken-link deny, `git diff --check` — clean.
+
+Limits: R6 (`saved_user_auth::revoked_login_is_refused`) needs the Keycloak
+identity lane and was not run; the change is compile-checked only. Rust
+environment-only and saved-only cases use the injected resolver per revision
+11, not process-environment mutation. Non-goals unchanged: no insert
+preconnection buffering, no saved platform credential source, docsite and
+README left to TASK-002.

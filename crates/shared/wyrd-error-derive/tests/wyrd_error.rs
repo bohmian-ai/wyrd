@@ -103,6 +103,22 @@ fn from_code_reconstructs_message_details_variants() {
     );
 }
 
+/// `from_unit_code` rebuilds only fieldless variants from their code.
+///
+/// # Panics
+///
+/// Panics when a unit code is not rebuilt or a field-bearing or delegated
+/// code is.
+#[test]
+fn from_unit_code_reconstructs_only_fieldless_variants() {
+    assert!(matches!(
+        ExampleError::from_unit_code("WYRD_TEST_500_INTERNAL"),
+        Some(ExampleError::Internal)
+    ));
+    assert!(ExampleError::from_unit_code("WYRD_TEST_400_VALIDATION").is_none());
+    assert!(ExampleError::from_unit_code("WYRD_TEST_503_UPSTREAM").is_none());
+}
+
 #[test]
 fn from_code_returns_none_for_unknown_or_unqualified_code() {
     assert_eq!(

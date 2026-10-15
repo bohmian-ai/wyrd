@@ -32,6 +32,9 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
     // (unit, tuple, delegate, extra fields) do not qualify and fall through.
     let mut from_code_arms = Vec::new();
     let mut from_code_field_types: Option<(syn::Type, syn::Type)> = None;
+    // Reverse code->variant reconstruction for fieldless variants, which carry
+    // nothing a transport could lose, so their code alone rebuilds them.
+    let mut from_unit_code_arms = Vec::new();
 
     for variant in &data.variants {
         let metadata = match parse_attr(variant) {
@@ -70,6 +73,11 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
                 title_arms.push(quote! { #pattern => #title });
                 remediation_arms.push(quote! { #pattern => #remediation });
                 code_list.push(quote! { codes.push(#code); });
+                if matches!(variant.fields, Fields::Unit) {
+                    from_unit_code_arms.push(quote! {
+                        #code => ::core::option::Option::Some(#name::#ident)
+                    });
+                }
 
                 if let Some((message_ty, details_ty)) = message_details_fields(&variant.fields) {
                     // Pin the param types to the first qualifying variant and
@@ -152,6 +160,24 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
         },
         None => quote! {},
     };
+    let from_unit_code_method = if from_unit_code_arms.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            /// Reconstruct the fieldless variant for a stable Wyrd `code`.
+            ///
+            /// The inverse of [`Self::code`] for unit variants, which a
+            /// transport that carries only the code (such as a provider-shaped
+            /// error envelope) can rebuild exactly. Returns `None` for any code
+            /// that names no unit variant.
+            pub fn from_unit_code(code: &str) -> ::core::option::Option<Self> {
+                match code {
+                    #(#from_unit_code_arms,)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+        }
+    };
 
     quote! {
         impl #name {
@@ -196,6 +222,8 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
             }
 
             #from_code_method
+
+            #from_unit_code_method
         }
     }
     .into()

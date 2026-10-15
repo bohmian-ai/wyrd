@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::time::Duration;
+use wyrd_ai::bifrost::BifrostOptions;
 
 use serde_json::json;
 use wiremock::matchers::{body_string_contains, method, path};
@@ -96,7 +97,9 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
         .expect("the setup administrator key");
     let admin = deployment.client(secrecy::ExposeSecret::expose_secret(&key));
     let bundle = tempfile::tempdir().expect("bundle directory creates");
-    Gateway::with_client(admin.clone())
+    Gateway::connect_with(&admin)
+        .await
+        .expect("handle connects")
         .put_deployment(&ProviderDeployment {
             name: ProviderDeploymentName::new("anthropic-gpt-4o").expect("deployment name"),
             model: ModelRef {
@@ -128,7 +131,7 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
 
     let desk = deploy(&admin, &bundle).await.expect("the desk deploys");
 
-    let tickets = Bifrost::connect(&admin)
+    let tickets = Bifrost::connect_with(&admin, BifrostOptions::default())
         .await
         .expect("Bifrost connects")
         .describe_table("vala.datasets", "tickets")
@@ -142,6 +145,7 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
     assert_eq!(fields, ["ticket_id", "question", "answer", "refund"]);
     let conflict = deployment
         .cards()
+        .await
         .register_from_path(&fixture("cards/support_desk/conflicting-desk.yaml"))
         .await
         .expect_err("a conflicting tickets schema is refused");
@@ -151,7 +155,7 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
         "{conflict}"
     );
     let viewer = deployment.client(&deployment.key("desk_viewer", &["viewer"]).await);
-    let denied = WyrdState::from_path_with_client(&bundle, viewer)
+    let denied = WyrdState::from_path_with(&bundle, viewer)
         .expect("the bundle loads")
         .run_for_card("agent")
         .expect("agent view resolves")

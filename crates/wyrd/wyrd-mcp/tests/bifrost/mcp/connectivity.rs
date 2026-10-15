@@ -163,13 +163,11 @@ pub(crate) fn transport_with_headers(
 ///
 /// Returns an error when the server is not bound to a listener or when the
 /// client cannot be constructed for `credential`.
-pub(crate) fn principals(
+pub(crate) async fn principals(
     server: &WyrdTestServer,
     credential: ResolvedCredential,
 ) -> Result<Principals, McpJourneyError> {
-    Ok(wyrd_client::principals::Principals::with_client(client(
-        server, credential,
-    )?))
+    Ok(wyrd_client::principals::Principals::connect_with(&client(server, credential)?).await?)
 }
 
 /// The modern, session-free MCP lifecycle: `server/discover` plus

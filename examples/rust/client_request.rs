@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Send a request through a capability handle. The token is injected as
     // `x-wyrd-access-token` and a `wyrd-request-id` is attached per request.
-    let cards = Cards::with_client(client);
+    let cards = Cards::connect_with(&client).await?;
     let listed = cards
         .list(ListCardsRequest {
             kind: None,

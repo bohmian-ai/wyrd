@@ -10,6 +10,7 @@
 //! Service in its own process.
 
 use std::collections::HashMap;
+use wyrd_ai::bifrost::BifrostOptions;
 
 use opentelemetry::propagation::TextMapPropagator as _;
 use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
@@ -151,17 +152,22 @@ async fn service_action_timeline_is_one_connected_tree() {
     let assistant = Assistant::start().await;
     let (_guard, operator) = shared_process_telemetry_for_test().expect("process telemetry");
     let checkpoint = operator.checkpoint().expect("operator checkpoint");
-    let admin = Bifrost::connect_with_table(
+    let admin = Bifrost::connect_with(
         &assistant.deployment.admin(),
-        TableConfig::from_json_schema(
-            ACTIONS,
-            &json!({
-                "type": "object",
-                "properties": { "action": { "type": "string" } },
-                "required": ["action"],
-            }),
-        )
-        .expect("table declares"),
+        BifrostOptions {
+            table: Some(
+                TableConfig::from_json_schema(
+                    ACTIONS,
+                    &json!({
+                        "type": "object",
+                        "properties": { "action": { "type": "string" } },
+                        "required": ["action"],
+                    }),
+                )
+                .expect("table declares"),
+            ),
+            ..BifrostOptions::default()
+        },
     )
     .await
     .expect("Bifrost connects");
@@ -170,7 +176,9 @@ async fn service_action_timeline_is_one_connected_tree() {
     let service = assistant
         .deployment
         .client(&assistant.deployment.service_key(&assistant.service).await);
-    let writer = Bifrost::connect(&service).await.expect("Bifrost connects");
+    let writer = Bifrost::connect_with(&service, BifrostOptions::default())
+        .await
+        .expect("Bifrost connects");
     let (dispatch, provider) = service_telemetry(&service);
     let action =
         tracing::dispatcher::with_default(&dispatch, || tracing::info_span!("service.action"));
@@ -369,7 +377,7 @@ async fn another_tenant_cannot_read_the_timeline() {
     );
 
     let foreign = deployment.client(&deployment.other_tenant_admin("other-tenant").await);
-    let timeline = Bifrost::connect(&foreign)
+    let timeline = Bifrost::connect_with(&foreign, BifrostOptions::default())
         .await
         .expect("Bifrost connects")
         .trace_timeline(TraceId::from_hex(CALLER_TRACE).expect("trace id"))

@@ -49,7 +49,7 @@ mod scope;
 mod sink;
 mod table;
 
-pub use facade::{Bifrost, QueryResult};
+pub use facade::{Bifrost, BifrostOptions, QueryResult};
 /// Binding plumbing: the explicit-option client door and the shared register
 /// outcome spelling the Python and TypeScript bindings project.
 #[cfg(feature = "internal")]

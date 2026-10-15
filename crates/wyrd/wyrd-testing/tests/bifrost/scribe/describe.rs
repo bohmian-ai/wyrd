@@ -3,6 +3,7 @@
 use arrow::array::Array;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::Bifrost;
+use wyrd_client::bifrost::BifrostOptions;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 
 use super::support::{start_scribe_server, unique_table};
@@ -53,9 +54,15 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
         arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
         arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Utf8, false),
     ]));
-    Bifrost::connect_with_table(
+    Bifrost::connect_with(
         &client,
-        wyrd_client::bifrost::TableConfig::from_arrow(&fqn, schema).expect("declared table"),
+        BifrostOptions {
+            table: Some(
+                wyrd_client::bifrost::TableConfig::from_arrow(&fqn, schema)
+                    .expect("declared table"),
+            ),
+            ..BifrostOptions::default()
+        },
     )
     .await
     .expect("the writer connects")

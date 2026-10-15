@@ -357,7 +357,8 @@ async fn register_tree(
 ) -> Result<RegistrationReceipt, WyrdCliError> {
     let tree = load_tree(path).map_err(WyrdCliError::CardLoad)?;
     let input = build_registration_input(tree).map_err(WyrdCliError::CardLoad)?;
-    Cards::with_client(connect()?)
+    Cards::connect_with(&connect()?)
+        .await?
         .register(&input)
         .await
         .map_err(|source| WyrdCliError::Server { source })
@@ -438,7 +439,7 @@ async fn hydrate(
             "required for hydrated get output",
         )
     })?;
-    let cards = Cards::with_client(connect()?);
+    let cards = Cards::connect_with(&connect()?).await?;
     let mode = if metadata_only {
         HydrationMode::MetadataOnly
     } else {
@@ -489,7 +490,7 @@ pub async fn dispatch_latest(args: LatestArgs) -> Result<ExitCode, WyrdCliError>
     let kind = parse_kind(&args.kind)?;
     let space = parse_id("space", &args.space, "a valid Card space")?;
     let name = parse_id("name", &args.name, "a valid Card name")?;
-    let cards = build_cards(args.connection.server.as_deref())?;
+    let cards = build_cards(args.connection.server.as_deref()).await?;
     let card_ref = cards
         .resolve_latest(kind, space, name)
         .await
@@ -552,7 +553,7 @@ pub async fn dispatch_list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
         limit: args.limit,
         cursor: args.cursor,
     };
-    let cards = build_cards(args.connection.server.as_deref())?;
+    let cards = build_cards(args.connection.server.as_deref()).await?;
     let response = cards
         .list(request)
         .await
@@ -614,7 +615,8 @@ async fn materialize(
     connect: impl FnOnce() -> Result<WyrdClient, WyrdCliError>,
 ) -> Result<LoadOutput, WyrdCliError> {
     let selector = selector_from_args(selector, false)?;
-    let loaded = Cards::with_client(connect()?)
+    let loaded = Cards::connect_with(&connect()?)
+        .await?
         .load(selector, path)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
@@ -650,7 +652,7 @@ pub async fn dispatch_load(args: LoadArgs) -> Result<ExitCode, WyrdCliError> {
 /// [`WyrdCliError::Server`] when the server refuses the delete.
 pub async fn dispatch_delete(args: DeleteArgs) -> Result<ExitCode, WyrdCliError> {
     let selector = selector_from_args(&args.selector, true)?;
-    let cards = build_cards(args.connection.server.as_deref())?;
+    let cards = build_cards(args.connection.server.as_deref()).await?;
     cards
         .delete(selector)
         .await
@@ -672,8 +674,8 @@ pub async fn dispatch_delete(args: DeleteArgs) -> Result<ExitCode, WyrdCliError>
 /// # Errors
 /// Returns the client-assembly errors documented on
 /// [`crate::client::from_global`].
-fn build_cards(server: Option<&str>) -> Result<Cards, WyrdCliError> {
-    Ok(Cards::with_client(crate::client::from_global(server)?))
+async fn build_cards(server: Option<&str>) -> Result<Cards, WyrdCliError> {
+    Ok(Cards::connect_with(&crate::client::from_global(server)?).await?)
 }
 
 fn selector_from_args(

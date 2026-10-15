@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -104,7 +105,7 @@ impl Fleet {
                 None,
             )
         })?;
-        let bifrost = Bifrost::connect(&client).await?;
+        let bifrost = Bifrost::connect_with(&client, BifrostOptions::default()).await?;
         let setup = leader
             .tenants()
             .first()

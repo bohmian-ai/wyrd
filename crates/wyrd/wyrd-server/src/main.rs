@@ -287,7 +287,7 @@ async fn setup(args: SetupArgs) -> Result<(), BootExit> {
         ..ClientConfig::default()
     })
     .map_err(|e| BootExit::Other(Box::new(e)))?;
-    let created = Platform::with_client(&client)
+    let created = Platform::connect_with(&client)
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?
         .create_tenant(&CreateTenantRequest {

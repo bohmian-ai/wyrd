@@ -9,6 +9,7 @@ use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
 use secrecy::SecretString;
 use wyrd_client::WyrdClient;
+use wyrd_client::bifrost::BifrostOptions;
 use wyrd_client::bifrost::{Bifrost, TableConfig};
 use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::error::WyrdError;
@@ -187,10 +188,12 @@ impl NativeWyrdClient {
         crate::trace::spawn(env, async move {
             let table = table.map(|table| table.parse()).transpose()?;
             Ok(NativeBifrostConnection::from_outcome(
-                Bifrost::connect_with_config(
+                Bifrost::connect_with(
                     &client,
-                    table,
-                    crate::queue_config(client_byte_limit_bytes),
+                    BifrostOptions {
+                        table: table,
+                        queue: crate::queue_config(client_byte_limit_bytes),
+                    },
                 )
                 .await,
             ))
@@ -215,7 +218,7 @@ impl NativeWyrdClient {
     ) -> napi::Result<PromiseRaw<'env, NativeTableConfigResult>> {
         let client = self.client.clone();
         crate::trace::spawn(env, async move {
-            match TableConfig::describe(&client, &table).await {
+            match TableConfig::describe_with(&client, &table).await {
                 Ok(config) => Ok(NativeTableConfigResult {
                     config: Some(NativeTableConfig::project(&config)?),
                     error: None,

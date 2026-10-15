@@ -19,6 +19,7 @@ mod variant_tables;
 
 mod pg_tests {
     use std::sync::Arc;
+    use wyrd_client::bifrost::BifrostOptions;
 
     use arrow::array::Array;
     use arrow::datatypes::ArrowPrimitiveType;
@@ -209,9 +210,15 @@ mod pg_tests {
         rows: &[T],
     ) {
         let config = TableConfig::from_arrow(fqn, schema).expect("declared table");
-        let bifrost = Bifrost::connect_with_table(client, config)
-            .await
-            .expect("the writer connects");
+        let bifrost = Bifrost::connect_with(
+            client,
+            BifrostOptions {
+                table: Some(config),
+                ..BifrostOptions::default()
+            },
+        )
+        .await
+        .expect("the writer connects");
         assert_eq!(
             bifrost.register().await.expect("register the table"),
             RegisterOutcome::Created
@@ -466,9 +473,15 @@ mod pg_tests {
 
         let first_fqn = owned_fqn("journey_first");
         let second_fqn = owned_fqn("journey_second");
-        let bifrost = Bifrost::connect_with_table(&client, table(&first_fqn))
-            .await
-            .expect("unified client connects");
+        let bifrost = Bifrost::connect_with(
+            &client,
+            BifrostOptions {
+                table: Some(table(&first_fqn)),
+                ..BifrostOptions::default()
+            },
+        )
+        .await
+        .expect("unified client connects");
 
         assert_eq!(
             bifrost.register().await.expect("register the first table"),
@@ -580,9 +593,12 @@ mod pg_tests {
             Field::new("value", DataType::Utf8, false),
             Field::new("note", DataType::Utf8, true),
         ]));
-        let stale = Bifrost::connect_with_table(
+        let stale = Bifrost::connect_with(
             client,
-            TableConfig::from_arrow(fqn, stale_schema).expect("stale declaration"),
+            BifrostOptions {
+                table: Some(TableConfig::from_arrow(fqn, stale_schema).expect("stale declaration")),
+                ..BifrostOptions::default()
+            },
         )
         .await
         .expect("stale writer connects");
@@ -638,9 +654,14 @@ mod pg_tests {
         let client = runtime.block_on(service_client(&srv, "sdk-blocking-journey", &["admin"]));
 
         let fqn = owned_fqn("blocking_journey");
-        let bifrost =
-            wyrd_client::bifrost::blocking::Bifrost::connect_with_table(&client, table(&fqn))
-                .expect("blocking client connects");
+        let bifrost = wyrd_client::bifrost::blocking::Bifrost::connect_with(
+            &client,
+            BifrostOptions {
+                table: Some(table(&fqn)),
+                ..BifrostOptions::default()
+            },
+        )
+        .expect("blocking client connects");
 
         assert_eq!(
             bifrost.register().expect("register the table"),
@@ -773,7 +794,9 @@ mod pg_tests {
         ];
         publish_rows(&srv, &client, &facts, inference_schema(), &inferences).await;
 
-        let reader = Bifrost::connect(&client).await.expect("reader connects");
+        let reader = Bifrost::connect_with(&client, BifrostOptions::default())
+            .await
+            .expect("reader connects");
         let select = format!(
             "SELECT call_id, model, tokens, latency_ms, status FROM {facts} ORDER BY call_id"
         );
@@ -873,7 +896,7 @@ mod pg_tests {
         ]));
         publish_rows(&srv, &client, &dims, dims_schema, &model_info).await;
 
-        let summary: Vec<ModelSummary> = Bifrost::connect(&client)
+        let summary: Vec<ModelSummary> = Bifrost::connect_with(&client, BifrostOptions::default())
             .await
             .expect("reader connects")
             .sql_as(
@@ -934,7 +957,9 @@ mod pg_tests {
                 .await
                 .expect("test server start");
             let client = service_client(&server, "sdk-canonical-writer", &["admin"]).await;
-            let bifrost = Bifrost::connect(&client).await.expect("writer connects");
+            let bifrost = Bifrost::connect_with(&client, BifrostOptions::default())
+                .await
+                .expect("writer connects");
             let scope = format!("wyrd.sdk.canonical.{}", uuid::Uuid::now_v7().simple());
             let anchor = 1_760_000_000_000_000_000_i64;
             for (fqn, build) in [
@@ -945,7 +970,7 @@ mod pg_tests {
                 ("vala.logs.records", fixture::logs),
                 ("vala.metrics.points", fixture::points),
             ] {
-                let described = TableConfig::describe(&client, fqn)
+                let described = TableConfig::describe_with(&client, fqn)
                     .await
                     .expect("describe the canonical table");
                 bifrost

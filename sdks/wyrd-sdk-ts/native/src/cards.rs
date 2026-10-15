@@ -55,7 +55,7 @@ impl NativeWyrdClient {
     #[napi]
     pub fn open_wyrd_state(&self, path: String) -> NativeWyrdState {
         NativeWyrdState {
-            state: WyrdState::from_path_with_client(path, self.client.clone()),
+            state: WyrdState::from_path_with(path, self.client.clone()),
         }
     }
 }

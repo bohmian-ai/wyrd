@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
+use wyrd_ai::bifrost::BifrostOptions;
 use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::{Bifrost, QueueConfig, SessionId, WyrdClient};
@@ -45,7 +46,7 @@ struct DriftRow {
 /// Panics when registration or hydration fails.
 async fn observed() -> (Deployment, TempDir) {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     register(&cards, "cards/observe_a_run/observed-model.yaml").await;
     let service = register(&cards, "cards/observe_a_run/observed-service.yaml").await;
     let bundle = hydrate(&cards, &service.root).await;
@@ -66,8 +67,7 @@ fn state(dir: &TempDir) -> WyrdState {
 /// # Panics
 /// Panics when the bundle does not load.
 fn state_as(dir: &TempDir, client: WyrdClient) -> WyrdState {
-    WyrdState::from_path_with_client(dir.path().join("bundle"), client)
-        .expect("bundle loads offline")
+    WyrdState::from_path_with(dir.path().join("bundle"), client).expect("bundle loads offline")
 }
 
 /// The observed Service's own client, from a key the `issue_key` CLI
@@ -112,7 +112,7 @@ async fn run_observations_read_back_by_run_id() {
         .expect("rows publish");
 
     let run_id = run.run_id().to_string();
-    let rows: Vec<DriftRow> = Bifrost::connect(&deployment.admin())
+    let rows: Vec<DriftRow> = Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
         .await
         .expect("Bifrost connects")
         .sql_as(

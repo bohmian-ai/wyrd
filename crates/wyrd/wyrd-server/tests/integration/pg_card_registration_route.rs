@@ -405,10 +405,12 @@ async fn client_registration_saga_returns_active_receipt() {
     else {
         panic!("user bootstrap returned a non-user principal");
     };
-    let cards = Cards::with_client(registry_client(
+    let cards = Cards::connect_with(&registry_client(
         server.base_url().expect("bound server has a base URL"),
         &jwt,
-    ));
+    ))
+    .await
+    .expect("handle connects");
 
     let receipt = cards
         .register(&input)

@@ -161,7 +161,7 @@ impl TableConfig {
     /// already resolved and carries the server's own physical layout.
     ///
     /// # Arguments
-    /// * `client` - The authenticated client the describe request is sent over.
+    /// * `client` - The client the describe request is sent as, used as given.
     /// * `fqn` - The registered table's `<namespace>.<name>`.
     ///
     /// # Errors
@@ -173,7 +173,7 @@ impl TableConfig {
     /// # Cancellation
     ///
     /// Abandoning the future leaves no server state behind; describe is a read.
-    pub async fn describe(client: &WyrdClient, fqn: &str) -> Result<Self, BifrostClientError> {
+    pub async fn describe_with(client: &WyrdClient, fqn: &str) -> Result<Self, BifrostClientError> {
         let (namespace, name) = split_fqn(fqn)?;
         let description = crate::bifrost::query::QueryClient::new(client)
             .describe_table(&namespace, &name)
@@ -181,18 +181,19 @@ impl TableConfig {
         Self::from_description(&description)
     }
 
-    /// As [`TableConfig::describe`], resolving the transport itself.
+    /// As [`TableConfig::describe_with`], acting as the ambient client
+    /// [`WyrdClient::from_global`] resolves.
     ///
     /// # Arguments
     /// * `fqn` - The registered table's `<namespace>.<name>`.
     ///
     /// # Errors
     ///
-    /// As [`TableConfig::describe`], plus the stable no-credentials error when
-    /// the credential chain yields nothing.
-    pub async fn describe_from_env(fqn: &str) -> Result<Self, BifrostClientError> {
-        let client = crate::bifrost::facade::client_from_env()?;
-        Self::describe(&client, fqn).await
+    /// As [`TableConfig::describe_with`], plus the configuration error or the
+    /// stable no-credentials error when the ambient client cannot be resolved.
+    pub async fn describe(fqn: &str) -> Result<Self, BifrostClientError> {
+        let client = WyrdClient::from_global().map_err(BifrostClientError::from)?;
+        Self::describe_with(&client, fqn).await
     }
 
     /// Project one server description onto a resolved config.

@@ -63,7 +63,8 @@ pub async fn dispatch(args: RevokeArgs) -> Result<ExitCode, WyrdCliError> {
         expected: "a principal UUID".to_owned(),
     })?;
 
-    wyrd_client::Principals::with_client(crate::client::from_global(Some(args.server.as_str()))?)
+    wyrd_client::Principals::connect_with(&crate::client::from_global(Some(args.server.as_str()))?)
+        .await?
         .revoke_principal(
             &principal_id,
             &RevokePrincipalRequest {

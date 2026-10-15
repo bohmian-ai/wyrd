@@ -6,6 +6,7 @@
 //! linking directly to it, deduplicated and in a total order.
 
 use std::collections::BTreeMap;
+use wyrd_client::bifrost::BifrostOptions;
 
 use wyrd_client::bifrost::{Bifrost, TableConfig};
 use wyrd_spec::vala::ids::TraceId;
@@ -72,8 +73,10 @@ async fn spans_written(rows: &[Row]) -> (WyrdTestServer, Bifrost) {
         .await
         .expect("the span table exists");
     let client = service_client(&srv, "timeline-reader", &["admin"]).await;
-    let bifrost = Bifrost::connect(&client).await.expect("Bifrost connects");
-    let described = TableConfig::describe(&client, SPANS)
+    let bifrost = Bifrost::connect_with(&client, BifrostOptions::default())
+        .await
+        .expect("Bifrost connects");
+    let described = TableConfig::describe_with(&client, SPANS)
         .await
         .expect("the span table describes");
     bifrost
@@ -194,7 +197,9 @@ fn invalid_trace_id_fails_locally() {
 async fn unseen_trace_returns_empty() {
     let srv = WyrdTestServer::start_bound().await.expect("server starts");
     let client = service_client(&srv, "timeline-reader", &["admin"]).await;
-    let bifrost = Bifrost::connect(&client).await.expect("Bifrost connects");
+    let bifrost = Bifrost::connect_with(&client, BifrostOptions::default())
+        .await
+        .expect("Bifrost connects");
     assert!(
         bifrost
             .trace_timeline(trace(0x0a))

@@ -573,7 +573,9 @@ impl Fixture {
     /// # Panics
     /// Panics when the client cannot build or registration fails.
     async fn register_as(&self, token: &str, workflow: &Path) {
-        let cards = Cards::with_client(self.client(token));
+        let cards = Cards::connect_with(&self.client(token))
+            .await
+            .expect("handle connects");
         Box::pin(cards.register_from_path(workflow))
             .await
             .unwrap_or_else(|error| panic!("{} registers: {error}", workflow.display()));

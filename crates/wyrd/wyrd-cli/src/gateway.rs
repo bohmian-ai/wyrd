@@ -139,7 +139,7 @@ impl GatewayCommand {
     /// not-found, or availability failures.
     pub async fn dispatch(self) -> Result<ExitCode, CliBoundaryError> {
         let client = crate::client::from_global(self.server.as_deref())?;
-        let gateway = Gateway::with_client(client.clone());
+        let gateway = Gateway::connect_with(&client).await?;
         match self.resource {
             // Credential mutation runs on the handle no SDK re-exports: a
             // submission can carry a key value, and a name-only revoke or

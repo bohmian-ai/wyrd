@@ -6,6 +6,7 @@
 //! reads back without a later size refusal.
 
 use std::sync::Arc;
+use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::array::{ArrayRef, BinaryArray, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -93,10 +94,16 @@ async fn register_public(
         &format!("vala.datasets.{name}"),
         Arc::new(Schema::new(fields)),
     )?;
-    wyrd_client::Bifrost::connect_with_table(client, config)
-        .await?
-        .register()
-        .await
+    wyrd_client::Bifrost::connect_with(
+        client,
+        BifrostOptions {
+            table: Some(config),
+            ..BifrostOptions::default()
+        },
+    )
+    .await?
+    .register()
+    .await
 }
 
 /// A native request is bounded by expanded bytes, not rows or wire alone.

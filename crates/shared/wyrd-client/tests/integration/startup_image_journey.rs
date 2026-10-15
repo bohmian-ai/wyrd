@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::array::Array;
 use arrow_schema::{DataType, Field, Schema};
@@ -151,16 +152,24 @@ async fn startup_image_write() {
     assert_eq!(client.grpc_url(), derived, "gRPC derives from server_url");
 
     let dir = state_dir();
-    let receipt = Cards::with_client(client.clone())
+    let receipt = Cards::connect_with(&client)
+        .await
+        .expect("handle connects")
         .register_from_path(std::path::Path::new(CARD))
         .await
         .expect("register a Card with a local artifact through nginx");
     let card_uid = receipt.root.uid.expect("registered root carries its uid");
 
     let fqn = format!("vala.datasets.startup_{}", uuid::Uuid::now_v7().simple());
-    let bifrost = Bifrost::connect_with_table(&client, table(&fqn))
-        .await
-        .expect("Bifrost over derived gRPC");
+    let bifrost = Bifrost::connect_with(
+        &client,
+        BifrostOptions {
+            table: Some(table(&fqn)),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("Bifrost over derived gRPC");
     assert_eq!(
         bifrost.register().await.expect("register"),
         RegisterOutcome::Created
@@ -187,9 +196,15 @@ async fn startup_image_write() {
         Some(derived),
     ))
     .expect("client with explicit gRPC override");
-    let explicit = Bifrost::connect_with_table(&overridden, table(&fqn))
-        .await
-        .expect("Bifrost over explicit gRPC");
+    let explicit = Bifrost::connect_with(
+        &overridden,
+        BifrostOptions {
+            table: Some(table(&fqn)),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("Bifrost over explicit gRPC");
     explicit
         .insert(
             JourneyRow {
@@ -223,7 +238,9 @@ async fn startup_image_verify() {
 
     let client = env_client();
     let download = dir.join("download");
-    Cards::with_client(client.clone())
+    Cards::connect_with(&client)
+        .await
+        .expect("handle connects")
         .download_artifacts_to(&card_uid, &download)
         .await
         .expect("download the artifact after restart");
@@ -232,9 +249,15 @@ async fn startup_image_verify() {
         ARTIFACT
     );
 
-    let bifrost = Bifrost::connect_with_table(&client, table(&fqn))
-        .await
-        .expect("Bifrost after restart");
+    let bifrost = Bifrost::connect_with(
+        &client,
+        BifrostOptions {
+            table: Some(table(&fqn)),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("Bifrost after restart");
     await_ids(&bifrost, &fqn, &[1, 2]).await;
     bifrost.shutdown().await.expect("drain");
 }
@@ -244,9 +267,15 @@ async fn startup_image_verify() {
 /// # Panics
 /// Panics when the table cannot be opened or a row is not acknowledged.
 async fn insert_ids(client: &WyrdClient, fqn: &str, ids: std::ops::RangeInclusive<i64>) {
-    let bifrost = Bifrost::connect_with_table(client, table(fqn))
-        .await
-        .expect("Bifrost on the anchor");
+    let bifrost = Bifrost::connect_with(
+        client,
+        BifrostOptions {
+            table: Some(table(fqn)),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("Bifrost on the anchor");
     bifrost
         .register()
         .await
@@ -274,9 +303,15 @@ async fn kind_seed() {
     let client = env_client();
     let fqn = format!("vala.datasets.kind_{}", uuid::Uuid::now_v7().simple());
     insert_ids(&client, &fqn, 1..=4).await;
-    let bifrost = Bifrost::connect_with_table(&client, table(&fqn))
-        .await
-        .expect("Bifrost for the seed read");
+    let bifrost = Bifrost::connect_with(
+        &client,
+        BifrostOptions {
+            table: Some(table(&fqn)),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("Bifrost for the seed read");
     await_ids(&bifrost, &fqn, &[1, 2, 3, 4]).await;
     bifrost.shutdown().await.expect("drain");
     std::fs::write(state_dir().join("kind_table"), &fqn).expect("kind state");

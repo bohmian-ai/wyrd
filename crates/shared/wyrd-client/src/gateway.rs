@@ -53,28 +53,36 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    /// Bind the handle to the ambient client, as [`WyrdClient::from_global`]
-    /// resolves it.
+    /// Connect the handle through the ambient client, as
+    /// [`WyrdClient::from_global`] resolves it.
     ///
-    /// No network call or token exchange happens here; the first request does
-    /// the exchange.
+    /// Completes any credential exchange the resolved credential requires
+    /// before returning; a presented-as-is bearer or fresh cached token is
+    /// reused without a request.
     ///
     /// # Errors
-    /// Returns the client configuration error when the global config file
-    /// cannot be read or parsed, or the credential resolution error.
-    pub fn from_env() -> Result<Self, WyrdError> {
-        let client = WyrdClient::from_global().map_err(WyrdError::from)?;
-        Ok(Self::with_client(client))
+    /// Returns the configuration or credential-resolution error, or the
+    /// server's stable error when a required exchange is refused or
+    /// unreachable.
+    pub async fn connect() -> Result<Self, WyrdError> {
+        Ok(Self {
+            client: WyrdClient::connect_ambient().await?,
+        })
     }
 
-    /// Bind the handle to an assembled client.
+    /// Connect the handle as `client`'s principal, used as given.
     ///
     /// # Arguments
-    /// * `client` - The authenticated client every administration request is
-    ///   sent through, as its principal.
-    #[must_use]
-    pub fn with_client(client: WyrdClient) -> Self {
-        Self { client }
+    /// * `client` - The client every administration request is sent through,
+    ///   such as a delegated client from [`WyrdClient::on_behalf_of`].
+    ///
+    /// # Errors
+    /// Returns the server's stable error when the client's required exchange
+    /// is refused or unreachable.
+    pub async fn connect_with(client: &WyrdClient) -> Result<Self, WyrdError> {
+        Ok(Self {
+            client: client.connected().await?,
+        })
     }
 
     /// Reads one redacted provider credential.

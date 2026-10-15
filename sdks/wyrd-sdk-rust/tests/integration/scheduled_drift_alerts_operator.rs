@@ -59,7 +59,9 @@ async fn failed_schedule_alerts_its_operator_on_the_connection_origin() {
     let deployment =
         Deployment::start_with(WyrdTestServer::builder().with_verification_runtime_for_test())
             .await;
-    OperatorConnections::with_client(deployment.admin())
+    OperatorConnections::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects")
         .create(&CreateOperatorConnectionRequest::Http {
             name: ConnectionName::new("on-call-hooks").expect("connection name"),
             origin: HttpsOrigin::parse(&hook.uri()).expect("hook origin parses"),
@@ -69,7 +71,7 @@ async fn failed_schedule_alerts_its_operator_on_the_connection_origin() {
         })
         .await
         .expect("connection creates");
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
     let watch = register(
         &cards,
@@ -89,8 +91,8 @@ async fn failed_schedule_alerts_its_operator_on_the_connection_origin() {
         .expect("the latency baseline fits");
     let bundle = hydrate(&cards, &watch.root).await;
     let watcher = deployment.client(&deployment.service_key(&watch.root).await);
-    let state = WyrdState::from_path_with_client(bundle.path().join("bundle"), watcher)
-        .expect("bundle loads");
+    let state =
+        WyrdState::from_path_with(bundle.path().join("bundle"), watcher).expect("bundle loads");
     state.start_bifrost().await.expect("Bifrost starts");
     let run = state.run();
     for _ in 0..100 {
@@ -152,6 +154,7 @@ async fn path_only_operator_without_connection_is_refused() {
 
     let refused = deployment
         .cards()
+        .await
         .register_from_path(&fixture("invalid/operator-path-without-connection.yaml"))
         .await
         .expect_err("a path-only Operator needs a connection");

@@ -154,7 +154,9 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
     let ingress = Ingress::new(&cluster, &api_key).await?;
     ingress.deploy().await?;
     let bundle = query_workflow()?;
-    Cards::with_client(public_client(cluster.server(INGRESS)?, &api_key)?)
+    Cards::connect_with(&public_client(cluster.server(INGRESS)?, &api_key)?)
+        .await
+        .expect("handle connects")
         .register_from_path(&bundle.path().join("workflow.yaml"))
         .await?;
 

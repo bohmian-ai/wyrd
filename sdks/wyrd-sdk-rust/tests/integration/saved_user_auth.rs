@@ -97,10 +97,8 @@ impl SavedLogins {
     ///
     /// # Errors
     /// Returns the client's refusal when no usable credential resolves.
-    fn cards(&self, tenant: Option<&str>) -> Result<Cards, WyrdError> {
-        Ok(Cards::with_client(WyrdClient::with_config(
-            self.config(tenant),
-        )?))
+    async fn cards(&self, tenant: Option<&str>) -> Result<Cards, WyrdError> {
+        Cards::connect_with(&WyrdClient::with_config(self.config(tenant))?).await
     }
 }
 
@@ -133,6 +131,7 @@ async fn newest_saved_login_is_used_without_a_selector() {
 
     let receipt = logins
         .cards(None)
+        .await
         .expect("the newest login resolves")
         .register_from_path(&fixture(PROMPT))
         .await
@@ -156,6 +155,7 @@ async fn saved_reader_login_is_denied_a_write() {
 
     let refused = logins
         .cards(Some(FIXTURE_TENANT_SLUG))
+        .await
         .expect("bob's login resolves")
         .register_from_path(&fixture(PROMPT))
         .await
@@ -179,6 +179,7 @@ async fn stale_login_refreshes_and_saves_the_renewal() {
 
     logins
         .cards(Some(FIXTURE_TENANT_SLUG))
+        .await
         .expect("bob's login resolves")
         .list(prompts())
         .await
@@ -210,6 +211,7 @@ async fn revoked_login_is_refused() {
 
     let refused = logins
         .cards(Some(FIXTURE_TENANT_SLUG))
+        .await
         .expect("bob's login resolves")
         .list(prompts())
         .await
@@ -231,6 +233,7 @@ async fn selector_naming_no_saved_login_is_refused() {
 
     let refused = logins
         .cards(Some("no-such-tenant"))
+        .await
         .err()
         .expect("a selector must name a saved login");
 

@@ -141,7 +141,7 @@ impl PyWyrdState {
         let client = client.map(|client| client.inner().clone());
         let inner = py
             .detach(|| match client {
-                Some(client) => WyrdState::from_path_with_client(&path, client),
+                Some(client) => WyrdState::from_path_with(&path, client),
                 None => WyrdState::from_path(&path),
             })
             .map_err(WyrdPyError::from)?;

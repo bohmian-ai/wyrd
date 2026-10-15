@@ -8,6 +8,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
+use wyrd_client::bifrost::BifrostOptions;
 
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::json;
@@ -375,9 +376,15 @@ async fn server_dev_first_run_is_client_ready() {
         }),
     )
     .expect("table declares");
-    let writer = Bifrost::connect_with_table(&local.client(), table)
-        .await
-        .expect("saved gRPC destination connects");
+    let writer = Bifrost::connect_with(
+        &local.client(),
+        BifrostOptions {
+            table: Some(table),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("saved gRPC destination connects");
     writer.register().await.expect("table registers");
     writer
         .insert(
@@ -386,12 +393,13 @@ async fn server_dev_first_run_is_client_ready() {
         )
         .expect("row inserts");
     writer.shutdown().await.expect("gRPC write is acknowledged");
-    let rows: Vec<serde_json::Value> = Bifrost::connect(&local.client())
-        .await
-        .expect("fresh reader")
-        .sql_as("SELECT id FROM vala.datasets.local_rows", &[])
-        .await
-        .expect("fresh saved client reads");
+    let rows: Vec<serde_json::Value> =
+        Bifrost::connect_with(&local.client(), BifrostOptions::default())
+            .await
+            .expect("fresh reader")
+            .sql_as("SELECT id FROM vala.datasets.local_rows", &[])
+            .await
+            .expect("fresh saved client reads");
     assert_eq!(rows, [json!({ "id": 1 })]);
     assert!(
         tokio::time::timeout(Duration::ZERO, stale.accept())
@@ -428,7 +436,9 @@ async fn server_dev_first_run_is_client_ready() {
         "{}",
         String::from_utf8_lossy(&applied.stderr)
     );
-    let cards = Cards::with_client(local.client());
+    let cards = Cards::connect_with(&local.client())
+        .await
+        .expect("handle connects");
     let card = cards
         .get(CardSelector::named(
             CardKind::Prompt,

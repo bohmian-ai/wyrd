@@ -173,7 +173,9 @@ mod pg_tests {
             let admin = server
                 .bootstrap_agent("mcp-card-discovery", &["admin"])
                 .await?;
-            let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
+            let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+                .await
+                .expect("handle connects");
             let fixtures = Path::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../../fixtures/cards"
@@ -433,7 +435,9 @@ mod pg_tests {
         let admin = server
             .bootstrap_service("mcp-run-admin", &["admin"])
             .await?;
-        let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+            .await
+            .expect("handle connects");
         let Fixture {
             service_uid,
             service_ref,
@@ -579,7 +583,7 @@ mod pg_tests {
             Some(key.as_str()),
             server.grpc_url().as_deref(),
         )?;
-        let state = WyrdState::from_path_with_client(&bundle, client)?;
+        let state = WyrdState::from_path_with(&bundle, client)?;
         state
             .start_bifrost_with_config(None, QueueConfig::default())
             .await?;
@@ -681,7 +685,9 @@ mod pg_tests {
         let admin = server
             .bootstrap_service("mcp-direct-admin", &["admin"])
             .await?;
-        let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+            .await
+            .expect("handle connects");
         let fixture = register_fixture(&cards).await?;
         emit_drifted_scores(&server, &cards, &fixture.service_ref).await?;
 
@@ -879,7 +885,9 @@ mod pg_tests {
         let admin = server
             .bootstrap_service("mcp-execute-admin", &["admin"])
             .await?;
-        let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+            .await
+            .expect("handle connects");
         let fixture = register_fixture(&cards).await?;
         let agent = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
@@ -1008,7 +1016,9 @@ mod pg_tests {
         let admin = server
             .bootstrap_service("mcp-traced-admin", &["admin"])
             .await?;
-        let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+            .await
+            .expect("handle connects");
         let fixture = register_fixture(&cards).await?;
         let judged = Box::pin(cards.register_from_path(Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),

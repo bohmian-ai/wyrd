@@ -1326,8 +1326,8 @@ async fn record_refuses_an_unknown_dataset_table() {
 async fn a_state_created_with_a_client_keeps_it_for_every_server_call() {
     let bundle = TestBundle::with_typed_cards();
     let (url, bodies) = execute_server();
-    let state = WyrdState::from_path_with_client(bundle.path(), client_for(&url))
-        .expect("fixture bundle loads");
+    let state =
+        WyrdState::from_path_with(bundle.path(), client_for(&url)).expect("fixture bundle loads");
     let clone = state.clone();
 
     assert_eq!(

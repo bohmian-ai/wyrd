@@ -83,7 +83,9 @@ mod pg_tests {
 
         // (2) Data-plane: the request carries x-wyrd-access-token, so the server
         // authenticates the principal and rejects only at the permission check.
-        let err = Cards::with_client(WyrdClient::clone(&client))
+        let err = Cards::connect_with(&client)
+            .await
+            .expect("handle connects")
             .list(ListCardsRequest {
                 kind: None,
                 space: None,

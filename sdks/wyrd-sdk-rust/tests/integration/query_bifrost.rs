@@ -6,6 +6,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::Int64Type;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use wyrd_ai::bifrost::BifrostOptions;
 use wyrd_ai::bifrost::{Correlation, QueryParam, TableConfig};
 use wyrd_ai::{Bifrost, QueryTerminalOutcome, WyrdError};
 use wyrd_spec::vala::ids::RunId;
@@ -66,9 +67,15 @@ async fn live() -> (Deployment, Bifrost) {
         }),
     )
     .expect("table declares");
-    let writer = Bifrost::connect_with_table(&admin, table)
-        .await
-        .expect("writer connects");
+    let writer = Bifrost::connect_with(
+        &admin,
+        BifrostOptions {
+            table: Some(table),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("writer connects");
     writer.register().await.expect("table registers");
     let (shared, other) = (RunId::new(), RunId::new());
     for (id, value, run_id) in [
@@ -93,7 +100,9 @@ async fn live() -> (Deployment, Bifrost) {
     writer.shutdown().await.expect("writer drains");
     (
         deployment,
-        Bifrost::connect(&admin).await.expect("Bifrost connects"),
+        Bifrost::connect_with(&admin, BifrostOptions::default())
+            .await
+            .expect("Bifrost connects"),
     )
 }
 
@@ -161,7 +170,7 @@ async fn bound_sql_text_is_treated_as_data() {
 async fn unwritten_builtin_table_reads_as_empty() {
     let deployment = Deployment::start().await;
 
-    let rows: Vec<Count> = Bifrost::connect(&deployment.admin())
+    let rows: Vec<Count> = Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
         .await
         .expect("Bifrost connects")
         .sql_as("SELECT COUNT(*) AS n FROM vala.eval.result_items", &[])
@@ -218,8 +227,9 @@ async fn stream_yields_arrow_batches_and_a_terminal() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn caller_without_bifrost_read_is_refused() {
     let (deployment, _) = published().await;
-    let denied = Bifrost::connect(
+    let denied = Bifrost::connect_with(
         &deployment.client(&deployment.scoped_key("query_denied", &["cards:read"]).await),
+        BifrostOptions::default(),
     )
     .await
     .expect("Bifrost connects");
@@ -412,12 +422,13 @@ async fn unauthorized_table_refusal_reveals_no_columns() {
         .seed_role("datasets_reader", &[datasets_only])
         .await
         .expect("role seeds");
-    let reader = Bifrost::connect(
+    let reader = Bifrost::connect_with(
         &deployment.client(
             &deployment
                 .key("datasets_reader", &["datasets_reader"])
                 .await,
         ),
+        BifrostOptions::default(),
     )
     .await
     .expect("Bifrost connects");

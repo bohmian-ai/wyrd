@@ -74,6 +74,37 @@ impl WyrdClient {
         Self::with_config(ClientConfig::from_global()?)
     }
 
+    /// Resolve the ambient client and complete any credential exchange it
+    /// requires: the one path every no-client handle `connect` takes.
+    ///
+    /// # Errors
+    /// Returns the configuration or credential-resolution error
+    /// [`Self::from_global`] reports, or the stable error of a refused or
+    /// unreachable exchange, as [`Self::connected`].
+    pub(crate) async fn connect_ambient() -> Result<Self, WyrdError> {
+        Self::from_global()
+            .map_err(WyrdError::from)?
+            .connected()
+            .await
+    }
+
+    /// Return a clone of this client after completing any credential exchange
+    /// its credential path requires, for a handle to retain.
+    ///
+    /// Reads through [`Self::access_token`], so a presented-as-is bearer or a
+    /// fresh cached token returns without a request, while an API key,
+    /// workload JWT, renewable saved login, or delegated credential exchanges
+    /// once and fills the shared cache every clone reads. Later renewal and
+    /// refusal-triggered re-exchange are unchanged.
+    ///
+    /// # Errors
+    /// Returns the server's stable error when it refuses the exchange, or a
+    /// transport error when `/auth/token` cannot be reached.
+    pub(crate) async fn connected(&self) -> Result<Self, WyrdError> {
+        self.access_token().await?;
+        Ok(self.clone())
+    }
+
     /// Build a client from an explicit [`ClientConfig`].
     ///
     /// Use this when endpoints or the API key are set programmatically rather
@@ -490,9 +521,113 @@ mod tests {
 
     use super::WyrdClient;
     use crate::auth::AuthMiddleware;
+    use crate::cards::Cards;
     use crate::config::{ClientConfig, TokenCacheMode};
+    use crate::gateway::Gateway;
+    use crate::operator_connections::OperatorConnections;
+    use crate::platform::Platform;
+    use crate::principals::Principals;
     use crate::transport::credential::ResolvedCredential;
     use crate::transport::http::HttpTransport;
+
+    /// Build a client against `server` presenting `credential`, with an
+    /// in-memory token cache so no test touches a token file.
+    fn client_for(server: &MockServer, credential: ResolvedCredential) -> WyrdClient {
+        let mut config = ClientConfig::default();
+        config.http.base_url = server.uri();
+        config.token_cache = TokenCacheMode::InMemory;
+        let auth = AuthMiddleware::new(&config, credential).expect("middleware builds");
+        let http = HttpTransport::new(&config.http, Arc::clone(&auth)).expect("transport builds");
+        WyrdClient::from_parts(auth, http, config.grpc)
+    }
+
+    /// Every HTTP-only handle's `connect_with` completes the client's required
+    /// exchange before returning and shares its one token cache: four handles
+    /// over one API-key client cause exactly one `/auth/token` exchange. A
+    /// presented-as-is bearer connects every handle with no request at all, a
+    /// refused exchange fails `connect_with` with the server's stable error,
+    /// and `Platform` keeps its own platform-session exchange.
+    #[tokio::test]
+    async fn server_handles_connect_eagerly_and_share_the_client_auth_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "tenant-bearer",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/auth/platform/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "platform-session",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api_key = client_for(
+            &server,
+            ResolvedCredential::ApiKey("wyrd_sk_t_v_s".to_owned().into()),
+        );
+        Cards::connect_with(&api_key).await.expect("cards connect");
+        Gateway::connect_with(&api_key)
+            .await
+            .expect("gateway connects");
+        Principals::connect_with(&api_key)
+            .await
+            .expect("principals connect");
+        OperatorConnections::connect_with(&api_key)
+            .await
+            .expect("operator connections connect");
+
+        let bearer = client_for(
+            &server,
+            ResolvedCredential::BearerToken("presented-as-is".to_owned().into()),
+        );
+        Cards::connect_with(&bearer).await.expect("cards connect");
+        Gateway::connect_with(&bearer)
+            .await
+            .expect("gateway connects");
+        Principals::connect_with(&bearer)
+            .await
+            .expect("principals connect");
+        OperatorConnections::connect_with(&bearer)
+            .await
+            .expect("operator connections connect");
+        Platform::connect_with(&bearer)
+            .await
+            .expect("platform exchanges its session");
+
+        let refusing = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/token"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "type": "about:blank",
+                "title": "Unauthenticated",
+                "status": 401,
+                "code": "WYRD_AUTH_401_UNAUTHENTICATED",
+                "detail": "credential refused"
+            })))
+            .mount(&refusing)
+            .await;
+        let refused = client_for(
+            &refusing,
+            ResolvedCredential::ApiKey("wyrd_sk_t_v_s".to_owned().into()),
+        );
+        let error = Principals::connect_with(&refused)
+            .await
+            .expect_err("a refused exchange fails at connect");
+        assert_eq!(error.status(), 401, "{error:?}");
+        assert!(
+            !format!("{error:?}").contains("wyrd_sk_t_v_s"),
+            "errors never carry the credential"
+        );
+    }
 
     /// `access_token` reads through the shared [`AuthMiddleware`]: an API key
     /// is exchanged at `/auth/token`, a token inside the refresh skew is

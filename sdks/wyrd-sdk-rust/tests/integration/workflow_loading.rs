@@ -83,7 +83,7 @@ async fn register_all(cards: &Cards, relative: &[&str]) -> HashMap<String, CardR
 /// Panics when a registration is refused.
 async fn team(deployment: &Deployment) -> HashMap<String, CardRef> {
     register_all(
-        &deployment.cards(),
+        &deployment.cards().await,
         &["team/security.yaml", "team/correctness.yaml"],
     )
     .await
@@ -97,7 +97,7 @@ async fn team(deployment: &Deployment) -> HashMap<String, CardRef> {
 /// Panics when a registration is refused.
 async fn applied(deployment: &Deployment) -> HashMap<String, CardRef> {
     let refs = register_all(
-        &deployment.cards(),
+        &deployment.cards().await,
         &[
             "team/security.yaml",
             "team/correctness.yaml",
@@ -106,7 +106,7 @@ async fn applied(deployment: &Deployment) -> HashMap<String, CardRef> {
     )
     .await;
     register(
-        &deployment.cards(),
+        &deployment.cards().await,
         "cards/workflow_loading/team-v2/security.yaml",
     )
     .await;
@@ -228,7 +228,7 @@ async fn gateway_workflow_without_credentials_is_refused_before_any_step() {
 async fn registry_refs_resolve_through_the_registry() {
     let deployment = Deployment::start().await;
     team(&deployment).await;
-    let mixed = Workflow::from_path_with_client(
+    let mixed = Workflow::from_path_with(
         workflow_fixture("mixed/workflow.yaml"),
         reader(&deployment).await,
     )
@@ -252,10 +252,9 @@ async fn registry_refs_without_read_access_are_refused() {
     team(&deployment).await;
     let no_roles = deployment.client(&deployment.key("workflow_no_roles", &[]).await);
 
-    let refused =
-        Workflow::from_path_with_client(workflow_fixture("mixed/workflow.yaml"), no_roles)
-            .await
-            .expect_err("the registry read is refused");
+    let refused = Workflow::from_path_with(workflow_fixture("mixed/workflow.yaml"), no_roles)
+        .await
+        .expect_err("the registry read is refused");
 
     assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
     deployment.shutdown().await;
@@ -271,7 +270,7 @@ async fn registry_refs_without_read_access_are_refused() {
 async fn local_sibling_never_satisfies_a_registry_ref() {
     let deployment = Deployment::start().await;
     team(&deployment).await;
-    let shadowed = Workflow::from_path_with_client(
+    let shadowed = Workflow::from_path_with(
         workflow_fixture("shadowed/workflow.yaml"),
         reader(&deployment).await,
     )
@@ -300,14 +299,14 @@ async fn local_sibling_never_satisfies_a_registry_ref() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn deleted_registry_card_is_refused() {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards();
+    let cards = deployment.cards().await;
     let retired = register(&cards, "cards/workflow_loading/retired/retired-prompt.yaml").await;
     cards
         .delete(CardSelector::exact(retired.root))
         .await
         .expect("the Prompt deletes");
 
-    let refused = Workflow::from_path_with_client(
+    let refused = Workflow::from_path_with(
         workflow_fixture("retired/workflow.yaml"),
         reader(&deployment).await,
     )
@@ -329,7 +328,9 @@ async fn deleted_registry_card_is_refused() {
 async fn applied_workflow_stays_pinned_to_its_registered_cards() {
     let deployment = Deployment::start().await;
     let refs = applied(&deployment).await;
-    let reader = Cards::with_client(reader(&deployment).await);
+    let reader = Cards::connect_with(&reader(&deployment).await)
+        .await
+        .expect("handle connects");
     let agents = [
         "security-reviewer",
         "correctness-reviewer",
@@ -396,7 +397,9 @@ fn sorted(mut refs: Vec<CardRef>) -> Vec<CardRef> {
 async fn loaded_workflow_runs_its_pinned_cards() {
     let deployment = Deployment::start().await;
     let refs = applied(&deployment).await;
-    let reader = Cards::with_client(reader(&deployment).await);
+    let reader = Cards::connect_with(&reader(&deployment).await)
+        .await
+        .expect("handle connects");
     let code_review = &refs["code-review"];
     let uid = code_review.uid.clone().expect("registered Card has a UID");
     let by_identity = CardRef {
@@ -443,7 +446,9 @@ async fn loading_a_bad_selector_is_refused() {
         .clone()
         .expect("registered Card has a UID");
 
-    let refused = Cards::with_client(reader(&deployment).await)
+    let refused = Cards::connect_with(&reader(&deployment).await)
+        .await
+        .expect("handle connects")
         .workflow()
         .load(&CardSelector::uid(CardKind::Workflow, agent_uid))
         .await

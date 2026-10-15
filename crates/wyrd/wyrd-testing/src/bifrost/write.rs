@@ -20,6 +20,7 @@ use arrow::datatypes::SchemaRef;
 use uuid::Uuid;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostGrpcTransport;
+use wyrd_client::bifrost::BifrostOptions;
 use wyrd_client::bifrost::{Bifrost, Correlation, IngestTransport, TableConfig};
 use wyrd_client::config::ClientConfig;
 use wyrd_queue::{ClientByteBudget, OwnedIpcBytes, QueueConfig, SealedBatch, SinkError};
@@ -57,12 +58,14 @@ impl BifrostWriter {
     pub async fn connect(config: ClientConfig, card_ref: CardRef) -> Result<Self, WyrdError> {
         let client =
             WyrdClient::with_config(config).map_err(|error| harness_error(&error.to_string()))?;
-        let handle = Bifrost::connect_with_config(
+        let handle = Bifrost::connect_with(
             &client,
-            None,
-            QueueConfig {
-                linger_ms: 60_000,
-                ..QueueConfig::default()
+            BifrostOptions {
+                table: None,
+                queue: QueueConfig {
+                    linger_ms: 60_000,
+                    ..QueueConfig::default()
+                },
             },
         )
         .await?;

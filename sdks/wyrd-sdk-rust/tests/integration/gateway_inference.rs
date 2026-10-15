@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use wyrd_ai::bifrost::BifrostOptions;
 
 use serde_json::{Map, Value, json};
 use wiremock::matchers::{method, path};
@@ -94,7 +95,9 @@ impl Inference {
         )
         .await;
         put_managed(deployment.admin(), "openai-key", PROVIDER_KEY).await;
-        let gateway = Gateway::with_client(deployment.admin());
+        let gateway = Gateway::connect_with(&deployment.admin())
+            .await
+            .expect("handle connects");
         for model in ["gpt-4o", "gpt-5-5"] {
             gateway
                 .put_deployment(&ProviderDeployment {
@@ -120,7 +123,11 @@ impl Inference {
             })
             .await
             .expect("the capture policy puts");
-        let ask = register(&deployment.cards(), "cards/gateway_inference/ask.yaml").await;
+        let ask = register(
+            &deployment.cards().await,
+            "cards/gateway_inference/ask.yaml",
+        )
+        .await;
         Self {
             deployment,
             upstream,
@@ -355,12 +362,13 @@ async fn malformed_traceparent_is_ignored_by_the_gateway() {
         inference.deployment.timeline(CALLER_TRACE).await.is_empty(),
         "nothing joined the caller's trace"
     );
-    let calls = wyrd_ai::Bifrost::connect(&inference.deployment.admin())
-        .await
-        .expect("Bifrost connects")
-        .sql_as::<CallId>("SELECT call_id FROM vala.gateway.calls", &[])
-        .await
-        .expect("calls read back");
+    let calls =
+        wyrd_ai::Bifrost::connect_with(&inference.deployment.admin(), BifrostOptions::default())
+            .await
+            .expect("Bifrost connects")
+            .sql_as::<CallId>("SELECT call_id FROM vala.gateway.calls", &[])
+            .await
+            .expect("calls read back");
     let [call] = &calls[..] else {
         panic!("exactly one call is recorded: {calls:?}");
     };
@@ -443,15 +451,16 @@ async fn gateway_call_records_whichever_attribution_it_carries() {
         .flush_bifrost()
         .await
         .expect("rows publish");
-    let mut calls: Vec<CallAttribution> = wyrd_ai::Bifrost::connect(&inference.deployment.admin())
-        .await
-        .expect("Bifrost connects")
-        .sql_as(
-            "SELECT caller_principal_id, run_id, card_uid FROM vala.gateway.calls",
-            &[],
-        )
-        .await
-        .expect("calls read back");
+    let mut calls: Vec<CallAttribution> =
+        wyrd_ai::Bifrost::connect_with(&inference.deployment.admin(), BifrostOptions::default())
+            .await
+            .expect("Bifrost connects")
+            .sql_as(
+                "SELECT caller_principal_id, run_id, card_uid FROM vala.gateway.calls",
+                &[],
+            )
+            .await
+            .expect("calls read back");
     calls.sort();
     let call = |run_id: Option<&str>, card_uid: Option<&str>| CallAttribution {
         caller_principal_id: id.to_string(),
@@ -558,6 +567,7 @@ async fn loaded_workflow_calls_the_gateway_through_its_loading_client() {
     let workflow = inference
         .deployment
         .cards()
+        .await
         .workflow()
         .load(&CardSelector::exact(inference.ask.root.clone()))
         .await
@@ -588,7 +598,7 @@ async fn loaded_workflow_calls_the_gateway_through_its_loading_client() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn example_workflow_runs_through_the_wyrd_gateway() {
     let inference = Inference::start().await;
-    let example = Workflow::from_path_with_client(
+    let example = Workflow::from_path_with(
         example().join("workflow.yaml"),
         inference.deployment.admin(),
     )
@@ -640,6 +650,7 @@ async fn registered_example_runs_through_the_gateway() {
     let registered = inference
         .deployment
         .cards()
+        .await
         .workflow()
         .load(&CardSelector::exact(applied.root))
         .await
@@ -672,11 +683,11 @@ async fn registered_example_runs_through_the_gateway() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn run_invokes_its_agent_through_the_gateway() {
     let inference = Inference::start().await;
-    let cards = inference.deployment.cards();
+    let cards = inference.deployment.cards().await;
     let service = register(&cards, "cards/gateway_inference/ask-service.yaml").await;
     let bundle = hydrate(&cards, &service.root).await;
     let state = |client: WyrdClient| {
-        WyrdState::from_path_with_client(bundle.path().join("bundle"), client)
+        WyrdState::from_path_with(bundle.path().join("bundle"), client)
             .expect("bundle loads offline")
     };
 

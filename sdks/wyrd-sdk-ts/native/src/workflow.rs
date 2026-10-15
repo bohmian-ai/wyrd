@@ -152,7 +152,7 @@ pub fn workflow_from_yaml(yaml: String) -> NativeWorkflowLoad {
 impl NativeWyrdClient {
     /// Load an authored Workflow file and its Cards as this client.
     ///
-    /// Delegates to the shared [`Workflow::from_path_with_client`]: registry
+    /// Delegates to the shared [`Workflow::from_path_with`]: registry
     /// refs are read, and gateway steps later run, as this client rather than
     /// the ambient configuration. Never rejects: a load failure is returned
     /// in [`NativeWorkflowLoad::error`] with its catalog code. Cancellation
@@ -167,7 +167,7 @@ impl NativeWyrdClient {
         crate::trace::spawn(env, async move {
             Ok({
                 NativeWorkflowLoad::from_outcome(
-                    Workflow::from_path_with_client(path, client.clone()).await,
+                    Workflow::from_path_with(path, client.clone()).await,
                 )
             })
         })

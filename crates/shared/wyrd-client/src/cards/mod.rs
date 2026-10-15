@@ -37,8 +37,8 @@ mod tests {
     /// The public handle, selector, and request types compose without staged-card or transport exports.
     #[test]
     fn public_surface_compiles_without_staged_card_or_transport_exports() {
-        let _ = Cards::from_env;
-        let _ = Cards::with_client;
+        let _ = Cards::connect;
+        let _ = Cards::connect_with;
         let _ = CardSelector::named(
             CardKind::Prompt,
             SpaceName::new("prod").expect("test space is valid"),

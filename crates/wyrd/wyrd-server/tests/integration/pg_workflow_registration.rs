@@ -369,7 +369,9 @@ async fn refused_registration(
 async fn registers_only_valid_explicit_workflow_graphs() {
     let storage_root = tempfile::tempdir().expect("storage root creates");
     let (server, jwt) = start_server(storage_root.path()).await;
-    let cards = Cards::with_client(registry_client(&server, &jwt));
+    let cards = Cards::connect_with(&registry_client(&server, &jwt))
+        .await
+        .expect("handle connects");
 
     let principals = principal_count(&server).await;
     let receipt = cards
@@ -715,7 +717,9 @@ fn inline_workflow(name: &str, version_line: &str) -> String {
 async fn fetches_and_executes_locked_workflow_graph() {
     let storage_root = tempfile::tempdir().expect("storage root creates");
     let (server, jwt) = start_server(storage_root.path()).await;
-    let cards = Cards::with_client(registry_client(&server, &jwt));
+    let cards = Cards::connect_with(&registry_client(&server, &jwt))
+        .await
+        .expect("handle connects");
     let receipt = cards
         .register_from_path(&bundle().join("workflow.yaml"))
         .await
@@ -899,7 +903,9 @@ async fn fetches_and_executes_locked_workflow_graph() {
 async fn refuses_stale_preflight_after_dependency_replacement() {
     let storage_root = tempfile::tempdir().expect("storage root creates");
     let (server, jwt) = start_server(storage_root.path()).await;
-    let cards = Cards::with_client(registry_client(&server, &jwt));
+    let cards = Cards::connect_with(&registry_client(&server, &jwt))
+        .await
+        .expect("handle connects");
     let receipt = cards
         .register_from_path(&bundle().join("workflow.yaml"))
         .await

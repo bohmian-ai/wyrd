@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use wyrd_ai::bifrost::BifrostOptions;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -102,7 +103,7 @@ struct Answer<'a> {
 /// gateway deployment to configure when none serves the Prompt's provider and
 /// model.
 pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Desk, Error> {
-    let cards = Cards::with_client(client.clone());
+    let cards = Cards::connect_with(&client).await?;
     let receipt = cards
         .register_from_path(service_dir().join("support-desk.yaml"))
         .await?;
@@ -113,8 +114,8 @@ pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Desk, Error> {
             HydrationMode::Complete,
         )
         .await?;
-    let state = WyrdState::from_path_with_client(bundle, client.clone())?;
-    let gateway = Gateway::with_client(client.clone());
+    let state = WyrdState::from_path_with(bundle, client.clone())?;
+    let gateway = Gateway::connect_with(&client).await?;
     gateway
         .put_capture_policy(&GatewayCapturePolicyWrite {
             mode: GatewayCaptureMode::Metadata,
@@ -227,7 +228,7 @@ pub async fn wait_for_verdicts(
     desk: &Desk,
     timeout: Duration,
 ) -> Result<Verdicts, Error> {
-    let bifrost = Bifrost::connect(client).await?;
+    let bifrost = Bifrost::connect_with(client, BifrostOptions::default()).await?;
     let names = ["answer-quality", "no-refund-promise"].map(|name| (desk.uid(name), name));
     let deadline = tokio::time::Instant::now() + timeout;
     loop {

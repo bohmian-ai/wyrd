@@ -194,7 +194,9 @@ async fn list_uses_typed_query_parameters_and_an_empty_get_body() {
     )])
     .await;
 
-    let cards = Cards::with_client(client(server.uri()));
+    let cards = Cards::connect_with(&client(server.uri()))
+        .await
+        .expect("handle connects");
     let page = cards
         .list(ListCardsRequest {
             kind: Some(CardKind::Prompt),
@@ -244,7 +246,9 @@ async fn uid_delete_uses_kind_qualified_path_and_preserves_idempotence() {
     )])
     .await;
 
-    let cards = Cards::with_client(client(server.uri()));
+    let cards = Cards::connect_with(&client(server.uri()))
+        .await
+        .expect("handle connects");
     cards
         .delete(CardSelector::uid(CardKind::Prompt, uid()))
         .await
@@ -271,7 +275,9 @@ async fn server_problem_code_and_status_survive_registry_boundary() {
     )])
     .await;
 
-    let cards = Cards::with_client(client(server.uri()));
+    let cards = Cards::connect_with(&client(server.uri()))
+        .await
+        .expect("handle connects");
     let error = cards
         .get(CardSelector::uid(CardKind::Prompt, uid()))
         .await

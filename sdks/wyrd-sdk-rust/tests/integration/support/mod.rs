@@ -10,6 +10,7 @@
 //! [`Deployment::client`] and passes it to the SDK or CLI call explicitly.
 
 use std::path::{Path, PathBuf};
+use wyrd_ai::bifrost::BifrostOptions;
 
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_ai::cards::{CardRef, CardSelector, Cards, HydrationMode, RegistrationReceipt};
@@ -107,8 +108,10 @@ impl Deployment {
     }
 
     /// The administrator's Cards handle.
-    pub fn cards(&self) -> Cards {
-        Cards::with_client(self.admin())
+    pub async fn cards(&self) -> Cards {
+        Cards::connect_with(&self.admin())
+            .await
+            .expect("handle connects")
     }
 
     /// Bootstrap a Service principal `name` holding built-in `roles` and
@@ -214,7 +217,7 @@ impl Deployment {
     /// Panics when the id is malformed or the flush or the read fails.
     pub async fn timeline(&self, trace: &str) -> Vec<SpanRecord> {
         self.server.flush_bifrost().await.expect("rows publish");
-        Bifrost::connect(&self.admin())
+        Bifrost::connect_with(&self.admin(), BifrostOptions::default())
             .await
             .expect("Bifrost connects")
             .trace_timeline(TraceId::from_hex(trace).expect("trace id"))

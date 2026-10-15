@@ -78,7 +78,9 @@ mod pg_tests {
             .jwt()
             .ok_or("admin bootstrap issues a jwt")?
             .to_owned();
-        let gateway = Gateway::with_client(http_client(&server, &admin_jwt)?);
+        let gateway = Gateway::connect_with(&http_client(&server, &admin_jwt)?)
+            .await
+            .expect("handle connects");
         let credential_admin = CredentialWriter::new(http_client(&server, &admin_jwt)?);
         credential_admin
             .put_credential(&serde_json::from_value(serde_json::json!({

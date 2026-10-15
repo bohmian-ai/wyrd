@@ -250,7 +250,7 @@ impl PyTableConfig {
         client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
     ) -> WyrdPyResult<Self> {
         let client = crate::client::PyWyrdClient::resolve(client.as_deref())?;
-        let inner = crate::trace::block_on(py, TableConfig::describe(&client, table))
+        let inner = crate::trace::block_on(py, TableConfig::describe_with(&client, table))
             .map_err(client_error)?;
         Ok(Self { inner })
     }

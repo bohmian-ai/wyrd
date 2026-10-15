@@ -120,7 +120,7 @@ impl PyWorkflow {
     /// # Errors
     ///
     /// Returns the error of the shared [`ClientWorkflow::from_path`] or
-    /// [`ClientWorkflow::from_path_with_client`], raised in Python as the
+    /// [`ClientWorkflow::from_path_with`], raised in Python as the
     /// `WyrdError` with the codes listed above.
     #[staticmethod]
     #[pyo3(signature = (path, client=None))]
@@ -132,7 +132,7 @@ impl PyWorkflow {
         let client = client.map(|client| client.get().inner().clone());
         let workflow = crate::trace::block_on(py, async move {
             match client {
-                Some(client) => ClientWorkflow::from_path_with_client(path, client).await,
+                Some(client) => ClientWorkflow::from_path_with(path, client).await,
                 None => ClientWorkflow::from_path(path).await,
             }
         })?;

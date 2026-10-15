@@ -373,9 +373,9 @@ async fn connected_handles_reuse_the_client_cache_and_renew() {
     deployment.shutdown().await;
 }
 
-/// A connected Bifrost lists its tenant's tables compactly, never another
-/// tenant's, refuses a caller without table read, and describes one table's
-/// declared fields on demand.
+/// A connected Bifrost lists its tenant's tables and the built-ins compactly,
+/// never another tenant's, refuses a caller without table read, and describes
+/// one table's declared fields on demand.
 ///
 /// # Panics
 /// Panics when a registration, listing, refusal, or description differs.
@@ -420,6 +420,10 @@ async fn bifrost_lists_tables_and_describes_on_demand() {
         .map(|entry| format!("{}.{}", entry.namespace, entry.name))
         .collect();
     assert!(listed.iter().any(|fqn| fqn == EVENTS), "{listed:?}");
+    assert!(
+        listed.iter().any(|fqn| fqn == "vala.drift.observations"),
+        "{listed:?}"
+    );
     assert!(
         !listed.iter().any(|fqn| fqn == OTHER_TENANT_EVENTS),
         "{listed:?}"

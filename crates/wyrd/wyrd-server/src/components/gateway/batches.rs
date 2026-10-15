@@ -185,7 +185,9 @@ fn invocable(caller: &Caller) -> (Vec<String>, Vec<String>, bool) {
             PermissionScope::Gateway(GatewayAccess::Model { deployment, model }) => {
                 models.push(format!("{}/{}", deployment.as_str(), model.as_str()));
             }
-            PermissionScope::Bifrost(_) | PermissionScope::Verifier(_) => {}
+            PermissionScope::Bifrost(_)
+            | PermissionScope::Verifier(_)
+            | PermissionScope::Tool(_) => {}
         }
     }
     (deployments, models, all)

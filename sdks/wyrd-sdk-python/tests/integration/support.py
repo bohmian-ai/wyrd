@@ -134,5 +134,5 @@ def binding_ids(cards: Cards, ref: CardRef) -> list[str]:
     """The verification binding ids the server derived for ``ref``."""
     status = cards.get(ref).status
     # Status and its verification block stay empty until the server derives them.
-    assert status is not None and status.verification is not None
-    return status.verification.binding_ids
+    assert status is not None and status.get("verification") is not None
+    return status["verification"]["binding_ids"]

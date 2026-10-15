@@ -8,15 +8,15 @@ that ran and what was bound into it.
 
 from __future__ import annotations
 
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import pytest
 from wyrd import WyrdError
 from wyrd.agent import Workflow
-from wyrd.cards import CardRef, Cards, RegisteredAgentCard, RegisteredCard, RegisteredWorkflowCard
+from wyrd.cards import CardKind, CardRef, Cards
 from wyrd.client import WyrdClient
+from wyrd.state import CardEnvelope
 from wyrd.testing import WyrdTestServer, cli
 
 from .support import FIXTURES, register
@@ -49,25 +49,24 @@ PINNED_PROMPTS = {
 """Each Agent the applied ``code-review`` Workflow runs, and the Prompt it is pinned to."""
 
 
-def outbound(card: RegisteredCard) -> dict[str, Any]:
+def outbound(card: CardEnvelope) -> dict[str, Any]:
     """Server-derived outbound relationship targets of a Card, by name."""
-    assert card.relationships is not None
-    return {target.ref.name: asdict(target.ref) for target in card.relationships.outbound_refs}
+    return {target["ref"]["name"]: target["ref"] for target in card.relationships["outbound_refs"]}
 
 
-def stored_agent(cards: Cards, ref: CardRef) -> RegisteredAgentCard:
-    """The registered Agent ``ref`` names, read back typed."""
+def stored_agent(cards: Cards, ref: CardRef) -> CardEnvelope:
+    """The registered Agent ``ref`` names, read back as its envelope."""
     card = cards.get(ref)
-    assert isinstance(card, RegisteredAgentCard)
+    assert card.kind == CardKind.Agent
     return card
 
 
-def prompt_ref(agent: RegisteredAgentCard) -> dict[str, Any]:
+def prompt_ref(agent: CardEnvelope) -> dict[str, Any]:
     """The Card reference an Agent's ``prompt`` is pinned to."""
-    prompt = agent.spec.prompt
+    prompt = agent.spec["prompt"]
     # A registered Agent stores its Prompt as a reference, never inline text.
-    assert not isinstance(prompt, str)
-    return asdict(prompt)
+    assert isinstance(prompt, dict)
+    return prompt
 
 
 @pytest.fixture(scope="module")
@@ -194,7 +193,7 @@ def test_applied_workflow_stays_pinned_to_its_registered_cards(
 
     stored = reader.get(applied["code-review"])
 
-    assert isinstance(stored, RegisteredWorkflowCard)
+    assert stored.kind == CardKind.Workflow
     assert [step["action"]["target"] for step in stored.spec["steps"]] == list(agents.values())
     assert outbound(stored) == agents
     prompts = {agent: applied[prompt].to_dict() for agent, prompt in PINNED_PROMPTS.items()}

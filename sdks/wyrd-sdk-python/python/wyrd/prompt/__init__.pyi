@@ -1,14 +1,8 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
-
 from collections.abc import Mapping
 from typing import Any
 
 from .._wyrd import JsonDict, PathLike, WyrdError
 from ..cards import CardRef
-
-#### end of imports ####
 
 class MediaRef:
     """Image or document content to bind into a ``${media:name}`` placeholder.

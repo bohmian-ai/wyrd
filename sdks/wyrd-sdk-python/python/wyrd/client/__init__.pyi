@@ -1,10 +1,4 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
-
 from typing import Literal
-
-#### end of imports ####
 
 class WyrdClient:
     """Authenticated Wyrd client that can act for another principal.

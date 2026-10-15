@@ -1,11 +1,6 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
 from typing import Literal, TypeAlias, TypedDict
 
 from ..client import WyrdClient
-
-#### end of imports ####
 
 PrincipalKind: TypeAlias = Literal["user", "service", "agent"]
 """The kind of an assignable principal."""

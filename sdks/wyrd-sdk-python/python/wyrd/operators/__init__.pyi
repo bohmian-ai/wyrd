@@ -1,12 +1,7 @@
-# AUTO-GENERATED STUB FILE. DO NOT EDIT.
-# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-#### begin imports ####
 import builtins
 from typing import Literal, TypeAlias, TypedDict
 
 from ..client import WyrdClient
-
-#### end of imports ####
 
 OperatorProvider: TypeAlias = Literal["slack", "pager_duty", "http"]
 """The provider an Operator connection authenticates to."""

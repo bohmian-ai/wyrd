@@ -5,9 +5,9 @@ from __future__ import annotations
 import functools
 import inspect
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, ParamSpec, TypeVar, overload
 
 from .._schema import annotation_to_schema as _annotation_to_schema
 
@@ -47,12 +47,34 @@ class _ToolCallable:
         return f"<wyrd tool {self.name!r}>"
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+@overload
+def tool(
+    fn: None = None,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]: ...
+
+
+@overload
+def tool(
+    fn: Callable[_P, _R],
+    *,
+    name: str | None = None,
+    description: str | None = None,
+) -> Callable[_P, _R]: ...
+
+
 def tool(
     fn: Callable | None = None,
     *,
     name: str | None = None,
     description: str | None = None,
-):
+) -> Any:
     """Decorate a function as a runtime-local tool and register it.
 
     The input schema comes from the parameters' annotations (parameters without
@@ -90,7 +112,7 @@ def tool(
 
 
 @contextmanager
-def local_registry():
+def local_registry() -> Iterator[None]:
     """Scope tool registration to a temporary, thread-local registry.
 
     Tools decorated inside the ``with`` block register into a fresh registry

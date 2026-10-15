@@ -97,18 +97,22 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 # Every documented stub parameter gets an ``Args:`` entry; the stubs are the
 # public help text. Other modules keep their existing docstring style.
-"!python/wyrd/stubs/**" = ["D417"]
+"!python/wyrd/**/*.pyi" = ["D417"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
 [tool.ty.src]
-# Public modules are typed by their ``__init__.pyi``; the ``stubs/`` sources are
-# assembled into those files, so neither is checked twice.
+# A module with native members is typed by its ``__init__.pyi``, so its
+# ``__init__.py`` is not checked twice; a pure-Python module has no stub.
 include = ["python/wyrd", "scripts", "tests"]
 # The agent framework journeys import the mcp-frameworks group, which only
 # their own lane installs.
-exclude = ["python/wyrd/stubs", "python/wyrd/**/__init__.py", "tests/integration/mcp_frameworks"]
+exclude = [
+    "python/wyrd/**/__init__.py",
+    "!python/wyrd/eval/__init__.py",
+    "tests/integration/mcp_frameworks",
+]
 
 [tool.ty.rules]
 unused-ignore-comment = "error"

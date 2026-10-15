@@ -452,3 +452,78 @@ exact compatibility decision needed; do not fake spans or skip the framework.
 - [Ambient-auth completion and owners](../../../completed/2026/ambient-auth.md)
 - [Docsite conventions](../../../../docs/CONTRIBUTING.md)
 - [Docsite product standards](../../../../docs/PRODUCT.md)
+
+## Implementation Evidence
+
+Status: `IMPLEMENTED`. Commits `a0b932ef6`, `67805c933`, `3e6179915`,
+`7d2ecb157`, `f7cb5d352`, and `aeaa22cbc` on top of packet `f7f0912d4`.
+
+### Acceptance map
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-010; AC-007 — bridge fidelity, safe callback lifecycle, optional imports | Python `python/wyrd/otel.py::WyrdAgentsTraceProcessor` (lock-guarded, end-time attributes, start-time Run scope, payload-free error status, release on shutdown, late callbacks ignored); TS `wyrd/src/index.ts::WyrdAgentsTraceProcessor` (same) | U1 4 passed, U4 1, T1 1, T4 1; J1 3 passed, K1 1 passed | PASS |
+| REQ-011; AC-001 — Pydantic AI, ADK, OpenAI Agents (Python) and OpenAI Agents (TS) export and read back with no manual spans | `tests/integration/otel/frameworks/app.py` runs stock framework agents against a local scripted upstream, one subprocess per app; TS `tests/integration/agents-trace-processor.test.ts` | J1 `test_managed_framework_telemetry` 3 passed (one per framework); J2 3 passed; K1/K2 1 passed each | PASS |
+| REQ-012; AC-008 — idempotent setup, provider preservation, owned-provider correlation | Python `install_run_correlation` retry-safe; TS public `runCorrelationProcessor()` from `wyrd-ai/otel` | U1, U2 1 passed, T1, T2 1 passed; J2 `test_owned_provider_framework_telemetry` 3 passed; K2 1 passed | PASS |
+| REQ-013; AC-009 — managed flush before native drain, drain on failure, two catalog errors | `crates/wyrd-spec/src/error.rs` (`WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT`, `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`); `crates/shared/wyrd-client/src/state.rs::TelemetryFlushFailure` shared by `sdks/wyrd-sdk-python/src/state/mod.rs` and `sdks/wyrd-sdk-ts/native/src/cards.rs::telemetry_flush_error`; TS `WyrdState.flush/shutdown` | U3 `test_managed_telemetry_lifecycle` 7 passed; T3 1 passed; J1/J2/K1/K2 read back after flush; K4 asserts the 503 on a refused export | PASS |
+| REQ-014; AC-010/011 — fidelity, scope, privacy, sampling | Start-time Run identity, enclosing-context parenting, `include_content=False` and `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false` recipes | J3 `test_framework_execution_edges` 3 passed (model failure, tool failure, stream completed after scope exit, nested, concurrent, uncorrelated); J4 3 passed (always_off sampler, SECRET sentinels absent); K3/K4 1 passed each | PASS |
+| REQ-015; AC-012 — docsite recipes match journeys | Observe `record-a-run-and-observations.md` sections "Trace an agent framework" and "Keep your own tracer provider", error rows, readback; Connect/Understand cross-links; `wyrd-ai[otel]` install name in quickstart and `otel.py`; `architecture/wyrd-design.md` managed flush contract. Draft flags preserved | `mise run docs:generate` (no drift), `mise run docs:check` exit 0 | PASS |
+| REQ-016; AC-003 — exact journeys collected with dependencies, no masked integrations | `mise.toml`: `py:test:mcp-frameworks:inner` and `test:bifrost:journey:python:inner` run `tests/integration/otel/frameworks` under `--group mcp-frameworks`; `test:bifrost:journey:typescript:inner` lists `agents-trace-processor.test.ts`; `pyproject.toml` norecursedirs keeps the default lane free of frameworks | Default `tests/integration` collects 0 framework tests; the group dirs collect 19; every J/K selector reports a positive pass count | PASS |
+| REQ-017; AC-013 — ambient clients, stock auth transport, fresh per-export tokens | Exporters call the shared client's `access_token` on every export; journeys set only `WYRD_API_KEY` and an isolated `WYRD_CONFIG_HOME`; the gateway path uses the existing `http_auth`/`httpAuth` | U5 1 passed, T5 1 passed; J5 1 passed (the upstream sees only `Bearer sk-local-upstream` and no `x-wyrd` headers; a run with no credential fails with the actionable `WyrdError`); K5 1 passed (`WYRD_CLIENT_401_NO_CREDENTIALS`); R1 2 passed, R2 1 passed | PASS |
+| INV-001 — tenant and auth boundaries | No server change; relies on the server's per-span Card-scope rejection | J4/K4: a viewer key persists nothing; an other-tenant credential cannot attribute spans to this tenant's Card, and this tenant reads nothing | PASS |
+| INV-002 — one managed provider, no global replacement | Collision refusal `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` retained | U1, T1 | PASS |
+| INV-003 — payload-free bridge and errors | The bridge records names, models, usage and status only; the flush error `cause` is a type name | U4/T4 sentinel cases; J4 sentinel absence | PASS |
+| INV-004 — runtime boundaries | No framework registry, patching, token cache, transport, migration, or production dependency; native glue lives only in the SDK runtimes | `mise run check:deps` exit 0; diff audit below | PASS |
+
+### Commands
+
+Static and owner lanes, all exit 0:
+- `mise run fmt`, `lints`
+- `py:format:check`, `py:lints`, `py:typecheck`, `py:test:unit` (610 passed at `aeaa22cbc`)
+- `ts:format:check`, `ts:lints`, `ts:typecheck`, `ts:test:unit` (71 passed), `ts:pack:check`
+- `ts:napi:check`, run because the native export `telemetry_flush_error` was added
+- `codegen:check`, `check:deps`
+- `docs:generate`, `docs:check`
+- `git diff --check`
+
+Focused selectors U1–U5, T1–T5, R1, R2 and K1–K5 ran exactly as listed above.
+J1–J5 ran with the listed wrapper and `--group mcp-frameworks`, at the actual
+path `tests/integration/otel/frameworks/test_framework_telemetry.py::<name>`.
+
+### Deviations and material limits
+
+- **Selector path.** J1–J5 live in `tests/integration/otel/frameworks/` rather
+  than `tests/integration/otel/`. That directory is excluded from the default
+  integration lane, so the lane never imports the optional frameworks. Each app
+  runs in its own subprocess for two reasons: OTEL allows one global provider
+  per process, and ADK binds its tracer at import.
+- **RED evidence.** Unit scenarios U1–U5/T1–T5 were written alongside the fix,
+  and no separate failing run was captured. The journeys supplied real RED for
+  the TS findings: the missing public `runCorrelationProcessor`, and a refused
+  export surfacing at shutdown.
+- **TS Chat Completions usage.** `OpenAIChatCompletionsModel` in
+  `@openai/agents-openai` 0.20 never sets usage on generation spans. K1–K3
+  therefore assert the model but not token counts. `OpenAIResponsesModel` does
+  report usage. The recipe documents this.
+- **TS enclosing span.** TS `run.scope()` does not stamp the already-active
+  enclosing span with `run_id`; Python's `Run.__enter__` does. The K journeys
+  assert run and card only on spans started inside the scope.
+- **Python denied export.** The Python OTEL SDK's `force_flush` returns true
+  after a refused export and only logs the refusal, so Python flush does not
+  raise for a 403. TS raises `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`. The error
+  notes in the docs say so.
+- **Removed proof.** `tests/integration/otel/test_agents_trace_processor.py`
+  used a custom model with manual generation spans. It was deleted and is
+  superseded by J1–J5.
+
+### Non-goals and diff audit
+
+None of the excluded scope was added:
+- server behavior, wire payloads, tables, or migrations;
+- framework discovery, monkey-patching, a framework registry, or a Pydantic/ADK adapter;
+- a transport, export queue, or token cache;
+- a Rust framework integration or a production dependency;
+- any revived ambient-auth helper.
+
+Draft docs remain `draft: true`. Every file changed since `f7f0912d4` is in the
+expected write set, and the working tree has no untracked files.

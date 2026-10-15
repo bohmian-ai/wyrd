@@ -1,7 +1,7 @@
 ---
 id: TASK-001-R1
 kind: remediation
-status: proposed
+status: implemented
 spec: SPEC-codegen-single-source
 spec_revision: 1
 parent_task: TASK-001
@@ -195,3 +195,53 @@ lint repairs remain implementation-owned.
 
 After remediation, request independent task review of the complete original
 base-to-new-candidate range, preserving FIND-TASK-001-1 and this diagnosis.
+
+## Implementation evidence
+
+Result: **IMPLEMENTED** at `ffda2b6a4` (review packet committed in `1bbf08a18`).
+
+Capability/reuse: the owners are unchanged. The Rust DTOs carry serde/schemars metadata, `wyrd_spec::schema` holds the one new helper, and the
+`gen_ts_types.py` output mode consumes it. Both mechanisms come from schemars 0.8.22,
+which is already installed. Neither adds a dependency, a field list or a TS interface.
+
+- **Always-emitted Option fields** get `#[serde(default)]`, which makes schemars write `default: null`. The existing
+  output rule then makes the field required and nullable. The input `required` lists are unchanged: Option was already
+  optional on input.
+- **Fields skipped when None** get `#[schemars(schema_with = "crate::schema::skipped_option::<T>")]`. The property keeps
+  the ordinary `Option<T>` input schema and adds `x-wyrd-serialized: <T schema>`, which the lowerer reads only in output mode.
+  This one mechanism serves both the response-owned fields and the shared `PhysicalLayoutWire.time_column`, so
+  `RegisterTableRequest` still accepts null or an omitted value. An earlier draft used `with = "T"` for the response-owned
+  fields; one mechanism replaced it.
+- **Already correct and left untouched:** the opaque `AssertionResult.actual` and `FeatureDriftReport.evidence`
+  (skipped `Option<Value>`, still `JsonValue` including null) and the `FieldSpec.metadata` skipped map.
+- **Bundle diff (before/after):** 17 definitions changed. Each change only adds `default: null` or the extension, and no
+  `required` list changed. The generated diff is 33 lines, every one a target field.
+- **Closure:** I enumerated every non-required, non-defaulted property of every output-only definition in the bundle
+  (34 properties). I classified each against its serde attributes: 24 got default, 8 got the extension, and 3 were
+  already correct.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Workflow fields exactly required `T \| null` | `card/workflow.rs` `serde(default)` ×9; `card-types.ts` | `workflow-types.test-d.ts` (`workflow`, `started_at`, `text`, `structured_output: JsonValue`); `ts:typecheck` | PASS |
+| Skipped scalars optional, non-null; opaque JSON keeps null | `skipped_option` on fingerprint/compaction/`counts`/`upstream_task_id`/`message`; `Option<Value>` untouched | `table-description.test-d.ts` fingerprint `string \| undefined`; `card-types.test-d.ts` `Judgment["counts"]`; `schema::tests::skipped_option_keeps_input_schema_and_records_serialized_value` (opaque extension `true`) | PASS |
+| Registration/principal siblings follow the same rule | `registry/{reads,submission}.rs`, `auth/tenant_principals.rs`, `gateway/credential.rs`, `vala/api.rs` (`QueryTerminalFrame.error`, `tz`), `verification.rs` | `card-types.test-d.ts` (`artifact_hash`, `card_blob_uri`, `email`); generated diff | PASS |
+| Shared layout input retained; output underlying; skipped map unchanged | `PhysicalLayoutWire.time_column` via extension | unit test asserts `["string","null"]` input + `{"type":"string"}` extension, not required; fixture `time_column: string \| undefined`, `metadata` map `Record \| undefined` | PASS |
+| No runtime/request/default/validation/wrapper change | serde(default) on `Option` only (missing already → None); `schema_with` is schema-only | `cargo nextest run -p wyrd-spec --all-features`: 878 passed | PASS |
+| Fixtures protect guarantees; output reproduces | three fixtures strengthened | RED: `tsc --noEmit` 11× TS2344 on candidate; GREEN after regen; `codegen:check` clean | PASS |
+
+Commands (all exit 0 unless noted):
+
+- `mise exec -- pnpm --dir sdks/wyrd-sdk-ts/wyrd exec tsc --noEmit`: RED with 11 TS2344 errors before the source fix;
+  GREEN through `mise run ts:typecheck`, which rebuilds the declarations it resolves.
+- `mise run codegen:regen`; `mise run codegen:check`; `mise run ts:typecheck`; `mise run ts:lints`;
+  `mise run ts:format:check`; `mise run fmt:check`.
+- `mise exec -- cargo clippy --locked -p wyrd-spec --all-targets --all-features -- -D warnings`.
+- `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=schema::tests::skipped_option_keeps_input_schema_and_records_serialized_value)'`: 1 passed.
+- `mise exec -- cargo nextest run --locked -p wyrd-spec --all-features`: 878 passed.
+- `mise exec -- uv run --project sdks/wyrd-sdk-python ruff check scripts/gen_ts_types.py`; `... ruff format --check scripts/gen_ts_types.py`.
+- `git diff --check`: clean.
+
+Non-goals held: no dependency or feature was added, no runtime serializer changed, no wrapper or API changed, and there are
+no consumer guards or copied interfaces. The write set is limited to the remediation's owners. Limits: no journeys, docs or
+gate runs, which change review owns. The served OpenAPI was not re-proved: utoipa ignores `serde(default)` on an `Option`
+for requiredness, and `schema_with` is schemars-only.

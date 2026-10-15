@@ -20,7 +20,7 @@ pub use authoring::{
 };
 pub use convert::{ProviderMessageConversion, convert_message_dyn};
 pub use error::{SkaldError, SkaldResult};
-pub use media::{MediaKind, MediaRef, MediaSource};
+pub use media::{MediaFormat, MediaKind, MediaRef, MediaSource, UnknownMediaFormat};
 pub use message::MessageNum;
 pub use prompt::{Prompt, ProviderSettingsRef, ResponseType};
 pub use request::{ProviderName, ProviderRequest, ToolDescriptor};

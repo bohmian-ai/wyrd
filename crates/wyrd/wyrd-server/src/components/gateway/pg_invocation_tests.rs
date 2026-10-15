@@ -1270,6 +1270,7 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
             ordinal: NonZeroU32::MIN,
             deployment: ProviderDeploymentName::new("dep-a").expect("name"),
             model: model("dep-a/a"),
+            provider: "openai",
             outcome: GatewayCallOutcome::Succeeded,
             billable: true,
             usage: usage(40, 2),
@@ -1349,6 +1350,7 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
         })
         .expect("name"),
         model: model(served),
+        provider: "openai",
         outcome: GatewayCallOutcome::Succeeded,
         billable: true,
         usage,

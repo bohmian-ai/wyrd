@@ -157,9 +157,9 @@ print(rows.to_pandas())
 <LangTab lang="rust">
 
 ```rust
-use wyrd_ai::{Bifrost, bifrost::QueryParam};
+use wyrd_ai::{Bifrost, bifrost::{BifrostOptions, QueryParam}};
 
-let bifrost = Bifrost::from_env().await?;
+let bifrost = Bifrost::connect(BifrostOptions::default()).await?;
 let rows = bifrost
     .sql(
         "SELECT r.verdict, i.task_id, i.passed, i.skip_reason, i.message \

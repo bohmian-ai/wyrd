@@ -91,11 +91,6 @@ compact, authorized table discovery in all three SDKs.
 - Delegated-connect attribution is asserted from retained audit rows
   (`sub_principal_id` is the subject, `act_principal_id` the actor), following
   the merged `sub-act-attribution` change.
-- **Not delivered:** TASK-002 (docsite and README portion of REQ-012 and
-  AC-006) was not implemented. The owner closed the change without it.
-  Docsite pages and READMEs may still show the removed construction forms;
-  that work needs a follow-up change.
-
 ## Acceptance closure
 
 | Criterion | Evidence |
@@ -105,7 +100,7 @@ compact, authorized table discovery in all three SDKs.
 | AC-003 delegated attribution | `delegated_connect_uses_the_subject_principal` journeys in all three SDKs, asserted against retained audit |
 | AC-004 lazy first use, eager refusal, exchange vs bearer | Python unit and integration instantiation tests; per-language `connect without a credential fails eagerly` and `credential paths preserve exchange and bearer behavior`; `saved_user_auth::revoked_login_is_refused` |
 | AC-005 Python constructors do no IO | Python unit `test_local_access_never_connects` and constructor tests |
-| AC-006 stubs, declarations, docs | Stubs and N-API declarations pass `py:lints`, `py:typecheck`, `codegen:check`, `ts:napi:check`; architecture Client model updated. Docsite/README portion not delivered (TASK-002) |
+| AC-006 stubs, declarations, docs | Stubs and N-API declarations pass `py:lints`, `py:typecheck`, `codegen:check`, `ts:napi:check`; architecture Client model updated; docsite setup gains "Connect from an SDK", root README states the no-client default, and every docsite handle snippet uses `connect` / `auth`; `docs:check` passes |
 | AC-007 resolve once, cache reuse, renewal | `connected_handles_reuse_the_client_cache_and_renew` (Rust), `test_handles_reuse_the_client_cache_and_renew` (Python), TypeScript `handles reuse the client cache and renew` |
 | AC-008 discovery journey | `bifrost_lists_tables_and_describes_on_demand` (Rust) and Python/TypeScript equivalents |
 | AC-009 discovery names and typed projections | Public-surface and generated-type tests in each SDK |
@@ -113,6 +108,7 @@ compact, authorized table discovery in all three SDKs.
 ## Links
 
 - Architecture: [Wyrd design — Client model](../../../architecture/wyrd-design.md#client-model)
+- Docs: [Set up Wyrd — Connect from an SDK](../../../docs/src/content/docs/get-started/setup.md)
 - Rust client owner: [`crates/shared/wyrd-client`](../../../crates/shared/wyrd-client)
 - SDKs: [`sdks/wyrd-sdk-rust`](../../../sdks/wyrd-sdk-rust),
   [`sdks/wyrd-sdk-python`](../../../sdks/wyrd-sdk-python),

@@ -7,6 +7,7 @@
 //! own: each execution composes them with its accepted authority and pinned
 //! evidence, and every limit comes from [`HostedLimits`].
 
+pub mod evidence;
 pub mod extract;
 
 /// The Deployment limits the hosted capabilities enforce.

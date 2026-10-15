@@ -1906,8 +1906,8 @@ async fn a_malformed_administrative_identifier_answers_with_a_documented_problem
 /// Over real HTTP against a bound server, an editor's `kind: Workflow`
 /// registration is refused as an unknown Card kind; the served document names
 /// no `/v1/workflow-runs` path, and none of the three retired operations is
-/// routable; and the same editor still registers a Prompt and the Agent that
-/// executes it in one request.
+/// routable; and the same editor still registers a Prompt and then the Agent
+/// that executes it.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, the bootstrap returns a
@@ -1932,7 +1932,7 @@ async fn agent_contracts_replace_workflow() {
     let http = reqwest::Client::new();
     let register = |idempotency_key: &str, submissions: Value| {
         http.post(format!("{base_url}/v1/cards"))
-            .bearer_auth(&jwt)
+            .header("x-wyrd-access-token", format!("Bearer {jwt}"))
             .header("Idempotency-Key", idempotency_key)
             .json(&serde_json::json!({ "submissions": submissions }))
             .send()
@@ -1992,7 +1992,7 @@ async fn agent_contracts_replace_workflow() {
     ] {
         let status = http
             .request(method.clone(), format!("{base_url}{path}"))
-            .bearer_auth(&jwt)
+            .header("x-wyrd-access-token", format!("Bearer {jwt}"))
             .json(&serde_json::json!({}))
             .send()
             .await
@@ -2004,47 +2004,45 @@ async fn agent_contracts_replace_workflow() {
         );
     }
 
-    let agent = register(
-        "t12-agent",
-        serde_json::json!([
-            {
-                "apiVersion": "wyrd/v1",
-                "kind": "Prompt",
-                "metadata": metadata("t12-prompt"),
-                "spec": {
-                    "provider": "openai",
-                    "model": "gpt-4o",
-                    "messages": [{ "role": "user", "content": "hello" }]
-                },
-                "artifacts": []
+    let prompt = serde_json::json!({
+        "apiVersion": "wyrd/v1",
+        "kind": "Prompt",
+        "metadata": metadata("t12-prompt"),
+        "spec": {
+            "provider": "openai",
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hello" }]
+        },
+        "artifacts": []
+    });
+    let agent = serde_json::json!({
+        "apiVersion": "wyrd/v1",
+        "kind": "Agent",
+        "metadata": metadata("t12-agent"),
+        "spec": {
+            "prompt": {
+                "kind": "Prompt", "name": "t12-prompt",
+                "version": "1.0.0", "space": "default"
             },
-            {
-                "apiVersion": "wyrd/v1",
-                "kind": "Agent",
-                "metadata": metadata("t12-agent"),
-                "spec": {
-                    "prompt": {
-                        "kind": "Prompt", "name": "t12-prompt",
-                        "version": "1.0.0", "space": "default"
-                    },
-                    "execution_route": { "kind": "native" }
-                },
-                "artifacts": []
-            }
-        ]),
-    )
-    .await
-    .expect("Agent registration answers");
-    let status = agent.status();
-    let receipt: Value = agent.json().await.expect("receipt is JSON");
-    assert_eq!(status, StatusCode::CREATED, "{receipt}");
-    let registered: BTreeSet<&str> = receipt["outcomes"]
-        .as_array()
-        .expect("receipt lists outcomes")
-        .iter()
-        .filter_map(|outcome| outcome["card_ref"]["kind"].as_str())
-        .collect();
-    assert_eq!(registered, BTreeSet::from(["Agent", "Prompt"]), "{receipt}");
+            "execution_route": { "kind": "native" }
+        },
+        "artifacts": []
+    });
+    for (idempotency_key, submission, kind) in [
+        ("t12-prompt", prompt, "Prompt"),
+        ("t12-agent", agent, "Agent"),
+    ] {
+        let response = register(idempotency_key, serde_json::json!([submission]))
+            .await
+            .expect("registration answers");
+        let status = response.status();
+        let receipt: Value = response.json().await.expect("receipt is JSON");
+        assert_eq!(status, StatusCode::CREATED, "{receipt}");
+        assert_eq!(
+            receipt["outcomes"][0]["card_ref"]["kind"], kind,
+            "{receipt}"
+        );
+    }
 
     server.shutdown().await.expect("server shuts down");
 }

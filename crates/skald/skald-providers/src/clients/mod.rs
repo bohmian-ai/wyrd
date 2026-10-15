@@ -2,14 +2,12 @@
 
 pub mod anthropic;
 pub mod embeddings;
-pub mod external;
 pub mod google;
 pub mod jev;
 pub mod openai;
 pub mod vertex;
 
 pub use anthropic::AnthropicClient;
-pub use external::ExternalGatewayClient;
 pub use google::GoogleClient;
 pub use jev::JevClient;
 pub use openai::{

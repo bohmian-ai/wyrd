@@ -62,8 +62,8 @@ pub enum ProviderError {
     /// in-process Wyrd error, retaining only the HTTP status, a safe message,
     /// the stable code, an optional safe field name, and the catalog
     /// remediation. It never carries a response body, prompt, credential, or
-    /// arbitrary upstream detail, and it passes through Agent and Workflow
-    /// boundaries unchanged.
+    /// arbitrary upstream detail, and it passes through Agent boundaries
+    /// unchanged.
     ///
     /// The fields are boxed so every `ProviderError` result stays small.
     #[error("{}", .0.message)]

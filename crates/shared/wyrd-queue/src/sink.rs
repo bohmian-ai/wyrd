@@ -11,6 +11,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
 
+use crate::queue::ProducerTrace;
+
 /// The server acknowledgement that settles one durable batch identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableBatchAck {
@@ -110,9 +112,10 @@ pub struct SealedBatch<G> {
     /// The PRODUCER spans whose rows this frame carries: the first
     /// [`crate::MAX_PRODUCER_TRACES`] distinct contexts in row-admission
     /// order. Fixed at seal, so every attempt of the batch sends the same
-    /// contexts; empty when no row was admitted under one. Their string
-    /// bytes are charged to the frame's reservation until settlement.
-    pub producer_traces: Vec<TraceContext>,
+    /// contexts; empty when no row was admitted under one. Each is shared
+    /// with the rows admitted under it and keeps its one admitted charge
+    /// until its last holder settles.
+    pub producer_traces: Vec<Arc<ProducerTrace>>,
 }
 
 impl<G> SealedBatch<G> {
@@ -267,7 +270,7 @@ impl<G: Send + Sync + 'static> BatchSink<G> for MockSink {
         self.attempted_traces
             .lock()
             .expect("mock sink is not poisoned")
-            .push(batch.producer_traces.clone());
+            .push(contexts(&batch.producer_traces));
         loop {
             let remaining = self.fail_next.load(Ordering::SeqCst);
             if remaining == 0 {
@@ -300,7 +303,7 @@ impl<G: Send + Sync + 'static> BatchSink<G> for MockSink {
             bytes: batch.bytes().to_vec(),
             rows: batch.rows,
             request_id: batch.request_id.clone(),
-            producer_traces: batch.producer_traces.clone(),
+            producer_traces: contexts(&batch.producer_traces),
         };
         let ack = DurableBatchAck {
             batch_id: receipt.batch_id,
@@ -312,4 +315,10 @@ impl<G: Send + Sync + 'static> BatchSink<G> for MockSink {
             .push(receipt);
         Ok(ack)
     }
+}
+
+/// Copies the W3C contexts out of a sealed batch's charged producer traces
+/// for a test receipt.
+fn contexts(traces: &[Arc<ProducerTrace>]) -> Vec<TraceContext> {
+    traces.iter().map(|trace| trace.context().clone()).collect()
 }

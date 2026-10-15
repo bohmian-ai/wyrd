@@ -341,7 +341,7 @@ impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
         let producers: Vec<_> = batch
             .producer_traces
             .iter()
-            .filter_map(producer_trace_context)
+            .filter_map(|trace| producer_trace_context(trace.context()))
             .collect();
         let send = self.send_owned_bytes(
             &batch.table,
@@ -501,7 +501,7 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use wyrd_queue::{ClientByteBudget, OwnedIpcBytes, QueueConfig, WyrdQueueError};
+    use wyrd_queue::{ClientByteBudget, OwnedIpcBytes, ProducerTrace, QueueConfig, WyrdQueueError};
 
     use crate::auth::AuthMiddleware;
     use crate::config::ClientConfig;
@@ -693,7 +693,9 @@ mod tests {
         };
         let retried = SealedBatch {
             request_id: Some(request_id.clone()),
-            producer_traces: vec![producer],
+            producer_traces: vec![Arc::new(
+                ProducerTrace::charged(&budget, producer).expect("context bytes fit"),
+            )],
             ..sealed_batch(&budget, vec![1, 2, 3])
         };
         let batch_id = retried.batch_id;

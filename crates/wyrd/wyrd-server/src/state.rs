@@ -35,6 +35,7 @@ use wyrd_tonic::tonic_health::server::HealthReporter;
 use crate::boot::ServerBootError;
 use crate::boot::data_root::BifrostDataRoot;
 use crate::components::auth::{ServerAuth, ServerAuthz};
+use crate::components::gateway::GatewayApiKeys;
 use crate::components::health::ReadinessSnapshot;
 use crate::components::operators::keys::OperatorKeys;
 use crate::components::workflow::WorkflowRuns;
@@ -2194,6 +2195,9 @@ pub struct AppState {
     pub gateway: Arc<GatewayConfig>,
     /// Shared gateway execution engine behind every governed invocation entry.
     pub gateway_engine: Arc<GatewayEngine>,
+    /// Tokens exchanged for Wyrd API keys presented to public gateway
+    /// ingress, reused per key for at most 60 seconds.
+    pub(crate) gateway_api_keys: Arc<GatewayApiKeys>,
     /// The process's one non-blocking outbox for audit decisions, gateway
     /// capture, and Verifier results; every audited surface stages on it
     /// without waiting for the write. Drained by `BoundServer::run` before
@@ -2266,6 +2270,7 @@ impl AppState {
             limits: LimitsConfig::default(),
             gateway: Arc::default(),
             gateway_engine: Arc::new(crate::components::gateway::unconnected_engine()),
+            gateway_api_keys: Arc::default(),
             scribe_outbox,
             grpc_health: reporter,
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),

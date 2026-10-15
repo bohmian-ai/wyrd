@@ -392,6 +392,7 @@ async fn otlp_unauthenticated_precedes_decode() {
         GrpcRouterConfig {
             reflection_enabled: false,
             tls_identity: None,
+            tenant_spans: None,
         },
     )
     .expect("gRPC router builds");
@@ -473,6 +474,7 @@ async fn ingest_unauthenticated_is_rejected() {
         GrpcRouterConfig {
             reflection_enabled: false,
             tls_identity: None,
+            tenant_spans: None,
         },
     )
     .expect("gRPC router builds with token verifier");
@@ -527,6 +529,7 @@ async fn ingest_valid_token_is_not_rejected_as_unauthenticated() {
         GrpcRouterConfig {
             reflection_enabled: false,
             tls_identity: None,
+            tenant_spans: None,
         },
     )
     .expect("gRPC router builds with token verifier");
@@ -607,6 +610,7 @@ async fn ingest_logical_batch(
         GrpcRouterConfig {
             reflection_enabled: false,
             tls_identity: None,
+            tenant_spans: None,
         },
     )
     .expect("gRPC router builds with token verifier");
@@ -976,6 +980,7 @@ impl ResultTableHarness {
             GrpcRouterConfig {
                 reflection_enabled: false,
                 tls_identity: None,
+                tenant_spans: None,
             },
         )
         .expect("gRPC router builds with token verifier");

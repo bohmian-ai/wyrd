@@ -15,16 +15,18 @@
 //!   request, and each descendant the behavior-span catalog names joins its
 //!   parent's route. A span outside the catalog has no route, so neither it
 //!   nor any span below it is copied, and the copied spans form one tree.
+//! - The serving server's request edge binds its own [`TenantSpanSink`] to
+//!   that route with [`bind_tenant_span_sink`], so a process hosting several
+//!   servers stages each request's copies on the server that served it.
 //! - Once authentication succeeds, the server binds the tenant and principal
 //!   to that route with [`bind_tenant_route`].
-//! - When a span on a bound route ends, it is filtered to its safe
-//!   attributes and staged on the [`TenantSpanSink`] the server set with
-//!   [`set_tenant_span_sink`].
+//! - When a span on a fully bound route ends, it is filtered to its safe
+//!   attributes and staged on that route's sink.
 //!
 //! The route is never a span attribute and is never exported.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use opentelemetry::trace::{
@@ -235,7 +237,8 @@ pub struct TenantSpanRoute {
 
 /// Where tenant span copies are staged.
 ///
-/// The server sets one with [`set_tenant_span_sink`] once its Scribe outbox
+/// Each server binds its own to the routes its request edge opens with
+/// [`bind_tenant_span_sink`] once its Scribe outbox
 /// exists.
 pub trait TenantSpanSink: Send + Sync {
     /// Stage one tenant copy for `route` as a single-span OTLP resource span.
@@ -245,19 +248,25 @@ pub trait TenantSpanSink: Send + Sync {
     fn stage(&self, route: TenantSpanRoute, span: ResourceSpans);
 }
 
-/// One request's route: unset until the server binds its authenticated
-/// identity, and shared by every span of the request.
-type RouteSlot = Arc<OnceLock<TenantSpanRoute>>;
+/// One request's route, shared by every span of the request.
+#[derive(Default)]
+struct Route {
+    /// The authenticated identity, unset until the server binds it.
+    identity: OnceLock<TenantSpanRoute>,
+    /// The serving server's sink, unset until its request edge binds it.
+    sink: OnceLock<Arc<dyn TenantSpanSink>>,
+}
 
-/// The process routing registry and the sink tenant copies are staged on.
+/// A request's route as every live span of the request holds it.
+type RouteSlot = Arc<Route>;
+
+/// The process routing registry of live request routes.
 struct TenantRoutes {
     /// The route of every live catalog span whose ancestors up to a sampled
     /// remote parent are all catalog spans, keyed by the span's own ids,
     /// which the server generated.
     // ponytail: one process lock per routed span start and end; shard by span id if it contends.
     live: Mutex<HashMap<(TraceId, SpanId), RouteSlot>>,
-    /// The bound sink; until the server binds one, nothing is staged.
-    sink: RwLock<Option<Arc<dyn TenantSpanSink>>>,
 }
 
 impl TenantRoutes {
@@ -287,13 +296,15 @@ impl TenantRoutes {
         }
     }
 
-    /// Forget the ended `span` and return its bound route, if it has one.
-    fn end(&self, span: &SpanContext) -> Option<TenantSpanRoute> {
-        self.live
+    /// Forget the ended `span` and return its route's identity and sink when
+    /// both are bound.
+    fn end(&self, span: &SpanContext) -> Option<(TenantSpanRoute, Arc<dyn TenantSpanSink>)> {
+        let route = self
+            .live
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&(span.trace_id(), span.span_id()))
-            .and_then(|route| route.get().copied())
+            .remove(&(span.trace_id(), span.span_id()))?;
+        Some((*route.identity.get()?, Arc::clone(route.sink.get()?)))
     }
 
     /// Bind `route` to the request `span` belongs to.
@@ -302,29 +313,32 @@ impl TenantRoutes {
     /// call: an untraced or unsampled request, deferred work, or a span
     /// that started after its parent ended.
     fn bind(&self, span: &SpanContext, route: TenantSpanRoute) {
-        if let Some(slot) = self
-            .live
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&(span.trace_id(), span.span_id()))
-        {
-            let _ = slot.set(route);
+        if let Some(slot) = self.slot(span) {
+            let _ = slot.identity.set(route);
         }
     }
 
-    /// The bound sink, if the server has set one.
-    fn sink(&self) -> Option<Arc<dyn TenantSpanSink>> {
-        self.sink
-            .read()
+    /// Bind `sink` to the request `span` belongs to; the first binding wins,
+    /// and a span with no route ignores the call.
+    fn bind_sink(&self, span: &SpanContext, sink: Arc<dyn TenantSpanSink>) {
+        if let Some(slot) = self.slot(span) {
+            let _ = slot.sink.set(sink);
+        }
+    }
+
+    /// The route of the live `span`, if it has one.
+    fn slot(&self, span: &SpanContext) -> Option<RouteSlot> {
+        self.live
+            .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .get(&(span.trace_id(), span.span_id()))
+            .map(Arc::clone)
     }
 }
 
 /// The one process routing registry.
 static ROUTES: LazyLock<TenantRoutes> = LazyLock::new(|| TenantRoutes {
     live: Mutex::new(HashMap::new()),
-    sink: RwLock::new(None),
 });
 
 /// Route the tenant copies of the current request's spans to `route`.
@@ -342,10 +356,15 @@ pub fn bind_tenant_route(route: TenantSpanRoute) {
     ROUTES.bind(context.span().span_context(), route);
 }
 
-/// Set the sink every later tenant copy is staged on, replacing any earlier
-/// one.
-pub fn set_tenant_span_sink(sink: Arc<dyn TenantSpanSink>) {
-    *ROUTES.sink.write().unwrap_or_else(PoisonError::into_inner) = Some(sink);
+/// Stage the tenant copies of the request that `span` opens on `sink`.
+///
+/// The server's request edge calls this with its own sink as it opens the
+/// request span, after continuing the caller's trace, so every copy of the
+/// request reaches the server that served it even when one process hosts
+/// several servers. A span that opened no route ignores the call.
+pub fn bind_tenant_span_sink(span: &tracing::Span, sink: Arc<dyn TenantSpanSink>) {
+    let context = span.context();
+    ROUTES.bind_sink(context.span().span_context(), sink);
 }
 
 /// Stages each ended span on a bound route as its tenant copy.
@@ -365,15 +384,13 @@ impl SpanProcessor for TenantExport {
         });
     }
 
-    /// Stage the tenant copy of an ended span if its route is bound.
+    /// Stage the tenant copy of an ended span on its route's sink if the
+    /// route's identity and sink are both bound.
     ///
     /// The span leaves the registry first, so the registry holds only live
     /// spans.
     fn on_end(&self, span: SpanData) {
-        let Some(route) = ROUTES.end(&span.span_context) else {
-            return;
-        };
-        if let Some(sink) = ROUTES.sink() {
+        if let Some((route, sink)) = ROUTES.end(&span.span_context) {
             sink.stage(route, ResourceSpans::new(tenant_copy(span), &self.resource));
         }
     }
@@ -590,13 +607,11 @@ mod tests {
         }
     }
 
-    /// The process sink every test stages on; tests tell their copies apart
-    /// by trace id.
+    /// The sink every test's request edge binds; tests tell their copies
+    /// apart by trace id.
     fn staged() -> Arc<Staged> {
         static STAGED: std::sync::OnceLock<Arc<Staged>> = std::sync::OnceLock::new();
-        let staged = Arc::clone(STAGED.get_or_init(Arc::default));
-        super::set_tenant_span_sink(Arc::clone(&staged) as Arc<dyn TenantSpanSink>);
-        staged
+        Arc::clone(STAGED.get_or_init(Arc::default))
     }
 
     /// A client's remote span context in a fresh trace, sampled or not.
@@ -807,6 +822,10 @@ mod tests {
                 KeyValue::new("path", "/v1/secret"),
             ])
             .start_with_context(&tracer, &caller);
+        ROUTES.bind_sink(
+            root.span_context(),
+            Arc::clone(&staged) as Arc<dyn TenantSpanSink>,
+        );
         if bind {
             ROUTES.bind(
                 root.span_context(),
@@ -910,6 +929,52 @@ mod tests {
         let (_, exported, staged) = continued_request(Sampler::AlwaysOn, true, true, false);
         assert_eq!(exported.len(), 4);
         assert!(staged.is_empty(), "{staged:?}");
+    }
+
+    /// Each request's copies stage on the sink its own server bound, so two
+    /// servers in one process never receive each other's spans.
+    #[test]
+    fn each_request_stages_on_the_sink_it_bound() {
+        let provider = tracer_provider(
+            Sampler::AlwaysOn,
+            Resource::builder_empty().build(),
+            None::<OperatorExport<Recorder>>,
+        );
+        let tracer = provider.tracer("wyrd");
+        let servers = [Arc::new(Staged::default()), Arc::new(Staged::default())];
+        let traces = servers.each_ref().map(|server| {
+            let parent = remote(true);
+            let trace_id = parent.trace_id();
+            let mut root = tracer
+                .span_builder("request")
+                .start_with_context(&tracer, &Context::new().with_remote_span_context(parent));
+            ROUTES.bind_sink(
+                root.span_context(),
+                Arc::clone(server) as Arc<dyn TenantSpanSink>,
+            );
+            ROUTES.bind(
+                root.span_context(),
+                TenantSpanRoute {
+                    tenant: DataTenantId::new_v7(),
+                    principal: "01900000-0000-7000-8000-000000000007"
+                        .parse::<PrincipalId>()
+                        .expect("a principal id"),
+                },
+            );
+            root.end();
+            trace_id
+        });
+        for (server, own) in servers.iter().zip(traces) {
+            assert_eq!(
+                server
+                    .0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .len(),
+                1
+            );
+            assert_eq!(server.of(own).len(), 1);
+        }
     }
 
     /// An ended span leaves the registry, so routes live only as long as

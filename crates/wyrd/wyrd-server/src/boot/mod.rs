@@ -879,10 +879,6 @@ pub async fn compose_bifrost(
         ),
         scribe_config.ingest_request_bytes,
     );
-    // Tenant copies of server spans stage on the same outbox from here on.
-    wyrd_telemetry::set_tenant_span_sink(Arc::new(crate::scribe_outbox::ServerSpanSink::new(
-        Arc::clone(&scribe_outbox),
-    )));
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(
             crate::oracle::PostgresPeerSecurityAudit::try_new(

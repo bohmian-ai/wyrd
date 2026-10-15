@@ -40,6 +40,7 @@ use crate::state::AppState;
 
 /// Build the HTTP router with shared server state.
 pub fn build_router(state: AppState) -> Router {
+    let tenant_spans = state.bifrost.tenant_span_sink();
     // Unprotected: /healthz and /readyz skip the fallible middleware stack so
     // they can respond even when inner layers are under pressure or broken.
     let unprotected = health_router().layer(CatchPanicLayer::custom(
@@ -145,7 +146,9 @@ pub fn build_router(state: AppState) -> Router {
         ))
         .layer(
             TraceLayer::new_for_http()
-                .make_span_with(request_span)
+                .make_span_with(move |request: &Request| {
+                    request_span(request, tenant_spans.as_ref())
+                })
                 .on_response(record_response),
         )
 }
@@ -161,8 +164,13 @@ pub fn build_router(state: AppState) -> Router {
 /// runs, and must not reach logs or exported traces. It also carries the
 /// OpenTelemetry HTTP server attributes: `http.request.method`, `http.route`
 /// as the matched route template (never the raw path), and
-/// `http.response.status_code`, which [`record_response`] fills in.
-fn request_span(request: &Request) -> Span {
+/// `http.response.status_code`, which [`record_response`] fills in. A
+/// continued trace stages its tenant span copies on this server's
+/// `tenant_spans` sink.
+fn request_span(
+    request: &Request,
+    tenant_spans: Option<&Arc<dyn wyrd_telemetry::TenantSpanSink>>,
+) -> Span {
     let span = tracing::info_span!(
         "request",
         otel.kind = "server",
@@ -178,6 +186,9 @@ fn request_span(request: &Request) -> Span {
     );
     if let Some(caller) = wyrd_telemetry::inbound_context(request.headers()) {
         wyrd_telemetry::continue_remote(&span, &caller);
+        if let Some(sink) = tenant_spans {
+            wyrd_telemetry::bind_tenant_span_sink(&span, Arc::clone(sink));
+        }
     }
     span
 }

@@ -143,6 +143,9 @@ pub struct GrpcRouterConfig {
     pub reflection_enabled: bool,
     /// Optional PEM identity applied before any service is mounted.
     pub tls_identity: Option<Identity>,
+    /// The serving server's tenant span sink, bound to every request that
+    /// continues a caller's trace; `None` copies no request spans to tenants.
+    pub tenant_spans: Option<Arc<dyn wyrd_telemetry::TenantSpanSink>>,
 }
 
 /// Build and return the configured tonic router.
@@ -176,7 +179,9 @@ where
     I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
 {
     wyrd_tls::install_crypto_provider()?;
-    let mut server = Server::builder().trace_fn(request_span);
+    let tenant_spans = cfg.tenant_spans;
+    let mut server =
+        Server::builder().trace_fn(move |request| request_span(request, tenant_spans.as_ref()));
     if let Some(identity) = cfg.tls_identity {
         server = server
             .tls_config(ServerTlsConfig::new().identity(identity))
@@ -216,8 +221,13 @@ where
 /// the caller's span its parent, so every service mounted on the public
 /// router continues the caller's trace; a missing, malformed, or repeated one
 /// leaves the span the root of a new trace. The span carries the RPC service
-/// and method from the request path, never metadata values.
-fn request_span(request: &HttpRequest<()>) -> tracing::Span {
+/// and method from the request path, never metadata values. A continued
+/// trace stages its tenant span copies on the serving server's
+/// `tenant_spans` sink.
+fn request_span(
+    request: &HttpRequest<()>,
+    tenant_spans: Option<&Arc<dyn wyrd_telemetry::TenantSpanSink>>,
+) -> tracing::Span {
     let (service, method) = request
         .uri()
         .path()
@@ -233,6 +243,9 @@ fn request_span(request: &HttpRequest<()>) -> tracing::Span {
     );
     if let Some(caller) = wyrd_telemetry::inbound_context(request.headers()) {
         wyrd_telemetry::continue_remote(&span, &caller);
+        if let Some(sink) = tenant_spans {
+            wyrd_telemetry::bind_tenant_span_sink(&span, Arc::clone(sink));
+        }
     }
     span
 }
@@ -517,6 +530,7 @@ mod tests {
             GrpcRouterConfig {
                 reflection_enabled: false,
                 tls_identity: None,
+                tenant_spans: None,
             },
         );
         assert!(result.is_ok());
@@ -532,6 +546,7 @@ mod tests {
             GrpcRouterConfig {
                 reflection_enabled: true,
                 tls_identity: None,
+                tenant_spans: None,
             },
         );
         assert!(result.is_ok());

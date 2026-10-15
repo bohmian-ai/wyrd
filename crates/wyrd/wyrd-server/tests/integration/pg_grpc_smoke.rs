@@ -32,6 +32,7 @@ mod grpc_tests {
             GrpcRouterConfig {
                 reflection_enabled: false,
                 tls_identity: None,
+                tenant_spans: None,
             },
         );
         assert!(
@@ -49,6 +50,7 @@ mod grpc_tests {
             GrpcRouterConfig {
                 reflection_enabled: true,
                 tls_identity: None,
+                tenant_spans: None,
             },
         );
         assert!(
@@ -180,6 +182,7 @@ mod grpc_tests {
             GrpcRouterConfig {
                 reflection_enabled: false,
                 tls_identity: None,
+                tenant_spans: None,
             },
         )
         .expect("router builds");
@@ -286,6 +289,7 @@ async fn serve_public_grpc(server: &WyrdTestServer) -> (Channel, CancellationTok
         GrpcRouterConfig {
             reflection_enabled: false,
             tls_identity: None,
+            tenant_spans: None,
         },
     )
     .expect("gRPC router builds");

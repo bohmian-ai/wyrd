@@ -25,7 +25,7 @@ use vala_bifrost_redux::resources::{BifrostRoleResources, OracleResources, Scrib
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailService;
 
-use crate::scribe_outbox::{ScribeOutbox, ScribeSink};
+use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ServerSpanSink};
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_gateway::{GatewayEngine, ManagedSecretKeys};
 use wyrd_storage::StorageHandle;
@@ -1528,6 +1528,12 @@ pub struct Bifrost {
     /// `None` only for the ownerless unit-test shell, whose `AppState` starts
     /// its own outbox.
     scribe_outbox: Option<Arc<ScribeOutbox>>,
+    /// This server's one tenant span sink over [`Self::scribe_outbox`], whose
+    /// permit pool caps the copies it holds unwritten; its request edges bind
+    /// it to every request they open.
+    ///
+    /// `None` only for the ownerless unit-test shell.
+    tenant_spans: Option<Arc<ServerSpanSink>>,
     /// The process membership poller every role, forwarder, and the Scribe
     /// outbox read through; stopped only after every role has drained.
     ///
@@ -1604,6 +1610,7 @@ impl Bifrost {
             test_resources: resources,
             #[cfg(feature = "test-support")]
             test_catalog: None,
+            tenant_spans: Some(Arc::new(ServerSpanSink::new(Arc::clone(&scribe_outbox)))),
             scribe_outbox: Some(scribe_outbox),
             membership_poller: Some(Arc::new(membership_poller)),
         })
@@ -1632,6 +1639,7 @@ impl Bifrost {
             test_resources: None,
             test_catalog: None,
             scribe_outbox: None,
+            tenant_spans: None,
             membership_poller: None,
         })
     }
@@ -1668,6 +1676,7 @@ impl Bifrost {
             test_resources: None,
             test_catalog: Some(catalog),
             scribe_outbox: None,
+            tenant_spans: None,
             membership_poller: None,
         })
     }
@@ -1719,6 +1728,14 @@ impl Bifrost {
     #[must_use]
     pub const fn scribe_outbox(&self) -> Option<&Arc<ScribeOutbox>> {
         self.scribe_outbox.as_ref()
+    }
+
+    /// This server's tenant span sink, which its request edges bind to every
+    /// request they open; absent only for the unit-test shell.
+    pub(crate) fn tenant_span_sink(&self) -> Option<Arc<dyn wyrd_telemetry::TenantSpanSink>> {
+        self.tenant_spans
+            .as_ref()
+            .map(|sink| Arc::clone(sink) as Arc<dyn wyrd_telemetry::TenantSpanSink>)
     }
 
     /// Borrows the one public Gate.

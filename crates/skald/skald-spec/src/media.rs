@@ -301,6 +301,10 @@ impl MediaFormat {
 
 impl std::fmt::Display for MediaFormat {
     /// Writes the canonical wire token.
+    ///
+    /// # Errors
+    /// Returns [`std::fmt::Error`] when the formatter's underlying writer
+    /// fails.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }

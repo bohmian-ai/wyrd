@@ -1463,7 +1463,26 @@ mod tests {
             json!({"description": "verdict", "type": "string", "enum": ["failed", "passed"]});
         variant["properties"]["reason"] = json!({"type": "string", "maxLength": 500});
         variant["description"] = json!("A judgment");
-        for compatible in [verdict_schema(), variant, super::verdict_schema()] {
+        let compatible = [
+            verdict_schema(),
+            variant,
+            super::verdict_schema(),
+            schema(
+                "/properties/reason",
+                json!({"type": "string", "allOf": [{"maxLength": 500}]}),
+            ),
+            schema("/properties/reason", json!({"const": "fixed"})),
+            schema("/properties/reason", json!({"enum": ["short", "long"]})),
+            schema(
+                "/properties/outcome",
+                json!({"type": "string", "enum": ["passed", "failed"], "allOf": [{"minLength": 1}]}),
+            ),
+            schema(
+                "/patternProperties",
+                json!({"^reason$": {"maxLength": 500}}),
+            ),
+        ];
+        for compatible in compatible {
             let body = with(
                 review(),
                 "/requirements/2/check/agent",
@@ -1474,6 +1493,9 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{compatible}: {error:?}"));
         }
         let incompatible = [
+            schema("/properties/reason", json!({"const": 7})),
+            schema("/properties/reason", json!({"enum": ["short", 1]})),
+            schema("/patternProperties", json!({"^score$": {"type": "number"}})),
             schema("/properties/outcome", json!({"type": "integer"})),
             schema("/properties/outcome", json!({"type": "string"})),
             schema(

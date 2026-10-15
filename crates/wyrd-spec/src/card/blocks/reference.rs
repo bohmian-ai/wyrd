@@ -232,6 +232,9 @@ impl<'a> Tokens<'a> {
 impl fmt::Display for Reference {
     /// Writes the canonical reference text, which [`Reference::parse`]
     /// reads back to an equal value.
+    ///
+    /// # Errors
+    /// Returns [`fmt::Error`] when the formatter's underlying writer fails.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.root {
             ReferenceRoot::Input(slot) => write!(f, "inputs.{slot}")?,

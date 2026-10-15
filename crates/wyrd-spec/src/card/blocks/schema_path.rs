@@ -27,9 +27,11 @@ pub(super) fn admits(root: &Value, schema: &Value, path: &[PathSegment]) -> bool
 /// Returns whether every value `authored` admits has the shape `typed`
 /// requires.
 ///
-/// Compares types, closed value sets (`enum`, `const`, and combinators of
-/// them), `allOf` parts (every typed part must hold; one authored part
-/// suffices), object properties, required and closed fields, and array items,
+/// Compares types (taken from `const`/`enum` values when no `type` is
+/// declared), closed value sets (`enum`, `const`, and combinators of them),
+/// `allOf` parts (every typed part must hold; one authored part or the
+/// authored node's own keywords suffice), object properties and exactly
+/// anchored literal-name `patternProperties` such as `^score$`, required and closed fields, and array items,
 /// following local `$ref` pointers on both sides. String formats, patterns,
 /// and numeric bounds are left to output decoding. An exhausted budget or an
 /// unresolved pointer is not shown to fit.
@@ -125,10 +127,12 @@ impl Walk {
                 .iter()
                 .all(|part| self.fits(a_root, authored, t_root, part));
         }
-        if let Some(parts) = authored.get("allOf").and_then(Value::as_array) {
-            return parts
+        if let Some(parts) = authored.get("allOf").and_then(Value::as_array)
+            && parts
                 .iter()
-                .any(|part| self.fits(a_root, part, t_root, typed));
+                .any(|part| self.fits(a_root, part, t_root, typed))
+        {
+            return true;
         }
         if let Some(allowed) = self.values(t_root, typed) {
             return self
@@ -146,7 +150,12 @@ impl Walk {
         if wanted.is_empty() {
             return true;
         }
-        let declared = types(authored);
+        let mut declared = types(authored);
+        if declared.is_empty()
+            && let Some(values) = self.values(a_root, authored)
+        {
+            declared = values.into_iter().map(json_type).collect();
+        }
         let allowed =
             |ty: &&str| wanted.contains(ty) || (*ty == "integer" && wanted.contains(&"number"));
         if declared.is_empty() || !declared.iter().all(allowed) {
@@ -163,7 +172,10 @@ impl Walk {
 
     /// Requires an authored object to declare every typed required field as
     /// a required property that fits, to add no field a closed typed object
-    /// refuses, and to stay closed when the typed object is.
+    /// refuses, and to stay closed when the typed object is. A literal-name
+    /// pattern property declares that one field: refining a declared property
+    /// adds nothing, otherwise it is compared like a property. Other patterns
+    /// are left to output decoding.
     fn fits_object(
         &mut self,
         a_root: &Value,
@@ -187,6 +199,24 @@ impl Walk {
         let known = own_required
             .iter()
             .all(|field| properties.contains_key(*field));
+        let named = authored
+            .get("patternProperties")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter_map(|(pattern, schema)| Some((literal_name(pattern)?, schema)));
+        for (name, schema) in named {
+            if own.is_some_and(|own| own.contains_key(name)) {
+                continue;
+            }
+            let fits = match properties.get(name) {
+                Some(expected) => self.fits(a_root, schema, t_root, expected),
+                None => !closed(typed),
+            };
+            if !fits {
+                return false;
+            }
+        }
         complete
             && known
             && own
@@ -230,6 +260,30 @@ fn types(schema: &Value) -> Vec<&str> {
         Some(Value::Array(declared)) => declared.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
     }
+}
+
+/// The JSON type of one value, as a schema `type` names it.
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// The one field name an exactly anchored literal pattern such as `^score$`
+/// matches, or `None` for any pattern that could match another name.
+fn literal_name(pattern: &str) -> Option<&str> {
+    let name = pattern.strip_prefix('^')?.strip_suffix('$')?;
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
+    .then_some(name)
 }
 
 /// The field names a schema's `required` lists.

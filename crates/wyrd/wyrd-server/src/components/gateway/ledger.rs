@@ -218,7 +218,7 @@ impl<'c, 'a> GatewayLedger<'c, 'a> {
             let reserve = plan
                 .candidates
                 .iter()
-                .flat_map(|candidate| candidate.deployments.iter().map(|_| &candidate.model))
+                .map(|candidate| &candidate.model)
                 .filter_map(bound)
                 .sum();
             for budget in budgets {
@@ -554,7 +554,7 @@ impl<'c, 'a> GatewayLedger<'c, 'a> {
                 entry_id: entry_id.as_uuid(),
                 call_id: call_id.as_uuid(),
                 kind,
-                provider: priced.map(|(model, _)| model.provider.as_str()),
+                deployment: priced.map(|(model, _)| model.deployment.as_str()),
                 model: priced.map(|(model, _)| model.model.as_str()),
                 pricing_version: priced.map(|(_, version)| version),
                 entry: &document,
@@ -589,7 +589,7 @@ fn budget_applies(budget: &GatewayBudget, principal: &Principal) -> bool {
 fn covers(target: &GatewayPolicyTarget, model: &ModelRef) -> bool {
     match target {
         GatewayPolicyTarget::All => true,
-        GatewayPolicyTarget::Provider { provider } => *provider == model.provider,
+        GatewayPolicyTarget::Deployment { deployment } => *deployment == model.deployment,
         GatewayPolicyTarget::Model { model: covered } => covered == model,
     }
 }
@@ -599,15 +599,13 @@ fn reached(cap: Option<NonZeroU64>, used: i64) -> bool {
     cap.is_some_and(|cap| u64::try_from(used).unwrap_or(0) >= cap.get())
 }
 
-/// Number of `plan` attempts, one per `(candidate, deployment)`, whose model
-/// `target` covers.
+/// Number of `plan` attempts, one per candidate, whose model `target` covers.
 fn covered_attempts(plan: &CallPlan, target: &GatewayPolicyTarget) -> i64 {
-    let attempts: usize = plan
+    let attempts = plan
         .candidates
         .iter()
         .filter(|candidate| covers(target, &candidate.model))
-        .map(|candidate| candidate.deployments.len())
-        .sum();
+        .count();
     i64::try_from(attempts).unwrap_or(i64::MAX)
 }
 

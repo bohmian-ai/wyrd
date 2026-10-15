@@ -51,7 +51,7 @@ use wyrd_spec::gateway::{
     GatewayLimitSubject, GatewayOperation, GatewayPayloadField, GatewayPolicySubject,
     GatewayPolicyTarget, GatewayUsageAmount, ModelRef, ProviderDeployment,
 };
-use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName, ProviderId};
+use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName};
 use wyrd_spec::request_id::RequestId;
 use wyrd_sql::queries::gateway::{
     GatewayAccountingEntryWrite, append_gateway_accounting_entry, claim_gateway_batch,
@@ -193,18 +193,16 @@ fn model(value: &str) -> ModelRef {
     ModelRef::from_projection(value).expect("model")
 }
 
-/// Invoke permission for every `acme` model.
-fn provider_access() -> Permission {
-    Permission::gateway_invoke(GatewayAccess::Provider {
-        provider: ProviderId::new("acme").expect("provider"),
-    })
+/// Invoke permission for every model of every open deployment.
+fn open_access() -> Permission {
+    Permission::gateway_invoke_any()
 }
 
 /// Invoke permission for exactly `value`.
 fn model_access(value: &str) -> Permission {
     let model = model(value);
     Permission::gateway_invoke(GatewayAccess::Model {
-        provider: model.provider,
+        deployment: model.deployment,
         model: model.model,
     })
 }
@@ -273,9 +271,10 @@ fn request(requested: &str, bound: Option<(u64, u64)>, timeout: Duration) -> Gat
     }
 }
 
-/// Configures deployments `dep-a` (`acme/a`) and `dep-b` (`acme/b`), a global
-/// fallback to `acme/b`, pricing of 2 and 8 per million input and output
-/// tokens, and the given limits, budgets, and unknown-cost policy.
+/// Configures open deployments `dep-a` and `dep-b`, a global fallback to
+/// `dep-b/b`, pricing of 2 and 8 per million input and output tokens for
+/// `dep-a/a` and `dep-b/b`, and the given limits, budgets, and unknown-cost
+/// policy.
 async fn configure(
     state: &AppState,
     tenant: DataTenantId,
@@ -285,14 +284,12 @@ async fn configure(
 ) {
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(state);
-    for (name, served) in [("dep-a", "acme/a"), ("dep-b", "acme/b")] {
+    for name in ["dep-a", "dep-b"] {
         let deployment: ProviderDeployment = serde_json::from_value(json!({
             "name": name,
-            "model": model(served),
             "adapter": {"openai_compatible": {"base_url": "https://acme.example/v1"}},
             "auth": "none",
             "capabilities": ["chat_completions"],
-            "routing_weight": 1,
         }))
         .expect("deployment decodes");
         gateway
@@ -308,7 +305,7 @@ async fn configure(
         .put_fallback(
             &admin,
             serde_json::from_value(
-                json!({"rules": [{"scope": "global", "candidates": [model("acme/b")]}]}),
+                json!({"rules": [{"scope": "global", "candidates": [model("dep-b/b")]}]}),
             )
             .expect("fallback decodes"),
         )
@@ -330,7 +327,7 @@ async fn configure(
             serde_json::from_value(json!({
                 "limits": limits,
                 "budgets": budgets,
-                "pricing": [pricing("acme/a", "a-v1"), pricing("acme/b", "b-v1")],
+                "pricing": [pricing("dep-a/a", "a-v1"), pricing("dep-b/b", "b-v1")],
                 "unknown_cost": unknown_cost,
             }))
             .expect("governance decodes"),
@@ -383,7 +380,7 @@ async fn append_raw(
             entry_id: Uuid::now_v7(),
             call_id,
             kind,
-            provider: None,
+            deployment: None,
             model: None,
             pricing_version: None,
             entry,
@@ -546,7 +543,7 @@ async fn replace_managed_envelope(fixture: &PgFixture, tenant: DataTenantId, sea
 }
 
 /// Submits `secret` as `tenant`'s managed credential and points the only
-/// deployment of `acme/a` at it with bearer authentication.
+/// deployment of `dep-a/a` at it with bearer authentication.
 ///
 /// # Panics
 ///
@@ -574,11 +571,9 @@ async fn configure_managed(state: &AppState, tenant: DataTenantId, secret: &str)
             &ProviderDeploymentName::new("dep-a").expect("deployment name"),
             serde_json::from_value(json!({
                 "name": "dep-a",
-                "model": model("acme/a"),
                 "adapter": {"openai_compatible": {"base_url": "https://acme.example/v1"}},
                 "auth": {"bearer": {"credential": "managed"}},
                 "capabilities": ["chat_completions"],
-                "routing_weight": 1,
             }))
             .expect("deployment decodes"),
         )
@@ -597,7 +592,7 @@ async fn configure_managed(state: &AppState, tenant: DataTenantId, secret: &str)
         .expect("governance stores");
 }
 
-/// Invokes `acme/a` in `tenant` as a narrowly scoped caller.
+/// Invokes `dep-a/a` in `tenant` as a narrowly scoped caller.
 ///
 /// # Errors
 /// Forwards every [`GatewayInvocation::invoke`] failure unchanged — the
@@ -609,13 +604,13 @@ async fn invoke_managed(
 ) -> Result<GatewayCallResponse, WyrdError> {
     GatewayInvocation::new(state)
         .invoke(
-            &invoker(tenant, 7, [model_access("acme/a")]),
-            request("acme/a", None, Duration::from_secs(10)),
+            &invoker(tenant, 7, [model_access("dep-a/a")]),
+            request("dep-a/a", None, Duration::from_secs(10)),
         )
         .await
 }
 
-/// Asserts that invoking `acme/a` in `tenant` on `state` is refused with the
+/// Asserts that invoking `dep-a/a` in `tenant` on `state` is refused with the
 /// stable, redacted upstream-unavailable error.
 ///
 /// # Panics
@@ -777,7 +772,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
         Ok(invoker(tenant, 1, [])),
         HeaderMap::new(),
         Ok(Json(
-            json!({"model": "acme/a", "max_tokens": 10, "messages": []}),
+            json!({"model": "dep-a/a", "max_tokens": 10, "messages": []}),
         )),
     )
     .await;
@@ -795,9 +790,9 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     );
 
     dispatch.push(Step::Return(failed(1000, 0)));
-    let narrow = invoker(tenant, 1, [model_access("acme/a")]);
+    let narrow = invoker(tenant, 1, [model_access("dep-a/a")]);
     let error = invocation
-        .invoke(&narrow, request("acme/a", None, Duration::from_secs(10)))
+        .invoke(&narrow, request("dep-a/a", None, Duration::from_secs(10)))
         .await
         .expect_err("the only authorized candidate fails");
     assert!(
@@ -807,7 +802,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     assert_eq!(
         dispatch.seen(),
         ["dep-a"],
-        "unauthorized acme/b is never dispatched"
+        "unauthorized dep-b/b is never dispatched"
     );
     drain_gateway(&state).await;
     let decisions = audit_decisions(&scribe, tenant);
@@ -818,20 +813,20 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
 
     dispatch.push(Step::Return(failed(1000, 0)));
     dispatch.push(Step::Return(completed(100, 50)));
-    let broad = invoker(tenant, 1, [provider_access()]);
+    let broad = invoker(tenant, 1, [open_access()]);
     // The failure above holds dep-a in replica-local cooldown; a fresh replica
     // attempts it again before falling back.
     let fresh = scribe.record(replica(&fixture, dispatch.clone()).await);
     let response = GatewayInvocation::new(&fresh)
         .invoke(
             &broad,
-            request("acme/a", Some((1000, 500)), Duration::from_secs(10)),
+            request("dep-a/a", Some((1000, 500)), Duration::from_secs(10)),
         )
         .await
         .expect("fallback completes");
     assert_eq!(
         (response.requested, response.resolved),
-        (model("acme/a"), model("acme/b"))
+        (model("dep-a/a"), model("dep-b/b"))
     );
     assert_eq!(dispatch.seen(), ["dep-a", "dep-a", "dep-b"]);
     let ledger = entries(&fixture, tenant, response.call_id).await;
@@ -879,7 +874,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
         Ok(broad),
         HeaderMap::new(),
         Ok(Json(
-            json!({"model": "acme/a", "max_tokens": 10, "messages": []}),
+            json!({"model": "dep-a/a", "max_tokens": 10, "messages": []}),
         )),
     )
     .await;
@@ -927,9 +922,9 @@ async fn gateway_admission_holds_limits_and_budgets_across_replicas() {
         "allow_unpriced",
     )
     .await;
-    let held = invoker(tenant, 1, [provider_access()]);
-    let other = invoker(tenant, 2, [provider_access()]);
-    let bounded = || request("acme/a", Some((1000, 500)), Duration::from_secs(30));
+    let held = invoker(tenant, 1, [open_access()]);
+    let other = invoker(tenant, 2, [open_access()]);
+    let bounded = || request("dep-a/a", Some((1000, 500)), Duration::from_secs(30));
 
     first.push(Step::Park(completed(100, 50)));
     let parked = tokio::spawn({
@@ -957,7 +952,7 @@ async fn gateway_admission_holds_limits_and_budgets_across_replicas() {
         "{over:?}"
     );
     let unbounded = on_b
-        .invoke(&other, request("acme/a", None, Duration::from_secs(30)))
+        .invoke(&other, request("dep-a/a", None, Duration::from_secs(30)))
         .await
         .expect_err("a budget requires a cost bound");
     assert!(
@@ -1034,8 +1029,8 @@ async fn gateway_ledger_fences_replays_and_settles_unknown_cost() {
     dispatch.push(Step::Hang);
     let error = GatewayInvocation::new(&state)
         .invoke(
-            &invoker(tenant, 1, [provider_access()]),
-            request("acme/a", Some((100, 100)), Duration::from_millis(300)),
+            &invoker(tenant, 1, [open_access()]),
+            request("dep-a/a", Some((100, 100)), Duration::from_millis(300)),
         )
         .await
         .expect_err("the attempt outlives the deadline");
@@ -1129,8 +1124,8 @@ async fn gateway_budget_reservations_cover_attempts_in_exact_periods() {
     .expect("reservation encodes");
     let kind = "budget_reservation_created";
     assert!(append_raw(&fixture, tenant, kind, month_call.as_uuid(), &month).await);
-    let caller = invoker(tenant, 1, [provider_access()]);
-    let bounded = || request("acme/a", Some((1000, 500)), Duration::from_secs(10));
+    let caller = invoker(tenant, 1, [open_access()]);
+    let bounded = || request("dep-a/a", Some((1000, 500)), Duration::from_secs(10));
 
     dispatch.push(Step::Return(failed(1000, 500)));
     dispatch.push(Step::Return(completed(1000, 500)));
@@ -1192,9 +1187,9 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
     })
     .expect("limit encodes");
     configure(&state, tenant, json!([limit]), json!([]), "allow_unpriced").await;
-    let caller = invoker(tenant, 1, [provider_access()]);
+    let caller = invoker(tenant, 1, [open_access()]);
     // 1500 bounded tokens per attempt over two deployments hold 3000.
-    let bounded = || request("acme/a", Some((1000, 500)), Duration::from_secs(30));
+    let bounded = || request("dep-a/a", Some((1000, 500)), Duration::from_secs(30));
 
     dispatch.push(Step::Park(completed(100, 50)));
     let parked = tokio::spawn({
@@ -1217,7 +1212,7 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
         "{held:?}"
     );
     let unbounded = invocation
-        .invoke(&caller, request("acme/a", None, Duration::from_secs(30)))
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(30)))
         .await
         .expect_err("unbounded exposure cannot pass a token limit");
     assert!(
@@ -1258,7 +1253,7 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
         &snapshot,
         call.call_id,
         GatewayOperation::ChatCompletions,
-        model("acme/a"),
+        model("dep-a/a"),
         None,
     );
     let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
@@ -1270,11 +1265,11 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
     let execution = CallExecution {
         outcome: GatewayCallOutcome::Succeeded,
         response: None,
-        resolved: Some(model("acme/a")),
+        resolved: Some(model("dep-a/a")),
         attempts: vec![AttemptRecord {
             ordinal: NonZeroU32::MIN,
             deployment: ProviderDeploymentName::new("dep-a").expect("name"),
-            model: model("acme/a"),
+            model: model("dep-a/a"),
             outcome: GatewayCallOutcome::Succeeded,
             billable: true,
             usage: usage(40, 2),
@@ -1333,12 +1328,12 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
     configure(
         &state,
         tenant,
-        serde_json::to_value([limit("acme/a"), limit("acme/b")]).expect("limits encode"),
+        serde_json::to_value([limit("dep-a/a"), limit("dep-b/b")]).expect("limits encode"),
         json!([]),
         "allow_unpriced",
     )
     .await;
-    let caller = invoker(tenant, 1, [provider_access()]);
+    let caller = invoker(tenant, 1, [open_access()]);
     let snapshot = GatewayAdministration::new(&state)
         .snapshot(tenant)
         .await
@@ -1347,8 +1342,12 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
     let usage_bound = [amount("input_tokens", 1000), amount("output_tokens", 500)];
     let attempt = |ordinal: u32, served: &str, usage: AttemptUsage| AttemptRecord {
         ordinal: NonZeroU32::new(ordinal).expect("ordinal"),
-        deployment: ProviderDeploymentName::new(if served == "acme/a" { "dep-a" } else { "dep-b" })
-            .expect("name"),
+        deployment: ProviderDeploymentName::new(if served == "dep-a/a" {
+            "dep-a"
+        } else {
+            "dep-b"
+        })
+        .expect("name"),
         model: model(served),
         outcome: GatewayCallOutcome::Succeeded,
         billable: true,
@@ -1376,12 +1375,12 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
     };
     let fallbacks = [
         vec![
-            attempt(1, "acme/a", usage(100, 0)),
-            attempt(2, "acme/b", usage(40, 2)),
+            attempt(1, "dep-a/a", usage(100, 0)),
+            attempt(2, "dep-b/b", usage(40, 2)),
         ],
         vec![
-            attempt(1, "acme/a", AttemptUsage::default()),
-            attempt(2, "acme/b", usage(40, 2)),
+            attempt(1, "dep-a/a", AttemptUsage::default()),
+            attempt(2, "dep-b/b", usage(40, 2)),
         ],
     ];
     // Each call holds 1500 bounded tokens in each model's window.
@@ -1401,7 +1400,7 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
             &snapshot,
             call.call_id,
             GatewayOperation::ChatCompletions,
-            model("acme/a"),
+            model("dep-a/a"),
             None,
         );
         let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
@@ -1416,7 +1415,7 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
                 &CallExecution {
                     outcome: GatewayCallOutcome::Succeeded,
                     response: None,
-                    resolved: Some(model("acme/b")),
+                    resolved: Some(model("dep-b/b")),
                     attempts,
                     refusal: None,
                     capture: None,
@@ -1426,7 +1425,7 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
             .await
             .expect("accounting");
         conn.commit().await.expect("call commits");
-        assert_eq!((window("acme/a").await, window("acme/b").await), expected);
+        assert_eq!((window("dep-a/a").await, window("dep-b/b").await), expected);
     }
     drain_gateway(&state).await;
 }
@@ -1470,12 +1469,12 @@ async fn race_admissions(limits: Value, budgets: Value) -> (usize, Vec<WyrdError
     let mut calls = JoinSet::new();
     for n in 0..RACE_CALLS {
         let state = replicas[n % 2].clone();
-        let caller = invoker(tenant, n as u128, [provider_access()]);
+        let caller = invoker(tenant, n as u128, [open_access()]);
         calls.spawn(async move {
             GatewayInvocation::new(&state)
                 .invoke(
                     &caller,
-                    request("acme/a", Some((1000, 500)), Duration::from_secs(30)),
+                    request("dep-a/a", Some((1000, 500)), Duration::from_secs(30)),
                 )
                 .await
         });
@@ -1650,14 +1649,13 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     gateway
         .put_deployment(
             &admin,
-            &ProviderDeploymentName::new("deepseek-chat").expect("name"),
+            &ProviderDeploymentName::new("deepseek").expect("name"),
             serde_json::from_value(json!({
-                "name": "deepseek-chat",
-                "model": model("deepseek/deepseek-chat"),
+                "name": "deepseek",
                 "adapter": {"openai_compatible": {"base_url": format!("{}/v1", upstream.uri())}},
                 "auth": {"bearer": {"credential": "deepseek-key"}},
+                "models": ["deepseek-chat"],
                 "capabilities": ["chat_completions", "responses", "embeddings", "images", "audio"],
-                "routing_weight": 1,
             }))
             .expect("deployment decodes"),
         )
@@ -1666,8 +1664,8 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let caller = invoker(
         tenant,
         7,
-        [Permission::gateway_invoke(GatewayAccess::Provider {
-            provider: ProviderId::new("deepseek").expect("provider"),
+        [Permission::gateway_invoke(GatewayAccess::Deployment {
+            deployment: ProviderDeploymentName::new("deepseek").expect("name"),
         })],
     );
     let chat = |extra: Value| {
@@ -1944,15 +1942,15 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         "invalid bodies never dispatch"
     );
 
-    // The model list shows exactly the configured models the caller may
-    // invoke; a caller without invoke permission sees none.
+    // The model list shows exactly the listed models the caller may invoke;
+    // a caller without invoke permission for them sees none.
     let listed =
         body_json(super::routes::models(State(state.clone()), Ok(caller.clone())).await).await;
     assert_eq!(
         listed,
         json!({"object": "list", "data": [{"id": "deepseek/deepseek-chat", "object": "model", "created": 0, "owned_by": "deepseek"}]})
     );
-    let outsider = invoker(tenant, 8, [provider_access()]);
+    let outsider = invoker(tenant, 8, [model_access("dep-a/a")]);
     assert_eq!(
         body_json(super::routes::models(State(state.clone()), Ok(outsider)).await).await,
         json!({"object": "list", "data": []})
@@ -2205,11 +2203,9 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
                     &ProviderDeploymentName::new(name).expect("name"),
                     serde_json::from_value(json!({
                         "name": name,
-                        "model": model(&format!("deepseek/{name}")),
                         "adapter": {"openai_compatible": {"base_url": format!("http://127.0.0.1:{port}/v1")}},
                         "auth": {"bearer": {"credential": "deepseek-key"}},
                         "capabilities": ["chat_completions"],
-                        "routing_weight": 1,
                     }))
                     .expect("deployment decodes"),
                 )
@@ -2221,10 +2217,10 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let open = |name: &str| {
         super::routes::chat_completions(
             State(state.clone()),
-            Ok(caller.clone()),
+            Ok(invoker(tenant, 7, [open_access()])),
             HeaderMap::new(),
             Ok(Json(json!({
-                "model": format!("deepseek/{name}"),
+                "model": format!("{name}/{name}"),
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": true,
             }))),
@@ -2259,7 +2255,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         .into_iter()
         .map(|document| serde_json::from_value::<GatewayAccountingEntryV1>(document).expect("entry"))
         .find(|entry| {
-            matches!(entry, GatewayAccountingEntryV1::AttemptAccounted { model: served, .. } if *served == model("deepseek/deepseek-hang"))
+            matches!(entry, GatewayAccountingEntryV1::AttemptAccounted { model: served, .. } if *served == model("deepseek-hang/deepseek-hang"))
         })
         .expect("drained accounting recorded the dropped stream's attempt");
     let GatewayAccountingEntryV1::AttemptAccounted { call_id, .. } = &attempt else {
@@ -2513,14 +2509,12 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     gateway
         .put_deployment(
             &admin,
-            &ProviderDeploymentName::new("deepseek-batch").expect("name"),
+            &ProviderDeploymentName::new("deepseek").expect("name"),
             serde_json::from_value(json!({
-                "name": "deepseek-batch",
-                "model": model("deepseek/deepseek-chat"),
+                "name": "deepseek",
                 "adapter": {"openai_compatible": {"base_url": format!("{}/v1", upstream.uri())}},
                 "auth": {"bearer": {"credential": "deepseek-key"}},
                 "capabilities": ["batches"],
-                "routing_weight": 1,
             }))
             .expect("deployment decodes"),
         )
@@ -2529,8 +2523,8 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     let caller = invoker(
         tenant,
         7,
-        [Permission::gateway_invoke(GatewayAccess::Provider {
-            provider: ProviderId::new("deepseek").expect("provider"),
+        [Permission::gateway_invoke(GatewayAccess::Deployment {
+            deployment: ProviderDeploymentName::new("deepseek").expect("name"),
         })],
     );
     let received = |route: &'static str, verb: &'static str| {
@@ -2732,8 +2726,8 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     let outsider = invoker(
         other,
         9,
-        [Permission::gateway_invoke(GatewayAccess::Provider {
-            provider: ProviderId::new("deepseek").expect("provider"),
+        [Permission::gateway_invoke(GatewayAccess::Deployment {
+            deployment: ProviderDeploymentName::new("deepseek").expect("name"),
         })],
     );
     let hidden = super::routes::get_batch(
@@ -2795,7 +2789,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     drain_gateway(&b).await;
 }
 
-/// Stores the `deepseek-batch` deployment serving `deepseek/deepseek-chat`
+/// Stores the `deepseek` deployment serving `deepseek/deepseek-chat`
 /// Batches from `base_url` through `replica`, and returns a caller that may
 /// invoke every `deepseek` model.
 ///
@@ -2820,14 +2814,12 @@ async fn batch_deployment(replica: &AppState, tenant: DataTenantId, base_url: &s
     gateway
         .put_deployment(
             &admin,
-            &ProviderDeploymentName::new("deepseek-batch").expect("name"),
+            &ProviderDeploymentName::new("deepseek").expect("name"),
             serde_json::from_value(json!({
-                "name": "deepseek-batch",
-                "model": model("deepseek/deepseek-chat"),
+                "name": "deepseek",
                 "adapter": {"openai_compatible": {"base_url": base_url}},
                 "auth": {"bearer": {"credential": "deepseek-key"}},
                 "capabilities": ["batches"],
-                "routing_weight": 1,
             }))
             .expect("deployment decodes"),
         )
@@ -2836,8 +2828,8 @@ async fn batch_deployment(replica: &AppState, tenant: DataTenantId, base_url: &s
     invoker(
         tenant,
         7,
-        [Permission::gateway_invoke(GatewayAccess::Provider {
-            provider: ProviderId::new("deepseek").expect("provider"),
+        [Permission::gateway_invoke(GatewayAccess::Deployment {
+            deployment: ProviderDeploymentName::new("deepseek").expect("name"),
         })],
     )
 }
@@ -3080,8 +3072,8 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
     let dispatch = Scripted::shared();
     let state = replica(&fixture, dispatch.clone()).await;
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
-    let caller = invoker(tenant, 1, [provider_access()]);
-    let call = || request("acme/a", Some((1000, 500)), Duration::from_secs(10));
+    let caller = invoker(tenant, 1, [open_access()]);
+    let call = || request("dep-a/a", Some((1000, 500)), Duration::from_secs(10));
 
     let (disabled, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
     dispatch.push(Step::Return(completed(100, 50)));
@@ -3215,10 +3207,10 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
                 card_uid: Some(card_uid.clone()),
             },
         )),
-        ..request("acme/a", Some((1000, 500)), Duration::from_secs(10))
+        ..request("dep-a/a", Some((1000, 500)), Duration::from_secs(10))
     };
     let invocation = GatewayInvocation::new(&state);
-    let unbound = invoker(tenant, 1, [provider_access()]);
+    let unbound = invoker(tenant, 1, [open_access()]);
 
     dispatch.push(Step::Return(completed(100, 50)));
     invocation
@@ -3262,7 +3254,7 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
             },
             tenant,
             Vec::<RoleRef>::new(),
-            PermissionSet::from_iter([provider_access()]),
+            PermissionSet::from_iter([open_access()]),
         ),
         ..invoker(tenant, 2, [])
     };
@@ -3393,13 +3385,13 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
         )
         .await
         .expect("payload policy stores");
-    let caller = invoker(tenant, 1, [provider_access()]);
+    let caller = invoker(tenant, 1, [open_access()]);
     let (state, scribe) = RecordingScribe::attach(state);
     let invocation = GatewayInvocation::new(&state);
     for _ in 0..2 {
         dispatch.push(Step::Return(media_completed(PAYLOAD_OBJECT_BYTES)));
         invocation
-            .invoke(&caller, request("acme/a", None, Duration::from_secs(10)))
+            .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
             .await
             .expect("the captured call completes");
     }
@@ -3628,7 +3620,7 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
     let (failing, unpublished) = RecordingScribe::attach(failing);
     dispatch.push(Step::Return(media_completed(PAYLOAD_OBJECT_BYTES)));
     let unaffected = GatewayInvocation::new(&failing)
-        .invoke(&caller, request("acme/a", None, Duration::from_secs(10)))
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
         .await
         .expect("unavailable storage never fails the call");
     drain_gateway(&failing).await;
@@ -3695,11 +3687,9 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
             &ProviderDeploymentName::new("speech").expect("name"),
             serde_json::from_value(json!({
                 "name": "speech",
-                "model": model("acme/speech"),
                 "adapter": {"openai_compatible": {"base_url": format!("{}/v1", upstream.uri())}},
                 "auth": "none",
                 "capabilities": ["audio"],
-                "routing_weight": 1,
             }))
             .expect("deployment decodes"),
         )
@@ -3726,9 +3716,9 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
         async move {
             let response = super::routes::audio_speech(
                 State(state),
-                Ok(invoker(tenant, 1, [provider_access()])),
+                Ok(invoker(tenant, 1, [open_access()])),
                 Ok(Json(
-                    json!({"model": "acme/speech", "input": "hi", "voice": voice}),
+                    json!({"model": "speech/speech", "input": "hi", "voice": voice}),
                 )),
             )
             .await;
@@ -3827,7 +3817,7 @@ async fn gateway_capture_work_ends_at_the_call_deadline() {
     let (state, scribe) =
         RecordingScribe::attach(replica_with_fixture_catalog(&fixture, dispatch.clone()).await);
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
-    let caller = invoker(tenant, 1, [provider_access()]);
+    let caller = invoker(tenant, 1, [open_access()]);
     let deadline = Duration::from_millis(500);
     let dropped = "wyrd_gateway_capture_total{outcome=unavailable}";
 
@@ -3863,7 +3853,7 @@ async fn gateway_capture_work_ends_at_the_call_deadline() {
     assert!(made.success(), "the parked object path is a FIFO");
     dispatch.push(Step::Return(media_completed(PAYLOAD_OBJECT_BYTES)));
     let answered = GatewayInvocation::new(&state)
-        .invoke(&caller, request("acme/a", None, deadline))
+        .invoke(&caller, request("dep-a/a", None, deadline))
         .await
         .expect("a parked object read never fails the call");
     assert!(
@@ -3911,8 +3901,8 @@ async fn gateway_capture_policy_change_affects_only_later_admissions() {
         .put_capture(&admin(tenant), write(GatewayCaptureMode::Metadata))
         .await
         .expect("metadata policy stores");
-    let caller = invoker(tenant, 1, [provider_access()]);
-    let call = || request("acme/a", Some((1000, 500)), Duration::from_secs(10));
+    let caller = invoker(tenant, 1, [open_access()]);
+    let call = || request("dep-a/a", Some((1000, 500)), Duration::from_secs(10));
 
     dispatch.push(Step::Park(completed(100, 50)));
     let in_flight = tokio::spawn({
@@ -4250,14 +4240,12 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
     gateway
         .put_deployment(
             &admin,
-            &ProviderDeploymentName::new("canary-chat").expect("name"),
+            &ProviderDeploymentName::new("deepseek").expect("name"),
             serde_json::from_value(json!({
-                "name": "canary-chat",
-                "model": model("deepseek/deepseek-chat"),
+                "name": "deepseek",
                 "adapter": {"openai_compatible": {"base_url": format!("{}/v1", upstream.uri())}},
                 "auth": {"bearer": {"credential": "canary-key"}},
                 "capabilities": ["chat_completions", "images"],
-                "routing_weight": 1,
             }))
             .expect("deployment decodes"),
         )
@@ -4266,8 +4254,8 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
     let caller = invoker(
         tenant,
         7,
-        [Permission::gateway_invoke(GatewayAccess::Provider {
-            provider: ProviderId::new("deepseek").expect("provider"),
+        [Permission::gateway_invoke(GatewayAccess::Deployment {
+            deployment: ProviderDeploymentName::new("deepseek").expect("name"),
         })],
     );
     let call = |user: &str| GatewayCallRequest {
@@ -4646,8 +4634,8 @@ async fn gateway_batch_listing_is_one_bounded_pruned_read() {
     // Denied batches 101..=220 lie between visible batches 300, 250 and 50.
     let visible = [300_u128, 250, 50];
     for (id, served) in (101..=220)
-        .map(|id| (id, "acme/b"))
-        .chain(visible.map(|id| (id, "acme/a")))
+        .map(|id| (id, "dep-b/b"))
+        .chain(visible.map(|id| (id, "dep-a/a")))
     {
         let row = GatewayBatchRow {
             batch_id: Uuid::from_u128(id),
@@ -4708,7 +4696,7 @@ async fn gateway_batch_listing_is_one_bounded_pruned_read() {
         audit_decisions(&scribe, tenant).len()
     };
 
-    let caller = invoker(tenant, 1, [model_access("acme/a")]);
+    let caller = invoker(tenant, 1, [model_access("dep-a/a")]);
     let before = decisions().await;
     let first = list(caller.clone(), None, 2).await;
     assert_eq!(ids(&first), [public(300), public(250)], "{first}");
@@ -4716,14 +4704,14 @@ async fn gateway_batch_listing_is_one_bounded_pruned_read() {
     assert_eq!(
         decisions().await,
         before + 1,
-        "one decision for acme/a only"
+        "one decision for dep-a/a only"
     );
     let second = list(caller, first["last_id"].as_str().map(str::to_owned), 2).await;
     assert_eq!(ids(&second), [public(50)], "{second}");
     assert_eq!(second["has_more"], false);
     assert_eq!(decisions().await, before + 2);
 
-    let wide = list(invoker(tenant, 2, [provider_access()]), None, 100).await;
+    let wide = list(invoker(tenant, 2, [open_access()]), None, 100).await;
     assert_eq!(wide["data"].as_array().map(Vec::len), Some(100));
     assert_eq!(wide["has_more"], true);
     assert_eq!(
@@ -4784,7 +4772,7 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
         )
         .await
         .expect("payload policy stores");
-    // Deploys `acme/<name>` against a provider that sends `frame` and holds.
+    // Deploys `<name>/<name>` against a provider that sends `frame` and holds.
     let held = |name: &'static str, frame: &'static str| {
         let gateway = &gateway;
         let admin = &admin;
@@ -4796,11 +4784,9 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
                     &ProviderDeploymentName::new(name).expect("name"),
                     serde_json::from_value(json!({
                         "name": name,
-                        "model": model(&format!("acme/{name}")),
                         "adapter": {"openai_compatible": {"base_url": format!("http://127.0.0.1:{port}/v1")}},
                         "auth": "none",
                         "capabilities": ["chat_completions"],
-                        "routing_weight": 1,
                     }))
                     .expect("deployment decodes"),
                 )
@@ -4810,12 +4796,12 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
         }
     };
     let call = |name: &str, stream: bool| {
-        let mut request = request(&format!("acme/{name}"), None, Duration::from_secs(2));
+        let mut request = request(&format!("{name}/{name}"), None, Duration::from_secs(2));
         request.stream = stream;
         request.body["stream"] = json!(stream);
         request
     };
-    let caller = |n: u128| invoker(tenant, n, [provider_access()]);
+    let caller = |n: u128| invoker(tenant, n, [open_access()]);
     let invocation = GatewayInvocation::new(&state);
     let deadline = wyrd_gateway::outcome_error_code(GatewayCallOutcome::TimedOut);
     let unavailable = wyrd_gateway::outcome_error_code(GatewayCallOutcome::Cancelled);
@@ -4940,7 +4926,7 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
     let error = invocation
         .invoke(
             &unauthorized,
-            request("acme/a", None, Duration::from_secs(2)),
+            request("dep-a/a", None, Duration::from_secs(2)),
         )
         .await
         .expect_err("an unauthorized call is refused");
@@ -4952,7 +4938,7 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
     ));
     let invalid = caller(7);
     let error = invocation
-        .invoke(&invalid, request("acme/a", None, Duration::MAX))
+        .invoke(&invalid, request("dep-a/a", None, Duration::MAX))
         .await
         .expect_err("an out-of-range timeout is refused");
     assert!(
@@ -4966,7 +4952,7 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
         None,
     ));
     let unroutable = caller(8);
-    let mut pinned = request("acme/a", None, Duration::from_secs(2));
+    let mut pinned = request("dep-a/a", None, Duration::from_secs(2));
     pinned.deployment = Some(ProviderDeploymentName::new("missing").expect("name"));
     let error = invocation
         .invoke(&unroutable, pinned)
@@ -4987,7 +4973,7 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
     let drained = caller(10);
     state.shutdown_token.cancel();
     let error = invocation
-        .invoke(&drained, request("acme/a", None, Duration::from_secs(2)))
+        .invoke(&drained, request("dep-a/a", None, Duration::from_secs(2)))
         .await
         .expect_err("a draining server refuses");
     expected.push((
@@ -5121,14 +5107,14 @@ async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_spa
         )
         .await
         .expect("metadata policy stores");
-    let caller = invoker(tenant, 1, [provider_access()]);
+    let caller = invoker(tenant, 1, [open_access()]);
 
     dispatch.push(Step::Park(completed(10, 5)));
     let call = tokio::spawn({
         let (state, caller) = (state.clone(), caller.clone());
         async move {
             GatewayInvocation::new(&state)
-                .invoke(&caller, request("acme/a", None, Duration::from_secs(30)))
+                .invoke(&caller, request("dep-a/a", None, Duration::from_secs(30)))
                 .await
         }
     });
@@ -5234,7 +5220,7 @@ enum FallbackIngress {
     Responses,
     /// `POST /v1/messages` served by `anthropic`.
     AnthropicMessages,
-    /// `POST /v1beta/models/{model}:generateContent` served by `gemini`.
+    /// `POST /v1beta/models/{deployment}/{model}:generateContent` served by `gemini`.
     GeminiGenerateContent,
 }
 
@@ -5247,15 +5233,6 @@ impl FallbackIngress {
         Self::GeminiGenerateContent,
     ];
 
-    /// Provider whose built-in deployments serve this ingress.
-    const fn provider(self) -> &'static str {
-        match self {
-            Self::ChatCompletions | Self::Responses => "openai",
-            Self::AnthropicMessages => "anthropic",
-            Self::GeminiGenerateContent => "gemini",
-        }
-    }
-
     /// Model name of this ingress's deployment `suffix`; `a` always fails
     /// upstream and `b` always answers.
     fn model(self, suffix: &str) -> String {
@@ -5267,13 +5244,18 @@ impl FallbackIngress {
         format!("{family}-{suffix}")
     }
 
-    /// Exact model reference of deployment `suffix`.
+    /// Address of deployment `suffix`, which serves the model of its own name.
     ///
     /// # Panics
-    /// Panics when the fixed provider and model names stop forming a valid
-    /// model projection.
+    /// Panics when the fixed names stop forming a valid address.
     fn model_ref(self, suffix: &str) -> ModelRef {
-        model(&format!("{}/{}", self.provider(), self.model(suffix)))
+        model(&self.address(suffix))
+    }
+
+    /// `<deployment>/<model>` address of deployment `suffix`.
+    fn address(self, suffix: &str) -> String {
+        let name = self.model(suffix);
+        format!("{name}/{name}")
     }
 
     /// Calls this ingress's handler for model `a` with `headers`.
@@ -5284,15 +5266,15 @@ impl FallbackIngress {
         headers: HeaderMap,
     ) -> Response {
         let state = State(state.clone());
-        let requested = self.model("a");
+        let requested = self.address("a");
         let messages = json!([{"role": "user", "content": "hi"}]);
         match self {
             Self::ChatCompletions => {
-                let body = json!({"model": format!("openai/{requested}"), "messages": messages});
+                let body = json!({"model": requested, "messages": messages});
                 super::routes::chat_completions(state, caller, headers, Ok(Json(body))).await
             }
             Self::Responses => {
-                let body = json!({"model": format!("openai/{requested}"), "input": "hi"});
+                let body = json!({"model": requested, "input": "hi"});
                 super::routes::responses(state, caller, headers, Ok(Json(body))).await
             }
             Self::AnthropicMessages => {
@@ -5464,11 +5446,9 @@ async fn public_ingress_workflow_fallback() {
                     &ProviderDeploymentName::new(&name).expect("name"),
                     serde_json::from_value(json!({
                         "name": name,
-                        "model": model(&format!("{provider}/{name}")),
                         "adapter": provider,
                         "auth": auth,
                         "capabilities": capabilities,
-                        "routing_weight": 1,
                     }))
                     .expect("deployment decodes"),
                 )
@@ -5486,15 +5466,7 @@ async fn public_ingress_workflow_fallback() {
         )
         .await
         .expect("governance stores");
-    let caller = invoker(
-        tenant,
-        11,
-        ["openai", "anthropic", "gemini"].map(|provider| {
-            Permission::gateway_invoke(GatewayAccess::Provider {
-                provider: ProviderId::new(provider).expect("provider"),
-            })
-        }),
-    );
+    let caller = invoker(tenant, 11, [open_access()]);
     let reached = |requests: &[Request], name: &str| {
         requests.iter().any(|request| {
             request.url.path().contains(name)
@@ -5537,7 +5509,7 @@ async fn public_ingress_workflow_fallback() {
         );
 
         let encode = |document: Value| URL_SAFE_NO_PAD.encode(document.to_string());
-        let requested = json!({"provider": ingress.provider(), "model": ingress.model("a")});
+        let requested = json!({"deployment": ingress.model("a"), "model": ingress.model("a")});
         let refused = [
             ("malformed", vec!["%%%".to_owned()]),
             ("empty value", vec![String::new()]),

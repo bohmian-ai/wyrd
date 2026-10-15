@@ -297,7 +297,9 @@ impl NativeCall {
                     encode(&body)?,
                 )
             }
-            ProviderRequest::GeminiGenerateContent(body) if model.provider.as_str() != "vertex" => {
+            ProviderRequest::GeminiGenerateContent(body)
+                if model.deployment.as_str() != "vertex" =>
+            {
                 (
                     Ingress::GeminiGenerateContent,
                     format!(

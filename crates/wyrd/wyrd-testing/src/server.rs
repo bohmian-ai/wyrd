@@ -3405,8 +3405,8 @@ impl WyrdTestServer {
         self.seed_role(
             role,
             &[Permission::gateway_invoke(
-                wyrd_spec::auth::GatewayAccess::Provider {
-                    provider: wyrd_spec::ids::ProviderId::new("openai")
+                wyrd_spec::auth::GatewayAccess::Deployment {
+                    deployment: wyrd_spec::ids::ProviderDeploymentName::new("openai")
                         .map_err(|error| WyrdTestServerError::Io(error.to_string()))?,
                 },
             )],

@@ -215,7 +215,10 @@ pub(crate) fn prepare(
         (IngressDialect::AnthropicMessages, ProviderAdapter::Anthropic) if chat => {
             Ok(Prepared::Native(native(body, Some(model))?))
         }
-        (IngressDialect::GeminiGenerateContent, ProviderAdapter::Gemini)
+        (
+            IngressDialect::GeminiGenerateContent,
+            ProviderAdapter::Gemini | ProviderAdapter::Vertex { .. },
+        )
         | (IngressDialect::VertexGenerateContent, ProviderAdapter::Vertex { .. })
             if chat =>
         {

@@ -98,8 +98,8 @@ impl GatewayCapture {
         self.server
             .seed_role(
                 "typed_invoker",
-                &[Permission::gateway_invoke(GatewayAccess::Provider {
-                    provider: "openai".parse()?,
+                &[Permission::gateway_invoke(GatewayAccess::Deployment {
+                    deployment: "openai".parse()?,
                 })],
             )
             .await?;

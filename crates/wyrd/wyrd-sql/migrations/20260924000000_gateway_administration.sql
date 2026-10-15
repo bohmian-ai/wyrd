@@ -62,25 +62,24 @@ CREATE POLICY operator_access ON wyrd.gateway_provider_credentials TO CURRENT_US
 CREATE TABLE wyrd.gateway_provider_deployments (
     data_tenant_id      UUID        NOT NULL REFERENCES platform.tenants(data_tenant_id),
     name                TEXT        NOT NULL,
-    provider            TEXT        NOT NULL,
-    model               TEXT        NOT NULL,
     -- NULL when the deployment uses no upstream authentication; MATCH SIMPLE
-    -- then skips the credential foreign key.
+    -- then skips the credential foreign key. Otherwise the referenced
+    -- credential's provider identity, which the adapter accepts.
     credential_name     TEXT,
+    credential_provider TEXT,
     -- Complete ProviderDeployment JSON.
     deployment          JSONB       NOT NULL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (data_tenant_id, name),
-    FOREIGN KEY (data_tenant_id, credential_name, provider)
+    CHECK ((credential_name IS NULL) = (credential_provider IS NULL)),
+    FOREIGN KEY (data_tenant_id, credential_name, credential_provider)
         REFERENCES wyrd.gateway_provider_credentials (data_tenant_id, name, provider)
         ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX gateway_provider_deployments_credential_idx
-    ON wyrd.gateway_provider_deployments (data_tenant_id, credential_name, provider);
-CREATE INDEX gateway_provider_deployments_model_idx
-    ON wyrd.gateway_provider_deployments (data_tenant_id, provider, model);
+    ON wyrd.gateway_provider_deployments (data_tenant_id, credential_name, credential_provider);
 
 ALTER TABLE wyrd.gateway_provider_deployments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE wyrd.gateway_provider_deployments FORCE ROW LEVEL SECURITY;
@@ -117,15 +116,15 @@ CREATE POLICY operator_access ON wyrd.gateway_policies TO CURRENT_USER
 -- ---------------------------------------------------------------------------
 CREATE TABLE wyrd.gateway_model_pricing (
     data_tenant_id      UUID        NOT NULL REFERENCES platform.tenants(data_tenant_id),
-    provider            TEXT        NOT NULL,
+    deployment          TEXT        NOT NULL,
     model               TEXT        NOT NULL,
     version             TEXT        NOT NULL,
     effective_at        TIMESTAMPTZ NOT NULL,
     active              BOOLEAN     NOT NULL,
     -- Complete GatewayModelPricing JSON; `active` above is authoritative.
     entry               JSONB       NOT NULL,
-    PRIMARY KEY (data_tenant_id, provider, model, version),
-    UNIQUE (data_tenant_id, provider, model, effective_at)
+    PRIMARY KEY (data_tenant_id, deployment, model, version),
+    UNIQUE (data_tenant_id, deployment, model, effective_at)
 );
 
 ALTER TABLE wyrd.gateway_model_pricing ENABLE ROW LEVEL SECURITY;
@@ -150,21 +149,21 @@ CREATE TABLE wyrd.gateway_accounting_entries (
         'call_accounted'
     )),
     -- Priced attempt entries only: the exact pricing version used.
-    provider            TEXT,
+    deployment          TEXT,
     model               TEXT,
     pricing_version     TEXT,
     -- Complete GatewayAccountingEntryV1 JSON.
     entry               JSONB       NOT NULL,
     recorded_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (data_tenant_id, entry_id),
-    CHECK (pricing_version IS NULL OR (provider IS NOT NULL AND model IS NOT NULL)),
-    FOREIGN KEY (data_tenant_id, provider, model, pricing_version)
-        REFERENCES wyrd.gateway_model_pricing (data_tenant_id, provider, model, version)
+    CHECK (pricing_version IS NULL OR (deployment IS NOT NULL AND model IS NOT NULL)),
+    FOREIGN KEY (data_tenant_id, deployment, model, pricing_version)
+        REFERENCES wyrd.gateway_model_pricing (data_tenant_id, deployment, model, version)
         ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX gateway_accounting_entries_pricing_idx
-    ON wyrd.gateway_accounting_entries (data_tenant_id, provider, model, pricing_version)
+    ON wyrd.gateway_accounting_entries (data_tenant_id, deployment, model, pricing_version)
     WHERE pricing_version IS NOT NULL;
 
 ALTER TABLE wyrd.gateway_accounting_entries ENABLE ROW LEVEL SECURITY;

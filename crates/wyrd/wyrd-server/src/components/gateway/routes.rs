@@ -1345,10 +1345,10 @@ pub(crate) async fn models(
             data: models
                 .iter()
                 .map(|model| GatewayModel {
-                    id: format!("{}/{}", model.provider.as_str(), model.model.as_str()),
+                    id: model.to_string(),
                     object: "model".to_owned(),
                     created: 0,
-                    owned_by: model.provider.as_str().to_owned(),
+                    owned_by: model.deployment.as_str().to_owned(),
                 })
                 .collect(),
         })

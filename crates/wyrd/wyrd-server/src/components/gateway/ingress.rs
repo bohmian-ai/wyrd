@@ -35,7 +35,6 @@ use wyrd_spec::gateway::{
     GatewayOperation, GatewayUsageAmount, MAX_RUN_HEADER_BYTES, ModelRef, RUN_HEADER,
 };
 use wyrd_spec::ids::CardUid;
-use wyrd_spec::ids::{ModelId, ProviderId};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
 
@@ -225,22 +224,13 @@ pub fn gateway_ingress_router(state: &AppState) -> OpenApiRouter<AppState> {
         .merge(GatewayIngress::GeminiGenerateContent.layer(gemini, state))
 }
 
-/// Provider identity fixed by a native route.
+/// Parses the `<deployment>/<model>` address a native route carries.
 ///
 /// # Errors
 /// Returns `GatewayInvalidRequest` naming `model` when `model` is not a valid
-/// model identifier.
-fn native_model(provider: &str, model: &str) -> Result<ModelRef, WyrdError> {
-    let invalid = || {
-        invalid_request(GatewayContractError::new(
-            "model",
-            "is not a valid model id",
-        ))
-    };
-    Ok(ModelRef {
-        provider: ProviderId::new(provider).map_err(|_| invalid())?,
-        model: ModelId::new(model).map_err(|_| invalid())?,
-    })
+/// address.
+fn native_model(model: &str) -> Result<ModelRef, WyrdError> {
+    ModelRef::from_projection(model).map_err(invalid_request)
 }
 
 /// OpenAPI description of the optional `wyrd-gateway-fallback` request header
@@ -374,8 +364,8 @@ pub(super) fn requested_subject(
 )]
 /// `POST /v1/messages`: one governed Anthropic Messages call.
 ///
-/// The body's `model` names an exact model of provider `anthropic`, and only
-/// built-in Anthropic deployments serve it, so fallback never leaves the
+/// The body's `model` is a `<deployment>/<model>` address, and only
+/// Anthropic-adapter deployments serve it, so fallback never leaves the
 /// protocol. A body that does not match [`GatewayAnthropicMessagesRequest`]
 /// is refused before dispatch; an accepted body, with every extension member,
 /// reaches the provider as sent apart from its model and
@@ -404,7 +394,7 @@ pub(crate) async fn anthropic_messages(
                     .ok_or_else(|| {
                         invalid_request(GatewayContractError::new("model", "is required"))
                     })
-                    .and_then(|model| native_model("anthropic", model))?;
+                    .and_then(native_model)?;
                 Ok(GatewayCallRequest {
                     operation: GatewayOperation::ChatCompletions,
                     ingress: IngressDialect::AnthropicMessages,
@@ -458,8 +448,8 @@ pub(crate) async fn anthropic_messages(
 )]
 /// `POST /v1/systemone`: one governed Jev question call.
 ///
-/// The body's `model` names an exact model of provider `jev`, and only
-/// deployments declaring `system_one` serve it, so fallback never leaves the
+/// The body's `model` is a `<deployment>/<model>` address, and only
+/// deployments serving `system_one` serve it, so fallback never leaves the
 /// protocol. A body that does not match [`GatewayJevRequest`], or breaks a
 /// documented question bound, is refused before dispatch; an accepted body
 /// reaches Jev with only its model rewritten and the answer returns
@@ -507,7 +497,7 @@ fn jev_call(
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_request(GatewayContractError::new("model", "is required")))
-        .and_then(|model| native_model("jev", model))?;
+        .and_then(native_model)?;
     Ok(GatewayCallRequest {
         operation: GatewayOperation::SystemOne,
         ingress: IngressDialect::Jev,
@@ -526,9 +516,9 @@ fn jev_call(
 
 #[utoipa::path(
     post,
-    path = "/v1beta/models/{target}",
+    path = "/v1beta/models/{*target}",
     params(
-        ("target" = String, Path, description = "`<model>:generateContent`, or `<model>:streamGenerateContent` with `alt=sse`, where `<model>` is an exact Gemini model id"),
+        ("target" = String, Path, description = "`<deployment>/<model>:generateContent`, or `<deployment>/<model>:streamGenerateContent` with `alt=sse`"),
         ("alt" = Option<String>, Query, description = "`sse` for streamGenerateContent; `json` or absent for generateContent"),
         ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
@@ -556,8 +546,8 @@ fn jev_call(
 /// `POST /v1beta/models/{model}:generateContent` and
 /// `:streamGenerateContent`: one governed Gemini `GenerateContent` call.
 ///
-/// The path model names an exact model of provider `gemini`, and only
-/// built-in Gemini deployments serve it. A body that does not match
+/// The path names a `<deployment>/<model>` address whose deployment uses
+/// a Google adapter. A body that does not match
 /// [`GatewayGeminiGenerateContentRequest`] is refused before dispatch; an
 /// accepted body reaches the provider as sent and the answer returns unchanged; the streaming method requires
 /// `alt=sse` and relays Gemini events, and a stream that ends before every
@@ -589,7 +579,7 @@ pub(crate) async fn gemini_generate_content(
     }
 }
 
-/// Builds the governed call of a Gemini `target` (`<model>:<method>`) with
+/// Builds the governed call of a Gemini `target` (`<deployment>/<model>:<method>`) with
 /// its raw `query`, request `headers`, and body.
 ///
 /// # Errors
@@ -605,7 +595,7 @@ fn gemini_call(
     headers: &HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Result<GatewayCallRequest, WyrdError> {
-    let (model, method) = target.split_once(':').unwrap_or((target, ""));
+    let (model, method) = target.rsplit_once(':').unwrap_or((target, ""));
     let stream = match method {
         "generateContent" => false,
         "streamGenerateContent" => true,
@@ -637,7 +627,7 @@ fn gemini_call(
             },
         )));
     }
-    let model = native_model("gemini", model)?;
+    let model = native_model(model)?;
     let body = typed_body::<GatewayGeminiGenerateContentRequest>(request)?;
     Ok(GatewayCallRequest {
         operation: GatewayOperation::ChatCompletions,

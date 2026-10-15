@@ -33,9 +33,9 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, GatewayAccess};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
-    GatewayAccountingEntryV1, GatewayCallId, GatewayCallOutcome, GatewayCaptureMode,
-    GatewayContractError, GatewayFallbackOverride, GatewayOperation, GatewayPayloadField,
-    GatewayUsageAmount, ModelRef,
+    DeploymentAccess, GatewayAccountingEntryV1, GatewayCallId, GatewayCallOutcome,
+    GatewayCaptureMode, GatewayContractError, GatewayFallbackOverride, GatewayOperation,
+    GatewayPayloadField, GatewayUsageAmount, ModelRef,
 };
 use wyrd_spec::ids::{CardUid, ProviderDeploymentName};
 use wyrd_spec::request_id::RequestId;
@@ -477,8 +477,12 @@ impl<'a> GatewayInvocation<'a> {
             .ok_or_else(|| {
                 invalid_request(GatewayContractError::new("timeout", "is out of range"))
             })?;
+        let tenant = caller.data_tenant_id;
+        let snapshot = GatewayAdministration::new(self.state)
+            .snapshot(tenant)
+            .await?;
         if !authorized {
-            self.decide(caller, OPERATION, &request.model)
+            self.decide(caller, OPERATION, &request.model, &snapshot)
                 .map_err(permission_deny_reason_to_wyrd)?;
         }
         let subject = match request.subject.take() {
@@ -492,10 +496,6 @@ impl<'a> GatewayInvocation<'a> {
         // this `gateway.call` span; an untraced call keeps its own trace.
         let trace = wyrd_telemetry::continued_context();
 
-        let tenant = caller.data_tenant_id;
-        let snapshot = GatewayAdministration::new(self.state)
-            .snapshot(tenant)
-            .await?;
         let mut plan = self.route(caller, &request, &snapshot, call_id).await?;
 
         let admitted_at = Utc::now();
@@ -554,7 +554,9 @@ impl<'a> GatewayInvocation<'a> {
         let mut denied = Vec::new();
         for candidate in &plan.candidates {
             if candidate.model != request.model
-                && self.decide(caller, OPERATION, &candidate.model).is_err()
+                && self
+                    .decide(caller, OPERATION, &candidate.model, snapshot)
+                    .is_err()
             {
                 denied.push(candidate.model.clone());
             }
@@ -659,22 +661,32 @@ impl<'a> GatewayInvocation<'a> {
         let snapshot = GatewayAdministration::new(self.state)
             .snapshot(caller.data_tenant_id)
             .await?;
-        let configured: BTreeSet<ModelRef> = snapshot
+        let listed: BTreeSet<ModelRef> = snapshot
             .deployments
-            .into_iter()
-            .map(|deployment| deployment.model)
+            .iter()
+            .flat_map(|deployment| {
+                deployment.models.iter().flatten().map(|model| ModelRef {
+                    deployment: deployment.name.clone(),
+                    model: model.clone(),
+                })
+            })
             .collect();
-        let mut visible = Vec::with_capacity(configured.len());
-        for model in configured {
-            if self.decide(caller, "gateway.models.list", &model).is_ok() {
-                visible.push(model);
-            }
-        }
-        Ok(visible)
+        Ok(listed
+            .into_iter()
+            .filter(|model| {
+                self.decide(caller, "gateway.models.list", model, &snapshot)
+                    .is_ok()
+            })
+            .collect())
     }
 
     /// Checks invoke permission for exactly `model` and stages the decision
     /// under the audited `operation`.
+    ///
+    /// A `granted` deployment in `snapshot` additionally requires a grant
+    /// scoped to its deployment or exact address, so an `all` grant reaches
+    /// only `open` deployments. An address whose deployment `snapshot` lacks
+    /// is decided as open and later fails as unavailable.
     ///
     /// Returns the verdict; the caller decides whether a denial refuses the
     /// call (requested model), only skips a candidate (fallback), or hides the
@@ -692,27 +704,42 @@ impl<'a> GatewayInvocation<'a> {
         caller: &Caller,
         operation: &str,
         model: &ModelRef,
+        snapshot: &GatewayTenantSnapshot,
     ) -> Result<(), PermissionDenyReason> {
         let permission = Permission::gateway_invoke(GatewayAccess::Model {
-            provider: model.provider.clone(),
+            deployment: model.deployment.clone(),
             model: model.model.clone(),
         });
+        let granted = snapshot
+            .deployment(&model.deployment)
+            .is_some_and(|deployment| deployment.access == DeploymentAccess::Granted);
         let verdict = self
             .state
             .authz
             .permission_check
             .check(&caller.principal, &permission)
-            .into_result();
+            .into_result()
+            .and_then(|()| {
+                if granted
+                    && !caller
+                        .principal
+                        .effective_permissions
+                        .contains_object_scoped(&permission)
+                {
+                    Err(PermissionDenyReason::Rbac {
+                        required: Box::new(permission.clone()),
+                        principal: caller.principal.id,
+                    })
+                } else {
+                    Ok(())
+                }
+            });
         let outcome = if verdict.is_ok() {
             AuditOutcome::Allowed
         } else {
             AuditOutcome::Denied
         };
-        let resource = format!(
-            "gateway_model:{}/{}",
-            model.provider.as_str(),
-            model.model.as_str()
-        );
+        let resource = format!("gateway_model:{model}");
         let event = audit::audit_event(
             caller,
             operation,

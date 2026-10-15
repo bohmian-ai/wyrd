@@ -918,7 +918,7 @@ fn otlp_span(
     }
     for (key, value) in [
         ("gen_ai.operation.name", operation),
-        ("gen_ai.provider.name", fields.model.provider.as_str()),
+        ("gen_ai.provider.name", fields.model.deployment.as_str()),
         ("gen_ai.request.model", fields.model.model.as_str()),
     ] {
         attributes.insert(key.to_owned(), AnyValueKind::StringValue(value.to_owned()));
@@ -1008,7 +1008,7 @@ pub(crate) mod tests {
     /// Terminal facts of one succeeded single-attempt chat call under `policy`
     /// whose request and response both carry the secret canary.
     pub(crate) fn facts(policy: GatewayCapturePolicy) -> CallFacts {
-        let model = ModelRef::from_projection("acme/a").expect("model");
+        let model = ModelRef::from_projection("dep-a/a").expect("model");
         let now = Utc::now();
         CallFacts {
             call_id: GatewayCallId::new_v7(),
@@ -1039,7 +1039,7 @@ pub(crate) mod tests {
             subject: None,
             trace: None,
             request: Some(json!({
-                "model": "acme/a",
+                "model": "dep-a/a",
                 "api_key": CANARY,
                 "headers": {"Authorization": format!("Bearer {CANARY}")},
                 "messages": [{"role": "user", "content": [
@@ -1084,7 +1084,7 @@ pub(crate) mod tests {
     /// Proves an unresolved call nulls both `resolved_model` children.
     ///
     /// DataFusion `get_field` returns a child without its parent's nulls, so
-    /// `resolved_model['provider']` reads SQL null only when the child slot
+    /// `resolved_model['deployment']` reads SQL null only when the child slot
     /// itself is null; the nullable children keep that null through Parquet.
     #[test]
     fn unresolved_call_nulls_resolved_model_children() {
@@ -1099,7 +1099,7 @@ pub(crate) mod tests {
             .and_then(|column| column.as_any().downcast_ref::<arrow::array::StructArray>())
             .expect("resolved_model Struct");
         assert!(resolved.is_null(0));
-        for child in ["provider", "model"] {
+        for child in ["deployment", "model"] {
             let child = resolved.column_by_name(child).expect(child);
             assert!(child.is_null(0), "an absent model has no child value");
         }

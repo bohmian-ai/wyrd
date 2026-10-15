@@ -858,8 +858,8 @@ async fn reauthenticate(server: &WyrdTestServer, principal: Principal) -> Princi
 /// # Panics
 /// Panics if `openai` stops being a valid provider id.
 fn openai_invoke() -> Permission {
-    Permission::gateway_invoke(GatewayAccess::Provider {
-        provider: "openai".parse().expect("provider id"),
+    Permission::gateway_invoke(GatewayAccess::Deployment {
+        deployment: "openai".parse().expect("deployment name"),
     })
 }
 
@@ -2355,8 +2355,8 @@ async fn server_routes_keep_gateway_and_external_ownership() {
         )
         .await;
     let invoke = |provider: &str| {
-        Permission::gateway_invoke(GatewayAccess::Provider {
-            provider: provider.parse().expect("provider id"),
+        Permission::gateway_invoke(GatewayAccess::Deployment {
+            deployment: provider.parse().expect("deployment name"),
         })
     };
     fixture

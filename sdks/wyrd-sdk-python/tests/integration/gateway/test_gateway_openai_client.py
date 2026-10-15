@@ -275,7 +275,7 @@ def test_each_users_usage_is_recorded_under_their_principal(
     for row in rows:
         by_subject.setdefault(row["sub_principal_id"], []).append(row)
     assert sorted(
-        (rows[0]["requested_model"]["provider"], usage(rows)) for rows in by_subject.values()
+        (rows[0]["requested_model"]["deployment"], usage(rows)) for rows in by_subject.values()
     ) == [
         ("anthropic", {("input_tokens", "5"), ("output_tokens", "3")}),
         ("openai", {("input_tokens", "11"), ("output_tokens", "4")}),

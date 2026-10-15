@@ -41,7 +41,7 @@ use super::invocation::{
     invalid_request,
 };
 use super::multipart::{FileSink, FormReader};
-use super::service::{internal, unavailable};
+use super::service::{GatewayAdministration, internal, unavailable};
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::state::AppState;
@@ -159,13 +159,14 @@ fn public_batch(row: &GatewayBatchRow, object: &Value) -> Value {
     object
 }
 
-/// Provider ids and exact `<provider>/<model>` projections the caller's
-/// gateway invoke grants reach, or `None` when a grant reaches every model.
+/// Deployment names and exact `<deployment>/<model>` addresses the caller's
+/// gateway invoke grants reach, or `None` when an `all` grant may reach every
+/// open deployment.
 ///
 /// Only prunes the batch listing: a model outside both lists can never pass
 /// the audited invoke decision, which stays authoritative for the rest.
 fn invocable(caller: &Caller) -> Option<(Vec<String>, Vec<String>)> {
-    let (mut providers, mut models) = (Vec::new(), Vec::new());
+    let (mut deployments, mut models) = (Vec::new(), Vec::new());
     for permission in caller
         .principal
         .effective_permissions
@@ -177,16 +178,16 @@ fn invocable(caller: &Caller) -> Option<(Vec<String>, Vec<String>)> {
     {
         match &permission.scope {
             PermissionScope::All => return None,
-            PermissionScope::Gateway(GatewayAccess::Provider { provider }) => {
-                providers.push(provider.as_str().to_owned());
+            PermissionScope::Gateway(GatewayAccess::Deployment { deployment }) => {
+                deployments.push(deployment.as_str().to_owned());
             }
-            PermissionScope::Gateway(GatewayAccess::Model { provider, model }) => {
-                models.push(format!("{}/{}", provider.as_str(), model.as_str()));
+            PermissionScope::Gateway(GatewayAccess::Model { deployment, model }) => {
+                models.push(format!("{}/{}", deployment.as_str(), model.as_str()));
             }
             PermissionScope::Bifrost(_) | PermissionScope::Verifier(_) => {}
         }
     }
-    Some((providers, models))
+    Some((deployments, models))
 }
 
 /// Governed Batches call of `action` for the exact `model`, pinned to
@@ -406,8 +407,11 @@ impl<'a> GatewayBatches<'a> {
         }
         let digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&body).map_err(internal)?));
         let (model, deployment) = pinned(&file.model, &file.deployment)?;
+        let snapshot = GatewayAdministration::new(self.state)
+            .snapshot(tenant)
+            .await?;
         GatewayInvocation::new(self.state)
-            .decide(caller, OPERATION, &model)
+            .decide(caller, OPERATION, &model, &snapshot)
             .map_err(permission_deny_reason_to_wyrd)?;
         let claim = GatewayBatchRow {
             batch_id: Uuid::now_v7(),
@@ -574,12 +578,15 @@ impl<'a> GatewayBatches<'a> {
             i64::from(limit) + 1,
             eligible
                 .as_ref()
-                .map(|(providers, models)| (providers.as_slice(), models.as_slice())),
+                .map(|(deployments, models)| (deployments.as_slice(), models.as_slice())),
         )
         .await
         .map_err(unavailable)?;
         conn.commit().await.map_err(unavailable)?;
         let has_more = rows.len() > limit as usize;
+        let snapshot = GatewayAdministration::new(self.state)
+            .snapshot(caller.data_tenant_id)
+            .await?;
         let invocation = GatewayInvocation::new(self.state);
         let mut verdicts: BTreeMap<&str, bool> = BTreeMap::new();
         let mut data = Vec::new();
@@ -589,7 +596,7 @@ impl<'a> GatewayBatches<'a> {
             } else {
                 let model = ModelRef::from_projection(&row.model).map_err(internal)?;
                 let visible = invocation
-                    .decide(caller, "gateway.batches.list", &model)
+                    .decide(caller, "gateway.batches.list", &model, &snapshot)
                     .is_ok();
                 verdicts.insert(&row.model, visible);
                 visible
@@ -620,8 +627,11 @@ impl<'a> GatewayBatches<'a> {
     pub async fn file(&self, caller: &Caller, id: &str) -> Result<BatchAnswer, WyrdError> {
         let row = self.uploaded(caller.data_tenant_id, id).await?;
         let model = ModelRef::from_projection(&row.model).map_err(internal)?;
+        let snapshot = GatewayAdministration::new(self.state)
+            .snapshot(caller.data_tenant_id)
+            .await?;
         GatewayInvocation::new(self.state)
-            .decide(caller, "gateway.files.read", &model)
+            .decide(caller, "gateway.files.read", &model, &snapshot)
             .map_err(permission_deny_reason_to_wyrd)?;
         BatchAnswer::object(&file_object(&row))
     }

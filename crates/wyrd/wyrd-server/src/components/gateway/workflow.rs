@@ -253,11 +253,7 @@ impl NativeCall {
             }
             ProviderRequest::GeminiGenerateContent(body) => (
                 GatewayOperation::ChatCompletions,
-                if model.provider.as_str() == "vertex" {
-                    IngressDialect::VertexGenerateContent
-                } else {
-                    IngressDialect::GeminiGenerateContent
-                },
+                IngressDialect::GeminiGenerateContent,
                 Answer::GeminiGenerateContent,
                 encode(&body)?,
             ),

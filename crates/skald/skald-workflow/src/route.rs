@@ -29,7 +29,7 @@ use url::{Host, Url};
 use wyrd_spec::card::workflow::{ExternalGatewayProtocol, LlmRoute, is_reserved_transport_header};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{GatewayFallbackOverride, ModelRef};
-use wyrd_spec::ids::{CredentialBindingName, ModelId, ProviderId, WorkflowRunId};
+use wyrd_spec::ids::{CredentialBindingName, ModelId, ProviderDeploymentName, WorkflowRunId};
 
 use crate::error::WorkflowResult;
 
@@ -502,7 +502,7 @@ fn gateway_model(provider: &ProviderName, model: &str) -> Option<ModelRef> {
         ProviderName::Custom(name) => name,
     };
     Some(ModelRef {
-        provider: ProviderId::new(provider).ok()?,
+        deployment: ProviderDeploymentName::new(provider).ok()?,
         model: ModelId::new(model).ok()?,
     })
 }

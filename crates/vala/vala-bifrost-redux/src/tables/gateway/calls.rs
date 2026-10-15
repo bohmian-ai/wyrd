@@ -86,7 +86,7 @@ impl DomainTable for CallsTable {
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
     /// Both Variant payload columns require payload-read authority.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[REQUEST_PAYLOAD, RESPONSE_PAYLOAD];
-    /// A resolved model carries both its provider and model, or neither.
+    /// A resolved model carries both its deployment and model, or neither.
     const WHOLE_STRUCTS: &'static [&'static str] = &[RESOLVED_MODEL];
 
     /// The `GatewayCallPayloadV1` fields in contract order.
@@ -100,11 +100,11 @@ impl DomainTable for CallsTable {
             utf8("call_id", false),
             utf8("operation", false),
             utf8("ingress_dialect", false),
-            // A `ModelRef`: its provider and provider-native model.
+            // A `ModelRef`: its deployment name and model identifier.
             Field::new(
                 "requested_model",
                 DataType::Struct(Fields::from(vec![
-                    utf8("provider", false),
+                    utf8("deployment", false),
                     utf8("model", false),
                 ])),
                 false,
@@ -115,7 +115,7 @@ impl DomainTable for CallsTable {
             Field::new(
                 RESOLVED_MODEL,
                 DataType::Struct(Fields::from(vec![
-                    utf8("provider", true),
+                    utf8("deployment", true),
                     utf8("model", true),
                 ])),
                 true,
@@ -232,7 +232,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 layout,
-                [("provider", nullable), ("model", nullable)],
+                [("deployment", nullable), ("model", nullable)],
                 "{model}"
             );
         }

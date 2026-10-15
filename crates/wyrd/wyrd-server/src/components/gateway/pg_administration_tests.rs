@@ -176,11 +176,9 @@ fn credential(name: &str, provider: &str, source: Value) -> ProviderCredentialWr
 fn deployment(name: &str, credential: &str) -> ProviderDeployment {
     serde_json::from_value(json!({
         "name": name,
-        "model": {"provider": "openai", "model": "gpt-4o"},
         "adapter": "openai",
         "auth": {"bearer": {"credential": credential}},
         "capabilities": ["chat_completions"],
-        "routing_weight": 1,
     }))
     .expect("deployment decodes")
 }
@@ -622,11 +620,9 @@ async fn gateway_credential_sources_stay_within_operator_assignments() {
     let compatible = |host: &str| -> ProviderDeployment {
         serde_json::from_value(json!({
             "name": "deepseek-chat",
-            "model": {"provider": "deepseek", "model": "deepseek-chat"},
             "adapter": {"openai_compatible": {"base_url": format!("https://{host}/v1")}},
             "auth": {"bearer": {"credential": "deepseek-key"}},
             "capabilities": ["chat_completions"],
-            "routing_weight": 1,
         }))
         .expect("deployment decodes")
     };
@@ -803,8 +799,8 @@ async fn gateway_administration_is_authorized_audited_and_tenant_isolated() {
 
     let invoker = caller(
         tenant,
-        [Permission::gateway_invoke(GatewayAccess::Provider {
-            provider: "openai".parse().expect("provider"),
+        [Permission::gateway_invoke(GatewayAccess::Deployment {
+            deployment: "openai".parse().expect("deployment"),
         })],
     );
     assert!(
@@ -887,7 +883,7 @@ async fn gateway_fallback_policy_replaces_and_resets() {
     );
     let policy: GatewayFallbackPolicy = serde_json::from_value(json!({"rules": [{
         "scope": "global",
-        "candidates": [{"provider": "openai", "model": "gpt-4o"}, {"provider": "anthropic", "model": "claude"}],
+        "candidates": [{"deployment": "openai", "model": "gpt-4o"}, {"deployment": "anthropic", "model": "claude"}],
     }]}))
     .expect("policy decodes");
     gateway
@@ -915,7 +911,7 @@ async fn gateway_governance_retains_referenced_pricing() {
     let gateway = GatewayAdministration::new(&state);
     let pricing = |version: &str, at: &str, price: &str| {
         json!({
-            "model": {"provider": "openai", "model": "gpt-4o"}, "version": version, "currency": "USD",
+            "model": {"deployment": "openai", "model": "gpt-4o"}, "version": version, "currency": "USD",
             "effective_at": at, "active": true,
             "rates": [{"dimension": "input_tokens", "unit": "1m_tokens", "price": price}],
         })
@@ -976,7 +972,7 @@ async fn gateway_governance_retains_referenced_pricing() {
             entry_id: Uuid::now_v7(),
             call_id: Uuid::now_v7(),
             kind: "attempt_accounted",
-            provider: Some("openai"),
+            deployment: Some("openai"),
             model: Some("gpt-4o"),
             pricing_version: Some("v1"),
             entry: &json!({}),
@@ -1010,7 +1006,7 @@ async fn gateway_governance_retains_referenced_pricing() {
             entry_id: Uuid::now_v7(),
             call_id: Uuid::now_v7(),
             kind: "attempt_accounted",
-            provider: Some("openai"),
+            deployment: Some("openai"),
             model: Some("gpt-4o"),
             pricing_version: Some("v2"),
             entry: &json!({}),
@@ -1337,10 +1333,10 @@ async fn gateway_concurrent_replacements_are_last_committed_and_family_independe
         "vault"
     );
 
-    // Deployment: weight 2 queues first, weight 3 commits last.
-    let weighted = |weight: u32| {
+    // Deployment: the `gpt-4o` list queues first, the `gpt-4.1` list commits last.
+    let listing = |model: &str| {
         let mut value = serde_json::to_value(deployment("primary", "shared")).expect("encode");
-        value["routing_weight"] = json!(weight);
+        value["models"] = json!([model]);
         serde_json::from_value::<ProviderDeployment>(value).expect("decode")
     };
     let mut holder = fixture.tenant_conn_for(tenant).await.expect("holder");
@@ -1352,7 +1348,12 @@ async fn gateway_concurrent_replacements_are_last_committed_and_family_independe
     .expect("deployment row held");
     let name = deployment_name("primary");
     let first = tokio::spawn({
-        let (state, admin, name, write) = (state.clone(), admin.clone(), name.clone(), weighted(2));
+        let (state, admin, name, write) = (
+            state.clone(),
+            admin.clone(),
+            name.clone(),
+            listing("gpt-4o"),
+        );
         async move {
             GatewayAdministration::new(&state)
                 .put_deployment(&admin, &name, write)
@@ -1361,7 +1362,12 @@ async fn gateway_concurrent_replacements_are_last_committed_and_family_independe
     });
     await_lock_waiters(&fixture, 1).await;
     let second = tokio::spawn({
-        let (state, admin, name, write) = (state.clone(), admin.clone(), name.clone(), weighted(3));
+        let (state, admin, name, write) = (
+            state.clone(),
+            admin.clone(),
+            name.clone(),
+            listing("gpt-4.1"),
+        );
         async move {
             GatewayAdministration::new(&state)
                 .put_deployment(&admin, &name, write)
@@ -1374,13 +1380,13 @@ async fn gateway_concurrent_replacements_are_last_committed_and_family_independe
     second.await.expect("second joins").expect("second commits");
     assert_eq!(
         gateway.deployment(&admin, &name).await.expect("read"),
-        weighted(3)
+        listing("gpt-4.1")
     );
 
     // Policy families: fallback and governance wait on the same row; both land.
     let fallback: GatewayFallbackPolicy = serde_json::from_value(json!({"rules": [{
         "scope": "global",
-        "candidates": [{"provider": "openai", "model": "gpt-4o"}, {"provider": "anthropic", "model": "claude"}],
+        "candidates": [{"deployment": "openai", "model": "gpt-4o"}, {"deployment": "anthropic", "model": "claude"}],
     }]}))
     .expect("fallback decodes");
     let governance: GatewayGovernancePolicy = serde_json::from_value(json!({

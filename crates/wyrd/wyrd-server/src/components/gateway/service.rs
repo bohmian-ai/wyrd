@@ -278,6 +278,7 @@ impl<'a> GatewayAdministration<'a> {
             |mut conn| async move {
                 require_path_name(name.as_str(), deployment.name.as_str())?;
                 deployment.validate().map_err(invalid)?;
+                let mut credential_provider = None;
                 if let Some(credential) = deployment.auth.credential() {
                     let row = gateway_credential_for_share(&mut conn, credential.as_str())
                         .await
@@ -287,27 +288,28 @@ impl<'a> GatewayAdministration<'a> {
                         Some(row) if row.state != "active" => {
                             Some("names a revoked provider credential")
                         }
-                        Some(row) if row.provider != deployment.model.provider.as_str() => {
-                            Some("names a credential for a different provider")
-                        }
-                        Some(row) => {
-                            let source: ProviderCredentialSourceView = decode(row.source)?;
-                            // A managed secret is the tenant's own value, so
-                            // it carries no operator assignment to confine.
-                            let assigned = matches!(
-                                source,
-                                ProviderCredentialSourceView::ManagedSecret
-                            ) || self.config.assignment(&source).is_some_and(|assignment| {
-                                assignment.permits(
-                                    caller.data_tenant_id,
-                                    &deployment.model.provider,
-                                    Some(&deployment.adapter),
+                        Some(row) => match ProviderId::new(&row.provider) {
+                            Ok(provider) if deployment.adapter.accepts_credential_provider(&provider) => {
+                                let source: ProviderCredentialSourceView = decode(row.source)?;
+                                // A managed secret is the tenant's own value, so
+                                // it carries no operator assignment to confine.
+                                let assigned = matches!(
+                                    source,
+                                    ProviderCredentialSourceView::ManagedSecret
+                                ) || self.config.assignment(&source).is_some_and(|assignment| {
+                                    assignment.permits(
+                                        caller.data_tenant_id,
+                                        &provider,
+                                        Some(&deployment.adapter),
+                                    )
+                                });
+                                credential_provider = Some(row.provider);
+                                (!assigned).then_some(
+                                    "names a credential not assigned to this tenant, provider, and endpoint host",
                                 )
-                            });
-                            (!assigned).then_some(
-                                "names a credential not assigned to this tenant, provider, and endpoint host",
-                            )
-                        }
+                            }
+                            _ => Some("names a credential for a provider this adapter does not serve"),
+                        },
                     };
                     if let Some(reason) = reason {
                         return Err(invalid(GatewayContractError::new(
@@ -321,12 +323,11 @@ impl<'a> GatewayAdministration<'a> {
                     &mut conn,
                     GatewayDeploymentWrite {
                         name: name.as_str(),
-                        provider: deployment.model.provider.as_str(),
-                        model: deployment.model.model.as_str(),
                         credential_name: deployment
                             .auth
                             .credential()
                             .map(ProviderCredentialName::as_str),
+                        credential_provider: credential_provider.as_deref(),
                         deployment: &document,
                     },
                 )
@@ -912,7 +913,7 @@ async fn replace_governance(
         upsert_gateway_pricing(
             conn,
             GatewayPricingWrite {
-                provider: entry.model.provider.as_str(),
+                deployment: entry.model.deployment.as_str(),
                 model: entry.model.model.as_str(),
                 version: &entry.version,
                 effective_at: entry.effective_at,

@@ -876,3 +876,133 @@ async fn run_invokes_its_agent_through_the_gateway() {
     );
     inference.deployment.shutdown().await;
 }
+
+/// An external OpenAI-compatible gateway onboarded as the deployment
+/// `support-gateway` receives the addressed model unchanged, including its
+/// own slashes, authenticated by the uploaded `external` credential and never
+/// by the caller's Wyrd token; once that credential is revoked the call is
+/// refused before reaching the gateway.
+///
+/// # Panics
+/// Panics when a setup step fails, or a status, upstream body, or upstream
+/// header differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn external_deployment_preserves_model_and_credentials() {
+    const EXTERNAL_KEY: &str = "sk-external-gateway";
+    const MODEL: &str = "meta-llama/Llama-3.3-70B";
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/gateway/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": MODEL,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+        })))
+        .mount(&upstream)
+        .await;
+    let deployment = Deployment::start_with(
+        WyrdTestServer::builder().with_gateway_provider_root_for_test(
+            upstream.uri().parse().expect("upstream URL parses"),
+        ),
+    )
+    .await;
+    let credential = ProviderCredentialName::new("external-key").expect("credential name");
+    cli::put_provider_credential(
+        &ProviderCredentialWrite {
+            name: credential.clone(),
+            provider: ProviderId::new("external").expect("provider"),
+            source: ProviderCredentialWriteSource::ManagedSecret {
+                secret: SecretBearer::new(EXTERNAL_KEY.to_owned()),
+            },
+        },
+        Some(deployment.admin()),
+    )
+    .await
+    .expect("the CLI writes the credential");
+    Gateway::with_client(deployment.admin())
+        .put_deployment(&ProviderDeployment {
+            name: ProviderDeploymentName::new("support-gateway").expect("deployment name"),
+            adapter: ProviderAdapter::OpenAiCompatible {
+                base_url: format!("{}/gateway/v1", upstream.uri())
+                    .parse()
+                    .expect("base URL parses"),
+            },
+            auth: ProviderAuth::Bearer {
+                credential: credential.clone(),
+            },
+            models: None,
+            capabilities: None,
+            access: DeploymentAccess::Open,
+        })
+        .await
+        .expect("deployment puts");
+    let caller = deployment.client(&deployment.key("external_caller", &["workload"]).await);
+    let token = caller.access_token().await.expect("access token mints");
+    let call = || {
+        reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                deployment
+                    .server()
+                    .base_url()
+                    .expect("bound server has a URL")
+            ))
+            .bearer_auth(token.expose())
+            .json(&json!({
+                "model": format!("support-gateway/{MODEL}"),
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+    };
+
+    let answered = call().await.expect("the gateway answers");
+    assert_eq!(answered.status().as_u16(), 200);
+    let received = upstream
+        .received_requests()
+        .await
+        .expect("request recording is on");
+    assert_eq!(received.len(), 1);
+    let body: Value = received[0].body_json().expect("upstream body is JSON");
+    assert_eq!(
+        body["model"], MODEL,
+        "the model reaches the gateway unchanged"
+    );
+    assert_eq!(
+        received[0]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("Bearer {EXTERNAL_KEY}").as_str()),
+        "the gateway sees only the uploaded credential"
+    );
+    assert!(
+        received[0]
+            .headers
+            .values()
+            .all(|value| !value.to_str().unwrap_or_default().contains(token.expose())),
+        "no Wyrd token is forwarded"
+    );
+
+    cli::revoke_provider_credential(&credential, Some(deployment.admin()))
+        .await
+        .expect("the credential revokes");
+    let refused = call().await.expect("the gateway answers");
+    let status = refused.status().as_u16();
+    let refusal: Value = refused.json().await.expect("the refusal is JSON");
+    assert_eq!(
+        (status, refusal["error"]["code"].as_str()),
+        (502, Some("WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE")),
+        "a revoked credential serves nothing"
+    );
+    assert_eq!(
+        upstream
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .len(),
+        1,
+        "the refused call never reaches the gateway"
+    );
+    deployment.shutdown().await;
+}

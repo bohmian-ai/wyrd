@@ -13,6 +13,8 @@ from wyrd.bifrost import (
     FieldSpec,
     ResolvedTable,
     SortKey,
+    SpanRecord,
+    SpanStatus,
     TableDescription,
 )
 
@@ -80,3 +82,73 @@ def client_value_types_are_declared_without_any() -> None:
     assert "run_id" not in correlation
     assert resolved["table_uid"] == "01J0"
     assert key["column"] == "created_at"
+
+
+def span_records_require_every_always_emitted_key() -> None:
+    record: SpanRecord = {
+        "trace_id": "0af7651916cd43dd8448eb211c80319c",
+        "span_id": "b7ad6b7169203331",
+        "parent_span_id": "00f067aa0ba902b7",
+        "flags": 1,
+        "trace_state": "",
+        "name": "request",
+        "kind": "server",
+        "start_time": "2026-07-01T00:00:00Z",
+        "end_time": "2026-07-01T00:00:01Z",
+        "duration_ms": 1000,
+        "status": {"code": "error", "description": "timed out"},
+        "attributes": {},
+        "dropped_attributes_count": 0,
+        "events": [
+            {
+                "timestamp": "2026-07-01T00:00:00Z",
+                "name": "log",
+                "attributes": {},
+                "dropped_attributes_count": 0,
+            }
+        ],
+        "dropped_events_count": 0,
+        "links": [
+            {
+                "trace_id": "0af7651916cd43dd8448eb211c80319c",
+                "span_id": "00f067aa0ba902b7",
+                "trace_state": "",
+                "flags": 1,
+                "attributes": {},
+                "dropped_attributes_count": 0,
+            }
+        ],
+        "dropped_links_count": 0,
+        "scope": {"name": "journey.service", "attributes": {}},
+        "resource": {"service_name": "assistant", "attributes": {}},
+    }
+    assert record["links"][0]["flags"] == 1
+    assert record["scope"]["name"] == "journey.service"
+
+    unlinked: SpanRecord = {  # ty: ignore[missing-typed-dict-key]
+        "trace_id": "0af7651916cd43dd8448eb211c80319c",
+        "span_id": "b7ad6b7169203331",
+        "flags": 1,
+        "trace_state": "",
+        "name": "request",
+        "kind": "server",
+        "start_time": "2026-07-01T00:00:00Z",
+        "end_time": "2026-07-01T00:00:01Z",
+        "duration_ms": 1000,
+        "status": {"code": "unset"},
+        "attributes": {},
+        "dropped_attributes_count": 0,
+        "events": [],
+        "dropped_events_count": 0,
+        "dropped_links_count": 0,
+        "scope": {"name": "journey.service", "attributes": {}},
+        "resource": {"service_name": "assistant", "attributes": {}},
+    }
+    assert unlinked["name"] == "request"
+
+
+def only_an_error_status_carries_a_description() -> None:
+    failed: SpanStatus = {"code": "error", "description": "timed out"}
+    passed: SpanStatus = {"code": "ok", "description": "fine"}  # ty: ignore[invalid-assignment]
+    unset: SpanStatus = {"code": "unset", "description": "none"}  # ty: ignore[invalid-assignment]
+    assert [failed["code"], passed["code"], unset["code"]] == ["error", "ok", "unset"]

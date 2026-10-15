@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -9,6 +10,7 @@ import { expect, vi } from "vitest";
 import { z } from "zod";
 
 import {
+  Bifrost,
   Cards,
   Gateway,
   Principals,
@@ -20,7 +22,7 @@ import {
 } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
-import { fixture, registered, serverTest } from "../support/server.js";
+import { ancestry, columnValues, fixture, registered, serverTest, timeline } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -125,8 +127,8 @@ function deployment(model: string): ProviderDeployment {
 
 /**
  * A server whose `openai` deployments of `gpt-4o` and `gpt-5-5` reach the
- * local upstream with the operator's provider key, and the registered `ask`
- * Workflow.
+ * local upstream with the operator's provider key, call metadata capture, and
+ * the registered `ask` Workflow.
  */
 const test = serverTest({
   provider: ({ path, body }) => ({
@@ -160,6 +162,7 @@ const test = serverTest({
       });
       await gateway.putDeployment(deployment("gpt-5-5"));
       await gateway.putDeployment({ ...deployment("gpt-4o-mini"), capabilities: ["responses"] });
+      await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });
       await use(await Cards.connect().registerFromPath(fixture("cards/gateway_inference/ask.yaml")));
     },
     { scope: "file" },
@@ -187,6 +190,41 @@ test("openai client calls the gateway with an access token", async ({ provider, 
   });
   expect(Object.values(upstream?.headers ?? {})).not.toContain(token);
   expect(Object.keys(upstream?.headers ?? {}).filter((name) => name.startsWith("x-wyrd"))).toEqual([]);
+});
+
+/** The gateway's model-call spans in the trace `traceId`, after publishing every captured row. */
+test("gateway span joins the caller's trace", async ({ server, ask: _ }) => {
+  const [traceId, spanId] = [randomBytes(16).toString("hex"), randomBytes(8).toString("hex")];
+  const token = await WyrdClient.connect().accessToken();
+  const client = new OpenAI({
+    baseURL: `${WyrdClient.connect().serverUrl}/v1`,
+    apiKey: token,
+    defaultHeaders: { traceparent: `00-${traceId}-${spanId}-01`, tracestate: "wyrd=journey" },
+  });
+
+  const reply = await client.chat.completions.create(ASK);
+
+  expect(reply.choices[0]?.message.content).toBe("hi");
+  const spans = await timeline(server, traceId);
+  const attempts = spans.filter((span) => span.scope.name === "wyrd.gateway");
+  expect(attempts).toHaveLength(1);
+  expect(ancestry(spans, attempts[0]).at(-1)?.parent_span_id).toBe(spanId);
+  expect(attempts[0].trace_state).toBe("wyrd=journey");
+});
+
+test("malformed traceparent is ignored by the gateway", async ({ server, ask: _ }) => {
+  const traceId = randomBytes(16).toString("hex");
+  const token = await WyrdClient.connect().accessToken();
+  const client = new OpenAI({
+    baseURL: `${WyrdClient.connect().serverUrl}/v1`,
+    apiKey: token,
+    defaultHeaders: { traceparent: `00-${traceId}-not-a-span-01` },
+  });
+
+  const reply = await client.chat.completions.create(ASK);
+
+  expect(reply.choices[0]?.message.content).toBe("hi");
+  expect(await timeline(server, traceId)).toEqual([]);
 });
 
 // Each client keeps a placeholder provider key; `httpAuth` drops it and sends
@@ -253,6 +291,29 @@ test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {
     status: 403,
     error: { code: "WYRD_PERMISSION_403_DENIED_RBAC" },
   });
+});
+
+test("gateway call records a lone run or card", async ({ server, ask }) => {
+  const issued = await cli.issueKey({ kind: "Agent", name: "ask-agent", version: "1.0.0", space: "default" });
+  const caller = WyrdClient.connect({ credential: issued.key });
+  const client = new OpenAI({ baseURL: `${caller.serverUrl}/v1`, apiKey: "wyrd", fetch: caller.httpAuth });
+  const cardUid = registered(ask, "ask-agent").uid;
+
+  for (const headers of [{ "wyrd-run-id": "run-alone" }, { "wyrd-card-uid": cardUid }]) {
+    const reply = await client.chat.completions.create(ASK, { headers });
+    expect(reply.choices[0]?.message.content).toBe("hi");
+  }
+
+  server.flushBifrost();
+  const calls = (
+    await (
+      await Bifrost.connect()
+    ).sql("SELECT run_id, card_uid FROM vala.gateway.calls WHERE caller_principal_id = $1 ORDER BY run_id", [
+      issued.principal_id,
+    ])
+  ).toArrow();
+  expect(columnValues(calls.getChild("run_id"))).toEqual(["run-alone", null]);
+  expect(columnValues(calls.getChild("card_uid"))).toEqual([null, cardUid]);
 });
 
 /** An Agents SDK agent on the Gateway's Responses API whose `echo` tool returns content parts. */

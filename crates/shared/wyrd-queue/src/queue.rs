@@ -14,6 +14,7 @@ use arrow_schema::SchemaRef;
 use tokio::time::Instant;
 use uuid::Uuid;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::trace::TraceContext;
 
 use crate::config::QueueConfig;
 use crate::error::WyrdQueueError;
@@ -25,6 +26,48 @@ use crate::sink::{BatchSink, DurableBatchAck, OwnedIpcBytes, SealedBatch, SinkEr
 const RETRY_BACKOFF_INITIAL_MS: u64 = 10;
 /// Maximum ceiling for one retained ambiguity backoff.
 const RETRY_BACKOFF_MAX_MS: u64 = 1_000;
+/// The most producer contexts one sealed frame carries; later distinct
+/// contexts are not linked.
+pub const MAX_PRODUCER_TRACES: usize = 32;
+
+/// One producer context and the client-byte charge for its strings.
+///
+/// Every row admitted under the context and every sealed batch that carries
+/// it share this one allocation through an [`Arc`], so the context is charged
+/// exactly once from admission until its last holder drops: rows release it
+/// when sealed unless a batch selected it, and a batch releases it on ACK,
+/// terminal loss, or shutdown.
+#[derive(Debug)]
+pub struct ProducerTrace {
+    /// The PRODUCER span's W3C context.
+    context: TraceContext,
+    /// The reservation for the context's string bytes.
+    _charge: ClientByteGuard,
+}
+
+impl ProducerTrace {
+    /// Charges `context`'s string bytes to `budget` under the admission
+    /// ceiling and returns the charged context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::Backpressure`] when the bytes do not fit.
+    pub fn charged(
+        budget: &ClientByteBudget,
+        context: TraceContext,
+    ) -> Result<Self, WyrdQueueError> {
+        Ok(Self {
+            _charge: budget.reserve(context_bytes(&context))?,
+            context,
+        })
+    }
+
+    /// Borrows the PRODUCER span's W3C context.
+    #[must_use]
+    pub fn context(&self) -> &TraceContext {
+        &self.context
+    }
+}
 
 /// One staged prepared row and the record reservation that pays for it.
 ///
@@ -37,8 +80,11 @@ pub struct Row {
     pub(crate) batch: RecordBatch,
     /// This row's even share of its record's charge, the staging seal weight.
     pub(crate) bytes: usize,
-    /// The record's one handle-wide reservation.
+    /// The record's one handle-wide reservation for its rows.
     pub(crate) _guard: Arc<ClientByteGuard>,
+    /// The charged PRODUCER span the record was admitted under, shared by
+    /// its rows and by every batch that selects it.
+    pub(crate) trace: Option<Arc<ProducerTrace>>,
 }
 
 /// One caller-built Arrow batch and the reservation that pays for its arrays.
@@ -354,6 +400,7 @@ impl RecordQueue {
                     frame: OwnedIpcBytes::new(frame, guard),
                     rows,
                     request_id,
+                    producer_traces: Vec::new(),
                 })
             });
         match sealed {
@@ -525,6 +572,9 @@ impl RecordQueue {
     /// Rows are chunked so each chunk's JSON stays within the message
     /// ceiling. Each chunk reserves a frame of the message ceiling from the
     /// sealing headroom before encoding, then shrinks it to the encoded size.
+    /// The batch shares its selected producer contexts with their rows, so
+    /// their admitted charge moves to the batch instead of being reserved
+    /// again.
     /// A chunk that cannot be framed is bisected so every encodable row still
     /// seals; a single row that cannot be framed is settled as lost. Rows
     /// already sealed stay in the outbox even when a later chunk fails.
@@ -550,6 +600,7 @@ impl RecordQueue {
             chunks.push_back(chunk);
         }
         while let Some(mut chunk) = chunks.pop_front() {
+            let producer_traces = producer_traces(&chunk);
             let frame_guard = match self.budget.reserve_sealing(self.config.max_message_bytes) {
                 Ok(guard) => guard,
                 Err(error) => {
@@ -582,6 +633,7 @@ impl RecordQueue {
                 frame: OwnedIpcBytes::new(frame, frame_guard),
                 rows: chunk.len() as u64,
                 request_id: None,
+                producer_traces,
             };
             drop(chunk);
             self.outbox().push_back(batch);
@@ -654,6 +706,33 @@ pub(crate) fn retry_backoff(batch_id: [u8; 16], attempt: u32) -> Duration {
     Duration::from_millis(floor + mixed % (ceiling - floor + 1))
 }
 
+/// The heap bytes one producer context owns, charged to the client budget
+/// by its [`ProducerTrace`].
+pub(crate) fn context_bytes(trace: &TraceContext) -> usize {
+    trace.trace_id.len() + trace.span_id.len() + trace.trace_state.len()
+}
+
+/// The first [`MAX_PRODUCER_TRACES`] distinct producer contexts of `rows`,
+/// by `(trace_id, span_id)`, in row-admission order.
+///
+/// Rows without a context add nothing, and contexts past the bound are
+/// ignored. Each selected context is shared with its rows, not copied.
+fn producer_traces(rows: &[Row]) -> Vec<Arc<ProducerTrace>> {
+    let mut traces: Vec<Arc<ProducerTrace>> = Vec::new();
+    for trace in rows.iter().filter_map(|row| row.trace.as_ref()) {
+        if traces.len() == MAX_PRODUCER_TRACES {
+            break;
+        }
+        let context = trace.context();
+        if !traces.iter().any(|seen| {
+            seen.context().trace_id == context.trace_id && seen.context().span_id == context.span_id
+        }) {
+            traces.push(Arc::clone(trace));
+        }
+    }
+    traces
+}
+
 #[cfg(test)]
 mod tests {
     //! Settlement tests for sealing, splitting, and restoration.
@@ -697,6 +776,7 @@ mod tests {
             _guard: Arc::new(budget.reserve(bytes).expect("row bytes fit")),
             bytes,
             batch,
+            trace: None,
         }
     }
 
@@ -882,6 +962,7 @@ mod tests {
             _guard: Arc::new(poison_budget.reserve(bytes).expect("row bytes fit")),
             bytes,
             batch,
+            trace: None,
         });
         poison_queue.push(row(&poison_budget, 3));
         assert!(matches!(
@@ -993,5 +1074,105 @@ mod tests {
             .expect("a later pass retries the batch");
         queue.settle(resend.await, &mut FlushOutcome::default());
         assert_eq!(sink.attempted().len(), 3);
+    }
+
+    /// A producer context with distinct trace and span ids for `n`.
+    fn trace(n: u8) -> TraceContext {
+        TraceContext {
+            trace_id: format!("{:032x}", u128::from(n) + 1),
+            span_id: format!("{:016x}", u64::from(n) + 1),
+            trace_flags: 1,
+            trace_state: String::new(),
+        }
+    }
+
+    /// A queue row admitted under `context`, or under none.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the row or its context charge does not fit.
+    fn traced_row(budget: &ClientByteBudget, id: i64, context: Option<TraceContext>) -> Row {
+        Row {
+            trace: context.map(|context| {
+                Arc::new(ProducerTrace::charged(budget, context).expect("context bytes fit"))
+            }),
+            ..row(budget, id)
+        }
+    }
+
+    /// A seal keeps the first 32 distinct producer contexts in row-admission
+    /// order: a repeated context and a context-free row add nothing, and
+    /// contexts past the bound are ignored and release their charge with
+    /// their rows.
+    #[test]
+    fn seal_keeps_the_first_distinct_producer_contexts_in_order() {
+        let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
+        let mut rows = vec![
+            traced_row(&budget, 1, Some(trace(0))),
+            traced_row(&budget, 2, None),
+            traced_row(&budget, 3, Some(trace(1))),
+            traced_row(&budget, 4, Some(trace(0))),
+        ];
+        rows.extend((2..40).map(|n| traced_row(&budget, i64::from(n), Some(trace(n)))));
+        let kept = producer_traces(&rows);
+        assert_eq!(kept.len(), MAX_PRODUCER_TRACES);
+        assert_eq!(
+            kept.iter()
+                .map(|kept| kept.context().clone())
+                .collect::<Vec<_>>(),
+            (0..32).map(trace).collect::<Vec<_>>()
+        );
+        assert!(
+            producer_traces(&[traced_row(&budget, 1, None)]).is_empty(),
+            "a context-free row adds nothing"
+        );
+        drop(rows);
+        assert_eq!(
+            budget.used_bytes(),
+            kept.iter()
+                .map(|kept| context_bytes(kept.context()))
+                .sum::<usize>(),
+            "only the selected contexts stay charged once their rows release"
+        );
+    }
+
+    /// Every attempt of one sealed batch, including the resend after an
+    /// ambiguous settlement, carries byte-identical producer contexts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch is not retained after the ambiguity or an
+    /// attempt's contexts differ.
+    #[tokio::test(start_paused = true)]
+    async fn an_ambiguous_retry_resends_the_same_producer_contexts() {
+        let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
+        let sink = Arc::new(MockSink::new());
+        let queue = RecordQueue::new(
+            "events".to_owned(),
+            output_schema(),
+            sink.clone(),
+            QueueConfig::default(),
+            budget.clone(),
+            Arc::new(Counters::default()),
+        );
+        queue
+            .place(Entry::Rows(vec![
+                traced_row(&budget, 1, Some(trace(7))),
+                traced_row(&budget, 2, Some(trace(3))),
+            ]))
+            .expect("rows staged");
+        queue.seal().expect("rows sealed");
+        sink.fail_next(1);
+
+        let first = queue.start(Instant::now()).expect("the fresh batch starts");
+        queue.settle(first.await, &mut FlushOutcome::default());
+        let due = queue.next_retry_due().expect("the ambiguity is retained");
+        tokio::time::advance(due - Instant::now()).await;
+        let retry = queue.start(Instant::now()).expect("the due batch starts");
+        queue.settle(retry.await, &mut FlushOutcome::default());
+
+        let attempts = sink.attempted_traces();
+        assert_eq!(attempts, vec![vec![trace(7), trace(3)]; 2]);
+        assert_eq!(sink.received()[0].producer_traces, attempts[0]);
     }
 }

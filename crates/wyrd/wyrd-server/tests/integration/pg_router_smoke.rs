@@ -2271,3 +2271,98 @@ async fn forge_runtime_composes_only_for_forge_targets() {
     );
     scribe.shutdown().await.expect("server shuts down");
 }
+
+/// Trace id of the caller span that the trace-continuity cases send.
+const CALLER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+/// Span id of the caller span that the trace-continuity cases send.
+const CALLER_SPAN: &str = "b7ad6b7169203331";
+
+/// Send `/healthz` with each `traceparent` value in `parents`, drain the
+/// response, and return the finished `request` spans it produced.
+///
+/// # Panics
+/// Panics when the server does not start, the probe does not answer `200`,
+/// or the server does not shut down.
+async fn traced_healthz(
+    traces: &wyrd_telemetry::TestTraceCapture,
+    parents: &[&str],
+) -> Vec<wyrd_telemetry::CapturedSpan> {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let checkpoint = traces.checkpoint();
+    let mut request = Request::builder().uri("/healthz");
+    for parent in parents {
+        request = request.header("traceparent", *parent);
+    }
+    let response = server
+        .oneshot(
+            request
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collects");
+    server.shutdown().await.expect("server shuts down");
+    traces
+        .finished_since(checkpoint)
+        .into_iter()
+        .filter(|span| span.name == "request")
+        .collect()
+}
+
+/// A valid inbound `traceparent` makes the caller's span the parent of the
+/// request's SERVER span, which is exported at the production `info` level.
+///
+/// # Panics
+/// Panics when the request span is missing, is not a SERVER child of the
+/// caller's span, or is recorded below `info`.
+#[tokio::test]
+async fn inbound_traceparent_parents_the_request_span() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let spans = traced_healthz(&traces, &[&format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01")]).await;
+    let [request] = spans.as_slice() else {
+        panic!("one request span: {spans:#?}");
+    };
+    assert_eq!(request.trace_id, CALLER_TRACE, "{request:?}");
+    assert_eq!(request.parent_span_id, CALLER_SPAN, "{request:?}");
+    assert_eq!(request.kind, "Server", "{request:?}");
+    assert_eq!(
+        request.attributes.get("level").map(String::as_str),
+        Some("INFO"),
+        "{request:?}"
+    );
+}
+
+/// A malformed or repeated `traceparent` starts a new trace and the request
+/// still succeeds.
+///
+/// # Panics
+/// Panics when a request fails or its span joins the supplied trace.
+#[tokio::test]
+async fn malformed_traceparent_starts_a_new_trace() {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let valid = format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01");
+    for parents in [
+        vec!["not-a-traceparent"],
+        vec![valid.as_str(), valid.as_str()],
+    ] {
+        let spans = traced_healthz(&traces, &parents).await;
+        let [request] = spans.as_slice() else {
+            panic!("one request span for {parents:?}: {spans:#?}");
+        };
+        assert_ne!(request.trace_id, CALLER_TRACE, "{parents:?}: {request:?}");
+        assert_eq!(
+            request.parent_span_id, "0000000000000000",
+            "{parents:?}: {request:?}"
+        );
+    }
+}

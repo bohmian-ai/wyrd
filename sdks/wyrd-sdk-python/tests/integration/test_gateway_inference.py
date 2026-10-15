@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import secrets
+
 import openai
 import pytest
 from wyrd.agent import Workflow
+from wyrd.bifrost import Bifrost
 from wyrd.cards import CardRef, Cards
 from wyrd.client import WyrdClient
+from wyrd.gateway import Gateway
 from wyrd.testing import WyrdTestServer, cli
 
 from .gateway.support import PROVIDER_KEY, deploy
-from .support import FIXTURES, Receiver, client_of
+from .support import FIXTURES, Receiver, ancestry, client_of, register, timeline
 
 pytestmark = pytest.mark.integration
 
@@ -37,10 +41,11 @@ def openai_client(caller: WyrdClient) -> openai.OpenAI:
 
 @pytest.fixture
 def server(gateway_server: tuple[WyrdTestServer, Receiver]) -> WyrdTestServer:
-    """A gateway server with OpenAI chat deployments of ``gpt-4o`` and ``gpt-5-5``."""
+    """A gateway server with OpenAI chat deployments of ``gpt-4o`` and ``gpt-5-5`` capturing call metadata."""
     server, _ = gateway_server
     deploy(server, "openai", "gpt-4o", ["chat_completions"])
     deploy(server, "openai", "gpt-5-5", ["chat_completions"])
+    Gateway(client_of(server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
     return server
 
 
@@ -72,6 +77,62 @@ def test_openai_client_calls_the_gateway_with_an_access_token(
     assert completion.choices[0].message.content == "hi"
     assert model_calls(upstream) == 1
     assert upstream.deliveries[0].headers["authorization"] == f"Bearer {PROVIDER_KEY}"
+
+
+def test_gateway_span_joins_the_callers_trace(server: WyrdTestServer, admin: WyrdClient) -> None:
+    trace_id, span_id = secrets.token_hex(16), secrets.token_hex(8)
+    completion = openai_client(admin).chat.completions.create(
+        model="openai/gpt-4o",
+        messages=[{"role": "user", "content": "hi"}],
+        extra_headers={"traceparent": f"00-{trace_id}-{span_id}-01", "tracestate": "wyrd=journey"},
+    )
+
+    assert completion.choices[0].message.content == "hi"
+    spans = timeline(server, trace_id)
+    attempts = [span for span in spans if span["scope"]["name"] == "wyrd.gateway"]
+    assert len(attempts) == 1, spans
+    assert ancestry(spans, attempts[0])[-1].get("parent_span_id") == span_id
+    assert attempts[0].get("trace_state") == "wyrd=journey"
+
+
+def test_malformed_traceparent_is_ignored_by_the_gateway(
+    server: WyrdTestServer, admin: WyrdClient
+) -> None:
+    trace_id = secrets.token_hex(16)
+    completion = openai_client(admin).chat.completions.create(
+        model="openai/gpt-4o",
+        messages=[{"role": "user", "content": "hi"}],
+        extra_headers={"traceparent": f"00-{trace_id.upper()}-00f067aa0ba902b7-01"},
+    )
+
+    assert completion.choices[0].message.content == "hi"
+    assert timeline(server, trace_id) == []
+
+
+def test_gateway_call_records_a_lone_run_or_card(server: WyrdTestServer, admin: WyrdClient) -> None:
+    card_uid = str(register(Cards(admin), "cards/gateway_inference/ask.yaml")["ask-agent"].uid)
+    issued = cli.issue_key(
+        kind="Agent", name="ask-agent", version="1.0.0", space="default", client=admin
+    )
+    agent = openai_client(client_of(server, issued.key))
+
+    for headers in ({"wyrd-run-id": "run-alone"}, {"wyrd-card-uid": card_uid}):
+        completion = agent.chat.completions.create(
+            model="openai/gpt-4o",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_headers=headers,
+        )
+        assert completion.choices[0].message.content == "hi"
+
+    server.flush_bifrost()
+    calls = Bifrost(client=admin).sql(
+        "SELECT run_id, card_uid FROM vala.gateway.calls WHERE caller_principal_id = $1 ORDER BY run_id",
+        [str(issued.principal_id)],
+    )
+    assert calls.to_arrow().to_pylist() == [
+        {"run_id": "run-alone", "card_uid": None},
+        {"run_id": None, "card_uid": card_uid},
+    ]
 
 
 def test_caller_without_gateway_invoke_is_refused(

@@ -10,6 +10,8 @@
 //! `serde_json`'s own message quotes the offending input, and a gateway body
 //! can carry a provider key, so that text never reaches Node.
 
+use napi::Env;
+use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
 use serde::de::DeserializeOwned;
 use serde_json::Error as JsonError;
@@ -58,12 +60,19 @@ impl NativeGateway {
     /// Returns a napi error only when the view cannot be serialized; an invalid
     /// name or server failure is returned in the result.
     #[napi]
-    pub async fn credential(&self, name: String) -> napi::Result<NativeLifecycleResult> {
-        let result = match decode_name(name) {
-            Ok(name) => self.gateway.credential(&name).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn credential<'env>(
+        &self,
+        env: &'env Env,
+        name: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            let result = match decode_name(name) {
+                Ok(name) => gateway.credential(&name).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Lists the tenant's redacted provider credentials ordered by name.
@@ -73,8 +82,14 @@ impl NativeGateway {
     /// Returns a napi error only when the list cannot be serialized; server
     /// failures are returned in the result.
     #[napi]
-    pub async fn credentials(&self) -> napi::Result<NativeLifecycleResult> {
-        NativeLifecycleResult::outcome(self.gateway.credentials().await)
+    pub fn credentials<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(gateway.credentials().await)
+        })
     }
 
     /// Creates or replaces a provider deployment from its serialized body.
@@ -84,15 +99,19 @@ impl NativeGateway {
     /// Returns a napi error only when the deployment cannot be serialized; a
     /// malformed body or server failure is returned in the result.
     #[napi]
-    pub async fn put_deployment(
+    pub fn put_deployment<'env>(
         &self,
+        env: &'env Env,
         deployment_json: String,
-    ) -> napi::Result<NativeLifecycleResult> {
-        let result = match decode(&deployment_json, "deployment") {
-            Ok(deployment) => self.gateway.put_deployment(&deployment).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            let result = match decode(&deployment_json, "deployment") {
+                Ok(deployment) => gateway.put_deployment(&deployment).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Reads one provider deployment by name.
@@ -102,12 +121,19 @@ impl NativeGateway {
     /// Returns a napi error only when the deployment cannot be serialized; an
     /// invalid name or server failure is returned in the result.
     #[napi]
-    pub async fn deployment(&self, name: String) -> napi::Result<NativeLifecycleResult> {
-        let result = match decode_name(name) {
-            Ok(name) => self.gateway.deployment(&name).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn deployment<'env>(
+        &self,
+        env: &'env Env,
+        name: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            let result = match decode_name(name) {
+                Ok(name) => gateway.deployment(&name).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Lists the tenant's provider deployments ordered by name.
@@ -117,8 +143,14 @@ impl NativeGateway {
     /// Returns a napi error only when the list cannot be serialized; server
     /// failures are returned in the result.
     #[napi]
-    pub async fn deployments(&self) -> napi::Result<NativeLifecycleResult> {
-        NativeLifecycleResult::outcome(self.gateway.deployments().await)
+    pub fn deployments<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(gateway.deployments().await)
+        })
     }
 
     /// Deletes one provider deployment; an absent name succeeds.
@@ -128,12 +160,19 @@ impl NativeGateway {
     /// Returns a napi error only when the result cannot be projected; an
     /// invalid name or server failure is returned in the result.
     #[napi]
-    pub async fn delete_deployment(&self, name: String) -> napi::Result<NativeLifecycleResult> {
-        let result = match decode_name(name) {
-            Ok(name) => self.gateway.delete_deployment(&name).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    pub fn delete_deployment<'env>(
+        &self,
+        env: &'env Env,
+        name: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            let result = match decode_name(name) {
+                Ok(name) => gateway.delete_deployment(&name).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Replaces the tenant fallback policy from its serialized body.
@@ -143,15 +182,19 @@ impl NativeGateway {
     /// Returns a napi error only when the policy cannot be serialized; a
     /// malformed body or server failure is returned in the result.
     #[napi]
-    pub async fn put_fallback_policy(
+    pub fn put_fallback_policy<'env>(
         &self,
+        env: &'env Env,
         policy_json: String,
-    ) -> napi::Result<NativeLifecycleResult> {
-        let result = match decode(&policy_json, "policy") {
-            Ok(policy) => self.gateway.put_fallback_policy(&policy).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            let result = match decode(&policy_json, "policy") {
+                Ok(policy) => gateway.put_fallback_policy(&policy).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Reads the tenant fallback policy, or the default when none is set.
@@ -161,8 +204,14 @@ impl NativeGateway {
     /// Returns a napi error only when the policy cannot be serialized; server
     /// failures are returned in the result.
     #[napi]
-    pub async fn fallback_policy(&self) -> napi::Result<NativeLifecycleResult> {
-        NativeLifecycleResult::outcome(self.gateway.fallback_policy().await)
+    pub fn fallback_policy<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(gateway.fallback_policy().await)
+        })
     }
 
     /// Restores the default fallback policy.
@@ -172,8 +221,14 @@ impl NativeGateway {
     /// Returns a napi error only when the result cannot be projected; server
     /// failures are returned in the result.
     #[napi]
-    pub async fn delete_fallback_policy(&self) -> napi::Result<NativeLifecycleResult> {
-        NativeLifecycleResult::outcome(self.gateway.delete_fallback_policy().await)
+    pub fn delete_fallback_policy<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(gateway.delete_fallback_policy().await)
+        })
     }
 
     /// Replaces the tenant governance policy from its serialized body.
@@ -183,15 +238,19 @@ impl NativeGateway {
     /// Returns a napi error only when the policy cannot be serialized; a
     /// malformed body or server failure is returned in the result.
     #[napi]
-    pub async fn put_governance_policy(
+    pub fn put_governance_policy<'env>(
         &self,
+        env: &'env Env,
         policy_json: String,
-    ) -> napi::Result<NativeLifecycleResult> {
-        let result = match decode(&policy_json, "policy") {
-            Ok(policy) => self.gateway.put_governance_policy(&policy).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            let result = match decode(&policy_json, "policy") {
+                Ok(policy) => gateway.put_governance_policy(&policy).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Reads the tenant governance policy, or the default when none is set.
@@ -201,8 +260,14 @@ impl NativeGateway {
     /// Returns a napi error only when the policy cannot be serialized; server
     /// failures are returned in the result.
     #[napi]
-    pub async fn governance_policy(&self) -> napi::Result<NativeLifecycleResult> {
-        NativeLifecycleResult::outcome(self.gateway.governance_policy().await)
+    pub fn governance_policy<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(gateway.governance_policy().await)
+        })
     }
 
     /// Restores the default governance policy.
@@ -212,8 +277,14 @@ impl NativeGateway {
     /// Returns a napi error only when the result cannot be projected; server
     /// failures are returned in the result.
     #[napi]
-    pub async fn delete_governance_policy(&self) -> napi::Result<NativeLifecycleResult> {
-        NativeLifecycleResult::outcome(self.gateway.delete_governance_policy().await)
+    pub fn delete_governance_policy<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(gateway.delete_governance_policy().await)
+        })
     }
 
     /// Replaces the tenant capture policy from its serialized write body.
@@ -224,15 +295,19 @@ impl NativeGateway {
     /// serialized; a malformed body or server failure is returned in the
     /// result.
     #[napi]
-    pub async fn put_capture_policy(
+    pub fn put_capture_policy<'env>(
         &self,
+        env: &'env Env,
         policy_json: String,
-    ) -> napi::Result<NativeLifecycleResult> {
-        let result = match decode(&policy_json, "policy") {
-            Ok(policy) => self.gateway.put_capture_policy(&policy).await,
-            Err(error) => Err(error),
-        };
-        NativeLifecycleResult::outcome(result)
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            let result = match decode(&policy_json, "policy") {
+                Ok(policy) => gateway.put_capture_policy(&policy).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
     }
 
     /// Reads the tenant capture policy, or the disabled default.
@@ -242,8 +317,14 @@ impl NativeGateway {
     /// Returns a napi error only when the policy cannot be serialized; server
     /// failures are returned in the result.
     #[napi]
-    pub async fn capture_policy(&self) -> napi::Result<NativeLifecycleResult> {
-        NativeLifecycleResult::outcome(self.gateway.capture_policy().await)
+    pub fn capture_policy<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let gateway = self.gateway.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(gateway.capture_policy().await)
+        })
     }
 }
 

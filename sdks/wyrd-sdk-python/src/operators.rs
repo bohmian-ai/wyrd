@@ -86,7 +86,7 @@ impl OperatorConnections {
     fn create(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> WyrdPyResult<Py<PyAny>> {
         let request: CreateOperatorConnectionRequest =
             decode("request", pyobject_to_json(request)?)?;
-        let view = py.detach(|| wyrd_runtime::runtime().block_on(self.inner.create(&request)))?;
+        let view = crate::trace::block_on(py, self.inner.create(&request))?;
         to_python(py, &view)
     }
 
@@ -96,7 +96,7 @@ impl OperatorConnections {
     /// Raises `WyrdError` when the caller lacks `operators:read` or the
     /// request fails.
     fn list(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        let views = py.detach(|| wyrd_runtime::runtime().block_on(self.inner.list()))?;
+        let views = crate::trace::block_on(py, self.inner.list())?;
         to_python(py, &views)
     }
 
@@ -108,7 +108,7 @@ impl OperatorConnections {
     /// tenant, or the request fails.
     fn get(&self, py: Python<'_>, connection_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let id: OperatorConnectionId = decode("connection_id", Value::from(connection_id))?;
-        let view = py.detach(|| wyrd_runtime::runtime().block_on(self.inner.get(&id)))?;
+        let view = crate::trace::block_on(py, self.inner.get(&id))?;
         to_python(py, &view)
     }
 
@@ -127,8 +127,7 @@ impl OperatorConnections {
         let id: OperatorConnectionId = decode("connection_id", Value::from(connection_id))?;
         let request: UpdateOperatorConnectionRequest =
             decode("request", pyobject_to_json(request)?)?;
-        let view =
-            py.detach(|| wyrd_runtime::runtime().block_on(self.inner.update(&id, &request)))?;
+        let view = crate::trace::block_on(py, self.inner.update(&id, &request))?;
         to_python(py, &view)
     }
 
@@ -140,7 +139,7 @@ impl OperatorConnections {
     /// fails.
     fn disable(&self, py: Python<'_>, connection_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let id: OperatorConnectionId = decode("connection_id", Value::from(connection_id))?;
-        let view = py.detach(|| wyrd_runtime::runtime().block_on(self.inner.disable(&id)))?;
+        let view = crate::trace::block_on(py, self.inner.disable(&id))?;
         to_python(py, &view)
     }
 }

@@ -5,6 +5,8 @@
 //! `fixtures/README.md`; nextest selects a story with
 //! `-E 'test(/^<module>::/)'`.
 
+/// One Service action read back as one connected trace timeline.
+mod action_timeline;
 mod gateway_admin;
 mod gateway_inference;
 /// TypeSafe Jev through the Gateway, natively and as a Verifier's judge.

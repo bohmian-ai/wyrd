@@ -78,6 +78,7 @@ mod grpc_connection {
                     leaf.certificate_pem(),
                     leaf.private_key_pem(),
                 )),
+                tenant_spans: None,
             },
         )
         .expect("TLS router");

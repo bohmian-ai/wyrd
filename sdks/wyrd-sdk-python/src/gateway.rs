@@ -95,7 +95,7 @@ impl PyGateway {
         T: Serialize + Send,
         F: Future<Output = Result<T, WyrdError>> + Send,
     {
-        let value = py.detach(|| wyrd_runtime::runtime().block_on(call))?;
+        let value = crate::trace::block_on(py, call)?;
         let json = serde_json::to_value(value)?;
         Ok(json_to_pyobject(py, &json)?)
     }

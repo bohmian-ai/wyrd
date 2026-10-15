@@ -72,6 +72,7 @@ import type {
   RunningQueryLifecycleState,
   RunningQuerySummary,
   SortKeyWire as SortKey,
+  SpanRecord,
   TokenAudience,
   UpdateOperatorConnectionRequest,
   WorkflowRun,
@@ -224,6 +225,7 @@ export type {
   RegisteredWorkflowCard,
   Relationships as CardRelationships,
   ServiceSpec,
+  SpanRecord,
   Status as CardStatus,
   TriggerSpec,
   TypedCardKind,
@@ -1330,6 +1332,22 @@ export class Bifrost {
   }
 
   /**
+   * Read one trace's span tree plus each trace linking directly to it.
+   *
+   * Spans come back deduplicated, ordered by start time, then trace id, then
+   * span id. A trace no span names reads as an empty array.
+   *
+   * @param traceId - The 32-character lowercase hex W3C trace id.
+   * @returns The canonical span records.
+   * @throws {@link WyrdError} `WYRD_SPEC_400_VALIDATION` for a malformed or
+   * all-zero id, before any request; otherwise a query, authorization, or
+   * transport failure.
+   */
+  async traceTimeline(traceId: string): Promise<SpanRecord[]> {
+    return lifecycleValue<SpanRecord[]>(await this.#native.traceTimeline(traceId));
+  }
+
+  /**
    * Describe one registered table's stored physical schema.
    *
    * @param namespace - The table's namespace, such as `vala.datasets`.
@@ -2195,6 +2213,44 @@ function activeSpanIds(): { readonly traceId?: string; readonly spanId?: string 
   return { traceId: spanContext.traceId, spanId: spanContext.spanId };
 }
 
+/**
+ * Node's active OpenTelemetry span as W3C `traceparent`/`tracestate`; `null`
+ * when no API is installed, no span is active, or its context is invalid.
+ * Every native call reads it on entry, so the Wyrd requests it sends join the
+ * caller's trace. Given `producerTable`, a queued write's `bifrost.enqueue`
+ * PRODUCER span opens and ends under the active span first, and its context
+ * is returned instead.
+ */
+function activeTraceContext(producerTable?: string | null): { traceparent: string; tracestate?: string } | null {
+  const api = otel();
+  if (api === null) {
+    return null;
+  }
+  let span = api.trace.getActiveSpan();
+  if (typeof producerTable === "string") {
+    span = api.trace.getTracer("wyrd.bifrost").startSpan("bifrost.enqueue", {
+      kind: api.SpanKind.PRODUCER,
+      attributes: {
+        "messaging.system": "bifrost",
+        "messaging.operation.type": "create",
+        "messaging.destination.name": producerTable,
+      },
+    });
+    span.end();
+  }
+  const spanContext = span?.spanContext();
+  if (spanContext === undefined || !api.isSpanContextValid(spanContext)) {
+    return null;
+  }
+  const flags = spanContext.traceFlags.toString(16).padStart(2, "0");
+  return {
+    traceparent: `00-${spanContext.traceId}-${spanContext.spanId}-${flags}`,
+    tracestate: spanContext.traceState?.serialize(),
+  };
+}
+
+nativeBinding.setTraceSource(activeTraceContext);
+
 /** The application's `@opentelemetry/api`, or `null` when it is not installed. */
 function otel(): typeof import("@opentelemetry/api") | null {
   if (otelApi === undefined) {
@@ -2322,7 +2378,8 @@ export class Observe {
    * Verifier takes an array of flat feature rows. A `failed` verdict resolves
    * normally. Nothing is observed, recorded, enqueued, or dispatched, Bifrost
    * need not be started, and the request is never replayed. It runs as the
-   * state's client.
+   * state's client and carries Node's active OpenTelemetry span as its W3C
+   * trace context, so the server's work joins the caller's trace.
    *
    * @param verifier - The bound Verifier's name.
    * @param input - One Eval context object, or an array of Drift feature rows.

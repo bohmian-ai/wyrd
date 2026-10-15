@@ -44,6 +44,7 @@ mod grpc;
 mod handle;
 pub mod observe;
 mod query;
+pub mod rows;
 mod scope;
 mod sink;
 mod table;
@@ -660,6 +661,7 @@ mod sdk {
             ),
             rows: 1,
             request_id: None,
+            producer_traces: Vec::new(),
         };
 
         let rt = wyrd_runtime::runtime();

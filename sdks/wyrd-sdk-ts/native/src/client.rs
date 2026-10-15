@@ -4,6 +4,8 @@
 //! [`NativeWyrdClient::on_behalf_of`] calls the Rust RFC 8693 exchange. Token
 //! exchange, caching, renewal, and errors stay in the Rust owner.
 
+use napi::Env;
+use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
 use secrecy::SecretString;
 use wyrd_client::WyrdClient;
@@ -100,17 +102,25 @@ impl NativeWyrdClient {
     /// token is renewed there; nothing is cached in Node. A refusal or
     /// transport failure is returned as catalog metadata.
     #[napi]
-    pub async fn access_token(&self) -> NativeAccessTokenResult {
-        match self.client.access_token().await {
-            Ok(bearer) => NativeAccessTokenResult {
-                token: Some(bearer.expose().to_owned()),
-                error: None,
-            },
-            Err(error) => NativeAccessTokenResult {
-                token: None,
-                error: Some(NativeWyrdError::from_wyrd(&error)),
-            },
-        }
+    pub fn access_token<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeAccessTokenResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            Ok({
+                match client.access_token().await {
+                    Ok(bearer) => NativeAccessTokenResult {
+                        token: Some(bearer.expose().to_owned()),
+                        error: None,
+                    },
+                    Err(error) => NativeAccessTokenResult {
+                        token: None,
+                        error: Some(NativeWyrdError::from_wyrd(&error)),
+                    },
+                }
+            })
+        })
     }
 
     /// Returns a client that acts for the holder of `subject_token`.
@@ -120,26 +130,32 @@ impl NativeWyrdClient {
     /// in Rust before expiry. An `audience` other than `wyrd` or `bifrost` is a
     /// `WYRD_SPEC_400_VALIDATION` result.
     #[napi]
-    pub async fn on_behalf_of(
+    pub fn on_behalf_of<'env>(
         &self,
+        env: &'env Env,
         subject_token: String,
         audience: String,
-    ) -> NativeWyrdClientResult {
-        let audience: TokenAudience =
-            match serde_json::from_value(serde_json::Value::String(audience)) {
-                Ok(audience) => audience,
-                Err(error) => {
-                    return NativeWyrdClientResult::from_outcome(Err(WyrdError::Validation {
-                        message: format!("audience is invalid: {error}"),
-                        details: serde_json::json!({ "field": "audience" }),
-                    }));
-                }
-            };
-        NativeWyrdClientResult::from_outcome(
-            self.client
-                .on_behalf_of(SecretString::from(subject_token), audience)
-                .await,
-        )
+    ) -> napi::Result<PromiseRaw<'env, NativeWyrdClientResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            let audience: TokenAudience =
+                match serde_json::from_value(serde_json::Value::String(audience)) {
+                    Ok(audience) => audience,
+                    Err(error) => {
+                        return Ok(NativeWyrdClientResult::from_outcome(Err(
+                            WyrdError::Validation {
+                                message: format!("audience is invalid: {error}"),
+                                details: serde_json::json!({ "field": "audience" }),
+                            },
+                        )));
+                    }
+                };
+            Ok(NativeWyrdClientResult::from_outcome(
+                client
+                    .on_behalf_of(SecretString::from(subject_token), audience)
+                    .await,
+            ))
+        })
     }
 
     /// Connects one Bifrost client over this client's authentication and
@@ -161,20 +177,24 @@ impl NativeWyrdClient {
     /// serialized `TableConfig`; the byte-budget and ingest-dial failures are
     /// returned as catalog metadata.
     #[napi]
-    pub async fn connect_bifrost(
+    pub fn connect_bifrost<'env>(
         &self,
+        env: &'env Env,
         table: Option<NativeTableConfig>,
         client_byte_limit_bytes: Option<i64>,
-    ) -> napi::Result<NativeBifrostConnection> {
-        let table = table.map(|table| table.parse()).transpose()?;
-        Ok(NativeBifrostConnection::from_outcome(
-            Bifrost::connect_with_config(
-                &self.client,
-                table,
-                crate::queue_config(client_byte_limit_bytes),
-            )
-            .await,
-        ))
+    ) -> napi::Result<PromiseRaw<'env, NativeBifrostConnection>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            let table = table.map(|table| table.parse()).transpose()?;
+            Ok(NativeBifrostConnection::from_outcome(
+                Bifrost::connect_with_config(
+                    &client,
+                    table,
+                    crate::queue_config(client_byte_limit_bytes),
+                )
+                .await,
+            ))
+        })
     }
 
     /// Fetches an already-registered table's config by name as this client.
@@ -188,19 +208,23 @@ impl NativeWyrdClient {
     /// Returns a napi error only when the described config cannot be encoded;
     /// transport and server refusals are returned as catalog metadata.
     #[napi]
-    pub async fn describe_table_config(
+    pub fn describe_table_config<'env>(
         &self,
+        env: &'env Env,
         table: String,
-    ) -> napi::Result<NativeTableConfigResult> {
-        match TableConfig::describe(&self.client, &table).await {
-            Ok(config) => Ok(NativeTableConfigResult {
-                config: Some(NativeTableConfig::project(&config)?),
-                error: None,
-            }),
-            Err(error) => Ok(NativeTableConfigResult {
-                config: None,
-                error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
-            }),
-        }
+    ) -> napi::Result<PromiseRaw<'env, NativeTableConfigResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            match TableConfig::describe(&client, &table).await {
+                Ok(config) => Ok(NativeTableConfigResult {
+                    config: Some(NativeTableConfig::project(&config)?),
+                    error: None,
+                }),
+                Err(error) => Ok(NativeTableConfigResult {
+                    config: None,
+                    error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
+                }),
+            }
+        })
     }
 }

@@ -97,6 +97,12 @@ pub use wyrd_spec::verification::{Judgment, VerificationVerdict, VerifierKind};
 /// The session an emitted observation belongs to.
 pub use wyrd_spec::vala::ids::SessionId;
 
+/// The trace a [`Bifrost::trace_timeline`] read names.
+pub use wyrd_spec::vala::ids::TraceId;
+
+/// One canonical span a [`Bifrost::trace_timeline`] read returns.
+pub use wyrd_spec::vala::trace::SpanRecord;
+
 /// The outcome the terminal frame of a [`bifrost::QueryResultStream`]
 /// reports.
 pub use wyrd_spec::vala::api::QueryTerminalOutcome;

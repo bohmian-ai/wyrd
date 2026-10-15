@@ -29,10 +29,12 @@ use rmcp::transport::streamable_http_server::session::never::NeverSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{RoleServer, ServerHandler};
 use serde::Serialize;
+use tracing::Instrument as _;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
 use crate::components::auth::{AuthenticatedPrincipal, Caller};
+use crate::http::middleware::trace_context;
 use crate::state::AppState;
 
 mod bifrost;
@@ -233,6 +235,31 @@ impl ServerHandler for WyrdMcpHandler {
             .with_cache_scope(CacheScope::Private)))
     }
 
+    /// Dispatch tools inside the HTTP request's span.
+    ///
+    /// The transport serves each request on a task of its own, so the request
+    /// span is not current here; it is read again from the original request,
+    /// so every span a tool
+    /// opens — a `verification.execute` and the judge and gateway calls inside
+    /// it — descends from the request span, which continues the agent's trace
+    /// like an HTTP verification does.
+    ///
+    /// # Errors
+    /// Every error of [`WyrdMcpHandler::dispatch`].
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let parts = context.extensions.get::<axum::http::request::Parts>();
+        let span = parts
+            .and_then(|parts| parts.extensions.get::<trace_context::RequestSpan>())
+            .map_or_else(tracing::Span::current, |span| span.0.clone());
+        self.dispatch(request, context).instrument(span).await
+    }
+}
+
+impl WyrdMcpHandler {
     /// Dispatch tools with verified request context and retain the shutdown
     /// tracker token through execution and cancellation settlement.
     ///
@@ -240,7 +267,7 @@ impl ServerHandler for WyrdMcpHandler {
     /// Returns invalid parameters for unknown tools, mapped context errors when
     /// trusted extensions are missing, or the owning tool's protocol error.
     /// Domain failures remain structured tool results.
-    async fn call_tool(
+    async fn dispatch(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,

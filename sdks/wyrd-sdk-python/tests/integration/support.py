@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from pydantic import BaseModel
+from wyrd.bifrost import Bifrost, SpanRecord
 from wyrd.cards import CardRef, Cards
 from wyrd.client import WyrdClient
 from wyrd.model import ModelInterface
@@ -104,6 +106,23 @@ def client_of(server: WyrdTestServer, credential: str | None = None) -> WyrdClie
         credential=credential or server.api_key,
         grpc_url=server.grpc_url,
     )
+
+
+def timeline(server: WyrdTestServer, trace_id: str) -> list[SpanRecord]:
+    """Publish every captured row, then read trace ``trace_id``'s spans as ``server``'s administrator."""
+    server.flush_bifrost()
+    return Bifrost(client=client_of(server)).trace_timeline(trace_id)
+
+
+def ancestry(spans: Sequence[SpanRecord], span: SpanRecord) -> list[SpanRecord]:
+    """``span`` and each ancestor its parent ids reach within ``spans``, nearest first."""
+    by_id = {(each["trace_id"], each["span_id"]): each for each in spans}
+    chain = [span]
+    while (
+        parent := by_id.get((chain[-1]["trace_id"], chain[-1].get("parent_span_id") or ""))
+    ) is not None:
+        chain.append(parent)
+    return chain
 
 
 def register(cards: Cards, path: str) -> dict[str, CardRef]:

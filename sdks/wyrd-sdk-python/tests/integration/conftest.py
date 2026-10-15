@@ -19,6 +19,7 @@ import pytest
 from wyrd.bifrost import Bifrost, TableConfig
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
+from wyrd.gateway import Gateway
 from wyrd.operators import OperatorConnections
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
@@ -30,6 +31,7 @@ from .support import (
     Delivery,
     QueryRow,
     Receiver,
+    client_of,
     download,
     hydrated,
     register,
@@ -250,6 +252,18 @@ def query_table(wyrd_server: WyrdTestServer) -> str:
     # Publish the flushed rows so every query journey reads them.
     wyrd_server.flush_bifrost()
     return fqn
+
+
+@pytest.fixture
+def metadata_capture(wyrd_server: WyrdTestServer) -> Iterator[None]:
+    """Gateway call metadata captured for one test, the session's policy restored after it."""
+    gateway = Gateway(client_of(wyrd_server))
+    previous = gateway.capture_policy()
+    gateway.put_capture_policy({"mode": "metadata", "payload_fields": []})
+    yield
+    gateway.put_capture_policy(
+        {"mode": previous["mode"], "payload_fields": previous["payload_fields"]}
+    )
 
 
 @pytest.fixture

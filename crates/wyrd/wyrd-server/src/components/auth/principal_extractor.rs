@@ -31,7 +31,16 @@ impl AuthenticatedPrincipal {
     /// Wrap a verifier result. Crate-private so the verify pipeline in
     /// [`verify_authenticated_principal`] stays the only producer: an
     /// unverified construction here would be a silent authentication bypass.
+    ///
+    /// Being that producer, it also routes the current request's tenant span
+    /// copies to the verified tenant and principal. A request that did not
+    /// continue a sampled client trace, or work outside a request, is not
+    /// routed.
     pub(crate) fn from_verified(verified: Arc<VerifiedToken>) -> Self {
+        wyrd_telemetry::bind_tenant_route(wyrd_telemetry::TenantSpanRoute {
+            tenant: verified.principal.tenant_id,
+            principal: verified.principal.id,
+        });
         Self { verified }
     }
 

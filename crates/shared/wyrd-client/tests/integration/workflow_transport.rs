@@ -559,9 +559,9 @@ fn problem(outcome: Result<ProviderResponse, ProviderError>) -> RemoteProblem {
     }
 }
 
-/// A caller bound to an application Run sends that Run and the Card UID as
-/// the paired `wyrd-run-id` and `wyrd-card-uid` headers, and an unbound
-/// caller sends neither.
+/// A caller sends each of the application Run and Card UID it was given as
+/// its own `wyrd-run-id` or `wyrd-card-uid` header: both, either alone, or
+/// neither.
 ///
 /// # Panics
 /// Panics when a call fails or a correlation header differs.
@@ -573,22 +573,25 @@ async fn public_gateway_call_carries_run_and_card_uid() {
         "POST",
         "/v1/chat/completions",
         ResponseTemplate::new(200).set_body_json(chat_answer()),
-        2,
+        4,
     )
     .await;
     let run = RunId::from_string("run-1".to_owned());
     let card_uid = CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00").expect("Card UID");
     let token = CancellationToken::new();
     let call = || gateway_call(chat_request(), "openai/gpt-a", None, Duration::from_secs(5));
-    PublicWyrdGatewayCaller::new(client(&server.uri()))
-        .with_subject(&run, &card_uid)
-        .call(call(), &token)
-        .await
-        .expect("the correlated call answers");
-    PublicWyrdGatewayCaller::new(client(&server.uri()))
-        .call(call(), &token)
-        .await
-        .expect("the uncorrelated call answers");
+    for (run, card_uid) in [
+        (Some(&run), Some(&card_uid)),
+        (None, None),
+        (Some(&run), None),
+        (None, Some(&card_uid)),
+    ] {
+        PublicWyrdGatewayCaller::new(client(&server.uri()))
+            .with_subject(run, card_uid)
+            .call(call(), &token)
+            .await
+            .expect("the call answers");
+    }
     let requests = received(&server).await;
     let header = |index: usize, name: &str| {
         requests[index]
@@ -603,6 +606,90 @@ async fn public_gateway_call_carries_run_and_card_uid() {
     );
     assert_eq!(header(1, "wyrd-run-id"), None);
     assert_eq!(header(1, "wyrd-card-uid"), None);
+    assert_eq!(header(2, "wyrd-run-id").as_deref(), Some("run-1"));
+    assert_eq!(header(2, "wyrd-card-uid"), None);
+    assert_eq!(header(3, "wyrd-run-id"), None);
+    assert_eq!(
+        header(3, "wyrd-card-uid").as_deref(),
+        Some(card_uid.as_str())
+    );
+}
+
+/// A gateway call made inside a `tracing` span carrying a valid
+/// OpenTelemetry context sends `traceparent` in the ambient trace, naming
+/// the call's own client span inside it, so the server's gateway work joins
+/// the caller's trace.
+///
+/// # Panics
+/// Panics when the call fails, the ambient span is not valid, or the sent
+/// `traceparent` is not a sampled child position in the ambient trace.
+#[tokio::test]
+async fn public_gateway_call_carries_the_ambient_trace_context() {
+    use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+    use tracing::Instrument as _;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        ResponseTemplate::new(200).set_body_json(chat_answer()),
+        1,
+    )
+    .await;
+    let traced = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(
+                opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                    .build()
+                    .tracer("workflow-transport"),
+            ),
+        ),
+    );
+    let ambient = tracing::dispatcher::with_default(&traced, || tracing::info_span!("caller"));
+    let (trace, ambient_span) = tracing::dispatcher::with_default(&traced, || {
+        let context = ambient.context();
+        let span = context.span();
+        let span_context = span.span_context();
+        assert!(
+            span_context.is_valid(),
+            "the ambient span carries a valid OpenTelemetry context"
+        );
+        (
+            format!("00-{}-", span_context.trace_id()),
+            span_context.span_id().to_string(),
+        )
+    });
+    let token = CancellationToken::new();
+    PublicWyrdGatewayCaller::new(client(&server.uri()))
+        .call(
+            gateway_call(chat_request(), "openai/gpt-a", None, Duration::from_secs(5)),
+            &token,
+        )
+        .instrument(ambient)
+        .with_subscriber(traced)
+        .await
+        .expect("the call answers");
+    let requests = received(&server).await;
+    assert_eq!(requests.len(), 1);
+    let sent = requests[0]
+        .headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .expect("the call sends traceparent");
+    assert!(sent.starts_with(&trace) && sent.ends_with("-01"), "{sent}");
+    assert!(
+        !sent.contains(&ambient_span),
+        "the call's own span is the parent: {sent}"
+    );
+    assert_eq!(
+        requests[0].headers.get("tracestate"),
+        None,
+        "empty state is not sent"
+    );
 }
 
 /// Concurrent public gateway calls keep their own fallback, deadline, and

@@ -2740,6 +2740,7 @@ mod tests {
             span_id: "0000000000000001".to_owned(),
             parent_span_id: "0000000000000000".to_owned(),
             name: name.to_owned(),
+            kind: "Internal".to_owned(),
             attributes: attributes
                 .iter()
                 .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
@@ -2747,6 +2748,7 @@ mod tests {
             duration_nanos: 1,
             status: wyrd_telemetry::CapturedSpanStatus::Unset,
             events: Vec::new(),
+            links: Vec::new(),
         }
     }
 

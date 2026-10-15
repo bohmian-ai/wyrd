@@ -775,14 +775,18 @@ Server spans export twice from one tracer provider:
 - The operator's configured trace backend receives every server span under
   the server's own sampler. No client-supplied field, including the inbound
   sampled flag and `tracestate`, changes what the operator receives.
-- A request that continued a sampled client trace also writes its server
-  spans to the requesting tenant's `vala.traces.spans` on the process Scribe
-  outbox, with the same trace, span, and parent ids, so the client's spans
-  and the server's spans form one tree. The tenant copy carries only the
+- A server span whose parent or one of whose links is a sampled client span
+  also writes, with its catalog descendants, to the requesting tenant's
+  `vala.traces.spans` on the process Scribe outbox, with the same trace,
+  span, and parent ids. A continued request's spans therefore form one tree
+  with the client's, and a queued write's `bifrost.gate.write` CONSUMER span,
+  which reaches the server with its producers as links and no `traceparent`,
+  reads back as a trace linked to them. The tenant copy carries only the
   behavior-span catalog — the request span, `verification.*`, `dispatch`,
   `workflow.gateway.call`, `gateway.*` except `gateway.attempt`,
   `bifrost.gate.*`, `bifrost.oracle.query`, and OTLP ingest — and only spans
-  whose ancestors up to the caller are all catalog spans. It keeps only safe
+  whose ancestors up to the span that opened the copy are all catalog
+  spans. It keeps only safe
   attributes (`wyrd.*`, `gen_ai.*`, and HTTP, RPC, and error semantic
   conventions); the tenant id is never a span attribute. The copy is
   non-blocking and never fails the request, and it works with or without an

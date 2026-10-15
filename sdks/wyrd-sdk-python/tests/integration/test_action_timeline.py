@@ -89,19 +89,30 @@ def test_service_action_timeline_is_one_connected_tree(
     state.shutdown()
 
     trace_id = format(action.get_span_context().trace_id, "032x")
-    spans = timeline(wyrd_server, trace_id)
-    starts = [span.start_time for span in spans]
-    assert starts == sorted(starts), spans
+    read = timeline(wyrd_server, trace_id)
+    starts = [span.start_time for span in read]
+    assert starts == sorted(starts), read
+    spans = [span for span in read if span.trace_id == trace_id]
+    linked = [span for span in read if span.trace_id != trace_id]
     roots = [span for span in spans if span.parent_span_id is None]
     assert [(root.name, root.scope.name) for root in roots] == [("service.action", SERVICE_SCOPE)]
     for span in spans:
-        assert span.trace_id == trace_id, span
         assert ancestry(spans, span)[-1] == roots[0], span.name
     assert any(span.name == "answer" for span in spans)
     producers = [
         span for span in spans if span.kind == "producer" and span.name == "bifrost.enqueue"
     ]
     assert len(producers) >= 2, outline(spans)
+    for producer in producers:
+        assert any(
+            consumer.name == "bifrost.gate.write"
+            and consumer.kind == "consumer"
+            and any(
+                (link.trace_id, link.span_id) == (producer.trace_id, producer.span_id)
+                for link in consumer.links
+            )
+            for consumer in linked
+        ), outline(linked)
     attempts = [
         [each.name for each in ancestry(spans, span)]
         for span in spans

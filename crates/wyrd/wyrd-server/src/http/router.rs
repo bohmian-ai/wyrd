@@ -184,12 +184,11 @@ fn request_span(
             .map(axum::extract::MatchedPath::as_str),
         http.response.status_code = tracing::field::Empty,
     );
-    if let Some(caller) = wyrd_telemetry::inbound_context(request.headers()) {
-        wyrd_telemetry::continue_remote(&span, &caller);
-        if let Some(sink) = tenant_spans {
-            wyrd_telemetry::bind_tenant_span_sink(&span, Arc::clone(sink));
-        }
-    }
+    wyrd_telemetry::serve_request(
+        &span,
+        wyrd_telemetry::inbound_context(request.headers()).as_ref(),
+        tenant_spans,
+    );
     span
 }
 

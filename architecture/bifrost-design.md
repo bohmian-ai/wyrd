@@ -1341,7 +1341,8 @@ across a restart; durable batch, file, and task rows answer that question.
   and the request's behavior-catalog spans are also copied to the tenant's
   `vala.traces.spans` (see `wyrd-design.md`, Trace context). A queued write's
   batch carries up to 32 producer trace contexts, and `bifrost.gate.write`,
-  the CONSUMER span, links each one.
+  the CONSUMER span, links each one from its start, so a batch linking a
+  sampled producer is also copied to the producer's tenant as a linked trace.
 
 ## Public surface
 

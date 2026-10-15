@@ -5,8 +5,8 @@
 mod context;
 mod export;
 
-pub use context::{continue_remote, continued_context, current_context, inbound_context};
-pub use export::{TenantSpanRoute, TenantSpanSink, bind_tenant_route, bind_tenant_span_sink};
+pub use context::{continued_context, current_context, inbound_context, serve_request};
+pub use export::{TenantSpanRoute, TenantSpanSink, bind_tenant_route};
 
 #[cfg(feature = "test-support")]
 use std::collections::BTreeMap;
@@ -275,12 +275,15 @@ impl TelemetryGuard {
 ///
 /// The link records that the remote span caused the work `span` measures
 /// without adopting it as a parent, so `span` keeps its own trace. The remote
-/// context is marked sampled and remote. Without an OpenTelemetry layer in the
-/// subscriber, or on a disabled span, this does nothing.
+/// context carries whether its producer `sampled` it. A link added before
+/// `span` is first entered is present when it starts, so a sampled one makes
+/// `span` eligible for its tenant's copy. Without an OpenTelemetry layer in
+/// the subscriber, or on a disabled span, this does nothing.
 pub fn link_remote_span(
     span: &tracing::Span,
     trace_id: &wyrd_spec::vala::ids::TraceId,
     span_id: &wyrd_spec::vala::ids::SpanId,
+    sampled: bool,
 ) {
     use opentelemetry::trace::{SpanContext, TraceFlags, TraceState};
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
@@ -288,7 +291,11 @@ pub fn link_remote_span(
     span.add_link(SpanContext::new(
         opentelemetry::trace::TraceId::from_bytes(*trace_id.as_bytes()),
         opentelemetry::trace::SpanId::from_bytes(*span_id.as_bytes()),
-        TraceFlags::SAMPLED,
+        if sampled {
+            TraceFlags::SAMPLED
+        } else {
+            TraceFlags::default()
+        },
         true,
         TraceState::default(),
     ));

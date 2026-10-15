@@ -2,12 +2,14 @@
 //!
 //! An inbound request names its caller's span in a `traceparent` header (HTTP)
 //! or metadata entry (gRPC, carried as an HTTP/2 header). [`inbound_context`]
-//! parses it once for every transport, [`continue_remote`] makes it the parent
+//! parses it once for every transport, [`serve_request`] makes it the parent
 //! of the server's request span so everything the request does descends from
 //! the caller, and [`current_context`] reads back the context of whatever span
 //! is current, for work that forwards it. [`continued_context`] reads it only
 //! inside a request that continued a caller's trace. Deferred work never adopts a cause as
 //! its parent; [`crate::link_remote_span`] records it as a span link instead.
+
+use std::sync::Arc;
 
 use http::HeaderMap;
 use opentelemetry::trace::{
@@ -16,6 +18,8 @@ use opentelemetry::trace::{
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::registry::{LookupSpan as _, Registry};
 use wyrd_spec::trace::TraceContext;
+
+use crate::export::{RequestSink, TenantSpanSink};
 
 /// W3C header carrying the caller's trace and parent span.
 const TRACEPARENT: &str = "traceparent";
@@ -92,16 +96,27 @@ struct Continued;
 /// [`continued_context`]. This must run before `span` is first entered; on a
 /// started or disabled span, or without an OpenTelemetry layer, it does
 /// nothing.
-pub fn continue_remote(span: &tracing::Span, context: &TraceContext) {
-    let Some(remote) = remote_span_context(context) else {
-        return;
-    };
+///
+/// The serving server's `tenant_spans` sink rides in the same parent context
+/// to every span the request opens, so the request's tenant copies stage on
+/// the server that served it. Without a caller, `span` stays the root of a
+/// new trace.
+pub fn serve_request(
+    span: &tracing::Span,
+    caller: Option<&TraceContext>,
+    tenant_spans: Option<&Arc<dyn TenantSpanSink>>,
+) {
+    let remote = caller.and_then(remote_span_context);
+    let mut parent = opentelemetry::Context::new();
+    if let Some(remote) = remote.clone() {
+        parent = parent.with_remote_span_context(remote);
+    }
+    if let Some(sink) = tenant_spans {
+        parent = parent.with_value(RequestSink(Arc::clone(sink)));
+    }
     // A span already started keeps its own trace; continuing is best-effort
     // observability and never fails the request.
-    if span
-        .set_parent(opentelemetry::Context::new().with_remote_span_context(remote))
-        .is_ok()
-    {
+    if span.set_parent(parent).is_ok() && remote.is_some() {
         span.with_subscriber(|(id, dispatch)| {
             if let Some(span) = dispatch
                 .downcast_ref::<Registry>()
@@ -117,7 +132,7 @@ pub fn continue_remote(span: &tracing::Span, context: &TraceContext) {
 /// caller's trace.
 ///
 /// A span continues the caller's trace when it or an ancestor was passed to
-/// [`continue_remote`], whatever the caller's sampled flag. Work that names
+/// [`serve_request`] with a caller, whatever the caller's sampled flag. Work that names
 /// the caller's position only for a continued trace (a captured gateway
 /// attempt's parent) reads it here; elsewhere it is `None`.
 #[must_use]
@@ -181,7 +196,7 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt as _;
     use wyrd_spec::trace::TraceContext;
 
-    use super::{continue_remote, continued_context, inbound_context};
+    use super::{continued_context, inbound_context, serve_request};
 
     /// A valid caller `traceparent`.
     const PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
@@ -322,7 +337,7 @@ mod tests {
                 )
                 .expect("valid traceparent");
                 let request = tracing::info_span!("request");
-                continue_remote(&request, &caller);
+                serve_request(&request, Some(&caller), None);
                 let work = tracing::info_span!(parent: &request, "work");
                 let continued =
                     work.in_scope(|| tracing::info_span!("call").in_scope(continued_context));

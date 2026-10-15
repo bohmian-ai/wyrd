@@ -5,23 +5,27 @@
 //! decision. [`ServerSampler`] makes that one decision carry two independent
 //! answers. The operator's answer comes from the server's configured policy
 //! alone. The tenant's answer is whether the request continued a sampled
-//! client trace. A span is sampled (the operator exports it), recorded but not
+//! client trace or links a sampled client span. A span is sampled (the operator exports it), recorded but not
 //! sampled (only a tenant may receive it), or dropped. [`OperatorExport`]
 //! limits the operator's processor to sampled spans, so what the operator
 //! receives never depends on client input.
 //!
 //! [`TenantExport`] stages the tenant copy:
-//! - A span starting under a sampled remote parent opens a route for its
-//!   request, and each descendant the behavior-span catalog names joins its
-//!   parent's route. A span outside the catalog has no route, so neither it
-//!   nor any span below it is copied, and the copied spans form one tree.
-//! - The serving server's request edge binds its own [`TenantSpanSink`] to
-//!   that route with [`bind_tenant_span_sink`], so a process hosting several
-//!   servers stages each request's copies on the server that served it.
+//! - The serving server's request edge puts its own [`TenantSpanSink`] in the
+//!   request span's parent context with [`crate::serve_request`], so a
+//!   process hosting several servers stages each request's copies on the
+//!   server that served it.
+//! - A span that starts with a sampled remote cause, its parent or one of its
+//!   links, opens a route on that sink, and each descendant the
+//!   behavior-span catalog names joins its parent's route. A span outside the
+//!   catalog has no route, so neither it nor any span below it is copied. A
+//!   queued write reaches the server with its producers as links and no
+//!   `traceparent`, so its CONSUMER span opens the route and the tenant reads
+//!   it as a trace linked to the producers.
 //! - Once authentication succeeds, the server binds the tenant and principal
 //!   to that route with [`bind_tenant_route`].
-//! - When a span on a fully bound route ends, it is filtered to its safe
-//!   attributes and staged on that route's sink.
+//! - When a span on a bound route ends, it is filtered to its safe attributes
+//!   and staged on that route's sink.
 //!
 //! The route is never a span attribute and is never exported.
 
@@ -85,8 +89,10 @@ pub(crate) fn tracer_provider(
 /// here, so no field the client sends changes the operator decision. If the
 /// operator rejects it and the client's parent is sampled, the span is still
 /// recorded for the tenant. A span with a local parent follows that parent:
-/// sampled, recorded only, or dropped. Every span starts with empty trace
-/// state, so a client's `tracestate` never reaches the operator.
+/// sampled, recorded only, or dropped. Any span the operator rejects is
+/// still recorded for the tenant when it links a sampled remote span. Every
+/// span starts with the parent's trace state, and the operator's copy drops
+/// it, so a client's `tracestate` never reaches the operator.
 #[derive(Clone, Debug)]
 pub(crate) struct ServerSampler {
     /// The configured operator policy: always on, or a trace id ratio.
@@ -139,23 +145,27 @@ impl ShouldSample for ServerSampler {
             .as_ref()
             .map(|parent| parent.span_context().trace_state().clone())
             .unwrap_or_default();
-        let decision = match parent {
-            None if self.operator_samples(trace_id, name, span_kind, attributes, links) => {
-                SamplingDecision::RecordAndSample
-            }
+        let operator = match &parent {
+            None => self.operator_samples(trace_id, name, span_kind, attributes, links),
             Some(parent) if parent.span_context().is_remote() => {
-                let drawn = self.ids.new_trace_id();
-                if self.operator_samples(drawn, name, span_kind, attributes, links) {
-                    SamplingDecision::RecordAndSample
-                } else if parent.span_context().is_sampled() {
-                    SamplingDecision::RecordOnly
-                } else {
-                    SamplingDecision::Drop
-                }
+                self.operator_samples(self.ids.new_trace_id(), name, span_kind, attributes, links)
             }
-            Some(parent) if parent.span_context().is_sampled() => SamplingDecision::RecordAndSample,
-            Some(parent) if parent.is_recording() => SamplingDecision::RecordOnly,
-            None | Some(_) => SamplingDecision::Drop,
+            Some(parent) => parent.span_context().is_sampled(),
+        };
+        let tenant = links_sampled(links)
+            || parent.as_ref().is_some_and(|parent| {
+                if parent.span_context().is_remote() {
+                    parent.span_context().is_sampled()
+                } else {
+                    parent.is_recording()
+                }
+            });
+        let decision = if operator {
+            SamplingDecision::RecordAndSample
+        } else if tenant {
+            SamplingDecision::RecordOnly
+        } else {
+            SamplingDecision::Drop
         };
         SamplingResult {
             decision,
@@ -163,6 +173,13 @@ impl ShouldSample for ServerSampler {
             trace_state,
         }
     }
+}
+
+/// Whether any of `links` is a sampled remote span.
+fn links_sampled(links: &[Link]) -> bool {
+    links
+        .iter()
+        .any(|link| link.span_context.is_remote() && link.span_context.is_sampled())
 }
 
 /// Wraps the operator's span processor and passes on only the spans the
@@ -237,9 +254,8 @@ pub struct TenantSpanRoute {
 
 /// Where tenant span copies are staged.
 ///
-/// Each server binds its own to the routes its request edge opens with
-/// [`bind_tenant_span_sink`] once its Scribe outbox
-/// exists.
+/// Each server builds one over its Scribe outbox, and its request edges carry
+/// it to the routes their requests open with [`crate::serve_request`].
 pub trait TenantSpanSink: Send + Sync {
     /// Stage one tenant copy for `route` as a single-span OTLP resource span.
     ///
@@ -249,13 +265,26 @@ pub trait TenantSpanSink: Send + Sync {
 }
 
 /// One request's route, shared by every span of the request.
-#[derive(Default)]
 struct Route {
     /// The authenticated identity, unset until the server binds it.
     identity: OnceLock<TenantSpanRoute>,
-    /// The serving server's sink, unset until its request edge binds it.
-    sink: OnceLock<Arc<dyn TenantSpanSink>>,
+    /// The serving server's sink the copies are staged on.
+    sink: Arc<dyn TenantSpanSink>,
 }
+
+impl Route {
+    /// An unbound route staging on `sink`.
+    fn new(sink: Arc<dyn TenantSpanSink>) -> RouteSlot {
+        Arc::new(Self {
+            identity: OnceLock::new(),
+            sink,
+        })
+    }
+}
+
+/// The serving server's tenant span sink, carried in a request span's
+/// OpenTelemetry context to every span the request opens.
+pub(crate) struct RequestSink(pub(crate) Arc<dyn TenantSpanSink>);
 
 /// A request's route as every live span of the request holds it.
 type RouteSlot = Arc<Route>;
@@ -272,39 +301,56 @@ struct TenantRoutes {
 impl TenantRoutes {
     /// Record the route `span` joins as it starts under `parent`.
     ///
-    /// A span with a sampled remote parent opens a new route for its request.
-    /// A span with a local parent joins the parent's route if the parent has
-    /// one. Either way the span joins only if `in_catalog` says the catalog
-    /// names it, so a span outside the catalog takes its whole subtree out of
-    /// the tenant copy and every staged span's parent is the caller's span or
-    /// another staged span. Any other span has no route.
-    fn start(&self, parent: &SpanContext, span: &SpanContext, in_catalog: impl FnOnce() -> bool) {
-        if !parent.is_valid() || (parent.is_remote() && !parent.is_sampled()) {
+    /// A span with a routed local parent joins the parent's route. A span
+    /// with a sampled remote cause, its parent or one of its links, opens a
+    /// new route on the serving server's `sink`, when the request edge
+    /// carried one. Either way the span joins only if the catalog names it,
+    /// so a span outside the catalog takes its whole subtree out of the
+    /// tenant copy. Any other span has no route. `data` reads the span's name
+    /// and links, only when it could join.
+    fn start(
+        &self,
+        parent: &SpanContext,
+        span: &SpanContext,
+        sink: Option<&RequestSink>,
+        data: impl FnOnce() -> Option<SpanData>,
+    ) {
+        let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+        let joined = (!parent.is_remote())
+            .then(|| {
+                live.get(&(parent.trace_id(), parent.span_id()))
+                    .map(Arc::clone)
+            })
+            .flatten();
+        if joined.is_none() && sink.is_none() {
             return;
         }
-        let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        let route = if parent.is_remote() {
-            RouteSlot::default()
-        } else {
-            match live.get(&(parent.trace_id(), parent.span_id())) {
-                Some(route) => Arc::clone(route),
-                None => return,
-            }
+        // ponytail: reads every unrouted request span's data to see its links; give the
+        // sampler's verdict to the processor if span starts show up in profiles.
+        let Some(data) = data().filter(|data| in_catalog(&data.name)) else {
+            return;
         };
-        if in_catalog() {
-            live.insert((span.trace_id(), span.span_id()), route);
-        }
+        let route = match (joined, sink) {
+            (Some(route), _) => route,
+            (None, Some(RequestSink(sink)))
+                if (parent.is_remote() && parent.is_sampled()) || links_sampled(&data.links) =>
+            {
+                Route::new(Arc::clone(sink))
+            }
+            _ => return,
+        };
+        live.insert((span.trace_id(), span.span_id()), route);
     }
 
-    /// Forget the ended `span` and return its route's identity and sink when
-    /// both are bound.
-    fn end(&self, span: &SpanContext) -> Option<(TenantSpanRoute, Arc<dyn TenantSpanSink>)> {
+    /// Forget the ended `span` and return its route and bound identity when
+    /// the route is bound.
+    fn end(&self, span: &SpanContext) -> Option<(TenantSpanRoute, RouteSlot)> {
         let route = self
             .live
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&(span.trace_id(), span.span_id()))?;
-        Some((*route.identity.get()?, Arc::clone(route.sink.get()?)))
+        Some((*route.identity.get()?, route))
     }
 
     /// Bind `route` to the request `span` belongs to.
@@ -315,14 +361,6 @@ impl TenantRoutes {
     fn bind(&self, span: &SpanContext, route: TenantSpanRoute) {
         if let Some(slot) = self.slot(span) {
             let _ = slot.identity.set(route);
-        }
-    }
-
-    /// Bind `sink` to the request `span` belongs to; the first binding wins,
-    /// and a span with no route ignores the call.
-    fn bind_sink(&self, span: &SpanContext, sink: Arc<dyn TenantSpanSink>) {
-        if let Some(slot) = self.slot(span) {
-            let _ = slot.sink.set(sink);
         }
     }
 
@@ -345,26 +383,16 @@ static ROUTES: LazyLock<TenantRoutes> = LazyLock::new(|| TenantRoutes {
 ///
 /// The server calls this once a request's credential verifies, inside the
 /// request. It binds every span of the request, including spans already
-/// running and spans started later. A request that did not continue a
-/// sampled client trace, deferred work, and the reserved system tenant are
-/// not routed. Their spans go only to the operator.
+/// running and spans started later. A request that neither continued a
+/// sampled client trace nor linked a sampled producer, deferred work, and the
+/// reserved system tenant are not routed. Their spans go only to the
+/// operator.
 pub fn bind_tenant_route(route: TenantSpanRoute) {
     if route.tenant == DataTenantId::SYSTEM_OWNER {
         return;
     }
     let context = tracing::Span::current().context();
     ROUTES.bind(context.span().span_context(), route);
-}
-
-/// Stage the tenant copies of the request that `span` opens on `sink`.
-///
-/// The server's request edge calls this with its own sink as it opens the
-/// request span, after continuing the caller's trace, so every copy of the
-/// request reaches the server that served it even when one process hosts
-/// several servers. A span that opened no route ignores the call.
-pub fn bind_tenant_span_sink(span: &tracing::Span, sink: Arc<dyn TenantSpanSink>) {
-    let context = span.context();
-    ROUTES.bind_sink(context.span().span_context(), sink);
 }
 
 /// Stages each ended span on a bound route as its tenant copy.
@@ -375,23 +403,28 @@ pub(crate) struct TenantExport {
 }
 
 impl SpanProcessor for TenantExport {
-    /// Record the route the starting span joins, reading its name only when
-    /// its parent is routed.
+    /// Record the route the starting span joins, as
+    /// [`TenantRoutes::start`] describes.
     fn on_start(&self, span: &mut Span, cx: &Context) {
-        ROUTES.start(cx.span().span_context(), span.span_context(), || {
-            span.exported_data()
-                .is_some_and(|data| in_catalog(&data.name))
-        });
+        ROUTES.start(
+            cx.span().span_context(),
+            span.span_context(),
+            cx.get::<RequestSink>(),
+            || span.exported_data(),
+        );
     }
 
     /// Stage the tenant copy of an ended span on its route's sink if the
-    /// route's identity and sink are both bound.
+    /// route's identity is bound.
     ///
     /// The span leaves the registry first, so the registry holds only live
     /// spans.
     fn on_end(&self, span: SpanData) {
-        if let Some((route, sink)) = ROUTES.end(&span.span_context) {
-            sink.stage(route, ResourceSpans::new(tenant_copy(span), &self.resource));
+        if let Some((identity, route)) = ROUTES.end(&span.span_context) {
+            route.sink.stage(
+                identity,
+                ResourceSpans::new(tenant_copy(span), &self.resource),
+            );
         }
     }
 
@@ -510,7 +543,8 @@ mod tests {
     use wyrd_spec::auth::PrincipalId;
 
     use super::{
-        OperatorExport, ROUTES, ServerSampler, TenantSpanRoute, TenantSpanSink, tracer_provider,
+        OperatorExport, ROUTES, RequestSink, ServerSampler, TenantSpanRoute, TenantSpanSink,
+        tracer_provider,
     };
 
     /// Records every span it is handed, standing in for an operator exporter.
@@ -813,7 +847,9 @@ mod tests {
         let tracer = provider.tracer("wyrd");
         let parent = remote(sampled);
         let trace_id = parent.trace_id();
-        let caller = Context::new().with_remote_span_context(parent);
+        let caller = Context::new()
+            .with_remote_span_context(parent)
+            .with_value(RequestSink(Arc::clone(&staged) as Arc<dyn TenantSpanSink>));
         let root = tracer
             .span_builder("request")
             .with_kind(SpanKind::Server)
@@ -822,10 +858,6 @@ mod tests {
                 KeyValue::new("path", "/v1/secret"),
             ])
             .start_with_context(&tracer, &caller);
-        ROUTES.bind_sink(
-            root.span_context(),
-            Arc::clone(&staged) as Arc<dyn TenantSpanSink>,
-        );
         if bind {
             ROUTES.bind(
                 root.span_context(),
@@ -931,6 +963,89 @@ mod tests {
         assert!(staged.is_empty(), "{staged:?}");
     }
 
+    /// A sampled remote link records a span the operator rejects; an
+    /// unsampled one does not.
+    #[test]
+    fn a_sampled_link_records_for_the_tenant() {
+        for (sampled, expected) in [
+            (true, SamplingDecision::RecordOnly),
+            (false, SamplingDecision::Drop),
+        ] {
+            let link = opentelemetry::trace::Link::with_context(remote(sampled));
+            let decision = ServerSampler::new(Sampler::AlwaysOff)
+                .should_sample(
+                    None,
+                    TraceId::from(1_u128),
+                    "bifrost.gate.write",
+                    &SpanKind::Consumer,
+                    &[],
+                    &[link],
+                )
+                .decision;
+            assert_eq!(decision, expected, "sampled={sampled}");
+        }
+    }
+
+    /// A queued write's consumer under an untraced request opens its own
+    /// route from a sampled producer link: the tenant receives the consumer
+    /// and its catalog child, not the request span, with the operator's ids
+    /// and parents; without a sampled link nothing is staged.
+    #[test]
+    fn a_sampled_producer_link_routes_the_consumer() {
+        let provider = tracer_provider(
+            Sampler::AlwaysOff,
+            Resource::builder_empty().build(),
+            None::<OperatorExport<Recorder>>,
+        );
+        let tracer = provider.tracer("wyrd");
+        for sampled in [true, false] {
+            let staged = Arc::new(Staged::default());
+            let edge = Context::new()
+                .with_value(RequestSink(Arc::clone(&staged) as Arc<dyn TenantSpanSink>));
+            let request = edge.with_span(tracer.start_with_context("request", &edge));
+            let consumer = tracer
+                .span_builder("bifrost.gate.write")
+                .with_kind(SpanKind::Consumer)
+                .with_links(vec![opentelemetry::trace::Link::with_context(remote(
+                    sampled,
+                ))])
+                .start_with_context(&tracer, &request);
+            let request_id = request.span().span_context().span_id();
+            let write = request.with_span(consumer);
+            ROUTES.bind(
+                write.span().span_context(),
+                TenantSpanRoute {
+                    tenant: DataTenantId::new_v7(),
+                    principal: "01900000-0000-7000-8000-000000000007"
+                        .parse::<PrincipalId>()
+                        .expect("a principal id"),
+                },
+            );
+            let trace_id = write.span().span_context().trace_id();
+            let write_id = write.span().span_context().span_id();
+            tracer.start_with_context("dispatch", &write).end();
+            write.span().end();
+            request.span().end();
+            let copies = staged
+                .of(trace_id)
+                .into_iter()
+                .map(|(_, name, _, parent, _)| (name, parent))
+                .collect::<Vec<_>>();
+            let expected = if sampled {
+                vec![
+                    ("dispatch".to_owned(), write_id.to_bytes().to_vec()),
+                    (
+                        "bifrost.gate.write".to_owned(),
+                        request_id.to_bytes().to_vec(),
+                    ),
+                ]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(copies, expected, "sampled={sampled}");
+        }
+    }
+
     /// Each request's copies stage on the sink its own server bound, so two
     /// servers in one process never receive each other's spans.
     #[test]
@@ -945,12 +1060,11 @@ mod tests {
         let traces = servers.each_ref().map(|server| {
             let parent = remote(true);
             let trace_id = parent.trace_id();
-            let mut root = tracer
-                .span_builder("request")
-                .start_with_context(&tracer, &Context::new().with_remote_span_context(parent));
-            ROUTES.bind_sink(
-                root.span_context(),
-                Arc::clone(server) as Arc<dyn TenantSpanSink>,
+            let mut root = tracer.span_builder("request").start_with_context(
+                &tracer,
+                &Context::new()
+                    .with_remote_span_context(parent)
+                    .with_value(RequestSink(Arc::clone(server) as Arc<dyn TenantSpanSink>)),
             );
             ROUTES.bind(
                 root.span_context(),

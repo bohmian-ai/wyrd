@@ -564,7 +564,7 @@ impl LeasedWork for VerifierRunner {
         .await?;
         Ok(claimed.map(|(run, verifier, loaded)| {
             if let Some((trace_id, span_id)) = &run.cause {
-                wyrd_telemetry::link_remote_span(&span, trace_id, span_id);
+                wyrd_telemetry::link_remote_span(&span, trace_id, span_id, true);
             }
             span.record("run_id", display(run.lease.run_id));
             span.record("attempt", run.attempt);

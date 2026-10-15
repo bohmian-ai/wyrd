@@ -178,7 +178,7 @@ impl EvalEngine {
             }
         };
         if let (Some(trace_id), Some(span_id)) = (&record.trace_id, &record.span_id) {
-            wyrd_telemetry::link_remote_span(&tracing::Span::current(), trace_id, span_id);
+            wyrd_telemetry::link_remote_span(&tracing::Span::current(), trace_id, span_id, true);
         }
         match sampled(run, spec, record_id, &record.context) {
             Ok(true) => {}

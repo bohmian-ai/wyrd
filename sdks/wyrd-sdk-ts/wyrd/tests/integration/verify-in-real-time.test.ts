@@ -11,7 +11,15 @@ import { Bifrost, Cards, Gateway, type SpanRecord, TableConfig, WyrdClient, Wyrd
 import { cli } from "@wyrd/testing";
 
 import { configureGateway } from "../support/local-development.js";
-import { type RegisteredRef, ancestry, columnValues, fixture, registered, serverTest, timeline } from "../support/server.js";
+import {
+  type RegisteredRef,
+  ancestry,
+  columnValues,
+  fixture,
+  registered,
+  serverTest,
+  timeline,
+} from "../support/server.js";
 
 vi.setConfig({ testTimeout: 120_000 });
 
@@ -270,21 +278,35 @@ test("service action timeline is one connected tree", async ({ server, state, as
   await state.shutdown();
   await flushTelemetry();
 
-  const spans = await timeline(server, action.traceId);
-  const starts = spans.map((span) => span.start_time);
+  const read = await timeline(server, action.traceId);
+  const starts = read.map((span) => span.start_time);
   expect(starts).toEqual([...starts].sort());
+  const spans = read.filter((span) => span.trace_id === action.traceId);
+  const linked = read.filter((span) => span.trace_id !== action.traceId);
   const roots = spans.filter((span) => span.parent_span_id == null);
   expect(
     roots.map((root) => [root.name, root.scope.name]),
     outline(spans),
   ).toEqual([["service.action", "journey.service"]]);
   for (const span of spans) {
-    expect(span.trace_id, span.name).toBe(action.traceId);
     expect(ancestry(spans, span).at(-1), span.name).toBe(roots[0]);
   }
   expect(spans.some((span) => span.name === "answer")).toBe(true);
   const producers = spans.filter((span) => span.kind === "producer" && span.name === "bifrost.enqueue");
   expect(producers.length, outline(spans)).toBeGreaterThanOrEqual(2);
+  for (const producer of producers) {
+    expect(
+      linked.some(
+        (consumer) =>
+          consumer.name === "bifrost.gate.write" &&
+          consumer.kind === "consumer" &&
+          (consumer.links ?? []).some(
+            (link) => link.trace_id === producer.trace_id && link.span_id === producer.span_id,
+          ),
+      ),
+      outline(linked),
+    ).toBe(true);
+  }
   const attempts = spans
     .filter((span) => span.scope.name === "wyrd.gateway")
     .map((span) => ancestry(spans, span).map((each) => each.name));

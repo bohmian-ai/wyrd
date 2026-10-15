@@ -139,8 +139,9 @@ fn holds_in_order(names: &[&str], steps: &[fn(&str) -> bool]) -> bool {
 /// table row, calls a model through the Gateway, and verifies its answer
 /// with an Eval LLM judge reads back as one connected, time-ordered tree
 /// rooted at the action's span. The queued writes are PRODUCER spans in that
-/// tree, and the operator's export holds every server span of it with the
-/// same ids plus the CONSUMER ingest spans linking each producer.
+/// tree, and the same read returns the CONSUMER ingest span linking each
+/// producer as a linked trace. The operator's export holds every server span
+/// of the action's trace with the same ids, and the consumers too.
 ///
 /// # Panics
 /// Panics when a step fails or the timeline or operator export differs.
@@ -217,14 +218,16 @@ async fn service_action_timeline_is_one_connected_tree() {
     state.shutdown().await.expect("emits drain");
     tokio::task::block_in_place(|| provider.force_flush()).expect("Service spans export");
 
-    let timeline = assistant.deployment.timeline(&trace).await;
+    let read = assistant.deployment.timeline(&trace).await;
     assert!(
-        timeline
-            .windows(2)
+        read.windows(2)
             .all(|pair| pair[0].start_time <= pair[1].start_time),
         "time-ordered: {}",
-        outline(&timeline)
+        outline(&read)
     );
+    let (timeline, linked): (Vec<SpanRecord>, Vec<SpanRecord>) = read
+        .into_iter()
+        .partition(|span| span.trace_id.to_hex() == trace);
     let [root] = &timeline
         .iter()
         .filter(|span| span.parent_span_id.is_none())
@@ -237,12 +240,6 @@ async fn service_action_timeline_is_one_connected_tree() {
         ("service.action", SERVICE_SCOPE)
     );
     for span in &timeline {
-        assert_eq!(
-            span.trace_id.to_hex(),
-            trace,
-            "no linked trace: {}",
-            outline(&timeline)
-        );
         assert_eq!(
             ancestry(&timeline, span).last().map(|top| top.span_id),
             Some(root.span_id),
@@ -309,12 +306,24 @@ async fn service_action_timeline_is_one_connected_tree() {
         );
     }
     for producer in producers {
+        assert!(
+            linked
+                .iter()
+                .any(|consumer| consumer.name == "bifrost.gate.write"
+                    && consumer.kind == SpanKind::Consumer
+                    && consumer.links.iter().any(|link| {
+                        link.trace_id == producer.trace_id && link.span_id == producer.span_id
+                    })),
+            "the tenant reads a CONSUMER ingest span linking {}: {}",
+            producer.span_id.to_hex(),
+            outline(&linked)
+        );
         let link = (trace.clone(), producer.span_id.to_hex());
         assert!(
             exported
                 .iter()
                 .any(|copy| copy.name == "bifrost.gate.write" && copy.links.contains(&link)),
-            "a CONSUMER ingest span links {link:?}"
+            "the operator holds a CONSUMER ingest span linking {link:?}"
         );
     }
     assistant.deployment.shutdown().await;

@@ -13,7 +13,7 @@ from wyrd.bifrost import Bifrost, TableConfig
 from wyrd.client import WyrdClient
 from wyrd.testing import WyrdTestServer
 
-from .support import Count, QueryRow
+from .support import Count, QueryRow, client_of
 
 pytestmark = pytest.mark.integration
 
@@ -50,8 +50,12 @@ def test_bound_sql_text_is_treated_as_data(bifrost: Bifrost, query_table: str) -
     assert rows == []
 
 
-def test_unwritten_builtin_table_reads_as_empty(bifrost: Bifrost) -> None:
-    [counted] = bifrost.sql("SELECT COUNT(*) AS n FROM vala.eval.result_items", model=Count)
+def test_unwritten_builtin_table_reads_as_empty() -> None:
+    # A fresh server, since the session server's journeys write and publish Eval results.
+    with WyrdTestServer(mutate_env=False) as server:
+        [counted] = Bifrost(client=client_of(server)).sql(
+            "SELECT COUNT(*) AS n FROM vala.eval.result_items", model=Count
+        )
     assert counted.n == 0
 
 

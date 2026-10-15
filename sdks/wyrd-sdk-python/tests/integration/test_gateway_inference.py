@@ -3,17 +3,28 @@
 from __future__ import annotations
 
 import secrets
+from pathlib import Path
 
 import openai
 import pytest
+from wyrd import WyrdError
 from wyrd.bifrost import Bifrost
 from wyrd.cards import CardRef, Cards
 from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
+from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
-from .gateway.support import PROVIDER_KEY, deploy
-from .support import FIXTURES, Receiver, ancestry, client_of, register, timeline
+from .gateway.support import PROVIDER_KEY, calls, deploy
+from .support import (
+    FIXTURES,
+    Receiver,
+    ancestry,
+    client_of,
+    download,
+    register,
+    timeline,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -165,3 +176,45 @@ def test_cli_issues_a_card_scoped_key_and_writes_a_provider_credential(
         "active",
     )
     assert "sk-managed" not in str(view)
+
+
+def test_agent_prompt_routes(
+    server: WyrdTestServer, admin: WyrdClient, upstream: Receiver, tmp_path: Path
+) -> None:
+    deploy(server, "openai", name="openai-backup")
+    deploy(server, "openai", name="openai-granted", access="granted")
+    register(Cards(admin), "cards/gateway_inference/ask-service.yaml")
+    bundle = download(Cards(admin), "ask-service", tmp_path)
+    key = cli.issue_key(
+        kind="Service", name="ask-service", version="1.0.0", space="default", client=admin
+    )
+    state = WyrdState.from_path(bundle, client_of(server, key.key))
+    backup = {"kind": "wyrd_gateway", "deployment": "openai-backup"}
+
+    for alias in ("agent", "body-agent"):
+        run = state.run(alias)
+        assert run.invoke({"question": "hi"}) == "hi"
+        assert run.invoke({"question": "hi"}, route=backup) == "hi"
+        assert state.card(alias).spec["execution_route"] == {
+            "kind": "wyrd_gateway",
+            "deployment": "openai",
+        }, "an override never changes the declared route"
+
+    assert [delivery.body["model"] for delivery in upstream.to("/v1/chat/completions")] == [
+        "gpt-4o"
+    ] * 4
+    assert calls(
+        server,
+        f"sub_principal_id = '{key.principal_id}'",
+        "requested_model.deployment AS deployment",
+    ) == [{"deployment": deployment} for deployment in ("openai", "openai-backup") * 2]
+
+    with pytest.raises(WyrdError) as refused:
+        state.run("agent").invoke(
+            {"question": "hi"}, route={"kind": "wyrd_gateway", "deployment": "openai-granted"}
+        )
+    assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+    with pytest.raises(WyrdError) as malformed:
+        state.run("agent").invoke({"question": "hi"}, route={"kind": "elsewhere"})
+    assert malformed.value.code == "WYRD_SPEC_400_VALIDATION"
+    assert model_calls(upstream) == 4, "both refusals precede upstream IO"

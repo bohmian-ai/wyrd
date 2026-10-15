@@ -240,17 +240,23 @@ def deploy(
     server: WyrdTestServer,
     provider: Literal["openai", "anthropic", "gemini", "vertex"],
     adapter: ProviderAdapter | None = None,
+    *,
+    name: str | None = None,
+    access: Literal["open", "granted"] = "open",
 ) -> None:
-    """Store a provider's ``Environment`` credential and its deployment named ``provider``.
+    """Store a provider's ``Environment`` credential and its deployment named ``name``.
 
-    Callers then address any model as ``<provider>/<model>``.
+    ``name`` defaults to ``provider``; callers then address any model as
+    ``<name>/<model>``. A ``"granted"`` deployment needs a deployment- or
+    model-scoped grant.
 
     The credential goes through in-process ``wyrd gateway credential put`` and
     the deployment through the public Python ``Gateway``, both as the harness
     admin, reading the operator binding the test server assigns to ``provider``.
     """
     gateway = Gateway(client_of(server))
-    credential = f"{provider}-key"
+    name = name or provider
+    credential = f"{name}-key"
     cli.put_provider_credential(
         {
             "name": credential,
@@ -270,9 +276,10 @@ def deploy(
         adapter = provider
     gateway.put_deployment(
         {
-            "name": provider,
+            "name": name,
             "adapter": adapter,
             "auth": auth,
+            "access": access,
         }
     )
 

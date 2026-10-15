@@ -9,3 +9,5 @@ spec:
   components:
     - alias: agent
       ref: ./ask-agent.yaml
+    - alias: body-agent
+      ref: ./ask-body-agent.yaml

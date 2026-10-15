@@ -317,6 +317,9 @@ mod tests {
     use super::*;
 
     /// Parse a reference's child selectors.
+    ///
+    /// # Panics
+    /// Panics when `inputs.x<text>` is not a valid reference.
     fn path(text: &str) -> Vec<PathSegment> {
         Reference::parse(&format!("inputs.x{text}"))
             .expect("reference")

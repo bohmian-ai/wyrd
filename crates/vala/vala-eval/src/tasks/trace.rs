@@ -156,6 +156,11 @@ fn elapsed_ms(start: chrono::DateTime<chrono::Utc>) -> u64 {
 
 #[cfg(test)]
 pub(crate) mod trace_executor {
+    //! Trace assertion executor tests and the shared span fixture.
+    //!
+    //! The [`span`] fixture is crate-visible so other engines' tests, such as
+    //! the Verifier engine's trace checks, project the same span shape the
+    //! trace executor reads instead of building their own.
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;

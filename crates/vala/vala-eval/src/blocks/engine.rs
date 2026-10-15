@@ -90,6 +90,9 @@ pub struct VerificationEngine {
 impl VerificationEngine {
     /// An engine running at most `concurrency` blocks at once, with no
     /// scheduled drift evidence.
+    ///
+    /// # Panics
+    /// Panics when `concurrency` exceeds [`Semaphore::MAX_PERMITS`].
     #[must_use]
     pub fn new(
         actions: Arc<dyn ActionExecutor>,
@@ -234,6 +237,9 @@ impl VerificationEngine {
     /// Prepare one step: a step whose bindings or `when` leave a gap is
     /// skipped with that gap, otherwise its action runs under the
     /// concurrency bound.
+    ///
+    /// # Panics
+    /// Panics when `index` is not a declared step of `spec`.
     fn step(
         &self,
         spec: &Arc<VerifierSpec>,
@@ -267,6 +273,9 @@ impl VerificationEngine {
     /// # Errors
     /// Returns [`EngineError::Capture`] when an actual value cannot be
     /// hashed.
+    ///
+    /// # Panics
+    /// Panics when `key` does not name a requirement of `spec`.
     fn requirement(
         &self,
         spec: &Arc<VerifierSpec>,

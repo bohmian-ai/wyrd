@@ -71,6 +71,21 @@ impl TaskExecutor for AssertionTaskExecutor {
     }
 }
 
+/// Judge one assertion task against `snapshot`.
+///
+/// Selects the observed value from the task's scoped view (the record
+/// context plus the declared dependencies' outputs under `$.task`), using
+/// the item path in item mode or the context path otherwise; without a path
+/// it compares the whole view, or the bare record when there are no
+/// dependencies. Item mode
+/// compares every selected item, single mode the one selected value. The
+/// result is attributed to the task at `stage` with its start time and
+/// duration; a false comparison is a Failed result, not an error.
+///
+/// # Errors
+/// Returns the [`EvalExecError`] of a selection that cannot be extracted
+/// (an invalid or missing required path) and of an operator that cannot
+/// compare the selected value's type, unchanged.
 fn execute_assertion(
     task: &AssertionTask,
     snapshot: &ContextSnapshot,

@@ -53,11 +53,18 @@ struct Script {
 
 impl Script {
     /// The calls made so far.
+    ///
+    /// # Panics
+    /// Panics when a recording call panicked while holding the log lock.
     fn calls(&self) -> Vec<String> {
         self.log.lock().expect("log").clone()
     }
 
     /// Record one call.
+    ///
+    /// # Panics
+    /// Panics when another recording call panicked while holding the log
+    /// lock.
     fn record(&self, entry: String) {
         self.log.lock().expect("log").push(entry);
     }
@@ -69,6 +76,15 @@ impl ActionExecutor for Script {
     ///
     /// # Errors
     /// Returns the scripted error of the current attempt.
+    ///
+    /// # Panics
+    /// Panics when another call panicked while holding the log or attempts
+    /// lock.
+    ///
+    /// # Cancellation
+    /// A `Together` call waits at its barrier and a `Hang` call never
+    /// finishes; dropping either is safe, and a dropped `Hang` call notifies
+    /// its signal.
     async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
         let id = call.id.as_str().to_owned();
         self.record(format!("action:{id}"));
@@ -107,6 +123,9 @@ impl CheckExecutor for Script {
     ///
     /// # Errors
     /// Returns the scripted error, or a terminal error when unscripted.
+    ///
+    /// # Panics
+    /// Panics when another call panicked while holding the log lock.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
         self.record(format!("check:{}", call.id.as_str()));
         self.checks
@@ -121,6 +140,9 @@ impl CheckExecutor for Script {
 }
 
 /// A validated Verifier.
+///
+/// # Panics
+/// Panics when `body` is not a valid Verifier spec.
 fn verifier(body: Value) -> Arc<VerifierSpec> {
     let spec: VerifierSpec = serde_json::from_value(body).expect("Verifier");
     spec.validate().expect("valid Verifier");
@@ -128,6 +150,10 @@ fn verifier(body: Value) -> Arc<VerifierSpec> {
 }
 
 /// An engine over `script`, `traces`, and a concurrency bound.
+///
+/// # Panics
+/// Panics when `concurrency` is zero or exceeds the semaphore's permit
+/// limit.
 fn engine(
     script: &Arc<Script>,
     traces: InMemoryTraceSource,
@@ -142,6 +168,16 @@ fn engine(
 }
 
 /// Run `spec` with JSON inputs and a 60-second deadline.
+///
+/// Each key of the `inputs` object becomes a JSON evidence slot.
+///
+/// # Errors
+/// Returns the engine's [`EngineError`] unchanged, including
+/// [`EngineError::DeadlineExceeded`] once the 60-second deadline passes,
+/// which cancels the running blocks.
+///
+/// # Panics
+/// Panics when `inputs` is not an object or a key is not a valid slot name.
 async fn run(
     engine: &VerificationEngine,
     spec: &Arc<VerifierSpec>,
@@ -179,6 +215,9 @@ fn outcomes(outcome: &VerificationOutcome) -> BTreeMap<&str, RequirementOutcome>
 }
 
 /// The result of one requirement.
+///
+/// # Panics
+/// Panics when `outcome` has no requirement `id`.
 fn requirement<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a RequirementResult {
     outcome
         .requirements
@@ -188,6 +227,9 @@ fn requirement<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a Requiremen
 }
 
 /// The result of one step.
+///
+/// # Panics
+/// Panics when `outcome` has no step `id`.
 fn step<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a StepResult {
     outcome
         .steps
@@ -207,6 +249,9 @@ fn code_action(inputs: Value) -> Value {
 }
 
 /// A scripted Verdict.
+///
+/// # Panics
+/// Panics when `citations` is not a JSON array of valid citations.
 fn verdict(outcome: VerificationVerdict, citations: Value) -> CheckOutput {
     CheckOutput {
         verdict: Verdict {
@@ -1066,6 +1111,9 @@ fn samples(
 }
 
 /// A drift requirement over `inputs.<slot>` with the given method fields.
+///
+/// # Panics
+/// Panics when `method` is not a JSON object.
 fn drift_requirement(id: &str, slot: &str, method: Value) -> Value {
     let mut check = json!({"kind": "drift", "on": format!("inputs.{slot}"), "condition": {"kind": "Statistical"}});
     check

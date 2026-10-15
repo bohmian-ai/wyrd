@@ -162,6 +162,7 @@ pub struct RunLedger<O> {
 }
 
 impl<O> Default for RunLedger<O> {
+    /// An empty ledger: nothing has settled.
     fn default() -> Self {
         Self {
             entries: Vec::new(),

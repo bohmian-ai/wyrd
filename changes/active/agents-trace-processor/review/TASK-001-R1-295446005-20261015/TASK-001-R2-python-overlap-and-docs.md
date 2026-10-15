@@ -245,3 +245,39 @@ cause or report the actual blocker.
 
 Return the implemented candidate and appended evidence for another independent
 cumulative `$wyrd-task-review` of original TASK-001 plus both remediation packets.
+
+## Implementation Evidence
+
+Start point `295446005`. Before remediation, `origin/main` was merged at
+`1b769759d` (clean merge). Post-merge proof: `py:setup`, `ts:build`, `fmt`,
+`lints`, Python and TS format/lint/typecheck, `codegen:check`, `check:deps`, C1
+exit 0, `ts:test:unit` 71 passed, `py:test:unit` 611 passed, C6 3 passed, and
+C7 1 passed.
+
+Remediation commits: `3d9371238` (FIND-2) and `42c4e20f0` (FIND-7, FIND-8).
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-001-2 | The TS install row in `record-a-run-and-observations.md` adds `@opentelemetry/exporter-logs-otlp-proto` and `@opentelemetry/exporter-metrics-otlp-proto`. The command now matches every external import of `src/otel.ts` (`api`, `context-async-hooks`, `core`, the three exporters, and `sdk-trace-base`). Tabs, links, frontmatter, and `draft: true` are unchanged | Transient probe in a clean `mktemp` project: `npm install` of exactly the documented set, with `wyrd-ai` and its linux-x64 addon from local `npm pack` tarballs, then `import("wyrd-ai/otel")` and `setTraceProcessors([new WyrdAgentsTraceProcessor()])` from `@openai/agents`. RED (previous set): `ERR_MODULE_NOT_FOUND: Cannot find package '@opentelemetry/exporter-logs-otlp-proto' imported from .../wyrd-ai/dist/otel.js`. GREEN: `loaded wyrd-ai/otel: logExporter, metricExporter, runCorrelationProcessor, spanExporter, startTelemetry`. `docs:generate` and `docs:check` exit 0. Docs checks do not prove installation; the probe does | PASS |
+| FIND-TASK-001-7 | `_ManagedTelemetry.force_flush` in `python/wyrd/otel.py` records the started-flush count at entry and computes one monotonic deadline. Only a provider flush started after entry is accepted as the result. If an earlier attempt is still running, the call waits for it within the remaining budget, then starts its own fresh flush. If the budget runs out first, the existing `TimeoutError` (504) is raised and native drain follows in the binding. At most one worker exists; nothing is queued, cancelled, or joined on the timeout path | Extended `test_managed_telemetry_flush_deadline` with `_stale_flush` for `flush` and `shutdown`. An earlier flush is held after the real stock `force_flush` returns but before its Future settles. Span `late-<method>` ends, then the public call enters. The earlier flush is released only once the caller's thread is blocked waiting (frame probe, no sleeps for ordering). RED: `assert 'late-flush' in {'before', 'during'}`. GREEN: both variants export the late span before success. Existing held-export assertions still pass: two 504s under 2 s with the export held, one worker, callbacks usable, active span and global provider survive | PASS |
+| FIND-TASK-001-8 | `PyWyrdState.telemetry_setup: Mutex<()>`; `start_telemetry` takes it with PyO3 `MutexExt::lock_py_attached` (detaches while waiting; poison recovered with `PoisonError::into_inner`, no unwrap) and rechecks `telemetry` under it. `OnceLock<Py<PyAny>>` stays the sole retained provider; `__traverse__`/`__clear__` and readers do not touch the gate. Rustdoc updated on the field and method | New `test_telemetry_setup[overlap]` case: two threads call `start_telemetry` on one state. The first holds inside `_start_telemetry` until the second call also enters, or for up to 1 s. RED: `WyrdError('an OpenTelemetry tracer provider is already installed')`. GREEN: no failures, one `_start_telemetry` entry, one installed provider. `test_telemetry_setup_names_the_otel_extra_without_the_sdk` now retries after the ImportError and succeeds. `other_state`, `application`, and `lost_race` (loser cleanup) are unchanged and pass | PASS |
+
+### Commands
+
+- `mise run py:setup` after the Rust edit
+- Lifecycle/deadline selector from this task plus the startup/refusal/retry selector: 16 passed. The deadline and setup selectors were repeated 5 times: 6 passed each time
+- `mise run fmt`, `lints`, `py:format:check`, `py:lints`, `py:typecheck`: exit 0; `py:test:unit` 612 passed
+- `mise run docs:generate`, `mise run docs:check`: exit 0
+- C6 (all three managed framework journeys) retained: 3 passed
+- `git diff --check 295446005 HEAD -- docs sdks scripts`: clean
+
+### Limits and audit
+
+- The `overlap` case's 1 s wait only bounds how long the first call holds
+  setup open on corrected code; correctness does not depend on it. On the old
+  code, the second call's entry releases the first deterministically.
+- Spans ending after a call's entry, and abrupt process death, gain no new
+  delivery promise.
+- The diff covers the observe docs page, `python/wyrd/otel.py`,
+  `src/state/mod.rs`, and `tests/unit/state/test_observe_surface.py`. There is
+  no API, stub, catalog, dependency, server, or schema change.

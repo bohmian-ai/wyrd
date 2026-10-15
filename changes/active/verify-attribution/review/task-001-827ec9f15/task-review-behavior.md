@@ -142,4 +142,3 @@ This discovery pass inspected source and the task's recorded green commands. It
 did not run Cargo, mise, Postgres, Python, or TypeScript commands because the
 parallel review was source-only. The three closure commands above remain for
 remediation verification.
-

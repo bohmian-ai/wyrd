@@ -67,4 +67,3 @@ No Cargo, mise, code-generation, Python, or TypeScript commands were rerun in
 this parallel discovery pass. The review inspected candidate source, callers,
 generated declarations, tests, and the verification evidence recorded in the
 task. No additional focused runtime command is needed for MAINT-001.
-

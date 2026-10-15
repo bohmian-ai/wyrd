@@ -471,6 +471,7 @@ pub async fn compose_bifrost(
         resources: bifrost_resources,
         cluster: cluster_registry,
         token_verifier,
+        issuing_key,
         peer_tls,
         config: bifrost_config,
         forge_config: forge_runtime,
@@ -966,8 +967,16 @@ pub async fn compose_bifrost(
     let interceptor =
         vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&token_verifier));
     let ingest_limits = scribe_config.ingest_limits();
-    let observation_runs =
-        crate::verification::observations::ObservationRunSink::outbox(postgres.wyrd().clone());
+    let observation_runs = crate::verification::observations::ObservationRunSink::outbox(
+        postgres.wyrd().clone(),
+        crate::verification::authority::BackgroundAuthority::new(issuing_key.map(|key| {
+            wyrd_auth::issuance::TenantTokenIssuer::new(
+                key,
+                wyrd_auth::issuance::TokenExchangeSettings::default(),
+                Arc::clone(&scribe_outbox) as _,
+            )
+        })),
+    );
     let gate = match scribe.as_ref() {
         Some(runtime) => vala_bifrost_redux::gate::Gate::with_scribe(
             Arc::clone(runtime.ingest()),
@@ -1172,6 +1181,7 @@ pub async fn build_state(
         resources: external.resources,
         cluster: Arc::clone(&external.cluster),
         token_verifier: verifier,
+        issuing_key: auth.issuing_key.clone(),
         peer_tls,
         config: config.bifrost.clone(),
         forge_config: config.forge,

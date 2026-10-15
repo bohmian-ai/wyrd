@@ -839,8 +839,10 @@ async fn fetches_and_executes_locked_workflow_graph() {
     .expect("foreign tenant inserts");
     sqlx::query(
         "INSERT INTO wyrd.cards \
-            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status) \
-         SELECT $1, $2, kind, space, 'foreign-review', version, spec, spec_hash, 'active' \
+            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status, \
+             sub_principal_id, act_principal_id) \
+         SELECT $1, $2, kind, space, 'foreign-review', version, spec, spec_hash, 'active', \
+                sub_principal_id, act_principal_id \
          FROM wyrd.cards WHERE card_uid = $3",
     )
     .bind(uuid::Uuid::now_v7())
@@ -930,9 +932,11 @@ async fn refuses_stale_preflight_after_dependency_replacement() {
         .expect("validated Agent deletes");
     sqlx::query(
         "INSERT INTO wyrd.cards \
-            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status) \
+            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status, \
+             sub_principal_id, act_principal_id) \
          SELECT $1, data_tenant_id, kind, space, name, version, \
-                jsonb_set(spec, '{prompt}', $2::jsonb), 'replacement-spec-hash', 'active' \
+                jsonb_set(spec, '{prompt}', $2::jsonb), 'replacement-spec-hash', 'active', \
+                sub_principal_id, act_principal_id \
          FROM wyrd.cards WHERE card_uid = $3",
     )
     .bind(replacement_uid)

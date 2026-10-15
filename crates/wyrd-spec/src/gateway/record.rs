@@ -222,8 +222,11 @@ pub enum GatewayAccountingEntryV1 {
         call_id: GatewayCallId,
         /// Tenant.
         data_tenant_id: DataTenantId,
-        /// Verified caller.
-        caller_principal_id: PrincipalId,
+        /// Principal the call was for, whom spend and admission are charged.
+        sub_principal_id: PrincipalId,
+        /// Principal that performed the call: the current delegate, or the
+        /// tenant SYSTEM principal for judge execution.
+        act_principal_id: PrincipalId,
         /// Call outcome.
         outcome: GatewayCallOutcome,
         /// Normalized usage, or null when unknown.
@@ -539,8 +542,6 @@ pub struct GatewayCallPayloadV1 {
     pub schema_version: u8,
     /// Logical call.
     pub call_id: GatewayCallId,
-    /// Verified caller whose invocation caused the call.
-    pub caller_principal_id: PrincipalId,
     /// Requested operation.
     pub operation: GatewayOperation,
     /// Ingress dialect, such as `openai_chat_completions`.
@@ -700,7 +701,6 @@ mod tests {
         json!({
             "schema_version": 1,
             "call_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01",
-            "caller_principal_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03",
             "operation": "chat_completions",
             "ingress_dialect": "openai_chat_completions",
             "requested_model": {"provider": "openai", "model": "gpt-4o"},
@@ -835,7 +835,6 @@ mod tests {
         json!({
             "schema_version": 1,
             "call_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01",
-            "caller_principal_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03",
             "operation": "chat_completions",
             "ingress_dialect": "openai_chat_completions",
             "requested_model": {"provider": "openai", "model": "gpt-4o"},

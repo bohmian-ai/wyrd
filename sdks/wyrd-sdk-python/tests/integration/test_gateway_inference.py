@@ -62,6 +62,12 @@ def admin(server: WyrdTestServer) -> WyrdClient:
 
 
 @pytest.fixture
+def tenant_admin(server: WyrdTestServer) -> WyrdClient:
+    """The tenant administrator ``wyrd setup`` issues, bound to no Card, so it may run any registered Workflow."""
+    return client_of(server, server.tenant_admin_key())
+
+
+@pytest.fixture
 def ask(admin: WyrdClient) -> CardRef:
     """The registered ``ask`` Workflow."""
     return Cards(admin).register_from_path(ASK).root
@@ -126,7 +132,7 @@ def test_gateway_call_records_a_lone_run_or_card(server: WyrdTestServer, admin: 
 
     server.flush_bifrost()
     calls = Bifrost(client=admin).sql(
-        "SELECT run_id, card_uid FROM vala.gateway.calls WHERE caller_principal_id = $1 ORDER BY run_id",
+        "SELECT run_id, card_uid FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY run_id",
         [str(issued.principal_id)],
     )
     assert calls.to_arrow().to_pylist() == [
@@ -174,9 +180,9 @@ def test_cli_issues_a_card_scoped_key_and_writes_a_provider_credential(
 
 
 def test_loaded_workflow_calls_the_gateway_through_its_loading_client(
-    admin: WyrdClient, upstream: Receiver, ask: CardRef
+    tenant_admin: WyrdClient, upstream: Receiver, ask: CardRef
 ) -> None:
-    workflow = Cards(admin).workflow.load(ask)
+    workflow = Cards(tenant_admin).workflow.load(ask)
 
     run = workflow.run({"question": "hi"})
 
@@ -203,9 +209,11 @@ def test_applying_a_workflow_calls_no_model(admin: WyrdClient, upstream: Receive
     assert upstream.deliveries == []
 
 
-def test_registered_example_runs_through_the_gateway(admin: WyrdClient, upstream: Receiver) -> None:
+def test_registered_example_runs_through_the_gateway(
+    admin: WyrdClient, tenant_admin: WyrdClient, upstream: Receiver
+) -> None:
     cli.apply(EXAMPLE, client=admin)
-    registered = Cards(admin).workflow.load(
+    registered = Cards(tenant_admin).workflow.load(
         space="engineering", name="code-review", version="1.0.0"
     )
 

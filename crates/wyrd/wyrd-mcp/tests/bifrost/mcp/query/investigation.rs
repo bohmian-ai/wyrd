@@ -15,9 +15,10 @@ use wyrd_client::cards::Cards;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_runtime::Permission;
 use wyrd_runtime::principal::PrincipalId;
-use wyrd_server::scribe_outbox::{ScribeWrite, VerifierAttribution};
+use wyrd_server::scribe_outbox::ScribeWrite;
 use wyrd_server::verification::engines::VerifierReport;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::VerificationResultId;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::GetCardResponse;
@@ -166,8 +167,7 @@ impl EvidenceInvestigation {
             let run = ResultRun {
                 run_id: None,
                 verifier_version: &version,
-                subject_card_uid: subject_uid,
-                requested_by: None,
+                card_uid: subject_uid,
                 owner_card_uid: Some(subject_uid),
                 binding_id: None,
                 trigger: None,
@@ -179,10 +179,7 @@ impl EvidenceInvestigation {
                 self.server.data_tenant_id(),
                 ScribeWrite::Result {
                     payload,
-                    attribution: VerifierAttribution {
-                        verifier: reference.clone(),
-                        principal: PrincipalId::new(seed.system_principal()),
-                    },
+                    attribution: Attribution::direct(PrincipalId::new(seed.system_principal())),
                 },
             );
         }
@@ -236,7 +233,7 @@ impl EvidenceInvestigation {
             ("vala.traces", "spans", "trace_id"),
             ("vala.logs", "records", "span_id"),
             ("vala.datasets", "investigation_events", "value"),
-            ("vala.verification", "results", "subject_card_uid"),
+            ("vala.verification", "results", "verifier_card_uid"),
             ("vala.drift", "result_features", "score"),
             ("vala.eval", "result_items", "passed"),
         ] {
@@ -297,7 +294,7 @@ impl EvidenceInvestigation {
             assert_eq!(response.card.metadata.uid, reference.uid);
         }
         let uid = self.subject.uid.as_ref().ok_or("subject UID")?;
-        let rows = self.query(&format!("SELECT implementation, verdict FROM vala.verification.results WHERE subject_card_uid = '{uid}' ORDER BY implementation LIMIT 20")).await?;
+        let rows = self.query(&format!("SELECT implementation, verdict FROM vala.verification.results WHERE card_uid = '{uid}' ORDER BY implementation LIMIT 20")).await?;
         assert_eq!(rows, json!([["drift", "failed"], ["eval", "failed"]]));
         let rows = self.query(&format!("SELECT feature, score, threshold, verdict FROM vala.drift.result_features WHERE result_id = '{}' LIMIT 20", self.drift_result)).await?;
         assert_eq!(rows, json!([["latency", 3.0, 1.0, "drift"]]));

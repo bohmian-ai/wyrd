@@ -1,15 +1,15 @@
--- Relax auth `created_by` FK to a generic issuer principal id.
+-- Relax the auth creation-subject FK to a generic issuer principal id.
 --
 -- Both wyrd.auth_api_keys and wyrd.auth_service_accounts declared an unnamed,
--- table-level composite FOREIGN KEY (data_tenant_id, created_by) referencing
+-- table-level composite FOREIGN KEY (data_tenant_id, sub_principal_id) referencing
 -- wyrd.auth_users(data_tenant_id, id). That forced every issuer to be a human
 -- user row. A service-account issuer's principal.id is not an auth_users row,
--- so it could not write `created_by` without violating the FK.
+-- so it could not write `sub_principal_id` without violating the FK.
 --
 -- This forward-only migration drops ONLY those two auth_users-referencing FKs,
--- turning `created_by` into an FK-free issuer principal id modeled like the
+-- turning `sub_principal_id` into an FK-free issuer principal id modeled like the
 -- existing audit_credential_issuance.issuer_principal_id. The columns stay
--- UUID NOT NULL. No backfill is needed: existing `created_by` values already
+-- UUID NOT NULL. No backfill is needed: existing `sub_principal_id` values already
 -- hold a valid auth_users.id, which remains a valid principal id.
 --
 -- The drop is name-agnostic: the original FKs were auto-named by Postgres, so

@@ -38,14 +38,15 @@ impl Run {
     /// or `WYRD_GATEWAY_404_MODEL_UNAVAILABLE`) when it refuses the call; and
     /// the Agent runtime's error for any other failure.
     pub async fn invoke(&self, variables: &[(&str, &str)]) -> Result<String, WyrdError> {
-        let card = self.state.agent(&self.alias)?;
+        let agent = self.state.agent(&self.alias)?;
+        let card = agent.card();
         if !card.spec.tool_names.is_empty() {
             return Err(invalid_agent(
                 &self.alias,
                 "Run.invoke supports only a tool-free Agent",
             ));
         }
-        let prompt = self.state.resolve_agent_prompt(&self.alias)?;
+        let prompt = &agent.prompt().metadata.prompt;
         let caller = PublicWyrdGatewayCaller::new(self.state.client()?.clone())
             .with_subject(Some(&self.run_id), Some(self.subject_uid()));
         let registry = wyrd_gateway_registry(Arc::new(caller), prompt).ok_or_else(|| {

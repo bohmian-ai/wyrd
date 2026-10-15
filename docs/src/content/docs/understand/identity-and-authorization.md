@@ -135,7 +135,7 @@ Every permission check produces an `allowed` or `denied` decision, and Wyrd reco
 The audit log is a Bifrost table, so a `viewer` can query it like any other:
 
 ```sql
-SELECT created_at, audit_principal_id, permission, outcome
+SELECT created_at, sub_principal_id, permission, outcome
 FROM vala.system.audit_log
 WHERE outcome = 'denied'
 ORDER BY created_at DESC

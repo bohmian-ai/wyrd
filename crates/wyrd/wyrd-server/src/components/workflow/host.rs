@@ -25,7 +25,7 @@ use wyrd_runtime::Permission;
 use wyrd_spec::AgentSpec;
 use wyrd_spec::card::workflow::{CreateWorkflowRunRequest, LlmRoute, WorkflowAction, WorkflowRun};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CredentialBindingName, IdempotencyKey, WorkflowRunId};
+use wyrd_spec::ids::{CardUid, CredentialBindingName, IdempotencyKey, WorkflowRunId};
 use wyrd_spec::reference::{CardRef, InlineableRef};
 
 use super::runs::{Admission, Reservation, RunKey, run_not_found, run_unavailable};
@@ -33,7 +33,7 @@ use super::tools::{RunTools, is_builtin};
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::components::cards::{GraphBounds, PinnedWorkflowGraph};
-use crate::components::gateway::ServerWyrdGatewayCaller;
+use crate::components::gateway::{GatewayCallSubject, ServerWyrdGatewayCaller};
 use crate::state::{AppState, registry_db_error};
 
 /// How a create was answered.
@@ -286,7 +286,9 @@ impl Preparation {
     /// and prepares the Skald run on the Workflow tracker's blocking pool, so
     /// shutdown waits for that work even when this future is cancelled. The
     /// run's tools are then bound to the total deadline the prepared run
-    /// fixed. No provider or tool is called.
+    /// fixed. Every step's gateway call is attributed to the pinned Workflow
+    /// Card under the captured caller, with no application Run. No provider
+    /// or tool is called.
     ///
     /// # Errors
     /// Returns the registry and graph-bound errors of
@@ -294,7 +296,8 @@ impl Preparation {
     /// for a `native` step; `WYRD_WORKFLOW_422_TOOL_UNAVAILABLE` for an
     /// unknown or duplicate tool; `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE`
     /// for an unreadable binding; `WYRD_WORKFLOW_500_INTERNAL` when the
-    /// blocking task fails; and the hydration, input, route, and terminal
+    /// pinned Workflow Card has no valid UID or the blocking task fails; and
+    /// the hydration, input, route, and terminal
     /// reserve errors of Skald's preparation.
     async fn prepare(
         state: &AppState,
@@ -340,8 +343,25 @@ impl Preparation {
         } else {
             ExternalEndpointProfile::Local
         };
-        let gateway: Arc<dyn WyrdGatewayCaller> =
-            Arc::new(ServerWyrdGatewayCaller::new(state.clone(), caller.clone()));
+        let workflow_card =
+            graph
+                .workflow()
+                .uid
+                .parse::<CardUid>()
+                .map_err(|_| WyrdError::WorkflowInternal {
+                    message: "the pinned Workflow Card has no valid UID".to_owned(),
+                    details: serde_json::json!({ "boundary": "preparation" }),
+                })?;
+        // A step's model call is the caller's own work on this Workflow Card;
+        // a Workflow run id is not an application Run, so none is recorded.
+        let gateway: Arc<dyn WyrdGatewayCaller> = Arc::new(
+            ServerWyrdGatewayCaller::new(state.clone(), caller.clone()).attributed(Some(
+                GatewayCallSubject {
+                    run_id: None,
+                    card_uid: Some(workflow_card),
+                },
+            )),
+        );
         let dependencies = WorkflowExecutionDependencies::new(ProviderRegistry::default())
             .with_wyrd_gateway(gateway)
             .with_external_gateways(bindings)

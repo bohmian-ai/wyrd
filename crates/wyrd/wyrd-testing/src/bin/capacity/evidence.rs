@@ -364,7 +364,7 @@ impl Queue {
     /// Read-only.
     pub async fn runs(&self, since: DateTime<Utc>) -> Result<BTreeMap<String, RunTally>> {
         let rows: Vec<RunRow> = sqlx::query_as(
-            "SELECT verifier_uid::text, status, \
+            "SELECT verifier_card_uid::text, status, \
                     (EXTRACT(EPOCH FROM settled_at - $1) * 1e6)::bigint \
                FROM wyrd.verifier_runs WHERE created_at >= $1",
         )

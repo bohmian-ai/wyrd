@@ -2055,6 +2055,7 @@ mod tests {
         crate::contracts::ScribeIngressFrame {
             attributed_cards: None,
             authenticated_tenant: tenant,
+            attribution: wyrd_spec::auth::Attribution::direct(principal.id),
             principal,
             table,
             expected_schema_fingerprint: Some(

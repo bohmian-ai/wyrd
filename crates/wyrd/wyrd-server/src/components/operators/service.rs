@@ -119,7 +119,7 @@ impl<'a> OperatorConnectionControl<'a> {
                     config: &config,
                     sealed: &sealed,
                     secret_version: 1,
-                    principal: caller.principal.id,
+                    attribution: caller.attribution(),
                 },
             )
             .await

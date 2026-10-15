@@ -958,7 +958,11 @@ export declare class NativeWyrdState {
    */
   workflow(alias: string): NativeLifecycleResult
   /**
-   * Returns the stored envelope of the Agent Card an alias names.
+   * Returns the stored envelope of the Agent Card an alias names, with
+   * the exact Prompt reference it pins and that Prompt's stored envelope.
+   *
+   * The Prompt is the one the shared state's hydrated Agent resolves, so
+   * the wrapper navigates without resolving the relationship itself.
    *
    * # Errors
    *

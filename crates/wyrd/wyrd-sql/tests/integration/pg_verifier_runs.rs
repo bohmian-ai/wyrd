@@ -10,13 +10,15 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
-use wyrd_runtime::PermissionSet;
-use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
+use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind, PrincipalRef};
+use wyrd_runtime::{AcceptedAuthority, DelegationStep, PermissionSet};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::operator::{MAX_SUMMARY_CHARS, OperatorFailureContext, VerifierCounts};
 use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
+use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::registry::RegistrationOperationId;
 use wyrd_spec::verification::{
     DriftWindow, OperatorDispatchStatus, VerificationError, VerificationExecutionStatus,
@@ -34,8 +36,9 @@ use wyrd_sql::queries::verification::{
 };
 use wyrd_sql::queries::verifier_runs::{
     ClaimedRun, EnqueueOutcome, EnqueueRefusal, ManualEnqueueOutcome, ObservationRecord,
-    QueueCounts, RequestKey, RetryOutcome, RunInput, RunOrigin, RunRequest, ScheduleOutcome,
-    ScheduleSkip, Settlement, TargetCards, TerminalStatus, TraceWaitOutcome, VerifierRunQueue,
+    QueueCounts, RequestKey, RetryOutcome, RunAuthority, RunInput, RunOrigin, RunRequest,
+    ScheduleOutcome, ScheduleSkip, ScheduleTick, Settlement, TargetCards, TerminalStatus,
+    TraceWaitOutcome, VerifierRunQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -115,7 +118,7 @@ async fn insert_card(conn: &mut TenantConn<'_>, actor: &Principal, card: &Card) 
         conn,
         NewRegistrationOperation {
             operation_id,
-            principal_id: actor.id,
+            attribution: wyrd_spec::auth::Attribution::direct(actor.id),
             idempotency_key: &key,
             request_hash: "request-hash",
         },
@@ -127,7 +130,7 @@ async fn insert_card(conn: &mut TenantConn<'_>, actor: &Principal, card: &Card) 
         NewCardRow {
             card,
             card_uid: uid(),
-            principal_id: actor.id,
+            attribution: wyrd_spec::auth::Attribution::direct(actor.id),
             operation_id,
             status: CardStatus::Pending,
             spec_hash: "spec-hash",
@@ -168,9 +171,14 @@ async fn register_service(
 ) -> (CardUid, PrincipalId) {
     let card = service_card(name);
     let card_uid = insert_card(conn, actor, &card).await;
-    let principal = upsert_service_account_from_card(conn, &card_uid, &card, actor)
-        .await
-        .expect("principal projects");
+    let principal = upsert_service_account_from_card(
+        conn,
+        &card_uid,
+        &card,
+        wyrd_spec::auth::Attribution::direct(actor.id),
+    )
+    .await
+    .expect("principal projects");
     sqlx::query("UPDATE wyrd.cards SET status = 'active' WHERE card_uid = $1")
         .bind(card_uid.as_uuid())
         .execute(&mut **conn.transaction())
@@ -218,8 +226,8 @@ async fn bind(
         &CardKind::Service,
         &[NewBinding {
             subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
-            subject_card_uid: owner.clone(),
-            verifier_uid: verifier.clone(),
+            card_uid: owner.clone(),
+            verifier_card_uid: verifier.clone(),
             trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
             operators,
             activation,
@@ -386,10 +394,97 @@ fn enqueued(outcome: EnqueueOutcome) -> VerificationRunId {
     }
 }
 
+/// The direct accepted authority of `principal`, with no delegation chain.
+fn authority(principal: &Principal) -> AcceptedAuthority {
+    AcceptedAuthority::new(principal, &[])
+}
+
+/// The accepted authority of the binding owner's Card-bound `principal`.
+///
+/// Persistence does not interpret the authority, so a Card-free Service
+/// principal with no permissions stands in for the owner.
+fn owner_authority(tenant: DataTenantId, principal: PrincipalId) -> AcceptedAuthority {
+    authority(&Principal::new(
+        principal,
+        PrincipalKind::Service {
+            card_ref: None,
+            card_ref_scope: CardRefScope::default(),
+        },
+        tenant,
+        Vec::new(),
+        PermissionSet::new(),
+    ))
+}
+
+/// The background authority of a binding owned by `owner`, executed by the
+/// tenant SYSTEM principal, provisioning SYSTEM when absent.
+///
+/// # Panics
+/// Panics when SYSTEM cannot be provisioned.
+async fn background(conn: &mut TenantConn<'_>, owner: PrincipalId) -> RunAuthority {
+    let system = provision_system_principal(conn, Attribution::unresolved())
+        .await
+        .expect("system principal provisions");
+    RunAuthority::background(
+        owner_authority(conn.data_tenant_id(), owner),
+        PrincipalId::new(system),
+    )
+}
+
+/// Claim and settle the next due binding the way the server scheduler does:
+/// resolve the owner's authority with the tenant SYSTEM actor, then settle.
+///
+/// # Panics
+/// Panics when the claim, SYSTEM provisioning, or settlement fails.
+async fn schedule_next_due(
+    queue: &VerifierRunQueue,
+    conn: &mut TenantConn<'_>,
+) -> Option<ScheduleTick> {
+    let due = queue.claim_due(conn).await.expect("due binding claims")?;
+    let authority = match due.owner() {
+        Some(owner) => Some(background(conn, owner).await),
+        None => None,
+    };
+    Some(
+        queue
+            .schedule_due(conn, due, authority)
+            .await
+            .expect("due binding settles"),
+    )
+}
+
+/// Enqueue observation runs the way the server observation path does: lock
+/// the matching bindings, resolve each owner's authority with the tenant
+/// SYSTEM actor, then insert. Returns the number of runs inserted.
+///
+/// # Panics
+/// Panics when the lock, SYSTEM provisioning, or insert fails.
+async fn enqueue_observation_batch(
+    queue: &VerifierRunQueue,
+    conn: &mut TenantConn<'_>,
+    records: &[ObservationRecord],
+) -> u64 {
+    let locked = queue
+        .lock_observation_bindings(conn, records)
+        .await
+        .expect("observation bindings lock");
+    let mut bindings = Vec::with_capacity(locked.len());
+    for binding in locked {
+        if let Some(owner) = binding.owner {
+            let authority = background(conn, owner).await;
+            bindings.push((binding, authority));
+        }
+    }
+    queue
+        .enqueue_observation_runs(conn, records, &bindings)
+        .await
+        .expect("observation runs enqueue")
+}
+
 /// Manual request for a binding by `requester`.
 fn manual_binding(requester: &Principal, binding_id: BindingId) -> RunRequest {
     RunRequest::Manual {
-        requested_by: requester.id,
+        authority: RunAuthority::manual(authority(requester)),
         target: VerificationRunTarget::Binding { binding_id },
         window: window(),
         cause: None,
@@ -450,10 +545,10 @@ async fn manual_enqueue_freezes_binding_and_direct_identities() {
             .expect("binding run enqueues"),
     );
     let direct_request = RunRequest::Manual {
-        requested_by: actor.id,
+        authority: RunAuthority::manual(authority(&actor)),
         target: VerificationRunTarget::Verifier {
-            verifier_uid: verifier.clone(),
-            subject_card_uid: owner.clone(),
+            verifier_card_uid: verifier.clone(),
+            card_uid: owner.clone(),
         },
         window: window(),
         cause: None,
@@ -480,18 +575,19 @@ async fn manual_enqueue_freezes_binding_and_direct_identities() {
         bound_claim.trigger,
         Some(FrozenTarget::Digest("sha256:trigger".to_owned()))
     );
-    assert_eq!(bound_claim.verifier_uid, verifier);
+    assert_eq!(bound_claim.verifier_card_uid, verifier);
     assert_eq!(bound_claim.verifier_version, "1.0.0");
-    assert_eq!(bound_claim.subject_card_uid, owner);
+    assert_eq!(bound_claim.card_uid, owner);
     assert_eq!(bound_claim.input, RunInput::DriftWindow(window()));
-    assert_eq!(bound_claim.requested_by, Some(actor.id));
+    assert_eq!(bound_claim.attribution, Attribution::direct(actor.id));
+    assert_eq!(bound_claim.authority, authority(&actor));
     assert_eq!((bound_claim.attempt, bound_claim.max_attempts), (1, 3));
 
     assert_eq!(direct_claim.lease.run_id, direct);
     assert_eq!(direct_claim.binding_id, None);
     assert_eq!(direct_claim.owner_card_uid, None);
     assert_eq!(direct_claim.trigger, None);
-    assert_eq!(direct_claim.requested_by, Some(actor.id));
+    assert_eq!(direct_claim.attribution, Attribution::direct(actor.id));
     let operators: Value =
         sqlx::query_scalar("SELECT operators FROM wyrd.verifier_runs WHERE run_id = $1")
             .bind(direct.as_uuid())
@@ -526,10 +622,10 @@ async fn enqueue_refuses_unrunnable_targets_without_writing() {
     let eval_verifier = register_verifier(&mut conn, &actor, "eval", eval()).await;
     let psi_binding = bind(&mut conn, &owner, &psi, daily(), Vec::new()).await;
     let direct = |verifier: &CardUid, subject: &CardUid| RunRequest::Manual {
-        requested_by: actor.id,
+        authority: RunAuthority::manual(authority(&actor)),
         target: VerificationRunTarget::Verifier {
-            verifier_uid: verifier.clone(),
-            subject_card_uid: subject.clone(),
+            verifier_card_uid: verifier.clone(),
+            card_uid: subject.clone(),
         },
         window: window(),
         cause: None,
@@ -619,7 +715,7 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
     let first = queue
         .enqueue_manual(
             &mut conn,
-            actor.id,
+            authority(&actor),
             &target,
             window(),
             None,
@@ -634,7 +730,7 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
         queue
             .enqueue_manual(
                 &mut conn,
-                actor.id,
+                authority(&actor),
                 &target,
                 window(),
                 None,
@@ -648,7 +744,7 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
         queue
             .enqueue_manual(
                 &mut conn,
-                actor.id,
+                authority(&actor),
                 &target,
                 window(),
                 None,
@@ -670,7 +766,7 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
     let other_run = queue
         .enqueue_manual(
             &mut conn,
-            other.id,
+            authority(&other),
             &target,
             window(),
             None,
@@ -691,7 +787,7 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
             queue
                 .enqueue_manual(
                     &mut conn,
-                    actor.id,
+                    authority(&actor),
                     &unready,
                     window(),
                     None,
@@ -717,8 +813,8 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
         })
     );
     let direct = VerificationRunTarget::Verifier {
-        verifier_uid: custom.clone(),
-        subject_card_uid: owner.clone(),
+        verifier_card_uid: custom.clone(),
+        card_uid: owner.clone(),
     };
     assert_eq!(
         queue
@@ -742,6 +838,109 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
     );
 }
 
+/// Manual idempotency is scoped by subject and actor together: the same
+/// actor for a different subject and the same subject through a different
+/// actor each create their own run under one key, while an exact replay of a
+/// pair returns its run and changed input under that pair conflicts. Each run
+/// stores the accepting pair.
+///
+/// # Panics
+/// Panics when two pairs share a run, a replay creates one, or a stored pair
+/// differs from the accepting request.
+#[tokio::test]
+async fn subject_actor_manual_replay() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let (alice, bob, carol) = (actor(tenant), actor(tenant), actor(tenant));
+    let queue = VerifierRunQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = register_service(&mut conn, &alice, "svc").await;
+    let custom = register_verifier(&mut conn, &alice, "custom", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &custom, daily(), Vec::new()).await;
+    let target = VerificationRunTarget::Binding {
+        binding_id: binding,
+    };
+    let through = |subject: &Principal, actor: &Principal| {
+        AcceptedAuthority::new(
+            subject,
+            &[DelegationStep {
+                principal: PrincipalRef::from_principal(actor),
+            }],
+        )
+    };
+    let key = |digest: &'static [u8]| {
+        Some(RequestKey {
+            key: "shared-key",
+            request_sha256: digest,
+        })
+    };
+
+    let mut runs = Vec::new();
+    for accepted in [
+        authority(&alice),
+        through(&alice, &bob),
+        through(&carol, &bob),
+    ] {
+        let pair = accepted.attribution();
+        let outcome = queue
+            .enqueue_manual(&mut conn, accepted, &target, window(), None, key(b"a"))
+            .await
+            .expect("keyed run enqueues");
+        let ManualEnqueueOutcome::Enqueued(run_id) = outcome else {
+            panic!("each subject/actor pair owns its key, got {outcome:?}");
+        };
+        let stored: (Uuid, Uuid) = sqlx::query_as(
+            "SELECT sub_principal_id, act_principal_id FROM wyrd.verifier_runs WHERE run_id = $1",
+        )
+        .bind(run_id.as_uuid())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("stored pair reads");
+        assert_eq!(
+            stored,
+            (
+                pair.sub_principal_id.as_uuid(),
+                pair.act_principal_id.as_uuid()
+            )
+        );
+        runs.push(run_id);
+    }
+    assert_eq!(run_count(&mut conn).await, 3);
+
+    assert_eq!(
+        queue
+            .enqueue_manual(
+                &mut conn,
+                through(&alice, &bob),
+                &target,
+                window(),
+                None,
+                key(b"a")
+            )
+            .await
+            .expect("replay answers"),
+        ManualEnqueueOutcome::Replayed(runs[1])
+    );
+    assert_eq!(
+        queue
+            .enqueue_manual(
+                &mut conn,
+                through(&alice, &bob),
+                &target,
+                window(),
+                None,
+                key(b"b")
+            )
+            .await
+            .expect("conflict answers"),
+        ManualEnqueueOutcome::KeyReused(runs[1])
+    );
+    assert_eq!(run_count(&mut conn).await, 3);
+}
+
 /// An observation creates one run per (binding, input record); a repeated
 /// delivery of the same record returns the existing run, and the claim carries
 /// the record and its exact event time.
@@ -757,10 +956,7 @@ async fn observation_runs_are_unique_per_input_record() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let system = provision_system_principal(&mut conn)
-        .await
-        .expect("the tenant SYSTEM principal provisions");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, owner_principal) = register_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "eval", eval()).await;
     let binding = bind(
         &mut conn,
@@ -770,11 +966,13 @@ async fn observation_runs_are_unique_per_input_record() {
         Vec::new(),
     )
     .await;
+    let authority = background(&mut conn, owner_principal).await;
     let event_time = at(22, 11, 59);
     let observation = |record: &str| RunRequest::Observation {
         binding_id: binding,
         record_id: record.to_owned(),
         event_time,
+        authority: authority.clone(),
     };
 
     let run = enqueued(
@@ -802,10 +1000,11 @@ async fn observation_runs_are_unique_per_input_record() {
     assert_eq!(claimed.lease.run_id, run);
     assert_eq!(claimed.origin, RunOrigin::Observation);
     assert_eq!(
-        claimed.requested_by,
-        Some(PrincipalId::new(system)),
-        "an observation-triggered run records the SYSTEM actor"
+        claimed.attribution,
+        authority.attribution(),
+        "an observation-triggered run serves the owner with the SYSTEM actor"
     );
+    assert_eq!(claimed.authority, *authority.authority());
     assert_eq!(
         claimed.input,
         RunInput::EvalRecord {
@@ -867,7 +1066,7 @@ async fn observation_ordinal_is_fixed_at_serialized_enqueue() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut setup, &actor, "svc").await;
+    let (owner, owner_principal) = register_service(&mut setup, &actor, "svc").await;
     let verifier = register_verifier(&mut setup, &actor, "eval", eval()).await;
     let binding = bind(
         &mut setup,
@@ -877,12 +1076,14 @@ async fn observation_ordinal_is_fixed_at_serialized_enqueue() {
         Vec::new(),
     )
     .await;
+    let authority = background(&mut setup, owner_principal).await;
     setup.commit().await.expect("setup commits");
     let event_time = at(22, 11, 59);
     let observation = |record: &str| RunRequest::Observation {
         binding_id: binding,
         record_id: record.to_owned(),
         event_time,
+        authority: authority.clone(),
     };
 
     let mut earlier = fixture.tenant_conn().await.expect("earlier opens");
@@ -994,7 +1195,7 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let system = provision_system_principal(&mut setup)
+    let system = provision_system_principal(&mut setup, Attribution::unresolved())
         .await
         .expect("the tenant SYSTEM principal provisions");
     let (owner, principal) = register_service(&mut setup, &actor, "svc").await;
@@ -1012,17 +1213,11 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
 
     let mut first = fixture.tenant_conn().await.expect("first scheduler opens");
     let mut second = fixture.tenant_conn().await.expect("second scheduler opens");
-    let tick = queue
-        .schedule_next_due(&mut first)
+    let tick = schedule_next_due(&queue, &mut first)
         .await
-        .expect("first tick runs")
         .expect("the binding is due");
     assert!(
-        queue
-            .schedule_next_due(&mut second)
-            .await
-            .expect("second tick runs")
-            .is_none(),
+        schedule_next_due(&queue, &mut second).await.is_none(),
         "a locked due binding is skipped"
     );
     assert_eq!(tick.binding_id, binding);
@@ -1033,11 +1228,7 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
     };
     first.commit().await.expect("first scheduler commits");
     assert!(
-        queue
-            .schedule_next_due(&mut second)
-            .await
-            .expect("second tick reruns")
-            .is_none(),
+        schedule_next_due(&queue, &mut second).await.is_none(),
         "the committed cursor is no longer due"
     );
     drop(second);
@@ -1050,21 +1241,19 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
         .tenant_conn(fixture.data_tenant_id())
         .await
         .expect("restarted scheduler opens");
-    assert!(
-        queue
-            .schedule_next_due(&mut conn)
-            .await
-            .expect("restarted tick runs")
-            .is_none()
-    );
+    assert!(schedule_next_due(&queue, &mut conn).await.is_none());
     assert_next_daily_boundary(cursor(&mut conn, binding).await, due);
     let claimed = claim(&queue, &mut conn).await;
     assert_eq!(claimed.lease.run_id, run);
     assert_eq!(claimed.origin, RunOrigin::Schedule);
     assert_eq!(
-        claimed.requested_by,
-        Some(PrincipalId::new(system)),
-        "a scheduled run records the SYSTEM principal it executes as"
+        claimed.attribution,
+        Attribution::new(principal, PrincipalId::new(system)),
+        "a scheduled run serves the owner with the SYSTEM actor"
+    );
+    assert_eq!(
+        claimed.authority,
+        owner_authority(fixture.data_tenant_id(), principal)
     );
     let RunInput::DriftWindow(occurrence) = claimed.input else {
         panic!(
@@ -1076,6 +1265,7 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
         occurrence.end, due,
         "the occurrence closes at its due instant"
     );
+    let replay = background(&mut conn, principal).await;
     assert_eq!(
         queue
             .enqueue(
@@ -1083,6 +1273,7 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
                 &RunRequest::Scheduled {
                     binding_id: binding,
                     window: occurrence,
+                    authority: replay,
                 },
             )
             .await
@@ -1131,7 +1322,7 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
     set_cursor(&mut conn, missed, Some(due - Duration::days(2))).await;
 
     let mut outcomes = Vec::new();
-    while let Some(tick) = queue.schedule_next_due(&mut conn).await.expect("tick runs") {
+    while let Some(tick) = schedule_next_due(&queue, &mut conn).await {
         assert_next_daily_boundary(tick.next_run_at, due);
         outcomes.push((tick.binding_id, tick.outcome));
     }
@@ -1571,10 +1762,10 @@ async fn failed_binding_runs_dispatch_each_distinct_operator_once() {
     )
     .await;
     let direct_request = RunRequest::Manual {
-        requested_by: actor.id,
+        authority: RunAuthority::manual(authority(&actor)),
         target: VerificationRunTarget::Verifier {
-            verifier_uid: verifier.clone(),
-            subject_card_uid: owner.clone(),
+            verifier_card_uid: verifier.clone(),
+            card_uid: owner.clone(),
         },
         window: window(),
         cause: None,
@@ -1816,7 +2007,7 @@ async fn observation_batches_insert_once_per_binding_and_record() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let system = provision_system_principal(&mut conn)
+    let system = provision_system_principal(&mut conn, Attribution::unresolved())
         .await
         .expect("the tenant SYSTEM principal provisions");
     let assertion = register_verifier(&mut conn, &actor, "assertion", eval()).await;
@@ -1871,25 +2062,16 @@ async fn observation_batches_insert_once_per_binding_and_record() {
         record(&live, &live, "r-1"),
     ];
 
-    let inserted = queue
-        .enqueue_observation_batch(&mut conn, &batch)
-        .await
-        .expect("batch enqueues");
+    let inserted = enqueue_observation_batch(&queue, &mut conn, &batch).await;
     assert_eq!(inserted, 5, "two live bindings x two records, one other");
     assert_eq!(
-        queue
-            .enqueue_observation_batch(&mut conn, &batch)
-            .await
-            .expect("repeat answers"),
+        enqueue_observation_batch(&queue, &mut conn, &batch).await,
         0,
         "a repeated batch inserts nothing"
     );
     assert_eq!(run_count(&mut conn).await, 5);
     assert_eq!(
-        queue
-            .enqueue_observation_batch(&mut conn, &[record(&live, &live, "r-3")])
-            .await
-            .expect("later record enqueues"),
+        enqueue_observation_batch(&queue, &mut conn, &[record(&live, &live, "r-3")]).await,
         2
     );
     let numbered = |records: &[(&str, i64)]| -> Vec<(String, i64)> {
@@ -1909,17 +2091,18 @@ async fn observation_batches_insert_once_per_binding_and_record() {
         ordinals(&mut conn, other_binding).await,
         numbered(&[("o-1", 1)])
     );
-    let requesters: Vec<Option<Uuid>> = sqlx::query_scalar(
-        "SELECT DISTINCT requested_by_principal_id FROM wyrd.verifier_runs WHERE binding_id = $1",
+    let pairs: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT DISTINCT sub_principal_id, act_principal_id \
+           FROM wyrd.verifier_runs WHERE binding_id = $1",
     )
     .bind(first.as_uuid())
     .fetch_all(&mut **conn.transaction())
     .await
-    .expect("requesters read");
+    .expect("pairs read");
     assert_eq!(
-        requesters,
-        [Some(system)],
-        "every observation-triggered run records the SYSTEM actor, not the writer"
+        pairs,
+        [(live_principal.as_uuid(), system)],
+        "every observation-triggered run serves the owner with the SYSTEM actor, never the writer"
     );
 }
 
@@ -1966,18 +2149,22 @@ async fn frames_naming_subjects_in_opposite_orders_serialize() {
     let [x, y] = [&subjects[0], &subjects[1]];
 
     let mut first = fixture.tenant_conn().await.expect("first opens");
-    let made = queue
-        .enqueue_observation_batch(&mut first, &[record(x, x, "a-1"), record(y, y, "a-2")])
-        .await
-        .expect("first frame enqueues");
+    let made = enqueue_observation_batch(
+        &queue,
+        &mut first,
+        &[record(x, x, "a-1"), record(y, y, "a-2")],
+    )
+    .await;
     assert_eq!(made, 2);
     let mut second = fixture.tenant_conn().await.expect("second opens");
     let mut probe = fixture.tenant_conn().await.expect("probe opens");
     let second_frame = async {
-        let made = queue
-            .enqueue_observation_batch(&mut second, &[record(y, y, "b-1"), record(x, x, "b-2")])
-            .await
-            .expect("second frame enqueues without a deadlock");
+        let made = enqueue_observation_batch(
+            &queue,
+            &mut second,
+            &[record(y, y, "b-1"), record(x, x, "b-2")],
+        )
+        .await;
         second.commit().await.expect("second commits");
         made
     };
@@ -2039,8 +2226,8 @@ async fn observation_runs_follow_the_writer() {
         &CardKind::Service,
         &[NewBinding {
             subject_occurrence_key: "a".to_owned(),
-            subject_card_uid: a.clone(),
-            verifier_uid: verifier.clone(),
+            card_uid: a.clone(),
+            verifier_card_uid: verifier.clone(),
             trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
             operators: Vec::new(),
             activation: BindingActivation::ObservationsReady,
@@ -2054,10 +2241,7 @@ async fn observation_runs_follow_the_writer() {
 
     let first = [record(&a, &a, "a-1")];
     assert_eq!(
-        queue
-            .enqueue_observation_batch(&mut conn, &first)
-            .await
-            .expect("A's record enqueues"),
+        enqueue_observation_batch(&queue, &mut conn, &first).await,
         1
     );
     record_machine_authentication(&mut conn, b_principal)
@@ -2065,18 +2249,12 @@ async fn observation_runs_follow_the_writer() {
         .expect("B authenticates again");
     let retried = [record(&a, &a, "a-1"), record(&a, &a, "a-2")];
     assert_eq!(
-        queue
-            .enqueue_observation_batch(&mut conn, &retried)
-            .await
-            .expect("A's retry enqueues"),
+        enqueue_observation_batch(&queue, &mut conn, &retried).await,
         1,
         "only A's new record runs, and only on A's binding"
     );
     assert_eq!(
-        queue
-            .enqueue_observation_batch(&mut conn, &[record(&a, &b, "b-1")])
-            .await
-            .expect("B's record enqueues"),
+        enqueue_observation_batch(&queue, &mut conn, &[record(&a, &b, "b-1")]).await,
         1
     );
 
@@ -2101,10 +2279,7 @@ async fn observation_runs_follow_the_writer() {
         ..record(&a, &a, "u-1")
     };
     assert_eq!(
-        queue
-            .enqueue_observation_batch(&mut conn, &[unbound])
-            .await
-            .expect("an unbound writer's record enqueues"),
+        enqueue_observation_batch(&queue, &mut conn, &[unbound]).await,
         2,
         "a writer bound to no Card activates every binding of the subject"
     );
@@ -2134,7 +2309,7 @@ async fn trace_wait_requeues_until_deadline_then_times_out() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let (owner, owner_principal) = register_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "eval", eval()).await;
     let binding = bind(
         &mut conn,
@@ -2144,6 +2319,7 @@ async fn trace_wait_requeues_until_deadline_then_times_out() {
         Vec::new(),
     )
     .await;
+    let authority = background(&mut conn, owner_principal).await;
     let run = enqueued(
         queue
             .enqueue(
@@ -2152,6 +2328,7 @@ async fn trace_wait_requeues_until_deadline_then_times_out() {
                     binding_id: binding,
                     record_id: "record-1".to_owned(),
                     event_time: at(22, 11, 59),
+                    authority,
                 },
             )
             .await
@@ -2317,13 +2494,7 @@ async fn queue_state_is_tenant_isolated() {
             .expect("foreign claim runs")
             .is_none()
     );
-    assert!(
-        queue
-            .schedule_next_due(&mut foreign)
-            .await
-            .expect("foreign tick runs")
-            .is_none()
-    );
+    assert!(schedule_next_due(&queue, &mut foreign).await.is_none());
     let dispatches: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.operator_dispatches")
         .fetch_one(&mut **foreign.transaction())
         .await
@@ -2431,8 +2602,8 @@ async fn binding_status_reports_activity_readiness_and_latest_run() {
         .expect("binding exists");
     assert_eq!(status.binding_id, ready);
     assert_eq!(status.owner_card_uid, owner);
-    assert_eq!(status.subject_card_uid, owner);
-    assert_eq!(status.verifier_uid, custom);
+    assert_eq!(status.card_uid, owner);
+    assert_eq!(status.verifier_card_uid, custom);
     assert!(status.active);
     assert_eq!(status.readiness, VerifierReadiness::Ready);
     assert_next_daily_boundary(status.next_run_at, activated_after);
@@ -2611,11 +2782,7 @@ async fn database_clock_owns_verifier_queue_deadlines() {
     )
     .await;
     assert!(
-        queue
-            .schedule_next_due(&mut conn)
-            .await
-            .expect("future tick runs")
-            .is_none(),
+        schedule_next_due(&queue, &mut conn).await.is_none(),
         "a cursor ahead of the database clock is not due"
     );
     sqlx::query(
@@ -2627,19 +2794,13 @@ async fn database_clock_owns_verifier_queue_deadlines() {
     .await
     .expect("cursor reaches the database clock");
     assert!(
-        queue
-            .schedule_next_due(&mut conn)
-            .await
-            .expect("window-end tick runs")
-            .is_none(),
+        schedule_next_due(&queue, &mut conn).await.is_none(),
         "a window that has just ended waits out the claim delay"
     );
     let due = database_now(&mut conn).await - SCHEDULE_CLAIM_DELAY;
     set_cursor(&mut conn, binding, Some(due)).await;
-    let tick = queue
-        .schedule_next_due(&mut conn)
+    let tick = schedule_next_due(&queue, &mut conn)
         .await
-        .expect("due tick runs")
         .expect("a cursor the claim delay behind the database clock is due");
     assert_eq!(tick.due_at, due);
 }

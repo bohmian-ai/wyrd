@@ -1084,7 +1084,7 @@ mod tests {
             run_id: VerificationRunId::new_v7(),
             result_id: VerificationResultId::new_v7(),
             binding_id: BindingId::new_v7(),
-            verifier_uid: CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 card uid"),
+            verifier_card_uid: CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 card uid"),
             verifier_ref: "verifier/drift@1.0.0".to_owned(),
             subject_uid: CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 card uid"),
             subject_ref: "service/owner@1.0.0".to_owned(),

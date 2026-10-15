@@ -57,7 +57,7 @@ async fn insert(
             config,
             sealed: &sealed(7, key_version),
             secret_version: 1,
-            principal: PrincipalId::new(Uuid::now_v7()),
+            attribution: wyrd_spec::auth::Attribution::direct(PrincipalId::new(Uuid::now_v7())),
         },
     )
     .await
@@ -115,7 +115,7 @@ async fn connections_store_redacted_authority_and_isolate_tenants() {
             config: &configs()[0],
             sealed: &sealed(9, 1),
             secret_version: 1,
-            principal: PrincipalId::new(Uuid::now_v7()),
+            attribution: wyrd_spec::auth::Attribution::direct(PrincipalId::new(Uuid::now_v7())),
         },
     )
     .await

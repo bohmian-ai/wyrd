@@ -39,7 +39,10 @@ impl AuthenticatedPrincipal {
     pub(crate) fn from_verified(verified: Arc<VerifiedToken>) -> Self {
         wyrd_telemetry::bind_tenant_route(wyrd_telemetry::TenantSpanRoute {
             tenant: verified.principal.tenant_id,
-            principal: verified.principal.id,
+            attribution: wyrd_runtime::delegated_attribution(
+                &verified.principal,
+                &verified.delegation_chain,
+            ),
         });
         Self { verified }
     }

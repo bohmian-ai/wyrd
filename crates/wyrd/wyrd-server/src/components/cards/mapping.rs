@@ -125,7 +125,7 @@ mod tests {
             artifact_hash: None,
             status,
             created_at: Utc::now(),
-            principal_id: PrincipalId::new(Uuid::now_v7()),
+            attribution: wyrd_spec::auth::Attribution::direct(PrincipalId::new(Uuid::now_v7())),
             operation_id: RegistrationOperationId::new(Uuid::now_v7()),
         }
     }

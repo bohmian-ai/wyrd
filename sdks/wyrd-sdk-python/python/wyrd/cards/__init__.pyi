@@ -7,7 +7,7 @@ from ..agent import Workflow
 from ..client import WyrdClient
 from ..data import DataCard, DataInterface
 from ..model import ModelCard, ModelInterface
-from ..prompt import Prompt, PromptCard, PromptReference
+from ..prompt import PromptCard, PromptReference
 from ..state import CardEnvelope
 from ._card import Card
 
@@ -31,8 +31,6 @@ class AgentCard:
         cascade_children: the referenced Prompt Card when the prompt is
             card-backed; empty for an inline prompt.
         prompt_ref: the durable prompt reference.
-        prompt: the inline `Prompt`, or `None` while the prompt is a
-            reference to a registered Prompt Card.
         kind: the Card kind, always ``"Agent"``.
     """
 
@@ -45,7 +43,6 @@ class AgentCard:
     spec: dict[str, JsonValue]
     cascade_children: list[CardRef]
     prompt_ref: PromptReference
-    prompt: Prompt | None
     kind: str
 
     def __init__(
@@ -76,6 +73,21 @@ class AgentCard:
             WyrdError: for an invalid label or annotation, or identity values
                 the Agent envelope rejects.
 
+        """
+        ...
+
+    def prompt(self) -> PromptCard:
+        """Return the registered Prompt Card this hydrated Agent pins.
+
+        A local read that performs no IO or registration. An authored inline
+        prompt is read through ``prompt_ref.prompt``.
+
+        Returns:
+            The hydrated `PromptCard`, the same Card any explicit Prompt alias
+            of the state names.
+
+        Raises:
+            WyrdError: when this Agent was not loaded through ``WyrdState``.
         """
         ...
 

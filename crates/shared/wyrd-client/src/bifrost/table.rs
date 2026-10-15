@@ -43,9 +43,10 @@ pub struct ResolvedTable {
 /// [`TableConfig::resolved`] is `None`.
 ///
 /// The declared schema holds **user columns only**. Correlation inputs
-/// (`card_uid`, `run_id`) and managed columns (`wyrd_*`) are appended by the
-/// producer and the server respectively, so declaring one here is a reserved
-/// name error rather than a way to control it.
+/// (`card_uid`, `run_id`) and managed columns (`wyrd_*`, `sub_principal_id`,
+/// `act_principal_id`) are appended by the producer and the server
+/// respectively, so declaring one here is a reserved name error rather than a
+/// way to control it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(into = "TableConfigWire", try_from = "TableConfigWire")]
 pub struct TableConfig {
@@ -457,8 +458,8 @@ impl WriterTable {
 /// Optional per-row correlation.
 ///
 /// Both fields are optional on the wire: the server stores an uncorrelated row
-/// against the authenticated `principal_id` with a null `card_uid`, so the
-/// default is a valid write rather than a degraded one.
+/// against the authenticated `sub_principal_id`/`act_principal_id` pair with a
+/// null `card_uid`, so the default is a valid write rather than a degraded one.
 #[derive(Debug, Clone, Default)]
 pub struct Correlation {
     /// The UID of the Card this row belongs to, which the server stores as

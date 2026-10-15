@@ -54,6 +54,7 @@ mod pg_tests {
             "space.table",
             &fingerprint,
             &layout_fixture(),
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await
         .expect("the tenant login reaches vala.bifrost_tables");
@@ -87,6 +88,7 @@ mod pg_tests {
                 "datasets.same",
                 &[3_u8; 32],
                 &layout_fixture(),
+                wyrd_spec::auth::Attribution::unresolved(),
             )
             .await
             .unwrap();

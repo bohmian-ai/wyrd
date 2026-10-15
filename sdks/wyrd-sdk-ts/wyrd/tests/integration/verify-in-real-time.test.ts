@@ -208,10 +208,13 @@ test("judge call is attributed to the run and card", async ({ server, state }) =
   const calls = (
     await (
       await Bifrost.connect()
-    ).sql("SELECT caller_principal_id, card_uid FROM vala.gateway.calls WHERE run_id = $1", [run.runId])
+    ).sql("SELECT sub_principal_id, act_principal_id, card_uid FROM vala.gateway.calls WHERE run_id = $1", [run.runId])
   ).toArrow();
   const issued = await cli.issueKey({ kind: "Service", name: "assistant", version: "1.0.0", space: "default" });
-  expect(columnValues(calls.getChild("caller_principal_id"))).toEqual([issued.principal_id]);
+  expect(columnValues(calls.getChild("sub_principal_id"))).toEqual([issued.principal_id]);
+  const actors = columnValues(calls.getChild("act_principal_id"));
+  expect(actors).toEqual([expect.any(String)]);
+  expect(actors).not.toEqual([issued.principal_id]);
   expect(columnValues(calls.getChild("card_uid"))).toEqual([judgment.subject.uid]);
 });
 
@@ -332,6 +335,30 @@ test("service action timeline is one connected tree", async ({ server, state, as
     ),
     JSON.stringify(attempts),
   ).toBe(true);
+  const stamped = await (await Bifrost.connect()).sql(
+    `SELECT encode(span_id, 'hex') AS span_id, sub_principal_id, act_principal_id FROM vala.traces.spans WHERE trace_id = X'${action.traceId}'`,
+    [],
+    z.object({ span_id: z.string(), sub_principal_id: z.string(), act_principal_id: z.string() }),
+  );
+  const pairs = (selected: typeof spans) => [
+    ...new Set(
+      selected.map((span) => {
+        const row = stamped.find((each) => each.span_id === span.span_id);
+        return `${row?.sub_principal_id}/${row?.act_principal_id}`;
+      }),
+    ),
+  ];
+  const requests = pairs(spans.filter((span) => span.name === "request"));
+  const [subject] = (requests[0] ?? "").split("/");
+  expect(requests).toEqual([`${subject}/${subject}`]);
+  const judge = pairs(
+    spans.filter(
+      (span) =>
+        span.scope.name === "wyrd.gateway" &&
+        ancestry(spans, span).some((each) => each.name.startsWith("verification.")),
+    ),
+  );
+  expect(judge).toEqual([expect.stringMatching(new RegExp(`^${subject}/(?!${subject}$)[0-9a-f-]{36}$`))]);
 });
 
 test("model latency like the baseline passes its verifier", async ({ server, assistant, state }) => {

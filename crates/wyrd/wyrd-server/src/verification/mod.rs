@@ -40,6 +40,7 @@ use wyrd_sql::queries::verifier_runs::VerifierRunQueue;
 
 use crate::state::AppState;
 
+use self::authority::BackgroundAuthority;
 use self::drift::DriftEngine;
 #[cfg(feature = "test-support")]
 use self::fault::PublicationFault;
@@ -382,6 +383,7 @@ impl VerificationRuntimeBuilder<'_> {
             postgres.clone(),
             operator.clone(),
             queue,
+            BackgroundAuthority::new(self.state.auth.tenant_issuer(&self.state.scribe_outbox)),
             self.limits.poll_interval,
         );
         #[cfg(feature = "test-support")]

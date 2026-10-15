@@ -855,8 +855,8 @@ async fn revocation_requires_admin_permission() {
 ///   1. Admin SA (`admin`) bootstrapped via harness SQL.
 ///   2. Target SA bootstrapped via harness SQL (the key is issued for this card).
 ///   3. Admin key → `POST /auth/token` → access token.
-///   4. `POST /auth/issue-key` authenticated as the admin SA; `created_by` is the
-///      SA's `service_account.id` — the direct assertion that the relaxed FK
+///   4. `POST /auth/issue-key` authenticated as the admin SA; the key's `sub_principal_id`
+///      and `act_principal_id` are the SA's `service_account.id` — the direct assertion that the relaxed FK
 ///      (commit 01) accepts a non-user issuer (pre-migration this would 500).
 ///   5. Issued key → `POST /auth/token` → access token.
 ///   6. `assert_v1_delegated_write_ok` → `POST /v1/cards 201`.
@@ -898,8 +898,8 @@ async fn service_account_issuer_full_chain() {
         .clone();
 
     // POST /auth/issue-key as the admin SA.
-    // The issuer principal is a service account (not a user), so `created_by`
-    // must resolve to `service_account.id` — the FK-relaxation path from commit 01.
+    // The issuer principal is a service account (not a user), so the key's
+    // sub/act pair must resolve to `service_account.id` — the FK-relaxation path from commit 01.
     let issue_req = IssueKeyRequest {
         card_ref: target_card_ref,
         label: Some("sa-chain".to_owned()),
@@ -2362,7 +2362,7 @@ async fn roles_sync_events(srv: &WyrdTestServer, principal_id: &str) -> usize {
         srv.data_tenant_id(),
         &format!(
             "operation = 'auth.user.roles.sync' AND outcome = 'allowed' \
-             AND audit_principal_id = '{principal_id}' \
+             AND sub_principal_id = '{principal_id}' \
              AND resource = 'principal:{principal_id}'"
         ),
     )
@@ -2403,7 +2403,7 @@ async fn activation_decisions(
         .expect("audit retention settles");
     srv.retained_audit_records(
         tenant,
-        "audit_principal_id, credential_id, permission, outcome",
+        "sub_principal_id, credential_id, permission, outcome",
         "operation = 'identity.oidc.candidate.activate'",
     )
     .await
@@ -3641,7 +3641,7 @@ async fn tenant_human_login_journey() {
         srv.data_tenant_id(),
         &format!(
             "operation = 'auth.token.exchange' AND outcome = 'allowed' \
-             AND audit_principal_id = '{alice}'"
+             AND sub_principal_id = '{alice}'"
         ),
     )
     .await;

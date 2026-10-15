@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_drift::{DriftReport, DriftVerdict, FeatureDriftReport};
+use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_server::verification::drift::DRIFT_INVALID;
 use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
 use wyrd_server::verification::fault::{PublicationFault, SentBatch};
@@ -1628,7 +1629,8 @@ async fn shutdown_drains_runs_that_finish_within_the_grace() {
 }
 
 /// Concurrent runtimes ticking the same due occurrence, and a runtime
-/// restarted after them, create exactly one run, and health is not degraded.
+/// restarted after them, create exactly one run, accepted for the binding
+/// owner with SYSTEM as actor, and health is not degraded.
 ///
 /// # Panics
 /// Panics when a duplicate run is created, the scheduler is not composed, or
@@ -1680,6 +1682,16 @@ async fn schedulers_create_one_run_per_occurrence_across_ticks_and_restart() {
     restarted.stop().await;
     let runs = harness.seed.runs().await.expect("runs read");
     assert_eq!(runs.len(), 1, "one run per occurrence");
+    let pair: (Uuid, Uuid) =
+        sqlx::query_as("SELECT sub_principal_id, act_principal_id FROM wyrd.verifier_runs")
+            .fetch_one(&harness.assertion)
+            .await
+            .expect("the run's pair reads");
+    assert_eq!(
+        pair,
+        (principal.as_uuid(), harness.seed.system_principal()),
+        "a scheduled run serves its owner with SYSTEM as actor"
+    );
 }
 
 /// The production bound server composes the runtime when enabled, reports it
@@ -2426,7 +2438,9 @@ async fn observation_outbox_retains_through_an_outage_and_flushes_at_shutdown() 
         event_time: Utc::now(),
     };
     let postgres = harness.server.state().postgres.wyrd().clone();
-    let outbox = ObservationRunSink::outbox(postgres.clone());
+    let state = harness.server.state();
+    let authority = BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox));
+    let outbox = ObservationRunSink::outbox(postgres.clone(), authority.clone());
 
     refuse_run_writes(&harness.assertion, true).await;
     outbox.stage(tenant, record("r-1"));
@@ -2461,7 +2475,7 @@ async fn observation_outbox_retains_through_an_outage_and_flushes_at_shutdown() 
         ["r-1", "r-2", "r-3", "r-4"]
     );
 
-    let stranded = ObservationRunSink::outbox(postgres);
+    let stranded = ObservationRunSink::outbox(postgres, authority);
     refuse_run_writes(&harness.assertion, true).await;
     stranded.stage(tenant, record("r-5"));
     assert_eq!(
@@ -2838,8 +2852,8 @@ async fn eval_judge_gateway_call_descends_from_the_request_span() {
     let checkpoint = traces.checkpoint();
     for (verifier, kind, caller_span) in &cases {
         let body = serde_json::json!({
-            "verifier_uid": verifier,
-            "subject_card_uid": subject,
+            "verifier_card_uid": verifier,
+            "card_uid": subject,
             "input": { "kind": kind, "context": { "answer": "yes" } },
         });
         let response = server
@@ -2964,8 +2978,8 @@ async fn manual_run_links_to_its_enqueuing_request() {
     let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
     let checkpoint = traces.checkpoint();
     let body = serde_json::json!({
-        "target": { "kind": "verifier", "verifier_uid": verifier,
-                    "subject_card_uid": harness.subject },
+        "target": { "kind": "verifier", "verifier_card_uid": verifier,
+                    "card_uid": harness.subject },
         "input": { "kind": "drift_window", "start": "2026-09-17T00:00:00Z",
                    "end": "2026-09-17T01:00:00Z" },
     });
@@ -3044,8 +3058,10 @@ struct TenantSpan {
     parent_span_id: String,
     /// Span name.
     name: String,
-    /// Principal Scribe stamped on the row.
-    principal_id: String,
+    /// Subject Scribe stamped on the row.
+    sub_principal_id: String,
+    /// Actor Scribe stamped on the row; the subject for a direct request.
+    act_principal_id: String,
     /// Attribute keys the tenant copy kept.
     attributes: Vec<String>,
 }
@@ -3105,8 +3121,8 @@ async fn traced_execute(
     traceparent: &str,
 ) -> axum::http::StatusCode {
     let body = serde_json::json!({
-        "verifier_uid": verifier,
-        "subject_card_uid": subject,
+        "verifier_card_uid": verifier,
+        "card_uid": subject,
         "input": { "kind": "task_context", "context": { "x": 1 } },
     });
     let request = axum::http::Request::builder()
@@ -3141,7 +3157,7 @@ async fn tenant_spans(
     let mut spans: Vec<TenantSpan> = server
         .retained_span_records(
             tenant,
-            "encode(span_id, 'hex'), encode(parent_span_id, 'hex'), name, principal_id, attributes",
+            "encode(span_id, 'hex'), encode(parent_span_id, 'hex'), name, sub_principal_id, act_principal_id, attributes",
             &format!("trace_id = X'{trace}'"),
         )
         .await
@@ -3152,9 +3168,10 @@ async fn tenant_spans(
                 Some(span_id),
                 Some(parent_span_id),
                 Some(name),
-                Some(principal_id),
+                Some(sub_principal_id),
+                Some(act_principal_id),
                 attributes,
-            ] = <[Option<String>; 5]>::try_from(row).expect("five projected columns")
+            ] = <[Option<String>; 6]>::try_from(row).expect("six projected columns")
             else {
                 panic!("a tenant span row is missing a column");
             };
@@ -3168,7 +3185,8 @@ async fn tenant_spans(
                 span_id,
                 parent_span_id,
                 name,
-                principal_id,
+                sub_principal_id,
+                act_principal_id,
                 attributes,
             }
         })
@@ -3222,7 +3240,8 @@ fn assert_tenant_copy(
                     && exported.name == span.name),
             "the tenant copy keeps the operator's ids and parent: {span:#?}"
         );
-        assert_eq!(span.principal_id, principal.to_string(), "{span:#?}");
+        assert_eq!(span.sub_principal_id, principal.to_string(), "{span:#?}");
+        assert_eq!(span.act_principal_id, principal.to_string(), "{span:#?}");
         for key in &span.attributes {
             assert!(
                 key.starts_with("wyrd.")
@@ -3340,7 +3359,8 @@ async fn operator_rejected_requests_still_reach_a_continuing_tenant() {
     assert!(
         tenant_copy.iter().any(|span| span.name == "request"
             && span.parent_span_id == "00f067aa0ba902b7"
-            && span.principal_id == principal.to_string()),
+            && span.sub_principal_id == principal.to_string()
+            && span.act_principal_id == principal.to_string()),
         "the sampled caller still receives its tenant copy: {tenant_copy:#?}"
     );
     assert_eq!(tenant_spans(&server, tenant, unsampled).await, Vec::new());

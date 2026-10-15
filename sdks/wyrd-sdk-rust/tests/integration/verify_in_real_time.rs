@@ -180,7 +180,7 @@ impl Assistant {
     }
 
     /// Publish every captured row, then read each `vala.gateway.calls` row's
-    /// id, requesting principal, and Run and Card attribution.
+    /// id, subject/actor pair, and Run and Card attribution.
     ///
     /// # Panics
     /// Panics when the flush or the read fails.
@@ -194,7 +194,8 @@ impl Assistant {
             .await
             .expect("Bifrost connects")
             .sql_as(
-                "SELECT call_id, caller_principal_id, run_id, card_uid FROM vala.gateway.calls",
+                "SELECT call_id, sub_principal_id, act_principal_id, run_id, card_uid \
+                 FROM vala.gateway.calls",
                 &[],
             )
             .await
@@ -202,8 +203,8 @@ impl Assistant {
     }
 
     /// Read the result `execution_id` wrote with the judge calls it joins on
-    /// its subject Card: the result's requesting principal and Run beside
-    /// each joined call's principal and Run. Rows are already published by
+    /// its verified Card: the result's subject, actor, and Run beside
+    /// each joined call's subject, actor, and Run. Rows are already published by
     /// [`Self::judge_calls`].
     ///
     /// # Panics
@@ -213,10 +214,12 @@ impl Assistant {
             .await
             .expect("Bifrost connects")
             .sql_as(
-                "SELECT r.requested_by_principal_id AS requester, r.run_id AS result_run, \
-                        c.caller_principal_id AS caller, c.run_id AS call_run \
+                "SELECT r.sub_principal_id AS result_subject, \
+                        r.act_principal_id AS result_actor, r.run_id AS result_run, \
+                        c.sub_principal_id AS call_subject, \
+                        c.act_principal_id AS call_actor, c.run_id AS call_run \
                    FROM vala.verification.results r \
-                   JOIN vala.gateway.calls c ON c.card_uid = r.subject_card_uid \
+                   JOIN vala.gateway.calls c ON c.card_uid = r.card_uid \
                   WHERE r.result_id = $1",
                 &[QueryParam::String(execution_id.to_owned())],
             )
@@ -249,8 +252,8 @@ impl Assistant {
             .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
             .header("traceparent", traceparent)
             .json(&json!({
-                "verifier_uid": self.answer_graded.uid,
-                "subject_card_uid": self.agent.uid,
+                "verifier_card_uid": self.answer_graded.uid,
+                "card_uid": self.agent.uid,
                 "input": { "kind": "task_context", "context": { "answer": "yes" } },
             }))
             .send()
@@ -289,8 +292,10 @@ impl Assistant {
 struct JudgeCall {
     /// The call's UUID, which its gateway spans carry as `gateway_call_id`.
     call_id: String,
-    /// The principal that requested the judgment.
-    caller_principal_id: String,
+    /// The principal the judgment was for.
+    sub_principal_id: String,
+    /// The principal that made the call: the tenant SYSTEM executor.
+    act_principal_id: String,
     /// The application Run the call is attributed to.
     run_id: Option<String>,
     /// The Card UID the call is attributed to.
@@ -313,14 +318,50 @@ impl JudgeCall {
 /// subject Card.
 #[derive(Debug, PartialEq, Deserialize)]
 struct ResultJudgeCall {
-    /// The principal that requested the execution, on the result.
-    requester: Option<String>,
+    /// The principal the result was for.
+    result_subject: String,
+    /// The principal that wrote the result.
+    result_actor: String,
     /// The application Run on the result.
     result_run: Option<String>,
+    /// The principal the judge call was for.
+    call_subject: String,
     /// The principal that made the judge call.
-    caller: String,
+    call_actor: String,
     /// The application Run on the judge call.
     call_run: Option<String>,
+}
+
+impl ResultJudgeCall {
+    /// Assert `joined` is exactly one result and judge call, both for
+    /// `principal` on `run`: the direct verify's result is performed by
+    /// `principal` itself, and the judge call inside it by SYSTEM.
+    ///
+    /// # Panics
+    /// Panics when the rows differ.
+    fn assert_judged_as_system(joined: &[Self], principal: &str, run: Option<&str>) {
+        let [row] = joined else {
+            panic!("exactly one joined judge call: {joined:?}");
+        };
+        assert_eq!(
+            (
+                row.result_subject.as_str(),
+                row.call_subject.as_str(),
+                row.result_run.as_deref(),
+                row.call_run.as_deref(),
+            ),
+            (principal, principal, run, run),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.result_actor, principal,
+            "the caller performs its direct verify: {row:?}"
+        );
+        assert_ne!(
+            row.call_actor, principal,
+            "SYSTEM performs the judgment: {row:?}"
+        );
+    }
 }
 
 /// The trace identity of a caller's W3C `traceparent`.
@@ -484,8 +525,9 @@ async fn judged_answer_passes_the_llm_judge() {
 }
 
 /// A judge Verifier run in real time for a Run calls its model through the
-/// gateway as the requesting principal, attributed to that Run and the judged
-/// Card, so the call joins the Run's other evidence.
+/// gateway for the requesting principal, performed by the tenant SYSTEM
+/// principal, attributed to that Run and the judged Card, so the call joins
+/// the Run's other evidence.
 ///
 /// # Panics
 /// Panics when the verify, flush, or read fails or the attribution differs.
@@ -506,11 +548,15 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
     let calls = assistant.judge_calls().await;
     let principal = assistant.principal().await;
     let run_id = run.run_id().to_string();
+    assert!(
+        calls.iter().all(|call| call.act_principal_id != principal),
+        "SYSTEM performs every judge call: {calls:?}"
+    );
     assert_eq!(
         calls
             .iter()
             .map(|call| (
-                call.caller_principal_id.as_str(),
+                call.sub_principal_id.as_str(),
                 call.run_id.as_deref(),
                 call.card_uid.clone()
             ))
@@ -522,16 +568,12 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
         )],
         "{calls:?}"
     );
-    assert_eq!(
-        assistant
+    ResultJudgeCall::assert_judged_as_system(
+        &assistant
             .result_with_its_judge_calls(&judgment.execution_id.to_string())
             .await,
-        [ResultJudgeCall {
-            requester: Some(principal.clone()),
-            result_run: Some(run_id.clone()),
-            caller: principal,
-            call_run: Some(run_id),
-        }]
+        &principal,
+        Some(&run_id),
     );
     assistant.deployment.shutdown().await;
 }
@@ -539,9 +581,10 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
 /// A judgment requested over HTTP with a caller `traceparent` and no Run
 /// judges in process within the caller's trace: the judge call's gateway span,
 /// joined on its call id, descends from the caller's span, and the call
-/// records the requesting principal and the subject Card with a null Run
-/// rather than an invented one. The
-/// result records the same principal and joins the call on that Card.
+/// records the requesting principal as subject, SYSTEM as actor, and the
+/// verified Card with a null Run rather than an invented one. The result
+/// records the requesting principal as both subject and actor, since the
+/// verify itself is direct work, and joins the call on that Card.
 ///
 /// # Panics
 /// Panics when the verify, flush, or read fails or the call differs.
@@ -561,7 +604,7 @@ async fn judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
     };
     assert_eq!(
         (
-            call.caller_principal_id.as_str(),
+            call.sub_principal_id.as_str(),
             call.run_id.as_deref(),
             call.card_uid.clone()
         ),
@@ -585,14 +628,10 @@ async fn judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
         Some(CALLER_SPAN),
         "{chain:#?}"
     );
-    assert_eq!(
-        assistant.result_with_its_judge_calls(&execution).await,
-        [ResultJudgeCall {
-            requester: Some(principal.clone()),
-            result_run: None,
-            caller: principal,
-            call_run: None,
-        }]
+    ResultJudgeCall::assert_judged_as_system(
+        &assistant.result_with_its_judge_calls(&execution).await,
+        &principal,
+        None,
     );
     assistant.deployment.shutdown().await;
 }

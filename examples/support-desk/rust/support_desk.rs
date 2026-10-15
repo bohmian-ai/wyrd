@@ -210,7 +210,7 @@ pub type Verdicts = BTreeMap<String, (u64, u64)>;
 #[derive(Deserialize)]
 struct VerdictCount {
     /// The Verifier Card.
-    card_uid: String,
+    verifier_card_uid: String,
     /// `passed`, `failed`, or `inconclusive`.
     verdict: String,
     /// Results with that verdict.
@@ -234,14 +234,14 @@ pub async fn wait_for_verdicts(
     loop {
         let rows: Vec<VerdictCount> = bifrost
             .sql_as(
-                "SELECT card_uid, verdict, COUNT(*) AS n FROM vala.verification.results \
-                 WHERE subject_card_uid = $1 GROUP BY card_uid, verdict",
+                "SELECT verifier_card_uid, verdict, COUNT(*) AS n FROM vala.verification.results \
+                 WHERE card_uid = $1 GROUP BY verifier_card_uid, verdict",
                 &[QueryParam::String(desk.uid("support-agent"))],
             )
             .await?;
         let mut verdicts = Verdicts::new();
         for row in rows {
-            if let Some((_, name)) = names.iter().find(|(uid, _)| *uid == row.card_uid) {
+            if let Some((_, name)) = names.iter().find(|(uid, _)| *uid == row.verifier_card_uid) {
                 let counts = verdicts.entry((*name).to_owned()).or_default();
                 let n = u64::try_from(row.n)?;
                 match row.verdict.as_str() {

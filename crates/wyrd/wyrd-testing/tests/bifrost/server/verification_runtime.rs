@@ -47,14 +47,14 @@ use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, WyrdJsonEncoderF
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
-use wyrd_server::scribe_outbox::{ScribeSink, ScribeWrite, VerifierAttribution};
+use wyrd_server::scribe_outbox::{ScribeSink, ScribeWrite};
 use wyrd_server::verification::VerificationRuntime;
 use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
 use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId};
 use wyrd_spec::reference::CardRef;
@@ -66,7 +66,9 @@ use wyrd_spec::vala::api::{
 use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::vala::eval::operator::ComparisonOperator;
 use wyrd_spec::vala::eval::result::AssertionResult;
-use wyrd_spec::vala::managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
+use wyrd_spec::vala::managed_columns::{
+    ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT,
+};
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
 use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::RunInput;
@@ -175,8 +177,8 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
     let identity = |alias: &str| {
         format!(
             "{alias}{RUN_ID} IS NULL AND {alias}result_id = '{result}' \
-             AND {alias}{PRINCIPAL_ID} = '{system}' AND {alias}{CARD_UID} = '{verifier}' \
-             AND {alias}subject_card_uid = '{subject}' AND {alias}owner_card_uid = '{owner}' \
+             AND {alias}{ACT_PRINCIPAL_ID} = '{system}' AND {alias}verifier_card_uid = '{verifier}' \
+             AND {alias}{CARD_UID} = '{subject}' AND {alias}owner_card_uid = '{owner}' \
              AND {alias}binding_id = '{binding}'"
         )
     };
@@ -206,7 +208,7 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
                 "SELECT f.result_id FROM vala.drift.result_features f \
                  JOIN vala.verification.results r \
                    ON f.result_id = r.result_id \
-                  AND f.{PRINCIPAL_ID} = r.{PRINCIPAL_ID} AND f.{CARD_UID} = r.{CARD_UID} \
+                  AND f.{ACT_PRINCIPAL_ID} = r.{ACT_PRINCIPAL_ID} AND f.{CARD_UID} = r.{CARD_UID} \
                  WHERE {}",
                 identity("f.")
             ),
@@ -455,7 +457,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         oracle,
         tenant,
         format!(
-            "SELECT {PRINCIPAL_ID}, {CARD_UID}, series FROM vala.drift.observations \
+            "SELECT {SUB_PRINCIPAL_ID}, {CARD_UID}, series FROM vala.drift.observations \
              WHERE record_id = '{record}' ORDER BY series"
         ),
     )
@@ -473,7 +475,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         )
         .into());
     }
-    for column in ["binding_id", "verifier_uid", "result_id"] {
+    for column in ["binding_id", "verifier_card_uid", "result_id"] {
         if query_texts(
             oracle,
             tenant,
@@ -492,7 +494,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
             oracle,
             tenant,
             format!(
-                "SELECT {CARD_UID}, subject_card_uid, verdict, {RUN_ID} \
+                "SELECT verifier_card_uid, {CARD_UID}, verdict, {RUN_ID} \
                  FROM vala.verification.results WHERE binding_id = '{binding}'"
             ),
         )
@@ -836,8 +838,7 @@ impl<'a> ResultLayoutJourney<'a> {
             ResultRun {
                 run_id: None,
                 verifier_version: "1.0.0",
-                subject_card_uid: &self.subject,
-                requested_by: None,
+                card_uid: &self.subject,
                 owner_card_uid: Some(&self.subject),
                 binding_id: Some(BindingId::new_v7()),
                 trigger: None,
@@ -861,10 +862,7 @@ impl<'a> ResultLayoutJourney<'a> {
             self.tenant,
             ScribeWrite::Result {
                 payload,
-                attribution: VerifierAttribution {
-                    verifier: self.verifier.clone(),
-                    principal: self.system,
-                },
+                attribution: Attribution::direct(self.system),
             },
         );
         let lost = outbox
@@ -923,12 +921,12 @@ impl<'a> ResultLayoutJourney<'a> {
     /// Returns a filesystem or Parquet error, or names the first table with
     /// no file or the first column chunk without a Bloom filter.
     fn assert_blooms(&self) -> Result<(), ServerJourneyError> {
-        let floor = [RUN_ID, CARD_UID, PRINCIPAL_ID];
+        let floor = [RUN_ID, CARD_UID, SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID];
         let tables: [(&str, &str, &[&str]); 3] = [
             (
                 "vala.verification.results",
                 "execution_status",
-                &["result_id", "subject_card_uid", "binding_id"],
+                &["result_id", "verifier_card_uid", "binding_id"],
             ),
             ("vala.drift.result_features", "feature", &["result_id"]),
             ("vala.eval.result_items", "task_id", &["result_id"]),
@@ -2520,7 +2518,6 @@ impl TypedPayloadJourney {
         .await?;
         let (subject, _) = seed.service("typed-subject").await?;
         let uid = seed.drift_verifier("typed-drift").await?;
-        let verifier: CardRef = format!("default/Verifier/typed-drift@1.0.0#{uid}").parse()?;
         for (namespace, name) in [
             ("verification", "results"),
             ("drift", "result_features"),
@@ -2589,8 +2586,7 @@ impl TypedPayloadJourney {
                 ResultRun {
                     run_id: None,
                     verifier_version: "1.0.0",
-                    subject_card_uid: &subject,
-                    requested_by: None,
+                    card_uid: &subject,
                     owner_card_uid: Some(&subject),
                     binding_id: Some(BindingId::new_v7()),
                     trigger: None,
@@ -2606,10 +2602,7 @@ impl TypedPayloadJourney {
                 self.gateway.tenant,
                 ScribeWrite::Result {
                     payload,
-                    attribution: VerifierAttribution {
-                        verifier: verifier.clone(),
-                        principal: PrincipalId::new(seed.system_principal()),
-                    },
+                    attribution: Attribution::direct(PrincipalId::new(seed.system_principal())),
                 },
             );
             published.push(result);
@@ -2715,7 +2708,7 @@ impl TypedPayloadJourney {
             operation.clone(),
             "vala.oracle.admission".to_owned(),
             None,
-            PrincipalId::new(uuid::Uuid::now_v7()),
+            Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())),
             PrincipalKindTag::User,
             "bifrost:query:read".to_owned(),
             AuditOutcome::Allowed,
@@ -2799,4 +2792,668 @@ impl TypedPayloadJourney {
             })
             .collect())
     }
+}
+
+/// Role a delegated manual run needs from both its subject and actor.
+const QUEUED_RUNNER: &str = "queued_runner";
+
+/// Role only the subject holds, so a delegated run's accepted authority
+/// excludes it.
+const QUEUED_SUBJECT_ONLY: &str = "queued_subject_only";
+
+/// A delegated manual run keeps its accepted subject, actor history, and
+/// narrowed authority through a retry and a restarted runtime (AC-013/017).
+///
+/// User A holds the runner role and gateway invocation; Service B holds
+/// only the runner role. B, acting for A, starts a manual Drift run over the
+/// public route. The run is stored as A/B with an authority snapshot whose
+/// principal is A, whose delegation chain names B, and which carries no
+/// gateway grant; the run view exposes no snapshot. A's runner role is then
+/// revoked and B is granted gateway invocation. A first runtime fails the
+/// attempt retryably and stops; a newly built runtime, holding no caller
+/// state, completes it. The snapshot is byte-for-byte unchanged and the
+/// result is attributed to A with SYSTEM as actor.
+///
+/// # Errors
+/// Returns server, exchange, route, runtime, or query errors, or a
+/// description of the first identity or snapshot that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::builder().start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let (subject, _) = seed.service("queued-subject").await?;
+    let verifier = seed
+        .custom_drift_verifier("queued-drift", "score", 1.0, 0.5)
+        .await?;
+    server
+        .seed_role(
+            QUEUED_RUNNER,
+            &[Permission::card_read(), Permission::verifier_run_any()],
+        )
+        .await?;
+    server
+        .seed_role(QUEUED_SUBJECT_ONLY, &[Permission::gateway_invoke_any()])
+        .await?;
+    let a = server
+        .bootstrap_user("queued-a", &[QUEUED_RUNNER, QUEUED_SUBJECT_ONLY])
+        .await?;
+    let b = server
+        .bootstrap_service("queued-b", &[QUEUED_RUNNER])
+        .await?;
+    let Bootstrap::User { jwt: a_token, .. } = &a else {
+        return Err("A bootstraps a user".into());
+    };
+    let a_token = a_token.clone();
+    let delegated = super::query::client_for(&server, b.api_key().ok_or("B carries an API key")?)?
+        .on_behalf_of(
+            secrecy::SecretString::from(a_token),
+            wyrd_spec::auth::TokenAudience::Wyrd,
+        )
+        .await?;
+    let now = Utc::now();
+    let started: Value = delegated
+        .request_json(
+            reqwest::Method::POST,
+            "/v1/verification/runs",
+            Some(&json!({
+                "target": { "kind": "verifier", "verifier_card_uid": verifier, "card_uid": subject },
+                "input": { "kind": "drift_window",
+                    "start": now - chrono::Duration::hours(1), "end": now }
+            })),
+        )
+        .await?;
+    let run_id = started["run_id"]
+        .as_str()
+        .ok_or("the run has an ID")?
+        .to_owned();
+    let run = seed
+        .runs()
+        .await?
+        .into_iter()
+        .find(|run| run.to_string() == run_id)
+        .ok_or("the accepted run is queued")?;
+
+    let superuser = server.pg_fixture().superuser_pool()?;
+    let stored = async || -> Result<(uuid::Uuid, uuid::Uuid, Value), ServerJourneyError> {
+        Ok(sqlx::query_as(
+            "SELECT sub_principal_id, act_principal_id, authority FROM wyrd.verifier_runs \
+             WHERE run_id = $1",
+        )
+        .bind(run.as_uuid())
+        .fetch_one(&superuser)
+        .await?)
+    };
+    let (sub, act, authority) = stored().await?;
+    let (a_id, b_id) = (a.id().as_uuid(), b.id().as_uuid());
+    let snapshot = authority.to_string();
+    if (sub, act) != (a_id, b_id)
+        || authority["principal"]["id"] != json!(a_id)
+        || !authority["delegation_chain"]
+            .to_string()
+            .contains(&b_id.to_string())
+        || snapshot.contains("gateway")
+    {
+        return Err(format!(
+            "expected A/B with A's narrowed authority, read {sub}/{act} {authority}"
+        )
+        .into());
+    }
+    let view: Value = delegated
+        .request_json::<(), _>(
+            reqwest::Method::GET,
+            &format!("/v1/verification/runs/{run_id}"),
+            None,
+        )
+        .await?;
+    if view.get("authority").is_some()
+        || view["sub_principal_id"] != json!(a_id)
+        || view["act_principal_id"] != json!(b_id)
+    {
+        return Err(format!("the run view differs or exposes authority: {view}").into());
+    }
+
+    server.revoke_role(&a, QUEUED_RUNNER).await?;
+    server.grant_role(&b, QUEUED_SUBJECT_ONLY).await?;
+    let retryable = wyrd_spec::verification::VerificationError {
+        code: "test_transient".to_owned(),
+        message: "the first worker fails transiently".to_owned(),
+    };
+    let settled = async |outcome: EngineOutcome,
+                         done: &[&str]|
+           -> Result<wyrd_testing::verification::RunRow, ServerJourneyError> {
+        let script = EngineScript::default();
+        script.push_unheld(outcome);
+        let runtime = VerificationRuntime::builder(server.state())
+            .engine_script(script)
+            .build()
+            .ok_or("the runtime did not compose")?;
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(runtime.run(stop.clone()));
+        let deadline = tokio::time::Instant::now() + WAIT;
+        let row = loop {
+            let row = seed.run(run).await?;
+            if done.contains(&row.status.as_str()) {
+                break row;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("the run never reached {done:?}: {row:?}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        stop.cancel();
+        tokio::time::timeout(WAIT, task).await??;
+        Ok(row)
+    };
+    let first = settled(EngineOutcome::Retry(retryable), &["retrying"]).await?;
+    seed.make_retry_due(run).await?;
+    let report: wyrd_server::verification::engines::VerifierReport = VerifierReport::Drift(Some(
+        serde_json::from_value(json!({
+            "method": "Custom",
+            "features": { "score": { "feature": "score", "score": 0.1, "threshold": 0.5, "verdict": "NoDrift" } },
+            "verdict": "NoDrift"
+        }))?,
+    ));
+    let second = settled(EngineOutcome::Completed(report), &["completed", "errored"]).await?;
+    let (Some(result), 2, "completed") =
+        (second.result_id, second.attempts, second.status.as_str())
+    else {
+        return Err(format!(
+            "expected completion on the second attempt: {first:?} then {second:?}"
+        )
+        .into());
+    };
+    let (sub, act, after) = stored().await?;
+    if (sub, act) != (a_id, b_id) || after != authority {
+        return Err(format!("the accepted run changed: {sub}/{act} {after}").into());
+    }
+
+    let unwritten = server
+        .state()
+        .scribe_outbox
+        .settle(std::time::Instant::now() + WAIT)
+        .await;
+    if unwritten != 0 {
+        return Err(format!("{unwritten} results never reached Scribe").into());
+    }
+    server.flush_bifrost().await?;
+    let system = seed.system_principal();
+    let rows = query_rows(
+        &server,
+        tenant,
+        format!(
+            "SELECT result_id FROM vala.verification.results WHERE result_id = '{result}' \
+             AND {SUB_PRINCIPAL_ID} = '{a_id}' AND {ACT_PRINCIPAL_ID} = '{system}'"
+        ),
+    )
+    .await?;
+    if rows != 1 {
+        return Err(format!("expected one A/SYSTEM result, read {rows}").into());
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// A delegated run's SYSTEM input reads keep the accepted delegation history
+/// (REQ-008/010, AC-017, FIND-TASK-001-6).
+///
+/// Service B, acting for User A, starts a manual Drift run over the public
+/// route. The real Drift engine reads the registered observation table under
+/// the tenant SYSTEM read authority. Every retained read decision of that run
+/// is recorded for A with SYSTEM as actor and carries exactly the accepted
+/// chain `[B]`; the history is attribution only, so the run still completes
+/// under SYSTEM's table grant alone.
+///
+/// # Errors
+/// Returns server, exchange, route, runtime, or query errors, or a
+/// description of the first expectation that does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::builder().start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let (subject, _) = seed.service("history-subject").await?;
+    let verifier = seed
+        .custom_drift_verifier("history-drift", "score", 1.0, 0.5)
+        .await?;
+    server
+        .ensure_builtin_table_for_test(tenant, "drift", "observations")
+        .await?;
+    server
+        .seed_role(
+            QUEUED_RUNNER,
+            &[Permission::card_read(), Permission::verifier_run_any()],
+        )
+        .await?;
+    let a = server.bootstrap_user("history-a", &[QUEUED_RUNNER]).await?;
+    let b = server
+        .bootstrap_service("history-b", &[QUEUED_RUNNER])
+        .await?;
+    let a_token = a.jwt().ok_or("A bootstraps a user")?.to_owned();
+    let delegated = super::query::client_for(&server, b.api_key().ok_or("B carries an API key")?)?
+        .on_behalf_of(
+            secrecy::SecretString::from(a_token),
+            wyrd_spec::auth::TokenAudience::Wyrd,
+        )
+        .await?;
+    let now = Utc::now();
+    let started: Value = delegated
+        .request_json(
+            reqwest::Method::POST,
+            "/v1/verification/runs",
+            Some(&json!({
+                "target": { "kind": "verifier", "verifier_card_uid": verifier, "card_uid": subject },
+                "input": { "kind": "drift_window",
+                    "start": now - chrono::Duration::hours(1), "end": now }
+            })),
+        )
+        .await?;
+    let run_id = started["run_id"].as_str().ok_or("the run has an ID")?;
+    let run = seed
+        .runs()
+        .await?
+        .into_iter()
+        .find(|run| run.to_string() == run_id)
+        .ok_or("the accepted run is queued")?;
+
+    let runtime = VerificationRuntime::builder(server.state())
+        .build()
+        .ok_or("the runtime did not compose")?;
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let row = loop {
+        let row = seed.run(run).await?;
+        if !["pending", "running", "retrying"].contains(&row.status.as_str()) {
+            break row;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("the Drift run never settled: {row:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    if row.status != "completed" {
+        return Err(format!("the delegated Drift run settled {row:?}").into());
+    }
+
+    server.await_audit_retained().await?;
+    let (a_id, b_id) = (a.id().to_string(), b.id().to_string());
+    let reads = server
+        .retained_audit_records(
+            tenant,
+            "act_principal_id, detail",
+            &format!("operation = 'bifrost.query.read_decision' AND sub_principal_id = '{a_id}'"),
+        )
+        .await?;
+    if reads.is_empty() {
+        return Err("the run's input read retained no decision for A".into());
+    }
+    let system = seed.system_principal().to_string();
+    for read in &reads {
+        let detail: Value =
+            serde_json::from_str(read[1].as_deref().ok_or("the decision has a detail")?)?;
+        let chain: Vec<&str> = super::audit_retention::find_field(&detail, "delegation_chain")
+            .and_then(Value::as_array)
+            .map(|steps| {
+                steps
+                    .iter()
+                    .filter_map(|step| step["principal_id"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if read[0].as_deref() != Some(system.as_str()) || chain != [b_id.as_str()] {
+            return Err(
+                format!("expected an A/SYSTEM read with chain [{b_id}], read {read:?}").into(),
+            );
+        }
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// A scheduled Drift occurrence runs for its binding owner with SYSTEM as
+/// actor from acceptance to the published result (AC-009/018,
+/// FIND-TASK-001-7).
+///
+/// A monthly Custom Drift binding of a subject Card is owned by a separate
+/// Service. Once the owner is active and the occurrence is due, the production
+/// runtime accepts it and runs the real Drift engine. The stored run pairs the
+/// owner with SYSTEM and captures the owner's recovered authority with no
+/// delegation history; its input read decision and its published result carry
+/// the same owner/SYSTEM pair.
+///
+/// # Errors
+/// Returns server, seeding, runtime, or query errors, or a description of
+/// the first expectation that does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::builder().start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let (subject, _) = seed.service("scheduled-subject").await?;
+    let (owner, owner_principal) = seed.service("scheduled-owner").await?;
+    let verifier = seed
+        .custom_drift_verifier("scheduled-drift", "score", 1.0, 0.5)
+        .await?;
+    server
+        .ensure_builtin_table_for_test(tenant, "drift", "observations")
+        .await?;
+    let binding = seed
+        .bind_schedule(&owner, &subject, &verifier, MONTHLY, Vec::new())
+        .await?;
+    seed.activate(owner_principal).await?;
+    seed.make_binding_due(binding).await?;
+
+    let runtime = VerificationRuntime::builder(server.state())
+        .build()
+        .ok_or("the runtime did not compose")?;
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let (run, row) = loop {
+        if let Some(run) = seed.runs().await?.first().copied() {
+            let row = seed.run(run).await?;
+            if !["pending", "running", "retrying"].contains(&row.status.as_str()) {
+                break (run, row);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the scheduled Drift run never settled".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    let ("completed", Some(result)) = (row.status.as_str(), row.result_id) else {
+        return Err(format!("the scheduled Drift run settled {row:?}").into());
+    };
+
+    let (owner_id, system) = (owner_principal.as_uuid(), seed.system_principal());
+    let (sub, act, authority): (uuid::Uuid, uuid::Uuid, Value) = sqlx::query_as(
+        "SELECT sub_principal_id, act_principal_id, authority FROM wyrd.verifier_runs \
+         WHERE run_id = $1",
+    )
+    .bind(run.as_uuid())
+    .fetch_one(&server.pg_fixture().superuser_pool()?)
+    .await?;
+    if (sub, act) != (owner_id, system)
+        || authority["principal"]["id"] != json!(owner_id)
+        || authority
+            .get("delegation_chain")
+            .and_then(Value::as_array)
+            .is_some_and(|chain| !chain.is_empty())
+    {
+        return Err(format!(
+            "expected the owner/SYSTEM run under the owner's own authority, read \
+             {sub}/{act} {authority}"
+        )
+        .into());
+    }
+    server.await_audit_retained().await?;
+    let reads = server
+        .retained_audit_records(
+            tenant,
+            "act_principal_id",
+            &format!(
+                "operation = 'bifrost.query.read_decision' AND sub_principal_id = '{owner_id}'"
+            ),
+        )
+        .await?;
+    if reads.is_empty()
+        || reads
+            .iter()
+            .any(|read| read[0].as_deref() != Some(system.to_string().as_str()))
+    {
+        return Err(format!("expected owner/SYSTEM input reads, read {reads:?}").into());
+    }
+
+    let unwritten = server
+        .state()
+        .scribe_outbox
+        .settle(std::time::Instant::now() + WAIT)
+        .await;
+    if unwritten != 0 {
+        return Err(format!("{unwritten} results never reached Scribe").into());
+    }
+    server.flush_bifrost().await?;
+    let rows = query_rows(
+        &server,
+        tenant,
+        format!(
+            "SELECT result_id FROM vala.verification.results WHERE result_id = '{result}' \
+             AND binding_id = '{binding}' AND {SUB_PRINCIPAL_ID} = '{owner_id}' \
+             AND {ACT_PRINCIPAL_ID} = '{system}'"
+        ),
+    )
+    .await?;
+    if rows != 1 {
+        return Err(format!("expected one owner/SYSTEM result, read {rows}").into());
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Access-token lifetime of [`reloaded_authority_cannot_widen_gateway_access`],
+/// short enough to observe the initiating credential expire.
+const WIDEN_ACCESS_TTL: chrono::Duration = chrono::Duration::seconds(3);
+
+/// A queued run's reloaded authority cannot reach a model its captured
+/// delegated intersection excluded (AC-013/017, FIND-TASK-001-7).
+///
+/// User A holds the runner and model roles; Service B holds only the
+/// runner role. B, acting for A, queues a manual Drift run, so the stored
+/// authority is A's narrowed by B and carries no model grant. B is then
+/// granted the model role and the initiating delegated token is let expire
+/// until the server refuses it. A fresh queue claim reloads the stored
+/// authority into the protected gateway consumer a judge uses: the model call
+/// is refused before any provider request and audited as A/SYSTEM with the
+/// accepted chain `[B]`. B's own fresh token then reaches the same model,
+/// proving the new grant permits it and only the captured intersection
+/// excluded it.
+///
+/// # Errors
+/// Returns server, exchange, route, claim, or query errors, or a description
+/// of the first expectation that does not hold.
+///
+/// # Panics
+/// Panics if `#[tokio::test]` cannot build its runtime, if the static
+/// `openai/gpt-test` projection stops parsing as a model reference, or if a
+/// retained audit row lacks either of the two projected columns; every
+/// behavioral expectation failure is returned as an error instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJourneyError> {
+    /// The role carrying the gateway model's invoke permission: A holds it
+    /// before acceptance, B receives it only after the run is accepted, so
+    /// the captured A∩B authority lacks it while B's fresh token, the
+    /// positive control, has it.
+    const MODEL_ROLE: &str = "widen_model";
+    let provider = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl_widen", "object": "chat.completion", "created": 1_700_000_000,
+            "model": "gpt-test",
+            "choices": [{ "index": 0, "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "ok" } }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        })))
+        .mount(&provider)
+        .await;
+    let server = Box::pin(
+        WyrdTestServer::builder()
+            .with_gateway_provider_root_for_test(url::Url::parse(&provider.uri())?)
+            .with_access_ttl(WIDEN_ACCESS_TTL)
+            .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
+                allowed_clock_skew: Duration::ZERO,
+            })
+            .start_bound(),
+    )
+    .await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let (subject, _) = seed.service("widen-subject").await?;
+    let verifier = seed
+        .custom_drift_verifier("widen-drift", "score", 1.0, 0.5)
+        .await?;
+    server
+        .deploy_gateway_model_for_test("gpt-test", MODEL_ROLE)
+        .await?;
+    server
+        .seed_role(
+            QUEUED_RUNNER,
+            &[Permission::card_read(), Permission::verifier_run_any()],
+        )
+        .await?;
+    let a = server
+        .bootstrap_user("widen-a", &[QUEUED_RUNNER, MODEL_ROLE])
+        .await?;
+    let b = server
+        .bootstrap_service("widen-b", &[QUEUED_RUNNER])
+        .await?;
+    let b_token = async || -> Result<String, ServerJourneyError> {
+        Ok(server
+            .exchange_api_key(b.api_key().ok_or("B carries an API key")?)
+            .await?)
+    };
+    let initiating = server
+        .delegate(
+            a.jwt().ok_or("A bootstraps a user")?,
+            &b_token().await?,
+            wyrd_spec::auth::TokenAudience::Wyrd,
+        )
+        .await?;
+    let now = Utc::now();
+    let started = server
+        .oneshot_authenticated(
+            &initiating,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/verification/runs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&json!({
+                    "target": { "kind": "verifier", "verifier_card_uid": verifier, "card_uid": subject },
+                    "input": { "kind": "drift_window",
+                        "start": now - chrono::Duration::hours(1), "end": now }
+                }))?))?,
+        )
+        .await?;
+    if !started.status().is_success() {
+        return Err(format!("the delegated run was not accepted: {}", started.status()).into());
+    }
+
+    server.grant_role(&b, MODEL_ROLE).await?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let probe = server
+            .oneshot_authenticated(
+                &initiating,
+                axum::http::Request::builder()
+                    .uri("/v1/verification/runs")
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?;
+        if probe.status() == axum::http::StatusCode::UNAUTHORIZED {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the initiating delegated token never expired".into());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let mut conn = server.tenant_conn_for(tenant).await?;
+    let claimed = wyrd_sql::queries::verifier_runs::VerifierRunQueue::default()
+        .claim(&mut conn, chrono::Duration::minutes(1))
+        .await?
+        .ok_or("the queued run is claimable")?;
+    conn.commit().await?;
+    let system = claimed.system_principal.ok_or("the tenant has SYSTEM")?;
+    let call = |subject: Option<CardUid>| wyrd_server::components::gateway::GatewayCallRequest {
+        operation: wyrd_spec::gateway::GatewayOperation::ChatCompletions,
+        ingress: wyrd_gateway::IngressDialect::OpenAi,
+        model: wyrd_spec::gateway::ModelRef::from_projection("openai/gpt-test")
+            .expect("the model reference is valid"),
+        fallback: None,
+        body: json!({ "model": "openai/gpt-test",
+            "messages": [{ "role": "user", "content": "hi" }] }),
+        media: None,
+        batch: None,
+        deployment: None,
+        stream: false,
+        usage_bound: None,
+        timeout: Duration::from_secs(10),
+        subject: subject.map(|card_uid| {
+            wyrd_server::components::gateway::GatewayCallAttribution::Resolved(
+                wyrd_server::components::gateway::GatewayCallSubject {
+                    run_id: None,
+                    card_uid: Some(card_uid),
+                },
+            )
+        }),
+    };
+    let reloaded = wyrd_server::components::auth::Caller::accepted(&claimed.authority, system);
+    if let Ok(response) = wyrd_server::components::gateway::GatewayInvocation::new(server.state())
+        .invoke(&reloaded, call(Some(claimed.card_uid.clone())))
+        .await
+    {
+        return Err(format!(
+            "the reloaded authority reached the model: {}",
+            response.status
+        )
+        .into());
+    }
+    let reached = provider.received_requests().await.unwrap_or_default().len();
+    if reached != 0 {
+        return Err(format!("the refused call reached the provider {reached} times").into());
+    }
+
+    let fresh = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/chat/completions",
+            server.base_url().ok_or("missing HTTP URL")?
+        ))
+        .bearer_auth(b_token().await?)
+        .json(&call(None).body)
+        .send()
+        .await?;
+    if !fresh.status().is_success() {
+        return Err(format!("B's fresh token was refused: {}", fresh.status()).into());
+    }
+
+    server.await_audit_retained().await?;
+    let (a_id, b_id) = (a.id().to_string(), b.id().to_string());
+    let denied = server
+        .retained_audit_records(
+            tenant,
+            "act_principal_id, detail",
+            &format!(
+                "operation = 'gateway.invoke' AND outcome = 'denied' \
+                 AND sub_principal_id = '{a_id}'"
+            ),
+        )
+        .await?;
+    let [row] = denied.as_slice() else {
+        return Err(format!("expected one denied A/SYSTEM model decision: {denied:?}").into());
+    };
+    let detail: Value = serde_json::from_str(row[1].as_deref().ok_or("the decision has detail")?)?;
+    let chain: Vec<&str> = super::audit_retention::find_field(&detail, "delegation_chain")
+        .and_then(Value::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter_map(|step| step["principal_id"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    if row[0].as_deref() != Some(system.to_string().as_str()) || chain != [b_id.as_str()] {
+        return Err(format!("expected A/SYSTEM with chain [{b_id}], read {row:?}").into());
+    }
+    server.shutdown().await?;
+    Ok(())
 }

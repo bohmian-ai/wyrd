@@ -84,7 +84,8 @@ Dependency rules below are enforced by `check:deps`:
 - Observation `card_ref` values are optional per row. Present values are
   authorized against the verified principal's signed Card scope and resolve
   from its trusted UID mapping; absent values leave `card_uid` null while
-  server-stamped `principal_id` identifies the publisher. `run_id` remains
+  server-stamped `sub_principal_id` and `act_principal_id` identify who the
+  work was for and who published it. `run_id` remains
   opaque and does not encode Card or tenant identity.
 
 ## Surface Alignment
@@ -157,7 +158,8 @@ replicas remain one logical surface behind one gateway.
 ## Observation Identity
 
 - One JWT can carry multiple component cards (nested service).
-- Each observation row carries server-stamped `principal_id`; optional per-row
+- Each observation row carries server-stamped `sub_principal_id` and
+  `act_principal_id`; optional per-row
   `card_uid` is server-authorized when present, and `run_id` remains opaque.
 - Run IDs are opaque client-side execution records, not server-persisted.
 - See `architecture/wyrd-design.md` §Observation identity.

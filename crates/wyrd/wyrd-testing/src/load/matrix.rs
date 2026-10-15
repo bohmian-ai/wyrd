@@ -735,6 +735,7 @@ async fn provision_tables(
                 table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
                 user_fields: fields.clone(),
                 tenant: *tenant,
+                attribution: wyrd_spec::auth::Attribution::unresolved(),
                 physical_layout: None,
             })
             .await

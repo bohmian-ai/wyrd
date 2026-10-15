@@ -15,7 +15,7 @@ The public correlation spine is:
 
 ```text
 authenticated tenant
-  + authenticated principal_id
+  + authenticated sub_principal_id / act_principal_id
   + Wyrd-Request-Id
   + optional authorized card_uid
   + optional opaque run_id
@@ -28,7 +28,8 @@ scope. Token mint and refresh resolve the bounded scope to authoritative Card
 UIDs; ingest uses that verified in-memory mapping without a Card-registry
 Postgres or cache lookup. The server derives tenant, publisher, and request
 identity from verified authority, stores a client `card_uid` only once that
-authority confirms it, and stamps `principal_id`, `wyrd_request_id`, and
+authority confirms it, and stamps `sub_principal_id`, `act_principal_id`,
+`wyrd_request_id`, and
 `wyrd_ingested_at`; the
 tenant is bound to the physical table rather than stored as a column. Missing Card correlation leaves
 `card_uid` null; it never erases the server-stamped publisher identity.

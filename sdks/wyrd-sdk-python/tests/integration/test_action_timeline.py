@@ -55,6 +55,7 @@ def test_service_action_timeline_is_one_connected_tree(
     assistant_key: str,
     fresh_tracer_provider: None,
     metadata_capture: None,
+    bifrost: Bifrost,
 ) -> None:
     Bifrost(TableConfig(Action, ACTIONS)).register()
     service = WyrdClient(credential=assistant_key)
@@ -143,3 +144,23 @@ def test_service_action_timeline_is_one_connected_tree(
         )
         for names in attempts
     ), attempts
+    stamped = {
+        row["span_id"]: (row["sub_principal_id"], row["act_principal_id"])
+        for row in bifrost.sql(
+            "SELECT encode(span_id, 'hex') AS span_id, sub_principal_id, act_principal_id "
+            f"FROM vala.traces.spans WHERE trace_id = X'{trace_id}'"
+        )
+        .to_arrow()
+        .to_pylist()
+    }
+    requests = {stamped[span["span_id"]] for span in spans if span["name"] == "request"}
+    judge = {
+        stamped[span["span_id"]]
+        for span in spans
+        if span["scope"]["name"] == GATEWAY_SCOPE
+        and any(each["name"].startswith("verification.") for each in ancestry(spans, span))
+    }
+    [(subject, actor)] = requests
+    assert subject == actor, requests
+    [(judged, system)] = judge
+    assert judged == subject and system not in (None, subject), judge

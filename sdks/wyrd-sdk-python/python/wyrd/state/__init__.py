@@ -8,5 +8,6 @@ never read payload bytes until the caller explicitly opens a path.
 """
 
 from .._wyrd.state import CardEnvelope, HydratedArtifact, WyrdState
+from ._hydrated import HydratedCard
 
-__all__ = ["CardEnvelope", "HydratedArtifact", "WyrdState"]
+__all__ = ["CardEnvelope", "HydratedArtifact", "HydratedCard", "WyrdState"]

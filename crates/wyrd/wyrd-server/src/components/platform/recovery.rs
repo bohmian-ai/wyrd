@@ -18,7 +18,7 @@ use uuid::Uuid;
 use wyrd_auth::platform_authz::{PlatformAuthorization, tenant_resource};
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, ProvisionedTenantAdmin, SecretBearer};
+use wyrd_spec::auth::{Attribution, PrincipalId, ProvisionedTenantAdmin, SecretBearer};
 use wyrd_sql::queries::auth::{insert_api_key, tenant_admin_principal_id};
 use wyrd_sql::queries::platform::tenants::tenant_by_id;
 use wyrd_sql::{OperatorPool, TenantConn};
@@ -131,7 +131,7 @@ impl TenantRecovery {
             principal_id,
             &plaintext.prefix,
             &key_hash,
-            caller.principal_id().as_uuid(),
+            Attribution::direct(caller.principal_id()),
             Some(RECOVERY_CREDENTIAL_LIFETIME),
         )
         .await

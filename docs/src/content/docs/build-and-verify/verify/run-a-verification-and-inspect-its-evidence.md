@@ -75,7 +75,7 @@ Call `verification.get_binding` (`GET /v1/verification/bindings/{binding_id}`):
 
 | Field | Tells you |
 | --- | --- |
-| `subject_card_uid`, `verifier_uid` | Exactly what is checked, and by which Verifier version |
+| `card_uid`, `verifier_card_uid` | Exactly what is checked, and by which Verifier version |
 | `readiness` | `ready`, `baseline_not_ready` (a drift baseline is still fitting or failed), or `verifier_unavailable` |
 | `active` | Whether the Service has authenticated in the last 24 hours. An inactive binding does not run on its Trigger |
 | `next_run_at` | The next scheduled window. Always null for an `observations_ready` binding |

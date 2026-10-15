@@ -7,8 +7,9 @@
 //! and capture exactly as a public ingress call does. Nothing about one call
 //! is stored on the caller, so concurrent steps cannot see each other's
 //! fallback, deadline, or correlation; correlation travels only in this
-//! call's tracing span. A caller built for a direct verification also carries
-//! the Card, and optional Run, its judge calls are attributed to.
+//! call's tracing span. A hosted Workflow run's caller carries its Workflow
+//! Card and no Run; a caller built for a direct verification carries the
+//! Card, and optional Run, its judge calls are attributed to.
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
@@ -89,6 +90,10 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
     /// [`ProviderError::RemoteProblem`] for a gateway refusal or a provider's
     /// non-success answer; and [`ProviderError::Decode`] when a success is not
     /// the dialect's native response.
+    ///
+    /// The call's span and the gateway spans under it are routed to the
+    /// tenant under the captured caller's own pair, so a judge call SYSTEM
+    /// performs for the request's subject is not recorded as the request.
     #[tracing::instrument(
         name = "workflow.gateway.call",
         skip_all,
@@ -103,6 +108,10 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
         call: WyrdGatewayCall,
         cancellation: &CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
+        wyrd_telemetry::bind_operation_route(wyrd_telemetry::TenantSpanRoute {
+            tenant: self.caller.data_tenant_id,
+            attribution: self.caller.attribution(),
+        });
         let NativeCall {
             operation,
             ingress,

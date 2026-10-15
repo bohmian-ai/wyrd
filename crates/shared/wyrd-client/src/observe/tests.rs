@@ -857,14 +857,14 @@ async fn verify_resolves_bound_verifiers_and_refuses_invalid_inputs_locally() {
         *bodies.lock().expect("body lock"),
         vec![
             json!({
-                "verifier_uid": quality,
-                "subject_card_uid": root,
+                "verifier_card_uid": quality,
+                "card_uid": root,
                 "input": { "kind": "eval_record", "context": { "answer": "yes" } },
                 "run_id": run_id,
             }),
             json!({
-                "verifier_uid": drift,
-                "subject_card_uid": root,
+                "verifier_card_uid": drift,
+                "card_uid": root,
                 "input": { "kind": "drift_samples", "columns": {
                     "score": [0.4, 0.6],
                     "tier": [null, "gold"],
@@ -944,8 +944,8 @@ async fn execute_outlives_the_configured_timeout() {
     .expect("transport builds");
     let client = crate::WyrdClient::from_parts(auth, transport, config.grpc);
     let request = wyrd_spec::verification::ExecuteVerificationRequest::decode(json!({
-        "verifier_uid": "018f4d8e-0000-7000-8000-000000000001",
-        "subject_card_uid": "018f4d8e-0000-7000-8000-000000000002",
+        "verifier_card_uid": "018f4d8e-0000-7000-8000-000000000001",
+        "card_uid": "018f4d8e-0000-7000-8000-000000000002",
         "input": { "kind": "eval_record", "context": { "answer": "yes" } },
     }))
     .expect("request decodes");

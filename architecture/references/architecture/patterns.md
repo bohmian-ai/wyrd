@@ -234,7 +234,8 @@ Observability code is explicit about:
 - Projection and pruning behavior
 - Ingestion vs query responsibilities
 
-Every observation row carries server-stamped `principal_id`. Optional per-row
+Every observation row carries server-stamped `sub_principal_id` and
+`act_principal_id`. Optional per-row
 `card_uid` is server-authorized when present; `run_id` remains opaque.
 
 Evaluation code keeps deterministic assertions deterministic.

@@ -289,7 +289,8 @@ export const evidenceJoins: DiagramSpec = {
           { name: 'source_record_id', fk: true },
           { name: 'run_id' },
           { name: 'binding_id' },
-          { name: 'subject_card_uid', fk: true },
+          { name: 'card_uid', fk: true },
+          { name: 'verifier_card_uid', fk: true },
           { name: 'verdict' },
           { name: 'verifier_version' }
         ]),
@@ -339,7 +340,7 @@ export const evidenceJoins: DiagramSpec = {
       nodes: ['dobs', 'res'],
       edges: ['j4'],
       caption: 'A scheduled drift result has no <code>run_id</code>. Match observations by subject Card and the result window instead.',
-      sql: 'SELECT o.series, o.num_value, o.created_at\nFROM vala.verification.results AS r\nJOIN vala.drift.observations AS o\n  ON o.card_uid = r.subject_card_uid\n AND o.created_at >= r.window_start AND o.created_at < r.window_end\nWHERE r.result_id = $1'
+      sql: 'SELECT o.series, o.num_value, o.created_at\nFROM vala.verification.results AS r\nJOIN vala.drift.observations AS o\n  ON o.card_uid = r.card_uid\n AND o.created_at >= r.window_start AND o.created_at < r.window_end\nWHERE r.result_id = $1'
     },
     {
       label: 'which version ran',
@@ -347,7 +348,7 @@ export const evidenceJoins: DiagramSpec = {
       nodes: ['res', 'cards'],
       edges: ['j5'],
       caption: 'Card UIDs point at one exact version in the registry. That lookup is <code>cards.get</code>, not SQL.',
-      note: 'Read <code>subject_card_uid</code> or <code>card_uid</code> from the row, then fetch that exact Card version with <code>Cards().get(...)</code> or the <code>cards.get</code> MCP tool.'
+      note: 'Read <code>card_uid</code> or <code>verifier_card_uid</code> from the row, then fetch that exact Card version with <code>Cards().get(...)</code> or the <code>cards.get</code> MCP tool.'
     },
     {
       label: 'one invocation',

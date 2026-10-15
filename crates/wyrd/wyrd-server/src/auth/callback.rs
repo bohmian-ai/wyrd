@@ -71,6 +71,7 @@ mod pg_tests {
     use wyrd_runtime::Permission;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssuerTokenPolicy;
+    use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
     use wyrd_spec::auth::{
         ClientAuthorization, ConnectionTester, IssuerUrl, LoginInitiation, OAuthClientId,
         OAuthErrorCode, PrincipalId, PrincipalKindTag, ProviderResponse, SecretBearer, Sha256Hex,
@@ -417,7 +418,7 @@ mod pg_tests {
         assert_eq!(error.0.code(), "WYRD_AUTH_401_INVALID_TOKEN");
         let audit = audit_rows(&state, &scribe).await;
         assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].0, Uuid::nil());
+        assert_eq!(audit[0].0, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
         assert_eq!(audit[0].1, "denied");
         assert_eq!(audit[0].2, auth_failure_detail("INVALID_TOKEN"));
         assert_eq!(issued_codes(&fixture).await, 0, "no code was issued");
@@ -1022,7 +1023,7 @@ mod pg_tests {
             .filter(|decision| decision.operation == operation)
             .map(|decision| {
                 (
-                    decision.audit_principal_id,
+                    decision.sub_principal_id,
                     decision.outcome,
                     decision.resource,
                 )
@@ -1396,7 +1397,7 @@ mod pg_tests {
             .filter(|decision| decision.operation == "auth.token.exchange")
             .map(|decision| {
                 let detail = decision.detail.expect("exchange detail is recorded");
-                (decision.audit_principal_id, decision.outcome, detail)
+                (decision.sub_principal_id, decision.outcome, detail)
             })
             .collect()
     }

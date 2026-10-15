@@ -250,6 +250,7 @@ async fn signed_forwarding_preserves_shorter_absolute_deadline() -> Result<(), S
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;
@@ -339,6 +340,7 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;
@@ -603,6 +605,7 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;
@@ -793,6 +796,7 @@ async fn oracle_only_pod_retains_audit_staged_before_its_drain() -> Result<(), S
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;
@@ -1040,6 +1044,7 @@ async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
             tenant,
             vala_bifrost_redux::tables::builtin_table("logs", "records")
                 .ok_or("no canonical vala.logs.records definition")?,
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await?;
     let spans_uid = catalog
@@ -1047,6 +1052,7 @@ async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
             tenant,
             vala_bifrost_redux::tables::builtin_table("traces", "spans")
                 .ok_or("no canonical vala.traces.spans definition")?,
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await?;
 
@@ -1229,6 +1235,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
             tenant,
             vala_bifrost_redux::tables::builtin_table("traces", "spans")
                 .ok_or("no canonical vala.traces.spans definition")?,
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await?;
     await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
@@ -1416,7 +1423,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
             tenant,
             "operation, resource, detail",
             &format!(
-                "audit_principal_id = '{}' \
+                "sub_principal_id = '{}' \
                  AND operation IN ('auth.token.exchange', '{READ_DECISION_OPERATION}')",
                 a.id()
             ),
@@ -1463,7 +1470,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
             tenant,
             "permission, credential_id",
             &format!(
-                "audit_principal_id = '{}' AND operation = 'auth.token.exchange' \
+                "sub_principal_id = '{}' AND operation = 'auth.token.exchange' \
                  AND resource = 'bifrost' AND outcome = 'allowed'",
                 a.id()
             ),
@@ -1491,7 +1498,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     let writes = server
         .retained_audit_records(
             tenant,
-            "outcome, audit_principal_id, detail, credential_id",
+            "outcome, sub_principal_id, detail, credential_id",
             "operation = 'bifrost.record.write'",
         )
         .await?;
@@ -1599,7 +1606,7 @@ async fn scoped_client(
 /// # Errors
 ///
 /// Returns a missing-listener or client-construction failure.
-fn client_for(
+pub(super) fn client_for(
     server: &WyrdTestServer,
     api_key: &secrecy::SecretString,
 ) -> Result<wyrd_client::WyrdClient, ServerJourneyError> {
@@ -1726,6 +1733,7 @@ async fn prove_stream_admission_expiry() -> Result<(), ServerJourneyError> {
             tenant,
             vala_bifrost_redux::tables::builtin_table("logs", "records")
                 .ok_or("no canonical vala.logs.records definition")?,
+            wyrd_spec::auth::Attribution::unresolved(),
         )
         .await?;
     await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
@@ -1808,6 +1816,7 @@ async fn query_edge_timeout_yields_to_oracle_deadline() -> Result<(), ServerJour
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;
@@ -1920,6 +1929,7 @@ async fn silent_remote_oracle_delivery_yields_typed_query_timeout() -> Result<()
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;
@@ -2161,6 +2171,7 @@ async fn configured_default_deadline_is_shared_by_local_and_forwarded_queries()
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await?;

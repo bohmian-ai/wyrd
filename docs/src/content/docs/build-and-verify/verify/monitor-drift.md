@@ -246,7 +246,7 @@ const rows = await bifrost.sql(
 </LangTab>
 </LangTabs>
 
-`binding_id` is in the Service's Card status (`status.verification.binding_ids`). A scheduled window has no `run_id`, because no application run produced it; filter on `binding_id` or `subject_card_uid` instead.
+`binding_id` is in the Service's Card status (`status.verification.binding_ids`). A scheduled window has no `run_id`, because no application run produced it; filter on `binding_id` or `card_uid` instead.
 
 ## Score a past window by hand
 
@@ -259,7 +259,7 @@ To check a window right now, such as the hour after a deploy, start a run yourse
 }
 ```
 
-The same body works for `POST /v1/verification/runs`. The window can span at most 31 days. A run that targets a binding behaves like a scheduled one: a `failed` verdict runs its Operators. To analyze without paging anyone, target the Verifier directly with `{ "kind": "verifier", "verifier_uid": "...", "subject_card_uid": "..." }`. [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) covers following the run to its result.
+The same body works for `POST /v1/verification/runs`. The window can span at most 31 days. A run that targets a binding behaves like a scheduled one: a `failed` verdict runs its Operators. To analyze without paging anyone, target the Verifier directly with `{ "kind": "verifier", "verifier_card_uid": "...", "card_uid": "..." }`. [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) covers following the run to its result.
 
 ## What can go wrong
 

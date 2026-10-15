@@ -106,7 +106,11 @@ not a passive integration or inventory product.
     have no card identity, are not registered standalone, and cannot be
     referenced from outside their parent. To reuse a child, register it as a
     card and reference it with `Ref::Ref(CardRef)`. Durable-only slots use
-    `Ref`.
+    `Ref`. One exception: registration materializes a registered Agent's
+    inline Prompt as its own Prompt Card named `<agent-name>-prompt` in the
+    Agent's space, versioned on its own registry line, and persists the Agent
+    with that Card's exact UID-bearing reference. Identical inline content in
+    differently named Agents is never shared.
 18. **Auth and Policy are two distinct planes.** Emit is **not** a third
     plane: a deployed service's observation/ingest writes are ordinary
     Auth-plane routes, authorized by the same JWT and a
@@ -132,7 +136,7 @@ not a passive integration or inventory product.
     An observation may carry its subject `card_uid`; when present, the
     server authorizes it against that scope's mapped UIDs and stores it.
     Generic telemetry may omit it and retains the authenticated publisher through
-    `principal_id`. A separate emit credential was redundant — see "Observation
+    the managed `sub_principal_id`/`act_principal_id` pair. A separate emit credential was redundant — see "Observation
     identity — Card → Run → Observation".
     - **Auth** gates Wyrd API calls: `Permission { resource, action, scope }` on
       the handler, stateless pubkey verify of the access token. Answers "is this
@@ -179,10 +183,24 @@ not a passive integration or inventory product.
     is a grant held at platform scope, not a property of a kind, and neither
     plane's credential or token is accepted by the other. Gateway capture is a
     server-internal write, not a principal that authenticates: captured rows
-    carry the reserved `GATEWAY_CAPTURE_PRINCIPAL`, which, like
-    `PLATFORM_AUDIT_PRINCIPAL`, never appears in a token. Every issuer refuses
-    it, every verifier rejects a token naming it, and it never replaces the
-    invocation caller in audit. `wyrd apply -f service.yaml` (or an Agent card) creates
+    carry the verified pair the call ran under. The reserved
+    `GATEWAY_CAPTURE_PRINCIPAL`, like `PLATFORM_AUDIT_PRINCIPAL`, never
+    appears in a token: every issuer refuses it, every verifier rejects a
+    token naming it, and it never replaces the invocation caller in audit.
+    `PLATFORM_AUDIT_PRINCIPAL` is the single no-verified-caller marker. It
+    fills both `sub_principal_id` and `act_principal_id` on an audited
+    decision with no verified identity and on a creation row no verified
+    caller caused: SYSTEM bootstrap, startup built-in reconciliation,
+    reserved audit-owner tables, the defining SQL backfill, and dev-fixture
+    seeding. It is not SYSTEM and authorizes nothing. Tenant provisioning by
+    an authenticated platform operator records that operator's platform pair
+    on the tenant's SYSTEM principal and built-in tables, an explicit
+    exception like platform audit; SYSTEM is never its own creator, and
+    retries and reconciliation keep the first pair. A request refused before
+    any principal resolves (no credential, a malformed bearer token, or one
+    failing signature or claim verification) records no audit decision; the
+    credential-exchange refusals audit records keep the sentinel pair when no
+    identity is verified. `wyrd apply -f service.yaml` (or an Agent card) creates
     or updates the principal row idempotently, keyed on
     `(tenant_id, card_kind, card_uid)`; re-apply preserves the same
     `principal_id`. No secret is returned. Credentials are issued out-of-band
@@ -412,7 +430,8 @@ OpenAI-compatible endpoint is an `open_ai_chat_completion` request with
 body with `provider: vertex`. Gateway routes ignore `provider` and select the
 upstream themselves. Standalone Prompt Cards may still be authored with the
 declarative `provider`/`model`/`messages` shorthand, which compiles to this
-envelope; an Agent's inline Prompt is the native envelope itself.
+envelope; an Agent's inline Prompt is authored as the native envelope itself
+and registers as the Agent's own Prompt Card (doctrine 17).
 
 ### Agent
 Agent contract: prompt + tools + run config. Tool names resolve through the
@@ -425,6 +444,16 @@ spec:
   run_config: AgentRunConfigSpec # max_iterations, tool_concurrency_cap, session_recent_limit, timeout_ms
   verified_by: [VerificationBinding]
 ```
+Every registered Agent persists `prompt` as an exact Prompt Card reference:
+Path and Sibling forms resolve to the authored Prompt Card, and an inline body
+registers as `<agent-name>-prompt` (doctrine 17). Hydrated state therefore
+always contains the Agent's Prompt Card without a separate Service component;
+a hydrated Agent's `prompt()` returns that Prompt Card, whose `ref` is its
+exact identity, and `prompt_ref` / `promptRef` is the stored reference.
+Generic state lookup (`state[alias]` / `get` in Python, `get` in Rust and
+TypeScript) returns the kind-appropriate hydrated Card. A bundle whose Agent
+Prompt has no registered identity is `WYRD_SDK_400_INVALID_STATE_BUNDLE`;
+re-register and rehydrate it.
 
 ### Workflow
 DAG of steps invoking other cards.
@@ -505,6 +534,13 @@ create/replay, get, and cancel requests authenticate and authorize afresh,
 and replay never replaces run authority. Within the run, Cards reads, Bifrost
 queries, and gateway calls still make and audit their own live per-call
 decisions under the captured authority and current owner admission rules.
+A step's gateway call records the captured caller as its subject and actor
+(A/B under delegation), the Workflow Card as `card_uid`, and a null `run_id`:
+a Workflow run id is not an application Run. A registered Workflow loaded
+and run locally sends its Card as the requested gateway Card, which the
+existing gateway Card check admits only for a caller whose Card scope includes
+it or a caller bound to no Card; an out-of-scope Card-bound caller is refused
+with `WYRD_VALA_403_BIFROST_CARD_SCOPE` before any provider call.
 Runs are process-local; restart loses them.
 
 The server bounds runs before acceptance: step count, dependency edges,
@@ -624,10 +660,9 @@ credential's non-secret id.
 
 Wyrd principals are UUID-backed runtime identities that exist independently of
 any credential: issuing, rotating, revoking, or losing a credential never
-creates, destroys, or alters a principal or its role grants. The reserved
-`GATEWAY_CAPTURE_PRINCIPAL` is not a credential-bearing identity: it is the
-id Scribe stamps on rows gateway capture writes server-internally, holding no
-token, role, or grant. Each `wyrd-server` process owns one capture writer,
+creates, destroys, or alters a principal or its role grants. Gateway capture
+is a server-internal write holding no token, role, or grant; Scribe stamps
+each captured row with the verified pair the call ran under. Each `wyrd-server` process owns one capture writer,
 chosen from pod topology (`WYRD_TARGET`): it submits in-process when Scribe
 runs in the pod, and otherwise over the peer plane through a capture-only RPC
 to a live, ready Scribe. A capture is delivered when Scribe acknowledges it
@@ -635,9 +670,11 @@ before the call's deadline; backpressure and an unavailable Scribe are retried
 with bounded backoff until then, and anything else drops the capture with a
 counted reason without changing the call. No per-tenant client, queue, or
 backlog outlives the call. The same writer submits Verifier results to the
-three result tables, attributed to the tenant's `System` principal and the
-run's exact Verifier Card, which Scribe stamps as `principal_id` and
-`card_uid`; a result batch is never dropped for time and is retried under its
+three result tables, attributed to the pair the result was produced under —
+the caller's verified pair for a realtime invocation, and the run's subject
+with the tenant's `System` principal as actor for a queued run — which Scribe
+stamps as `sub_principal_id` and `act_principal_id`; each row names the verified Card as `card_uid` and the
+exact Verifier Card as `verifier_card_uid`; a result batch is never dropped for time and is retried under its
 own batch id until Scribe acknowledges it. Gate refuses every public write to
 `vala.gateway.calls` and the three result tables.
 `Service` and
@@ -872,11 +909,13 @@ and Run correlation are optional per-row values:
 |---|---|---|---|
 | `card_uid` | optional client assertion of the row's exact subject Card UID (the run view's selected Card); server authorizes it when present | per row | the optional Card-version anchor — *which* Card |
 | `run_id` | optional client-generated value per `.run()`, shared by every Card-scoped view of that invocation; passed through opaquely | per row | the optional Run anchor — *which* execution |
-| `principal_id` | server-stamped from the verified JWT | per request | the authenticated publisher — *who* emitted it |
+| `sub_principal_id` | server-stamped from the verified JWT | per request | the subject — *for whom* the work was done; the party a delegated token acts for |
+| `act_principal_id` | server-stamped from the verified JWT | per request | the actor — *who* emitted it; equals the subject for a direct publisher |
 | `tenant_id` | server-stamped from the verified JWT | per request | the tenancy boundary |
 | `wyrd_request_id` | the propagated `Wyrd-Request-Id` (minted at first sighting) | per request | the request spine — one request spans **many** runs and hops |
 
-Resolution rule: **tenant and `principal_id` come from the token; a present
+Resolution rule: **tenant, `sub_principal_id`, and `act_principal_id` come
+from the token; a present
 `card_uid` is client-asserted and server-authorized against the trusted signed
 scope, or, for a principal bound to no Card, against the tenant registry;
 absent Card correlation produces null `card_uid`;
@@ -907,7 +946,8 @@ Consequences, stated so they stop drifting:
 
 - **`card_uid` is optional and authorized, not trusted.** Its absence is valid
   generic telemetry and produces null `card_uid`; the authenticated publisher
-  remains available through non-null `principal_id`. When present, the server checks the asserted
+  remains available through non-null `sub_principal_id` and `act_principal_id`.
+  When present, the server checks the asserted
   `card_uid` against the principal's **card scope**. For Service and Agent
   principals, the scope is the principal's own `card_ref` plus the
   **observation-target** cards reachable through the transitive card-ref graph
@@ -941,7 +981,7 @@ Consequences, stated so they stop drifting:
   — the card is the authorized `card_uid` on the row. `run_id` is an **opaque**
   correlation id, never a composite that encodes the card.
 - **When present, `Card → Run → Observation` is the `(card_uid, run_id)` pair on
-  the row;** generic telemetry remains attributable to `principal_id`, and the
+  the row;** generic telemetry remains attributable to its subject and actor, and the
   request spine is the `wyrd_request_id` label that joins many runs across hops.
 - **The observation owns subject identity.** Under pub/sub (Doctrine #3, #21),
   the observation's `card_uid` IS its subject — no separate `subject_ref` on
@@ -1261,17 +1301,36 @@ shared across tenants. A deleted Verifier terminates the run `errored`.
 
 When execution completes, the runner builds the result once, with one result
 ID and event time, stages it on the process Scribe outbox attributed to the
-tenant SYSTEM principal and the exact Verifier, and settles the run at once:
+run's subject with the tenant SYSTEM principal as actor and to the exact
+Verifier, and settles the run at once:
 settlement never waits for Scribe. The outbox writes the result tables through
 the same in-memory path as audit and gateway capture, so a result Scribe has
 not acknowledged is lost on abrupt process death or an expired shutdown
 deadline, and that loss never changes the settled run. A realtime Verifier
-invocation stages its result the same way. While a run is in flight, one
+invocation stages its result the same way, attributed to its caller's
+verified pair. While a run is in flight, one
 statement per tenant renews its leases on the PostgreSQL clock once a third of
 the lease has passed. An expired lease is never revived, and a renewal that no
 longer finds a run's token cancels that run's work. A run holds a connection
 only to claim, settle, and renew. The settlement retries with backoff while
 the lease holds.
+
+Every work record names who the work was for (`sub_principal_id`) and who
+performed it (`act_principal_id`). A direct caller A records A/A and a
+delegated caller B acting for A records A/B, on its request's audit, on an
+accepted manual run, and on a realtime invocation's result; a scheduled or
+observation-triggered run records its binding owner as subject. Wyrd performs
+a queued run's judge calls, input reads, and result writes, and a realtime
+invocation's judge calls, as the tenant SYSTEM principal, so they record the
+subject with SYSTEM as actor and keep the accepted delegation chain as audit
+history. SYSTEM is never a subject and authorizes nothing: judge calls are checked against the
+run's accepted authority — the caller's verified effective principal and
+delegation chain for a manual run, the owner's authority recovered at
+acceptance for a background run — and gateway spend is charged to the subject.
+The accepted authority is stored with the run without a credential and
+survives claim, retry, and restart. Creation pairs are immutable, and
+registration and manual-run replay are scoped by tenant, subject, actor, and
+key.
 
 #### Drift implementation
 Subject-less observation definition. The implementation is orthogonal: signal +
@@ -1665,7 +1724,7 @@ Exact field schema lives in OpenAPI.
 
 | Implementation | Template fields |
 |---|---|
-| any | `dispatch_id`, `run_id`, `result_id`, `binding_id`, `verifier_ref`, `verifier_uid`, `subject_ref`, `subject_uid`, `verdict`, `completed_at`, `summary` |
+| any | `dispatch_id`, `run_id`, `result_id`, `binding_id`, `verifier_ref`, `verifier_card_uid`, `subject_ref`, `subject_uid`, `verdict`, `completed_at`, `summary` |
 | `drift` | `drift.drifted_features`, `drift.total_features` |
 | `eval` | `eval.passed_tasks`, `eval.failed_tasks`, `eval.total_tasks`, `eval.pass_rate_percent` (rounded down; `0` with no tasks) |
 
@@ -1833,7 +1892,7 @@ is available only at `InlineableRef<T>` slots.
 | `Data`         | **Yes** (unless used purely as inline eval scenarios, which v1 does not support — `dataset` is `DatasetRef`-only) | Carries dataset bytes; lineage anchor. |
 | `Experiment`   | **Yes** | Carries run history. |
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
-| `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`. |
+| `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`; registration materializes it as `<agent-name>-prompt`. |
 | `Agent`        | Optional | Light. Spec-only; `apply` registers it. `LlmJudgeTask.judge_ref` is `InlineableRef<AgentSpec>`. |
 | `Verifier`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Workflow`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
 
@@ -1856,7 +1915,7 @@ prompt: { kind: Prompt, name: triage, version: "1.0.0", space: prod }
 # Local full Card envelope, resolved relative to the containing file.
 prompt: ./prompts/triage.yaml
 
-# Inline native Prompt body: no independent Card identity.
+# Inline native Prompt body: registers as the Agent's `<agent-name>-prompt` Card.
 prompt:
   model: example-model
   request:
@@ -1886,8 +1945,10 @@ components:
 inherits the containing authored context. Local loading never registers. Apply
 registers path-loaded Cards in the same composite request, projects paths to
 Sibling references, and preserves external refs even at matching identities.
-Inline bodies remain embedded. Only resolved Ref/Sibling and inline bodies
-cross registration; durable persistence contains no Path or Sibling.
+Inline bodies remain embedded, except a registered Agent's inline Prompt,
+which registration materializes as its own Prompt Card and replaces with that
+Card's exact reference (doctrine 17). Only resolved Ref/Sibling and inline
+bodies cross registration; durable persistence contains no Path or Sibling.
 
 ### Reference-slot inventory
 

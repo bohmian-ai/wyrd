@@ -23,6 +23,7 @@ use wyrd_server::components::platform::builtins::BuiltinTables;
 use wyrd_server::config::BifrostRuntimeRole;
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::vala::api::{NodeId, TenantTableBinding};
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 use wyrd_telemetry::{CapturedSpan, TelemetryConfig, TelemetryGuard, TestTraceCapture};
@@ -2497,7 +2498,7 @@ impl WyrdTestCluster {
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
         if let Some(server) = self.server(0) {
             BuiltinTables::new(server.bifrost_catalog())
-                .ensure_tenant(tenant)
+                .ensure_tenant(tenant, Attribution::unresolved())
                 .await
                 .map_err(|error| ClusterError::Resource(error.to_string()))?;
         }

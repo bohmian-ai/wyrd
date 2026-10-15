@@ -22,6 +22,7 @@ use serde_json::json;
 use wyrd_gateway::{AttemptRecord, CallExecution, CallPlan, GatewayCost, PricedModel};
 use wyrd_runtime::Principal;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
     CurrencyCode, GatewayAccountingEntryId, GatewayAccountingEntryV1, GatewayBudget,
@@ -49,8 +50,10 @@ pub(crate) struct LedgerCall<'s> {
     pub call_id: GatewayCallId,
     /// Verified tenant.
     pub tenant: DataTenantId,
-    /// Verified caller.
+    /// Verified subject, whose limits and budgets the call is charged to.
     pub principal: &'s Principal,
+    /// Subject and actor pair the accounting entry records.
+    pub attribution: Attribution,
     /// Governance policy of the admitted snapshot.
     pub governance: &'s GatewayGovernancePolicy,
     /// Largest usage the call can incur, or `None` when it is unbounded.
@@ -341,7 +344,8 @@ impl<'c, 'a> GatewayLedger<'c, 'a> {
             entry_id: GatewayAccountingEntryId::new_v7(),
             call_id: call.call_id,
             data_tenant_id: call.tenant,
-            caller_principal_id: call.principal.id,
+            sub_principal_id: call.attribution.sub_principal_id,
+            act_principal_id: call.attribution.act_principal_id,
             outcome: execution.outcome,
             normalized_usage: usage.map(|totals| {
                 totals

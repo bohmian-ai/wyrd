@@ -24,7 +24,7 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::BifrostTableDescription;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::vala::managed_columns::CARD_UID;
+use wyrd_spec::vala::managed_columns::{ACT_PRINCIPAL_ID, CARD_UID, SUB_PRINCIPAL_ID};
 
 use crate::error::WyrdQueueError;
 use crate::queue::Row;
@@ -38,11 +38,13 @@ use crate::variant::{EncodedVariant, VariantColumnBuilder};
 pub const RUN_ID_COLUMN: &str = "run_id";
 const RESERVED_PREFIX: &str = "wyrd_";
 
-/// Returns true when `name` is a reserved column (server-stamped `wyrd_*` prefix
-/// or one of the two correlation columns presented as a payload key).
+/// Returns true when `name` is a reserved column: a server-stamped `wyrd_*`
+/// name, the server-stamped `sub_principal_id`/`act_principal_id` pair, or one
+/// of the two correlation columns presented as a payload key.
 #[must_use]
 pub fn is_reserved_column(name: &str) -> bool {
-    name.starts_with(RESERVED_PREFIX) || name == CARD_UID || name == RUN_ID_COLUMN
+    name.starts_with(RESERVED_PREFIX)
+        || [CARD_UID, RUN_ID_COLUMN, SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID].contains(&name)
 }
 
 /// Converts complete row inputs against one destination schema.
@@ -165,8 +167,9 @@ impl RowPreflight {
     /// # Errors
     ///
     /// Returns the first refusal in that order:
-    /// [`WyrdQueueError::ReservedColumn`] for a `wyrd_*`, `card_uid`, or
-    /// `run_id` key, [`WyrdQueueError::Contract`] with
+    /// [`WyrdQueueError::ReservedColumn`] for a `wyrd_*`, `card_uid`,
+    /// `run_id`, `sub_principal_id`, or `act_principal_id` key,
+    /// [`WyrdQueueError::Contract`] with
     /// `BIFROST_UNDECLARED_FIELD` for any other key the schema does not
     /// declare or with the catalogued Variant error for an unstorable Variant
     /// value, and [`WyrdQueueError::SchemaParse`] for invalid JSON, a value
@@ -873,6 +876,14 @@ mod batch_builder_tests {
             ),
             (
                 r#"{"id": 1, "wyrd_ts": 1}"#,
+                "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
+            ),
+            (
+                r#"{"id": 1, "sub_principal_id": "x"}"#,
+                "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
+            ),
+            (
+                r#"{"id": 1, "act_principal_id": "x"}"#,
                 "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
             ),
             (

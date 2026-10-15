@@ -618,6 +618,7 @@ async fn start_test_server_async(
             table: TableRef::new(BifrostNamespace::Bifrost, table_name),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant: server.data_tenant_id(),
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: None,
         })
         .await

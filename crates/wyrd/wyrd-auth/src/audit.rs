@@ -6,7 +6,7 @@
 //! Scribe outbox into retained audit history. A grant never waits for, or
 //! fails on, that write; this module owns no table and no other sink.
 
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::{Attribution, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
@@ -39,7 +39,7 @@ pub fn audit_request_id(request_id: &str) -> RequestId {
     RequestId::parse(request_id).unwrap_or_else(|_| RequestId::now_v7())
 }
 
-/// Build one auth audit event attributed to the acting principal.
+/// Build one auth audit event attributed to its verified subject/actor pair.
 ///
 /// [`principal_event`] with `detail` attached; see it for the resource and
 /// permission rules.
@@ -47,8 +47,8 @@ pub fn audit_request_id(request_id: &str) -> RequestId {
 pub fn auth_event(
     request_id: &str,
     operation: &str,
-    principal_id: PrincipalId,
-    principal_kind: PrincipalKindTag,
+    attribution: Attribution,
+    sub_principal_kind: PrincipalKindTag,
     card_ref: Option<CardRef>,
     outcome: AuditOutcome,
     detail: AuditDetail,
@@ -56,40 +56,43 @@ pub fn auth_event(
     principal_event(
         request_id,
         operation,
-        principal_id,
-        principal_kind,
+        attribution,
+        sub_principal_kind,
         card_ref,
         outcome,
     )
     .with_detail(detail)
 }
 
-/// Build one detail-less auth audit event attributed to the acting principal.
+/// Build one detail-less auth audit event attributed to its verified
+/// subject/actor pair.
 ///
-/// The resource is the acting card when there is one, otherwise the principal
-/// id. The permission is the operation name, because these grants authenticate
+/// A refusal with no verified identity passes [`Attribution::unresolved`],
+/// never a nil or claimed principal. The resource is the subject's card when
+/// there is one, otherwise the subject id. The permission is the operation name, because these grants authenticate
 /// rather than evaluate a dynamic permission; callers that did evaluate one
 /// overwrite `permission` (and `resource`) on the returned event.
 #[must_use]
 pub fn principal_event(
     request_id: &str,
     operation: &str,
-    principal_id: PrincipalId,
-    principal_kind: PrincipalKindTag,
+    attribution: Attribution,
+    sub_principal_kind: PrincipalKindTag,
     card_ref: Option<CardRef>,
     outcome: AuditOutcome,
 ) -> AuditEvent {
-    let resource = card_ref
-        .as_ref()
-        .map_or_else(|| format!("principal:{principal_id}"), ToString::to_string);
+    let resource = card_ref.as_ref().map_or_else(
+        || format!("principal:{}", attribution.sub_principal_id),
+        ToString::to_string,
+    );
     AuditEvent::new(
         audit_request_id(request_id),
         None,
         operation.to_owned(),
         resource,
         card_ref,
-        principal_id,
-        principal_kind,
+        attribution,
+        sub_principal_kind,
         operation.to_owned(),
         outcome,
     )

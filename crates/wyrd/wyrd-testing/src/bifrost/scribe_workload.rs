@@ -1129,6 +1129,7 @@ impl crate::WyrdTestServer {
                             workload_time_field(),
                         ],
                         tenant,
+                        attribution: wyrd_spec::auth::Attribution::unresolved(),
                         physical_layout: Some(wyrd_spec::vala::api::PhysicalLayoutWire {
                             partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Hour,
                             time_column: Some(WORKLOAD_TIME_COLUMN.to_owned()),

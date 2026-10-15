@@ -200,7 +200,7 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
     let mut stream = query
         .query(&BifrostQueryRequest {
             params: Vec::new(),
-            sql: format!("SELECT id, card_uid, principal_id FROM {fqn} ORDER BY id"),
+            sql: format!("SELECT id, card_uid, sub_principal_id FROM {fqn} ORDER BY id"),
             deadline_ms: None,
         })
         .await
@@ -209,8 +209,8 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
     while let Some(batch) = stream.next_batch().await.expect("valid terminal stream") {
         let card_uid = batch.column_by_name("card_uid").expect("card_uid column");
         let principal_id = batch
-            .column_by_name("principal_id")
-            .expect("principal_id column");
+            .column_by_name("sub_principal_id")
+            .expect("sub_principal_id column");
         for row in 0..batch.num_rows() {
             correlation.push((card_uid.is_null(row), principal_id.is_null(row)));
         }

@@ -18,5 +18,8 @@ pub const RUN_ID: &str = "run_id";
 /// lies in the writer's Card scope, or for a writer bound to no Card, that it
 /// names a registered observation-target Card in the writer's tenant.
 pub const CARD_UID: &str = "card_uid";
-/// Arrow column name for the server-stamped principal id.
-pub const PRINCIPAL_ID: &str = "principal_id";
+/// Arrow column name for the server-stamped principal the row's work was for.
+pub const SUB_PRINCIPAL_ID: &str = "sub_principal_id";
+/// Arrow column name for the server-stamped principal that performed the
+/// row's work.
+pub const ACT_PRINCIPAL_ID: &str = "act_principal_id";

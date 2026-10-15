@@ -20,6 +20,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_runtime::principal::Principal;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::request_id::RequestId;
 
 use wyrd_spec::vala::api::BifrostQueryRequest;
@@ -46,7 +47,10 @@ pub(crate) fn projected_source_schema_fingerprint(
         .filter(|field| {
             !matches!(
                 field.name().as_str(),
-                wyrd_spec::vala::CARD_UID | wyrd_spec::vala::PRINCIPAL_ID | "run_id"
+                wyrd_spec::vala::CARD_UID
+                    | wyrd_spec::vala::SUB_PRINCIPAL_ID
+                    | wyrd_spec::vala::ACT_PRINCIPAL_ID
+                    | "run_id"
             ) && !field.name().starts_with("wyrd_")
         })
         .map(|field| field.as_ref().clone())
@@ -57,8 +61,17 @@ pub(crate) fn projected_source_schema_fingerprint(
 /// One logical batch crossing the Gate-to-Scribe boundary.
 #[derive(Debug)]
 pub struct ScribeIngressFrame {
-    /// The server-verified principal that owns the write.
+    /// The server-verified principal that submits the write: the caller for
+    /// client ingest, or a server-internal transport identity. It is checked
+    /// for tenant and Card scope and never stamped onto rows.
     pub principal: Principal,
+    /// The trusted subject/actor pair Scribe stamps as `sub_principal_id` and
+    /// `act_principal_id`.
+    ///
+    /// Gate derives it from the verified token; a server-internal writer from
+    /// the operation that produced the rows, never from its transport
+    /// identity. No row or header value can set it.
+    pub attribution: Attribution,
     /// Authenticated tenant selected by the transport boundary.
     pub authenticated_tenant: wyrd_spec::DataTenantId,
     /// Card UIDs the frame's rows may correlate to, when the principal's

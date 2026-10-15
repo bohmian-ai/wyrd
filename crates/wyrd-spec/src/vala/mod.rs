@@ -18,8 +18,6 @@ pub mod api;
 pub mod assignment_authority;
 /// Typed and redacted audit detail contracts.
 pub mod audit_detail;
-/// Reserved server-stamped correlation column names.
-pub mod correlation;
 /// Drift observation records (traditional-ML drift measurements).
 pub mod drift;
 /// Public Bifrost error catalog for HTTP, MCP, and Python SDK boundaries.
@@ -43,6 +41,7 @@ pub use audit_detail::{
     ForgeScribePromotionPhase, ForgeSnapshotExpirePhase, OracleTableProtectionPhase,
     RevocationReason, ScopeHash, StoragePath, audit_detail_canonical_json,
 };
-pub use correlation::CorrelationColumns;
 pub use error::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
-pub use managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
+pub use managed_columns::{
+    ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+};

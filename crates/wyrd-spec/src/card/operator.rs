@@ -422,7 +422,7 @@ pub struct OperatorFailureContext {
     /// The binding that configured this Operator.
     pub binding_id: BindingId,
     /// Exact Verifier Card UID.
-    pub verifier_uid: CardUid,
+    pub verifier_card_uid: CardUid,
     /// Exact Verifier identity as `space/name@version`.
     pub verifier_ref: String,
     /// Exact subject Card UID.
@@ -542,7 +542,7 @@ impl OperatorFailureContext {
         "run_id",
         "result_id",
         "binding_id",
-        "verifier_uid",
+        "verifier_card_uid",
         "verifier_ref",
         "subject_uid",
         "subject_ref",
@@ -566,7 +566,7 @@ impl OperatorFailureContext {
             "run_id" => self.run_id.to_string(),
             "result_id" => self.result_id.to_string(),
             "binding_id" => self.binding_id.to_string(),
-            "verifier_uid" => self.verifier_uid.to_string(),
+            "verifier_card_uid" => self.verifier_card_uid.to_string(),
             "verifier_ref" => self.verifier_ref.clone(),
             "subject_uid" => self.subject_uid.to_string(),
             "subject_ref" => self.subject_ref.clone(),

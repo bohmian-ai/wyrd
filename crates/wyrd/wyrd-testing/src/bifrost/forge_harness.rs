@@ -1849,6 +1849,7 @@ async fn create_fixture_table(
             table: binding.table_ref.clone(),
             user_fields: fields,
             tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: Some(daily_layout_declaration()),
         })
         .await

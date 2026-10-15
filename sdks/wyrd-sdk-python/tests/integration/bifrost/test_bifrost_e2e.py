@@ -312,6 +312,55 @@ def test_delegated_client_reads_as_a_and_cannot_write_with_b_authority(
     assert items(bifrost, "vala.datasets.delegated") == [Item(id=1, value="as-a")]
 
 
+class AttributedRow(BaseModel):
+    """One row read back with the subject and actor Wyrd stamped on it."""
+
+    id: int
+    sub_principal_id: str
+    act_principal_id: str
+
+
+@pytest.mark.parametrize("column", ["sub_principal_id", "act_principal_id"])
+def test_subject_actor_rows_and_reserved_columns(
+    wyrd_server: WyrdTestServer, bifrost: Bifrost, column: str
+) -> None:
+    table = f"vala.datasets.attributed_{column}"
+    permissions: list[str | dict[str, object]] = [
+        "bifrost_query:read",
+        "bifrost_record:write",
+        "bifrost_table:read",
+    ]
+    a = WyrdClient(credential=wyrd_server.scoped_api_key(f"subject_{column}", permissions))
+    b = WyrdClient(credential=wyrd_server.scoped_api_key(f"actor_{column}", permissions))
+    config = TableConfig(Item, table)
+    assert Bifrost(config).register() == "created"
+
+    for id, client in [(1, a), (2, b.on_behalf_of(a.access_token())), (3, b)]:
+        writer = Bifrost(config, client=client)
+        writer.insert(Item(id=id, value="attributed"))
+        with pytest.raises(WyrdError) as spoofed:
+            writer.insert({"id": 4, "value": "spoofed", column: "someone-else"})
+        assert spoofed.value.code == "WYRD_VALA_400_BIFROST_RESERVED_COLUMN"
+        writer.shutdown()
+    wyrd_server.flush_bifrost()
+
+    direct, delegated, actor = bifrost.sql(
+        f"SELECT id, sub_principal_id, act_principal_id FROM {table} ORDER BY id",
+        model=AttributedRow,
+    )
+    assert direct.sub_principal_id == direct.act_principal_id
+    assert (delegated.sub_principal_id, delegated.act_principal_id) == (
+        direct.sub_principal_id,
+        actor.act_principal_id,
+    )
+    assert actor.sub_principal_id == actor.act_principal_id != direct.sub_principal_id
+    with pytest.raises(WyrdError) as declared:
+        TableConfig.from_json_schema(
+            "vala.datasets.spoofed", {"type": "object", "properties": {column: {"type": "string"}}}
+        )
+    assert declared.value.code == "WYRD_VALA_400_BIFROST_RESERVED_COLUMN"
+
+
 def test_async_stream_yields_arrow_batches_and_a_terminal(inferences: str) -> None:
     async def stream() -> tuple[list[pyarrow.RecordBatch], QueryTerminal | None]:
         batches = await AsyncBifrost().stream(f"SELECT call_id FROM {inferences} ORDER BY call_id")

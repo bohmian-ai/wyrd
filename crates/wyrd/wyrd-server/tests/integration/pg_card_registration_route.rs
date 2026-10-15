@@ -20,6 +20,7 @@ use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_loader::{build_registration_input, load};
+use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, DataTenantId, SpaceName};
@@ -78,8 +79,8 @@ async fn seed_card(
     let spec_hash = blake3::hash(name.as_bytes()).to_hex().to_string();
     sqlx::query(
         "INSERT INTO wyrd.cards \
-            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status) \
-         VALUES ($1, $2, $3, 'default', $4, '1.0.0', $5, $6, $7)",
+            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
+         VALUES ($1, $2, $3, 'default', $4, '1.0.0', $5, $6, $7, '00000000-0000-7000-8000-000000000000', '00000000-0000-7000-8000-000000000000')",
     )
     .bind(uid.as_uuid())
     .bind(tenant.as_uuid())
@@ -553,7 +554,7 @@ async fn registration_replays_through_public_authenticated_route() {
         .await_retained_audit_count(
             server.data_tenant_id(),
             &format!(
-                "operation = 'card.registration.create' AND audit_principal_id = '{}'",
+                "operation = 'card.registration.create' AND sub_principal_id = '{}'",
                 id.as_uuid()
             ),
             2,
@@ -1727,7 +1728,7 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
         .await_retained_audit_count(
             server.data_tenant_id(),
             &format!(
-                "operation = 'card.registration.create' AND audit_principal_id = '{}'",
+                "operation = 'card.registration.create' AND sub_principal_id = '{}'",
                 id.as_uuid()
             ),
             1,
@@ -3102,7 +3103,7 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
         .await
         .expect("tenant connection opens");
     let registered_runs: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.verifier_runs WHERE owner_card_uid = $1 OR subject_card_uid = $1",
+        "SELECT count(*) FROM wyrd.verifier_runs WHERE owner_card_uid = $1 OR card_uid = $1",
     )
     .bind(service_uid)
     .fetch_one(&mut **conn.transaction())
@@ -3144,9 +3145,7 @@ async fn registration_audits(server: &WyrdTestServer, principal: Uuid) -> Vec<(S
         .retained_audit_records(
             server.data_tenant_id(),
             "permission, outcome",
-            &format!(
-                "operation = 'card.registration.create' AND audit_principal_id = '{principal}'"
-            ),
+            &format!("operation = 'card.registration.create' AND sub_principal_id = '{principal}'"),
         )
         .await
         .expect("audit rows read")
@@ -3842,12 +3841,22 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         .tenant_conn_for(server.data_tenant_id())
         .await
         .expect("tenant connection opens");
+    let queue = VerifierRunQueue::default();
+    let state = server.state();
+    let authority = BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox));
     let mut outcomes = Vec::new();
-    while let Some(tick) = VerifierRunQueue::default()
-        .schedule_next_due(&mut conn)
-        .await
-        .expect("scheduler ticks")
-    {
+    while let Some(due) = queue.claim_due(&mut conn).await.expect("scheduler claims") {
+        let accepted = match due.owner() {
+            Some(owner) => authority
+                .resolve(&mut conn, owner)
+                .await
+                .expect("owner authority resolves"),
+            None => None,
+        };
+        let tick = queue
+            .schedule_due(&mut conn, due, accepted)
+            .await
+            .expect("scheduler ticks");
         outcomes.push(tick.outcome);
     }
     let (runs, cursor_ahead): (i64, f64) = sqlx::query_as(
@@ -4028,6 +4037,581 @@ async fn service_declared_tables_are_ensured_before_activation() {
             .len(),
         4,
         "the conflicting declaration never altered the stored table"
+    );
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Build an auto-versioned Agent registration whose Prompt is authored inline.
+///
+/// # Panics
+/// Panics through [`native_prompt`] when the declarative Prompt fixture does
+/// not compile, or through [`request_with_body`] when the HTTP request cannot
+/// be built.
+fn inline_agent_request(name: &str, message: &str, idempotency_key: &str) -> Request<Body> {
+    request_with_body(
+        idempotency_key,
+        json!({
+            "submissions": [{
+                "apiVersion": "wyrd/v1",
+                "kind": "Agent",
+                "metadata": { "name": name, "space": "default" },
+                "spec": { "prompt": native_prompt(message) },
+                "artifacts": []
+            }]
+        }),
+    )
+}
+
+/// Compile a one-message declarative Prompt into the native inline body an
+/// Agent's `prompt` slot carries.
+///
+/// # Panics
+/// Panics when the fixed `openai`/`gpt-4o` declarative fixture no longer
+/// deserializes as a `PromptSpec`, or its compiled native Prompt does not
+/// serialize back to JSON.
+fn native_prompt(message: &str) -> Value {
+    let spec: wyrd_spec::card::prompt::PromptSpec = serde_json::from_value(json!({
+        "provider": "openai",
+        "model": "gpt-4o",
+        "messages": [message]
+    }))
+    .expect("declarative prompt compiles");
+    serde_json::to_value(spec.prompt).expect("native prompt serializes")
+}
+
+/// Register one inline Agent and return its response body after asserting success.
+///
+/// # Panics
+/// Panics when the in-process server does not answer, the response body is not
+/// JSON, the status is not `201 Created`, or building the request panics.
+async fn register_inline_agent(
+    server: &WyrdTestServer,
+    jwt: &str,
+    name: &str,
+    message: &str,
+    idempotency_key: &str,
+) -> Value {
+    let response = server
+        .oneshot_authenticated(jwt, inline_agent_request(name, message, idempotency_key))
+        .await
+        .expect("inline agent registration responds");
+    let status = response.status();
+    let body = response_json(response).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body
+}
+
+/// Return the response outcome registered for one Card kind.
+///
+/// # Panics
+/// Panics when the body carries no `outcomes` array or no outcome of `kind`.
+fn outcome_for<'a>(body: &'a Value, kind: &str) -> &'a Value {
+    body["outcomes"]
+        .as_array()
+        .expect("outcomes are an array")
+        .iter()
+        .find(|outcome| outcome["card_ref"]["kind"] == kind)
+        .unwrap_or_else(|| panic!("no {kind} outcome in {body}"))
+}
+
+/// Read the exact Prompt reference a persisted Agent version pins.
+///
+/// # Panics
+/// Panics when the outcome has no deserializable `card_ref.uid`, the tenant
+/// connection or read transaction fails, no live Card has that UID, the stored
+/// Card is not an Agent, or its Prompt is still inline instead of a reference.
+async fn persisted_agent_prompt(server: &WyrdTestServer, agent: &Value) -> CardRef {
+    let uid: CardUid = serde_json::from_value(agent["card_ref"]["uid"].clone())
+        .expect("agent outcome carries a uid");
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let stored = get_card_by_uid(&mut conn, &uid)
+        .await
+        .expect("persisted agent loads");
+    conn.commit().await.expect("assertion transaction commits");
+    let Spec::Agent(spec) = stored.spec else {
+        panic!("persisted card is not an Agent");
+    };
+    let InlineableRef::Ref(prompt) = spec.prompt else {
+        panic!("persisted agent prompt is not a card reference");
+    };
+    prompt
+}
+
+#[tokio::test(flavor = "current_thread")]
+/// An inline Agent Prompt registers as its own `<agent>-prompt` Card on its
+/// own version line, and the Agent pins that exact UID-bearing reference.
+///
+/// # Panics
+/// Panics when the server cannot start or shut down, the editor or viewer cannot
+/// bootstrap, a tenant query fails, or any outcome, stored pin, edge count,
+/// replay, version change, derived-name refusal, or authorization refusal
+/// differs from the registered-Prompt contract.
+async fn inline_agent_prompt_materializes() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("inline-prompt-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+
+    let first = register_inline_agent(&server, &jwt, "inline-agent", "hello", "inline-001").await;
+    assert_eq!(first["outcomes"].as_array().map(Vec::len), Some(2));
+    assert_eq!(first["root"]["kind"], "Agent");
+    let prompt = outcome_for(&first, "Prompt");
+    let agent = outcome_for(&first, "Agent");
+    assert_eq!(prompt["card_ref"]["name"], "inline-agent-prompt");
+    assert_eq!(prompt["card_ref"]["space"], "default");
+    assert_eq!(prompt["outcome"], "registered");
+    assert_eq!(prompt["status"], "active");
+    let pinned = persisted_agent_prompt(&server, agent).await;
+    assert_eq!(
+        serde_json::to_value(&pinned).expect("ref serializes"),
+        prompt["card_ref"]
+    );
+    let prompt_uid: CardUid =
+        serde_json::from_value(prompt["card_ref"]["uid"].clone()).expect("prompt uid");
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let edges: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM wyrd.card_relationships WHERE target_uid = $1")
+            .bind(prompt_uid.as_uuid())
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("relationship count reads");
+    conn.commit().await.expect("assertion transaction commits");
+    assert_eq!(edges, 1, "the Agent persists one edge to its Prompt");
+
+    let replay = register_inline_agent(&server, &jwt, "inline-agent", "hello", "inline-002").await;
+    assert_eq!(outcome_for(&replay, "Prompt")["outcome"], "deduplicated");
+    assert_eq!(
+        outcome_for(&replay, "Prompt")["card_ref"],
+        prompt["card_ref"]
+    );
+    assert_eq!(outcome_for(&replay, "Agent")["card_ref"], agent["card_ref"]);
+
+    let changed =
+        register_inline_agent(&server, &jwt, "inline-agent", "goodbye", "inline-003").await;
+    let changed_prompt = outcome_for(&changed, "Prompt");
+    assert_eq!(changed_prompt["outcome"], "registered");
+    assert_eq!(changed_prompt["card_ref"]["name"], "inline-agent-prompt");
+    assert_ne!(
+        changed_prompt["card_ref"]["version"],
+        prompt["card_ref"]["version"]
+    );
+    assert_ne!(
+        outcome_for(&changed, "Agent")["card_ref"],
+        agent["card_ref"]
+    );
+    assert_eq!(
+        persisted_agent_prompt(&server, agent).await,
+        pinned,
+        "the old Agent version keeps its original Prompt"
+    );
+
+    let other = register_inline_agent(&server, &jwt, "other-agent", "hello", "inline-004").await;
+    let other_prompt = outcome_for(&other, "Prompt");
+    assert_eq!(other_prompt["card_ref"]["name"], "other-agent-prompt");
+    assert_ne!(other_prompt["card_ref"]["uid"], prompt["card_ref"]["uid"]);
+
+    let long_name = "a".repeat(60);
+    let response = server
+        .oneshot_authenticated(
+            &jwt,
+            inline_agent_request(&long_name, "hello", "inline-005"),
+        )
+        .await
+        .expect("invalid derived name responds");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await["code"],
+        "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
+    );
+    assert_no_registration_writes(&server, "inline-005", &long_name).await;
+
+    let Bootstrap::User { jwt: viewer, .. } = server
+        .bootstrap_user("inline-prompt-viewer", &["viewer"])
+        .await
+        .expect("viewer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let response = server
+        .oneshot_authenticated(
+            &viewer,
+            inline_agent_request("denied-agent", "hello", "inline-006"),
+        )
+        .await
+        .expect("denied registration responds");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_no_registration_writes(&server, "inline-006", "denied-agent").await;
+    assert_no_registration_writes(&server, "inline-006", "denied-agent-prompt").await;
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Build one exact-pinned Agent submission whose Prompt is authored inline.
+///
+/// `tool_names` lets a caller change a non-Prompt Agent field under the same pin.
+///
+/// # Panics
+/// Panics through [`native_prompt`] when the inline Prompt fixture does not compile.
+fn pinned_inline_agent(name: &str, version: &str, message: &str, tool_names: &[&str]) -> Value {
+    json!({
+        "apiVersion": "wyrd/v1",
+        "kind": "Agent",
+        "metadata": { "name": name, "version": version, "space": "default" },
+        "spec": { "prompt": native_prompt(message), "tool_names": tool_names },
+        "artifacts": []
+    })
+}
+
+/// Build a pinned Service submission whose components reference exact siblings
+/// given as `(alias, kind, name, version)`.
+fn sibling_service(name: &str, components: &[(&str, &str, &str, &str)]) -> Value {
+    let components: Vec<Value> = components
+        .iter()
+        .map(|(alias, kind, card, version)| {
+            json!({ "alias": alias, "ref": { "sibling": {
+                "kind": kind, "name": card, "version": version, "space": "default"
+            } } })
+        })
+        .collect();
+    json!({
+        "apiVersion": "wyrd/v1",
+        "kind": "Service",
+        "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+        "spec": { "components": components },
+        "artifacts": []
+    })
+}
+
+/// Submit one registration request and return its status and response body.
+///
+/// # Panics
+/// Panics when the in-process server does not answer the request or the
+/// response body is not JSON.
+async fn submit(
+    server: &WyrdTestServer,
+    jwt: &str,
+    idempotency_key: &str,
+    submissions: Vec<Value>,
+) -> (StatusCode, Value) {
+    let response = server
+        .oneshot_authenticated(
+            jwt,
+            request_with_body(idempotency_key, json!({ "submissions": submissions })),
+        )
+        .await
+        .expect("registration responds");
+    let status = response.status();
+    (status, response_json(response).await)
+}
+
+/// Return every response outcome registered for one Card kind and name.
+///
+/// # Panics
+/// Panics when the response body carries no `outcomes` array.
+fn outcomes_named<'a>(body: &'a Value, kind: &str, name: &str) -> Vec<&'a Value> {
+    body["outcomes"]
+        .as_array()
+        .expect("outcomes are an array")
+        .iter()
+        .filter(|outcome| {
+            outcome["card_ref"]["kind"] == kind && outcome["card_ref"]["name"] == name
+        })
+        .collect()
+}
+
+/// Count the registration operations stored for one idempotency key and the
+/// live Card rows stored under one name.
+///
+/// # Panics
+/// Panics when the tenant connection or either count query fails.
+async fn operation_and_card_counts(
+    server: &WyrdTestServer,
+    idempotency_key: &str,
+    name: &str,
+) -> (i64, i64) {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let operations: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.card_registration_operations WHERE idempotency_key = $1",
+    )
+    .bind(idempotency_key)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("operation count reads");
+    let cards: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.cards WHERE name = $1 AND status != 'deleted'",
+    )
+    .bind(name)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("card count reads");
+    conn.commit().await.expect("assertion transaction commits");
+    (operations, cards)
+}
+
+#[tokio::test(flavor = "current_thread")]
+/// Reapplying an unchanged exact Agent pin after its generated Prompt line
+/// advanced keeps the Prompt that Agent already pins, while a changed Prompt
+/// or Agent field under that pin still conflicts without writes.
+///
+/// # Panics
+/// Panics when the server cannot start, a writer cannot bootstrap, or any
+/// registration outcome, stored pin, edge, or conflict differs from the above.
+async fn inline_agent_prompt_reapply_preserves_pin() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("inline-pin-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+
+    let a = || pinned_inline_agent("pin-agent", "1.0.0", "a", &[]);
+    let (status, first) = submit(&server, &jwt, "inline-pin-001", vec![a()]).await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let (status, second) = submit(
+        &server,
+        &jwt,
+        "inline-pin-002",
+        vec![pinned_inline_agent("pin-agent", "2.0.0", "b", &[])],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    assert_ne!(
+        outcome_for(&second, "Prompt")["card_ref"]["version"],
+        outcome_for(&first, "Prompt")["card_ref"]["version"],
+        "the second Agent advanced the generated Prompt line"
+    );
+
+    let (status, reapplied) = submit(
+        &server,
+        &jwt,
+        "inline-pin-003",
+        vec![
+            sibling_service("pin-service", &[("desk", "Agent", "pin-agent", "1.0.0")]),
+            a(),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reapplied}");
+    let agent = outcome_for(&reapplied, "Agent");
+    assert_eq!(agent["card_ref"], outcome_for(&first, "Agent")["card_ref"]);
+    assert_eq!(agent["outcome"], "idempotent_noop");
+    assert_eq!(
+        outcome_for(&reapplied, "Prompt")["card_ref"],
+        outcome_for(&first, "Prompt")["card_ref"]
+    );
+    assert_eq!(
+        operation_and_card_counts(&server, "inline-pin-003", "pin-agent-prompt").await,
+        (1, 2),
+        "no third Prompt version"
+    );
+    let service_uid: CardUid =
+        serde_json::from_value(outcome_for(&reapplied, "Service")["card_ref"]["uid"].clone())
+            .expect("service uid");
+    let agent_uid: CardUid =
+        serde_json::from_value(agent["card_ref"]["uid"].clone()).expect("agent uid");
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.card_relationships WHERE card_uid = $1 AND target_uid = $2",
+    )
+    .bind(service_uid.as_uuid())
+    .bind(agent_uid.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("relationship count reads");
+    conn.commit().await.expect("assertion transaction commits");
+    assert_eq!(edges, 1, "the Service binds the reapplied exact Agent");
+
+    for (key, changed) in [
+        (
+            "inline-pin-004",
+            pinned_inline_agent("pin-agent", "1.0.0", "changed", &[]),
+        ),
+        (
+            "inline-pin-005",
+            pinned_inline_agent("pin-agent", "1.0.0", "a", &["extra"]),
+        ),
+    ] {
+        let (status, body) = submit(&server, &jwt, key, vec![changed]).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "WYRD_REGISTRY_409_SPEC_DRIFT", "{body}");
+        assert_eq!(
+            operation_and_card_counts(&server, key, "pin-agent-prompt").await,
+            (0, 2),
+            "{key} leaves no partial writes"
+        );
+    }
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+#[tokio::test(flavor = "current_thread")]
+/// Repeated Prompt selection on one line inside a single composite accounts
+/// for the selections this registration already made: identical bodies reuse
+/// one Prompt, different bodies get successive versions, and an authored
+/// exact pin that conflicts with stored content still refuses atomically.
+///
+/// # Panics
+/// Panics when the server cannot start, a writer cannot bootstrap, or any
+/// registration outcome, stored pin, row count, or conflict differs from the above.
+async fn inline_agent_prompt_reuses_transaction_selection() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("inline-selection-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+
+    let (status, twins) = submit(
+        &server,
+        &jwt,
+        "select-001",
+        vec![
+            sibling_service(
+                "twin-service",
+                &[
+                    ("one", "Agent", "twin-agent", "1.0.0"),
+                    ("two", "Agent", "twin-agent", "2.0.0"),
+                ],
+            ),
+            pinned_inline_agent("twin-agent", "1.0.0", "same", &[]),
+            pinned_inline_agent("twin-agent", "2.0.0", "same", &[]),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{twins}");
+    let prompts = outcomes_named(&twins, "Prompt", "twin-agent-prompt");
+    assert_eq!(prompts.len(), 1, "{twins}");
+    assert_eq!(prompts[0]["status"], "active");
+    for agent in outcomes_named(&twins, "Agent", "twin-agent") {
+        assert_eq!(
+            serde_json::to_value(persisted_agent_prompt(&server, agent).await)
+                .expect("ref serializes"),
+            prompts[0]["card_ref"]
+        );
+    }
+    assert_eq!(
+        operation_and_card_counts(&server, "select-001", "twin-agent-prompt").await,
+        (1, 1)
+    );
+
+    let (status, authored) = submit(
+        &server,
+        &jwt,
+        "select-002",
+        vec![
+            sibling_service(
+                "authored-service",
+                &[
+                    ("prompt", "Prompt", "authored-agent-prompt", "0.1.0"),
+                    ("agent", "Agent", "authored-agent", "1.0.0"),
+                ],
+            ),
+            json!({
+                "apiVersion": "wyrd/v1",
+                "kind": "Prompt",
+                "metadata": { "name": "authored-agent-prompt", "version": "0.1.0", "space": "default" },
+                "spec": native_prompt("same"),
+                "artifacts": []
+            }),
+            pinned_inline_agent("authored-agent", "1.0.0", "same", &[]),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{authored}");
+    let prompts = outcomes_named(&authored, "Prompt", "authored-agent-prompt");
+    assert_eq!(prompts.len(), 1, "{authored}");
+    assert_eq!(
+        serde_json::to_value(
+            persisted_agent_prompt(&server, outcome_for(&authored, "Agent")).await
+        )
+        .expect("ref serializes"),
+        prompts[0]["card_ref"]
+    );
+
+    let (status, split) = submit(
+        &server,
+        &jwt,
+        "select-003",
+        vec![
+            sibling_service(
+                "split-service",
+                &[
+                    ("one", "Agent", "split-agent", "1.0.0"),
+                    ("two", "Agent", "split-agent", "2.0.0"),
+                ],
+            ),
+            pinned_inline_agent("split-agent", "1.0.0", "one", &[]),
+            pinned_inline_agent("split-agent", "2.0.0", "two", &[]),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{split}");
+    let mut versions: Vec<&Value> = outcomes_named(&split, "Prompt", "split-agent-prompt")
+        .iter()
+        .map(|outcome| &outcome["card_ref"]["version"])
+        .collect();
+    versions.sort_by_key(ToString::to_string);
+    assert_eq!(versions, [&json!("0.1.0"), &json!("0.1.1")], "{split}");
+
+    let (status, clash) = submit(
+        &server,
+        &jwt,
+        "select-004",
+        vec![
+            sibling_service(
+                "clash-service",
+                &[
+                    ("prompt", "Prompt", "twin-agent-prompt", "0.1.0"),
+                    ("agent", "Agent", "clash-agent", "1.0.0"),
+                ],
+            ),
+            json!({
+                "apiVersion": "wyrd/v1",
+                "kind": "Prompt",
+                "metadata": { "name": "twin-agent-prompt", "version": "0.1.0", "space": "default" },
+                "spec": native_prompt("other"),
+                "artifacts": []
+            }),
+            pinned_inline_agent("clash-agent", "1.0.0", "other", &[]),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{clash}");
+    assert_eq!(clash["code"], "WYRD_REGISTRY_409_SPEC_DRIFT", "{clash}");
+    assert_eq!(
+        operation_and_card_counts(&server, "select-004", "clash-agent").await,
+        (0, 0)
+    );
+    assert_eq!(
+        operation_and_card_counts(&server, "select-004", "twin-agent-prompt").await,
+        (0, 1)
     );
 
     server.shutdown().await.expect("test server shuts down");

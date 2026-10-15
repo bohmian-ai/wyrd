@@ -2,9 +2,10 @@
 //! real server, from environment-only or saved-only configuration, through
 //! both credential paths, as a delegated subject, and across token renewal.
 //!
-//! The ambient chain is driven through a fixed [`Environment`] passed to the
-//! same resolver `connect()` reaches through `WyrdClient::from_global`, so no
-//! test reads or changes the process environment.
+//! The ambient chain is driven through `WyrdClient::from_environment` with a
+//! fixed [`Environment`]: the one resolver `connect()` reaches through
+//! `WyrdClient::from_global` with the process environment, so no test reads
+//! or changes the process environment.
 
 use std::path::Path;
 use std::time::Duration;
@@ -15,7 +16,6 @@ use tempfile::TempDir;
 use wyrd_ai::auth::Principals;
 use wyrd_ai::bifrost::{BifrostOptions, TableConfig};
 use wyrd_ai::cards::{CardKind, Cards, ListCardsRequest};
-use wyrd_ai::config::ClientConfig;
 use wyrd_ai::environment::Environment;
 use wyrd_ai::{
     Bifrost, Gateway, GlobalConfig, OperatorConnections, Platform, QueueConfig, WyrdClient,
@@ -41,21 +41,6 @@ const ACCESS_TTL: chrono::Duration = chrono::Duration::seconds(35);
 /// Wait after which the renewal story's cached token is inside the refresh
 /// skew.
 const PAST_REUSE_WINDOW: Duration = Duration::from_secs(6);
-
-/// Resolve the ambient client from `environment` alone, exactly as
-/// `WyrdClient::from_global` resolves it from the process.
-///
-/// # Errors
-/// Returns the configuration or credential-resolution refusal.
-fn ambient(environment: Environment) -> Result<WyrdClient, WyrdError> {
-    let global = GlobalConfig::load_in(&environment)?;
-    Ok(WyrdClient::with_config(ClientConfig::from_environment(
-        environment,
-        &global,
-        None,
-        None,
-    ))?)
-}
 
 /// UTF-8 text of `path`, for an [`Environment`] value.
 ///
@@ -143,7 +128,7 @@ async fn ambient_connect_opens_every_handle() {
     let key = deployment.key("ambient_admin", &["admin"]).await;
     let empty = private_config_home();
 
-    let from_environment = ambient(Environment::from([
+    let from_environment = WyrdClient::from_environment(Environment::from([
         ("WYRD_CONFIG_HOME", utf8(empty.path())),
         ("WYRD_SERVER_URL", url.as_str()),
         ("WYRD_GRPC_URL", grpc.as_str()),
@@ -155,7 +140,7 @@ async fn ambient_connect_opens_every_handle() {
         .expect("environment-only handles open");
 
     let saved = saved_config(&deployment, &key);
-    let from_saved = ambient(Environment::from([(
+    let from_saved = WyrdClient::from_environment(Environment::from([(
         "WYRD_CONFIG_HOME",
         utf8(saved.path()),
     )]))
@@ -168,7 +153,7 @@ async fn ambient_connect_opens_every_handle() {
         .initialize_platform_root()
         .await
         .expect("platform root initializes");
-    let platform_client = ambient(Environment::from([
+    let platform_client = WyrdClient::from_environment(Environment::from([
         ("WYRD_CONFIG_HOME", utf8(empty.path())),
         ("WYRD_SERVER_URL", url.as_str()),
         (
@@ -198,7 +183,7 @@ async fn connect_without_a_credential_fails_eagerly() {
     let deployment = Deployment::start().await;
     let empty = private_config_home();
 
-    let refused = ambient(Environment::from([
+    let refused = WyrdClient::from_environment(Environment::from([
         ("WYRD_CONFIG_HOME", utf8(empty.path())),
         (
             "WYRD_SERVER_URL",
@@ -210,7 +195,10 @@ async fn connect_without_a_credential_fails_eagerly() {
     ]))
     .expect_err("an empty chain is refused");
 
-    assert_eq!(refused.code(), "WYRD_CLIENT_401_NO_CREDENTIALS");
+    assert_eq!(
+        WyrdError::from(refused).code(),
+        "WYRD_CLIENT_401_NO_CREDENTIALS"
+    );
     deployment.shutdown().await;
 }
 
@@ -277,17 +265,22 @@ async fn credential_paths_preserve_exchange_and_bearer_behavior() {
 }
 
 /// Handles connected with a delegated client act with the subject's
-/// authority, not the actor's.
+/// authority, not the actor's, and the server's retained audit attributes a
+/// delegated query to the subject with the actor in its delegation chain.
 ///
 /// # Panics
-/// Panics when the delegation fails or a call is decided with the actor's
-/// authority.
+/// Panics when the delegation fails, a call is decided with the actor's
+/// authority, or the retained decision names another principal.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn delegated_connect_uses_the_subject_principal() {
     let deployment = Deployment::start().await;
     let reader = deployment
-        .client(&deployment.scoped_key("card_reader", &["cards:read"]).await)
+        .client(
+            &deployment
+                .scoped_key("card_reader", &["cards:read", "bifrost_query:read"])
+                .await,
+        )
         .access_token()
         .await
         .expect("the subject's key exchanges");
@@ -317,6 +310,61 @@ async fn delegated_connect_uses_the_subject_principal() {
         .await
         .expect("the actor alone may read operators");
 
+    let to_bifrost = admin
+        .on_behalf_of(SecretString::from(reader.expose()), TokenAudience::Bifrost)
+        .await
+        .expect("the actor delegates to Bifrost");
+    Bifrost::connect_with(&to_bifrost, BifrostOptions::default())
+        .await
+        .expect("Bifrost connects")
+        .sql("SELECT COUNT(*) AS n FROM vala.system.audit_log", &[])
+        .await
+        .expect("the subject queries");
+    let principals = Principals::connect_with(&admin)
+        .await
+        .expect("principals connect");
+    let mut ids = Vec::new();
+    for name in ["card_reader", "journey_admin"] {
+        let page = principals
+            .list(&PrincipalQuery {
+                name: Some(name.to_owned()),
+                ..PrincipalQuery::default()
+            })
+            .await
+            .expect("principals list");
+        ids.push(page.principals[0].principal_id.to_string());
+    }
+    let server = deployment.server();
+    server.await_audit_retained().await.expect("audit settles");
+    let decisions = server
+        .retained_audit_records(
+            server.data_tenant_id(),
+            "detail",
+            &format!(
+                "operation = 'bifrost.query.read_decision' AND audit_principal_id = '{}'",
+                ids[0]
+            ),
+        )
+        .await
+        .expect("retained audit reads");
+    let actors: Vec<String> = decisions
+        .iter()
+        .map(|record| {
+            let detail: serde_json::Value =
+                serde_json::from_str(record[0].as_deref().expect("a decision has detail"))
+                    .expect("detail is JSON");
+            detail["delegation_chain"][0]["principal_id"]
+                .as_str()
+                .expect("the decision names its actor")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        actors,
+        [ids[1].clone()],
+        "attributed to the subject, acted by the actor"
+    );
+
     deployment.shutdown().await;
 }
 
@@ -339,7 +387,7 @@ async fn connected_handles_reuse_the_client_cache_and_renew() {
     .await;
     let key = deployment.key("renewing_admin", &["admin"]).await;
     let saved = saved_config(&deployment, &key);
-    let client = ambient(Environment::from([(
+    let client = WyrdClient::from_environment(Environment::from([(
         "WYRD_CONFIG_HOME",
         utf8(saved.path()),
     )]))

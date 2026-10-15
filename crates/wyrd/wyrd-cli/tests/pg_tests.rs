@@ -17,7 +17,6 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use wyrd_client::bifrost::{Correlation, TableConfig};
 use wyrd_client::cards::{CardSelector, Cards};
-use wyrd_client::config::ClientConfig;
 use wyrd_client::environment::Environment;
 use wyrd_client::{Bifrost, GlobalConfig, WyrdClient};
 use wyrd_dev_fixtures::pg::UnmigratedDatabase;
@@ -276,15 +275,7 @@ impl LocalDev {
     /// # Panics
     /// Panics when local setup's public configuration is unusable.
     fn client(&self) -> WyrdClient {
-        let environment = self.environment();
-        let global = GlobalConfig::load_in(&environment).expect("saved config loads");
-        WyrdClient::with_config(ClientConfig::from_environment(
-            environment,
-            &global,
-            None,
-            None,
-        ))
-        .expect("fresh client resolves saved key")
+        WyrdClient::from_environment(self.environment()).expect("fresh client resolves saved key")
     }
 }
 

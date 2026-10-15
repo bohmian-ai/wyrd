@@ -1,8 +1,9 @@
 //! Top-level client configuration.
 //!
 //! [`ClientConfig`] is the single entry point for configuring `wyrd-client`.
-//! Build from the global profile with [`ClientConfig::from_global`] or from
-//! environment variables with [`ClientConfig::from_env`], optionally set
+//! Build from the global profile and an [`Environment`] with
+//! [`ClientConfig::from_environment`] or from environment variables with
+//! [`ClientConfig::from_env`], optionally set
 //! [`ClientConfig::credential`] for an explicit credential that outranks env and
 //! file credentials, then call [`ClientConfig::resolve_credential`] to obtain
 //! the effective [`ResolvedCredential`].
@@ -95,15 +96,6 @@ impl ClientConfig {
     #[must_use]
     pub fn from_env() -> Self {
         Self::from_global_with_env(&GlobalConfig::default())
-    }
-
-    /// Build from the global config file, environment variables, and defaults.
-    ///
-    /// # Errors
-    /// Returns an error when the global config file exists but cannot be read
-    /// or parsed.
-    pub fn from_global() -> Result<Self, WyrdClientError> {
-        Ok(Self::from_global_with_env(&GlobalConfig::load()?))
     }
 
     /// Overlay global config values with environment values and defaults.

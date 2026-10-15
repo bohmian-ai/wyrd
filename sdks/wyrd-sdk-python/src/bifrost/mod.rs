@@ -548,7 +548,7 @@ pub struct Bifrost {
 /// Owner of a Python [`Bifrost`]'s write target.
 enum Binding {
     /// Not yet moved into the native client: the target bound so far.
-    Local(Option<TableConfig>),
+    Local(Option<Box<TableConfig>>),
     /// Moved: the native client's active table is the only binding.
     Native,
 }
@@ -581,7 +581,7 @@ impl Bifrost {
             .map_err(client_error)?;
         let mut binding = self.binding();
         if let Binding::Local(Some(table)) = std::mem::replace(&mut *binding, Binding::Native) {
-            native.use_table(table);
+            native.use_table(*table);
         }
         Ok(native)
     }
@@ -629,7 +629,7 @@ impl Bifrost {
     ) -> Self {
         Self {
             handle: crate::client::LazyConnection::new(client.as_deref()),
-            binding: Mutex::new(Binding::Local(table.map(|table| table.inner))),
+            binding: Mutex::new(Binding::Local(table.map(|table| Box::new(table.inner)))),
             client_byte_limit_bytes,
         }
     }
@@ -697,7 +697,7 @@ impl Bifrost {
     fn use_table(&self, table: PyTableConfig) -> Option<PyTableConfig> {
         let mut binding = self.binding();
         match &mut *binding {
-            Binding::Local(local) => local.replace(table.inner),
+            Binding::Local(local) => local.replace(Box::new(table.inner)).map(|inner| *inner),
             Binding::Native => self.native().use_table(table.inner),
         }
         .map(|inner| PyTableConfig { inner })
@@ -718,7 +718,7 @@ impl Bifrost {
     #[getter]
     fn table(&self) -> Option<PyTableConfig> {
         match &*self.binding() {
-            Binding::Local(local) => local.clone(),
+            Binding::Local(local) => local.as_deref().cloned(),
             Binding::Native => self.native().table(),
         }
         .map(|inner| PyTableConfig { inner })

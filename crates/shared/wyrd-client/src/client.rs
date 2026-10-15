@@ -27,7 +27,9 @@ use wyrd_spec::request_id::RequestId;
 
 use crate::auth::{AuthError, AuthMiddleware};
 use crate::config::ClientConfig;
+use crate::environment::Environment;
 use crate::error::WyrdClientError;
+use crate::global_config::GlobalConfig;
 use crate::transport::config::GrpcConfig;
 #[cfg(feature = "internal")]
 use crate::transport::http::ArrowResponse;
@@ -59,11 +61,11 @@ impl WyrdClient {
     /// Build the ambient client: the one resolution every no-argument
     /// constructor uses.
     ///
-    /// Resolves [`ClientConfig::from_global`] for endpoints (the global config
-    /// file, then environment variables, then defaults), then the effective
-    /// credential via [`ClientConfig::resolve_credential`], and assembles the
-    /// auth and HTTP layers. No network call is made here; the first token
-    /// exchange happens lazily on the first request.
+    /// [`Self::from_environment`] over [`Environment::Process`]: endpoints
+    /// from the global config file, then environment variables, then
+    /// defaults, then the effective credential via
+    /// [`ClientConfig::resolve_credential`], assembled into the auth and HTTP
+    /// layers. No network call is made here.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::Config`] when the global config file exists
@@ -71,7 +73,32 @@ impl WyrdClient {
     /// credential source is configured, or [`WyrdClientError::TransportDown`]
     /// when the HTTP client cannot be built.
     pub fn from_global() -> Result<Self, WyrdClientError> {
-        Self::with_config(ClientConfig::from_global()?)
+        Self::from_environment(Environment::Process)
+    }
+
+    /// Resolve the ambient client from `environment`: the one resolver every
+    /// no-client handle `connect` reaches through [`Self::from_global`] with
+    /// [`Environment::Process`].
+    ///
+    /// Loads `config.toml` from the configuration directory `environment`
+    /// names, overlays `environment`'s endpoint variables and defaults, and
+    /// resolves the credential chain from the same variables. No network call
+    /// is made here.
+    ///
+    /// # Arguments
+    /// * `environment` - Source of every ambient variable, such as a fixed set
+    ///   in a test or a saved local configuration home.
+    ///
+    /// # Errors
+    /// As [`Self::from_global`].
+    pub fn from_environment(environment: Environment) -> Result<Self, WyrdClientError> {
+        let global = GlobalConfig::load_in(&environment)?;
+        Self::with_config(ClientConfig::from_environment(
+            environment,
+            &global,
+            None,
+            None,
+        ))
     }
 
     /// Resolve the ambient client and complete any credential exchange it

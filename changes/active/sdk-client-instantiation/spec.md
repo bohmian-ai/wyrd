@@ -1,6 +1,6 @@
 ---
 id: SPEC-sdk-client-instantiation
-revision: 10
+revision: 11
 status: approved
 ---
 
@@ -250,6 +250,11 @@ Out of scope:
   saved source: the tenant handles. `Platform` accepts only a platform bearer,
   which has no saved source (D4), so its journey covers the environment-only
   case and the no-credential refusal through `Platform::connect()`.
+  Rust ambient journeys, here and in AC-004 and AC-007, resolve the ambient
+  environment through `WyrdClient::from_environment` with an injected
+  `Environment`, the same resolver `connect()` applies to the process
+  environment, so they need no process-environment mutation, runner-preset
+  variables, fixed ports, or provisioned keys.
 - **AC-003** A user journey per language opens a handle with `connect` and a
   delegated client and shows the server attributes the call to the delegated
   principal (INV-003).
@@ -352,6 +357,7 @@ None. D1 through D5 are resolved; see *Decided*.
 | 8 | approved | User-requested repository-alignment revisions: authored Python stubs and their actual checks, current `wyrd_ai` module paths, eager exchange qualified by credential kind, retained-cache renewal, and preservation of Platform's existing session exchange. Public construction and discovery scope unchanged. |
 | 9 | approved | User clarification: client is always optional, no-client environment/saved-configuration instantiation is the common usage, and explicit clients are for testing, advanced configuration, or delegation. Require environment-only and saved-only coverage and focused docsite/README guidance. Resolver precedence and API scope unchanged. |
 | 10 | approved | User decision on review finding FIND-TASK-001-6: AC-002's saved-configuration-only case applies to handles with a saved credential source. `Platform` proves environment-only and no-credential `connect()`; no saved platform credential source is added. |
+| 11 | approved | User decision on review finding FIND-TASK-001-2: Rust ambient cases are proven through `WyrdClient::from_environment` with an injected `Environment`, the single resolver `connect()` uses; no runner-preset environment, fixed ports, or provisioned keys. |
 
 ## Authority
 

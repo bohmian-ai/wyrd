@@ -2498,6 +2498,11 @@ mod envelope_roundtrip_tests {
         assert_eq!(decoded, card);
     }
 
+    /// The OpenAI Chat Prompt spec with one user turn that the Card envelope
+    /// tests wrap.
+    ///
+    /// # Panics
+    /// Panics when the static request is not a valid Prompt spec.
     fn prompt_spec() -> PromptSpec {
         PromptSpec::new(
             Prompt::new(
@@ -2921,6 +2926,9 @@ mod kind_tests {
 
     /// Lock 15 native kinds (14 registrable plus `External`), with `Verifier`
     /// replacing both `Drift` and `Eval` and no `Workflow`.
+    ///
+    /// # Panics
+    /// Panics when the native or registrable kind set changes.
     #[test]
     fn native_card_kind_count_is_locked() {
         assert_eq!(CardKind::native().len(), CardKind::NATIVE_COUNT);
@@ -2965,7 +2973,12 @@ mod kind_tests {
         assert_eq!(decoded, CardKind::External);
     }
 
-    /// Publish exactly the 15 registrable kinds in the CardKind schema.
+    /// Publish exactly the 14 registrable kinds in the CardKind schema, with
+    /// no `External` or retired kind.
+    ///
+    /// # Panics
+    /// Panics when the schema is not a string enum of exactly the registrable
+    /// kinds.
     #[test]
     fn card_kind_schema_is_string_enum_with_registrable_kinds() {
         let schema = schemars::schema_for!(CardKind);

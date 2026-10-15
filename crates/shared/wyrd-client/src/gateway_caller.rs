@@ -10,7 +10,9 @@
 //! gateway correlation header. Every call names its Prompt provider in the
 //! `wyrd-prompt-provider` header, so the gateway refuses a requested
 //! deployment whose adapter that provider is not compatible with before any
-//! provider IO. Refusals in the
+//! provider IO. A Vertex Prompt is refused before any IO: the public gateway
+//! serves no Vertex ingress, so only the server's own caller runs one.
+//! Refusals in the
 //! protocol's native error envelope are normalized to a redacted
 //! [`RemoteProblem`].
 
@@ -21,7 +23,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use skald_agent::{WyrdGatewayCall, WyrdGatewayCaller};
 use skald_providers::{ProviderError, RemoteProblem};
-use skald_spec::{ProviderRequest, ProviderResponse};
+use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::native::{AnthropicErrorEnvelope, GoogleErrorEnvelope};
@@ -82,15 +84,15 @@ impl PublicWyrdGatewayCaller {
 impl WyrdGatewayCaller for PublicWyrdGatewayCaller {
     /// Submit one governed model call to its protocol ingress.
     ///
-    /// The request is projected before any IO, so an unservable dialect
-    /// dispatches nothing. The HTTP exchange is raced against `cancellation`
+    /// A Vertex Prompt is refused and the request is projected before any IO,
+    /// so neither a Vertex call nor an unservable dialect dispatches anything. The HTTP exchange is raced against `cancellation`
     /// and bounded by `call.timeout`; either drops the in-flight request. A
     /// request already sent may have been accepted and dispatched by the
     /// gateway; dropping it does not roll that back, and it is never resent.
     ///
     /// # Errors
-    /// Returns [`ProviderError::BadRequest`] for a dialect the public gateway
-    /// does not serve or an unencodable request;
+    /// Returns [`ProviderError::BadRequest`] for a Vertex Prompt, a dialect
+    /// the public gateway does not serve, or an unencodable request;
     /// [`ProviderError::Timeout`] when the call's time runs out or it is
     /// cancelled; [`ProviderError::Connect`] for a transport
     /// failure; [`ProviderError::RemoteProblem`] for a refusal or an
@@ -102,6 +104,12 @@ impl WyrdGatewayCaller for PublicWyrdGatewayCaller {
         call: WyrdGatewayCall,
         cancellation: &CancellationToken,
     ) -> Result<ProviderResponse, ProviderError> {
+        if call.provider == ProviderName::Vertex {
+            return Err(ProviderError::bad_request(
+                PROVIDER,
+                "the public Wyrd gateway cannot run a Vertex Prompt",
+            ));
+        }
         let native = NativeCall::project(call.request, &call.model)?;
         let mut headers: Vec<(&str, &str)> = vec![(PROMPT_PROVIDER_HEADER, call.provider.as_str())];
         if let Some(run_id) = &self.run_id {

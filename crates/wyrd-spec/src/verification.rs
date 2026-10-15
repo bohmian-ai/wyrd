@@ -884,6 +884,9 @@ mod tests {
 
     /// Judge presence wins, an all-assertion graph is an assertion Eval, any
     /// other graph is `eval_other`, and a profile-less Drift is `unknown`.
+    ///
+    /// # Panics
+    /// Panics when a fixture is classified as another kind.
     #[test]
     fn kind_classification_follows_the_closed_precedence() {
         let assertion = serde_json::json!({

@@ -4049,6 +4049,10 @@ impl WyrdError {
 }
 
 impl From<skald_spec::SkaldError> for WyrdError {
+    /// Maps each Prompt-facing Skald error to its public Prompt catalog
+    /// variant, carrying the offending name, path, provider, or field as
+    /// details; any other Skald error becomes an internal error that keeps its
+    /// Skald code.
     fn from(error: skald_spec::SkaldError) -> Self {
         let message = error.to_string();
         match error {
@@ -4459,6 +4463,8 @@ mod tests {
         assert_eq!(value["kind"], "credential_revoked");
     }
 
+    /// One instance of every authentication and credential error, used to check
+    /// that each code's status segment matches its HTTP status.
     fn auth_errors() -> Vec<WyrdError> {
         vec![
             WyrdError::Unauthenticated {

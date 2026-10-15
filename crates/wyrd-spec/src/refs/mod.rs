@@ -662,6 +662,11 @@ mod completeness_tests {
         .expect("fixture prompt is valid")
     }
 
+    /// A native-route Agent spec with an inline Prompt and a one-iteration run
+    /// config, used as a nested reference slot.
+    ///
+    /// # Panics
+    /// Panics when the fixture Prompt is invalid.
     fn agent() -> AgentSpec {
         AgentSpec {
             prompt: InlineableRef::Inline(Box::new(prompt())),
@@ -807,6 +812,10 @@ mod completeness_tests {
     }
 
     /// Confirm the canonical visitor exposes every supported reference slot exactly once.
+    ///
+    /// # Panics
+    /// Panics when a fixture is invalid or the visitor reports another set of
+    /// slots.
     #[test]
     fn every_spec_ref_field_is_ref_or_inlineable_ref() {
         let image = data(DataInterface::Image(ImageMeta {

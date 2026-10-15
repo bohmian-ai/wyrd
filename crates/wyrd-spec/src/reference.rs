@@ -892,6 +892,11 @@ mod tests {
         );
     }
 
+    /// A path reference nested in an inline Agent of a judge task is reported
+    /// as unresolved.
+    ///
+    /// # Panics
+    /// Panics when another set of paths is reported.
     #[test]
     fn unresolved_card_ref_paths_include_nested_slots() {
         let spec = nested_judge(InlineableRef::Path(PathBuf::from("nested/agent.yaml")));
@@ -969,6 +974,10 @@ mod tests {
     }
 
     /// Confirm sibling collection covers top-level and nested slots in visitor order.
+    ///
+    /// # Panics
+    /// Panics when a static name is invalid or another set of siblings is
+    /// collected.
     #[test]
     fn registration_only_sibling_refs_include_top_level_and_nested_slots() {
         let top_level = sample_ref();
@@ -1001,6 +1010,9 @@ mod tests {
     }
 
     /// Confirm durable refs, paths, and inline bodies are not classified as siblings.
+    ///
+    /// # Panics
+    /// Panics when a non-sibling reference is collected.
     #[test]
     fn registration_only_sibling_refs_ignore_other_reference_forms() {
         let durable = sample_ref();

@@ -176,8 +176,8 @@ test("hydrated agent prompt card navigation", async ({ cards }) => {
 const PORTABLE_SPEC = {
   provider: "anthropic",
   model: "claude-sonnet-4-5",
-  system: "You answer for ${team}.",
-  messages: [{ role: "user", content: "${question}" }],
+  system: `You answer for \${team}.`,
+  messages: [{ role: "user", content: `\${question}` }],
   settings: { temperature: 0.2, max_output_tokens: 256 },
   response_format: {
     type: "object",
@@ -202,11 +202,12 @@ test("prompt forms round trip as authored", async ({ cards }) => {
   await cards.hydrate(receipt.root, bundle);
   const state = WyrdState.fromPath(bundle);
 
-  for (const [name, hydrated, authored] of [
-    ["portable-prompt", state.prompt("portable"), PORTABLE_SPEC],
-    ["native-prompt", state.prompt("native"), NATIVE_SPEC],
-    ["inline-prompt-agent-prompt", state.agent("agent").prompt(), PORTABLE_SPEC],
-    ["inline-native-prompt-agent-prompt", state.agent("native-agent").prompt(), NATIVE_SPEC],
+  const answer = PORTABLE_SPEC.response_format;
+  for (const [name, hydrated, authored, variables, schema] of [
+    ["portable-prompt", state.prompt("portable"), PORTABLE_SPEC, ["question", "team"], answer],
+    ["native-prompt", state.prompt("native"), NATIVE_SPEC, ["ticket"], null],
+    ["inline-prompt-agent-prompt", state.agent("agent").prompt(), PORTABLE_SPEC, ["question", "team"], answer],
+    ["inline-native-prompt-agent-prompt", state.agent("native-agent").prompt(), NATIVE_SPEC, ["ticket"], null],
   ] as const) {
     const read = await cards.get(registered(receipt, name));
     expect(hydrated.ref).toEqual(registered(receipt, name));
@@ -214,5 +215,9 @@ test("prompt forms round trip as authored", async ({ cards }) => {
     expect(hydrated.spec).toEqual(authored);
     expect(read.metadata.spec_hash).toBeTruthy();
     expect(hydrated.metadata.spec_hash).toBe(read.metadata.spec_hash);
+    expect([...hydrated.variables].sort()).toEqual(variables);
+    expect(hydrated.mediaVariables).toEqual([]);
+    expect(hydrated.responseSchema).toEqual(schema);
+    expect(hydrated.responseSchemaName).toBe(schema === null ? null : "response");
   }
 });

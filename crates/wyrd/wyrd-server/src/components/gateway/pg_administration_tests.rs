@@ -77,6 +77,9 @@ pub(super) fn assigned(tenant: DataTenantId, provider: &str) -> CredentialAssign
 /// Operator gateway configuration for `tenant`: `openai-env` and
 /// `anthropic-env` bindings plus a `vault` backend whose `openai` and
 /// `anthropic` prefixes are assigned to the matching provider.
+///
+/// # Panics
+/// Panics when a static binding or backend name is invalid.
 fn gateway_config(tenant: DataTenantId) -> GatewayConfig {
     let binding = |variable: &str, provider| GatewayCredentialBinding {
         secret: SecretRef::Env {
@@ -779,6 +782,9 @@ async fn gateway_deployments_guard_credential_references() {
 }
 
 /// Proves RBAC per operation class, decision audit, and tenant isolation.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn gateway_administration_is_authorized_audited_and_tenant_isolated() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -872,6 +878,9 @@ async fn gateway_administration_is_authorized_audited_and_tenant_isolated() {
 }
 
 /// Proves fallback defaults, replacement, and idempotent delete.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn gateway_fallback_policy_replaces_and_resets() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -903,6 +912,9 @@ async fn gateway_fallback_policy_replaces_and_resets() {
 
 /// Proves governance validation, pricing immutability, and retention of
 /// pricing referenced by accounting history across replace and delete.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn gateway_governance_retains_referenced_pricing() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1262,6 +1274,9 @@ pub(super) async fn await_lock_waiters(fixture: &PgFixture, waiters: i64) {
 /// Proves last-committed-write-wins for one credential and one deployment and
 /// that concurrent fallback and governance updates both survive the shared
 /// policy row. A held row lock queues the writers in a known order.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn gateway_concurrent_replacements_are_last_committed_and_family_independent() {
     let fixture = PgFixture::start().await.expect("fixture starts");

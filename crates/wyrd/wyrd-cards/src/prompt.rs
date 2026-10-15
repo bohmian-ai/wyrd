@@ -874,6 +874,13 @@ fn default_prompt() -> skald_spec::Prompt {
 mod tests {
     use super::*;
 
+    /// A native Prompt held by a `PromptCard` converts to the same Prompt spec
+    /// and projects to an envelope with no server-derived state that reads back
+    /// to the same Prompt.
+    ///
+    /// # Panics
+    /// Panics when the Prompt is invalid or a conversion or round trip fails or
+    /// changes it.
     #[test]
     fn converts_holder_metadata_to_prompt_spec() {
         let prompt: skald_spec::Prompt = serde_json::from_value(serde_json::json!({

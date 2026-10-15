@@ -899,7 +899,8 @@ export declare class NativeWyrdState {
   verifier(alias: string): NativeLifecycleResult
   /**
    * Returns the stored envelope of the Agent Card an alias names, with
-   * the exact Prompt reference it pins and that Prompt's stored envelope.
+   * the exact Prompt reference it pins and that Prompt's stored envelope
+   * and derived metadata.
    *
    * The Prompt is the one the shared state's hydrated Agent resolves, so
    * the wrapper navigates without resolving the relationship itself.
@@ -910,7 +911,8 @@ export declare class NativeWyrdState {
    */
   agent(alias: string): NativeLifecycleResult
   /**
-   * Returns the stored envelope of the Prompt Card an alias names.
+   * Returns the stored envelope of the Prompt Card an alias names, with
+   * the metadata the shared state's hydrated Prompt derives from it.
    *
    * # Errors
    *

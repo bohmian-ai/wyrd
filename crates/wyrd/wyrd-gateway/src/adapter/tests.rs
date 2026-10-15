@@ -43,6 +43,10 @@ fn parsed(body: &ResponseBody) -> Value {
 
 /// Deployment `dep` with `adapter` and `auth` JSON whose model list holds
 /// only the native model of `model` (`deployment/native`).
+///
+/// # Panics
+/// Panics when `model` is not an address or the fixture is not a valid
+/// deployment.
 fn deployment(model: &str, adapter: Value, auth: Value) -> ProviderDeployment {
     let (_, native) = model.split_once('/').expect("fixture model is an address");
     let mut value = json!({"name": "dep", "models": [native]});
@@ -3317,6 +3321,9 @@ fn jev_answer() -> Value {
 }
 
 /// Jev deployment of `jev/jev-latest` with bearer credential `cred`.
+///
+/// # Panics
+/// Panics when the fixture is not a valid deployment.
 fn jev_deployment() -> ProviderDeployment {
     serde_json::from_value(json!({
         "name": "jev",

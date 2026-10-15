@@ -315,6 +315,9 @@ async fn gateway_commands_manage_redacted_tenant_configuration() {
 /// the run with ordered completed/failed/unattempted outcomes and earlier
 /// writes kept; rerunning converges without deleting unnamed deployments; and
 /// standard input carries a list the same way.
+///
+/// # Panics
+/// Panics when the test server, a CLI run, or an assertion fails.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the serialized Postgres-backed CLI journey lane"]
 async fn deployment_file_accepts_one_or_many() {

@@ -218,6 +218,9 @@ mod tests {
 
     /// Builds an OpenAI-compatible deployment `name` with optional model and
     /// capability lists.
+    ///
+    /// # Panics
+    /// Panics when the fixture is not a valid deployment.
     fn deployment(
         name: &str,
         models: Option<&[&str]>,
@@ -256,6 +259,9 @@ mod tests {
     }
 
     /// Parses an address.
+    ///
+    /// # Panics
+    /// Panics when `value` is not an address.
     fn model(value: &str) -> ModelRef {
         ModelRef::from_projection(value).expect("model")
     }
@@ -399,6 +405,9 @@ mod tests {
     /// Override, exact model, operation, and global rules apply in that
     /// precedence without merging; the requested address and duplicates are
     /// skipped and incapable candidates are dropped.
+    ///
+    /// # Panics
+    /// Panics when a fixture is invalid or the plan holds other candidates.
     #[test]
     fn fallback_precedence_is_first_defined_without_merging() {
         let chat_only = Some(&["chat_completions"][..]);

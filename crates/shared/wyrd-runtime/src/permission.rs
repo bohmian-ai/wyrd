@@ -1283,6 +1283,9 @@ mod tests {
     /// deployment invoke grant covers that deployment's models only, only an
     /// object-scoped grant counts as scoped, and a gateway object scope is
     /// refused anywhere but gateway invoke.
+    ///
+    /// # Panics
+    /// Panics when a fixture fails to build or an assertion fails.
     #[test]
     fn gateway_permissions_are_typed_and_scope_checked() {
         use super::GatewayAccess;

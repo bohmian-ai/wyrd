@@ -383,6 +383,11 @@ mod metadata_tests {
         assert_eq!(decoded, card);
     }
 
+    /// The OpenAI Chat Prompt spec with one user turn that the metadata
+    /// round-trip tests embed.
+    ///
+    /// # Panics
+    /// Panics when the static request is not a valid Prompt spec.
     fn prompt_spec() -> PromptSpec {
         PromptSpec::new(
             Prompt::new(

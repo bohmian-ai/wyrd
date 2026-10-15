@@ -648,6 +648,7 @@ async fn run_invokes_its_agent_through_the_gateway() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn agent_routes_and_pre_run_overrides() {
+    /// Upstream credential that proves a call reached the backup deployment.
     const BACKUP_KEY: &str = "sk-backup-upstream";
     let inference = Inference::start().await;
     put_openai(
@@ -893,7 +894,9 @@ async fn agent_routes_reach_named_native_ingress() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn external_deployment_preserves_model_and_credentials() {
+    /// Bearer credential the external deployment must present upstream.
     const EXTERNAL_KEY: &str = "sk-external-gateway";
+    /// Upstream model id the external deployment must forward unchanged.
     const MODEL: &str = "meta-llama/Llama-3.3-70B";
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))

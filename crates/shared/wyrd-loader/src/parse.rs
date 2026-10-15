@@ -349,6 +349,11 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    /// An envelope without `kind` is refused with one invalid-envelope
+    /// diagnostic naming the missing field.
+    ///
+    /// # Panics
+    /// Panics when the temporary fixture cannot be written or the envelope parses.
     #[test]
     fn parse_rejects_missing_kind() {
         let mut file = NamedTempFile::new().unwrap();
@@ -416,6 +421,12 @@ spec: {{}}
         }
     }
 
+    /// A multi-document YAML file parses into one Card per document, in file
+    /// order; a document without `apiVersion` takes `wyrd/v1`.
+    ///
+    /// # Panics
+    /// Panics when the temporary fixture cannot be written or the documents do
+    /// not parse as a Prompt followed by an Agent.
     #[test]
     fn parse_accepts_multi_doc_yaml() {
         let mut file = NamedTempFile::new().unwrap();
@@ -460,6 +471,12 @@ spec:
         assert_eq!(cards[1].api_version, ApiVersion::v1());
     }
 
+    /// A parsed Card keeps the path it was read from, which later path
+    /// resolution uses as the base for relative references.
+    ///
+    /// # Panics
+    /// Panics when the temporary fixture cannot be written or does not parse to
+    /// one Card from that path.
     #[test]
     fn parse_preserves_source_path() {
         let mut file = NamedTempFile::new().unwrap();
@@ -486,6 +503,12 @@ spec:
         assert_eq!(result[0].source_path, file.path());
     }
 
+    /// Envelope violations in every document of one file are reported together,
+    /// in document order, rather than stopping at the first.
+    ///
+    /// # Panics
+    /// Panics when the temporary fixture cannot be written or the two
+    /// violations are not both reported.
     #[test]
     fn parse_collects_every_envelope_violation() {
         let mut file = NamedTempFile::new().unwrap();
@@ -522,6 +545,12 @@ spec:
         assert!(err.diagnostics[1].message.contains("kind"));
     }
 
+    /// An inline `!file` reference inside a native Prompt body that resolves
+    /// through a symlink outside the workspace is refused as a path escape.
+    ///
+    /// # Panics
+    /// Panics when the fixture files or symlink cannot be created or the inline
+    /// file loads.
     #[cfg(unix)]
     #[test]
     fn parse_rejects_inline_file_symlink_outside_workspace() {

@@ -26,7 +26,7 @@ from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
 
 from ..support import Receiver, client_of
-from .support import PROVIDER_KEY, assert_upstream_credentials, deploy
+from .support import PROVIDER_KEY, assert_upstream_credentials, calls, deploy
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -152,6 +152,7 @@ def test_openai_agents_sdk_runs_through_the_gateway(
     assert_upstream_credentials(
         upstream, "authorization", f"Bearer {PROVIDER_KEY}", wyrd.access_token()
     )
+    assert_one_retained_call(server)
 
 
 def test_pydantic_ai_agent_runs_through_the_gateway(
@@ -172,6 +173,21 @@ def test_pydantic_ai_agent_runs_through_the_gateway(
     assert_upstream_credentials(
         upstream, "authorization", f"Bearer {PROVIDER_KEY}", wyrd.access_token()
     )
+    assert_one_retained_call(server)
+
+
+def assert_one_retained_call(server: WyrdTestServer) -> None:
+    """The server retained exactly the test's one ``openai/gpt-4o`` call, attributed to its caller."""
+    rows = calls(
+        server,
+        "TRUE",
+        "requested_model.deployment AS deployment, requested_model.model AS model, "
+        "outcome, sub_principal_id",
+    )
+    assert [(row["deployment"], row["model"], row["outcome"]) for row in rows] == [
+        ("openai", "gpt-4o", "succeeded")
+    ]
+    assert rows[0]["sub_principal_id"] is not None
 
 
 def test_httpx_reaches_mcp_with_http_auth(gateway_server: tuple[WyrdTestServer, Receiver]) -> None:

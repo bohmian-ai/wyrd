@@ -374,6 +374,11 @@ mod agent_spec_tests {
         .expect("static prompt is valid")
     }
 
+    /// An inline Prompt and the run config round-trip through Agent spec JSON
+    /// as the bare authored Prompt, with no `inline` tag or `value` wrapper.
+    ///
+    /// # Panics
+    /// Panics when the spec does not round-trip or serializes a wrapper.
     #[test]
     fn agent_spec_inline_prompt_roundtrips() {
         let spec = AgentSpec {
@@ -398,6 +403,13 @@ mod agent_spec_tests {
         assert!(!json.contains(r#""value":"#));
     }
 
+    /// A Prompt CardRef in an Agent spec serializes with one `version` field
+    /// and its real `kind`, never a `card` tag, `value` wrapper, or version
+    /// requirement.
+    ///
+    /// # Panics
+    /// Panics when an identity field is invalid, the spec does not round-trip,
+    /// or the YAML carries a removed spelling.
     #[test]
     fn agent_spec_card_prompt_uses_single_version_field() {
         let spec = AgentSpec {
@@ -426,6 +438,13 @@ mod agent_spec_tests {
         assert!(!yaml.contains(&format!("{}{}", "version: ", "^")));
     }
 
+    /// A local Agent Card projects to the shared envelope with no spec hash,
+    /// relationships, or status, which only the server derives, and its JSON
+    /// round-trips the spec.
+    ///
+    /// # Panics
+    /// Panics when the envelope or JSON carries server-derived state or the
+    /// Card does not round-trip.
     #[test]
     fn agent_card_uses_the_shared_envelope_without_client_derived_state() {
         let card = AgentCard {
@@ -466,6 +485,10 @@ mod agent_spec_tests {
     /// reference, plus one required execution route of exactly two shapes;
     /// removed route spellings, route fields on a Prompt, and partial routes
     /// are refused.
+    ///
+    /// # Panics
+    /// Panics when a valid Agent shape is refused or round-trips differently,
+    /// or a refused shape decodes.
     #[test]
     fn agent_prompt_execution_contract() {
         use serde_json::{Value, json};

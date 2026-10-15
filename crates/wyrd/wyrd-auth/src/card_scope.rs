@@ -595,6 +595,12 @@ mod pg_tests {
         assert!(result.is_err(), "missing card should error");
     }
 
+    /// The Card-count cap refusal names the `cards` limit, its value, and the
+    /// scope root; the cap itself is unreachable here without Agent Cards that
+    /// have scope children, so the test checks the refusal's shape.
+    ///
+    /// # Panics
+    /// Panics when the refusal is another variant or carries other details.
     #[tokio::test]
     async fn resolve_caps_at_max_scope_cards() {
         // Verify the cap boundary fires: too_large("cards", MAX_SCOPE_CARDS, root)

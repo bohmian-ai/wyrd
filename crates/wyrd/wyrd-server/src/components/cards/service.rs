@@ -2673,6 +2673,9 @@ mod tests {
     }
 
     /// Build matching row/blob/inventory values for read-integrity regression tests.
+    ///
+    /// # Panics
+    /// Panics when a static fixture value is invalid.
     fn matching_read_integrity_values() -> (
         wyrd_spec::envelope::Card,
         Vec<ArtifactManifestEntry>,

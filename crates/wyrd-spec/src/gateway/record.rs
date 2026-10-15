@@ -794,6 +794,10 @@ mod tests {
 
     /// Proves the attempt entry's cost triple must be all-present or all-null
     /// and unknown usage stays null rather than zero.
+    ///
+    /// # Panics
+    /// Panics when a partial triple is accepted, a complete one is refused, or
+    /// unknown usage is not null.
     #[test]
     fn attempt_cost_triple_is_all_or_nothing() {
         let attempt =
@@ -928,6 +932,9 @@ mod tests {
     }
 
     /// Proves attempt spans validate usage JSON, billing triples, and codes.
+    ///
+    /// # Panics
+    /// Panics when a valid span is refused or an invalid one is accepted.
     #[test]
     fn attempt_span_fields_enforce_record_invariants() {
         let span = |patch: Value| {

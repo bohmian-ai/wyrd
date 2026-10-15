@@ -638,9 +638,11 @@ class BifrostBatchIterator(Iterator[pyarrow.RecordBatch]):
 class _BifrostBase:
     """Everything the sync and async clients share.
 
-    Construction and the two non-IO operations live here because they are
-    identical on both facades: ``insert`` is a bounded channel send and
-    ``use_table`` is a lock swap, so neither has an ``await`` form to differ in.
+    Construction, the local binding and counters, and ``insert`` live here
+    because they are identical on both facades: ``use_table``, ``table``,
+    ``dropped``, and ``producer_count`` never connect, and ``insert`` is a
+    bounded channel send once connected, so none has an ``await`` form to
+    differ in.
     """
 
     def __init__(
@@ -651,9 +653,10 @@ class _BifrostBase:
     ) -> None:
         """Retain one client's arguments, optionally bound to a write target.
 
-        Construction performs no IO and resolves nothing. The first operation
-        connects exactly as ``connect`` does, once per handle, and raises its
-        errors.
+        Construction performs no IO and resolves nothing. The first server
+        operation, including the first ``insert``, connects exactly as
+        ``connect`` does, once per handle, and raises its errors. Binding and
+        reading the write target and reading the counters never connect.
 
         Args:
             table: the active write target. Omitted, the client is query-only
@@ -678,7 +681,8 @@ class _BifrostBase:
         """Bind ``table`` as the write target, returning the previous binding.
 
         The previous table's producer stays pooled, so its buffered rows still
-        flush; a swap loses nothing.
+        flush; a swap loses nothing. Local: it never connects, and a binding
+        made before the first server operation is carried into it.
 
         Args:
             table: the new write target.
@@ -692,7 +696,7 @@ class _BifrostBase:
 
     @property
     def table(self) -> TableConfig | None:
-        """The active write binding, if any."""
+        """The active write binding, if any. Local; never connects."""
 
         native = self._native.table
         return None if native is None else TableConfig._from_native(native)
@@ -700,8 +704,10 @@ class _BifrostBase:
     def insert(self, row: Any, correlation: Correlation | None = None) -> None:
         """Enqueue one row into the active table.
 
-        Non-blocking; the row is durable after ``flush()``. A saturated queue
-        refuses here rather than dropping silently.
+        Non-blocking once connected; the row is durable after ``flush()``. A
+        saturated queue refuses here rather than dropping silently. On a
+        handle not yet connected, the first ``insert`` connects as
+        ``connect`` does, blocking the caller until it completes.
 
         Args:
             row: a Pydantic model instance, a mapping, or a JSON object string
@@ -713,7 +719,8 @@ class _BifrostBase:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an unparsable
                 ``card_uid``; ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table
                 is bound; ``WYRD_CLIENT_429_QUEUE_FULL`` when the producer
-                queue is full.
+                queue is full; or, on a handle not yet connected, the error
+                ``connect`` raises.
 
         """
 
@@ -726,13 +733,19 @@ class _BifrostBase:
 
     @property
     def dropped(self) -> int:
-        """Rows dropped by the fire-and-forget ``wyrd.observe.record`` path."""
+        """Rows dropped by the fire-and-forget ``wyrd.observe.record`` path.
+
+        Zero before the first server operation. Local; never connects.
+        """
 
         return int(self._native.dropped)
 
     @property
     def producer_count(self) -> int:
-        """Number of distinct table producers currently pooled."""
+        """Number of distinct table producers currently pooled.
+
+        Zero before the first server operation. Local; never connects.
+        """
 
         return int(self._native.producer_count)
 
@@ -1028,8 +1041,12 @@ class AsyncBifrost(_BifrostBase):
     """The ``await`` surface over the same native client.
 
     Every blocking native call runs in a worker thread, so the event loop is
-    never blocked. ``insert`` and ``use_table`` stay synchronous because they
-    perform no IO. Each method behaves as its ``Bifrost`` counterpart.
+    never blocked. ``use_table``, ``table``, ``dropped``, and
+    ``producer_count`` stay synchronous because they never connect;
+    ``insert`` stays synchronous because it is a bounded channel send once
+    connected, so connect first with ``await AsyncBifrost.connect()`` or an
+    awaited operation to keep its first call off the event loop. Each method
+    behaves as its ``Bifrost`` counterpart.
     """
 
     @classmethod

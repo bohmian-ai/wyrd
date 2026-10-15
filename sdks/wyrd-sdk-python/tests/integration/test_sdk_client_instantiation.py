@@ -53,6 +53,10 @@ class Event(BaseModel):
     label: str
 
 
+class Decision(BaseModel):
+    detail: dict[str, Any]
+
+
 @pytest.fixture(scope="module")
 def server() -> Iterator[WyrdTestServer]:
     """A server with short-lived access tokens, exported to the environment."""
@@ -91,6 +95,9 @@ def forged_clients(server: WyrdTestServer) -> tuple[WyrdClient, WyrdClient]:
 def test_ambient_connect_opens_every_handle(
     server: WyrdTestServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    async def eager_async_operation() -> object:
+        return await (await AsyncBifrost.connect()).list_tables()
+
     for ambient in (
         lambda: None,
         lambda: saved_configuration_only(server, monkeypatch, tmp_path / "saved"),
@@ -98,6 +105,7 @@ def test_ambient_connect_opens_every_handle(
         ambient()
         for handle, call in HANDLES:
             call(handle.connect())
+        asyncio.run(eager_async_operation())
         bound = Bifrost.connect(
             table=TableConfig(Event, "vala.datasets.ambient_options"),
             client_byte_limit_bytes=8 * 1024 * 1024,
@@ -119,6 +127,25 @@ def test_lazy_constructors_open_every_handle_on_first_operation(
         for handle, call in HANDLES:
             call(handle())
         asyncio.run(first_async_operation())
+
+
+def test_local_state_survives_the_first_connection(
+    server: WyrdTestServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bifrost = Bifrost(table=TableConfig(Event, "vala.datasets.lazy_first"))
+    bifrost.use_table(TableConfig(Event, "vala.datasets.lazy_bound"))
+    cards = Cards()
+    prompts = cards.prompt
+
+    assert bifrost.register() in ("created", "already_exists")
+    assert bifrost.table is not None and bifrost.table.fqn == "vala.datasets.lazy_bound"
+    assert "vala.datasets.lazy_bound" in [
+        f"{entry['namespace']}.{entry['name']}" for entry in bifrost.list_tables()
+    ]
+    prompts.list(space="default")
+    monkeypatch.setenv("WYRD_SERVER_URL", UNREACHABLE)
+    monkeypatch.delenv("WYRD_API_KEY")
+    cards.prompt.list(space="default")
 
 
 def test_connect_and_lazy_first_call_share_the_no_credentials_error(
@@ -160,12 +187,28 @@ def test_delegated_connect_uses_the_subject_principal(server: WyrdTestServer) ->
         )
     )
     delegated = actor.on_behalf_of(subject.access_token())
+    principals = Principals.connect()
+    subject_id, actor_id = (
+        principals.list(name=name)["principals"][0]["principal_id"]
+        for name in ("instantiation_subject", "instantiation_actor")
+    )
 
     for bifrost in (Bifrost.connect(client=delegated), Bifrost(client=delegated)):
         with pytest.raises(WyrdError) as refused:
             bifrost.list_tables()
         assert refused.value.code == DENIED
+        bifrost.sql("SELECT COUNT(*) AS n FROM vala.system.audit_log")
     Bifrost.connect(client=actor).list_tables()
+
+    server.flush_bifrost()
+    decisions = Bifrost.connect(client=actor).sql(
+        "SELECT detail FROM vala.system.audit_log "
+        "WHERE operation = 'bifrost.query.read_decision' AND audit_principal_id = $1",
+        [subject_id],
+        model=Decision,
+    )
+    actors = [row.detail["delegation_chain"][0]["principal_id"] for row in decisions]
+    assert actors == [actor_id, actor_id]
 
 
 def test_handles_reuse_the_client_cache_and_renew(

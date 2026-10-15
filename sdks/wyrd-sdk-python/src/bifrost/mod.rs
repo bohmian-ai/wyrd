@@ -17,7 +17,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::io::Cursor;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
@@ -529,22 +529,36 @@ impl PyQueryTerminal {
 /// active one.
 ///
 /// Construction performs no IO: it retains the optional `WyrdClient`, the
-/// initial write target, and the byte budget, and the first operation
-/// connects through the shared Rust `Bifrost::connect` exactly once. The
-/// `connect` factory connects immediately.
+/// initial write target, and the byte budget, and the first server operation
+/// connects through the shared Rust `Bifrost::connect` exactly once. Binding
+/// and reading the write target and reading the counters stay local until
+/// then. The `connect` factory connects immediately.
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "Bifrost")]
 pub struct Bifrost {
     /// The one native client both public Python facades drive, connected on
     /// first use.
     handle: crate::client::LazyConnection<NativeBifrost>,
-    /// The initial write target the connection binds.
-    table: Option<TableConfig>,
+    /// Where the write target is bound: here until the first server
+    /// operation moves it into the native client.
+    binding: Mutex<Binding>,
     /// The handle-wide ingestion byte budget the connection applies.
     client_byte_limit_bytes: Option<usize>,
 }
 
+/// Owner of a Python [`Bifrost`]'s write target.
+enum Binding {
+    /// Not yet moved into the native client: the target bound so far.
+    Local(Option<TableConfig>),
+    /// Moved: the native client's active table is the only binding.
+    Native,
+}
+
 impl Bifrost {
     /// Return the connected native client, connecting it on first use.
+    ///
+    /// The first caller after a successful connection moves the locally bound
+    /// write target into the native client under the binding lock, so a
+    /// target bound concurrently with the connection is never lost.
     ///
     /// # Errors
     ///
@@ -553,17 +567,41 @@ impl Bifrost {
     /// `Bifrost::connect`.
     fn handle(&self, py: Python<'_>) -> WyrdPyResult<&NativeBifrost> {
         let options = BifrostOptions {
-            table: self.table.clone(),
+            table: None,
             queue: wyrd_queue::QueueConfig::with_client_byte_limit(self.client_byte_limit_bytes),
         };
-        self.handle
+        let native = self
+            .handle
             .get(py, |client| async move {
                 match client {
                     Some(client) => NativeBifrost::connect_with(&client, options).await,
                     None => NativeBifrost::connect(options).await,
                 }
             })
-            .map_err(client_error)
+            .map_err(client_error)?;
+        let mut binding = self.binding();
+        if let Binding::Local(Some(table)) = std::mem::replace(&mut *binding, Binding::Native) {
+            native.use_table(table);
+        }
+        Ok(native)
+    }
+
+    /// The native client the binding moved into.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no connection has succeeded; [`Binding::Native`] is set
+    /// only after one, so callers that matched it cannot reach this.
+    fn native(&self) -> &NativeBifrost {
+        self.handle
+            .connected()
+            .expect("a moved binding has a connected native client")
+    }
+
+    /// Lock the write-target binding; a panic while it was held leaves a
+    /// whole value, so a poisoned lock is still read.
+    fn binding(&self) -> MutexGuard<'_, Binding> {
+        self.binding.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -591,7 +629,7 @@ impl Bifrost {
     ) -> Self {
         Self {
             handle: crate::client::LazyConnection::new(client.as_deref()),
-            table: table.map(|table| table.inner),
+            binding: Mutex::new(Binding::Local(table.map(|table| table.inner))),
             client_byte_limit_bytes,
         }
     }
@@ -653,15 +691,16 @@ impl Bifrost {
     }
 
     /// Binds `table` as the write target, returning the previous binding.
-    fn use_table(
-        &self,
-        py: Python<'_>,
-        table: PyTableConfig,
-    ) -> WyrdPyResult<Option<PyTableConfig>> {
-        Ok(self
-            .handle(py)?
-            .use_table(table.inner)
-            .map(|inner| PyTableConfig { inner }))
+    ///
+    /// Local: before the first server operation the binding is kept here and
+    /// carried into the connection.
+    fn use_table(&self, table: PyTableConfig) -> Option<PyTableConfig> {
+        let mut binding = self.binding();
+        match &mut *binding {
+            Binding::Local(local) => local.replace(table.inner),
+            Binding::Native => self.native().use_table(table.inner),
+        }
+        .map(|inner| PyTableConfig { inner })
     }
 
     /// Binds an already-registered table by name, describing it first.
@@ -675,13 +714,14 @@ impl Bifrost {
         Ok(())
     }
 
-    /// The active write binding, if any.
+    /// The active write binding, if any. Local; never connects.
     #[getter]
-    fn table(&self, py: Python<'_>) -> WyrdPyResult<Option<PyTableConfig>> {
-        Ok(self
-            .handle(py)?
-            .table()
-            .map(|inner| PyTableConfig { inner }))
+    fn table(&self) -> Option<PyTableConfig> {
+        match &*self.binding() {
+            Binding::Local(local) => local.clone(),
+            Binding::Native => self.native().table(),
+        }
+        .map(|inner| PyTableConfig { inner })
     }
 
     /// Enqueues one JSON row into the active table.
@@ -887,16 +927,20 @@ impl Bifrost {
 
     /// Rows dropped by the fire-and-forget observe path under backpressure.
     ///
-    /// Always zero for [`Bifrost::insert`], which refuses rather than drops.
+    /// Always zero for [`Bifrost::insert`], which refuses rather than drops,
+    /// and before the first server operation. Local; never connects.
     #[getter]
-    fn dropped(&self, py: Python<'_>) -> WyrdPyResult<u64> {
-        Ok(self.handle(py)?.dropped())
+    fn dropped(&self) -> u64 {
+        self.handle.connected().map_or(0, NativeBifrost::dropped)
     }
 
-    /// Number of distinct table producers currently pooled.
+    /// Number of distinct table producers currently pooled; zero before the
+    /// first server operation. Local; never connects.
     #[getter]
-    fn producer_count(&self, py: Python<'_>) -> WyrdPyResult<usize> {
-        Ok(self.handle(py)?.producer_count())
+    fn producer_count(&self) -> usize {
+        self.handle
+            .connected()
+            .map_or(0, NativeBifrost::producer_count)
     }
 }
 

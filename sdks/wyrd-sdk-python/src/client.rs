@@ -105,6 +105,12 @@ impl<T: Send + Sync> LazyConnection<T> {
         }
     }
 
+    /// The connected handle when a connection has already succeeded; never
+    /// connects, so local state can be read without IO.
+    pub(crate) fn connected(&self) -> Option<&T> {
+        self.handle.get()
+    }
+
     /// Return the connected handle, connecting it with `connect` on first use.
     ///
     /// `connect` receives the retained client and runs on the shared runtime

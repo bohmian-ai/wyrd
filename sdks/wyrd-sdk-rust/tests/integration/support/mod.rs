@@ -305,7 +305,7 @@ impl Deployment {
                 "{}/v1/verification/bindings/{binding}",
                 self.server.base_url().expect("bound server has a URL")
             ))
-            .bearer_auth(token.expose())
+            .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
             .send()
             .await
             .expect("the server answers")

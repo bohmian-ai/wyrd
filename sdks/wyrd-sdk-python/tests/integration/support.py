@@ -165,7 +165,7 @@ def binding_status(server: WyrdTestServer, binding_id: str) -> dict[str, Any]:
     """``binding_id``'s status, read as the administrator over HTTP."""
     response = httpx.get(
         f"{server.base_url}/v1/verification/bindings/{binding_id}",
-        headers={"authorization": f"Bearer {server.access_token()}"},
+        headers={"x-wyrd-access-token": f"Bearer {server.access_token()}"},
         timeout=30,
     )
     response.raise_for_status()

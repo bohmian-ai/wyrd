@@ -254,7 +254,7 @@ test("unfitted baseline is skipped on schedule", async ({ server }) => {
   const token = await WyrdClient.connect().accessToken();
   const status = async (): Promise<{ next_run_at?: string; readiness: string; last_execution_id?: string }> => {
     const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${id}`, {
-      headers: { authorization: `Bearer ${token}` },
+      headers: { "x-wyrd-access-token": `Bearer ${token}` },
     });
     expect(response.status).toBe(200);
     return (await response.json()) as { next_run_at?: string; readiness: string; last_execution_id?: string };

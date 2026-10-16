@@ -1,7 +1,7 @@
 ---
 id: TASK-004-R1
 kind: remediation
-status: ready
+status: complete
 spec: SPEC-verifier-building-blocks
 spec_revision: 7
 parent_task: TASK-004

@@ -10,14 +10,15 @@ owned.
 
 The owner approved Task 001 and its final remediation at
 `a02055b5561b889fa9d934038109f3028b0ecb1d`. Tasks 002–004 can now execute
-in parallel from that shared contract handoff.
+in parallel from that shared contract handoff. The owner approved Task 004
+at `b4226148e9f962d0508ba46edb9c07676cad48ba`.
 
 | Task | Status | Next step |
 | --- | --- | --- |
 | [001 — contracts](TASK-001-verifier-contract.md) | Complete; owner-approved | Shared handoff available |
 | [002 — engine](TASK-002-verification-engine.md) | Ready | Execute alongside 003 and 004 |
 | [003 — hosted runtime](TASK-003-hosted-check-runtime.md) | Ready | Execute alongside 002 and 004 |
-| [004 — SDKs, examples, docs](TASK-004-sdks-examples-and-docs.md) | Ready | Execute alongside 002 and 003 |
+| [004 — SDKs, examples, docs](TASK-004-sdks-examples-and-docs.md) | Complete; owner-approved | Journeys run at merged-change review |
 | [005 — integration](TASK-005-server-integration.md) | Proposed; awaiting 002–004 | Compose their integrated result, then run final proof |
 
 This records direct owner acceptance, not a new independent review PASS.

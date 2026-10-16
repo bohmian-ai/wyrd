@@ -1,7 +1,7 @@
 ---
 id: TASK-004
 kind: implementation
-status: ready
+status: complete
 spec: SPEC-verifier-building-blocks
 spec_revision: 6
 requirements: [REQ-001, REQ-002, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, INV-001, INV-002, INV-003, INV-004, INV-006, INV-008, AC-005, AC-006, AC-007, AC-008, AC-009, AC-010]
@@ -321,3 +321,18 @@ Limits and TASK-005 handoff (approved r7):
   `WYRD_GATEWAY_404_MODEL_UNAVAILABLE`.
 - r8 moved the external example repositories to TASK-005; the uncommitted
   partial `wyrd-example-ts` update is discarded, not handed off.
+
+## Owner acceptance — 2026-10-15
+
+The owner explicitly approved Task 004 at
+`b4226148e9f962d0508ba46edb9c07676cad48ba`. The R1 re-review
+(`task-004-r1-20261015-dddf98556`) closed FIND-004-2 through -6 and -9 and
+confirmed FIND-004-7 superseded by r8. The owner accepts the remediation of
+FIND-004-1, -8 and -10 using the
+[R2 implementation evidence](../review/task-004-r1-20261015-dddf98556/TASK-004-R2-python-wait-and-typed-check-closure.md#implementation-evidence).
+
+Completion here records direct owner acceptance, not a new independent
+review PASS. Prior immutable verdicts remain unchanged. The authored
+three-language journeys are compiled, typechecked and discovered but not
+executed; they run with the merged-change review after Task 005, which also
+owns the Verifier loader cutover and the `code.run` argument contract.

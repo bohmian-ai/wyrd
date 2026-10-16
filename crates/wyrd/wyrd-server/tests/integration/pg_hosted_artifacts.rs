@@ -24,7 +24,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use vala_eval::blocks::{
     ActionExecutor, AgentCardResolver, AgentExecutor, BlockCall, BlockError, CallInput, CallValue,
-    CheckExecutor, EvidenceReader, Position, PromptCardResolver,
+    CheckExecutor, DriftChecks, EngineError, EvidenceReader, Position, PromptCardResolver,
 };
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
@@ -40,8 +40,9 @@ use wyrd_runtime::{
     PermissionScope, Principal, PrincipalKind, PrincipalRef,
 };
 use wyrd_server::components::auth::Caller;
+use wyrd_server::components::gateway::GatewayCallSubject;
 use wyrd_server::verification::hosted::HostedLimits;
-use wyrd_server::verification::hosted::blocks::HostedBlocks;
+use wyrd_server::verification::hosted::blocks::{Execution, HostedBlocks};
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
 use wyrd_server::verification::hosted::registry::TenantRegistry;
 use wyrd_server::verification::hosted::sandbox::{CodeExecutor, Sandbox};
@@ -51,7 +52,9 @@ use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex};
 use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, ExecutionRoute};
-use wyrd_spec::card::verifier::{Action, AgentCall, Check, CodeCall, CodeRuntime, CodeSource};
+use wyrd_spec::card::verifier::{
+    Action, AgentCall, Check, CodeCall, CodeRuntime, CodeSource, VerifierSpec,
+};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
@@ -1057,4 +1060,262 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
     assert!(settled.result_id.is_some(), "{settled:?}");
     let spun = seed.execution(spinning).await.expect("spinner reads");
     assert_eq!(spun.status, "completed", "{spun:?}");
+}
+
+/// Hosted limits whose combined input-file bound admits the 11-byte notes
+/// file once but not twice.
+fn tight_files() -> HostedLimits {
+    HostedLimits {
+        files_max_bytes: 20,
+        ..HostedLimits::default()
+    }
+}
+
+/// A Verifier extracting media slots `a` and optional `b`, accepting
+/// `formats` up to `max_bytes`, whose one requirement holds when `a`
+/// extracts in two separate steps.
+///
+/// # Panics
+/// Panics when the static spec is invalid.
+fn two_extracts(formats: &[&str], max_bytes: Option<u64>) -> Arc<VerifierSpec> {
+    let slot = |required: bool| json!({ "type": "media", "formats": formats, "max_bytes": max_bytes, "required": required });
+    let spec: VerifierSpec = serde_json::from_value(json!({
+        "inputs": { "a": slot(true), "b": slot(false) },
+        "steps": [
+            { "id": "first", "action": { "kind": "extract", "from": "inputs.a" } },
+            { "id": "again", "action": { "kind": "extract", "from": "inputs.a" } }
+        ],
+        "requirements": [{ "id": "read-twice", "statement": "a extracts twice.",
+            "check": { "kind": "assert", "path": "steps.again.output", "operator": "is_not_null" } }]
+    }))
+    .expect("Verifier decodes");
+    spec.validate().expect("valid Verifier");
+    Arc::new(spec)
+}
+
+/// A selected Artifact file is admitted against its media slot and the
+/// execution's combined input-file bound before any block runs, through the
+/// per-execution engine direct and queued executions share: a format the
+/// slot refuses, a file above the slot's `max_bytes`, the same file pinned
+/// in two slots, and an Artifact plus an unread uploaded file whose
+/// declared lengths together pass the bound are all refused. One pinned
+/// Artifact read by two extract steps is charged once and passes.
+///
+/// # Panics
+/// Panics when the server, pool, or engine fails to start, a refusal is
+/// not the expected input error, or the within-budget control fails.
+#[tokio::test]
+#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
+async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit() {
+    let registered = Registered::start().await;
+    let blocks = HostedBlocks::start(worker(), tight_files())
+        .await
+        .expect("pool starts");
+    let caller = user(
+        registered.server.data_tenant_id(),
+        [Permission::card_read()],
+    );
+    let slot = |name: &str| SlotName::new(name).expect("slot");
+    let run = |spec: Arc<VerifierSpec>, evidence: BTreeMap<SlotName, InputDeclaration>| {
+        let (blocks, caller, state) = (&blocks, &caller, registered.server.state());
+        async move {
+            let routes = BTreeMap::new();
+            blocks
+                .engine(
+                    state,
+                    Execution {
+                        caller,
+                        evidence: &evidence,
+                        routes: &routes,
+                        subject: GatewayCallSubject {
+                            run_id: None,
+                            card_uid: None,
+                        },
+                        accepted_at: chrono::Utc::now(),
+                        drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                    },
+                )
+                .expect("engine builds")
+                .run(spec, evidence, Instant::now() + Duration::from_secs(30))
+                .await
+        }
+    };
+    let unread = InputDeclaration::File {
+        sha256: Sha256Hex::digest(b"never uploaded"),
+        size_bytes: 10,
+        format: "text".parse().expect("format"),
+        filename: None,
+    };
+    let cases = [
+        (
+            two_extracts(&["pdf"], None),
+            vec![("a", registered.file("notes.txt"))],
+            "does not accept",
+            false,
+        ),
+        (
+            two_extracts(&["text"], Some(5)),
+            vec![("a", registered.file("notes.txt"))],
+            "5-byte limit",
+            true,
+        ),
+        (
+            two_extracts(&["text"], None),
+            vec![
+                ("a", registered.file("notes.txt")),
+                ("b", registered.file("notes.txt")),
+            ],
+            "combined 20-byte limit",
+            true,
+        ),
+        (
+            two_extracts(&["text"], None),
+            vec![("a", registered.file("notes.txt")), ("b", unread)],
+            "combined 20-byte limit",
+            true,
+        ),
+    ];
+    for (spec, inputs, expected, too_large) in cases {
+        let evidence = inputs
+            .into_iter()
+            .map(|(name, declaration)| (slot(name), declaration))
+            .collect();
+        let refused = run(spec, evidence).await;
+        let reason = match (&refused, too_large) {
+            (Err(EngineError::InputInvalid(reason)), false)
+            | (Err(EngineError::InputTooLarge(reason)), true) => reason,
+            _ => panic!("expected a refusal containing {expected:?}: {refused:?}"),
+        };
+        assert!(reason.contains(expected), "{reason}");
+    }
+
+    let outcome = run(
+        two_extracts(&["text"], Some(11)),
+        BTreeMap::from([(slot("a"), registered.file("notes.txt"))]),
+    )
+    .await
+    .expect("one pinned Artifact within every bound runs");
+    assert_eq!(outcome.verdict, VerificationVerdict::Passed, "{outcome:?}");
+}
+
+/// A queued execution whose evidence does not conform to its Verifier, or
+/// whose declared files together pass the combined input-file bound, settles
+/// `errored` with `input_invalid` on its first attempt and no result, so no
+/// verdict or Operator follows and no retry is spent; conforming evidence in
+/// the same runtime completes.
+///
+/// # Panics
+/// Panics when the server, seeding, or runtime fails, or an execution
+/// settles otherwise.
+#[tokio::test]
+#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
+async fn nonconforming_queued_evidence_errors_without_a_verdict() {
+    let registered = Registered::start().await;
+    let tenant = registered.server.data_tenant_id();
+    registered
+        .server
+        .ensure_builtin_tables_for_test(tenant)
+        .await
+        .expect("tenant receives every built-in table");
+    let state = registered
+        .server
+        .state()
+        .clone()
+        .with_verification_blocks(Arc::new(
+            HostedBlocks::start(worker(), tight_files())
+                .await
+                .expect("pool starts"),
+        ));
+    let seed = VerificationFixture::provision(state.postgres.wyrd(), tenant)
+        .await
+        .expect("tenant provisions");
+    let (subject, _) = seed
+        .service("conform-subject")
+        .await
+        .expect("subject registers");
+    let verifier = seed
+        .verifier(
+            "conform-typed",
+            &json!({
+                "inputs": {
+                    "x": { "type": "json", "schema": { "type": "integer" } },
+                    "a": { "type": "media", "formats": ["text"], "required": false },
+                    "b": { "type": "media", "formats": ["text"], "required": false }
+                },
+                "requirements": [{ "id": "x-present", "statement": "x is present.",
+                    "check": { "kind": "assert", "path": "inputs.x", "operator": "is_not_null" } }]
+            }),
+        )
+        .await
+        .expect("Verifier registers");
+    let slot = |name: &str| SlotName::new(name).expect("slot");
+    let x = |value: Value| (slot("x"), InputDeclaration::Json { value });
+    let file = |name: &str, body: &[u8]| {
+        (
+            slot(name),
+            InputDeclaration::File {
+                sha256: Sha256Hex::digest(body),
+                size_bytes: 15,
+                format: "text".parse().expect("format"),
+                filename: None,
+            },
+        )
+    };
+    let invalid = seed
+        .submit(&verifier, &subject, BTreeMap::from([x(json!("one"))]))
+        .await
+        .expect("schema-invalid execution queues");
+    let oversized = seed
+        .submit(
+            &verifier,
+            &subject,
+            BTreeMap::from([x(json!(1)), file("a", b"first"), file("b", b"second")]),
+        )
+        .await
+        .expect("oversized execution queues");
+    let valid = seed
+        .submit(&verifier, &subject, BTreeMap::from([x(json!(1))]))
+        .await
+        .expect("valid execution queues");
+
+    let runtime = VerificationRuntime::builder(&state)
+        .limits(RuntimeLimits {
+            lease: Duration::from_mins(1),
+            execution_timeout: Duration::from_secs(20),
+            poll_interval: Duration::from_millis(50),
+            ..RuntimeLimits::default()
+        })
+        .build()
+        .expect("the runtime composes");
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let mut settled = Vec::new();
+    for execution in [invalid, oversized, valid] {
+        settled.push(loop {
+            let row = seed.execution(execution).await.expect("execution reads");
+            if !matches!(row.status.as_str(), "pending" | "running" | "retrying") {
+                break row;
+            }
+            assert!(Instant::now() < deadline, "{execution} never settled");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+    }
+    stop.cancel();
+    task.await.expect("the runtime stops");
+
+    for refused in &settled[..2] {
+        assert_eq!(
+            (
+                refused.status.as_str(),
+                refused.attempts,
+                refused.error_code.as_deref()
+            ),
+            ("errored", 1, Some("input_invalid")),
+            "{refused:?}"
+        );
+        assert!(refused.result_id.is_none(), "{refused:?}");
+    }
+    assert_eq!(settled[2].status, "completed", "{:?}", settled[2]);
+    assert!(settled[2].result_id.is_some(), "{:?}", settled[2]);
 }

@@ -45,11 +45,6 @@ spec:
         space: wyrd-team
         name: retention-guardrail
         version: "1.0.0"
-      runs_on:
-        kind: Trigger
-        space: wyrd-team
-        name: retention-observations-ready
-        version: "1.0.0"
       on_failure:
         - kind: Operator
           space: wyrd-team

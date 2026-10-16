@@ -9,27 +9,34 @@ spec:
   # NO subject. Subjects attach this Verifier through their own `verified_by`
   # bindings, so any Model over the same feature set can reuse it without
   # reversioning this card.
-  implementation:
-    kind: drift
-    spec:
-      method: Psi
-      signal:
-        kind: Distribution
-        # Baseline Data card was registered by a data pipeline. External `ref:`.
-        baseline_ref:
-          kind: Data
-          space: wyrd-team
-          name: churn-classifier-data
-          version: "1.4.2"
-        features: [tenure_months, monthly_charges, contract_type]
-      condition:
-        kind: Statistical
-      profile:
-        kind: Psi
-        binning_strategy:
-          kind: Quantile
-          n_bins: 10
-        categorical_features: [contract_type]
-        threshold:
-          kind: Fixed
-          value: 0.2
+  inputs:
+    current:
+      type: samples
+      features: [tenure_months, monthly_charges, contract_type]
+  requirements:
+    - id: inputs-stable
+      statement: Churn classifier inputs keep their training distribution.
+      check:
+        kind: drift
+        on: inputs.current
+        method: Psi
+        signal:
+          kind: Distribution
+          # Baseline Data card was registered by a data pipeline. External `ref:`.
+          baseline_ref:
+            kind: Data
+            space: wyrd-team
+            name: churn-classifier-data
+            version: "1.4.2"
+          features: [tenure_months, monthly_charges, contract_type]
+        condition:
+          kind: Statistical
+        profile:
+          kind: Psi
+          binning_strategy:
+            kind: Quantile
+            n_bins: 10
+          categorical_features: [contract_type]
+          threshold:
+            kind: Fixed
+            value: 0.2

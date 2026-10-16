@@ -46,49 +46,6 @@ pub enum WyrdCliError {
         detail: String,
     },
 
-    /// Registry reference loading is not implemented for this command yet.
-    #[error("registry-resolved eval refs are not supported yet; pass a card file path")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_REGISTRY_REF_UNSUPPORTED",
-        status = 400,
-        title = "Registry ref resolution is not implemented",
-        remediation = "Pass a filesystem path to a Verifier card YAML or JSON file whose `implementation.kind` is `eval`."
-    )]
-    RegistryRefUnsupported,
-
-    /// LLM judge tasks require the deterministic mock until provider wiring lands.
-    #[error("LLM judge tasks require --judge-mock")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_JUDGE_MOCK_REQUIRED",
-        status = 400,
-        title = "Judge mock required",
-        remediation = "Pass --judge-mock for Eval specs containing LLM judge tasks."
-    )]
-    JudgeMockRequired,
-
-    /// Verifier card path had an unsupported extension.
-    #[error("verifier card file extension is not supported: {path}")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_CARD_EXTENSION_UNSUPPORTED",
-        status = 400,
-        title = "Verifier card extension unsupported",
-        remediation = "Use .json, .yaml, or .yml for Verifier card files."
-    )]
-    CardExtensionUnsupported {
-        /// Display path.
-        path: String,
-    },
-
-    /// Card file did not contain an eval-backed Verifier card.
-    #[error("card file must contain kind: Verifier with implementation.kind: eval")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_NOT_EVAL_CARD",
-        status = 400,
-        title = "Card file is not an eval Verifier card",
-        remediation = "Pass a Wyrd card envelope with kind: Verifier and implementation.kind: eval."
-    )]
-    NotEvalCard,
-
     /// Records JSONL parsing failed.
     #[error("records JSONL parse failed for {path}: {detail}")]
     #[wyrd_error(
@@ -127,7 +84,7 @@ pub enum WyrdCliError {
         code = "WYRD_CLI_400_EVAL_SPEC_INVALID",
         status = 400,
         title = "Eval spec invalid",
-        remediation = "Fix the eval implementation spec on the Verifier card before running the evaluation."
+        remediation = "Fix the Eval spec file before running the evaluation."
     )]
     EvalSpecInvalid {
         /// Validation detail.
@@ -457,10 +414,6 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
                 details: serde_json::json!({ "field": field }),
             },
             WyrdCliError::QueryConfig { .. }
-            | WyrdCliError::RegistryRefUnsupported
-            | WyrdCliError::JudgeMockRequired
-            | WyrdCliError::CardExtensionUnsupported { .. }
-            | WyrdCliError::NotEvalCard
             | WyrdCliError::RecordsParse { .. }
             | WyrdCliError::Parse { .. }
             | WyrdCliError::EvalSpecInvalid { .. }

@@ -2674,8 +2674,8 @@ mod verifier_card_tests {
                     .replace("spec:\n  inputs:", "spec:\n  thresholds: {}\n  inputs:"),
             ),
             (
-                "llm judge check",
-                ASSERT_VERIFIER_YAML.replace("kind: assert", "kind: llm_judge"),
+                "unknown check kind",
+                ASSERT_VERIFIER_YAML.replace("kind: assert", "kind: judge"),
             ),
         ] {
             assert_ne!(yaml, ASSERT_VERIFIER_YAML, "{case} edit applies");

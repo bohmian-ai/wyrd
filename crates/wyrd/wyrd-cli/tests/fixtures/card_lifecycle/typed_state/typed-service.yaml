@@ -18,6 +18,9 @@ spec:
           runs_on:
             kind: schedule
             cron: "0 * * * *"
+          inputs:
+            current:
+              features: [feature]
     - alias: model_shadow
       ref:
         kind: Model
@@ -28,8 +31,6 @@ spec:
       ref: ./agent-triage.yaml
       verified_by:
         - verifier: ./quality.yaml
-          runs_on:
-            kind: observations_ready
     - alias: agent_inline
       ref: ./agent-inline.yaml
     - alias: triage_prompt

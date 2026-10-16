@@ -1304,11 +1304,15 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 /// enqueue answers `202 Accepted`, direct execution answers `200` with its
 /// result and documents its stable refusals, and no other Verification
 /// operation is routed. The in-process server uses local storage, so its
-/// evidence plans target the digest-keyed local upload route.
+/// evidence plans target the digest-keyed local upload route. The served
+/// document names no retired abbreviated evaluation identifier (`eval`,
+/// `evals`, `Eval…`, `…_EVAL_…`), mirroring the `check:deps` vocabulary rule,
+/// while standard words such as `evaluation` and `retrieval` stay legal.
 ///
 /// # Panics
-/// Panics when the server fails to start or stop, or when a Verification path,
-/// method, status, or schema reference differs.
+/// Panics when the server fails to start or stop, when a Verification path,
+/// method, status, or schema reference differs, or when the document names a
+/// retired evaluation identifier.
 #[tokio::test]
 async fn verification_contract_publishes_five_typed_operations_and_the_local_upload() {
     let server = WyrdTestServer::start_in_process()
@@ -1399,6 +1403,39 @@ async fn verification_contract_publishes_five_typed_operations_and_the_local_upl
             .iter()
             .all(|status| documented.contains(status)),
         "{documented:?}"
+    );
+
+    let served = document.to_string();
+    let retired: Vec<String> = served
+        .to_ascii_lowercase()
+        .match_indices("eval")
+        .map(|(start, _)| start)
+        .filter(|&start| {
+            let word = &served[start..start + 4];
+            let before = served[..start].chars().next_back();
+            let rest = served[start + 4..].trim_start_matches(['s', 'S']);
+            let after = rest.chars().next();
+            match word {
+                "eval" => {
+                    !before.is_some_and(|c| c.is_ascii_alphabetic())
+                        && !after.is_some_and(|c| c.is_ascii_lowercase())
+                }
+                "Eval" => {
+                    !before.is_some_and(|c| c.is_ascii_uppercase())
+                        && !after.is_some_and(|c| c.is_ascii_lowercase())
+                }
+                "EVAL" => {
+                    !before.is_some_and(|c| c.is_ascii_uppercase())
+                        && !after.is_some_and(|c| c.is_ascii_uppercase())
+                }
+                _ => false,
+            }
+        })
+        .map(|start| served[start..].chars().take(60).collect())
+        .collect();
+    assert!(
+        retired.is_empty(),
+        "served OpenAPI names the retired evaluation vocabulary: {retired:?}"
     );
 
     server.shutdown().await.expect("server shuts down");

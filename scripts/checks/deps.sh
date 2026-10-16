@@ -130,7 +130,7 @@ eval_exempt=(
   '^\./crates/vala/vala-sql/tests/integration/pg_migration\.rs:'
   '^\./crates/wyrd/wyrd-mcp/tests/bifrost/mcp/(query|verification)\.rs:'
   '^\./crates/wyrd/wyrd-cli/tests/(cli|card_lifecycle)\.rs:'
-  '^\./crates/wyrd/wyrd-server/tests/integration/pg_card_registration_route\.rs:'
+  '^\./crates/wyrd/wyrd-server/tests/integration/pg_(card_registration_route|openapi_contract)\.rs:'
   '^\./crates/wyrd/wyrd-sql/tests/integration/pg_verifier_executions\.rs:'
   '^\./crates/shared/wyrd-client/src/observe/tests\.rs:'
   '^\./sdks/wyrd-sdk-rust/tests/integration/verify_in_real_time\.rs:'

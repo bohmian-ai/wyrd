@@ -384,3 +384,164 @@ counts, select one check, or fabricate values.
   [Bifrost design](../../../../architecture/bifrost-design.md).
 - [Execution and final proof coordination](README.md). Task status is proposed;
   this packet does not grant a readiness verdict or implementation approval.
+
+## Implementation Evidence
+
+Commits `f2a726c90..HEAD` on `change/verifier-building-blocks-task-005`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Execution status exposes dispatch states; delivery failure keeps the verdict; binding `last_execution_id` follows admitted work | `c01c9739a`, `142ea3d46` (queue on `execution_id`, `VerificationExecutionState` with dispatch, binding `last_execution_id`) | `pg_operator_delivery` 17/17 (incl. `verifiers_progress_while_operator_deliveries_are_capped`); drift lane 40/40 | PASS |
+| MCP r7 tools; old start/get-run removed with no aliases; OpenAPI/SDK/CLI/UI/docs agree | `142ea3d46`, `093a77ba7`, `ef98b0b8f`, `05a7370b3`, `b1dc71cb2` | `pg_openapi_contract::verification_contract_publishes_five_typed_operations_and_the_local_upload`; `codegen:check`; `docs:check`; MCP runtime tests in `093a77ba7` | PASS |
+| Operator queue/worker/renderer reused with execution identity; obsolete `run_id`/`eval.*` fields rejected | `c01c9739a`, `a36c01870` (template `{{execution_id}}`/`{{summary}}`) | `scheduled_drift_alerts_operator::*` 5/5 in drift lane | PASS |
+| Bifrost reads prove `execution_id`, nullable `binding_id`, application `run_id`, times; lineage semantic kinds | `f210fef96`, `142ea3d46` | `verify_in_real_time::*`, `verifier_building_blocks::*` (retained result reads); `register_and_hydrate` 13/13 | PASS |
+| Reconnected handles exercise `status()` and bounded `wait()` against the real server | `142ea3d46` | `verify_in_real_time::submitted_answer_is_judged_in_the_background_and_resumes_by_id`, `another_tenant_cannot_resume_an_execution` | PASS |
+| Built-in Agent tools and hosted Invoker resolution under real authority, delegation, isolation and audit | `5690c6452`, `b5be79e2b`, `c4a31e8bd`, `b3316b1d5` | `verifier_building_blocks::hosted_tools_need_the_tool_and_domain_grants`, `delegated_tools_keep_the_narrower_authority`, `forbidden_code_access_cannot_pass_dependent_work` | PASS |
+| No execute/enqueue request writes Postgres; queue insertions batched | `142ea3d46` (evidence at `evidence/sha256/<digest>`, no row; enqueue through batched queue) | `wyrd-server --lib verification::` selections; `check:tenant-isolation` | PASS |
+| Stable-key replay and delayed conflict | `142ea3d46` | `093a77ba7` server integration replay/conflict cases | PASS |
+| Direct recording never activates the runner; failed-only Operator; leases | `c01c9739a` | `pg_operator_delivery` 17/17; `passing_window_alerts_no_one`, `empty_window_is_inconclusive_and_alerts_no_one` | PASS |
+| Generic input/results replace old live contracts without history deletion | `f210fef96` (additive migration), `ac9539734` | `test:sql`; `pg_migration::migrations_apply_and_are_idempotent` | PASS |
+| README scheduled drift lifecycle in all three SDKs, unseeded, through the scheduler | `a36c01870`, `b3316b1d5`, `50e4ed235` | Rust `scheduled_drift_alerts_operator::*` and `verify_in_real_time::unfitted_baseline_is_skipped_on_schedule`; Python/TS mirrors (see Proof below) | see Proof |
+| Eight README action/check rows in Rust, Python and TypeScript | `5690c6452`, `a36c01870` | Rust `verifier_building_blocks::*` 20/20; Python/TS mirrors (see Proof below) | see Proof |
+| External examples own Cards, follow REQ-016, pass against the candidate | `wyrd-example-rs` `f7647cf`; `wyrd-example-py` `5b2e1e9`, `a9a6327`; `wyrd-example-ts` branch `verifier-building-blocks` `79ea206`, `0e45152` | `cargo test` 1/1; `pytest` 5/5; `npm run typecheck && npm run test` 5/5 | PASS (README quickstarts not run live) |
+| Merged candidate closes AC-001–010 | — | `mise run gate` (see Proof below) | see Proof |
+
+### Diagnoses
+
+- **Local evidence plan was unusable.** Symptom: hosted journeys failed to
+  upload evidence on the local backend. Cause: `presign_single_put` returned a
+  `file://` URL that no client can PUT to. Fix site:
+  `wyrd_storage::service::evidence_upload_plan` returns the existing
+  `UploadPlan::LocalFs` shape (same pattern as `/v1/cards/upload/local/{id}`),
+  served by `PUT /v1/verification/evidence/local/{sha256}`, which verifies the
+  digest before writing.
+- **Denied tool-call error lacked its code.** Symptom: drift run 2,
+  `hosted_tools_need_the_tool_and_domain_grants` expected
+  `WYRD_PERMISSION_403`. Cause: `RecordedTool::invoke` recorded only the
+  message. Fix: prefix with the `WyrdError` code (`b5be79e2b`).
+- **Tool names and `code.run` arguments.** Cause: scripted provider turns
+  used dotted names and `code`, but providers see `provider_tool_name`
+  (underscores) and the tool schema names `source`. Fix: journey fixtures in
+  all three SDKs (`5690c6452`, `a36c01870`).
+- **Agent loop spans were missing from the tenant trace.** Cause: the
+  behavior-span catalog in `wyrd-telemetry::export::in_catalog` omitted
+  `invoke_agent`/`chat`/`execute_tool`. Fix: the catalog and design doc (`dd755c4fd`).
+- **RunningQueryConflict (diag-drift-2, cause A).** Cause: every hosted
+  Bifrost statement in one execution reused the caller's `request_id`, and
+  Oracle keys running queries by (tenant, request_id). Fix:
+  `hosted::statement_caller` mints a fresh request id per statement (`c4a31e8bd`).
+- **No-domain-grant case could not resolve its Agent (cause B).** Cause: the
+  fixture omitted `cards:read`, so the failure was Card resolution rather than
+  the domain-grant denial under test. Fix: the fixture grants
+  `tool:invoke` + `cards:read` in all three SDKs (`b3316b1d5`).
+- **Unfitted baseline (cause C).** Cause: the scheduler skips a binding
+  whose baseline is not ready (existing readiness rule, retained by the spec)
+  and advances its cursor without an execution. The old test expected an
+  execution. Fix: the journey asserts the skip through binding status
+  (`b3316b1d5`). Its helper first sent `Authorization`. The Wyrd API reads
+  `x-wyrd-access-token`, so the request got a 401. Fixed in all three
+  SDKs (`50e4ed235`).
+- **Python session cooldown leak (diag-py-vbb).** Symptom: three Python VBB
+  tests fail (`answer-facts` skipped, `investigate` failed) only in the full
+  file. Cause: PROVIDER-DOWN's 500 makes `DeploymentHealth` mark the
+  (tenant, `openai`) deployment unhealthy for 30s (`wyrd-gateway`
+  `engine.rs:633`, `health.rs:16`). Python shares one session server and
+  tenant, while Rust and TS use one server per test. The OFF-SCHEMA and
+  SLOW-READER cases were also passing for the wrong reason. Fix: the failed-reader
+  test gets its own server, with PROVIDER-DOWN last (`a38d479cb`).
+- **Delegated Python token audience.** Cause: `on_behalf_of` defaults to
+  the `bifrost` audience, and the server rejects that audience on
+  `/v1/verification/execute`. Fix: `audience="wyrd"`, matching Rust and TS (`a38d479cb`).
+- **TS unfitted journey missing dependencies.** Cause: the test requested only
+  the lazy `server` fixture, so `latency-baseline` and `latency-model` were never
+  registered. Fix: register them first, as the Python fixture does (`a38d479cb`).
+- **TS span start-time tie.** Cause: the OTel JS default start time has
+  millisecond precision, and the server orders spans by
+  `start_time_unix_nano, span_id` (`hosted/traces.rs:83`). Parent and child can
+  therefore swap. Fix: explicit start times 1ms apart in `recordTrace` (`a38d479cb`).
+- **Hosted `bifrost.query` result too large.** Cause: `max_rows` fails rather
+  than truncates (`query/collect.rs` tool schema). The scripted query had no
+  LIMIT and broke once the session retained more than one result. Fix:
+  `LIMIT 1` in all three SDKs (`670ad206e`; confirmed by diag-py-vbb, which
+  also notes a latent Rust/TS flake if a flush lands between investigations).
+- **Missing `bifrost.enqueue` PRODUCER span from `observe.submit` (diag-gate-py,
+  diag-gate-ts).** Symptom: the Python and TS action timelines held one
+  producer span; the test expects two. Cause: the Window sample write ran
+  inside the async submit, outside the binding's `traced` producer scope, so
+  `transport::trace::producer()` reused the caller's span. Fix site:
+  `wyrd-client` `Observe::submit` is split into a synchronous
+  `stage` and an async `enqueue_staged`. Python and TS stage inside `traced`
+  on the calling thread. Rust's signature is unchanged (`854a2f1cd`).
+- **TS scheduled custom drift timed out (diag-gate-ts).** Cause: vitest shares
+  file-scoped fixtures by name, so the runtime-enabled `observedService` reused
+  the first test's server, which had no scheduler. Fix: the file uses one
+  runtime-enabled server (`12cd91605`).
+- **TS empty window timed out.** Cause: `BINDING_ACTIVITY_SQL` requires the
+  owner to have authenticated recently. The TS test never acted as the Service,
+  so the scheduler skipped the binding as `Inactive`. Fix: submit an empty window
+  first, mirroring Rust `a36c01870` (`12cd91605`).
+- **TS gateway round trip.** Cause: `ProviderDeployment.access` is always
+  serialized (`deployment.rs:310`). Fix: expect `access: "open"`, as Python
+  does (`12cd91605`).
+- **`observe_ingest` x3 (diag-gate-rust).** Cause: the tests submitted
+  measurements that the shared `observed-drift` samples slot does not declare.
+  The client refusal (REQ-014) is correct. Fix: each test registers a copy of
+  the fixture that declares its measurements. The shared fixture is
+  unchanged (`12cd91605`).
+- **`builtin_variant_columns_are_refused_before_ack`.** Cause: the test was
+  repointed at `vala.verification.execution_inputs`, which the gate reserves for
+  the server writer (REQ-015). Every frame was therefore refused before any
+  Variant check. Fix: the raw frames target the client-writable
+  `vala.logs.records` (`attributes`/`body`). On a signal table, a non-Variant
+  type change is refused as `UnsupportedType` (`signal.rs:1020`), so that
+  expectation changed with the table. The Scribe-ingress panic backtraces in
+  this test come from `EncodedVariant::validate`'s intentional `catch_unwind`
+  (`12cd91605`).
+- **`delegated_input_reads_keep_history` (server bug).** Cause:
+  `oracle_context` dropped `Caller::executed_by`, so a queued Verifier's
+  trace-read decision recorded the delegating Service as actor instead of
+  SYSTEM. Fix site: `AuthorizedQueryContext.executed_by`, an attribution-only
+  field that is serde-optional, so forwarded peers keep it. It is applied in
+  `query_audit_event`, set by `oracle_context`, and carried by
+  `record_object_denial` (`d8a7db603`).
+- **Oracle `agent_runs_three_table_analytical_query_through_mcp`
+  (intermittent).** A follower pod held 604 reserved bytes after teardown. The
+  test passed when rerun alone. The cause is in the Oracle follower-stage
+  memory release (`resources.rs:2797-2830`), which this change does not touch.
+  The Monty prewarm load may widen the window. Not fixed here; see Proof.
+- **CLI canonical journey count (11 vs 13).** Cause: the installed
+  server did not ship the Monty worker. Fix: `2c55785e1`. Rerun passes.
+
+### Non-goals
+
+No per-request Postgres writes, new Card kind, new queue/renderer/delivery
+loop, durable result outbox, synchronous replay ack, or history rewrite was
+added. Files outside the write set: `wyrd-telemetry` span catalog and
+`architecture/wyrd-design.md` (required for the trace-copy criterion).
+
+### Risks for review
+
+- `PUT /v1/verification/evidence/local/{sha256}` is a sixth verification route
+  that exists only on the local backend. It serves the existing `UploadPlan::LocalFs`
+  contract and follows the Card upload precedent. Reviewers should confirm it does
+  not count as a new public API under the material stop.
+- Hosted query audit rows carry per-statement request ids, not the verify request id.
+- Recorded tool errors are formatted `CODE: message`.
+- Enqueue skips the Card-scope check. A foreign tenant gets 202, and the execution
+  later reads as not found.
+- The enqueue inputs row has an empty `verifier_version`. Result queries have no
+  time pruning. The execution view has no principal fields. The trace lookback is
+  7 days, and trace anchors are approximate.
+- The `kind` metric label was removed. The capacity YAML and `bench:capacity`
+  (Linux-only opt-in) were not run.
+- `wyrd-example-rs` copies the workspace DataFusion/Arrow patch pins.
+- The external examples' live README quickstarts were not run. The
+  `wyrd-example-ts` commits are not pushed.
+- The TS `startTelemetry` docs list four OTel peers, but the SDK imports seven
+  (pre-existing).
+- The Agents SDK SIGINT handling can exit before `WyrdState.shutdown`.
+- Trace documents order spans by `start_time_unix_nano, span_id`. A JS client that
+  starts a parent and child in the same millisecond gets an arbitrary `spans[0]`.
+  Breaking ties parent-before-child would be a server or spec decision.
+
+### Proof

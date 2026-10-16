@@ -9,6 +9,7 @@
 
 mod api_keys;
 mod batches;
+mod caller;
 mod capture;
 pub(crate) mod ingress;
 mod invocation;
@@ -20,10 +21,10 @@ mod pg_administration_tests;
 mod pg_invocation_tests;
 pub(crate) mod routes;
 mod service;
-mod workflow;
 
 pub(crate) use api_keys::GatewayApiKeys;
 pub use batches::{BatchAnswer, GatewayBatches};
+pub(crate) use caller::ServerWyrdGatewayCaller;
 pub use capture::CallCapture;
 pub(crate) use capture::CaptureDrop;
 #[cfg(test)]
@@ -37,5 +38,4 @@ pub use invocation::{
 pub use routes::gateway_router;
 pub use service::GatewayAdministration;
 pub(crate) use service::invalid;
-pub(crate) use workflow::ServerWyrdGatewayCaller;
 pub use wyrd_gateway::{GatewayCredentialSnapshot, GatewayCredentialSource, GatewayTenantSnapshot};

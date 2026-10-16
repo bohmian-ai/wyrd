@@ -186,6 +186,11 @@ RFC 8693 token exchange has no permission of its own. Service B acts for
 Service A by presenting A's token as `subject_token` and its own as
 `actor_token`. The
 issued token names A as its principal and B as its outer `act`, and its
-permissions are `PermissionSet::intersection` of B's current permissions and
-A's verified ones, so delegation narrows authority and never amplifies either
-party.
+permissions are the exact intersection of B's current permissions and A's
+verified ones, so delegation narrows authority and never amplifies either
+party. If the complete intersection cannot be represented by existing scopes,
+refuse exchange before signing and issue no token. Do not silently attenuate
+the result or introduce new conditional scopes. Mixed broad and explicit input
+grants are allowed when their complete intersection is representable.
+Explicit deployment/model grants must survive merging with `all`, because
+`all` does not authorize `granted` deployments.

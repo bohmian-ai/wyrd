@@ -16,11 +16,9 @@ function environmentCredential(name: string) {
 function deployment(name: string, credential: string): ProviderDeployment {
   return {
     name,
-    model: { provider: "openai", model: "gpt-4o" },
     adapter: "openai",
     auth: { bearer: { credential } },
     capabilities: ["chat_completions"],
-    routing_weight: 1,
   };
 }
 
@@ -40,10 +38,11 @@ test("cli written credential reads back through the gateway", async ({ gateway }
 test("deployment round trips", async ({ gateway }) => {
   await cli.putProviderCredential(environmentCredential("round-trip-key"));
   const primary = deployment("round-trip", "round-trip-key");
+  const stored = { ...primary, access: "open" };
 
-  expect(await gateway.putDeployment(primary)).toEqual(primary);
-  expect(await gateway.deployment("round-trip")).toEqual(primary);
-  expect(await gateway.deployments()).toContainEqual(primary);
+  expect(await gateway.putDeployment(primary)).toEqual(stored);
+  expect(await gateway.deployment("round-trip")).toEqual(stored);
+  expect(await gateway.deployments()).toContainEqual(stored);
 
   await gateway.deleteDeployment("round-trip");
   await expect(gateway.deployment("round-trip")).rejects.toMatchObject({
@@ -71,7 +70,7 @@ test("deleting a credential twice succeeds", async ({ gateway }) => {
   });
 });
 
-test("deployment without capabilities is refused", async ({ gateway }) => {
+test("deployment with an empty capabilities list is refused", async ({ gateway }) => {
   await cli.putProviderCredential(environmentCredential("no-capability-key"));
 
   await expect(

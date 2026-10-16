@@ -1,30 +1,34 @@
-"""Callers reach the Wyrd gateway with an access token, a Card-scoped key, or a loaded Workflow (AC-051, AC-053)."""
+"""Callers reach the Wyrd gateway with an access token or a Card-scoped key (AC-051, AC-053)."""
 
 from __future__ import annotations
 
 import secrets
+from pathlib import Path
 
 import openai
 import pytest
-from wyrd.agent import Workflow
+from wyrd import WyrdError
 from wyrd.bifrost import Bifrost
 from wyrd.cards import CardRef, Cards
 from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
+from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
-from .gateway.support import PROVIDER_KEY, deploy
-from .support import FIXTURES, Receiver, ancestry, client_of, register, timeline
+from .gateway.support import PROVIDER_KEY, calls, deploy
+from .support import (
+    FIXTURES,
+    Receiver,
+    ancestry,
+    client_of,
+    download,
+    register,
+    timeline,
+)
 
 pytestmark = pytest.mark.integration
 
-ASK = FIXTURES / "cards/gateway_inference/ask.yaml"
-
-EXAMPLE = FIXTURES.parent / "examples/workflows/code-review"
-"""The code-review example Workflow directory; its Prompts call ``gpt-5-5`` through the Wyrd gateway."""
-
-EXAMPLE_INPUT = {"code": "diff"}
-"""A code-review input; every Prompt renders it into the request the upstream answers."""
+ASK = FIXTURES / "cards/gateway_inference/ask-agent.yaml"
 
 
 def model_calls(upstream: Receiver) -> int:
@@ -41,10 +45,9 @@ def openai_client(caller: WyrdClient) -> openai.OpenAI:
 
 @pytest.fixture
 def server(gateway_server: tuple[WyrdTestServer, Receiver]) -> WyrdTestServer:
-    """A gateway server with OpenAI chat deployments of ``gpt-4o`` and ``gpt-5-5`` capturing call metadata."""
+    """A gateway server with the ``openai`` deployment capturing call metadata."""
     server, _ = gateway_server
-    deploy(server, "openai", "gpt-4o", ["chat_completions"])
-    deploy(server, "openai", "gpt-5-5", ["chat_completions"])
+    deploy(server, "openai")
     Gateway(client_of(server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
     return server
 
@@ -62,14 +65,8 @@ def admin(server: WyrdTestServer) -> WyrdClient:
 
 
 @pytest.fixture
-def tenant_admin(server: WyrdTestServer) -> WyrdClient:
-    """The tenant administrator ``wyrd setup`` issues, bound to no Card, so it may run any registered Workflow."""
-    return client_of(server, server.tenant_admin_key())
-
-
-@pytest.fixture
 def ask(admin: WyrdClient) -> CardRef:
-    """The registered ``ask`` Workflow."""
+    """The registered ``ask-agent`` Agent."""
     return Cards(admin).register_from_path(ASK).root
 
 
@@ -116,7 +113,9 @@ def test_malformed_traceparent_is_ignored_by_the_gateway(
 
 
 def test_gateway_call_records_a_lone_run_or_card(server: WyrdTestServer, admin: WyrdClient) -> None:
-    card_uid = str(register(Cards(admin), "cards/gateway_inference/ask.yaml")["ask-agent"].uid)
+    card_uid = str(
+        register(Cards(admin), "cards/gateway_inference/ask-agent.yaml")["ask-agent"].uid
+    )
     issued = cli.issue_key(
         kind="Agent", name="ask-agent", version="1.0.0", space="default", client=admin
     )
@@ -179,45 +178,43 @@ def test_cli_issues_a_card_scoped_key_and_writes_a_provider_credential(
     assert "sk-managed" not in str(view)
 
 
-def test_loaded_workflow_calls_the_gateway_through_its_loading_client(
-    tenant_admin: WyrdClient, upstream: Receiver, ask: CardRef
+def test_agent_prompt_routes(
+    server: WyrdTestServer, admin: WyrdClient, upstream: Receiver, tmp_path: Path
 ) -> None:
-    workflow = Cards(tenant_admin).workflow.load(ask)
-
-    run = workflow.run({"question": "hi"})
-
-    assert (run.status, run.outputs) == ("succeeded", {"answer": "hi"})
-    assert model_calls(upstream) == 1
-    assert upstream.deliveries[0].headers["authorization"] == f"Bearer {PROVIDER_KEY}"
-
-
-def test_example_workflow_runs_through_the_wyrd_gateway(
-    admin: WyrdClient, upstream: Receiver
-) -> None:
-    example = Workflow.from_path(EXAMPLE / "workflow.yaml", admin)
-
-    run = example.run(EXAMPLE_INPUT)
-
-    assert (run.status, run.outputs) == ("succeeded", {"review": "hi"})
-    assert model_calls(upstream) == 3
-
-
-def test_applying_a_workflow_calls_no_model(admin: WyrdClient, upstream: Receiver) -> None:
-    applied = cli.apply(EXAMPLE, client=admin)
-
-    assert str(applied.root).startswith("engineering/Workflow/code-review@1.0.0#")
-    assert upstream.deliveries == []
-
-
-def test_registered_example_runs_through_the_gateway(
-    admin: WyrdClient, tenant_admin: WyrdClient, upstream: Receiver
-) -> None:
-    cli.apply(EXAMPLE, client=admin)
-    registered = Cards(tenant_admin).workflow.load(
-        space="engineering", name="code-review", version="1.0.0"
+    deploy(server, "openai", name="openai-backup")
+    deploy(server, "openai", name="openai-granted", access="granted")
+    register(Cards(admin), "cards/gateway_inference/ask-service.yaml")
+    bundle = download(Cards(admin), "ask-service", tmp_path)
+    key = cli.issue_key(
+        kind="Service", name="ask-service", version="1.0.0", space="default", client=admin
     )
+    state = WyrdState.from_path(bundle, client_of(server, key.key))
+    backup = {"kind": "wyrd_gateway", "deployment": "openai-backup"}
 
-    run = registered.run(EXAMPLE_INPUT)
+    for alias in ("agent", "body-agent"):
+        run = state.run(alias)
+        assert run.invoke({"question": "hi"}) == "hi"
+        assert run.invoke({"question": "hi"}, route=backup) == "hi"
+        assert state.card(alias).spec["execution_route"] == {
+            "kind": "wyrd_gateway",
+            "deployment": "openai",
+        }, "an override never changes the declared route"
 
-    assert (run.status, run.outputs) == ("succeeded", {"review": "hi"})
-    assert model_calls(upstream) == 3
+    assert [delivery.body["model"] for delivery in upstream.to("/v1/chat/completions")] == [
+        "gpt-4o"
+    ] * 4
+    assert calls(
+        server,
+        f"sub_principal_id = '{key.principal_id}'",
+        "requested_model.deployment AS deployment",
+    ) == [{"deployment": deployment} for deployment in ("openai", "openai-backup") * 2]
+
+    with pytest.raises(WyrdError) as refused:
+        state.run("agent").invoke(
+            {"question": "hi"}, route={"kind": "wyrd_gateway", "deployment": "openai-granted"}
+        )
+    assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+    with pytest.raises(WyrdError) as malformed:
+        state.run("agent").invoke({"question": "hi"}, route={"kind": "elsewhere"})
+    assert malformed.value.code == "WYRD_SPEC_400_VALIDATION"
+    assert model_calls(upstream) == 4, "both refusals precede upstream IO"

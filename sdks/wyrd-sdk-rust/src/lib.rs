@@ -24,10 +24,9 @@
 //! behind the `testing` feature and is absent from production builds.
 //!
 //! The list also holds the projection to the surface every SDK shares
-//! (REQ-210): the `wyrd_client::workflow` module is left off, so the remote
-//! `Workflows` handle and the gateway caller are not reachable here; Workflows
-//! are YAML-authored through [`Workflow`]. The `wyrd_client::auth` and `storage`
-//! modules are left off too (this package's [`auth`] is the principal
+//! (REQ-210): the `wyrd_client::gateway_caller` module is left off, so the
+//! Agent gateway caller is not reachable here. The `wyrd_client::auth` and
+//! `storage` modules are left off too (this package's [`auth`] is the principal
 //! handle, `wyrd_client::principals`): the authentication middleware and the artifact-transfer
 //! client are mechanics behind [`WyrdClient`] and [`cards::Cards`]. [`transport`]
 //! carries only the endpoint and credential types [`config::ClientConfig`]
@@ -110,10 +109,6 @@
 //! ```
 //!
 //! ```compile_fail
-//! let _ = wyrd_ai::Workflow::from_path_with_client;
-//! ```
-//!
-//! ```compile_fail
 //! let _ = wyrd_ai::bifrost::TableConfig::describe_from_env;
 //! ```
 
@@ -122,8 +117,8 @@
 
 pub use wyrd_client::{
     Bifrost, Gateway, GlobalConfig, OperatorConnections, Platform, Principals, QueueConfig,
-    Workflow, WorkflowCards, WyrdClient, bifrost, cards, client, config, environment, error,
-    gateway, global_config, observe, operator_connections, platform, state,
+    WyrdClient, bifrost, cards, client, config, environment, error, gateway, global_config,
+    observe, operator_connections, platform, state,
 };
 
 /// Tenant principal administration: the [`auth::Principals`] handle and its
@@ -166,12 +161,12 @@ pub use wyrd_spec::error::WyrdError;
 /// typed spec.
 pub use wyrd_spec::envelope::{Card, Spec};
 
+/// Where an Agent's model calls go: declared on every Agent Card and
+/// replaceable whole for one invocation with `Run::invoke_on`.
+pub use wyrd_spec::ExecutionRoute;
+
 /// How a Verifier Card judges: an Eval or a Drift implementation.
 pub use wyrd_spec::card::verifier::VerifierImplementation;
-
-/// The record of one Workflow run, as [`Workflow::run`] returns it, and its
-/// final status.
-pub use wyrd_spec::card::workflow::{WorkflowRun, WorkflowRunStatus};
 
 /// The count rollup a [`Judgment`] carries.
 pub use wyrd_spec::card::operator::VerifierCounts;
@@ -227,9 +222,6 @@ mod tests {
             TableConfig::describe_with(client, fqn)
         };
         let _ = super::WyrdClient::with_config;
-        let _ = super::Workflow::from_yaml;
-        let _ = super::Workflow::steps;
-        let _ = super::cards::Cards::workflow;
         let _ = super::WyrdError::code;
     }
 

@@ -25,9 +25,6 @@ Skald does not depend on `wyrd-*` or `vala-*`.
 - `skald-agent`: live agent runtime. It owns `Agent`, `AgentDef`, the bounded
   tool loop, `Observer`, `AgentTool`, `ToolRegistry`, and the
   `SKALD_AGENT_*` error catalog.
-- `skald-workflow`: workflow runtime. It owns `Workflow`, `WorkflowDef`,
-  `Task`/`TaskDef`, `Context`, the DAG executor, `execute_task`,
-  `MessageConversion`-routed handoff, and stable Wyrd workflow error codes.
 - `skald-prompt`: Python authoring boundary. It builds native prompt/request
   values and exposes the `wyrd.prompt.Prompt` Python class.
 
@@ -40,7 +37,7 @@ crates do not depend on `wyrd-spec`.
 The dependency layers are:
 
 ```text
-skald-workflow -> skald-agent -> skald-runtime
+                  skald-agent -> skald-runtime
                                   |
                                   v
                 {skald-providers, skald-cache, skald-tool} -> skald-spec
@@ -50,8 +47,8 @@ skald-workflow -> skald-agent -> skald-runtime
 ```
 
 `skald-prompt` is the Python authoring boundary and uses Wyrd Python
-error/stub utilities. The runtime, providers, cache, tool, spec, agent, and
-workflow crates remain Rust-native engine crates.
+error/stub utilities. The runtime, providers, cache, tool, spec, and agent
+crates remain Rust-native engine crates.
 
 ## Runtime Boundary
 
@@ -62,7 +59,7 @@ read provider output through `ResponseAdapter`.
 `MockProvider` is a public `skald-runtime` type so runtime behavior can be
 tested without credentials or live provider calls.
 
-`skald-agent` and `skald-workflow` observe runtime activity through the injected
+`skald-agent` observes runtime activity through the injected
 `Observer` trait and `tracing` spans. They never link `vala-client`; Wyrd/Vala
 consumers provide observer implementations from their own layer.
 
@@ -74,6 +71,6 @@ Only the authoring and Wyrd-card boundary crates opt into Python:
 - `wyrd-cards`, for the local `PromptCard` holder.
 
 `skald-spec`, `skald-cache`, `skald-tool`, `skald-providers`, `skald-runtime`,
-`skald-agent`, `skald-workflow`, and `wyrd-spec` remain PyO3-free at the engine.
+`skald-agent`, and `wyrd-spec` remain PyO3-free at the engine.
 Their manifests may carry optional Python feature scaffolding, but source-level
 PyO3 belongs outside the engine path.

@@ -124,6 +124,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// Project resolved references into deterministic server-owned relationships.
+    ///
+    /// # Panics
+    /// Panics when the fixture spec is invalid or other relationships are
+    /// projected.
     #[test]
     fn relationships_project_uid_bearing_refs() {
         let spec = Spec::from_kind_and_value(
@@ -135,7 +139,8 @@ mod tests {
                     "version": "1.0.0",
                     "space": "default",
                     "uid": "018f0000-0000-7000-8000-000000000001"
-                }
+                },
+                "execution_route": {"kind": "native"}
             }),
         )
         .expect("agent reference fixture decodes");

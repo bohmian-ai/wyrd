@@ -1,5 +1,6 @@
 """An Agent authored in Python, saved as a Card, and run offline."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,12 @@ def test_saved_agent_loads_and_runs_on_the_mock_provider(tmp_path: Path) -> None
 
 
 def test_journey_to_card_round_trip(tmp_path: Path) -> None:
+    """A saved Agent reloads to the same Card, and a loaded Agent exports its authored spec unchanged.
+
+    Omitted, partial, explicit-default and nondefault run configs plus a verification
+    binding survive `to_card`, `model_dump_json` and a YAML save and reload; a
+    `with_run_config` edit persists and keeps the bindings.
+    """
     path = tmp_path / "agent.yaml"
     agent = Agent(
         prompt=Prompt.openai_chat("gpt-4o-mini", messages=["hello"]),
@@ -49,10 +56,54 @@ def test_journey_to_card_round_trip(tmp_path: Path) -> None:
 
     assert loaded_card.model_dump() == card.model_dump()
 
+    envelope = json.loads(agent.model_dump_json())
+    binding = {
+        "verifier": {
+            "kind": "Verifier",
+            "name": "answers-grounded",
+            "version": "1.0.0",
+            "space": "default",
+        }
+    }
+    for run_config in (
+        {},
+        {"timeout_ms": 5000},
+        {"max_iterations": 10, "tool_concurrency_cap": 8},
+        {
+            "max_iterations": 3,
+            "tool_concurrency_cap": 2,
+            "session_recent_limit": 20,
+            "timeout_ms": 9000,
+        },
+    ):
+        authored = {**envelope["spec"], "verified_by": [binding]}
+        authored.pop("run_config", None)
+        if run_config:
+            authored["run_config"] = run_config
+        source = Agent.model_validate_json(json.dumps({**envelope, "spec": authored}))
+
+        assert source.to_card().model_dump()["spec"] == authored
+        assert json.loads(source.model_dump_json())["spec"] == authored
+        source.save(path)
+        assert json.loads(Agent.from_yaml(path).model_dump_json())["spec"] == authored
+
+        source.with_run_config(RunConfig(max_iterations=4))
+        spec = json.loads(source.model_dump_json())["spec"]
+        assert spec["run_config"]["max_iterations"] == 4
+        assert spec["verified_by"] == [binding]
+        source.save(path)
+        assert json.loads(Agent.from_yaml(path).model_dump_json())["spec"] == spec
+
 
 def test_agent_card_json_round_trip() -> None:
     prompt = PromptReference.inline(Prompt.openai_chat("gpt-4o-mini", messages=["hello"]))
-    card = AgentCard(prompt, space="research", name="planner", version="0.3.0")
+    card = AgentCard(
+        prompt,
+        execution_route={"kind": "native"},
+        space="research",
+        name="planner",
+        version="0.3.0",
+    )
 
     payload = card.model_dump()
     restored = AgentCard.model_validate_json(card.model_dump_json())
@@ -77,7 +128,9 @@ def test_agent_card_preserves_unresolved_registered_prompt_reference() -> None:
         uid="018f90f5-8e1b-7c4a-a834-4d2d4df6e9c2",
     )
     restored = AgentCard.model_validate_json(
-        AgentCard(prompt_ref, space="research", name="planner").model_dump_json()
+        AgentCard(
+            prompt_ref, execution_route={"kind": "native"}, space="research", name="planner"
+        ).model_dump_json()
     )
 
     with pytest.raises(WyrdError):
@@ -164,3 +217,38 @@ def test_journey_callbacks_fire_in_registration_order() -> None:
         "after_model",
         "after_agent",
     ]
+
+
+def test_agent_keeps_its_gateway_route_through_save_load_and_run_refusal(
+    tmp_path: Path,
+) -> None:
+    """A gateway Agent keeps its route through YAML and JSON, and refuses to run locally.
+
+    A local Agent has no gateway caller, so a run on a ``wyrd_gateway`` route,
+    declared or as a per-run override, is refused before any provider IO; the
+    override never changes the Agent's own route.
+    """
+    route = {"kind": "wyrd_gateway", "deployment": "openai-primary"}
+    mock = MockProvider(["native answer"])
+    prompt = Prompt(messages="hi", model="m", provider="mock")
+    agent = Agent(prompt=prompt, name="routed", version="1.0.0", execution_route=route)
+    path = tmp_path / "routed.yaml"
+    agent.save(path)
+
+    loaded = Agent.from_yaml(path)
+    validated = Agent.model_validate_json(agent.model_dump_json())
+
+    for restored in (loaded, validated):
+        assert restored.to_card().spec["execution_route"] == route
+    with pytest.raises(WyrdError) as captured:
+        Agent(prompt=prompt, mock_provider=mock, execution_route=route).run("hi")
+    assert captured.value.code == "WYRD_AGENT_422_INVALID_ARGUMENT"
+    native = Agent(prompt=prompt, name="native", version="1.0.0", mock_provider=mock)
+    with pytest.raises(WyrdError) as captured:
+        native.run("hi", execution_route=route)
+    assert captured.value.code == "WYRD_AGENT_422_INVALID_ARGUMENT"
+    assert native.to_card().spec["execution_route"] == {"kind": "native"}
+    assert native.run("hi").output == "native answer", "no refused run reached the mock"
+    with pytest.raises(WyrdError) as captured:
+        Agent(prompt=prompt, execution_route={"kind": "external"})
+    assert captured.value.code == "WYRD_SPEC_400_VALIDATION"

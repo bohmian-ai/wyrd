@@ -1,4 +1,4 @@
-"""Every workflow example runs as its own script, without credentials."""
+"""Every example runs as its own script, without credentials."""
 
 import runpy
 from pathlib import Path
@@ -11,7 +11,6 @@ EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 @pytest.mark.parametrize(
     "example",
     [
-        "from_yaml",
         "structured_pipeline",
         "transport_grpc",
         "transport_http",

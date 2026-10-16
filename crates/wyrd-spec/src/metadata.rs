@@ -329,7 +329,6 @@ mod metadata_tests {
     use skald_spec::wire::openai_chat::OpenAiMessageContent;
     use skald_spec::{
         OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, Prompt, ProviderRequest,
-        ResponseType,
     };
     use wyrd_semver::VersionBlock;
 
@@ -384,35 +383,38 @@ mod metadata_tests {
         assert_eq!(decoded, card);
     }
 
+    /// The OpenAI Chat Prompt spec with one user turn that the metadata
+    /// round-trip tests embed.
+    ///
+    /// # Panics
+    /// Panics when the static request is not a valid Prompt spec.
     fn prompt_spec() -> PromptSpec {
-        PromptSpec::new(Prompt {
-            request: ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
-                model: "gpt-4o".to_owned(),
-                messages: vec![OpenAiChatMessage {
-                    role: "user".to_owned(),
-                    content: Some(OpenAiMessageContent::Text("Answer carefully.".to_owned())),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    refusal: None,
-                    annotations: Vec::new(),
-                    audio: None,
-                }],
-                response_format: None,
-                stream: None,
-                stream_options: None,
-                tools: None,
-                tool_choice: None,
-                parallel_tool_calls: None,
-                settings: OpenAiChatSettings::default(),
-            }),
-            model: "gpt-4o".to_owned(),
-            version: None,
-            variables: Vec::new(),
-            media_variables: Vec::new(),
-            response_type: ResponseType::Text,
-            provider: None,
-        })
+        PromptSpec::new(
+            Prompt::new(
+                ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
+                    model: "gpt-4o".to_owned(),
+                    messages: vec![OpenAiChatMessage {
+                        role: "user".to_owned(),
+                        content: Some(OpenAiMessageContent::Text("Answer carefully.".to_owned())),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        refusal: None,
+                        annotations: Vec::new(),
+                        audio: None,
+                    }],
+                    response_format: None,
+                    stream: None,
+                    stream_options: None,
+                    tools: None,
+                    tool_choice: None,
+                    parallel_tool_calls: None,
+                    settings: OpenAiChatSettings::default(),
+                }),
+                "gpt-4o".to_owned(),
+            )
+            .expect("static prompt is valid"),
+        )
         .expect("static prompt spec is valid")
     }
 

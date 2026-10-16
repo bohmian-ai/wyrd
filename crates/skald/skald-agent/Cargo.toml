@@ -28,12 +28,14 @@ python = [
 skald-spec = { workspace = true }
 skald-prompt = { workspace = true }
 skald-runtime = { workspace = true }
+skald-providers = { workspace = true }
 skald-tool = { workspace = true }
 wyrd-spec = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 async-trait = { workspace = true }
+tokio-util = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }

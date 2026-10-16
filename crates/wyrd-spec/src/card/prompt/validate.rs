@@ -1,13 +1,9 @@
 //! PromptCard envelope validation.
 
-use std::collections::HashSet;
-
 use serde_json::json;
 use thiserror::Error;
 
-use crate::card::prompt::{
-    ParameterName, PromptSpec, extract_media_placeholders, extract_text_placeholders,
-};
+use crate::card::prompt::{ParameterName, PromptSpec};
 use crate::error::WyrdError;
 
 /// PromptCard validation and boundary-mapping failures.
@@ -17,36 +13,6 @@ pub enum PromptError {
     #[error("invalid variable name: {name}")]
     InvalidVariableName {
         /// Offending variable name.
-        name: String,
-    },
-    /// A variable name appeared more than once in `prompt.variables`.
-    #[error("duplicate variable name: {name}")]
-    DuplicateVariable {
-        /// Duplicated variable name.
-        name: String,
-    },
-    /// A `{{name}}` placeholder was present but not declared.
-    #[error("undeclared placeholder: {name}")]
-    UndeclaredPlaceholder {
-        /// Placeholder name that was not declared.
-        name: String,
-    },
-    /// A declared variable was not referenced in the native request.
-    #[error("unreferenced variable: {name}")]
-    UnreferencedVariable {
-        /// Variable name that was never referenced.
-        name: String,
-    },
-    /// A `${media:name}` placeholder was present but not declared.
-    #[error("undeclared media placeholder: {name}")]
-    UndeclaredMediaPlaceholder {
-        /// Placeholder name that was not declared.
-        name: String,
-    },
-    /// A declared media variable was not referenced in the native request.
-    #[error("unreferenced media variable: {name}")]
-    UnreferencedMediaVariable {
-        /// Media variable name that was never referenced.
         name: String,
     },
     /// A media placeholder was not isolated in its own text part.
@@ -215,14 +181,6 @@ pub enum PromptError {
         /// Decode or validation message.
         message: String,
     },
-    /// A declarative `PromptDraft` failed to compile into a native prompt.
-    #[error("prompt draft compile failed for provider {provider}: {message}")]
-    DraftInvalid {
-        /// Provider name from the draft.
-        provider: String,
-        /// Compile failure message.
-        message: String,
-    },
 }
 
 impl PromptError {
@@ -230,13 +188,6 @@ impl PromptError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::InvalidVariableName { .. } => "WYRD_PROMPT_400_INVALID_VARIABLE_NAME",
-            Self::DuplicateVariable { .. } => "WYRD_PROMPT_409_DUPLICATE_VARIABLE",
-            Self::UndeclaredPlaceholder { .. } => "WYRD_PROMPT_422_UNDECLARED_PLACEHOLDER",
-            Self::UnreferencedVariable { .. } => "WYRD_PROMPT_422_UNREFERENCED_VARIABLE",
-            Self::UndeclaredMediaPlaceholder { .. } => {
-                "WYRD_PROMPT_422_UNDECLARED_MEDIA_PLACEHOLDER"
-            }
-            Self::UnreferencedMediaVariable { .. } => "WYRD_PROMPT_422_UNREFERENCED_MEDIA_VARIABLE",
             Self::MediaPlaceholderNotIsolated { .. } => {
                 "WYRD_PROMPT_422_MEDIA_PLACEHOLDER_NOT_ISOLATED"
             }
@@ -265,80 +216,28 @@ impl PromptError {
             Self::MissingVariable { .. } => "WYRD_PROMPT_422_MISSING_VARIABLE",
             Self::UnsupportedHandoff { .. } => "WYRD_PROMPT_501_UNSUPPORTED_HANDOFF",
             Self::ResponseDecode { .. } => "WYRD_PROMPT_422_RESPONSE_DECODE",
-            Self::DraftInvalid { .. } => "WYRD_PROMPT_400_DRAFT_INVALID",
         }
     }
 }
 
-/// Runs the six PromptCard envelope invariants in deterministic order.
+/// Checks the derived placeholder names against the parameter grammar.
+///
+/// Shape, provider/format, settings, media, and schema rules are enforced
+/// when the authored Prompt compiles; variables are derived, so there is no
+/// declared list to reconcile.
+///
+/// # Errors
+///
+/// Returns the parameter-name error for a placeholder outside the grammar.
 pub fn validate(spec: &PromptSpec) -> Result<(), WyrdError> {
-    if spec.prompt.model.trim().is_empty() {
-        return Err(PromptError::EmptyModel.into());
-    }
-
-    let mut variable_seen = HashSet::new();
-    for name in &spec.prompt.variables {
-        ParameterName::new(name.clone())?;
-        if !variable_seen.insert(name.as_str()) {
-            return Err(PromptError::DuplicateVariable { name: name.clone() }.into());
-        }
-    }
-
-    let mut media_seen = HashSet::new();
-    for name in &spec.prompt.media_variables {
-        ParameterName::new(name.clone())?;
-        if !media_seen.insert(name.as_str()) {
-            return Err(PromptError::DuplicateVariable { name: name.clone() }.into());
-        }
-    }
-
-    let referenced = extract_text_placeholders(spec)?;
-    let declared: HashSet<&str> = spec.prompt.variables.iter().map(String::as_str).collect();
-    let referenced_set: HashSet<&str> = referenced.iter().map(String::as_str).collect();
-
-    if let Some(name) = referenced_set.difference(&declared).next() {
-        return Err(PromptError::UndeclaredPlaceholder {
-            name: (*name).to_owned(),
-        }
-        .into());
-    }
-
-    let media_referenced = extract_media_placeholders(spec)?;
-    let media_declared: HashSet<&str> = spec
+    for name in spec
         .prompt
-        .media_variables
+        .variables
         .iter()
-        .map(String::as_str)
-        .collect();
-    let media_referenced_set: HashSet<&str> = media_referenced.iter().map(String::as_str).collect();
-
-    if let Some(name) = media_referenced_set.difference(&media_declared).next() {
-        return Err(PromptError::UndeclaredMediaPlaceholder {
-            name: (*name).to_owned(),
-        }
-        .into());
-    }
-
-    if let Some(name) = media_declared.difference(&media_referenced_set).next() {
-        return Err(PromptError::UnreferencedMediaVariable {
-            name: (*name).to_owned(),
-        }
-        .into());
-    }
-
-    if let Some(name) = declared.difference(&referenced_set).next() {
-        return Err(PromptError::UnreferencedVariable {
-            name: (*name).to_owned(),
-        }
-        .into());
-    }
-
-    if let skald_spec::ResponseType::JsonSchema { schema, .. } = &spec.prompt.response_type
-        && !schema.is_object()
+        .chain(&spec.prompt.media_variables)
     {
-        return Err(PromptError::InvalidResponseSchema.into());
+        ParameterName::new(name.clone())?;
     }
-
     Ok(())
 }
 
@@ -350,30 +249,6 @@ impl From<PromptError> for WyrdError {
                 message,
                 details: json!({ "name": name }),
             },
-            PromptError::DuplicateVariable { name } => WyrdError::PromptDuplicateVariable {
-                message,
-                details: json!({ "name": name }),
-            },
-            PromptError::UndeclaredPlaceholder { name } => WyrdError::PromptUndeclaredPlaceholder {
-                message,
-                details: json!({ "name": name }),
-            },
-            PromptError::UnreferencedVariable { name } => WyrdError::PromptUnreferencedVariable {
-                message,
-                details: json!({ "name": name }),
-            },
-            PromptError::UndeclaredMediaPlaceholder { name } => {
-                WyrdError::PromptUndeclaredMediaPlaceholder {
-                    message,
-                    details: json!({ "name": name }),
-                }
-            }
-            PromptError::UnreferencedMediaVariable { name } => {
-                WyrdError::PromptUnreferencedMediaVariable {
-                    message,
-                    details: json!({ "name": name }),
-                }
-            }
             PromptError::MediaPlaceholderNotIsolated { name } => {
                 WyrdError::PromptMediaPlaceholderNotIsolated {
                     message,
@@ -497,13 +372,6 @@ impl From<PromptError> for WyrdError {
             } => WyrdError::PromptResponseDecode {
                 message,
                 details: json!({ "schema_name": schema_name, "source": source }),
-            },
-            PromptError::DraftInvalid {
-                provider,
-                message: source,
-            } => WyrdError::PromptDraftInvalid {
-                message,
-                details: json!({ "provider": provider, "source": source }),
             },
         }
     }

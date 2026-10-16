@@ -4,7 +4,7 @@ use skald_agent::{Agent, RunConfig};
 use skald_prompt::Prompt;
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::{
-    Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
+    Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse,
     wire::openai_chat::{
         OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse,
         OpenAiChatSettings, OpenAiMessageContent, OpenAiResponseFormat, OpenAiToolCall,
@@ -12,6 +12,11 @@ use skald_spec::{
     },
 };
 
+/// An Agent over a resolved Prompt for `request`, capped at
+/// `max_iterations`, and a provider registry holding only `mock`.
+///
+/// # Panics
+/// Panics when `request` does not build a Prompt.
 fn build_agent(
     request: ProviderRequest,
     mock: MockProvider,
@@ -21,7 +26,7 @@ fn build_agent(
     providers.register(Arc::new(mock));
 
     let prompt = Arc::new(Prompt::from_native(
-        SpecPrompt::new(request, "gpt-4o", None, ResponseType::Text).expect("prompt should build"),
+        SpecPrompt::new(request, "gpt-4o").expect("prompt should build"),
     ));
     let agent = Agent::from_resolved("a", prompt).with_run_config(RunConfig {
         max_iterations,
@@ -184,6 +189,12 @@ async fn provider_failure_surfaces_provider_code() {
     assert_eq!(err.code(), "SKALD_AGENT_502_PROVIDER");
 }
 
+/// `run_prompt` renders the Prompt's variables and sends exactly that
+/// request, response format included, on the first turn.
+///
+/// # Panics
+/// Panics when a Prompt does not build, the mock sees another request, or
+/// the run fails or takes more than one iteration.
 #[tokio::test]
 async fn run_prompt_sends_rendered_prompt_verbatim_on_first_turn() {
     let template_request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
@@ -239,7 +250,7 @@ async fn run_prompt_sends_rendered_prompt_verbatim_on_first_turn() {
     providers.register(Arc::new(mock));
 
     let prompt = Arc::new(Prompt::from_native(
-        SpecPrompt::new(template_request.clone(), "gpt-4o", None, ResponseType::Text).unwrap(),
+        SpecPrompt::new(template_request.clone(), "gpt-4o").unwrap(),
     ));
     let agent = Agent::from_resolved("a", prompt).with_run_config(RunConfig {
         max_iterations: 10,
@@ -249,9 +260,7 @@ async fn run_prompt_sends_rendered_prompt_verbatim_on_first_turn() {
     let run = agent
         .run_prompt(
             &providers,
-            &Prompt::from_native(
-                SpecPrompt::new(template_request, "gpt-4o", None, ResponseType::Text).unwrap(),
-            ),
+            &Prompt::from_native(SpecPrompt::new(template_request, "gpt-4o").unwrap()),
             &[("name", "Ada")],
         )
         .await
@@ -259,6 +268,12 @@ async fn run_prompt_sends_rendered_prompt_verbatim_on_first_turn() {
     assert_eq!(run.iterations, 1);
 }
 
+/// `run_prompt` refuses a Prompt for another provider than the Agent's with
+/// the provider-mismatch code before any dispatch.
+///
+/// # Panics
+/// Panics when the Prompt does not build, the run succeeds, or the refusal
+/// carries another code.
 #[tokio::test]
 async fn run_prompt_provider_mismatch_returns_409_provider_mismatch() {
     let agent_request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
@@ -276,9 +291,7 @@ async fn run_prompt_provider_mismatch_returns_409_provider_mismatch() {
         provider: ProviderName::Anthropic,
         body: serde_json::json!({}),
     };
-    let prompt = Prompt::from_native(
-        SpecPrompt::new(prompt_request, "claude", None, ResponseType::Text).unwrap(),
-    );
+    let prompt = Prompt::from_native(SpecPrompt::new(prompt_request, "claude").unwrap());
     let (agent, providers) =
         build_agent(agent_request, MockProvider::new(ProviderName::OpenAi), 10);
 
@@ -289,6 +302,12 @@ async fn run_prompt_provider_mismatch_returns_409_provider_mismatch() {
     assert_eq!(err.code(), "SKALD_AGENT_409_PROVIDER_MISMATCH");
 }
 
+/// `run_prompt` refuses a render that leaves a declared variable unbound
+/// with the Prompt error code before any dispatch.
+///
+/// # Panics
+/// Panics when the Prompt does not build, the run succeeds, or the refusal
+/// carries another code.
 #[tokio::test]
 async fn run_prompt_missing_variable_emits_prompt_error() {
     let request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
@@ -305,7 +324,7 @@ async fn run_prompt_missing_variable_emits_prompt_error() {
     let mock = MockProvider::new(ProviderName::OpenAi);
     let (agent, providers) = build_agent(request.clone(), mock, 10);
     let prompt = Arc::new(Prompt::from_native(
-        SpecPrompt::new(request, "gpt-4o", None, ResponseType::Text).unwrap(),
+        SpecPrompt::new(request, "gpt-4o").unwrap(),
     ));
 
     let err = agent

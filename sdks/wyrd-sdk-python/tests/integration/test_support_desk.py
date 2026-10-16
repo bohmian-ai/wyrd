@@ -88,12 +88,9 @@ def test_support_desk_answers_verifies_and_explains_every_request(tmp_path: Path
             )
             Gateway(admin).put_deployment(
                 {
-                    "name": "anthropic-gpt-4o",
-                    "model": {"provider": "anthropic", "model": "gpt-4o"},
+                    "name": "anthropic",
                     "adapter": "anthropic",
                     "auth": "none",
-                    "capabilities": ["chat_completions"],
-                    "routing_weight": 1,
                 }
             )
             with pytest.raises(

@@ -6,6 +6,8 @@ metadata:
   space: default
 spec:
   prompt: ./desk-prompt.yaml
+  execution_route:
+    kind: native
   run_config:
     max_iterations: 2
     timeout_ms: 1000

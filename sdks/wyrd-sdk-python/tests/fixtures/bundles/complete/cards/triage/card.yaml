@@ -10,7 +10,9 @@ metadata:
 spec:
   provider: openai
   model: gpt-4o
-  messages: hello
+  messages:
+  - role: user
+    content: hello
 relationships:
   outbound: []
   outbound_refs: []

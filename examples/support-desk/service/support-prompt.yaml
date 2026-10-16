@@ -5,13 +5,8 @@ metadata:
   version: 1.0.0
   space: default
 spec:
+  provider: openai
   model: gpt-4o
-  request:
-    provider: open_ai_chat_completion
-    body:
-      model: gpt-4o
-      messages:
-        - role: user
-          content: "Answer the customer: {{question}}"
-  variables: [question]
-  response_type: text
+  messages:
+  - role: user
+    content: 'Answer the customer: {{question}}'

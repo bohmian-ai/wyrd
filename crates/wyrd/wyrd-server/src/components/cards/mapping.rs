@@ -82,6 +82,9 @@ mod tests {
     use super::outcome_row_to_response;
 
     /// Project a resolved sibling/external reference into deterministic blob data.
+    ///
+    /// # Panics
+    /// Panics when a fixture fails to build or an assertion fails.
     #[test]
     fn relationships_project_uid_bearing_refs() {
         let spec = Spec::from_kind_and_value(
@@ -93,7 +96,8 @@ mod tests {
                     "version": "1.0.0",
                     "space": "default",
                     "uid": "018f0000-0000-7000-8000-000000000001"
-                }
+                },
+                "execution_route": {"kind": "native"}
             }),
         )
         .expect("agent reference fixture decodes");

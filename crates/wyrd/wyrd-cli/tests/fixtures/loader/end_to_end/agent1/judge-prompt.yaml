@@ -3,7 +3,7 @@ kind: Prompt
 metadata:
   space: wyrd-team
   name: triage-judge-prompt
-  version: "1.0.0"
+  version: 1.0.0
 spec:
   provider: openai
   model: gpt-5-5
@@ -11,6 +11,7 @@ spec:
     You grade a triage agent's runbook selection. Return passed=true only
     when the runbook is grounded in the supplied score and context.
   messages:
-    - |
+  - role: user
+    content: |
       Triage score and context:
       ${context}

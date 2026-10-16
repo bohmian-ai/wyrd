@@ -1,0 +1,19 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: gemini-agent
+  version: 1.0.0
+  space: default
+spec:
+  prompt:
+    provider: google
+    model: tuned/gemini-2.5-pro
+    messages:
+    - role: user
+      content: ${question}
+  execution_route:
+    kind: wyrd_gateway
+    deployment: gemini-team
+  tool_names: []
+  run_config:
+    max_iterations: 1

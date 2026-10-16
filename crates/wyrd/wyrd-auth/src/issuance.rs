@@ -20,7 +20,7 @@ use uuid::Uuid;
 use wyrd_auth_issue::{AccessGrant, IssueError, IssuingKey};
 use wyrd_auth_verify::{ActClaim, TokenAudience, TokenPrincipalRef, VerifiedToken};
 use wyrd_runtime::audit::AuditStage;
-use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
+use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef, UnrepresentableIntersection};
 use wyrd_spec::auth::{
     Attribution, ExchangeTokenType, OAuthClientId, PrincipalKindTag, SecretBearer, TokenResponse,
     TokenType,
@@ -206,17 +206,23 @@ impl TenantGrant {
     ///
     /// Every grant but a delegation names `issued` with its own authority and
     /// the `wyrd` audience. A delegation names the subject instead, carries
-    /// only the intersection of `issued`'s permissions with the subject's, and
-    /// records `issued` as the outermost actor over any earlier actors. The
-    /// actor is attribution only, so its Card scope stays out of the token.
+    /// only the exact intersection of `issued`'s permissions with the
+    /// subject's, and records `issued` as the outermost actor over any earlier
+    /// actors. The actor is attribution only, so its Card scope stays out of
+    /// the token.
+    ///
+    /// # Errors
+    /// Returns [`IssuanceError::UnrepresentableDelegation`] when a
+    /// delegation's exact shared authority has no token representation; the
+    /// caller then signs nothing.
     fn into_access_grant(
         self,
         issued: TokenPrincipalRef,
         roles: Vec<RoleRef>,
         permissions: PermissionSet,
-    ) -> AccessGrant {
+    ) -> Result<AccessGrant, IssuanceError> {
         let credential_id = self.credential_id();
-        match self {
+        Ok(match self {
             Self::Delegation {
                 subject,
                 subject_roles,
@@ -227,7 +233,7 @@ impl TenantGrant {
             } => AccessGrant {
                 principal: *subject,
                 roles: subject_roles,
-                permissions: permissions.intersection(&subject_permissions),
+                permissions: permissions.intersection(&subject_permissions)?,
                 credential_id,
                 act: Some(Box::new(ActClaim {
                     sub: issued.id.to_string(),
@@ -247,7 +253,7 @@ impl TenantGrant {
                 act: None,
                 audience: TokenAudience::Wyrd,
             },
-        }
+        })
     }
 }
 
@@ -288,9 +294,18 @@ pub enum IssuanceError {
     /// A Card-scope or audit step failed with its own stable error.
     #[error("wyrd error")]
     Wyrd(#[from] WyrdError),
+    /// A delegation's exact shared authority has no token representation,
+    /// so no token was signed.
+    #[error("delegated permissions cannot be represented")]
+    UnrepresentableDelegation(#[from] UnrepresentableIntersection),
 }
 
 impl From<IssuanceError> for WyrdError {
+    /// Maps each issuance refusal to its public catalog error: inactive
+    /// principals and tenants to revoked credentials, an unrepresentable
+    /// delegation to its own refusal naming the permission (no token was
+    /// issued), store failures to a retryable unavailable error, and other issue
+    /// failures to a logged internal error.
     fn from(error: IssuanceError) -> Self {
         match error {
             IssuanceError::TenantNotAdmitting | IssuanceError::PrincipalInactive => {
@@ -334,6 +349,12 @@ impl From<IssuanceError> for WyrdError {
                 }
             }
             IssuanceError::Wyrd(error) => error,
+            IssuanceError::UnrepresentableDelegation(error) => {
+                WyrdError::UnrepresentableDelegation {
+                    message: format!("{error}; the exchange issued no token"),
+                    details: json!({ "permission": error.permission }),
+                }
+            }
         }
     }
 }
@@ -419,8 +440,11 @@ impl TenantTokenIssuer {
     /// [`IssuanceError::PrincipalInactive`] for an inactive tenant or
     /// principal, [`IssuanceError::RoleCorrupt`] for a corrupt role,
     /// [`IssuanceError::Issue`] when signing rejects the grant,
-    /// [`IssuanceError::Database`] when a read or the activity write fails, and
-    /// [`IssuanceError::Wyrd`] when Card-scope resolution fails.
+    /// [`IssuanceError::Database`] when a read or the activity write fails,
+    /// [`IssuanceError::Wyrd`] when Card-scope resolution fails, and
+    /// [`IssuanceError::UnrepresentableDelegation`] when a delegation's exact
+    /// shared authority has no token representation, before anything is
+    /// signed.
     #[tracing::instrument(level = "debug", skip(self, conn, grant), fields(principal_id = %principal_id), err)]
     pub async fn issue(
         &self,
@@ -447,7 +471,7 @@ impl TenantTokenIssuer {
         let access_token = self
             .issuing_key
             .issue_access_token(
-                grant.into_access_grant(principal, roles, permissions),
+                grant.into_access_grant(principal, roles, permissions)?,
                 self.settings.access_ttl,
             )
             .map_err(|error| match &scope_mint {
@@ -512,7 +536,7 @@ impl TenantTokenIssuer {
             )
             .await?;
         let claims = self.issuing_key.access_claims(
-            grant.into_access_grant(principal, roles, permissions),
+            grant.into_access_grant(principal, roles, permissions)?,
             self.settings.access_ttl,
         )?;
         Ok(claims.into_verified().map_err(auth_error_to_wyrd)?)

@@ -29,7 +29,8 @@ pub use credential::{
     ProviderCredentialView, ProviderCredentialWrite, ProviderCredentialWriteSource,
 };
 pub use deployment::{
-    ProviderAdapter, ProviderAuth, ProviderAuthHeader, ProviderDeployment, VertexLocation,
+    DeploymentAccess, ProviderAdapter, ProviderAuth, ProviderAuthHeader, ProviderDeployment,
+    VertexLocation,
 };
 pub use policy::{
     FALLBACK_HEADER, FallbackRule, FallbackScope, GatewayBudget, GatewayBudgetPeriod,
@@ -44,12 +45,12 @@ pub use record::{
     GatewayCallPayloadV1, GatewayPayloadObjectRefV1, GatewayUsageAmount,
 };
 
-use crate::ids::{ModelId, ProviderId};
+use crate::ids::{ModelId, ProviderDeploymentName};
 
 /// Longest accepted bounded gateway text value, such as a pricing version.
 const MAX_TEXT_LEN: usize = 128;
 
-/// Provider identifiers reserved for the built-in adapters.
+/// Credential-provider identifiers reserved for the built-in adapters.
 pub const BUILTIN_PROVIDER_IDS: [&str; 5] = ["openai", "anthropic", "gemini", "vertex", "jev"];
 
 /// Request header naming the application Run a gateway call belongs to.
@@ -61,6 +62,14 @@ pub const RUN_HEADER: &str = "wyrd-run-id";
 /// Request header naming, by Card UID, the Card a gateway call is attributed
 /// to; it appears together with [`RUN_HEADER`] or not at all.
 pub const CARD_UID_HEADER: &str = "wyrd-card-uid";
+
+/// Request header naming the Prompt provider of an Agent call, such as
+/// `openai` or `google`.
+///
+/// It binds the requested deployment's adapter to the Prompt-provider
+/// compatibility matrix before any IO; fallback candidates keep ordinary
+/// conversion, and a call without it is a direct client call.
+pub const PROMPT_PROVIDER_HEADER: &str = "wyrd-prompt-provider";
 
 /// Longest accepted [`RUN_HEADER`] value, in bytes.
 pub const MAX_RUN_HEADER_BYTES: usize = 128;
@@ -106,37 +115,39 @@ fn validate_text(field: &str, value: &str) -> Result<(), GatewayContractError> {
     Ok(())
 }
 
-/// One exact provider-native model selected by a caller.
+/// One exact model addressed through one named deployment.
 ///
 /// Typed surfaces carry the pair; the OpenAI-compatible `model` string is the
-/// canonical `<provider>/<model>` projection, split on the first `/` so a
-/// native model identifier may itself contain slashes.
+/// canonical `<deployment>/<model>` address, split on the first `/` so a
+/// provider-native model identifier may itself contain slashes. The model
+/// half is sent upstream unchanged.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
 )]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ModelRef {
-    /// Provider that serves the model.
-    pub provider: ProviderId,
+    /// Deployment that serves the call.
+    pub deployment: ProviderDeploymentName,
     /// Provider-native model identifier.
     pub model: ModelId,
 }
 
 impl ModelRef {
-    /// Parses the canonical `<provider>/<model>` projection.
+    /// Parses the canonical `<deployment>/<model>` address.
     ///
     /// # Errors
     ///
     /// Returns [`GatewayContractError`] for field `model` when the value has no
     /// `/`, or when either half is not a valid identity.
     pub fn from_projection(value: &str) -> Result<Self, GatewayContractError> {
-        let (provider, model) = value
+        let (deployment, model) = value
             .split_once('/')
-            .ok_or_else(|| GatewayContractError::new("model", "must be <provider>/<model>"))?;
+            .ok_or_else(|| GatewayContractError::new("model", "must be <deployment>/<model>"))?;
         Ok(Self {
-            provider: ProviderId::new(provider)
-                .map_err(|_| GatewayContractError::new("model", "provider is not a valid name"))?,
+            deployment: ProviderDeploymentName::new(deployment).map_err(|_| {
+                GatewayContractError::new("model", "deployment is not a valid name")
+            })?,
             model: ModelId::new(model)
                 .map_err(|_| GatewayContractError::new("model", "model is not a valid model id"))?,
         })
@@ -144,9 +155,12 @@ impl ModelRef {
 }
 
 impl fmt::Display for ModelRef {
-    /// Renders the canonical `<provider>/<model>` projection.
+    /// Renders the canonical `<deployment>/<model>` address.
+    ///
+    /// # Errors
+    /// Returns the formatter's error.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.provider, self.model)
+        write!(f, "{}/{}", self.deployment, self.model)
     }
 }
 
@@ -304,16 +318,21 @@ mod tests {
     use super::{CurrencyCode, GatewayDecimal, GatewayOperation, ModelRef};
     use serde_json::json;
 
-    /// Proves the OpenAI-compatible projection splits on the first slash only.
+    /// Proves the address splits on the first slash only, preserving the
+    /// complete model suffix.
+    ///
+    /// # Panics
+    /// Panics when the projection does not parse or splits elsewhere.
     #[test]
     fn model_projection_splits_on_first_slash() {
-        let model = ModelRef::from_projection("deepseek/org/model-v3").expect("projection parses");
-        assert_eq!(model.provider.as_str(), "deepseek");
+        let model =
+            ModelRef::from_projection("support-gateway/org/model-v3").expect("projection parses");
+        assert_eq!(model.deployment.as_str(), "support-gateway");
         assert_eq!(model.model.as_str(), "org/model-v3");
-        assert_eq!(model.to_string(), "deepseek/org/model-v3");
+        assert_eq!(model.to_string(), "support-gateway/org/model-v3");
         assert_eq!(
             serde_json::to_value(&model).expect("model serializes"),
-            json!({"provider": "deepseek", "model": "org/model-v3"})
+            json!({"deployment": "support-gateway", "model": "org/model-v3"})
         );
         assert!(ModelRef::from_projection("no-slash").is_err());
         assert!(ModelRef::from_projection("Bad/model").is_err());

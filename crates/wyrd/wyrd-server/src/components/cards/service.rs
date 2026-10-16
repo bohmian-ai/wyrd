@@ -2645,7 +2645,7 @@ mod tests {
             "apiVersion": "wyrd/v1",
             "kind": "Prompt",
             "metadata": { "name": name, "version": "1.0.0", "space": "default" },
-            "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+            "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
             "artifacts": []
         })
     }
@@ -2673,6 +2673,9 @@ mod tests {
     }
 
     /// Build matching row/blob/inventory values for read-integrity regression tests.
+    ///
+    /// # Panics
+    /// Panics when a static fixture value is invalid.
     fn matching_read_integrity_values() -> (
         wyrd_spec::envelope::Card,
         Vec<ArtifactManifestEntry>,
@@ -2690,7 +2693,7 @@ mod tests {
             "apiVersion": "wyrd/v1",
             "kind": "Prompt",
             "metadata": { "name": "integrity", "version": "1.0.0", "space": "default" },
-            "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] }
+            "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] }
         }))
         .expect("test_setup: blob card fixture is valid");
         let spec_hash = card
@@ -2846,7 +2849,7 @@ mod tests {
             "apiVersion": "wyrd/v1",
             "kind": "Prompt",
             "metadata": { "name": "blob", "version": "1.0.0", "space": "default" },
-            "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+            "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
             "relationships": { "outbound": [], "inbound": ["live-edge"] },
             "status": { "phase": "pending" }
         }))

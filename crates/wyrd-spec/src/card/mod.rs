@@ -18,7 +18,6 @@ pub mod service;
 pub mod source;
 pub mod trigger;
 pub mod verifier;
-pub mod workflow;
 
 pub use crate::ids::{ColumnName, FeatureName, QueryName, SplitName};
 pub use common::{
@@ -2465,7 +2464,6 @@ mod envelope_roundtrip_tests {
     use skald_spec::wire::openai_chat::OpenAiMessageContent;
     use skald_spec::{
         OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, Prompt, ProviderRequest,
-        ResponseType,
     };
     use wyrd_semver::VersionBlock;
 
@@ -2499,35 +2497,38 @@ mod envelope_roundtrip_tests {
         assert_eq!(decoded, card);
     }
 
+    /// The OpenAI Chat Prompt spec with one user turn that the Card envelope
+    /// tests wrap.
+    ///
+    /// # Panics
+    /// Panics when the static request is not a valid Prompt spec.
     fn prompt_spec() -> PromptSpec {
-        PromptSpec::new(Prompt {
-            request: ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
-                model: "gpt-4o".to_owned(),
-                messages: vec![OpenAiChatMessage {
-                    role: "user".to_owned(),
-                    content: Some(OpenAiMessageContent::Text("Answer carefully.".to_owned())),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    refusal: None,
-                    annotations: Vec::new(),
-                    audio: None,
-                }],
-                response_format: None,
-                stream: None,
-                stream_options: None,
-                tools: None,
-                tool_choice: None,
-                parallel_tool_calls: None,
-                settings: OpenAiChatSettings::default(),
-            }),
-            model: "gpt-4o".to_owned(),
-            version: None,
-            variables: Vec::new(),
-            media_variables: Vec::new(),
-            response_type: ResponseType::Text,
-            provider: None,
-        })
+        PromptSpec::new(
+            Prompt::new(
+                ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
+                    model: "gpt-4o".to_owned(),
+                    messages: vec![OpenAiChatMessage {
+                        role: "user".to_owned(),
+                        content: Some(OpenAiMessageContent::Text("Answer carefully.".to_owned())),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        refusal: None,
+                        annotations: Vec::new(),
+                        audio: None,
+                    }],
+                    response_format: None,
+                    stream: None,
+                    stream_options: None,
+                    tools: None,
+                    tool_choice: None,
+                    parallel_tool_calls: None,
+                    settings: OpenAiChatSettings::default(),
+                }),
+                "gpt-4o".to_owned(),
+            )
+            .expect("static prompt is valid"),
+        )
         .expect("static prompt spec is valid")
     }
 
@@ -2922,14 +2923,17 @@ mod kind_tests {
     use proptest::prelude::*;
     use serde_json::json;
 
-    /// Lock 16 native kinds (15 registrable plus `External`), with `Verifier`
-    /// replacing both `Drift` and `Eval`.
+    /// Lock 15 native kinds (14 registrable plus `External`), with `Verifier`
+    /// replacing both `Drift` and `Eval` and no `Workflow`.
+    ///
+    /// # Panics
+    /// Panics when the native or registrable kind set changes.
     #[test]
     fn native_card_kind_count_is_locked() {
         assert_eq!(CardKind::native().len(), CardKind::NATIVE_COUNT);
-        assert_eq!(CardKind::NATIVE_COUNT, 16);
+        assert_eq!(CardKind::NATIVE_COUNT, 15);
         assert_eq!(CardKind::registrable().len(), CardKind::REGISTRABLE_COUNT);
-        assert_eq!(CardKind::REGISTRABLE_COUNT, 15);
+        assert_eq!(CardKind::REGISTRABLE_COUNT, 14);
         assert!(CardKind::registrable().contains(&CardKind::Verifier));
         assert!(!CardKind::registrable().contains(&CardKind::External));
         assert!(
@@ -2968,7 +2972,12 @@ mod kind_tests {
         assert_eq!(decoded, CardKind::External);
     }
 
-    /// Publish exactly the 15 registrable kinds in the CardKind schema.
+    /// Publish exactly the 14 registrable kinds in the CardKind schema, with
+    /// no `External` or retired kind.
+    ///
+    /// # Panics
+    /// Panics when the schema is not a string enum of exactly the registrable
+    /// kinds.
     #[test]
     fn card_kind_schema_is_string_enum_with_registrable_kinds() {
         let schema = schemars::schema_for!(CardKind);
@@ -2988,7 +2997,8 @@ mod kind_tests {
         assert!(enum_values.contains(&json!("Verifier")));
         assert!(!enum_values.contains(&json!("Drift")));
         assert!(!enum_values.contains(&json!("Eval")));
-        assert_eq!(enum_values.len(), 15);
+        assert!(!enum_values.contains(&json!("Workflow")));
+        assert_eq!(enum_values.len(), 14);
     }
 
     proptest! {

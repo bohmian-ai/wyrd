@@ -1,43 +1,46 @@
-//! Deterministic call planning: fallback candidates and deployment order.
+//! Deterministic call planning: the requested target and its fallbacks.
 //!
-//! Planning is pure. The requested model comes first, followed by the first
-//! defined fallback source — request override, exact `Model` rule,
-//! `Operation` rule, then `Global` — without merging rules. Candidates equal
-//! to the requested model or already listed are skipped, and a candidate with
-//! no deployment declaring the operation is dropped; a deployment whose
+//! Planning is pure. Every candidate is one `<deployment>/<model>` address
+//! naming exactly one configured deployment. The requested address comes
+//! first, followed by the first defined fallback source — request override,
+//! exact `Model` rule, `Operation` rule, then `Global` — without merging
+//! rules. Candidates equal to the requested address or already listed are
+//! skipped, and a candidate whose deployment is missing, does not serve the
+//! operation, or does not permit the model is dropped; a deployment whose
 //! adapter cannot represent the request body is dropped later by
-//! [`CallPlan::retain_representable`]. Each remaining candidate's deployments are ordered by weighted selection keyed by the
-//! logical call id, so every replica picks the same first deployment.
+//! [`CallPlan::retain_representable`].
 
 use serde_json::Value;
+use skald_spec::ProviderName;
 use wyrd_spec::gateway::{
     FallbackScope, GatewayCallId, GatewayFallbackOverride, GatewayOperation, ModelRef,
-    ProviderDeployment,
+    ProviderAdapter, ProviderDeployment,
 };
 use wyrd_spec::ids::ProviderDeploymentName;
 
-use crate::adapter::{IngressDialect, MediaRequest, UnsupportedRequest, prepare};
+use crate::adapter::{IngressDialect, MediaRequest, UnsupportedRequest, adapter_name, prepare};
 use crate::snapshot::GatewayTenantSnapshot;
 
-/// One model the call may use, with its deployments in attempt order.
+/// One address the call may use and the deployment it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedCandidate {
-    /// Exact model.
+    /// Exact deployment/model address.
     pub model: ModelRef,
-    /// Capable deployments in deterministic attempt order.
-    pub deployments: Vec<ProviderDeployment>,
+    /// The deployment the address names.
+    pub deployment: ProviderDeployment,
 }
 
 /// Immutable ordered candidates for one admitted call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallPlan {
-    /// Logical call identity keying deployment selection.
+    /// Logical call identity.
     pub call_id: GatewayCallId,
     /// Requested operation.
     pub operation: GatewayOperation,
-    /// Model the caller asked for.
+    /// Address the caller asked for.
     pub requested: ModelRef,
-    /// Candidates in attempt order; the requested model first when capable.
+    /// Candidates in attempt order; the requested address first when its
+    /// deployment can serve it.
     pub candidates: Vec<PlannedCandidate>,
 }
 
@@ -77,18 +80,15 @@ impl CallPlan {
         let candidates = models
             .into_iter()
             .filter_map(|model| {
-                let capable: Vec<&ProviderDeployment> = snapshot
-                    .deployments
-                    .iter()
-                    .filter(|d| d.model == *model && d.capabilities.contains(&operation))
-                    .collect();
-                (!capable.is_empty()).then(|| PlannedCandidate {
-                    model: model.clone(),
-                    deployments: weighted_order(&capable, call_id)
-                        .into_iter()
-                        .cloned()
-                        .collect(),
-                })
+                snapshot
+                    .deployment(&model.deployment)
+                    .filter(|deployment| {
+                        deployment.serves(operation) && deployment.permits(&model.model)
+                    })
+                    .map(|deployment| PlannedCandidate {
+                        model: model.clone(),
+                        deployment: deployment.clone(),
+                    })
             })
             .collect();
         Self {
@@ -99,19 +99,16 @@ impl CallPlan {
         }
     }
 
-    /// Restricts the plan to the requested model on exactly `deployment`.
+    /// Restricts the plan to the requested address on exactly `deployment`.
     ///
     /// A call that continues provider-held state, such as a batch or its files,
-    /// must reach the deployment holding that state, so fallback candidates and
-    /// sibling deployments are dropped. The plan is empty when `deployment` no
-    /// longer serves the requested model's operation.
+    /// must reach the deployment holding that state, so fallback candidates are
+    /// dropped. The plan is empty when the requested address no longer names
+    /// `deployment` or it no longer serves the operation.
     pub fn pin(&mut self, deployment: &ProviderDeploymentName) {
         let requested = &self.requested;
-        self.candidates.retain_mut(|candidate| {
-            candidate
-                .deployments
-                .retain(|planned| planned.name == *deployment);
-            candidate.model == *requested && !candidate.deployments.is_empty()
+        self.candidates.retain(|candidate| {
+            candidate.model == *requested && candidate.deployment.name == *deployment
         });
     }
 
@@ -120,9 +117,57 @@ impl CallPlan {
         self.candidates.retain(|candidate| keep(&candidate.model));
     }
 
-    /// Drops deployments whose adapter cannot represent `body` in `ingress`
-    /// with its `media` route and files, then candidates left without
-    /// deployments.
+    /// Refuses an Agent call whose requested deployment's adapter is outside
+    /// the initial-target compatibility matrix of its Prompt `provider`.
+    ///
+    /// `openai` and custom Prompts need an `openai` or `openai_compatible`
+    /// adapter, `anthropic` an `anthropic`, `google` a `gemini`, `vertex` a
+    /// `vertex`, and `jev` a `jev` adapter. Only the requested address is
+    /// bound: fallback candidates keep ordinary conversion, and a plan whose
+    /// requested deployment no longer serves the call is left to the
+    /// unavailable-model refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnsupportedRequest`] naming `model` when the requested
+    /// deployment's adapter cannot serve a `provider` Prompt.
+    pub fn require_compatible_initial(
+        &self,
+        provider: &ProviderName,
+    ) -> Result<(), UnsupportedRequest> {
+        let Some(initial) = self
+            .candidates
+            .iter()
+            .find(|candidate| candidate.model == self.requested)
+        else {
+            return Ok(());
+        };
+        let compatible = matches!(
+            (provider, &initial.deployment.adapter),
+            (
+                ProviderName::OpenAi | ProviderName::Custom(_),
+                ProviderAdapter::OpenAi | ProviderAdapter::OpenAiCompatible { .. },
+            ) | (ProviderName::Anthropic, ProviderAdapter::Anthropic)
+                | (ProviderName::Google, ProviderAdapter::Gemini)
+                | (ProviderName::Vertex, ProviderAdapter::Vertex { .. })
+                | (ProviderName::Jev, ProviderAdapter::Jev)
+        );
+        if compatible {
+            Ok(())
+        } else {
+            Err(UnsupportedRequest::new(
+                "model",
+                format!(
+                    "deployment `{}` uses the {} adapter, which cannot serve a {provider} Prompt",
+                    initial.deployment.name,
+                    adapter_name(&initial.deployment.adapter)
+                ),
+            ))
+        }
+    }
+
+    /// Drops candidates whose adapter cannot represent `body` in `ingress`
+    /// with its `media` route and files.
     ///
     /// Runs before admission so an unrepresentable request never reaches a
     /// provider or consumes budget, while a request some candidate can carry
@@ -130,8 +175,8 @@ impl CallPlan {
     ///
     /// # Errors
     ///
-    /// Returns the first [`UnsupportedRequest`] when no deployment of any
-    /// candidate can represent the request; the plan is then empty.
+    /// Returns the first [`UnsupportedRequest`] when no candidate can
+    /// represent the request; the plan is then empty.
     pub fn retain_representable(
         &mut self,
         ingress: IngressDialect,
@@ -141,60 +186,28 @@ impl CallPlan {
     ) -> Result<(), UnsupportedRequest> {
         let operation = self.operation;
         let mut first = None;
-        for candidate in &mut self.candidates {
-            candidate.deployments.retain(|deployment| {
-                match prepare(ingress, operation, stream, body, deployment, media) {
-                    Ok(_) => true,
-                    Err(error) => {
-                        first.get_or_insert(error);
-                        false
-                    }
+        self.candidates.retain(|candidate| {
+            match prepare(
+                ingress,
+                operation,
+                stream,
+                body,
+                &candidate.deployment,
+                &candidate.model.model,
+                media,
+            ) {
+                Ok(_) => true,
+                Err(error) => {
+                    first.get_or_insert(error);
+                    false
                 }
-            });
-        }
-        self.candidates
-            .retain(|candidate| !candidate.deployments.is_empty());
+            }
+        });
         match first {
             Some(error) if self.candidates.is_empty() => Err(error),
             _ => Ok(()),
         }
     }
-}
-
-/// Orders `deployments` (sorted by name) for `call_id`.
-///
-/// The call id modulo the total weight picks the first deployment by
-/// cumulative weight; the others follow in name order after it, wrapping.
-/// Planning orders every capable deployment; the engine reapplies it to the
-/// healthy subset. An empty slice yields an empty order.
-pub(crate) fn weighted_order<'d>(
-    deployments: &[&'d ProviderDeployment],
-    call_id: GatewayCallId,
-) -> Vec<&'d ProviderDeployment> {
-    let total: u128 = deployments
-        .iter()
-        .map(|d| u128::from(d.routing_weight.get()))
-        .sum();
-    let Some(mut pick) = call_id.as_uuid().as_u128().checked_rem(total) else {
-        return Vec::new();
-    };
-    let first = deployments
-        .iter()
-        .position(|d| {
-            let weight = u128::from(d.routing_weight.get());
-            if pick < weight {
-                true
-            } else {
-                pick -= weight;
-                false
-            }
-        })
-        .unwrap_or(0);
-    deployments[first..]
-        .iter()
-        .chain(&deployments[..first])
-        .copied()
-        .collect()
 }
 
 #[cfg(test)]
@@ -203,17 +216,28 @@ mod tests {
     use serde_json::json;
     use wyrd_spec::gateway::{GatewayCapturePolicy, GatewayFallbackPolicy};
 
-    /// Builds a deployment of `model` named `name` with `weight` and operations.
-    fn deployment(name: &str, model: &str, weight: u32, ops: &[&str]) -> ProviderDeployment {
-        serde_json::from_value(json!({
+    /// Builds an OpenAI-compatible deployment `name` with optional model and
+    /// capability lists.
+    ///
+    /// # Panics
+    /// Panics when the fixture is not a valid deployment.
+    fn deployment(
+        name: &str,
+        models: Option<&[&str]>,
+        capabilities: Option<&[&str]>,
+    ) -> ProviderDeployment {
+        let mut value = json!({
             "name": name,
-            "model": ModelRef::from_projection(model).expect("model"),
             "adapter": {"openai_compatible": {"base_url": "https://acme.example/v1"}},
             "auth": "none",
-            "capabilities": ops,
-            "routing_weight": weight,
-        }))
-        .expect("deployment decodes")
+        });
+        if let Some(models) = models {
+            value["models"] = json!(models);
+        }
+        if let Some(capabilities) = capabilities {
+            value["capabilities"] = json!(capabilities);
+        }
+        serde_json::from_value(value).expect("deployment decodes")
     }
 
     /// Builds a snapshot from deployments and a fallback policy document.
@@ -234,36 +258,171 @@ mod tests {
         }
     }
 
-    /// Parses a model projection.
+    /// Parses an address.
+    ///
+    /// # Panics
+    /// Panics when `value` is not an address.
     fn model(value: &str) -> ModelRef {
         ModelRef::from_projection(value).expect("model")
     }
 
-    /// Candidate models of a plan.
+    /// Candidate addresses of a plan.
     fn models(plan: &CallPlan) -> Vec<String> {
         plan.candidates
             .iter()
-            .map(|c| format!("{}/{}", c.model.provider.as_str(), c.model.model.as_str()))
+            .map(|c| c.model.to_string())
             .collect()
     }
 
-    /// Override, exact model, operation, and global rules apply in that
-    /// precedence without merging; the requested model and duplicates are
-    /// skipped and incapable candidates are dropped.
+    /// Plans a chat call for `requested` with no override.
+    fn chat(snap: &GatewayTenantSnapshot, requested: &str) -> CallPlan {
+        CallPlan::new(
+            snap,
+            GatewayCallId::new_v7(),
+            GatewayOperation::ChatCompletions,
+            model(requested),
+            None,
+        )
+    }
+
+    /// The deployment prefix selects exactly one target: two same-adapter
+    /// deployments stay independent, an unrestricted deployment accepts any
+    /// model suffix including slashes, an allowlist and capability set
+    /// narrow it, and a missing deployment plans nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a plan names another deployment or keeps a target its
+    /// deployment does not permit.
     #[test]
-    fn fallback_precedence_is_first_defined_without_merging() {
+    fn named_target_and_allowlist_resolution() {
         let snap = snapshot(
             vec![
-                deployment("dep-a", "acme/a", 1, &["chat_completions"]),
-                deployment("dep-b", "acme/b", 1, &["chat_completions"]),
-                deployment("dep-c", "acme/c", 1, &["chat_completions"]),
-                deployment("dep-d", "acme/d", 1, &["chat_completions"]),
-                deployment("dep-e", "acme/e", 1, &["embeddings"]),
+                deployment("primary", None, None),
+                deployment("dedicated", Some(&["gpt-4o"]), Some(&["chat_completions"])),
+            ],
+            json!({"rules": []}),
+        );
+        let primary = chat(&snap, "primary/org/model-v3");
+        assert_eq!(models(&primary), ["primary/org/model-v3"]);
+        assert_eq!(primary.candidates[0].deployment.name.as_str(), "primary");
+        assert_eq!(primary.candidates[0].model.model.as_str(), "org/model-v3");
+        let dedicated = chat(&snap, "dedicated/gpt-4o");
+        assert_eq!(
+            dedicated.candidates[0].deployment.name.as_str(),
+            "dedicated"
+        );
+        assert!(
+            chat(&snap, "dedicated/gpt-4.1").candidates.is_empty(),
+            "an allowlist refuses an unlisted model"
+        );
+        assert!(chat(&snap, "missing/gpt-4o").candidates.is_empty());
+        assert!(
+            CallPlan::new(
+                &snap,
+                GatewayCallId::new_v7(),
+                GatewayOperation::Embeddings,
+                model("dedicated/gpt-4o"),
+                None,
+            )
+            .candidates
+            .is_empty(),
+            "declared capabilities narrow the adapter's operations"
+        );
+        assert_eq!(
+            models(&CallPlan::new(
+                &snap,
+                GatewayCallId::new_v7(),
+                GatewayOperation::Embeddings,
+                model("primary/text-embedding-3-small"),
+                None,
+            )),
+            ["primary/text-embedding-3-small"],
+            "omitted capabilities permit every adapter operation"
+        );
+    }
+
+    /// An Agent's requested deployment must use an adapter its Prompt
+    /// provider is compatible with, whatever the deployment is named, while
+    /// an incompatible fallback candidate and a missing requested deployment
+    /// are left to ordinary routing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a compatible pair is refused or an incompatible one is
+    /// admitted.
+    #[test]
+    fn agent_initial_target_follows_the_prompt_provider_matrix() {
+        let native = |name: &str, adapter: Value| -> ProviderDeployment {
+            serde_json::from_value(json!({"name": name, "adapter": adapter, "auth": "none"}))
+                .expect("deployment decodes")
+        };
+        let snap = snapshot(
+            vec![
+                native("openai", json!("openai")),
+                deployment("compat", None, None),
+                native("claude", json!("anthropic")),
+                native("vertex", json!("gemini")),
+                native(
+                    "gcp",
+                    json!({"vertex": {"project": "acme", "location": "us-central1"}}),
+                ),
+                native("judge", json!("jev")),
+            ],
+            json!({"rules": [{"scope": "global", "candidates": [model("claude/m")]}]}),
+        );
+        let provider = |name: &str| name.parse::<ProviderName>().expect("provider");
+        for (prompt, deployment, compatible) in [
+            ("openai", "openai", true),
+            ("openai", "compat", true),
+            ("local", "compat", true),
+            ("anthropic", "claude", true),
+            ("google", "vertex", true),
+            ("vertex", "gcp", true),
+            ("jev", "judge", true),
+            ("openai", "claude", false),
+            ("openai", "gcp", false),
+            ("google", "gcp", false),
+            ("vertex", "vertex", false),
+            ("anthropic", "openai", false),
+            ("jev", "openai", false),
+        ] {
+            let plan = chat(&snap, &format!("{deployment}/m"));
+            let outcome = plan.require_compatible_initial(&provider(prompt));
+            assert_eq!(outcome.is_ok(), compatible, "{prompt} -> {deployment}");
+            if let Err(error) = outcome {
+                assert_eq!(error.field, "model");
+            }
+        }
+        assert!(
+            chat(&snap, "missing/m")
+                .require_compatible_initial(&provider("openai"))
+                .is_ok(),
+            "a missing requested deployment is the unavailable-model refusal"
+        );
+    }
+
+    /// Override, exact model, operation, and global rules apply in that
+    /// precedence without merging; the requested address and duplicates are
+    /// skipped and incapable candidates are dropped.
+    ///
+    /// # Panics
+    /// Panics when a fixture is invalid or the plan holds other candidates.
+    #[test]
+    fn fallback_precedence_is_first_defined_without_merging() {
+        let chat_only = Some(&["chat_completions"][..]);
+        let snap = snapshot(
+            vec![
+                deployment("dep-a", None, chat_only),
+                deployment("dep-b", None, chat_only),
+                deployment("dep-c", None, chat_only),
+                deployment("dep-d", None, chat_only),
+                deployment("dep-e", None, Some(&["embeddings"])),
             ],
             json!({"rules": [
-                {"scope": "global", "candidates": [model("acme/a"), model("acme/d")]},
-                {"scope": {"operation": {"operation": "chat_completions"}}, "candidates": [model("acme/c"), model("acme/e")]},
-                {"scope": {"model": {"model": model("acme/a")}}, "candidates": [model("acme/b")]},
+                {"scope": "global", "candidates": [model("dep-a/a"), model("dep-d/d")]},
+                {"scope": {"operation": {"operation": "chat_completions"}}, "candidates": [model("dep-c/c"), model("dep-e/e")]},
+                {"scope": {"model": {"model": model("dep-a/a")}}, "candidates": [model("dep-b/b")]},
             ]}),
         );
         let call = GatewayCallId::new_v7();
@@ -273,119 +432,61 @@ mod tests {
         };
 
         let over: GatewayFallbackOverride =
-            serde_json::from_value(json!({"candidates": [model("acme/d"), model("acme/c")]}))
+            serde_json::from_value(json!({"candidates": [model("dep-d/d"), model("dep-c/c")]}))
                 .expect("override");
         assert_eq!(
-            models(&plan("acme/a", Some(over))),
-            ["acme/a", "acme/d", "acme/c"]
+            models(&plan("dep-a/a", Some(over))),
+            ["dep-a/a", "dep-d/d", "dep-c/c"]
         );
-        assert_eq!(models(&plan("acme/a", None)), ["acme/a", "acme/b"]);
+        assert_eq!(models(&plan("dep-a/a", None)), ["dep-a/a", "dep-b/b"]);
         assert_eq!(
-            models(&plan("acme/b", None)),
-            ["acme/b", "acme/c"],
-            "operation rule wins over global; incapable acme/e is dropped"
+            models(&plan("dep-b/b", None)),
+            ["dep-b/b", "dep-c/c"],
+            "operation rule wins over global; incapable dep-e is dropped"
         );
         assert!(
             CallPlan::new(
                 &snap,
                 call,
                 GatewayOperation::Embeddings,
-                model("acme/d"),
+                model("dep-d/d"),
                 None
             )
             .candidates
             .is_empty(),
-            "an incapable requested model and incapable global candidates are dropped"
-        );
-        let global = snapshot(
-            vec![
-                deployment("dep-a", "acme/a", 1, &["chat_completions"]),
-                deployment("dep-d", "acme/d", 1, &["chat_completions"]),
-            ],
-            json!({"rules": [{"scope": "global", "candidates": [model("acme/a"), model("acme/d")]}]}),
-        );
-        assert_eq!(
-            models(&CallPlan::new(&global, call, chat, model("acme/a"), None)),
-            ["acme/a", "acme/d"],
-            "global self candidate is skipped at runtime"
+            "an incapable requested address and incapable global candidates are dropped"
         );
     }
 
-    /// Selection is a pure function of the call id and weights: repeated
-    /// planning agrees, every deployment appears once, and first picks follow
-    /// the weights.
-    #[test]
-    fn weighted_selection_is_deterministic_by_call_id() {
-        let snap = snapshot(
-            vec![
-                deployment("heavy", "acme/a", 3, &["chat_completions"]),
-                deployment("light", "acme/a", 1, &["chat_completions"]),
-            ],
-            json!({"rules": []}),
-        );
-        let mut heavy_first = 0;
-        for low in 0..400_u128 {
-            let call = GatewayCallId::from_uuid(uuid::Uuid::from_u128((7_u128 << 76) | low));
-            let plan = CallPlan::new(
-                &snap,
-                call,
-                GatewayOperation::ChatCompletions,
-                model("acme/a"),
-                None,
-            );
-            let again = CallPlan::new(
-                &snap,
-                call,
-                GatewayOperation::ChatCompletions,
-                model("acme/a"),
-                None,
-            );
-            assert_eq!(plan, again);
-            let names: Vec<&str> = plan.candidates[0]
-                .deployments
-                .iter()
-                .map(|d| d.name.as_str())
-                .collect();
-            assert_eq!(names.len(), 2);
-            if names[0] == "heavy" {
-                heavy_first += 1;
-            }
-        }
-        assert_eq!(heavy_first, 300, "weight 3:1 over a uniform residue range");
-    }
-
-    /// Pinning keeps only the named deployment of the requested model, dropping
-    /// sibling deployments and fallback candidates, and empties the plan for a
-    /// deployment that no longer serves it.
+    /// Pinning keeps only the requested address on the named deployment,
+    /// dropping fallback candidates, and empties the plan for another name.
     ///
     /// # Panics
     ///
-    /// Panics when a pinned plan keeps another deployment or model.
+    /// Panics when a pinned plan keeps another deployment or address.
     #[test]
-    fn pin_keeps_only_the_named_deployment_of_the_requested_model() {
+    fn pin_keeps_only_the_requested_address_on_its_deployment() {
         let snap = snapshot(
             vec![
-                deployment("dep-a1", "acme/a", 1, &["batches"]),
-                deployment("dep-a2", "acme/a", 1, &["batches"]),
-                deployment("dep-b", "acme/b", 1, &["batches"]),
+                deployment("dep-a", None, None),
+                deployment("dep-b", None, None),
             ],
-            json!({"rules": [{"scope": "global", "candidates": [model("acme/b")]}]}),
+            json!({"rules": [{"scope": "global", "candidates": [model("dep-b/m")]}]}),
         );
         let plan = || {
             CallPlan::new(
                 &snap,
                 GatewayCallId::new_v7(),
                 GatewayOperation::Batches,
-                model("acme/a"),
+                model("dep-a/m"),
                 None,
             )
         };
         let name = |value: &str| ProviderDeploymentName::new(value).expect("name");
         let mut pinned = plan();
-        pinned.pin(&name("dep-a2"));
-        assert_eq!(models(&pinned), ["acme/a"]);
-        assert_eq!(pinned.candidates[0].deployments.len(), 1);
-        assert_eq!(pinned.candidates[0].deployments[0].name.as_str(), "dep-a2");
+        assert_eq!(models(&pinned), ["dep-a/m", "dep-b/m"]);
+        pinned.pin(&name("dep-a"));
+        assert_eq!(models(&pinned), ["dep-a/m"]);
         let mut fallback = plan();
         fallback.pin(&name("dep-b"));
         assert!(
@@ -395,7 +496,7 @@ mod tests {
     }
 
     /// Fallback stays within the protocol by capability and representability
-    /// alone: a `systemone` question keeps only deployments declaring that
+    /// alone: a `systemone` question keeps only deployments serving that
     /// operation, and an ordinary chat body drops every Jev deployment because
     /// the Jev adapter cannot represent it.
     ///
@@ -404,25 +505,18 @@ mod tests {
     /// Panics when a plan keeps a candidate that cannot carry the request.
     #[test]
     fn fallback_keeps_only_capable_and_representable_candidates() {
-        let jev = |name: &str, model: &str| -> ProviderDeployment {
+        let jev = |name: &str| -> ProviderDeployment {
             serde_json::from_value(json!({
                 "name": name,
-                "model": ModelRef::from_projection(model).expect("model"),
                 "adapter": "jev",
                 "auth": {"bearer": {"credential": "jev-key"}},
-                "capabilities": ["system_one", "chat_completions"],
-                "routing_weight": 1,
             }))
             .expect("jev deployment decodes")
         };
         let snap = snapshot(
-            vec![
-                jev("jev-a", "jev/jev-latest"),
-                jev("jev-b", "jev/jev-preview"),
-                deployment("chat", "acme/chat", 1, &["chat_completions"]),
-            ],
+            vec![jev("jev-a"), jev("jev-b"), deployment("chat", None, None)],
             json!({"rules": [{"scope": "global", "candidates": [
-                model("jev/jev-latest"), model("jev/jev-preview"), model("acme/chat"),
+                model("jev-a/jev-latest"), model("jev-b/jev-preview"), model("chat/gpt-4o"),
             ]}]}),
         );
         let call = GatewayCallId::new_v7();
@@ -431,29 +525,29 @@ mod tests {
                 &snap,
                 call,
                 GatewayOperation::SystemOne,
-                model("jev/jev-preview"),
+                model("jev-b/jev-preview"),
                 None
             )),
-            ["jev/jev-preview", "jev/jev-latest"],
+            ["jev-b/jev-preview", "jev-a/jev-latest"],
             "only systemone-capable deployments answer a Jev question"
         );
         let mut chat = CallPlan::new(
             &snap,
             call,
             GatewayOperation::ChatCompletions,
-            model("acme/chat"),
+            model("chat/gpt-4o"),
             None,
         );
         chat.retain_representable(
             IngressDialect::OpenAi,
             false,
-            &json!({"model": "acme/chat", "messages": [{"role": "user", "content": "hi"}]}),
+            &json!({"model": "chat/gpt-4o", "messages": [{"role": "user", "content": "hi"}]}),
             None,
         )
         .expect("ordinary chat is representable");
         assert_eq!(
             models(&chat),
-            ["acme/chat"],
+            ["chat/gpt-4o"],
             "an ordinary chat body is not a Jev request"
         );
     }

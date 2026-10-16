@@ -10,7 +10,8 @@ use skald_prompt::Prompt;
 use skald_spec::Prompt as PromptSpec;
 use skald_tool::{AgentTool, ToolError, ToolResolver};
 use wyrd_spec::{
-    AgentCard, AgentRunConfigSpec, AgentSpec, CardMetadata,
+    AgentCard, AgentRunConfigSpec, AgentSpec, CardMetadata, ExecutionRoute,
+    card::verifier::VerificationBinding,
     envelope::CardKind,
     error::WyrdError,
     metadata::{Annotations, Labels},
@@ -21,7 +22,8 @@ use crate::callbacks::{
     AfterAgentFn, AfterModelFn, AfterToolFn, BeforeAgentFn, BeforeModelFn, BeforeToolFn,
 };
 use crate::card_error::AgentCardError;
-use crate::error::AgentResult;
+use crate::error::{AgentError, AgentResult};
+use crate::gateway::{WyrdGatewayCaller, wyrd_gateway_registry};
 use crate::journal::{Journal, NoopJournal};
 use crate::run::{AgentRun, RunConfig};
 use crate::session::{NoSession, SessionMemory};
@@ -181,6 +183,16 @@ pub struct Agent {
     pub prompt: Arc<Prompt>,
     /// Loop execution settings.
     pub run_config: RunConfig,
+    /// Run configuration exactly as the loaded Agent Card authored it, with
+    /// omitted fields still omitted; `None` for an Agent built in code.
+    ///
+    /// [`Self::to_spec`] exports each field from here while
+    /// [`Self::run_config`] still holds the value this resolved to, so an
+    /// untouched loaded Agent keeps its authored spec and hash.
+    pub(crate) authored_run_config: Option<AgentRunConfigSpec>,
+    /// Verification bindings the loaded Agent Card declared, exported
+    /// unchanged and never resolved or run by the Agent.
+    pub(crate) verified_by: Vec<VerificationBinding>,
     /// Per-agent runtime-local tool cache.
     pub(crate) tools: Vec<Arc<dyn AgentTool>>,
     /// Session memory backend for this agent.
@@ -192,6 +204,14 @@ pub struct Agent {
     /// Per-agent provider registry override. When set, overrides the global
     /// default registry for this agent's runs only. Not serialized.
     pub(crate) provider_override: Option<Arc<skald_runtime::ProviderRegistry>>,
+    /// Declared execution route, projected into and read from the Card spec.
+    ///
+    /// A `wyrd_gateway` route sends every model call of every run through
+    /// [`Self::gateway_caller`]; it never falls back to native providers.
+    pub(crate) execution_route: ExecutionRoute,
+    /// Host-supplied gateway seam a `wyrd_gateway` route dispatches through.
+    /// Runtime state only, never serialized.
+    pub(crate) gateway_caller: Option<Arc<dyn WyrdGatewayCaller>>,
     /// Python class retained for structured-output instantiation.
     ///
     /// Set via `Agent(output_type=...)` or `agent.run(output_type=...)`.
@@ -202,6 +222,12 @@ pub struct Agent {
 }
 
 impl fmt::Debug for Agent {
+    /// Formats the Agent's identity, Prompt model, run config, tool names,
+    /// and execution route, omitting the Prompt body, callbacks, session, and
+    /// gateway caller.
+    ///
+    /// # Errors
+    /// Returns the formatter's error.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Agent")
@@ -211,6 +237,7 @@ impl fmt::Debug for Agent {
             .field("prompt_model", &self.prompt.native().model)
             .field("run_config", &self.run_config)
             .field("tool_names", &self.tool_names)
+            .field("execution_route", &self.execution_route)
             .finish_non_exhaustive()
     }
 }
@@ -307,6 +334,63 @@ impl Agent {
         fallback: &'a skald_runtime::ProviderRegistry,
     ) -> &'a skald_runtime::ProviderRegistry {
         self.provider_override.as_deref().unwrap_or(fallback)
+    }
+
+    /// Return a copy declaring `route` as this Agent's execution route.
+    ///
+    /// The route is durable identity: [`Self::to_spec`] projects it and
+    /// [`Self::from_card`] restores it. Applying it to a clone is how one
+    /// invocation overrides the route whole without touching the original.
+    #[must_use]
+    pub fn with_execution_route(mut self, route: ExecutionRoute) -> Self {
+        self.execution_route = route;
+        self
+    }
+
+    /// Return a copy whose `wyrd_gateway` route dispatches through `caller`.
+    ///
+    /// The caller is host-owned runtime state, never serialized; a `native`
+    /// route ignores it.
+    #[must_use]
+    pub fn with_gateway_caller(mut self, caller: Arc<dyn WyrdGatewayCaller>) -> Self {
+        self.gateway_caller = Some(caller);
+        self
+    }
+
+    /// Return the declared execution route.
+    #[must_use]
+    pub fn execution_route(&self) -> &ExecutionRoute {
+        &self.execution_route
+    }
+
+    /// Build the gateway registry one run of `prompt` must use, or `None` for
+    /// a `native` route.
+    ///
+    /// A `wyrd_gateway` route addresses `<deployment>/<prompt model>` through
+    /// the host's gateway caller, so a run never reaches native provider
+    /// credentials. This runs before any journal, session, or provider IO.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::InvalidArgument`] for `execution_route` when the
+    /// route is `wyrd_gateway` but no gateway caller is configured, or the
+    /// Prompt model is not a gateway model identifier.
+    pub fn route_registry(
+        &self,
+        prompt: &Prompt,
+    ) -> AgentResult<Option<skald_runtime::ProviderRegistry>> {
+        let ExecutionRoute::WyrdGateway { deployment } = &self.execution_route else {
+            return Ok(None);
+        };
+        let refuse = |detail: &str| AgentError::InvalidArgument {
+            name: "execution_route".to_owned(),
+            detail: format!("agent '{}' {detail}", self.id),
+        };
+        let caller = self.gateway_caller.as_ref().ok_or_else(|| {
+            refuse("routes through the Wyrd gateway, but no gateway caller is configured")
+        })?;
+        wyrd_gateway_registry(Arc::clone(caller), prompt.native(), deployment)
+            .map(Some)
+            .ok_or_else(|| refuse("has a Prompt model that is not a gateway model identifier"))
     }
 
     /// Return a copy with one runtime-local tool appended.
@@ -596,6 +680,10 @@ impl Agent {
 
     /// Reconstruct an agent from a typed Agent Card envelope.
     ///
+    /// The Card's run configuration resolves to runtime defaults for
+    /// execution, while the authored form and verification bindings are kept
+    /// so [`Self::to_spec`] exports the Card's spec unchanged.
+    ///
     /// # Errors
     /// Returns prompt resolution or tool resolution errors.
     pub fn from_card(
@@ -610,6 +698,7 @@ impl Agent {
 
         let mut agent = Self::try_from_ref(card.spec.prompt.clone(), prompt_resolver)?
             .with_id(card.name.clone())
+            .with_execution_route(card.spec.execution_route.clone())
             .with_run_config(run_config_from_agent_run_config_spec(&card.spec.run_config))
             .with_tools(tools);
         agent.meta = CardMetadata {
@@ -621,6 +710,8 @@ impl Agent {
             annotations: card.annotations,
         };
         agent.tool_names = card.spec.tool_names;
+        agent.authored_run_config = Some(card.spec.run_config);
+        agent.verified_by = card.spec.verified_by;
         Ok(agent)
     }
 
@@ -678,6 +769,9 @@ impl Agent {
         Self::from_resolved_arc_parts(id, prompt_ref, Arc::new(prompt))
     }
 
+    /// Builds an Agent with identity `id` over an already resolved shared
+    /// Prompt and its authored reference; every other field takes its default,
+    /// including the native execution route and no gateway caller.
     fn from_resolved_arc_parts(
         id: String,
         prompt_ref: InlineableRef<PromptSpec>,
@@ -690,24 +784,77 @@ impl Agent {
             id,
             prompt,
             run_config: RunConfig::default(),
+            authored_run_config: None,
+            verified_by: Vec::new(),
             tools: Vec::new(),
             session: Arc::new(NoSession),
             journal: Arc::new(NoopJournal),
             callbacks: AgentCallbacks::default(),
             provider_override: None,
+            execution_route: ExecutionRoute::Native {},
+            gateway_caller: None,
             #[cfg(feature = "python")]
             py_output_cls: None,
         }
     }
 
     /// Project this agent into its pure durable [`AgentSpec`] body.
+    ///
+    /// A loaded Agent exports its Card's verification bindings and, through
+    /// [`Self::run_config_spec`], its authored run configuration; an Agent
+    /// built in code exports its current configuration and no bindings.
     #[must_use]
     pub fn to_spec(&self) -> AgentSpec {
         AgentSpec {
             prompt: self.prompt_ref.clone(),
+            execution_route: self.execution_route.clone(),
             tool_names: self.tool_names.clone(),
-            run_config: agent_run_config_spec_from_run_config(&self.run_config),
-            verified_by: Vec::new(),
+            run_config: self.run_config_spec(),
+            verified_by: self.verified_by.clone(),
+        }
+    }
+
+    /// Projects [`Self::run_config`] into its durable spec form.
+    ///
+    /// For a loaded Agent, a field whose current value still equals what the
+    /// authored field resolved to exports as authored, so an omitted default
+    /// stays omitted and an explicit one stays explicit. A field changed
+    /// since load, through [`Self::with_run_config`] or the public field,
+    /// exports its current value. Comparing per field keeps unrelated
+    /// authored values when only one setting is edited.
+    fn run_config_spec(&self) -> AgentRunConfigSpec {
+        /// Keeps the authored value unless the current one moved off what
+        /// that authored value resolved to.
+        fn keep<T: PartialEq>(
+            authored: Option<T>,
+            loaded: Option<T>,
+            current: Option<T>,
+        ) -> Option<T> {
+            if current == loaded { authored } else { current }
+        }
+        let current = agent_run_config_spec_from_run_config(&self.run_config);
+        let Some(authored) = &self.authored_run_config else {
+            return current;
+        };
+        let loaded =
+            agent_run_config_spec_from_run_config(&run_config_from_agent_run_config_spec(authored));
+        AgentRunConfigSpec {
+            max_iterations: keep(
+                authored.max_iterations,
+                loaded.max_iterations,
+                current.max_iterations,
+            ),
+            tool_concurrency_cap: keep(
+                authored.tool_concurrency_cap,
+                loaded.tool_concurrency_cap,
+                current.tool_concurrency_cap,
+            ),
+            session_recent_limit: keep(
+                authored.session_recent_limit,
+                loaded.session_recent_limit,
+                current.session_recent_limit,
+            ),
+            timeout_ms: keep(authored.timeout_ms, loaded.timeout_ms, current.timeout_ms),
         }
     }
 

@@ -133,5 +133,5 @@ threads-required = 'num-test-threads'
 max-threads = 1
 
 [[profile.journey.overrides]]
-filter = 'package(wyrd-testing) and binary(oracle) and test(/^(analytical_activation|peer_network|mcp|workflow)::/)'
+filter = 'package(wyrd-testing) and binary(oracle) and test(/^(analytical_activation|peer_network|mcp)::/)'
 test-group = 'peer-clusters'

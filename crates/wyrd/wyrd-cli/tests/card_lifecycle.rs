@@ -69,6 +69,11 @@ macro_rules! run_cli_async {
     };
 }
 
+/// Writes the `cli-prompt` Prompt Card and its declared text artifact into
+/// `temp` and returns the Card's path.
+///
+/// # Panics
+/// Panics when a file cannot be written.
 fn write_prompt(temp: &TempDir) -> std::path::PathBuf {
     let artifact = b"cli-card-artifact";
     let digest = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(artifact));
@@ -77,7 +82,7 @@ fn write_prompt(temp: &TempDir) -> std::path::PathBuf {
     std::fs::write(
         &path,
         format!(
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: cli-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: cli-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
             artifact.len()
         ),
     )
@@ -85,6 +90,11 @@ fn write_prompt(temp: &TempDir) -> std::path::PathBuf {
     path
 }
 
+/// Writes a Service graph whose two Agents share one Prompt Card and one
+/// Model, each artifact-bearing, into `temp` and returns the Service path.
+///
+/// # Panics
+/// Panics when a file cannot be written.
 fn write_multi_card_service(temp: &TempDir) -> std::path::PathBuf {
     let prompt_artifact = b"shared-prompt-artifact";
     let prompt_digest =
@@ -94,7 +104,7 @@ fn write_multi_card_service(temp: &TempDir) -> std::path::PathBuf {
     std::fs::write(
         temp.path().join("shared-prompt.yaml"),
         format!(
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: shared-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\nartifacts:\n  - relative_path: shared-prompt.txt\n    sha256: {prompt_digest}\n    size_bytes: {}\n    content_type: text/plain\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: shared-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\nartifacts:\n  - relative_path: shared-prompt.txt\n    sha256: {prompt_digest}\n    size_bytes: {}\n    content_type: text/plain\n",
             prompt_artifact.len()
         ),
     )
@@ -117,7 +127,7 @@ fn write_multi_card_service(temp: &TempDir) -> std::path::PathBuf {
         std::fs::write(
             temp.path().join(format!("{name}.yaml")),
             format!(
-                "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: {prompt_name}\n  version: 1.0.0\n  space: default\nspec:\n  prompt:\n    kind: Prompt\n    name: shared-prompt\n    version: 1.0.0\n    space: default\n  run_config:\n    max_iterations: 2\n    timeout_ms: 1000\n"
+                "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: {prompt_name}\n  version: 1.0.0\n  space: default\nspec:\n  prompt:\n    kind: Prompt\n    name: shared-prompt\n    version: 1.0.0\n    space: default\n  execution_route:\n    kind: native\n  run_config:\n    max_iterations: 2\n    timeout_ms: 1000\n"
             ),
         )
         .expect("agent writes");
@@ -196,7 +206,6 @@ impl RuntimeServiceFixture {
         "agent-inline.yaml",
         "quality.yaml",
         "model-drift.yaml",
-        "runtime.yaml",
         "typed-service.yaml",
     ];
 
@@ -204,7 +213,6 @@ impl RuntimeServiceFixture {
     const EXPECTED_ALIASES: &[&str] = &[
         "agent_inline",
         "agent_triage",
-        "default-Agent-triage-1.0.0",
         "default-Data-training-1.0.0",
         "default-Prompt-inline-prompt-0.1.0",
         "default-Prompt-triage-prompt-1.0.0",
@@ -213,7 +221,6 @@ impl RuntimeServiceFixture {
         "model_primary",
         "model_shadow",
         "root",
-        "runtime_workflow",
         "shared_prompt",
         "triage_prompt",
     ];
@@ -771,7 +778,7 @@ mod pg_tests {
     ///
     /// # Panics
     /// Panics when an alias is unresolved, a CardRef is not versioned, a UID is
-    /// absent or empty, or aliases do not cover eleven unique Cards.
+    /// absent or empty, or aliases do not cover ten unique Cards.
     fn assert_all_refs_are_uid_pinned(state: &WyrdState) {
         let aliases = state.aliases().collect::<Vec<_>>();
         let mut refs = BTreeSet::new();
@@ -782,7 +789,7 @@ mod pg_tests {
             assert!(!uid.to_string().is_empty());
             refs.insert(card_ref.to_string());
         }
-        assert_eq!(refs.len(), 11);
+        assert_eq!(refs.len(), 10);
     }
 
     /// Assert no loaded Card retains an authored or unresolved path reference.
@@ -1329,7 +1336,7 @@ mod pg_tests {
         .await
         .expect("CLI get succeeds");
         assert_eq!(summary["mode"], "complete");
-        assert_eq!(summary["card_count"], 11);
+        assert_eq!(summary["card_count"], 10);
         assert_eq!(summary["downloaded_artifact_count"], 3);
 
         drop(cards);
@@ -1414,13 +1421,6 @@ mod pg_tests {
             drift.implementation,
             VerifierImplementation::Drift(_)
         ));
-        assert_eq!(
-            state
-                .workflow("runtime_workflow")
-                .expect("workflow resolves")
-                .name,
-            "runtime"
-        );
         assert_verified_artifact_bytes(&state);
         assert_all_refs_are_uid_pinned(&state);
         assert_no_unresolved_paths(&state);
@@ -2260,9 +2260,7 @@ mod pg_tests {
     /// `plan` and `apply` refuse the retired `kind: Drift` and `kind: Eval`
     /// Cards with the loader's stable envelope diagnostic and leave no Card on
     /// the server; `kind: Verifier` Cards with `implementation.kind: drift`
-    /// and `eval` apply. A standalone Workflow Operator Card applies, while a
-    /// Service binding it in `on_failure` is refused by the server with
-    /// `WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION` and is not registered.
+    /// and `eval` apply.
     ///
     /// # Panics
     /// Panics when the server fails to start or stop, a bootstrap fails, a
@@ -2350,14 +2348,6 @@ mod pg_tests {
                 "cli-eval-verifier",
                 "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-eval-verifier\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: eval\n    spec:\n      tasks: {}\n",
             ),
-            (
-                "cli-rollback",
-                "apiVersion: wyrd/v1\nkind: Workflow\nmetadata:\n  name: cli-rollback\n  version: 1.0.0\n  space: default\nspec:\n  steps:\n    - id: rollback\n      action:\n        type: agent\n        target:\n          prompt:\n            model: gpt-5-5\n            provider:\n              custom: mock\n            request:\n              provider: open_ai_chat_completion\n              body:\n                model: gpt-5-5\n                messages:\n                  - role: user\n                    content: Roll back.\n            response_type: text\n          tool_names: []\n  outputs:\n    result: steps.rollback.output.text\n",
-            ),
-            (
-                "cli-rollback-operator",
-                "apiVersion: wyrd/v1\nkind: Operator\nmetadata:\n  name: cli-rollback-operator\n  version: 1.0.0\n  space: default\nspec:\n  kind: workflow\n  workflow_ref:\n    kind: Workflow\n    name: cli-rollback\n    version: 1.0.0\n    space: default\n",
-            ),
         ] {
             let path = write_fixture(temp.path(), &format!("{name}.yaml"), contents);
             let receipt = run_cli_json(apply(&path), &jwt)
@@ -2366,29 +2356,6 @@ mod pg_tests {
             assert_eq!(receipt["root"]["name"], name, "{receipt}");
         }
 
-        let service = write_fixture(
-            temp.path(),
-            "cli-workflow-bound.yaml",
-            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: cli-workflow-bound\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: cli-custom-verifier\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: schedule\n        cron: \"0 2 * * *\"\n      on_failure:\n        - kind: Operator\n          name: cli-rollback-operator\n          version: 1.0.0\n          space: default\n",
-        );
-        let refused = run_cli_owned_with_token(apply(&service), Some(jwt.clone())).await;
-        assert!(!refused.status.success());
-        let stderr = String::from_utf8_lossy(&refused.stderr);
-        assert!(
-            stderr.contains("WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION"),
-            "binding a Workflow Operator is refused by the server: {stderr}"
-        );
-        let mut conn = server
-            .tenant_conn_for(server.data_tenant_id())
-            .await
-            .expect("tenant connection opens");
-        let bound: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM wyrd.cards WHERE name = 'cli-workflow-bound'")
-                .fetch_one(&mut **conn.transaction())
-                .await
-                .expect("card count reads");
-        conn.commit().await.expect("assertion transaction commits");
-        assert_eq!(bound, 0, "the refused Service is not registered");
         server.shutdown().await.expect("test server shuts down");
     }
 

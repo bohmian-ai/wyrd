@@ -3,7 +3,7 @@ kind: Prompt
 metadata:
   space: wyrd-team
   name: churn-triage-prompt
-  version: "1.0.0"
+  version: 1.0.0
 spec:
   provider: openai
   model: gpt-5-5
@@ -14,6 +14,7 @@ spec:
     the top three churn drivers. Never recommend a discount above 20%
     without human review.
   messages:
-    - |
+  - role: user
+    content: |
       churn score + features:
       ${customer}

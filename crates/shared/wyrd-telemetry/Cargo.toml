@@ -1,6 +1,7 @@
 [package]
 name = "wyrd-telemetry"
 version = { workspace = true }
+description = "Wyrd process telemetry: tracing, OTLP export, and W3C trace context."
 edition = { workspace = true }
 license = { workspace = true }
 rust-version = { workspace = true }

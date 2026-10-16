@@ -23,8 +23,6 @@ pub enum Kind {
     Prompt,
     /// Agent Card.
     Agent,
-    /// Workflow Card.
-    Workflow,
     /// Verifier Card.
     Verifier,
     /// Service Card.
@@ -55,7 +53,6 @@ impl Kind {
             Self::Experiment => "Experiment",
             Self::Prompt => "Prompt",
             Self::Agent => "Agent",
-            Self::Workflow => "Workflow",
             Self::Verifier => "Verifier",
             Self::Service => "Service",
             Self::Policy => "Policy",
@@ -76,7 +73,6 @@ impl Kind {
             Self::Experiment => CardKind::Experiment,
             Self::Prompt => CardKind::Prompt,
             Self::Agent => CardKind::Agent,
-            Self::Workflow => CardKind::Workflow,
             Self::Verifier => CardKind::Verifier,
             Self::Service => CardKind::Service,
             Self::Policy => CardKind::Policy,
@@ -97,7 +93,6 @@ impl Kind {
             CardKind::Experiment => Self::Experiment,
             CardKind::Prompt => Self::Prompt,
             CardKind::Agent => Self::Agent,
-            CardKind::Workflow => Self::Workflow,
             CardKind::Verifier => Self::Verifier,
             CardKind::Service => Self::Service,
             CardKind::Policy => Self::Policy,
@@ -147,7 +142,7 @@ impl CardRefPy {
     /// Build a `CardRef` from its identity components.
     ///
     /// `kind` accepts the native wire name of a registered card kind
-    /// (one of `Data`, `Model`, `Experiment`, `Prompt`, `Agent`, `Workflow`,
+    /// (one of `Data`, `Model`, `Experiment`, `Prompt`, `Agent`,
     /// `Verifier`, `Service`, `Policy`, `Mcp`, `Audit`, `Artifact`,
     /// `Trigger`, `Operator`, `Source`). External
     /// kinds are not constructable from Python in v1.

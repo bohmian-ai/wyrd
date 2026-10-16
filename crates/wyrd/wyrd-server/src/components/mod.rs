@@ -10,4 +10,3 @@ pub mod platform;
 pub mod principals;
 pub mod storage;
 pub mod verification;
-pub mod workflow;

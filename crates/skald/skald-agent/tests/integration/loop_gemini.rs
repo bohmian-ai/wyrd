@@ -8,10 +8,10 @@ use skald_spec::wire::google_generate::{
     GoogleGenerateContentRequest, GoogleGenerateContentResponse, GoogleGenerateSettings,
     GooglePart,
 };
-use skald_spec::{
-    Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
-};
+use skald_spec::{Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse};
 
+/// A model-role Gemini answer carrying one text part, used to script the
+/// mock provider's responses.
 fn google_answer(text: &str) -> GoogleAnswerContent {
     GoogleAnswerContent {
         role: Some("model".to_owned()),
@@ -59,6 +59,13 @@ fn gemini_text_response(text: &str) -> ProviderResponse {
     })
 }
 
+/// A Gemini Prompt runs the Agent loop against the Google provider: the user
+/// input is appended to the native contents and a text answer stops the run
+/// after one iteration.
+///
+/// # Panics
+/// Panics when the Prompt does not build, the mock sees another request, or
+/// the run fails or finishes otherwise.
 #[tokio::test]
 async fn agent_run_executes_gemini_loop_against_mock_provider() {
     let expected_request = gemini_request(vec![google_content("user", "hello")]);
@@ -69,13 +76,8 @@ async fn agent_run_executes_gemini_loop_against_mock_provider() {
     providers.register(Arc::new(mock));
 
     let prompt = Prompt::from_native(
-        SpecPrompt::new(
-            gemini_request(Vec::new()),
-            "gemini-1.5-pro",
-            None,
-            ResponseType::Text,
-        )
-        .expect("Gemini prompt should build"),
+        SpecPrompt::new(gemini_request(Vec::new()), "gemini-1.5-pro")
+            .expect("Gemini prompt should build"),
     );
     let agent = Agent::new(prompt).with_id("g").with_run_config(RunConfig {
         max_iterations: 3,

@@ -82,7 +82,6 @@ fn write_graph(root: &Path) -> PathBuf {
         "gpt-test",
         skald_prompt::OpenAiChatOptions {
             messages: vec!["Grade the answer ${answer} against ${media:shot}.".to_owned()],
-            variables: vec!["answer".to_owned()],
             output: Some(
                 skald_prompt::ResponseFormat::json_schema(
                     "judge_result",
@@ -109,7 +108,7 @@ fn write_graph(root: &Path) -> PathBuf {
         ("judge-prompt.json", card.to_string()),
         (
             "agent-prompt.yaml",
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: eval-agent-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-test\n  messages: [answer the question]\n".to_owned(),
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: eval-agent-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-test\n  messages:\n    - role: user\n      content: answer the question\n".to_owned(),
         ),
         ("agent.yaml", agent("eval-agent")),
         ("traced-agent.yaml", agent("eval-traced-agent")),
@@ -121,7 +120,7 @@ fn write_graph(root: &Path) -> PathBuf {
             "gated.yaml",
             verifier(
                 "eval-gated",
-                "      pass_gate: {kind: all_pass}\n      tasks:\n        answer: {kind: assertion, id: answer, context_path: $.answer, operator: equals, expected: \"yes\"}\n        judge:\n          kind: llm_judge\n          id: judge\n          judge_ref: {prompt: ./judge-prompt.json, tool_names: [], run_config: {max_iterations: 1}}\n          context_path: $.answer\n          operator: equals\n          expected: {passed: true}\n          max_retries: 0\n",
+                "      pass_gate: {kind: all_pass}\n      tasks:\n        answer: {kind: assertion, id: answer, context_path: $.answer, operator: equals, expected: \"yes\"}\n        judge:\n          kind: llm_judge\n          id: judge\n          judge_ref: {prompt: ./judge-prompt.json, execution_route: {kind: wyrd_gateway, deployment: openai}, tool_names: [], run_config: {max_iterations: 1}}\n          context_path: $.answer\n          operator: equals\n          expected: {passed: true}\n          max_retries: 0\n",
             ),
         ),
         (
@@ -170,7 +169,7 @@ fn write_graph(root: &Path) -> PathBuf {
 /// One Agent Card named `name` over the shared agent Prompt.
 fn agent(name: &str) -> String {
     format!(
-        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  prompt: ./agent-prompt.yaml\n  run_config:\n    max_iterations: 1\n"
+        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  prompt: ./agent-prompt.yaml\n  execution_route: {{kind: wyrd_gateway, deployment: openai}}\n  run_config:\n    max_iterations: 1\n"
     )
 }
 
@@ -1460,7 +1459,7 @@ fn write_trace_graph(root: &Path) -> PathBuf {
     ]
     .concat();
     let ceiling = format!(
-        "{}        judge:\n          kind: llm_judge\n          id: judge\n          judge_ref: {{prompt: ./judge-prompt.json, tool_names: [], run_config: {{max_iterations: 1}}}}\n          context_path: $.answer\n          operator: equals\n          expected: {{passed: true}}\n          max_retries: 0\n",
+        "{}        judge:\n          kind: llm_judge\n          id: judge\n          judge_ref: {{prompt: ./judge-prompt.json, execution_route: {{kind: wyrd_gateway, deployment: openai}}, tool_names: [], run_config: {{max_iterations: 1}}}}\n          context_path: $.answer\n          operator: equals\n          expected: {{passed: true}}\n          max_retries: 0\n",
         task("first", "$.spans[0].name", "span-0")
     );
     let files = [
@@ -2373,7 +2372,7 @@ fn write_owner_graph(root: &Path) -> (PathBuf, PathBuf) {
     let files = [
         (
             "agent-prompt.yaml",
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: eval-agent-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-test\n  messages: [answer the question]\n".to_owned(),
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: eval-agent-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-test\n  messages:\n    - role: user\n      content: answer the question\n".to_owned(),
         ),
         ("agent.yaml", agent("eval-shared-agent")),
         (
@@ -3142,7 +3141,6 @@ fn write_realtime_graph(root: &Path) -> PathBuf {
         "gpt-test",
         skald_prompt::OpenAiChatOptions {
             messages: vec!["Grade the answer ${answer}.".to_owned()],
-            variables: vec!["answer".to_owned()],
             output: Some(
                 skald_prompt::ResponseFormat::json_schema(
                     "judge_result",
@@ -3165,7 +3163,7 @@ fn write_realtime_graph(root: &Path) -> PathBuf {
         "metadata": { "name": "realtime-judge-prompt", "version": "1.0.0", "space": "default" },
         "spec": judge.into_native(),
     });
-    let check = "kind: llm_judge, id: judge, judge_ref: {prompt: ./realtime-judge-prompt.json, tool_names: [], run_config: {max_iterations: 1}}, context_path: $.answer, operator: equals, expected: {passed: true}, max_retries: 0";
+    let check = "kind: llm_judge, id: judge, judge_ref: {prompt: ./realtime-judge-prompt.json, execution_route: {kind: wyrd_gateway, deployment: openai}, tool_names: [], run_config: {max_iterations: 1}}, context_path: $.answer, operator: equals, expected: {passed: true}, max_retries: 0";
     let files = [
         ("realtime-judge-prompt.json", prompt.to_string()),
         (

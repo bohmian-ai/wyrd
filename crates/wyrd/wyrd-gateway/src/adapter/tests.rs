@@ -14,11 +14,13 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_spec::gateway::{
     GATEWAY_JSON_MAX_BYTES, GatewayCallId, GatewayCallOutcome, GatewayDecimal, GatewayOperation,
-    GatewayUsageAmount, ModelRef, ProviderDeployment,
+    GatewayUsageAmount, ProviderDeployment,
 };
+use wyrd_spec::ids::ModelId;
 
 use super::{
-    BuiltinEndpoints, HttpProviderDispatch, IngressDialect, MediaRequest, Prepared, prepare,
+    BuiltinEndpoints, HttpProviderDispatch, IngressDialect, MediaRequest, Prepared,
+    UnsupportedRequest,
 };
 use crate::credential::ProviderSecret;
 use crate::engine::{
@@ -39,17 +41,51 @@ fn parsed(body: &ResponseBody) -> Value {
     serde_json::from_str(raw.get()).expect("json body")
 }
 
-/// Deployment of `model` (`provider/native`) with `adapter` and `auth` JSON.
+/// Deployment `dep` with `adapter` and `auth` JSON whose model list holds
+/// only the native model of `model` (`deployment/native`).
+///
+/// # Panics
+/// Panics when `model` is not an address or the fixture is not a valid
+/// deployment.
 fn deployment(model: &str, adapter: Value, auth: Value) -> ProviderDeployment {
-    let mut value = json!({
-        "name": "dep",
-        "model": ModelRef::from_projection(model).expect("model"),
-        "capabilities": ["chat_completions", "embeddings"],
-        "routing_weight": 1,
-    });
+    let (_, native) = model.split_once('/').expect("fixture model is an address");
+    let mut value = json!({"name": "dep", "models": [native]});
     value["adapter"] = adapter;
     value["auth"] = auth;
     serde_json::from_value(value).expect("deployment")
+}
+
+/// The first model `deployment` lists: the model every fixture call targets.
+///
+/// # Panics
+///
+/// Panics when the fixture deployment lists no models.
+fn model_of(deployment: &ProviderDeployment) -> &ModelId {
+    &deployment.models.as_ref().expect("fixture lists its model")[0]
+}
+
+/// Prepares `body` for the fixture model of `deployment`.
+///
+/// # Errors
+///
+/// Returns the [`UnsupportedRequest`] of [`super::prepare`].
+fn prepare(
+    ingress: IngressDialect,
+    operation: GatewayOperation,
+    stream: bool,
+    body: &Value,
+    deployment: &ProviderDeployment,
+    media: Option<&MediaRequest>,
+) -> Result<Prepared, UnsupportedRequest> {
+    super::prepare(
+        ingress,
+        operation,
+        stream,
+        body,
+        deployment,
+        model_of(deployment),
+        media,
+    )
 }
 
 /// Bearer authentication through credential `cred`.
@@ -112,6 +148,7 @@ async fn attempt_mode(
             operation: GatewayOperation::ChatCompletions,
             ingress,
             deployment,
+            model: model_of(deployment),
             credential: secret.as_ref(),
             body,
             media: None,
@@ -972,6 +1009,7 @@ async fn embeddings_preserve_batches_and_reject_invalid_requests() {
             operation: GatewayOperation::Embeddings,
             ingress: IngressDialect::OpenAi,
             deployment: &target,
+            model: model_of(&target),
             credential: Some(&secret),
             body: &body,
             media: None,
@@ -1210,6 +1248,7 @@ async fn open_stream(
             operation,
             ingress,
             deployment: &deployment,
+            model: model_of(&deployment),
             credential: Some(&secret),
             body: &body,
             media: None,
@@ -1732,6 +1771,7 @@ async fn media_attempt(
             operation,
             ingress: IngressDialect::OpenAi,
             deployment,
+            model: model_of(deployment),
             credential: Some(&secret),
             body,
             media: Some(media),
@@ -1879,6 +1919,7 @@ async fn media_capturing(
             operation: GatewayOperation::Audio,
             ingress: IngressDialect::OpenAi,
             deployment,
+            model: model_of(deployment),
             credential: Some(&secret),
             body,
             media: Some(&media),
@@ -2257,6 +2298,7 @@ async fn batch_actions_reach_their_routes_with_native_files() {
                     operation: GatewayOperation::Batches,
                     ingress: IngressDialect::OpenAi,
                     deployment: target,
+                    model: model_of(target),
                     credential: Some(secret),
                     body: &body,
                     media: None,
@@ -2469,6 +2511,7 @@ async fn embeddings_attempt(encoding: &str, answer: &Value) -> AttemptResult {
             operation: GatewayOperation::Embeddings,
             ingress: IngressDialect::OpenAi,
             deployment: &target,
+            model: model_of(&target),
             credential: Some(&secret),
             body: &body,
             media: None,
@@ -2716,6 +2759,7 @@ async fn capturing(
             operation: GatewayOperation::ChatCompletions,
             ingress: IngressDialect::OpenAi,
             deployment,
+            model: model_of(deployment),
             credential: Some(&secret),
             body,
             media: None,
@@ -2851,6 +2895,7 @@ async fn image_capturing(
             operation: GatewayOperation::Images,
             ingress: IngressDialect::OpenAi,
             deployment,
+            model: model_of(deployment),
             credential: Some(&secret),
             body: &json!({"model": "openai/gpt-4o", "prompt": prompt}),
             media: Some(&media),
@@ -3091,6 +3136,7 @@ async fn held_open_streams_settle_at_their_terminator() {
                 operation,
                 ingress: IngressDialect::OpenAi,
                 deployment: &target,
+                model: model_of(&target),
                 credential: Some(&secret),
                 body: &body,
                 media: None,
@@ -3275,14 +3321,15 @@ fn jev_answer() -> Value {
 }
 
 /// Jev deployment of `jev/jev-latest` with bearer credential `cred`.
+///
+/// # Panics
+/// Panics when the fixture is not a valid deployment.
 fn jev_deployment() -> ProviderDeployment {
     serde_json::from_value(json!({
         "name": "jev",
-        "model": ModelRef::from_projection("jev/jev-latest").expect("model"),
+        "models": ["jev-latest"],
         "adapter": "jev",
         "auth": bearer(),
-        "capabilities": ["system_one", "chat_completions"],
-        "routing_weight": 1,
     }))
     .expect("jev deployment")
 }
@@ -3317,6 +3364,7 @@ async fn jev_attempt(
             operation,
             ingress,
             deployment: &target,
+            model: model_of(&target),
             credential: Some(&secret),
             body,
             media: None,

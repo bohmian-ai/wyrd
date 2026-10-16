@@ -1,0 +1,17 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: native-prompt
+  version: 1.0.0
+  space: default
+spec:
+  provider: openai
+  model: gpt-4o
+  format: chat_completion
+  body:
+    messages:
+    - role: user
+      content: Summarize {{ticket}}.
+    seed: 123
+    future_knob:
+      enabled: true

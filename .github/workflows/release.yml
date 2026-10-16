@@ -175,7 +175,7 @@ jobs:
             if [[ "$ARCH" == "x86_64" ]]; then PROTOC_ARCH="linux-x86_64"
             elif [[ "$ARCH" == "aarch64" ]]; then PROTOC_ARCH="linux-aarch_64"
             else echo "Unsupported: $ARCH"; exit 1; fi
-            curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v33.2/protoc-33.2-${PROTOC_ARCH}.zip"
+            curl -fsSLO --retry 5 --retry-all-errors "https://github.com/protocolbuffers/protobuf/releases/download/v33.2/protoc-33.2-${PROTOC_ARCH}.zip"
             unzip "protoc-33.2-${PROTOC_ARCH}.zip" -d /usr/local
             rm "protoc-33.2-${PROTOC_ARCH}.zip"
             chmod +x /usr/local/bin/protoc && protoc --version
@@ -536,6 +536,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.bundle }}
+
+      # The dist profile's fat LTO link of wyrd-server outgrows the arm
+      # runner's memory, which kills the runner mid-link; swap carries it.
+      - name: Add swap for the LTO link
+        if: runner.os == 'Linux' && runner.arch == 'ARM64'
+        run: |
+          sudo fallocate -l 16G /mnt/wyrd-build.swap
+          sudo chmod 600 /mnt/wyrd-build.swap
+          sudo mkswap /mnt/wyrd-build.swap
+          sudo swapon /mnt/wyrd-build.swap
+          free -h
 
       - name: Build bundle
         run: scripts/build.sh bundle

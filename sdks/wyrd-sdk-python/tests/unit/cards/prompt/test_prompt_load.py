@@ -1,5 +1,6 @@
 """A Prompt dumped to YAML or JSON loads back unchanged."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -64,15 +65,17 @@ def test_dumped_prompt_loads_back_unchanged(tmp_path: Path, prompt: Prompt, suff
     assert Prompt.load(path).model_dump() == prompt.model_dump()
 
 
-def test_prompt_load_raw_v1_preserves_provider_and_body(tmp_path: Path) -> None:
-    path = tmp_path / "raw.json"
-    prompt = Prompt.raw("openai", "gpt-4o", b'{"model":"gpt-4o","future":true}')
-    prompt.dump(path)
+def test_native_prompt_load_preserves_extension_options(tmp_path: Path) -> None:
+    path = tmp_path / "native.json"
+    authored = {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "format": "chat_completion",
+        "body": {"messages": [{"role": "user", "content": "hi"}], "future": True},
+    }
+    Prompt.model_validate_json(json.dumps(authored)).dump(path)
 
-    loaded = Prompt.load(path)
-
-    assert loaded.provider == "openai"
-    assert loaded.request.model_dump()["body"]["body"]["future"] is True
+    assert Prompt.load(path).model_dump() == authored
 
 
 def test_missing_prompt_file_is_refused(tmp_path: Path) -> None:

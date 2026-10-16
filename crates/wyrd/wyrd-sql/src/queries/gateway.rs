@@ -79,16 +79,15 @@ const DELETE_CREDENTIAL_SQL: &str = r"
      WHERE name = $1
 ";
 
-/// Creates or replaces one deployment document together with its provider,
-/// model, and credential-reference columns that the foreign keys check.
+/// Creates or replaces one deployment document together with the
+/// credential-reference columns the foreign key checks.
 const UPSERT_DEPLOYMENT_SQL: &str = r"
     INSERT INTO wyrd.gateway_provider_deployments (
-        data_tenant_id, name, provider, model, credential_name, deployment
-    ) VALUES ($1, $2, $3, $4, $5, $6)
+        data_tenant_id, name, credential_name, credential_provider, deployment
+    ) VALUES ($1, $2, $3, $4, $5)
     ON CONFLICT (data_tenant_id, name) DO UPDATE SET
-        provider = EXCLUDED.provider,
-        model = EXCLUDED.model,
         credential_name = EXCLUDED.credential_name,
+        credential_provider = EXCLUDED.credential_provider,
         deployment = EXCLUDED.deployment,
         updated_at = now()
 ";
@@ -147,16 +146,16 @@ const UPDATE_POLICY_SQL: &str = r"
 const PRICING_SQL: &str = r"
     SELECT active, entry
       FROM wyrd.gateway_model_pricing
-     ORDER BY provider, model, effective_at
+     ORDER BY deployment, model, effective_at
 ";
 
 /// Inserts a pricing version, or updates only the `active` flag and entry of an
-/// existing `(provider, model, version)`; callers reject changed version content.
+/// existing `(deployment, model, version)`; callers reject changed version content.
 const UPSERT_PRICING_SQL: &str = r"
     INSERT INTO wyrd.gateway_model_pricing (
-        data_tenant_id, provider, model, version, effective_at, active, entry
+        data_tenant_id, deployment, model, version, effective_at, active, entry
     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-    ON CONFLICT (data_tenant_id, provider, model, version) DO UPDATE SET
+    ON CONFLICT (data_tenant_id, deployment, model, version) DO UPDATE SET
         active = EXCLUDED.active,
         entry = EXCLUDED.entry
 ";
@@ -165,7 +164,7 @@ const UPSERT_PRICING_SQL: &str = r"
 /// entry is written at most once.
 const APPEND_ACCOUNTING_ENTRY_SQL: &str = r"
     INSERT INTO wyrd.gateway_accounting_entries (
-        data_tenant_id, entry_id, call_id, kind, provider, model, pricing_version, entry
+        data_tenant_id, entry_id, call_id, kind, deployment, model, pricing_version, entry
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
     ON CONFLICT DO NOTHING
 ";
@@ -295,7 +294,7 @@ const SNAPSHOT_SQL: &str = r"
         COALESCE((
             SELECT jsonb_agg(
                        p.entry || jsonb_build_object('active', p.active)
-                       ORDER BY p.provider, p.model, p.effective_at
+                       ORDER BY p.deployment, p.model, p.effective_at
                    )
               FROM wyrd.gateway_model_pricing p
         ), '[]'::jsonb) AS pricing,
@@ -325,12 +324,11 @@ pub struct GatewayCredentialWrite<'a> {
 pub struct GatewayDeploymentWrite<'a> {
     /// Tenant-unique deployment name.
     pub name: &'a str,
-    /// Provider identity of the served model.
-    pub provider: &'a str,
-    /// Provider-native model identifier.
-    pub model: &'a str,
     /// Referenced credential, if the deployment authenticates upstream.
     pub credential_name: Option<&'a str>,
+    /// Provider identity of the referenced credential; present exactly when
+    /// `credential_name` is.
+    pub credential_provider: Option<&'a str>,
     /// Complete deployment JSON.
     pub deployment: &'a Value,
 }
@@ -338,9 +336,9 @@ pub struct GatewayDeploymentWrite<'a> {
 /// Column values for one pricing entry create-or-retire.
 #[derive(Debug, Clone, Copy)]
 pub struct GatewayPricingWrite<'a> {
-    /// Provider identity.
-    pub provider: &'a str,
-    /// Provider-native model identifier.
+    /// Deployment name of the priced address.
+    pub deployment: &'a str,
+    /// Model identifier of the priced address.
     pub model: &'a str,
     /// Immutable version label.
     pub version: &'a str,
@@ -361,9 +359,9 @@ pub struct GatewayAccountingEntryWrite<'a> {
     pub call_id: Uuid,
     /// Entry variant tag.
     pub kind: &'a str,
-    /// Priced model provider, for a priced attempt entry.
-    pub provider: Option<&'a str>,
-    /// Priced model identifier, for a priced attempt entry.
+    /// Priced address deployment, for a priced attempt entry.
+    pub deployment: Option<&'a str>,
+    /// Priced address model, for a priced attempt entry.
     pub model: Option<&'a str>,
     /// Pricing version used, for a priced attempt entry.
     pub pricing_version: Option<&'a str>,
@@ -481,9 +479,8 @@ pub async fn upsert_gateway_deployment(
     sqlx::query(UPSERT_DEPLOYMENT_SQL)
         .bind(conn.data_tenant_id().as_uuid())
         .bind(write.name)
-        .bind(write.provider)
-        .bind(write.model)
         .bind(write.credential_name)
+        .bind(write.credential_provider)
         .bind(write.deployment)
         .execute(&mut **conn.transaction())
         .await
@@ -597,7 +594,7 @@ pub async fn upsert_gateway_pricing(
 ) -> Result<(), Error> {
     sqlx::query(UPSERT_PRICING_SQL)
         .bind(conn.data_tenant_id().as_uuid())
-        .bind(write.provider)
+        .bind(write.deployment)
         .bind(write.model)
         .bind(write.version)
         .bind(write.effective_at)
@@ -627,7 +624,7 @@ pub async fn append_gateway_accounting_entry(
         .bind(write.entry_id)
         .bind(write.call_id)
         .bind(write.kind)
-        .bind(write.provider)
+        .bind(write.deployment)
         .bind(write.model)
         .bind(write.pricing_version)
         .bind(write.entry)
@@ -859,13 +856,15 @@ const BATCH_SQL: &str = r"
      WHERE batch_id = $1
 ";
 
-/// Lists created batches newest first below an optional cursor, restricted,
-/// unless `$3` is NULL, to models of providers `$3` or exact models `$4`.
+/// Lists created batches newest first below an optional cursor, restricted to
+/// models of deployments `$3`, exact addresses `$4`, or, unless `$5` is NULL,
+/// any deployment not named in `$5`.
 const BATCHES_SQL: &str = r"
     SELECT batch_id, file_id, model, deployment, upstream_batch_id, batch
       FROM wyrd.gateway_batches
      WHERE upstream_batch_id IS NOT NULL AND ($1::uuid IS NULL OR batch_id < $1)
-       AND ($3::text[] IS NULL OR split_part(model, '/', 1) = ANY($3) OR model = ANY($4::text[]))
+       AND (split_part(model, '/', 1) = ANY($3::text[]) OR model = ANY($4::text[])
+            OR ($5::text[] IS NOT NULL AND split_part(model, '/', 1) <> ALL($5::text[])))
      ORDER BY batch_id DESC
      LIMIT $2
 ";
@@ -994,9 +993,11 @@ pub async fn gateway_batch(
 /// Lists at most `limit` created batches, newest first, strictly older than
 /// the `after` cursor when given.
 ///
-/// `eligible`, when given, is the `(providers, models)` pair of provider ids
-/// and exact `<provider>/<model>` projections a batch's model must match; it
-/// lets a caller prune batches it can never see inside this one bounded read.
+/// A batch is listed when its model's deployment is one of `deployments`,
+/// its model is one of the exact `<deployment>/<model>` addresses in `models`,
+/// or, when `open_except` is given, its deployment is not named there. The
+/// pruning happens before `limit`, so a caller never pages through batches it
+/// can never see inside this one bounded read.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the query.
@@ -1004,13 +1005,16 @@ pub async fn gateway_batches(
     conn: &mut TenantConn<'_>,
     after: Option<Uuid>,
     limit: i64,
-    eligible: Option<(&[String], &[String])>,
+    deployments: &[String],
+    models: &[String],
+    open_except: Option<&[String]>,
 ) -> Result<Vec<GatewayBatchRow>, Error> {
     sqlx::query_as::<_, GatewayBatchRow>(BATCHES_SQL)
         .bind(after)
         .bind(limit)
-        .bind(eligible.map(|(providers, _)| providers))
-        .bind(eligible.map_or(&[][..], |(_, models)| models))
+        .bind(deployments)
+        .bind(models)
+        .bind(open_except)
         .fetch_all(&mut **conn.transaction())
         .await
 }

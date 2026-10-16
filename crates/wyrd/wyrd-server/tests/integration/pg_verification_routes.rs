@@ -1318,8 +1318,9 @@ async fn direct_execution_refusals_are_stable() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// An `llm_judge` check asking an inline OpenAI judge to grade `$.answer`,
-/// with no retries; the Eval and task judge Verifiers both carry it.
+/// An `llm_judge` check asking an inline OpenAI judge, routed to the `openai`
+/// gateway deployment, to grade `$.answer`, with no retries; the Eval and task
+/// judge Verifiers both carry it.
 ///
 /// # Panics
 /// Panics when the judge prompt cannot be built.
@@ -1328,7 +1329,6 @@ pub(crate) fn judge_check() -> Value {
         "gpt-test",
         skald_prompt::OpenAiChatOptions {
             messages: vec!["Grade the answer ${answer}.".to_owned()],
-            variables: vec!["answer".to_owned()],
             output: Some(
                 skald_prompt::ResponseFormat::json_schema(
                     "judge_result",
@@ -1347,7 +1347,7 @@ pub(crate) fn judge_check() -> Value {
     .expect("the judge prompt builds");
     json!({
         "kind": "llm_judge", "id": "judge",
-        "judge_ref": { "prompt": prompt.into_native(), "tool_names": [],
+        "judge_ref": { "prompt": prompt.into_native(), "execution_route": { "kind": "wyrd_gateway", "deployment": "openai" }, "tool_names": [],
                        "run_config": { "max_iterations": 1 } },
         "context_path": "$.answer", "operator": "equals",
         "expected": { "passed": true }, "max_retries": 0

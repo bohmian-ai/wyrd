@@ -1526,11 +1526,10 @@ class Prompt:
         system_messages: as ``ProviderRequest.system``.
         model: the model name. Assigning also updates the request's model and
             raises ``WYRD_PROMPT_400_EMPTY_MODEL`` for a blank name.
-        version: an optional free-form prompt version.
         variables: the text variables still unbound.
         media_variables: the media placeholders still unbound.
         model_settings: a copy of the typed generation settings, or ``None``
-            for a raw prompt.
+            when the request carries none.
 
     Examples:
         >>> from wyrd import MediaRef, Prompt
@@ -1551,7 +1550,6 @@ class Prompt:
     message: JsonDict | None
     system_messages: Any
     model: str
-    version: str | None
     variables: list[str]
     media_variables: list[str]
     model_settings: (
@@ -1588,8 +1586,6 @@ class Prompt:
         | GeminiSettings
         | Mapping[str, Any]
         | None = ...,
-        variables: list[str] | None = ...,
-        version: str | None = ...,
     ) -> None:
         """Build a prompt for any provider from one call.
 
@@ -1600,9 +1596,8 @@ class Prompt:
                 part or list of parts, such as ``Prompt.image_url()`` returns.
                 For a custom provider every item must be a string.
             model: the provider model name; must not be blank.
-            provider: ``"openai"``, ``"anthropic"``, ``"gemini"`` or
-                ``"google"``, ``"vertex"``, case-insensitive (``"open_ai"``
-                and ``"vertex_ai"`` also work). Any other name builds an
+            provider: ``"openai"``, ``"anthropic"``, ``"google"`` (Gemini),
+                or ``"vertex"``. Any other lowercase name builds an
                 OpenAI-compatible Chat request for that custom provider.
             system: the system instruction. OpenAI Responses stores it as
                 ``instructions``. Omitted, no system instruction is sent.
@@ -1625,15 +1620,11 @@ class Prompt:
             model_settings: generation settings for this provider, as the
                 matching settings class or a mapping of its fields. Omitted,
                 provider defaults apply (Anthropic sends ``max_tokens`` 4096).
-            variables: the text variable names to require at render time.
-                Omitted, every ``${name}`` and ``{{name}}`` placeholder found
-                in the request is used.
-            version: an optional free-form version label stored on the prompt.
 
         Raises:
             WyrdError: ``WYRD_PROMPT_400_EMPTY_MODEL`` for a blank model;
                 ``WYRD_PROMPT_400_INVALID_RESPONSE_SCHEMA`` for a schema that
-                is not a JSON object; ``WYRD_PROMPT_400_DRAFT_INVALID`` for an
+                is not a JSON object; ``WYRD_PROMPT_400_INVALID`` for an
                 unsupported ``output`` value;
                 ``WYRD_PROMPT_400_SETTINGS_PROVIDER_MISMATCH`` for settings of
                 another provider; ``WYRD_PROMPT_400_SETTINGS_DECODE`` for a
@@ -1653,8 +1644,6 @@ class Prompt:
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         cache: str | Mapping[str, Any] | None = ...,
         model_settings: OpenAISettings | Mapping[str, Any] | None = ...,
-        variables: list[str] | None = ...,
-        version: str | None = ...,
     ) -> Prompt:
         """Build an OpenAI Chat Completions prompt.
 
@@ -1669,8 +1658,6 @@ class Prompt:
             output: as for ``Prompt()``.
             cache: as for ``Prompt()``.
             model_settings: ``OpenAISettings``, or a mapping of its fields.
-            variables: as for ``Prompt()``.
-            version: as for ``Prompt()``.
 
         Returns:
             the new prompt.
@@ -1689,8 +1676,6 @@ class Prompt:
         response_format: ResponseFormat | type | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: OpenAIResponsesSettings | Mapping[str, Any] | None = ...,
-        variables: list[str] | None = ...,
-        version: str | None = ...,
     ) -> Prompt:
         """Build an OpenAI Responses prompt.
 
@@ -1704,8 +1689,6 @@ class Prompt:
             response_format: as for ``Prompt()``.
             output: as for ``Prompt()``.
             model_settings: ``OpenAIResponsesSettings``, or a mapping of its fields.
-            variables: as for ``Prompt()``.
-            version: as for ``Prompt()``.
 
         Returns:
             the new prompt.
@@ -1724,8 +1707,6 @@ class Prompt:
         response_format: ResponseFormat | type | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: AnthropicSettings | Mapping[str, Any] | None = ...,
-        variables: list[str] | None = ...,
-        version: str | None = ...,
     ) -> Prompt:
         """Build an Anthropic Messages prompt.
 
@@ -1739,8 +1720,6 @@ class Prompt:
             response_format: as for ``Prompt()``.
             output: as for ``Prompt()``.
             model_settings: ``AnthropicSettings``, or a mapping of its fields.
-            variables: as for ``Prompt()``.
-            version: as for ``Prompt()``.
 
         Returns:
             the new prompt.
@@ -1759,8 +1738,6 @@ class Prompt:
         response_format: ResponseFormat | type | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
-        variables: list[str] | None = ...,
-        version: str | None = ...,
     ) -> Prompt:
         """Build a Gemini GenerateContent prompt.
 
@@ -1774,8 +1751,6 @@ class Prompt:
             response_format: as for ``Prompt()``.
             output: as for ``Prompt()``.
             model_settings: ``GeminiSettings``, or a mapping of its fields.
-            variables: as for ``Prompt()``.
-            version: as for ``Prompt()``.
 
         Returns:
             the new prompt.
@@ -1794,8 +1769,6 @@ class Prompt:
         response_format: ResponseFormat | type | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
-        variables: list[str] | None = ...,
-        version: str | None = ...,
     ) -> Prompt:
         """Build a Vertex GenerateContent prompt.
 
@@ -1809,37 +1782,12 @@ class Prompt:
             response_format: as for ``Prompt()``.
             output: as for ``Prompt()``.
             model_settings: ``GeminiSettings``, or a mapping of its fields.
-            variables: as for ``Prompt()``.
-            version: as for ``Prompt()``.
 
         Returns:
             the new prompt.
 
         Raises:
             WyrdError: as for ``Prompt()``.
-        """
-        ...
-
-    @staticmethod
-    def raw(provider: str, model: str, body: bytes) -> Prompt:
-        """Wrap a provider request body Wyrd does not model.
-
-        A raw prompt has no variables, no typed settings, and no typed request
-        view; builder methods such as ``user()`` raise
-        ``WYRD_PROMPT_400_PROVIDER_MISMATCH``.
-
-        Args:
-            provider: the provider name, spelled as for ``Prompt()``.
-            model: the model name; must not be blank.
-            body: the request body as UTF-8 JSON bytes, stored unchanged.
-
-        Returns:
-            the raw prompt.
-
-        Raises:
-            WyrdError: ``WYRD_PROMPT_400_EMPTY_MODEL`` for a blank model, or
-                ``WYRD_PROMPT_500_SERIALIZE_REQUEST`` when ``body`` is not
-                valid UTF-8 JSON.
         """
         ...
 
@@ -1856,7 +1804,7 @@ class Prompt:
             the new prompt.
 
         Raises:
-            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for a raw prompt,
+            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for a non-chat prompt such as Jev,
                 or ``WYRD_PROMPT_400_MEDIA_IN_SYSTEM_MESSAGE`` when ``text``
                 holds a media placeholder.
         """
@@ -1873,7 +1821,7 @@ class Prompt:
             the new prompt.
 
         Raises:
-            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for a raw prompt.
+            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for a non-chat prompt such as Jev.
         """
         ...
 
@@ -1888,7 +1836,7 @@ class Prompt:
             the new prompt.
 
         Raises:
-            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for a raw prompt.
+            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for a non-chat prompt such as Jev.
         """
         ...
 
@@ -1906,7 +1854,7 @@ class Prompt:
             the new prompt.
 
         Raises:
-            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for a raw prompt.
+            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for a non-chat prompt such as Jev.
         """
         ...
 
@@ -1946,7 +1894,7 @@ class Prompt:
             the new prompt.
 
         Raises:
-            WyrdError: ``WYRD_PROMPT_400_DRAFT_INVALID`` when no binding is
+            WyrdError: ``WYRD_PROMPT_400_INVALID`` when no binding is
                 given.
         """
         ...
@@ -1960,7 +1908,7 @@ class Prompt:
             **kwargs: more variable values, converted with ``str()``.
 
         Raises:
-            WyrdError: ``WYRD_PROMPT_400_DRAFT_INVALID`` when no binding is
+            WyrdError: ``WYRD_PROMPT_400_INVALID`` when no binding is
                 given.
         """
         ...
@@ -2000,11 +1948,11 @@ class Prompt:
         ...
 
     def model_dump(self) -> JsonDict:
-        """Return the native prompt as a dictionary."""
+        """Return the prompt in its authored portable or native form as a dictionary."""
         ...
 
     def model_dump_json(self) -> str:
-        """Return the native prompt as a JSON string."""
+        """Return the prompt in its authored portable or native form as a JSON string."""
         ...
 
     @staticmethod
@@ -2018,7 +1966,7 @@ class Prompt:
             the rebuilt prompt.
 
         Raises:
-            WyrdError: when ``data`` is not a valid native prompt.
+            WyrdError: when ``data`` is not a valid portable or native prompt.
         """
         ...
 
@@ -2414,7 +2362,7 @@ class PromptCard:
             prompt.
         prompt: the card's prompt; assigning it replaces the stored prompt.
         model_settings: a copy of the prompt's typed settings, or ``None``
-            for a raw prompt.
+            when the request carries none.
         ref: the card's exact ``CardRef``, carrying its registered version
             and UID; the value ``as_card_ref()`` returns.
         content_hash: the hash of the validated ``spec`` body.

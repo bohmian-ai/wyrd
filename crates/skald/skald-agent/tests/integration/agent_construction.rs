@@ -5,8 +5,13 @@ use skald_prompt::Prompt;
 use skald_spec::wire::openai_chat::{
     OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, OpenAiMessageContent,
 };
-use skald_spec::{Prompt as SpecPrompt, ProviderName, ProviderRequest, ResponseType};
+use skald_spec::{Prompt as SpecPrompt, ProviderName, ProviderRequest};
 
+/// A resolved OpenAI Chat Prompt for `gpt-4o` with one system message, the
+/// base Prompt these construction tests give an Agent.
+///
+/// # Panics
+/// Panics when the static request does not build a Prompt.
 fn openai_prompt() -> Arc<Prompt> {
     let request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
         model: "gpt-4o".into(),
@@ -28,8 +33,8 @@ fn openai_prompt() -> Arc<Prompt> {
         parallel_tool_calls: None,
         settings: OpenAiChatSettings::default(),
     });
-    let prompt = SpecPrompt::new(request, "gpt-4o".to_string(), None, ResponseType::Text)
-        .expect("test helper setup succeeds");
+    let prompt =
+        SpecPrompt::new(request, "gpt-4o".to_string()).expect("test helper setup succeeds");
     Arc::new(Prompt::from_native(prompt))
 }
 
@@ -45,12 +50,18 @@ fn agent_new_uses_resolved_prompt_and_default_run_config() {
     );
 }
 
+/// `Agent::with_prompt` replaces the resolved Prompt the Agent was built
+/// with, so the replacement's model is the one the Agent calls.
+///
+/// # Panics
+/// Panics when the replacement Prompt does not build or the Agent keeps the
+/// original model.
 #[test]
 fn agent_with_prompt_overrides_prompt_reference() {
     let original = openai_prompt();
-    let mut prompt = SpecPrompt::new(
+    let prompt = SpecPrompt::new(
         ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
-            model: "gpt-4o".into(),
+            model: "gpt-4o-mini".into(),
             messages: vec![],
             response_format: None,
             stream: None,
@@ -60,17 +71,14 @@ fn agent_with_prompt_overrides_prompt_reference() {
             parallel_tool_calls: None,
             settings: OpenAiChatSettings::default(),
         }),
-        "gpt-4o",
-        None,
-        ResponseType::Text,
+        "gpt-4o-mini",
     )
     .unwrap();
-    prompt.version = Some("1".to_string());
     let replacement = Arc::new(Prompt::from_native(prompt));
 
     let agent = Agent::from_resolved("a", original).with_prompt(replacement.clone());
 
-    assert_eq!(agent.prompt.native().version.as_deref(), Some("1"));
+    assert_eq!(agent.prompt.native().model, "gpt-4o-mini");
 }
 
 #[test]

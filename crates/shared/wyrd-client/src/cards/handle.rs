@@ -193,12 +193,12 @@ impl Cards {
 
     /// Build a handle over `client` without completing any exchange.
     ///
-    /// Crate-internal: local loaders that must stay IO-free and offline unit
-    /// tests construct the registry engine here; public callers use
-    /// [`Self::connect`] or [`Self::connect_with`].
+    /// Test-only: offline unit tests construct the registry engine here;
+    /// public callers use [`Self::connect`] or [`Self::connect_with`].
     ///
     /// # Arguments
     /// * `client` - The client every call is sent through.
+    #[cfg(test)]
     pub(crate) fn new(client: WyrdClient) -> Self {
         Self {
             engine: RegistryEngine::new(client),
@@ -835,17 +835,16 @@ mod tests {
             (
                 CardKind::Prompt,
                 serde_json::json!({
+                    "provider": "openai",
                     "model": "gpt-4o",
-                    "request": {
-                        "provider": "open_ai_chat_completion",
-                        "body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
-                    }
+                    "messages": [{"role": "user", "content": "hi"}]
                 }),
             ),
             (
                 CardKind::Agent,
                 serde_json::json!({
-                    "prompt": {"kind": "Prompt", "name": "triage", "space": "retention", "version": "1.0.0"}
+                    "prompt": {"kind": "Prompt", "name": "triage", "space": "retention", "version": "1.0.0"},
+                    "execution_route": {"kind": "native"}
                 }),
             ),
             (

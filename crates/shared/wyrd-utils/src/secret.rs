@@ -2,7 +2,7 @@
 //!
 //! Every Wyrd process that resolves a [`SecretRef`] itself — gateway
 //! credential bindings, the server's tenant wrapping keys, signing key, and
-//! issuer sealing keys, and local Workflow gateway bindings — reads it here,
+//! issuer sealing keys — reads it here,
 //! so all share one rule: a file is checked
 //! through metadata of the already-open handle, so no path swap can slip
 //! between check and read, and must be a regular file that, on Unix, has no

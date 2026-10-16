@@ -39,22 +39,24 @@ impl Agent {
     /// The run journals `AgentStart`, seeds recent session turns, appends the
     /// user turn to the session, applies `before_agent` callbacks, renders the
     /// Agent's own Prompt, and drives the bounded loop inside one
-    /// `invoke_agent` span. The Agent's provider override, when set, replaces
-    /// `providers`.
+    /// `invoke_agent` span. A `wyrd_gateway` execution route sends every model
+    /// call through the Agent's gateway caller; otherwise the Agent's provider
+    /// override, when set, replaces `providers`.
     ///
     /// When [`RunConfig::timeout`](crate::RunConfig) is set, everything up to
     /// the loop result is bounded by it; on expiry the in-flight provider or
     /// tool work is dropped and the run fails with [`AgentError::Timeout`].
     /// The terminal `AgentFinish` or `AgentError` journal append happens after
     /// that bound and is best effort: its failure is logged and never changes
-    /// the result. A caller that must bound settlement too, such as a
-    /// Workflow attempt, races this future against its own fixed deadline and
-    /// drops it. Dropping the future cancels all outstanding work; events and
+    /// the result. A caller that must bound settlement too races this future
+    /// against its own fixed deadline and drops it. Dropping the future cancels all outstanding work; events and
     /// session turns already appended stay recorded.
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::JournalAppendFailed`] when a non-terminal journal
+    /// Returns [`AgentError::InvalidArgument`] before any IO when a
+    /// `wyrd_gateway` route has no gateway caller or a non-gateway model,
+    /// [`AgentError::JournalAppendFailed`] when a non-terminal journal
     /// append fails, session read or append failures, callback panics, Prompt
     /// rendering and loop-shape errors, provider and tool failures, structured
     /// output decode failures, an exhausted iteration budget, or
@@ -65,7 +67,10 @@ impl Agent {
         session_id: Option<SessionId>,
         input: &str,
     ) -> AgentResult<AgentRun> {
-        let providers = self.effective_providers(providers);
+        let gateway = self.route_registry(&self.prompt)?;
+        let providers = gateway
+            .as_ref()
+            .unwrap_or_else(|| self.effective_providers(providers));
         let span = self.invoke_agent_span(&self.prompt);
         async move {
             const MAX_JOURNAL_INPUT_CHARS: usize = 4096;
@@ -173,8 +178,11 @@ impl Agent {
     /// The run journals `AgentStart`, renders `prompt`, refuses a provider
     /// that differs from the Agent's own Prompt, and drives
     /// the bounded loop inside one `invoke_agent` span whose model is the
-    /// explicit Prompt's model. The Agent's provider override, when set,
-    /// replaces `providers`.
+    /// explicit Prompt's model. A `wyrd_gateway` execution route sends every
+    /// model call to `<deployment>/<prompt model>` through the Agent's gateway
+    /// caller; otherwise the Agent's provider override, when set, replaces
+    /// `providers`. A Jev `systemone` Prompt has no loop: it is dispatched
+    /// once by [`Self::call_once`].
     ///
     /// Timeout, cancellation, and terminal-journal behavior match
     /// [`Self::run_with`]: the optional run timeout bounds the loop, the
@@ -183,8 +191,11 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::JournalAppendFailed`] when a non-terminal journal
-    /// append fails, [`AgentError::Prompt`] when rendering fails,
+    /// Returns [`AgentError::InvalidArgument`] before any IO when a
+    /// `wyrd_gateway` route has no gateway caller or a non-gateway model,
+    /// [`AgentError::JournalAppendFailed`] when a non-terminal journal
+    /// append fails, [`AgentError::Prompt`] when rendering fails or a Jev
+    /// Agent has tools,
     /// [`AgentError::ProviderMismatch`] when `prompt` targets another provider,
     /// loop-shape, provider, tool, and structured-output failures, an
     /// exhausted iteration budget, or [`AgentError::Timeout`].
@@ -194,7 +205,10 @@ impl Agent {
         prompt: &Prompt,
         vars: &[(&str, &str)],
     ) -> AgentResult<AgentRun> {
-        let providers = self.effective_providers(providers);
+        let gateway = self.route_registry(prompt)?;
+        let providers = gateway
+            .as_ref()
+            .unwrap_or_else(|| self.effective_providers(providers));
         let span = self.invoke_agent_span(prompt);
         async move {
             let result = async {
@@ -221,6 +235,11 @@ impl Agent {
                         agent_provider,
                         prompt_provider: request_provider,
                     });
+                }
+                if matches!(rendered, ProviderRequest::JevSystemOne(_)) {
+                    return self
+                        .call_once(providers, rendered, &prompt.native().model)
+                        .await;
                 }
                 let seed_messages = extract_messages(&self.id, &rendered)?;
                 self.run_loop(
@@ -252,6 +271,70 @@ impl Agent {
         }
         .instrument(span)
         .await
+    }
+
+    /// Dispatches a rendered Jev `systemone` `request` once, with no tool
+    /// loop, journaling the call and its result as iteration 0.
+    ///
+    /// The run's output is the JSON of the keyed answers, and the typed
+    /// answer is its final response. `model` labels the `chat` span when the
+    /// request names none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Prompt`] when the Agent has tools, which Jev
+    /// cannot call, [`AgentError::JournalAppendFailed`] when a journal append
+    /// fails, and [`AgentError::Provider`] when dispatch fails.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: string-keyed Jev answers always serialize.
+    async fn call_once(
+        &self,
+        providers: &ProviderRegistry,
+        request: ProviderRequest,
+        model: &str,
+    ) -> AgentResult<AgentRun> {
+        if !self.tools.is_empty() {
+            return Err(AgentError::Prompt {
+                agent: self.id.clone(),
+                detail: "a Jev systemone Agent cannot call tools".to_owned(),
+            });
+        }
+        self.append_model_journal_call(0, &request).await?;
+        let provider = self.prompt.native().provider();
+        let chat = chat_span(&provider, &request, model);
+        let response = dispatch(providers, provider, request)
+            .instrument(chat.clone())
+            .await;
+        let finish_reason = match &response {
+            Ok(response) => response_finish_reason(response),
+            Err(error) => {
+                record_error(&chat, error.code());
+                format!("provider_error:{error}")
+            }
+        };
+        self.append_model_journal_result(0, finish_reason, response.is_err())
+            .await?;
+        let response = response.map_err(AgentError::Provider)?;
+        let output = match &response {
+            ProviderResponse::JevSystemOne(answer) => {
+                serde_json::to_string(&answer.answers).expect("Jev answers are string-keyed JSON")
+            }
+            _ => String::new(),
+        };
+        Ok(AgentRun {
+            output,
+            final_response: Some(Arc::new(response)),
+            iterations: 1,
+            finish_reason: FinishReason::ModelStopped,
+            conversation: Conversation::new(),
+            error: None,
+            errors: Vec::new(),
+            structured_output: None,
+            #[cfg(feature = "python")]
+            parsed: None,
+        })
     }
 
     /// Runs the bounded model/tool loop inside the caller's `invoke_agent` span.
@@ -732,7 +815,7 @@ impl Agent {
         self.journal
             .append(JournalEvent::ModelCall {
                 iteration,
-                provider: provider_label(&self.prompt.native().provider()),
+                provider: self.prompt.native().provider().to_string(),
                 model: request_model(request).unwrap_or_default().to_owned(),
             })
             .await
@@ -953,17 +1036,6 @@ fn genai_provider_name(provider: &ProviderName) -> &str {
         ProviderName::Vertex => "gcp.vertex_ai",
         ProviderName::Jev => "jev",
         ProviderName::Custom(name) => name,
-    }
-}
-
-fn provider_label(provider: &ProviderName) -> String {
-    match provider {
-        ProviderName::OpenAi => "openai".to_owned(),
-        ProviderName::Anthropic => "anthropic".to_owned(),
-        ProviderName::Google => "google".to_owned(),
-        ProviderName::Vertex => "vertex".to_owned(),
-        ProviderName::Jev => "jev".to_owned(),
-        ProviderName::Custom(name) => name.clone(),
     }
 }
 

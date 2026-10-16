@@ -28,7 +28,7 @@ pub async fn seed_backing_card(conn: &mut TenantConn<'_>, card_ref: &CardRef, cr
                     "space": "prod",
                     "name": "fixture-prompt",
                     "version": "1.0.0"
-                }
+                }, "execution_route": {"kind": "native"}
             }),
         )
         .expect("agent fixture spec decodes"),

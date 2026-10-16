@@ -13,10 +13,10 @@ use skald_spec::wire::openai_responses::{
     OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesRequest, OpenAiResponsesSettings,
     OpenAiResponsesText, OpenAiTextResponseFormat,
 };
-use skald_spec::{ProviderName, ProviderRequest, ResponseType};
+use skald_spec::{ProviderName, ProviderRequest};
 
 use crate::coerce::{checked_model, schema_object};
-use crate::error::{PromptBuilderError, PromptBuilderResult};
+use crate::error::PromptBuilderResult;
 use crate::messages::{anthropic_text_block, google_text_part};
 use crate::prompt::Prompt;
 use crate::response_format::{ResponseFormat, ResponseFormatKind};
@@ -36,10 +36,6 @@ pub struct OpenAiChatOptions {
     pub prompt_cache_key: Option<String>,
     /// Native `OpenAI` Chat generation settings.
     pub settings: OpenAiChatSettings,
-    /// Declared render variables.
-    pub variables: Vec<String>,
-    /// Optional prompt version.
-    pub version: Option<String>,
 }
 
 /// `OpenAI` Responses constructor options.
@@ -55,10 +51,6 @@ pub struct OpenAiResponsesOptions {
     pub output: Option<ResponseFormat>,
     /// Native `OpenAI` Responses generation settings.
     pub settings: OpenAiResponsesSettings,
-    /// Declared render variables.
-    pub variables: Vec<String>,
-    /// Optional prompt version.
-    pub version: Option<String>,
 }
 
 /// Anthropic Messages constructor options.
@@ -74,10 +66,6 @@ pub struct AnthropicOptions {
     pub output: Option<ResponseFormat>,
     /// Native Anthropic generation settings.
     pub settings: AnthropicMessagesSettings,
-    /// Declared render variables.
-    pub variables: Vec<String>,
-    /// Optional prompt version.
-    pub version: Option<String>,
 }
 
 /// Google Gemini `GenerateContent` constructor options.
@@ -93,16 +81,20 @@ pub struct GeminiOptions {
     pub output: Option<ResponseFormat>,
     /// Native Google/Gemini request settings.
     pub settings: GoogleGenerateSettings,
-    /// Declared render variables.
-    pub variables: Vec<String>,
-    /// Optional prompt version.
-    pub version: Option<String>,
 }
 
 /// Vertex `GenerateContent` constructor options.
 pub type VertexOptions = GeminiOptions;
 
 /// Builds a native `OpenAI` Chat prompt.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::EmptyModel`](crate::error::PromptBuilderError::EmptyModel) for a blank model,
+/// [`PromptBuilderError::InvalidResponseSchema`](crate::error::PromptBuilderError::InvalidResponseSchema) when a JSON-schema response
+/// format is not a JSON object, and [`PromptBuilderError::Skald`](crate::error::PromptBuilderError::Skald) when the
+/// model is not literal, the output schema is invalid for the destination, or
+/// native Prompt construction otherwise rejects the request.
 pub fn openai_chat(
     model: impl Into<String>,
     options: OpenAiChatOptions,
@@ -110,7 +102,6 @@ pub fn openai_chat(
     let model = checked_model(model)?;
     let effective =
         effective_response_format(options.response_format.as_ref(), options.output.as_ref());
-    let response_type = response_type(effective);
     let response_format = effective.map(openai_chat_response_format).transpose()?;
     let mut settings = options.settings;
     if settings.prompt_cache_key.is_none() {
@@ -126,8 +117,8 @@ pub fn openai_chat(
     }
     messages.extend(options.messages.into_iter().map(openai_user_message));
 
-    finalize_prompt(skald_spec::Prompt {
-        request: ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
+    finalize_prompt(
+        ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
             model: model.clone(),
             messages,
             response_format,
@@ -139,15 +130,19 @@ pub fn openai_chat(
             settings,
         }),
         model,
-        version: options.version,
-        variables: options.variables,
-        media_variables: Vec::new(),
-        response_type,
-        provider: None,
-    })
+        None,
+    )
 }
 
 /// Builds a native `OpenAI` Responses prompt.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::EmptyModel`](crate::error::PromptBuilderError::EmptyModel) for a blank model,
+/// [`PromptBuilderError::InvalidResponseSchema`](crate::error::PromptBuilderError::InvalidResponseSchema) when a JSON-schema response
+/// format is not a JSON object, and [`PromptBuilderError::Skald`](crate::error::PromptBuilderError::Skald) when the
+/// model is not literal, the output schema is invalid for the destination, or
+/// native Prompt construction otherwise rejects the request.
 pub fn openai_responses(
     model: impl Into<String>,
     options: OpenAiResponsesOptions,
@@ -155,7 +150,6 @@ pub fn openai_responses(
     let model = checked_model(model)?;
     let effective =
         effective_response_format(options.response_format.as_ref(), options.output.as_ref());
-    let response_type = response_type(effective);
     let text = effective.map(openai_responses_text).transpose()?;
     let input = options
         .messages
@@ -164,8 +158,8 @@ pub fn openai_responses(
         .collect::<Vec<_>>()
         .into();
 
-    finalize_prompt(skald_spec::Prompt {
-        request: ProviderRequest::OpenAiResponses(OpenAiResponsesRequest {
+    finalize_prompt(
+        ProviderRequest::OpenAiResponses(OpenAiResponsesRequest {
             model: model.clone(),
             input,
             instructions: options.instructions,
@@ -178,15 +172,19 @@ pub fn openai_responses(
             settings: options.settings,
         }),
         model,
-        version: options.version,
-        variables: options.variables,
-        media_variables: Vec::new(),
-        response_type,
-        provider: None,
-    })
+        None,
+    )
 }
 
 /// Builds a native Anthropic Messages prompt.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::EmptyModel`](crate::error::PromptBuilderError::EmptyModel) for a blank model,
+/// [`PromptBuilderError::InvalidResponseSchema`](crate::error::PromptBuilderError::InvalidResponseSchema) when a JSON-schema response
+/// format is not a JSON object, and [`PromptBuilderError::Skald`](crate::error::PromptBuilderError::Skald) when the
+/// model is not literal, the output schema is invalid for the destination, or
+/// native Prompt construction otherwise rejects the request.
 pub fn anthropic(
     model: impl Into<String>,
     options: AnthropicOptions,
@@ -194,7 +192,6 @@ pub fn anthropic(
     let model = checked_model(model)?;
     let effective =
         effective_response_format(options.response_format.as_ref(), options.output.as_ref());
-    let response_type = response_type(effective);
     let output_config = effective
         .map(anthropic_output_config)
         .transpose()?
@@ -208,8 +205,8 @@ pub fn anthropic(
         })
         .collect();
 
-    finalize_prompt(skald_spec::Prompt {
-        request: ProviderRequest::AnthropicMessage(AnthropicMessagesRequest {
+    finalize_prompt(
+        ProviderRequest::AnthropicMessage(AnthropicMessagesRequest {
             model: model.clone(),
             messages,
             system: options
@@ -222,15 +219,19 @@ pub fn anthropic(
             settings: options.settings,
         }),
         model,
-        version: options.version,
-        variables: options.variables,
-        media_variables: Vec::new(),
-        response_type,
-        provider: None,
-    })
+        None,
+    )
 }
 
 /// Builds a native Google Gemini `GenerateContent` prompt.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::EmptyModel`](crate::error::PromptBuilderError::EmptyModel) for a blank model,
+/// [`PromptBuilderError::InvalidResponseSchema`](crate::error::PromptBuilderError::InvalidResponseSchema) when a JSON-schema response
+/// format is not a JSON object, and [`PromptBuilderError::Skald`](crate::error::PromptBuilderError::Skald) when the
+/// model is not literal, the output schema is invalid for the destination, or
+/// native Prompt construction otherwise rejects the request.
 pub fn gemini(model: impl Into<String>, options: GeminiOptions) -> PromptBuilderResult<Prompt> {
     let model = checked_model(model)?;
     let prompt = google_prompt(model, options, false)?;
@@ -245,40 +246,14 @@ pub fn gemini(model: impl Into<String>, options: GeminiOptions) -> PromptBuilder
 ///
 /// # Errors
 ///
-/// Returns [`PromptBuilderError::EmptyModel`] for a blank model,
-/// [`PromptBuilderError::InvalidResponseSchema`] when a JSON-schema response
-/// format is not a JSON object, and [`PromptBuilderError::Skald`] when native
-/// Prompt construction rejects the request.
+/// Returns [`PromptBuilderError::EmptyModel`](crate::error::PromptBuilderError::EmptyModel) for a blank model,
+/// [`PromptBuilderError::InvalidResponseSchema`](crate::error::PromptBuilderError::InvalidResponseSchema) when a JSON-schema response
+/// format is not a JSON object, and [`PromptBuilderError::Skald`](crate::error::PromptBuilderError::Skald) when the
+/// model is not literal, the output schema is invalid for the destination, or
+/// native Prompt construction otherwise rejects the request.
 pub fn vertex(model: impl Into<String>, options: VertexOptions) -> PromptBuilderResult<Prompt> {
     let model = checked_model(model)?;
     google_prompt(model, options, true)
-}
-
-/// Builds a raw passthrough prompt with a durable provider target.
-///
-/// `bytes` is parsed as JSON and stored as the `RawV1` body sent to `provider`.
-///
-/// # Errors
-///
-/// Returns an invalid-model error for a blank model and
-/// [`PromptBuilderError::InvalidRawJson`] when `bytes` is not JSON.
-pub fn raw(
-    provider: ProviderName,
-    model: impl Into<String>,
-    bytes: &[u8],
-) -> PromptBuilderResult<Prompt> {
-    let model = checked_model(model)?;
-    let body = serde_json::from_slice(bytes)
-        .map_err(|error| PromptBuilderError::InvalidRawJson(error.to_string()))?;
-    finalize_prompt(skald_spec::Prompt {
-        request: ProviderRequest::RawV1 { provider, body },
-        model,
-        version: None,
-        variables: Vec::new(),
-        media_variables: Vec::new(),
-        response_type: ResponseType::Text,
-        provider: None,
-    })
 }
 
 /// Builds the shared `GenerateContent` Prompt behind [`gemini`] and [`vertex`].
@@ -289,8 +264,8 @@ pub fn raw(
 ///
 /// # Errors
 ///
-/// Returns [`PromptBuilderError::InvalidResponseSchema`] when a JSON-schema
-/// response format is not a JSON object, and [`PromptBuilderError::Skald`]
+/// Returns [`PromptBuilderError::InvalidResponseSchema`](crate::error::PromptBuilderError::InvalidResponseSchema) when a JSON-schema
+/// response format is not a JSON object, and [`PromptBuilderError::Skald`](crate::error::PromptBuilderError::Skald)
 /// when [`finalize_prompt`] rejects the request.
 fn google_prompt(
     model: String,
@@ -299,7 +274,6 @@ fn google_prompt(
 ) -> PromptBuilderResult<Prompt> {
     let effective =
         effective_response_format(options.response_format.as_ref(), options.output.as_ref());
-    let response_type = response_type(effective);
     let settings = google_settings(&options, effective)?;
     let request = GoogleGenerateContentRequest {
         contents: options
@@ -318,50 +292,32 @@ fn google_prompt(
         tool_config: None,
         settings,
     };
-    finalize_prompt(skald_spec::Prompt {
-        request: ProviderRequest::GeminiGenerateContent(request),
+    finalize_prompt(
+        ProviderRequest::GeminiGenerateContent(request),
         model,
-        version: options.version,
-        variables: options.variables,
-        media_variables: Vec::new(),
-        response_type,
-        provider: vertex_target.then_some(ProviderName::Vertex),
-    })
+        vertex_target.then_some(ProviderName::Vertex),
+    )
 }
 
-/// Normalizes a builder-assembled Prompt and wraps it for callers.
-///
-/// Without caller-declared variables, the Prompt is rebuilt through
-/// [`skald_spec::Prompt::new`] so variables and media placeholders are derived
-/// from the request. That constructor always resets the destination to `None`,
-/// so the builder's `provider` (for example Vertex for a shared
-/// `GenerateContent` body) is saved first and restored afterwards; dropping
-/// that step would silently retarget Vertex Prompts to Google. With declared
-/// variables, only media placeholders are normalized and the destination is
-/// untouched.
+/// Builds the Prompt through [`skald_spec::Prompt::new`], which derives
+/// variables, media placeholders, and the response type from the request,
+/// then sets the dispatch destination (for example Vertex for a shared
+/// `GenerateContent` body) and wraps it for callers.
 ///
 /// # Errors
 ///
-/// Returns [`PromptBuilderError::Skald`] when system content holds a media
-/// placeholder or the request cannot be serialized for variable extraction.
-fn finalize_prompt(mut prompt: skald_spec::Prompt) -> PromptBuilderResult<Prompt> {
-    if prompt.variables.is_empty() {
-        let provider = prompt.provider;
-        prompt = skald_spec::Prompt::new(
-            prompt.request,
-            prompt.model,
-            prompt.version,
-            prompt.response_type,
-        )?;
-        prompt.provider = provider;
-    } else {
-        prompt.normalize_media_placeholders_mut()?;
-    }
+/// Returns [`PromptBuilderError::Skald`](crate::error::PromptBuilderError::Skald) when the model is not literal, the
+/// output schema is invalid for its destination, system content holds a
+/// media placeholder, or the request cannot be serialized for variable
+/// extraction.
+pub(crate) fn finalize_prompt(
+    request: ProviderRequest,
+    model: String,
+    provider: Option<ProviderName>,
+) -> PromptBuilderResult<Prompt> {
+    let mut prompt = skald_spec::Prompt::new(request, model)?;
+    prompt.provider = provider;
     Ok(Prompt::from_native(prompt))
-}
-
-fn response_type(format: Option<&ResponseFormat>) -> ResponseType {
-    format.map_or(ResponseType::Text, ResponseFormat::response_type)
 }
 
 fn effective_response_format<'a>(
@@ -473,7 +429,7 @@ mod builder_tests {
     };
     use crate::{
         AnthropicOptions, GeminiOptions, OpenAiChatOptions, OpenAiResponsesOptions, ResponseFormat,
-        anthropic, gemini, openai_chat, openai_responses, raw, vertex,
+        anthropic, gemini, openai_chat, openai_responses, vertex,
     };
     use skald_spec::wire::anthropic_messages::{AnthropicContentBlock, AnthropicImageSource};
     use skald_spec::wire::google_generate::GooglePart;
@@ -498,8 +454,6 @@ mod builder_tests {
                 response_format: Some(
                     ResponseFormat::json_schema("answer", schema.clone()).unwrap(),
                 ),
-                variables: vec!["name".to_owned()],
-                version: Some("v1".to_owned()),
                 ..OpenAiChatOptions::default()
             },
         )
@@ -522,6 +476,111 @@ mod builder_tests {
         ));
     }
 
+    /// Proves builders share the authored literal-model rule: placeholder
+    /// and control-character models are refused as the `model` field while a
+    /// slash model is kept exactly.
+    ///
+    /// # Panics
+    /// Panics when a templated or control-character model builds, its refusal
+    /// names another field, or the slash model is not kept.
+    #[test]
+    fn builders_refuse_templated_models() {
+        let options = || AnthropicOptions {
+            messages: vec!["{{question}}".to_owned()],
+            ..AnthropicOptions::default()
+        };
+        for model in ["{{target}}", "${target}", "claude\t1"] {
+            let error = anthropic(model, options()).expect_err("templated model is refused");
+            assert!(
+                matches!(&error, crate::PromptBuilderError::Skald(skald_spec::SkaldError::PromptInvalid { field, .. }) if field == "model"),
+                "{model:?}: {error:?}"
+            );
+            assert!(openai_chat(model, OpenAiChatOptions::default()).is_err());
+        }
+        let prompt = anthropic("org/claude-1", options()).expect("slash model builds");
+        assert_eq!(prompt.native().model, "org/claude-1");
+        assert_eq!(prompt.native().variables, vec!["question"]);
+    }
+
+    /// Proves builder finalization shares the authored output-schema rule:
+    /// an invalid type, a malformed nested keyword, and a non-object strict
+    /// OpenAI root are refused at their native body path before any
+    /// dispatch, while GenerateContent keeps a list root unchanged.
+    ///
+    /// # Panics
+    /// Panics when an invalid schema builds, its refusal names another path or
+    /// is not a field refusal, or the GenerateContent list root is not kept.
+    #[test]
+    fn builders_refuse_invalid_output_schemas() {
+        let field = |error: crate::PromptBuilderError| match error {
+            crate::PromptBuilderError::Skald(skald_spec::SkaldError::PromptInvalid {
+                field,
+                ..
+            }) => field,
+            other => panic!("expected a field refusal, got {other:?}"),
+        };
+        let bad = ResponseFormat::json_schema("answer", json!({"type": "text"})).unwrap();
+        let error = openai_chat(
+            "gpt-4o",
+            OpenAiChatOptions {
+                messages: vec!["hi".to_owned()],
+                output: Some(bad),
+                ..OpenAiChatOptions::default()
+            },
+        )
+        .expect_err("invalid type is refused");
+        assert_eq!(field(error), "body.response_format.json_schema.schema.type");
+        let nested = ResponseFormat::json_schema(
+            "answer",
+            json!({"type": "object", "properties": {"n": {"type": "number", "minimum": "wrong"}}}),
+        )
+        .unwrap();
+        let error = gemini(
+            "gemini-2.5-pro",
+            GeminiOptions {
+                messages: vec!["hi".to_owned()],
+                output: Some(nested),
+                ..GeminiOptions::default()
+            },
+        )
+        .expect_err("a malformed nested keyword is refused");
+        assert_eq!(
+            field(error),
+            "body.generation_config.response_schema.properties.n.minimum"
+        );
+
+        let list = json!({"type": "array", "items": {"type": "string"}});
+        let error = openai_responses(
+            "gpt-4.1",
+            OpenAiResponsesOptions {
+                messages: vec!["hi".to_owned()],
+                output: Some(ResponseFormat::json_schema("answer", list.clone()).unwrap()),
+                ..OpenAiResponsesOptions::default()
+            },
+        )
+        .expect_err("strict responses output needs an object root");
+        assert_eq!(field(error), "body.text.format.schema.type");
+        let prompt = gemini(
+            "gemini-2.5-pro",
+            GeminiOptions {
+                messages: vec!["hi".to_owned()],
+                output: Some(ResponseFormat::json_schema("answer", list.clone()).unwrap()),
+                ..GeminiOptions::default()
+            },
+        )
+        .expect("generate_content accepts a list root");
+        assert!(matches!(
+            &prompt.native().response_type,
+            ResponseType::JsonSchema { schema, .. } if *schema == list
+        ));
+    }
+
+    /// The Responses builder writes a JSON-object response format as the native
+    /// `text.format` field rather than a Chat `response_format`.
+    ///
+    /// # Panics
+    /// Panics when the Prompt does not build, is not a Responses request, or
+    /// carries another text format.
     #[test]
     fn openai_responses_emits_native_text_format() {
         let prompt = openai_responses(
@@ -655,22 +714,6 @@ mod builder_tests {
             ProviderRequest::GeminiGenerateContent(_)
         ));
         assert_eq!(vertex_prompt.native().provider(), ProviderName::Vertex);
-    }
-
-    #[test]
-    fn raw_preserves_provider_and_body() {
-        let prompt = raw(
-            ProviderName::Custom("local".to_owned()),
-            "local-model",
-            br#"{"a":1}"#,
-        )
-        .unwrap();
-
-        let ProviderRequest::RawV1 { provider, body } = &prompt.native().request else {
-            panic!("expected raw request");
-        };
-        assert_eq!(provider, &ProviderName::Custom("local".to_owned()));
-        assert_eq!(body, &serde_json::json!({"a": 1}));
     }
 
     #[test]

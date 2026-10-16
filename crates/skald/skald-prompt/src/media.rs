@@ -4,6 +4,7 @@ use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+pub use skald_spec::media::MAX_MEDIA_FILE_BYTES;
 use skald_spec::{MediaKind, MediaRef, SkaldError, SkaldResult};
 
 #[cfg(feature = "python")]
@@ -11,9 +12,6 @@ use skald_spec::MediaSource;
 
 #[cfg(feature = "python")]
 use pyo3::types::PyBytesMethods;
-
-/// Maximum local media file size read by path helpers.
-pub const MAX_MEDIA_FILE_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Construct an image media reference by eagerly reading a local file.
 pub fn image_path(path: impl AsRef<Path>) -> SkaldResult<MediaRef> {

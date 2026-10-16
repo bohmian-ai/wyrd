@@ -27,7 +27,6 @@ export const cardRows: CardRow[] = [
   { uid: 'card_eval_01', name: 'checkout-quality', kind: 'Verifier', version: 'v5', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'm.linden', updated: '1d ago', updatedAt: '2026-09-07T14:00:00Z', labels: ['plane=eval'] },
   { uid: 'card_data_02', name: 'checkout-quality-dataset', kind: 'Data', version: 'v1', space: 'staging', status: { label: 'Active', tone: 'ok' }, owner: 'm.linden', updated: '2d ago', updatedAt: '2026-09-06T15:00:00Z', labels: ['plane=eval'] },
   { uid: 'card_source_01', name: 'warehouse-telemetry', kind: 'Source', version: 'v2', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'j.reyes', updated: '3d ago', updatedAt: '2026-09-05T15:00:00Z', labels: ['plane=data'] },
-  { uid: 'card_workflow_01', name: 'checkout-quality', kind: 'Workflow', version: 'v7', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'm.linden', updated: '4d ago', updatedAt: '2026-09-04T15:00:00Z', labels: ['plane=eval'] },
   { uid: 'card_verifier_01', name: 'pii-review', kind: 'Verifier', version: 'v5', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'r.okafor', updated: '5d ago', updatedAt: '2026-09-03T15:00:00Z', labels: ['plane=governance'] },
   { uid: 'card_mcp_01', name: 'payments-mcp', kind: 'Mcp', version: 'v1', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'j.reyes', updated: '6d ago', updatedAt: '2026-09-02T15:00:00Z', labels: ['plane=agents'] },
   { uid: 'card_audit_01', name: 'q3-access-audit', kind: 'Audit', version: 'v1', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'j.reyes', updated: '2w ago', updatedAt: '2026-08-25T15:00:00Z', labels: ['plane=governance'] },
@@ -35,7 +34,6 @@ export const cardRows: CardRow[] = [
   // workspace node keeps its own resolvable Card route.
   { uid: 'card_agent_02', name: 'fraud-review', kind: 'Agent', version: 'v2', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'r.okafor', updated: '2d ago', updatedAt: '2026-09-06T12:00:00Z', labels: ['plane=agents'] },
   { uid: 'card_model_02', name: 'ranker-shadow', kind: 'Model', version: 'v11', space: 'prod', status: { label: 'Shadow', tone: 'neutral' }, owner: 'm.linden', updated: '2d ago', updatedAt: '2026-09-06T11:00:00Z', labels: ['plane=serving'] },
-  { uid: 'card_workflow_02', name: 'runtime', kind: 'Workflow', version: 'v1', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'j.reyes', updated: '3d ago', updatedAt: '2026-09-05T12:00:00Z', labels: ['plane=serving'] },
   { uid: 'card_prompt_02', name: 'capture-review', kind: 'Prompt', version: 'v3', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'r.okafor', updated: '4d ago', updatedAt: '2026-09-04T12:00:00Z', labels: ['plane=agents'] },
   { uid: 'card_policy_01', name: 'checkout-guardrails', kind: 'Policy', version: 'v2', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'j.reyes', updated: '1w ago', updatedAt: '2026-09-01T12:00:00Z', labels: ['plane=governance'] },
   { uid: 'card_eval_02', name: 'checkout-agent-eval', kind: 'Verifier', version: 'v4', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'm.linden', updated: '1w ago', updatedAt: '2026-09-01T11:00:00Z', labels: ['plane=eval'] }
@@ -61,8 +59,7 @@ export type CardDetailFixture = CardDetail & {
 
 /**
  * Full detail fixtures for the presentations this task owns — the shared
- * shell on a Policy (C-02), the earned Workflow (C-08) and Verifier (C-12)
- * presentations — plus interim Model, Data and Service declarations so the
+ * shell on a Policy (C-02), the earned Verifier (C-12) presentation — plus interim Model, Data and Service declarations so the
  * primary registry cards answer real questions until their focused
  * workspace tasks land. Every other row gets a generated generic detail.
  * Hrefs are tenant-relative; pages prefix the tenant base. Spec sections
@@ -137,43 +134,6 @@ export const cardDetails: Record<string, CardDetailFixture> = {
     relationships: [
       { relation: 'applies_to', label: 'settlement-api (Service)', href: '/cards/card_service_06' },
       { relation: 'subject_of', label: 'change_02', href: '/changes/change_02' }
-    ]
-  },
-  card_workflow_01: {
-    uid: 'card_workflow_01',
-    name: 'checkout-quality',
-    kind: 'Workflow',
-    summary: 'Declares the ordered evaluation stages the checkout agent must pass.',
-    status: { label: 'Active', tone: 'ok' },
-    version: 'v7',
-    currentVersion: 'v7',
-    versions: [
-      { version: 'v7', created: '2026-08-28 11:20Z', by: 'm.linden', note: 'add judge thresholds stage' },
-      { version: 'v6', created: '2026-08-10 09:05Z', by: 'm.linden', note: 'initial prod registration' }
-    ],
-    actions: [{ label: 'Evaluation results ↗', href: '/observe/evaluations?evalCard=card_eval_01' }],
-    spec: [],
-    presentation: {
-      stages: ['retrieve context', 'score tasks', 'judge thresholds', 'publish record'],
-      stageNote: 'Stage order is declared here; execution and results belong to Observe.',
-      io: [
-        { k: 'consumes', v: 'checkout quality dataset (Data)', href: '/cards/card_data_02' },
-        { k: 'evaluates', v: 'checkout-agent (Agent)', href: '/cards/card_agent_01' },
-        { k: 'produces', v: 'evaluation records → Observe' },
-        { k: 'gate', v: 'all required tasks pass' }
-      ],
-      governance: [{ k: 'governed by', v: 'eval-standards (Policy)' }],
-      execution:
-        'A Workflow is a declaration — no run results render here. Results live in Observe → Evaluations.'
-    },
-    metadata: [
-      { k: 'owner', v: 'm.linden · data science' },
-      { k: 'labels', v: 'plane=eval' },
-      { k: 'created', v: '2026-08-10' },
-      { k: 'updated', v: '4d ago' }
-    ],
-    relationships: [
-      { relation: 'referenced_by', label: 'checkout quality (Eval)', href: '/cards/card_eval_01' }
     ]
   },
   card_verifier_01: {

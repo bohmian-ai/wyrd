@@ -5,7 +5,7 @@
 //! Authorization, tenancy, audit, SQL admission, execution, cancellation, and
 //! terminal settlement all stay with the server operations this module calls —
 //! `bifrost::service` for the catalog and `query::collect` for the bounded
-//! read path it shares with Workflow Agent tools — so there is one
+//! read path — so there is one
 //! implementation of each, not an MCP-shaped copy.
 
 use std::sync::Arc;

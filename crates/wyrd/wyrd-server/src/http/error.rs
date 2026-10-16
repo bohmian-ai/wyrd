@@ -592,6 +592,8 @@ mod error_mapper_tests {
         );
     }
 
+    /// One instance of every public error variant, used to prove each renders
+    /// as problem JSON with its catalog status.
     fn sample_errors() -> Vec<WyrdError> {
         macro_rules! sample {
             ($($variant:ident),+ $(,)?) => {
@@ -620,6 +622,7 @@ mod error_mapper_tests {
             UnsupportedGrantType,
             DeviceAuthorization,
             DelegationDepthExceededIssue,
+            UnrepresentableDelegation,
             PrincipalKindCardKindMismatch,
             InvalidCardRefVersion,
             CredentialRevoked,
@@ -650,11 +653,7 @@ mod error_mapper_tests {
             ModelCustomLoaderInvalid,
             ModelSerializerUnavailable,
             PromptInvalidVariableName,
-            PromptDuplicateVariable,
-            PromptUndeclaredPlaceholder,
-            PromptUnreferencedVariable,
             PromptUndeclaredMediaPlaceholder,
-            PromptUnreferencedMediaVariable,
             PromptMediaPlaceholderNotIsolated,
             PromptMediaInSystemMessage,
             PromptUnsupportedMediaForProvider,
@@ -676,7 +675,7 @@ mod error_mapper_tests {
             PromptProviderUpstream,
             PromptProviderTimeout,
             PromptProviderMismatch,
-            PromptDraftInvalid,
+            PromptInvalid,
             PromptSettingsProviderMismatch,
             PromptSettingsDecode,
             PromptMissingVariable,
@@ -691,12 +690,6 @@ mod error_mapper_tests {
             AgentCallbackReturnType,
             AgentCallbackAborted,
             AgentLoopMessageType,
-            WorkflowValidation,
-            WorkflowMissingName,
-            WorkflowMissingVersion,
-            WorkflowDuplicateStepId,
-            WorkflowMissingDependency,
-            WorkflowCycle,
         );
         errors.push(
             WyrdStorageError::ObjectNotFound {

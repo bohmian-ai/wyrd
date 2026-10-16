@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::value::to_raw_value;
 use serde_json::{Value, json};
+use skald_spec::ProviderName;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -25,7 +26,7 @@ use wyrd_gateway::{
     AttemptResult, AttemptUsage, BatchAction, CallExecution, CallInput, CallPlan,
     CredentialResolver, DeploymentHealth, FailureClass, GatewayEngine, GatewayTenantSnapshot,
     IngressDialect, MediaRequest, ProviderAttempt, ProviderDispatch, ResponseBody, ResponseCapture,
-    StreamEnd, outcome_error_code, outcome_name,
+    StreamEnd, UnsupportedRequest, outcome_error_code, outcome_name,
 };
 use wyrd_runtime::principal::CardAttribution;
 use wyrd_runtime::{Permission, PermissionDenyReason, Principal};
@@ -33,9 +34,9 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, GatewayAccess};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
-    GatewayAccountingEntryV1, GatewayCallId, GatewayCallOutcome, GatewayCaptureMode,
-    GatewayContractError, GatewayFallbackOverride, GatewayOperation, GatewayPayloadField,
-    GatewayUsageAmount, ModelRef,
+    DeploymentAccess, GatewayAccountingEntryV1, GatewayCallId, GatewayCallOutcome,
+    GatewayCaptureMode, GatewayContractError, GatewayFallbackOverride, GatewayOperation,
+    GatewayPayloadField, GatewayUsageAmount, ModelRef,
 };
 use wyrd_spec::ids::{CardUid, ProviderDeploymentName};
 use wyrd_spec::request_id::RequestId;
@@ -93,6 +94,9 @@ pub struct GatewayCallRequest {
     /// Application Run and Card the call is attributed to; `None` records an
     /// uncorrelated call.
     pub subject: Option<GatewayCallAttribution>,
+    /// Prompt provider of an Agent call, which bounds the requested
+    /// deployment's adapter before any IO; `None` for a direct client call.
+    pub prompt_provider: Option<ProviderName>,
 }
 
 /// How a governed call's Run and Card attribution reached the gateway.
@@ -298,16 +302,16 @@ impl<'a> GatewayInvocation<'a> {
         request: GatewayCallRequest,
     ) -> Result<GatewayCallResponse, WyrdError> {
         Ok(self
-            .run(caller, request, false, &self.state.shutdown_token)
+            .run(caller, request, &self.state.shutdown_token)
             .await?)
     }
 
     /// Runs one governed call exactly as [`Self::invoke`] does, reporting with
     /// each error whether a provider may have received the request.
     ///
-    /// `authorized` skips the invoke decision when the caller already took and
-    /// audited it for the requested model. The call's cancellation is a child
-    /// of `cancel`, so an owner that keeps this future alive can still cancel
+    /// The invoke decision is always taken against the snapshot that routes
+    /// the call, even when the caller decided earlier against an older one.
+    /// The call's cancellation is a child of `cancel`, so an owner that keeps this future alive can still cancel
     /// the call and observe its dispatch evidence; `invoke` passes the server
     /// shutdown token.
     ///
@@ -350,11 +354,10 @@ impl<'a> GatewayInvocation<'a> {
         &self,
         caller: &Caller,
         request: GatewayCallRequest,
-        authorized: bool,
         cancel: &CancellationToken,
     ) -> Result<GatewayCallResponse, CallFailure> {
         let operation = operation_name(request.operation);
-        let result = self.govern(caller, request, authorized, cancel).await;
+        let result = self.govern(caller, request, cancel).await;
         if let Err(failure) = &result {
             let span = tracing::Span::current();
             if !failure.settled {
@@ -397,12 +400,11 @@ impl<'a> GatewayInvocation<'a> {
         &self,
         caller: &Caller,
         request: GatewayCallRequest,
-        authorized: bool,
         cancel: &CancellationToken,
     ) -> Result<GatewayCallResponse, CallFailure> {
         let received = Instant::now();
         let (ingress, stream) = (request.ingress, request.stream);
-        let (call, plan, admission) = self.admit_call(caller, request, authorized).await?;
+        let (call, plan, admission) = self.admit_call(caller, request).await?;
         let cancel = cancel.child_token();
         let cancel_on_drop = cancel.clone().drop_guard();
         let (head, answer) = oneshot::channel();
@@ -455,7 +457,6 @@ impl<'a> GatewayInvocation<'a> {
         &self,
         caller: &Caller,
         mut request: GatewayCallRequest,
-        authorized: bool,
     ) -> Result<(AdmittedCall, CallPlan, Admission), CallFailure> {
         let call_id = GatewayCallId::new_v7();
         tracing::Span::current().record("call_id", tracing::field::display(call_id.as_uuid()));
@@ -477,10 +478,12 @@ impl<'a> GatewayInvocation<'a> {
             .ok_or_else(|| {
                 invalid_request(GatewayContractError::new("timeout", "is out of range"))
             })?;
-        if !authorized {
-            self.decide(caller, OPERATION, &request.model)
-                .map_err(permission_deny_reason_to_wyrd)?;
-        }
+        let tenant = caller.data_tenant_id;
+        let snapshot = GatewayAdministration::new(self.state)
+            .snapshot(tenant)
+            .await?;
+        self.decide(caller, OPERATION, &request.model, &snapshot)
+            .map_err(permission_deny_reason_to_wyrd)?;
         let subject = match request.subject.take() {
             Some(GatewayCallAttribution::Requested(subject)) => {
                 Some(self.attribute(caller, subject).await?)
@@ -492,10 +495,6 @@ impl<'a> GatewayInvocation<'a> {
         // this `gateway.call` span; an untraced call keeps its own trace.
         let trace = wyrd_telemetry::continued_context();
 
-        let tenant = caller.data_tenant_id;
-        let snapshot = GatewayAdministration::new(self.state)
-            .snapshot(tenant)
-            .await?;
         let mut plan = self.route(caller, &request, &snapshot, call_id).await?;
 
         let admitted_at = Utc::now();
@@ -524,12 +523,16 @@ impl<'a> GatewayInvocation<'a> {
     /// Plans the candidate routes of one call inside a `gateway.route` span.
     ///
     /// Builds the fallback plan from the admitted `snapshot`, applies a pinned
-    /// deployment, authorizes every fallback model other than the requested
-    /// one, and keeps only candidates that can represent the request.
+    /// deployment, binds an Agent call's requested deployment to its Prompt
+    /// provider's compatible adapters, authorizes every fallback model other
+    /// than the requested one, and keeps only candidates that can represent
+    /// the request.
     ///
     /// # Errors
-    /// Returns `GatewayInvalidRequest` when no authorized candidate can
-    /// represent the request and `GatewayModelUnavailable` when no authorized
+    /// Returns `GatewayInvalidRequest` naming `model` when an Agent call's
+    /// requested deployment uses an adapter its Prompt provider is not
+    /// compatible with, `GatewayInvalidRequest` when no authorized candidate can
+    /// represent the request, and `GatewayModelUnavailable` when no authorized
     /// candidate remains. An authorization decision returns no error of its
     /// own: its audit is staged off the request path, so a failed append is
     /// logged and counted rather than surfaced here.
@@ -551,10 +554,16 @@ impl<'a> GatewayInvocation<'a> {
         if let Some(deployment) = &request.deployment {
             plan.pin(deployment);
         }
+        if let Some(provider) = &request.prompt_provider {
+            plan.require_compatible_initial(provider)
+                .map_err(|error| CallFailure::from(unsupported_request(&error)))?;
+        }
         let mut denied = Vec::new();
         for candidate in &plan.candidates {
             if candidate.model != request.model
-                && self.decide(caller, OPERATION, &candidate.model).is_err()
+                && self
+                    .decide(caller, OPERATION, &candidate.model, snapshot)
+                    .is_err()
             {
                 denied.push(candidate.model.clone());
             }
@@ -570,10 +579,7 @@ impl<'a> GatewayInvocation<'a> {
             .err();
         if plan.candidates.is_empty() {
             return Err(CallFailure::from(match unsupported {
-                Some(error) => WyrdError::GatewayInvalidRequest {
-                    message: error.to_string(),
-                    details: json!({ "field": error.field, "reason": error.reason }),
-                },
+                Some(error) => unsupported_request(&error),
                 None => WyrdError::GatewayModelUnavailable {
                     message: "no authorized deployment serves the requested operation".to_owned(),
                     details: json!({}),
@@ -659,22 +665,32 @@ impl<'a> GatewayInvocation<'a> {
         let snapshot = GatewayAdministration::new(self.state)
             .snapshot(caller.data_tenant_id)
             .await?;
-        let configured: BTreeSet<ModelRef> = snapshot
+        let listed: BTreeSet<ModelRef> = snapshot
             .deployments
-            .into_iter()
-            .map(|deployment| deployment.model)
+            .iter()
+            .flat_map(|deployment| {
+                deployment.models.iter().flatten().map(|model| ModelRef {
+                    deployment: deployment.name.clone(),
+                    model: model.clone(),
+                })
+            })
             .collect();
-        let mut visible = Vec::with_capacity(configured.len());
-        for model in configured {
-            if self.decide(caller, "gateway.models.list", &model).is_ok() {
-                visible.push(model);
-            }
-        }
-        Ok(visible)
+        Ok(listed
+            .into_iter()
+            .filter(|model| {
+                self.decide(caller, "gateway.models.list", model, &snapshot)
+                    .is_ok()
+            })
+            .collect())
     }
 
     /// Checks invoke permission for exactly `model` and stages the decision
     /// under the audited `operation`.
+    ///
+    /// A `granted` deployment in `snapshot` additionally requires a grant
+    /// scoped to its deployment or exact address, so an `all` grant reaches
+    /// only `open` deployments. An address whose deployment `snapshot` lacks
+    /// is decided as open and later fails as unavailable.
     ///
     /// Returns the verdict; the caller decides whether a denial refuses the
     /// call (requested model), only skips a candidate (fallback), or hides the
@@ -692,27 +708,42 @@ impl<'a> GatewayInvocation<'a> {
         caller: &Caller,
         operation: &str,
         model: &ModelRef,
+        snapshot: &GatewayTenantSnapshot,
     ) -> Result<(), PermissionDenyReason> {
         let permission = Permission::gateway_invoke(GatewayAccess::Model {
-            provider: model.provider.clone(),
+            deployment: model.deployment.clone(),
             model: model.model.clone(),
         });
+        let granted = snapshot
+            .deployment(&model.deployment)
+            .is_some_and(|deployment| deployment.access == DeploymentAccess::Granted);
         let verdict = self
             .state
             .authz
             .permission_check
             .check(&caller.principal, &permission)
-            .into_result();
+            .into_result()
+            .and_then(|()| {
+                if granted
+                    && !caller
+                        .principal
+                        .effective_permissions
+                        .contains_object_scoped(&permission)
+                {
+                    Err(PermissionDenyReason::Rbac {
+                        required: Box::new(permission.clone()),
+                        principal: caller.principal.id,
+                    })
+                } else {
+                    Ok(())
+                }
+            });
         let outcome = if verdict.is_ok() {
             AuditOutcome::Allowed
         } else {
             AuditOutcome::Denied
         };
-        let resource = format!(
-            "gateway_model:{}/{}",
-            model.provider.as_str(),
-            model.model.as_str()
-        );
+        let resource = format!("gateway_model:{model}");
         let event = audit::audit_event(
             caller,
             operation,
@@ -1277,6 +1308,15 @@ pub(crate) fn unconnected_engine() -> GatewayEngine {
 
 /// Stable rejection of an invalid call request.
 pub(crate) fn invalid_request(error: GatewayContractError) -> WyrdError {
+    WyrdError::GatewayInvalidRequest {
+        message: error.to_string(),
+        details: json!({ "field": error.field, "reason": error.reason }),
+    }
+}
+
+/// The `GatewayInvalidRequest` refusal of a request no candidate can serve,
+/// naming the unsupported member and its reason.
+fn unsupported_request(error: &UnsupportedRequest) -> WyrdError {
     WyrdError::GatewayInvalidRequest {
         message: error.to_string(),
         details: json!({ "field": error.field, "reason": error.reason }),

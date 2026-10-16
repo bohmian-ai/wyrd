@@ -882,6 +882,9 @@ mod tests {
 
     /// Judge presence wins, an all-assertion graph is an assertion Eval, any
     /// other graph is `eval_other`, and a profile-less Drift is `unknown`.
+    ///
+    /// # Panics
+    /// Panics when a fixture is classified as another kind.
     #[test]
     fn kind_classification_follows_the_closed_precedence() {
         let assertion = serde_json::json!({
@@ -892,7 +895,7 @@ mod tests {
             "kind": "llm_judge", "id": "j",
             "judge_ref": {"prompt": {
                 "kind": "Prompt", "name": "judge", "version": "1.0.0", "space": "default"
-            }},
+            }, "execution_route": {"kind": "wyrd_gateway", "deployment": "judge"}},
             "operator": "greater_than_or_equals", "expected": 0.5
         });
         let trace = serde_json::json!({

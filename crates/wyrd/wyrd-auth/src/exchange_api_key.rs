@@ -1725,4 +1725,82 @@ pub(crate) mod pg_tests {
         assert_eq!(subject_principal_id.as_uuid(), subject_id);
         assert_eq!(actor_principal_id.as_uuid(), actor);
     }
+
+    /// A gateway exchange carries the exact authority both parties hold, or
+    /// refuses with no token when no scope can state it.
+    ///
+    /// The actor's grants come from a real role merge, so an explicit
+    /// deployment grant stored beside `all` must survive into the exchange.
+    /// `all` meeting an explicit deployment grant — in either direction — is
+    /// "that deployment, only while open", which no scope states: the exchange
+    /// refuses with `WYRD_AUTH_403_UNREPRESENTABLE_DELEGATION`, signs nothing,
+    /// and stages its one allowed exchange decision with no effect.
+    ///
+    /// # Panics
+    /// Panics when a representable case fails or carries other permissions, or
+    /// an unrepresentable case issues a token, maps to another error, or stages
+    /// anything but one exchange decision.
+    #[tokio::test]
+    async fn a_gateway_exchange_carries_exact_authority_or_refuses() {
+        use wyrd_spec::auth::GatewayAccess;
+        use wyrd_spec::ids::ProviderDeploymentName;
+        let explicit = Permission::gateway_invoke(GatewayAccess::Deployment {
+            deployment: ProviderDeploymentName::new("restricted").expect("valid deployment"),
+        });
+        let all_json =
+            serde_json::json!({ "resource": "gateway", "action": "invoke", "scope": "all" });
+        let explicit_json = serde_json::to_value(&explicit).expect("grant serializes");
+        let cases = [
+            (
+                serde_json::json!([all_json, explicit_json]),
+                vec![explicit.clone()],
+                Some(vec![explicit.clone()]),
+            ),
+            (
+                serde_json::json!([all_json, explicit_json]),
+                vec![Permission::gateway_invoke_any()],
+                Some(vec![Permission::gateway_invoke_any()]),
+            ),
+            (serde_json::json!([all_json]), vec![explicit.clone()], None),
+            (
+                serde_json::json!([explicit_json]),
+                vec![Permission::gateway_invoke_any()],
+                None,
+            ),
+        ];
+        for (actor_grants, subject_grants, expected) in cases {
+            let fixture = PgFixture::start().await.expect("fixture starts");
+            let audit = RecordedAudit::new();
+            let tenant = fixture.data_tenant_id();
+            let actor = seed_actor(&fixture, actor_grants.clone()).await;
+            let result = exchange(
+                &fixture,
+                &audit,
+                subject_token(tenant, subject_grants.into_iter().collect()),
+                actor_token(actor, tenant),
+            )
+            .await;
+            if let Some(expected) = expected {
+                let exchanged = result.expect("representable exchange succeeds");
+                let delegated = delegate_service(&audit)
+                    .verifier
+                    .verify_on(&exchanged.access_token, &tenant, TokenAudience::Bifrost)
+                    .expect("delegated token verifies");
+                assert_eq!(
+                    delegated.principal.effective_permissions,
+                    expected.into_iter().collect(),
+                    "{actor_grants}"
+                );
+            } else {
+                let error = WyrdError::from(result.expect_err("exchange refuses"));
+                assert_eq!(error.code(), "WYRD_AUTH_403_UNREPRESENTABLE_DELEGATION");
+                assert_eq!(error.status(), 403);
+            }
+            assert_eq!(
+                exchange_outcomes(&audit),
+                [(AuditOutcome::Allowed, TOKEN_EXCHANGE_OPERATION.to_owned())],
+                "{actor_grants}"
+            );
+        }
+    }
 }

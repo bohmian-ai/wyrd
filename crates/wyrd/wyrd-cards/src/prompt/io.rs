@@ -127,7 +127,6 @@ mod prompt_io {
 
     use crate::prompt::PromptCard;
     use crate::prompt::io::{read_card_file, write_card_file};
-    use wyrd_spec::envelope::Spec;
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -137,18 +136,10 @@ mod prompt_io {
         ))
     }
 
+    /// The typed Prompt Card fixture renamed to `growth/lead-scoring` version
+    /// `1.2.3`, which the file round-trip tests save and load.
     fn prompt_card() -> PromptCard {
-        let prompt = skald_spec::Prompt::new(
-            skald_spec::ProviderRequest::RawV1 {
-                provider: skald_spec::ProviderName::Custom("unit".to_owned()),
-                body: serde_json::json!({"messages": ["hello"]}),
-            },
-            "unit-model",
-            None,
-            skald_spec::ResponseType::Text,
-        )
-        .expect("static prompt is valid");
-        let mut card = PromptCard::from_native_prompt(prompt);
+        let mut card = typed_prompt_card();
         "growth".clone_into(&mut card.space);
         "lead-scoring".clone_into(&mut card.name);
         "1.2.3".clone_into(&mut card.version);
@@ -181,8 +172,6 @@ mod prompt_io {
         let prompt = skald_spec::Prompt::new(
             skald_spec::ProviderRequest::OpenAiChatCompletion(request),
             "gpt-4o-mini",
-            None,
-            skald_spec::ResponseType::Text,
         )
         .expect("static typed prompt is valid");
         PromptCard::from_native_prompt(prompt)
@@ -212,8 +201,14 @@ mod prompt_io {
         let _ = std::fs::remove_file(path);
     }
 
+    /// A YAML native Prompt Card keeps known settings and unknown provider
+    /// extension options from its body when loaded.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be written, the Card does not load as an
+    /// OpenAI Chat Prompt, or a setting or extension option is lost.
     #[test]
-    fn yaml_prompt_card_envelope_with_model_settings_loads() {
+    fn yaml_native_prompt_card_preserves_extension_options() {
         let path = temp_path("authored_card.yaml");
         std::fs::write(
             &path,
@@ -228,9 +223,11 @@ metadata:
 spec:
   provider: openai
   model: gpt-4o
-  messages:
-    - hello
-  model_settings:
+  format: chat_completion
+  body:
+    messages:
+      - role: user
+        content: hello
     seed: 123
     future_knob:
       enabled: true
@@ -272,39 +269,5 @@ spec:
         let error = read_card_file(&path).expect_err("missing file fails");
 
         assert_eq!(error.code(), "WYRD_PROMPT_500_LOADER_IO");
-    }
-
-    #[test]
-    fn raw_v1_prompt_body_preserves_provider_body() {
-        let path = temp_path("raw_v1.json");
-        let raw = r#"{"a":[true,{"nested":"value"}],"z":2}"#;
-        let prompt = skald_spec::Prompt::new(
-            skald_spec::ProviderRequest::RawV1 {
-                provider: skald_spec::ProviderName::Custom("raw-provider".to_owned()),
-                body: serde_json::from_str(raw).expect("static raw JSON is valid"),
-            },
-            "raw-model",
-            None,
-            skald_spec::ResponseType::Text,
-        )
-        .expect("static prompt is valid");
-        let card = PromptCard::from_native_prompt(prompt)
-            .to_card()
-            .expect("card is valid");
-
-        write_card_file(&card, &path).expect("write succeeds");
-        let loaded = read_card_file(&path).expect("read succeeds");
-
-        let Spec::Prompt(spec) = loaded.spec else {
-            panic!("loaded card is a Prompt spec");
-        };
-        let skald_spec::ProviderRequest::RawV1 { body, .. } = spec.prompt.request else {
-            panic!("loaded prompt is RawV1");
-        };
-        assert_eq!(
-            body,
-            serde_json::from_str::<serde_json::Value>(raw).expect("static raw JSON is valid")
-        );
-        let _ = std::fs::remove_file(path);
     }
 }

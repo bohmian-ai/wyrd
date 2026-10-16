@@ -27,6 +27,8 @@ axum-core = { version = "0.5", default-features = false, features = ["tracing"] 
 base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
 base64-3c51e837cfc5589a = { package = "base64", version = "0.22" }
 bigdecimal = { version = "0.4", features = ["serde"] }
+bit-set = { version = "0.8" }
+bit-vec = { version = "0.8" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
 bytes = { version = "1" }
@@ -52,6 +54,7 @@ futures-sink = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 half = { version = "2", default-features = false, features = ["num-traits"] }
 hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
@@ -61,24 +64,20 @@ hex = { version = "0.4" }
 httparse = { version = "1" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
+idna = { version = "1" }
 indexmap = { version = "2", features = ["serde"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.11" }
 memchr = { version = "2" }
 moka = { version = "0.12", features = ["future", "sync"] }
-nom-181b0d20215bb231 = { package = "nom", version = "8" }
 num-bigint = { version = "0.4", default-features = false, features = ["serde", "std"] }
-num-integer = { version = "0.1", default-features = false, features = ["i128", "std"] }
-num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
-num-rational = { version = "0.4", default-features = false, features = ["num-bigint-std", "std"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 object_store = { version = "0.14", features = ["aws", "azure", "gcp"] }
 once_cell = { version = "1" }
 opentelemetry = { version = "0.31" }
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace", "with-serde"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-parking_lot = { version = "0.12" }
 percent-encoding = { version = "2" }
 petgraph = { version = "0.8" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
@@ -140,6 +139,8 @@ axum-core = { version = "0.5", default-features = false, features = ["tracing"] 
 base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
 base64-3c51e837cfc5589a = { package = "base64", version = "0.22" }
 bigdecimal = { version = "0.4", features = ["serde"] }
+bit-set = { version = "0.8" }
+bit-vec = { version = "0.8" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
 bytes = { version = "1" }
@@ -166,6 +167,7 @@ futures-sink = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 half = { version = "2", default-features = false, features = ["num-traits"] }
 hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
@@ -175,24 +177,20 @@ hex = { version = "0.4" }
 httparse = { version = "1" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
+idna = { version = "1" }
 indexmap = { version = "2", features = ["serde"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.11" }
 memchr = { version = "2" }
 moka = { version = "0.12", features = ["future", "sync"] }
-nom-181b0d20215bb231 = { package = "nom", version = "8" }
 num-bigint = { version = "0.4", default-features = false, features = ["serde", "std"] }
-num-integer = { version = "0.1", default-features = false, features = ["i128", "std"] }
-num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
-num-rational = { version = "0.4", default-features = false, features = ["num-bigint-std", "std"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 object_store = { version = "0.14", features = ["aws", "azure", "gcp"] }
 once_cell = { version = "1" }
 opentelemetry = { version = "0.31" }
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace", "with-serde"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-parking_lot = { version = "0.12" }
 percent-encoding = { version = "2" }
 petgraph = { version = "0.8" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
@@ -249,7 +247,6 @@ zstd-sys = { version = "2", default-features = false, features = ["legacy", "std
 [target.x86_64-unknown-linux-gnu.dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
 compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "xz", "zstd"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
@@ -267,7 +264,6 @@ zstd-safe = { version = "7", default-features = false, features = ["arrays", "le
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
 compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "xz", "zstd"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
@@ -285,7 +281,6 @@ zstd-safe = { version = "7", default-features = false, features = ["arrays", "le
 [target.aarch64-unknown-linux-gnu.dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
 compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "xz", "zstd"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
@@ -303,7 +298,6 @@ zstd-safe = { version = "7", default-features = false, features = ["arrays", "le
 [target.aarch64-unknown-linux-gnu.build-dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
 compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "xz", "zstd"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
@@ -322,7 +316,6 @@ zstd-safe = { version = "7", default-features = false, features = ["arrays", "le
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
 compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "xz", "zstd"] }
 errno = { version = "0.3" }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
@@ -330,7 +323,7 @@ itertools = { version = "0.13" }
 libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
-nom-15128469a54ed75a = { package = "nom", version = "7" }
+nom = { version = "7" }
 objc2 = { version = "0.6" }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFPlugInCOM", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
 rustix = { version = "1", features = ["fs", "process", "termios"] }
@@ -345,7 +338,6 @@ zstd-safe = { version = "7", default-features = false, features = ["arrays", "le
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
 compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "xz", "zstd"] }
 errno = { version = "0.3" }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
@@ -353,7 +345,7 @@ itertools = { version = "0.13" }
 libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
-nom-15128469a54ed75a = { package = "nom", version = "7" }
+nom = { version = "7" }
 objc2 = { version = "0.6" }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFPlugInCOM", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
 rustix = { version = "1", features = ["fs", "process", "termios"] }
@@ -367,7 +359,6 @@ zstd-safe = { version = "7", default-features = false, features = ["arrays", "le
 [target.x86_64-pc-windows-msvc.dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
 compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "xz", "zstd"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
@@ -376,15 +367,13 @@ liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
-windows-sys-c8eced492e86ede7 = { package = "windows-sys", version = "0.48", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_SystemInformation", "Win32_UI_Shell"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
 zstd = { version = "0.13" }
 zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 
 [target.x86_64-pc-windows-msvc.build-dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
 compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "xz", "zstd"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
@@ -393,8 +382,7 @@ liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
-windows-sys-c8eced492e86ede7 = { package = "windows-sys", version = "0.48", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_SystemInformation", "Win32_UI_Shell"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
 zstd = { version = "0.13" }
 zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 

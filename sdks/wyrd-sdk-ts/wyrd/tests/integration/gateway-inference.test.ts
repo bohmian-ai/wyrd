@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { Agent, run, setTracingDisabled, tool } from "@openai/agents-core";
 import { OpenAIResponsesModel } from "@openai/agents-openai";
@@ -16,11 +17,11 @@ import {
   Principals,
   type ProviderDeployment,
   type RegistrationReceipt,
-  Workflow,
   WyrdClient,
   WyrdError,
+  WyrdState,
 } from "wyrd-ai";
-import { cli, type NativeWyrdTestServer } from "@wyrd/testing";
+import { cli } from "@wyrd/testing";
 
 import { ancestry, columnValues, fixture, registered, serverTest, timeline } from "../support/server.js";
 
@@ -104,31 +105,18 @@ function responsesTurn(body: string): unknown {
       ]);
 }
 
-/** The code-review example Workflow directory; its Prompts call `gpt-5-5` through the Wyrd gateway. */
-const EXAMPLE = resolve(import.meta.dirname, "../../../../../examples/workflows/code-review");
-
-/** The example's own input. */
-const EXAMPLE_INPUT = JSON.parse(readFileSync(resolve(EXAMPLE, "input.json"), "utf8")) as { code: string };
-
 /** One user turn to `openai/gpt-4o`. */
 const ASK = { model: "openai/gpt-4o", max_completion_tokens: 16, messages: [{ role: "user" as const, content: "hi" }] };
 
-/** An `openai` deployment of `model` that authenticates with the `openai-key` credential. */
-function deployment(model: string): ProviderDeployment {
-  return {
-    name: model,
-    model: { provider: "openai", model },
-    adapter: "openai",
-    auth: { bearer: { credential: "openai-key" } },
-    capabilities: ["chat_completions"],
-    routing_weight: 1,
-  };
+/** An OpenAI deployment named `name` that authenticates with the `openai-key` credential. */
+function openaiDeployment(name: string, access: ProviderDeployment["access"] = "open"): ProviderDeployment {
+  return { name, adapter: "openai", auth: { bearer: { credential: "openai-key" } }, access };
 }
 
 /**
- * A server whose `openai` deployments of `gpt-4o` and `gpt-5-5` reach the
- * local upstream with the operator's provider key, call metadata capture, and
- * the registered `ask` Workflow.
+ * A server whose `openai` and `anthropic` deployments reach the local upstream
+ * with the operator's provider keys, call metadata capture, and the registered
+ * `ask-agent` Agent.
  */
 const test = serverTest({
   provider: ({ path, body }) => ({
@@ -151,19 +139,14 @@ const test = serverTest({
         source: { environment: { binding: "test-anthropic-key" } },
       });
       const gateway = await Gateway.connect();
-      await gateway.putDeployment(deployment("gpt-4o"));
+      await gateway.putDeployment(openaiDeployment("openai"));
       await gateway.putDeployment({
-        name: "claude-sonnet-5",
-        model: { provider: "anthropic", model: "claude-sonnet-5" },
+        name: "anthropic",
         adapter: "anthropic",
         auth: { api_key_header: { header: "x-api-key", credential: "anthropic-key" } },
-        capabilities: ["chat_completions"],
-        routing_weight: 1,
       });
-      await gateway.putDeployment(deployment("gpt-5-5"));
-      await gateway.putDeployment({ ...deployment("gpt-4o-mini"), capabilities: ["responses"] });
       await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });
-      await use(await (await Cards.connect()).registerFromPath(fixture("cards/gateway_inference/ask.yaml")));
+      await use(await (await Cards.connect()).registerFromPath(fixture("cards/gateway_inference/ask-agent.yaml")));
     },
     { scope: "file" },
   ],
@@ -249,7 +232,7 @@ test("stock anthropic client authenticates with httpAuth alone", async ({ provid
   const before = provider.received.length;
 
   const message = await client.messages.create({
-    model: "claude-sonnet-5",
+    model: "anthropic/claude-sonnet-5",
     max_tokens: 16,
     messages: [{ role: "user", content: "hi" }],
   });
@@ -401,59 +384,44 @@ test("cli issues a card scoped key and writes a provider credential", async ({ a
   expect(JSON.stringify(view)).not.toContain("sk-managed");
 });
 
-/** Cards of the tenant administrator `wyrd setup` issues, who is bound to no Card and so may run any registered Workflow. */
-async function tenantAdminCards(server: NativeWyrdTestServer): Promise<Cards> {
-  return Cards.connect({
-    client: WyrdClient.connect({
-      serverUrl: server.baseUrl,
-      credential: server.tenantAdminKey(),
-      grpcUrl: server.grpcUrl,
-    }),
-  });
-}
-
-test("loaded workflow calls the gateway through its loading client", async ({ server, provider, ask }) => {
-  const before = provider.received.length;
-  const workflow = await (await tenantAdminCards(server)).workflow.load({ uid: registered(ask).uid });
-
-  const run = await workflow.run({ question: "hi" });
-
-  expect(run).toMatchObject({ status: "succeeded", outputs: { answer: "hi" } });
-  expect(provider.received.slice(before)).toMatchObject([
-    { path: "/v1/chat/completions", headers: { authorization: `Bearer ${PROVIDER_KEY}` } },
-  ]);
-});
-
-test("example workflow runs through the wyrd gateway", async ({ provider, ask: _ }) => {
-  const before = provider.received.length;
-  const example = await Workflow.fromPath(resolve(EXAMPLE, "workflow.yaml"));
-
-  const run = await example.run(EXAMPLE_INPUT);
-
-  expect(run).toMatchObject({ status: "succeeded", outputs: { review: "hi" } });
-  expect(provider.received.slice(before)).toHaveLength(3);
-});
-
-test("applying a workflow calls no model", async ({ provider, ask: _ }) => {
+test("agent prompt routes", async ({ server, provider, ask: _ }) => {
+  const gateway = await Gateway.connect();
+  await gateway.putDeployment(openaiDeployment("openai-backup"));
+  await gateway.putDeployment(openaiDeployment("openai-granted", "granted"));
+  const cards = await Cards.connect();
+  const receipt = await cards.registerFromPath(fixture("cards/gateway_inference/ask-service.yaml"));
+  const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-ask-"));
+  await cards.hydrate(receipt.root, bundle);
+  const issued = await cli.issueKey({ kind: "Service", name: "ask-service", version: "1.0.0", space: "default" });
+  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: issued.key }) });
+  const backup = { kind: "wyrd_gateway", deployment: "openai-backup" } as const;
   const before = provider.received.length;
 
-  const applied = await cli.apply(EXAMPLE);
+  for (const alias of ["agent", "body-agent"]) {
+    const run = state.run(alias);
+    expect(await run.invoke({ question: "hi" })).toBe("hi");
+    expect(await run.invoke({ question: "hi" }, { route: backup })).toBe("hi");
+    expect(state.agent(alias).spec.execution_route).toEqual({ kind: "wyrd_gateway", deployment: "openai" });
+  }
+  const upstream = provider.received.slice(before);
+  expect(upstream.map(({ body }) => (JSON.parse(body) as { model: string }).model)).toEqual(Array(4).fill("gpt-4o"));
 
-  expect(applied.root).toMatchObject({ kind: "Workflow", space: "engineering", name: "code-review" });
-  expect(provider.received.slice(before)).toEqual([]);
-});
+  server.flushBifrost();
+  const calls = (
+    await (
+      await Bifrost.connect()
+    ).sql(
+      "SELECT requested_model.deployment AS deployment FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at",
+      [issued.principal_id],
+    )
+  ).toArrow();
+  expect(columnValues(calls.getChild("deployment"))).toEqual(["openai", "openai-backup", "openai", "openai-backup"]);
 
-test("registered example runs through the gateway", async ({ server, provider, ask: _ }) => {
-  await cli.apply(EXAMPLE);
-  const before = provider.received.length;
-  const registeredExample = await (await tenantAdminCards(server)).workflow.load({
-    space: "engineering",
-    name: "code-review",
-    version: "1.0.0",
-  });
-
-  const run = await registeredExample.run(EXAMPLE_INPUT);
-
-  expect(run).toMatchObject({ status: "succeeded", outputs: { review: "hi" } });
-  expect(provider.received.slice(before)).toHaveLength(3);
+  await expect(
+    state.run("agent").invoke({ question: "hi" }, { route: { kind: "wyrd_gateway", deployment: "openai-granted" } }),
+  ).rejects.toMatchObject({ code: "WYRD_PERMISSION_403_DENIED_RBAC" });
+  await expect(
+    state.run("agent").invoke({ question: "hi" }, { route: { kind: "elsewhere" } as never }),
+  ).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
+  expect(provider.received.length - before).toBe(4);
 });

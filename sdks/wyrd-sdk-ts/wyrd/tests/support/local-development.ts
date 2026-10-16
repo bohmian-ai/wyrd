@@ -78,19 +78,17 @@ export function exportSpan(run: Run): void {
   run.scope(() => trace.getTracer("wyrd.tests.local").startSpan("answer").end());
 }
 
-/** Write the `openai-key` credential and deploy `gpt-4o` on it as `client`. */
+/** Write the `openai-key` credential and deploy `openai` on it as `client`. */
 export async function configureGateway(client: WyrdClient): Promise<void> {
   await cli.putProviderCredential(
     { name: "openai-key", provider: "openai", source: { managed_secret: { secret: "sk-local-upstream" } } },
     { client },
   );
   await (await Gateway.connect({ client })).putDeployment({
-    name: "gpt-4o",
-    model: { provider: "openai", model: "gpt-4o" },
+    name: "openai",
     adapter: "openai",
     auth: { bearer: { credential: "openai-key" } },
     capabilities: ["chat_completions"],
-    routing_weight: 1,
   });
 }
 

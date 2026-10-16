@@ -28,9 +28,7 @@ use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings,
     OpenAiMessageContent, OpenAiToolCall, OpenAiToolFunctionCall,
 };
-use skald_spec::{
-    Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
-};
+use skald_spec::{Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse};
 use skald_tool::{AgentTool, ToolError};
 use tokio::sync::Notify;
 use wyrd_telemetry::{
@@ -322,6 +320,10 @@ async fn agent_run_chat_span_records_callback_replaced_model() {
 /// `gcp.gemini` and `gcp.vertex_ai` and the Prompt's resolved model on both
 /// `invoke_agent` and `chat`, keep the `chat` operation, omit the scalar
 /// finish-reasons attribute, and carry no payload.
+///
+/// # Panics
+/// Panics when a Prompt does not build, a run fails, or a captured span
+/// names another provider, model, or operation, or carries a payload.
 #[tokio::test]
 async fn agent_run_genai_google_provider_and_model() {
     capture();
@@ -347,8 +349,7 @@ async fn agent_run_genai_google_provider_and_model() {
         mock.push_response(response);
         let mut providers = ProviderRegistry::new();
         providers.register(Arc::new(mock));
-        let mut native = SpecPrompt::new(request, model, None, ResponseType::Text)
-            .expect("Google prompt builds");
+        let mut native = SpecPrompt::new(request, model).expect("Google prompt builds");
         native.provider = Some(provider);
         let agent = Agent::new(Prompt::from_native(native)).with_id(agent_id);
 
@@ -663,6 +664,9 @@ fn fixed_tool(name: &str, output: Value) -> Arc<dyn AgentTool> {
 }
 
 /// Builds the minimal OpenAI chat Prompt every test agent runs.
+///
+/// # Panics
+/// Panics when the static request does not build a Prompt.
 fn test_prompt() -> Arc<Prompt> {
     let request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
         model: "gpt-4o".to_owned(),
@@ -685,7 +689,7 @@ fn test_prompt() -> Arc<Prompt> {
         settings: OpenAiChatSettings::default(),
     });
     Arc::new(Prompt::from_native(
-        SpecPrompt::new(request, "gpt-4o", None, ResponseType::Text).expect("test prompt builds"),
+        SpecPrompt::new(request, "gpt-4o").expect("test prompt builds"),
     ))
 }
 

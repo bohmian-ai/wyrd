@@ -38,8 +38,8 @@ impl LoadError {
 
 /// Projects a failed Card tree load onto the one public catalog refusal.
 ///
-/// Every surface that loads a Card tree — `wyrd apply`/`plan`, registration
-/// from a path, and Workflow bundle loading — routes its load failure through
+/// Every surface that loads a Card tree — `wyrd apply`/`plan` and
+/// registration from a path — routes its load failure through
 /// this conversion, so the same broken input yields the same code on every
 /// path. The per-file diagnostics, each with its own code, span, and
 /// remediation, travel under `details.diagnostics` so an author can fix the

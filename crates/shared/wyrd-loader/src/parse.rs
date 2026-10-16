@@ -349,6 +349,11 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    /// An envelope without `kind` is refused with one invalid-envelope
+    /// diagnostic naming the missing field.
+    ///
+    /// # Panics
+    /// Panics when the temporary fixture cannot be written or the envelope parses.
     #[test]
     fn parse_rejects_missing_kind() {
         let mut file = NamedTempFile::new().unwrap();
@@ -366,6 +371,8 @@ spec:
     name: system-prompt
     version: "1.0.0"
     space: default
+  execution_route:
+    kind: native
 "#
         )
         .unwrap();
@@ -414,6 +421,12 @@ spec: {{}}
         }
     }
 
+    /// A multi-document YAML file parses into one Card per document, in file
+    /// order; a document without `apiVersion` takes `wyrd/v1`.
+    ///
+    /// # Panics
+    /// Panics when the temporary fixture cannot be written or the documents do
+    /// not parse as a Prompt followed by an Agent.
     #[test]
     fn parse_accepts_multi_doc_yaml() {
         let mut file = NamedTempFile::new().unwrap();
@@ -427,9 +440,9 @@ metadata:
   space: default
   version: "1.0.0"
 spec:
-  provider: anthropic
-  model: claude-sonnet-4.5
-  messages: []
+  provider: openai
+  model: gpt-5
+  system: Be brief.
 ---
 kind: Agent
 metadata:
@@ -442,6 +455,8 @@ spec:
     name: system-prompt
     version: "1.0.0"
     space: default
+  execution_route:
+    kind: native
 "#
         )
         .unwrap();
@@ -456,6 +471,12 @@ spec:
         assert_eq!(cards[1].api_version, ApiVersion::v1());
     }
 
+    /// A parsed Card keeps the path it was read from, which later path
+    /// resolution uses as the base for relative references.
+    ///
+    /// # Panics
+    /// Panics when the temporary fixture cannot be written or does not parse to
+    /// one Card from that path.
     #[test]
     fn parse_preserves_source_path() {
         let mut file = NamedTempFile::new().unwrap();
@@ -469,9 +490,9 @@ metadata:
   space: default
   version: "1.0.0"
 spec:
-  provider: anthropic
-  model: claude-sonnet-4.5
-  messages: []
+  provider: openai
+  model: gpt-5
+  system: Be brief.
 "#
         )
         .unwrap();
@@ -482,6 +503,12 @@ spec:
         assert_eq!(result[0].source_path, file.path());
     }
 
+    /// Envelope violations in every document of one file are reported together,
+    /// in document order, rather than stopping at the first.
+    ///
+    /// # Panics
+    /// Panics when the temporary fixture cannot be written or the two
+    /// violations are not both reported.
     #[test]
     fn parse_collects_every_envelope_violation() {
         let mut file = NamedTempFile::new().unwrap();
@@ -491,9 +518,9 @@ spec:
 apiVersion: wyrd/v1
 kind: Prompt
 spec:
-  provider: anthropic
-  model: claude-sonnet-4.5
-  messages: []
+  provider: openai
+  model: gpt-5
+  system: Be brief.
 ---
 apiVersion: wyrd/v1
 metadata:
@@ -501,9 +528,9 @@ metadata:
   space: default
   version: "1.0.0"
 spec:
-  provider: anthropic
-  model: claude-sonnet-4.5
-  messages: []
+  provider: openai
+  model: gpt-5
+  system: Be brief.
 "#
         )
         .unwrap();
@@ -518,6 +545,12 @@ spec:
         assert!(err.diagnostics[1].message.contains("kind"));
     }
 
+    /// An inline `!file` reference inside a native Prompt body that resolves
+    /// through a symlink outside the workspace is refused as a path escape.
+    ///
+    /// # Panics
+    /// Panics when the fixture files or symlink cannot be created or the inline
+    /// file loads.
     #[cfg(unix)]
     #[test]
     fn parse_rejects_inline_file_symlink_outside_workspace() {
@@ -531,7 +564,7 @@ spec:
         let source = workspace.path().join("agent.yaml");
         std::fs::write(
             &source,
-            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  space: default\n  version: 1.0.0\nspec:\n  prompt:\n    request:\n      provider: gemini_generate_content\n      body:\n        contents: []\n        system_instruction:\n          role: system\n          parts:\n            - text: !file runbook.txt\n    model: gemini-flash-lite\n    variables: []\n    media_variables: []\n    response_type: text\n  tool_names: []\n  run_config: {}\n",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  space: default\n  version: 1.0.0\nspec:\n  prompt:\n    provider: google\n    model: gemini-flash-lite\n    format: generate_content\n    body:\n      contents: []\n      system_instruction:\n        role: system\n        parts:\n          - text: !file runbook.txt\n  execution_route:\n    kind: native\n  tool_names: []\n  run_config: {}\n",
         )
         .unwrap();
 

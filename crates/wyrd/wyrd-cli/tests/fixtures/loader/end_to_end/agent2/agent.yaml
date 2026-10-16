@@ -16,21 +16,20 @@ spec:
   # reusable card. Use `ref:` when the child is already registered
   # elsewhere.
   prompt:
-    request:
-      provider: gemini_generate_content
-      body:
-        contents:
-          - role: user
-            parts:
-              - text: Execute the selected retention runbook.
-        system_instruction:
-          role: system
-          parts:
-            - text: !file runbook.txt
+    provider: google
     model: gemini-flash-lite
-    variables: []
-    media_variables: []
-    response_type: text
+    format: generate_content
+    body:
+      contents:
+        - role: user
+          parts:
+            - text: Execute the selected retention runbook.
+      system_instruction:
+        role: system
+        parts:
+          - text: !file runbook.txt
+  execution_route:
+    kind: native
 
   tool_names: [crm_note_write, billing_apply_credit, email_send]
   run_config:

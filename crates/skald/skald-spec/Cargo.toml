@@ -18,6 +18,7 @@ schemars = { workspace = true, optional = true }
 thiserror = { workspace = true }
 base64 = { workspace = true }
 regex = { workspace = true }
+jsonschema = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true

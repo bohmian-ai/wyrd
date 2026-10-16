@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict
+
+if TYPE_CHECKING:
+    from typing_extensions import NotRequired
 
 GatewayOperation = Literal[
     "chat_completions", "responses", "embeddings", "images", "audio", "batches", "system_one"
@@ -21,16 +24,15 @@ UnknownCostPolicy = Literal["reject", "allow_unpriced"]
 
 
 class ModelRef(TypedDict):
-    """One exact provider-native model.
+    """One exact model on one named deployment, addressed as ``<deployment>/<model>``.
 
-    ``provider`` is a lowercase Wyrd name (3 to 64 of ``a-z``, ``0-9``, ``_``,
-    ``-``, starting with a letter); ``openai``, ``anthropic``, ``gemini``,
-    ``vertex``, and ``jev`` are reserved for the built-in adapters. ``model`` is the
-    provider's own identifier, 1 to 255 bytes without control characters, and
-    may contain ``/``.
+    ``deployment`` is a lowercase Wyrd name (3 to 64 of ``a-z``, ``0-9``,
+    ``_``, ``-``, starting with a letter). ``model`` is the provider's own
+    identifier, 1 to 255 bytes without control characters, and may contain
+    ``/``.
     """
 
-    provider: str
+    deployment: str
     model: str
 
 
@@ -104,8 +106,8 @@ class VertexAdapter(TypedDict):
     """Google Vertex GenerateContent protocol.
 
     ``vertex.project`` and ``vertex.location`` (such as ``us-central1``) are
-    each 1 to 128 ASCII alphanumerics, ``-``, or ``_``. The deployment's
-    provider must be ``vertex``.
+    each 1 to 128 ASCII alphanumerics, ``-``, or ``_``. A referenced credential
+    must be for provider ``vertex``.
     """
 
     vertex: _VertexLocation
@@ -118,8 +120,8 @@ class _OpenAiCompatibleBase(TypedDict):
 class OpenAiCompatibleAdapter(TypedDict):
     """Standard OpenAI-compatible routes under a tenant base URL.
 
-    ``openai_compatible.base_url`` is an absolute URL. The deployment's
-    provider must not be one of the reserved built-in identities.
+    ``openai_compatible.base_url`` is an absolute URL. A referenced credential
+    must not be for one of the reserved built-in providers.
     """
 
     openai_compatible: _OpenAiCompatibleBase
@@ -130,8 +132,8 @@ ProviderAdapter = (
 )
 """Upstream protocol family a deployment speaks.
 
-``"openai"``, ``"anthropic"``, ``"gemini"``, and ``"jev"`` require the provider
-of the same name. OpenAI-protocol adapters serve every operation except
+``"openai"``, ``"anthropic"``, ``"gemini"``, and ``"jev"`` require a credential
+for the provider of the same name. OpenAI-protocol adapters serve every operation except
 ``system_one``; the Anthropic, Gemini, and Vertex adapters serve
 ``chat_completions`` only. The Jev adapter serves ``system_one``, typed
 ``{"model", "state", "questions"}`` requests answered by typed ``answers``, and
@@ -182,20 +184,22 @@ The caller's own Wyrd token is never forwarded.
 class ProviderDeployment(TypedDict):
     """Named provider deployment; the same shape is written and read.
 
-    ``name`` (a lowercase Wyrd name) is an administration identifier only:
-    inference callers select a ``ModelRef``, never a deployment.
-    ``capabilities`` must be non-empty and served by ``adapter``.
-    ``routing_weight`` is a positive weight among deployments serving the same
-    model. A referenced credential must be active and for the same provider.
-    Unknown keys are rejected.
+    Callers address it as ``<name>/<model>``; ``name`` (a lowercase Wyrd name)
+    selects exactly this adapter and credential binding. ``models`` is an
+    optional allowlist of addressable models; absent, any model may be
+    addressed. ``capabilities`` optionally narrows the operations ``adapter``
+    serves. ``access`` is ``"open"`` (the default: any covering
+    ``gateway:invoke`` grant) or ``"granted"`` (only a deployment- or
+    model-scoped grant). A referenced credential must be active and for the
+    adapter's provider. Unknown keys are rejected.
     """
 
     name: str
-    model: ModelRef
     adapter: ProviderAdapter
     auth: ProviderAuth
-    capabilities: list[GatewayOperation]
-    routing_weight: int
+    models: NotRequired[list[str]]
+    capabilities: NotRequired[list[GatewayOperation]]
+    access: NotRequired[Literal["open", "granted"]]
 
 
 class _OperationScope(TypedDict):
@@ -268,14 +272,14 @@ GatewayLimitSubject = Literal["tenant"] | PrincipalSubject
 GatewayPolicySubject = Literal["tenant"] | PrincipalSubject | RoleSubject
 
 
-class _ProviderTargetRef(TypedDict):
-    provider: str
+class _DeploymentTargetRef(TypedDict):
+    deployment: str
 
 
-class ProviderTarget(TypedDict):
-    """One provider."""
+class DeploymentTarget(TypedDict):
+    """Every model of one deployment."""
 
-    provider: _ProviderTargetRef
+    deployment: _DeploymentTargetRef
 
 
 class _ModelTargetRef(TypedDict):
@@ -288,7 +292,7 @@ class ModelTarget(TypedDict):
     model: _ModelTargetRef
 
 
-GatewayPolicyTarget = Literal["all"] | ProviderTarget | ModelTarget
+GatewayPolicyTarget = Literal["all"] | DeploymentTarget | ModelTarget
 
 
 class GatewayLimit(TypedDict):

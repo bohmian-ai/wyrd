@@ -2741,7 +2741,7 @@ const JUDGE_CALLER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
 const JUDGE_CHAIN: [&str; 8] = [
     "gateway.execute",
     "gateway.call",
-    "workflow.gateway.call",
+    "agent.gateway.call",
     "dispatch",
     "verification.judge",
     "verification.score",

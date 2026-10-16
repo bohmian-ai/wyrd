@@ -365,7 +365,6 @@ const composition: ServiceComposition = {
         { uid: 'card_model_01', kind: 'Model', name: 'ranker', version: 'v12', status: '✓ deployed', note: 'component · model_primary' },
         { uid: 'card_model_02', kind: 'Model', name: 'ranker-shadow', version: 'v11', status: '○ shadow', note: 'component · model_shadow' },
         { uid: 'card_agent_02', kind: 'Agent', name: 'fraud-review', version: 'v2', status: '✓ healthy', note: 'component · agent_inline' },
-        { uid: 'card_workflow_02', kind: 'Workflow', name: 'runtime', version: 'v1', status: '✓ active', note: 'component · runtime_workflow' }
       ]
     },
     {
@@ -396,7 +395,7 @@ const composition: ServiceComposition = {
       note: 'mock-only continuation',
       nodes: [
         { uid: 'card_trigger_01', kind: 'Trigger', name: 'ranking-drift-response', version: 'v1', status: '✓ active', note: 'fires on breached report' },
-        { uid: 'card_operator_01', kind: 'Operator', name: 'investigate-ranking-drift', version: 'v1', status: '✓ active', note: 'invokes · dispatches Workflow runtime' }
+        { uid: 'card_operator_01', kind: 'Operator', name: 'investigate-ranking-drift', version: 'v1', status: '✓ active', note: 'invokes · notifies the on-call channel' }
       ]
     }
   ],
@@ -407,7 +406,6 @@ const composition: ServiceComposition = {
     { from: 'card_drift_01', to: 'card_trigger_01', label: 'fires' },
     { from: 'card_trigger_01', to: 'card_operator_01', label: 'invokes', route: 'down' },
     { from: 'card_data_01', to: 'card_drift_01', label: 'baseline', route: 'under' },
-    { from: 'card_operator_01', to: 'card_workflow_02', label: 'dispatches workflow', route: 'under' }
   ],
   aliasNote:
     'capture_prompt and shared_prompt are two authored aliases resolving to capture-review — one Card, one node. Binding reads as “verified by · through checkout-api v12”, not global ownership. A declared edge never proves a runtime execution or observation occurred.',
@@ -441,8 +439,6 @@ spec:
       ref: { kind: Agent, name: fraud-review, version: v2 }
     - alias: model_shadow
       ref: { kind: Model, name: ranker-shadow, version: v11 }
-    - alias: runtime_workflow
-      ref: { kind: Workflow, name: runtime, version: v1 }
     - alias: capture_prompt
       ref: { kind: Prompt, name: capture-review, version: v3 }
     - alias: shared_prompt
@@ -467,7 +463,6 @@ const definition: ServiceDefinition = {
       { alias: 'agent_triage', ref: 'checkout-agent · v6', href: '/cards/card_agent_01', kind: 'Agent', publishes: 'checkout-agent-eval (Verifier)', publishesHref: '/cards/card_eval_02' },
       { alias: 'agent_inline', ref: 'fraud-review · v2', href: '/cards/card_agent_02', kind: 'Agent', publishes: '—' },
       { alias: 'model_shadow', ref: 'ranker-shadow · v11', href: '/cards/card_model_02', kind: 'Model', publishes: '—' },
-      { alias: 'runtime_workflow', ref: 'runtime · v1', href: '/cards/card_workflow_02', kind: 'Workflow', publishes: '—' },
       { alias: 'capture_prompt', ref: 'capture-review · v3', href: '/cards/card_prompt_02', kind: 'Prompt', publishes: '—' },
       { alias: 'shared_prompt', ref: 'capture-review · v3', href: '/cards/card_prompt_02', kind: 'Prompt', publishes: 'alias of the same Card' }
     ],
@@ -590,7 +585,6 @@ const v11Presentation: ServicePresentation = {
           { uid: 'card_agent_01', kind: 'Agent', name: 'checkout-agent', version: 'v6', status: '✓ healthy', note: 'component · agent_triage' },
           { uid: 'card_model_01', kind: 'Model', name: 'ranker', version: 'v11', status: '○ superseded', note: 'component · model_primary' },
           { uid: 'card_agent_02', kind: 'Agent', name: 'fraud-review', version: 'v2', status: '✓ healthy', note: 'component · agent_inline' },
-          { uid: 'card_workflow_02', kind: 'Workflow', name: 'runtime', version: 'v1', status: '✓ active', note: 'component · runtime_workflow' }
         ]
       },
       { title: 'MEASUREMENT', note: 'v11 declares no publication bindings', nodes: [] },

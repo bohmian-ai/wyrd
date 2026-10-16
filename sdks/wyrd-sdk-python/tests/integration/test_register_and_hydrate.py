@@ -197,3 +197,75 @@ def test_hydrated_agent_prompt_card_navigation(
     with pytest.raises(WyrdError) as mismatch:
         state.agent("my_prompt")
     assert mismatch.value.code == "WYRD_SDK_400_CARD_KIND_MISMATCH"
+
+
+PORTABLE_SPEC = {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-5",
+    "system": "You answer for ${team}.",
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "${question}"},
+                {"type": "image", "source": "${media:photo}"},
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "mime_type": "image/png", "data": "iVBORw0KGgo="},
+                },
+                {"type": "document", "source": "${media:__wyrd_media_0}"},
+            ],
+        }
+    ],
+    "settings": {"temperature": 0.2, "max_output_tokens": 256},
+    "response_format": {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    },
+}
+NATIVE_SPEC = {
+    "provider": "openai",
+    "model": "gpt-4o",
+    "format": "chat_completion",
+    "body": {
+        "messages": [{"role": "user", "content": "Summarize {{ticket}}."}],
+        "seed": 123,
+        "future_knob": {"enabled": True},
+    },
+}
+
+
+def test_prompt_forms_round_trip_as_authored(cards: Cards, tmp_path: Path) -> None:
+    """Portable and native Prompts, standalone and inline, read and hydrate as authored with one hash."""
+    registered = register(cards, "cards/register_and_hydrate/authored-prompts.yaml")
+    state = WyrdState.from_path(download(cards, "authored-prompts", tmp_path))
+    answer = PORTABLE_SPEC["response_format"]
+
+    for name, prompt, authored, variables, schema in (
+        ("portable-prompt", state.prompt("portable"), PORTABLE_SPEC, ["question", "team"], answer),
+        ("native-prompt", state.prompt("native"), NATIVE_SPEC, ["ticket"], None),
+        (
+            "inline-prompt-agent-prompt",
+            state.agent("agent").prompt(),
+            PORTABLE_SPEC,
+            ["question", "team"],
+            answer,
+        ),
+        (
+            "inline-native-prompt-agent-prompt",
+            state.agent("native-agent").prompt(),
+            NATIVE_SPEC,
+            ["ticket"],
+            None,
+        ),
+    ):
+        read = cards.get(registered[name])
+        envelope = state.card(next(a for a in state.aliases if state.card_ref(a) == read.card_ref))
+        assert prompt.ref == read.card_ref == registered[name]
+        assert read.spec == envelope.spec == prompt.metadata.to_spec() == authored
+        assert read.metadata["spec_hash"] == envelope.metadata["spec_hash"]
+        assert sorted(prompt.parameters) == sorted(prompt.prompt.variables) == variables
+        assert prompt.prompt.response_schema == schema
+        media = ["__wyrd_media_0", "photo"] if authored is PORTABLE_SPEC else []
+        assert sorted(prompt.prompt.media_variables) == media

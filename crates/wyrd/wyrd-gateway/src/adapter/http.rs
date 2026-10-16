@@ -20,6 +20,7 @@ use skald_providers::{
 use skald_spec::{ProviderRequest, ProviderResponse};
 use url::Url;
 use wyrd_spec::gateway::{GatewayOperation, ProviderAdapter, ProviderAuth, ProviderDeployment};
+use wyrd_spec::ids::ModelId;
 
 use super::stream::{ChatChunks, Frames, MediaCapture, StreamCapture, relay, relay_media};
 use super::{
@@ -36,9 +37,12 @@ use skald_providers::EndpointPolicy;
 /// Base URL overrides of the built-in adapters.
 ///
 /// `None` keeps the Skald client's provider endpoint, which production uses;
-/// tests point the built-ins at local mock servers. OpenAI-compatible
-/// deployments always use their own declared base URL.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// tests and local development point the built-ins at local provider
+/// fixtures, the latter through the server's non-production
+/// `[gateway.endpoints]` configuration. OpenAI-compatible deployments always
+/// use their own declared base URL.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuiltinEndpoints {
     /// `OpenAI` API base, including its `/v1` segment.
     pub openai: Option<Url>,
@@ -85,8 +89,8 @@ impl HttpProviderDispatch {
         })
     }
 
-    /// Builds the Skald client of `deployment`, authenticated with
-    /// `credential`.
+    /// Builds the Skald client of `deployment` for `model`, authenticated
+    /// with `credential`.
     ///
     /// `OpenAI` takes bearer authentication; compatible endpoints take any
     /// style; Anthropic takes its `x-api-key` header; Gemini its
@@ -98,6 +102,7 @@ impl HttpProviderDispatch {
     fn client(
         &self,
         deployment: &ProviderDeployment,
+        model: &ModelId,
         credential: Option<&ProviderSecret>,
     ) -> Option<Client> {
         let base = match &deployment.adapter {
@@ -115,7 +120,7 @@ impl HttpProviderDispatch {
             base => base.map(|url| url.as_str().trim_end_matches('/').to_owned()),
         };
         let key = || credential.map(ProviderSecret::expose);
-        let model = deployment.model.model.as_str();
+        let model = model.as_str();
         let retry = RetryPolicy {
             max_attempts: 1,
             ..RetryPolicy::default()
@@ -606,11 +611,7 @@ impl Client {
         attempt: &ProviderAttempt<'_>,
         prepared: Prepared,
     ) -> AttemptResult {
-        let deployment = attempt.deployment;
-        match self
-            .batch(action, deployment.model.model.as_str(), prepared)
-            .await
-        {
+        match self.batch(action, attempt.model.as_str(), prepared).await {
             Ok(answer) => match serde_json::from_slice::<Box<RawValue>>(&answer.bytes) {
                 Ok(raw) if json(&answer.content_type) => AttemptResult::Completed {
                     capture: captured(attempt, &raw),
@@ -625,7 +626,7 @@ impl Client {
             },
             Err(error) => {
                 tracing::warn!(
-                    deployment = deployment.name.as_str(),
+                    deployment = attempt.deployment.name.as_str(),
                     code = error.code(),
                     "gateway batch lifecycle call failed"
                 );
@@ -637,6 +638,16 @@ impl Client {
 
 #[async_trait]
 impl ProviderDispatch for HttpProviderDispatch {
+    /// Sends one admitted attempt to its deployment over HTTP.
+    ///
+    /// The body is first prepared for the deployment's adapter; an
+    /// unrepresentable request is rejected and an unusable endpoint, auth, or
+    /// credential fails before dispatch, neither reaching the network. A
+    /// streaming call returns translated frames, a Batches action its lifecycle
+    /// answer, speech its audio stream, and other media its content unchanged;
+    /// any other answer is decoded and, on an OpenAI ingress, translated back to
+    /// the caller's dialect. Every outcome, including upstream failures, is an
+    /// [`AttemptResult`] for the engine to account and retry.
     async fn dispatch(&self, attempt: ProviderAttempt<'_>) -> AttemptResult {
         let deployment = attempt.deployment;
         let failed = |class| AttemptResult::Failed {
@@ -651,6 +662,7 @@ impl ProviderDispatch for HttpProviderDispatch {
                     attempt.stream,
                     attempt.body,
                     deployment,
+                    attempt.model,
                     attempt.media,
                 )
             }) {
@@ -660,7 +672,7 @@ impl ProviderDispatch for HttpProviderDispatch {
                 return failed(FailureClass::Rejected);
             }
         };
-        let Some(client) = self.client(deployment, attempt.credential) else {
+        let Some(client) = self.client(deployment, attempt.model, attempt.credential) else {
             tracing::warn!(
                 deployment = deployment.name.as_str(),
                 "gateway deployment endpoint, authentication, or credential is not usable"
@@ -673,7 +685,7 @@ impl ProviderDispatch for HttpProviderDispatch {
             !matches!(prepared, Prepared::Native(_)) && attempt.ingress == IngressDialect::OpenAi;
         let wire = Wire::of(&deployment.adapter);
         let id = format!("chatcmpl-{}", attempt.call_id.as_uuid().simple());
-        let model = deployment.model.model.as_str();
+        let model = attempt.model.as_str();
         if attempt.stream {
             let frames = frames(&attempt, translated, id, model);
             let limit = self.transport.config().max_response_bytes;

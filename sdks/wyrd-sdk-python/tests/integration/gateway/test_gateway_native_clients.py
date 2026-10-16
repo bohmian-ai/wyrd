@@ -39,7 +39,7 @@ def anthropic_gateway(
 ) -> tuple[WyrdTestServer, Receiver]:
     """A server with one Anthropic chat deployment and metadata capture."""
     server, upstream = gateway_server
-    deploy(server, "anthropic", "claude-sonnet-5", ["chat_completions"])
+    deploy(server, "anthropic")
     Gateway(client_of(server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
     return server, upstream
 
@@ -50,7 +50,7 @@ def gemini_gateway(
 ) -> tuple[WyrdTestServer, Receiver]:
     """A server with one Gemini chat deployment and metadata capture."""
     server, upstream = gateway_server
-    deploy(server, "gemini", "gemini-2.5-flash", ["chat_completions"])
+    deploy(server, "gemini")
     Gateway(client_of(server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
     return server, upstream
 
@@ -79,9 +79,11 @@ def test_anthropic_client_calls_and_streams_through_the_gateway(
     token = server.access_token()
     client = anthropic_client(server, token)
 
-    message = client.messages.create(model="claude-sonnet-5", max_tokens=16, messages=MESSAGES)
+    message = client.messages.create(
+        model="anthropic/claude-sonnet-5", max_tokens=16, messages=MESSAGES
+    )
     with client.messages.stream(
-        model="claude-sonnet-5", max_tokens=16, messages=MESSAGES
+        model="anthropic/claude-sonnet-5", max_tokens=16, messages=MESSAGES
     ) as stream:
         streamed = "".join(stream.text_stream)
         final = stream.get_final_message()
@@ -102,9 +104,11 @@ def test_anthropic_client_authenticates_with_a_wyrd_api_key(
     api_key = server.bootstrap_service(["workload"], name="anthropic-key-caller")
     client = anthropic.Anthropic(base_url=server.base_url, api_key=api_key, max_retries=0)
 
-    message = client.messages.create(model="claude-sonnet-5", max_tokens=16, messages=MESSAGES)
+    message = client.messages.create(
+        model="anthropic/claude-sonnet-5", max_tokens=16, messages=MESSAGES
+    )
     with client.messages.stream(
-        model="claude-sonnet-5", max_tokens=16, messages=MESSAGES
+        model="anthropic/claude-sonnet-5", max_tokens=16, messages=MESSAGES
     ) as stream:
         streamed = "".join(stream.text_stream)
 
@@ -124,13 +128,15 @@ def test_anthropic_refusals_never_reach_the_provider(
 
     with pytest.raises(anthropic.PermissionDeniedError) as denied:
         anthropic_client(server, access_token(server, viewer_key)).messages.create(
-            model="claude-sonnet-5", max_tokens=16, messages=MESSAGES
+            model="anthropic/claude-sonnet-5", max_tokens=16, messages=MESSAGES
         )
     ambiguous_client = anthropic_client(
         server, token, default_headers={"Authorization": f"Bearer {token}"}
     )
     with pytest.raises(anthropic.BadRequestError) as ambiguous:
-        ambiguous_client.messages.create(model="claude-sonnet-5", max_tokens=16, messages=MESSAGES)
+        ambiguous_client.messages.create(
+            model="anthropic/claude-sonnet-5", max_tokens=16, messages=MESSAGES
+        )
 
     assert denied.value.response.json()["error"]["code"] == "WYRD_PERMISSION_403_DENIED_RBAC"
     assert ambiguous.value.response.json()["error"]["code"] == "WYRD_AUTH_400_BAD_TOKEN_FORMAT"
@@ -142,9 +148,9 @@ def test_anthropic_calls_are_recorded_with_their_usage(
 ) -> None:
     server, _ = anthropic_gateway
     client = anthropic_client(server, server.access_token())
-    client.messages.create(model="claude-sonnet-5", max_tokens=16, messages=MESSAGES)
+    client.messages.create(model="anthropic/claude-sonnet-5", max_tokens=16, messages=MESSAGES)
     with client.messages.stream(
-        model="claude-sonnet-5", max_tokens=16, messages=MESSAGES
+        model="anthropic/claude-sonnet-5", max_tokens=16, messages=MESSAGES
     ) as stream:
         stream.get_final_message()
 
@@ -167,8 +173,10 @@ def test_gemini_client_calls_and_streams_through_the_gateway(
     token = server.access_token()
     client = gemini_client(server, token)
 
-    answer = client.models.generate_content(model="gemini-2.5-flash", contents="hi")
-    chunks = list(client.models.generate_content_stream(model="gemini-2.5-flash", contents="hi"))
+    answer = client.models.generate_content(model="gemini/gemini-2.5-flash", contents="hi")
+    chunks = list(
+        client.models.generate_content_stream(model="gemini/gemini-2.5-flash", contents="hi")
+    )
 
     assert answer.text == "hi"
     assert answer.usage_metadata is not None
@@ -194,8 +202,10 @@ def test_gemini_client_authenticates_with_a_wyrd_api_key(
         http_options=genai_types.HttpOptions(base_url=server.base_url, retry_options=None),
     )
 
-    answer = client.models.generate_content(model="gemini-2.5-flash", contents="hi")
-    chunks = list(client.models.generate_content_stream(model="gemini-2.5-flash", contents="hi"))
+    answer = client.models.generate_content(model="gemini/gemini-2.5-flash", contents="hi")
+    chunks = list(
+        client.models.generate_content_stream(model="gemini/gemini-2.5-flash", contents="hi")
+    )
 
     assert answer.text == "hi"
     assert "".join(chunk.text or "" for chunk in chunks) == "hi"
@@ -213,9 +223,9 @@ def test_gemini_refusals_never_reach_the_provider(
     reader = gemini_client(server, access_token(server, viewer_key))
     ambiguous_client = gemini_client(server, token, Authorization=f"Bearer {token}")
     with pytest.raises(genai_errors.ClientError) as denied:
-        reader.models.generate_content(model="gemini-2.5-flash", contents="hi")
+        reader.models.generate_content(model="gemini/gemini-2.5-flash", contents="hi")
     with pytest.raises(genai_errors.ClientError) as ambiguous:
-        ambiguous_client.models.generate_content(model="gemini-2.5-flash", contents="hi")
+        ambiguous_client.models.generate_content(model="gemini/gemini-2.5-flash", contents="hi")
 
     assert (denied.value.code, denied.value.status) == (403, "PERMISSION_DENIED")
     assert (
@@ -232,8 +242,8 @@ def test_gemini_calls_are_recorded_with_their_usage(
 ) -> None:
     server, _ = gemini_gateway
     client = gemini_client(server, server.access_token())
-    client.models.generate_content(model="gemini-2.5-flash", contents="hi")
-    list(client.models.generate_content_stream(model="gemini-2.5-flash", contents="hi"))
+    client.models.generate_content(model="gemini/gemini-2.5-flash", contents="hi")
+    list(client.models.generate_content_stream(model="gemini/gemini-2.5-flash", contents="hi"))
 
     rows = calls(
         server,

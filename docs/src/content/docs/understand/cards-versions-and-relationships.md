@@ -9,7 +9,7 @@ draft: true
 
 A Card is a versioned declaration: one model, prompt, agent, or dataset in your system, or one rule for checking them. You declare a whole service as a folder of Card files in YAML, whatever language the service is written in, and a Service Card ties the set together by naming its components.
 
-Wyrd has 15 Card kinds. These are the ones a service declaration uses most:
+Wyrd has 14 Card kinds. These are the ones a service declaration uses most:
 
 | Card | Declares |
 | --- | --- |
@@ -18,7 +18,6 @@ Wyrd has 15 Card kinds. These are the ones a service declaration uses most:
 | `Prompt` | A versioned prompt template |
 | `Model` | A trained model and its artifact |
 | `Data` | A dataset, such as a training set or a baseline |
-| `Workflow` | A multi-step process across agents or calls |
 | `Verifier` | A check on how a component behaves |
 | `Trigger` | When a Verifier runs |
 | `Operator` | What happens when a check fails |
@@ -108,7 +107,7 @@ Wherever one Card points at another, you can write the reference three ways.
 | File path | `ref: ./support-agent.yaml` | The Card lives in the same folder; Wyrd registers it first |
 | Inline | `prompt: { model: ..., request: ... }` | The body only makes sense inside its parent; it gets no identity of its own, except an Agent's Prompt |
 
-A registered reference always names an exact `version`. A path is relative to the file that contains it, not to the folder you run `wyrd apply` from, and the Card in that file must set its own `metadata.version`. An inline body is written directly under the field, with no wrapper key. Inline bodies are allowed only where the field accepts them: an Agent's `prompt`, a Workflow step's agent, and a verification binding's Trigger and Operators. An Agent's inline `prompt` is the exception to having no identity: registering the Agent also registers it as a Prompt Card named `<agent-name>-prompt`, in the Agent's space with its own version line, so `state.agent(alias).prompt()` returns it like any other Prompt Card.
+A registered reference always names an exact `version`. A path is relative to the file that contains it, not to the folder you run `wyrd apply` from, and the Card in that file must set its own `metadata.version`. An inline body is written directly under the field, with no wrapper key. Inline bodies are allowed only where the field accepts them: an Agent's `prompt`, an LLM judge's agent, and a verification binding's Trigger and Operators. An Agent's inline `prompt` is the exception to having no identity: registering the Agent also registers it as a Prompt Card named `<agent-name>-prompt`, in the Agent's space with its own version line, so `state.agent(alias).prompt()` returns it like any other Prompt Card.
 
 ## Versions are exact
 

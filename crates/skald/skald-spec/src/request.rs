@@ -55,9 +55,10 @@ pub enum ProviderRequest {
 }
 
 /// Which provider a request targets.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
+///
+/// Written as one plain name: a built-in (`openai`, `anthropic`, `google`,
+/// `vertex`, `jev`) or a registered custom provider name such as `local`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProviderName {
     /// OpenAI provider.
     OpenAi,
@@ -69,34 +70,114 @@ pub enum ProviderName {
     Vertex,
     /// TypeSafe Jev provider.
     Jev,
-    /// Provider not modeled by skald-spec.
+    /// Registered provider not modeled by skald-spec.
     Custom(String),
 }
 
-/// Writes the JSON form the derived `Deserialize` reads in every format.
-///
-/// Built-in providers are unit variants written as their snake-case name.
-/// `Custom` is written as the one-entry map `{"custom": name}` rather than a
-/// newtype variant: JSON output is unchanged, while YAML gets a plain map
-/// instead of a `!custom name` tag that a YAML document cannot carry through
-/// the buffered, untagged deserialization of an inline Prompt in an Agent
-/// Card. Both forms still deserialize.
-impl Serialize for ProviderName {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-
+impl ProviderName {
+    /// The provider's authored name.
+    pub fn as_str(&self) -> &str {
         match self {
-            Self::OpenAi => serializer.serialize_unit_variant("ProviderName", 0, "open_ai"),
-            Self::Anthropic => serializer.serialize_unit_variant("ProviderName", 1, "anthropic"),
-            Self::Google => serializer.serialize_unit_variant("ProviderName", 2, "google"),
-            Self::Vertex => serializer.serialize_unit_variant("ProviderName", 3, "vertex"),
-            Self::Jev => serializer.serialize_unit_variant("ProviderName", 4, "jev"),
-            Self::Custom(name) => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("custom", name)?;
-                map.end()
-            }
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Google => "google",
+            Self::Vertex => "vertex",
+            Self::Jev => "jev",
+            Self::Custom(name) => name,
         }
+    }
+}
+
+impl std::str::FromStr for ProviderName {
+    /// Human-readable reason a provider name was refused.
+    type Err = String;
+
+    /// Parse a built-in name, or else a custom name of lowercase ASCII
+    /// letters, digits, `-`, and `_` that starts with a letter or digit.
+    ///
+    /// `gemini` is the gateway's built-in Gemini provider id, so it is never a
+    /// custom name: a Gemini Prompt names `google`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when a custom name is empty, uses other characters,
+    /// or is `gemini`.
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Ok(match name {
+            "openai" => Self::OpenAi,
+            "anthropic" => Self::Anthropic,
+            "google" => Self::Google,
+            "vertex" => Self::Vertex,
+            "jev" => Self::Jev,
+            "gemini" => {
+                return Err(
+                    "provider `gemini` is the gateway's built-in id; a Gemini Prompt names provider `google`"
+                        .to_owned(),
+                );
+            }
+            custom
+                if custom.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                    && custom.chars().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'
+                    }) =>
+            {
+                Self::Custom(custom.to_owned())
+            }
+            other => {
+                return Err(format!(
+                    "provider `{other}` must be a built-in or a lowercase registered name"
+                ));
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for ProviderName {
+    /// Writes the authored spelling from [`ProviderName::as_str`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatter's error when writing fails.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ProviderName {
+    /// Serializes the authored spelling as a string.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serializer's error.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderName {
+    /// Decodes a string and parses it with [`ProviderName::from_str`](std::str::FromStr::from_str).
+    ///
+    /// # Errors
+    ///
+    /// Returns the deserializer's error for a non-string and a custom error
+    /// carrying the parse refusal for an invalid name.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for ProviderName {
+    /// Names the schema `ProviderName`.
+    fn schema_name() -> String {
+        "ProviderName".to_owned()
+    }
+
+    /// Publishes the name as a plain string schema.
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        String::json_schema(generator)
     }
 }
 
@@ -304,12 +385,17 @@ mod round_trip {
 
     /// Every provider keeps its JSON form, and its YAML form reads back
     /// through a buffered `serde_json::Value`, the path an inline Prompt in
-    /// an Agent Card takes.
+    /// an Agent Card takes; malformed names and the reserved `gemini` are
+    /// refused.
+    ///
+    /// # Panics
+    /// Panics when a provider name does not round-trip or a refused name is
+    /// accepted.
     #[test]
     fn provider_name_yaml_reads_back_through_buffered_json() {
         assert_eq!(
             serde_json::to_value(ProviderName::Custom("mock".to_owned())).unwrap(),
-            json!({"custom": "mock"})
+            json!("mock")
         );
         for provider in [
             ProviderName::OpenAi,
@@ -325,6 +411,12 @@ mod round_trip {
             assert_eq!(
                 serde_json::from_value::<ProviderName>(buffered).unwrap(),
                 provider
+            );
+        }
+        for refused in ["", "Local", "a b", "-x", "a/b", "gemini"] {
+            assert!(
+                refused.parse::<ProviderName>().is_err(),
+                "{refused:?} is refused"
             );
         }
     }
@@ -348,10 +440,13 @@ mod round_trip {
 
     /// Stores such as Postgres `jsonb` reorder keys, so the body may precede
     /// its tag; a raw body must still read back unchanged.
+    ///
+    /// # Panics
+    /// Panics when the reordered request does not parse or its body changes.
     #[test]
     fn raw_v1_request_reads_back_when_body_precedes_tag() {
         let reparsed: ProviderRequest = serde_json::from_str(
-            r#"{"body":{"body":{"x":1},"provider":{"custom":"acme"}},"provider":"raw_v1"}"#,
+            r#"{"body":{"body":{"x":1},"provider":"acme"},"provider":"raw_v1"}"#,
         )
         .unwrap();
         assert_eq!(

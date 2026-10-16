@@ -15,7 +15,6 @@ mod saga;
 
 pub use engine::RegistryContext;
 pub use handle::{CardSelector, Cards, LoadedCard};
-pub(crate) use hydrate::WorkflowBodies;
 pub use hydrate::{
     CardGraphHydrator, HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest,
     HydrationMode, HydrationSummary,

@@ -595,13 +595,19 @@ mod pg_tests {
         assert!(result.is_err(), "missing card should error");
     }
 
+    /// The Card-count cap refusal names the `cards` limit, its value, and the
+    /// scope root; the cap itself is unreachable here without Agent Cards that
+    /// have scope children, so the test checks the refusal's shape.
+    ///
+    /// # Panics
+    /// Panics when the refusal is another variant or carries other details.
     #[tokio::test]
     async fn resolve_caps_at_max_scope_cards() {
         // Verify the cap boundary fires: too_large("cards", MAX_SCOPE_CARDS, root)
         // We can't easily create MAX_SCOPE_CARDS+1 Service cards with children,
         // but we can verify the pure error shape produced by too_large directly
         // and confirm resolve errors for a missing card (cap logic is unreachable
-        // without Agent/Workflow cards having scope children).
+        // without Agent cards having scope children).
         let root = make_card_ref(CardKind::Service, "prod", "svc-cap-test");
         let err = too_large("cards", MAX_SCOPE_CARDS, &root);
         let WyrdError::CardScopeTooLarge { message, details } = err else {

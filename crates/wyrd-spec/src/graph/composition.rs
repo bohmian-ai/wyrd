@@ -4,13 +4,12 @@ use std::collections::BTreeSet;
 
 use super::{GraphError, RootPick, identity_key, submission_card_ref};
 use crate::card::agent::AgentSpec;
-use crate::card::operator::{OperatorAction, OperatorSpec};
+use crate::card::operator::OperatorSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::card::verifier::{
     OWNER_OCCURRENCE_KEY, TaskVerifierSpec, VerificationBinding, VerifierImplementation,
     VerifierTask,
 };
-use crate::card::workflow::WorkflowAction;
 use crate::envelope::{CardKind, Spec};
 use crate::error::WyrdError;
 use crate::reference::InlineableRef;
@@ -120,15 +119,14 @@ pub fn validate_composition(
 ///
 /// Verification bindings are part of the shared Card contract, so loaders and
 /// server registration use this pure projection rather than maintaining
-/// independent kind, duplicate, and unsupported-action checks. Path forms are
+/// independent kind and duplicate checks. Path forms are
 /// resolved by their owning boundary; only resolved durable references and
 /// inline bodies participate.
 ///
 /// The checks are: the Verifier reference names a `Verifier` Card; one subject
 /// occurrence binds each Verifier version at most once; `runs_on` names a
 /// `Trigger` Card or is inline; each `on_failure` entry names an `Operator`
-/// Card or is inline; one binding lists each Operator at most once; and no
-/// bound Operator uses the non-invocable `workflow` action.
+/// Card or is inline; and one binding lists each Operator at most once.
 ///
 /// Duplicate detection uses the canonical named identity
 /// ([`crate::reference::CardRef::identity_key`]) for referenced Verifiers and
@@ -197,7 +195,7 @@ fn check_runs_on(
     }
 }
 
-/// Push kind, duplicate, and unsupported-action errors for one `on_failure` list.
+/// Push kind and duplicate errors for one `on_failure` list.
 fn check_on_failure(
     on_failure: &[InlineableRef<OperatorSpec>],
     binding_field: &str,
@@ -211,10 +209,6 @@ fn check_on_failure(
         let operator_field = format!("{binding_field}.on_failure[{index}]");
         match operator {
             InlineableRef::Inline(spec) => {
-                if matches!(spec.action, OperatorAction::Workflow { .. }) {
-                    errors.push(unsupported_workflow_action(&operator_field));
-                    continue;
-                }
                 if seen_inline_operators
                     .iter()
                     .any(|seen| *seen == spec.as_ref())
@@ -289,7 +283,7 @@ impl Spec {
     /// Enumerate every `verified_by` list this spec carries, legal or not.
     ///
     /// Top-level sites are the three legal binding owners. Nested sites are the
-    /// inline Agent bodies a Workflow step or an Eval LLM judge can hold; they
+    /// inline Agent bodies an Eval LLM judge can hold; they
     /// are enumerated so that [`spec_binding_errors`] can refuse them instead
     /// of letting resolution, UID pinning, and relationship derivation run on a
     /// binding the contract does not allow.
@@ -316,17 +310,6 @@ impl Spec {
                         bindings: &component.verified_by,
                         nested: false,
                     });
-                }
-            }
-            Self::Workflow(workflow) => {
-                for (index, step) in workflow.steps.iter().enumerate() {
-                    if let WorkflowAction::Agent(InlineableRef::Inline(agent)) = &step.action {
-                        push_nested_agent(
-                            agent,
-                            &format!("spec.steps[{index}].action.Agent"),
-                            &mut sites,
-                        );
-                    }
                 }
             }
             Self::Verifier(verifier) => match &verifier.implementation {
@@ -413,14 +396,6 @@ fn nested_binding_error(field: &str) -> WyrdError {
         "{field} is not a verification binding location; bind on a Service, \
          a Service component occurrence, or a standalone Agent"
     ))
-}
-
-/// Build the stable refusal for a `workflow` Operator bound to `on_failure`.
-fn unsupported_workflow_action(field: &str) -> WyrdError {
-    WyrdError::SpecUnsupportedOperatorAction {
-        message: format!("{field} uses the workflow action, which is not invocable"),
-        details: serde_json::json!({ "field": field, "action": "workflow" }),
-    }
 }
 
 /// Return whether a Card kind participates beside a Service instead of inside it.
@@ -752,7 +727,7 @@ mod tests {
         let bindings: Vec<VerificationBinding> = serde_json::from_value(json!([{
             "verifier": card_ref(CardKind::Verifier, "quality"),
             "runs_on": { "kind": "observations_ready" },
-            "on_failure": [card_ref(CardKind::Workflow, "rollback")],
+            "on_failure": [card_ref(CardKind::Agent, "rollback")],
         }]))
         .expect("binding fixture decodes");
 
@@ -882,67 +857,6 @@ mod tests {
         assert_eq!(errors[0].code(), "WYRD_SPEC_400_DUPLICATE_BINDING_OPERATOR");
     }
 
-    /// Reject an inline `on_failure` Operator that uses the `workflow` action.
-    ///
-    /// # Panics
-    /// Panics when the binding fixture fails to decode, or when no unsupported
-    /// operator-action error is reported for the inline `workflow` body.
-    #[test]
-    fn binding_validation_rejects_inline_workflow_operator() {
-        let bindings: Vec<VerificationBinding> = serde_json::from_value(json!([{
-            "verifier": card_ref(CardKind::Verifier, "quality"),
-            "runs_on": { "kind": "observations_ready" },
-            "on_failure": [{
-                "kind": "workflow",
-                "workflow_ref": card_ref(CardKind::Workflow, "rollback"),
-            }],
-        }]))
-        .expect("binding fixture decodes");
-
-        let errors = binding_validation_errors(&bindings, "spec.verified_by");
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.code() == "WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION"),
-            "{errors:?}"
-        );
-    }
-
-    /// Refuse a binding carried by an inline Agent inside a Workflow step.
-    ///
-    /// `AgentSpec.verified_by` decodes wherever an Agent body is inlined, so
-    /// the location restriction has to be enforced at the one binding-site
-    /// owner rather than by each validator matching the top-level spec.
-    ///
-    /// # Panics
-    /// Panics when the Workflow spec fails to decode, or when the nested binding
-    /// is not refused as the single stable invalid-card-spec error.
-    #[test]
-    fn spec_binding_errors_refuse_a_workflow_step_inline_agent_binding() {
-        let spec = Spec::from_kind_and_value(
-            &CardKind::Workflow,
-            json!({
-                "steps": [{
-                    "id": "judge",
-                    "action": {
-                        "type": "agent",
-                        "target": {
-                            "prompt": card_ref(CardKind::Prompt, "judge"),
-                            "verified_by": [binding(&card_ref(CardKind::Model, "classifier"))],
-                        },
-                    },
-                }],
-            }),
-        )
-        .expect("the inline Agent body still decodes");
-
-        let errors = spec_binding_errors(&spec);
-
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert_eq!(errors[0].code(), "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
-    }
-
     /// Refuse a binding carried by an Eval Verifier's inline LLM-judge Agent.
     ///
     /// # Panics
@@ -962,6 +876,7 @@ mod tests {
                                 "id": "helpful",
                                 "judge_ref": {
                                     "prompt": card_ref(CardKind::Prompt, "judge"),
+                                    "execution_route": {"kind": "native"},
                                     "verified_by": [
                                         binding(&card_ref(CardKind::Verifier, "quality"))
                                     ],
@@ -982,26 +897,36 @@ mod tests {
         assert_eq!(errors[0].code(), "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
     }
 
-    /// Keep an inline Agent with no bindings acceptable.
+    /// Keep an inline judge Agent with no bindings acceptable.
     ///
     /// # Panics
-    /// Panics when the Workflow spec fails to decode, or when a binding-free
+    /// Panics when the Verifier spec fails to decode, or when a binding-free
     /// inline Agent produces any error.
     #[test]
     fn spec_binding_errors_accept_an_inline_agent_without_bindings() {
         let spec = Spec::from_kind_and_value(
-            &CardKind::Workflow,
+            &CardKind::Verifier,
             json!({
-                "steps": [{
-                    "id": "judge",
-                    "action": {
-                        "type": "agent",
-                        "target": { "prompt": card_ref(CardKind::Prompt, "judge") },
+                "implementation": {
+                    "kind": "eval",
+                    "spec": {
+                        "tasks": {
+                            "helpful": {
+                                "kind": "llm_judge",
+                                "id": "helpful",
+                                "judge_ref": {
+                                    "prompt": card_ref(CardKind::Prompt, "judge"),
+                                    "execution_route": {"kind": "native"},
+                                },
+                                "operator": "greater_than_or_equals",
+                                "expected": 0.5,
+                            },
+                        },
                     },
-                }],
+                },
             }),
         )
-        .expect("the inline Agent body decodes");
+        .expect("the inline judge Agent body decodes");
 
         assert!(spec_binding_errors(&spec).is_empty());
     }

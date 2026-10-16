@@ -90,7 +90,7 @@ def test_gemini_eager_inline_data_is_an_inline_data_part() -> None:
 
 
 def test_gemini_gs_uri_binds_as_a_file_data_part() -> None:
-    prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="gemini").bind_media(
+    prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="google").bind_media(
         "img", MediaRef.image_url("gs://bucket/logo.png", mime_type="image/png")
     )
 
@@ -98,7 +98,7 @@ def test_gemini_gs_uri_binds_as_a_file_data_part() -> None:
 
 
 def test_gemini_rejects_ordinary_https_media_uri() -> None:
-    prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="gemini")
+    prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="google")
 
     with pytest.raises(WyrdError) as error:
         prompt.bind_media("img", MediaRef.image_url(LOGO_URL, mime_type="image/png"))
@@ -114,7 +114,7 @@ def test_vertex_mirrors_gemini_media_behavior() -> None:
 
 
 def test_gemini_url_missing_mime_raises_exact_code() -> None:
-    prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="gemini")
+    prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="google")
 
     with pytest.raises(WyrdError) as error:
         prompt.bind_media("img", MediaRef.image_url("gs://bucket/logo.png"))
@@ -144,3 +144,58 @@ def test_media_in_the_system_message_is_refused() -> None:
         Prompt("hello", "gpt-4o", provider="openai", system="${media:logo}")
 
     assert error.value.code == "WYRD_PROMPT_400_MEDIA_IN_SYSTEM_MESSAGE"
+
+
+@pytest.mark.parametrize(
+    ("provider", "media", "code"),
+    [
+        pytest.param(
+            "openai",
+            MediaRef.image_base64("image/png", "%%%"),
+            "WYRD_PROMPT_400_INVALID_MEDIA_TYPE",
+            id="malformed-base64",
+        ),
+        pytest.param(
+            "anthropic",
+            MediaRef.image_base64("image/png", "A" * (28 * 1024 * 1024)),
+            "WYRD_PROMPT_400_MEDIA_TOO_LARGE",
+            id="over-budget",
+        ),
+        pytest.param(
+            "openai",
+            MediaRef.image_base64("application/pdf", "QUJD"),
+            "WYRD_PROMPT_400_INVALID_MEDIA_TYPE",
+            id="kind-mismatch",
+        ),
+        pytest.param(
+            "anthropic",
+            MediaRef.image_base64("image/svg+xml", "QUJD"),
+            "WYRD_PROMPT_400_INVALID_MEDIA_TYPE",
+            id="provider-unsupported",
+        ),
+        pytest.param(
+            "google",
+            MediaRef.image_file("https://example.test/a.png", mime_type="image/png"),
+            "WYRD_PROMPT_400_UNSUPPORTED_MEDIA_FOR_PROVIDER",
+            id="google-file-uri",
+        ),
+    ],
+)
+def test_invalid_media_source_is_refused_before_binding(
+    provider: str, media: MediaRef, code: str
+) -> None:
+    prompt = Prompt("see ${media:img}", "model-1", provider=provider)
+
+    with pytest.raises(WyrdError) as error:
+        prompt.bind_media_mut("img", media)
+
+    assert error.value.code == code
+    assert prompt.media_variables == ["img"]
+
+
+def test_provider_file_ids_bind_as_written() -> None:
+    bound = Prompt("see ${media:doc}", "gpt-4o", provider="openai").bind_media(
+        "doc", MediaRef.document_file("file-abc123")
+    )
+
+    assert "file-abc123" in bound.model_dump_json()

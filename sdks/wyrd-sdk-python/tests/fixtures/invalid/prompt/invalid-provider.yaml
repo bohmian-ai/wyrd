@@ -1,0 +1,10 @@
+kind: Prompt
+metadata:
+  name: invalid-provider
+  version: 0.1.0
+spec:
+  provider: Not A Provider
+  model: some-model
+  messages:
+  - role: user
+    content: Hello

@@ -165,11 +165,9 @@ async fn gateway_commands_manage_redacted_tenant_configuration() {
         "deployment.json",
         &json!({
             "name": "primary",
-            "model": {"provider": "openai", "model": "gpt-4o"},
             "adapter": "openai",
             "auth": {"bearer": {"credential": "primary"}},
             "capabilities": ["chat_completions"],
-            "routing_weight": 1,
         }),
     );
     ok_json(&gateway(
@@ -309,5 +307,141 @@ async fn gateway_commands_manage_redacted_tenant_configuration() {
         &["credential", "list"],
     ));
     assert_eq!(denied["status"], 403, "{denied}");
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// One `deployment put` reads a single deployment or a list: a malformed,
+/// empty, duplicated, or invalid list writes nothing; a server refusal stops
+/// the run with ordered completed/failed/unattempted outcomes and earlier
+/// writes kept; rerunning converges without deleting unnamed deployments; and
+/// standard input carries a list the same way.
+///
+/// # Panics
+/// Panics when the test server, a CLI run, or an assertion fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the serialized Postgres-backed CLI journey lane"]
+async fn deployment_file_accepts_one_or_many() {
+    let server = WyrdTestServer::start_bound()
+        .await
+        .expect("test server starts");
+    let endpoint = server.base_url().expect("server is bound").to_owned();
+    let admin = server
+        .bootstrap_user("cli-deployment-admin", &["admin"])
+        .await
+        .expect("admin bootstraps");
+    let token = admin.jwt().expect("admin jwt").to_owned();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let credential = document(
+        dir.path(),
+        "credential.json",
+        &json!({
+            "name": "openai-key",
+            "provider": "openai",
+            "source": {"environment": {"binding": TEST_GATEWAY_CREDENTIAL_BINDING}},
+        }),
+    );
+    ok_json(&gateway(
+        &endpoint,
+        &token,
+        &["credential", "put", "--file", &credential],
+    ));
+    let entry = |name: &str, credential: &str| json!({"name": name, "adapter": "openai", "auth": {"bearer": {"credential": credential}}});
+    let put = |file: &str| gateway(&endpoint, &token, &["deployment", "put", "--file", file]);
+    let names = || {
+        let mut names: Vec<String> = ok_json(&gateway(&endpoint, &token, &["deployment", "list"]))
+            .as_array()
+            .expect("deployments list")
+            .iter()
+            .map(|deployment| deployment["name"].as_str().expect("name").to_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let invalid = json!({"name": "bad", "adapter": "openai", "auth": "none", "models": []});
+    for (file, refused, expected) in [
+        ("empty.json", json!([]), "a nonempty list of deployments"),
+        (
+            "duplicate.json",
+            json!([entry("openai", "openai-key"), entry("openai", "openai-key")]),
+            "[1] repeats an earlier name",
+        ),
+        (
+            "invalid.json",
+            json!([entry("openai", "openai-key"), invalid]),
+            "[1].gateway field models is invalid",
+        ),
+    ] {
+        let problem = problem(&put(&document(dir.path(), file, &refused)));
+        assert_eq!(problem["status"], 400, "{problem}");
+        assert!(problem.to_string().contains(expected), "{file}: {problem}");
+    }
+    assert!(names().is_empty(), "a refused file writes no entry");
+
+    let partial = put(&document(
+        dir.path(),
+        "partial.json",
+        &json!([
+            entry("openai", "openai-key"),
+            entry("missing", "absent-key"),
+            entry("later", "openai-key"),
+        ]),
+    ));
+    let refusal = problem(&partial);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&partial.stdout).expect("stdout is the outcome list"),
+        json!([
+            {"name": "openai", "status": "completed"},
+            {"name": "missing", "status": "failed", "code": refusal["code"]},
+            {"name": "later", "status": "unattempted"},
+        ])
+    );
+    assert_eq!(names(), ["openai"], "earlier writes stay committed");
+
+    let fixed = document(
+        dir.path(),
+        "fixed.json",
+        &json!([
+            entry("openai", "openai-key"),
+            entry("missing", "openai-key"),
+            entry("later", "openai-key"),
+        ]),
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            ok_json(&put(&fixed)),
+            json!([
+                {"name": "openai", "status": "completed"},
+                {"name": "missing", "status": "completed"},
+                {"name": "later", "status": "completed"},
+            ])
+        );
+        assert_eq!(names(), ["later", "missing", "openai"], "reruns converge");
+    }
+
+    let single = ok_json(&put(&document(
+        dir.path(),
+        "single.json",
+        &entry("openai", "openai-key"),
+    )));
+    assert_eq!(
+        single["name"], "openai",
+        "one object answers with the deployment"
+    );
+    let piped = gateway_stdin(
+        &endpoint,
+        &token,
+        &["deployment", "put", "--file", "-"],
+        &json!([entry("piped", "openai-key")]).to_string(),
+    );
+    assert_eq!(
+        ok_json(&piped),
+        json!([{"name": "piped", "status": "completed"}])
+    );
+    assert_eq!(
+        names(),
+        ["later", "missing", "openai", "piped"],
+        "names absent from a file are never deleted"
+    );
     server.shutdown().await.expect("test server shuts down");
 }

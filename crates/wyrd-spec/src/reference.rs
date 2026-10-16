@@ -593,7 +593,6 @@ mod tests {
     use crate::card::agent::{AgentRunConfigSpec, AgentSpec};
     use crate::card::mcp::McpSpec;
     use crate::card::service::{ServiceComponent, ServiceSpec};
-    use crate::card::workflow::{WorkflowAction, WorkflowSpec, WorkflowStep};
 
     fn sample_ref() -> CardRef {
         CardRef {
@@ -893,24 +892,14 @@ mod tests {
         );
     }
 
+    /// A path reference nested in an inline Agent of a judge task is reported
+    /// as unresolved.
+    ///
+    /// # Panics
+    /// Panics when another set of paths is reported.
     #[test]
     fn unresolved_card_ref_paths_include_nested_slots() {
-        let spec = Spec::Workflow(WorkflowSpec {
-            steps: vec![WorkflowStep {
-                id: "nested".to_owned(),
-                action: WorkflowAction::Agent(InlineableRef::Path(PathBuf::from(
-                    "nested/agent.yaml",
-                ))),
-                depends_on: Vec::new(),
-                inputs: BTreeMap::new(),
-                llm_route: None,
-                fallback: None,
-                timeout_seconds: None,
-                retry: None,
-                display: BTreeMap::new(),
-            }],
-            ..WorkflowSpec::default()
-        });
+        let spec = nested_judge(InlineableRef::Path(PathBuf::from("nested/agent.yaml")));
 
         assert_eq!(
             unresolved_card_ref_paths(&spec),
@@ -944,8 +933,6 @@ mod tests {
                 settings: skald_spec::OpenAiChatSettings::default(),
             }),
             "gpt-test",
-            None,
-            skald_spec::ResponseType::Text,
         )
         .expect("fixture prompt is valid")
     }
@@ -954,33 +941,43 @@ mod tests {
     fn nested_agent(prompt: InlineableRef<skald_spec::Prompt>) -> AgentSpec {
         AgentSpec {
             prompt,
+            execution_route: crate::card::agent::ExecutionRoute::Native {},
             tool_names: Vec::new(),
             run_config: AgentRunConfigSpec::default(),
             verified_by: Vec::new(),
         }
     }
 
-    /// Return a complete Workflow spec containing one inline Agent step.
-    fn nested_workflow(prompt: InlineableRef<skald_spec::Prompt>) -> WorkflowSpec {
-        WorkflowSpec {
-            steps: vec![WorkflowStep {
-                id: "agent".to_owned(),
-                action: WorkflowAction::Agent(InlineableRef::Inline(Box::new(nested_agent(
-                    prompt,
-                )))),
-                depends_on: Vec::new(),
-                inputs: BTreeMap::new(),
-                llm_route: None,
-                fallback: None,
-                timeout_seconds: None,
-                retry: None,
-                display: BTreeMap::new(),
-            }],
-            ..WorkflowSpec::default()
-        }
+    /// Return an Eval Verifier spec whose one LLM judge holds `judge_ref`.
+    ///
+    /// # Panics
+    /// Panics when the fixed task id, judge, or Eval stops validating.
+    fn nested_judge(judge_ref: InlineableRef<AgentSpec>) -> Spec {
+        use crate::card::verifier::{VerifierImplementation, VerifierSpec};
+        use crate::vala::eval::{ComparisonOperator, EvalSpec, EvalTask, LlmJudgeTask, TaskId};
+
+        let task_id = TaskId::new("judge").expect("fixture task id is valid");
+        let judge = LlmJudgeTask::new(
+            task_id.clone(),
+            judge_ref,
+            ComparisonOperator::Equals,
+            serde_json::json!(true),
+        )
+        .expect("fixture judge is valid");
+        Spec::Verifier(VerifierSpec {
+            description: None,
+            implementation: VerifierImplementation::Eval(
+                EvalSpec::new(BTreeMap::from([(task_id, EvalTask::LlmJudge(judge))]))
+                    .expect("fixture eval is valid"),
+            ),
+        })
     }
 
     /// Confirm sibling collection covers top-level and nested slots in visitor order.
+    ///
+    /// # Panics
+    /// Panics when a static name is invalid or another set of siblings is
+    /// collected.
     #[test]
     fn registration_only_sibling_refs_include_top_level_and_nested_slots() {
         let top_level = sample_ref();
@@ -999,15 +996,11 @@ mod tests {
             config: BTreeMap::new(),
             credential_refs: Vec::new(),
         });
-        let workflow = nested_workflow(InlineableRef::Inline(Box::new(nested_prompt())));
-        let mut spec = Spec::Workflow(workflow);
-        if let Spec::Workflow(workflow) = &mut spec {
-            workflow.steps[0].action = WorkflowAction::Agent(InlineableRef::Inline(Box::new(
-                nested_agent(InlineableRef::Sibling {
-                    sibling: nested.clone(),
-                }),
-            )));
-        }
+        let spec = nested_judge(InlineableRef::Inline(Box::new(nested_agent(
+            InlineableRef::Sibling {
+                sibling: nested.clone(),
+            },
+        ))));
 
         assert_eq!(
             registration_only_sibling_refs(&Spec::Service(service)),
@@ -1017,6 +1010,9 @@ mod tests {
     }
 
     /// Confirm durable refs, paths, and inline bodies are not classified as siblings.
+    ///
+    /// # Panics
+    /// Panics when a non-sibling reference is collected.
     #[test]
     fn registration_only_sibling_refs_ignore_other_reference_forms() {
         let durable = sample_ref();
@@ -1040,9 +1036,11 @@ mod tests {
                 credential_refs: Vec::new(),
             },
         ]);
-        let workflow = nested_workflow(InlineableRef::Inline(Box::new(nested_prompt())));
+        let judge = nested_judge(InlineableRef::Inline(Box::new(nested_agent(
+            InlineableRef::Inline(Box::new(nested_prompt())),
+        ))));
 
         assert!(registration_only_sibling_refs(&Spec::Service(service)).is_empty());
-        assert!(registration_only_sibling_refs(&Spec::Workflow(workflow)).is_empty());
+        assert!(registration_only_sibling_refs(&judge).is_empty());
     }
 }

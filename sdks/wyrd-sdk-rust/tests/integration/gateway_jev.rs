@@ -10,7 +10,6 @@
 //! a bearer token, which is the whole of what such a client sends.
 
 use std::collections::BTreeSet;
-use std::num::NonZeroU32;
 use wyrd_ai::bifrost::BifrostOptions;
 
 use serde::{Deserialize, Serialize};
@@ -20,7 +19,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::cli;
 use wyrd_ai::gateway::{
-    GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation, ModelId, ModelRef,
+    DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation,
     ProviderAdapter, ProviderAuth, ProviderCredentialName, ProviderCredentialWrite,
     ProviderCredentialWriteSource, ProviderDeployment, ProviderDeploymentName, ProviderId,
 };
@@ -186,20 +185,17 @@ impl Jev {
             .await
             .expect("handle connects")
             .put_deployment(&ProviderDeployment {
-                name: ProviderDeploymentName::new("jev-latest").expect("deployment name"),
-                model: ModelRef {
-                    provider: ProviderId::new("jev").expect("provider"),
-                    model: ModelId::new("jev-latest").expect("model"),
-                },
+                name: ProviderDeploymentName::new("jev").expect("deployment name"),
                 adapter: ProviderAdapter::Jev,
                 auth: ProviderAuth::Bearer {
                     credential: ProviderCredentialName::new("jev-key").expect("credential"),
                 },
-                capabilities: BTreeSet::from([
+                models: None,
+                capabilities: Some(BTreeSet::from([
                     GatewayOperation::SystemOne,
                     GatewayOperation::ChatCompletions,
-                ]),
-                routing_weight: NonZeroU32::MIN,
+                ])),
+                access: DeploymentAccess::Open,
             })
             .await
             .expect("deployment puts");
@@ -329,7 +325,7 @@ async fn native_systemone_answers_relay_intact() {
     let (status, reply) = jev
         .post(
             "/v1/systemone",
-            &json!({"model": "jev-latest", "state": "Thanks!", "questions": questions()}),
+            &json!({"model": "jev/jev-latest", "state": "Thanks!", "questions": questions()}),
         )
         .await;
 
@@ -355,10 +351,10 @@ async fn invalid_jev_questions_are_refused_before_jev() {
     let jev = Jev::start().await;
 
     for body in [
-        json!({"model": "jev-latest", "state": "s",
+        json!({"model": "jev/jev-latest", "state": "s",
                "questions": {"q": {"type": "essay", "instructions": "x"}}}),
-        json!({"model": "jev-latest", "state": {"answer": "s"}, "questions": questions()}),
-        json!({"model": "jev-latest", "state": "s", "questions": questions(), "temperature": 0}),
+        json!({"model": "jev/jev-latest", "state": {"answer": "s"}, "questions": questions()}),
+        json!({"model": "jev/jev-latest", "state": "s", "questions": questions(), "temperature": 0}),
     ] {
         let (status, reply) = jev.post("/v1/systemone", &body).await;
         assert_eq!(
@@ -449,7 +445,7 @@ async fn chat_completions_pass_typed_jev_requests_through() {
 async fn jev_refusals_relay_like_other_providers() {
     let jev = Jev::start().await;
     let native =
-        |state: &str| json!({"model": "jev-latest", "state": state, "questions": questions()});
+        |state: &str| json!({"model": "jev/jev-latest", "state": state, "questions": questions()});
 
     for (state, status) in [("refused-form", 400_u16), ("bad-key", 401)] {
         let before = jev.received().await.len();

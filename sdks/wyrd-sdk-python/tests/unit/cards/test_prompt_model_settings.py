@@ -100,7 +100,6 @@ def test_model_settings_getter_round_trip() -> None:
 
     assert isinstance(prompt.model_settings, OpenAISettings)
     assert json.loads(prompt.model_settings.model_dump_json())["seed"] == 11
-    assert Prompt.raw("openai", "gpt-4o", b'{"model":"gpt-4o"}').model_settings is None
 
 
 def test_cache_sugar_and_model_settings_precedence() -> None:

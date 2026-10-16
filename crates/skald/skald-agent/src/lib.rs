@@ -20,6 +20,7 @@ pub mod conversation;
 pub mod delegate;
 pub mod delegation;
 pub mod error;
+pub mod gateway;
 pub mod journal;
 pub mod loop_runtime;
 #[cfg(feature = "python")]
@@ -43,6 +44,10 @@ pub use card_error::AgentCardError;
 pub use conversation::{Conversation, ConversationTurn};
 pub use delegate::AgentDelegateTool;
 pub use error::{AgentError, AgentResult};
+pub use gateway::{
+    DEFAULT_GATEWAY_CALL_TIMEOUT, WyrdGatewayCall, WyrdGatewayCaller, agent_error_retryable,
+    wyrd_gateway_registry,
+};
 pub use journal::{Journal, JournalError, JournalEvent, NoopJournal};
 #[cfg(feature = "python")]
 pub use python::python_register;

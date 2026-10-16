@@ -2,7 +2,8 @@
 
 One recording stdlib HTTP server stands in for every built-in provider the
 test server's adapters reach: OpenAI under ``/v1``, Anthropic Messages, Gemini
-and Vertex ``GenerateContent``, and OpenAI embeddings and images. Journeys
+and Vertex ``GenerateContent``, Jev ``systemone``, and OpenAI embeddings and
+images. Journeys
 point a real ``WyrdTestServer`` at it, drive unmodified clients through the
 server, and read the published ``vala.gateway.calls`` rows once.
 """
@@ -16,7 +17,7 @@ from http.server import BaseHTTPRequestHandler
 from typing import Any, Literal
 
 from wyrd.bifrost import Bifrost
-from wyrd.gateway import Gateway, GatewayOperation, ProviderAdapter, ProviderAuth
+from wyrd.gateway import Gateway, ProviderAdapter, ProviderAuth
 from wyrd.testing import WyrdTestServer, cli
 
 from ..support import Delivery, Receiver, client_of
@@ -150,6 +151,12 @@ EMBEDDING = {
     "usage": {"prompt_tokens": 6, "total_tokens": 6},
 }
 
+JEV_ANSWER = {
+    "model": "jev-latest",
+    "answers": {"helpful": {"type": "noul", "noul": 0.9}},
+    "usage": {"input_tokens": 3, "output_tokens": 1},
+}
+
 IMAGE_BYTES = b"\x89PNG\r\n\x1a\nwyrd-gateway-journey-image"
 
 IMAGE_DIGEST = "sha256:f9356b2f6c0a4aacf9c5728186a6bb26677be8b3b0dbe951b4dd886e39e21956"
@@ -205,6 +212,8 @@ class Upstream(BaseHTTPRequestHandler):
             )
         elif self.path.endswith(":generateContent"):
             self._send("application/json", json.dumps(GEMINI_ANSWER))
+        elif self.path == "/v1/systemone":
+            self._send("application/json", json.dumps(JEV_ANSWER))
         else:
             self.send_error(404)
 
@@ -230,18 +239,24 @@ def _sse(events: list[Any]) -> str:
 def deploy(
     server: WyrdTestServer,
     provider: Literal["openai", "anthropic", "gemini", "vertex"],
-    model: str,
-    capabilities: list[GatewayOperation],
     adapter: ProviderAdapter | None = None,
+    *,
+    name: str | None = None,
+    access: Literal["open", "granted"] = "open",
 ) -> None:
-    """Store a provider's ``Environment`` credential and one built-in deployment of ``model``.
+    """Store a provider's ``Environment`` credential and its deployment named ``name``.
+
+    ``name`` defaults to ``provider``; callers then address any model as
+    ``<name>/<model>``. A ``"granted"`` deployment needs a deployment- or
+    model-scoped grant.
 
     The credential goes through in-process ``wyrd gateway credential put`` and
     the deployment through the public Python ``Gateway``, both as the harness
     admin, reading the operator binding the test server assigns to ``provider``.
     """
     gateway = Gateway(client_of(server))
-    credential = f"{provider}-key"
+    name = name or provider
+    credential = f"{name}-key"
     cli.put_provider_credential(
         {
             "name": credential,
@@ -261,12 +276,10 @@ def deploy(
         adapter = provider
     gateway.put_deployment(
         {
-            "name": model.replace(".", "-"),
-            "model": {"provider": provider, "model": model},
+            "name": name,
             "adapter": adapter,
             "auth": auth,
-            "capabilities": capabilities,
-            "routing_weight": 1,
+            "access": access,
         }
     )
 

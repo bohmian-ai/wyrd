@@ -4,13 +4,18 @@ use serde_json::json;
 use skald_agent::{Agent, RunConfig};
 use skald_prompt::Prompt;
 use skald_spec::{
-    Prompt as SpecPrompt, ProviderRequest, ResponseType,
+    Prompt as SpecPrompt, ProviderRequest,
     wire::openai_chat::{
         OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, OpenAiMessageContent,
     },
 };
 use skald_tool::ToolDef;
 
+/// A resolved OpenAI Chat Prompt for `model` with one system message, shared
+/// by the Agent field tests.
+///
+/// # Panics
+/// Panics when the static request does not build a Prompt.
 fn test_prompt(model: &str) -> Arc<Prompt> {
     let request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
         model: model.to_owned(),
@@ -33,7 +38,7 @@ fn test_prompt(model: &str) -> Arc<Prompt> {
         settings: OpenAiChatSettings::default(),
     });
     Arc::new(Prompt::from_native(
-        SpecPrompt::new(request, model, None, ResponseType::Text).expect("test prompt builds"),
+        SpecPrompt::new(request, model).expect("test prompt builds"),
     ))
 }
 

@@ -44,14 +44,12 @@ def backends(
 ) -> tuple[WyrdTestServer, Receiver]:
     """A server with one chat model on each built-in provider and metadata capture."""
     server, upstream = gateway_server
-    deploy(server, "openai", "gpt-4o", ["chat_completions"])
-    deploy(server, "anthropic", "claude-sonnet-5", ["chat_completions"])
-    deploy(server, "gemini", "gemini-2.5-flash", ["chat_completions"])
+    deploy(server, "openai")
+    deploy(server, "anthropic")
+    deploy(server, "gemini")
     deploy(
         server,
         "vertex",
-        "gemini-2.5-pro",
-        ["chat_completions"],
         adapter={"vertex": {"project": "acme", "location": "us-central1"}},
     )
     Gateway(client_of(server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
@@ -178,7 +176,7 @@ def test_openai_client_receives_stable_refusals_without_dispatch_or_leakage(
         )
     with pytest.raises(openai.APIStatusError) as unknown:
         client.chat.completions.create(
-            model="openai/gpt-missing", messages=MESSAGES, max_completion_tokens=16
+            model="undeployed/gpt-4o", messages=MESSAGES, max_completion_tokens=16
         )
     with pytest.raises(openai.APIStatusError) as incapable:
         client.embeddings.create(model="anthropic/claude-sonnet-5", input="hi")
@@ -215,12 +213,12 @@ def test_server_keeps_serving_after_a_cancelled_stream(
     assert PROVIDER_KEY not in healthy.model_dump_json()
 
 
-def model_access(provider: str, model: str) -> dict[str, object]:
+def model_access(deployment: str, model: str) -> dict[str, object]:
     """A permission to invoke exactly one gateway model."""
     return {
         "resource": "gateway",
         "action": "invoke",
-        "scope": {"gateway": {"model": {"provider": provider, "model": model}}},
+        "scope": {"gateway": {"model": {"deployment": deployment, "model": model}}},
     }
 
 
@@ -275,7 +273,7 @@ def test_each_users_usage_is_recorded_under_their_principal(
     for row in rows:
         by_subject.setdefault(row["sub_principal_id"], []).append(row)
     assert sorted(
-        (rows[0]["requested_model"]["provider"], usage(rows)) for rows in by_subject.values()
+        (rows[0]["requested_model"]["deployment"], usage(rows)) for rows in by_subject.values()
     ) == [
         ("anthropic", {("input_tokens", "5"), ("output_tokens", "3")}),
         ("openai", {("input_tokens", "11"), ("output_tokens", "4")}),
@@ -300,8 +298,7 @@ def test_embedding_and_image_evidence_reaches_bifrost(
 ) -> None:
     """Payload capture records the image by digest; fetching the bytes is proven in Rust."""
     server, upstream = gateway_server
-    deploy(server, "openai", "text-embedding-3-small", ["embeddings"])
-    deploy(server, "openai", "gpt-image-1", ["images"])
+    deploy(server, "openai")
     Gateway(client_of(server)).put_capture_policy(
         {"mode": "payload", "payload_fields": ["response"]}
     )

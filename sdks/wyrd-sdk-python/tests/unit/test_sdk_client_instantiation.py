@@ -92,7 +92,7 @@ def test_local_access_never_connects(monkeypatch: pytest.MonkeyPatch) -> None:
     local(Bifrost(table=first))
     asyncio.run(on_the_event_loop())
     cards = Cards()
-    views = (cards.data, cards.model, cards.prompt, cards.workflow)
+    views = (cards.data, cards.model, cards.prompt)
     assert all(view is not None for view in views)
     with pytest.raises(WyrdError) as captured:
         cards.prompt.list()

@@ -1189,8 +1189,8 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     // Gateway capture: the resolved call carries both model Structs whole,
     // and the refused call's absent resolved model reads both children null.
     let models_sql = format!(
-        "SELECT wyrd_request_id, requested_model['provider'], requested_model['model'], \
-         resolved_model['provider'], resolved_model['model'] FROM vala.gateway.calls \
+        "SELECT wyrd_request_id, requested_model['deployment'], requested_model['model'], \
+         resolved_model['deployment'], resolved_model['model'] FROM vala.gateway.calls \
          WHERE wyrd_request_id IN ('{}', '{}') ORDER BY wyrd_request_id",
         call.request_id, call.unresolved_request_id
     );
@@ -3396,6 +3396,7 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
                 },
             )
         }),
+        prompt_provider: None,
     };
     let reloaded = wyrd_server::components::auth::Caller::accepted(&claimed.authority, system);
     if let Ok(response) = wyrd_server::components::gateway::GatewayInvocation::new(server.state())

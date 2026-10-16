@@ -419,20 +419,6 @@ class WyrdState:
         """
         ...
 
-    def workflow(self, alias: str) -> CardEnvelope:
-        """Return the kind-checked Workflow envelope selected by ``alias``.
-
-        Args:
-            alias: A friendly alias of a Workflow Card.
-
-        Returns:
-            The Workflow Card envelope.
-
-        Raises:
-            WyrdError: For an unknown alias or non-Workflow Card.
-        """
-        ...
-
     def artifacts(self, alias: str) -> tuple[HydratedArtifact, ...]:
         """Return verified artifact descriptors without reading payload bytes.
 

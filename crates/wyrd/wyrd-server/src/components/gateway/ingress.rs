@@ -20,6 +20,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
+use skald_spec::ProviderName;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use wyrd_gateway::IngressDialect;
@@ -32,10 +33,10 @@ use wyrd_spec::gateway::native::{
 use wyrd_spec::gateway::openai::OpenAiErrorEnvelope;
 use wyrd_spec::gateway::{
     CARD_UID_HEADER, FALLBACK_HEADER, GatewayContractError, GatewayFallbackOverride,
-    GatewayOperation, GatewayUsageAmount, MAX_RUN_HEADER_BYTES, ModelRef, RUN_HEADER,
+    GatewayOperation, GatewayUsageAmount, MAX_RUN_HEADER_BYTES, ModelRef, PROMPT_PROVIDER_HEADER,
+    RUN_HEADER,
 };
 use wyrd_spec::ids::CardUid;
-use wyrd_spec::ids::{ModelId, ProviderId};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
 
@@ -225,22 +226,13 @@ pub fn gateway_ingress_router(state: &AppState) -> OpenApiRouter<AppState> {
         .merge(GatewayIngress::GeminiGenerateContent.layer(gemini, state))
 }
 
-/// Provider identity fixed by a native route.
+/// Parses the `<deployment>/<model>` address a native route carries.
 ///
 /// # Errors
 /// Returns `GatewayInvalidRequest` naming `model` when `model` is not a valid
-/// model identifier.
-fn native_model(provider: &str, model: &str) -> Result<ModelRef, WyrdError> {
-    let invalid = || {
-        invalid_request(GatewayContractError::new(
-            "model",
-            "is not a valid model id",
-        ))
-    };
-    Ok(ModelRef {
-        provider: ProviderId::new(provider).map_err(|_| invalid())?,
-        model: ModelId::new(model).map_err(|_| invalid())?,
-    })
+/// address.
+fn native_model(model: &str) -> Result<ModelRef, WyrdError> {
+    ModelRef::from_projection(model).map_err(invalid_request)
 }
 
 /// OpenAPI description of the optional `wyrd-gateway-fallback` request header
@@ -293,6 +285,46 @@ pub(super) const CARD_UID_HEADER_DOC: &str = "Optional Card the call is attribut
     caller bound to no Card, one naming no registered observation-target Card of the tenant, \
     with WYRD_VALA_403_BIFROST_CARD_SCOPE. Every refusal precedes dispatch. The header never \
     reaches a provider.";
+
+/// OpenAPI description of the optional `wyrd-prompt-provider` request header.
+pub(super) const PROMPT_PROVIDER_HEADER_DOC: &str = "Optional Prompt provider of an Agent \
+    call: `openai`, `anthropic`, `google`, `vertex`, `jev`, or a custom provider name. The \
+    requested deployment's adapter must be compatible with it (`openai` and custom: `openai` or \
+    `openai_compatible`; `anthropic`: `anthropic`; `google`: `gemini`; `vertex`: `vertex`; \
+    `jev`: `jev`), or the call is refused before dispatch with \
+    WYRD_GATEWAY_400_INVALID_REQUEST naming `model`; fallback candidates keep ordinary \
+    conversion. A repeated or invalid value is refused naming the header. Absent means a direct \
+    client call. The header never reaches a provider.";
+
+/// Reads the optional Prompt provider of an Agent call from its
+/// `wyrd-prompt-provider` header.
+///
+/// The header is consumed here and never reaches a provider; its absence
+/// marks a direct client call that keeps ordinary protocol translation.
+///
+/// # Errors
+/// Returns `GatewayInvalidRequest` naming the header when it repeats or its
+/// value is not a provider name.
+pub(super) fn requested_prompt_provider(
+    headers: &HeaderMap,
+) -> Result<Option<ProviderName>, WyrdError> {
+    let invalid =
+        |reason| invalid_request(GatewayContractError::new(PROMPT_PROVIDER_HEADER, reason));
+    let mut values = headers.get_all(PROMPT_PROVIDER_HEADER).iter();
+    let value = values.next();
+    if values.next().is_some() {
+        return Err(invalid("must appear at most once"));
+    }
+    value
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|name| name.parse().ok())
+                .ok_or_else(|| invalid("must be a Prompt provider name"))
+        })
+        .transpose()
+}
 
 /// Reads the optional Run and Card attribution of a call from its
 /// independent `wyrd-run-id` and `wyrd-card-uid` headers.
@@ -351,7 +383,8 @@ pub(super) fn requested_subject(
     params(
         ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
-        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC),
+        ("wyrd-prompt-provider" = Option<String>, Header, description = PROMPT_PROVIDER_HEADER_DOC)
     ),
     request_body(content = GatewayAnthropicMessagesRequest, description = "Anthropic Messages request whose `model` is an exact Anthropic model id; the Wyrd access token, or a `wyrd_sk_` Wyrd API key the gateway exchanges for one, travels in `x-api-key` or an `Authorization` bearer"),
     responses(
@@ -374,8 +407,8 @@ pub(super) fn requested_subject(
 )]
 /// `POST /v1/messages`: one governed Anthropic Messages call.
 ///
-/// The body's `model` names an exact model of provider `anthropic`, and only
-/// built-in Anthropic deployments serve it, so fallback never leaves the
+/// The body's `model` is a `<deployment>/<model>` address, and only
+/// Anthropic-adapter deployments serve it, so fallback never leaves the
 /// protocol. A body that does not match [`GatewayAnthropicMessagesRequest`]
 /// is refused before dispatch; an accepted body, with every extension member,
 /// reaches the provider as sent apart from its model and
@@ -404,7 +437,7 @@ pub(crate) async fn anthropic_messages(
                     .ok_or_else(|| {
                         invalid_request(GatewayContractError::new("model", "is required"))
                     })
-                    .and_then(|model| native_model("anthropic", model))?;
+                    .and_then(native_model)?;
                 Ok(GatewayCallRequest {
                     operation: GatewayOperation::ChatCompletions,
                     ingress: IngressDialect::AnthropicMessages,
@@ -418,6 +451,7 @@ pub(crate) async fn anthropic_messages(
                     deployment: None,
                     timeout: PUBLIC_CALL_TIMEOUT,
                     subject: requested_subject(&headers)?,
+                    prompt_provider: requested_prompt_provider(&headers)?,
                 })
             });
             match call {
@@ -438,7 +472,8 @@ pub(crate) async fn anthropic_messages(
     params(
         ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
-        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC),
+        ("wyrd-prompt-provider" = Option<String>, Header, description = PROMPT_PROVIDER_HEADER_DOC)
     ),
     request_body(content = GatewayJevRequest, description = "Jev systemone request whose `model` is an exact Jev model id, such as `jev-latest`, with keyed `noul`, `choice`, or `score` questions about `state`"),
     responses(
@@ -458,8 +493,8 @@ pub(crate) async fn anthropic_messages(
 )]
 /// `POST /v1/systemone`: one governed Jev question call.
 ///
-/// The body's `model` names an exact model of provider `jev`, and only
-/// deployments declaring `system_one` serve it, so fallback never leaves the
+/// The body's `model` is a `<deployment>/<model>` address, and only
+/// deployments serving `system_one` serve it, so fallback never leaves the
 /// protocol. A body that does not match [`GatewayJevRequest`], or breaks a
 /// documented question bound, is refused before dispatch; an accepted body
 /// reaches Jev with only its model rewritten and the answer returns
@@ -497,7 +532,7 @@ pub(crate) async fn jev_systemone(
 /// # Errors
 /// Returns `GatewayInvalidRequest` naming `body` or the missing member for a
 /// body that is not a Jev request, `model` for an invalid model id, and every
-/// error of [`requested_fallback`] and [`requested_subject`].
+/// error of [`requested_fallback`], [`requested_subject`], and [`requested_prompt_provider`].
 fn jev_call(
     headers: &HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
@@ -507,7 +542,7 @@ fn jev_call(
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_request(GatewayContractError::new("model", "is required")))
-        .and_then(|model| native_model("jev", model))?;
+        .and_then(native_model)?;
     Ok(GatewayCallRequest {
         operation: GatewayOperation::SystemOne,
         ingress: IngressDialect::Jev,
@@ -521,18 +556,21 @@ fn jev_call(
         deployment: None,
         timeout: PUBLIC_CALL_TIMEOUT,
         subject: requested_subject(headers)?,
+        prompt_provider: requested_prompt_provider(headers)?,
     })
 }
 
 #[utoipa::path(
     post,
-    path = "/v1beta/models/{target}",
+    path = "/v1beta/models/{deployment}/{target}",
     params(
-        ("target" = String, Path, description = "`<model>:generateContent`, or `<model>:streamGenerateContent` with `alt=sse`, where `<model>` is an exact Gemini model id"),
+        ("deployment" = String, Path, description = "Named gateway deployment that uses a Google adapter"),
+        ("target" = String, Path, description = "`<model>:generateContent`, or `<model>:streamGenerateContent` with `alt=sse`"),
         ("alt" = Option<String>, Query, description = "`sse` for streamGenerateContent; `json` or absent for generateContent"),
         ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
-        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC),
+        ("wyrd-prompt-provider" = Option<String>, Header, description = PROMPT_PROVIDER_HEADER_DOC)
     ),
     request_body(content = GatewayGeminiGenerateContentRequest, description = "Gemini GenerateContent request; the Wyrd access token, or a `wyrd_sk_` Wyrd API key the gateway exchanges for one, travels in `x-goog-api-key` or an `Authorization` bearer"),
     responses(
@@ -553,11 +591,11 @@ fn jev_call(
     ),
     tag = "Gateway"
 )]
-/// `POST /v1beta/models/{model}:generateContent` and
+/// `POST /v1beta/models/{deployment}/{model}:generateContent` and
 /// `:streamGenerateContent`: one governed Gemini `GenerateContent` call.
 ///
-/// The path model names an exact model of provider `gemini`, and only
-/// built-in Gemini deployments serve it. A body that does not match
+/// The path names a `<deployment>/<model>` address whose deployment uses
+/// a Google adapter. A body that does not match
 /// [`GatewayGeminiGenerateContentRequest`] is refused before dispatch; an
 /// accepted body reaches the provider as sent and the answer returns unchanged; the streaming method requires
 /// `alt=sse` and relays Gemini events, and a stream that ends before every
@@ -571,14 +609,19 @@ fn jev_call(
 pub(crate) async fn gemini_generate_content(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
-    Path(target): Path<String>,
+    Path((deployment, target)): Path<(String, String)>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let answer = match caller {
         Err(WyrdErrorResponse(error)) => Err(error),
-        Ok(caller) => match gemini_call(&target, query.as_deref(), &headers, request) {
+        Ok(caller) => match gemini_call(
+            &format!("{deployment}/{target}"),
+            query.as_deref(),
+            &headers,
+            request,
+        ) {
             Ok(call) => GatewayInvocation::new(&state).invoke(&caller, call).await,
             Err(error) => Err(error),
         },
@@ -589,7 +632,7 @@ pub(crate) async fn gemini_generate_content(
     }
 }
 
-/// Builds the governed call of a Gemini `target` (`<model>:<method>`) with
+/// Builds the governed call of a Gemini `target` (`<deployment>/<model>:<method>`) with
 /// its raw `query`, request `headers`, and body.
 ///
 /// # Errors
@@ -597,15 +640,15 @@ pub(crate) async fn gemini_generate_content(
 /// `generateContent` or `streamGenerateContent`, `alt` when it repeats or the
 /// response format does not match the method, `model` for an invalid model id,
 /// `body` or the missing member for a body that is not a `GenerateContent`
-/// request, and every error of [`requested_fallback`] and
-/// [`requested_subject`].
+/// request, and every error of [`requested_fallback`], [`requested_subject`],
+/// and [`requested_prompt_provider`].
 fn gemini_call(
     target: &str,
     query: Option<&str>,
     headers: &HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Result<GatewayCallRequest, WyrdError> {
-    let (model, method) = target.split_once(':').unwrap_or((target, ""));
+    let (model, method) = target.rsplit_once(':').unwrap_or((target, ""));
     let stream = match method {
         "generateContent" => false,
         "streamGenerateContent" => true,
@@ -637,7 +680,7 @@ fn gemini_call(
             },
         )));
     }
-    let model = native_model("gemini", model)?;
+    let model = native_model(model)?;
     let body = typed_body::<GatewayGeminiGenerateContentRequest>(request)?;
     Ok(GatewayCallRequest {
         operation: GatewayOperation::ChatCompletions,
@@ -652,6 +695,7 @@ fn gemini_call(
         deployment: None,
         timeout: PUBLIC_CALL_TIMEOUT,
         subject: requested_subject(headers)?,
+        prompt_provider: requested_prompt_provider(headers)?,
     })
 }
 

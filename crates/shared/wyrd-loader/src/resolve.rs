@@ -249,6 +249,12 @@ mod tests {
     use crate::parse::parse_file;
     use tempfile::TempDir;
 
+    /// An Agent's `prompt:` path reference resolves to its sibling Prompt file,
+    /// which is loaded alongside the Agent with no diagnostics.
+    ///
+    /// # Panics
+    /// Panics when the fixtures cannot be written or parsed, resolution reports a
+    /// diagnostic, or the sibling Prompt is not loaded after the Agent.
     #[test]
     fn resolve_path_rewrites_durable_ref_and_loads_sibling() {
         let temp = TempDir::new().unwrap();
@@ -256,13 +262,13 @@ mod tests {
         let target = root.join("prompt.yaml");
         std::fs::write(
             &target,
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: anthropic\n  model: claude\n  messages: []\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
         )
         .unwrap();
         let entry = root.join("agent.yaml");
         std::fs::write(
             &entry,
-            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n  execution_route:\n    kind: native\n",
         )
         .unwrap();
 
@@ -278,19 +284,25 @@ mod tests {
         assert!(matches!(cards[0].spec, wyrd_spec::envelope::Spec::Agent(_)));
     }
 
+    /// A path reference must name a single-Card file; a target with several
+    /// documents is refused.
+    ///
+    /// # Panics
+    /// Panics when the fixtures cannot be written, the load succeeds, or no
+    /// diagnostic reports the multi-Card target.
     #[test]
     fn resolve_rejects_multi_document_path_targets() {
         let temp = TempDir::new().unwrap();
         let target = temp.path().join("prompts.yaml");
         std::fs::write(
             &target,
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: first\n  version: 1.0.0\n  space: default\nspec:\n  provider: anthropic\n  model: claude\n  messages: []\n---\napiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: second\n  version: 1.0.0\n  space: default\nspec:\n  provider: anthropic\n  model: claude\n  messages: []\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: first\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n---\napiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: second\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
         )
         .unwrap();
         let entry = temp.path().join("agent.yaml");
         std::fs::write(
             &entry,
-            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompts.yaml\n",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompts.yaml\n  execution_route:\n    kind: native\n",
         )
         .unwrap();
 
@@ -302,18 +314,24 @@ mod tests {
         }));
     }
 
+    /// Path references resolve transitively (Service to Agent to Prompt) and
+    /// the loaded Cards keep that discovery order.
+    ///
+    /// # Panics
+    /// Panics when the fixtures cannot be written or parsed, resolution reports a
+    /// diagnostic, or the Cards are loaded in another order.
     #[test]
     fn resolve_loads_transitive_path_references_in_discovery_order() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
         std::fs::write(
             root.join("prompt.yaml"),
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: anthropic\n  model: claude\n  messages: []\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
         )
         .unwrap();
         std::fs::write(
             root.join("agent.yaml"),
-            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n  execution_route:\n    kind: native\n",
         )
         .unwrap();
         let entry = root.join("service.yaml");

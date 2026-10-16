@@ -24,7 +24,6 @@ TYPED_STATE_SOURCE = (
 EXPECTED_ALIASES = (
     "agent_inline",
     "agent_triage",
-    "default-Agent-triage-1.0.0",
     "default-Data-training-1.0.0",
     "default-Prompt-inline-prompt-0.1.0",
     "default-Prompt-triage-prompt-1.0.0",
@@ -33,7 +32,6 @@ EXPECTED_ALIASES = (
     "model_primary",
     "model_shadow",
     "root",
-    "runtime_workflow",
     "shared_prompt",
     "triage_prompt",
 )
@@ -128,9 +126,6 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
     drift = state.verifier("default-Verifier-model-drift-1.0.0")
     assert drift.kind is wyrd.CardKind.Verifier
     assert drift.spec["implementation"]["kind"] == "drift"
-    assert state.workflow("runtime_workflow").spec["outputs"] == {
-        "answer": "steps.triage.output.text"
-    }
     for alias in state.aliases:
         ref = state.card_ref(alias)
         assert ref.uid is not None and ref.version

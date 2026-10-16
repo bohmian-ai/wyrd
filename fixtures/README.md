@@ -11,13 +11,13 @@ A story uses the same file and test names in every SDK: `<story>.rs`,
 
 | Story | Register, in order | Tests |
 |---|---|---|
-| `register_and_hydrate` | `register_and_hydrate/support-model.yaml`, `register_and_hydrate/support-desk.yaml` (`cards_get_returns_every_kind_typed` also registers `latency_baseline/latency-baseline.yaml` for its Data) | `service_graph_registers_and_hydrates`, `latest_version_resolves_to_the_registered_card`, `registering_the_graph_again_is_idempotent`, `cards_get_returns_every_kind_typed`, `artifact_without_digest_registers`, `wrong_artifact_digest_is_refused`, `retired_card_kind_is_refused`, `reader_cannot_register_cards`, `cli_apply_and_get_round_trip_the_graph`, `refused_cli_command_raises_its_catalog_code` |
+| `register_and_hydrate` | `register_and_hydrate/support-model.yaml`, `register_and_hydrate/support-desk.yaml` (`cards_get_returns_every_kind_typed` also registers `latency_baseline/latency-baseline.yaml` for its Data); `register_and_hydrate/authored-prompts.yaml` holds the portable, native, and inline-Agent Prompt forms | `prompt_forms_round_trip_as_authored`, `service_graph_registers_and_hydrates`, `latest_version_resolves_to_the_registered_card`, `registering_the_graph_again_is_idempotent`, `cards_get_returns_every_kind_typed`, `artifact_without_digest_registers`, `wrong_artifact_digest_is_refused`, `retired_card_kind_is_refused`, `reader_cannot_register_cards`, `cli_apply_and_get_round_trip_the_graph`, `refused_cli_command_raises_its_catalog_code` |
 | `workflow_loading` | `workflow_loading/team/security.yaml`, `workflow_loading/team/correctness.yaml`; see the table below | `local_workflow_runs_without_credentials`, `gateway_workflow_without_credentials_is_refused_before_any_step`, `registry_refs_resolve_through_the_registry`, `registry_refs_without_read_access_are_refused`, `local_sibling_never_satisfies_a_registry_ref`, `deleted_registry_card_is_refused`, `applied_workflow_stays_pinned_to_its_registered_cards`, `loaded_workflow_runs_its_pinned_cards`, `loading_a_bad_selector_is_refused`, `text_input_needs_a_declared_input_named_input`, `yaml_workflow_loads_without_resolving_file_targets` |
 | `observe_a_run` | `observe_a_run/observed-model.yaml`, `observe_a_run/observed-service.yaml` | `run_observations_read_back_by_run_id`, `run_view_exposes_its_alias`, `card_scoped_key_cannot_write_another_cards_observations`, `unsealable_byte_budget_is_refused_at_connect` |
-| `verify_in_real_time` | `latency_baseline/latency-baseline.yaml`, `verify_in_real_time/latency-model.yaml`, `verify_in_real_time/assistant.yaml`; `verify_in_real_time/unfitted-assistant.yaml` binds `tier-drift`, whose baseline never fits | `agent_answer_passes_its_verifier`, `agent_answer_fails_its_verifier`, `judged_answer_passes_the_llm_judge`, `model_latency_like_the_baseline_passes_its_verifier`, `model_latency_drift_is_judged_failed`, `verify_before_baseline_ready_is_refused`, `unbound_verifier_fails_locally`, `input_of_the_wrong_shape_fails_locally`, `caller_without_evals_run_is_refused`, `another_tenant_cannot_verify_the_assistant`, `verify_records_no_observation` |
+| `verify_in_real_time` | `latency_baseline/latency-baseline.yaml`, `verify_in_real_time/latency-model.yaml`, `verify_in_real_time/assistant.yaml`; `verify_in_real_time/unfitted-assistant.yaml` binds `tier-drift`, whose baseline never fits | `agent_answer_passes_its_verifier`, `agent_answer_fails_its_verifier`, `judged_answer_passes_the_llm_judge`, `model_latency_like_the_baseline_passes_its_verifier`, `model_latency_drift_is_judged_failed`, `verify_before_baseline_ready_is_refused`, `unbound_verifier_fails_locally`, `input_of_the_wrong_shape_fails_locally`, `caller_without_evals_run_is_refused`, `another_tenant_cannot_verify_the_assistant`, `verify_records_no_observation`, `judge_prompt_forms_use_agent_execution_route` |
 | `scheduled_drift_alerts_operator` | create http connection `on-call-hooks` on the local receiver's origin, then `latency_baseline/latency-baseline.yaml`, `scheduled_drift_alerts_operator/latency-watch.yaml` | `failed_schedule_alerts_its_operator_on_the_connection_origin`, `path_only_operator_without_connection_is_refused` |
 | `query_bifrost` | no Cards | `parameterized_sql_returns_the_callers_rows`, `bound_sql_text_is_treated_as_data`, `unwritten_builtin_table_reads_as_empty`, `stream_yields_arrow_batches_and_a_terminal`, `caller_without_bifrost_read_is_refused` |
-| `gateway_inference` | `gateway_inference/ask.yaml`; `ask-external.yaml` names the registered `ask-agent`; the example Workflow is `examples/workflows/code-review` | `openai_client_calls_the_gateway_with_an_access_token`, `caller_without_gateway_invoke_is_refused`, `cli_issues_a_card_scoped_key_and_writes_a_provider_credential`, `loaded_workflow_calls_the_gateway_through_its_loading_client`, `example_workflow_runs_through_the_wyrd_gateway`, `applying_a_workflow_calls_no_model`, `registered_example_runs_through_the_gateway` |
+| `gateway_inference` | `gateway_inference/ask-agent.yaml` with its `ask-prompt.yaml`; `ask-service.yaml` composes that Agent | `openai_client_calls_the_gateway_with_an_access_token`, `caller_without_gateway_invoke_is_refused`, `cli_issues_a_card_scoped_key_and_writes_a_provider_credential` |
 | `gateway_jev` | `gateway_jev/reviewer.yaml`, after the `jev/jev-latest` deployment; its `reply-quality` Verifier judges with `jev-judge-prompt.yaml` | `native_systemone_answers_relay_intact`, `invalid_jev_questions_are_refused_before_jev`, `chat_completions_pass_typed_jev_requests_through`, `jev_refusals_map_to_stable_errors`, `jev_judge_passes_a_helpful_polite_reply`, `jev_judge_fails_an_unhelpful_rude_reply`, `jev_judge_judges_a_reply_with_quotes_and_newlines`, `jev_judge_refusal_is_a_typed_error_without_retry` |
 | `gateway_admin` | no Cards | `cli_written_credential_reads_back_through_the_gateway`, `deployment_round_trips`, `deployment_without_capabilities_is_refused`, `credential_in_use_cannot_be_deleted`, `deleting_a_credential_twice_succeeds`, `capture_policy_round_trips`, `gateway_reader_cannot_delete_a_deployment` |
 | `operator_connections` | no Cards | `admin_manages_redacted_connections`, `writer_is_refused`, `reader_cannot_disable_a_connection`, `other_tenant_sees_nothing` |
@@ -39,20 +39,6 @@ executable, Python framework integrations and async iterators, OTel log and
 metric signals, Arrow conversions) lives outside these story files and is
 not mirrored.
 
-`workflow_loading/` Cards live in the `workflow-loading` space and are
-derived from `examples/workflows/code-review`. Their Prompts send the
-example's Chat messages to the built-in `mock` provider, which answers with
-the rendered user message, so a run's outputs show which Prompt body ran.
-
-| Directory | What it is | What the journeys prove with it |
-|---|---|---|
-| `team/` | `security-reviewer` and `correctness-reviewer` Agents with their Prompts (`registered ... review`), registered first | The registered Cards that other fixtures reference |
-| `team-v2/` | `security-reviewer@2.0.0`, whose Prompt answers `v2 security review` | A newer version never floats into a pinned Workflow |
-| `mixed/` | Workflow `code-review`: security and correctness are registry refs, the final reviewer is a local file | Authored refs resolve through the registry; this file is applied, reloaded, and run |
-| `shadowed/workflow.yaml` | Workflow `shadowed-review`: a local `security-reviewer@1.0.0` plus a step referencing the registered `security-reviewer@1.0.0` | A local sibling never satisfies a registry ref with the same identity |
-| `shadowed/local-workflow.yaml` | Workflow `local-review`: the same directory's three local Agents only | A wholly local Workflow loads and runs with no server |
-| `retired/` | Workflow `retired-review`, whose local security Agent references Prompt `retired-prompt@1.0.0`, which the journey registers and then deletes | A deleted registry Card is refused |
-
 Refusals load one deliberately broken Card from `invalid/`:
 
 | File | Refused with |
@@ -60,6 +46,7 @@ Refusals load one deliberately broken Card from `invalid/`:
 | `invalid/wrong-artifact-digest/support-model.yaml` | `WYRD_REGISTRY_400_MANIFEST_HASH_MISMATCH` |
 | `invalid/operator-path-without-connection.yaml` | `WYRD_SPEC_400_INVALID_OPERATOR` |
 | `invalid/retired-drift-kind.yaml` | `WYRD_LOADER_400_INVALID_ENVELOPE` (registration and `wyrd apply` alike) |
+| `invalid/prompt-with-removed-fields.yaml` | `WYRD_LOADER_400_INVALID_ENVELOPE` |
 
 Names are fixed, so registering a fixture again is idempotent. Add a story
 only when a journey needs Cards none of these provide.

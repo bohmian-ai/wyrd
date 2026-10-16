@@ -5,8 +5,7 @@ import { beforeAll, afterAll, expect, test } from 'vitest';
 
 // The shared Card detail journey against the real dev server: exact
 // identity/version/metadata/relationships/Spec, read-only prior versions,
-// the typed Spec fallback, and the earned Workflow and Verifier
-// presentations inside the unchanged shell (TASK-006 scenarios 2 and 4).
+// the typed Spec fallback, and the earned Verifier presentation inside the unchanged shell (TASK-006 scenarios 2 and 4).
 let server: ChildProcess;
 let origin: string;
 beforeAll(async () => {
@@ -104,19 +103,10 @@ test('selecting a prior version renders that version’s declared Spec', async (
 });
 
 test('a prior version without a projected declaration says so instead of lying', async () => {
-  const html = await (await get('/t/acme/cards/card_workflow_01?version=v6')).text();
-  expect(html).toContain('Viewing v6');
-  expect(html).not.toContain('retrieve context');
-  expect(html).toContain('The v6 declaration is not projected in this environment.');
-});
-
-test('Workflow renders its earned stage presentation inside the same shell', async () => {
-  const html = await (await get('/t/acme/cards/card_workflow_01')).text();
-  for (const marker of SHELL) expect(html).toContain(marker);
-  for (const stage of ['retrieve context', 'score tasks', 'judge thresholds', 'publish record'])
-    expect(html).toContain(stage);
-  expect(html).toContain('no run results render here');
-  expect(html).toContain('/t/acme/cards/card_eval_01');
+  const html = await (await get('/t/acme/cards/card_verifier_01?version=v4')).text();
+  expect(html).toContain('Viewing v4');
+  expect(html).not.toContain('Accepted evidence');
+  expect(html).toContain('The v4 declaration is not projected in this environment.');
 });
 
 test('Verifier renders its earned presentation inside the same shell', async () => {

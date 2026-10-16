@@ -86,6 +86,11 @@ impl Prompt {
     }
 
     /// Return a copy with a native system message applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::UnsupportedRole`] when the request
+    /// format has no system slot, and the errors of [`Prompt::rederived`].
     pub fn with_system(&self, text: impl Into<String>) -> PromptBuilderResult<Self> {
         let mut prompt = self.clone();
         let text = text.into();
@@ -110,8 +115,7 @@ impl Prompt {
             }
             other => return unsupported_role(other, "system"),
         }
-        prompt.inner.normalize_media_placeholders_mut()?;
-        Ok(prompt)
+        prompt.rederived()
     }
 
     /// Return a copy with a native user message appended.
@@ -125,6 +129,11 @@ impl Prompt {
     }
 
     /// Return a copy with a native tool-result message appended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::UnsupportedRole`] when the request
+    /// format has no tool-result message, and the errors of [`Prompt::rederived`].
     pub fn with_tool_result(
         &self,
         tool_use_id: impl Into<String>,
@@ -162,10 +171,34 @@ impl Prompt {
             }
             other => return unsupported_role(other, "tool_result"),
         }
-        prompt.inner.normalize_media_placeholders_mut()?;
-        Ok(prompt)
+        prompt.rederived()
     }
 
+    /// Rebuild after a request edit so the derived variables, media
+    /// placeholders, and response type describe the edited request; the
+    /// dispatch destination is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::Skald`] when the edited request puts a
+    /// media placeholder in system content or cannot be scanned.
+    fn rederived(mut self) -> PromptBuilderResult<Self> {
+        let skald_spec::Prompt {
+            request,
+            model,
+            provider,
+            ..
+        } = self.inner;
+        self.inner = crate::builder::finalize_prompt(request, model, provider)?.into_native();
+        Ok(self)
+    }
+
+    /// Appends one plain-text turn for `role` in the request's native shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::UnsupportedRole`] when the request
+    /// format has no conversation turns, and the errors of [`Prompt::rederived`].
     fn with_role_text(&self, role: &str, text: impl Into<String>) -> PromptBuilderResult<Self> {
         let mut prompt = self.clone();
         let text = text.into();
@@ -198,8 +231,7 @@ impl Prompt {
             }
             other => return unsupported_role(other, role),
         }
-        prompt.inner.normalize_media_placeholders_mut()?;
-        Ok(prompt)
+        prompt.rederived()
     }
 }
 
@@ -258,24 +290,19 @@ fn google_tool_result(name: String, content: &str) -> GoogleContent {
     }
 }
 
+/// Refuses a role edit the request format cannot carry.
+///
+/// # Errors
+///
+/// Always returns [`PromptBuilderError::UnsupportedRole`].
 fn unsupported_role(request: &ProviderRequest, role: &str) -> PromptBuilderResult<Prompt> {
     Err(PromptBuilderError::UnsupportedRole {
-        provider: provider_name_to_string(&request.provider()),
+        provider: request.provider().to_string(),
         role: role.to_owned(),
     })
 }
 
-pub(crate) fn provider_name_to_string(provider: &skald_spec::ProviderName) -> String {
-    match provider {
-        skald_spec::ProviderName::OpenAi => "openai".to_owned(),
-        skald_spec::ProviderName::Anthropic => "anthropic".to_owned(),
-        skald_spec::ProviderName::Google => "google".to_owned(),
-        skald_spec::ProviderName::Vertex => "vertex".to_owned(),
-        skald_spec::ProviderName::Jev => "jev".to_owned(),
-        skald_spec::ProviderName::Custom(value) => value.clone(),
-    }
-}
-
+/// Builds the error for a typed accessor called on another request format.
 #[cfg(feature = "python")]
 pub(crate) fn wrong_provider(
     expected: &str,
@@ -283,7 +310,7 @@ pub(crate) fn wrong_provider(
 ) -> crate::error::PromptBuilderError {
     crate::error::PromptBuilderError::WrongProvider {
         expected: expected.to_owned(),
-        actual: provider_name_to_string(&actual),
+        actual: actual.to_string(),
     }
 }
 
@@ -301,7 +328,7 @@ use crate::python;
 #[cfg(feature = "python")]
 use {
     crate::builder::{AnthropicOptions, GeminiOptions, OpenAiChatOptions, OpenAiResponsesOptions},
-    crate::coerce::{provider_name_from_py, provider_name_from_str, strings_from_py},
+    crate::coerce::{provider_name_from_py, strings_from_py},
     crate::media::PyMediaRef,
     crate::response_format::ResponseFormat,
     crate::settings::{
@@ -312,7 +339,7 @@ use {
     pyo3::{
         IntoPyObjectExt,
         prelude::*,
-        types::{PyAny, PyBytes, PyDict, PyList, PyString, PyTuple},
+        types::{PyAny, PyDict, PyList, PyString, PyTuple},
     },
     serde::de::DeserializeOwned,
     wyrd_utils::py::WyrdPyResult,
@@ -323,7 +350,7 @@ use {
 impl Prompt {
     /// Build a vendor-native prompt from provider and message inputs.
     #[new]
-    #[pyo3(signature = (messages, model, *, provider, system=None, response_format=None, output=None, operation=None, cache=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (messages, model, *, provider, system=None, response_format=None, output=None, operation=None, cache=None, model_settings=None))]
     #[allow(
         clippy::too_many_arguments,
         reason = "pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments"
@@ -338,14 +365,10 @@ impl Prompt {
         operation: Option<&str>,
         cache: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
-        variables: Option<Vec<String>>,
-        version: Option<String>,
     ) -> WyrdPyResult<Self> {
         let provider = provider_name_from_py(provider)?;
         let response_format = response_format_from_py(response_format)?;
         let (output, py_output_cls) = output_from_py(output)?;
-        let explicit_variables = variables.clone();
-        let variables = variables.unwrap_or_default();
         let append_messages = !matches!(provider, skald_spec::ProviderName::Custom(_));
         let mut prompt = match provider {
             skald_spec::ProviderName::OpenAi
@@ -359,8 +382,6 @@ impl Prompt {
                         response_format,
                         output,
                         settings: resolve_openai_responses_settings(model_settings)?,
-                        variables,
-                        version,
                         ..OpenAiResponsesOptions::default()
                     },
                 )?
@@ -373,8 +394,6 @@ impl Prompt {
                     output,
                     prompt_cache_key: cache_prompt_key(cache)?,
                     settings: resolve_openai_chat_settings(model_settings)?,
-                    variables,
-                    version,
                     ..OpenAiChatOptions::default()
                 },
             )?,
@@ -385,8 +404,6 @@ impl Prompt {
                     response_format,
                     output,
                     settings: resolve_anthropic_settings(model_settings)?,
-                    variables,
-                    version,
                     ..AnthropicOptions::default()
                 },
             )?,
@@ -396,8 +413,6 @@ impl Prompt {
                     response_format,
                     output,
                     settings: resolve_google_settings(model_settings)?,
-                    variables,
-                    version,
                     ..GeminiOptions::default()
                 };
                 crate::builder::gemini(model, options)?
@@ -408,8 +423,6 @@ impl Prompt {
                     response_format,
                     output,
                     settings: resolve_google_settings(model_settings)?,
-                    variables,
-                    version,
                     ..GeminiOptions::default()
                 };
                 crate::builder::vertex(model, options)?
@@ -429,8 +442,6 @@ impl Prompt {
                         response_format,
                         output,
                         settings: resolve_openai_chat_settings(model_settings)?,
-                        variables,
-                        version,
                         ..OpenAiChatOptions::default()
                     },
                 )?;
@@ -442,14 +453,18 @@ impl Prompt {
         if append_messages {
             prompt = append_py_messages(prompt, messages)?;
         }
-        let mut prompt = assign_variables(prompt, explicit_variables)?;
         prompt.py_output_cls = py_output_cls;
         Ok(prompt)
     }
 
     /// Build an `OpenAI` Chat prompt from native constructor arguments.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when an argument cannot be converted or the
+    /// builder refuses the model, output schema, or request.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, cache=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, cache=None, model_settings=None))]
     #[allow(
         clippy::too_many_arguments,
         reason = "pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments"
@@ -462,12 +477,9 @@ impl Prompt {
         output: Option<&Bound<'_, PyAny>>,
         cache: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
-        variables: Option<Vec<String>>,
-        version: Option<String>,
     ) -> WyrdPyResult<Self> {
-        let explicit_variables = variables.clone();
         let (output, py_output_cls) = output_from_py(output)?;
-        let prompt = crate::builder::openai_chat(
+        let mut prompt = crate::builder::openai_chat(
             model,
             OpenAiChatOptions {
                 system,
@@ -476,18 +488,20 @@ impl Prompt {
                 output,
                 prompt_cache_key: cache_prompt_key(cache)?,
                 settings: resolve_openai_chat_settings(model_settings)?,
-                variables: variables.unwrap_or_default(),
-                version,
             },
         )?;
-        let mut prompt = assign_variables(prompt, explicit_variables)?;
         prompt.py_output_cls = py_output_cls;
         Ok(prompt)
     }
 
     /// Build an `OpenAI` Responses prompt from native constructor arguments.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when an argument cannot be converted or the
+    /// builder refuses the model, output schema, or request.
     #[staticmethod]
-    #[pyo3(signature = (model, *, instructions=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, instructions=None, messages=None, response_format=None, output=None, model_settings=None))]
     #[allow(
         clippy::too_many_arguments,
         reason = "pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments"
@@ -499,12 +513,9 @@ impl Prompt {
         response_format: Option<&Bound<'_, PyAny>>,
         output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
-        variables: Option<Vec<String>>,
-        version: Option<String>,
     ) -> WyrdPyResult<Self> {
-        let explicit_variables = variables.clone();
         let (output, py_output_cls) = output_from_py(output)?;
-        let prompt = crate::builder::openai_responses(
+        let mut prompt = crate::builder::openai_responses(
             model,
             OpenAiResponsesOptions {
                 instructions,
@@ -512,18 +523,20 @@ impl Prompt {
                 response_format: response_format_from_py(response_format)?,
                 output,
                 settings: resolve_openai_responses_settings(model_settings)?,
-                variables: variables.unwrap_or_default(),
-                version,
             },
         )?;
-        let mut prompt = assign_variables(prompt, explicit_variables)?;
         prompt.py_output_cls = py_output_cls;
         Ok(prompt)
     }
 
     /// Build an Anthropic Messages prompt from native constructor arguments.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when an argument cannot be converted or the
+    /// builder refuses the model, output schema, or request.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None))]
     #[allow(
         clippy::too_many_arguments,
         reason = "pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments"
@@ -535,12 +548,9 @@ impl Prompt {
         response_format: Option<&Bound<'_, PyAny>>,
         output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
-        variables: Option<Vec<String>>,
-        version: Option<String>,
     ) -> WyrdPyResult<Self> {
-        let explicit_variables = variables.clone();
         let (output, py_output_cls) = output_from_py(output)?;
-        let prompt = crate::builder::anthropic(
+        let mut prompt = crate::builder::anthropic(
             model,
             AnthropicOptions {
                 system,
@@ -548,18 +558,20 @@ impl Prompt {
                 response_format: response_format_from_py(response_format)?,
                 output,
                 settings: resolve_anthropic_settings(model_settings)?,
-                variables: variables.unwrap_or_default(),
-                version,
             },
         )?;
-        let mut prompt = assign_variables(prompt, explicit_variables)?;
         prompt.py_output_cls = py_output_cls;
         Ok(prompt)
     }
 
     /// Build a Google Gemini `GenerateContent` prompt from native constructor arguments.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when an argument cannot be converted or the
+    /// builder refuses the model, output schema, or request.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None))]
     #[allow(
         clippy::too_many_arguments,
         reason = "pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments"
@@ -571,10 +583,7 @@ impl Prompt {
         response_format: Option<&Bound<'_, PyAny>>,
         output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
-        variables: Option<Vec<String>>,
-        version: Option<String>,
     ) -> WyrdPyResult<Self> {
-        let explicit_variables = variables.clone();
         let (output, py_output_cls) = output_from_py(output)?;
         let options = GeminiOptions {
             system,
@@ -582,18 +591,20 @@ impl Prompt {
             response_format: response_format_from_py(response_format)?,
             output,
             settings: resolve_google_settings(model_settings)?,
-            variables: variables.unwrap_or_default(),
-            version,
         };
-        let prompt = crate::builder::gemini(model, options)?;
-        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        let mut prompt = crate::builder::gemini(model, options)?;
         prompt.py_output_cls = py_output_cls;
         Ok(prompt)
     }
 
     /// Build a Vertex `GenerateContent` prompt from native constructor arguments.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when an argument cannot be converted or the
+    /// builder refuses the model, output schema, or request.
     #[staticmethod]
-    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
+    #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None))]
     #[allow(
         clippy::too_many_arguments,
         reason = "pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments"
@@ -605,10 +616,7 @@ impl Prompt {
         response_format: Option<&Bound<'_, PyAny>>,
         output: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
-        variables: Option<Vec<String>>,
-        version: Option<String>,
     ) -> WyrdPyResult<Self> {
-        let explicit_variables = variables.clone();
         let (output, py_output_cls) = output_from_py(output)?;
         let options = GeminiOptions {
             system,
@@ -616,27 +624,10 @@ impl Prompt {
             response_format: response_format_from_py(response_format)?,
             output,
             settings: resolve_google_settings(model_settings)?,
-            variables: variables.unwrap_or_default(),
-            version,
         };
-        let prompt = crate::builder::vertex(model, options)?;
-        let mut prompt = assign_variables(prompt, explicit_variables)?;
+        let mut prompt = crate::builder::vertex(model, options)?;
         prompt.py_output_cls = py_output_cls;
         Ok(prompt)
-    }
-
-    /// Build a raw JSON passthrough prompt with a required provider target.
-    #[staticmethod]
-    pub fn raw(
-        provider: &Bound<'_, PyAny>,
-        model: String,
-        body: &Bound<'_, PyBytes>,
-    ) -> WyrdPyResult<Self> {
-        Ok(crate::builder::raw(
-            provider_name_from_py(provider)?,
-            model,
-            body.as_bytes(),
-        )?)
     }
 
     /// Return a copy with a system message applied.
@@ -783,6 +774,11 @@ impl Prompt {
     }
 
     /// Return a provider-native image URL part for the current prompt provider.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` for an invalid provider name or a provider with no
+    /// image URL part, and when the part cannot be converted to Python.
     #[staticmethod]
     #[pyo3(signature = (url, *, detail=None, provider="openai"))]
     pub fn image_url(
@@ -791,7 +787,10 @@ impl Prompt {
         detail: Option<String>,
         provider: &str,
     ) -> WyrdPyResult<Py<PyAny>> {
-        match provider_name_from_str(provider) {
+        match provider
+            .parse()
+            .map_err(|_| PromptBuilderError::InvalidProvider(provider.to_owned()))?
+        {
             skald_spec::ProviderName::OpenAi => {
                 py_value(py, &crate::messages::openai_image_url_part(url, detail))
             }
@@ -799,7 +798,7 @@ impl Prompt {
                 py_value(py, &crate::messages::anthropic_image_url_block(url))
             }
             other => Err(PromptBuilderError::UnsupportedRole {
-                provider: provider_name_to_string(&other),
+                provider: other.to_string(),
                 role: "image_url".to_owned(),
             }
             .into()),
@@ -918,7 +917,7 @@ impl Prompt {
     /// Return the provider name native dispatch sends this prompt to.
     #[getter]
     pub fn provider(&self) -> String {
-        provider_name_to_string(&self.inner.provider())
+        self.inner.provider().to_string()
     }
 
     /// Return the native provider request wrapper.
@@ -974,12 +973,17 @@ impl Prompt {
     }
 
     /// Replace the native provider request from a wrapper or JSON-like object.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when the value is not a provider request or the
+    /// shared construction boundary refuses its model or output schema.
     #[setter]
     pub fn set_request(&mut self, value: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
-        self.inner.request = provider_request_from_py(value)?;
-        if let Some(model) = request_model(&self.inner.request) {
-            self.inner.model = model.to_owned();
-        }
+        let request = provider_request_from_py(value)?;
+        let model = request_model(&request).map_or_else(|| self.inner.model.clone(), str::to_owned);
+        self.inner = crate::builder::finalize_prompt(request, model, self.inner.provider.take())?
+            .into_native();
         Ok(())
     }
 
@@ -996,18 +1000,6 @@ impl Prompt {
         self.inner.model.clone_from(&model);
         set_request_model(&mut self.inner.request, model);
         Ok(())
-    }
-
-    /// Return the prompt version when present.
-    #[getter]
-    pub fn version(&self) -> Option<&str> {
-        self.inner.version.as_deref()
-    }
-
-    /// Set the optional prompt version.
-    #[setter]
-    pub fn set_version(&mut self, version: Option<String>) {
-        self.inner.version = version;
     }
 
     /// Return declared render variables.
@@ -1046,23 +1038,28 @@ impl Prompt {
         }
     }
 
-    /// Set declared render variables.
-    #[setter]
-    pub fn set_variables(&mut self, variables: Vec<String>) {
-        self.inner.variables = variables;
-    }
-
-    /// Return native prompt JSON as a Python dictionary.
+    /// Return the authored prompt JSON as a Python dictionary.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when the authored form does not serialize or convert
+    /// to a Python value.
     pub fn model_dump(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         py_value(py, &self.inner)
     }
 
     /// Return this prompt as a JSON string.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when the authored form does not serialize.
     pub fn model_dump_json(&self) -> WyrdPyResult<String> {
         Ok(serde_json::to_string(&self.inner)?)
     }
 
-    /// Build a prompt from serialized native prompt JSON.
+    /// Build a prompt from serialized authored prompt JSON.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when `data` is not JSON or does not compile as an
+    /// authored Prompt.
     #[staticmethod]
     pub fn model_validate_json(data: &str) -> WyrdPyResult<Self> {
         Ok(Self::from_native(serde_json::from_str(data)?))
@@ -1113,7 +1110,7 @@ impl PyProviderRequest {
     /// `Prompt.provider` names the dispatch destination.
     #[getter]
     pub fn provider(&self) -> String {
-        provider_name_to_string(&self.inner.provider())
+        self.inner.provider().to_string()
     }
 
     /// Return a typed `OpenAI` Chat Completions request accessor.
@@ -1129,6 +1126,10 @@ impl PyProviderRequest {
 
     /// Return a typed `OpenAI` Responses API request accessor.
     /// Raises `WyrdError` when the provider is not openai responses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::WrongProvider`] for another request format.
     pub fn openai_responses(&self) -> WyrdPyResult<python::PyOpenAiResponsesRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::OpenAiResponses(_) => Ok(
@@ -1140,6 +1141,10 @@ impl PyProviderRequest {
 
     /// Return a typed Anthropic Messages request accessor.
     /// Raises `WyrdError` when the provider is not anthropic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::WrongProvider`] for another request format.
     pub fn anthropic(&self) -> WyrdPyResult<python::PyAnthropicMessagesRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::AnthropicMessage(_) => Ok(
@@ -1151,6 +1156,10 @@ impl PyProviderRequest {
 
     /// Return a typed Google Gemini request accessor.
     /// Raises `WyrdError` when the provider is not google/gemini.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::WrongProvider`] for another request format.
     pub fn gemini(&self) -> WyrdPyResult<python::PyGeminiRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::GeminiGenerateContent(_) => {
@@ -1195,26 +1204,6 @@ impl PyProviderRequest {
     pub fn __str__(&self) -> String {
         wyrd_utils::json::pretty_json_string(self.inner.as_ref())
     }
-}
-
-#[cfg(feature = "python")]
-fn assign_variables(
-    mut prompt: Prompt,
-    explicit_variables: Option<Vec<String>>,
-) -> WyrdPyResult<Prompt> {
-    prompt.inner.variables = match explicit_variables {
-        Some(variables) => variables,
-        None => extract_prompt_variables(&prompt)?,
-    };
-    Ok(prompt)
-}
-
-#[cfg(feature = "python")]
-fn extract_prompt_variables(prompt: &Prompt) -> WyrdPyResult<Vec<String>> {
-    let spec = wyrd_spec::PromptSpec {
-        prompt: prompt.inner.clone(),
-    };
-    Ok(wyrd_spec::extract_text_placeholders(&spec)?)
 }
 
 #[cfg(feature = "python")]
@@ -1600,6 +1589,12 @@ fn append_py_content(
     append_native_json_content(prompt, role, value)
 }
 
+/// Appends one turn of native JSON content parts for `role`.
+///
+/// # Errors
+///
+/// Raises `WyrdError` when `value` does not decode as the format's content
+/// parts or the format has no conversation turns.
 #[cfg(feature = "python")]
 fn append_native_json_content(
     prompt: &Prompt,
@@ -1647,7 +1642,7 @@ fn append_native_json_content(
         }
         other => {
             return Err(PromptBuilderError::UnsupportedRole {
-                provider: provider_name_to_string(&other.provider()),
+                provider: other.provider().to_string(),
                 role: role.to_owned(),
             }
             .into());

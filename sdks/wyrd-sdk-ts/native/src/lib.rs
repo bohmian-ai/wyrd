@@ -13,7 +13,6 @@ pub mod operators;
 /// The napi projection of the tenant principal handle.
 pub mod principals;
 pub mod trace;
-pub mod workflow;
 
 use std::collections::HashMap;
 use std::result::Result as StdResult;

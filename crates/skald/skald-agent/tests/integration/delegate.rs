@@ -10,7 +10,7 @@ use skald_prompt::Prompt;
 use skald_providers::ProviderError;
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::{
-    Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
+    Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse,
     wire::openai_chat::{
         OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse,
         OpenAiChatSettings, OpenAiMessageContent,
@@ -193,10 +193,13 @@ fn test_agent(id: &str) -> Agent {
     })
 }
 
+/// The resolved OpenAI Chat Prompt each delegating test Agent is built from.
+///
+/// # Panics
+/// Panics when the static request does not build a Prompt.
 fn test_prompt() -> Arc<Prompt> {
     Arc::new(Prompt::from_native(
-        SpecPrompt::new(openai_request(), "gpt-4o", None, ResponseType::Text)
-            .expect("test prompt should build"),
+        SpecPrompt::new(openai_request(), "gpt-4o").expect("test prompt should build"),
     ))
 }
 

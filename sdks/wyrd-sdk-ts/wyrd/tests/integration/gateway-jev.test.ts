@@ -117,12 +117,10 @@ const test = serverTest({ provider: jev, verificationRuntime: true }).extend<{ r
         source: { environment: { binding: "test-jev-key" } },
       });
       await (await Gateway.connect()).putDeployment({
-        name: "jev-latest",
-        model: { provider: "jev", model: "jev-latest" },
+        name: "jev",
         adapter: "jev",
         auth: { bearer: { credential: "jev-key" } },
         capabilities: ["system_one", "chat_completions"],
-        routing_weight: 1,
       });
       await (await Gateway.connect()).putCapturePolicy({ mode: "metadata", payload_fields: [] });
       const cards = await Cards.connect();
@@ -140,7 +138,7 @@ test("native systemone answers relay intact", async ({ provider, reviewer: _ }) 
   const before = provider.received.length;
   const body = { model: "jev-latest", state: "Thanks!", questions: QUESTIONS };
 
-  const { status, reply } = await post("/v1/systemone", body);
+  const { status, reply } = await post("/v1/systemone", { ...body, model: "jev/jev-latest" });
 
   expect({ status, reply }).toEqual({ status: 200, reply: answer(0.93, "polite") });
   const [upstream, ...rest] = provider.received.slice(before);
@@ -153,9 +151,9 @@ test("invalid jev questions are refused before jev", async ({ provider, reviewer
   const before = provider.received.length;
 
   for (const body of [
-    { model: "jev-latest", state: "s", questions: { q: { type: "essay", instructions: "x" } } },
-    { model: "jev-latest", state: { answer: "s" }, questions: QUESTIONS },
-    { model: "jev-latest", state: "s", questions: QUESTIONS, temperature: 0 },
+    { model: "jev/jev-latest", state: "s", questions: { q: { type: "essay", instructions: "x" } } },
+    { model: "jev/jev-latest", state: { answer: "s" }, questions: QUESTIONS },
+    { model: "jev/jev-latest", state: "s", questions: QUESTIONS, temperature: 0 },
   ]) {
     const { status, reply } = await post("/v1/systemone", body);
     expect({ body, status, code: reply.error?.code }).toEqual({
@@ -295,7 +293,7 @@ async function chatRefusal(openai: OpenAI, state: string): Promise<InstanceType<
 // Completions, the operator key removed, and no Wyrd code invented.
 test("jev refusals relay like other providers", async ({ provider, reviewer: _ }) => {
   const openai = await openaiClient();
-  const native = (state: string) => post("/v1/systemone", { model: "jev-latest", state, questions: QUESTIONS });
+  const native = (state: string) => post("/v1/systemone", { model: "jev/jev-latest", state, questions: QUESTIONS });
 
   for (const [state, status] of [
     ["refused-form", 400],

@@ -48,7 +48,7 @@ async fn seed_dependency(
         tenant,
         "Prompt",
         name,
-        json!({ "provider": "openai", "model": "gpt-4o", "messages": ["hello"] }),
+        json!({ "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] }),
         status,
     )
     .await
@@ -188,6 +188,9 @@ fn request_with_body(idempotency_key: &str, body: Value) -> Request<Body> {
 }
 
 /// Build the fixed request used to prove exact idempotent replay.
+///
+/// # Panics
+/// Panics when the static request does not build.
 fn registration_request() -> Request<Body> {
     Request::builder()
         .method(Method::POST)
@@ -207,7 +210,7 @@ fn registration_request() -> Request<Body> {
                     "spec": {
                         "provider": "openai",
                         "model": "gpt-4o",
-                        "messages": ["hello"]
+                        "messages": [{"role": "user", "content": "hello"}]
                     },
                     "artifacts": []
                 }]
@@ -218,6 +221,9 @@ fn registration_request() -> Request<Body> {
 }
 
 /// Build a metadata-only Prompt registration request.
+///
+/// # Panics
+/// Panics when the request does not build.
 fn prompt_registration_request(name: &str, idempotency_key: &str) -> Request<Body> {
     Request::builder()
         .method(Method::POST)
@@ -237,7 +243,7 @@ fn prompt_registration_request(name: &str, idempotency_key: &str) -> Request<Bod
                     "spec": {
                         "provider": "openai",
                         "model": "gpt-4o",
-                        "messages": ["hello"]
+                        "messages": [{"role": "user", "content": "hello"}]
                     },
                     "artifacts": []
                 }]
@@ -248,6 +254,9 @@ fn prompt_registration_request(name: &str, idempotency_key: &str) -> Request<Bod
 }
 
 /// Build an Agent registration request referencing an existing Prompt.
+///
+/// # Panics
+/// Panics when the request does not build.
 fn agent_registration_request(
     name: &str,
     child_name: &str,
@@ -274,7 +283,7 @@ fn agent_registration_request(
                             "name": child_name,
                             "version": "1.0.0",
                             "space": "default"
-                        }
+                        }, "execution_route": {"kind": "native"}
                     },
                     "artifacts": []
                 }]
@@ -303,13 +312,13 @@ fn three_card_composite_request(idempotency_key: &str) -> Request<Body> {
                 "metadata": { "name": "composite-agent", "version": "1.0.0", "space": "default" },
                 "spec": { "prompt": {
                     "sibling": { "kind": "Prompt", "name": "composite-prompt", "version": "1.0.0", "space": "default" }
-                } },
+                }, "execution_route": {"kind": "native"} },
                 "artifacts": []
             },
             {
                 "apiVersion": "wyrd/v1", "kind": "Prompt",
                 "metadata": { "name": "composite-prompt", "version": "1.0.0", "space": "default" },
-                "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+                "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
                 "artifacts": []
             }
         ] }),
@@ -324,7 +333,7 @@ fn permuted_three_card_composite_request(idempotency_key: &str) -> Request<Body>
             {
                 "apiVersion": "wyrd/v1", "kind": "Prompt",
                 "metadata": { "name": "composite-prompt", "version": "1.0.0", "space": "default" },
-                "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+                "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
                 "artifacts": []
             },
             {
@@ -341,7 +350,7 @@ fn permuted_three_card_composite_request(idempotency_key: &str) -> Request<Body>
                 "metadata": { "name": "composite-agent", "version": "1.0.0", "space": "default" },
                 "spec": { "prompt": {
                     "sibling": { "kind": "Prompt", "name": "composite-prompt", "version": "1.0.0", "space": "default" }
-                } },
+                }, "execution_route": {"kind": "native"} },
                 "artifacts": []
             }
         ] }),
@@ -355,7 +364,7 @@ fn heavy_registration_request(idempotency_key: &str) -> Request<Body> {
         json!({ "submissions": [{
             "apiVersion": "wyrd/v1", "kind": "Prompt",
             "metadata": { "name": "heavy-prompt", "version": "1.0.0", "space": "default" },
-            "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+            "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
             "artifacts": [{
                 "relative_path": "prompt.txt",
                 "sha256": "ypeBEsobvcr6wjGzmiPcTaeG7/gUfE5yuYB3ha/uSLs=",
@@ -392,7 +401,7 @@ async fn client_registration_saga_returns_active_receipt() {
     std::fs::write(
         &prompt_path,
         format!(
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: client-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: client-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
             artifact.len()
         ),
     )
@@ -629,18 +638,21 @@ async fn registration_resolves_child_card_refs_before_persisting() {
 
 #[tokio::test(flavor = "current_thread")]
 /// The offline loader hands its wire projection to the composite registration route.
+///
+/// # Panics
+/// Panics when the loader workspace, test server, a request, or an assertion fails.
 async fn registration_accepts_loader_projection_and_persists_sibling_binding() {
     let temp = tempfile::tempdir().expect("loader workspace creates");
     let prompt_path = temp.path().join("prompt.yaml");
     let agent_path = temp.path().join("agent.yaml");
     std::fs::write(
         &prompt_path,
-        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: loader-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\n",
+        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: loader-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\n",
     )
     .expect("prompt card writes");
     std::fs::write(
         &agent_path,
-        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: loader-agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n",
+        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: loader-agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n  execution_route:\n    kind: native\n",
     )
     .expect("agent card writes");
 
@@ -867,7 +879,7 @@ fn bound_agent_request(
                 "prompt": {
                     "kind": "Prompt", "name": prompt_name,
                     "version": "1.0.0", "space": "default"
-                },
+                }, "execution_route": {"kind": "native"},
                 "verified_by": [{
                     "verifier": {
                         "kind": "Verifier", "name": verifier_name,
@@ -955,60 +967,6 @@ async fn referenced_binding_refusals_leave_no_writes() {
         "active",
     )
     .await;
-    seed_card(
-        &server,
-        tenant,
-        "Workflow",
-        "binding-rollback-workflow",
-        json!({ "steps": [] }),
-        "active",
-    )
-    .await;
-    seed_card(
-        &server,
-        tenant,
-        "Operator",
-        "binding-workflow-operator",
-        json!({
-            "kind": "workflow",
-            "workflow_ref": {
-                "kind": "Workflow", "name": "binding-rollback-workflow",
-                "version": "1.0.0", "space": "default"
-            }
-        }),
-        "active",
-    )
-    .await;
-
-    let workflow_operator = server
-        .oneshot_authenticated(
-            &jwt,
-            bound_agent_request(
-                "binding-workflow-operator-agent",
-                "binding-prompt",
-                "binding-eval-verifier",
-                "binding-observations-trigger",
-                json!([{
-                    "kind": "Operator", "name": "binding-workflow-operator",
-                    "version": "1.0.0", "space": "default"
-                }]),
-                "binding-workflow-operator-operation",
-            ),
-        )
-        .await
-        .expect("workflow-Operator registration responds");
-    assert_eq!(workflow_operator.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response_json(workflow_operator).await["code"],
-        "WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION"
-    );
-    assert_no_registration_writes(
-        &server,
-        "binding-workflow-operator-operation",
-        "binding-workflow-operator-agent",
-    )
-    .await;
-
     seed_card(
         &server,
         tenant,
@@ -1172,34 +1130,41 @@ async fn referenced_binding_refusals_leave_no_writes() {
                 "binding-nested-operation",
                 json!({ "submissions": [{
                     "apiVersion": "wyrd/v1",
-                    "kind": "Workflow",
+                    "kind": "Verifier",
                     "metadata": {
-                        "name": "binding-nested-workflow",
+                        "name": "binding-nested-judge",
                         "version": "1.0.0",
                         "space": "default"
                     },
                     "spec": {
-                        "steps": [{
-                            "id": "judge",
-                            "action": {
-                                "type": "agent",
-                                "target": {
-                                    "prompt": {
-                                        "kind": "Prompt", "name": "binding-prompt",
-                                        "version": "1.0.0", "space": "default"
-                                    },
-                                    "verified_by": [{
-                                        "verifier": {
-                                            "kind": "Verifier",
-                                            "name": "binding-eval-verifier",
-                                            "version": "1.0.0",
-                                            "space": "default"
+                        "implementation": {
+                            "kind": "eval",
+                            "spec": {
+                                "tasks": {
+                                    "helpful": {
+                                        "kind": "llm_judge",
+                                        "id": "helpful",
+                                        "judge_ref": {
+                                            "prompt": {
+                                                "kind": "Prompt", "name": "binding-prompt",
+                                                "version": "1.0.0", "space": "default"
+                                            }, "execution_route": {"kind": "native"},
+                                            "verified_by": [{
+                                                "verifier": {
+                                                    "kind": "Verifier",
+                                                    "name": "binding-eval-verifier",
+                                                    "version": "1.0.0",
+                                                    "space": "default"
+                                                },
+                                                "runs_on": { "kind": "observations_ready" },
+                                            }],
                                         },
-                                        "runs_on": { "kind": "observations_ready" },
-                                    }],
+                                        "operator": "greater_than_or_equals",
+                                        "expected": 0.5,
+                                    },
                                 },
                             },
-                        }],
+                        },
                     },
                     "artifacts": []
                 }] }),
@@ -1212,12 +1177,8 @@ async fn referenced_binding_refusals_leave_no_writes() {
         response_json(nested).await["code"],
         "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
     );
-    assert_no_registration_writes(
-        &server,
-        "binding-nested-operation",
-        "binding-nested-workflow",
-    )
-    .await;
+    assert_no_registration_writes(&server, "binding-nested-operation", "binding-nested-judge")
+        .await;
 
     server.shutdown().await.expect("test server shuts down");
 }
@@ -1238,7 +1199,7 @@ fn agent_with_bindings(name: &str, verified_by: Value, idempotency_key: &str) ->
                 "prompt": {
                     "kind": "Prompt", "name": "vc-prompt",
                     "version": "1.0.0", "space": "default"
-                },
+                }, "execution_route": {"kind": "native"},
                 "verified_by": verified_by,
             },
             "artifacts": []
@@ -1264,8 +1225,7 @@ fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Re
 ///
 /// Through the public HTTP route, with real registered targets behind every
 /// reference, this proves: the retired `kind: Drift` and `kind: Eval` Cards
-/// are refused; a standalone Workflow Operator Card registers, while binding
-/// it to `on_failure` is refused; a `verifier`, `runs_on`, or `on_failure`
+/// are refused; a `verifier`, `runs_on`, or `on_failure`
 /// reference that resolves to a Card of the wrong kind is refused with its
 /// stable kind error; a repeated Verifier or Operator in one binding is
 /// refused as a duplicate; and an Operator carrying literal credential
@@ -1291,15 +1251,6 @@ async fn verifier_contract_refusals_leave_no_writes() {
     };
     let tenant = server.data_tenant_id();
     seed_dependency(&server, tenant, "vc-prompt", "active").await;
-    seed_card(
-        &server,
-        tenant,
-        "Workflow",
-        "vc-rollback-workflow",
-        json!({ "steps": [] }),
-        "active",
-    )
-    .await;
     let card_ref = |kind: &str, name: &str| json!({ "kind": kind, "name": name, "version": "1.0.0", "space": "default" });
     let register = |kind: &'static str, name: &'static str, spec: Value| {
         let server = &server;
@@ -1336,14 +1287,6 @@ async fn verifier_contract_refusals_leave_no_writes() {
                 "url": "https://hooks.example.test/verification-failed" }),
     )
     .await;
-    register(
-        "Operator",
-        "vc-workflow-operator",
-        json!({ "kind": "workflow",
-                "workflow_ref": card_ref("Workflow", "vc-rollback-workflow") }),
-    )
-    .await;
-
     let refuse = |label: &str, request: Request<Body>, status: StatusCode, code: &str| {
         let server = &server;
         let jwt = jwt.as_str();
@@ -1401,15 +1344,6 @@ async fn verifier_contract_refusals_leave_no_writes() {
     let trigger = card_ref("Trigger", "vc-observations-trigger");
     let hook = card_ref("Operator", "vc-hook");
     let cases = [
-        (
-            "workflow-operator",
-            json!([binding(
-                eval.clone(),
-                trigger.clone(),
-                json!([card_ref("Operator", "vc-workflow-operator")])
-            )]),
-            "WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION",
-        ),
         (
             "verifier-wrong-kind",
             json!([binding(trigger.clone(), trigger.clone(), json!([]))]),
@@ -1584,6 +1518,9 @@ async fn assert_no_registration_writes(server: &WyrdTestServer, operation_key: &
 }
 
 /// Reject an artifact-bearing submission when another card shares the request.
+///
+/// # Panics
+/// Panics when the test server or bootstrap fails, bootstrap returns a non-user principal, or an assertion fails.
 #[tokio::test(flavor = "current_thread")]
 async fn composite_with_manifest_rejects_before_writes() {
     let server = WyrdTestServer::start_in_process()
@@ -1605,13 +1542,13 @@ async fn composite_with_manifest_rejects_before_writes() {
                     {
                         "apiVersion": "wyrd/v1", "kind": "Prompt",
                         "metadata": { "name": "heavy", "version": "1.0.0", "space": "default" },
-                        "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+                        "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
                         "artifacts": [{ "relative_path": "prompt.txt", "sha256": "YQ==", "size_bytes": 1 }]
                     },
                     {
                         "apiVersion": "wyrd/v1", "kind": "Prompt",
                         "metadata": { "name": "light", "version": "1.0.0", "space": "default" },
-                        "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+                        "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
                         "artifacts": []
                     }
                 ] }),
@@ -2796,7 +2733,7 @@ fn bound_service_body(service_name: &str, runs_on: Value, second_alias: Option<&
                 "metadata": { "name": "vb-agent", "version": "1.0.0", "space": "default" },
                 "spec": { "prompt": {
                     "kind": "Prompt", "name": "vb-prompt", "version": "1.0.0", "space": "default"
-                } },
+                }, "execution_route": {"kind": "native"} },
                 "artifacts": []
             }
         ] })
@@ -4056,27 +3993,30 @@ fn inline_agent_request(name: &str, message: &str, idempotency_key: &str) -> Req
                 "apiVersion": "wyrd/v1",
                 "kind": "Agent",
                 "metadata": { "name": name, "space": "default" },
-                "spec": { "prompt": native_prompt(message) },
+                "spec": {
+                    "prompt": portable_prompt(message),
+                    "execution_route": { "kind": "native" }
+                },
                 "artifacts": []
             }]
         }),
     )
 }
 
-/// Compile a one-message declarative Prompt into the native inline body an
-/// Agent's `prompt` slot carries.
+/// The one-message portable Prompt body an Agent's inline `prompt` slot or a
+/// Prompt Card's `spec` carries, as validated by `PromptSpec`.
 ///
 /// # Panics
-/// Panics when the fixed `openai`/`gpt-4o` declarative fixture no longer
-/// deserializes as a `PromptSpec`, or its compiled native Prompt does not
-/// serialize back to JSON.
-fn native_prompt(message: &str) -> Value {
+/// Panics when the fixed `openai`/`gpt-4o` portable fixture no longer
+/// deserializes as a `PromptSpec`, or its Prompt does not serialize back to
+/// JSON.
+fn portable_prompt(message: &str) -> Value {
     let spec: wyrd_spec::card::prompt::PromptSpec = serde_json::from_value(json!({
         "provider": "openai",
         "model": "gpt-4o",
-        "messages": [message]
+        "messages": [{ "role": "user", "content": message }]
     }))
-    .expect("declarative prompt compiles");
+    .expect("portable prompt validates");
     serde_json::to_value(spec.prompt).expect("native prompt serializes")
 }
 
@@ -4270,7 +4210,11 @@ fn pinned_inline_agent(name: &str, version: &str, message: &str, tool_names: &[&
         "apiVersion": "wyrd/v1",
         "kind": "Agent",
         "metadata": { "name": name, "version": version, "space": "default" },
-        "spec": { "prompt": native_prompt(message), "tool_names": tool_names },
+        "spec": {
+            "prompt": portable_prompt(message),
+            "execution_route": { "kind": "native" },
+            "tool_names": tool_names
+        },
         "artifacts": []
     })
 }
@@ -4537,7 +4481,7 @@ async fn inline_agent_prompt_reuses_transaction_selection() {
                 "apiVersion": "wyrd/v1",
                 "kind": "Prompt",
                 "metadata": { "name": "authored-agent-prompt", "version": "0.1.0", "space": "default" },
-                "spec": native_prompt("same"),
+                "spec": portable_prompt("same"),
                 "artifacts": []
             }),
             pinned_inline_agent("authored-agent", "1.0.0", "same", &[]),
@@ -4596,7 +4540,7 @@ async fn inline_agent_prompt_reuses_transaction_selection() {
                 "apiVersion": "wyrd/v1",
                 "kind": "Prompt",
                 "metadata": { "name": "twin-agent-prompt", "version": "0.1.0", "space": "default" },
-                "spec": native_prompt("other"),
+                "spec": portable_prompt("other"),
                 "artifacts": []
             }),
             pinned_inline_agent("clash-agent", "1.0.0", "other", &[]),
@@ -4613,6 +4557,146 @@ async fn inline_agent_prompt_reuses_transaction_selection() {
         operation_and_card_counts(&server, "select-004", "twin-agent-prompt").await,
         (0, 1)
     );
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Invalid authored Prompt declarations are refused by public registration
+/// before anything is persisted.
+///
+/// Each case is submitted as a standalone Prompt Card and as an inline Agent
+/// Prompt through the authenticated route. The shared Prompt compiler refuses
+/// it (a standalone refusal names the offending field), so the server stores
+/// no operation, Card,
+/// relationship, principal, or binding. Refusal happens during decoding and
+/// never reaches storage or a provider. Cases cover a templated model,
+/// invalid output schemas in the portable and native forms (including
+/// malformed nested keywords that fail meta-validation), a media binding
+/// declared as two kinds, and invalid literal media sources.
+///
+/// # Panics
+/// Panics when the server cannot start or shut down, the writer cannot
+/// bootstrap, a route call or count fails, a case is accepted, or its refusal
+/// does not name the offending field.
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_prompt_authoring_is_refused_before_writes() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("prompt-authoring-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let portable = |extra: Value| {
+        let mut prompt = json!({"provider": "openai", "model": "gpt-4o",
+                                "messages": [{"role": "user", "content": "hello {{name}}"}]});
+        if let (Some(prompt), Value::Object(extra)) = (prompt.as_object_mut(), extra) {
+            prompt.extend(extra);
+        }
+        prompt
+    };
+    let media =
+        |blocks: Value| portable(json!({"messages": [{"role": "user", "content": blocks}]}));
+    let cases = [
+        (
+            "templated-model",
+            portable(json!({"model": "{{target}}"})),
+            "model",
+        ),
+        (
+            "schema-type",
+            portable(
+                json!({"response_format": {"type": "object", "properties": {"a": {"type": "text"}}}}),
+            ),
+            "response_format.properties.a.type",
+        ),
+        (
+            "schema-required",
+            portable(json!({"response_format": {"type": "object", "required": "a"}})),
+            "response_format.required",
+        ),
+        (
+            "native-schema",
+            json!({"provider": "openai", "model": "gpt-4o", "format": "chat_completion",
+                   "body": {"messages": [{"role": "user", "content": "hi"}],
+                            "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": {"type": "object", "properties": []}}}}}),
+            "body.response_format.json_schema.schema.properties",
+        ),
+        (
+            "schema-minimum",
+            portable(
+                json!({"response_format": {"type": "object", "properties": {"n": {"type": "number", "minimum": "wrong"}}}}),
+            ),
+            "response_format.properties.n.minimum",
+        ),
+        (
+            "native-schema-defs",
+            json!({"provider": "anthropic", "model": "claude", "format": "messages",
+                   "body": {"max_tokens": 8, "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object", "$defs": {"item": {"minLength": -1}}}}}}}),
+            "body.output_config.format.schema.$defs.item.minLength",
+        ),
+        (
+            "media-kind-conflict",
+            media(json!([{"type": "image", "source": "${media:x}"},
+                         {"type": "document", "source": "${media:x}"}])),
+            "messages.content.source",
+        ),
+        (
+            "media-base64",
+            media(
+                json!([{"type": "image", "source": {"type": "base64", "mime_type": "image/png", "data": "%%%"}}]),
+            ),
+            "not valid base64",
+        ),
+        (
+            "media-mime",
+            media(
+                json!([{"type": "image", "source": {"type": "base64", "mime_type": "application/pdf", "data": "JVBERi0="}}]),
+            ),
+            "does not match kind",
+        ),
+    ];
+    for (label, prompt, field) in cases {
+        let prompt_name = format!("pa-{label}-prompt");
+        let agent_name = format!("pa-{label}-agent");
+        // The inline slot decodes through the untagged `InlineableRef`, whose
+        // refusal keeps the stable code but not the inner field path.
+        let submissions = [
+            (
+                standalone_card_request("Prompt", &prompt_name, prompt.clone(), &prompt_name),
+                prompt_name.as_str(),
+                field,
+            ),
+            (
+                standalone_card_request(
+                    "Agent",
+                    &agent_name,
+                    json!({"prompt": prompt, "execution_route": {"kind": "native"}}),
+                    &agent_name,
+                ),
+                agent_name.as_str(),
+                "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
+            ),
+        ];
+        for (request, name, needle) in submissions {
+            let response = server
+                .oneshot_authenticated(&jwt, request)
+                .await
+                .expect("refused registration responds");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("response body reads");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(status.is_client_error(), "{name}: {status} {text}");
+            assert!(text.contains(needle), "{name}: {text}");
+            assert_no_registration_writes(&server, name, name).await;
+        }
+    }
 
     server.shutdown().await.expect("test server shuts down");
 }

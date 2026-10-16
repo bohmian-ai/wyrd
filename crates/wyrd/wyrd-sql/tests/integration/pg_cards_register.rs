@@ -20,12 +20,15 @@ use wyrd_sql::queries::cards::{
 use wyrd_sql::row_types::cards::CardStatus;
 
 /// Build one resolved Prompt card fixture.
+///
+/// # Panics
+/// Panics when the static Card fixture does not deserialize.
 fn prompt_card(name: &str) -> Card {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
         "kind": "Prompt",
         "metadata": { "name": name, "version": "1.0.0", "space": "default" },
-        "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+        "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
         "relationships": { "outbound": [], "inbound": [] }
     }))
     .expect("card fixture must deserialize")
@@ -663,6 +666,9 @@ async fn manifest_upload_liveness_is_decided_by_postgres() {
 }
 
 /// Persist a UID-bearing outbound edge atomically with its source Card row.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn relationship_rows_preserve_exact_target_identity() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -682,7 +688,7 @@ async fn relationship_rows_preserve_exact_target_identity() {
             "version": "1.0.0",
             "space": "default",
             "uid": target_uid
-        }}
+        }, "execution_route": {"kind": "native"}}
     }))
     .expect("agent fixture must deserialize");
 
@@ -789,7 +795,7 @@ async fn relationship_recheck_blocks_target_lifecycle_race() {
             "name": "race-target",
             "version": "1.0.0",
             "space": "default"
-        }}
+        }, "execution_route": {"kind": "native"}}
     }))
     .expect("agent fixture must deserialize");
 
@@ -927,6 +933,9 @@ async fn relationship_recheck_blocks_target_lifecycle_race() {
 }
 
 /// Exact delete blocks visible inbound references, preserves tenant parity, and retries idempotently.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
 #[tokio::test]
 async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -957,7 +966,7 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
             "version": "1.0.0",
             "space": "default",
             "uid": target_uid
-        }}
+        }, "execution_route": {"kind": "native"}}
     }))
     .expect("source fixture deserializes");
     let target_ref = CardRef {

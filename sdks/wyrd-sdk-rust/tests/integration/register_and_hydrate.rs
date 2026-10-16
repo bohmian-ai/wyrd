@@ -54,17 +54,13 @@ metadata:
   space: default
 spec:
   prompt:
-    request:
-      provider: gemini_generate_content
-      body:
-        contents:
-          - role: user
-            parts:
-              - text: {message}
+    provider: openai
     model: gpt-4o
-    variables: []
-    media_variables: []
-    response_type: text
+    messages:
+      - role: user
+        content: {message}
+  execution_route:
+    kind: native
 "
         ),
     )
@@ -422,6 +418,177 @@ async fn refused_cli_command_raises_its_catalog_code() {
     deployment.shutdown().await;
 }
 
+/// The portable Prompt spec `portable-prompt.yaml` and the inline Agent
+/// prompt author, as JSON.
+fn portable_spec() -> serde_json::Value {
+    serde_json::json!({
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "system": "You answer for ${team}.",
+        "messages": [{ "role": "user", "content": [
+            { "type": "text", "text": "${question}" },
+            { "type": "image", "source": "${media:photo}" },
+            { "type": "image", "source": { "type": "base64", "mime_type": "image/png", "data": "iVBORw0KGgo=" } },
+            { "type": "document", "source": "${media:__wyrd_media_0}" },
+        ] }],
+        "settings": { "temperature": 0.2, "max_output_tokens": 256 },
+        "response_format": {
+            "type": "object",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"],
+        },
+    })
+}
+
+/// The native Prompt spec `native-prompt.yaml` authors, as JSON.
+fn native_spec() -> serde_json::Value {
+    serde_json::json!({
+        "provider": "openai",
+        "model": "gpt-4o",
+        "format": "chat_completion",
+        "body": {
+            "messages": [{ "role": "user", "content": "Summarize {{ticket}}." }],
+            "seed": 123,
+            "future_knob": { "enabled": true },
+        },
+    })
+}
+
+/// The authored JSON of `card`'s spec.
+///
+/// # Panics
+/// Panics when the Card does not serialize.
+fn authored_spec(card: &Card) -> serde_json::Value {
+    serde_json::to_value(card).expect("Card serializes")["spec"].clone()
+}
+
+/// The sorted variables and response schema a Prompt Card derives from its
+/// authored text, `None` for a text response.
+///
+/// # Panics
+/// Panics when the Card is not a Prompt or its response type does not
+/// serialize.
+fn derived(card: &Card) -> (Vec<String>, Option<serde_json::Value>) {
+    let Spec::Prompt(prompt) = &card.spec else {
+        panic!("the Card is a Prompt");
+    };
+    let mut variables = prompt.prompt.variables.clone();
+    variables.sort();
+    let response = serde_json::to_value(&prompt.prompt.response_type).expect("response serializes");
+    (variables, response["json_schema"].get("schema").cloned())
+}
+
+/// Portable and native Prompts, standalone and inline in an Agent, register,
+/// read back, re-register idempotently, and hydrate exactly as authored with
+/// the same spec hash, which is the authored spec's canonical hash, and the
+/// same derived variables and response schema; each inline Agent Prompt
+/// registers as the Agent's own `<agent>-prompt` Card the hydrated Agent
+/// navigates to; a Prompt carrying a removed field is refused before
+/// registration.
+///
+/// # Panics
+/// Panics when a round trip changes the authored form, hash, or derived
+/// metadata, a re-registration mints a new reference, or the removed field is
+/// accepted.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn prompt_forms_round_trip_as_authored() {
+    let deployment = Deployment::start().await;
+    let cards = deployment.cards().await;
+    let fixture_path = "cards/register_and_hydrate/authored-prompts.yaml";
+    let receipt = register(&cards, fixture_path).await;
+    let again = register(&cards, fixture_path).await;
+    let bundle = hydrate(&cards, &receipt.root).await;
+    let state = WyrdState::from_path(bundle.path().join("bundle")).expect("bundle loads offline");
+    let answer_schema = Some(portable_spec()["response_format"].clone());
+    let forms = [
+        (
+            "portable-prompt",
+            portable_spec(),
+            vec!["question", "team"],
+            answer_schema.clone(),
+        ),
+        ("native-prompt", native_spec(), vec!["ticket"], None),
+        (
+            "inline-prompt-agent-prompt",
+            portable_spec(),
+            vec!["question", "team"],
+            answer_schema,
+        ),
+        (
+            "inline-native-prompt-agent-prompt",
+            native_spec(),
+            vec!["ticket"],
+            None,
+        ),
+    ];
+
+    assert_eq!(
+        again.root, receipt.root,
+        "the graph re-registers idempotently"
+    );
+    for (alias, prompt) in [
+        ("agent", "inline-prompt-agent-prompt"),
+        ("native-agent", "inline-native-prompt-agent-prompt"),
+    ] {
+        assert_eq!(
+            state.agent(alias).expect("agent hydrates").prompt_ref(),
+            &registered(&receipt, prompt),
+            "{alias} navigates to its registered inline Prompt"
+        );
+    }
+    for (name, authored, variables, schema) in forms {
+        let card_ref = registered(&receipt, name);
+        let read = cards
+            .get(CardSelector::exact(card_ref.clone()))
+            .await
+            .expect("registered Card reads");
+        let alias = &state.aliases_for(&card_ref).expect("the Prompt hydrates")[0];
+        let hydrated = state.card(alias).expect("the Prompt hydrates");
+
+        assert_eq!(authored_spec(&read), authored, "{name} reads as authored");
+        assert_eq!(
+            authored_spec(hydrated),
+            authored,
+            "{name} hydrates as authored"
+        );
+        assert_eq!(
+            read.metadata.spec_hash,
+            Some(read.spec.canonical_hash().expect("the spec hashes")),
+            "{name} reads with its authored spec's hash"
+        );
+        assert_eq!(
+            hydrated.metadata.spec_hash, read.metadata.spec_hash,
+            "{name} hydrates with its registered hash"
+        );
+        let expected = (
+            variables.into_iter().map(String::from).collect::<Vec<_>>(),
+            schema,
+        );
+        assert_eq!(
+            derived(&read),
+            expected,
+            "{name} reads its derived metadata"
+        );
+        assert_eq!(
+            derived(hydrated),
+            expected,
+            "{name} hydrates its derived metadata"
+        );
+        assert_eq!(
+            registered(&again, name),
+            registered(&receipt, name),
+            "{name} keeps its reference"
+        );
+    }
+
+    let refused = cards
+        .register_from_path(&fixture("invalid/prompt-with-removed-fields.yaml"))
+        .await
+        .expect_err("a removed Prompt field is refused");
+    assert_eq!(refused.code(), "WYRD_LOADER_400_INVALID_ENVELOPE");
+    deployment.shutdown().await;
+}
 /// An inline Prompt registers as its own `<agent>-prompt` Card that replay
 /// reuses, changed content versions while older Agents stay pinned, and
 /// another Agent never shares; an independently authored line of the same
@@ -471,7 +638,9 @@ metadata:
 spec:
   provider: openai
   model: gpt-4o
-  messages: [Authored independently.]
+  messages:
+    - role: user
+      content: Authored independently.
 ",
     )
     .expect("authored prompt writes");

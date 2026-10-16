@@ -105,15 +105,6 @@ cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E
 cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^register_and_hydrate::/)'
 """
 
-[tasks."test:workflow:journey"]
-description = "Run the Rust SDK Workflow loading journeys against a real server"
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:workflow:journey:inner'"
-
-[tasks."test:workflow:journey:inner"]
-hide = true
-description = "Run the Rust SDK Workflow loading journeys with their lifecycle already provisioned"
-run = "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^workflow_loading::/)'"
-
 [tasks."test:principals:unit"]
 description = "Run the principal and credential model unit slices"
 run = """
@@ -166,7 +157,7 @@ description = "Run the real-server CLI Card lifecycle journey with its lifecycle
 run = "cargo test --locked -p wyrd-cli --test cli -- --nocapture --test-threads=1"
 
 [tasks."test:local-dev:journey"]
-description = "Installed CLI bootstrap and fresh saved-config Rust, Python, TypeScript, and MCP callers"
+description = "Installed CLI bootstrap, CLI gateway setup, and fresh saved-config Rust, Python, TypeScript, and MCP callers"
 depends = ["py:setup", "ts:build", "ts:build:testing"]
 run = [
   # --tests puts the dev-only workspace-hack in the graph, so these binaries
@@ -178,6 +169,7 @@ run = [
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[exit]",
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[python]",
   "scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[typescript]",
+  "scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_gateway_setup",
 ]
 
 [tasks."test:wyrdstate:journey"]
@@ -1176,34 +1168,6 @@ dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/datacard_local_workflow.py"
 
-[tasks."examples:python:workflow:openai"]
-hide = true
-description = "Run the sequential OpenAI workflow example"
-dir = "sdks/wyrd-sdk-python"
-depends = ["py:setup"]
-run = "uv run python ../../examples/python/workflow_openai.py"
-
-[tasks."examples:python:workflow:anthropic"]
-hide = true
-description = "Run the sequential Anthropic workflow example"
-dir = "sdks/wyrd-sdk-python"
-depends = ["py:setup"]
-run = "uv run python ../../examples/python/workflow_anthropic.py"
-
-[tasks."examples:python:workflow:gemini"]
-hide = true
-description = "Run the sequential Gemini workflow example"
-dir = "sdks/wyrd-sdk-python"
-depends = ["py:setup"]
-run = "uv run python ../../examples/python/workflow_gemini.py"
-
-[tasks."examples:python:workflow:gateway"]
-hide = true
-description = "Run the split-registry gateway workflow example"
-dir = "sdks/wyrd-sdk-python"
-depends = ["py:setup"]
-run = "uv run python ../../examples/python/workflow_gateway.py"
-
 [tasks."examples:python:support-desk"]
 description = "Run the support desk example against WYRD_SERVER_URL (Python)"
 dir = "sdks/wyrd-sdk-python"
@@ -1224,26 +1188,6 @@ run = "pnpm start"
 hide = true
 description = "Run the credential-free Rust agent smoke example"
 run = "cargo run -p wyrd-rust-examples --bin agent_smoke"
-
-[tasks."examples:rust:workflow:openai"]
-hide = true
-description = "Run the sequential OpenAI workflow example (Rust)"
-run = "cargo run -p wyrd-rust-examples --bin workflow_openai"
-
-[tasks."examples:rust:workflow:anthropic"]
-hide = true
-description = "Run the sequential Anthropic workflow example (Rust)"
-run = "cargo run -p wyrd-rust-examples --bin workflow_anthropic"
-
-[tasks."examples:rust:workflow:gemini"]
-hide = true
-description = "Run the sequential Gemini workflow example (Rust)"
-run = "cargo run -p wyrd-rust-examples --bin workflow_gemini"
-
-[tasks."examples:rust:workflow:gateway"]
-hide = true
-description = "Run the split-registry gateway workflow example (Rust)"
-run = "cargo run -p wyrd-rust-examples --bin workflow_gateway"
 
 [tasks."examples:cli:registration-progress"]
 description = "Show Card registration terminal progress rendering"

@@ -49,7 +49,6 @@ use wyrd_spec::card::source::{
 };
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
 use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
-use wyrd_spec::card::workflow::{CreateWorkflowRunRequest, WorkflowRun, WorkflowSpec};
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
@@ -168,9 +167,6 @@ fn contracts() -> Value {
         PromptRef,
         ParameterName,
         AgentSpec,
-        WorkflowSpec,
-        WorkflowRun,
-        CreateWorkflowRunRequest,
         CardEvalSpec,
         DriftSpec,
         TriggerSpec,

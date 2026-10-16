@@ -15,9 +15,7 @@ use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings,
     OpenAiMessageContent, OpenAiToolCall, OpenAiToolFunctionCall,
 };
-use skald_spec::{
-    Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
-};
+use skald_spec::{Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse};
 use skald_tool::{AgentTool, ToolError};
 use wyrd_spec::error::WyrdError;
 
@@ -744,6 +742,11 @@ fn fixed_tool(name: &str, output: Value) -> Arc<dyn AgentTool> {
     })
 }
 
+/// The resolved OpenAI Chat Prompt with one system message that the session
+/// journal tests run.
+///
+/// # Panics
+/// Panics when the static request does not build a Prompt.
 fn test_prompt() -> Arc<Prompt> {
     let request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
         model: "gpt-4o".to_owned(),
@@ -766,7 +769,7 @@ fn test_prompt() -> Arc<Prompt> {
         settings: OpenAiChatSettings::default(),
     });
     Arc::new(Prompt::from_native(
-        SpecPrompt::new(request, "gpt-4o", None, ResponseType::Text).expect("test prompt builds"),
+        SpecPrompt::new(request, "gpt-4o").expect("test prompt builds"),
     ))
 }
 

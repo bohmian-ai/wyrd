@@ -25,7 +25,6 @@ pub mod query;
 pub mod registration;
 /// `wyrd server`: verified installation of official server releases.
 pub mod server;
-mod workflow;
 
 use clap::{Parser, error::ErrorKind};
 
@@ -101,8 +100,8 @@ fn code_to_u8(code: std::process::ExitCode) -> u8 {
         2
     } else if code == std::process::ExitCode::from(64) {
         64
-    } else if code == std::process::ExitCode::from(workflow::INTERRUPTED) {
-        workflow::INTERRUPTED
+    } else if code == std::process::ExitCode::from(130) {
+        130
     } else {
         1
     }

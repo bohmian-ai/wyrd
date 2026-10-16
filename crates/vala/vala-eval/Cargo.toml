@@ -27,7 +27,6 @@ skald-prompt = { workspace = true }
 skald-providers = { workspace = true }
 skald-runtime = { workspace = true }
 skald-spec = { workspace = true }
-skald-workflow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
 tracing = { workspace = true }
@@ -42,6 +41,7 @@ wyrd-semver = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "test-util"] }
+tokio-util = { workspace = true }
 
 [lints]
 workspace = true

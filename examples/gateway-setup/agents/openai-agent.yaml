@@ -1,0 +1,19 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: openai-agent
+  version: 1.0.0
+  space: default
+spec:
+  prompt:
+    provider: openai
+    model: acme/gpt-4o-agent
+    messages:
+    - role: user
+      content: ${question}
+  execution_route:
+    kind: wyrd_gateway
+    deployment: openai-prod
+  tool_names: []
+  run_config:
+    max_iterations: 1

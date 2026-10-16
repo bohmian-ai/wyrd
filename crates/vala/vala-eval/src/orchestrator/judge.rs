@@ -5,13 +5,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
-use skald_agent::{Agent, AgentError, run_config_from_agent_run_config_spec};
+use skald_agent::{
+    Agent, AgentError, WyrdGatewayCaller, agent_error_retryable,
+    run_config_from_agent_run_config_spec,
+};
 use skald_prompt::Prompt;
 use skald_providers::ProviderError;
 use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
-use skald_workflow::{WyrdGatewayCaller, agent_error_retryable, wyrd_gateway_registry};
 use tokio::sync::Mutex;
-use wyrd_spec::card::agent::AgentSpec;
+use wyrd_spec::card::agent::{AgentSpec, ExecutionRoute};
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::vala::eval::media::MediaRef as EvalMediaRef;
 
@@ -87,11 +89,15 @@ impl SkaldJudgeInvoker {
         self
     }
 
-    /// Serve every judge model call through the Wyrd gateway `caller`.
+    /// Serve judge model calls through the Wyrd gateway `caller`, marking
+    /// this invoker as server-controlled.
     ///
-    /// The judge Agent then dispatches only to the gateway adapter keyed by
-    /// its Prompt's provider, so the gateway's authorization, accounting,
-    /// capture, and audit apply to each call and `providers` is never used.
+    /// A judge Agent's `wyrd_gateway` route then dispatches only to the
+    /// gateway adapter bound to `<deployment>/<Prompt model>`, so the
+    /// gateway's authorization, accounting, capture, and audit apply to each
+    /// call and `providers` is never used; a `native` route is refused rather
+    /// than reaching server credentials. Without a caller, a native route uses
+    /// `providers` and a gateway route is refused.
     #[must_use]
     pub fn with_wyrd_gateway(mut self, caller: Arc<dyn WyrdGatewayCaller>) -> Self {
         self.gateway = Some(caller);
@@ -128,6 +134,23 @@ impl SkaldJudgeInvoker {
         Ok(Prompt::from_native(native))
     }
 
+    /// Resolve, validate, and cache the one judge Agent this invoker runs.
+    ///
+    /// The judge reference resolves through the Agent resolver (inline specs
+    /// are used as authored), its Prompt through the Prompt resolver, and the
+    /// result is checked to be a structured-output judge. The Agent keeps its
+    /// declared execution route: a `wyrd_gateway` route dispatches through
+    /// this invoker's gateway caller, a `native` route through the caller's
+    /// providers. The first resolved Agent is cached for the invoker's
+    /// lifetime; holding the cache lock across resolution makes concurrent
+    /// first calls resolve once.
+    ///
+    /// # Errors
+    /// Returns [`JudgeError::Terminal`] when a second, different judge
+    /// reference is requested, a path reference was not resolved by the
+    /// loader, the judge Agent or its Prompt is invalid for judging, a gateway
+    /// route has no gateway caller, or a server-controlled invoker meets a
+    /// native route; and the resolvers' own errors.
     async fn agent_for(
         &self,
         judge_ref: &InlineableRef<AgentSpec>,
@@ -184,22 +207,30 @@ impl SkaldJudgeInvoker {
             || "inline-judge".to_owned(),
             |reference| reference.name.to_string(),
         );
-        let gateway = match &self.gateway {
-            Some(caller) => Some(Arc::new(
-                wyrd_gateway_registry(Arc::clone(caller), prompt.native()).ok_or_else(|| {
-                    JudgeError::Terminal {
-                        reason: "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED: judge Prompt provider and model are not a gateway model identity".to_owned(),
-                    }
-                })?,
-            )),
-            None => None,
-        };
         let mut agent = Agent::new(prompt)
             .with_id(id)
             .with_tools(std::iter::empty())
-            .with_run_config(run_config_from_agent_run_config_spec(&spec.run_config));
-        if let Some(registry) = gateway {
-            agent = agent.with_provider_registry(registry);
+            .with_run_config(run_config_from_agent_run_config_spec(&spec.run_config))
+            .with_execution_route(spec.execution_route.clone());
+        match (&spec.execution_route, &self.gateway) {
+            (ExecutionRoute::WyrdGateway { .. }, Some(caller)) => {
+                agent = agent.with_gateway_caller(Arc::clone(caller));
+            }
+            (ExecutionRoute::Native {}, None) => {}
+            (ExecutionRoute::WyrdGateway { .. }, None) => {
+                return Err(JudgeError::Terminal {
+                    reason: "judge Agent routes through the Wyrd gateway, which this invoker \
+                             is not configured with"
+                        .to_owned(),
+                });
+            }
+            (ExecutionRoute::Native {}, Some(_)) => {
+                return Err(JudgeError::Terminal {
+                    reason: "server-controlled judge execution refuses a native judge Agent \
+                             route; declare a wyrd_gateway route"
+                        .to_owned(),
+                });
+            }
         }
         let agent = Arc::new(agent);
         *cached = Some((judge_ref.clone(), Arc::clone(&agent)));
@@ -247,11 +278,15 @@ impl JudgeInvoker for SkaldJudgeInvoker {
             .map_err(|error| JudgeError::Terminal {
                 reason: format!("judge Prompt does not render: {error}"),
             })?;
-        let call = skald_runtime::dispatch(
-            agent.effective_providers(&self.providers),
-            prompt.native().provider(),
-            request,
-        );
+        let gateway = agent
+            .route_registry(prompt)
+            .map_err(|error| JudgeError::Terminal {
+                reason: error.to_string(),
+            })?;
+        let providers = gateway
+            .as_ref()
+            .unwrap_or_else(|| agent.effective_providers(&self.providers));
+        let call = skald_runtime::dispatch(providers, prompt.native().provider(), request);
         let response = tokio::time::timeout(self.call_deadline, call)
             .await
             .map_err(|_| JudgeError::Timeout {

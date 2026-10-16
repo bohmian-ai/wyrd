@@ -326,7 +326,7 @@ async fn agent_owner_occurrence_is_the_reserved_key() {
         "metadata": { "name": "helper", "version": "1.0.0", "space": "default" },
         "spec": { "prompt": {
             "kind": "Prompt", "name": "helper-prompt", "version": "1.0.0", "space": "default"
-        }},
+        }, "execution_route": {"kind": "native"}},
         "relationships": { "outbound": [], "inbound": [] }
     }))
     .expect("agent fixture must deserialize");

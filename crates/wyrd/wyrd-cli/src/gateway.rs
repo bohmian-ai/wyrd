@@ -2,9 +2,11 @@
 //!
 //! Each verb reads at most one JSON document, calls the shared
 //! [`wyrd_client::Gateway`] handle, and prints the server's redacted response
-//! as JSON on stdout. Authorization, validation, audit, and persistence stay on
+//! as JSON on stdout. `deployment put` also accepts a nonempty list of
+//! deployments, validated whole before it writes each one in order. Authorization, validation, audit, and persistence stay on
 //! the server; failures keep their originating stable problem.
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -17,7 +19,7 @@ use serde_json::error::Category;
 use wyrd_client::gateway_credential::CredentialWriter;
 use wyrd_client::{Gateway, WyrdClient};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::gateway::{ProviderCredentialView, ProviderCredentialWrite};
+use wyrd_spec::gateway::{ProviderCredentialView, ProviderCredentialWrite, ProviderDeployment};
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName};
 
 use crate::error::{CliBoundaryError, WyrdCliError};
@@ -72,7 +74,8 @@ pub enum CredentialVerb {
 /// Provider deployment operations.
 #[derive(Debug, Subcommand)]
 pub enum DeploymentVerb {
-    /// Create or replace the deployment named in the JSON document.
+    /// Create or replace the deployment named in the JSON document, or each
+    /// deployment of a nonempty JSON list in order.
     Put(DocumentArg),
     /// Read one deployment.
     Get(DeploymentNameArg),
@@ -157,9 +160,14 @@ impl GatewayCommand {
                 CredentialVerb::Delete(arg) => Ok(delete_credential_with(client, &arg.name).await?),
             },
             GatewayResource::Deployment(verb) => match verb {
-                DeploymentVerb::Put(arg) => {
-                    print(&gateway.put_deployment(&read_document(&arg.file)?).await?)
-                }
+                DeploymentVerb::Put(arg) => match DeploymentFile::read(&arg.file)? {
+                    DeploymentFile::One(deployment) => {
+                        print(&gateway.put_deployment(&deployment).await?)
+                    }
+                    DeploymentFile::Many(deployments) => {
+                        put_deployments(&gateway, &deployments).await
+                    }
+                },
                 DeploymentVerb::Get(arg) => print(&gateway.deployment(&arg.name).await?),
                 DeploymentVerb::List => print(&gateway.deployments().await?),
                 DeploymentVerb::Delete(arg) => Ok(gateway.delete_deployment(&arg.name).await?),
@@ -303,19 +311,168 @@ async fn delete_credential_with(
 /// Returns [`WyrdCliError::Io`] when the file or standard input cannot be read
 /// and [`WyrdCliError::InvalidArgument`] when it is not the expected contract.
 fn read_document<T: DeserializeOwned>(path: &Path) -> Result<T, WyrdCliError> {
-    let bytes = if path == Path::new("-") {
+    decode_document(path, &read_bytes(path)?)
+}
+
+/// Reads the raw bytes of the document at `path`, or of standard input when
+/// `path` is `-`.
+///
+/// # Errors
+///
+/// Returns [`WyrdCliError::Io`] when the file or standard input cannot be read.
+fn read_bytes(path: &Path) -> Result<Vec<u8>, WyrdCliError> {
+    if path == Path::new("-") {
         let mut bytes = Vec::new();
         io::Read::read_to_end(&mut io::stdin().lock(), &mut bytes)
             .map(|_| bytes)
-            .map_err(|source| WyrdCliError::Io { source })?
+            .map_err(|source| WyrdCliError::Io { source })
     } else {
-        std::fs::read(path).map_err(|source| WyrdCliError::Io { source })?
-    };
-    serde_json::from_slice(&bytes).map_err(|error| WyrdCliError::InvalidArgument {
+        std::fs::read(path).map_err(|source| WyrdCliError::Io { source })
+    }
+}
+
+/// Decodes `bytes`, read from `path`, as the request contract `T`, reporting
+/// a failure as [`read_document`] does.
+///
+/// # Errors
+///
+/// Returns [`WyrdCliError::InvalidArgument`] when `bytes` is not the contract.
+fn decode_document<T: DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T, WyrdCliError> {
+    serde_json::from_slice(bytes).map_err(|error| invalid_file(path, decode_failure(&error)))
+}
+
+/// The `--file` argument at `path` refused because it is not `expected`.
+fn invalid_file(path: &Path, expected: String) -> WyrdCliError {
+    WyrdCliError::InvalidArgument {
         field: "--file".to_owned(),
         value: path.display().to_string(),
-        expected: decode_failure(&error),
-    })
+        expected,
+    }
+}
+
+/// The document of `wyrd gateway deployment put`: one deployment object, or
+/// a JSON list of the same objects.
+#[derive(Debug)]
+enum DeploymentFile {
+    /// A single deployment; its put prints the server's response unchanged.
+    One(ProviderDeployment),
+    /// A nonempty, name-unique list of valid deployments, put in order.
+    Many(Vec<ProviderDeployment>),
+}
+
+impl DeploymentFile {
+    /// Reads the deployment document at `path` (`-` for standard input).
+    ///
+    /// A document whose first token is `[` is a list; anything else is one
+    /// deployment. A list is refused whole, before anything is written, when
+    /// it is empty, repeats a name, or holds an entry that breaks the
+    /// deployment contract, so no earlier entry is written for a later
+    /// mistake.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdCliError::Io`] when the document cannot be read and
+    /// [`WyrdCliError::InvalidArgument`] when it does not decode, or a list is
+    /// empty, repeats a name, or holds an invalid entry.
+    fn read(path: &Path) -> Result<Self, WyrdCliError> {
+        let bytes = read_bytes(path)?;
+        if bytes.trim_ascii_start().first() != Some(&b'[') {
+            return decode_document(path, &bytes).map(Self::One);
+        }
+        let deployments: Vec<ProviderDeployment> = decode_document(path, &bytes)?;
+        if deployments.is_empty() {
+            return Err(invalid_file(
+                path,
+                "a nonempty list of deployments".to_owned(),
+            ));
+        }
+        let mut names = HashSet::new();
+        for (index, deployment) in deployments.iter().enumerate() {
+            if !names.insert(&deployment.name) {
+                return Err(invalid_file(
+                    path,
+                    format!("unique deployment names ([{index}] repeats an earlier name)"),
+                ));
+            }
+            deployment
+                .validate()
+                .map_err(|error| invalid_file(path, format!("[{index}].{error}")))?;
+        }
+        Ok(Self::Many(deployments))
+    }
+}
+
+/// How one entry of a deployment list fared.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PutStatus {
+    /// The server stored the deployment.
+    Completed,
+    /// The server refused the deployment; nothing after it was attempted.
+    Failed,
+    /// Not sent, because an earlier entry failed.
+    Unattempted,
+}
+
+/// One line of the ordered outcome a deployment-list put prints.
+#[derive(Debug, Serialize)]
+struct PutOutcome<'a> {
+    /// Deployment the entry names.
+    name: &'a ProviderDeploymentName,
+    /// What happened to it.
+    status: PutStatus,
+    /// Stable code of the refusal, for the failed entry only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+}
+
+/// Puts each of `deployments` in order through the existing per-deployment
+/// write and prints one ordered outcome per entry.
+///
+/// Writes are separate requests, not one transaction: the first refusal stops
+/// the run, every earlier write stays committed, and later entries are
+/// reported unattempted. Rerunning the file converges, since each write
+/// replaces its named deployment; names absent from the file are untouched.
+///
+/// # Errors
+///
+/// Returns the first entry's server refusal after printing the outcomes, or
+/// [`WyrdCliError::Output`] when they cannot be printed.
+async fn put_deployments(
+    gateway: &Gateway,
+    deployments: &[ProviderDeployment],
+) -> Result<(), CliBoundaryError> {
+    let mut outcomes = Vec::with_capacity(deployments.len());
+    let mut refusal = None;
+    for deployment in deployments {
+        let (status, code) = match gateway.put_deployment(deployment).await {
+            Ok(_) => (PutStatus::Completed, None),
+            Err(error) => {
+                let code = error.code().to_owned();
+                refusal = Some(error);
+                (PutStatus::Failed, Some(code))
+            }
+        };
+        outcomes.push(PutOutcome {
+            name: &deployment.name,
+            status,
+            code,
+        });
+        if refusal.is_some() {
+            break;
+        }
+    }
+    outcomes.extend(
+        deployments[outcomes.len()..]
+            .iter()
+            .map(|deployment| PutOutcome {
+                name: &deployment.name,
+                status: PutStatus::Unattempted,
+                code: None,
+            }),
+    );
+    print(&outcomes)?;
+    refusal.map_or(Ok(()), |error| Err(error.into()))
 }
 
 /// Describes a JSON decode failure by kind and position, quoting none of the

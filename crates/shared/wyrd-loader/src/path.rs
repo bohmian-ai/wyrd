@@ -260,13 +260,19 @@ mod tests {
         assert_eq!(error.code, "WYRD_LOADER_400_PATH_ESCAPE");
     }
 
+    /// Directory discovery does not descend into a symlinked directory, so a
+    /// Card reachable through a link is not loaded twice.
+    ///
+    /// # Panics
+    /// Panics when the fixture directory or symlink cannot be created, the path
+    /// does not parse, or the linked Card is loaded again.
     #[cfg(unix)]
     #[test]
     fn path_discovery_does_not_follow_symlink_directories() {
         let temp = TempDir::new().unwrap();
         let cards = temp.path().join("cards");
         std::fs::create_dir(&cards).unwrap();
-        std::fs::write(cards.join("prompt.yaml"), "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  space: default\n  version: 1.0.0\nspec:\n  provider: anthropic\n  model: claude\n  messages: []\n").unwrap();
+        std::fs::write(cards.join("prompt.yaml"), "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\n  space: default\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n").unwrap();
         symlink(&cards, temp.path().join("linked-cards")).unwrap();
 
         let loaded = crate::parse::parse_path(temp.path()).unwrap();

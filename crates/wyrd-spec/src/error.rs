@@ -658,6 +658,21 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Token exchange refused because no token scope states the exact
+    /// authority the subject and actor share.
+    #[error("[WYRD_AUTH_403_UNREPRESENTABLE_DELEGATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_UNREPRESENTABLE_DELEGATION",
+        status = 403,
+        title = "Delegated permissions cannot be represented",
+        remediation = "The subject's and actor's shared permissions cannot be represented by token scopes, so the exchange issued no token. Exchange with grants whose exact shared authority fits the supported scopes, such as both parties holding the same explicit gateway deployment or model grant."
+    )]
+    UnrepresentableDelegation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// CardRef kind cannot back a non-human principal.
     #[error("[WYRD_AUTH_400_PRINCIPAL_KIND_CARD_KIND_MISMATCH] {message}")]
     #[wyrd_error(
@@ -1977,20 +1992,6 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
-    /// A binding attaches the non-executable `workflow` Operator action.
-    #[error("[WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION] {message}")]
-    #[wyrd_error(
-        code = "WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION",
-        status = 400,
-        title = "Unsupported Operator action",
-        remediation = "Use a notify or http Operator in on_failure; the workflow action is not invocable yet."
-    )]
-    SpecUnsupportedOperatorAction {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// An Operator template, URL origin, or header violates the Operator contract.
     #[error("[WYRD_SPEC_400_INVALID_OPERATOR] {message}")]
     #[wyrd_error(
@@ -2457,71 +2458,15 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// PromptCard declared the same variable more than once.
-    #[error("[WYRD_PROMPT_409_DUPLICATE_VARIABLE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_PROMPT_409_DUPLICATE_VARIABLE",
-        status = 409,
-        title = "Duplicate variable name",
-        remediation = "Each entry in prompt.variables must be unique."
-    )]
-    PromptDuplicateVariable {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// PromptCard request referenced an undeclared placeholder.
-    #[error("[WYRD_PROMPT_422_UNDECLARED_PLACEHOLDER] {message}")]
-    #[wyrd_error(
-        code = "WYRD_PROMPT_422_UNDECLARED_PLACEHOLDER",
-        status = 422,
-        title = "Undeclared placeholder in request",
-        remediation = "Add the placeholder name to prompt.variables, or remove it from the request."
-    )]
-    PromptUndeclaredPlaceholder {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// PromptCard declared a variable that the request never references.
-    #[error("[WYRD_PROMPT_422_UNREFERENCED_VARIABLE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_PROMPT_422_UNREFERENCED_VARIABLE",
-        status = 422,
-        title = "Declared variable is never referenced",
-        remediation = "Reference the variable somewhere in the native request, or drop it from prompt.variables."
-    )]
-    PromptUnreferencedVariable {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// PromptCard request referenced an undeclared media placeholder.
     #[error("[WYRD_PROMPT_422_UNDECLARED_MEDIA_PLACEHOLDER] {message}")]
     #[wyrd_error(
         code = "WYRD_PROMPT_422_UNDECLARED_MEDIA_PLACEHOLDER",
         status = 422,
         title = "Undeclared media placeholder in request",
-        remediation = "Add the media placeholder name to prompt.media_variables, or remove it from the request."
+        remediation = "Bind only media placeholders the Prompt references as ${media:name}."
     )]
     PromptUndeclaredMediaPlaceholder {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// PromptCard declared a media variable that the request never references.
-    #[error("[WYRD_PROMPT_422_UNREFERENCED_MEDIA_VARIABLE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_PROMPT_422_UNREFERENCED_MEDIA_VARIABLE",
-        status = 422,
-        title = "Declared media variable is never referenced",
-        remediation = "Reference the media variable as ${media:name}, or drop it from prompt.media_variables."
-    )]
-    PromptUnreferencedMediaVariable {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -2821,15 +2766,16 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Declarative prompt draft failed to compile into a native prompt.
-    #[error("[WYRD_PROMPT_400_DRAFT_INVALID] {message}")]
+    /// An authored Prompt field is invalid, unsupported, or mixes the
+    /// portable and native forms.
+    #[error("[WYRD_PROMPT_400_INVALID] {message}")]
     #[wyrd_error(
-        code = "WYRD_PROMPT_400_DRAFT_INVALID",
+        code = "WYRD_PROMPT_400_INVALID",
         status = 400,
-        title = "Declarative prompt draft compile failed",
-        remediation = "Check the provider, model, messages, and model_settings fields in your prompt YAML."
+        title = "Invalid Prompt field",
+        remediation = "Fix the field named in details.field: author either portable system/messages/settings/response_format or native format/body, with provider and model once."
     )]
-    PromptDraftInvalid {
+    PromptInvalid {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -3353,374 +3299,6 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// WorkflowCard validation failed.
-    #[error("[WYRD_WORKFLOW_422_VALIDATION] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_422_VALIDATION",
-        status = 422,
-        title = "WorkflowCard validation failed",
-        remediation = "Fix the Workflow Card envelope, metadata, steps, inputs, or outputs fields."
-    )]
-    WorkflowValidation {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// A registered Workflow was requested with a malformed Card reference.
-    ///
-    /// Returned by the SDK `cards.workflow.load` calls before any registry
-    /// read, when the caller passes neither `uid` alone nor `space`, `name`,
-    /// and an exact `version`, or one of those fields is malformed.
-    #[error("[WYRD_WORKFLOW_400_INVALID_CARD_REF] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_400_INVALID_CARD_REF",
-        status = 400,
-        title = "Invalid Workflow Card reference",
-        remediation = "Pass either uid alone, or space, name, and an exact version of a registered Workflow."
-    )]
-    WorkflowInvalidCardRef {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload naming the offending `field`.
-        details: serde_json::Value,
-    },
-    /// WorkflowCard save or envelope projection is missing a name.
-    #[error("[WYRD_WORKFLOW_422_MISSING_NAME] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_422_MISSING_NAME",
-        status = 422,
-        title = "WorkflowCard name is missing",
-        remediation = "Set a card name before saving or projecting the workflow to a card envelope."
-    )]
-    WorkflowMissingName {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// WorkflowCard save or envelope projection is missing a version.
-    #[error("[WYRD_WORKFLOW_422_MISSING_VERSION] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_422_MISSING_VERSION",
-        status = 422,
-        title = "WorkflowCard version is missing",
-        remediation = "Set a concrete semantic version before saving or projecting the workflow to a card envelope."
-    )]
-    WorkflowMissingVersion {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// Workflow DAG contains two steps that share the same id.
-    #[error("[WYRD_WORKFLOW_422_DUPLICATE_STEP_ID] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID",
-        status = 422,
-        title = "Workflow contains a duplicate step id",
-        remediation = "Give each workflow step a unique id."
-    )]
-    WorkflowDuplicateStepId {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// Workflow step depends on an id that no step defines.
-    #[error("[WYRD_WORKFLOW_422_MISSING_DEPENDENCY] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_422_MISSING_DEPENDENCY",
-        status = 422,
-        title = "Workflow step depends on an unknown id",
-        remediation = "Ensure every depends_on entry matches the id of a step defined in the workflow."
-    )]
-    WorkflowMissingDependency {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// Workflow DAG contains a dependency cycle.
-    #[error("[WYRD_WORKFLOW_422_CYCLE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_422_CYCLE",
-        status = 422,
-        title = "Workflow contains a dependency cycle",
-        remediation = "Break the dependency cycle by removing or reordering depends_on edges."
-    )]
-    WorkflowCycle {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// A workflow task referenced an agent id the workflow does not define.
-    #[error("[WYRD_WORKFLOW_404_AGENT] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_404_AGENT",
-        status = 404,
-        title = "Workflow agent not found",
-        remediation = "Add the referenced agent to the workflow or correct the task's agent id."
-    )]
-    WorkflowAgentNotFound {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// A declared step binding or Workflow output selected a value the run did not produce.
-    #[error("[WYRD_WORKFLOW_422_MISSING_PARAMETER] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_422_MISSING_PARAMETER",
-        status = 422,
-        title = "Workflow binding selected a missing value",
-        remediation = "Make the bound step produce the selected field, or bind a field it always produces."
-    )]
-    WorkflowMissingParameter {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// A workflow task produced output that failed its declared response-schema validation.
-    #[error("[WYRD_WORKFLOW_422_OUTPUT_SCHEMA] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_422_OUTPUT_SCHEMA",
-        status = 422,
-        title = "Workflow task output failed schema validation",
-        remediation = "Align the task's model output with the response schema its prompt declares."
-    )]
-    WorkflowOutputSchema {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// The workflow user surface raised a boundary failure with no more specific code.
-    #[error("[WYRD_WORKFLOW_500_INTERNAL] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_500_INTERNAL",
-        status = 500,
-        title = "Workflow surface failed internally",
-        remediation = "Inspect the workflow run logs; the failure detail names the internal boundary that failed."
-    )]
-    WorkflowInternal {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// No visible Workflow run has the requested id.
-    #[error("[WYRD_WORKFLOW_404_RUN_NOT_FOUND] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_404_RUN_NOT_FOUND",
-        status = 404,
-        title = "Workflow run not found",
-        remediation = "Check the run id; runs are process-local, expire after retention, and are visible only to their owning tenant and replica."
-    )]
-    WorkflowRunNotFound {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// The idempotency key was already used with a different Workflow run request.
-    #[error("[WYRD_WORKFLOW_409_IDEMPOTENCY_CONFLICT] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_409_IDEMPOTENCY_CONFLICT",
-        status = 409,
-        title = "Workflow run idempotency conflict",
-        remediation = "Reuse an Idempotency-Key only with the identical request body, or choose a new key for a different request."
-    )]
-    WorkflowIdempotencyConflict {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// The Workflow run request has an invalid input, timeout, CardRef, or shape.
-    #[error("[WYRD_WORKFLOW_422_RUN_REQUEST] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_422_RUN_REQUEST",
-        status = 422,
-        title = "Invalid Workflow run request",
-        remediation = "Fix the field named in details: the input must match the declared Workflow inputs and the timeout and CardRef must be valid."
-    )]
-    WorkflowRunRequest {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// The resolved llm_route is not supported for this step in this execution environment.
-    #[error("[WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
-        status = 422,
-        title = "Workflow route unsupported",
-        remediation = "Choose an llm_route whose protocol matches the Prompt request dialect and that this execution environment supports."
-    )]
-    WorkflowRouteUnsupported {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// A server-executed Workflow step resolves to the native llm_route.
-    #[error("[WYRD_WORKFLOW_422_SERVER_NATIVE_UNSUPPORTED] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_422_SERVER_NATIVE_UNSUPPORTED",
-        status = 422,
-        title = "Native route unsupported on the server",
-        remediation = "Set llm_route to wyrd_gateway or ext_gateway for every step before running the Workflow on the server."
-    )]
-    WorkflowServerNativeUnsupported {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// A Workflow Agent declares an unknown, disallowed, or duplicate tool.
-    #[error("[WYRD_WORKFLOW_422_TOOL_UNAVAILABLE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_422_TOOL_UNAVAILABLE",
-        status = 422,
-        title = "Workflow Agent tool unavailable",
-        remediation = "Declare only tools the execution environment provides, once each, in the Agent tool_names list."
-    )]
-    WorkflowToolUnavailable {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// The global or tenant active Workflow run capacity is exhausted.
-    #[error("[WYRD_WORKFLOW_429_RUN_CAPACITY] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_429_RUN_CAPACITY",
-        status = 429,
-        title = "Workflow run capacity exhausted",
-        remediation = "Wait for active Workflow runs to finish, then submit the run again."
-    )]
-    WorkflowRunCapacity {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// A required execution-environment route binding is absent or unavailable.
-    #[error("[WYRD_WORKFLOW_503_BINDING_UNAVAILABLE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE",
-        status = 503,
-        title = "Workflow route binding unavailable",
-        remediation = "Configure the named credential binding or Wyrd gateway caller in the execution environment before running the Workflow."
-    )]
-    WorkflowBindingUnavailable {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// The server is shutting down or cannot accept tracked Workflow work.
-    #[error("[WYRD_WORKFLOW_503_RUN_UNAVAILABLE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_503_RUN_UNAVAILABLE",
-        status = 503,
-        title = "Workflow run admission unavailable",
-        remediation = "Retry once the server is accepting Workflow runs again."
-    )]
-    WorkflowRunUnavailable {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// The decoded Workflow input exceeds the configured input bound.
-    #[error("[WYRD_WORKFLOW_413_INPUT_TOO_LARGE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_413_INPUT_TOO_LARGE",
-        status = 413,
-        title = "Workflow input too large",
-        remediation = "Reduce the decoded Workflow input below the configured input bound."
-    )]
-    WorkflowInputTooLarge {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// The Workflow graph exceeds its step, edge, byte, or terminal snapshot bound.
-    #[error("[WYRD_WORKFLOW_413_GRAPH_TOO_LARGE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_413_GRAPH_TOO_LARGE",
-        status = 413,
-        title = "Workflow graph too large",
-        remediation = "Reduce the step count, dependency edges, or resolved Agent and Prompt bodies below the configured graph bounds."
-    )]
-    WorkflowGraphTooLarge {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// A normalized Workflow step result exceeds its configured bound.
-    #[error("[WYRD_WORKFLOW_413_STEP_RESULT_TOO_LARGE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_413_STEP_RESULT_TOO_LARGE",
-        status = 413,
-        title = "Workflow step result too large",
-        remediation = "Constrain the step's Prompt output or raise the configured step-result bound."
-    )]
-    WorkflowStepResultTooLarge {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// The retained Workflow run snapshot exceeds its configured bound.
-    #[error("[WYRD_WORKFLOW_413_RUN_TOO_LARGE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_413_RUN_TOO_LARGE",
-        status = 413,
-        title = "Workflow run snapshot too large",
-        remediation = "Reduce step and output payload sizes or raise the configured run snapshot bound."
-    )]
-    WorkflowRunTooLarge {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// A Workflow step exhausted its retries after an attempt timeout.
-    #[error("[WYRD_WORKFLOW_504_STEP_TIMEOUT] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_504_STEP_TIMEOUT",
-        status = 504,
-        title = "Workflow step attempt timed out",
-        remediation = "Raise the step timeout_seconds or retry budget, or make the step's Agent finish sooner."
-    )]
-    WorkflowStepTimeout {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// The total Workflow deadline expired.
-    #[error("[WYRD_WORKFLOW_504_RUN_TIMEOUT] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_504_RUN_TIMEOUT",
-        status = 504,
-        title = "Workflow run deadline expired",
-        remediation = "Raise the Workflow run timeout or reduce the work the Workflow performs."
-    )]
-    WorkflowRunTimeout {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// Server is not ready to serve requests.
     #[error("[WYRD_SERVER_503_NOT_READY] {message}")]
     #[wyrd_error(
@@ -4054,6 +3632,7 @@ impl WyrdError {
             | Self::RefreshReused { message, details }
             | Self::RefreshRevoked { message, details }
             | Self::DelegationDepthExceededIssue { message, details }
+            | Self::UnrepresentableDelegation { message, details }
             | Self::PrincipalKindCardKindMismatch { message, details }
             | Self::InvalidCardRefVersion { message, details }
             | Self::CredentialRevoked { message, details }
@@ -4109,11 +3688,7 @@ impl WyrdError {
             | Self::ModelCustomLoaderInvalid { message, details }
             | Self::ModelSerializerUnavailable { message, details }
             | Self::PromptInvalidVariableName { message, details }
-            | Self::PromptDuplicateVariable { message, details }
-            | Self::PromptUndeclaredPlaceholder { message, details }
-            | Self::PromptUnreferencedVariable { message, details }
             | Self::PromptUndeclaredMediaPlaceholder { message, details }
-            | Self::PromptUnreferencedMediaVariable { message, details }
             | Self::PromptMediaPlaceholderNotIsolated { message, details }
             | Self::PromptMediaInSystemMessage { message, details }
             | Self::PromptUnsupportedMediaForProvider { message, details }
@@ -4140,7 +3715,7 @@ impl WyrdError {
             | Self::PromptMissingVariable { message, details }
             | Self::PromptUnsupportedHandoff { message, details }
             | Self::PromptResponseDecode { message, details }
-            | Self::PromptDraftInvalid { message, details }
+            | Self::PromptInvalid { message, details }
             | Self::AgentValidation { message, details }
             | Self::AgentMissingName { message, details }
             | Self::AgentMissingVersion { message, details }
@@ -4150,13 +3725,6 @@ impl WyrdError {
             | Self::AgentCallbackReturnType { message, details }
             | Self::AgentCallbackAborted { message, details }
             | Self::AgentLoopMessageType { message, details }
-            | Self::WorkflowValidation { message, details }
-            | Self::WorkflowInvalidCardRef { message, details }
-            | Self::WorkflowMissingName { message, details }
-            | Self::WorkflowMissingVersion { message, details }
-            | Self::WorkflowDuplicateStepId { message, details }
-            | Self::WorkflowMissingDependency { message, details }
-            | Self::WorkflowCycle { message, details }
             | Self::CfgInvalidToml { message, details }
             | Self::CfgSchemaMismatch { message, details }
             | Self::CfgNameDefaultRejected { message, details }
@@ -4217,7 +3785,6 @@ impl WyrdError {
             | Self::VerificationInputUnsupported { message, details }
             | Self::VerificationDependencyFailed { message, details }
             | Self::VerificationExecutionTimedOut { message, details }
-            | Self::SpecUnsupportedOperatorAction { message, details }
             | Self::SpecInvalidOperator { message, details }
             | Self::SpecOperatorConnectionUnavailable { message, details }
             | Self::OperatorConnectionNotFound { message, details }
@@ -4259,25 +3826,6 @@ impl WyrdError {
             | Self::ToolOutputSerialization { message, details }
             | Self::RuntimeProviderNotRegistered { message, details }
             | Self::RuntimeResponseDecode { message, details }
-            | Self::WorkflowAgentNotFound { message, details }
-            | Self::WorkflowMissingParameter { message, details }
-            | Self::WorkflowOutputSchema { message, details }
-            | Self::WorkflowInternal { message, details }
-            | Self::WorkflowRunNotFound { message, details }
-            | Self::WorkflowIdempotencyConflict { message, details }
-            | Self::WorkflowRunRequest { message, details }
-            | Self::WorkflowRouteUnsupported { message, details }
-            | Self::WorkflowServerNativeUnsupported { message, details }
-            | Self::WorkflowToolUnavailable { message, details }
-            | Self::WorkflowRunCapacity { message, details }
-            | Self::WorkflowBindingUnavailable { message, details }
-            | Self::WorkflowRunUnavailable { message, details }
-            | Self::WorkflowInputTooLarge { message, details }
-            | Self::WorkflowGraphTooLarge { message, details }
-            | Self::WorkflowStepResultTooLarge { message, details }
-            | Self::WorkflowRunTooLarge { message, details }
-            | Self::WorkflowStepTimeout { message, details }
-            | Self::WorkflowRunTimeout { message, details }
             | Self::ClientConfigInvalid { message, details }
             | Self::ClientNoCredentials { message, details }
             | Self::ClientSavedLoginUnusable { message, details }
@@ -4501,6 +4049,10 @@ impl WyrdError {
 }
 
 impl From<skald_spec::SkaldError> for WyrdError {
+    /// Maps each Prompt-facing Skald error to its public Prompt catalog
+    /// variant, carrying the offending name, path, provider, or field as
+    /// details; any other Skald error becomes an internal error that keeps its
+    /// Skald code.
     fn from(error: skald_spec::SkaldError) -> Self {
         let message = error.to_string();
         match error {
@@ -4595,12 +4147,12 @@ impl From<skald_spec::SkaldError> for WyrdError {
                     "source": source,
                 }),
             },
-            skald_spec::SkaldError::PromptDraftInvalid {
-                provider,
+            skald_spec::SkaldError::PromptInvalid {
+                field,
                 message: source,
-            } => Self::PromptDraftInvalid {
+            } => Self::PromptInvalid {
                 message,
-                details: serde_json::json!({ "provider": provider, "source": source }),
+                details: serde_json::json!({ "field": field, "source": source }),
             },
             other => Self::internal_from_skald(other.code(), other.to_string()),
         }
@@ -4640,13 +4192,6 @@ mod tests {
         ("WYRD_TOOL_500_OUTPUT", 500),
         ("WYRD_RUNTIME_404_PROVIDER", 404),
         ("WYRD_RUNTIME_422_RESPONSE_DECODE", 422),
-        ("WYRD_WORKFLOW_404_AGENT", 404),
-        ("WYRD_WORKFLOW_422_CYCLE", 422),
-        ("WYRD_WORKFLOW_422_DUPLICATE_STEP_ID", 422),
-        ("WYRD_WORKFLOW_422_MISSING_DEPENDENCY", 422),
-        ("WYRD_WORKFLOW_422_MISSING_PARAMETER", 422),
-        ("WYRD_WORKFLOW_422_OUTPUT_SCHEMA", 422),
-        ("WYRD_WORKFLOW_500_INTERNAL", 500),
         ("WYRD_CLIENT_400_CONFIG_INVALID", 400),
         ("WYRD_CLIENT_401_NO_CREDENTIALS", 401),
         ("WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE", 401),
@@ -4918,6 +4463,8 @@ mod tests {
         assert_eq!(value["kind"], "credential_revoked");
     }
 
+    /// One instance of every authentication and credential error, used to check
+    /// that each code's status segment matches its HTTP status.
     fn auth_errors() -> Vec<WyrdError> {
         vec![
             WyrdError::Unauthenticated {
@@ -4963,6 +4510,10 @@ mod tests {
             WyrdError::DelegationDepthExceededIssue {
                 message: "delegation chain would exceed depth 5".to_owned(),
                 details: serde_json::json!({ "max": 5 }),
+            },
+            WyrdError::UnrepresentableDelegation {
+                message: "delegated permissions cannot be represented".to_owned(),
+                details: serde_json::json!({}),
             },
             WyrdError::PrincipalKindCardKindMismatch {
                 message: "model cards cannot back service accounts".to_owned(),

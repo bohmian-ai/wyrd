@@ -13,9 +13,7 @@ use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings,
     OpenAiMessageContent, OpenAiToolCall, OpenAiToolFunctionCall,
 };
-use skald_spec::{
-    Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
-};
+use skald_spec::{Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse};
 use skald_tool::{AgentTool, ToolError};
 use wyrd_spec::error::WyrdError;
 
@@ -398,15 +396,17 @@ impl Provider for RecordingProvider {
     }
 }
 
+/// Tool returning a fixed output and recording the arguments of every call.
 #[derive(Debug)]
-struct RecordingTool {
+pub(crate) struct RecordingTool {
     name: String,
     output: Value,
     calls: Mutex<Vec<Value>>,
 }
 
 impl RecordingTool {
-    fn new(name: &str, output: Value) -> Self {
+    /// A tool named `name` that always answers `output`.
+    pub(crate) fn new(name: &str, output: Value) -> Self {
         Self {
             name: name.to_owned(),
             output,
@@ -414,7 +414,8 @@ impl RecordingTool {
         }
     }
 
-    fn calls(&self) -> Vec<Value> {
+    /// The arguments of every call so far, in order.
+    pub(crate) fn calls(&self) -> Vec<Value> {
         match self.calls.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
@@ -466,7 +467,11 @@ fn callback_abort<T>() -> CallbackOutcome<T> {
     })
 }
 
-fn test_prompt() -> Arc<Prompt> {
+/// An OpenAI Chat Completions Prompt for `gpt-4o` with one system turn.
+///
+/// # Panics
+/// Panics when the static request does not build a Prompt.
+pub(crate) fn test_prompt() -> Arc<Prompt> {
     let request = ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
         model: "gpt-4o".to_owned(),
         messages: vec![OpenAiChatMessage {
@@ -488,11 +493,12 @@ fn test_prompt() -> Arc<Prompt> {
         settings: OpenAiChatSettings::default(),
     });
     Arc::new(Prompt::from_native(
-        SpecPrompt::new(request, "gpt-4o", None, ResponseType::Text).expect("test prompt builds"),
+        SpecPrompt::new(request, "gpt-4o").expect("test prompt builds"),
     ))
 }
 
-fn openai_text_response(text: &str) -> ProviderResponse {
+/// A final OpenAI Chat Completions answer of `text`.
+pub(crate) fn openai_text_response(text: &str) -> ProviderResponse {
     ProviderResponse::OpenAiChatCompletion(OpenAiChatResponse {
         id: "resp_text".to_owned(),
         object: "chat.completion".to_owned(),
@@ -519,7 +525,8 @@ fn openai_text_response(text: &str) -> ProviderResponse {
     })
 }
 
-fn openai_tool_call_response(calls: Vec<OpenAiToolCall>) -> ProviderResponse {
+/// An OpenAI Chat Completions answer requesting `calls`.
+pub(crate) fn openai_tool_call_response(calls: Vec<OpenAiToolCall>) -> ProviderResponse {
     ProviderResponse::OpenAiChatCompletion(OpenAiChatResponse {
         id: "resp_call".to_owned(),
         object: "chat.completion".to_owned(),
@@ -546,7 +553,12 @@ fn openai_tool_call_response(calls: Vec<OpenAiToolCall>) -> ProviderResponse {
     })
 }
 
-fn tool_call(id: impl Into<String>, name: impl Into<String>, args: Value) -> OpenAiToolCall {
+/// One function tool call `id` to `name` with JSON `args`.
+pub(crate) fn tool_call(
+    id: impl Into<String>,
+    name: impl Into<String>,
+    args: Value,
+) -> OpenAiToolCall {
     OpenAiToolCall {
         id: id.into(),
         kind: "function".to_owned(),

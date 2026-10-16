@@ -1,0 +1,14 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: removed-fields-prompt
+  version: 1.0.0
+  space: default
+spec:
+  provider: openai
+  model: gpt-4o
+  messages:
+  - role: user
+    content: ${question}
+  variables:
+  - question

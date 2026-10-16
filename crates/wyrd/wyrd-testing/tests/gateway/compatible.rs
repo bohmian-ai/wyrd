@@ -96,7 +96,7 @@ async fn openai_compatible_streams_terminate_and_survive_a_capture_outage() {
         .mount(&journey.upstream)
         .await;
     journey
-        .deploy("openai", "authorization", "gpt-4o", &["chat_completions"])
+        .deploy("openai", "authorization", &["chat_completions"])
         .await;
     journey
         .put(
@@ -229,7 +229,7 @@ async fn managed_secret_rotation_survives_server_restart() {
         .mount(&journey.upstream)
         .await;
     journey
-        .deploy("openai", "authorization", "gpt-4o", &["chat_completions"])
+        .deploy("openai", "authorization", &["chat_completions"])
         .await;
     let credential = "provider-credentials/openai-key";
 

@@ -46,6 +46,7 @@ use wyrd_spec::gateway::openai::{OpenAiError, OpenAiErrorEnvelope};
 use wyrd_spec::gateway::{
     GatewayOperation, GatewayUsageAmount, ProviderAdapter, ProviderDeployment,
 };
+use wyrd_spec::ids::ModelId;
 
 use crate::credential::ProviderSecret;
 use crate::engine::AttemptUsage;
@@ -132,7 +133,7 @@ pub(crate) enum Prepared {
     Jev(Box<JevRequest>),
 }
 
-/// Builds the upstream request of `body` for `deployment`.
+/// Builds the upstream request of `body` for `model` on `deployment`.
 ///
 /// Pure and deterministic, so planning can use it to drop deployments that
 /// cannot represent a request before admission and dispatch repeats it.
@@ -153,9 +154,10 @@ pub(crate) fn prepare(
     stream: bool,
     body: &Value,
     deployment: &ProviderDeployment,
+    model: &ModelId,
     media: Option<&MediaRequest>,
 ) -> Result<Prepared, UnsupportedRequest> {
-    let model = deployment.model.model.as_str();
+    let model = model.as_str();
     media::validate(operation, media, body)?;
     let chat = operation == GatewayOperation::ChatCompletions;
     if stream && !operation.streams() {
@@ -213,7 +215,10 @@ pub(crate) fn prepare(
         (IngressDialect::AnthropicMessages, ProviderAdapter::Anthropic) if chat => {
             Ok(Prepared::Native(native(body, Some(model))?))
         }
-        (IngressDialect::GeminiGenerateContent, ProviderAdapter::Gemini)
+        (
+            IngressDialect::GeminiGenerateContent,
+            ProviderAdapter::Gemini | ProviderAdapter::Vertex { .. },
+        )
         | (IngressDialect::VertexGenerateContent, ProviderAdapter::Vertex { .. })
             if chat =>
         {
@@ -504,7 +509,7 @@ pub fn google_error_body(status: u16, message: &str, code: &str) -> Value {
 }
 
 /// Name of `adapter` as it appears on the wire.
-fn adapter_name(adapter: &ProviderAdapter) -> &'static str {
+pub(crate) fn adapter_name(adapter: &ProviderAdapter) -> &'static str {
     adapter.builtin_provider().unwrap_or("openai_compatible")
 }
 

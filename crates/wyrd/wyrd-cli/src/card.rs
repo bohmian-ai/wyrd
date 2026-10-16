@@ -742,12 +742,17 @@ impl OptionalVersionSelector for CardSelector {
     }
 }
 
+/// Parses a `--kind` argument by its wire name.
+///
+/// # Errors
+/// Returns an invalid-argument error for a name that is not a known Card
+/// kind.
 fn parse_kind(value: &str) -> Result<CardKind, WyrdCliError> {
     CardKind::from_wire_name(value).ok_or_else(|| {
         invalid_argument(
             "kind",
             value,
-            "a known Wyrd Card kind such as Model, Prompt, or Workflow",
+            "a known Wyrd Card kind such as Model, Prompt, or Agent",
         )
     })
 }
@@ -969,7 +974,7 @@ mod tests {
         let path = temp.path().join("prompt.yaml");
         std::fs::write(
             &path,
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: cli-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: cli-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\n",
         )
         .expect("prompt card writes");
         let missing = temp.path().join("missing.yaml");

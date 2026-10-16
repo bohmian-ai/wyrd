@@ -68,7 +68,7 @@ use wyrd_server::components::platform::builtins::BuiltinTables;
 use wyrd_server::config::{
     BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
     GatewayConfig, IssuerEntry, OperatorKeySource, OperatorKeysConfig, ServeMode,
-    ServerWorkflowConfig, WorkloadBindingEntry,
+    WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -543,8 +543,6 @@ pub struct WyrdTestServerBuilder {
     omit_token_verifier: bool,
     /// Optional non-default edge limits applied to the composed `AppState`.
     limits: Option<wyrd_server::state::LimitsConfig>,
-    /// Optional non-default Workflow run bounds and bindings.
-    workflow_config: Option<ServerWorkflowConfig>,
     /// Built-in provider base URLs of an attached HTTP gateway engine; `None`
     /// keeps the default engine that dispatches nothing.
     gateway_endpoints: Option<BuiltinEndpoints>,
@@ -683,7 +681,6 @@ impl Default for WyrdTestServerBuilder {
             readiness_failure: false,
             omit_token_verifier: false,
             limits: None,
-            workflow_config: None,
             gateway_endpoints: None,
             gateway_vault_backend: None,
             stalled_drain_for_test: None,
@@ -3343,9 +3340,10 @@ impl WyrdTestServer {
         conn.commit().await.map_err(sql)
     }
 
-    /// Deploy `openai/{model}` Chat Completions behind a managed `openai-key`
-    /// credential through the gateway administration routes, and seed `role`
-    /// granting gateway invoke on the `openai` provider.
+    /// Deploy `openai/{model}` Chat Completions as the `openai` deployment
+    /// behind a managed `openai-key` credential through the gateway
+    /// administration routes, and seed `role` granting gateway invoke on the
+    /// `openai` deployment.
     ///
     /// A judge or Agent Prompt naming `openai/{model}` then resolves through
     /// the gateway to the provider root the server was built with, and only a
@@ -3377,14 +3375,13 @@ impl WyrdTestServer {
                 }),
             ),
             (
-                format!("provider-deployments/{model}"),
+                "provider-deployments/openai".to_owned(),
                 serde_json::json!({
-                    "name": model,
-                    "model": { "provider": "openai", "model": model },
+                    "name": "openai",
+                    "models": [model],
                     "adapter": "openai",
                     "auth": { "bearer": { "credential": "openai-key" } },
                     "capabilities": ["chat_completions"],
-                    "routing_weight": 1,
                 }),
             ),
         ] {
@@ -3405,8 +3402,8 @@ impl WyrdTestServer {
         self.seed_role(
             role,
             &[Permission::gateway_invoke(
-                wyrd_spec::auth::GatewayAccess::Provider {
-                    provider: wyrd_spec::ids::ProviderId::new("openai")
+                wyrd_spec::auth::GatewayAccess::Deployment {
+                    deployment: wyrd_spec::ids::ProviderDeploymentName::new("openai")
                         .map_err(|error| WyrdTestServerError::Io(error.to_string()))?,
                 },
             )],
@@ -4234,14 +4231,6 @@ impl WyrdTestServerBuilder {
         token_variable: &str,
     ) -> Self {
         self.gateway_vault_backend = Some((address, token_variable.to_owned()));
-        self
-    }
-
-    /// Compose the server with `config` as its Workflow run bounds and
-    /// tenant-assigned external gateway bindings instead of the defaults.
-    #[must_use]
-    pub fn with_workflow_config_for_test(mut self, config: ServerWorkflowConfig) -> Self {
-        self.workflow_config = Some(config);
         self
     }
 
@@ -5088,9 +5077,6 @@ impl WyrdTestServerBuilder {
         if let Some(limits) = self.limits {
             state = state.with_limits(limits);
         }
-        if let Some(workflow) = self.workflow_config {
-            state = state.with_workflow_config(workflow);
-        }
         state = state.with_mcp_context_probe(self.mcp_context_probe);
         state.authz.permission_check = Arc::new(RbacCheck);
         let (forge_publisher, _forge_inbox) = staging_file_channel(16)
@@ -5275,6 +5261,7 @@ fn test_gateway_config(
         ))
     };
     Ok(wyrd_server::config::GatewayConfig {
+        endpoints: wyrd_gateway::BuiltinEndpoints::default(),
         credential_bindings: [
             binding(TEST_GATEWAY_CREDENTIAL_BINDING, "openai")?,
             binding(TEST_GATEWAY_ANTHROPIC_BINDING, "anthropic")?,
@@ -5553,6 +5540,7 @@ async fn seed_machine_card(
                 &CardKind::Agent,
                 serde_json::json!({
                     "prompt": prompt_ref,
+                    "execution_route": { "kind": "native" },
                 }),
             )
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
@@ -5581,7 +5569,7 @@ async fn seed_prompt_card(
         serde_json::json!({
             "provider": "openai",
             "model": "gpt-4o-mini",
-            "messages": "Fixture agent."
+            "messages": [{ "role": "user", "content": "Fixture agent." }]
         }),
     )
     .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;

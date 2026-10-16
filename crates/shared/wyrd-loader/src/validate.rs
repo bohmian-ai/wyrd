@@ -59,17 +59,12 @@ fn check_duplicate_identities(cards: &[AuthoredCard], diagnostics: &mut Vec<Diag
 }
 
 /// Run the kind-specific local validation that is not covered by envelope
-/// parsing or reference resolution, including the pure Workflow contract.
+/// parsing or reference resolution.
 fn validate_card(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
     for error in spec_binding_errors(&card.spec) {
         diagnostics.push(catalog_error(card, &error));
     }
     if let Spec::Verifier(spec) = &card.spec
-        && let Err(error) = spec.validate()
-    {
-        diagnostics.push(catalog_error(card, &error.into()));
-    }
-    if let Spec::Workflow(spec) = &card.spec
         && let Err(error) = spec.validate()
     {
         diagnostics.push(catalog_error(card, &error.into()));

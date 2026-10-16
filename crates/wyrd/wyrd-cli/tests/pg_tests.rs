@@ -699,12 +699,10 @@ async fn server_dev_keeps_the_gateway_managed_secret_key() {
         (
             ["gateway", "deployment", "put", "--file", "-"],
             json!({
-                "name": "local-mock-m",
-                "model": {"provider": "local-mock", "model": "m"},
+                "name": "local-mock",
                 "adapter": {"openai_compatible": {"base_url": format!("{}/v1", provider.uri())}},
                 "auth": {"bearer": {"credential": "local-key"}},
                 "capabilities": ["chat_completions"],
-                "routing_weight": 1,
             })
             .to_string(),
         ),

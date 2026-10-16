@@ -6,17 +6,16 @@ metadata:
   space: default
 spec:
   prompt:
-    request:
-      provider: gemini_generate_content
-      body:
-        contents:
-          - role: user
-            parts:
-              - text: Inline triage
+    provider: google
     model: gpt-4o
-    variables: []
-    media_variables: []
-    response_type: text
+    format: generate_content
+    body:
+      contents:
+      - role: user
+        parts:
+        - text: Inline triage
+  execution_route:
+    kind: native
   run_config:
     max_iterations: 2
     timeout_ms: 1000

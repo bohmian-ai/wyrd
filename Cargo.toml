@@ -42,7 +42,6 @@ skald-providers = { package = "wyrd-skald-providers", path = "crates/skald/skald
 skald-runtime = { package = "wyrd-skald-runtime", path = "crates/skald/skald-runtime", version = "0.1.0" }
 skald-prompt = { package = "wyrd-skald-prompt", path = "crates/skald/skald-prompt", version = "0.1.0" }
 skald-agent = { package = "wyrd-skald-agent", path = "crates/skald/skald-agent", version = "0.1.0" }
-skald-workflow = { package = "wyrd-skald-workflow", path = "crates/skald/skald-workflow", version = "0.1.0" }
 vala-bifrost-redux = { path = "crates/vala/vala-bifrost-redux" }
 vala-sql = { path = "crates/vala/vala-sql", version = "0.1.0" }
 vala-ingest = { path = "crates/vala/vala-ingest", version = "0.1.0" }
@@ -117,7 +116,7 @@ serde_json = "1"
 serde_urlencoded = "0.7"
 serde_yaml = "0.9"
 strum = { version = "0.27", features = ["derive"] }
-jsonschema = { version = "0.18", default-features = false }
+jsonschema = { version = "0.46.4", default-features = false }
 schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 utoipa-axum = { version = "0.2" }
@@ -195,7 +194,7 @@ toml = "0.8"
 toml_edit = "0.22"
 shellexpand = "3"
 ipnetwork = "0.20"
-wyrd-telemetry = { path = "crates/shared/wyrd-telemetry" }
+wyrd-telemetry = { path = "crates/shared/wyrd-telemetry", version = "0.1.0" }
 arc-swap = "1.7"
 # Client-safe baseline (no `transport`/`server` → no axum). `wyrd-tonic` adds the
 # client `channel`/`tls` features and gates `tonic/server` behind its `server`

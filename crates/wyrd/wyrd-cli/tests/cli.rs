@@ -29,8 +29,6 @@ mod secret_sources;
 /// `wyrd server install` against a mock release service.
 #[path = "server_install.rs"]
 mod server_install;
-#[path = "workflow_journey.rs"]
-mod workflow_journey;
 
 /// Local bootstrap is an installed CLI capability rather than a checkout script.
 ///

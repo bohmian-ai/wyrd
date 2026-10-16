@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from wyrd import WyrdError
 from wyrd.prompt import (
     AnthropicSettings,
     GeminiSettings,
@@ -50,6 +51,19 @@ def test_bind_returns_new_prompt_and_bind_mut_updates_in_place() -> None:
     assert "London" in rendered.model_dump_json()
 
 
+@pytest.mark.parametrize("model", ["{{target}}", "${target}", "gpt\n4o"])
+def test_model_is_literal_and_never_a_render_variable(model: str) -> None:
+    with pytest.raises(WyrdError) as built:
+        Prompt("Hello {{name}}", model, provider="openai")
+    prompt = Prompt("Hello {{name}}", "org/model-1", provider="openai")
+    with pytest.raises(WyrdError) as assigned:
+        prompt.model = model
+
+    assert built.value.code == assigned.value.code == "WYRD_PROMPT_400_INVALID"
+    assert prompt.model == prompt.request.openai().model == "org/model-1"
+    assert prompt.variables == ["name"]
+
+
 def test_bind_media_replaces_native_media_placeholder() -> None:
     prompt = Prompt("What logo is this? ${media:logo}", "gpt-4o", provider="openai")
 
@@ -92,11 +106,6 @@ def test_response_format_json_schema_sets_the_response_schema() -> None:
         ),
         pytest.param(Prompt.gemini("gemini-2.5-pro", messages="hello"), "google", id="gemini"),
         pytest.param(Prompt.vertex("gemini-2.5-pro", messages="hello"), "vertex", id="vertex"),
-        pytest.param(
-            Prompt.raw("openai", "gpt-4o", b'{"model":"gpt-4o","messages":["hello"]}'),
-            "openai",
-            id="raw",
-        ),
     ],
 )
 def test_every_provider_builder_round_trips_through_a_promptcard(

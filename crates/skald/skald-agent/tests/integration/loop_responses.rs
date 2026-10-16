@@ -15,7 +15,7 @@ use skald_spec::wire::openai_responses::{
     OpenAiResponsesRequest, OpenAiResponsesResponse, OpenAiResponsesSettings, OpenAiResponsesTool,
 };
 use skald_spec::{
-    MessageNum, Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
+    MessageNum, Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse,
 };
 use skald_tool::{AgentTool, ToolError};
 
@@ -118,6 +118,10 @@ fn lookup_call() -> OpenAiResponseItem {
 /// A Responses Agent calls a tool and the next request replays the user
 /// input, the returned reasoning item, the function call, and its output as
 /// native input items in provider order.
+///
+/// # Panics
+/// Panics when the Prompt does not build, the mock sees another request, or
+/// the run fails or ends otherwise.
 #[tokio::test]
 async fn agent_run_executes_openai_responses_tool_loop() {
     let user = message(
@@ -150,13 +154,8 @@ async fn agent_run_executes_openai_responses_tool_loop() {
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock.clone()));
     let prompt = Prompt::from_native(
-        SpecPrompt::new(
-            responses_request(Vec::new(), false),
-            "gpt-4o",
-            None,
-            ResponseType::Text,
-        )
-        .expect("Responses prompt builds"),
+        SpecPrompt::new(responses_request(Vec::new(), false), "gpt-4o")
+            .expect("Responses prompt builds"),
     );
     let agent = Agent::new(prompt)
         .with_id("r")
@@ -207,6 +206,10 @@ impl SessionMemory for PriorTurnSession {
 
 /// A Responses Agent seeds prior session turns as native Responses output
 /// messages ahead of the new user input.
+///
+/// # Panics
+/// Panics when the Prompt does not build, the mock sees another request, or
+/// the run fails.
 #[tokio::test]
 async fn responses_session_turns_seed_native_items() {
     let mock = MockProvider::new(ProviderName::OpenAi)
@@ -236,13 +239,8 @@ async fn responses_session_turns_seed_native_items() {
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(mock.clone()));
     let prompt = Prompt::from_native(
-        SpecPrompt::new(
-            responses_request(Vec::new(), false),
-            "gpt-4o",
-            None,
-            ResponseType::Text,
-        )
-        .expect("Responses prompt builds"),
+        SpecPrompt::new(responses_request(Vec::new(), false), "gpt-4o")
+            .expect("Responses prompt builds"),
     );
     let agent = Agent::new(prompt)
         .with_id("r")

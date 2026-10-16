@@ -181,7 +181,7 @@ Record evidence and lineage
 Enforce policy or trigger action
 ```
 
-- **Cards** identify the exact data, models, prompts, agents, workflows, and
+- **Cards** identify the exact data, models, prompts, agents, and
   services being verified.
 - **Verifiers** define reusable Drift and Agent Eval checks.
 - **Runs and Observations** record what happened during execution.
@@ -197,7 +197,7 @@ Enforce policy or trigger action
   and audit.
 - **Vala** owns observations, Drift and Agent Eval execution, and the Bifrost
   warehouse.
-- **Skald** owns LLM providers, prompts, tools, agents, and workflows.
+- **Skald** owns LLM providers, prompts, tools, and agents.
 
 ## Release status
 

@@ -237,6 +237,11 @@ mod tests {
         }
     }
 
+    /// A durable reference to a Card outside the submission set derives no
+    /// edge, though both Cards remain nodes.
+    ///
+    /// # Panics
+    /// Panics when the graph does not build or derives an edge.
     #[test]
     fn build_ignores_external_refs() {
         let parent = card_ref(CardKind::Service, "service");
@@ -248,7 +253,7 @@ mod tests {
             ),
             submission(
                 &external,
-                json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+                json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
             ),
         ])
         .expect("resolved submission builds");
@@ -257,6 +262,11 @@ mod tests {
         assert!(edges.is_empty());
     }
 
+    /// A sibling reference nested inside a component value derives the edge
+    /// from the parent to that sibling.
+    ///
+    /// # Panics
+    /// Panics when the graph does not build or derives other edges.
     #[test]
     fn build_derives_sibling_edges_from_nested_refs() {
         let parent = card_ref(CardKind::Service, "service");
@@ -271,7 +281,7 @@ mod tests {
             ),
             submission(
                 &child,
-                json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+                json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
             ),
         ])
         .expect("resolved submissions build");
@@ -301,12 +311,18 @@ mod tests {
         assert_eq!(identity_key(&first), identity_key(&second));
     }
 
+    /// Graph projection pins an unversioned submission to `0.0.0` without
+    /// changing the authored submission.
+    ///
+    /// # Panics
+    /// Panics when projection fails, changes the authored version, or pins
+    /// another version.
     #[test]
     fn graph_ready_submissions_preserves_authored_version_selection() {
         let card = card_ref(CardKind::Prompt, "prompt");
         let mut authored = submission(
             &card,
-            json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+            json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
         );
         authored.metadata.version = None;
 
@@ -319,17 +335,21 @@ mod tests {
         );
     }
 
+    /// Two submissions with the same identity are refused instead of merged.
+    ///
+    /// # Panics
+    /// Panics when the graph builds or fails with another error.
     #[test]
     fn duplicate_submission_identity_is_rejected() {
         let first = card_ref(CardKind::Prompt, "duplicate");
         let error = build(&[
             submission(
                 &first,
-                json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+                json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
             ),
             submission(
                 &first,
-                json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+                json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
             ),
         ])
         .expect_err("duplicate identities must be rejected");

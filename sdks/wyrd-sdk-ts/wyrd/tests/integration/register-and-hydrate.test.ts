@@ -172,3 +172,63 @@ test("hydrated agent prompt card navigation", async ({ cards }) => {
   expect(() => state.get("missing")).toThrow(expect.objectContaining({ code: "WYRD_SDK_404_UNKNOWN_ALIAS" }));
   expect(() => state.agent("my_prompt")).toThrow(expect.objectContaining({ code: "WYRD_SDK_400_CARD_KIND_MISMATCH" }));
 });
+
+const PORTABLE_SPEC = {
+  provider: "anthropic",
+  model: "claude-sonnet-4-5",
+  system: `You answer for \${team}.`,
+  messages: [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: `\${question}` },
+        { type: "image", source: `\${media:photo}` },
+        { type: "image", source: { type: "base64", mime_type: "image/png", data: "iVBORw0KGgo=" } },
+        { type: "document", source: `\${media:__wyrd_media_0}` },
+      ],
+    },
+  ],
+  settings: { temperature: 0.2, max_output_tokens: 256 },
+  response_format: {
+    type: "object",
+    properties: { answer: { type: "string" } },
+    required: ["answer"],
+  },
+};
+const NATIVE_SPEC = {
+  provider: "openai",
+  model: "gpt-4o",
+  format: "chat_completion",
+  body: {
+    messages: [{ role: "user", content: "Summarize {{ticket}}." }],
+    seed: 123,
+    future_knob: { enabled: true },
+  },
+};
+
+test("prompt forms round trip as authored", async ({ cards }) => {
+  const receipt = await cards.registerFromPath(fixture("cards/register_and_hydrate/authored-prompts.yaml"));
+  const bundle = bundleDir();
+  await cards.hydrate(receipt.root, bundle);
+  const state = WyrdState.fromPath(bundle);
+
+  const answer = PORTABLE_SPEC.response_format;
+  const media = ["__wyrd_media_0", "photo"];
+  for (const [name, hydrated, authored, variables, mediaVariables, schema] of [
+    ["portable-prompt", state.prompt("portable"), PORTABLE_SPEC, ["question", "team"], media, answer],
+    ["native-prompt", state.prompt("native"), NATIVE_SPEC, ["ticket"], [], null],
+    ["inline-prompt-agent-prompt", state.agent("agent").prompt(), PORTABLE_SPEC, ["question", "team"], media, answer],
+    ["inline-native-prompt-agent-prompt", state.agent("native-agent").prompt(), NATIVE_SPEC, ["ticket"], [], null],
+  ] as const) {
+    const read = await cards.get(registered(receipt, name));
+    expect(hydrated.ref).toEqual(registered(receipt, name));
+    expect(read.spec).toEqual(authored);
+    expect(hydrated.spec).toEqual(authored);
+    expect(read.metadata.spec_hash).toBeTruthy();
+    expect(hydrated.metadata.spec_hash).toBe(read.metadata.spec_hash);
+    expect([...hydrated.variables].sort()).toEqual(variables);
+    expect([...hydrated.mediaVariables].sort()).toEqual(mediaVariables);
+    expect(hydrated.responseSchema).toEqual(schema);
+    expect(hydrated.responseSchemaName).toBe(schema === null ? null : "response");
+  }
+});

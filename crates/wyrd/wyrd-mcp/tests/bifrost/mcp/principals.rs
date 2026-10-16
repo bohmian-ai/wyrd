@@ -11,7 +11,7 @@ use crate::connectivity::{McpJourneyError, discover, principals, problem, struct
 mod pg_tests {
     use super::{McpJourneyError, discover, principals, problem, structured, transport};
 
-    use jsonschema::JSONSchema;
+    use jsonschema::Validator;
     use rmcp::ClientServiceExt as _;
     use rmcp::model::CallToolRequestParams;
     use secrecy::ExposeSecret as _;
@@ -50,11 +50,11 @@ mod pg_tests {
     /// # Errors
     ///
     /// Returns an error when the advertised schema does not compile.
-    fn validator(schema: &JsonMap<String, JsonValue>) -> Result<JSONSchema, McpJourneyError> {
-        JSONSchema::options()
+    fn validator(schema: &JsonMap<String, JsonValue>) -> Result<Validator, McpJourneyError> {
+        jsonschema::options()
             .should_validate_formats(true)
-            .with_format("uuid", |value| uuid::Uuid::parse_str(value).is_ok())
-            .compile(&JsonValue::Object(schema.clone()))
+            .with_format("uuid", |value: &str| uuid::Uuid::parse_str(value).is_ok())
+            .build(&JsonValue::Object(schema.clone()))
             .map_err(|error| format!("an advertised schema compiles: {error}").into())
     }
 

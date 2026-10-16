@@ -3,19 +3,14 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import (
     Any,
-    Literal,
 )
 
 from .._wyrd import JsonDict, PathLike, WyrdError
 from ..cards import AgentCard
-from ..client import WyrdClient
 from ..prompt import Prompt, ProviderResponse
 from ._session import (
     NoSession,
     SessionMemory,
-    WorkflowRunDict,
-    WorkflowRunError,
-    WorkflowStepResult,
 )
 from .tool import local_registry, tool
 
@@ -357,6 +352,7 @@ class Agent:
         provider_api_key: str | None = ...,
         output_type: type | None = ...,
         mock_provider: MockProvider | None = ...,
+        execution_route: Mapping[str, str] | None = ...,
     ) -> None:
         """Create an Agent.
 
@@ -398,6 +394,12 @@ class Agent:
             mock_provider (MockProvider | None): Run `provider="mock"` prompts offline
                 against this provider instead of the process default registry. Cannot be
                 combined with `provider_base_url`.
+            execution_route (Mapping[str, str] | None): Route saved with the Agent Card:
+                ``{"kind": "native"}`` (the default) or
+                ``{"kind": "wyrd_gateway", "deployment": <name>}``. A local Agent has no
+                gateway caller, so running a ``wyrd_gateway`` route here is refused with
+                ``WYRD_AGENT_422_INVALID_ARGUMENT`` before any provider IO; invoke it
+                through ``wyrd.observe`` instead.
         """
         ...
 
@@ -517,6 +519,7 @@ class Agent:
         *,
         session_id: str | None = ...,
         output_type: type | None = ...,
+        execution_route: Mapping[str, str] | None = ...,
     ) -> AgentRun:
         """Run the bounded model/tool loop to completion, blocking until it ends.
 
@@ -532,6 +535,8 @@ class Agent:
                 used.
             output_type: as ``Agent(output_type=)``, for this call only; it
                 takes precedence over the Agent's and the Prompt's class.
+            execution_route: replaces the Agent's declared route whole for this
+                run only; the Agent and its Card keep their own route.
 
         Returns:
             The completed run, with its output and turns.
@@ -542,7 +547,10 @@ class Agent:
                 ``WYRD_AGENT_404_TOOL_NOT_IN_AGENT`` when the model calls an
                 unattached tool, ``WYRD_AGENT_422_STRUCTURED_DECODE`` when the
                 declared JSON output or ``output_type`` cannot be parsed,
-                ``WYRD_SESSION_500_RECENT`` or ``WYRD_SESSION_500_APPEND``.
+                ``WYRD_SESSION_500_RECENT`` or ``WYRD_SESSION_500_APPEND``;
+                ``WYRD_AGENT_422_INVALID_ARGUMENT`` before any IO for a
+                ``wyrd_gateway`` route, which a local Agent cannot serve; and
+                ``WYRD_SPEC_400_VALIDATION`` for a malformed ``execution_route``.
         """
         ...
 
@@ -673,151 +681,6 @@ class Agent:
         """
         ...
 
-class WorkflowRun:
-    """Terminal Workflow run snapshot returned by `Workflow.run`.
-
-    Values are the portable wire projection: named `outputs`, step results
-    keyed by step id, and the bounded primary `error`.
-    """
-
-    @property
-    def run_id(self) -> str:
-        """Return the run identifier."""
-        ...
-
-    @property
-    def status(self) -> Literal["succeeded", "failed", "cancelled", "timed_out"]:
-        """Return the terminal run status."""
-        ...
-
-    @property
-    def outputs(self) -> dict[str, Any]:
-        """Return the named Workflow outputs; empty unless the run succeeded."""
-        ...
-
-    @property
-    def steps(self) -> dict[str, WorkflowStepResult]:
-        """Return step results keyed by step id."""
-        ...
-
-    @property
-    def error(self) -> WorkflowRunError | None:
-        """Return the primary run error, or None."""
-        ...
-
-    def to_dict(self) -> WorkflowRunDict:
-        """Return the complete snapshot as its wire-shaped dictionary."""
-        ...
-
-class Workflow:
-    """A YAML-authored DAG of Agent steps, loaded with ``from_path`` or ``from_yaml``.
-
-    Each step is identified by its Agent's ``name``, or its ``id`` when the
-    Agent is unnamed.
-    """
-
-    @property
-    def name(self) -> str | None:
-        """Return the workflow name."""
-        ...
-
-    @property
-    def version(self) -> str | None:
-        """Return the workflow version, or ``None`` when unset."""
-        ...
-
-    @property
-    def space(self) -> str | None:
-        """Return the workflow space, or ``None`` when unset."""
-        ...
-
-    @property
-    def steps(self) -> Sequence[str]:
-        """Return the ordered step ids."""
-        ...
-
-    @staticmethod
-    def from_path(path: PathLike, client: WyrdClient | None = None) -> Workflow:
-        """Load an authored Workflow file and the Cards it references.
-
-        Relative paths and sibling Agents and Prompts in the same bundle load
-        locally; a wholly local file needs no server or credentials. Registry
-        Card refs are read exactly as ``client``; omitted, they are read
-        through the ambient Wyrd client configuration (`WYRD_SERVER_URL` and
-        `WYRD_API_KEY` or `WYRD_ACCESS_TOKEN`). A given ``client`` also makes
-        the loaded Workflow's gateway calls, so a program serving several
-        principals passes each one's client.
-
-        Loading only reads files and Cards; it registers and runs nothing. A
-        failure after some reads returns no partial Workflow.
-
-        Args:
-            path (PathLike): Workflow entry file.
-            client (WyrdClient | None): Principal that reads registry refs and
-                calls the gateway; the ambient configuration when omitted.
-
-        Returns:
-            Workflow: Fully hydrated and validated workflow.
-
-        Raises:
-            WyrdError: When the file fails to load or validate;
-                `WYRD_CLIENT_401_NO_CREDENTIALS` when the file references a
-                registered Card and no credential is configured;
-                `WYRD_PERMISSION_403_DENIED_RBAC` when the credential cannot
-                read Cards; `WYRD_REGISTRY_404_CARD_NOT_FOUND` when a
-                referenced Card does not exist or was deleted.
-
-        Example:
-            ```python
-            from wyrd.agent import Workflow
-
-            workflow = Workflow.from_path("workflows/code-review/workflow.yaml")
-            print(workflow.steps)
-            ```
-        """
-        ...
-
-    @staticmethod
-    def from_yaml(yaml: str) -> Workflow:
-        """Parse a workflow from envelope YAML text, resolving inline Agents eagerly.
-
-        Args:
-            yaml: the workflow envelope YAML text.
-
-        Returns:
-            The parsed workflow.
-
-        Raises:
-            WyrdError: When parse or resolution fails.
-        """
-        ...
-
-    def run(self, input: str | Mapping[str, Any] | None = None) -> WorkflowRun:
-        """Run this workflow, preparing only what its step routes select.
-
-        Native steps use the process-local provider registry. Steps routed to
-        the Wyrd gateway call the server and credential this Workflow was
-        loaded through, or the ambient client configuration when it was built
-        locally. Steps routed to an external gateway use the bindings named in
-        the shared client configuration; only the selected bindings' secrets
-        are read, at run start. Dependencies order steps only; data reaches a step solely through its
-        declared bindings.
-
-        Args:
-            input (str | Mapping[str, Any] | None): Workflow input. A string is
-                shorthand for the declared string input named `input`; a
-                mapping supplies declared inputs by name; `None` uses defaults.
-
-        Returns:
-            WorkflowRun: Terminal run snapshot. Step failures are recorded in
-            it rather than raised.
-
-        Raises:
-            WyrdError: When validation, input, or route checks fail before any
-                step is dispatched.
-        """
-        ...
-
 __all__ = [
     "Agent",
     "AgentRun",
@@ -831,11 +694,6 @@ __all__ = [
     "RunConfig",
     "SessionMemory",
     "SessionTurn",
-    "Workflow",
-    "WorkflowRun",
-    "WorkflowRunDict",
-    "WorkflowRunError",
-    "WorkflowStepResult",
     "local_registry",
     "tool",
 ]

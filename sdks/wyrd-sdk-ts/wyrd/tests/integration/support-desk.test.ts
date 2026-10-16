@@ -51,12 +51,9 @@ test("support desk answers, verifies, and explains every request", async ({ serv
   });
   const scratch = mkdtempSync(join(tmpdir(), "wyrd-ts-desk-"));
   await (await Gateway.connect({ client: admin })).putDeployment({
-    name: "anthropic-gpt-4o",
-    model: { provider: "anthropic", model: "gpt-4o" },
+    name: "anthropic",
     adapter: "anthropic",
     auth: "none",
-    capabilities: ["chat_completions"],
-    routing_weight: 1,
   });
   await expect(deploy(admin, join(scratch, "refused"))).rejects.toThrow(
     "configure a gateway provider deployment for openai/gpt-4o",

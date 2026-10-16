@@ -135,8 +135,8 @@ async fn submit_partial_resolved_model(
         "call_id": call_id.to_string(),
         "operation": "chat_completions",
         "ingress_dialect": "openai",
-        "requested_model": {"provider": "openai", "model": "gpt-4o"},
-        "resolved_model": {"provider": "openai", "model": null},
+        "requested_model": {"deployment": "openai", "model": "gpt-4o"},
+        "resolved_model": {"deployment": "openai", "model": null},
         "streaming": false,
         "started_at": now,
         "terminal_at": now,
@@ -226,8 +226,8 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
         "the gateway pod runs no Scribe"
     );
 
-    let invoke = [Permission::gateway_invoke(GatewayAccess::Provider {
-        provider: "openai".parse().expect("provider id"),
+    let invoke = [Permission::gateway_invoke(GatewayAccess::Deployment {
+        deployment: "openai".parse().expect("deployment name"),
     })];
     gateway
         .seed_role("gateway_invoker", &invoke)
@@ -285,14 +285,12 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
         &http,
         &base,
         &admin,
-        "provider-deployments/gpt-4o",
+        "provider-deployments/openai",
         json!({
-            "name": "gpt-4o",
-            "model": {"provider": "openai", "model": "gpt-4o"},
+            "name": "openai",
             "adapter": "openai",
             "auth": {"bearer": {"credential": "openai-key"}},
             "capabilities": ["chat_completions"],
-            "routing_weight": 1,
         }),
     )
     .await;

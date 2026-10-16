@@ -98,11 +98,11 @@ name = "wyrd-skald-tool"
 publish = true
 
 [[package]]
-name = "wyrd-skald-workflow"
+name = "wyrd-spec"
 publish = true
 
 [[package]]
-name = "wyrd-spec"
+name = "wyrd-telemetry"
 publish = true
 
 [[package]]

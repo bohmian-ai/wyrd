@@ -705,6 +705,16 @@ mod pg_tests {
         Ok(id)
     }
 
+    /// Seeds a minimal Card of `target_ref`'s kind owned by `creator`; an
+    /// Agent first seeds its `<name>-prompt` Prompt Card and references it.
+    ///
+    /// # Errors
+    /// Never returns an error; the `Result` matches the fixture helpers it is
+    /// called alongside.
+    ///
+    /// # Panics
+    /// Panics when a fixture spec does not decode, seeding fails, or the kind is
+    /// not a Service, Agent, or Prompt.
     async fn insert_test_card(
         conn: &mut TenantConn<'_>,
         target_ref: &CardRef,
@@ -722,7 +732,7 @@ mod pg_tests {
                     serde_json::json!({
                         "provider": "openai",
                         "model": "gpt-4o-mini",
-                        "messages": "Fixture agent."
+                        "system": "Fixture agent."
                     }),
                 )
                 .expect("prompt fixture spec decodes");
@@ -730,7 +740,7 @@ mod pg_tests {
                 Spec::from_kind_and_value(
                     &CardKind::Agent,
                     serde_json::json!({
-                        "prompt": prompt_ref,
+                        "prompt": prompt_ref, "execution_route": {"kind": "native"},
                     }),
                 )
                 .expect("agent fixture spec decodes")

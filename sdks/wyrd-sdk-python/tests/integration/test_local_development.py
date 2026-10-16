@@ -10,6 +10,7 @@ one client, so the signed-in story proves the same steps for a saved login.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import pty
 import select
@@ -118,7 +119,7 @@ def export(run: Run) -> None:
 
 
 def configure_gateway(client: WyrdClient) -> None:
-    """Write the ``openai-key`` credential and deploy ``gpt-4o`` on it as ``client``."""
+    """Write the ``openai-key`` credential and deploy ``openai`` on it as ``client``."""
     cli.put_provider_credential(
         {
             "name": "openai-key",
@@ -129,12 +130,10 @@ def configure_gateway(client: WyrdClient) -> None:
     )
     Gateway(client).put_deployment(
         {
-            "name": "gpt-4o",
-            "model": {"provider": "openai", "model": "gpt-4o"},
+            "name": "openai",
             "adapter": "openai",
             "auth": {"bearer": {"credential": "openai-key"}},
             "capabilities": ["chat_completions"],
-            "routing_weight": 1,
         }
     )
 
@@ -218,6 +217,95 @@ def test_cli_bootstrap_saved_config(cli_bootstrap_client: WyrdClient) -> None:
     cards = Cards(cli_bootstrap_client)
     refs = register(cards, "cards/gateway_inference/ask-prompt.yaml")
     assert cards.get(refs["ask-prompt"]).metadata["name"] == "ask-prompt"
+
+
+GATEWAY_AGENTS = {
+    "openai": ("openai-prod", "acme/gpt-4o-agent", "hi"),
+    "anthropic": ("claude-prod", "claude-haiku-4-5", "hi"),
+    "google": ("gemini-team", "tuned/gemini-2.5-pro", "hi"),
+    "jev": ("judge-pool", "jev-judge", '{"helpful":{"type":"noul","noul":0.9}}'),
+}
+"""``examples/gateway-setup/agents`` alias (its Prompt provider) → deployment, model, and answer."""
+
+
+def test_cli_gateway_agents(cli_bootstrap_client: WyrdClient) -> None:
+    """A fresh Python runtime loads the downloaded gateway Agents and runs each on its deployment.
+
+    Each loaded Agent keeps the registered route, Prompt provider, model, and
+    identities, and its invocation is retained under its own Run and Card. A
+    caller whose key is bound to another Card is refused.
+    """
+    bundle = Path(os.environ["WYRD_LOCAL_DEV_AGENT_BUNDLE"])
+    state = WyrdState.from_path(bundle, cli_bootstrap_client)
+    cards = Cards(cli_bootstrap_client)
+    runs = {}
+    for alias, (deployment, model, answer) in GATEWAY_AGENTS.items():
+        downloaded = state.card(alias)
+        registered = cards.get(downloaded.card_ref)
+        prompt = state.agent(alias).prompt()
+        route = {"kind": "wyrd_gateway", "deployment": deployment}
+        assert downloaded.card_ref == registered.card_ref == state.card_ref(alias)
+        assert downloaded.spec == registered.spec
+        assert downloaded.spec["execution_route"] == route
+        assert cards.get(prompt.ref).card_ref == prompt.ref
+        assert (prompt.prompt.provider, prompt.prompt.model) == (alias, model)
+        run = state.run(alias)
+        assert run.invoke({"question": "hi"}) == answer
+        runs[run.run_id] = {
+            "deployment": deployment,
+            "model": model,
+            "resolved_deployment": deployment,
+            "card_uid": str(downloaded.card_ref.uid),
+            "outcome": "succeeded",
+        }
+
+    other_card = WyrdClient(
+        server_url=cli_bootstrap_client.server_url,
+        credential=os.environ["WYRD_LOCAL_DEV_DENIED_KEY"],
+    )
+    with pytest.raises(WyrdError) as refused:
+        WyrdState.from_path(bundle, other_card).run("openai").invoke({"question": "hi"})
+    assert refused.value.code == "WYRD_VALA_403_BIFROST_CARD_SCOPE", refused.value
+
+    bifrost = Bifrost(client=cli_bootstrap_client)
+    query = (
+        "SELECT run_id, requested_model['deployment'] AS deployment,"
+        " requested_model['model'] AS model, resolved_deployment, card_uid, outcome"
+        " FROM vala.gateway.calls WHERE run_id IN ($1, $2, $3, $4)"
+    )
+    deadline = time.monotonic() + 60
+    while True:
+        rows = bifrost.sql(query, list(runs)).to_arrow().to_pylist()
+        retained = {row.pop("run_id"): row for row in rows}
+        if retained == runs or time.monotonic() > deadline:
+            break
+        time.sleep(0.5)
+    assert retained == runs
+
+
+def run_python(env: dict[str, str], name: str) -> None:
+    """Run the local-development Python test ``name`` in a fresh interpreter with ``env``."""
+    root = Path(__file__).resolve().parents[4]
+    command = [
+        sys.executable,
+        *("-m", "pytest", "-q", "-m", "integration"),
+        f"tests/integration/test_local_development.py::{name}",
+    ]
+    ran = subprocess.run(
+        command, cwd=root / "sdks/wyrd-sdk-python", env=env, capture_output=True, text=True
+    )
+    assert ran.returncode == 0 and "1 passed" in ran.stdout, ran.stdout + ran.stderr
+
+
+def run_rust(env: dict[str, str], name: str) -> None:
+    """Run the ignored ``wyrd-client`` integration test ``name`` in a fresh process with ``env``."""
+    root = Path(__file__).resolve().parents[4]
+    command = [
+        *("mise", "exec", "--", "cargo", "nextest", "run", "--locked"),
+        *("-p", "wyrd-client", "--test", "integration", "--run-ignored=all"),
+        *("-E", f"test(={name})"),
+    ]
+    subprocess.run(command, cwd=root, env=env, check=True)
 
 
 def local_listener() -> str:
@@ -362,9 +450,9 @@ def local_deployment() -> Iterator[tuple[Path, dict[str, str]]]:
 
 @contextmanager
 def installed_local_cli(
-    cli_path: str, home: Path, env: dict[str, str], terminal: str
+    cli_path: str, home: Path, env: dict[str, str], terminal: str, tenant: str = "local"
 ) -> Iterator[None]:
-    """Run a real installed CLI against ``home`` until the block ends."""
+    """Run a real installed CLI serving ``tenant`` against ``home`` until the block ends."""
     command_env = dict(env)
     master, slave = pty.openpty() if terminal else (-1, -1)
     if terminal:
@@ -372,7 +460,7 @@ def installed_local_cli(
         command_env["CODEX_HOME"] = str(home / "codex")
     with tempfile.TemporaryFile(mode="w+") as errors:
         child = subprocess.Popen(
-            [cli_path, "server", "dev", "--tenant", "local"],
+            [cli_path, "server", "dev", "--tenant", tenant],
             cwd=home,
             env=command_env,
             stdin=slave if terminal else subprocess.DEVNULL,
@@ -406,6 +494,24 @@ def installed_local_cli(
             finally:
                 if terminal:
                     os.close(master)
+
+
+def run_typescript(env: dict[str, str], name: str) -> None:
+    """Run the local-development TypeScript test ``name`` in a fresh Node process with ``env``."""
+    root = Path(__file__).resolve().parents[4]
+    command = [
+        "mise",
+        "exec",
+        "--",
+        "pnpm",
+        "exec",
+        "vitest",
+        "run",
+        "tests/integration/local-development.test.ts",
+        "-t",
+        name,
+    ]
+    subprocess.run(command, cwd=root / "sdks/wyrd-sdk-ts/wyrd", env=env, check=True)
 
 
 @pytest.mark.local_dev
@@ -458,19 +564,7 @@ def test_installed_cli_bootstrap(runtime: str) -> None:
                 ]
                 subprocess.run(command, cwd=root / "sdks/wyrd-sdk-python", env=env, check=True)
             elif runtime == "typescript":
-                command = [
-                    "mise",
-                    "exec",
-                    "--",
-                    "pnpm",
-                    "exec",
-                    "vitest",
-                    "run",
-                    "tests/integration/local-development.test.ts",
-                    "-t",
-                    "cli_bootstrap_saved_config",
-                ]
-                subprocess.run(command, cwd=root / "sdks/wyrd-sdk-ts/wyrd", env=env, check=True)
+                run_typescript(env, "cli_bootstrap_saved_config")
         if not terminal:
             return
         saved = [
@@ -483,3 +577,203 @@ def test_installed_cli_bootstrap(runtime: str) -> None:
             (home / name).read_bytes()
             for name in ("wyrd/credentials.toml", "wyrd/config.toml", "codex/config.toml")
         ]
+
+
+UPSTREAM_KEYS = {
+    "openai": ("authorization", "Bearer sk-openai-local"),
+    "anthropic": ("x-api-key", "sk-anthropic-local"),
+    "gemini": ("x-goog-api-key", "sk-gemini-local"),
+    "jev": ("authorization", "Bearer sk-jev-local"),
+}
+"""Provider → the upstream credential header and value its fixture key arrives as."""
+
+UPSTREAM_CALLS = {
+    "/v1/chat/completions": ("openai", "gpt-4o"),
+    "/v1/messages": ("anthropic", "claude-sonnet-4-5"),
+    "/v1beta/models/gemini-2.5-flash:generateContent": ("gemini", None),
+    "/v1/systemone": ("jev", "jev-latest"),
+}
+"""Upstream path → the provider serving it and the body model it must receive unchanged."""
+
+AGENT_CALLS = [
+    ("/v1/chat/completions", "acme/gpt-4o-agent"),
+    ("/v1/messages", "claude-haiku-4-5"),
+    ("/v1beta/models/tuned%2Fgemini-2.5-pro:generateContent", None),
+    ("/v1/systemone", "jev-judge"),
+]
+"""The upstream path and unchanged body model of each ``GATEWAY_AGENTS`` run, in run order."""
+
+
+def calls_since(recorded: Receiver, start: int) -> list[tuple[str, str | None]]:
+    """The path and body model of every upstream request after the first ``start``."""
+    return [(d.path, d.body.get("model")) for d in recorded.deliveries[start:]]
+
+
+@pytest.mark.local_dev
+def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
+    """Set up four named deployments with the installed CLI, as ``examples/gateway-setup`` does.
+
+    The server reaches local provider fixtures through its non-production
+    ``[gateway.endpoints]`` configuration. Refused files write nothing,
+    reapplying converges, a fresh TypeScript process calls every deployment
+    with the saved deployment alone, and each upstream sees its own key and
+    never a Wyrd credential. One Agent per provider is then applied, downloaded
+    with ``wyrd get``, and loaded and run from that bundle by a fresh Python
+    process and by a fresh Rust process through the public Agent loader,
+    neither of which calls a native provider. A restarted server still
+    decrypts the credentials and serves the same downloaded Agents, and a
+    revoked credential or an under-granted caller is refused.
+    """
+    root = Path(__file__).resolve().parents[4]
+    cli_path = str(root / "target/debug/wyrd")
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    recorded = Receiver(url=f"http://127.0.0.1:{upstream.server_address[1]}")
+    upstream.RequestHandlerClass = type("SetupUpstream", (Upstream,), {"upstream": recorded})
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    for name in ("gateway.json", "capture-policy.json"):
+        shutil.copy2(root / "examples/gateway-setup" / name, tmp_path / name)
+    entries = json.loads((tmp_path / "gateway.json").read_text())
+    for provider, (_, value) in UPSTREAM_KEYS.items():
+        secret = value.removeprefix("Bearer ")
+        source = {"managed_secret": {"secret": secret}}
+        document = {"name": f"{provider}-key", "provider": provider, "source": source}
+        (tmp_path / f"{provider}-credential.json").write_text(json.dumps(document))
+    (tmp_path / "openai-prod.json").write_text(json.dumps(entries[0]))
+    (tmp_path / "malformed.json").write_text("[{")
+    (tmp_path / "duplicate.json").write_text(json.dumps([entries[0], entries[0]]))
+    trap = socket.create_server(("127.0.0.1", 0))
+    trap.setblocking(False)
+    try:
+        with local_deployment() as (home, env):
+            (home / "server.toml").write_text(
+                "[gateway.endpoints]\n"
+                f'openai = "{recorded.url}/v1"\n'
+                f'anthropic = "{recorded.url}"\n'
+                f'gemini = "{recorded.url}"\n'
+                f'jev = "{recorded.url}"\n'
+            )
+            env["WYRD_CONFIG_PATH"] = str(home / "server.toml")
+
+            def wyrd(*args: str, caller: dict[str, str] = env) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [cli_path, *args], cwd=tmp_path, env=caller, capture_output=True, text=True
+                )
+
+            def deployments() -> list[str]:
+                listed = wyrd("gateway", "deployment", "list")
+                assert listed.returncode == 0, listed.stderr
+                return sorted(deployment["name"] for deployment in json.loads(listed.stdout))
+
+            with installed_local_cli(cli_path, home, env, "", tenant="acme"):
+                for refused in ("malformed.json", "duplicate.json"):
+                    failed = wyrd("gateway", "deployment", "put", "--file", refused)
+                    assert failed.returncode != 0 and "--file" in failed.stderr, failed.stderr
+                missing = wyrd("gateway", "deployment", "put", "--file", "gateway.json")
+                assert missing.returncode != 0
+                assert [o["status"] for o in json.loads(missing.stdout)] == [
+                    "failed",
+                    *["unattempted"] * 3,
+                ], missing.stdout
+                assert deployments() == []
+
+                for provider in UPSTREAM_KEYS:
+                    put = wyrd(
+                        "gateway", "credential", "put", "--file", f"{provider}-credential.json"
+                    )
+                    assert put.returncode == 0, put.stderr
+                    assert "sk-" not in put.stdout + put.stderr
+                for _ in range(2):
+                    applied = wyrd("gateway", "deployment", "put", "--file", "gateway.json")
+                    assert applied.returncode == 0, applied.stderr
+                    assert {o["status"] for o in json.loads(applied.stdout)} == {"completed"}
+                single = wyrd("gateway", "deployment", "put", "--file", "openai-prod.json")
+                assert json.loads(single.stdout)["name"] == "openai-prod", single.stderr
+                names = sorted(entry["name"] for entry in entries)
+                assert deployments() == names
+                captured = wyrd("gateway", "capture-policy", "put", "--file", "capture-policy.json")
+                assert captured.returncode == 0, captured.stderr
+
+                agent = root / "fixtures/cards/gateway_inference/ask-agent.yaml"
+                assert wyrd("apply", str(agent)).returncode == 0
+                issued = wyrd(
+                    *("auth", "issue-key", "--kind", "Agent", "--name", "ask-agent"),
+                    *("--version", "1.0.0", "--space", "default"),
+                    *("--server", f"http://{env['WYRD_SERVER_BIND']}"),
+                )
+                assert issued.returncode == 0, issued.stderr
+                key = next(
+                    line.split()[1]
+                    for line in issued.stdout.splitlines()
+                    if line.startswith("key:")
+                )
+                under_granted = {**env, "WYRD_API_KEY": key}
+                denied = wyrd(
+                    "gateway",
+                    "deployment",
+                    "put",
+                    "--file",
+                    "openai-prod.json",
+                    caller=under_granted,
+                )
+                assert denied.returncode != 0 and "403" in denied.stderr, denied.stderr
+
+                run_typescript(env, "cli_gateway_setup")
+                direct = len(recorded.deliveries)
+
+                applied = wyrd("apply", str(root / "examples/gateway-setup/agents/service.yaml"))
+                assert applied.returncode == 0, applied.stderr
+                got = wyrd(
+                    *("get", "--kind", "Service", "--name", "gateway-agents"),
+                    *("--version", "1.0.0", "--space", "default", "--output-dir", "gateway-agents"),
+                )
+                assert got.returncode == 0, got.stderr
+                native = f"https://{trap.getsockname()[0]}:{trap.getsockname()[1]}"
+                agent_env = {
+                    **env,
+                    "WYRD_LOCAL_DEV_AGENT_BUNDLE": str(tmp_path / "gateway-agents"),
+                    "WYRD_LOCAL_DEV_DENIED_KEY": key,
+                    "OPENAI_API_KEY": "sk-native-trap",
+                    "OPENAI_BASE_URL": native,
+                    "ANTHROPIC_API_KEY": "sk-native-trap",
+                    "ANTHROPIC_BASE_URL": native,
+                    "GOOGLE_API_KEY": "sk-native-trap",
+                    "GOOGLE_API_BASE_URL": native,
+                }
+                agent_env.pop("TYPESAFE_API_KEY", None)
+                run_python(agent_env, "test_cli_gateway_agents")
+                run_rust(agent_env, "local_development::cli_gateway_agents")
+                assert calls_since(recorded, direct) == AGENT_CALLS * 2
+
+            wyrd_credentials = (home / "wyrd/credentials.toml").read_text()
+            assert sorted(calls_since(recorded, 0)[:direct]) == sorted(
+                (path, model) for path, (_, model) in UPSTREAM_CALLS.items()
+            )
+
+            with installed_local_cli(cli_path, home, env, "", tenant="acme"):
+                assert deployments() == names
+                run_typescript(env, "cli_gateway_setup")
+                rerun = len(recorded.deliveries)
+                run_python(agent_env, "test_cli_gateway_agents")
+                run_rust(agent_env, "local_development::cli_gateway_agents")
+                assert calls_since(recorded, rerun) == AGENT_CALLS * 2
+                revoked = wyrd("gateway", "credential", "revoke", "openai-key")
+                assert revoked.returncode == 0, revoked.stderr
+                delivered = len(recorded.deliveries)
+                run_typescript(env, "cli_gateway_revoked")
+                assert len(recorded.deliveries) == delivered, "a revoked credential was sent"
+            assert (home / "wyrd/credentials.toml").read_text() == wyrd_credentials
+            for delivery in recorded.deliveries:
+                gemini = delivery.path.endswith(":generateContent")
+                header, value = UPSTREAM_KEYS[
+                    "gemini" if gemini else UPSTREAM_CALLS[delivery.path][0]
+                ]
+                assert delivery.headers[header] == value
+                assert header == "authorization" or "authorization" not in delivery.headers
+                assert not any(name.startswith("x-wyrd") for name in delivery.headers)
+                assert "wyrd_" not in json.dumps(delivery.headers)
+                assert not any(v.startswith("Bearer ey") for v in delivery.headers.values())
+            with pytest.raises(BlockingIOError):
+                trap.accept()
+    finally:
+        upstream.shutdown()
+        trap.close()

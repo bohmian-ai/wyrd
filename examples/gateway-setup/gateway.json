@@ -1,0 +1,26 @@
+[
+  {
+    "name": "openai-prod",
+    "adapter": "openai",
+    "auth": { "bearer": { "credential": "openai-key" } },
+    "capabilities": ["chat_completions"]
+  },
+  {
+    "name": "claude-prod",
+    "adapter": "anthropic",
+    "auth": { "api_key_header": { "header": "x-api-key", "credential": "anthropic-key" } },
+    "capabilities": ["chat_completions"]
+  },
+  {
+    "name": "gemini-team",
+    "adapter": "gemini",
+    "auth": { "api_key_header": { "header": "x-goog-api-key", "credential": "gemini-key" } },
+    "capabilities": ["chat_completions"]
+  },
+  {
+    "name": "judge-pool",
+    "adapter": "jev",
+    "auth": { "bearer": { "credential": "jev-key" } },
+    "capabilities": ["system_one"]
+  }
+]

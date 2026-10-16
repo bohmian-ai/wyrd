@@ -703,7 +703,7 @@ mod tests {
             "call_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01",
             "operation": "chat_completions",
             "ingress_dialect": "openai_chat_completions",
-            "requested_model": {"provider": "openai", "model": "gpt-4o"},
+            "requested_model": {"deployment": "openai", "model": "gpt-4o"},
             "resolved_model": null,
             "resolved_deployment": null,
             "streaming": false,
@@ -794,6 +794,10 @@ mod tests {
 
     /// Proves the attempt entry's cost triple must be all-present or all-null
     /// and unknown usage stays null rather than zero.
+    ///
+    /// # Panics
+    /// Panics when a partial triple is accepted, a complete one is refused, or
+    /// unknown usage is not null.
     #[test]
     fn attempt_cost_triple_is_all_or_nothing() {
         let attempt =
@@ -804,7 +808,7 @@ mod tests {
                     "data_tenant_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02",
                     "attempt_ordinal": 1,
                     "deployment": "primary",
-                    "model": {"provider": "openai", "model": "gpt-4o"},
+                    "model": {"deployment": "openai", "model": "gpt-4o"},
                     "outcome": "failed",
                     "provider_usage_json": null,
                     "normalized_usage": null,
@@ -837,7 +841,7 @@ mod tests {
             "call_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01",
             "operation": "chat_completions",
             "ingress_dialect": "openai_chat_completions",
-            "requested_model": {"provider": "openai", "model": "gpt-4o"},
+            "requested_model": {"deployment": "openai", "model": "gpt-4o"},
             "resolved_model": null,
             "resolved_deployment": null,
             "streaming": false,
@@ -928,6 +932,9 @@ mod tests {
     }
 
     /// Proves attempt spans validate usage JSON, billing triples, and codes.
+    ///
+    /// # Panics
+    /// Panics when a valid span is refused or an invalid one is accepted.
     #[test]
     fn attempt_span_fields_enforce_record_invariants() {
         let span = |patch: Value| {
@@ -935,7 +942,7 @@ mod tests {
                 "gateway_call_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01",
                 "attempt_ordinal": 1,
                 "deployment": "primary",
-                "model": {"provider": "openai", "model": "gpt-4o"},
+                "model": {"deployment": "openai", "model": "gpt-4o"},
                 "outcome": "failed",
                 "error_code": "WYRD_GATEWAY_502_UPSTREAM",
                 "started_at": "2026-09-13T00:00:00Z",

@@ -63,21 +63,17 @@ async fn anthropic_messages_ingress_is_native_governed_and_fail_closed() {
         .mount(&journey.upstream)
         .await;
     journey
-        .deploy(
-            "anthropic",
-            "x-api-key",
-            "claude-sonnet-5",
-            &["chat_completions"],
-        )
+        .deploy("anthropic", "x-api-key", &["chat_completions"])
         .await;
+    allow_only(&journey, "anthropic", "x-api-key", "claude-sonnet-5").await;
     journey
-        .deploy("openai", "authorization", "gpt-4o", &["chat_completions"])
+        .deploy("openai", "authorization", &["chat_completions"])
         .await;
     journey
         .put(
             "fallback-policy",
-            json!({"rules": [{"scope": {"model": {"model": {"provider": "anthropic", "model": "claude-missing"}}},
-                              "candidates": [{"provider": "openai", "model": "gpt-4o"}]}]}),
+            json!({"rules": [{"scope": {"model": {"model": {"deployment": "anthropic", "model": "claude-missing"}}},
+                              "candidates": [{"deployment": "openai", "model": "gpt-4o"}]}]}),
         )
         .await;
     let key = |token: &str| {
@@ -98,7 +94,7 @@ async fn anthropic_messages_ingress_is_native_governed_and_fail_closed() {
         .post(
             "/v1/messages",
             &key(&journey.caller),
-            &body("claude-sonnet-5", json!({"service_tier": "auto"})),
+            &body("anthropic/claude-sonnet-5", json!({"service_tier": "auto"})),
         )
         .await;
     assert_eq!(answer.status().as_u16(), 200);
@@ -119,7 +115,7 @@ async fn anthropic_messages_ingress_is_native_governed_and_fail_closed() {
         .post(
             "/v1/messages",
             &bearer,
-            &body("claude-sonnet-5", json!({"stream": true})),
+            &body("anthropic/claude-sonnet-5", json!({"stream": true})),
         )
         .await;
     assert_eq!(stream.status().as_u16(), 200);
@@ -138,7 +134,7 @@ async fn anthropic_messages_ingress_is_native_governed_and_fail_closed() {
             "/v1/messages",
             &key(&journey.caller),
             &body(
-                "claude-sonnet-5",
+                "anthropic/claude-sonnet-5",
                 json!({"stream": true, "metadata": {"user_id": "truncate-me"}}),
             ),
         )
@@ -158,7 +154,7 @@ async fn anthropic_messages_ingress_is_native_governed_and_fail_closed() {
     assert_eq!(dispatched.len(), 3);
     assert_provider_credentials(&dispatched, "x-api-key", PROVIDER_KEY, &journey.caller);
 
-    let valid = body("claude-sonnet-5", json!({}));
+    let valid = body("anthropic/claude-sonnet-5", json!({}));
     let both = vec![
         ("x-api-key", journey.caller.clone()),
         ("authorization", format!("Bearer {}", journey.caller)),
@@ -243,7 +239,7 @@ async fn anthropic_messages_ingress_is_native_governed_and_fail_closed() {
             .post(
                 "/v1/messages",
                 &key(&journey.caller),
-                &body("claude-missing", json!({})),
+                &body("anthropic/claude-missing", json!({})),
             )
             .await,
         400,
@@ -326,27 +322,23 @@ async fn gemini_generate_content_ingress_is_native_governed_and_fail_closed() {
         .mount(&journey.upstream)
         .await;
     journey
-        .deploy(
-            "gemini",
-            "x-goog-api-key",
-            "gemini-2.5-flash",
-            &["chat_completions"],
-        )
+        .deploy("gemini", "x-goog-api-key", &["chat_completions"])
         .await;
+    allow_only(&journey, "gemini", "x-goog-api-key", "gemini-2.5-flash").await;
     journey
-        .deploy("openai", "authorization", "gpt-4o", &["chat_completions"])
+        .deploy("openai", "authorization", &["chat_completions"])
         .await;
     journey
         .put(
             "fallback-policy",
-            json!({"rules": [{"scope": {"model": {"model": {"provider": "gemini", "model": "gemini-missing"}}},
-                              "candidates": [{"provider": "openai", "model": "gpt-4o"}]}]}),
+            json!({"rules": [{"scope": {"model": {"model": {"deployment": "gemini", "model": "gemini-missing"}}},
+                              "candidates": [{"deployment": "openai", "model": "gpt-4o"}]}]}),
         )
         .await;
     let key = |token: &str| vec![("x-goog-api-key", token.to_owned())];
     let body = |text: &str| json!({"contents": [{"role": "user", "parts": [{"text": text}]}], "generationConfig": {"maxOutputTokens": 16}});
-    let generate = "/v1beta/models/gemini-2.5-flash:generateContent";
-    let stream_route = "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse";
+    let generate = "/v1beta/models/gemini/gemini-2.5-flash:generateContent";
+    let stream_route = "/v1beta/models/gemini/gemini-2.5-flash:streamGenerateContent?alt=sse";
 
     let mut labeled = body("hi");
     labeled["labels"] = json!({"team": "wyrd"});
@@ -442,7 +434,7 @@ async fn gemini_generate_content_ingress_is_native_governed_and_fail_closed() {
     refusal(
         journey
             .post(
-                "/v1beta/models/gemini-2.5-flash:countTokens",
+                "/v1beta/models/gemini/gemini-2.5-flash:countTokens",
                 &key(&journey.caller),
                 &valid,
             )
@@ -455,7 +447,7 @@ async fn gemini_generate_content_ingress_is_native_governed_and_fail_closed() {
     refusal(
         journey
             .post(
-                "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+                "/v1beta/models/gemini/gemini-2.5-flash:streamGenerateContent",
                 &key(&journey.caller),
                 &valid,
             )
@@ -468,7 +460,7 @@ async fn gemini_generate_content_ingress_is_native_governed_and_fail_closed() {
     refusal(
         journey
             .post(
-                "/v1beta/models/gemini-missing:generateContent",
+                "/v1beta/models/gemini/gemini-missing:generateContent",
                 &key(&journey.caller),
                 &valid,
             )
@@ -526,6 +518,27 @@ fn completion() -> Value {
         "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop", "logprobs": null}],
         "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15},
     })
+}
+
+/// Restricts the deployment `provider` [`Journey::deploy`] stored, which
+/// authenticates with `header`, to the single model `model`, so any other
+/// model on it is unservable and only its fallback can answer.
+///
+/// # Panics
+/// Panics when the write is refused.
+async fn allow_only(journey: &Journey, provider: &str, header: &str, model: &str) {
+    journey
+        .put(
+            &format!("provider-deployments/{provider}"),
+            json!({
+                "name": provider,
+                "adapter": provider,
+                "auth": {"api_key_header": {"header": header, "credential": format!("{provider}-key")}},
+                "models": [model],
+                "capabilities": ["chat_completions"],
+            }),
+        )
+        .await;
 }
 
 /// The `wyrd-request-id` of a gateway answer.
@@ -694,23 +707,13 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
         .mount(&journey.upstream)
         .await;
     journey
-        .deploy("openai", "authorization", "gpt-4o", &["chat_completions"])
+        .deploy("openai", "authorization", &["chat_completions"])
         .await;
     journey
-        .deploy(
-            "anthropic",
-            "x-api-key",
-            "claude-sonnet-5",
-            &["chat_completions"],
-        )
+        .deploy("anthropic", "x-api-key", &["chat_completions"])
         .await;
     journey
-        .deploy(
-            "gemini",
-            "x-goog-api-key",
-            "gemini-2.5-flash",
-            &["chat_completions"],
-        )
+        .deploy("gemini", "x-goog-api-key", &["chat_completions"])
         .await;
     journey
         .put(
@@ -758,9 +761,9 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
     };
     let google = |key: &str| vec![("x-goog-api-key", key.to_owned())];
     let chat = json!({"model": "openai/gpt-4o", "max_completion_tokens": 16, "messages": [{"role": "user", "content": "hi"}]});
-    let messages = json!({"model": "claude-sonnet-5", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]});
+    let messages = json!({"model": "anthropic/claude-sonnet-5", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]});
     let contents = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"maxOutputTokens": 16}});
-    let generate = "/v1beta/models/gemini-2.5-flash:generateContent";
+    let generate = "/v1beta/models/gemini/gemini-2.5-flash:generateContent";
     let mut bodies = Vec::new();
 
     // Warm the key that is retired below, then retire that one credential
@@ -1022,7 +1025,6 @@ async fn gateway_api_key_exchange_is_scoped_cached_and_revocable() {
             &other_admin,
             "anthropic",
             "x-api-key",
-            "claude-sonnet-5",
             &["chat_completions"],
         )
         .await;
@@ -1162,7 +1164,7 @@ async fn gateway_api_keys_remain_rejected_outside_ingress() {
         .mount(&journey.upstream)
         .await;
     journey
-        .deploy("openai", "authorization", "gpt-4o", &["chat_completions"])
+        .deploy("openai", "authorization", &["chat_completions"])
         .await;
     let key = api_key(&journey.server, "key_admin", &["admin"]).await;
     let key = key.expose_secret().to_owned();

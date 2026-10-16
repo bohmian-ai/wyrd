@@ -32,4 +32,3 @@ mod support;
 /// The canonical support desk, from the checked-in example.
 mod support_desk;
 mod verify_in_real_time;
-mod workflow_loading;

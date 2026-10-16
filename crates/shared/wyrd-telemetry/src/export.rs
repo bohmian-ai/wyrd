@@ -496,14 +496,14 @@ impl SpanProcessor for TenantExport {
 /// eligible for a tenant copy.
 ///
 /// The catalog is the request span, `verification.*`, `dispatch`,
-/// `workflow.gateway.call`, `gateway.*` except `gateway.attempt` (the gateway
+/// `agent.gateway.call`, `gateway.*` except `gateway.attempt` (the gateway
 /// captures attempts as their own rows, so nothing below an attempt is
 /// copied either), `bifrost.gate.*`,
 /// `bifrost.oracle.query`, and the OTLP ingest spans.
 fn in_catalog(name: &str) -> bool {
     matches!(
         name,
-        "request" | "dispatch" | "workflow.gateway.call" | "bifrost.oracle.query"
+        "request" | "dispatch" | "agent.gateway.call" | "bifrost.oracle.query"
     ) || name.starts_with("verification.")
         || name.starts_with("bifrost.gate.")
         || name.starts_with("otlp.")
@@ -1168,7 +1168,7 @@ mod tests {
                 attribution: request_pair,
             },
         );
-        let judge = request.with_span(tracer.start_with_context("workflow.gateway.call", &request));
+        let judge = request.with_span(tracer.start_with_context("agent.gateway.call", &request));
         ROUTES.rebind(
             judge.span().span_context(),
             TenantSpanRoute {
@@ -1192,7 +1192,7 @@ mod tests {
             copies,
             vec![
                 ("gateway.invoke".to_owned(), judge_pair),
-                ("workflow.gateway.call".to_owned(), judge_pair),
+                ("agent.gateway.call".to_owned(), judge_pair),
                 ("verification.result".to_owned(), request_pair),
                 ("request".to_owned(), request_pair),
             ]
@@ -1247,12 +1247,15 @@ mod tests {
     }
 
     /// The catalog admits behavior spans and excludes attempts and internals.
+    ///
+    /// # Panics
+    /// Panics when a span name is misclassified by the catalog.
     #[test]
     fn catalog_names_only_behavior_spans() {
         for name in [
             "request",
             "dispatch",
-            "workflow.gateway.call",
+            "agent.gateway.call",
             "verification.judge",
             "gateway.call",
             "bifrost.gate.write",

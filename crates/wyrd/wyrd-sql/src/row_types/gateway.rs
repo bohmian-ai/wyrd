@@ -87,7 +87,7 @@ pub struct GatewayBatchFileRow {
     pub content_type: String,
     /// Endpoint every request line targets.
     pub endpoint: String,
-    /// `<provider>/<model>` projection that served the upload.
+    /// `<deployment>/<model>` address that served the upload.
     pub model: String,
     /// Deployment holding the file.
     pub deployment: String,
@@ -104,7 +104,7 @@ pub struct GatewayBatchRow {
     pub batch_id: Uuid,
     /// Input file id.
     pub file_id: Uuid,
-    /// `<provider>/<model>` projection of the batch.
+    /// `<deployment>/<model>` address of the batch.
     pub model: String,
     /// Deployment holding the batch.
     pub deployment: String,

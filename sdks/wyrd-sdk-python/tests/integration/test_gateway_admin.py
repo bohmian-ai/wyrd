@@ -28,11 +28,9 @@ def deployment(name: str, credential: str) -> ProviderDeployment:
     """An ``openai`` deployment named ``name`` that authenticates with ``credential``."""
     return {
         "name": name,
-        "model": {"provider": "openai", "model": "gpt-4o"},
         "adapter": "openai",
         "auth": {"bearer": {"credential": credential}},
         "capabilities": ["chat_completions"],
-        "routing_weight": 1,
     }
 
 
@@ -58,9 +56,10 @@ def test_deployment_round_trips(gateway: Gateway) -> None:
     cli.put_provider_credential(environment_credential("round-trip-key"))
     primary = deployment("round-trip", "round-trip-key")
 
-    assert gateway.put_deployment(primary) == primary
-    assert gateway.deployment("round-trip") == primary
-    assert primary in gateway.deployments()
+    stored = {**primary, "access": "open"}
+    assert gateway.put_deployment(primary) == stored
+    assert gateway.deployment("round-trip") == stored
+    assert stored in gateway.deployments()
 
     gateway.delete_deployment("round-trip")
     with pytest.raises(WyrdError) as deleted:

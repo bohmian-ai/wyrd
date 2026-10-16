@@ -16,8 +16,8 @@ cloud = ["object_store/aws", "object_store/gcp", "object_store/azure"]
 emulator = ["cloud"]
 
 [dependencies]
-wyrd-sql = { path = "../wyrd-sql", version = "0.1.1" }
-vala-sql = { path = "../../vala/vala-sql", version = "0.1.1" }
+wyrd-sql = { path = "../wyrd-sql", version = "0.2.0" }
+vala-sql = { path = "../../vala/vala-sql", version = "0.2.0" }
 wyrd-spec = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 tokio-util = { workspace = true }
@@ -43,8 +43,8 @@ wyrd-tls = { workspace = true }
 [dev-dependencies]
 workspace-hack.workspace = true
 temp-env = { workspace = true, features = ["async_closure"] }
-wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.1.1", features = ["pg"] }
-wyrd-testing = { path = "../wyrd-testing", version = "0.1.1" }
+wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.2.0", features = ["pg"] }
+wyrd-testing = { path = "../wyrd-testing", version = "0.2.0" }
 
 [lints]
 workspace = true

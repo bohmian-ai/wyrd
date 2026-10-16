@@ -1,13 +1,15 @@
 /**
  * The support desk: an Agent-backed Service that answers customer questions,
- * records each ticket, and is verified continuously and in real time.
+ * records each ticket, and checks every answer against its refund policy
+ * with the `support/policy-check` Verifier.
  *
  * {@link deploy} registers the checked-in Cards under `service/`, which
  * ensures the declared `vala.datasets.tickets` table, turns on metadata
  * capture, and checks the Agent's model is deployed. {@link serve} answers
- * every question in its own Agent Run. {@link waitForVerdicts} waits for both
- * Verifiers to judge every answer, and {@link explain} joins one Run's
- * evidence over MCP.
+ * every question in its own Agent Run and submits each answer for a
+ * background policy check. {@link waitForVerdicts} resumes each check from
+ * its execution ID alone and waits for its result, {@link check} judges one
+ * answer immediately, and {@link explain} joins one Run's evidence over MCP.
  *
  * Run it against a server: `WYRD_SERVER_URL=... WYRD_API_KEY=... pnpm start`.
  */
@@ -15,10 +17,18 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
 
 import { trace } from "@opentelemetry/api";
-import { Bifrost, Cards, Gateway, type RegistrationReceipt, WyrdClient, WyrdState } from "wyrd-ai";
+import {
+  Cards,
+  Gateway,
+  type RegistrationReceipt,
+  type VerificationResult,
+  type VerifierInputs,
+  verify,
+  WyrdClient,
+  WyrdState,
+} from "wyrd-ai";
 
 /** How many requests {@link serve} answers; every tenth asks for a refund. */
 export const REQUESTS = 100;
@@ -38,12 +48,14 @@ export interface Desk {
 /** One answered request. */
 export interface Served {
   readonly runId: string;
-  /** Whether `no-refund-promise` passed the answer in real time. */
-  readonly passed: boolean;
+  /** The background policy check of the request's answer. */
+  readonly executionId: string;
 }
 
-/** Verdict counts per Verifier name: `[passed, failed]`. */
-export type Verdicts = Record<string, [number, number]>;
+/** The `policy-check` inputs for `answer`: the answer text and the checked-in refund policy PDF. */
+function policyCheck(answer: string): VerifierInputs {
+  return { answer, policy: verify.File.path(join(SERVICE, "refund-policy.pdf")) };
+}
 
 /** The registered UID of the Card named `name`. */
 export function uid(desk: Desk, name: string): string {
@@ -102,8 +114,8 @@ export function question(index: number): string {
 /**
  * Answer {@link REQUESTS} questions, each in its own Agent Run inside a
  * `support-desk.request` span: invoke the Agent through the gateway, record
- * the ticket, observe the answer for `answer-quality`, and judge it with
- * `no-refund-promise`. Telemetry and observations are flushed on return.
+ * the ticket, and submit the answer for a background `policy-check` without
+ * waiting for it. Telemetry and tickets are flushed on return.
  */
 export async function serve(desk: Desk): Promise<Served[]> {
   const { state } = desk;
@@ -114,7 +126,7 @@ export async function serve(desk: Desk): Promise<Served[]> {
   for (let index = 0; index < REQUESTS; index++) {
     const run = state.run("agent");
     const asked = question(index);
-    const passed = await run.scope(() =>
+    const executionId = await run.scope(() =>
       tracer.startActiveSpan("support-desk.request", async (span) => {
         try {
           const answer = await run.invoke({ question: asked });
@@ -125,57 +137,53 @@ export async function serve(desk: Desk): Promise<Served[]> {
             answer,
             refund: asked.includes("refund"),
           });
-          observe.eval({ answer });
-          return (await observe.verify("no-refund-promise", { answer })).passed;
+          const submitted = await observe.submit("policy-check", policyCheck(answer));
+          if (submitted.kind !== "queued") {
+            throw new Error("policy-check judges Run evidence, not a window");
+          }
+          return submitted.execution.id;
         } finally {
           span.end();
         }
       }),
     );
-    served.push({ runId: run.runId, passed });
+    served.push({ runId: run.runId, executionId });
   }
   await state.shutdown();
   return served;
 }
 
-/**
- * Wait until both Verifiers have judged every answer, then return their
- * verdict counts.
- *
- * @throws Error - when the verdicts are not all in within `timeoutMs`.
- */
-export async function waitForVerdicts(client: WyrdClient, desk: Desk, timeoutMs: number): Promise<Verdicts> {
-  const bifrost = await Bifrost.connect({ client });
-  const names = new Map(["answer-quality", "no-refund-promise"].map((name) => [uid(desk, name), name]));
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const rows = await bifrost.sql(
-      "SELECT verifier_card_uid, verdict, COUNT(*) AS n FROM vala.verification.results " +
-        "WHERE card_uid = $1 GROUP BY verifier_card_uid, verdict",
-      [uid(desk, "support-agent")],
-      { parse: (row) => row as { verifier_card_uid: string; verdict: string; n: number | bigint } },
-    );
-    const verdicts: Verdicts = {};
-    for (const row of rows) {
-      const name = names.get(row.verifier_card_uid);
-      if (name) {
-        const counts = (verdicts[name] ??= [0, 0]);
-        counts[row.verdict === "passed" ? 0 : 1] += Number(row.n);
-      }
-    }
-    if ([...names.values()].every((name) => (verdicts[name]?.[0] ?? 0) + (verdicts[name]?.[1] ?? 0) >= REQUESTS)) {
-      return verdicts;
-    }
-    if (Date.now() >= deadline) {
-      throw new Error(`verdicts still incomplete after ${timeoutMs} ms: ${JSON.stringify(verdicts)}`);
-    }
-    await sleep(1_000);
-  }
+/** Judge `answer` with `policy-check` now, in a fresh Agent Run, with the verdict and each requirement's outcome. */
+export function check(desk: Desk, answer: string): Promise<VerificationResult> {
+  return desk.state.run("agent").observe.verify("policy-check", policyCheck(answer));
 }
 
 /**
- * Join every piece of evidence of Run `runId` — its observation, ticket,
- * request span, gateway call, and both verdicts — through MCP
+ * Resume every served request's background check from its execution ID
+ * alone, as another process would, and wait for its result; results are in
+ * `served` order.
+ *
+ * @throws WyrdError - the execution's own error, or
+ *   `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` when the results are not all in
+ *   within `timeoutMs`.
+ */
+export async function waitForVerdicts(
+  client: WyrdClient,
+  served: readonly Served[],
+  timeoutMs: number,
+): Promise<VerificationResult[]> {
+  const deadline = Date.now() + timeoutMs;
+  const results: VerificationResult[] = [];
+  for (const request of served) {
+    const execution = await verify.Execution.connect(request.executionId, { client });
+    results.push(await execution.wait({ timeoutMs: Math.max(0, deadline - Date.now()) }));
+  }
+  return results;
+}
+
+/**
+ * Join every piece of evidence of Run `runId` — its ticket, request span,
+ * gateway call, and policy-check verdict — through MCP
  * `bifrost.query` with a fresh access token, as column name to value.
  *
  * @throws Error - for a malformed Run ID, when MCP or the tool refuses the
@@ -186,15 +194,14 @@ export async function explain(client: WyrdClient, runId: string): Promise<Record
     throw new Error(`malformed Run ID ${runId}`);
   }
   const sql =
-    "SELECT o.run_id, o.trace_id, t.ticket_id, t.answer, s.name AS span, " +
-    "g.call_id, g.card_uid AS call_card_uid, c.verdict AS continuous, r.verdict AS realtime " +
-    "FROM vala.eval.observations o " +
-    "JOIN vala.datasets.tickets t ON t.run_id = o.run_id " +
-    "JOIN vala.traces.spans s ON s.trace_id = o.trace_id AND s.run_id = o.run_id " +
-    "JOIN vala.gateway.calls g ON g.run_id = o.run_id AND g.card_uid = o.card_uid " +
-    "JOIN vala.verification.results c ON c.run_id = o.run_id AND c.binding_id IS NOT NULL " +
-    "JOIN vala.verification.results r ON r.run_id = o.run_id AND r.binding_id IS NULL " +
-    `WHERE o.run_id = '${runId}' AND s.name = 'support-desk.request'`;
+    "SELECT t.run_id, s.trace_id, t.ticket_id, t.answer, s.name AS span, " +
+    "g.call_id, g.card_uid AS call_card_uid, r.verdict " +
+    "FROM vala.datasets.tickets t " +
+    "JOIN vala.traces.spans s ON s.run_id = t.run_id " +
+    "JOIN vala.gateway.calls g ON g.run_id = t.run_id " +
+    "JOIN vala.verification.results r ON r.run_id = t.run_id " +
+    `WHERE t.run_id = '${runId}' AND s.name = 'support-desk.request' ` +
+    "ORDER BY g.call_id LIMIT 1";
   const response = await fetch(`${client.serverUrl}/mcp`, {
     method: "POST",
     headers: {
@@ -240,14 +247,30 @@ export async function explain(client: WyrdClient, runId: string): Promise<Record
   return Object.fromEntries(content.columns.map((column, index) => [column.name, row[index]]));
 }
 
-/** Deploy, serve, and print the verdicts and one passing and one failing explanation. */
+/**
+ * Deploy, judge one refund promise immediately, serve every request, wait
+ * for every background policy check, and print the requirement breakdown of
+ * a failing answer and the joined evidence of one passing and one failing
+ * request.
+ */
 async function main(): Promise<void> {
   const client = WyrdClient.connect();
   const desk = await deploy(client, join(mkdtempSync(join(tmpdir(), "support-desk-")), "bundle"));
+  console.log(`deployed support-agent ${uid(desk, "support-agent")}`);
+  const promise = await check(desk, "You have a guaranteed refund.");
+  console.log(`immediate check: ${promise.outcome.verdict}`);
   const served = await serve(desk);
-  console.log(await waitForVerdicts(client, desk, 300_000));
-  for (const passed of [true, false]) {
-    const request = served.find((candidate) => candidate.passed === passed);
+  const results = await waitForVerdicts(client, served, 300_000);
+  const failed = served.find((_, index) => results[index]?.outcome.verdict === "failed");
+  if (failed) {
+    // Any process can resume a check from its ID with the ambient client.
+    const resumed = await (await verify.Execution.connect(failed.executionId)).wait({ timeoutMs: 30_000 });
+    for (const requirement of resumed.outcome.requirements) {
+      console.log(`${requirement.id}: ${requirement.outcome} (${requirement.reason})`);
+    }
+  }
+  for (const verdict of ["passed", "failed"]) {
+    const request = served.find((_, index) => results[index]?.outcome.verdict === verdict);
     if (request) {
       console.log(await explain(client, request.runId));
     }

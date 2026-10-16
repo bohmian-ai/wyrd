@@ -2,10 +2,10 @@
 //!
 //! [`VerificationScheduler`] lists tenants with a due scheduled binding
 //! through the operator pool, then advances each tenant's due bindings one
-//! occurrence per short tenant transaction: [`VerifierRunQueue::claim_due`]
+//! occurrence per short tenant transaction: [`VerifierExecutionQueue::claim_due`]
 //! decides the occurrence, [`BackgroundAuthority`] resolves the owner/SYSTEM
 //! authority a run would be accepted under, and
-//! [`VerifierRunQueue::schedule_due`] settles it. The queue locks each binding with
+//! [`VerifierExecutionQueue::schedule_due`] settles it. The queue locks each binding with
 //! `SKIP LOCKED` and dedupes an occurrence's run, so concurrent schedulers on
 //! many processes, duplicate ticks, and a restart mid-pass never create a
 //! second run for one occurrence.
@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
-use wyrd_sql::queries::verifier_runs::{
-    QueueCounts, ScheduleOutcome, ScheduleSkip, ScheduleTick, VerifierRunQueue,
+use wyrd_sql::queries::verifier_executions::{
+    QueueCounts, ScheduleOutcome, ScheduleSkip, ScheduleTick, VerifierExecutionQueue,
 };
 use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
 
@@ -40,7 +40,7 @@ pub struct VerificationScheduler {
     /// Operator pool for the cross-tenant due list and queue depth.
     operator: OperatorPool,
     /// Queue policies and transitions.
-    queue: VerifierRunQueue,
+    queue: VerifierExecutionQueue,
     /// Resolves the owner/SYSTEM authority each scheduled run is accepted under.
     authority: BackgroundAuthority,
     /// Idle wait between passes.
@@ -60,7 +60,7 @@ impl VerificationScheduler {
     pub fn new(
         postgres: WyrdPostgres,
         operator: OperatorPool,
-        queue: VerifierRunQueue,
+        queue: VerifierExecutionQueue,
         authority: BackgroundAuthority,
         poll_interval: Duration,
     ) -> Self {
@@ -220,7 +220,7 @@ impl VerificationScheduler {
     /// Returns [`SqlError`] when the depth query fails.
     async fn report_depth(&self) -> Result<(), SqlError> {
         let depth = self.queue.queue_depth(&self.operator).await?;
-        record_depth("runs", depth.runs);
+        record_depth("executions", depth.executions);
         record_depth("dispatches", depth.dispatches);
         Ok(())
     }

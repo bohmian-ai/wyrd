@@ -409,7 +409,7 @@ fn google_settings(
             ResponseFormatKind::JsonSchema { schema, .. } => {
                 schema_object(schema)?;
                 config.response_mime_type = Some("application/json".to_owned());
-                config.response_schema = Some(schema.clone());
+                config.response_json_schema = Some(schema.clone());
             }
         }
     }
@@ -546,7 +546,7 @@ mod builder_tests {
         .expect_err("a malformed nested keyword is refused");
         assert_eq!(
             field(error),
-            "body.generation_config.response_schema.properties.n.minimum"
+            "body.generation_config.response_json_schema.properties.n.minimum"
         );
 
         let list = json!({"type": "array", "items": {"type": "string"}});

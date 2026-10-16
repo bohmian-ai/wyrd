@@ -3,9 +3,9 @@
 //! Returns `WyrdError::PayloadTooLarge` rendered as `application/problem+json`
 //! when the body exceeds `max_bytes`. Audio transcription and translation
 //! uploads pass through unbuffered: their handlers stream them under
-//! `limits.audio_upload_bytes`. Direct verification execution passes through
-//! too: its handler reads under its own contract bound and refuses with the
-//! verification error code. Uses bounded buffering: `to_bytes` reads
+//! `limits.audio_upload_bytes`. Verification execute, enqueue, evidence, and
+//! local evidence upload requests pass through too: their handlers read under
+//! their own contract bound and refuse with the verification error code. Uses bounded buffering: `to_bytes` reads
 //! the full body into memory up to `max_bytes + 1`; the worst-case process
 //! footprint is `max_bytes * concurrency`.
 
@@ -94,10 +94,16 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let path = request.uri().path();
         if matches!(
-            request.uri().path(),
-            "/v1/audio/transcriptions" | "/v1/audio/translations" | "/v1/verification/execute"
-        ) {
+            path,
+            "/v1/audio/transcriptions"
+                | "/v1/audio/translations"
+                | "/v1/verification/execute"
+                | "/v1/verification/enqueue"
+                | "/v1/verification/evidence"
+        ) || path.starts_with("/v1/verification/evidence/local/")
+        {
             let mut inner = self.inner.clone();
             return Box::pin(async move { inner.call(request).await.map_err(Into::into) });
         }
@@ -434,8 +440,9 @@ mod tests {
         assert!(invoked.load(Ordering::Acquire));
     }
 
-    /// Audio transcription and translation uploads and direct verification
-    /// executions reach their handler unbuffered past the general limit,
+    /// Audio transcription and translation uploads and verification execute,
+    /// enqueue, and evidence requests reach their handler unbuffered past the
+    /// general limit,
     /// which still refuses every other route, including Audio speech.
     ///
     /// # Panics
@@ -452,6 +459,12 @@ mod tests {
             ("/v1/audio/transcriptions", axum::http::StatusCode::OK),
             ("/v1/audio/translations", axum::http::StatusCode::OK),
             ("/v1/verification/execute", axum::http::StatusCode::OK),
+            ("/v1/verification/enqueue", axum::http::StatusCode::OK),
+            ("/v1/verification/evidence", axum::http::StatusCode::OK),
+            (
+                "/v1/verification/evidence/local/00",
+                axum::http::StatusCode::OK,
+            ),
             (
                 "/v1/audio/speech",
                 axum::http::StatusCode::PAYLOAD_TOO_LARGE,

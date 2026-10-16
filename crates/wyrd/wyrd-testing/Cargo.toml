@@ -75,14 +75,6 @@ http-body-util = "0.1"
 object_store = { workspace = true }
 parquet = { workspace = true }
 rand = { workspace = true }
-# The capacity benchmark serves its judge mock over trusted TLS.
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
-# Roots the bound server's Eval judge at the test gateway's mock upstream.
-skald-runtime = { workspace = true }
-skald-spec = { workspace = true }
-# Journeys and the capacity benchmark build their native judge Prompt.
-skald-prompt = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 secrecy = { workspace = true }

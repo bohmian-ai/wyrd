@@ -1,4 +1,5 @@
-//! The scoped observation surface: one invocation, Card-scoped views, three emits.
+//! The scoped observation surface: one invocation, Card-scoped views, and
+//! Verifier executions.
 //!
 //! [`Run`] is one application invocation. It is opened locally — no network IO,
 //! no server-side Run resource — and carries the `run_id` and the observed
@@ -6,19 +7,19 @@
 //! [`Run::for_card`] returns an immutable sibling view over the same invocation,
 //! so concurrent views never disturb each other's subject.
 //!
-//! The Drift and Eval projections live here rather than in
+//! [`Observe::verify`] executes a bound Verifier now and [`Observe::submit`]
+//! queues one execution or records scheduled-window samples. Slot projection,
+//! evidence upload, and execution polling live here rather than in
 //! [`crate::bifrost`]: the facade, the producer pool, and `wyrd-queue` stay
-//! generic plumbing that buffers JSON rows against a described schema and never
-//! interprets a Verifier kind. Every SDK projects this one Rust surface, so the
-//! three languages cannot drift into three projections.
+//! generic plumbing that buffers JSON rows against a described schema. Every
+//! SDK projects this one Rust surface, so the three languages cannot drift
+//! into three projections.
 
 pub mod drift;
-pub mod eval;
 mod invoke;
 pub mod lifecycle;
 #[cfg(test)]
 mod tests;
-mod verify;
 
 use arrow_schema::DataType;
 use serde::Serialize;
@@ -26,15 +27,15 @@ use serde_json::{Value, json};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::vala::eval::media::MediaRef;
-use wyrd_spec::vala::ids::{RunId, SessionId};
-use wyrd_spec::verification::{ExecuteVerificationRequest, Judgment};
+use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::ids::SessionId;
+use wyrd_spec::verification::execution::VerificationResult;
 
 use crate::bifrost::{Correlation, WriterTable};
-use crate::state::WyrdState;
+use crate::state::{BoundVerifier, WyrdState};
+use crate::verify::{Execution, Inputs, Projected, RunEvidence, Submission, Target};
 
-pub use eval::EvalObservationOptions;
-pub use lifecycle::{DRIFT_OBSERVATIONS_TABLE, EVAL_OBSERVATIONS_TABLE};
+pub use lifecycle::DRIFT_OBSERVATIONS_TABLE;
 
 /// The only namespace `observe.record` may write.
 ///
@@ -188,12 +189,10 @@ impl Run {
     }
 }
 
-/// The three observation emits available on one scoped run.
+/// The observation and verification surface of one scoped run.
 ///
-/// Drift and Eval are synchronous: their fixed tables were described at
-/// `start_bifrost`, so the call only projects and enqueues. Enqueueing is not a
-/// durability acknowledgement — the queue publishes in the background and
-/// `WyrdState::shutdown` is the barrier.
+/// Recording is not a durability acknowledgement — the queue publishes in the
+/// background and `WyrdState::shutdown` is the barrier.
 #[derive(Debug)]
 pub struct Observe<'a> {
     /// The view whose subject and invocation every emit correlates to.
@@ -201,48 +200,6 @@ pub struct Observe<'a> {
 }
 
 impl Observe<'_> {
-    /// Emit one Drift observation from a `Serialize` feature object.
-    ///
-    /// # Arguments
-    /// * `features` - One flat object of supported scalar feature values.
-    /// * `session_id` - The session the observation belongs to, or `None`.
-    ///
-    /// # Errors
-    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
-    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown,
-    /// `WYRD_SDK_400_INVALID_OBSERVATION` when the input is not a flat object of
-    /// supported scalars, and `WYRD_CLIENT_429_QUEUE_FULL` when the producer is
-    /// saturated.
-    pub fn drift<T: Serialize>(
-        &self,
-        features: &T,
-        session_id: Option<SessionId>,
-    ) -> Result<(), WyrdError> {
-        self.drift_value(&to_value(features, "drift features")?, session_id)
-    }
-
-    /// Emit one Drift observation from a foreign runtime's JSON text.
-    ///
-    /// The Python and TypeScript boundaries hold a JSON document, not a Rust
-    /// type, and reach the same projection through this door.
-    ///
-    /// An integer literal beyond 64-bit range is refused from the text before
-    /// parsing would round it to a float.
-    ///
-    /// # Arguments
-    /// * `json` - One flat JSON object of supported scalar feature values.
-    /// * `session_id` - The session the observation belongs to, or `None`.
-    ///
-    /// # Errors
-    /// As [`Observe::drift`], plus an invalid-observation error when `json` is
-    /// not valid JSON or carries an integer literal beyond exact `Float64`
-    /// range.
-    #[cfg(feature = "internal")]
-    pub fn drift_json(&self, json: &str, session_id: Option<SessionId>) -> Result<(), WyrdError> {
-        drift::check_integer_literals(json)?;
-        self.drift_value(&parse_json(json, "drift features")?, session_id)
-    }
-
     /// Project and enqueue one Drift observation.
     ///
     /// Input validation runs before the lifecycle lookup so a malformed feature
@@ -250,7 +207,10 @@ impl Observe<'_> {
     /// not started.
     ///
     /// # Errors
-    /// As [`Observe::drift`].
+    /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` for a malformed feature
+    /// map, `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and
+    /// `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
     fn drift_value(
         &self,
         features: &Value,
@@ -261,55 +221,6 @@ impl Observe<'_> {
         started.bifrost.insert_observation(
             &started.drift,
             drift::rows(&record)?,
-            self.run.correlation(),
-        )?;
-        Ok(())
-    }
-
-    /// Emit one Eval observation from a `Serialize` context value.
-    ///
-    /// # Arguments
-    /// * `context` - The context object the Eval observation records.
-    /// * `options` - The optional trace correlation, session, and media.
-    ///
-    /// # Errors
-    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
-    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, a validation error when
-    /// `span_id` is supplied without `trace_id`,
-    /// `WYRD_SDK_400_INVALID_OBSERVATION` when the context or media cannot be
-    /// encoded, and `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
-    pub fn eval<T: Serialize>(
-        &self,
-        context: &T,
-        options: EvalObservationOptions,
-    ) -> Result<(), WyrdError> {
-        self.eval_value(to_value(context, "eval context")?, options)
-    }
-
-    /// Emit one Eval observation from a foreign runtime's JSON text.
-    ///
-    /// # Arguments
-    /// * `json` - The context object as JSON text.
-    /// * `options` - The optional trace correlation, session, and media.
-    ///
-    /// # Errors
-    /// As [`Observe::eval`], plus an invalid-observation error when `json` is
-    /// not valid JSON.
-    #[cfg(feature = "internal")]
-    pub fn eval_json(&self, json: &str, options: EvalObservationOptions) -> Result<(), WyrdError> {
-        self.eval_value(parse_json(json, "eval context")?, options)
-    }
-
-    /// Project and enqueue one Eval observation.
-    ///
-    /// # Errors
-    /// As [`Observe::eval`].
-    fn eval_value(&self, context: Value, options: EvalObservationOptions) -> Result<(), WyrdError> {
-        let record = eval::observation(context, options)?;
-        let started = self.run.state.started_bifrost()?;
-        started.bifrost.insert_observation(
-            &started.eval,
-            vec![eval::row(&record)?],
             self.run.correlation(),
         )?;
         Ok(())
@@ -376,112 +287,175 @@ impl Observe<'_> {
 }
 
 impl Observe<'_> {
-    /// Judge `input` with the Verifier named `verifier` and return its judgment.
+    /// Execute the Verifier named `verifier` on this view's subject now and
+    /// return its attributable result.
     ///
-    /// `verifier` is the `metadata.name` of a Verifier bound in `verified_by`
-    /// to this view's subject in the hydrated graph; the subject is always
-    /// this view's. An Eval Verifier takes one context object, in the forms
-    /// [`Observe::eval`] accepts; a Drift Verifier takes a non-empty sequence
-    /// of feature rows, in the forms [`Observe::drift`] accepts. It creates
-    /// no observation, run, or Operator dispatch, and Bifrost need not be
-    /// started; the server records the judgment as one result correlated to
-    /// this Run. A `failed` verdict is a normal return.
+    /// `verifier` is the `metadata.name` of a Verifier bound in
+    /// `verified_by` to this view's subject in the hydrated graph. Values
+    /// project onto its named slots as [`Inputs`] describes; files are hashed
+    /// and uploaded during this call. The execution carries this view's
+    /// `run_id`, creates no queued work, and dispatches no Operator. A failed
+    /// verdict is a normal result, not an error.
     ///
     /// # Arguments
     /// * `verifier` - The `metadata.name` of a Verifier bound to this view's subject.
-    /// * `input` - One Eval context object, or a non-empty sequence of Drift feature rows.
+    /// * `inputs` - Values named by slot, or one value for a single-slot Verifier.
     ///
     /// # Errors
     /// Returns `WYRD_SDK_404_UNKNOWN_VERIFIER` when no Verifier of that name
-    /// is bound to the subject and `WYRD_SDK_400_INVALID_OBSERVATION` when the
-    /// input's shape does not match the Verifier's kind, both before any
-    /// network call; the client resolution error when no server or credential
-    /// is configured; and the server's refusal, including
-    /// `WYRD_VERIFICATION_409_BASELINE_NOT_READY` for an unfitted baseline.
+    /// is bound to the subject, `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED`
+    /// for a scheduled-window Verifier, which only `submit` records samples
+    /// for, and the slot refusals of `submit`, all before any execution
+    /// request; then the client resolution error and the server's refusal,
+    /// including `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` after the
+    /// 60-second deadline.
     ///
     /// # Cancellation
-    /// Dropping the future abandons the request; the call is never retried.
-    pub async fn verify<T: Serialize>(
+    /// Dropping the future abandons the request; it is never retried.
+    pub async fn verify(
         &self,
         verifier: &str,
-        input: &T,
-    ) -> Result<Judgment, WyrdError> {
-        self.verify_value(verifier, to_value(input, "verify input")?, Vec::new())
-            .await
+        inputs: impl Into<Inputs>,
+    ) -> Result<VerificationResult, WyrdError> {
+        let state = &self.run.state;
+        let bound = state.bound_verifier(&self.run.subject, verifier)?;
+        let target = self.target(&bound);
+        match target.project(inputs.into())? {
+            Projected::Run(run) => target.execute(state.client()?, run).await,
+            Projected::Window(_) => Err(WyrdError::VerificationInputUnsupported {
+                message:
+                    "a scheduled-window Verifier judges recorded samples; record them with submit"
+                        .to_owned(),
+                details: json!({ "verifier": verifier }),
+            }),
+        }
     }
 
-    /// Judge one Eval context carrying media a judge Prompt binds by `id`.
+    /// Submit evidence for the Verifier named `verifier` on this view's
+    /// subject without waiting for a judgment.
     ///
-    /// # Arguments
-    /// * `verifier` - The `metadata.name` of an Eval Verifier bound to this view's subject.
-    /// * `context` - The Eval context object.
-    /// * `media` - Media references a judge Prompt binds by `id`.
-    ///
-    /// # Errors
-    /// As [`Observe::verify`], plus `WYRD_SDK_400_INVALID_OBSERVATION` when
-    /// `verifier` is a Drift Verifier, which takes no media.
-    ///
-    /// # Cancellation
-    /// As [`Observe::verify`].
-    pub async fn verify_with_media<T: Serialize>(
-        &self,
-        verifier: &str,
-        context: &T,
-        media: Vec<MediaRef>,
-    ) -> Result<Judgment, WyrdError> {
-        self.verify_value(verifier, to_value(context, "verify input")?, media)
-            .await
-    }
-
-    /// Judge input from a foreign runtime's JSON text.
+    /// Run evidence is staged for one queued execution and returns its
+    /// [`Execution`]; a `202` confirms staging, not queue
+    /// acceptance, so a replay conflict or a loss before acceptance surfaces
+    /// through the handle. Window samples are recorded through this state's
+    /// Bifrost Drift observation path and return [`Submission::Recorded`]:
+    /// the Verifier's schedule judges the window later.
     ///
     /// # Arguments
     /// * `verifier` - The `metadata.name` of a Verifier bound to this view's subject.
-    /// * `json` - The input as JSON text, in the shape [`Observe::verify`] takes.
-    /// * `media` - Media references a judge Prompt binds by `id`; empty for none.
+    /// * `inputs` - Values named by slot, or one value for a single-slot Verifier.
     ///
     /// # Errors
-    /// As [`Observe::verify_with_media`], plus an invalid-observation error
-    /// when `json` is not valid JSON or a Drift row carries an integer literal
-    /// beyond exact `Float64` range.
+    /// Returns `WYRD_SDK_404_UNKNOWN_VERIFIER` for an unbound name and
+    /// `WYRD_VERIFICATION_400_INPUT_INVALID` for an unknown slot, a value of
+    /// the wrong kind, an unreadable file, or a file format its slot does not
+    /// accept, and `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` for a file above
+    /// its slot's `max_bytes`, all before any execution request; for Window
+    /// samples, the Bifrost lifecycle and queue errors of an observation;
+    /// otherwise the client resolution error and the server's refusal.
     ///
     /// # Cancellation
-    /// As [`Observe::verify`].
-    #[cfg(feature = "internal")]
-    pub async fn verify_json(
+    /// Dropping the future after the request was sent may leave a staged
+    /// submission whose execution ID the caller never learns.
+    pub async fn submit(
         &self,
         verifier: &str,
-        json: &str,
-        media: Vec<MediaRef>,
-    ) -> Result<Judgment, WyrdError> {
-        verify::check_drift_integer_literals(json)?;
-        self.verify_value(verifier, parse_json(json, "verify input")?, media)
+        inputs: impl Into<Inputs>,
+    ) -> Result<Submission, WyrdError> {
+        match self.record_or_stage(verifier, inputs)? {
+            None => Ok(Submission::Recorded),
+            Some(staged) => Ok(Submission::Queued(self.enqueue_run(staged).await?)),
+        }
+    }
+
+    /// The synchronous half of [`Observe::submit`]: project `inputs` for the
+    /// Verifier named `verifier`, record Window samples now, and return
+    /// `None`, or return the Run evidence still to enqueue.
+    ///
+    /// A foreign runtime calls this on its own thread, inside its producer
+    /// span scope, so each recorded sample's queued write records its
+    /// `bifrost.enqueue` PRODUCER span there.
+    ///
+    /// # Errors
+    /// As [`Observe::submit`], before any execution request.
+    #[cfg(feature = "internal")]
+    pub fn stage(
+        &self,
+        verifier: &str,
+        inputs: impl Into<Inputs>,
+    ) -> Result<Option<StagedRun>, WyrdError> {
+        self.record_or_stage(verifier, inputs)
+    }
+
+    /// Project `inputs` for the Verifier named `verifier`: record Window
+    /// samples and return `None`, or return the Run evidence to enqueue.
+    ///
+    /// # Errors
+    /// As [`Observe::submit`], before any execution request.
+    fn record_or_stage(
+        &self,
+        verifier: &str,
+        inputs: impl Into<Inputs>,
+    ) -> Result<Option<StagedRun>, WyrdError> {
+        let bound = self.run.state.bound_verifier(&self.run.subject, verifier)?;
+        match self.target(&bound).project(inputs.into())? {
+            Projected::Run(evidence) => Ok(Some(StagedRun {
+                verifier: verifier.to_owned(),
+                evidence,
+            })),
+            Projected::Window(features) => {
+                self.drift_value(&features, None)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// The asynchronous half of [`Observe::submit`]: pin `staged`'s files
+    /// and stage it for one queued execution.
+    ///
+    /// # Errors
+    /// As [`Observe::submit`] for Run evidence.
+    ///
+    /// # Cancellation
+    /// As [`Observe::submit`].
+    #[cfg(feature = "internal")]
+    pub async fn enqueue_staged(&self, staged: StagedRun) -> Result<Execution, WyrdError> {
+        self.enqueue_run(staged).await
+    }
+
+    /// Pin `staged`'s files and stage it for one queued execution.
+    ///
+    /// # Errors
+    /// As [`Observe::submit`] for Run evidence.
+    ///
+    /// # Cancellation
+    /// As [`Observe::submit`].
+    async fn enqueue_run(&self, staged: StagedRun) -> Result<Execution, WyrdError> {
+        let state = &self.run.state;
+        let bound = state.bound_verifier(&self.run.subject, &staged.verifier)?;
+        self.target(&bound)
+            .enqueue(state.client()?, staged.evidence)
             .await
     }
 
-    /// Resolve the bound Verifier, build its request, and execute it.
-    ///
-    /// Resolution and input conversion are local and complete before the
-    /// client is resolved, so a refusal of either sends nothing.
-    ///
-    /// # Errors
-    /// As [`Observe::verify_with_media`].
-    async fn verify_value(
-        &self,
-        verifier: &str,
-        input: Value,
-        media: Vec<MediaRef>,
-    ) -> Result<Judgment, WyrdError> {
-        let state = &self.run.state;
-        let bound = state.bound_verifier(&self.run.subject, verifier)?;
-        let request = ExecuteVerificationRequest {
-            verifier_card_uid: bound.verifier_card_uid,
-            card_uid: bound.card_uid,
-            input: verify::direct_input(bound.implementation, input, media)?,
-            run_id: Some(self.run.run_id.clone()),
-        };
-        verify::execute(state.client()?, &request).await
+    /// The execution target of `bound` for this view's Run.
+    fn target<'a>(&self, bound: &'a BoundVerifier) -> Target<'a> {
+        Target {
+            spec: &bound.spec,
+            verifier_card_uid: bound.verifier_card_uid.clone(),
+            card_uid: bound.card_uid.clone(),
+            run_id: self.run.run_id.clone(),
+        }
     }
+}
+
+/// Run evidence [`Observe::stage`] projected and still has to enqueue.
+#[derive(Debug)]
+pub struct StagedRun {
+    /// The bound Verifier's `metadata.name`, resolved again on enqueue.
+    verifier: String,
+    /// The projected evidence, before its files are pinned.
+    evidence: RunEvidence,
 }
 
 /// Serialize the bytes of one projected row.

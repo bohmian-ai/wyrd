@@ -4,17 +4,16 @@ description: How Wyrd records what a declared service actually does, and ties ea
 pillar: wyrd
 section: Understand
 order: 3
-draft: true
 ---
 
 Observe is how you record what the declared system actually does. Observations go straight into Bifrost, the Wyrd data plane. You can record:
 
 - telemetry: traces, metrics, and logs;
-- drift measurements;
-- agent and model eval results;
+- drift samples;
+- the inputs and results of every verification;
 - custom data in your own tables.
 
-You write observations through the Rust, Python, or TypeScript SDK, through OpenTelemetry instrumentation such as an [agent framework's spans](/build-and-verify/observe/record-a-run-and-observations/#trace-an-agent-framework), or through the HTTP API. Each observation is tied to the Card and run that produced it, so a verdict can always point back to exactly what ran.
+You write observations through the Rust, Python, or TypeScript SDK, through OpenTelemetry instrumentation such as an agent framework's spans, or through the HTTP API. Each observation is tied to the Card and run that produced it, so a verdict can always point back to exactly what ran.
 
 If the data already lives elsewhere, such as Prometheus or a SQL warehouse, a Source Card describes where it is. The server does not read Source Cards yet; see [Read data where it already lives](#read-data-where-it-already-lives).
 
@@ -38,7 +37,6 @@ with state.run("agent") as run:
         "vala.datasets.tickets",
         {"ticket_id": ticket_id, "question": question, "answer": answer, "refund": "refund" in question},
     )
-    run.observe.eval({"answer": answer})
 ```
 
 </LangTab>
@@ -47,14 +45,12 @@ with state.run("agent") as run:
 ```rust
 let run = state.run_for_card("agent")?;
 let answer = run.invoke(&[("question", question)]).await?;
-let observe = run.observe();
-observe
+run.observe()
     .record(
         "vala.datasets.tickets",
         &json!({ "ticket_id": ticket_id, "question": question, "answer": answer, "refund": question.contains("refund") }),
     )
     .await?;
-observe.eval(&json!({ "answer": answer }), EvalObservationOptions::default())?;
 ```
 
 </LangTab>
@@ -69,13 +65,12 @@ await run.observe.record("vala.datasets.tickets", {
   answer,
   refund: question.includes("refund"),
 });
-run.observe.eval({ answer });
 ```
 
 </LangTab>
 </LangTabs>
 
-`state.run("agent")` scopes the run to the `agent` component, so the eval row is about `support-agent@1.0.0`. The ticket row, the eval row, and the Agent's gateway call all share one `run_id`, so one question reads back as one invocation. When one request touches several components, `run.for_card(alias)` scopes the same run to each in turn. A `session_id` groups the runs of one conversation and must be a UUID.
+`state.run("agent")` scopes the run to the `agent` component, so the ticket row is about `support-agent@1.0.0`. The ticket row, the Agent's trace spans, and its gateway call all share one `run_id`, so one question reads back as one invocation. When one request touches several components, `run.for_card(alias)` scopes the same run to each in turn. A `session_id` groups the runs of one conversation and must be a UUID.
 
 Opening a run makes no network call and creates nothing on the server. A run exists only as the `run_id` on the rows it produced.
 
@@ -85,8 +80,8 @@ Each kind of observation has its own table in Bifrost:
 
 | You call | Lands in | Read by |
 | --- | --- | --- |
-| `observe.drift(features)` | `vala.drift.observations`, one row per feature | `drift` Verifiers on their schedule |
-| `observe.eval(context)` | `vala.eval.observations` | `eval` Verifiers, as each row is committed |
+| `observe.submit(verifier, samples)` on a drift Verifier | `vala.drift.observations`, one row per feature | That Verifier, on its schedule |
+| `observe.verify` and `observe.submit` on other Verifiers | `vala.verification.execution_inputs` and `vala.verification.results` | Your queries; see [How verification works](/understand/how-verification-works/) |
 | `observe.record(table, row)` | Your own `vala.datasets.<name>` table | Your queries |
 | OpenTelemetry spans, metrics, and logs | `vala.traces.spans`, `vala.metrics.points`, and `vala.logs.records` | Your queries |
 | Calls through the AI Gateway | `vala.gateway.calls` and `vala.traces.spans` | Your queries |
@@ -101,7 +96,7 @@ Every row also carries columns you do not write:
 | `wyrd_request_id` | The server, per write request | Which write delivered it, and which audit record goes with it? |
 | `wyrd_ingested_at` | The server | When did Bifrost receive it? |
 
-Event time lives in each table's own time column: `created_at` for drift and eval observations, `start_time_unix_nano` for spans, and `time_unix_nano` for logs and metrics. A table registered through the Bifrost client can name a `time_column`; a table declared on a Service cannot, and uses `wyrd_ingested_at`. There is no shared event-time column across tables.
+Event time lives in each table's own time column: `created_at` for drift samples, `start_time_unix_nano` for spans, and `time_unix_nano` for logs and metrics. A table registered through the Bifrost client can name a `time_column`; a table declared on a Service cannot, and uses `wyrd_ingested_at`. There is no shared event-time column across tables.
 
 `card_uid` is checked, not trusted. A service's credential is bound to the Cards in its own graph, and the server rejects an observation about any other Card with `WYRD_VALA_403_BIFROST_CARD_SCOPE`, so one service cannot write evidence about another.
 
@@ -117,17 +112,17 @@ Inside a running service, `observe.record` writes a row tied to the current run 
 
 Outside a service, such as a backfill, a batch job, or a notebook, use the Bifrost client directly: register a table from a type you already have, insert rows, and query them with SQL. Those rows carry no run. [Write and query custom data with Bifrost](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/) covers it.
 
-Both paths write only to `vala.datasets`. The drift, eval, telemetry, and verification tables are written by Wyrd.
+Both paths write only to `vala.datasets`. The drift, telemetry, and verification tables are written by Wyrd.
 
 ## Query the evidence
 
-Everything above is queryable with SQL from any SDK or the `bifrost.query` MCP tool. This joins one conversation's verdicts back to what the agent was given:
+Everything above is queryable with SQL from any SDK or the `bifrost.query` MCP tool. This joins each verdict back to the ticket the same run recorded:
 
 ```sql
-SELECT o.run_id, o.context, r.verdict, r.verifier_version
-FROM vala.eval.observations AS o
-JOIN vala.verification.results AS r ON r.source_record_id = o.record_id
-WHERE o.session_id = $1
+SELECT t.run_id, t.question, t.answer, r.verdict, r.verifier_version
+FROM vala.datasets.tickets AS t
+JOIN vala.verification.results AS r ON r.run_id = t.run_id
+WHERE t.ticket_id = $1
 ```
 
 Bifrost keeps every observation and verdict, so a question like "which model version was running when this verdict failed, and what did it see?" is one query, months later.

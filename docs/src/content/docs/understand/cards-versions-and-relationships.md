@@ -4,7 +4,6 @@ description: A Service declaration is a set of versioned Cards, each one a defin
 pillar: wyrd
 section: Understand
 order: 1
-draft: true
 ---
 
 A Card is a versioned declaration: one model, prompt, agent, or dataset in your system, or one rule for checking them. You declare a whole service as a folder of Card files in YAML, whatever language the service is written in, and a Service Card ties the set together by naming its components.
@@ -24,78 +23,46 @@ Wyrd has 14 Card kinds. These are the ones a service declaration uses most:
 
 Not every Card starts in YAML. In a traditional ML workflow, you register `Data` and `Model` Cards from code as they are produced, with the Python SDK.
 
-The examples on this page use `support-desk`, the service in [`examples/support-desk/`](https://github.com/bohmian-ai/wyrd/tree/main/examples/support-desk): an agent that answers customer questions, the prompt it runs, and two Verifiers that check its answers. The quickstart and the SDK journey tests run the same Cards.
+The examples on this page use the support-desk Service in `examples/support-desk-app/service/`, the same Cards the [quickstart](/get-started/quickstart/) runs: an agent that answers customer questions, the prompt it runs, three Verifiers that check it, and the judge Agent one of those Verifiers calls.
 
 ## Every Card has the same shape
 
-Each Card is a YAML document with six top-level fields. You write the first four; the server writes the rest.
+Each Card is a YAML document with six top-level fields. You write the first four; the server writes the rest. Switch tabs to see how the Service, its Agent, and the Prompt fit together:
 
-```yaml title="service/support-agent.yaml"
-apiVersion: wyrd/v1
-kind: Agent
-metadata:
-  name: support-agent
-  version: 1.0.0
-  space: default
-spec:
-  prompt: ./support-prompt.yaml  # a Prompt Card file with its own version
-  tool_names: []
-  run_config:
-    max_iterations: 1
-```
+<Tabs>
+<Tab label="support-desk.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/support-desk.yaml" lang="yaml" title="service/support-desk.yaml" />
+
+</Tab>
+<Tab label="support-agent.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/support-agent.yaml" lang="yaml" title="service/support-agent.yaml" />
+
+</Tab>
+<Tab label="support-prompt.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/support-prompt.yaml" lang="yaml" title="service/support-prompt.yaml" />
+
+</Tab>
+</Tabs>
 
 | Field | Who writes it | Holds |
 | --- | --- | --- |
 | `apiVersion` | You | Always `wyrd/v1`; a Card without it is rejected |
 | `kind` | You | One of the Card kinds above |
-| `metadata` | You | `space`, `name`, and optionally `version`, `labels`, and `annotations` |
+| `metadata` | You | `space`, `name`, and optionally `version`, `bump`, `labels`, and `annotations` |
 | `spec` | You | The kind-specific body |
-| `relationships` | The server | Every Card this one references and every Card that references it |
-| `status` | The server | Lifecycle state, such as whether uploads finished and the Card is active |
+| `relationships` | The server | `outbound_refs` and `inbound_refs`: every Card this one references and every Card that references it |
+| `status` | The server | `phase` (`pending`, `active`, `deprecated`, `failed`, `expired`, or `deleted`), `message`, `updated_at`, and `verification`, the state of its bindings and Triggers |
 
-A Card is identified by `space`, `kind`, `name`, and `version`. A `space` groups related Cards, such as a team or a domain. Leave it out and the CLI and SDKs fill it in from your `wyrd.toml` defaults, or `default` if none is set.
+A Card is identified by `space`, `kind`, `name`, and `version`. A `space` groups related Cards, such as a team or a domain. Leave it out and the CLI and SDKs fill it in from `wyrd.toml`, [`[kind.<Kind>]` before `[defaults]`](/build-and-verify/declare/define-a-service/#set-the-space-once), or use `default`.
 
 ## A Service names its components
 
-The Service Card is the root of the declaration. Each component gets an `alias`, the name your code uses to reach it at runtime.
+The Service Card is the root of the declaration. Each component gets an `alias`, the name your code uses to reach it at runtime, such as `run.for_card("agent")`. `verified_by` binds Verifiers: on the Service itself, or on one component. `tables` declares `vala.datasets.tickets`, which registration creates in Bifrost.
 
-```yaml title="service/support-desk.yaml"
-apiVersion: wyrd/v1
-kind: Service
-metadata:
-  name: support-desk
-  version: 1.0.0
-  space: default
-spec:
-  service_type: agent
-  tables:
-    - name: tickets
-      schema:
-        type: object
-        properties:
-          ticket_id: {type: string}
-          question: {type: string}
-          answer: {type: string}
-          refund: {type: boolean}
-        required: [ticket_id, question, answer, refund]
-  components:
-    - alias: agent
-      ref: ./support-agent.yaml
-    - alias: prompt
-      ref: ./support-prompt.yaml
-```
-
-Both components point at files in the declaration folder, so Wyrd registers those Cards first. `tables` declares `vala.datasets.tickets`, which registration creates in Bifrost. The real file also attaches Verifiers to `agent`; [How verification works](/understand/how-verification-works/#bindings-attach-verifiers-to-what-they-check) covers that part.
-
-Register the whole folder with one command:
-
-```bash
-wyrd apply examples/support-desk/service/
-```
-
-`wyrd apply` reads every Card in the folder, registers them in dependency order, and makes the Service the root. The folder must have exactly one root. If any Card fails validation, nothing is registered.
-
-To validate the folder locally first, without contacting the server, run `wyrd plan examples/support-desk/service/`.
+Registering `support-desk.yaml` registers every Card it reaches, dependencies first. One root is required: Cards nothing references are allowed only if exactly one of them is a Service, and with a Service root every Verifier in the folder must be bound. [Define a Service](/build-and-verify/declare/define-a-service/) and [Register and inspect](/build-and-verify/declare/register-and-inspect/) walk through it.
 
 ## Three ways to reference another Card
 
@@ -103,11 +70,19 @@ Wherever one Card points at another, you can write the reference three ways.
 
 | Form | Example | Use it when |
 | --- | --- | --- |
-| Registered Card | `ref: { kind: Model, name: churn-classifier, version: 1.4.2 }` | The Card already exists in the registry |
-| File path | `ref: ./support-agent.yaml` | The Card lives in the same folder; Wyrd registers it first |
-| Inline | `prompt: { model: ..., request: ... }` | The body only makes sense inside its parent; it gets no identity of its own, except an Agent's Prompt |
+| Registered Card | `ref: {kind: Model, name: churn-classifier, version: 1.4.2}` | The Card already exists in the registry |
+| File path | `ref: ./support-agent.yaml` | The Card file is in your declaration; Wyrd registers it first |
+| Inline | `prompt: {provider: openai, model: gpt-6-luna, messages: [...]}` | The body only makes sense inside its parent |
 
-A registered reference always names an exact `version`. A path is relative to the file that contains it, not to the folder you run `wyrd apply` from, and the Card in that file must set its own `metadata.version`. An inline body is written directly under the field, with no wrapper key. Inline bodies are allowed only where the field accepts them: an Agent's `prompt`, an LLM judge's agent, and a verification binding's Trigger and Operators. An Agent's inline `prompt` is the exception to having no identity: registering the Agent also registers it as a Prompt Card named `<agent-name>-prompt`, in the Agent's space with its own version line, so `state.agent(alias).prompt()` returns it like any other Prompt Card.
+Rules for each form:
+
+| Form | Rule |
+| --- | --- |
+| Registered Card | Names an exact `version`, such as `1.4.2` |
+| File path | Relative to the file that contains it, not to where you run `wyrd apply`; the Card in that file sets its own `metadata.version` |
+| Inline | Written directly under the field, with no wrapper key; allowed only for an Agent's `prompt`, a Verifier's `agent`, and a binding's `runs_on` and `on_failure` |
+
+An inline body gets no identity of its own, with one exception: an Agent's inline `prompt` is registered as a Prompt Card named `<agent-name>-prompt`, in the Agent's space, so `state.agent(alias).prompt()` returns it like any other Prompt Card.
 
 ## Versions are exact
 
@@ -120,16 +95,11 @@ Every reference names an exact version, so a registered Service records exactly 
 | No `version`, content unchanged | Nothing new; the existing version stands |
 | `version: 1` or `version: 1.2` | The next version within that line, or `1.0.0` / `1.2.0` if the line is empty |
 | `version: 2.1.0` | Exactly `2.1.0`; re-registering it with different content fails with `WYRD_REGISTRY_409_SPEC_DRIFT` |
+| `bump: minor` with no `version` or a partial one | Bumps that part instead of the patch; `major`, `minor`, and `patch` (the default) are allowed, and an exact `version` refuses it |
 
-So `support-desk@1.0.0` is stored with `support-agent@1.0.0` and `support-prompt@1.0.0`. The same holds for a registered reference: if the desk referenced `churn-classifier@1.4.2`, registering `churn-classifier@1.5.0` later would not change the Service. To pick up the new model, change the reference to `1.5.0` and re-apply; the Service content changed, so Wyrd records a new Service version.
+So `support-desk@1.0.0` is stored with `support-agent@1.0.0`, `support-prompt@1.0.0`, and the exact Verifier versions it binds. The same holds for a registered reference: if the desk referenced `churn-classifier@1.4.2`, registering `churn-classifier@1.5.0` later would not change the Service. To pick up the new model, change the reference to `1.5.0` and re-apply; the Service content changed, so Wyrd records a new Service version.
 
 This is what makes a verdict reproducible. A verdict always names the Service version it checked, and that version names exactly which model, prompt, and agent ran.
-
-To see what a name currently resolves to:
-
-```bash
-wyrd latest --kind Agent --space default --name support-agent
-```
 
 ## Register Cards from code
 
@@ -164,32 +134,39 @@ cards.model.register(card)
 
 A `ModelCard` needs a signature, the names and types of the model's inputs and outputs; without one, construction fails with `WYRD_MODEL_400_MISSING_SIGNATURE`. Code-built Cards default to version `0.1.0`, so set `version` yourself. `register` updates the card object in place with its server-assigned `uid`. The Service can now list it as a component with `ref: { kind: Model, name: churn-classifier, version: 1.4.2 }`.
 
-The Rust and TypeScript SDKs do not build `Data` or `Model` Cards in code. They register Card files, including any `artifacts:` the file lists, with `register_from_path` and `registerFromPath`.
+Python can register a Prompt from code the same way, with `cards.prompt.register`. The Rust and TypeScript SDKs do not build Cards in code; they register Card files, including `Data` and `Model` files that list `artifacts:`, with `register_from_path` and `registerFromPath`.
 
 ## Relationships come from references
 
-You never write `relationships` yourself. When a Card is registered, the server reads every reference in its `spec` and records the edge in both directions. For the components of `support-desk` that graph is:
+You never write `relationships` yourself. When a Card is registered, the server reads every reference in its `spec`, components and bindings alike, and records the edge in both directions. For `support-desk` that graph is:
 
 ```text
 Service support-desk
-├── Agent support-agent
-│   └── Prompt support-prompt
-└── Prompt support-prompt
+├── agent:  Agent support-agent
+│           └── Prompt support-prompt
+├── prompt: Prompt support-prompt
+├── Verifier no-refund-promise
+├── Verifier ticket-complete
+└── Verifier follows-policy
+            └── Agent policy-judge
 ```
 
-Two things follow from that graph:
+Components carry their alias in `outbound_refs`; binding edges have none.
 
-- **Lineage.** From any Card you can walk to everything it depends on and everything that depends on it. Before changing `support-prompt`, you can see every Agent and Service that uses it.
-- **Observation scope.** A running service may only record observations about Cards in its own graph. `support-desk` can record observations for `support-agent` or `support-prompt`, but not for a Card it does not reference. See [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/).
+The graph gives you lineage. From any Card you can walk to everything it depends on and everything that depends on it, so before changing `support-prompt` you can see every Agent and Service that uses it.
+
+It also scopes observations. A running service may only record observations about Cards in its own graph: `support-desk` can record them for `support-agent` or `support-prompt`, but not for a Card it does not reference. See [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/).
 
 ## What can go wrong
 
-| Error code | Cause |
-| --- | --- |
-| `WYRD_LOADER_400_INVALID_ENVELOPE` | A Card file is missing a required top-level field, such as `apiVersion` or `kind` |
-| `WYRD_REGISTRY_409_SPEC_DRIFT` | An exact `version` is already registered with different content |
-| `WYRD_REGISTRY_400_UNRESOLVED_PATH_REF` | A `ref:` path does not point at a Card file |
-| `WYRD_REGISTRY_400_DEPENDENCY_CYCLE` | Two Cards reference each other, directly or through others |
-| `WYRD_REGISTRY_400_UNRESOLVED_INLINE_REFERENCE` | An inline body references a Card that does not exist |
+| Error code | Cause | Fix |
+| --- | --- | --- |
+| `WYRD_CLI_400_CARD_LOAD` from `wyrd plan` or `wyrd apply`, `WYRD_LOADER_400_INVALID_ENVELOPE` from an SDK | A file failed to load; each problem is listed with its file | Fix the files listed |
+| `WYRD_REGISTRY_400_UNRESOLVED_PATH_REF`, after `WYRD_LOADER_400_IO` | A `ref:` path points at no file; the message names the file that holds the `ref` | Fix the path, relative to that file |
+| `WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND` | A Verifier, Trigger, Operator, Audit, or Source is listed as a component | Bind it with `verified_by` instead |
+| `WYRD_SPEC_400_UNBOUND_VERIFIER_PEER` | A Verifier file in the folder is not bound to anything | Bind it, or move it out of the folder |
+| `WYRD_REGISTRY_409_SPEC_DRIFT` | An exact `version` is already registered with different content | Bump the `version` |
+| `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` | A registered-Card reference names a Card that does not exist | Register it first, or fix the reference |
+| `WYRD_PERMISSION_403_DENIED_RBAC` | Your credential lacks `cards:write` | Use a credential that can register Cards |
 
 Next, [How verification works](/understand/how-verification-works/) shows how Verifiers attach to these Cards.

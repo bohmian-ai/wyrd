@@ -5,7 +5,10 @@
 mod context;
 mod export;
 
-pub use context::{continued_context, current_context, inbound_context, serve_request};
+pub use context::{
+    adopt_span, caller_sampled, continued_context, current_context, inbound_context,
+    serve_linked_work, serve_request,
+};
 pub use export::{TenantSpanRoute, TenantSpanSink, bind_operation_route, bind_tenant_route};
 
 #[cfg(feature = "test-support")]

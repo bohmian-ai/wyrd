@@ -430,11 +430,11 @@ spec:
       verified_by:
         - verifier: { kind: Verifier, name: model-drift, version: v3 }
           runs_on: { kind: schedule, cron: "0 * * * *" }
+          inputs: { current: { features: [basket_value, item_count] } }
     - alias: agent_triage
       ref: { kind: Agent, name: checkout-agent, version: v6 }
       verified_by:
         - verifier: { kind: Verifier, name: checkout-agent-eval, version: v4 }
-          runs_on: { kind: observations_ready }
     - alias: agent_inline
       ref: { kind: Agent, name: fraud-review, version: v2 }
     - alias: model_shadow

@@ -20,8 +20,6 @@ use wyrd_spec::vala::eval::result::AssertionResult;
 use wyrd_spec::vala::ids::TraceId;
 
 use crate::error::EvalExecError;
-use crate::store::JudgeOutcome;
-use crate::tasks::MediaBindings;
 
 /// Typed identity tuple every [`AssertionResult`] row aggregates against.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,24 +34,14 @@ pub struct RecordIdentity {
 
 /// Engine-local payload of one task.
 ///
-/// `AssertionResult` is the wire shape the aggregator (commit 12) and the
-/// persistence layer consume; `TaskOutput` is the engine-local view that
-/// retains the judge raw / parsed payload so a downstream task can JSONPath
-/// into `$.task.<judge_id>.parsed` per the scoped-view contract.
+/// `AssertionResult` is the wire shape the aggregator and the persistence
+/// layer consume; `TaskOutput` tags it with the executor kind that produced
+/// it so a downstream task can JSONPath into `$.task.<id>` per the
+/// scoped-view contract.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaskOutput {
     /// An [`crate::tasks::AssertionTaskExecutor`] result.
     Assertion(AssertionResult),
-    /// An [`crate::tasks::JudgeTaskExecutor`] result plus the judge invocation
-    /// payload retained for downstream tasks.
-    Judge {
-        /// Persisted assertion-result row.
-        result: AssertionResult,
-        /// Judge raw / parsed payload retained on the snapshot.
-        ///
-        /// Boxed so the judge variant does not dominate every `TaskOutput`.
-        outcome: Box<JudgeOutcome>,
-    },
     /// An [`crate::tasks::TraceTaskExecutor`] result.
     Trace(AssertionResult),
     /// An [`crate::tasks::AgentTaskExecutor`] result.
@@ -65,10 +53,7 @@ impl TaskOutput {
     #[must_use]
     pub fn result(&self) -> &AssertionResult {
         match self {
-            Self::Assertion(result)
-            | Self::Trace(result)
-            | Self::Agent(result)
-            | Self::Judge { result, .. } => result,
+            Self::Assertion(result) | Self::Trace(result) | Self::Agent(result) => result,
         }
     }
 }
@@ -88,10 +73,6 @@ pub struct ContextSnapshot {
     pub base_context: Arc<Value>,
     /// Per-task outputs accumulated by prior stages.
     pub task_outputs: Arc<HashMap<TaskId, Arc<TaskOutput>>>,
-    /// Per-record opaque media bindings.
-    pub media: Arc<MediaBindings>,
-    /// Media ids required by this record's judge context.
-    pub required_media: Arc<Vec<String>>,
 }
 
 impl ContextSnapshot {
@@ -103,18 +84,6 @@ impl ContextSnapshot {
             trace_id: None,
             base_context,
             task_outputs: Arc::new(HashMap::new()),
-            media: Arc::new(MediaBindings::new()),
-            required_media: Arc::new(Vec::new()),
-        }
-    }
-
-    /// Attach media and required media ids to this snapshot.
-    #[must_use]
-    pub fn with_media(self, media: MediaBindings, required_media: Vec<String>) -> Self {
-        Self {
-            media: Arc::new(media),
-            required_media: Arc::new(required_media),
-            ..self
         }
     }
 
@@ -148,8 +117,6 @@ impl ContextSnapshot {
             trace_id: self.trace_id,
             base_context: Arc::clone(&self.base_context),
             task_outputs: Arc::new(next),
-            media: Arc::clone(&self.media),
-            required_media: Arc::clone(&self.required_media),
         }
     }
 
@@ -182,18 +149,9 @@ impl ContextSnapshot {
     }
 }
 
+/// Project one task output into its `$.task.<id>` scoped-view object.
 fn output_to_view(output: &TaskOutput) -> Value {
-    match output {
-        TaskOutput::Assertion(result) | TaskOutput::Trace(result) | TaskOutput::Agent(result) => {
-            Value::Object(result_view(result))
-        }
-        TaskOutput::Judge { result, outcome } => {
-            let mut map = result_view(result);
-            map.insert("parsed".to_owned(), outcome.parsed.clone());
-            map.insert("raw".to_owned(), outcome.raw.clone());
-            Value::Object(map)
-        }
-    }
+    Value::Object(result_view(output.result()))
 }
 
 fn result_view(result: &AssertionResult) -> Map<String, Value> {
@@ -247,17 +205,6 @@ impl ExecutionContext {
             scenario_id,
         };
         let snapshot = ContextSnapshot::new(Arc::new(base_context), identity);
-        Self::from_snapshot(Arc::new(snapshot))
-    }
-
-    /// Return a context with per-record media attached.
-    #[must_use]
-    pub fn with_media(self, media: MediaBindings, required_media: Vec<String>) -> Self {
-        let snapshot = self
-            .snapshot
-            .as_ref()
-            .clone()
-            .with_media(media, required_media);
         Self::from_snapshot(Arc::new(snapshot))
     }
 

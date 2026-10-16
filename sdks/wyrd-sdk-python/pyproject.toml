@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "wyrd-ai"
-version = "0.1.1"
+version = "0.2.0"
 description = "Python bindings for Wyrd"
 readme = { text = "Python SDK for Wyrd verification and assurance.", content-type = "text/markdown" }
 requires-python = ">=3.11"
@@ -104,7 +104,6 @@ convention = "google"
 include = ["python/wyrd", "scripts", "tests"]
 exclude = [
     "python/wyrd/**/__init__.py",
-    "!python/wyrd/eval/__init__.py",
 ]
 
 [tool.ty.rules]

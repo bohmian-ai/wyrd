@@ -7,40 +7,21 @@ metadata:
 spec:
   # NO subject. Subjects attach this Verifier through their own `verified_by`
   # bindings, so multiple agents share it without reversioning it.
-  implementation:
-    kind: eval
-    spec:
-      pass_gate:
-        kind: all_pass
-
-      tasks:
-        lookup_called:
-          kind: assertion
-          id: lookup_called
-          context_path: $.tool_call_names
-          operator: contains
-          expected: customer_lookup
-
-        cohort_valid:
-          kind: assertion
-          id: cohort_valid
-          context_path: $.cohort
-          operator: in
-          expected: [loyal_win_back, price_sensitive, service_frustrated, unreachable]
-          depends_on: [lookup_called]
-
-        runbook_grounded:
-          kind: llm_judge
-          id: runbook_grounded
-          judge_ref:
-            prompt: ./judge-prompt.yaml
-            execution_route:
-              kind: native
-            tool_names: []
-            run_config:
-              max_iterations: 1
-          context_path: $.score
-          operator: equals
-          expected: { passed: true }
-          depends_on: [cohort_valid]
-          max_retries: 3
+  inputs:
+    triage:
+      type: json
+  requirements:
+    - id: lookup-called
+      statement: The triage agent looked up the customer.
+      check:
+        kind: assert
+        path: inputs.triage.tool_call_names
+        operator: contains
+        expected: customer_lookup
+    - id: cohort-valid
+      statement: The triage agent chose a supported cohort.
+      check:
+        kind: assert
+        path: inputs.triage.cohort
+        operator: in
+        expected: [loyal_win_back, price_sensitive, service_frustrated, unreachable]

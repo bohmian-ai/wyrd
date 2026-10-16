@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+────────────
+ Nextest run ID 0f5d18d7-223c-43f8-bfb9-ece2ae19f968 with nextest profile: default
+    Starting 9 tests across 3 binaries (1031 tests skipped)
+        PASS [   0.003s] (1/9) wyrd-runtime permission::tests::tool_invoke_is_exact_name_scoped_and_independent
+        PASS [   0.003s] (2/9) wyrd-spec card::blocks::schema_path::tests::schema_path_refuses_only_known_missing_selectors
+        PASS [   0.003s] (3/9) wyrd-runtime request_context::tests::accepted_authority_keeps_exact_tool_scope
+        PASS [   0.005s] (4/9) vala-eval blocks::tests::action_tool_calls_carry_into_step_results
+        PASS [   0.005s] (5/9) wyrd-spec verification::execution::tests::verification_result_round_trips_documented_outcome
+        PASS [   0.018s] (6/9) wyrd-spec card::blocks::validate::tests::verifier_spec_bounds_cyclic_schema_references
+        PASS [   0.021s] (7/9) wyrd-spec card::blocks::validate::tests::verifier_spec_enforces_agent_positions_and_media
+        PASS [   0.026s] (8/9) wyrd-spec card::blocks::validate::tests::verifier_spec_admits_every_builtin_step_tool
+        PASS [   0.039s] (9/9) wyrd-spec card::blocks::validate::tests::verifier_spec_requires_check_agents_to_produce_a_verdict
+────────────
+     Summary [   0.041s] 9 tests run: 9 passed, 1031 skipped

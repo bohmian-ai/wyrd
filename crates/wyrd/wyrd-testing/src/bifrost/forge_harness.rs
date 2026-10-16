@@ -666,7 +666,7 @@ impl Catalog for CommitUncertaintyCatalog {
         if self
             .controls
             .reject_commit_budget
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |budget| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |budget| {
                 budget.checked_sub(1)
             })
             .is_ok()

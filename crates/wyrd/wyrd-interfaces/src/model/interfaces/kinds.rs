@@ -201,16 +201,13 @@ impl_model_interface_methods!(SklearnInterface {
         py: Python<'_>,
         model: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
-    ) -> WyrdPyResult<(Self, ModelInterface)> {
-        Ok((
-            Self {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
+        Ok(PyClassInitializer::from(ModelInterface::marker("Sklearn")).add_subclass(Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
                 model: shared_py(model),
                 preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "scikit-learn")?,
-            },
-            ModelInterface::marker("Sklearn"),
-        ))
+            }))
     }
 });
 
@@ -223,16 +220,13 @@ impl_model_interface_methods!(XgboostInterface {
         py: Python<'_>,
         model: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
-    ) -> WyrdPyResult<(Self, ModelInterface)> {
-        Ok((
-            Self {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
+        Ok(PyClassInitializer::from(ModelInterface::marker("Xgboost")).add_subclass(Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
                 model: shared_py(model),
                 preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "xgboost")?,
-            },
-            ModelInterface::marker("Xgboost"),
-        ))
+            }))
     }
 });
 
@@ -245,16 +239,13 @@ impl_model_interface_methods!(LightgbmInterface {
         py: Python<'_>,
         model: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
-    ) -> WyrdPyResult<(Self, ModelInterface)> {
-        Ok((
-            Self {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
+        Ok(PyClassInitializer::from(ModelInterface::marker("Lightgbm")).add_subclass(Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
                 model: shared_py(model),
                 preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "lightgbm")?,
-            },
-            ModelInterface::marker("Lightgbm"),
-        ))
+            }))
     }
 });
 
@@ -267,16 +258,13 @@ impl_model_interface_methods!(CatboostInterface {
         py: Python<'_>,
         model: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
-    ) -> WyrdPyResult<(Self, ModelInterface)> {
-        Ok((
-            Self {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
+        Ok(PyClassInitializer::from(ModelInterface::marker("Catboost")).add_subclass(Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
                 model: shared_py(model),
                 preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "catboost")?,
-            },
-            ModelInterface::marker("Catboost"),
-        ))
+            }))
     }
 });
 
@@ -290,17 +278,14 @@ impl_model_interface_methods!(TorchInterface {
         model: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
         save_format: &str,
-    ) -> WyrdPyResult<(Self, ModelInterface)> {
-        Ok((
-            Self {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
+        Ok(PyClassInitializer::from(ModelInterface::marker("Torch")).add_subclass(Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
                 model: shared_py(model),
                 preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "torch")?,
                 save_format: parse_torch_save_format(save_format)?,
-            },
-            ModelInterface::marker("Torch"),
-        ))
+            }))
     }
 
     /// Return the canonical save-format token.
@@ -320,17 +305,14 @@ impl_model_interface_methods!(LightningInterface {
         model: Option<Py<PyAny>>,
         trainer: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
-    ) -> WyrdPyResult<(Self, ModelInterface)> {
-        Ok((
-            Self {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
+        Ok(PyClassInitializer::from(ModelInterface::marker("Lightning")).add_subclass(Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
                 model: shared_py(model),
                 trainer: shared_py(trainer),
                 preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "pytorch-lightning")?,
-            },
-            ModelInterface::marker("Lightning"),
-        ))
+            }))
     }
 });
 
@@ -344,17 +326,14 @@ impl_model_interface_methods!(TensorflowInterface {
         model: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
         save_format: &str,
-    ) -> WyrdPyResult<(Self, ModelInterface)> {
-        Ok((
-            Self {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
+        Ok(PyClassInitializer::from(ModelInterface::marker("Tensorflow")).add_subclass(Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
                 model: shared_py(model),
                 preprocessor: shared_py(preprocessor),
                 framework_version: package_version(py, "tensorflow")?,
                 save_format: parse_tf_save_format(save_format)?,
-            },
-            ModelInterface::marker("Tensorflow"),
-        ))
+            }))
     }
 
     /// Return the canonical save-format token.
@@ -376,9 +355,8 @@ impl_model_interface_methods!(HuggingfaceInterface {
         processor: Option<Py<PyAny>>,
         repo_id: Option<String>,
         revision: Option<String>,
-    ) -> WyrdPyResult<(Self, ModelInterface)> {
-        Ok((
-            Self {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
+        Ok(PyClassInitializer::from(ModelInterface::marker("Huggingface")).add_subclass(Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
                 model: shared_py(model),
                 processor: shared_py(processor),
@@ -386,9 +364,7 @@ impl_model_interface_methods!(HuggingfaceInterface {
                 hf_task: parse_huggingface_task(hf_task)?,
                 repo_id,
                 revision,
-            },
-            ModelInterface::marker("Huggingface"),
-        ))
+            }))
     }
 
     /// Return the canonical Hugging Face task token.

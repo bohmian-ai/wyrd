@@ -12,6 +12,7 @@
   const id = untrack(() => label.toLowerCase().replace(/\s+/g, '-'));
 
   const ctx = getContext<{
+    uid: string;
     activeId: string;
     register: (id: string, label: string) => void;
     activate: (id: string) => void;
@@ -23,8 +24,8 @@
 <div
   class="tab-panel"
   role="tabpanel"
-  id={`tabpanel-${id}`}
-  aria-labelledby={`tab-${id}`}
+  id={`${ctx.uid}-tabpanel-${id}`}
+  aria-labelledby={`${ctx.uid}-tab-${id}`}
   tabindex={ctx.activeId === id ? 0 : -1}
   hidden={ctx.activeId !== id}
 >

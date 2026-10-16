@@ -26,7 +26,7 @@ use crate::wire::google_generate::{
 };
 use crate::wire::openai_chat::{
     OpenAiChatMessage, OpenAiChatRequest, OpenAiChatSettings, OpenAiContentPart, OpenAiJsonSchema,
-    OpenAiMessageContent, OpenAiResponseFormat, OpenAiStop,
+    OpenAiMessageContent, OpenAiReasoningEffort, OpenAiResponseFormat, OpenAiStop,
 };
 
 /// Schema name every portable structured-output request carries.
@@ -152,7 +152,7 @@ pub enum BlockSource {
     Media(MediaSource),
 }
 
-/// The eight portable generation settings.
+/// The nine portable generation settings.
 ///
 /// A setting the destination protocol cannot carry is refused, never dropped.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -183,6 +183,48 @@ pub struct PortableSettings {
     /// Frequency penalty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f64>,
+    /// Reasoning effort for reasoning models; Chat Completions only.
+    ///
+    /// `none` also lets a model that refuses function tools while reasoning
+    /// accept them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// How much a reasoning model reasons before it answers.
+///
+/// The levels are the Chat Completions `reasoning_effort` values; a
+/// destination without an effort control refuses the setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    /// No reasoning.
+    None,
+    /// The least reasoning a reasoning model allows.
+    Minimal,
+    /// Low effort.
+    Low,
+    /// Medium effort.
+    Medium,
+    /// High effort.
+    High,
+    /// The most effort the model offers.
+    Xhigh,
+}
+
+impl ReasoningEffort {
+    /// The Chat Completions `reasoning_effort` value carrying this level.
+    const fn openai(self) -> OpenAiReasoningEffort {
+        match self {
+            Self::None => OpenAiReasoningEffort::None,
+            Self::Minimal => OpenAiReasoningEffort::Minimal,
+            Self::Low => OpenAiReasoningEffort::Low,
+            Self::Medium => OpenAiReasoningEffort::Medium,
+            Self::High => OpenAiReasoningEffort::High,
+            Self::Xhigh => OpenAiReasoningEffort::Xhigh,
+        }
+    }
 }
 
 /// One portable turn lowered to ordered text parts, media as isolated
@@ -662,6 +704,7 @@ fn openai_chat(
                 -2.0,
                 2.0,
             )?,
+            reasoning_effort: settings.reasoning_effort.map(ReasoningEffort::openai),
             ..Default::default()
         },
     })
@@ -674,8 +717,8 @@ fn openai_chat(
 ///
 /// # Errors
 ///
-/// Returns [`SkaldError::PromptInvalid`] for `seed`, a presence or frequency
-/// penalty, a missing or zero `max_output_tokens`, or an out-of-range
+/// Returns [`SkaldError::PromptInvalid`] for `seed`, `reasoning_effort`, a
+/// presence or frequency penalty, a missing or zero `max_output_tokens`, or an out-of-range
 /// sampling setting.
 fn anthropic(
     model: &str,
@@ -686,6 +729,11 @@ fn anthropic(
 ) -> SkaldResult<AnthropicMessagesRequest> {
     let destination = "messages";
     refuse(destination, "seed", settings.seed.is_some())?;
+    refuse(
+        destination,
+        "reasoning_effort",
+        settings.reasoning_effort.is_some(),
+    )?;
     refuse(
         destination,
         "presence_penalty",
@@ -743,12 +791,13 @@ fn anthropic(
 /// Builds the portable Google/Vertex GenerateContent request.
 ///
 /// Assistant turns take the `model` role, system text becomes
-/// `system_instruction`, and a schema becomes `response_schema` with a JSON
-/// response MIME type. An all-default generation config is omitted.
+/// `system_instruction`, and a schema becomes `response_json_schema` with a
+/// JSON response MIME type, so it reaches Gemini as authored JSON Schema. An all-default generation config is omitted.
 ///
 /// # Errors
 ///
-/// Returns [`SkaldError::PromptInvalid`] for a seed outside 32 bits, more
+/// Returns [`SkaldError::PromptInvalid`] for `reasoning_effort`, a seed
+/// outside 32 bits, more
 /// than five stop sequences, or an out-of-range sampling setting.
 fn google(
     system: Option<String>,
@@ -757,6 +806,11 @@ fn google(
     schema: Option<Map<String, Value>>,
 ) -> SkaldResult<GoogleGenerateContentRequest> {
     let destination = "generate_content";
+    refuse(
+        destination,
+        "reasoning_effort",
+        settings.reasoning_effort.is_some(),
+    )?;
     if let Some(seed) = settings.seed
         && i32::try_from(seed).is_err()
     {
@@ -793,7 +847,7 @@ fn google(
             2.0,
         )?,
         response_mime_type: schema.as_ref().map(|_| "application/json".to_owned()),
-        response_schema: schema.map(Value::Object),
+        response_json_schema: schema.map(Value::Object),
         ..Default::default()
     };
     Ok(GoogleGenerateContentRequest {
@@ -991,7 +1045,7 @@ mod tests {
     }
 
     /// Proves portable text, image, and document blocks compile in order for
-    /// every provider format; the eight settings map or refuse per the table;
+    /// every provider format; the nine settings map or refuse per the table;
     /// structured output takes the deterministic schema name; media bindings,
     /// slash-containing models, and invalid shapes behave as specified.
     ///
@@ -1085,7 +1139,7 @@ mod tests {
             gemini["generation_config"]["response_mime_type"],
             "application/json"
         );
-        assert_eq!(gemini["generation_config"]["response_schema"], schema);
+        assert_eq!(gemini["generation_config"]["response_json_schema"], schema);
         let vertex = compile(authored("vertex", &document)).expect("vertex compiles");
         assert_eq!(vertex.provider(), ProviderName::Vertex);
 
@@ -1130,6 +1184,18 @@ mod tests {
             "settings.stop_sequences"
         );
         assert_eq!(refused(with("openai", json!({"temp": 1.0}))), "decode");
+        let effort = |provider: &str| {
+            with(
+                provider,
+                json!({"max_output_tokens": 8, "reasoning_effort": "none"}),
+            )
+        };
+        assert_eq!(
+            body(&compile(effort("openai")).expect("openai carries reasoning effort"))["reasoning_effort"],
+            "none"
+        );
+        assert_eq!(refused(effort("anthropic")), "settings.reasoning_effort");
+        assert_eq!(refused(effort("google")), "settings.reasoning_effort");
         let all = json!({"temperature": 1.0, "top_p": 0.5, "max_output_tokens": 9, "top_k": 4,
                          "stop_sequences": ["x"], "seed": 7, "presence_penalty": 0.5, "frequency_penalty": -0.5});
         let config = body(&compile(with("google", all)).expect("google carries all eight"))
@@ -1418,7 +1484,7 @@ mod tests {
         for (provider, path) in [
             ("openai", "/response_format/json_schema/schema"),
             ("anthropic", "/output_config/format/schema"),
-            ("google", "/generation_config/response_schema"),
+            ("google", "/generation_config/response_json_schema"),
         ] {
             let compiled =
                 body(&compile(portable(provider, nested.clone())).expect("nested schema compiles"));
@@ -1915,5 +1981,25 @@ mod tests {
             "a mutated Prompt serializes natively"
         );
         assert_eq!(authored["model"], "claude-next");
+    }
+
+    /// Proves a native GenerateContent body may omit `role`, as Gemini's own
+    /// API allows, on its `system_instruction` and on a turn, and that the
+    /// absent role round-trips as absent rather than as an empty string.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the body does not compile or does not round-trip.
+    #[test]
+    fn native_generate_content_role_is_optional() {
+        let native = json!({
+            "provider": "google", "model": "gemini-3.8-flash", "format": "generate_content",
+            "body": {
+                "system_instruction": {"parts": [{"text": "Answer briefly."}]},
+                "contents": [{"parts": [{"text": "hi"}]}],
+            },
+        });
+        let prompt = compile(native.clone()).expect("role-less native compiles");
+        assert_eq!(serde_json::to_value(&prompt).expect("prompt json"), native);
     }
 }

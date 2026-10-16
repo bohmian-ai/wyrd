@@ -10,16 +10,13 @@ use chrono::Utc;
 use serde_json::json;
 use uuid::Uuid;
 use wyrd_semver::VersionBlock;
-use wyrd_spec::api_version::ApiVersion;
-use wyrd_spec::card::verifier::{VerifierImplementation, VerifierSpec};
-use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
+use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
-use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
 use wyrd_spec::vala::eval::{
     AssertionTask, ComparisonOperator, EvalPassGate, EvalScenario, EvalSpec, EvalTask, JsonPath,
-    LlmJudgeTask, RecordId, ScenarioId, ScenarioTask, TaskId,
+    RecordId, ScenarioId, ScenarioTask, TaskId,
 };
 
 pub fn tid(value: &str) -> TaskId {
@@ -40,41 +37,8 @@ pub fn card_ref(kind: CardKind, name: &str) -> CardRef {
     }
 }
 
-pub fn eval_ref() -> CardRef {
-    card_ref(CardKind::Verifier, "cli-eval")
-}
-
 pub fn subject_ref() -> CardRef {
     card_ref(CardKind::Agent, "agent-under-test")
-}
-
-pub fn eval_card(spec: EvalSpec) -> Card {
-    Card {
-        api_version: ApiVersion::default(),
-        kind: CardKind::Verifier,
-        metadata: Metadata {
-            name: CardName::new("cli-eval").expect("static card name is valid"),
-            version: Some(
-                VersionBlock::parse("1.0.0")
-                    .expect("static version is valid")
-                    .into(),
-            ),
-            bump: None,
-            space: Some(SpaceName::new("tests").expect("static space is valid")),
-            uid: None,
-            labels: Labels::default(),
-            annotations: Annotations::default(),
-            spec_hash: None,
-            artifact_hash: None,
-            origin: None,
-        },
-        spec: Spec::Verifier(VerifierSpec {
-            description: None,
-            implementation: VerifierImplementation::Eval(spec),
-        }),
-        relationships: Relationships::default(),
-        status: None,
-    }
 }
 
 pub fn assertion_task() -> EvalTask {
@@ -85,19 +49,6 @@ pub fn assertion_task() -> EvalTask {
         operator: ComparisonOperator::Equals,
         expected: json!(true),
         depends_on: Vec::new(),
-        condition: None,
-    })
-}
-
-pub fn judge_task() -> EvalTask {
-    EvalTask::LlmJudge(LlmJudgeTask {
-        id: tid("judge_check"),
-        judge_ref: card_ref(CardKind::Agent, "judge").into(),
-        context_path: None,
-        expected: json!({"passed": true}),
-        operator: ComparisonOperator::Equals,
-        depends_on: Vec::new(),
-        max_retries: 0,
         condition: None,
     })
 }
@@ -153,10 +104,9 @@ pub fn record(ok: bool) -> EvalRecordObservation {
     }
 }
 
-pub fn write_eval_card(path: &Path, spec: EvalSpec) {
-    let card = eval_card(spec);
-    let raw = serde_json::to_string_pretty(&card).expect("card serializes");
-    std::fs::write(path, raw).expect("card fixture writes");
+pub fn write_eval_spec(path: &Path, spec: EvalSpec) {
+    let raw = serde_json::to_string_pretty(&spec).expect("spec serializes");
+    std::fs::write(path, raw).expect("spec fixture writes");
 }
 
 pub fn write_scenarios(path: &Path) {

@@ -1,0 +1,21 @@
+tests/integration/verifier-building-blocks.test.ts > policy review runs every action and check kind
+tests/integration/verifier-building-blocks.test.ts > refund over the limit fails the assertion
+tests/integration/verifier-building-blocks.test.ts > judge verdict fails the agent check
+tests/integration/verifier-building-blocks.test.ts > uncited judge verdict cannot pass
+tests/integration/verifier-building-blocks.test.ts > raising code check cannot pass
+tests/integration/verifier-building-blocks.test.ts > forbidden code access cannot pass dependent work
+tests/integration/verifier-building-blocks.test.ts > trace check fails a guess and needs its trace
+tests/integration/verifier-building-blocks.test.ts > missing policy is inconclusive
+tests/integration/verifier-building-blocks.test.ts > malformed policy cannot pass
+tests/integration/verifier-building-blocks.test.ts > oversized policy is refused locally
+tests/integration/verifier-building-blocks.test.ts > submitted review is judged in the background
+tests/integration/verifier-building-blocks.test.ts > every format extracts its locked output
+tests/integration/verifier-building-blocks.test.ts > document passed positionally fills the only slot
+tests/integration/verifier-building-blocks.test.ts > positional value for a multi slot verifier is refused locally
+tests/integration/verifier-building-blocks.test.ts > failed reader leaves its dependents inconclusive
+tests/integration/verifier-building-blocks.test.ts > failed code step leaves its assertion inconclusive
+tests/integration/verifier-building-blocks.test.ts > trace check judges span order and attributes
+tests/integration/verifier-building-blocks.test.ts > invalid judge verdicts are inconclusive
+tests/integration/verifier-building-blocks.test.ts > code check fails with citations and is inconclusive otherwise
+tests/integration/verifier-building-blocks.test.ts > hosted tools need the tool and domain grants
+tests/integration/verifier-building-blocks.test.ts > delegated tools keep the narrower authority

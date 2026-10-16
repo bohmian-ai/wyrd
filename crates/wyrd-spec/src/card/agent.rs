@@ -50,6 +50,93 @@ pub enum ExecutionRoute {
     },
 }
 
+/// One server-owned built-in Agent tool.
+///
+/// The closed catalog a Verifier step Agent may name in
+/// [`AgentSpec::tool_names`] and the exact object a `tool:invoke` permission
+/// may be scoped to. Registration and authorization share this one
+/// vocabulary, so a name is either a built-in everywhere or nowhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub enum BuiltinTool {
+    /// List Cards the caller may read.
+    #[serde(rename = "cards.list")]
+    CardsList,
+    /// Read one Card by UID.
+    #[serde(rename = "cards.get")]
+    CardsGet,
+    /// Read one Card by reference.
+    #[serde(rename = "cards.get_by_ref")]
+    CardsGetByRef,
+    /// List Bifrost tables the caller may read.
+    #[serde(rename = "bifrost.list_tables")]
+    BifrostListTables,
+    /// Describe one Bifrost table.
+    #[serde(rename = "bifrost.describe_table")]
+    BifrostDescribeTable,
+    /// Run one read-only Bifrost query.
+    #[serde(rename = "bifrost.query")]
+    BifrostQuery,
+    /// List workspace files.
+    #[serde(rename = "fs.list")]
+    FsList,
+    /// Read bounded workspace text with locators.
+    #[serde(rename = "fs.read")]
+    FsRead,
+    /// Search workspace files for matching locations.
+    #[serde(rename = "fs.search")]
+    FsSearch,
+    /// Run sandboxed Python over the workspace.
+    #[serde(rename = "code.run")]
+    CodeRun,
+}
+
+impl BuiltinTool {
+    /// Every built-in, in catalog order.
+    pub const ALL: [Self; 10] = [
+        Self::CardsList,
+        Self::CardsGet,
+        Self::CardsGetByRef,
+        Self::BifrostListTables,
+        Self::BifrostDescribeTable,
+        Self::BifrostQuery,
+        Self::FsList,
+        Self::FsRead,
+        Self::FsSearch,
+        Self::CodeRun,
+    ];
+
+    /// The wire name, identical to the serde spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CardsList => "cards.list",
+            Self::CardsGet => "cards.get",
+            Self::CardsGetByRef => "cards.get_by_ref",
+            Self::BifrostListTables => "bifrost.list_tables",
+            Self::BifrostDescribeTable => "bifrost.describe_table",
+            Self::BifrostQuery => "bifrost.query",
+            Self::FsList => "fs.list",
+            Self::FsRead => "fs.read",
+            Self::FsSearch => "fs.search",
+            Self::CodeRun => "code.run",
+        }
+    }
+
+    /// The built-in with this exact wire name; prefixes, paths, and case
+    /// variants name no built-in.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tool| tool.as_str() == name)
+    }
+
+    /// True for the `fs.*` tools, which read only a declared workspace.
+    #[must_use]
+    pub const fn is_filesystem(self) -> bool {
+        matches!(self, Self::FsList | Self::FsRead | Self::FsSearch)
+    }
+}
+
 /// Agent authoring body inside a Wyrd Agent Card envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]

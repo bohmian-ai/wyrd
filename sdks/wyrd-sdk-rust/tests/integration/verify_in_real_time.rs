@@ -1,48 +1,40 @@
 //! An assistant judges its own behavior while it runs: `observe().verify`
-//! returns a `Judgment` from the Verifier bound to the observed Card, whether
-//! that Verifier is an Eval, a Drift, or a single task check. Only
-//! `verifier:run` on the named Verifier authorizes the call; an LLM judge
-//! then calls the gateway as that same caller.
+//! returns the `VerificationResult` of the Verifier bound to the observed
+//! Card, with its verdict and per-requirement breakdown, and `submit` queues
+//! the same judgment in the background or records drift samples for the
+//! Verifier's schedule. Only `verifier:run` on the named Verifier authorizes
+//! the call; an Agent check then calls the gateway as that same caller.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 use wyrd_ai::bifrost::BifrostOptions;
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde::Deserialize;
+use serde_json::json;
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::cards::CardRef;
-use wyrd_ai::gateway::{DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite};
+use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::state::WyrdState;
+use wyrd_ai::verify::{Execution, File, Inputs, Submission};
 use wyrd_ai::{
-    Bifrost, Gateway, SpanRecord, VerificationVerdict, VerifierCounts, VerifierKind, WyrdClient,
-    cli,
+    Bifrost, CallProvenance, Citation, Gateway, Locator, RequirementOutcome, SpanRecord,
+    VerificationVerdict, WyrdClient, cli,
 };
+use wyrd_spec::verification::VerifierReadiness;
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::gateway_inference::put_openai;
 use crate::local_development::configure_gateway;
 use crate::support::{Deployment, ancestry, coordinates, hydrate, register, registered};
 
-/// How long a test waits for the latency baseline to fit.
-const BASELINE_FIT: Duration = Duration::from_secs(90);
+/// How long a test waits for a queued execution or a scheduled result.
+const WAIT: Duration = Duration::from_secs(90);
 
-/// One agent answer, the input the Eval Verifiers judge.
-#[derive(Serialize)]
-pub(crate) struct Answer {
-    /// The answer text.
-    pub(crate) answer: &'static str,
-}
-
-/// One observed request latency, the input `latency-drift` judges.
-#[derive(Serialize)]
-struct Latency {
-    /// Milliseconds.
-    latency: u32,
-}
+/// The Verdict the local judge returns for every answer: passed, citing the
+/// whole answer.
+const AGREES: &str = r#"{"outcome":"passed","reason":"it agrees","citations":[{"slot":"answer","locator":{"json_pointer":""}}]}"#;
 
 /// The assistant deployment: a server running the verification runtime whose
 /// gateway deploys `gpt-4o` on a local judge that passes every answer, with
@@ -51,20 +43,16 @@ struct Latency {
 pub(crate) struct Assistant {
     /// The deployment.
     pub(crate) deployment: Deployment,
-    /// The local judge the server's Eval judge calls.
+    /// The local judge the `answer-judged` Agent check calls.
     judge: MockServer,
     /// The hydrated assistant bundle.
     bundle: TempDir,
     /// The registered assistant Service.
     pub(crate) service: CardRef,
-    /// The registered `latency-drift` Verifier.
-    latency_drift: CardRef,
-    /// The registered `answer-is-yes` Eval Verifier.
-    answer_is_yes: CardRef,
-    /// The registered `answer-check` task Verifier.
+    /// The registered `answer-check` assertion Verifier.
     answer_check: CardRef,
-    /// The registered `answer-graded` task LLM-judge Verifier.
-    answer_graded: CardRef,
+    /// The registered `answer-judged` Agent-check Verifier.
+    answer_judged: CardRef,
     /// The registered `assistant-agent` Card the Verifiers judge.
     agent: CardRef,
 }
@@ -88,7 +76,7 @@ impl Assistant {
                 "choices": [{
                     "index": 0,
                     "finish_reason": "stop",
-                    "message": { "role": "assistant", "content": "{\"passed\":true}" },
+                    "message": { "role": "assistant", "content": AGREES },
                 }],
                 "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 },
             })))
@@ -122,10 +110,8 @@ impl Assistant {
             judge,
             bundle,
             service: assistant.root.clone(),
-            latency_drift: registered(&assistant, "latency-drift"),
-            answer_is_yes: registered(&assistant, "answer-is-yes"),
             answer_check: registered(&assistant, "answer-check"),
-            answer_graded: registered(&assistant, "answer-graded"),
+            answer_judged: registered(&assistant, "answer-judged"),
             agent: registered(&assistant, "assistant-agent"),
         }
     }
@@ -221,16 +207,16 @@ impl Assistant {
                         c.act_principal_id AS call_actor, c.run_id AS call_run \
                    FROM vala.verification.results r \
                    JOIN vala.gateway.calls c ON c.card_uid = r.card_uid \
-                  WHERE r.result_id = $1",
+                  WHERE r.execution_id = $1",
                 &[QueryParam::String(execution_id.to_owned())],
             )
             .await
             .expect("the result joins its judge calls")
     }
 
-    /// Judge `answer` with `answer-graded` over plain HTTP the way an agent
-    /// does, as the assistant Service with `traceparent` and no Run, and
-    /// return the judgment's `execution_id`.
+    /// Judge the answer `yes` with `answer-judged` over plain HTTP the way an
+    /// agent does, as the assistant Service with `traceparent` and no Run,
+    /// and return the result's `execution_id`.
     ///
     /// # Panics
     /// Panics when no token mints or the judgment is refused.
@@ -253,38 +239,21 @@ impl Assistant {
             .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
             .header("traceparent", traceparent)
             .json(&json!({
-                "verifier_card_uid": self.answer_graded.uid,
+                "verifier_card_uid": self.answer_judged.uid,
                 "card_uid": self.agent.uid,
-                "input": { "kind": "task_context", "context": { "answer": "yes" } },
+                "inputs": { "answer": { "kind": "json", "value": "yes" } },
             }))
             .send()
             .await
             .expect("the server answers");
         let status = response.status().as_u16();
-        let judgment: serde_json::Value = response.json().await.expect("the judgment is JSON");
-        assert_eq!(status, 200, "{judgment}");
-        judgment["execution_id"]
+        let result: serde_json::Value = response.json().await.expect("the result is JSON");
+        assert_eq!(status, 200, "{result}");
+        assert_eq!(result["outcome"]["verdict"], "passed", "{result}");
+        result["execution_id"]
             .as_str()
-            .expect("the judgment names its execution")
+            .expect("the result names its execution")
             .to_owned()
-    }
-
-    /// Wait until the `latency-drift` baseline has fitted.
-    ///
-    /// # Panics
-    /// Panics when the baseline does not fit in time.
-    async fn wait_for_baseline(&self) {
-        self.deployment
-            .server()
-            .wait_for_baseline(
-                self.latency_drift
-                    .uid
-                    .as_ref()
-                    .expect("registered Verifier has a UID"),
-                BASELINE_FIT,
-            )
-            .await
-            .expect("the latency baseline fits");
     }
 }
 
@@ -370,229 +339,124 @@ const CALLER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
 /// The caller's span identity within [`CALLER_TRACE`].
 const CALLER_SPAN: &str = "b7ad6b7169203331";
 
-/// An answer the assertion expects passes, judged against the agent.
+/// An answer the assertion expects passes, judged against the agent within
+/// the caller's Run.
 ///
 /// # Panics
-/// Panics when the verify fails or the judgment differs.
+/// Panics when the verify fails or the result differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn agent_answer_passes_its_verifier() {
     let assistant = Assistant::start().await;
     let state = assistant.state().await;
+    let run = state.run_for_card("agent").expect("agent run opens");
 
-    let judgment = state
-        .run_for_card("agent")
-        .expect("agent run opens")
+    let result = run
         .observe()
-        .verify("answer-is-yes", &Answer { answer: "yes" })
+        .verify("answer-check", json!("yes"))
         .await
         .expect("the answer is judged");
 
-    assert!(judgment.passed());
-    assert_eq!(judgment.kind, VerifierKind::EvalAssertion);
-    assert_eq!(judgment.verifier.name.as_str(), "answer-is-yes");
-    assert_eq!(&judgment.subject, state.card_ref("agent").expect("agent"));
+    assert_eq!(result.outcome.verdict, VerificationVerdict::Passed);
+    assert_eq!(result.verifier.name.as_str(), "answer-check");
+    assert_eq!(&result.subject, state.card_ref("agent").expect("agent"));
+    assert_eq!(result.run_id.as_ref(), Some(run.run_id()));
+    let [requirement] = &result.outcome.requirements[..] else {
+        panic!("one requirement: {:?}", result.outcome.requirements);
+    };
+    assert_eq!(
+        (requirement.id.as_str(), requirement.outcome),
+        ("says-yes", RequirementOutcome::Passed)
+    );
     assistant.deployment.shutdown().await;
 }
 
-/// An answer the assertion does not expect fails.
+/// An answer the assertion does not expect fails, and the failed requirement
+/// carries the compared value; a failed verdict is a result, not an error.
 ///
 /// # Panics
-/// Panics when the verify fails or the judgment differs.
+/// Panics when the verify fails or the result differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn agent_answer_fails_its_verifier() {
     let assistant = Assistant::start().await;
     let state = assistant.state().await;
 
-    let judgment = state
+    let result = state
         .run_for_card("agent")
         .expect("agent run opens")
         .observe()
-        .verify("answer-is-yes", &Answer { answer: "no" })
+        .verify("answer-check", json!("no"))
         .await
         .expect("the answer is judged");
 
+    assert_eq!(result.outcome.verdict, VerificationVerdict::Failed);
+    let [requirement] = &result.outcome.requirements[..] else {
+        panic!("one requirement: {:?}", result.outcome.requirements);
+    };
     assert_eq!(
-        (judgment.verdict, judgment.kind),
-        (VerificationVerdict::Failed, VerifierKind::EvalAssertion)
+        (requirement.outcome, requirement.actual.as_ref()),
+        (RequirementOutcome::Failed, Some(&json!("no")))
     );
     assistant.deployment.shutdown().await;
 }
 
-/// A task Verifier's one assertion passes the expected answer and fails any
-/// other, with no counts: a single check has nothing to count.
+/// The tool-less judge Agent of `answer-judged` judges the bound answer
+/// through the server's provider upstream, here the local mock judge, and
+/// its cited Verdict passes the requirement with the Agent's provenance.
 ///
 /// # Panics
-/// Panics when a verify fails or a judgment differs.
+/// Panics when the verify fails, the result differs, or the judge did not
+/// receive the claim and the answer.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn agent_answer_is_judged_by_its_task_check() {
-    let assistant = Assistant::start().await;
-    let state = assistant.state().await;
-    let run = state.run_for_card("agent").expect("agent run opens");
-
-    for (answer, verdict) in [
-        ("yes", VerificationVerdict::Passed),
-        ("no", VerificationVerdict::Failed),
-    ] {
-        let judgment = run
-            .observe()
-            .verify("answer-check", &Answer { answer })
-            .await
-            .expect("the answer is judged");
-        assert_eq!(
-            (judgment.verdict, judgment.kind, judgment.counts),
-            (verdict, VerifierKind::TaskAssertion, None)
-        );
-        assert_eq!(judgment.verifier.name.as_str(), "answer-check");
-    }
-    assistant.deployment.shutdown().await;
-}
-
-/// A task Verifier's LLM judge grades the answer through the server's
-/// provider upstream, here the local mock judge.
-///
-/// # Panics
-/// Panics when the verify fails, the judgment differs, or the judge did not
-/// receive the graded answer.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn graded_answer_passes_the_task_llm_judge() {
+async fn judged_answer_passes_the_agent_check() {
     let assistant = Assistant::start().await;
     let state = assistant.state().await;
 
-    let judgment = state
+    let result = state
         .run_for_card("agent")
         .expect("agent run opens")
         .observe()
-        .verify("answer-graded", &Answer { answer: "yes" })
+        .verify("answer-judged", json!("yes"))
         .await
         .expect("the answer is judged");
 
+    assert_eq!(result.outcome.verdict, VerificationVerdict::Passed);
+    let [requirement] = &result.outcome.requirements[..] else {
+        panic!("one requirement: {:?}", result.outcome.requirements);
+    };
+    assert_eq!(requirement.outcome, RequirementOutcome::Passed);
     assert_eq!(
-        (judgment.verdict, judgment.kind, judgment.counts),
-        (
-            VerificationVerdict::Passed,
-            VerifierKind::TaskLlmJudge,
-            None
-        )
+        requirement.citations,
+        [Citation {
+            slot: "answer".parse().expect("slot name"),
+            locator: Locator::JsonPointer(String::new()),
+        }]
     );
-    let graded = assistant
-        .judge
-        .received_requests()
-        .await
-        .expect("the judge records requests");
-    assert_eq!(graded.len(), 1);
     assert!(
-        String::from_utf8_lossy(&graded[0].body).contains("Grade the answer yes."),
-        "the judge received the answer"
+        matches!(
+            &requirement.provenance,
+            Some(CallProvenance::Agent { agent: Some(agent), .. }) if agent.name.as_str() == "judge-agent"
+        ),
+        "{:?}",
+        requirement.provenance
     );
-    assistant.deployment.shutdown().await;
-}
-
-/// The LLM judge grades the answer through the server's provider upstream.
-///
-/// # Panics
-/// Panics when the verify fails, the judgment differs, or the judge did not
-/// receive the graded answer.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn judged_answer_passes_the_llm_judge() {
-    let assistant = Assistant::start().await;
-    let state = assistant.state().await;
-
-    let judgment = state
-        .run_for_card("agent")
-        .expect("agent run opens")
-        .observe()
-        .verify("answer-is-judged", &Answer { answer: "yes" })
-        .await
-        .expect("the answer is judged");
-
-    assert!(judgment.passed());
-    assert_eq!(judgment.kind, VerifierKind::EvalLlmJudge);
-    let graded = assistant
+    let judged = assistant
         .judge
         .received_requests()
         .await
         .expect("the judge records requests");
-    assert_eq!(graded.len(), 1);
+    assert_eq!(judged.len(), 1);
+    let body = String::from_utf8_lossy(&judged[0].body);
     assert!(
-        String::from_utf8_lossy(&graded[0].body).contains("Grade the answer yes."),
-        "the judge received the answer"
+        body.contains("Claim: The answer agrees with the customer"),
+        "the judge received the requirement statement: {body}"
     );
     assistant.deployment.shutdown().await;
 }
 
-/// Judges authored in the native (`answer-is-judged`) and portable
-/// (`answer-graded`) Prompt forms both send a structured-output request for
-/// `gpt-4o` through their Agent's declared `openai` route and pass on the
-/// parsed answer. A judge routed to the `granted` deployment `openai-granted`
-/// is authorized for the requesting Service, which holds no grant for it, so
-/// it never reaches the provider and the verify fails as a dependency
-/// failure.
-///
-/// # Panics
-/// Panics when a verify, judgment, refusal, or judge request differs.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn judge_prompt_forms_use_agent_execution_route() {
-    let assistant = Assistant::start().await;
-    put_openai(
-        &assistant.deployment,
-        "openai-granted",
-        "sk-granted-upstream",
-        DeploymentAccess::Granted,
-    )
-    .await;
-    let state = assistant.state().await;
-    let run = state.run_for_card("agent").expect("agent run opens");
-
-    for verifier in ["answer-is-judged", "answer-graded"] {
-        let judgment = run
-            .observe()
-            .verify(verifier, &Answer { answer: "yes" })
-            .await
-            .expect("the answer is judged");
-        assert_eq!(judgment.verdict, VerificationVerdict::Passed, "{verifier}");
-    }
-    let refused = run
-        .observe()
-        .verify("answer-judged-off-route", &Answer { answer: "yes" })
-        .await;
-
-    let graded = assistant
-        .judge
-        .received_requests()
-        .await
-        .expect("the judge records requests");
-    let bodies: Vec<Value> = graded
-        .iter()
-        .map(|request| serde_json::from_slice(&request.body).expect("JSON request"))
-        .collect();
-    assert_eq!(
-        bodies.len(),
-        2,
-        "the off-route judge never reaches the provider"
-    );
-    for body in &bodies {
-        assert_eq!(
-            (&body["model"], &body["response_format"]["type"]),
-            (&json!("gpt-4o"), &json!("json_schema")),
-            "{body}"
-        );
-    }
-    let refused = refused.expect_err("the off-route judge is refused");
-    assert_eq!(
-        refused.code(),
-        "WYRD_VERIFICATION_502_DEPENDENCY_FAILED",
-        "{refused}"
-    );
-    assistant.deployment.shutdown().await;
-}
-
-/// A judge Verifier run in real time for a Run calls its model through the
+/// An Agent check run in real time for a Run calls its model through the
 /// gateway for the requesting principal, performed by the tenant SYSTEM
 /// principal, attributed to that Run and the judged Card, so the call joins
 /// the Run's other evidence.
@@ -606,9 +470,9 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
     let state = assistant.state().await;
     let run = state.run_for_card("agent").expect("agent run opens");
 
-    let judgment = run
+    let result = run
         .observe()
-        .verify("answer-graded", &Answer { answer: "yes" })
+        .verify("answer-judged", json!("yes"))
         .await
         .expect("the answer is judged");
     state.shutdown().await.expect("Bifrost stops");
@@ -632,13 +496,13 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
         [(
             principal.as_str(),
             Some(run_id.as_str()),
-            judgment.subject.uid.as_ref().map(ToString::to_string)
+            result.subject.uid.as_ref().map(ToString::to_string)
         )],
         "{calls:?}"
     );
     ResultJudgeCall::assert_called_as_system(
         &assistant
-            .result_with_its_judge_calls(&judgment.execution_id.to_string())
+            .result_with_its_judge_calls(&result.execution_id.to_string())
             .await,
         &principal,
         Some(&run_id),
@@ -751,7 +615,7 @@ async fn traced_sdk_verify_joins_the_callers_trace() {
         .expect("the caller span joins the caller's trace");
 
     run.observe()
-        .verify("answer-graded", &Answer { answer: "yes" })
+        .verify("answer-judged", json!("yes"))
         .instrument(caller)
         .with_subscriber(traced)
         .await
@@ -763,6 +627,94 @@ async fn traced_sdk_verify_joins_the_callers_trace() {
     assert!(
         calls.len() == 1 && calls[0].span(&timeline).is_some(),
         "{calls:?} in {timeline:#?}"
+    );
+    assistant.deployment.shutdown().await;
+}
+
+/// A Run's `submit` made inside a sampled caller span queues its judgment,
+/// and the background attempt is a trace of its own that links back to the
+/// caller's span: the caller's timeline returns that linked
+/// `verification.attempt` and, below it in the attempt's trace, the judge
+/// call's gateway span.
+///
+/// # Panics
+/// Panics when the submission is not queued, the wait, flush, or read fails,
+/// or the attempt or its judge call is missing from the caller's timeline.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn traced_sdk_submit_links_its_attempt_to_the_callers_trace() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry::trace::{
+        SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId, TraceState,
+    };
+    use tracing::Instrument as _;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    const SUBMIT_TRACE: &str = "1af7651916cd43dd8448eb211c80319c";
+    let assistant = Assistant::start().await;
+    let state = assistant.state().await;
+    let run = state.run_for_card("agent").expect("agent run opens");
+    let traced = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(
+                opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                    .build()
+                    .tracer("journey"),
+            ),
+        ),
+    );
+    let caller = tracing::dispatcher::with_default(&traced, || tracing::info_span!("caller"));
+    caller
+        .set_parent(
+            opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+                TraceId::from_hex(SUBMIT_TRACE).expect("trace id"),
+                SpanId::from_hex(CALLER_SPAN).expect("span id"),
+                TraceFlags::SAMPLED,
+                true,
+                TraceState::default(),
+            )),
+        )
+        .expect("the caller span joins the caller's trace");
+
+    let Submission::Queued(execution) = run
+        .observe()
+        .submit("answer-judged", json!("yes"))
+        .instrument(caller)
+        .with_subscriber(traced)
+        .await
+        .expect("the answer is submitted")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    execution.wait(WAIT).await.expect("the execution settles");
+    state.shutdown().await.expect("Bifrost stops");
+
+    let calls = assistant.judge_calls().await;
+    let timeline = assistant.deployment.timeline(SUBMIT_TRACE).await;
+    let attempt = timeline
+        .iter()
+        .find(|span| span.name == "verification.attempt")
+        .unwrap_or_else(|| panic!("the caller's timeline links the attempt: {timeline:#?}"));
+    assert_ne!(attempt.trace_id.to_hex(), SUBMIT_TRACE, "{attempt:#?}");
+    assert!(
+        attempt
+            .links
+            .iter()
+            .any(|link| link.trace_id.to_hex() == SUBMIT_TRACE),
+        "the attempt links to the caller's trace: {attempt:#?}"
+    );
+    let [call] = calls.as_slice() else {
+        panic!("exactly one judge call: {calls:?}");
+    };
+    let judged = call
+        .span(&timeline)
+        .unwrap_or_else(|| panic!("the judge call is in the timeline: {timeline:#?}"));
+    assert_eq!(
+        ancestry(&timeline, judged).last().map(|root| root.span_id),
+        Some(attempt.span_id),
+        "the judge call descends from the attempt: {timeline:#?}"
     );
     assistant.deployment.shutdown().await;
 }
@@ -790,83 +742,120 @@ async fn malformed_traceparent_is_ignored_by_the_judge_call() {
     assistant.deployment.shutdown().await;
 }
 
-/// One hundred latencies spread like the healthy baseline's 0 to 99 ms pass
-/// the drift Verifier on the Model.
+/// `submit` queues the judgment and returns its execution handle at once;
+/// `wait` returns the failed result, and a handle rebuilt from the
+/// execution ID alone, as another process would, reads the same result.
 ///
 /// # Panics
-/// Panics when the baseline does not fit, the verify fails, or the judgment
-/// differs.
+/// Panics when the submission is not queued, a wait fails, or the results
+/// differ.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn model_latency_like_the_baseline_passes_its_verifier() {
+async fn submitted_answer_is_judged_in_the_background_and_resumes_by_id() {
     let assistant = Assistant::start().await;
     let state = assistant.state().await;
-    assistant.wait_for_baseline().await;
-    let healthy = (0..100)
-        .map(|row| Latency {
-            latency: (row * 37) % 100,
-        })
-        .collect::<Vec<_>>();
+    let run = state.run_for_card("agent").expect("agent run opens");
 
-    let judgment = state
-        .run_for_card("model")
-        .expect("model run opens")
+    let Submission::Queued(execution) = run
         .observe()
-        .verify("latency-drift", &healthy)
+        .submit("answer-check", json!("no"))
         .await
-        .expect("the latencies are judged");
+        .expect("the answer is submitted")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    let waited = execution.wait(WAIT).await.expect("the execution settles");
+    let key = assistant.deployment.service_key(&assistant.service).await;
+    let resumed = Execution::connect_with(*execution.id(), &assistant.deployment.client(&key))
+        .await
+        .expect("the handle rebuilds from its ID")
+        .wait(WAIT)
+        .await
+        .expect("the resumed handle reads the result");
 
-    assert!(judgment.passed());
-    assert_eq!(judgment.kind, VerifierKind::DriftPsi);
-    assert_eq!(&judgment.subject, state.card_ref("model").expect("model"));
+    assert_eq!(waited.outcome.verdict, VerificationVerdict::Failed);
+    assert_eq!(&waited.execution_id, execution.id());
+    assert_eq!(waited.run_id.as_ref(), Some(run.run_id()));
+    assert_eq!(resumed, waited);
     assistant.deployment.shutdown().await;
 }
 
-/// Latencies all at the slow end of the baseline drift, and the drift
-/// Verifier judges the Model failed on its one feature.
+/// Another tenant cannot read a queued execution by its ID: the status read
+/// is refused as not found until the wait gives up.
 ///
 /// # Panics
-/// Panics when the baseline does not fit, the verify fails, or the judgment
-/// differs.
+/// Panics when the foreign wait returns a result or another error.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn model_latency_drift_is_judged_failed() {
+async fn another_tenant_cannot_resume_an_execution() {
     let assistant = Assistant::start().await;
     let state = assistant.state().await;
-    assistant.wait_for_baseline().await;
-    let slow = (0..100)
-        .map(|_| Latency { latency: 99 })
-        .collect::<Vec<_>>();
-
-    let judgment = state
-        .run_for_card("model")
-        .expect("model run opens")
+    let Submission::Queued(execution) = state
+        .run_for_card("agent")
+        .expect("agent run opens")
         .observe()
-        .verify("latency-drift", &slow)
+        .submit("answer-check", json!("yes"))
         .await
-        .expect("the latencies are judged");
+        .expect("the answer is submitted")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    execution.wait(WAIT).await.expect("the execution settles");
+    let foreign = assistant
+        .deployment
+        .other_tenant_admin("other-tenant")
+        .await;
 
-    assert_eq!(
-        (judgment.verdict, judgment.kind, judgment.counts),
-        (
-            VerificationVerdict::Failed,
-            VerifierKind::DriftPsi,
-            Some(VerifierCounts::Drift {
-                drifted_features: 1,
-                total_features: 1
-            })
-        )
-    );
+    let refused = Execution::connect_with(*execution.id(), &assistant.deployment.client(&foreign))
+        .await
+        .expect("the handle rebuilds from its ID")
+        .wait(Duration::from_secs(2))
+        .await
+        .expect_err("another tenant sees no execution");
+
+    assert_eq!(refused.code(), "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT");
     assistant.deployment.shutdown().await;
 }
 
-/// A drift Verifier whose baseline has not fitted refuses to judge.
+/// A drift Verifier judges a scheduled window, so `verify` refuses it before
+/// any call while `submit` records the samples for the schedule.
 ///
 /// # Panics
-/// Panics when the verify succeeds or is refused with another code.
+/// Panics when the verify is not refused with the stable code or the
+/// submission is not recorded.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn verify_before_baseline_ready_is_refused() {
+async fn window_verifier_records_samples_and_refuses_verify() {
+    let assistant = Assistant::start().await;
+    let state = assistant.state().await;
+    let run = state.run_for_card("model").expect("model run opens");
+    let observe = run.observe();
+
+    let refused = observe
+        .verify("latency-drift", json!({ "latency": 12.5 }))
+        .await
+        .expect_err("a window Verifier is judged on its schedule");
+    let submitted = observe
+        .submit("latency-drift", json!({ "latency": 12.5 }))
+        .await
+        .expect("the sample is recorded");
+
+    assert_eq!(refused.code(), "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED");
+    assert!(matches!(submitted, Submission::Recorded), "{submitted:?}");
+    assistant.deployment.shutdown().await;
+}
+
+/// An SPC drift Verifier whose baseline can never fit is skipped when its
+/// schedule comes due: the scheduler advances the cursor without admitting
+/// an execution, so nothing is judged and no result is retained, and the
+/// binding reports the baseline as not ready.
+///
+/// # Panics
+/// Panics when a step fails, the occurrence is not skipped in time, or the
+/// binding admitted an execution.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn unfitted_baseline_is_skipped_on_schedule() {
     let assistant = Assistant::start().await;
     let cards = assistant.deployment.cards().await;
     let unfitted = register(&cards, "cards/verify_in_real_time/unfitted-assistant.yaml").await;
@@ -878,19 +867,43 @@ async fn verify_before_baseline_ready_is_refused() {
     )
     .expect("bundle loads");
     state.start_bifrost().await.expect("Bifrost starts");
-    let tiers = (0..5)
-        .map(|_| json!({ "tier": "gold" }))
-        .collect::<Vec<_>>();
-
-    let refused = state
-        .run_for_card("model")
-        .expect("model run opens")
-        .observe()
-        .verify("tier-drift", &tiers)
+    let run = state.run_for_card("model").expect("model run opens");
+    let observe = run.observe();
+    for _ in 0..5 {
+        observe
+            .submit("tier-drift", json!("gold"))
+            .await
+            .expect("the tier is recorded");
+    }
+    state.shutdown().await.expect("samples drain");
+    let binding = assistant.deployment.binding(&unfitted.root).await;
+    assistant
+        .deployment
+        .server()
+        .make_binding_due(binding)
         .await
-        .expect_err("an unfitted baseline is refused");
+        .expect("the binding comes due");
+    let due = assistant
+        .deployment
+        .binding_status(&binding)
+        .await
+        .next_run_at;
 
-    assert_eq!(refused.code(), "WYRD_VERIFICATION_409_BASELINE_NOT_READY");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let status = loop {
+        let status = assistant.deployment.binding_status(&binding).await;
+        if status.next_run_at > due {
+            break status;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the due occurrence was not scheduled within {WAIT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    assert_eq!(status.readiness, VerifierReadiness::BaselineNotReady);
+    assert_eq!(status.last_execution_id, None, "no execution is admitted");
     assistant.deployment.shutdown().await;
 }
 
@@ -908,7 +921,7 @@ async fn unbound_verifier_fails_locally() {
         .run_for_card("agent")
         .expect("agent run opens")
         .observe()
-        .verify("not-bound-here", &Answer { answer: "yes" })
+        .verify("not-bound-here", json!("yes"))
         .await
         .expect_err("an unbound Verifier is refused");
 
@@ -916,25 +929,29 @@ async fn unbound_verifier_fails_locally() {
     assistant.deployment.shutdown().await;
 }
 
-/// A list where the Verifier judges one answer fails before any call.
+/// A value for a slot the Verifier does not declare, or a file for its `json`
+/// slot, fails before any call.
 ///
 /// # Panics
-/// Panics when the verify succeeds or is refused with another code.
+/// Panics when a verify succeeds or is refused with another code.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn input_of_the_wrong_shape_fails_locally() {
+async fn input_that_does_not_fit_its_slot_fails_locally() {
     let assistant = Assistant::start().await;
     let state = assistant.state().await;
+    let run = state.run_for_card("agent").expect("agent run opens");
+    let observe = run.observe();
 
-    let refused = state
-        .run_for_card("agent")
-        .expect("agent run opens")
-        .observe()
-        .verify("answer-is-yes", &[Answer { answer: "yes" }])
-        .await
-        .expect_err("a list is not one answer");
-
-    assert_eq!(refused.code(), "WYRD_SDK_400_INVALID_OBSERVATION");
+    for inputs in [
+        Inputs::named([("reply", json!("yes"))]),
+        Inputs::named([("answer", File::bytes(b"yes".to_vec()))]),
+    ] {
+        let refused = observe
+            .verify("answer-check", inputs)
+            .await
+            .expect_err("the input does not fit");
+        assert_eq!(refused.code(), "WYRD_VERIFICATION_400_INPUT_INVALID");
+    }
     assistant.deployment.shutdown().await;
 }
 
@@ -954,7 +971,7 @@ async fn caller_without_the_verifier_grant_is_refused() {
         .await;
     let other_verifier = assistant
         .deployment
-        .verifier_key("other_verifier", &assistant.answer_is_yes)
+        .verifier_key("other_verifier", &assistant.answer_judged)
         .await;
 
     for key in [evals_only, other_verifier] {
@@ -963,7 +980,7 @@ async fn caller_without_the_verifier_grant_is_refused() {
             .run_for_card("agent")
             .expect("agent run opens")
             .observe()
-            .verify("answer-check", &Answer { answer: "yes" })
+            .verify("answer-check", json!("yes"))
             .await
             .expect_err("no grant names answer-check");
         assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
@@ -987,15 +1004,15 @@ async fn exact_verifier_grant_verifies_only_that_verifier() {
     let state = assistant.state_as(assistant.deployment.client(&key));
     let run = state.run_for_card("agent").expect("agent run opens");
 
-    let judgment = run
+    let result = run
         .observe()
-        .verify("answer-check", &Answer { answer: "yes" })
+        .verify("answer-check", json!("yes"))
         .await
         .expect("the granted Verifier judges");
-    assert!(judgment.passed());
+    assert_eq!(result.outcome.verdict, VerificationVerdict::Passed);
     let refused = run
         .observe()
-        .verify("answer-is-yes", &Answer { answer: "yes" })
+        .verify("answer-judged", json!("yes"))
         .await
         .expect_err("the grant names one Verifier");
     assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
@@ -1003,7 +1020,7 @@ async fn exact_verifier_grant_verifies_only_that_verifier() {
 }
 
 /// Another tenant's administrator cannot verify this tenant's assistant with
-/// either its Eval or its task Verifier.
+/// either its assertion or its Agent-check Verifier.
 ///
 /// # Panics
 /// Panics when the verify succeeds or is refused with another code.
@@ -1019,10 +1036,10 @@ async fn another_tenant_cannot_verify_the_assistant() {
     state.start_bifrost().await.expect("Bifrost starts");
     let run = state.run_for_card("agent").expect("agent run opens");
 
-    for verifier in ["answer-is-yes", "answer-check"] {
+    for verifier in ["answer-check", "answer-judged"] {
         let refused = run
             .observe()
-            .verify(verifier, &Answer { answer: "yes" })
+            .verify(verifier, json!("yes"))
             .await
             .expect_err("another tenant cannot verify");
         assert_eq!(
@@ -1031,41 +1048,5 @@ async fn another_tenant_cannot_verify_the_assistant() {
             "{verifier}"
         );
     }
-    assistant.deployment.shutdown().await;
-}
-
-/// Judging an input does not record it as an observation.
-///
-/// # Panics
-/// Panics when the verify or the read-back fails, or an observation exists.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn verify_records_no_observation() {
-    let assistant = Assistant::start().await;
-    let state = assistant.state().await;
-    let run = state.run_for_card("agent").expect("agent run opens");
-
-    run.observe()
-        .verify("answer-is-yes", &Answer { answer: "yes" })
-        .await
-        .expect("the answer is judged");
-    state.shutdown().await.expect("Bifrost stops");
-    assistant
-        .deployment
-        .server()
-        .flush_bifrost()
-        .await
-        .expect("rows publish");
-
-    let observed = Bifrost::connect_with(&assistant.deployment.admin(), BifrostOptions::default())
-        .await
-        .expect("Bifrost connects")
-        .sql(
-            "SELECT record_id FROM vala.eval.observations WHERE run_id = $1",
-            &[QueryParam::String(run.run_id().to_string())],
-        )
-        .await
-        .expect("observations read back");
-    assert_eq!(observed.num_rows(), 0);
     assistant.deployment.shutdown().await;
 }

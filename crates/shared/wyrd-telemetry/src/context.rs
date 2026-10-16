@@ -6,8 +6,10 @@
 //! of the server's request span so everything the request does descends from
 //! the caller, and [`current_context`] reads back the context of whatever span
 //! is current, for work that forwards it. [`continued_context`] reads it only
-//! inside a request that continued a caller's trace. Deferred work never adopts a cause as
-//! its parent; [`crate::link_remote_span`] records it as a span link instead.
+//! inside a request that continued a caller's trace, and [`caller_sampled`]
+//! reports the caller's own sampling decision there. Deferred work never
+//! adopts a cause as its parent; [`serve_linked_work`] links it to that cause
+//! instead, carrying the decision, and marks it continued the same way.
 
 use std::sync::Arc;
 
@@ -84,8 +86,13 @@ fn trace_state(values: &[&str]) -> Option<String> {
 ///
 /// It lives in the `tracing` span tree, so every span opened inside the
 /// request finds it among its ancestors, including spans on tasks the
-/// request spawned inside its span.
-struct Continued;
+/// request spawned inside its span. It holds the caller's sampled flag,
+/// which the request span's own flags do not keep: those carry the operator's
+/// decision.
+struct Continued {
+    /// Whether the caller sampled the span the request continued.
+    sampled: bool,
+}
 
 /// Make the caller's span `context` the OpenTelemetry parent of `span`.
 ///
@@ -116,16 +123,89 @@ pub fn serve_request(
     }
     // A span already started keeps its own trace; continuing is best-effort
     // observability and never fails the request.
-    if span.set_parent(parent).is_ok() && remote.is_some() {
-        span.with_subscriber(|(id, dispatch)| {
-            if let Some(span) = dispatch
+    if span.set_parent(parent).is_ok()
+        && let Some(remote) = remote
+    {
+        mark_continued(span, remote.is_sampled());
+    }
+}
+
+/// Start deferred work `span` as its own trace caused by the caller's span
+/// `span_id` of trace `trace_id`.
+///
+/// `span` stays the root of a new trace, linked to its cause through
+/// [`crate::link_remote_span`] with the caller's `sampled` decision, and
+/// carries the serving server's `tenant_spans` sink like a request does. It
+/// is marked continued with that decision, so [`continued_context`] places
+/// work inside it (a captured gateway attempt) in `span`'s trace, and
+/// [`caller_sampled`] reports the original caller's decision. This must run
+/// before `span` is first entered; on a started or disabled span, or without
+/// an OpenTelemetry layer, it does nothing.
+pub fn serve_linked_work(
+    span: &tracing::Span,
+    trace_id: &wyrd_spec::vala::ids::TraceId,
+    span_id: &wyrd_spec::vala::ids::SpanId,
+    sampled: bool,
+    tenant_spans: Option<&Arc<dyn TenantSpanSink>>,
+) {
+    let mut parent = opentelemetry::Context::new();
+    if let Some(sink) = tenant_spans {
+        parent = parent.with_value(RequestSink(Arc::clone(sink)));
+    }
+    if span.set_parent(parent).is_ok() {
+        crate::link_remote_span(span, trace_id, span_id, sampled);
+        mark_continued(span, sampled);
+    }
+}
+
+/// Make `parent` the parent of `child`, which timed work before `parent`
+/// could start.
+///
+/// `child` keeps the start time it was created with and joins `parent`'s
+/// trace, so a phase that must run before its parent's trace is fixed (a
+/// queued attempt's claim statement) still reads back inside it. `child`
+/// must not have been entered, which would have fixed its own trace; on an
+/// entered or disabled span, or without an OpenTelemetry layer, this does
+/// nothing. Reading `parent`'s context starts it, so its links and parent
+/// must already be installed.
+pub fn adopt_span(child: &tracing::Span, parent: &tracing::Span) {
+    // An entered child keeps its trace; adoption is best-effort observability.
+    let _ = child.set_parent(parent.context());
+}
+
+/// Mark `span` as continuing a caller whose own decision was `sampled`.
+///
+/// The marker lives in the `tracing` registry, so it is skipped without a
+/// registry subscriber or on a disabled span.
+fn mark_continued(span: &tracing::Span, sampled: bool) {
+    span.with_subscriber(|(id, dispatch)| {
+        if let Some(span) = dispatch
+            .downcast_ref::<Registry>()
+            .and_then(|registry| registry.span(id))
+        {
+            span.extensions_mut().insert(Continued { sampled });
+        }
+    });
+}
+
+/// The caller's sampled flag when the current span lies inside a request
+/// that continued a caller's trace; `None` elsewhere.
+///
+/// Reads the nearest continued ancestor, so a span on a task the request
+/// spawned inside its span reads it too.
+fn continued() -> Option<bool> {
+    tracing::Span::current()
+        .with_subscriber(|(id, dispatch)| {
+            dispatch
                 .downcast_ref::<Registry>()
                 .and_then(|registry| registry.span(id))
-            {
-                span.extensions_mut().insert(Continued);
-            }
-        });
-    }
+                .and_then(|span| {
+                    span.scope().find_map(|ancestor| {
+                        ancestor.extensions().get::<Continued>().map(|c| c.sampled)
+                    })
+                })
+        })
+        .flatten()
 }
 
 /// The current span's trace context, only inside a request that continued a
@@ -137,18 +217,19 @@ pub fn serve_request(
 /// attempt's parent) reads it here; elsewhere it is `None`.
 #[must_use]
 pub fn continued_context() -> Option<TraceContext> {
-    let continued = tracing::Span::current()
-        .with_subscriber(|(id, dispatch)| {
-            dispatch
-                .downcast_ref::<Registry>()
-                .and_then(|registry| registry.span(id))
-                .is_some_and(|span| {
-                    span.scope()
-                        .any(|ancestor| ancestor.extensions().get::<Continued>().is_some())
-                })
-        })
-        .unwrap_or(false);
-    continued.then(current_context).flatten()
+    continued().and_then(|_| current_context())
+}
+
+/// Whether the current span lies inside a request that continued a caller
+/// span the caller sampled.
+///
+/// This is the caller's decision, not the operator's: work the request
+/// defers records it with its cause so the later work's link asks for the
+/// same tenant copy the request received. `false` outside a continued
+/// request.
+#[must_use]
+pub fn caller_sampled() -> bool {
+    continued().unwrap_or(false)
 }
 
 /// The trace context of the current `tracing` span, when it has a valid one.
@@ -196,7 +277,9 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt as _;
     use wyrd_spec::trace::TraceContext;
 
-    use super::{continued_context, inbound_context, serve_request};
+    use super::{
+        caller_sampled, continued_context, inbound_context, serve_linked_work, serve_request,
+    };
 
     /// A valid caller `traceparent`.
     const PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
@@ -322,8 +405,9 @@ mod tests {
     }
 
     /// Spans inside a continued request, at any depth and whatever the
-    /// caller's sampled flag, read the current context; spans of a request
-    /// that did not continue a caller's trace read none.
+    /// caller's sampled flag, read the current context and the caller's own
+    /// sampled flag; spans of a request that did not continue a caller's
+    /// trace read none and report the caller unsampled.
     #[test]
     fn only_spans_of_a_continued_request_read_a_continued_context() {
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
@@ -339,19 +423,50 @@ mod tests {
                 let request = tracing::info_span!("request");
                 serve_request(&request, Some(&caller), None);
                 let work = tracing::info_span!(parent: &request, "work");
-                let continued =
-                    work.in_scope(|| tracing::info_span!("call").in_scope(continued_context));
+                let (continued, sampled) = work.in_scope(|| {
+                    tracing::info_span!("call").in_scope(|| (continued_context(), caller_sampled()))
+                });
                 assert_eq!(
                     continued.map(|context| context.trace_id),
                     Some(caller.trace_id),
                     "flags {flags}"
                 );
+                assert_eq!(sampled, flags == "01", "flags {flags}");
             }
             let untraced = tracing::info_span!("request");
             assert!(
                 untraced.in_scope(continued_context).is_none(),
                 "an uncontinued request reads no continued context"
             );
+            assert!(
+                !untraced.in_scope(caller_sampled),
+                "an uncontinued request has no sampled caller"
+            );
+        });
+    }
+
+    /// Linked deferred work keeps a trace of its own but reads as continued
+    /// inside it: its spans read that new trace's context and the original
+    /// caller's sampled flag.
+    #[test]
+    fn linked_work_continues_its_own_trace_with_the_callers_decision() {
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("context")));
+        let cause = wyrd_spec::vala::ids::TraceId::from_hex("0af7651916cd43dd8448eb211c80319c")
+            .expect("trace id");
+        let span_id = wyrd_spec::vala::ids::SpanId::from_hex("b7ad6b7169203331").expect("span id");
+        tracing::subscriber::with_default(subscriber, || {
+            for sampled in [false, true] {
+                let attempt = tracing::info_span!("attempt");
+                serve_linked_work(&attempt, &cause, &span_id, sampled, None);
+                let (continued, caller) = attempt.in_scope(|| {
+                    tracing::info_span!("call").in_scope(|| (continued_context(), caller_sampled()))
+                });
+                let continued = continued.expect("linked work reads as continued");
+                assert_ne!(continued.trace_id, cause.to_hex(), "sampled {sampled}");
+                assert_eq!(caller, sampled);
+            }
         });
     }
 }

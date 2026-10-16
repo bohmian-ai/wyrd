@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, RegistrationReceipt};
 use wyrd_ai::cli::{self, SelectorArgs};
 use wyrd_ai::state::{HydratedCard, WyrdState};
-use wyrd_ai::{Card, Spec, VerifierImplementation};
+use wyrd_ai::{Card, Spec};
 
 use crate::support::{Deployment, fixture, hydrate, register, registered};
 
@@ -184,8 +184,8 @@ async fn latest_version_resolves_to_the_registered_card() {
     deployment.shutdown().await;
 }
 
-/// Registering the unchanged graph again keeps its root and its binding
-/// identities.
+/// Registering the unchanged graph again keeps its root. The desk's only
+/// binding has no schedule Trigger, so no binding is projected either time.
 ///
 /// # Panics
 /// Panics when the second registration or a read differs.
@@ -195,33 +195,21 @@ async fn registering_the_graph_again_is_idempotent() {
     let deployment = Deployment::start().await;
     let cards = deployment.cards().await;
     let (_, desk) = register_desk(&cards).await;
-    let bindings = |card: Card| {
-        card.status
-            .and_then(|status| status.verification)
-            .expect("the desk serves verification status")
-            .binding_ids
-    };
-    let before = bindings(
-        cards
-            .get(CardSelector::exact(desk.root.clone()))
-            .await
-            .expect("desk reads"),
-    );
 
     let again = register(&cards, DESK).await;
 
     assert_eq!(again.root, desk.root);
-    let after = bindings(
-        cards
-            .get(CardSelector::exact(again.root))
-            .await
-            .expect("desk reads"),
-    );
-    assert_eq!(after, before);
+    let status = cards
+        .get(CardSelector::exact(again.root))
+        .await
+        .expect("desk reads")
+        .status
+        .expect("the desk serves status");
+    assert_eq!(status.verification, None);
     deployment.shutdown().await;
 }
 
-/// `cards.get` returns each of the eight kinds the fixtures register as its
+/// `cards.get` returns each of the seven kinds the fixtures register as its
 /// typed spec.
 ///
 /// # Panics
@@ -258,15 +246,10 @@ async fn cards_get_returns_every_kind_typed() {
         CardKind::Operator,
         CardKind::Prompt,
         CardKind::Service,
-        CardKind::Trigger,
         CardKind::Verifier,
     ];
     expected.sort();
     assert_eq!(kinds, expected);
-    assert!(read.iter().any(|card| matches!(
-        &card.spec,
-        Spec::Verifier(verifier) if matches!(verifier.implementation, VerifierImplementation::Eval(_))
-    )));
     assert!(read.iter().any(|card| matches!(
         &card.spec,
         Spec::Data(data) if data.stats.row_count == Some(100)

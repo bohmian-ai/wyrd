@@ -110,6 +110,25 @@ pub fn build(data_tenant_id: DataTenantId, card_uid: &str, relative_path: &str) 
     format!("{data_tenant_id}/cards/{card_uid}/{relative_path}")
 }
 
+/// The tenant-qualified object of pinned verification evidence `sha256`.
+///
+/// Evidence lives at `<tenant>/evidence/sha256/<digest>`, outside any Card,
+/// so the path carries an empty `card_uid`. The canonical lowercase digest
+/// is the only variable segment, so the path is valid by construction.
+#[must_use]
+pub fn evidence(
+    data_tenant_id: DataTenantId,
+    sha256: &wyrd_spec::auth::Sha256Hex,
+) -> ValidatedPath {
+    let relative_path = format!("evidence/sha256/{sha256}");
+    ValidatedPath {
+        full: format!("{data_tenant_id}/{relative_path}"),
+        data_tenant_id,
+        card_uid: String::new(),
+        relative_path,
+    }
+}
+
 /// Validate a full tenant-scoped object path.
 ///
 /// `caller_data_tenant_id` must come from a verified identity claim.

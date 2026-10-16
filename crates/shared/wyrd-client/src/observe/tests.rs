@@ -1,5 +1,5 @@
 //! Server-free proof of the observation surface: one Bifrost lifetime, immutable
-//! Card-scoped views, and the two fixed projections.
+//! Card-scoped views, Verifier execution, and the Drift projection.
 //!
 //! The fixed-table describe bodies are built from the canonical
 //! `vala-bifrost-redux` table definitions rather than a hand-copied column list,
@@ -7,26 +7,24 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arrow_schema::{DataType, Field, Schema};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use vala_bifrost_redux::tables::{DomainTable, DriftObservationsTable, EvalObservationsTable};
+use vala_bifrost_redux::tables::{DomainTable, DriftObservationsTable};
 use wyrd_queue::{ClientByteGuard, MockSink, QueueConfig};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     BifrostTableDescription, BifrostTableEntry, FieldSpec, PARQUET_FIELD_ID_KEY,
 };
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_spec::vala::eval::media::{MediaKind, MediaRef};
-use wyrd_spec::vala::ids::{SessionId, SpanId, TraceId};
+use wyrd_spec::vala::ids::SessionId;
 
 use crate::bifrost::Bifrost;
 use crate::observe::lifecycle::BifrostLifecycle;
-use crate::observe::{
-    DRIFT_OBSERVATIONS_TABLE, EVAL_OBSERVATIONS_TABLE, EvalObservationOptions, drift, eval,
-};
+use crate::observe::{DRIFT_OBSERVATIONS_TABLE, drift};
 use crate::state::WyrdState;
 use crate::state::tests::TestBundle;
 
@@ -219,24 +217,14 @@ fn route_key(fqn: &str) -> String {
 
 /// The describe bodies a healthy startup sees, from the canonical definitions.
 fn fixed_table_bodies() -> HashMap<String, String> {
-    [
-        (
-            route_key(DRIFT_OBSERVATIONS_TABLE),
-            serde_json::to_string(&description(
-                DRIFT_OBSERVATIONS_TABLE,
-                DriftObservationsTable::arrow_fields(),
-            ))
-            .expect("drift description serializes"),
-        ),
-        (
-            route_key(EVAL_OBSERVATIONS_TABLE),
-            serde_json::to_string(&description(
-                EVAL_OBSERVATIONS_TABLE,
-                EvalObservationsTable::arrow_fields(),
-            ))
-            .expect("eval description serializes"),
-        ),
-    ]
+    [(
+        route_key(DRIFT_OBSERVATIONS_TABLE),
+        serde_json::to_string(&description(
+            DRIFT_OBSERVATIONS_TABLE,
+            DriftObservationsTable::arrow_fields(),
+        ))
+        .expect("drift description serializes"),
+    )]
     .into()
 }
 
@@ -308,32 +296,25 @@ async fn start_over(state: &WyrdState, server: &DescribeServer) -> Result<(), Wy
 
 // ── Scenario 1: one Bifrost lifetime per state ──────────────────────────────
 
-/// Startup describes both fixed tables exactly once and then serves every run.
+/// Startup describes the fixed Drift table exactly once and then serves
+/// every run.
 #[tokio::test]
-async fn startup_describes_both_fixed_tables_once() {
+async fn startup_describes_the_fixed_table_once() {
     let server = DescribeServer::start(fixed_table_bodies());
     let (_bundle, state) = state_fixture();
 
     start_over(&state, &server).await.expect("startup succeeds");
 
     assert_eq!(server.calls(DRIFT_OBSERVATIONS_TABLE), 1);
-    assert_eq!(server.calls(EVAL_OBSERVATIONS_TABLE), 1);
     let run = state.run();
-    run.observe()
-        .drift(&json!({ "age": 42 }), None)
-        .expect("drift enqueues");
-    run.observe()
-        .eval(
-            &json!({ "answer": "yes" }),
-            EvalObservationOptions::default(),
-        )
-        .expect("eval enqueues");
+    for _ in 0..2 {
+        run.observe()
+            .drift_value(&json!({ "age": 42 }), None)
+            .expect("drift enqueues");
+    }
     assert_eq!(
-        (
-            server.calls(DRIFT_OBSERVATIONS_TABLE),
-            server.calls(EVAL_OBSERVATIONS_TABLE)
-        ),
-        (1, 1),
+        server.calls(DRIFT_OBSERVATIONS_TABLE),
+        1,
         "an observation never re-describes its fixed table"
     );
 }
@@ -342,7 +323,7 @@ async fn startup_describes_both_fixed_tables_once() {
 #[tokio::test]
 async fn missing_fixed_table_fails_startup() {
     let mut bodies = fixed_table_bodies();
-    bodies.remove(&route_key(EVAL_OBSERVATIONS_TABLE));
+    bodies.remove(&route_key(DRIFT_OBSERVATIONS_TABLE));
     let server = DescribeServer::start(bodies);
     let (_bundle, state) = state_fixture();
 
@@ -353,7 +334,7 @@ async fn missing_fixed_table_fails_startup() {
     let refusal = state
         .run()
         .observe()
-        .drift(&json!({ "age": 42 }), None)
+        .drift_value(&json!({ "age": 42 }), None)
         .expect_err("a failed startup leaves no writer");
     assert_eq!(refusal.code(), "WYRD_SDK_400_BIFROST_NOT_STARTED");
 }
@@ -407,9 +388,9 @@ async fn incompatible_fixed_table_fails_startup() {
 #[tokio::test]
 async fn failed_startup_may_be_retried() {
     let mut bodies = fixed_table_bodies();
-    let eval_body = bodies
-        .remove(&route_key(EVAL_OBSERVATIONS_TABLE))
-        .expect("fixture has an eval body");
+    let drift_body = bodies
+        .remove(&route_key(DRIFT_OBSERVATIONS_TABLE))
+        .expect("fixture has a drift body");
     let server = DescribeServer::start(bodies);
     let (_bundle, state) = state_fixture();
 
@@ -420,7 +401,7 @@ async fn failed_startup_may_be_retried() {
         .bodies
         .lock()
         .expect("body lock")
-        .insert(route_key(EVAL_OBSERVATIONS_TABLE), eval_body);
+        .insert(route_key(DRIFT_OBSERVATIONS_TABLE), drift_body);
     start_over(&state, &server)
         .await
         .expect("a released claim lets startup retry");
@@ -456,7 +437,7 @@ async fn shutdown_closes_the_state_permanently() {
 
     let refusal = run
         .observe()
-        .drift(&json!({ "age": 42 }), None)
+        .drift_value(&json!({ "age": 42 }), None)
         .expect_err("a closed state refuses writes");
     assert_eq!(refusal.code(), "WYRD_SDK_409_BIFROST_CLOSED");
     let restart = start_over(&state, &server)
@@ -479,7 +460,7 @@ async fn shutdown_without_startup_closes_permanently() {
     let refusal = state
         .run()
         .observe()
-        .drift(&json!({ "age": 42 }), None)
+        .drift_value(&json!({ "age": 42 }), None)
         .expect_err("a closed state refuses writes");
     assert_eq!(refusal.code(), "WYRD_SDK_409_BIFROST_CLOSED");
 }
@@ -546,7 +527,7 @@ async fn ambiguous_shutdown_retries_the_same_batch_on_the_same_state() {
     state
         .run()
         .observe()
-        .drift(&json!({ "age": 42 }), None)
+        .drift_value(&json!({ "age": 42 }), None)
         .expect("one row enqueues");
     sink.fail_next(1);
 
@@ -590,7 +571,7 @@ async fn ambiguous_shutdown_retries_the_same_batch_on_the_same_state() {
     let refusal = state
         .run()
         .observe()
-        .drift(&json!({ "age": 42 }), None)
+        .drift_value(&json!({ "age": 42 }), None)
         .expect_err("a closed state refuses writes");
     assert_eq!(refusal.code(), "WYRD_SDK_409_BIFROST_CLOSED");
     let restart = start_over(&state, &server)
@@ -691,240 +672,14 @@ fn run_for_card_refuses_an_unknown_alias_without_network_io() {
     assert_eq!(error.code(), "WYRD_SDK_404_UNKNOWN_ALIAS");
 }
 
-// ── Scenario 2b: judging a view's subject with a bound Verifier ───────────
+// ── Scenario 2b: Verifier execution through named slots ────────────────────
 
-/// A stub execute endpoint that records each request body and answers with
-/// one fixed passing Eval judgment.
+/// A client presenting a static bearer to `base_url` with `timeout_ms`, so no
+/// token exchange appears among the recorded requests.
 ///
 /// # Panics
-/// Panics when the listener cannot bind or adopt the test runtime.
-fn execute_server() -> (String, Arc<Mutex<Vec<Value>>>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds");
-    let address = listener.local_addr().expect("listener has an address");
-    listener
-        .set_nonblocking(true)
-        .expect("listener converts to tokio");
-    let listener = TcpListener::from_std(listener).expect("listener adopts the runtime");
-    let bodies = Arc::new(Mutex::new(Vec::new()));
-    let seen = Arc::clone(&bodies);
-    tokio::spawn(async move {
-        while let Ok((mut socket, _)) = listener.accept().await {
-            let seen = Arc::clone(&seen);
-            tokio::spawn(async move {
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 4096];
-                let (head, body) = loop {
-                    let Ok(read) = socket.read(&mut buffer).await else {
-                        return;
-                    };
-                    request.extend_from_slice(&buffer[..read]);
-                    let text = String::from_utf8_lossy(&request).to_string();
-                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                        let length = head
-                            .lines()
-                            .find_map(|line| {
-                                line.to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .map(|n| n.trim().parse::<usize>().unwrap_or(0))
-                            })
-                            .unwrap_or(0);
-                        if body.len() >= length || read == 0 {
-                            break (head.to_owned(), body.to_owned());
-                        }
-                    }
-                };
-                let response = if head.starts_with("POST /auth/token") {
-                    ok_json(
-                        r#"{"access_token":"test-token","token_type":"Bearer","expires_in":3600}"#,
-                    )
-                } else {
-                    seen.lock()
-                        .expect("body lock")
-                        .push(serde_json::from_str(&body).expect("execute body is JSON"));
-                    ok_json(&judgment_body().to_string())
-                };
-                let _ = socket.write_all(response.as_bytes()).await;
-            });
-        }
-    });
-    (format!("http://{address}"), bodies)
-}
-
-/// The passing Eval judgment the stub execute endpoint answers with.
-fn judgment_body() -> Value {
-    let card =
-        json!({ "kind": "Verifier", "name": "quality", "version": "1.0.0", "space": "default" });
-    json!({
-        "execution_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1bff",
-        "verifier": card,
-        "subject": card,
-        "kind": "eval_assertion",
-        "verdict": "passed",
-        "summary": "1 of 1 assertions passed",
-        "counts": { "implementation": "eval", "passed_tasks": 1, "failed_tasks": 0, "total_tasks": 1, "pass_rate_percent": 100 },
-        "detail": { "eval": { "results": [], "skipped": [] } },
-    })
-}
-
-/// `observe.verify` resolves a bound Verifier locally, sends one request in
-/// the shape its kind takes carrying the view's `run_id`, and returns the typed judgment; an unbound name
-/// and a wrong input shape are refused before any request is sent.
-///
-/// # Panics
-/// Panics when a refusal carries the wrong code, a refusal reaches the
-/// server, or the sent request or returned judgment differs from expected.
-#[tokio::test]
-async fn verify_resolves_bound_verifiers_and_refuses_invalid_inputs_locally() {
-    let bundle = TestBundle::with_typed_cards();
-    let state = WyrdState::from_path(bundle.path()).expect("fixture bundle loads");
-    let (url, bodies) = execute_server();
-    state.use_client_for_test(client_for(&url));
-    let service = state.run();
-    let observe = service.observe();
-
-    let refusals = [
-        (
-            "not-bound",
-            json!({ "answer": "yes" }),
-            "WYRD_SDK_404_UNKNOWN_VERIFIER",
-        ),
-        (
-            "quality",
-            json!([{ "answer": "yes" }]),
-            "WYRD_SDK_400_INVALID_OBSERVATION",
-        ),
-        (
-            "model-drift",
-            json!({ "score": 0.4 }),
-            "WYRD_SDK_400_INVALID_OBSERVATION",
-        ),
-        ("model-drift", json!([]), "WYRD_SDK_400_INVALID_OBSERVATION"),
-        (
-            "model-drift",
-            json!([{ "score": [1] }]),
-            "WYRD_SDK_400_INVALID_OBSERVATION",
-        ),
-    ];
-    for (verifier, input, code) in refusals {
-        let error = observe
-            .verify(verifier, &input)
-            .await
-            .expect_err("a local refusal");
-        assert_eq!(error.code(), code, "{verifier} over {input}");
-    }
-    let unbound_view = state.run_for_card("training_data").expect("data alias");
-    let error = unbound_view
-        .observe()
-        .verify("quality", &json!({ "answer": "yes" }))
-        .await
-        .expect_err("a Verifier bound to the Service is not bound to its Data");
-    assert_eq!(error.code(), "WYRD_SDK_404_UNKNOWN_VERIFIER");
-    assert!(
-        bodies.lock().expect("body lock").is_empty(),
-        "refusals send nothing"
-    );
-
-    let judgment = observe
-        .verify("quality", &json!({ "answer": "yes" }))
-        .await
-        .expect("a bound Eval Verifier judges");
-    assert!(judgment.passed());
-    observe
-        .verify(
-            "model-drift",
-            &json!([{ "score": 0.4 }, { "score": 0.6, "tier": "gold" }]),
-        )
-        .await
-        .expect("a bound Drift Verifier judges");
-
-    let root = state.root_ref().uid.clone().expect("root uid").to_string();
-    let quality = state
-        .card_ref("quality_eval")
-        .expect("eval ref")
-        .uid
-        .clone()
-        .expect("eval uid")
-        .to_string();
-    let drift = state
-        .card_ref("model_drift")
-        .expect("drift ref")
-        .uid
-        .clone()
-        .expect("drift uid")
-        .to_string();
-    let run_id = service.run_id().as_str();
-    assert_eq!(
-        *bodies.lock().expect("body lock"),
-        vec![
-            json!({
-                "verifier_card_uid": quality,
-                "card_uid": root,
-                "input": { "kind": "eval_record", "context": { "answer": "yes" } },
-                "run_id": run_id,
-            }),
-            json!({
-                "verifier_card_uid": drift,
-                "card_uid": root,
-                "input": { "kind": "drift_samples", "columns": {
-                    "score": [0.4, 0.6],
-                    "tier": [null, "gold"],
-                } },
-                "run_id": run_id,
-            }),
-        ]
-    );
-}
-
-/// Delay before [`deadline_server`] answers, longer than the client's
-/// configured `timeout_ms` in [`execute_outlives_the_configured_timeout`].
-const DEADLINE_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
-
-/// Bind a stub execute endpoint that answers every request, after
-/// [`DEADLINE_DELAY`], with the server's execution-deadline refusal.
-///
-/// Returns the base URL and the number of requests it served, which proves
-/// the request was sent once and never replayed.
-///
-/// # Panics
-/// Panics when the listener cannot bind or adopt the test runtime.
-fn deadline_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds");
-    let address = listener.local_addr().expect("listener has an address");
-    listener
-        .set_nonblocking(true)
-        .expect("listener converts to tokio");
-    let listener = TcpListener::from_std(listener).expect("listener adopts the runtime");
-    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let served = Arc::clone(&hits);
-    tokio::spawn(async move {
-        while let Ok((mut socket, _)) = listener.accept().await {
-            served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            tokio::spawn(async move {
-                let mut buffer = [0_u8; 4096];
-                if socket.read(&mut buffer).await.is_err() {
-                    return;
-                }
-                tokio::time::sleep(DEADLINE_DELAY).await;
-                let body = r#"{"code":"WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT","detail":"the direct execution exceeded its deadline","details":{}}"#;
-                let response = format!(
-                    "HTTP/1.1 504 Gateway Timeout\r\ncontent-type: application/problem+json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-            });
-        }
-    });
-    (format!("http://{address}"), hits)
-}
-
-/// A direct execution waits past a shorter configured `timeout_ms` so the
-/// server's own deadline answer reaches the caller, sent once.
-///
-/// # Panics
-/// Panics when the delayed 504 is replaced by a client timeout or replayed.
-#[tokio::test]
-async fn execute_outlives_the_configured_timeout() {
-    let (url, hits) = deadline_server();
+/// Panics when the auth middleware or transport cannot be built.
+fn bearer_client(base_url: String, timeout_ms: u64) -> crate::WyrdClient {
     let config = crate::config::ClientConfig::default();
     let auth = crate::auth::AuthMiddleware::new(
         &config,
@@ -935,30 +690,568 @@ async fn execute_outlives_the_configured_timeout() {
     .expect("auth builds");
     let transport = crate::transport::HttpTransport::new(
         &crate::transport::HttpConfig {
-            base_url: url,
-            timeout_ms: 20,
+            base_url,
+            timeout_ms,
             ..crate::transport::HttpConfig::default()
         },
         Arc::clone(&auth),
     )
     .expect("transport builds");
-    let client = crate::WyrdClient::from_parts(auth, transport, config.grpc);
-    let request = wyrd_spec::verification::ExecuteVerificationRequest::decode(json!({
-        "verifier_card_uid": "018f4d8e-0000-7000-8000-000000000001",
-        "card_uid": "018f4d8e-0000-7000-8000-000000000002",
-        "input": { "kind": "eval_record", "context": { "answer": "yes" } },
-    }))
-    .expect("request decodes");
+    crate::WyrdClient::from_parts(auth, transport, config.grpc)
+}
 
-    let error = super::verify::execute(&client, &request)
+/// A Verifier with one slot of every Run type.
+///
+/// # Panics
+/// Panics when the fixture does not decode.
+fn run_verifier() -> wyrd_spec::card::verifier::VerifierSpec {
+    serde_json::from_value(json!({
+        "inputs": {
+            "answer": { "type": "json" },
+            "policy": { "type": "media", "formats": ["pdf"], "max_bytes": 64 },
+            "deck": { "type": "media", "formats": ["pptx", "pdf"] },
+            "copy": { "type": "media", "formats": ["pdf"], "required": false },
+            "archive": { "type": "media", "formats": ["pdf"], "required": false },
+            "trace": { "type": "trace", "required": false },
+        },
+        "requirements": [{
+            "id": "answered", "statement": "An answer is given",
+            "check": { "kind": "assert", "path": "inputs.answer", "operator": "is_not_null" },
+        }],
+    }))
+    .expect("run Verifier decodes")
+}
+
+/// An execution target over `spec` with fixed Card UIDs.
+///
+/// # Panics
+/// Panics when the fixed UIDs do not decode.
+fn target(spec: &wyrd_spec::card::verifier::VerifierSpec) -> crate::verify::Target<'_> {
+    crate::verify::Target {
+        spec,
+        verifier_card_uid: serde_json::from_value(json!("018f4d8e-0000-7000-8000-000000000001"))
+            .expect("Verifier UID"),
+        card_uid: serde_json::from_value(json!("018f4d8e-0000-7000-8000-000000000002"))
+            .expect("subject UID"),
+        run_id: wyrd_spec::vala::ids::RunId::new(),
+    }
+}
+
+/// Project `inputs` onto `spec` as Run evidence.
+///
+/// # Panics
+/// Panics when the projection is refused or is Window evidence.
+fn run_evidence(
+    spec: &wyrd_spec::card::verifier::VerifierSpec,
+    inputs: crate::verify::Inputs,
+) -> crate::verify::RunEvidence {
+    match target(spec)
+        .project(inputs)
+        .expect("values fit their slots")
+    {
+        crate::verify::Projected::Run(run) => run,
+        crate::verify::Projected::Window(_) => panic!("expected Run evidence"),
+    }
+}
+
+/// A passing result body for execution `id`.
+fn result_body(id: &wyrd_spec::ids::ExecutionId) -> Value {
+    let card = json!({ "kind": "Verifier", "space": "support", "name": "policy-check", "version": "1.0.0" });
+    json!({
+        "execution_id": id,
+        "verifier": card,
+        "subject": card,
+        "outcome": { "verdict": "passed", "requirements": [], "steps": [], "evidence": {} },
+    })
+}
+
+/// Samples fill a Window projection as one flat feature object, a
+/// single-measurement slot takes a bare value, and a positional value fills a
+/// single-slot Verifier; unknown slots, wrong kinds, bad trace IDs,
+/// undeclared measurements, and ambiguous positional values are refused.
+///
+/// # Panics
+/// Panics when a projection differs or a refusal passes.
+#[test]
+fn values_project_onto_named_slots_by_slot_type() {
+    let window: wyrd_spec::card::verifier::VerifierSpec = serde_json::from_value(json!({
+        "inputs": {
+            "current": { "type": "samples", "features": ["income", "dti"] },
+            "latency": { "type": "samples", "features": ["latency_p95"] },
+        },
+    }))
+    .expect("window Verifier decodes");
+    let projected = target(&window)
+        .project(crate::verify::Inputs::named([
+            ("current", json!({ "income": 52_000, "dti": 0.31 })),
+            ("latency", json!(840)),
+        ]))
+        .expect("samples fit their slots");
+    let crate::verify::Projected::Window(features) = projected else {
+        panic!("samples are Window evidence");
+    };
+    assert_eq!(
+        features,
+        json!({ "income": 52_000, "dti": 0.31, "latency_p95": 840 })
+    );
+
+    let single: wyrd_spec::card::verifier::VerifierSpec =
+        serde_json::from_value(json!({ "inputs": { "answer": { "type": "json" } } }))
+            .expect("single-slot Verifier decodes");
+    run_evidence(&single, json!("yes").into());
+
+    let run = run_verifier();
+    let refusals: [(
+        &wyrd_spec::card::verifier::VerifierSpec,
+        crate::verify::Inputs,
+    ); 7] = [
+        (&run, crate::verify::Inputs::named([("missing", json!(1))])),
+        (
+            &run,
+            crate::verify::Inputs::named([("policy", json!("policy.pdf"))]),
+        ),
+        (
+            &run,
+            crate::verify::Inputs::named([("answer", crate::verify::File::bytes(vec![1]))]),
+        ),
+        (
+            &run,
+            crate::verify::Inputs::named([("trace", json!("not-a-trace"))]),
+        ),
+        (&run, json!("positional needs one slot").into()),
+        (
+            &window,
+            crate::verify::Inputs::named([("current", json!({ "age": 1 }))]),
+        ),
+        (
+            &window,
+            crate::verify::Inputs::named([("current", json!(1))]),
+        ),
+    ];
+    for (spec, inputs) in refusals {
+        let error = target(spec)
+            .project(inputs.clone())
+            .expect_err("the value cannot fill its slot");
+        assert_eq!(
+            error.code(),
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
+            "{inputs:?}"
+        );
+    }
+}
+
+/// `execute` hashes path and in-memory files during the call, plans each
+/// distinct digest once, uploads only the digest the server lacks with one
+/// PUT, and sends inline JSON, trace, Artifact, and pinned file
+/// declarations in one execution request.
+///
+/// # Panics
+/// Panics when a request or the typed result differs from expected.
+#[tokio::test]
+async fn execute_pins_files_and_uploads_only_missing_digests() {
+    use sha2::Digest as _;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy = dir.path().join("Policy.pdf");
+    std::fs::write(&policy, b"%PDF-policy").expect("policy written");
+    let policy_sha = hex::encode(sha2::Sha256::digest(b"%PDF-policy"));
+    let deck_sha = hex::encode(sha2::Sha256::digest(b"%PDF-deck"));
+    let plan = wyrd_spec::storage::UploadPlan::SinglePut {
+        put_url: format!("{}/bucket/{deck_sha}", server.uri()),
+        ttl_secs: 60,
+        required_headers: Vec::new(),
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/verification/evidence"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "uploads": [{ "sha256": deck_sha, "plan": plan }] })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/bucket/{deck_sha}")))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let id = wyrd_spec::ids::ExecutionId::new_v7();
+    Mock::given(method("POST"))
+        .and(path("/v1/verification/execute"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(result_body(&id)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let artifact: wyrd_spec::reference::CardRef = serde_json::from_value(
+        json!({ "kind": "Artifact", "space": "support", "name": "decks", "version": "1.0.0" }),
+    )
+    .expect("Artifact ref decodes");
+    let spec = run_verifier();
+    let run = run_evidence(
+        &spec,
+        crate::verify::Inputs::named([
+            (
+                "answer",
+                crate::verify::Input::from(json!({ "text": "yes" })),
+            ),
+            ("trace", json!("0af7651916cd43dd8448eb211c80319c").into()),
+            ("policy", crate::verify::File::path(&policy).into()),
+            (
+                "deck",
+                crate::verify::File::bytes(&b"%PDF-deck"[..])
+                    .with_format(skald_spec::MediaFormat::Pdf)
+                    .into(),
+            ),
+            (
+                "copy",
+                crate::verify::File::bytes(&b"%PDF-policy"[..]).into(),
+            ),
+            (
+                "archive",
+                crate::verify::ArtifactRef::new(artifact, Some("q3.pdf".to_owned())).into(),
+            ),
+        ]),
+    );
+
+    let result = target(&spec)
+        .execute(&bearer_client(server.uri(), 5_000), run)
+        .await
+        .expect("the execution succeeds");
+    assert_eq!(result.execution_id, id);
+
+    let requests = server.received_requests().await.expect("requests recorded");
+    let body = |route: &str| -> Value {
+        requests
+            .iter()
+            .find(|request| request.url.path() == route)
+            .map(|request| serde_json::from_slice(&request.body).expect("JSON body"))
+            .expect("route was called")
+    };
+    assert_eq!(
+        body("/v1/verification/evidence"),
+        json!({ "files": [
+            { "sha256": policy_sha, "size_bytes": 11 },
+            { "sha256": deck_sha, "size_bytes": 9 },
+        ] }),
+        "each distinct digest is planned once, in slot order"
+    );
+    assert_eq!(
+        body("/v1/verification/execute")["inputs"],
+        json!({
+            "answer": { "kind": "json", "value": { "text": "yes" } },
+            "archive": { "kind": "artifact", "artifact": { "kind": "Artifact", "space": "support", "name": "decks", "version": "1.0.0" }, "path": "q3.pdf" },
+            "copy": { "kind": "file", "sha256": policy_sha, "size_bytes": 11, "format": "pdf" },
+            "deck": { "kind": "file", "sha256": deck_sha, "size_bytes": 9, "format": "pdf" },
+            "policy": { "kind": "file", "sha256": policy_sha, "size_bytes": 11, "format": "pdf", "filename": "Policy.pdf" },
+            "trace": { "kind": "trace", "trace_id": "0af7651916cd43dd8448eb211c80319c" },
+        })
+    );
+}
+
+/// A `File` reads nothing when constructed; an unreadable file, a format
+/// its slot does not accept or cannot be inferred, and a file above its
+/// slot's `max_bytes` are refused during the call before any request.
+///
+/// # Panics
+/// Panics when a refusal passes or any request reaches the server.
+#[tokio::test]
+async fn file_refusals_happen_locally_before_any_request() {
+    let server = wiremock::MockServer::start().await;
+    let client = bearer_client(server.uri(), 5_000);
+    let spec = run_verifier();
+    for (file, code) in [
+        (
+            crate::verify::File::path("/no/such/policy.pdf"),
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
+        ),
+        (
+            crate::verify::File::bytes(&b"text"[..]).with_filename("policy.txt"),
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
+        ),
+        (
+            crate::verify::File::bytes(vec![0_u8; 65]),
+            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
+        ),
+    ] {
+        let run = run_evidence(&spec, crate::verify::Inputs::named([("policy", file)]));
+        let error = target(&spec)
+            .execute(&client, run)
+            .await
+            .expect_err("the file is refused");
+        assert_eq!(error.code(), code);
+    }
+    let run = run_evidence(
+        &spec,
+        crate::verify::Inputs::named([("deck", crate::verify::File::bytes(vec![1]))]),
+    );
+    let error = target(&spec)
+        .execute(&client, run)
+        .await
+        .expect_err("a format must be declared when several are accepted");
+    assert_eq!(error.code(), "WYRD_VERIFICATION_400_INPUT_INVALID");
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests recorded")
+            .is_empty(),
+        "no refusal reached the server"
+    );
+}
+
+/// `enqueue` replays one minted `Idempotency-Key` across a retried 503, and
+/// `wait` on the returned handle tolerates a not-yet-visible execution, a
+/// pending status, and a completion whose result is not visible yet before
+/// returning the real result.
+///
+/// # Panics
+/// Panics when the key changes across attempts or `wait` returns early.
+#[tokio::test]
+async fn enqueue_replays_its_key_and_wait_returns_only_a_real_result() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let id = wyrd_spec::ids::ExecutionId::new_v7();
+    Mock::given(method("POST"))
+        .and(path("/v1/verification/enqueue"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/verification/enqueue"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "execution_id": id })))
+        .mount(&server)
+        .await;
+    let status = format!("/v1/verification/executions/{id}");
+    for answer in [
+        ResponseTemplate::new(404)
+            .set_body_json(json!({ "code": "WYRD_SPEC_404_NOT_FOUND", "detail": "not yet" })),
+        ResponseTemplate::new(200)
+            .set_body_json(json!({ "execution_id": id, "status": "pending" })),
+        ResponseTemplate::new(200)
+            .set_body_json(json!({ "execution_id": id, "status": "completed" })),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(status.as_str()))
+            .respond_with(answer)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path(status.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "execution_id": id, "status": "completed", "result": result_body(&id),
+        })))
+        .mount(&server)
+        .await;
+    let spec = run_verifier();
+    let run = run_evidence(
+        &spec,
+        crate::verify::Inputs::named([("answer", json!("yes"))]),
+    );
+
+    let execution = target(&spec)
+        .enqueue(&bearer_client(server.uri(), 5_000), run)
+        .await
+        .expect("the retried submission is staged");
+    assert_eq!(execution.id(), &id);
+    let result = execution
+        .wait(Duration::from_secs(10))
+        .await
+        .expect("the result arrives");
+    assert_eq!(result.execution_id, id);
+
+    let requests = server.received_requests().await.expect("requests recorded");
+    let keys: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/verification/enqueue")
+        .map(|request| request.headers.get("idempotency-key").cloned())
+        .collect();
+    assert_eq!(keys.len(), 2, "the 503 was retried once");
+    assert!(keys[0].is_some() && keys[0] == keys[1], "one key: {keys:?}");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == status)
+            .count(),
+        4
+    );
+}
+
+/// `wait` raises a settled execution's own error, including an asynchronous
+/// idempotency conflict, returns a non-transient read error unchanged, and
+/// times out with the last status instead of inventing a result; a handle
+/// rebuilt with `connect_with` reads the same execution.
+///
+/// # Panics
+/// Panics when an error code or detail differs from expected.
+#[tokio::test]
+async fn wait_raises_terminal_errors_and_times_out_without_a_result() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let client = bearer_client(server.uri(), 5_000);
+    let [conflicted, forbidden, pending] =
+        std::array::from_fn(|_| wyrd_spec::ids::ExecutionId::new_v7());
+    for (id, answer) in [
+        (
+            &conflicted,
+            ResponseTemplate::new(200).set_body_json(json!({
+                "execution_id": conflicted, "status": "errored",
+                "error": { "code": "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT", "message": "key reused" },
+            })),
+        ),
+        (
+            &forbidden,
+            ResponseTemplate::new(403).set_body_json(
+                json!({ "code": "WYRD_PERMISSION_403_DENIED_RBAC", "detail": "no read scope" }),
+            ),
+        ),
+        (
+            &pending,
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "execution_id": pending, "status": "running" })),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/verification/executions/{id}")))
+            .respond_with(answer)
+            .mount(&server)
+            .await;
+    }
+    let wait = |id: wyrd_spec::ids::ExecutionId, timeout: Duration| {
+        let client = client.clone();
+        async move {
+            crate::verify::Execution::connect_with(id, &client)
+                .await
+                .expect("a bearer client connects without a request")
+                .wait(timeout)
+                .await
+                .expect_err("no result")
+        }
+    };
+
+    let error = wait(conflicted, Duration::from_secs(5)).await;
+    assert_eq!(error.code(), "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT");
+    assert_eq!(error.as_problem_json()["details"]["status"], "errored");
+    let error = wait(forbidden, Duration::from_secs(5)).await;
+    assert_eq!(error.status(), 403);
+    let error = wait(pending, Duration::from_millis(300)).await;
+    assert_eq!(error.code(), "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT");
+    assert_eq!(error.as_problem_json()["details"]["last_status"], "running");
+}
+
+/// The caller's deadline bounds the whole status read: a completed result
+/// that arrives after it, or a read stuck retrying 503s, still times out on
+/// time, and a zero budget starts no read at all.
+///
+/// # Panics
+/// Panics when a late result beats the deadline, a wait outlives it, or a
+/// zero-budget wait sends a request.
+#[tokio::test]
+async fn wait_deadline_bounds_slow_reads_and_starts_no_read_after_expiry() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let client = bearer_client(server.uri(), 10_000);
+    let [late, unavailable, unread] =
+        std::array::from_fn(|_| wyrd_spec::ids::ExecutionId::new_v7());
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/verification/executions/{late}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "execution_id": late, "status": "completed", "result": result_body(&late),
+                }))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/verification/executions/{unavailable}")))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    for id in [late, unavailable] {
+        let started = tokio::time::Instant::now();
+        let error = crate::verify::Execution::connect_with(id, &client)
+            .await
+            .expect("a bearer client connects without a request")
+            .wait(Duration::from_millis(200))
+            .await
+            .expect_err("the deadline wins");
+        assert_eq!(error.code(), "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait outlived its deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    let error = crate::verify::Execution::connect_with(unread, &client)
+        .await
+        .expect("a bearer client connects without a request")
+        .wait(Duration::ZERO)
+        .await
+        .expect_err("an expired budget times out");
+    assert_eq!(error.code(), "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT");
+    let unread_path = format!("/v1/verification/executions/{unread}");
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests recorded")
+            .iter()
+            .all(|request| request.url.path() != unread_path),
+        "no read starts after expiry"
+    );
+}
+
+/// A direct execution waits past a shorter configured `timeout_ms` so the
+/// server's own deadline answer reaches the caller, sent once.
+///
+/// # Panics
+/// Panics when the delayed 504 is replaced by a client timeout or replayed.
+#[tokio::test]
+async fn execute_outlives_the_configured_timeout() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/verification/execute"))
+        .respond_with(
+            ResponseTemplate::new(504)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(json!({
+                    "code": "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT",
+                    "detail": "deadline elapsed",
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let spec = run_verifier();
+    let run = run_evidence(
+        &spec,
+        crate::verify::Inputs::named([("answer", json!("yes"))]),
+    );
+
+    let error = target(&spec)
+        .execute(&bearer_client(server.uri(), 20), run)
         .await
         .expect_err("the server's deadline answer is an error");
     assert_eq!(error.code(), "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT");
-    assert_eq!(
-        hits.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "never replayed"
-    );
 }
 
 // ── Scenario 3: the Drift projection ───────────────────────────────────────
@@ -1062,124 +1355,6 @@ fn drift_refuses_unsupported_inputs() {
     }
 }
 
-/// Foreign JSON integer literals beyond 64-bit range are refused from the text,
-/// while in-range integers, large float literals, and non-object roots are left
-/// to the feature-map checks.
-///
-/// # Panics
-/// Panics when an out-of-range literal is admitted or a valid one is refused.
-#[test]
-fn drift_json_refuses_integer_literals_beyond_64_bits() {
-    for text in [
-        "{\"count\": 18446744073709551616}",
-        "{\"count\": -18446744073709551616}",
-        "{\"count\": 1180591620717411303424}",
-    ] {
-        let error = drift::check_integer_literals(text)
-            .expect_err(&format!("{text} must be refused before parsing"));
-        assert_eq!(error.code(), "WYRD_SDK_400_INVALID_OBSERVATION", "{text}");
-    }
-    for text in [
-        "{\"count\": 3, \"latency\": 1.5e20, \"big\": 9223372036854775808}",
-        "[1, 2]",
-    ] {
-        drift::check_integer_literals(text).expect("left to the feature-map checks");
-    }
-}
-
-/// A non-finite float cannot even reach JSON, so it is refused at the door.
-#[test]
-fn drift_refuses_non_finite_floats() {
-    /// A typed Drift input whose only feature is a float the test sets to NaN.
-    #[derive(serde::Serialize)]
-    struct Features {
-        /// The feature under test; holds a non-finite value.
-        score: f64,
-    }
-    let (_bundle, state) = state_fixture();
-    let error = state
-        .run()
-        .observe()
-        .drift(&Features { score: f64::NAN }, None)
-        .expect_err("NaN is not a Float64 projection");
-    assert_eq!(error.code(), "WYRD_SDK_400_INVALID_OBSERVATION");
-}
-
-// ── Scenario 4: the Eval projection ────────────────────────────────────────
-
-/// The fixed row preserves context, session, media, and trace identity.
-#[test]
-fn eval_projects_context_media_and_trace_identity() {
-    let trace_id = TraceId::from_hex("0102030405060708090a0b0c0d0e0f10").expect("trace hex");
-    let span_id = SpanId::from_hex("1112131415161718").expect("span hex");
-    let record = eval::observation(
-        json!({ "question": "why?", "answer": "because" }),
-        EvalObservationOptions {
-            session_id: Some(SessionId(uuid::Uuid::nil())),
-            media: vec![MediaRef {
-                id: "screenshot".parse().expect("binding id"),
-                kind: MediaKind::Image,
-                uri: "s3://bucket/shot.png".to_owned(),
-                media_type: Some("image/png".to_owned()),
-            }],
-            trace_id: Some(trace_id),
-            span_id: Some(span_id),
-        },
-    )
-    .expect("the canonical record builds");
-    let row = row_value(&eval::row(&record).expect("projection succeeds"));
-
-    assert_eq!(row["trace_id"], json!("0102030405060708090a0b0c0d0e0f10"));
-    assert_eq!(row["span_id"], json!("1112131415161718"));
-    assert_eq!(row["session_id"], json!(uuid::Uuid::nil().to_string()));
-    assert_eq!(
-        row["context"],
-        json!({ "question": "why?", "answer": "because" }),
-        "context stays a JSON value for its Variant column"
-    );
-    let media = &row["media"];
-    assert_eq!(media[0]["id"], json!("screenshot"));
-    assert_eq!(media[0]["uri"], json!("s3://bucket/shot.png"));
-    assert_eq!(
-        row.as_object().expect("row is an object").len(),
-        7,
-        "a row carries exactly the fixed user columns"
-    );
-    assert!(
-        row.get("eval_ref").is_none() && row.get("run_id").is_none(),
-        "the row names neither a Verifier nor a duplicate run id"
-    );
-}
-
-/// No active span and no explicit ids leaves both trace fields absent.
-#[test]
-fn eval_without_a_span_omits_trace_identity() {
-    let record = eval::observation(
-        json!({ "answer": "yes" }),
-        EvalObservationOptions::default(),
-    )
-    .expect("record builds");
-    assert!(record.trace_id.is_none() && record.span_id.is_none());
-    let row = row_value(&eval::row(&record).expect("projection succeeds"));
-    assert_eq!(row["trace_id"], Value::Null);
-    assert_eq!(row["span_id"], Value::Null);
-    assert_eq!(row["media"], Value::Null);
-}
-
-/// A span without its trace is refused before enqueue.
-#[test]
-fn eval_refuses_a_span_without_its_trace() {
-    let error = eval::observation(
-        json!({ "answer": "yes" }),
-        EvalObservationOptions {
-            span_id: Some(SpanId::from_hex("1112131415161718").expect("span hex")),
-            ..EvalObservationOptions::default()
-        },
-    )
-    .expect_err("a span id is only meaningful inside its trace");
-    assert_eq!(error.code(), "WYRD_SPEC_400_VALIDATION");
-}
-
 // ── Scenario 5: the generic record path ────────────────────────────────────
 
 /// The first call describes the table once; later calls reuse its schema.
@@ -1275,7 +1450,7 @@ async fn record_refuses_reserved_and_system_tables() {
 
     for table in [
         DRIFT_OBSERVATIONS_TABLE,
-        EVAL_OBSERVATIONS_TABLE,
+        "vala.eval.observations",
         "vala.system.audit_log",
         "vala.traces.spans",
         "vala.verification.results",
@@ -1315,31 +1490,24 @@ async fn record_refuses_an_unknown_dataset_table() {
 }
 
 /// A state created with a client keeps it for every server call: its clones
-/// resolve the same client, which Bifrost startup connects over, and
-/// `observe.verify` sends its request to that client's server without
-/// reading the ambient configuration.
+/// resolve the same client, which Bifrost startup and Verifier execution use
+/// without reading the ambient configuration.
 ///
 /// # Panics
-/// Panics when the bundle does not load, the state resolves another client,
-/// or the judgment request does not reach the bound client's server.
-#[tokio::test]
-async fn a_state_created_with_a_client_keeps_it_for_every_server_call() {
+/// Panics when the bundle does not load or the state resolves another client.
+#[test]
+fn a_state_created_with_a_client_keeps_it_for_every_server_call() {
     let bundle = TestBundle::with_typed_cards();
-    let (url, bodies) = execute_server();
+    let url = "http://127.0.0.1:9";
     let state =
-        WyrdState::from_path_with(bundle.path(), client_for(&url)).expect("fixture bundle loads");
-    let clone = state.clone();
+        WyrdState::from_path_with(bundle.path(), client_for(url)).expect("fixture bundle loads");
 
     assert_eq!(
-        clone.client().expect("the bound client").server_url(),
-        url,
-        "Bifrost startup connects over the client the state was created with"
+        state
+            .clone()
+            .client()
+            .expect("the bound client")
+            .server_url(),
+        url
     );
-    clone
-        .run()
-        .observe()
-        .verify("quality", &json!({ "answer": "yes" }))
-        .await
-        .expect("the bound client's server judges");
-    assert_eq!(bodies.lock().expect("body lock").len(), 1);
 }

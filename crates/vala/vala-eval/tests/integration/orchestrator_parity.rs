@@ -5,14 +5,13 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use orchestrator_support::{
-    assertion_task, eval_ref, fixture_value, judge_task, record, scenario, spec, subject_ref, tid,
+    assertion_task, eval_ref, fixture_value, record, scenario, spec, subject_ref, tid,
 };
 use serde_json::json;
 use tokio::sync::Mutex;
 use vala_eval::orchestrator::{NextDirective, RunState, ScenarioScoring};
 use vala_eval::{
-    EvalResults, JudgeError, MockJudgeInvoker, RunIdentity, ScenarioAggregationInput,
-    ScenarioExecutionResults, SubjectKey,
+    EvalResults, RunIdentity, ScenarioAggregationInput, ScenarioExecutionResults, SubjectKey,
 };
 use wyrd_spec::vala::eval::protocol::{AgentTurnSubmission, SimulatedUserMode, TurnDirective};
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
@@ -50,17 +49,24 @@ struct TestOutcome {
     run: EvalResults,
 }
 
+/// Drive one scenario through `RunState` the way the hosted orchestrator does:
+/// answer each agent turn from `replies` in order, score each completed
+/// scenario through [`ScenarioScoring`], and finalize the run aggregate.
+///
+/// The loop ends at `RunComplete`; scoring uses in-memory traces, so no IO
+/// leaves the process.
+///
+/// # Panics
+/// Panics when scoring cannot be built from `tasks`, the state machine refuses
+/// a directive or submission, the scripted agent runs out of replies, the
+/// scenario requests a simulated user turn, or scoring and finalization fail.
 async fn drive(
     tasks: Vec<EvalTask>,
-    judge_outputs: Vec<Result<serde_json::Value, JudgeError>>,
     input_scenario: EvalScenario,
     replies: Vec<(String, Vec<EvalRecordObservation>)>,
 ) -> TestOutcome {
-    let scoring = ScenarioScoring::with_in_memory_traces(
-        Arc::new(spec(tasks)),
-        MockJudgeInvoker::new(judge_outputs),
-    )
-    .expect("scoring builds");
+    let scoring =
+        ScenarioScoring::with_in_memory_traces(Arc::new(spec(tasks))).expect("scoring builds");
     let agent = ScriptedAgent::new(replies);
     let mut state = RunState::open(eval_ref(), SimulatedUserMode::Client, vec![input_scenario]);
     let mut scenario_results: Vec<ScenarioExecutionResults> = Vec::new();
@@ -110,7 +116,7 @@ async fn drive(
 
     let identity = RunIdentity {
         run_id: state.run_id,
-        eval_ref: eval_ref(),
+        eval_ref: Some(eval_ref()),
         started_at: state.opened_at,
         ended_at: Utc::now(),
     };
@@ -123,15 +129,15 @@ async fn drive(
     }
 }
 
-/// A scripted LLM-judge walk reaches the fixture's expected pass rate.
+/// A scripted multi-turn walk scores every turn's record and reaches the
+/// fixture's expected pass rate.
 #[tokio::test(flavor = "multi_thread")]
-async fn scripted_walk_llm_judge_parity() {
-    let fixture = fixture_value(include_str!("fixtures/parity/scripted_judge.json"));
+async fn scripted_walk_parity() {
+    let fixture = fixture_value(include_str!("fixtures/parity/scripted_walk.json"));
     assert_eq!(fixture["expected_pass_rate"], json!(1.0));
     let outcome = drive(
-        vec![judge_task("judge_passes")],
-        vec![Ok(json!({"passed": true})), Ok(json!({"passed": true}))],
-        scenario("scripted_judge", vec!["Continue"], None, 2),
+        vec![assertion_task("context_ok")],
+        scenario("scripted_walk", vec!["Continue"], None, 2),
         vec![
             reply("First answer", vec![record(true)]),
             reply("DONE", vec![record(true)]),
@@ -158,7 +164,6 @@ async fn termination_signal_parity() {
     assert_eq!(fixture["expected_scenario_passed"], json!(true));
     let outcome = drive(
         vec![assertion_task("context_ok")],
-        Vec::new(),
         scenario("termination_signal", Vec::new(), Some("DONE"), 8),
         vec![reply("DONE", vec![record(true)])],
     )
@@ -177,16 +182,11 @@ async fn termination_signal_parity() {
 
 /// Per-subject outcomes roll up exactly as the fixture expects.
 #[tokio::test(flavor = "multi_thread")]
-#[expect(
-    clippy::float_cmp,
-    reason = "the expected value is produced by exact arithmetic on fixed inputs"
-)]
 async fn subject_aggregation_parity() {
     let fixture = fixture_value(include_str!("fixtures/parity/subject_rollup.json"));
     assert_eq!(fixture["expected_subject_pass_rate"], json!(1.0));
     let outcome = drive(
         vec![assertion_task("subject_context_ok")],
-        Vec::new(),
         scenario("subject_rollup", Vec::new(), Some("DONE"), 1),
         vec![reply("DONE", vec![record(true)])],
     )

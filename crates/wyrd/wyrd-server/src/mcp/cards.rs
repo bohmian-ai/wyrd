@@ -25,23 +25,23 @@ pub(super) const GET_BY_REF: &str = "cards.get_by_ref";
 /// The existing UID-read contract; kind namespaces the server-minted UID.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct GetCardArgs {
+pub(crate) struct GetCardArgs {
     /// Card kind namespace of the UID.
-    kind: CardKind,
+    pub(crate) kind: CardKind,
     /// Server-minted Card UID.
-    card_uid: CardUid,
+    pub(crate) card_uid: CardUid,
 }
 
 /// Exact identity selected from discovery or a server-derived relationship.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct GetCardByRefArgs {
+pub(crate) struct GetCardByRefArgs {
     /// Versioned Card identity; reads require its resolved space.
-    card_ref: CardRef,
+    pub(crate) card_ref: CardRef,
 }
 
 /// Advertise all Card reads; each operation still enforces cards:read when called.
-pub(super) fn descriptors() -> Vec<Tool> {
+pub(crate) fn descriptors() -> Vec<Tool> {
     vec![
         tool::<GetCardArgs, GetCardResponse>(
             GET,

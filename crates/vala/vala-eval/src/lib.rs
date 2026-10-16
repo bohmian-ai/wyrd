@@ -1,10 +1,12 @@
-//! In-memory eval engine for Wyrd's eval-backed Verifier Card.
+//! Verification and offline scenario-evaluation engines.
 //!
-//! Consumes the locked `wyrd_spec::vala::eval` contract (`EvalSpec`,
-//! `EvalTask`, `ExecutionPlan`, `AssertionResult`, `ComparisonOperator`,
-//! typed ids) and produces results. Mode-agnostic: this crate executes the
-//! per-record / per-scenario tasks; how records arrive is the orchestrator's
-//! or the server's problem.
+//! - [`blocks`] runs building-block Verifier specs: steps, requirements,
+//!   checks, and the `decide` rule, producing one verification result.
+//! - The task-DAG engine consumes the `wyrd_spec::vala::eval` contract
+//!   (`EvalSpec`, `EvalTask`, `ExecutionPlan`, `AssertionResult`,
+//!   `ComparisonOperator`, typed ids) and scores scenario records offline.
+//!   It is mode-agnostic: how records arrive is the orchestrator's or the
+//!   caller's problem.
 //!
 //! ## Engine boundary
 //!
@@ -21,14 +23,12 @@
 //! - `context` - `ExecutionContext`, `ContextSnapshot`, `TaskOutput`,
 //!   `RecordIdentity`. Per-stage state is rebuilt at each stage barrier via
 //!   `ContextSnapshot::extend` (Arc bumps, no JSON cloning).
-//! - `store` - immutable `TaskRegistry`, `EvalTaskKind`, `JudgeOutcome`.
-//! - `tasks` - the four executors (`assertion`, `judge`, `trace`, `agent`)
-//!   plus `media` bindings.
+//! - `store` - immutable `TaskRegistry` and `EvalTaskKind`.
+//! - `tasks` - the three executors (`assertion`, `trace`, `agent`).
 //! - `scenario` - loader plus mechanic/passenger pass.
 //! - `results` - task -> scenario -> subject -> run aggregation,
 //!   `pass_gate`, `context_capture` application.
 //! - `compare` - four-quadrant comparison.
-//! - `judge` - `JudgeInvoker` trait; impls live outside this crate.
 //! - `trace_source` - `TraceSource` trait plus in-memory impl.
 //!
 //! ## Error model
@@ -41,11 +41,11 @@
 //!   shape used at external surfaces. `From<EvalExecError> for
 //!   EvalError` translates at the surface.
 
+pub mod blocks;
 pub mod compare;
 pub mod context;
 pub mod error;
 pub mod executor;
-pub mod judge;
 pub mod operators;
 pub mod orchestrator;
 pub mod results;
@@ -68,7 +68,6 @@ pub use executor::{
     EvalReport, EvalWorkflowSummary, Executors, RunLedger, SkipReason, TaskExecutor,
     TaskRunOutcome, execute_plan,
 };
-pub use judge::{JudgeError, JudgeInvoker, MockJudgeInvoker};
 pub use operators::{OperatorVerdict, evaluate_operator};
 pub use results::{
     AggregationInput, EvalMetrics, EvalResults, MechanicSubjectInput, PassGateVerdict,
@@ -76,9 +75,8 @@ pub use results::{
     SubjectMetrics, SubjectResults, TaskSummary, aggregate_run, apply_context_capture,
 };
 pub use scenario::{
-    EvalScenarioCollection, RecordTaskResult, RecordWithMedia, ScenarioExecutionInputs,
-    ScenarioExecutionResults, execute_scenario, load_scenario_collection,
+    EvalScenarioCollection, RecordTaskResult, ScenarioExecutionInputs, ScenarioExecutionResults,
+    ScenarioRecord, execute_scenario, load_scenario_collection,
 };
-pub use store::{EvalTaskKind, JudgeOutcome, TaskRegistry};
-pub use tasks::MediaBindings;
+pub use store::{EvalTaskKind, TaskRegistry};
 pub use trace_source::{InMemoryTraceSource, MockTraceSource, TraceSource, TraceUnavailable};

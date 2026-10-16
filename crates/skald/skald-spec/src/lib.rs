@@ -16,11 +16,11 @@ pub mod wire;
 pub use adapter::{ResponseAdapter, ToolCallView, UsageView};
 pub use authoring::{
     AuthoredPrompt, BlockSource, ContentBlock, PortableContent, PortableMessage, PortableRole,
-    PortableSettings, PromptFormat,
+    PortableSettings, PromptFormat, ReasoningEffort,
 };
 pub use convert::{ProviderMessageConversion, convert_message_dyn};
 pub use error::{SkaldError, SkaldResult};
-pub use media::{MediaKind, MediaRef, MediaSource};
+pub use media::{MediaFormat, MediaKind, MediaRef, MediaSource, UnknownMediaFormat};
 pub use message::MessageNum;
 pub use prompt::{Prompt, ProviderSettingsRef, ResponseType};
 pub use request::{ProviderName, ProviderRequest, ToolDescriptor};

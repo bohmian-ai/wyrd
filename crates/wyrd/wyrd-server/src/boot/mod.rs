@@ -68,6 +68,7 @@ use crate::state::{
     AppState, Forge, ForgeCompactionRuntime, Oracle, ProductionValidationError, Scribe,
     ScribeCoordinationRuntime,
 };
+use crate::verification::hosted::blocks::HostedBlocks;
 
 /// Cadence of the leader's Forge maintenance timer when `[forge]` sets no
 /// `maintenance_interval_secs`; [`resolve_forge_config`] applies it.
@@ -160,6 +161,11 @@ pub enum ServerBootError {
     /// gateway that fails every call.
     #[error("gateway provider transport could not be built: {0}")]
     GatewayTransport(String),
+    /// The hosted Verifier blocks could not start: no Monty worker path was
+    /// resolved or a prewarmed worker failed. Boot fails instead of serving
+    /// verification that fails every execution.
+    #[error("hosted Verifier blocks could not start: {0}")]
+    VerificationBlocks(String),
     /// OIDC discovery for a configured trusted issuer was unavailable after the
     /// bounded retry schedule. Boot fails closed rather than starting with a
     /// silently empty registry; the message surfaces the stable
@@ -471,7 +477,6 @@ pub async fn compose_bifrost(
         resources: bifrost_resources,
         cluster: cluster_registry,
         token_verifier,
-        issuing_key,
         peer_tls,
         config: bifrost_config,
         forge_config: forge_runtime,
@@ -967,16 +972,8 @@ pub async fn compose_bifrost(
     let interceptor =
         vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&token_verifier));
     let ingest_limits = scribe_config.ingest_limits();
-    let observation_runs = crate::verification::observations::ObservationRunSink::outbox(
-        postgres.wyrd().clone(),
-        crate::verification::authority::BackgroundAuthority::new(issuing_key.map(|key| {
-            wyrd_auth::issuance::TenantTokenIssuer::new(
-                key,
-                wyrd_auth::issuance::TokenExchangeSettings::default(),
-                Arc::clone(&scribe_outbox) as _,
-            )
-        })),
-    );
+    let submissions =
+        crate::verification::submissions::SubmissionSink::outbox(postgres.wyrd().clone());
     let gate = match scribe.as_ref() {
         Some(runtime) => vala_bifrost_redux::gate::Gate::with_scribe(
             Arc::clone(runtime.ingest()),
@@ -989,9 +986,6 @@ pub async fn compose_bifrost(
         Arc::clone(&query_forwarder) as Arc<dyn vala_bifrost_redux::contracts::OracleQueryDispatch>
     )
     .with_audit(Arc::clone(&scribe_outbox))
-    .with_observation_ack(Arc::new(
-        crate::verification::observations::ObservationEnqueue::new(Arc::clone(&observation_runs)),
-    ))
     .with_card_registry(vala_bifrost_redux::gate::attribution::CardRegistry::new(
         postgres.wyrd().clone(),
     ));
@@ -1006,7 +1000,7 @@ pub async fn compose_bifrost(
             token_verifier,
             query_forwarder: Some(query_forwarder),
             query_controls: Some(query_controls),
-            observation_runs,
+            submissions,
             scribe_outbox,
             membership_poller,
             #[cfg(feature = "test-support")]
@@ -1130,6 +1124,33 @@ pub fn production_guards(config: &WyrdServerConfig) {
     }
 }
 
+/// Start the hosted Verifier blocks of an API-serving process with the
+/// verification runtime enabled, and attach them to `state`.
+///
+/// Other processes keep `state` unchanged, so their verification routes
+/// answer unavailable.
+///
+/// # Errors
+/// Returns [`ServerBootError::VerificationBlocks`] when no Monty worker path
+/// was resolved or the sandbox pool cannot start.
+async fn attach_verification_blocks(
+    state: AppState,
+    config: &WyrdServerConfig,
+) -> Result<AppState, ServerBootError> {
+    if !(config.verification.enabled && config.role.serves_api()) {
+        return Ok(state);
+    }
+    let worker = config.verification.monty_worker.clone().ok_or_else(|| {
+        ServerBootError::VerificationBlocks(
+            "no Monty worker path; set WYRD_VERIFICATION_MONTY_WORKER".to_owned(),
+        )
+    })?;
+    let blocks = HostedBlocks::start(worker, config.verification.limits)
+        .await
+        .map_err(|error| ServerBootError::VerificationBlocks(error.to_string()))?;
+    Ok(state.with_verification_blocks(Arc::new(blocks)))
+}
+
 /// Assemble production `AppState` from config, applying `overrides` before
 /// production validation.
 ///
@@ -1181,7 +1202,6 @@ pub async fn build_state(
         resources: external.resources,
         cluster: Arc::clone(&external.cluster),
         token_verifier: verifier,
-        issuing_key: auth.issuing_key.clone(),
         peer_tls,
         config: config.bifrost.clone(),
         forge_config: config.forge,
@@ -1209,6 +1229,7 @@ pub async fn build_state(
     .with_auth(auth);
     let state = attach_human_logins(state, config, sealing_key.clone());
     let state = attach_config_fields(state, config, telemetry)?;
+    let state = attach_verification_blocks(state, config).await?;
     if let Err(error) = seed_federation(&state, config, sealing_key.as_deref()).await {
         rollback_state_roles(&state).await;
         return Err(error);

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
-use wyrd_sql::queries::verifier_runs::{LeaseToken, VerifierRunQueue};
+use wyrd_sql::queries::verifier_executions::{LeaseToken, VerifierExecutionQueue};
 use wyrd_sql::{SqlError, WyrdPostgres};
 
 /// One held lease: the work's cancellation and when it was last known held.
@@ -30,7 +30,7 @@ pub(super) struct LeaseRenewal {
     /// Wyrd Postgres owner that opens each tenant's renewal transaction.
     postgres: WyrdPostgres,
     /// Queue owning the renewal statement.
-    queue: VerifierRunQueue,
+    queue: VerifierExecutionQueue,
     /// Lease length every claim and renewal grants.
     lease: Duration,
     /// Held leases by tenant, behind one short synchronous lock.
@@ -74,7 +74,11 @@ impl Drop for HeldLease {
 
 impl LeaseRenewal {
     /// Build a renewal owner granting `lease` through `postgres`.
-    pub(super) fn new(postgres: WyrdPostgres, queue: VerifierRunQueue, lease: Duration) -> Self {
+    pub(super) fn new(
+        postgres: WyrdPostgres,
+        queue: VerifierExecutionQueue,
+        lease: Duration,
+    ) -> Self {
         Self {
             postgres,
             queue,

@@ -5,7 +5,13 @@ metadata:
   version: 1.0.0
   space: default
 spec:
-  implementation:
-    kind: eval
-    spec:
-      tasks: {}
+  inputs:
+    answer:
+      type: json
+  requirements:
+    - id: answered
+      statement: The agent produced an answer.
+      check:
+        kind: assert
+        path: inputs.answer
+        operator: is_not_null

@@ -285,6 +285,15 @@ fn output_schema_field(request: &ProviderRequest) -> (&'static str, bool) {
             ),
         ),
         ProviderRequest::AnthropicMessage(_) => ("body.output_config.format.schema", false),
+        ProviderRequest::GeminiGenerateContent(request)
+            if request
+                .settings
+                .generation_config
+                .as_ref()
+                .is_some_and(|config| config.response_json_schema.is_some()) =>
+        {
+            ("body.generation_config.response_json_schema", false)
+        }
         _ => ("body.generation_config.response_schema", false),
     }
 }
@@ -406,6 +415,17 @@ impl Prompt {
         self.provider
             .clone()
             .unwrap_or_else(|| self.request.provider())
+    }
+
+    /// The media kind a portable `${media:name}` binding requires, from its
+    /// image or document block; `None` for an unknown name or a native
+    /// placeholder, which carries no kind.
+    #[must_use]
+    pub fn media_kind(&self, name: &str) -> Option<MediaKind> {
+        self.media_kinds
+            .iter()
+            .find(|(bound, _)| bound == name)
+            .map(|(_, kind)| *kind)
     }
 
     /// Whether every answer to this Prompt is a structured JSON object.
@@ -643,7 +663,12 @@ fn response_type_of(request: &ProviderRequest) -> ResponseType {
             .settings
             .generation_config
             .as_ref()
-            .and_then(|config| config.response_schema.clone())
+            .and_then(|config| {
+                config
+                    .response_json_schema
+                    .clone()
+                    .or_else(|| config.response_schema.clone())
+            })
             .map_or(ResponseType::Text, |schema| named("response", schema)),
         _ => ResponseType::Text,
     }

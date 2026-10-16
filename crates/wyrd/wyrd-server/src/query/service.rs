@@ -162,8 +162,9 @@ impl<'a> QueryAuthority<'a> {
 
 /// Converts the authenticated server caller into Oracle's exact context.
 ///
-/// The verified delegation chain travels with the effective principal so both
-/// local and forwarded execution build the same attributed read decision.
+/// The verified delegation chain and any SYSTEM executor travel with the
+/// effective principal so both local and forwarded execution build the same
+/// attributed read decision.
 ///
 /// # Errors
 ///
@@ -178,7 +179,11 @@ pub(crate) fn oracle_context(caller: &Caller) -> Result<AuthorizedQueryContext, 
         AuthMethod::Jwt,
         Permission::bifrost_query_read(),
     )
-    .map(|context| context.with_delegation_chain(caller.delegation_chain.clone()))
+    .map(|context| {
+        context
+            .with_delegation_chain(caller.delegation_chain.clone())
+            .executed_by(caller.executed_by)
+    })
     .map_err(Into::into)
 }
 

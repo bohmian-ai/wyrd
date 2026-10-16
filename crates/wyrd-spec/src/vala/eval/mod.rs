@@ -1,5 +1,5 @@
-//! Eval primitive types — the typed spec body carried by a `kind: Verifier`
-//! card whose `implementation.kind` is `eval`.
+//! Eval primitive types — the scenario-evaluation spec scored offline by
+//! `wyrd eval run`.
 //!
 //! Authors declare evaluations as DAGs of typed tasks. Each task references
 //! the workflow context (or scenario `{response, expected_outcome}`) via
@@ -21,7 +21,6 @@
 //! - `workflow` — `Workflow`, `WorkflowFieldType` (optional declared shape).
 //! - `condition` — `EvalCondition` gate predicates shared by tasks.
 //! - `assertion` — `AssertionTask` programmatic assertions.
-//! - `llm_judge` — `LlmJudgeTask` Agent-backed judge task.
 //! - `trace` — `TraceAssertionTask` trace document assertions.
 //! - `agent` — `AgentAssertionTask` workflow envelope assertions.
 //! - `task` — `EvalTask` executable task enum.
@@ -36,7 +35,6 @@ pub mod agent;
 pub mod assertion;
 pub mod condition;
 pub mod ids;
-pub mod llm_judge;
 /// Media reference descriptors for eval records — object-storage URIs, no inline blobs.
 pub mod media;
 pub mod operator;
@@ -63,10 +61,9 @@ pub use ids::{
     EntityUid, JsonPath, RecordId, RunId, ScenarioId, SessionId, SpanId, TaskId, TraceId,
     WorkflowUid,
 };
-pub use llm_judge::LlmJudgeTask;
 pub use media::MediaRef;
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
-pub use plan::{DagError, ExecutionPlan, Stage, validate_dag};
+pub use plan::{DagError, ExecutionPlan, Stage, plan_stages, validate_dag};
 pub use protocol::{
     AgentTurnSubmission, ConversationTurn, MAX_HISTORY_TURNS, ProtocolError, SimulatedUserMode,
     SimulatedUserTurn, TurnDirective, TurnRole, UserTurnSubmission,
@@ -740,94 +737,6 @@ mod ids_tests {
             serde_json::from_str("[1,2,3,4,5,6,7,8]").expect("legacy byte array deserializes");
         let json = serde_json::to_string(&span).expect("span id serializes");
         assert_eq!(json, "\"0102030405060708\"");
-    }
-}
-
-#[cfg(test)]
-mod llm_judge_tests {
-    use crate::envelope::CardKind;
-    use crate::ids::{CardName, SpaceName};
-    use crate::reference::CardRef;
-    use crate::vala::eval::ids::TaskId;
-    use crate::vala::eval::llm_judge::LlmJudgeTask;
-    use crate::vala::eval::operator::ComparisonOperator;
-    use wyrd_semver::VersionBlock;
-
-    fn agent_ref(name: &str) -> CardRef {
-        CardRef {
-            kind: CardKind::Agent,
-            name: CardName::new(name).unwrap(),
-            version: VersionBlock::parse("1.0.0").unwrap(),
-            space: Some(SpaceName::new("default").unwrap()),
-            uid: None,
-        }
-    }
-
-    fn data_ref(name: &str) -> CardRef {
-        CardRef {
-            kind: CardKind::Data,
-            name: CardName::new(name).unwrap(),
-            version: VersionBlock::parse("1.0.0").unwrap(),
-            space: Some(SpaceName::new("default").unwrap()),
-            uid: None,
-        }
-    }
-
-    #[test]
-    fn new_accepts_agent_kind() {
-        let task = LlmJudgeTask::new(
-            TaskId::new("judge_one").unwrap(),
-            agent_ref("factuality-judge"),
-            ComparisonOperator::Equals,
-            serde_json::json!("pass"),
-        )
-        .expect("agent-kind ref is valid");
-
-        assert_eq!(task.max_retries, 2);
-    }
-
-    #[test]
-    fn new_rejects_non_agent_kind() {
-        let result = LlmJudgeTask::new(
-            TaskId::new("judge_two").unwrap(),
-            data_ref("dataset"),
-            ComparisonOperator::Equals,
-            serde_json::json!("pass"),
-        );
-        let err = result.unwrap_err();
-        assert_eq!(err.code(), "WYRD_VALA_400_EVAL_REF_KIND_MISMATCH");
-    }
-
-    #[test]
-    fn validate_catches_deserialized_kind_mismatch() {
-        let task = LlmJudgeTask::new(
-            TaskId::new("judge").unwrap(),
-            agent_ref("prompt"),
-            ComparisonOperator::Equals,
-            serde_json::json!("ok"),
-        )
-        .unwrap();
-        let mut value = serde_json::to_value(&task).unwrap();
-        value["judge_ref"]["kind"] = serde_json::json!("Data");
-        let bad: LlmJudgeTask = serde_json::from_value(value).unwrap();
-
-        let err = bad.validate().unwrap_err();
-        assert_eq!(err.code(), "WYRD_VALA_400_EVAL_REF_KIND_MISMATCH");
-    }
-
-    #[test]
-    fn round_trip() {
-        let task = LlmJudgeTask::new(
-            TaskId::new("judge").unwrap(),
-            agent_ref("prompt"),
-            ComparisonOperator::ContainsIgnoreCase,
-            serde_json::json!("paris"),
-        )
-        .unwrap();
-
-        let serialized = serde_json::to_string(&task).unwrap();
-        let deserialized: LlmJudgeTask = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(task, deserialized);
     }
 }
 
@@ -1685,9 +1594,7 @@ mod spec_tests {
     use crate::ids::{CardName, SpaceName};
     use crate::reference::CardRef;
     use crate::vala::eval::assertion::AssertionTask;
-    use crate::vala::eval::condition::{ConditionCombinator, EvalCondition};
     use crate::vala::eval::ids::{JsonPath, TaskId};
-    use crate::vala::eval::llm_judge::LlmJudgeTask;
     use crate::vala::eval::operator::ComparisonOperator;
     use crate::vala::eval::result::{AssertionResult, EvalContextCapture, EvalPassGate};
     use crate::vala::eval::spec::{DatasetRef, EvalSampling, EvalSpec, MAX_EVAL_TASKS};
@@ -1707,16 +1614,6 @@ mod spec_tests {
     fn prompt_ref(name: &str) -> CardRef {
         CardRef {
             kind: CardKind::Prompt,
-            name: CardName::new(name).unwrap(),
-            version: VersionBlock::parse("1.0.0").unwrap(),
-            space: Some(SpaceName::new("default").unwrap()),
-            uid: None,
-        }
-    }
-
-    fn agent_ref(name: &str) -> CardRef {
-        CardRef {
-            kind: CardKind::Agent,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
             space: Some(SpaceName::new("default").unwrap()),
@@ -1883,28 +1780,6 @@ mod spec_tests {
             bucket: 0,
         };
         assert!(bad.validate().is_err());
-    }
-
-    #[test]
-    fn validate_catches_llm_judge_with_bad_condition() {
-        let mut spec = EvalSpec::new(one_task_map()).unwrap();
-        let judge_id = TaskId::new("judge").unwrap();
-        let mut judge = LlmJudgeTask::new(
-            judge_id.clone(),
-            agent_ref("judge-agent"),
-            ComparisonOperator::ContainsIgnoreCase,
-            serde_json::json!("pass"),
-        )
-        .unwrap();
-        judge.condition = Some(EvalCondition {
-            path: JsonPath::new("$.flag").unwrap(),
-            operator: ComparisonOperator::IsTruthy,
-            expected: serde_json::Value::Null,
-            combinator: Some(ConditionCombinator::And),
-            subsequent: None,
-        });
-        spec.tasks.insert(judge_id, EvalTask::LlmJudge(judge));
-        assert!(spec.validate().is_err());
     }
 
     #[test]

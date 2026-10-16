@@ -305,7 +305,7 @@ impl ForgeObjectStore for CountingObjectStore {
         }
         if self
             .stat_errors
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()
@@ -325,7 +325,7 @@ impl ForgeObjectStore for CountingObjectStore {
         let submitted = self.inner.delete(path).await;
         if self
             .delete_errors
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()
@@ -337,7 +337,7 @@ impl ForgeObjectStore for CountingObjectStore {
         }
         if self
             .delete_absences
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()
@@ -683,7 +683,7 @@ impl Catalog for PromotionCatalogSeam {
         self.attempts.fetch_add(1, Ordering::AcqRel);
         if self
             .reject_budget
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |budget| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |budget| {
                 budget.checked_sub(1)
             })
             .is_ok()
@@ -714,7 +714,7 @@ impl Catalog for PromotionCatalogSeam {
         }
         if self
             .stall_response_budget
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |budget| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |budget| {
                 budget.checked_sub(1)
             })
             .is_ok()

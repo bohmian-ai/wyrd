@@ -32,7 +32,7 @@ pub struct Caller {
     /// never from tool arguments, request bodies, or arbitrary headers.
     pub delegation_chain: Vec<DelegationStep>,
     /// The tenant SYSTEM principal when Wyrd itself executes work this
-    /// caller's request caused, such as a Verifier's judge calls; `None` when
+    /// caller's request caused, such as a Verifier's agent-check calls; `None` when
     /// the caller performs the work.
     ///
     /// Changes only the recorded actor. Authority stays [`Self::principal`]
@@ -68,7 +68,7 @@ impl Caller {
     /// executed by Wyrd as `system`, the tenant SYSTEM principal.
     ///
     /// The effective principal and delegation chain are exactly the stored
-    /// ones, so a queued Verifier's judge calls are checked against what was
+    /// ones, so a queued Verifier's agent-check calls are checked against what was
     /// accepted and record its subject with SYSTEM as actor.
     #[must_use]
     pub fn accepted(authority: &AcceptedAuthority, system: PrincipalId) -> Self {

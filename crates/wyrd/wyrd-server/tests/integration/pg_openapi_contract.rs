@@ -154,8 +154,10 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1/principals/{principal_id}/roles",
         "/v1/principals/{principal_id}/roles/{role}",
         "/v1/verification/bindings/{binding_id}",
-        "/v1/verification/runs",
-        "/v1/verification/runs/{run_id}",
+        "/v1/verification/evidence",
+        "/v1/verification/execute",
+        "/v1/verification/enqueue",
+        "/v1/verification/executions/{execution_id}",
         "/v1/bifrost/tables",
         "/v1/bifrost/tables/{namespace}/{name}",
         "/auth/token",
@@ -1294,19 +1296,21 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// The Verification surface is exactly four typed operations.
+/// The Verification surface is exactly five typed operations, plus the
+/// local evidence upload on the local storage backend.
 ///
-/// Binding status, manual run request, run status, and direct execution
-/// publish their typed request and response schemas, the manual request
-/// answers `202 Accepted`, direct execution answers `200` with its judgment
-/// and documents its stable refusals, and no result or other Verification
-/// operation is routed: queued verdicts are read from Bifrost by `result_id`.
+/// Binding status, evidence planning, direct execution, enqueue, and
+/// execution status publish their typed request and response schemas,
+/// enqueue answers `202 Accepted`, direct execution answers `200` with its
+/// result and documents its stable refusals, and no other Verification
+/// operation is routed. The in-process server uses local storage, so its
+/// evidence plans target the digest-keyed local upload route.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, or when a Verification path,
 /// method, status, or schema reference differs.
 #[tokio::test]
-async fn verification_contract_publishes_exactly_four_typed_operations() {
+async fn verification_contract_publishes_five_typed_operations_and_the_local_upload() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1328,9 +1332,11 @@ async fn verification_contract_publishes_exactly_four_typed_operations() {
         verification,
         BTreeSet::from([
             ("/v1/verification/bindings/{binding_id}", "get"),
+            ("/v1/verification/enqueue", "post"),
+            ("/v1/verification/evidence", "post"),
+            ("/v1/verification/evidence/local/{sha256}", "put"),
             ("/v1/verification/execute", "post"),
-            ("/v1/verification/runs", "post"),
-            ("/v1/verification/runs/{run_id}", "get"),
+            ("/v1/verification/executions/{execution_id}", "get"),
         ])
     );
 
@@ -1339,14 +1345,23 @@ async fn verification_contract_publishes_exactly_four_typed_operations() {
             .as_str()
             .map(str::to_owned)
     };
-    let start = &paths["/v1/verification/runs"]["post"];
+    let enqueue = &paths["/v1/verification/enqueue"]["post"];
     assert_eq!(
-        start["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-        "#/components/schemas/StartVerificationRunRequest"
+        enqueue["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/VerificationRequest"
     );
     assert_eq!(
-        schema_ref(start, "202").as_deref(),
-        Some("#/components/schemas/StartVerificationRunResponse")
+        schema_ref(enqueue, "202").as_deref(),
+        Some("#/components/schemas/EnqueueVerificationResponse")
+    );
+    let evidence = &paths["/v1/verification/evidence"]["post"];
+    assert_eq!(
+        evidence["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/EvidencePlanRequest"
+    );
+    assert_eq!(
+        schema_ref(evidence, "200").as_deref(),
+        Some("#/components/schemas/EvidencePlanResponse")
     );
     assert_eq!(
         schema_ref(
@@ -1357,17 +1372,21 @@ async fn verification_contract_publishes_exactly_four_typed_operations() {
         Some("#/components/schemas/VerificationBindingStatus")
     );
     assert_eq!(
-        schema_ref(&paths["/v1/verification/runs/{run_id}"]["get"], "200").as_deref(),
-        Some("#/components/schemas/VerificationRunStatus")
+        schema_ref(
+            &paths["/v1/verification/executions/{execution_id}"]["get"],
+            "200"
+        )
+        .as_deref(),
+        Some("#/components/schemas/VerificationExecutionState")
     );
     let execute = &paths["/v1/verification/execute"]["post"];
     assert_eq!(
         execute["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-        "#/components/schemas/ExecuteVerificationRequest"
+        "#/components/schemas/VerificationRequest"
     );
     assert_eq!(
         schema_ref(execute, "200").as_deref(),
-        Some("#/components/schemas/Judgment")
+        Some("#/components/schemas/VerificationResult")
     );
     let documented: BTreeSet<&str> = execute["responses"]
         .as_object()
@@ -1376,7 +1395,7 @@ async fn verification_contract_publishes_exactly_four_typed_operations() {
         .map(String::as_str)
         .collect();
     assert!(
-        ["400", "403", "404", "409", "413", "422", "502", "504"]
+        ["400", "403", "404", "413", "422", "504"]
             .iter()
             .all(|status| documented.contains(status)),
         "{documented:?}"

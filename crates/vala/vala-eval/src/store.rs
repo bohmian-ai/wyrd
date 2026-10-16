@@ -1,5 +1,4 @@
-//! Per-`ExecutionPlan` task registry plus the engine-local [`JudgeOutcome`]
-//! shape.
+//! Per-`ExecutionPlan` task registry.
 //!
 //! Built once per plan, immutable thereafter. Per-run state (skip ledger,
 //! task outputs) lives on [`crate::executor::RunLedger`] and
@@ -8,8 +7,6 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use serde_json::Value;
-use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::ids::TaskId;
 use wyrd_spec::vala::eval::plan::ExecutionPlan;
 use wyrd_spec::vala::eval::task::EvalTask;
@@ -21,8 +18,6 @@ use crate::error::EvalExecError;
 pub enum EvalTaskKind {
     /// `EvalTask::Assertion`.
     Assertion,
-    /// `EvalTask::LlmJudge`.
-    LlmJudge,
     /// `EvalTask::TraceAssertion`.
     TraceAssertion,
     /// `EvalTask::AgentAssertion`.
@@ -35,7 +30,6 @@ impl EvalTaskKind {
     pub fn from_task(task: &EvalTask) -> Self {
         match task {
             EvalTask::Assertion(_) => Self::Assertion,
-            EvalTask::LlmJudge(_) => Self::LlmJudge,
             EvalTask::TraceAssertion(_) => Self::TraceAssertion,
             EvalTask::AgentAssertion(_) => Self::AgentAssertion,
         }
@@ -156,21 +150,6 @@ impl TaskRegistry {
     }
 }
 
-/// One judge invocation's raw and parsed payload.
-///
-/// The judge executor (commit 9) produces this; the engine retains it on the
-/// snapshot's `task_outputs` so downstream tasks can JSONPath into
-/// `$.task.<judge_id>.parsed`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct JudgeOutcome {
-    /// Raw provider response payload as the judge invoker returned it.
-    pub raw: Value,
-    /// Structured projection the judge executor extracted from `raw`.
-    pub parsed: Value,
-    /// Durable Agent identity when this judge was registered.
-    pub judge_ref: Option<CardRef>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,7 +201,11 @@ mod tests {
             registry.ids_of_kind(EvalTaskKind::Assertion),
             &[task_id("alpha"), task_id("beta")]
         );
-        assert!(registry.ids_of_kind(EvalTaskKind::LlmJudge).is_empty());
+        assert!(
+            registry
+                .ids_of_kind(EvalTaskKind::TraceAssertion)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -249,16 +232,5 @@ mod tests {
             EvalExecError::UnknownDependency { ref task, ref dep }
                 if task == &task_id("alpha") && dep == &task_id("ghost")
         ));
-    }
-
-    #[test]
-    fn judge_outcome_round_trip_is_value_type() {
-        let outcome = JudgeOutcome {
-            raw: json!({"choices": [{"verdict": "pass"}]}),
-            parsed: json!({"verdict": "pass"}),
-            judge_ref: None,
-        };
-        let cloned = outcome.clone();
-        assert_eq!(outcome, cloned);
     }
 }

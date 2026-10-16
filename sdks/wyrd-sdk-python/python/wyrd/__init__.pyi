@@ -1,4 +1,4 @@
-from . import cards, client, config, data, model, prompt, state
+from . import cards, client, config, data, model, prompt, state, verify
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError
 from .agent import (
     Agent,
@@ -81,6 +81,7 @@ __all__ = [
     "model",
     "prompt",
     "state",
+    "verify",
     "client",
     "run_wyrd_cli",
     "tool",

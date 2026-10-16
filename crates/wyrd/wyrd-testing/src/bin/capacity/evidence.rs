@@ -16,7 +16,6 @@ use sqlx::PgPool;
 use wyrd_testing::release_server::Metrics;
 
 use crate::Result;
-use crate::fixture::Kind;
 
 /// p50, p95, and p99 of something.
 #[derive(Debug, Default, Clone, Copy, Serialize)]
@@ -50,11 +49,9 @@ impl Percentiles {
     }
 }
 
-/// Paired direct engine overhead of one kind over one step (AC-040).
+/// Paired direct engine overhead over one step (AC-040).
 #[derive(Debug, Clone, Serialize)]
 pub struct Overhead {
-    /// The workload's metric label.
-    pub kind: &'static str,
     /// Samples recorded.
     pub samples: f64,
     /// p95 bucket bound, seconds; `None` without samples.
@@ -71,17 +68,16 @@ pub struct Scrapes {
 }
 
 impl Scrapes {
-    /// Direct-mode paired engine overhead of `kind` between the two scrapes.
-    pub fn overhead(&self, kind: Kind) -> Overhead {
-        let kind_label = format!("kind=\"{}\"", kind.label());
-        let labels = [kind_label.as_str(), "mode=\"direct\""];
+    /// Direct-mode paired engine overhead between the two scrapes, every
+    /// outcome together.
+    pub fn overhead(&self) -> Overhead {
+        let labels = ["mode=\"direct\""];
         let family = "wyrd_verification_engine_overhead_seconds";
         let deltas = deltas(
             &merged(&self.before, family, &labels),
             &merged(&self.after, family, &labels),
         );
         Overhead {
-            kind: kind.label(),
             samples: deltas.last().map_or(0.0, |(_, count)| *count),
             p95: quantile(&deltas, 0.95),
         }
@@ -290,9 +286,9 @@ impl Queue {
     ) -> Result<Backlog> {
         let (outstanding, created, forge): (i64, i64, i64) = sqlx::query_as(
             "SELECT \
-               (SELECT COUNT(*) FROM wyrd.verifier_runs \
+               (SELECT COUNT(*) FROM wyrd.verifier_executions \
                  WHERE created_at >= $1 AND status IN ('pending','running','retrying')), \
-               (SELECT COUNT(*) FROM wyrd.verifier_runs WHERE created_at >= $1), \
+               (SELECT COUNT(*) FROM wyrd.verifier_executions WHERE created_at >= $1), \
                (SELECT COUNT(*) FROM vala.forge_tasks \
                  WHERE created_at <= $2 \
                    AND state NOT IN ('succeeded','failed','cancelled'))",
@@ -366,7 +362,7 @@ impl Queue {
         let rows: Vec<RunRow> = sqlx::query_as(
             "SELECT verifier_card_uid::text, status, \
                     (EXTRACT(EPOCH FROM settled_at - $1) * 1e6)::bigint \
-               FROM wyrd.verifier_runs WHERE created_at >= $1",
+               FROM wyrd.verifier_executions WHERE created_at >= $1",
         )
         .bind(since)
         .fetch_all(&self.owner)

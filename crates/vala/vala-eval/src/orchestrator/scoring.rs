@@ -9,17 +9,14 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
 use wyrd_spec::vala::eval::{EvalSpec, ScenarioId};
 
-use crate::tasks::{
-    AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, MediaBindings, TraceTaskExecutor,
-};
+use crate::tasks::{AgentTaskExecutor, AssertionTaskExecutor, TraceTaskExecutor};
 use wyrd_spec::vala::ids::RunId;
 
 use crate::{
     AggregationInput, EvalExecError, EvalReport, EvalResults, Executors, InMemoryTraceSource,
-    JudgeInvoker, MechanicSubjectInput, RecordTaskResult, RecordWithMedia, ResultsConfig,
-    RunIdentity, ScenarioAggregationInput, ScenarioExecutionInputs, ScenarioExecutionResults,
-    SubjectKey, TaskRegistry, TaskRunOutcome, TaskSummary, TraceSource, aggregate_run,
-    execute_plan, execute_scenario,
+    MechanicSubjectInput, RecordTaskResult, ResultsConfig, RunIdentity, ScenarioAggregationInput,
+    ScenarioExecutionInputs, ScenarioExecutionResults, ScenarioRecord, SubjectKey, TaskRegistry,
+    TaskRunOutcome, TaskSummary, TraceSource, aggregate_run, execute_plan, execute_scenario,
 };
 
 use super::{OrchestratorError, ScenarioCursor};
@@ -39,7 +36,6 @@ impl ScenarioScoring {
     /// Returns [`OrchestratorError`] when the eval DAG or task registry is invalid.
     pub fn new(
         spec: Arc<EvalSpec>,
-        judge: Arc<dyn JudgeInvoker>,
         traces: Arc<dyn TraceSource>,
         trace_fetch_deadline: Duration,
     ) -> Result<Self, OrchestratorError> {
@@ -51,7 +47,6 @@ impl ScenarioScoring {
         let registry = TaskRegistry::from_plan(&plan, spec.tasks.clone())?;
         let executors = Executors {
             assertion: Arc::new(AssertionTaskExecutor::new()),
-            judge: Arc::new(JudgeTaskExecutor::new(judge)),
             trace: Arc::new(TraceTaskExecutor::new(traces, trace_fetch_deadline)),
             agent: Arc::new(AgentTaskExecutor::new()),
         };
@@ -67,13 +62,9 @@ impl ScenarioScoring {
     ///
     /// # Errors
     /// Returns [`OrchestratorError`] when planning fails.
-    pub fn with_in_memory_traces(
-        spec: Arc<EvalSpec>,
-        judge: Arc<dyn JudgeInvoker>,
-    ) -> Result<Self, OrchestratorError> {
+    pub fn with_in_memory_traces(spec: Arc<EvalSpec>) -> Result<Self, OrchestratorError> {
         Self::new(
             spec,
-            judge,
             Arc::new(InMemoryTraceSource::new()),
             Duration::from_millis(250),
         )
@@ -87,7 +78,7 @@ impl ScenarioScoring {
         &self,
         cursor: &ScenarioCursor,
     ) -> Result<ScenarioExecutionResults, OrchestratorError> {
-        let records = records_with_media(cursor);
+        let records = scenario_records(cursor);
         let inputs = ScenarioExecutionInputs {
             scenario: &cursor.scenario,
             plan: &self.plan,
@@ -167,11 +158,10 @@ impl ScenarioScoring {
 
     /// Execute the task DAG over one committed record.
     ///
-    /// The record's named media descriptors become the snapshot's
-    /// [`MediaBindings`] so the judge invoker can bind them natively, and its
-    /// trace id is attached for trace tasks. This is the one record execution
-    /// path shared by continuous verification and batch replay; it returns
-    /// every `Ran` and `Skipped` outcome and never aggregates or captures.
+    /// The record's trace id is attached for trace tasks. This is the one
+    /// record execution path shared by batch replay and its callers; it
+    /// returns every `Ran` and `Skipped` outcome and never aggregates or
+    /// captures.
     ///
     /// # Errors
     /// Returns the [`EvalExecError`] of the first task that could not produce
@@ -182,7 +172,6 @@ impl ScenarioScoring {
         scenario_id: Option<ScenarioId>,
         record: &EvalRecordObservation,
     ) -> Result<EvalReport, EvalExecError> {
-        let media = MediaBindings::from_refs(record.media.iter().flatten().cloned());
         let snapshot = crate::ContextSnapshot::new(
             Arc::new(record.context.clone()),
             crate::RecordIdentity {
@@ -190,8 +179,7 @@ impl ScenarioScoring {
                 record_id: record.record_id.clone(),
                 scenario_id,
             },
-        )
-        .with_media(media, Vec::new());
+        );
         let snapshot = match record.trace_id {
             Some(trace_id) => snapshot.with_trace_id(trace_id),
             None => snapshot,
@@ -257,16 +245,16 @@ impl ScenarioScoring {
     }
 }
 
-fn records_with_media(cursor: &ScenarioCursor) -> Vec<RecordWithMedia> {
+/// Project the cursor's emitted records into the scenario records the
+/// mechanic pass runs.
+fn scenario_records(cursor: &ScenarioCursor) -> Vec<ScenarioRecord> {
     cursor
         .emitted_records
         .iter()
-        .map(|record| RecordWithMedia {
+        .map(|record| ScenarioRecord {
             record_id: record.record_id.clone(),
             trace_id: record.trace_id,
             context: record.context.clone(),
-            media: MediaBindings::new(),
-            required_media: Vec::new(),
         })
         .collect()
 }

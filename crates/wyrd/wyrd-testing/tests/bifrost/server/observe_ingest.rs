@@ -1,8 +1,9 @@
 //! Observation ingest reliability through a started `WyrdState`.
 //!
-//! Each test boots a fresh server, registers the shared `observe_a_run`
-//! fixture Service, and drives its Model view; every read-back sees only the
-//! rows that test wrote, so no query filters by run.
+//! Each test boots a fresh server, registers a copy of the `observe_a_run`
+//! fixture Service whose drift Verifier declares the test's measurements, and
+//! drives its Model view; every read-back sees only the rows that test wrote,
+//! so no query filters by run.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,8 +12,9 @@ use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode};
-use wyrd_client::observe::{EvalObservationOptions, Run};
+use wyrd_client::observe::Run;
 use wyrd_client::state::WyrdState;
+use wyrd_client::verify::Submission;
 use wyrd_client::{Bifrost, QueueConfig, WyrdClient};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::WyrdTestServer;
@@ -45,12 +47,14 @@ struct Observed {
 }
 
 impl Observed {
-    /// Boot a server, register and hydrate the fixture Service, and start
-    /// Bifrost on the bundle with the Service's own key and `queue`.
+    /// Boot a server, register and hydrate the fixture Service with
+    /// `measurements` declared beside `latency`, and start Bifrost on the
+    /// bundle with the Service's own key and `queue`.
     ///
     /// # Panics
     /// Panics when a setup step fails.
-    async fn start(queue: QueueConfig) -> Self {
+    async fn start(queue: QueueConfig, measurements: &[String]) -> Self {
+        let cards_dir = declaring(measurements);
         let server = Box::pin(WyrdTestServer::start_bound())
             .await
             .expect("test server starts");
@@ -64,12 +68,13 @@ impl Observed {
             ),
         );
         let cards = Cards::connect_with(&admin).await.expect("handle connects");
-        Box::pin(cards.register_from_path(&fixture("observed-model.yaml")))
+        Box::pin(cards.register_from_path(&cards_dir.path().join("observed-model.yaml")))
             .await
             .expect("the Model registers");
-        let receipt = Box::pin(cards.register_from_path(&fixture("observed-service.yaml")))
-            .await
-            .expect("the Service registers");
+        let receipt =
+            Box::pin(cards.register_from_path(&cards_dir.path().join("observed-service.yaml")))
+                .await
+                .expect("the Service registers");
         let bundle = tempfile::tempdir().expect("bundle directory creates");
         Box::pin(CardGraphHydrator::new(cards.registry_context()).hydrate(
             &CardSelector::exact(receipt.root.clone()),
@@ -135,13 +140,44 @@ impl Observed {
     }
 }
 
-/// Path of a shared `observe_a_run` fixture Card.
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(concat!(
+/// A copy of the shared `observe_a_run` fixture Cards whose drift Verifier
+/// and its Service binding declare `measurements` beside `latency`.
+///
+/// The shared fixture stays unchanged because other journeys submit against
+/// its single `latency` measurement.
+///
+/// # Panics
+/// Panics when the fixture cannot be copied.
+fn declaring(measurements: &[String]) -> tempfile::TempDir {
+    let source = PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../../fixtures/cards/observe_a_run"
-    ))
-    .join(name)
+    ));
+    let declared = format!(
+        "features: [{}]",
+        std::iter::once("latency")
+            .chain(measurements.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let copy = tempfile::tempdir().expect("fixture directory creates");
+    for entry in std::fs::read_dir(&source).expect("fixture directory reads") {
+        let path = entry.expect("fixture entry reads").path();
+        let target = copy
+            .path()
+            .join(path.file_name().expect("fixture file is named"));
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("observed-drift.yaml" | "observed-service.yaml") => {
+                let card = std::fs::read_to_string(&path).expect("fixture Card reads");
+                std::fs::write(&target, card.replace("features: [latency]", &declared))
+                    .expect("fixture Card writes");
+            }
+            _ => {
+                std::fs::copy(&path, &target).expect("fixture file copies");
+            }
+        }
+    }
+    copy
 }
 
 /// A client of `server` that authenticates with `credential`.
@@ -168,16 +204,28 @@ fn api_key(bootstrap: Bootstrap) -> String {
     }
 }
 
+/// Drift feature names `prefix0..prefixN`.
+fn names(count: u16, prefix: &str) -> Vec<String> {
+    (0..count)
+        .map(|feature| format!("{prefix}{feature}"))
+        .collect()
+}
+
 /// Drift features `prefix0..prefixN`, valued by `value(feature)`.
 fn features(count: u16, prefix: &str, value: impl Fn(u16) -> f64) -> Value {
     Value::Object(
-        (0..count)
-            .map(|feature| (format!("{prefix}{feature}"), json!(value(feature))))
+        names(count, prefix)
+            .into_iter()
+            .zip((0..count).map(|feature| json!(value(feature))))
             .collect::<Map<_, _>>(),
     )
 }
 
-/// Emit one drift observation, flushing and resubmitting it on `QUEUE_FULL`.
+/// The Window Verifier bound to the observed Model whose `samples` slot
+/// records Drift observations through `observe.submit`.
+const DRIFT_VERIFIER: &str = "observed-drift";
+
+/// Submit one drift observation, flushing and resubmitting it on `QUEUE_FULL`.
 ///
 /// Admission is all-or-none per observation, so a refused observation
 /// admitted no row and resubmitting it after the flush duplicates nothing.
@@ -187,8 +235,13 @@ fn features(count: u16, prefix: &str, value: impl Fn(u16) -> f64) -> Value {
 /// fails.
 async fn emit_with_resubmit(state: &WyrdState, view: &Run, features: &Value) {
     loop {
-        match view.observe().drift(features, None) {
-            Ok(()) => return,
+        match view
+            .observe()
+            .submit(DRIFT_VERIFIER, features.clone())
+            .await
+        {
+            Ok(Submission::Recorded) => return,
+            Ok(Submission::Queued(_)) => panic!("Window samples are recorded, never queued"),
             Err(error) if error.code() == "WYRD_CLIENT_429_QUEUE_FULL" => {
                 state.flush().await.expect("a flush frees the budget");
             }
@@ -214,8 +267,8 @@ fn assert_exactly_once(groups: &[RecordCount], observations: u16, features: u16)
     );
 }
 
-/// Every Drift and Eval observation stores the client clock reading of its
-/// emit call as its declared `created_at` time axis, not Scribe's receipt
+/// Every Drift observation stores the client clock reading of its
+/// submit call as its declared `created_at` time axis, not Scribe's receipt
 /// instant.
 ///
 /// Scribe's receipt clock runs one day ahead for the whole emit-to-ingest
@@ -227,7 +280,7 @@ fn assert_exactly_once(groups: &[RecordCount], observations: u16, features: u16)
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn observations_store_the_client_emit_time() {
-    let observed = Observed::start(QueueConfig::default()).await;
+    let observed = Observed::start(QueueConfig::default(), &[]).await;
     let scribe = observed
         .server
         .bifrost_scribe()
@@ -238,31 +291,18 @@ async fn observations_store_the_client_emit_time() {
     let before = chrono::Utc::now().timestamp_micros();
     model
         .observe()
-        .drift(&json!({ "latency": 12.5, "tier": "gold" }), None)
-        .expect("drift emits");
-    model
-        .observe()
-        .eval(
-            &json!({ "answer": "yes" }),
-            EvalObservationOptions::default(),
-        )
-        .expect("eval emits");
+        .submit(DRIFT_VERIFIER, json!({ "latency": 12.5 }))
+        .await
+        .expect("drift records");
     let after = chrono::Utc::now().timestamp_micros();
-    let mut emitted: Vec<EventTime> = observed
+    let emitted: Vec<EventTime> = observed
         .drain_and_read(
             "SELECT CAST(created_at AS BIGINT) AS event_time FROM vala.drift.observations",
         )
         .await;
     scribe.shift_receipt_clock_for_test(Duration::ZERO);
-    emitted.extend(
-        observed
-            .read::<EventTime>(
-                "SELECT CAST(created_at AS BIGINT) AS event_time FROM vala.eval.observations",
-            )
-            .await,
-    );
 
-    assert_eq!(emitted.len(), 3, "two drift rows, one eval");
+    assert_eq!(emitted.len(), 1, "one drift row");
     for row in &emitted {
         assert!(
             (before..=after).contains(&row.event_time),
@@ -283,8 +323,11 @@ async fn observations_store_the_client_emit_time() {
 async fn drift_burst_survives_a_byte_budget_override() {
     const OBSERVATIONS: u16 = 1_000;
     const FEATURES: u16 = 9;
-    let observed =
-        Observed::start(QueueConfig::with_client_byte_limit(Some(16 * 1024 * 1024))).await;
+    let observed = Observed::start(
+        QueueConfig::with_client_byte_limit(Some(16 * 1024 * 1024)),
+        &names(FEATURES, "feature_"),
+    )
+    .await;
     let model = observed.model();
 
     for observation in 0..OBSERVATIONS {
@@ -321,7 +364,7 @@ async fn sustained_hundred_feature_drift_lands_exactly_once_with_flat_client_byt
     const RATE: u16 = 100;
     const SECONDS: u16 = 15;
     const SAMPLE: Duration = Duration::from_millis(250);
-    let observed = Observed::start(QueueConfig::default()).await;
+    let observed = Observed::start(QueueConfig::default(), &names(FEATURES, "f")).await;
     let model = observed.model();
     let owned_bytes = || {
         observed

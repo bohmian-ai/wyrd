@@ -181,6 +181,15 @@ pub struct AuthorizedQueryContext {
     /// when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_subject: Option<ServedSubject>,
+    /// The tenant SYSTEM principal when Wyrd performs this read for
+    /// [`Self::principal`], such as a queued Verifier reading its run's trace.
+    ///
+    /// Attribution only, like [`Self::delegation_chain`]: the read decision
+    /// records it as actor in place of the chain's actor, while Oracle still
+    /// authorizes against [`Self::principal`] alone. Omitted from the wire
+    /// when absent, so forwarded peers record the same actor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executed_by: Option<wyrd_spec::auth::PrincipalId>,
 }
 
 /// The subject a server-owned read is performed for; see
@@ -231,6 +240,7 @@ impl AuthorizedQueryContext {
             permission,
             delegation_chain: Vec::new(),
             served_subject: None,
+            executed_by: None,
         })
     }
 
@@ -253,6 +263,15 @@ impl AuthorizedQueryContext {
     #[must_use]
     pub const fn serving(mut self, subject: ServedSubject) -> Self {
         self.served_subject = Some(subject);
+        self
+    }
+
+    /// Records `actor`, when present, as the SYSTEM executor of this read.
+    ///
+    /// Attribution only; see [`Self::executed_by`].
+    #[must_use]
+    pub const fn executed_by(mut self, actor: Option<wyrd_spec::auth::PrincipalId>) -> Self {
+        self.executed_by = actor;
         self
     }
 }
@@ -720,7 +739,8 @@ impl<T: AuditStage> OracleAudit for T {
 /// The event names the credential the principal authenticated with, when it
 /// has one, exactly as HTTP audit does. A read served for another subject
 /// records that subject with the principal as actor; any other read records
-/// the principal's verified delegation pair.
+/// the principal's verified delegation pair, with its SYSTEM executor as
+/// actor when Wyrd performs the read.
 fn query_audit_event(
     context: &AuthorizedQueryContext,
     operation: &str,
@@ -734,7 +754,15 @@ fn query_audit_event(
         "bifrost.query".to_owned(),
         context.principal.card_ref().cloned(),
         context.served_subject.map_or_else(
-            || wyrd_runtime::delegated_attribution(&context.principal, &context.delegation_chain),
+            || {
+                let verified = wyrd_runtime::delegated_attribution(
+                    &context.principal,
+                    &context.delegation_chain,
+                );
+                context
+                    .executed_by
+                    .map_or(verified, |actor| verified.executed_by(actor))
+            },
             |served| wyrd_spec::auth::Attribution::new(served.id, context.principal.id),
         ),
         context
@@ -4102,9 +4130,9 @@ mod tests {
     }
 
     /// A read served for another subject records that subject and its kind
-    /// with the reading principal as actor; any other read records the
-    /// principal's own direct pair. Both encodings survive the forwarding
-    /// envelope.
+    /// with the reading principal as actor; a read Wyrd executes records the
+    /// principal with SYSTEM as actor; any other read records the principal's
+    /// own direct pair. Every encoding survives the forwarding envelope.
     ///
     /// # Panics
     ///
@@ -4149,11 +4177,32 @@ mod tests {
         assert_eq!(event.act_principal_id, served.principal.id);
         assert_eq!(event.sub_principal_kind, subject.kind);
 
-        for context in [direct, served] {
+        let system = wyrd_runtime::PrincipalId::new(uuid::Uuid::now_v7());
+        let executed = payload_context(&[]).executed_by(Some(system));
+        let event = query_audit_event(
+            &executed,
+            "bifrost.query.read_decision",
+            AuditOutcome::Allowed,
+            AuditDetail::OracleAdmissionRecovery {
+                expired_lease_count: 0,
+                active_lease_count: 0,
+                interactive_slots: 0,
+                analytical_slots: 0,
+                total_slots: 0,
+            },
+        );
+        assert_eq!(event.sub_principal_id, executed.principal.id);
+        assert_eq!(event.act_principal_id, system);
+
+        for context in [direct, served, executed] {
             let wire = serde_json::to_value(&context).expect("context serializes");
             assert_eq!(
                 wire.get("served_subject").is_some(),
                 context.served_subject.is_some()
+            );
+            assert_eq!(
+                wire.get("executed_by").is_some(),
+                context.executed_by.is_some()
             );
             let back: AuthorizedQueryContext =
                 serde_json::from_value(wire).expect("context deserializes");

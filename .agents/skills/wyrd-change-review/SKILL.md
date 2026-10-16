@@ -19,6 +19,8 @@ Read these directly from the target. Read `AGENTS.md`,
 and applicable architecture and testing references. Follow CodeGraph
 instructions and inspect the complete diff plus enough surrounding code to
 evaluate integrated impact.
+Read the diff from git with `git diff <base>...<target>`; never write a diff,
+patch, or source archive into the review directory, which holds reports only.
 
 The reviewer must be fresh relative to implementation and integration. If the
 current context participated in either, delegate this audit to one fresh

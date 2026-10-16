@@ -1,77 +1,96 @@
 ---
 title: Verify a request in real time
-description: Call a bound Verifier from your service while a request is in flight, act on the verdict, and find the stored result.
+description: Call a bound Verifier from your service while a request is in flight, act on the verdict, and read the requirement breakdown.
 pillar: wyrd
 section: Build and verify
 topic: Verify
 order: 1
-draft: true
 status: runnable
 ---
 
-Call `observe.verify` inside a run, get a verdict back in the same request, and decide what your service does next. Here the support desk checks that an answer never promises a refund before it goes out, and hands the ticket to a person if it does.
+Call `run.observe.verify` inside a request, get the verdict back before you reply, and decide what to send.
 
 ## Prerequisites
 
-- A running service that loads its bundle and starts Bifrost, as in [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/).
-- The Verifier bound to the component you call it on, in the Service's `verified_by`. A binding with no `runs_on` is only ever called from your code:
+- A running service with a loaded bundle, as in [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/).
+- A Verifier bound to the Card you call it on, such as this one:
 
-  ```yaml title="service/support-desk.yaml (excerpt)"
-  - alias: agent
-    ref: ./support-agent.yaml
-    verified_by:
-      - verifier: ./no-refund-promise.yaml
-  ```
+```yaml title="my-check.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: my-check, version: 1.0.0}
+spec:
+  inputs:
+    answer: {type: json}
+  requirements:
+    - id: no-refund-promise
+      statement: The answer never promises a guaranteed refund
+      check: {kind: assert, path: inputs.answer, operator: not_contains, expected: guaranteed refund}
+```
 
-  ```yaml title="service/no-refund-promise.yaml"
-  apiVersion: wyrd/v1
-  kind: Verifier
-  metadata:
-    name: no-refund-promise
-    version: 1.0.0
-    space: default
-  spec:
-    description: The agent never promises a refund.
-    implementation:
-      kind: eval
-      spec:
-        pass_gate: {kind: all_pass}
-        tasks:
-          no_refund_promise:
-            kind: assertion
-            id: no_refund_promise
-            context_path: $.answer
-            operator: not_contains
-            expected: guaranteed refund
-  ```
+- `verifier:run` on it. The `workload` role a registered Service gets includes it.
 
-- `verifier:run` on that Verifier. The `workload` role a registered Service gets includes it.
+## 1. Call the Verifier
 
-## 1. Call the Verifier and act on the verdict
+Pass one input per slot the Verifier declares:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
 ```python
-with state.run("agent") as run:
-    answer = run.invoke({"question": question})
-    judgment = run.observe.verify("no-refund-promise", {"answer": answer})
-    if not judgment.passed:
-        answer = hand_to_person(ticket_id)  # your fallback
+with state.run() as run:
+    result = run.observe.verify("my-check", answer=answer)
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
 ```rust
-let run = state.run_for_card("agent")?;
-let mut answer = run.invoke(&[("question", question)]).await?;
-let judgment = run
+use serde_json::json;
+use wyrd_ai::verify::{Input, Inputs};
+
+let run = state.run();
+let result = run
     .observe()
-    .verify("no-refund-promise", &json!({ "answer": answer }))
+    .verify("my-check", Inputs::named([("answer", Input::from(json!(answer)))]))
     .await?;
-if !judgment.passed() {
-    answer = hand_to_person(ticket_id); // your fallback
+```
+
+</LangTab>
+<LangTab lang="typescript">
+
+```typescript
+const run = state.run();
+const result = await run.observe.verify("my-check", { answer });
+```
+
+</LangTab>
+</LangTabs>
+
+The name is the Verifier's Card name, looked up among the Verifiers bound to the run's Card. For a Verifier bound to a component, call it on `run.for_card("<alias>")`. A Verifier with one slot also takes one positional value.
+
+Python blocks until the result arrives; Rust and TypeScript await it. The server allows 60 seconds.
+
+## 2. Act on the verdict
+
+A `failed` verdict is a normal return value, not an exception:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+```python
+if result.verdict != "passed":
+    answer = "Let me pass this to our billing team."
+```
+
+</LangTab>
+<LangTab lang="rust">
+
+```rust
+use wyrd_ai::VerificationVerdict;
+
+if result.outcome.verdict != VerificationVerdict::Passed {
+    answer = "Let me pass this to our billing team.".to_owned();
 }
 ```
 
@@ -79,34 +98,73 @@ if !judgment.passed() {
 <LangTab lang="typescript">
 
 ```typescript
-const run = state.run("agent");
-let answer = await run.invoke({ question });
-const judgment = await run.observe.verify("no-refund-promise", { answer });
-if (!judgment.passed) {
-  answer = await handToPerson(ticketId); // your fallback
+const reply = result.outcome.verdict === "passed" ? answer : "Let me pass this to our billing team.";
+```
+
+</LangTab>
+</LangTabs>
+
+`inconclusive` means no judgment was possible, such as a missing input. Treat it as not passed.
+
+### Files
+
+`File` reads nothing when you create it. During the call the SDK hashes it, asks the server which digests it is missing, uploads only those directly to your tenant's object storage, and sends the digest in the request. The same file uploads once and is reused by every later call. Format comes from the file extension, from the slot when it accepts one format, or from what you declare:
+
+| Language | From a path | From bytes |
+| --- | --- | --- |
+| Python | `verify.File("report.pdf")` | `verify.File(data, format="pdf", filename="report.pdf")` |
+| Rust | `wyrd_ai::verify::File::path("report.pdf")` | `wyrd_ai::verify::File::bytes(data).with_format(MediaFormat::Pdf)` |
+| TypeScript | `verify.File.path("report.pdf")` | `verify.File.bytes(data, { format: "pdf" })` |
+
+To use a file already registered as an Artifact, pass an `ArtifactRef` instead: `wyrd.verify.ArtifactRef(card_ref, path="report.pdf")`, `verify::ArtifactRef::new(card_ref, Some(path))`, or `new verify.ArtifactRef(cardRef, "report.pdf")`. It is read with the Artifact's own authorization.
+
+## 3. Read the breakdown
+
+| Field | Holds |
+| --- | --- |
+| `execution_id` | The server-issued ID of this execution |
+| `run_id` | Your run |
+| `verifier`, `subject` | The exact Verifier and Card versions |
+| `outcome.verdict` | `passed`, `failed`, or `inconclusive`. Python also exposes it as `result.verdict` |
+| `outcome.requirements` | One entry per requirement: `id`, `step`, `statement`, `outcome`, `reason`, `actual`, `citations`, `detail`, and the check's provenance |
+| `outcome.steps` | One entry per step: `id`, `status`, `output`, `attempts`, `duration_ms`, `reason`, `tool_calls` |
+| `outcome.evidence` | The pinned input declarations, by slot, with file digests |
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+```python
+for requirement in result.requirements:
+    print(requirement["id"], requirement["outcome"], requirement["reason"])
+# no-refund-promise passed ...
+```
+
+</LangTab>
+<LangTab lang="rust">
+
+```rust
+for requirement in &result.outcome.requirements {
+    println!("{} {:?} {}", requirement.id, requirement.outcome, requirement.reason);
+}
+```
+
+</LangTab>
+<LangTab lang="typescript">
+
+```typescript
+for (const requirement of result.outcome.requirements) {
+  console.log(requirement.id, requirement.outcome, requirement.reason);
 }
 ```
 
 </LangTab>
 </LangTabs>
 
-The name is the Verifier's Card name. The SDK looks it up among the Verifiers bound to `agent` in your loaded bundle, so a Verifier bound only to another component is not callable from this view.
+Each citation names an original input slot and a location in it, such as `{ "slot": "answer", "locator": { "json_pointer": "" } }`, or `{ "slot": "report", "locator": { "page": 2 } }` from a judge reading a PDF. A judge that passes without a valid citation is reported as `inconclusive`.
 
-Python blocks until the verdict arrives; Rust and TypeScript await it. Either way the call waits up to 60 seconds. A `failed` verdict is an ordinary return value, so check `passed` rather than catching an exception.
+## 4. Confirm the result was stored
 
-## 2. Read the judgment
-
-| Field | Holds |
-| --- | --- |
-| `verdict` | `passed`, `failed`, or `inconclusive` |
-| `passed` | `true` only for `passed`. An `inconclusive` verdict is not a pass |
-| `kind` | What ran, such as `task_assertion`, `task_llm_judge`, `eval_assertion`, or `drift_psi` |
-| `summary` | A one-line explanation you can log |
-| `execution_id` | The stored result's `result_id` |
-
-## 3. Confirm the result was stored
-
-A real-time call stores its result in `vala.verification.results`, tied to your run, with `binding_id` null. It creates no observation and never runs Operators.
+After it answers, the server stores the pinned inputs and the result in `vala.verification.results`, tied to your run, with `binding_id` null. A `verify` call never starts queued work and never runs Operators.
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -155,28 +213,21 @@ const rows = await bifrost.sql(
 </LangTab>
 </LangTabs>
 
-The row appears shortly after the call returns. The server stores it in the background, after it has already answered you, so the verdict your code received stands even in the rare case the row is lost, such as an abrupt server restart. Queries also read Bifrost on a best-effort basis: an empty result seconds after a call is not proof the row is missing. Retry before concluding that.
+The row appears shortly after the call returns. The server stores it in the background, after it has already answered you, so the result your code received stands even in the rare case the row is lost, such as an abrupt server restart. An empty query seconds after a call is not proof the row is missing; retry before concluding that.
 
-## Other Verifier kinds in real time
+## Checks that do not belong on the request path
 
-The same call works for every Verifier kind bound to the component; only the input changes:
-
-| Kind | Input | Example |
-| --- | --- | --- |
-| `task` | One object, the context the check reads | `{"tool_call_names": [...]}` |
-| `eval` | One object, the record the tasks read | `{"answer": answer}` |
-| `drift` | A non-empty list of flat rows, one per sample | `[{"tenure_months": 14, "monthly_spend": 82.5}, ...]` |
-
-An eval Verifier called this way runs its `assertion` and `llm_judge` tasks. `trace_assertion` and `agent_assertion` need a recorded trace and are refused in real time. Every SDK also accepts media references (`media=` in Python, `options.media` in TypeScript, `verify_with_media` in Rust) for eval and task inputs.
+A Verifier with `samples` slots and `drift` checks judges a scheduled window, so `verify` refuses it; record its samples with `submit` as in [Monitor drift](/build-and-verify/verify/monitor-drift/). A slow check, such as a model judge, belongs in `submit` instead of holding the request; see [Submit for later](/build-and-verify/observe/record-a-run-and-observations/#3-record-verify-and-submit).
 
 ## What can go wrong
 
 | Error code | Cause | Fix |
 | --- | --- | --- |
 | `WYRD_SDK_404_UNKNOWN_VERIFIER` | No Verifier with that name is bound to this component in the loaded bundle | Check the name and the component alias; reload the bundle after changing `verified_by` |
-| `WYRD_SDK_400_INVALID_OBSERVATION` | The input has the wrong shape for the Verifier kind, such as an object for drift | Match the table above. Nothing was sent |
-| `WYRD_PERMISSION_403_DENIED_RBAC` | The credential lacks `verifier:run` on this Verifier. `evals:run` alone is not enough | Grant a role that includes `verifier:run` |
-| `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | The eval Verifier has a `trace_assertion` or `agent_assertion` task | Bind it with `observations_ready` and let the [verifier runtime](/build-and-verify/verify/evaluate-agent-behavior/) run it |
-| `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` | The check took longer than 60 seconds, usually a slow LLM judge | Decide your fallback for this case in code. The SDK does not retry |
+| `WYRD_VERIFICATION_400_INPUT_INVALID` | An unknown slot name, a value of the wrong kind for its slot, an invalid trace ID, an unreadable file, or a format the slot does not accept | Match the Verifier's `inputs`. Nothing ran |
+| `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` | A file is larger than its slot's `max_bytes` or the deployment limit | Send a smaller file, or raise `max_bytes` up to the deployment limit |
+| `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | The Verifier judges a scheduled window | Use `submit` |
+| `WYRD_PERMISSION_403_DENIED_RBAC` | The credential lacks `verifier:run` on this Verifier, or read access to an Artifact or trace it names | Grant a role that includes it |
+| `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` | The execution took longer than 60 seconds, usually a slow Agent step | Decide your fallback in code, or use `submit`. The SDK does not retry `verify` |
 
-For when to check in real time versus letting the server check on its own, see [How verification works](/understand/how-verification-works/).
+A missing required input is not an error: the requirements that need it come back `inconclusive`. For when to check in real time versus in the background, see [How verification works](/understand/how-verification-works/).

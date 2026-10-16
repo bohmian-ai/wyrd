@@ -122,10 +122,10 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
     assert state.prompt("triage_prompt") is state.prompt("shared_prompt")
     quality = state.verifier("default-Verifier-quality-1.0.0")
     assert quality.kind is wyrd.CardKind.Verifier
-    assert quality.spec["implementation"]["kind"] == "eval"
+    assert quality.spec["requirements"][0]["check"]["kind"] == "assert"
     drift = state.verifier("default-Verifier-model-drift-1.0.0")
     assert drift.kind is wyrd.CardKind.Verifier
-    assert drift.spec["implementation"]["kind"] == "drift"
+    assert drift.spec["requirements"][0]["check"]["kind"] == "drift"
     for alias in state.aliases:
         ref = state.card_ref(alias)
         assert ref.uid is not None and ref.version

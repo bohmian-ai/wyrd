@@ -497,6 +497,79 @@ pub async fn upload_local_blob(
         .map_err(map_storage_error)
 }
 
+/// Mint the single-PUT plan for one content-addressed evidence object.
+///
+/// Cloud backends presign `path` directly. The local backend has no URL a
+/// client can PUT to, so it returns the root-relative authenticated route
+/// served by [`upload_local_evidence`], keyed by the digest alone: content
+/// addressing replaces the upload-session row a Card upload keeps.
+///
+/// # Errors
+/// Returns the storage error when a cloud signature fails.
+pub async fn evidence_upload_plan(
+    storage: &StorageHandle,
+    path: &ValidatedPath,
+    sha256: &wyrd_spec::auth::Sha256Hex,
+    size_bytes: u64,
+    ttl: Duration,
+) -> Result<UploadPlan, StorageError> {
+    if storage.backend() == StorageBackendKind::Local {
+        return Ok(UploadPlan::LocalFs {
+            put_url: format!("/v1/verification/evidence/local/{sha256}"),
+            ttl_secs: u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX),
+        });
+    }
+    storage
+        .signer()
+        .presign_single_put(path, size_bytes, ttl)
+        .await
+}
+
+/// Write one evidence body to `<tenant>/evidence/sha256/<digest>` on the
+/// local backend.
+///
+/// The body must hash to `sha256`, so a caller can only ever write the bytes
+/// the path names; a repeated upload rewrites identical content. Writes no
+/// Postgres row.
+///
+/// # Errors
+/// Returns the storage `Sha256Mismatch` error when the body does not hash to
+/// `sha256`, an internal error when the backend is not local, and the
+/// storage error when the write fails.
+#[instrument(skip(storage, body), fields(tenant = %data_tenant_id, sha256 = %sha256))]
+pub async fn upload_local_evidence(
+    storage: &StorageHandle,
+    data_tenant_id: DataTenantId,
+    sha256: &wyrd_spec::auth::Sha256Hex,
+    body: &[u8],
+) -> Result<(), WyrdError> {
+    let actual = wyrd_spec::auth::Sha256Hex::digest(body);
+    if actual != *sha256 {
+        return Err(map_storage_error(StorageError::Sha256Mismatch {
+            expected: base64::engine::general_purpose::STANDARD.encode(sha256.as_bytes()),
+            actual: base64::engine::general_purpose::STANDARD.encode(actual.as_bytes()),
+        }));
+    }
+    #[cfg_attr(
+        not(feature = "cloud"),
+        expect(
+            irrefutable_let_patterns,
+            reason = "without `cloud` the local signer is the only backend"
+        )
+    )]
+    let crate::BackendSigner::Local(local) = storage.signer() else {
+        return Err(internal_error(
+            "local evidence route mounted for non-local backend",
+            serde_json::json!({ "backend": storage.backend() }),
+        ));
+    };
+    let path = tenant_path::evidence(data_tenant_id, sha256);
+    local
+        .write_atomically(Path::new(&path.full), body)
+        .await
+        .map_err(map_storage_error)
+}
+
 /// Initialize an artifact download.
 #[instrument(skip(storage, postgres, caller, body), fields(tenant = %caller.data_tenant_id))]
 pub async fn download_init(
@@ -1512,6 +1585,57 @@ mod tests {
             "/v1/cards/upload/local/wyu_018f0000-0000-7000-8000-000000000001"
         );
         assert_eq!(ttl_secs, 600);
+    }
+
+    /// On the local backend evidence plans target the digest-keyed route,
+    /// and that route writes only a body that hashes to its digest.
+    ///
+    /// # Panics
+    /// Panics when the plan, the refusal, or the stored bytes differ.
+    #[tokio::test]
+    async fn local_evidence_plans_the_digest_route_and_writes_only_matching_bytes() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let storage = StorageHandle::from_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_mins(10),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+        })
+        .await
+        .expect("local storage handle");
+        let tenant = DataTenantId::new_v7();
+        let body = b"evidence";
+        let sha256 = wyrd_spec::auth::Sha256Hex::digest(body);
+        let path = tenant_path::evidence(tenant, &sha256);
+
+        let plan = evidence_upload_plan(&storage, &path, &sha256, 8, Duration::from_mins(10))
+            .await
+            .expect("local plan");
+        assert_eq!(
+            plan,
+            UploadPlan::LocalFs {
+                put_url: format!("/v1/verification/evidence/local/{sha256}"),
+                ttl_secs: 600,
+            }
+        );
+
+        let refused = upload_local_evidence(&storage, tenant, &sha256, b"tampered")
+            .await
+            .expect_err("a body of another digest is refused");
+        assert_eq!(refused.code(), "WYRD_STORAGE_400_SHA256_MISMATCH");
+        assert_eq!(
+            storage.object_len(&path).await.ok(),
+            None,
+            "nothing is written"
+        );
+
+        upload_local_evidence(&storage, tenant, &sha256, body)
+            .await
+            .expect("matching body is written");
+        assert_eq!(storage.object_len(&path).await.expect("stored"), 8);
     }
 
     #[test]

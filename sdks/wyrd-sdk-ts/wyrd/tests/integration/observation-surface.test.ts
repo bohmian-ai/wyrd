@@ -1,78 +1,20 @@
 // TypeScript's own observation surface beyond the shared `observe_a_run`
-// story: span capture through an OTel context manager, generic records, local
-// emit refusals, and a burst through the byte budget. Not mirrored.
-import { context, trace } from "@opentelemetry/api";
-import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-grpc";
-import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
+// story: generic records, local emit refusals, and a burst through the byte
+// budget. Not mirrored.
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
 import { Bifrost, TableConfig, WyrdError, WyrdState } from "wyrd-ai";
 
-import { StorageContextManager } from "../support/otel-context.js";
 import { observedServiceTest as test } from "../support/observed-service.js";
 
 vi.setConfig({ testTimeout: 120_000 });
 
-const SESSION = "0190f5a4-8c3e-7b21-9d4f-3a6b2c1d0e9f";
-const SCREENSHOT = { id: "screenshot", kind: "image", uri: "s3://bucket/shot.png", mediaType: "image/png" } as const;
 const ANSWERS = "vala.datasets.observed_answers";
 const SCORES = "vala.datasets.observed_scores";
 const VALUE_ROW = { type: "object", properties: { value: { type: "integer" } }, required: ["value"] } as const;
 
-/** A stored fixed-width trace or span identity, read as lower-case hex. */
-const HexId = z.instanceof(Uint8Array).transform((bytes) => Buffer.from(bytes).toString("hex"));
-
-const SpannedEvalRow = z.object({
-  context: z.record(z.string(), z.unknown()),
-  session_id: z.string().nullable(),
-  media: z.array(z.record(z.string(), z.unknown())).nullable(),
-  trace_id: HexId,
-  span_id: HexId,
-  card_uid: z.string(),
-  span_name: z.string(),
-});
-
 const RecordRow = z.object({ value: z.bigint(), card_uid: z.string() });
-
-test("eval observation carries its session, media, and active span", async ({ server, reader, state }) => {
-  vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", server.grpcUrl);
-  vi.stubEnv("OTEL_EXPORTER_OTLP_HEADERS", `x-wyrd-api-key=${server.apiKey}`);
-  const tracing = new BasicTracerProvider({ spanProcessors: [new BatchSpanProcessor(new OTLPTraceExporter())] });
-  context.setGlobalContextManager(new StorageContextManager());
-  await state.startBifrost();
-  const agent = state.run("agent");
-
-  const span = tracing.getTracer("wyrd.tests.observe").startSpan("answer");
-  context.with(trace.setSpan(context.active(), span), () =>
-    agent.observe.eval({ answer: "yes" }, { sessionId: SESSION, media: [SCREENSHOT] }),
-  );
-  span.end();
-  await tracing.shutdown();
-  context.disable();
-  await state.shutdown();
-  server.flushBifrost();
-
-  const rows = await reader.sql(
-    `SELECT e.context, e.session_id, e.media, e.trace_id, e.span_id, e.card_uid, s.name AS span_name
-         FROM vala.eval.observations e
-         JOIN vala.traces.spans s ON e.trace_id = s.trace_id AND e.span_id = s.span_id
-         WHERE e.run_id = $1`,
-    [agent.runId],
-    SpannedEvalRow,
-  );
-  expect(rows).toEqual([
-    {
-      context: { answer: "yes" },
-      session_id: SESSION,
-      media: [{ id: "screenshot", kind: "image", uri: "s3://bucket/shot.png", media_type: "image/png" }],
-      trace_id: span.spanContext().traceId,
-      span_id: span.spanContext().spanId,
-      card_uid: state.cardRef("agent").uid,
-      span_name: "answer",
-    },
-  ]);
-});
 
 test("records land in their tables under the view that wrote them", async ({ server, reader, state }) => {
   for (const table of [ANSWERS, SCORES]) {
@@ -100,31 +42,8 @@ type Refusal = readonly [string, (state: WyrdState, bundle: string) => unknown, 
 test.for<Refusal>([
   [
     "emit before Bifrost starts",
-    (_, bundle) => WyrdState.fromPath(bundle).run().observe.drift({ latency: 1 }),
+    (_, bundle) => WyrdState.fromPath(bundle).run("model").observe.submit("observed-drift", { latency: 1 }),
     "WYRD_SDK_400_BIFROST_NOT_STARTED",
-  ],
-  [
-    "span id without its trace id",
-    (state) => state.run("agent").observe.eval({ answer: "yes" }, { spanId: "00f067aa0ba902b7" }),
-    "WYRD_SPEC_400_VALIDATION",
-  ],
-  [
-    "malformed trace id",
-    (state) =>
-      state
-        .run("agent")
-        .observe.eval({ answer: "yes" }, { traceId: "zzf92f3577b34da6a3ce929d0e0e4736", spanId: "00f067aa0ba902b7" }),
-    "WYRD_SPEC_400_VALIDATION",
-  ],
-  [
-    "media kind outside the closed set",
-    (state) =>
-      state.run("agent").observe.eval(
-        { answer: "yes" },
-        // @ts-expect-error a kind outside the closed set reaches server-owned validation.
-        { media: [{ ...SCREENSHOT, kind: "hologram" }] },
-      ),
-    "WYRD_SPEC_400_VALIDATION",
   ],
   [
     "record into a built-in table",
@@ -145,19 +64,16 @@ test.for<Refusal>([
   await state.shutdown();
 });
 
-test("drift burst lands every row exactly once", async ({ server, reader, state }) => {
+test("submitted burst lands every row exactly once", async ({ server, reader, state }) => {
   await state.startBifrost({ clientByteLimitBytes: 16 * 1024 * 1024 });
   const model = state.run("model");
 
   for (let observation = 0; observation < 1_000; observation += 1) {
-    const features = Object.fromEntries(
-      Array.from({ length: 9 }, (_, feature) => [`feature_${feature}`, observation + feature / 10]),
-    );
     // Admission is all-or-none per observation: a refused one admitted no
     // row, so resubmitting it after a flush duplicates nothing.
     for (;;) {
       try {
-        model.observe.drift(features);
+        await model.observe.submit("observed-drift", { latency: observation });
         break;
       } catch (error) {
         if (!(error instanceof WyrdError) || error.code !== "WYRD_CLIENT_429_QUEUE_FULL") {
@@ -171,10 +87,10 @@ test("drift burst lands every row exactly once", async ({ server, reader, state 
   server.flushBifrost();
 
   const perRecord = await reader.sql(
-    `SELECT COUNT(*) AS features FROM vala.drift.observations WHERE run_id = $1 GROUP BY record_id`,
+    `SELECT COUNT(*) AS samples FROM vala.drift.observations WHERE run_id = $1 GROUP BY record_id`,
     [model.runId],
-    z.object({ features: z.bigint() }),
+    z.object({ samples: z.bigint() }),
   );
   expect(perRecord).toHaveLength(1_000);
-  expect(new Set(perRecord.map((row) => row.features))).toEqual(new Set([9n]));
+  expect(new Set(perRecord.map((row) => row.samples))).toEqual(new Set([1n]));
 });

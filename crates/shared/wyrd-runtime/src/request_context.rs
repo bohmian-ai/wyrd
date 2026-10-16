@@ -344,4 +344,41 @@ mod tests {
             subject.id
         );
     }
+
+    /// Accepted authority keeps a delegated exact tool grant: the effective
+    /// subject/actor meet stays exactly the one tool after a JSON round trip,
+    /// with subject and delegation history unchanged.
+    ///
+    /// # Panics
+    /// Panics when the round trip widens, drops, or rewrites the tool scope,
+    /// subject, or chain.
+    #[test]
+    fn accepted_authority_keeps_exact_tool_scope() {
+        use crate::permission::Permission;
+        use wyrd_spec::card::agent::BuiltinTool;
+        let query = Permission::tool_invoke(BuiltinTool::BifrostQuery);
+        let mut subject = service_principal("subject");
+        subject.effective_permissions = [Permission::tool_invoke_any()].into_iter().collect();
+        let actor_grants: PermissionSet = [query.clone()].into_iter().collect();
+        subject.effective_permissions = subject
+            .effective_permissions
+            .intersection(&actor_grants)
+            .expect("representable meet");
+        let chain = vec![DelegationStep {
+            principal: PrincipalRef::from_principal(&service_principal("actor")),
+        }];
+
+        let accepted = AcceptedAuthority::new(&subject, &chain);
+        let json = serde_json::to_value(&accepted).expect("serialize accepted authority");
+        let parsed: AcceptedAuthority =
+            serde_json::from_value(json).expect("deserialize accepted authority");
+
+        assert_eq!(parsed, accepted);
+        assert_eq!(parsed.principal.id, subject.id);
+        assert_eq!(parsed.delegation_chain, chain);
+        let grants = &parsed.principal.effective_permissions;
+        assert_eq!(grants.iter().collect::<Vec<_>>(), vec![&query]);
+        assert!(!grants.contains(&Permission::tool_invoke(BuiltinTool::FsRead)));
+        assert!(!grants.contains(&Permission::bifrost_query_read()));
+    }
 }

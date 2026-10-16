@@ -5,7 +5,6 @@ pillar: wyrd
 section: Build and verify
 topic: Observe
 order: 2
-draft: true
 status: runnable
 ---
 
@@ -272,8 +271,8 @@ The tables you can read besides your own:
 
 | Namespace | Holds |
 | --- | --- |
-| `vala.drift`, `vala.eval` | Observations and per-feature or per-task results |
-| `vala.verification` | One row per verdict |
+| `vala.drift` | Drift samples |
+| `vala.verification` | One row per verdict, and the pinned inputs of each execution |
 | `vala.traces`, `vala.metrics`, `vala.logs` | OpenTelemetry data |
 | `vala.gateway` | AI Gateway calls. Request and response payload columns also need `gateway_payload:read` |
 | `vala.system` | The audit log |

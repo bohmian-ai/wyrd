@@ -860,6 +860,7 @@ mod tests {
             on_failure: vec![InlineableRef::Path(PathBuf::from(format!(
                 "{dir}/operator.yaml"
             )))],
+            inputs: BTreeMap::new(),
         }
     }
 
@@ -892,8 +893,8 @@ mod tests {
         );
     }
 
-    /// A path reference nested in an inline Agent of a judge task is reported
-    /// as unresolved.
+    /// A path reference nested in an inline Agent of an Agent check is
+    /// reported as unresolved.
     ///
     /// # Panics
     /// Panics when another set of paths is reported.
@@ -948,28 +949,30 @@ mod tests {
         }
     }
 
-    /// Return an Eval Verifier spec whose one LLM judge holds `judge_ref`.
+    /// Return a Verifier spec whose one requirement is an Agent check of
+    /// `agent`.
     ///
     /// # Panics
-    /// Panics when the fixed task id, judge, or Eval stops validating.
-    fn nested_judge(judge_ref: InlineableRef<AgentSpec>) -> Spec {
-        use crate::card::verifier::{VerifierImplementation, VerifierSpec};
-        use crate::vala::eval::{ComparisonOperator, EvalSpec, EvalTask, LlmJudgeTask, TaskId};
+    /// Panics when the fixed requirement id stops validating.
+    fn nested_judge(agent: InlineableRef<AgentSpec>) -> Spec {
+        use crate::card::verifier::{AgentCall, Check, Decide, Requirement, VerifierSpec};
+        use crate::vala::eval::TaskId;
 
-        let task_id = TaskId::new("judge").expect("fixture task id is valid");
-        let judge = LlmJudgeTask::new(
-            task_id.clone(),
-            judge_ref,
-            ComparisonOperator::Equals,
-            serde_json::json!(true),
-        )
-        .expect("fixture judge is valid");
         Spec::Verifier(VerifierSpec {
             description: None,
-            implementation: VerifierImplementation::Eval(
-                EvalSpec::new(BTreeMap::from([(task_id, EvalTask::LlmJudge(judge))]))
-                    .expect("fixture eval is valid"),
-            ),
+            inputs: BTreeMap::new(),
+            steps: Vec::new(),
+            requirements: vec![Requirement {
+                id: TaskId::new("judge").expect("fixture requirement id is valid"),
+                statement: "The answer is grounded.".to_owned(),
+                check: Check::Agent(AgentCall {
+                    agent,
+                    inputs: BTreeMap::new(),
+                    workspace: BTreeMap::new(),
+                }),
+            }],
+            decide: Decide::All,
+            context_capture: None,
         })
     }
 

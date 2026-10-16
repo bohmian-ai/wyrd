@@ -16,3 +16,5 @@ spec:
       verified_by:
         - verifier: ./tier-drift.yaml
           runs_on: {kind: schedule, cron: "0 0 * * *"}
+          inputs:
+            tier: {features: [tier]}

@@ -1,4 +1,4 @@
-//! Trigger Card spec: the closed activation that creates a Verifier run.
+//! Trigger Card spec: the closed activation that creates a Verifier execution.
 //!
 //! A Trigger declares *when* a bound Verifier runs. It never names the
 //! Verifier, an Operator, or a verdict threshold: the verification binding
@@ -16,17 +16,17 @@ pub struct TriggerSpec {
     /// Optional human-readable purpose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// The single activation condition that creates a run.
+    /// The single activation condition that creates an execution.
     #[serde(flatten)]
     pub activation: TriggerActivation,
 }
 
 /// The closed set of conditions that activate a bound Verifier.
 ///
-/// `Schedule` is valid only for a Drift-backed Verifier and
-/// `ObservationsReady` only for an Eval-backed Verifier. Server registration
-/// enforces that pairing once the effective Verifier's implementation is
-/// known; the activation itself never names the Verifier.
+/// `Schedule` is the only automatic activation. It is valid only for a
+/// Verifier whose checks judge recorded samples; server registration enforces
+/// that pairing once the effective Verifier is known. The activation itself
+/// never names the Verifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -39,13 +39,6 @@ pub enum TriggerActivation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tz: Option<String>,
     },
-    /// Activate on each successfully committed observation for the subject.
-    ///
-    /// Declared as a fieldless struct variant so the enum-level
-    /// `deny_unknown_fields` applies: a unit variant's internally tagged
-    /// visitor would silently drain every sibling key, admitting typos and
-    /// pasted secrets. The authored wire shape stays `{kind: observations_ready}`.
-    ObservationsReady {},
 }
 
 #[cfg(test)]
@@ -57,50 +50,38 @@ mod tests {
     use super::{TriggerActivation, TriggerSpec};
     use crate::envelope::{CardKind, Spec};
 
-    /// Decode the fieldless activation and its optional description.
+    /// Decode the schedule activation and its optional description.
     ///
     /// # Panics
-    /// Panics when either authored form fails to decode, or when the decoded
+    /// Panics when the authored form fails to decode, or when the decoded
     /// activation or description is not the authored one.
     #[test]
-    fn observations_ready_decodes_with_optional_description() {
-        let spec: TriggerSpec =
-            serde_json::from_value(serde_json::json!({ "kind": "observations_ready" }))
-                .expect("the bare activation decodes");
-        assert!(matches!(
-            spec.activation,
-            TriggerActivation::ObservationsReady { .. }
-        ));
-        assert_eq!(spec.description, None);
-
-        let described: TriggerSpec = serde_json::from_value(serde_json::json!({
-            "kind": "observations_ready",
-            "description": "after each committed observation",
+    fn schedule_decodes_with_optional_description() {
+        let spec: TriggerSpec = serde_json::from_value(serde_json::json!({
+            "kind": "schedule",
+            "cron": "0 * * * *",
+            "description": "hourly",
         }))
         .expect("description decodes beside the activation");
-        assert_eq!(
-            described.description.as_deref(),
-            Some("after each committed observation")
-        );
+        assert!(matches!(
+            spec.activation,
+            TriggerActivation::Schedule { .. }
+        ));
+        assert_eq!(spec.description.as_deref(), Some("hourly"));
     }
 
-    /// Refuse an unknown or secret-shaped key beside `observations_ready`.
-    ///
-    /// A unit variant's internally tagged visitor would drain these silently,
-    /// so the server would re-serialize the typed spec with the extra content
-    /// dropped and no diagnostic.
+    /// Refuse the removed `observations_ready` activation.
     ///
     /// # Panics
-    /// Panics when the unknown sibling key is accepted, or when the refusal
-    /// does not name it.
+    /// Panics when the removed activation decodes.
     #[test]
-    fn observations_ready_rejects_unknown_fields() {
-        let error = serde_json::from_value::<TriggerSpec>(serde_json::json!({
-            "kind": "observations_ready",
-            "api_token": "sk-live-not-a-real-token",
-        }))
-        .expect_err("an unknown sibling key is refused");
-        assert!(error.to_string().contains("api_token"), "{error}");
+    fn observations_ready_is_not_an_activation() {
+        assert!(
+            serde_json::from_value::<TriggerSpec>(serde_json::json!({
+                "kind": "observations_ready",
+            }))
+            .is_err()
+        );
     }
 
     /// Refuse an unknown key beside the `schedule` activation's own fields.
@@ -132,7 +113,8 @@ mod tests {
         let error = Spec::from_kind_and_value(
             &CardKind::Trigger,
             serde_json::json!({
-                "kind": "observations_ready",
+                "kind": "schedule",
+                "cron": "0 * * * *",
                 "api_token": "sk-live-not-a-real-token",
             }),
         )

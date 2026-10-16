@@ -18,18 +18,16 @@ use crate::eval::run::{self, EvalRunArgs};
 /// Returns an error when input loading, scoring, comparison, or output writing
 /// fails.
 pub async fn run_local_records(args: EvalRunArgs) -> Result<ExitCode, WyrdCliError> {
-    let (eval_ref, spec) = run::load_eval_card(&args.eval)?;
+    let spec = run::load_eval_spec(&args.eval)?;
     let records = load_records_jsonl(&args.records)?;
-    let judge = run::judge_for_spec(&spec, args.judge_mock)?;
-    let scoring =
-        vala_eval::orchestrator::ScenarioScoring::with_in_memory_traces(Arc::new(spec), judge)
-            .map_err(|source| WyrdCliError::Orchestrator { source })?;
+    let scoring = vala_eval::orchestrator::ScenarioScoring::with_in_memory_traces(Arc::new(spec))
+        .map_err(|source| WyrdCliError::Orchestrator { source })?;
     let now = Utc::now();
     let run = scoring
         .score_record_batch(
             vala_eval::RunIdentity {
                 run_id: RunId::new(),
-                eval_ref,
+                eval_ref: None,
                 started_at: now,
                 ended_at: now,
             },

@@ -77,8 +77,9 @@ pub struct EvalResults {
 pub struct RunIdentity {
     /// Typed run identifier.
     pub run_id: RunId,
-    /// Eval-backed Verifier Card whose execution produced this run.
-    pub eval_ref: CardRef,
+    /// Registered Card whose `EvalSpec` this run scored, or `None` when the
+    /// spec was loaded from a bare file for an offline run.
+    pub eval_ref: Option<CardRef>,
     /// Wall-clock UTC start.
     pub started_at: DateTime<Utc>,
     /// Wall-clock UTC end.
@@ -333,21 +334,29 @@ pub fn apply_context_capture(
     mut result: AssertionResult,
     capture: EvalContextCapture,
 ) -> Result<AssertionResult, EvalExecError> {
+    result.actual = capture_actual(result.actual, capture)?;
+    Ok(result)
+}
+
+/// Apply `capture` to one stored `actual` value: kept verbatim for `full`,
+/// replaced by its SHA-256 hex digest for `hash`, and dropped for `redact`.
+///
+/// The one capture rule shared by Eval results and Verifier requirement
+/// results.
+///
+/// # Errors
+/// Returns `ContextHashFailed` if hashing cannot serialize the value.
+pub fn capture_actual(
+    actual: Option<serde_json::Value>,
+    capture: EvalContextCapture,
+) -> Result<Option<serde_json::Value>, EvalExecError> {
     match capture {
-        EvalContextCapture::Full => Ok(result),
-        EvalContextCapture::Hash => {
-            result.actual = result
-                .actual
-                .as_ref()
-                .map(hash_context_value)
-                .transpose()?
-                .map(serde_json::Value::String);
-            Ok(result)
-        }
-        EvalContextCapture::Redact => {
-            result.actual = None;
-            Ok(result)
-        }
+        EvalContextCapture::Full => Ok(actual),
+        EvalContextCapture::Hash => actual
+            .as_ref()
+            .map(|value| hash_context_value(value).map(serde_json::Value::String))
+            .transpose(),
+        EvalContextCapture::Redact => Ok(None),
     }
 }
 
@@ -649,12 +658,20 @@ impl EvalResults {
     #[must_use]
     pub fn as_table(&self) -> String {
         let mut out = String::new();
+        let eval_ref = self.identity.eval_ref.as_ref().map_or_else(
+            || "file".to_owned(),
+            |eval_ref| {
+                format!(
+                    "{}::{}",
+                    format!("{:?}", eval_ref.kind).to_lowercase(),
+                    eval_ref.name.as_str()
+                )
+            },
+        );
         let _ = writeln!(
             out,
-            "EvalRun {} | eval_ref={}::{} | started {} | ended {}",
+            "EvalRun {} | eval_ref={eval_ref} | started {} | ended {}",
             self.identity.run_id,
-            format!("{:?}", self.identity.eval_ref.kind).to_lowercase(),
-            self.identity.eval_ref.name.as_str(),
             self.identity.started_at.to_rfc3339(),
             self.identity.ended_at.to_rfc3339()
         );
@@ -789,7 +806,7 @@ mod results_aggregation {
     fn identity() -> RunIdentity {
         RunIdentity {
             run_id: RunId::from_string("run-test".to_owned()),
-            eval_ref: eval_card_ref(),
+            eval_ref: Some(eval_card_ref()),
             started_at: Utc::now(),
             ended_at: Utc::now(),
         }
@@ -834,10 +851,6 @@ mod results_aggregation {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the expected value is produced by exact arithmetic on fixed inputs"
-    )]
     fn aggregation_pass_rates_match_per_level() {
         let task_id = TaskId::new("non_empty").expect("static task id is valid");
         let subject = card_ref("agent_a");
@@ -1042,10 +1055,6 @@ mod results_aggregation {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the expected value is produced by exact arithmetic on fixed inputs"
-    )]
     fn empty_run_aggregation_does_not_panic() {
         let output = aggregate_run(input_with(
             vec![],

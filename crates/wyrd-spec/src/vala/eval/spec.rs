@@ -13,7 +13,6 @@ use crate::error::WyrdError;
 use crate::reference::{CardRef, Ref};
 
 use super::ids::{JsonPath, TaskId};
-use super::operator::{ComparisonOperator, validate_regex_pattern};
 use super::plan::{DagError, ExecutionPlan, validate_dag};
 use super::result::{EvalContextCapture, EvalPassGate};
 use super::task::EvalTask;
@@ -128,9 +127,6 @@ impl EvalSpec {
         validate_dag(&self.tasks).map_err(EvalSpecError::Dag)?;
 
         for task in self.tasks.values() {
-            if let EvalTask::LlmJudge(task) = task {
-                task.validate().map_err(EvalSpecError::Wyrd)?;
-            }
             if let Some(condition) = task.condition() {
                 condition.validate().map_err(EvalSpecError::Wyrd)?;
             }
@@ -180,18 +176,19 @@ impl From<EvalSpecError> for WyrdError {
     }
 }
 
+/// Validates the comparison operator every eval task kind carries, through
+/// the operator's own rules shared with Verifier block checks.
+///
+/// # Errors
+/// Returns [`WyrdError::Validation`] when the operator's parameters are
+/// invalid, such as an uncompilable regex pattern.
 fn validate_task_operator(task: &EvalTask) -> Result<(), WyrdError> {
     let operator = match task {
         EvalTask::Assertion(t) => &t.operator,
-        EvalTask::LlmJudge(t) => &t.operator,
         EvalTask::TraceAssertion(t) => &t.operator,
         EvalTask::AgentAssertion(t) => &t.operator,
     };
-    match operator {
-        ComparisonOperator::MatchesRegex { pattern }
-        | ComparisonOperator::NotMatchesRegex { pattern } => validate_regex_pattern(pattern),
-        _ => Ok(()),
-    }
+    operator.validate()
 }
 
 fn validate_task_keys(tasks: &BTreeMap<TaskId, EvalTask>) -> Result<(), WyrdError> {

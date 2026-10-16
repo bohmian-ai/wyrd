@@ -28,6 +28,7 @@ use vala_bifrost_redux::scribe::{replay::replay_wal_directory, tail_rpc::TonicTa
 use vala_bifrost_redux::tables::{DomainTable, verification::ResultsTable};
 use vala_sql::TenantConn;
 use wyrd_auth_verify::TokenPrincipalRef;
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_runtime::{
     BifrostPermissionScope, BifrostTableScope, PermissionScope, PermissionSet, Principal,
     PrincipalId, PrincipalKind, RoleRef,
@@ -851,8 +852,8 @@ async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
 ///
 /// Carries every authored column of the built-in result table, taken from
 /// [`ResultsTable::arrow_fields`] so the row tracks the canonical declaration:
-/// a completed passing drift result with every implementation summary null,
-/// and `card_uid` in the correlation column.
+/// a completed passing result with an empty outcome, every optional column
+/// null, and `card_uid` in the correlation column.
 ///
 /// # Panics
 ///
@@ -864,17 +865,22 @@ fn verification_result_ipc(card_uid: &str) -> Vec<u8> {
     let columns: Vec<ArrayRef> = fields
         .iter()
         .map(|field| match (field.name().as_str(), field.data_type()) {
-            ("result_id" | "verifier_card_uid", _) => {
+            ("result_id" | "execution_id" | "verifier_card_uid", _) => {
                 Arc::new(StringArray::from(vec![uuid::Uuid::now_v7().to_string()])) as ArrayRef
             }
-            ("implementation", _) => Arc::new(StringArray::from(vec!["drift"])),
             ("execution_status", _) => Arc::new(StringArray::from(vec!["completed"])),
-            ("verdict", _) => Arc::new(StringArray::from(vec!["pass"])),
+            ("verdict", _) => Arc::new(StringArray::from(vec!["passed"])),
             ("verifier_version", _) => Arc::new(StringArray::from(vec!["1.0.0"])),
             ("started_at" | "ended_at", data_type) => Arc::new(
                 TimestampMicrosecondArray::from(vec![now]).with_data_type(data_type.clone()),
             ),
             ("card_uid", _) => Arc::new(StringArray::from(vec![card_uid])),
+            ("outcome", _) => {
+                VariantColumnBuilder::encode("outcome", [Some(serde_json::json!({}))], |value| {
+                    EncodedVariant::from_json(&value)
+                })
+                .expect("empty outcome encodes")
+            }
             (_, data_type) => arrow::array::new_null_array(data_type, 1),
         })
         .collect();

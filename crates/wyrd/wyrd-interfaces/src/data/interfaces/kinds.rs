@@ -296,15 +296,12 @@ impl_interface_methods!(PandasInterface {
     /// A pandas interface with kind `Pandas`.
     #[new]
     #[pyo3(signature = (*, data=None, compression="snappy"))]
-    fn __new__(data: Option<Py<PyAny>>, compression: &str) -> WyrdPyResult<(Self, DataInterface)> {
+    fn __new__(data: Option<Py<PyAny>>, compression: &str) -> WyrdPyResult<PyClassInitializer<Self>> {
         parse_parquet_compression(compression)?;
-        Ok((
-            Self {
+        Ok(PyClassInitializer::from(DataInterface::marker("Pandas")).add_subclass(Self {
                 data: shared_py(data),
                 compression: normalize_option(compression),
-            },
-            DataInterface::marker("Pandas"),
-        ))
+            }))
     }
 });
 
@@ -323,15 +320,12 @@ impl_interface_methods!(PolarsInterface {
     /// A polars interface with kind `Polars`.
     #[new]
     #[pyo3(signature = (*, data=None, compression="snappy"))]
-    fn __new__(data: Option<Py<PyAny>>, compression: &str) -> WyrdPyResult<(Self, DataInterface)> {
+    fn __new__(data: Option<Py<PyAny>>, compression: &str) -> WyrdPyResult<PyClassInitializer<Self>> {
         parse_parquet_compression(compression)?;
-        Ok((
-            Self {
+        Ok(PyClassInitializer::from(DataInterface::marker("Polars")).add_subclass(Self {
                 data: shared_py(data),
                 compression: normalize_option(compression),
-            },
-            DataInterface::marker("Polars"),
-        ))
+            }))
     }
 });
 
@@ -350,15 +344,12 @@ impl_interface_methods!(ArrowInterface {
     /// An Arrow interface with kind `Arrow`.
     #[new]
     #[pyo3(signature = (*, data=None, format="parquet"))]
-    fn __new__(data: Option<Py<PyAny>>, format: &str) -> WyrdPyResult<(Self, DataInterface)> {
+    fn __new__(data: Option<Py<PyAny>>, format: &str) -> WyrdPyResult<PyClassInitializer<Self>> {
         parse_arrow_format(format)?;
-        Ok((
-            Self {
+        Ok(PyClassInitializer::from(DataInterface::marker("Arrow")).add_subclass(Self {
                 data: shared_py(data),
                 format: normalize_option(format),
-            },
-            DataInterface::marker("Arrow"),
-        ))
+            }))
     }
 });
 
@@ -382,16 +373,13 @@ impl_interface_methods!(ParquetInterface {
         data: Option<Py<PyAny>>,
         compression: &str,
         row_group_size: Option<u32>,
-    ) -> WyrdPyResult<(Self, DataInterface)> {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
         parse_parquet_compression(compression)?;
-        Ok((
-            Self {
+        Ok(PyClassInitializer::from(DataInterface::marker("Parquet")).add_subclass(Self {
                 data: shared_py(data),
                 compression: normalize_option(compression),
                 row_group_size,
-            },
-            DataInterface::marker("Parquet"),
-        ))
+            }))
     }
 });
 
@@ -418,17 +406,14 @@ impl_interface_methods!(NumpyInterface {
         dtype: Option<String>,
         shape: Option<Vec<i64>>,
         format: &str,
-    ) -> WyrdPyResult<(Self, DataInterface)> {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
         parse_numpy_format(format)?;
-        Ok((
-            Self {
+        Ok(PyClassInitializer::from(DataInterface::marker("Numpy")).add_subclass(Self {
                 data: shared_py(data),
                 dtype,
                 shape,
                 format: normalize_option(format),
-            },
-            DataInterface::marker("Numpy"),
-        ))
+            }))
     }
 });
 
@@ -448,15 +433,12 @@ impl_interface_methods!(TorchInterface {
     /// A Torch interface with kind `Torch`.
     #[new]
     #[pyo3(signature = (*, data=None, save_format="safetensors"))]
-    fn __new__(data: Option<Py<PyAny>>, save_format: &str) -> WyrdPyResult<(Self, DataInterface)> {
+    fn __new__(data: Option<Py<PyAny>>, save_format: &str) -> WyrdPyResult<PyClassInitializer<Self>> {
         parse_torch_save_format(save_format)?;
-        Ok((
-            Self {
+        Ok(PyClassInitializer::from(DataInterface::marker("Torch")).add_subclass(Self {
                 data: shared_py(data),
                 save_format: normalize_option(save_format),
-            },
-            DataInterface::marker("Torch"),
-        ))
+            }))
     }
 });
 
@@ -479,16 +461,13 @@ impl_interface_methods!(SqlInterface {
         data: Option<Py<PyAny>>,
         dialect: &str,
         connection_hint: Option<String>,
-    ) -> WyrdPyResult<(Self, DataInterface)> {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
         let dialect = parse_sql_dialect(dialect)?;
-        Ok((
-            Self {
+        Ok(PyClassInitializer::from(DataInterface::marker("Sql")).add_subclass(Self {
                 data: shared_py(data),
                 dialect,
                 connection_hint,
-            },
-            DataInterface::marker("Sql"),
-        ))
+            }))
     }
 });
 
@@ -512,16 +491,13 @@ impl_interface_methods!(JsonlInterface {
         data: Option<Py<PyAny>>,
         compression: &str,
         lines_per_file: Option<u64>,
-    ) -> WyrdPyResult<(Self, DataInterface)> {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
         parse_jsonl_compression(compression)?;
-        Ok((
-            Self {
+        Ok(PyClassInitializer::from(DataInterface::marker("Jsonl")).add_subclass(Self {
                 data: shared_py(data),
                 compression: normalize_option(compression),
                 lines_per_file,
-            },
-            DataInterface::marker("Jsonl"),
-        ))
+            }))
     }
 });
 
@@ -553,18 +529,15 @@ impl_interface_methods!(ImageInterface {
         format: &str,
         color_mode: &str,
         manifest_ref: Option<&Bound<'_, PyAny>>,
-    ) -> WyrdPyResult<(Self, DataInterface)> {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
         parse_image_format(format)?;
         parse_color_mode(color_mode)?;
-        Ok((
-            Self {
+        Ok(PyClassInitializer::from(DataInterface::marker("Image")).add_subclass(Self {
                 data: shared_py(data),
                 format: normalize_option(format),
                 color_mode: normalize_option(color_mode),
                 manifest_ref: parse_card_ref(manifest_ref)?,
-            },
-            DataInterface::marker("Image"),
-        ))
+            }))
     }
 });
 
@@ -592,15 +565,12 @@ impl_interface_methods!(TextInterface {
         data: Option<Py<PyAny>>,
         encoding: &str,
         manifest_ref: Option<&Bound<'_, PyAny>>,
-    ) -> WyrdPyResult<(Self, DataInterface)> {
-        Ok((
-            Self {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
+        Ok(PyClassInitializer::from(DataInterface::marker("Text")).add_subclass(Self {
                 data: shared_py(data),
                 encoding: encoding.to_string(),
                 manifest_ref: parse_card_ref(manifest_ref)?,
-            },
-            DataInterface::marker("Text"),
-        ))
+            }))
     }
 });
 
@@ -629,7 +599,7 @@ impl_interface_methods!(HuggingfaceInterface {
         revision: Option<String>,
         split: Option<String>,
         config: Option<String>,
-    ) -> WyrdPyResult<(Self, DataInterface)> {
+    ) -> WyrdPyResult<PyClassInitializer<Self>> {
         if let Some(revision) = revision.as_deref()
             && (!(7..=40).contains(&revision.len())
                 || !revision
@@ -641,15 +611,12 @@ impl_interface_methods!(HuggingfaceInterface {
                 serde_json::json!({ "revision": revision }),
             ).into());
         }
-        Ok((
-            Self {
+        Ok(PyClassInitializer::from(DataInterface::marker("Huggingface")).add_subclass(Self {
                 data: shared_py(data),
                 dataset_id,
                 revision,
                 split,
                 config,
-            },
-            DataInterface::marker("Huggingface"),
-        ))
+            }))
     }
 });

@@ -454,7 +454,7 @@ mod pg_tests {
             self.evaluations.fetch_add(1, Ordering::SeqCst);
             let budget = self
                 .allowed
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                     left.checked_sub(1)
                 });
             if budget.is_ok() {

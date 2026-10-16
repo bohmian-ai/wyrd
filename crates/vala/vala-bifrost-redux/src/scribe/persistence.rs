@@ -421,7 +421,7 @@ impl PersistenceFaults {
             return true;
         }
         self.object_write_failure_countdown
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 if remaining > 0 {
                     Some(remaining - 1)
                 } else {

@@ -27,9 +27,6 @@ class WyrdTestServer:
     ``provider_base_url``, when set, makes the gateway dispatch over HTTP with
     every built-in adapter pointed at that local mock upstream (``OpenAI`` under
     ``/v1``); operator credential bindings read ``WYRD_TEST_GATEWAY_PROVIDER_KEY``.
-    The same ``/v1`` upstream also serves the verification runtime's ``OpenAI``
-    LLM judge, so a continuous Eval journey's judge calls
-    ``<root>/v1/chat/completions``.
 
     ``live_providers`` instead points every built-in adapter at its real
     provider endpoint, which only the opt-in live smoke lane asks for. It
@@ -60,9 +57,8 @@ class WyrdTestServer:
             provider_base_url: an absolute URL that every built-in gateway
                 adapter targets as a local mock upstream (``OpenAI`` under
                 ``/v1``); operator credential bindings read
-                ``WYRD_TEST_GATEWAY_PROVIDER_KEY``. The same ``/v1`` upstream
-                serves the verification runtime's ``OpenAI`` LLM judge at
-                ``<root>/v1/chat/completions``. Omitted, the gateway reaches no
+                ``WYRD_TEST_GATEWAY_PROVIDER_KEY``, so Verifier agent checks
+                reach it through the gateway. Omitted, the gateway reaches no
                 provider unless ``live_providers`` is set.
             live_providers: true points every built-in adapter at its real
                 provider endpoint, for the opt-in live smoke lane only.

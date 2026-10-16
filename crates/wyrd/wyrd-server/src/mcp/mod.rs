@@ -37,8 +37,8 @@ use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::middleware::trace_context;
 use crate::state::AppState;
 
-mod bifrost;
-mod cards;
+pub(crate) mod bifrost;
+pub(crate) mod cards;
 mod gateway;
 mod guide;
 mod operators;
@@ -218,7 +218,7 @@ impl ServerHandler for WyrdMcpHandler {
             if principals::may_administer(&caller) {
                 catalog.extend(principals::write_descriptors());
             }
-            if verification::may_start_runs(&caller) {
+            if verification::may_run_verifiers(&caller) {
                 catalog.extend(verification::write_descriptors());
             }
             if operators::may_manage(&caller) {
@@ -343,23 +343,16 @@ impl WyrdMcpHandler {
                     .await
                     .map_err(wyrd_error_to_mcp)
             }
-            verification::GET_RUN => {
+            verification::GET_EXECUTION => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
-                self.mcp_get_run(caller, request.arguments)
+                self.mcp_get_execution(caller, request.arguments)
                     .await
                     .map_err(wyrd_error_to_mcp)
             }
-            verification::START_RUN => {
+            name @ (verification::EVIDENCE | verification::EXECUTE | verification::ENQUEUE) => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 // Authorized and audited by the operation, like revocation.
-                self.mcp_start_run(caller, request.arguments)
-                    .await
-                    .map_err(wyrd_error_to_mcp)
-            }
-            verification::EXECUTE => {
-                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
-                // Authorized and audited by the operation, like a manual run.
-                self.mcp_execute(caller, request.arguments)
+                self.mcp_verification_write(name, caller, request.arguments)
                     .await
                     .map_err(wyrd_error_to_mcp)
             }

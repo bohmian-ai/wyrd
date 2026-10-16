@@ -1,15 +1,14 @@
 ---
 title: Record a run and observations
-description: Load your Service's bundle, record eval observations and custom rows inside a run, and read them back by run ID.
+description: Load your Service's bundle, record rows inside a run, verify or submit them to a Verifier, and read them back by run ID.
 pillar: wyrd
 section: Build and verify
 topic: Observe
 order: 1
-draft: true
 status: runnable
 ---
 
-Load the exact Service version you deployed, wrap each request in a run, and record what each component saw and did. Verifiers judge these rows, and every row points back to the Card version and run that produced it. This is the path for application code; to load or query tables directly, use the [Bifrost client](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/).
+Load the exact Service version you deployed, wrap each request in a run, record what each component saw and did, and hand it to a Verifier with `verify` or `submit`. Verifiers judge these runs, and every row points back to the Card version and run that produced it. This is the path for application code; to load or query tables directly, use the [Bifrost client](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/).
 
 [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/) explains the model behind these calls.
 
@@ -73,23 +72,27 @@ await state.startBifrost();
 
 `from_path` reads local files only. `start_bifrost` is the first server call: it connects the writer and fails at startup if the server is unreachable or your credential cannot write observations.
 
-## 3. Record inside a run
+## 3. Record, verify, and submit
 
-Open one run per request with `run(alias)`, which scopes it to one component. Every row records which Card it is about, and all of them share one `run_id`. This is the support desk's handler:
+Open a run, then call `observe` on it. Everything in one run shares a `run_id`.
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
 ```python
-def answer_question(ticket_id: str, question: str) -> str:
-    with state.run("agent") as run:
-        answer = run.invoke({"question": question})
-        run.observe.record(
-            "vala.datasets.tickets",
-            {"ticket_id": ticket_id, "question": question, "answer": answer, "refund": "refund" in question},
-        )
-        run.observe.eval({"answer": answer})
-    return answer
+from wyrd import verify
+
+with state.run() as run:
+    # Store a row
+    run.observe.record("vala.datasets.answers", {"question": question, "answer": answer})
+
+    # Run a Verifier now and wait for the result
+    result = run.observe.verify("my-check", answer=answer)
+    print(result.verdict)
+
+    # Queue a Verifier and return immediately
+    execution = run.observe.submit("my-review", document=verify.File("report.pdf"))
+    print(execution.id)
 ```
 
 </LangTab>
@@ -97,268 +100,91 @@ def answer_question(ticket_id: str, question: str) -> str:
 
 ```rust
 use serde_json::json;
-use wyrd_ai::observe::EvalObservationOptions;
+use wyrd_ai::verify::{File, Input, Inputs};
 
-async fn answer_question(state: &WyrdState, ticket_id: &str, question: &str) -> Result<String, WyrdError> {
-    let run = state.run_for_card("agent")?;
-    let answer = run.invoke(&[("question", question)]).await?;
-    let observe = run.observe();
-    observe
-        .record(
-            "vala.datasets.tickets",
-            &json!({ "ticket_id": ticket_id, "question": question, "answer": answer, "refund": question.contains("refund") }),
-        )
-        .await?;
-    observe.eval(&json!({ "answer": answer }), EvalObservationOptions::default())?;
-    Ok(answer)
-}
+let run = state.run();
+
+// Store a row
+run.observe()
+    .record("vala.datasets.answers", &json!({ "question": question, "answer": answer }))
+    .await?;
+
+// Run a Verifier now and wait for the result
+let result = run
+    .observe()
+    .verify("my-check", Inputs::named([("answer", Input::from(json!(answer)))]))
+    .await?;
+println!("{:?}", result.outcome.verdict);
+
+// Queue a Verifier and return immediately
+let submission = run
+    .observe()
+    .submit("my-review", Inputs::named([("document", Input::from(File::path("report.pdf")))]))
+    .await?;
 ```
 
 </LangTab>
 <LangTab lang="typescript">
 
 ```typescript
-async function answerQuestion(ticketId: string, question: string): Promise<string> {
-  const run = state.run("agent");
-  const answer = await run.invoke({ question });
-  await run.observe.record("vala.datasets.tickets", {
-    ticket_id: ticketId,
-    question,
-    answer,
-    refund: question.includes("refund"),
-  });
-  run.observe.eval({ answer });
-  return answer;
-}
+import { verify } from "wyrd-ai";
+
+const run = state.run();
+
+// Store a row
+await run.observe.record("vala.datasets.answers", { question, answer });
+
+// Run a Verifier now and wait for the result
+const result = await run.observe.verify("my-check", { answer });
+console.log(result.outcome.verdict);
+
+// Queue a Verifier and return immediately
+const submitted = await run.observe.submit("my-review", { document: verify.File.path("report.pdf") });
 ```
 
 </LangTab>
 </LangTabs>
 
-`invoke` runs the Agent's Prompt through the AI Gateway, so the model call lands in `vala.gateway.calls` under the same run. It needs a gateway deployment for the Prompt's model. If your service calls its model itself, skip `invoke` and record what it did; the observations work the same.
-
-When one request touches several components, such as an agent and a model that scores the customer, `run.for_card(alias)` rescopes the same run to each one, so the rows still share one `run_id`. `eval` also takes a `session_id`, a UUID that groups the runs of one conversation.
-
-What each call is for:
-
-| Call | Records | Use it when |
+| Call | Does | Returns |
 | --- | --- | --- |
-| `observe.drift(features)` | One flat row of feature values, stored one row per feature | A [drift Verifier](/build-and-verify/verify/monitor-drift/) should compare these values with a baseline |
-| `observe.eval(context)` | One JSON record of what the agent was given and did | An [eval Verifier](/build-and-verify/verify/evaluate-agent-behavior/) should judge it |
-| `observe.record(table, row)` | One row in your own `vala.datasets` table | You want the data for your own queries |
-| `observe.verify(name, input)` | Nothing to observe; returns a verdict now | Your code needs the answer before it responds. See [Verify a request in real time](/build-and-verify/verify/verify-a-request-in-real-time/) |
+| `record(table, row)` | Queues one row for a `vala.datasets` table | Nothing; the row is stored at the next flush |
+| `verify(name, inputs)` | Runs a Verifier and waits for it | The verdict (`passed`, `failed`, or `inconclusive`) and one result per requirement |
+| `submit(name, inputs)` | Queues a Verifier on the server | An execution whose `id` reads the result later |
 
-`record` needs the table to exist first. Declare it under the Service's `spec.tables` so it is created on registration, or register it with the [Bifrost client](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/#1-register-a-table).
+`verify` and `submit` take a Verifier bound to the run's Card, and one input per slot that Verifier declares. `verify.File` fills a file slot. A failed verdict is a normal return, not an error.
 
-The Python `with` block tags every OpenTelemetry span started inside it with the run, so traces line up with observations. It does not flush. In TypeScript, `run.scope(fn)` does the same for spans started in `fn`; in Rust, `run.scope(future)`.
+To run on one component instead of the Service, use `run.for_card("<alias>")`; it shares the same `run_id`.
 
-`drift` and `eval` return once the row is queued, and add almost no time to a request. `record` is async in Rust and TypeScript because the first call for a table looks it up on the server.
+Read a submitted result back from any process:
 
-### Trace an agent framework
-
-Agent frameworks describe each run as OpenTelemetry spans: the agent, every model call with its model and token counts, and every tool call. Send them to Wyrd and run the agent inside a run, and its spans land in `vala.traces.spans` with the run's `run_id` and the Card's `card_uid`, next to the run's observations.
-
-Install the SDK's OpenTelemetry support with your framework:
-
-| Framework | Install |
-| --- | --- |
-| Pydantic AI | `pip install 'wyrd-ai[otel]' 'pydantic-ai-slim[openai]'` |
-| Google ADK | `pip install 'wyrd-ai[otel]' google-adk` |
-| OpenAI Agents SDK, Python | `pip install 'wyrd-ai[otel,agents]'` |
-| OpenAI Agents SDK, TypeScript | `npm install wyrd-ai @openai/agents zod @opentelemetry/api @opentelemetry/sdk-trace-base @opentelemetry/exporter-trace-otlp-proto @opentelemetry/exporter-logs-otlp-proto @opentelemetry/exporter-metrics-otlp-proto @opentelemetry/context-async-hooks @opentelemetry/core` |
-
-The framework calls its model provider with the provider's own key, such as `OPENAI_API_KEY` for OpenAI models or `GOOGLE_API_KEY` for Gemini, read from the environment. Never give it `WYRD_API_KEY`: the Wyrd credential only sends spans and observations to Wyrd.
-
-Each recipe below starts from the `state` loaded in [step 2](#2-load-it-and-start-bifrost). Call `start_telemetry()` (`startTelemetry()`) once at startup, before you build any agent. It installs the global tracer provider, exporting as the state's client: the same `WYRD_SERVER_URL` and credential as everything else, with a fresh access token on every export. Then build the agent. Each `answer` returns the reply and the run's `run_id`, which [reads the spans back](#read-the-agents-spans-back).
-
-The Python recipes share one tool:
-
-```python
-def lookup_order(order_id: str) -> str:
-    """Return an order's shipping status."""
-    return f"Order {order_id} shipped yesterday."
-```
-
-**Pydantic AI** emits spans itself. Turn its instrumentation on without message content:
-
-```python
-from pydantic_ai import Agent
-from pydantic_ai.models.instrumented import InstrumentationSettings
-
-state.start_telemetry()
-Agent.instrument_all(InstrumentationSettings(include_content=False))
-agent = Agent("openai:gpt-4o", tools=[lookup_order])
-
-
-async def answer(question: str) -> tuple[str, str]:
-    with state.run("agent") as run:
-        result = await agent.run(question)
-    return result.output, run.run_id
-```
-
-`include_content=False` drops prompts, completions, tool arguments, and tool results. Pydantic AI still records each tool's name, description, and JSON schema in `gen_ai.tool.definitions` and `model_request_parameters`.
-
-**Google ADK** emits spans itself, under the instrumentation scope `gcp.vertex.agent`. It records message content in its spans by default; set `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false` in the process environment, and leave `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` unset.
-
-```python
-from google.adk.agents import LlmAgent
-from google.adk.runners import InMemoryRunner
-from google.genai import types
-
-state.start_telemetry()
-agent = LlmAgent(name="assistant", model="gemini-2.5-flash", tools=[lookup_order])
-runner = InMemoryRunner(agent=agent)
-
-
-async def answer(question: str) -> tuple[str, str]:
-    session = await runner.session_service.create_session(app_name=runner.app_name, user_id="support")
-    message = types.Content(role="user", parts=[types.Part(text=question)])
-    reply = ""
-    with state.run("agent") as run:
-        async for event in runner.run_async(user_id="support", session_id=session.id, new_message=message):
-            if event.is_final_response() and event.content and event.content.parts:
-                reply = event.content.parts[0].text or ""
-    return reply, run.run_id
-```
-
-**The OpenAI Agents SDK** records its own traces rather than OpenTelemetry spans. Give it `WyrdAgentsTraceProcessor`, and each agent, tool, handoff, and model call becomes a span named by the OpenTelemetry GenAI conventions, such as `invoke_agent assistant`, `execute_tool lookup_order`, and `chat gpt-4o`. The processor records names, models, token counts, and an error status, never inputs or outputs. Wyrd never installs it for you.
-
-<LangTabs langs={['python', 'typescript']}>
+<LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
 ```python
-from agents import Agent, Runner, function_tool, set_trace_processors
-from wyrd.otel import WyrdAgentsTraceProcessor
+execution = verify.Execution.connect(execution_id, client)
+result = execution.wait(30)
+```
 
-state.start_telemetry()
-set_trace_processors([WyrdAgentsTraceProcessor()])
-agent = Agent(name="assistant", model="gpt-4o", tools=[function_tool(lookup_order)])
+</LangTab>
+<LangTab lang="rust">
 
-
-async def answer(question: str) -> tuple[str, str]:
-    with state.run("agent") as run:
-        result = await Runner.run(agent, question)
-    return str(result.final_output), run.run_id
+```rust
+let execution = Execution::connect_with(id, state.client()?).await?;
+let result = execution.wait(Duration::from_secs(30)).await?;
 ```
 
 </LangTab>
 <LangTab lang="typescript">
 
 ```typescript
-import { Agent, run, setTraceProcessors, tool } from "@openai/agents";
-import { z } from "zod";
-import { WyrdAgentsTraceProcessor } from "wyrd-ai";
-
-await state.startTelemetry();
-setTraceProcessors([new WyrdAgentsTraceProcessor()]);
-const lookupOrder = tool({
-  name: "lookup_order",
-  description: "Return an order's shipping status.",
-  parameters: z.object({ orderId: z.string() }),
-  execute: async ({ orderId }) => `Order ${orderId} shipped yesterday.`,
-});
-const agent = new Agent({ name: "assistant", model: "gpt-4o", tools: [lookupOrder] });
-
-async function answer(question: string): Promise<[string, string]> {
-  const agentRun = state.run("agent");
-  const result = await agentRun.scope(() => run(agent, question));
-  return [String(result.finalOutput), agentRun.runId];
-}
+const execution = await verify.Execution.connect(executionId, { client });
+const result = await execution.wait({ timeoutMs: 30_000 });
 ```
 
 </LangTab>
 </LangTabs>
 
-`set_trace_processors` replaces the SDK's default exporter to OpenAI; use `add_trace_processor` (`addTraceProcessor`) to keep it. In TypeScript, `OpenAIChatCompletionsModel` reports no token counts on its spans; `OpenAIResponsesModel` does.
-
-A span started inside the run keeps the run even when it finishes after the block exits, such as a streamed response you consume later. Nested and concurrent runs each keep their own `run_id`, and spans outside any run export without one.
-
-None of this needs the AI Gateway. To send the model calls through it as well, give the framework's OpenAI client `http_auth` (`httpAuth`), as in [Call Wyrd from a stock client](/connect/call-wyrd-from-a-stock-client/#openai).
-
-These recipes are tested with Pydantic AI 2.56, Google ADK 2.12, OpenAI Agents SDK 0.23 for Python, and OpenAI Agents SDK 0.20 for TypeScript.
-
-#### Read the agent's spans back
-
-Ask a question, flush, and read the run's spans back with the same ambient credential:
-
-<LangTabs langs={['python', 'typescript']}>
-<LangTab lang="python">
-
-```python
-import asyncio
-
-from wyrd.bifrost import Bifrost
-
-reply, run_id = asyncio.run(answer("Where is order 1234?"))
-state.flush()
-spans = Bifrost().sql(
-    "SELECT name, gen_ai_usage_input_tokens, gen_ai_usage_output_tokens FROM vala.traces.spans WHERE run_id = $1",
-    [run_id],
-)
-```
-
-</LangTab>
-<LangTab lang="typescript">
-
-```typescript
-import { Bifrost } from "wyrd-ai";
-
-const [reply, runId] = await answer("Where is order 1234?");
-await state.flush();
-const spans = await (await Bifrost.connect()).sql(
-  "SELECT name, gen_ai_usage_input_tokens, gen_ai_usage_output_tokens FROM vala.traces.spans WHERE run_id = $1",
-  [runId],
-);
-```
-
-</LangTab>
-</LangTabs>
-
-`flush` exports the spans and drains the writer, and leaves both open, so the agent keeps working afterward. As with any row, spans become queryable a short time after `flush` returns.
-
-#### Keep your own tracer provider
-
-If your application already installs a tracer provider, `start_telemetry` refuses with `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS`. Add Wyrd's exporter and run correlation to your provider instead:
-
-<LangTabs langs={['python', 'typescript']}>
-<LangTab lang="python">
-
-```python
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from wyrd import WyrdClient
-from wyrd.otel import install_run_correlation, span_exporter
-
-provider = TracerProvider()
-provider.add_span_processor(BatchSpanProcessor(span_exporter(WyrdClient())))
-install_run_correlation(provider)
-trace.set_tracer_provider(provider)
-```
-
-</LangTab>
-<LangTab lang="typescript">
-
-```typescript
-import { context, trace } from "@opentelemetry/api";
-import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
-import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
-import { WyrdClient } from "wyrd-ai";
-import { runCorrelationProcessor, spanExporter } from "wyrd-ai/otel";
-
-const provider = new BasicTracerProvider({
-  spanProcessors: [runCorrelationProcessor(), new BatchSpanProcessor(spanExporter(WyrdClient.connect()))],
-});
-trace.setGlobalTracerProvider(provider);
-context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
-```
-
-</LangTab>
-</LangTabs>
-
-You own this provider: `shutdown` on the state never flushes it, so shut it down yourself at exit.
-
-Either provider samples by the standard `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` variables; a span the sampler drops is never exported. The server stores a span only when the credential may attribute it: a span naming a Card outside the credential's scope or tenant is rejected on its own, and the rest of the export is stored.
+`status()` on the execution returns its state without waiting.
 
 ## 4. Shut down cleanly
 
@@ -401,7 +227,7 @@ await state.shutdown();
 from wyrd.bifrost import Bifrost
 
 rows = Bifrost().sql(
-    "SELECT ticket_id, answer, card_uid FROM vala.datasets.tickets WHERE run_id = $1",
+    "SELECT question, answer, card_uid FROM vala.datasets.answers WHERE run_id = $1",
     [run.run_id],
 )
 print(rows.to_pandas())
@@ -416,7 +242,7 @@ use wyrd_ai::{Bifrost, bifrost::{BifrostOptions, QueryParam}};
 let rows = Bifrost::connect(BifrostOptions::default())
     .await?
     .sql(
-        "SELECT ticket_id, answer, card_uid FROM vala.datasets.tickets WHERE run_id = $1",
+        "SELECT question, answer, card_uid FROM vala.datasets.answers WHERE run_id = $1",
         &[QueryParam::String(run.run_id().to_string())],
     )
     .await?;
@@ -430,7 +256,7 @@ import { Bifrost } from "wyrd-ai";
 
 const bifrost = await Bifrost.connect();
 const rows = await bifrost.sql(
-  "SELECT ticket_id, answer, card_uid FROM vala.datasets.tickets WHERE run_id = $1",
+  "SELECT question, answer, card_uid FROM vala.datasets.answers WHERE run_id = $1",
   [run.runId],
 );
 ```
@@ -448,7 +274,7 @@ WHERE run_id = $1
 
 `Bifrost().trace_timeline(trace_id)` (`traceTimeline` in TypeScript) returns one trace's spans with their parent ids, status, and attributes.
 
-The ticket row has `card_uid` set to the `support-agent` version that ran. The eval row in `vala.eval.observations` and the gateway call in `vala.gateway.calls` carry the same `run_id`, so one join reads the whole request back. Rows become queryable a short time after `flush` returns. An empty result right after a flush is not proof they are missing; retry first.
+The row has `card_uid` set to the Card version that ran. Spans in `vala.traces.spans` and gateway calls in `vala.gateway.calls` carry the same `run_id`, so one join reads the whole request back. Rows become queryable a short time after `flush` returns. An empty result right after a flush is not proof they are missing; retry first.
 
 ## What can go wrong
 
@@ -462,7 +288,7 @@ The ticket row has `card_uid` set to the `support-agent` version that ran. The e
 | `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND` | At `record` | The table was never registered | Declare it in `spec.tables` or register it |
 | `WYRD_VALA_403_BIFROST_CARD_SCOPE` | At `flush` or `shutdown` | The credential is bound to a different Card than the one recorded about | Use the key issued for this Service version |
 | `WYRD_PERMISSION_403_DENIED_RBAC` | At `flush` or `shutdown` | The credential lacks `bifrost_record:write` | Use a `workload` credential |
-| `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | At `start_telemetry` | The application already installed a tracer provider | [Keep your own tracer provider](#keep-your-own-tracer-provider) |
+| `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | At `start_telemetry` | The application already installed a tracer provider | Don't call `start_telemetry`; keep your own provider |
 | `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` | At `flush` or `shutdown` | The tracer provider `start_telemetry` installed did not flush in time | Check that the server is reachable. The writer still drained; `details.native_code` names its failure, if any |
 | `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` | At `flush` or `shutdown` | That provider failed to flush. In TypeScript this includes a refused span export | Check that the credential may write telemetry. `details.native_code` names any writer failure |
 

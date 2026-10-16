@@ -927,10 +927,10 @@ impl BoundServer {
                 }),
             )
         };
-        // Gate has closed and Scribe has drained, so no acknowledgement can
-        // still stage a run request; write what the run outbox holds. Losses
-        // are counted and logged by the outbox.
-        if let Some(outbox) = self.state.bifrost.observation_runs() {
+        // The Scribe outbox has drained, so no acknowledged inputs row can
+        // still stage a submission; queue what the submission outbox holds.
+        // Losses are counted and logged by the outbox.
+        if let Some(outbox) = self.state.bifrost.submissions() {
             outbox.shutdown(deadline).await;
         }
         tracing::info!("wyrd-server shutdown complete");

@@ -7,16 +7,15 @@
 //!   offered inside the arrival window;
 //! - errors: none — no refusal, loss, wrong judgment, or failed run
 //!   (intentionally failing inputs judged failed are correct);
-//! - overhead: each non-judge kind's direct paired engine overhead p95
-//!   bucket below 10 ms, from at least [`MIN_SAMPLES`] samples in the
-//!   one-replica sustained step (AC-040);
+//! - overhead: the direct paired engine overhead p95 bucket below 10 ms,
+//!   from at least [`MIN_SAMPLES`] samples in the one-replica sustained step
+//!   (AC-040);
 //! - ingest drain: every tenant's client queue drained within
 //!   [`INGEST_DRAIN`] with no `QUEUE_FULL` (AC-041, counted as an error);
 //! - backlogs: run queue, Scribe, audit outbox, and Forge tasks empty
 //!   within [`DRAIN_LIMIT`] of load stopping.
 //!
-//! Client latency, replica CPU and memory, the judge kind's engine overhead,
-//! and the judge provider's wait are reported, never judged.
+//! Client latency and replica CPU and memory are reported, never judged.
 //! The run passes when the one-replica sustained step and both two-replica
 //! steps pass. Missing evidence never passes.
 
@@ -32,7 +31,7 @@ use crate::step::{DRAIN_LIMIT, OpRecord, Record, StepKind};
 /// Achieved share of offered traffic a step needs (REQ-171).
 const TRAFFIC: f64 = 0.95;
 
-/// Overhead samples per kind the one-replica sustained step needs (AC-040).
+/// Overhead samples the one-replica sustained step needs (AC-040).
 const MIN_SAMPLES: f64 = 1_000.0;
 
 /// Exclusive p95 overhead bound, seconds (AC-040).
@@ -40,9 +39,6 @@ const OVERHEAD_LIMIT: f64 = 0.010;
 
 /// Longest client-queue drain after load stops, seconds (AC-041).
 const INGEST_DRAIN: f64 = 1.0;
-
-/// Kinds the overhead SLO covers; the judge kind is reported only.
-const OBJECTIVE_KINDS: [&str; 4] = ["drift_psi", "drift_spc", "drift_custom", "eval_assertion"];
 
 /// One judged or reported cell.
 #[derive(Debug, Clone, Serialize)]
@@ -84,7 +80,7 @@ pub struct Row {
     pub traffic: Cell,
     /// Errors.
     pub errors: Cell,
-    /// Direct paired engine overhead p95, non-judge kinds.
+    /// Direct paired engine overhead p95.
     pub overhead: Cell,
     /// Scribe ingest client queue drain.
     pub ingest_drain: Cell,
@@ -189,22 +185,16 @@ fn none() -> Cell {
     Cell::reported("n/a".to_owned())
 }
 
-/// The overhead cell of `record`: every non-judge kind below the bound,
-/// with the sample floor in the one-replica sustained step, where a kind
-/// short of it is marked `< 1,000`; the judge kind's engine overhead and,
-/// separately, the judge provider's wait are shown for diagnosis.
+/// The overhead cell of `record`: below the bound, with the sample floor in
+/// the one-replica sustained step, where a shortfall is marked `< 1,000`.
 fn overhead(record: &Record) -> Cell {
-    let mut pass = true;
-    let mut parts = Vec::new();
-    for overhead in &record.overhead {
-        let judged = OBJECTIVE_KINDS.contains(&overhead.kind);
-        let short = record.plan.sample_floor && overhead.samples < MIN_SAMPLES;
-        let ok = overhead.p95.is_some_and(|p95| p95 < OVERHEAD_LIMIT) && !short;
-        pass &= !judged || ok;
-        parts.push(format!(
-            "{}{} {} (n {:.0}{})",
-            if judged && !ok { "✗ " } else { "" },
-            overhead.kind,
+    let overhead = &record.overhead;
+    let short = record.plan.sample_floor && overhead.samples < MIN_SAMPLES;
+    let pass = overhead.p95.is_some_and(|p95| p95 < OVERHEAD_LIMIT) && !short;
+    Cell::judged(
+        pass,
+        format!(
+            "{} (n {:.0}{})",
             overhead
                 .p95
                 .map_or("-".to_owned(), |p95| if p95.is_infinite() {
@@ -214,23 +204,8 @@ fn overhead(record: &Record) -> Cell {
                 }),
             overhead.samples,
             if short { " < 1,000" } else { "" }
-        ));
-    }
-    parts.push(judge_wait(record));
-    Cell::judged(pass, parts.join(", "))
-}
-
-/// The judge provider's wait in `record`, milliseconds, or `not measured`
-/// when no judge call was answered during the step.
-fn judge_wait(record: &Record) -> String {
-    let wait = record.judge_wait_ms;
-    match (wait.p50, wait.p95, wait.p99) {
-        (Some(p50), Some(p95), Some(p99)) => format!(
-            "judge provider wait {p50:.1}/{p95:.1}/{p99:.1} ms (n {})",
-            record.judge_calls
         ),
-        _ => "judge provider wait not measured".to_owned(),
-    }
+    )
 }
 
 /// The ingest drain cell of an operation record, when it measured one.
@@ -475,7 +450,7 @@ impl Report {
         }
         let _ = writeln!(
             text,
-            "\nL is verification executions per second over four identical tenants; each step offers direct and queued verification at L/2 each, Scribe ingest at 2.5·L Drift observations of 100 features, and Oracle queries at L/2. SLOs: traffic ≥ 95% of offered per operation; 0 errors (refused, lost, wrong judgment, failed run; QUEUE_FULL counts); direct overhead p95 < 10 ms for PSI, SPC, Custom and assertion Eval, from ≥ 1,000 samples each in the 1-replica sustained step; client queue drain ≤ 1 s; every backlog (run queue, Scribe, audit outbox, Forge tasks) drained within 60 s of load stopping. Latency, CPU/memory, judge engine overhead, and judge provider wait are reported, not judged. Overhead figures are bucket upper bounds. Each step row (operation `all`) is followed by its operation rows; `n/a` marks a column that does not apply.\n"
+            "\nL is verification executions per second over four identical tenants; each step offers direct and queued verification at L/2 each, Scribe ingest at 2.5·L Drift observations of 100 features, and Oracle queries at L/2. SLOs: traffic ≥ 95% of offered per operation; 0 errors (refused, lost, wrong judgment, failed run; QUEUE_FULL counts); direct assertion overhead p95 < 10 ms, from ≥ 1,000 samples in the 1-replica sustained step; client queue drain ≤ 1 s; every backlog (run queue, Scribe, audit outbox, Forge tasks) drained within 60 s of load stopping. Latency and CPU/memory are reported, not judged. Overhead figures are bucket upper bounds. Each step row (operation `all`) is followed by its operation rows; `n/a` marks a column that does not apply.\n"
         );
         let _ = writeln!(text, "{HEADER}");
         for record in &self.records {
@@ -488,13 +463,8 @@ impl Report {
         }
         let _ = writeln!(
             text,
-            "\nEnvelope: `{}`. Judge calls per step: {}. Replica shutdown: {}.",
+            "\nEnvelope: `{}`. Replica shutdown: {}.",
             self.envelope,
-            self.records
-                .iter()
-                .map(|record| record.judge_calls.to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
             self.shutdown
                 .iter()
                 .enumerate()
@@ -566,13 +536,13 @@ fn result(record: &Record, row: &Row) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{HEADER, Report, step_row};
-    use crate::evidence::{Backlog, Overhead, Percentiles};
+    use crate::evidence::{Backlog, Overhead};
     use crate::load::Op;
     use crate::step::{OpRecord, Plan, Record, StepKind};
 
     /// A step whose every operation completed all it offered with no error,
-    /// whose overhead holds with `samples` per kind, whose backlogs drained,
-    /// and whose judge provider answered 40 calls in about 200 ms.
+    /// whose overhead holds with `samples` samples, and whose backlogs
+    /// drained.
     fn record(name: StepKind, replicas: usize, samples: f64) -> Record {
         let op = OpRecord {
             offered: 100,
@@ -588,29 +558,13 @@ mod tests {
             },
             window_seconds: 10.0,
             ops: Op::ALL.into_iter().map(|op_| (op_, op.clone())).collect(),
-            overhead: [
-                "drift_psi",
-                "drift_spc",
-                "drift_custom",
-                "eval_assertion",
-                "eval_llm_judge",
-            ]
-            .into_iter()
-            .map(|kind| Overhead {
-                kind,
+            overhead: Overhead {
                 samples,
                 p95: Some(0.005),
-            })
-            .collect(),
+            },
             backlog_drain_seconds: Some(1.0),
             backlog: Backlog::default(),
             resources: Vec::new(),
-            judge_calls: 40,
-            judge_wait_ms: Percentiles {
-                p50: Some(200.4),
-                p95: Some(201.5),
-                p99: Some(203.0),
-            },
             profiles: Vec::new(),
         }
     }
@@ -631,8 +585,7 @@ mod tests {
 
     /// Every SLO failure fails its step: low traffic, any error, slow
     /// overhead, too few samples in the one-replica sustained step, a slow
-    /// client drain, and an undrained backlog. The judge kind's overhead is
-    /// reported only.
+    /// client drain, and an undrained backlog.
     ///
     /// # Panics
     ///
@@ -644,11 +597,8 @@ mod tests {
         slow.ops[1].1.completed = 94;
         assert!(!step_row(&slow).passed());
         let mut overhead = record(StepKind::Ramp, 1, 10.0);
-        overhead.overhead[0].p95 = Some(0.01);
+        overhead.overhead.p95 = Some(0.01);
         assert!(!step_row(&overhead).passed());
-        let mut judge = record(StepKind::Ramp, 1, 10.0);
-        judge.overhead[4].p95 = Some(0.5);
-        assert!(step_row(&judge).passed());
         assert!(!step_row(&record(StepKind::Sustained, 1, 999.0)).passed());
         assert!(step_row(&record(StepKind::Sustained, 1, 1_000.0)).passed());
         assert!(step_row(&record(StepKind::Sustained, 2, 10.0)).passed());
@@ -705,35 +655,6 @@ mod tests {
         assert_eq!(drained(Some(60.0)), Some(true));
         assert_eq!(drained(Some(60.1)), Some(false));
         assert_eq!(drained(None), Some(false));
-    }
-
-    /// The judge provider's wait appears apart from the judge kind's engine
-    /// overhead in Markdown and JSON, and a step without answered judge
-    /// calls says it was not measured instead of showing a wait.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the wait is missing, merged, or invented.
-    #[test]
-    fn judge_provider_wait_is_reported_apart_from_overhead() {
-        let step = record(StepKind::Ramp, 1, 10.0);
-        let cell = step_row(&step).overhead.text;
-        assert!(cell.contains("eval_llm_judge ≤5 ms (n 10)"));
-        assert!(cell.contains("judge provider wait 200.4/201.5/203.0 ms (n 40)"));
-        let json = serde_json::to_value(&step).unwrap_or_default();
-        assert_eq!(json["judge_wait_ms"]["p95"], 201.5);
-        assert_eq!(json["judge_calls"], 40);
-        assert_eq!(json["overhead"][4]["kind"], "eval_llm_judge");
-        assert!(json["overhead"][4].get("judge_wait_ms").is_none());
-        let mut silent = record(StepKind::Ramp, 1, 10.0);
-        silent.judge_calls = 0;
-        silent.judge_wait_ms = Percentiles::default();
-        assert!(
-            step_row(&silent)
-                .overhead
-                .text
-                .contains("judge provider wait not measured")
-        );
     }
 
     /// The Markdown holds one table: one header, every line with the same

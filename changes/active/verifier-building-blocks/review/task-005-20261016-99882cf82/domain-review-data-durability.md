@@ -1,0 +1,50 @@
+# TASK-005 persistent-data and durability review
+
+Result: **FAIL**
+
+## Immutable subject and scope
+
+Repository `/home/thorrester/Documents/GitHub/wyrd-verifier-building-blocks`; cumulative base `f2a726c90edbf8956c7b91c843379175ee20eac0` exclusive through candidate `99882cf824e70a601033aba4cfa5c5b27a8dfc7c`. Approved authority: `changes/active/verifier-building-blocks/spec.md` r8 and `tasks/TASK-005-server-integration.md`. No production source was changed. This report is independent discovery and does not incorporate peer conclusions.
+
+Reviewed persistent-data boundary: the SQL cutover, acknowledged inputs to queue acceptance, replay/conflict identity, result staging and settlement, canonical analytical declarations and upgrade/read behavior. CodeGraph was consulted before code location searches. Source navigation followed the shared map, then expanded to the unchanged catalog and server startup owners that consume the changed table declarations.
+
+## Authority and source coverage
+
+| Boundary | Governing authority | Source inspected and consumers |
+| --- | --- | --- |
+| Historical data and canonical table cutover | Spec REQ-015, INV-008; task scope/history preservation and scenario 3; `architecture/references/domain/iceberg.md` schema and field-identity rules | `migrations/20261016000000_verifier_executions.sql`; changed `tables/verification/results.rs`, `tables/verification/execution_inputs.rs`, `tables/drift/result_features.rs`, `tables/eval/mod.rs`, built-in inventory/contract tests; existing `catalog/bifrost_catalog.rs::{ensure_builtin,create_table_locked,describe_table}`; `components/platform/builtins.rs::{ensure_tenant,reconcile}`; `boot/mod.rs` startup caller |
+| ACK and queue acceptance | REQ-013, INV-004; AGENTS SQL/outbox ownership; `architecture/wyrd-design.md` verification lifecycle; `architecture/bifrost-design.md` observation/verification persistence | `components/verification/service.rs::enqueue`; `verification/results.rs::ResultPayloadBuilder::inputs`; `scribe_outbox.rs::{ScribeWrite,ScribeSink::frames,encode,split,identify,write}`; `verification/submissions.rs::SubmissionSink::write`; `queries/verifier_executions.rs::{Submission::new,accept_submissions,accept,insert_submission}` |
+| Lease/settlement and result visibility | REQ-012/013/014/015; INV-004/006; analytical-operations reliability reference | `queries/verifier_executions.rs` claim, completion, dispatch and status SQL plus `complete`; `verification/runner.rs::{settle,result}`; `components/verification/service.rs::{get_execution,read_result}`; shared client execution wait implementation |
+| Requirement-specific fitted state and reactions | REQ-014, INV-008 | Migration requirement key and retirement updates; full diff of `queries/drift_baselines.rs`; SQL readiness function; `queries/operator_dispatches.rs` claim/settlement; `verification/operators.rs` frozen-context decode, exact operator resolve and delivery path |
+| Available proof | AC-005/006/007/010; testing/spec-driven-development references | Supplied gate result in task proof; test source `pg_verifier_executions.rs`, `pg_verification_routes.rs`, `pg_verification_runtime.rs`; Scribe outbox retry/frame tests; canonical table contract tests. No upgrade-from-old-catalog proof was found in this coverage. |
+
+Also consulted `architecture/agent-rules.md`, the reference router, evaluation reference, spec-driven-development reference, and the applicable verification sections of Wyrd/Bifrost design. This role reviews durability/data behavior rather than certifying every repository-language standard.
+
+## Assessment
+
+| Obligation | Implementation evidence | Verification assessment | Result |
+| --- | --- | --- | --- |
+| Retain the canonical result surface and preserve historical evidence during cutover | New result/drift schemas reuse existing FQNs; unchanged catalog only accepts exact prior schema/layout | Fresh canonical-shape tests cannot exercise an already provisioned tenant. Upgrade deterministically fails registration. | FAIL |
+| Queue only after acknowledged submit inputs; direct recording never activates | `ExecutionInputs.queued` is absent for direct recording; Scribe sink stages submission outbox only after every relevant frame completes and excludes lost writes | Route replay/conflict source and sink retry tests support the intended path; no new durability claim inferred | PASS |
+| No Postgres write on enqueue request path; async replay/conflict | `enqueue` builds/stages `Submission`; background `SubmissionSink` owns one tenant transaction; scoped key locking and existing-row checks live in queue acceptance | Supplied gate includes real route/SQL coverage; deterministic keyed identity survives HTTP retries | PASS |
+| Distinguish result staging from queue settlement and analytical visibility | Runner stages before commit without awaiting Scribe; status reads actual Bifrost outcome; client wait polls through not-found/missing result until deadline | Existing fault, restart, staged-result and retry tests exercise these boundaries; abrupt death remains an approved loss window | PASS |
+| Requirement-specific baseline authority and existing reaction queue | Baseline operations key exact verifier and requirement with lease tokens; dispatch uniqueness/settlement remains in existing queue | Scoped SQL and scheduled journeys are included in supplied proof; no second durable writer introduced | PASS |
+
+## Material proposed finding
+
+### DATA-001 — Existing tenant catalogs cannot upgrade to the changed built-in schemas
+
+- Classification: **REGRESSION / MISSING**.
+- Violated obligation: REQ-015 retains `vala.verification.results` as the canonical analytical read surface; INV-008 and original task require historical evidence preservation without relabeling; task scenario 3 explicitly requires preserving historical rows. Iceberg reference requires explicit compatibility for required-field and schema changes.
+- Changed locations: `crates/vala/vala-bifrost-redux/src/tables/verification/results.rs:51-66` removes the old implementation/detail columns and adds required `execution_id` and `outcome` on the same FQN; `tables/drift/result_features.rs:37-40` inserts required `requirement_id` on its existing FQN. Result layout additionally adds execution-id Bloom intent.
+- Producer-to-consumer evidence: a previously provisioned active tenant already owns both FQNs, their stored user-schema fingerprints, physical schemas/layouts, and historical files. On restart, `wyrd-server/src/boot/mod.rs:507-510` unconditionally calls `BuiltinTables::reconcile` and propagates any failure. `components/platform/builtins.rs:81-95` passes each current built-in declaration to `BifrostCatalog::ensure_builtin`. That method passes the candidate's new fields/layout into `create_table_locked` (`bifrost_catalog.rs:929-940`). The authoritative stored registration is read under the existing table advisory lock, and `create_table_locked:1022-1024` returns `FingerprintMismatch` as soon as old and new fingerprints differ. No table/catalog evolution is present in this cumulative diff; the new SQL migration only changes the Wyrd control tables. This failure occurs even for an old tenant with zero verification result rows because built-ins are eagerly provisioned.
+- Observable consequence: restarting/upgrading any normal existing deployment with active tenants fails server boot before roles activate, including unrelated capabilities. Merely bypassing the fingerprint check would leave physical field identities/layouts and old result files incompatible; it is not a valid correction and can jeopardize historical evidence.
+- Existing alternative/owner: `BifrostCatalog` already owns tenant-bound catalog/physical-schema registration and the bootstrap path. Its exact-repeat registration cannot perform evolution. Extend that owning boundary for the approved cutover; do not replace it with a second result store, delete registrations/files, silently relabel old rows, or weaken mismatch validation globally.
+- Required correction outcome: provide a supported upgrade path for the existing canonical result and drift-detail FQNs that preserves historical bytes and meaning, keeps old evidence readable under its original fields, accepts new generic-result writes, and leaves repeated restart idempotent. All altered fingerprints, registered Iceberg field IDs and physical layouts must agree after the cutover. The current approved text establishes preservation and canonical FQNs but does not specify a separate historical table or permission to discard old data; any proposed archival rename, destructive reset, history reinterpretation, or newly incompatible public read contract requires a spec revision rather than an implementation shortcut.
+- Smallest credible closure proof: provision old built-in definitions/registrations and representative old result plus drift-detail rows using the existing catalog fixture, perform the actual candidate startup reconciliation/cutover, then prove startup succeeds twice, original evidence remains readable unchanged, and one new generic result/detail writes and reads successfully. Include the empty-but-provisioned tenant case. Use the existing catalog/server integration fixture and the narrow environment-owning lane; no new harness or broad gate is needed to diagnose this gap.
+
+## Verification limits
+
+I did not rerun the full gate or launch a second database lane during parallel review. Supplied `mise run gate` evidence is credible for its recorded candidate and fresh-fixture paths but does not establish upgrade compatibility. This finding follows the reachable startup call chain and incompatible fingerprint check directly; it does not rely on live providers, external example repos, the reported Oracle flake, or a speculative production load scenario.
+
+Skipped live-provider and external-repository execution; neither can prove the persistent upgrade boundary. Main risk: an existing deployment cannot start on this candidate until the canonical-table cutover is made compatible.

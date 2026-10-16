@@ -1,24 +1,24 @@
 //! `PyO3` boundary for the scoped observation surface.
 //!
-//! Python holds a JSON document, not a Rust type, so this boundary owns exactly
-//! one thing: turning a mapping, dataclass instance, or Pydantic model into the
-//! JSON text the shared `wyrd_client::observe` projection already accepts. No
-//! validation, projection, record construction, or routing is re-implemented
-//! here.
+//! Python holds JSON documents, paths, and bytes, not Rust types, so this
+//! boundary owns exactly one thing: converting them into the inputs the shared
+//! `wyrd_client::verify` projection accepts and handing back the
+//! `wyrd.verify` result types. No slot projection, hashing, upload, polling,
+//! or routing is re-implemented here.
 
 use std::fmt::Display;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyMapping, PyModule, PyString, PyType};
-use wyrd_cards::card_ref::CardRefPy;
-use wyrd_client::observe::eval::parse_session_id;
-use wyrd_client::observe::{EvalObservationOptions, Observe, Run};
+use pyo3::types::{PyDict, PyMapping, PyModule, PyString, PyTuple, PyType};
+use wyrd_client::observe::{Observe, Run};
+use wyrd_client::verify::{Input, Inputs, Submission};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::verification::Judgment;
-use wyrd_utils::py::{WyrdPyError, WyrdPyResult, execution_route_from_py, json_to_pyobject};
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult, execution_route_from_py};
+
+use crate::verify::{PyArtifactRef, PyExecution, PyFile, PyRecorded, PyVerificationResult};
 
 /// One boundary validation failure naming the offending argument.
-fn invalid_argument(field: &str, reason: impl Display) -> WyrdPyError {
+pub(crate) fn invalid_argument(field: &str, reason: impl Display) -> WyrdPyError {
     WyrdPyError::from(WyrdError::Validation {
         message: format!("{field} is invalid: {reason}"),
         details: serde_json::json!({ "field": field, "reason": reason.to_string() }),
@@ -109,31 +109,85 @@ fn require_string_keys(field: &str, mapping: &Bound<'_, PyAny>) -> WyrdPyResult<
     Ok(())
 }
 
-/// Serialize a list of Python media descriptors as one JSON array.
+/// Convert one Python slot value to JSON.
+///
+/// Mappings, dataclass instances, and Pydantic models convert as
+/// [`json_text`] does; any other value goes through
+/// `json.dumps(..., allow_nan=False)`, so a non-finite float or an object
+/// JSON cannot represent is refused rather than stringified.
 ///
 /// # Errors
-/// As [`json_text`], plus a validation error when `value` is not a list.
-fn json_array_text(py: Python<'_>, field: &str, value: &Bound<'_, PyAny>) -> WyrdPyResult<String> {
-    let items = value
-        .cast::<PyList>()
-        .map_err(|_| invalid_argument(field, "expected a list of media descriptors"))?;
-    let encoded = items
-        .iter()
-        .map(|item| json_text(py, field, &item))
-        .collect::<WyrdPyResult<Vec<_>>>()?;
-    Ok(format!("[{}]", encoded.join(",")))
+/// Raises `WYRD_SPEC_400_VALIDATION` naming `field` for a value JSON cannot
+/// represent.
+fn json_value(
+    py: Python<'_>,
+    field: &str,
+    value: &Bound<'_, PyAny>,
+) -> WyrdPyResult<serde_json::Value> {
+    let text = match json_text(py, field, value) {
+        Ok(text) => text,
+        Err(_) if value.cast::<PyMapping>().is_err() => py
+            .import("json")
+            .and_then(|json| {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("allow_nan", false)?;
+                json.call_method("dumps", (value,), Some(&kwargs))
+            })
+            .and_then(|text| text.extract::<String>())
+            .map_err(|error| invalid_argument(field, error))?,
+        Err(error) => return Err(error),
+    };
+    serde_json::from_str(&text).map_err(|error| invalid_argument(field, error))
 }
 
-/// Read trace and span identity from Python's active OpenTelemetry span.
+/// Convert one Python value to the shared client's slot input.
 ///
-/// Python's OpenTelemetry context never becomes Rust's current `tracing` span across
-/// `PyO3`, so the shared Rust fallback cannot see it; this boundary reads it
-/// instead and hands the IDs to the ordinary explicit-options path. Both IDs
-/// or neither, as [`crate::trace::active_trace_context`] supplies them.
-fn active_span_ids(py: Python<'_>) -> (Option<String>, Option<String>) {
-    crate::trace::active_trace_context(py).map_or((None, None), |context| {
-        (Some(context.trace_id), Some(context.span_id))
-    })
+/// A [`PyFile`] or [`PyArtifactRef`] keeps its meaning; anything else is an
+/// ordinary JSON value whose slot decides its form.
+///
+/// # Errors
+/// As [`json_value`].
+fn input(py: Python<'_>, field: &str, value: &Bound<'_, PyAny>) -> WyrdPyResult<Input> {
+    if let Ok(file) = value.cast::<PyFile>() {
+        return Ok(Input::File(file.get().inner.clone()));
+    }
+    if let Ok(artifact) = value.cast::<PyArtifactRef>() {
+        return Ok(Input::Artifact(artifact.get().inner.clone()));
+    }
+    json_value(py, field, value).map(Input::Value)
+}
+
+/// Convert a call's positional value or keyword slots to [`Inputs`].
+///
+/// # Errors
+/// Raises `WYRD_SPEC_400_VALIDATION` when both a positional value and keyword
+/// slots are given, or more than one positional value, and as [`input`].
+fn inputs(
+    py: Python<'_>,
+    value: &Bound<'_, PyTuple>,
+    named: Option<&Bound<'_, PyDict>>,
+) -> WyrdPyResult<Inputs> {
+    let named = named.filter(|named| !named.is_empty());
+    match (value.len(), named) {
+        (0, named) => named
+            .map(|named| {
+                named
+                    .iter()
+                    .map(|(slot, value)| {
+                        let slot = slot.extract::<String>()?;
+                        let value = input(py, &slot, &value)?;
+                        Ok((slot, value))
+                    })
+                    .collect::<WyrdPyResult<Vec<_>>>()
+            })
+            .transpose()
+            .map(|named| Inputs::named(named.unwrap_or_default())),
+        (1, None) => Ok(Inputs::One(input(py, "value", &value.get_item(0)?)?)),
+        _ => Err(invalid_argument(
+            "inputs",
+            "pass one positional value for a single-slot Verifier or keyword slots, not both",
+        )),
+    }
 }
 
 /// Python wrapper for one invocation or one Card-scoped view of it.
@@ -277,7 +331,7 @@ impl PyRun {
     }
 }
 
-/// Python wrapper for the three emits available on one scoped run.
+/// Python wrapper for the record, verify, and submit calls on one scoped run.
 ///
 /// It owns its own view clone rather than borrowing the `Run`, because a Python
 /// caller keeps `run.observe` alive independently of the object it came from.
@@ -289,122 +343,77 @@ pub struct PyObserveHandle {
 
 #[pymethods]
 impl PyObserveHandle {
-    /// Emit one Drift observation.
-    ///
-    /// Synchronous: the fixed table was described at `start_bifrost`, so this
-    /// only projects and enqueues. Returning is not a durability
-    /// acknowledgement; `WyrdState.shutdown()` is the barrier.
-    ///
-    /// # Errors
-    /// Raises `WYRD_SDK_400_BIFROST_NOT_STARTED`,
-    /// `WYRD_SDK_409_BIFROST_CLOSED`, `WYRD_SDK_400_INVALID_OBSERVATION` for an
-    /// input that is not a flat object of supported scalars, or
-    /// `WYRD_CLIENT_429_QUEUE_FULL`.
-    #[pyo3(signature = (features, *, session_id=None))]
-    fn drift(
-        &self,
-        py: Python<'_>,
-        features: &Bound<'_, PyAny>,
-        session_id: Option<&str>,
-    ) -> WyrdPyResult<()> {
-        let json = json_text(py, "features", features)?;
-        let session = parse_session_id(session_id).map_err(WyrdPyError::from)?;
-        crate::trace::traced(|| self.observe().drift_json(&json, session))
-            .map_err(WyrdPyError::from)
-    }
-
-    /// Emit one Eval observation.
-    ///
-    /// Explicit `trace_id`/`span_id` win. With neither, Python's active
-    /// OpenTelemetry span supplies both when it is valid, and otherwise both
-    /// stay absent.
-    ///
-    /// # Errors
-    /// As [`PyObserveHandle::drift`], plus a validation error for a malformed
-    /// media descriptor or a `span_id` supplied without `trace_id`.
-    #[pyo3(signature = (context, *, session_id=None, media=None, trace_id=None, span_id=None))]
-    fn eval(
-        &self,
-        py: Python<'_>,
-        context: &Bound<'_, PyAny>,
-        session_id: Option<&str>,
-        media: Option<&Bound<'_, PyAny>>,
-        trace_id: Option<&str>,
-        span_id: Option<&str>,
-    ) -> WyrdPyResult<()> {
-        let json = json_text(py, "context", context)?;
-        let media = media
-            .map(|media| json_array_text(py, "media", media))
-            .transpose()?;
-        let (active_trace, active_span) = if trace_id.is_none() && span_id.is_none() {
-            active_span_ids(py)
-        } else {
-            (None, None)
-        };
-        let options = EvalObservationOptions::from_parts(
-            session_id,
-            media.as_deref(),
-            trace_id.or(active_trace.as_deref()),
-            span_id.or(active_span.as_deref()),
-        )
-        .map_err(WyrdPyError::from)?;
-        crate::trace::traced(|| self.observe().eval_json(&json, options)).map_err(WyrdPyError::from)
-    }
-
     /// Emit one row into a registered caller-owned table.
     ///
     /// Blocking: the first call for a table describes it. Later calls reuse the
     /// writer's cached schema and producer and perform no schema lookup.
     ///
     /// # Errors
-    /// As [`PyObserveHandle::drift`], plus the server's error for an unknown,
-    /// unauthorized, or unavailable table, and a validation error for a table
-    /// outside `vala.datasets`.
+    /// Raises `WYRD_SPEC_400_VALIDATION` for a row of another shape,
+    /// `WYRD_SDK_400_INVALID_OBSERVATION` for a table outside
+    /// `vala.datasets`, `WYRD_SDK_400_BIFROST_NOT_STARTED`,
+    /// `WYRD_SDK_409_BIFROST_CLOSED`, `WYRD_CLIENT_429_QUEUE_FULL`, and the
+    /// server's error for an unknown, unauthorized, or unavailable table.
     fn record(&self, py: Python<'_>, table: &str, row: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
         let json = json_text(py, "row", row)?;
         crate::trace::block_on(py, self.observe().record_json(table, &json))
             .map_err(WyrdPyError::from)
     }
 
-    /// Judge this view's subject with a bound Verifier and return its judgment.
+    /// Execute the bound Verifier `verifier` on this view's subject now.
     ///
-    /// An Eval Verifier takes one context mapping, dataclass instance, or
-    /// Pydantic model plus optional media; a Drift Verifier takes a list of flat
-    /// feature rows. Blocks with the GIL released for the one server call,
-    /// which carries Python's active OpenTelemetry span as its W3C trace
-    /// context so the server's work joins the caller's trace; a
-    /// `failed` verdict returns normally. Nothing is observed, recorded,
-    /// enqueued, or dispatched, and Bifrost need not be started.
+    /// Pass one positional value for a single-slot Verifier or one keyword
+    /// per slot. The shared client projects each value by its slot, hashes
+    /// and uploads `File` values during the call, and returns the result;
+    /// a `failed` verdict returns normally. Blocks with the GIL released.
     ///
     /// # Errors
-    /// Raises `WYRD_SDK_404_UNKNOWN_VERIFIER` for a Verifier not bound to this
-    /// view's subject and `WYRD_SDK_400_INVALID_OBSERVATION` for input of the
-    /// wrong shape, both before any network IO, and otherwise the server's
-    /// verification refusal.
-    #[pyo3(signature = (verifier, input, *, media=None))]
+    /// Raises `WYRD_SDK_404_UNKNOWN_VERIFIER`,
+    /// `WYRD_VERIFICATION_400_INPUT_INVALID` or `413_INPUT_TOO_LARGE` before
+    /// the execution request, `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` for
+    /// a scheduled-window Verifier, and otherwise the server's refusal.
+    #[pyo3(signature = (verifier, /, *value, **named))]
     fn verify(
         &self,
         py: Python<'_>,
         verifier: &str,
-        input: &Bound<'_, PyAny>,
-        media: Option<&Bound<'_, PyAny>>,
-    ) -> WyrdPyResult<PyJudgment> {
-        let json = if input.cast::<PyList>().is_ok() {
-            json_array_text(py, "input", input)?
-        } else {
-            json_text(py, "input", input)?
-        };
-        let media = media
-            .map(|media| json_array_text(py, "media", media))
-            .transpose()?
-            .map(|text| serde_json::from_str(&text))
-            .transpose()
-            .map_err(|error| invalid_argument("media", error))?
-            .unwrap_or_default();
+        value: &Bound<'_, PyTuple>,
+        named: Option<&Bound<'_, PyDict>>,
+    ) -> WyrdPyResult<PyVerificationResult> {
+        let inputs = inputs(py, value, named)?;
         let observe = self.observe();
-        crate::trace::block_on(py, observe.verify_json(verifier, &json, media))
-            .map(|inner| PyJudgment { inner })
+        crate::trace::block_on(py, observe.verify(verifier, inputs))
+            .map(PyVerificationResult)
             .map_err(WyrdPyError::from)
+    }
+
+    /// Submit evidence for the bound Verifier `verifier` without waiting.
+    ///
+    /// Run evidence is staged for one queued execution, returned as a
+    /// `wyrd.verify.Execution`; scheduled-window samples are recorded and
+    /// `Recorded` is returned, and each queued sample write records a
+    /// `bifrost.enqueue` PRODUCER span in Python's tracer. Arguments are as
+    /// for `verify`.
+    ///
+    /// # Errors
+    /// As [`PyObserveHandle::verify`] for Run evidence; for window samples,
+    /// `WYRD_SDK_400_BIFROST_NOT_STARTED`, `WYRD_SDK_409_BIFROST_CLOSED`, or
+    /// `WYRD_CLIENT_429_QUEUE_FULL`.
+    #[pyo3(signature = (verifier, /, *value, **named))]
+    fn submit(
+        &self,
+        py: Python<'_>,
+        verifier: &str,
+        value: &Bound<'_, PyTuple>,
+        named: Option<&Bound<'_, PyDict>>,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let inputs = inputs(py, value, named)?;
+        let observe = self.observe();
+        match crate::trace::traced(|| crate::trace::block_on(py, observe.submit(verifier, inputs)))?
+        {
+            Submission::Recorded => Ok(Py::new(py, PyRecorded)?.into_any()),
+            Submission::Queued(inner) => Ok(Py::new(py, PyExecution::queued(inner))?.into_any()),
+        }
     }
 }
 
@@ -415,109 +424,7 @@ impl PyObserveHandle {
     }
 }
 
-/// Python view of one direct verification judgment.
-///
-/// Read-only projection of the wire `Judgment`; `passed` is derived from the
-/// verdict, not carried on the wire.
-#[pyclass(module = "wyrd._wyrd.observe", name = "Judgment", frozen)]
-pub struct PyJudgment {
-    /// The judgment the server returned.
-    inner: Judgment,
-}
-
-#[pymethods]
-impl PyJudgment {
-    /// Whether the expectations held: true only for a `passed` verdict.
-    #[getter]
-    fn passed(&self) -> bool {
-        self.inner.passed()
-    }
-
-    /// Transient identity of this execution, shared with its audit and trace.
-    #[getter]
-    fn execution_id(&self) -> String {
-        self.inner.execution_id.to_string()
-    }
-
-    /// The exact Verifier executed.
-    #[getter]
-    fn verifier(&self) -> CardRefPy {
-        CardRefPy(self.inner.verifier.clone())
-    }
-
-    /// The exact subject judged.
-    #[getter]
-    fn subject(&self) -> CardRefPy {
-        CardRefPy(self.inner.subject.clone())
-    }
-
-    /// The Verifier classification, `drift` or `eval`.
-    ///
-    /// # Errors
-    /// Raises an internal error only if the wire enum stops serializing as a
-    /// string.
-    #[getter]
-    fn kind(&self) -> WyrdPyResult<String> {
-        wire_string(&self.inner.kind)
-    }
-
-    /// The common verdict: `passed`, `failed`, or `inconclusive`.
-    ///
-    /// # Errors
-    /// As [`PyJudgment::kind`].
-    #[getter]
-    fn verdict(&self) -> WyrdPyResult<String> {
-        wire_string(&self.inner.verdict)
-    }
-
-    /// Bounded human-readable summary of the verdict.
-    #[getter]
-    fn summary(&self) -> &str {
-        &self.inner.summary
-    }
-
-    /// Count-only rollup of a Drift or Eval judgment as its wire mapping;
-    /// `None` for a task Verifier.
-    ///
-    /// # Errors
-    /// Raises an internal error when the rollup cannot be converted.
-    #[getter]
-    fn counts(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Ok(json_to_pyobject(
-            py,
-            &serde_json::to_value(self.inner.counts)?,
-        )?)
-    }
-
-    /// The engine report as its wire mapping: `{"drift": ...}`, `{"eval": ...}`,
-    /// or `{"task": {"result": ...}}`.
-    ///
-    /// # Errors
-    /// Raises an internal error when the report cannot be converted.
-    #[getter]
-    fn detail(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Ok(json_to_pyobject(
-            py,
-            &serde_json::to_value(&self.inner.detail)?,
-        )?)
-    }
-}
-
-/// The wire spelling of a unit enum value.
-///
-/// # Errors
-/// Raises an internal error when `value` does not serialize as a string.
-fn wire_string<T: serde::Serialize>(value: &T) -> WyrdPyResult<String> {
-    match serde_json::to_value(value)? {
-        serde_json::Value::String(text) => Ok(text),
-        other => Err(invalid_argument(
-            "judgment",
-            format!("unexpected wire value {other}"),
-        )),
-    }
-}
-
-/// Register the scoped observation classes on `wyrd._wyrd.observe`.
+/// Register the scoped run classes on `wyrd._wyrd.observe`.
 ///
 /// # Errors
 /// Propagates the Python error from a failed `add_class` call, such as an
@@ -525,6 +432,5 @@ fn wire_string<T: serde::Serialize>(value: &T) -> WyrdPyResult<String> {
 pub fn register_run(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRun>()?;
     module.add_class::<PyObserveHandle>()?;
-    module.add_class::<PyJudgment>()?;
     Ok(())
 }

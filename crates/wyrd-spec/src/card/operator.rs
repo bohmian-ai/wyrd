@@ -12,10 +12,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::card::verifier::VerifierImplementation;
+use crate::card::verifier::VerifierSpec;
 use crate::error::WyrdError;
 use crate::ids::{
-    BindingId, CardUid, ConnectionName, OperatorDispatchId, VerificationResultId, VerificationRunId,
+    BindingId, CardUid, ConnectionName, ExecutionId, OperatorDispatchId, VerificationResultId,
 };
 use crate::operator_connection::{
     HttpAuthScheme, HttpsOrigin, OperatorConnectionConfig, OperatorProvider,
@@ -65,11 +65,10 @@ impl OperatorSpec {
     /// Validate the connection-independent shape of this Operator.
     ///
     /// Checks every `{{field}}` template against the closed failure-context
-    /// field set. With `implementation`, the Operator is attached to a binding
-    /// of that exact Verifier, so a kind-specific field of another
-    /// implementation (for example `drift.*` under an Eval Verifier) is
-    /// refused; without it (a standalone Operator Card) every known field is
-    /// allowed. It also requires a literal `https` (or loopback `http`) URL origin
+    /// field set. With `verifier`, the Operator is attached to a binding of
+    /// that exact Verifier, so a `drift.*` field is refused unless it has
+    /// exactly one drift check; without it (a standalone Operator Card) every
+    /// known field is allowed. It also requires a literal `https` (or loopback `http`) URL origin
     /// with templates confined to its path and query, or a `/`-prefixed
     /// path-only URL whose origin comes from the named `auth` connection at
     /// delivery, refuses server-owned
@@ -80,16 +79,12 @@ impl OperatorSpec {
     /// # Errors
     /// Returns [`WyrdError::SpecInvalidOperator`] naming `field` and the first
     /// violation found, including a path-only URL without a named connection.
-    pub fn validate(
-        &self,
-        field: &str,
-        implementation: Option<&VerifierImplementation>,
-    ) -> Result<(), WyrdError> {
+    pub fn validate(&self, field: &str, verifier: Option<&VerifierSpec>) -> Result<(), WyrdError> {
         let invalid = |at: &str, reason: String| WyrdError::SpecInvalidOperator {
             message: format!("{field}{at}: {reason}"),
             details: serde_json::json!({ "field": format!("{field}{at}"), "reason": reason }),
         };
-        let lookup = |name: &str| field_applies(name, implementation).then(String::new);
+        let lookup = |name: &str| field_applies(name, verifier).then(String::new);
         let template = |at: &str, value: &str| {
             render_template(value, lookup).map_err(|reason| invalid(at, reason))
         };
@@ -408,9 +403,9 @@ pub struct OperatorBudget {
 pub struct OperatorFailureContext {
     /// The dispatch being delivered.
     pub dispatch_id: OperatorDispatchId,
-    /// The failed run.
-    pub run_id: VerificationRunId,
-    /// The run's canonical result.
+    /// The failed execution.
+    pub execution_id: ExecutionId,
+    /// The execution's canonical result.
     pub result_id: VerificationResultId,
     /// The binding that configured this Operator.
     pub binding_id: BindingId,
@@ -424,115 +419,57 @@ pub struct OperatorFailureContext {
     pub subject_ref: String,
     /// Always `failed`.
     pub verdict: VerificationVerdict,
-    /// When the run settled.
+    /// When the execution settled.
     pub completed_at: DateTime<Utc>,
     /// Bounded human-readable result summary.
     pub summary: String,
-    /// Aggregate counts of the failed run's Verifier implementation.
-    pub verifier: VerifierCounts,
+    /// Counts of the Verifier's one drift check, when it has exactly one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift: Option<DriftCounts>,
 }
 
-/// Aggregate, count-only numbers of one failed run, per Verifier implementation.
+/// Count-only numbers of a failed execution's one drift check.
 ///
 /// Frozen into the failure context beside `summary` and derived from the same
-/// acknowledged result, so the two never disagree. Carries counts only: no
-/// feature names, feature rows, task inputs or outputs, or assertion detail.
-/// Templates reach these values as `drift.*` or `eval.*` fields, and a binding
-/// may only reference the block of its own Verifier implementation.
+/// result, so the two never disagree. Carries counts only: no feature names
+/// or rows. Templates reach them as `drift.*` fields, which apply only to a
+/// Verifier with exactly one drift check; counts of several checks are never
+/// combined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(tag = "implementation", rename_all = "snake_case", deny_unknown_fields)]
-pub enum VerifierCounts {
-    /// Counts of a failed Drift run.
-    Drift {
-        /// Features whose own verdict is `drift`.
-        drifted_features: u32,
-        /// Features scored in the report.
-        total_features: u32,
-    },
-    /// Counts of a failed Eval run.
-    Eval {
-        /// Tasks that passed.
-        passed_tasks: u32,
-        /// Tasks that ran and did not pass.
-        failed_tasks: u32,
-        /// Tasks that ran.
-        total_tasks: u32,
-        /// `floor(100 * passed / total)`, or `0` when no task ran.
-        pass_rate_percent: u32,
-    },
+#[serde(deny_unknown_fields)]
+pub struct DriftCounts {
+    /// Features whose own verdict is `drift`.
+    pub drifted_features: u32,
+    /// Features scored in the report.
+    pub total_features: u32,
 }
 
-impl VerifierCounts {
-    /// Eval counts from `passed` of `total` tasks that ran.
-    ///
-    /// Derives `failed_tasks` and a pass rate rounded down, so a partial pass
-    /// never reads `100`. `passed` above `total` is clamped to `total`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a percentage of at most 100 does not fit `u32`, which cannot happen.
-    #[must_use]
-    pub fn eval(passed: u32, total: u32) -> Self {
-        let passed = passed.min(total);
-        let pass_rate_percent = if total == 0 {
-            0
-        } else {
-            u32::try_from(u64::from(passed) * 100 / u64::from(total))
-                .expect("invariant: a rate of at most 100 fits u32")
-        };
-        Self::Eval {
-            passed_tasks: passed,
-            failed_tasks: total - passed,
-            total_tasks: total,
-            pass_rate_percent,
-        }
-    }
-
-    /// The rendered value of one `drift.*` or `eval.*` field, or `None` when
-    /// the field is unknown or belongs to another implementation.
+impl DriftCounts {
+    /// The rendered value of one `drift.*` field, or `None` when unknown.
     fn field(self, name: &str) -> Option<u32> {
-        match (self, name) {
-            (
-                Self::Drift {
-                    drifted_features, ..
-                },
-                "drift.drifted_features",
-            ) => Some(drifted_features),
-            (Self::Drift { total_features, .. }, "drift.total_features") => Some(total_features),
-            (Self::Eval { passed_tasks, .. }, "eval.passed_tasks") => Some(passed_tasks),
-            (Self::Eval { failed_tasks, .. }, "eval.failed_tasks") => Some(failed_tasks),
-            (Self::Eval { total_tasks, .. }, "eval.total_tasks") => Some(total_tasks),
-            (
-                Self::Eval {
-                    pass_rate_percent, ..
-                },
-                "eval.pass_rate_percent",
-            ) => Some(pass_rate_percent),
+        match name {
+            "drift.drifted_features" => Some(self.drifted_features),
+            "drift.total_features" => Some(self.total_features),
             _ => None,
         }
     }
 }
 
 /// Whether template field `name` may be used by an Operator bound to
-/// `implementation`; every field applies to a standalone Operator (`None`).
-fn field_applies(name: &str, implementation: Option<&VerifierImplementation>) -> bool {
-    !matches!(
-        (name.split_once('.').map(|(kind, _)| kind), implementation),
-        (Some("drift"), Some(VerifierImplementation::Eval(_)))
-            | (Some("eval"), Some(VerifierImplementation::Drift(_)))
-            | (
-                Some("drift" | "eval"),
-                Some(VerifierImplementation::Task(_))
-            )
-    )
+/// `verifier`; every field applies to a standalone Operator (`None`).
+///
+/// `drift.*` fields apply only to a Verifier with exactly one drift check, so
+/// counts are never guessed across several checks.
+fn field_applies(name: &str, verifier: Option<&VerifierSpec>) -> bool {
+    !name.starts_with("drift.") || verifier.is_none_or(|spec| spec.drift_checks().count() == 1)
 }
 
 impl OperatorFailureContext {
     /// Every placeholder name a template may reference.
-    pub const FIELDS: [&'static str; 17] = [
+    pub const FIELDS: [&'static str; 13] = [
         "dispatch_id",
-        "run_id",
+        "execution_id",
         "result_id",
         "binding_id",
         "verifier_card_uid",
@@ -544,10 +481,6 @@ impl OperatorFailureContext {
         "summary",
         "drift.drifted_features",
         "drift.total_features",
-        "eval.passed_tasks",
-        "eval.failed_tasks",
-        "eval.total_tasks",
-        "eval.pass_rate_percent",
     ];
 
     /// The rendered value of one placeholder, or `None` for an unknown name
@@ -556,7 +489,7 @@ impl OperatorFailureContext {
     pub fn field(&self, name: &str) -> Option<String> {
         Some(match name {
             "dispatch_id" => self.dispatch_id.to_string(),
-            "run_id" => self.run_id.to_string(),
+            "execution_id" => self.execution_id.to_string(),
             "result_id" => self.result_id.to_string(),
             "binding_id" => self.binding_id.to_string(),
             "verifier_card_uid" => self.verifier_card_uid.to_string(),
@@ -566,7 +499,7 @@ impl OperatorFailureContext {
             "verdict" => <&'static str>::from(self.verdict).to_owned(),
             "completed_at" => self.completed_at.to_rfc3339(),
             "summary" => self.summary.clone(),
-            _ => return self.verifier.field(name).map(|count| count.to_string()),
+            _ => return self.drift?.field(name).map(|count| count.to_string()),
         })
     }
 
@@ -688,7 +621,7 @@ mod tests {
     fn http(url: &str, headers: Value, auth: Value) -> OperatorSpec {
         let mut value = serde_json::json!({
             "kind": "http", "method": "post", "url": url, "headers": headers,
-            "body": { "text": "{{ summary }}", "ids": ["{{run_id}}"] }
+            "body": { "text": "{{ summary }}", "ids": ["{{execution_id}}"] }
         });
         if !auth.is_null() {
             value["auth"] = auth;
@@ -699,45 +632,21 @@ mod tests {
     /// Known fields render; unknown and unterminated placeholders are refused.
     #[test]
     fn templates_accept_only_the_closed_context_fields() {
-        let rendered = render_template("run {{run_id}} / {{ summary }}", |name| {
+        let rendered = render_template("run {{execution_id}} / {{ summary }}", |name| {
             Some(name.to_uppercase())
         })
         .expect("known fields render");
-        assert_eq!(rendered, "run RUN_ID / SUMMARY");
+        assert_eq!(rendered, "run EXECUTION_ID / SUMMARY");
         assert!(render_template("{{secret}}", |_| Some(String::new())).is_err());
-        assert!(render_template("{{run_id", |_| Some(String::new())).is_err());
+        assert!(render_template("{{execution_id", |_| Some(String::new())).is_err());
     }
 
-    /// Eval counts derive failures and a pass rate that rounds down, never
-    /// reading 100 for a partial pass, and read 0 when no task ran.
+    /// Drift fields render from the frozen counts and apply only to a
+    /// binding whose Verifier has exactly one drift check; a standalone
+    /// Operator accepts every known field, and removed fields are unknown.
     #[test]
-    fn eval_counts_round_the_pass_rate_down() {
-        assert_eq!(
-            VerifierCounts::eval(999, 1000),
-            VerifierCounts::Eval {
-                passed_tasks: 999,
-                failed_tasks: 1,
-                total_tasks: 1000,
-                pass_rate_percent: 99,
-            }
-        );
-        assert_eq!(
-            VerifierCounts::eval(0, 0),
-            VerifierCounts::Eval {
-                passed_tasks: 0,
-                failed_tasks: 0,
-                total_tasks: 0,
-                pass_rate_percent: 0,
-            }
-        );
-    }
-
-    /// Kind fields render from the frozen counts; a field of the other
-    /// implementation does not render, and a binding of that implementation
-    /// refuses it while a standalone Operator accepts every known field.
-    #[test]
-    fn kind_fields_follow_the_verifier_implementation() {
-        let counts = VerifierCounts::Drift {
+    fn drift_fields_need_exactly_one_drift_check() {
+        let counts = DriftCounts {
             drifted_features: 3,
             total_features: 20,
         };
@@ -747,34 +656,50 @@ mod tests {
         )
         .expect("drift fields render");
         assert_eq!(rendered, "3/20");
-        let refusal = render_template("{{eval.total_tasks}}", |name| {
-            counts.field(name).map(|count| count.to_string())
-        })
-        .expect_err("an eval field does not render from drift counts");
-        assert!(refusal.contains("does not apply"), "{refusal}");
+        for removed in ["{{run_id}}", "{{eval.total_tasks}}"] {
+            let refusal = render_template(removed, |_| Some(String::new()))
+                .expect_err("a removed field is unknown");
+            assert!(refusal.contains("unknown template field"), "{refusal}");
+        }
 
-        let eval: VerifierImplementation =
-            serde_json::from_value(serde_json::json!({ "kind": "eval", "spec": { "tasks": {} } }))
-                .expect("test_setup: eval implementation parses");
+        let drift = |id: &str| {
+            serde_json::json!({
+                "id": id, "statement": "stable",
+                "check": {"kind": "drift", "on": "inputs.current", "method": "Spc",
+                    "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "space": "risk", "name": "train", "version": "1.0.0"}, "features": ["latency"]},
+                    "condition": {"kind": "Statistical"},
+                    "profile": {"kind": "Spc", "sample_size": 5}}
+            })
+        };
+        let verifier = |requirements: Vec<Value>| -> VerifierSpec {
+            serde_json::from_value(serde_json::json!({
+                "inputs": {"current": {"type": "samples", "features": ["latency"]}},
+                "requirements": requirements
+            }))
+            .expect("test_setup: drift Verifier parses")
+        };
+        let one = verifier(vec![drift("latency-stable")]);
+        let two = verifier(vec![drift("latency-stable"), drift("latency-steady")]);
+        let assertion: VerifierSpec = serde_json::from_value(serde_json::json!({
+            "inputs": {"answer": {"type": "json"}},
+            "requirements": [{"id": "present", "statement": "answer present", "check": {
+                "kind": "assert", "path": "inputs.answer", "operator": "is_not_null"
+            }}]
+        }))
+        .expect("test_setup: assertion Verifier parses");
         let drift_hook = http(
             "https://hooks.example.com/{{drift.total_features}}",
             serde_json::json!({}),
             Value::Null,
         );
         assert!(drift_hook.validate("spec", None).is_ok());
-        let error = drift_hook
-            .validate("spec", Some(&eval))
-            .expect_err("an eval binding refuses a drift field");
-        assert!(
-            error.to_string().contains("drift.total_features"),
-            "{error}"
-        );
-        let eval_hook = http(
-            "https://hooks.example.com/{{eval.pass_rate_percent}}",
-            serde_json::json!({}),
-            Value::Null,
-        );
-        assert!(eval_hook.validate("spec", Some(&eval)).is_ok());
+        assert!(drift_hook.validate("spec", Some(&one)).is_ok());
+        for refused in [&two, &assertion] {
+            let error = drift_hook
+                .validate("spec", Some(refused))
+                .expect_err("drift counts do not apply");
+            assert!(error.to_string().contains("does not apply"), "{error}");
+        }
     }
 
     /// Slack, PagerDuty, and HTTP Operators validate; each violation is refused.
@@ -806,7 +731,7 @@ mod tests {
             serde_json::json!({ "scheme": "header", "name": "X-Api-Key", "connection": "hooks" });
         assert!(
             http(
-                "https://hooks.example.com/v1/{{run_id}}",
+                "https://hooks.example.com/v1/{{execution_id}}",
                 serde_json::json!({}),
                 auth.clone()
             )
@@ -815,7 +740,7 @@ mod tests {
         );
         for (url, headers, auth) in [
             (
-                "https://{{run_id}}.example.com/",
+                "https://{{execution_id}}.example.com/",
                 serde_json::json!({}),
                 Value::Null,
             ),
@@ -861,7 +786,7 @@ mod tests {
     #[test]
     fn url_origin_is_literal_and_normalized() {
         let origin =
-            operator_url_origin("https://Hooks.Example.com:443/a/{{run_id}}?q={{summary}}")
+            operator_url_origin("https://Hooks.Example.com:443/a/{{execution_id}}?q={{summary}}")
                 .expect("literal origin");
         assert_eq!(origin.as_str(), "https://hooks.example.com");
         assert!(operator_url_origin("https://user@hooks.example.com/").is_err());
@@ -875,7 +800,7 @@ mod tests {
         let header =
             serde_json::json!({ "scheme": "header", "name": "x-api-key", "connection": "hooks" });
         let op = http(
-            "https://Hooks.Example.com:443/v1/{{run_id}}",
+            "https://Hooks.Example.com:443/v1/{{execution_id}}",
             serde_json::json!({}),
             header,
         );
@@ -910,13 +835,13 @@ mod tests {
     #[test]
     fn path_only_url_requires_a_named_http_connection() {
         let auth = serde_json::json!({ "scheme": "bearer", "connection": "hooks" });
-        let named = http("/v1/{{run_id}}", serde_json::json!({}), auth);
+        let named = http("/v1/{{execution_id}}", serde_json::json!({}), auth);
         assert!(named.validate("spec", None).is_ok());
         assert!(named.matches_authority(&OperatorConnectionConfig::Http {
             origin: HttpsOrigin::parse("https://staging.example.com").expect("origin"),
             auth: HttpAuthScheme::Bearer,
         }));
-        let anonymous = http("/v1/{{run_id}}", serde_json::json!({}), Value::Null);
+        let anonymous = http("/v1/{{execution_id}}", serde_json::json!({}), Value::Null);
         assert_eq!(
             anonymous
                 .validate("spec", None)

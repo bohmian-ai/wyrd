@@ -1,39 +1,123 @@
-"""A scheduled Drift binding that fails alerts its HTTP Operator through a named connection.
+"""A scheduled drift check over submitted samples fails and its Operator alerts the on-call hook.
 
-``latency-watch`` binds ``latency-shift`` on the ``daily`` Trigger; on failure
-the ``alert-on-call`` Operator posts to the path ``/hooks/latency-shift`` on
-the origin, and with the bearer token, of the ``on-call-hooks`` connection.
+The story follows the full scheduled lifecycle: register the baseline and the
+``latency-watch`` Service, let the real fitter fit the baseline,
+``observe.submit`` the samples, make the schedule due, read the retained
+result back, and receive the ``alert-on-call`` Operator's delivery exactly
+once on the origin, and with the bearer token, of the ``on-call-hooks``
+connection. A passing or empty window alerts no one. A second Service,
+``latency-steady``, control-charts the same latency against its fitted SPC
+baseline.
 """
 
-import pytest
-from wyrd import WyrdError
-from wyrd.cards import Cards
-from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer
+import json
+import time
+from collections.abc import Iterable
+from typing import Any, cast
 
-from .support import FIXTURES, ON_CALL_TOKEN, Receiver, binding_ids
+import pytest
+from wyrd import WyrdError, verify
+from wyrd.cards import Cards
+
+from .support import FIXTURES, ON_CALL_TOKEN, Watch, scheduled_result
 
 pytestmark = pytest.mark.integration
 
-DELIVERY_TIMEOUT_SECONDS = 90.0
-"""How long the scheduler, Verifier, and Operator together may take to deliver."""
+WAIT_SECONDS = 90.0
+"""How long the story waits for the result and for the alert."""
+
+QUIET_SECONDS = 5.0
+"""How long the story listens for an alert that must not arrive."""
+
+HOOK = "/hooks/latency-shift"
+"""The path the Operator posts to on the connection's origin."""
+
+
+def submit(watch: Watch, latencies: Iterable[int]) -> None:
+    """Submit every latency as the Service, each recorded for the schedule, and publish them."""
+    observe = watch.state.run().observe
+    for latency in latencies:
+        assert isinstance(observe.submit(watch.verifier, {"latency": latency}), verify.Recorded)
+    watch.state.flush()
+    watch.server.flush_bifrost()
+
+
+def assert_quiet(watch: Watch) -> None:
+    """Assert the hook receives nothing for ``QUIET_SECONDS``."""
+    time.sleep(QUIET_SECONDS)
+    assert watch.hooks.to(HOOK) == []
 
 
 def test_failed_schedule_alerts_its_operator_on_the_connection_origin(
-    latency_watch: WyrdState, wyrd_server: WyrdTestServer, cards: Cards, receiver: Receiver
+    latency_watch: Watch,
 ) -> None:
-    with latency_watch.run() as run:
-        for row in range(120):
-            run.observe.drift({"latency": 150.0 + row})
-    latency_watch.flush()
-    # Publish the drifted observations so the scheduled Verifier evaluates them.
-    wyrd_server.flush_bifrost()
-    [binding_id] = binding_ids(cards, latency_watch.root_ref)
+    submit(latency_watch, [99] * 100)
+    assert latency_watch.hooks.to(HOOK) == [], "submitting alone runs no check"
 
-    wyrd_server.make_binding_due(binding_id)
+    result = scheduled_result(latency_watch.server, latency_watch.binding_id, WAIT_SECONDS)
 
-    alert = receiver.wait_for("/hooks/latency-shift", DELIVERY_TIMEOUT_SECONDS)
+    assert result.verdict == "failed"
+    assert result.subject == latency_watch.root
+    assert result.verifier.name == "latency-shift"
+    assert result.run_id is None, "a scheduled execution has no Run"
+    [requirement] = result.requirements
+    assert (requirement["id"], requirement["outcome"]) == ("latency-unshifted", "failed")
+    provenance = requirement.get("provenance")
+    assert provenance is not None and provenance["kind"] == "drift", provenance
+    window = provenance.get("window")
+    assert window is not None and window["start"] < window["end"], window
+    check = requirement["check"]
+    assert check["kind"] == "drift", check
+    signal = cast("dict[str, Any]", check["signal"])
+    assert signal["baseline_ref"]["name"] == "latency-baseline"
+    score = requirement["detail"]["drift"]["features"]["latency"]["score"]
+    assert score is not None and score > 0.25
+
+    alert = latency_watch.hooks.wait_for(HOOK, WAIT_SECONDS)
     assert alert.headers["authorization"] == f"Bearer {ON_CALL_TOKEN}"
+    assert result.execution_id in json.dumps(alert.body), alert.body
+    time.sleep(QUIET_SECONDS)
+    assert len(latency_watch.hooks.to(HOOK)) == 1, "the alert is delivered once"
+
+
+def test_passing_window_alerts_no_one(latency_watch: Watch) -> None:
+    submit(latency_watch, ((row * 37) % 100 for row in range(100)))
+
+    result = scheduled_result(latency_watch.server, latency_watch.binding_id, WAIT_SECONDS)
+
+    assert result.verdict == "passed"
+    assert_quiet(latency_watch)
+
+
+def test_empty_window_is_inconclusive_and_alerts_no_one(latency_watch: Watch) -> None:
+    result = scheduled_result(latency_watch.server, latency_watch.binding_id, WAIT_SECONDS)
+
+    assert result.verdict == "inconclusive"
+    assert_quiet(latency_watch)
+
+
+def test_ready_spc_baseline_charts_a_scheduled_window(latency_steady: Watch) -> None:
+    submit(latency_steady, [99] * 20)
+
+    result = scheduled_result(latency_steady.server, latency_steady.binding_id, WAIT_SECONDS)
+
+    assert result.verdict == "failed"
+    assert result.verifier.name == "latency-control"
+    [requirement] = result.requirements
+    assert (requirement["id"], requirement["outcome"]) == ("latency-in-control", "failed")
+    check = requirement["check"]
+    assert check["kind"] == "drift", check
+    assert check["method"] == "Spc", check
+    latency = requirement["detail"]["drift"]["features"]["latency"]
+    assert (latency["score"], latency["threshold"]) == (4.0, 0.0), latency
+    chart = cast("dict[str, Any]", latency.get("evidence"))["Spc"]
+    assert (
+        chart["subgroup_size"],
+        chart["subgroups"],
+        chart["x_bar"]["center"],
+        chart["x_bar"]["signals"],
+        chart["s"]["signals"],
+    ) == (5, 4, 49.5, 4, 0), chart
 
 
 def test_path_only_operator_without_connection_is_refused(cards: Cards) -> None:

@@ -7,7 +7,7 @@
 //! certificate. That admits a trusted cluster process, not a tenant: the
 //! request names its tenant and destination explicitly and carries no token.
 //! The service accepts only the audit log, the two capture destinations, and
-//! the three Verifier result tables, each with the subject and actor its rows
+//! the Verifier result and execution input tables, each with the subject and actor its rows
 //! are stamped with, and the reserved system tenant only for audit history,
 //! then submits through the same frame the in-process Scribe outbox route
 //! uses.
@@ -61,7 +61,7 @@ impl ScribeCapturePeerGrpc {
             .map_err(|_| Status::invalid_argument("capture tenant_id is not a tenant id"))?;
         let table = ScribeTable::from_fqn(&request.table).ok_or_else(|| {
             Status::permission_denied(format!(
-                "the peer writer accepts only the audit, gateway capture, and Verifier result tables, not {}",
+                "the peer writer accepts only the audit, gateway capture, and Verifier result and input tables, not {}",
                 request.table
             ))
         })?;
@@ -150,8 +150,8 @@ mod tests {
     }
 
     /// Proves the peer service accepts exactly the audit log (for a tenant or
-    /// the system owner), the two capture destinations, and the three
-    /// Verifier result tables, each carrying the sent subject and actor
+    /// the system owner), the two capture destinations, and the Verifier
+    /// result and execution input tables, each carrying the sent subject and actor
     /// through, and refuses the reserved system tenant elsewhere, every other
     /// table, and malformed ids, all before any Scribe work.
     ///
@@ -168,7 +168,7 @@ mod tests {
             (tenant, "vala.traces.spans"),
             (tenant, "vala.verification.results"),
             (tenant, "vala.drift.result_features"),
-            (tenant, "vala.eval.result_items"),
+            (tenant, "vala.verification.execution_inputs"),
         ] {
             let wire = request(tenant, table);
             let sent = (wire.sub_principal_id.clone(), wire.act_principal_id.clone());

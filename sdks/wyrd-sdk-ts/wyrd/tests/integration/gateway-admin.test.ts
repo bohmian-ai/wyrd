@@ -38,7 +38,7 @@ test("cli written credential reads back through the gateway", async ({ gateway }
 test("deployment round trips", async ({ gateway }) => {
   await cli.putProviderCredential(environmentCredential("round-trip-key"));
   const primary = deployment("round-trip", "round-trip-key");
-  const stored = { ...primary, access: "open" };
+  const stored = { ...primary, access: "open" as const };
 
   expect(await gateway.putDeployment(primary)).toEqual(stored);
   expect(await gateway.deployment("round-trip")).toEqual(stored);

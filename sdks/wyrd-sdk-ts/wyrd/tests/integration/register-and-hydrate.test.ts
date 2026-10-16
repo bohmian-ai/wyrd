@@ -61,17 +61,17 @@ test("latest version resolves to the registered card", async ({ cards, desk }) =
 });
 
 test("registering the graph again is idempotent", async ({ cards, desk }) => {
-  const bindings = (await cards.get(desk.root)).status?.verification?.binding_ids;
-
   const again = await cards.registerFromPath(DESK);
 
   expect(again.root).toEqual(desk.root);
-  expect((await cards.get(again.root)).status?.verification?.binding_ids).toEqual(bindings);
+  // The desk's only binding has no schedule Trigger, so none is projected.
+  expect((await cards.get(again.root)).status?.verification).toBeUndefined();
 });
 
 test("cards get returns every kind typed", async ({ cards, model, desk }) => {
   const baseline = await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
-  const refs = [baseline, model, desk].flatMap((receipt) => receipt.outcomes.map((outcome) => outcome.card_ref));
+  const daily = await cards.registerFromPath(fixture("cards/scheduled_drift_alerts_operator/daily.yaml"));
+  const refs = [baseline, daily, model, desk].flatMap((receipt) => receipt.outcomes.map((outcome) => outcome.card_ref));
 
   const read = await Promise.all(refs.map((ref) => cards.get(ref)));
 
@@ -86,7 +86,7 @@ test("cards get returns every kind typed", async ({ cards, model, desk }) => {
     "Verifier",
   ]);
   const verifier = read.find((card) => card.kind === "Verifier");
-  expect(verifier?.kind === "Verifier" && verifier.spec.implementation.kind).toBe("eval");
+  expect(verifier?.kind === "Verifier" && verifier.spec.requirements?.[0]?.check.kind).toBe("assert");
   const data = read.find((card) => card.kind === "Data");
   expect(data?.kind === "Data" && data.spec.stats?.row_count).toBe(100);
 });

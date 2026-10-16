@@ -20,7 +20,7 @@ use wyrd_cards::model::ModelCard;
 use wyrd_cards::prompt::PromptCard;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::agent::AgentCard;
-use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
+use wyrd_spec::card::verifier::{VerificationBinding, VerifierSpec};
 use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
@@ -426,15 +426,15 @@ impl HydratedStateIndex {
 /// The alias of the root Service view `WyrdState::run` opens.
 const ROOT_ALIAS: &str = "root";
 
-/// A Verifier bound to a subject, resolved for one direct execution.
+/// A Verifier bound to a subject, resolved for one execution.
 #[derive(Debug)]
-pub(crate) struct BoundVerifier<'a> {
+pub(crate) struct BoundVerifier {
     /// The exact Verifier Card version.
     pub(crate) verifier_card_uid: CardUid,
     /// The exact subject Card version it judges.
     pub(crate) card_uid: CardUid,
-    /// The Verifier's Drift or Eval implementation, which fixes its input shape.
-    pub(crate) implementation: &'a VerifierImplementation,
+    /// The building-block Verifier, whose slots fix each input's projection.
+    pub(crate) spec: VerifierSpec,
 }
 
 /// The server-resolved UID a hydrated reference carries.
@@ -578,8 +578,8 @@ impl WyrdState {
     /// Connect this state's one Bifrost writer as the state's client.
     ///
     /// The client is the one the state was created with, else the ambient
-    /// one [`WyrdState::from_path`] describes. Startup describes both fixed
-    /// observation tables before reporting success, so a run can never
+    /// one [`WyrdState::from_path`] describes. Startup describes the fixed Drift
+    /// observation table before reporting success, so a run can never
     /// enqueue against a missing, unauthorized, or incompatible system table.
     ///
     /// # Errors
@@ -647,13 +647,6 @@ impl WyrdState {
             .await
     }
 
-    /// Pin the client this state's server calls go through, for server-free
-    /// tests that point it at a stub instead of the ambient configuration.
-    #[cfg(test)]
-    pub(crate) fn use_client_for_test(&self, client: WyrdClient) {
-        let _ = self.client.set(client);
-    }
-
     /// The client this state's server calls go through.
     ///
     /// The client the state was created with when there is one; otherwise one
@@ -687,7 +680,7 @@ impl WyrdState {
         &self,
         subject: &CardRef,
         name: &str,
-    ) -> Result<BoundVerifier<'_>, WyrdError> {
+    ) -> Result<BoundVerifier, WyrdError> {
         let subject_key = subject.to_string();
         let mut bindings: Vec<&VerificationBinding> = Vec::new();
         if let Spec::Service(service) = &self.service().spec {
@@ -717,10 +710,23 @@ impl WyrdState {
                     json!({ "verifier": verifier_ref }),
                 ));
             };
+            // Staged switch point: until the hydrated `Spec::Verifier`
+            // carries building blocks, an implementation-kind Verifier has
+            // no slots to project onto and is refused here. The cutover
+            // replaces this conversion with a borrow.
+            let spec = serde_json::to_value(spec)
+                .ok()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .ok_or_else(|| {
+                    state_bundle_error(
+                        "a bound Verifier does not declare building-block inputs and requirements",
+                        json!({ "verifier": verifier_ref }),
+                    )
+                })?;
             return Ok(BoundVerifier {
                 verifier_card_uid: required_uid(verifier_ref)?,
                 card_uid: required_uid(subject)?,
-                implementation: &spec.implementation,
+                spec,
             });
         }
         Err(WyrdError::SdkUnknownVerifier {
@@ -801,7 +807,7 @@ impl WyrdState {
         self.bifrost.claim()?.complete(bifrost).await
     }
 
-    /// The started writer and its two described fixed tables.
+    /// The started writer and its described fixed Drift table.
     ///
     /// # Errors
     /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup and
@@ -2180,16 +2186,14 @@ pub(crate) mod tests {
     use wyrd_spec::api_version::ApiVersion;
     use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec};
     use wyrd_spec::card::data::{CustomDataMeta, DataInterface, DataSchema, DataSpec, DataStats};
-    use wyrd_spec::card::drift::{
-        CustomProfile, DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec,
-    };
-    use wyrd_spec::card::eval::EvalSpec;
     use wyrd_spec::card::field::FieldSpec;
     use wyrd_spec::card::model::{CustomMeta, ModelInterface, ModelSignature, ModelSpec, TaskType};
     use wyrd_spec::card::prompt::PromptSpec;
     use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
     use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
-    use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
+    use wyrd_spec::card::verifier::{
+        AgentCall, Check, Requirement, VerificationBinding, VerifierSpec,
+    };
     use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
     use wyrd_spec::graph::relationships_from_spec;
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
@@ -2393,10 +2397,7 @@ pub(crate) mod tests {
                 card(
                     &eval_ref,
                     CardKind::Verifier,
-                    Spec::Verifier(VerifierSpec {
-                        description: None,
-                        implementation: VerifierImplementation::Eval(eval_spec()),
-                    }),
+                    Spec::Verifier(assert_verifier()),
                     Relationships::default(),
                 ),
                 &[],
@@ -2406,10 +2407,7 @@ pub(crate) mod tests {
                 card(
                     &drift_ref,
                     CardKind::Verifier,
-                    Spec::Verifier(VerifierSpec {
-                        description: Some("fixture drift".to_owned()),
-                        implementation: VerifierImplementation::Drift(drift_spec()),
-                    }),
+                    Spec::Verifier(drift_verifier()),
                     Relationships::default(),
                 ),
                 &[],
@@ -2425,13 +2423,13 @@ pub(crate) mod tests {
                     service_component("agent_triage", &agent_ref),
                 ]);
                 spec.verified_by.extend([
-                    verification_binding(eval_ref, TriggerActivation::ObservationsReady {}),
+                    verification_binding(eval_ref, None),
                     verification_binding(
                         drift_ref,
-                        TriggerActivation::Schedule {
+                        Some(TriggerActivation::Schedule {
                             cron: "0 * * * *".to_owned(),
                             tz: None,
-                        },
+                        }),
                     ),
                 ]);
             });
@@ -2439,19 +2437,18 @@ pub(crate) mod tests {
             bundle
         }
 
-        /// Add an Eval Verifier, bound to the root Service, whose LLM judge is
+        /// Add a Verifier, bound to the root Service, whose agent check runs
         /// an inline Agent with a prompt in the supplied reference form.
         ///
         /// # Panics
-        /// Panics if the judge fixture cannot be built, rewritten, or serialized.
+        /// Panics if the agent-check fixture cannot be built, rewritten, or
+        /// serialized.
         fn with_nested_prompt(&mut self, prompt_ref: CardRef, sibling: bool) -> CardRef {
-            use wyrd_spec::vala::eval::{ComparisonOperator, EvalTask, LlmJudgeTask, TaskId};
+            use wyrd_spec::vala::eval::TaskId;
 
             let verifier_ref = test_ref(CardKind::Verifier, "judge", 4);
-            let task_id = TaskId::new("judge").expect("fixture task id is valid");
-            let judge = LlmJudgeTask::new(
-                task_id.clone(),
-                InlineableRef::Inline(Box::new(AgentSpec {
+            let check = Check::Agent(AgentCall {
+                agent: InlineableRef::Inline(Box::new(AgentSpec {
                     prompt: if sibling {
                         InlineableRef::Sibling {
                             sibling: prompt_ref,
@@ -2464,33 +2461,27 @@ pub(crate) mod tests {
                     run_config: AgentRunConfigSpec::default(),
                     verified_by: Vec::new(),
                 })),
-                ComparisonOperator::Equals,
-                serde_json::json!(true),
-            )
-            .expect("fixture judge is valid");
-            let eval = EvalSpec {
-                tasks: BTreeMap::from([(task_id, EvalTask::LlmJudge(judge))]),
-                ..eval_spec()
+                inputs: BTreeMap::new(),
+                workspace: BTreeMap::new(),
+            });
+            let verifier = VerifierSpec {
+                requirements: vec![Requirement {
+                    id: TaskId::new("judge").expect("fixture requirement id is valid"),
+                    statement: "The answer follows the policy.".to_owned(),
+                    check,
+                }],
+                ..assert_verifier()
             };
             self.add_card(
                 "judge",
-                canonical_card(
-                    &verifier_ref,
-                    CardKind::Verifier,
-                    Spec::Verifier(VerifierSpec {
-                        description: None,
-                        implementation: VerifierImplementation::Eval(eval),
-                    }),
-                ),
+                canonical_card(&verifier_ref, CardKind::Verifier, Spec::Verifier(verifier)),
                 &[],
             );
             let root_ref = test_ref(CardKind::Service, "service", 1);
             self.rewrite_card(&root_ref, |card| {
                 if let Spec::Service(spec) = &mut card.spec {
-                    spec.verified_by.push(verification_binding(
-                        verifier_ref.clone(),
-                        TriggerActivation::ObservationsReady {},
-                    ));
+                    spec.verified_by
+                        .push(verification_binding(verifier_ref.clone(), None));
                 }
             });
             self.write();
@@ -2835,56 +2826,72 @@ pub(crate) mod tests {
         }
     }
 
-    /// Build an empty Eval spec used to prove pure-spec borrowing.
+    /// Build a one-requirement assert Verifier used to prove pure-spec
+    /// borrowing.
     ///
     /// # Panics
-    /// This pure constructor does not panic.
-    fn eval_spec() -> EvalSpec {
-        EvalSpec {
-            dataset: None,
-            tasks: BTreeMap::new(),
-            workflow: None,
-            sampling: None,
-            pass_gate: None,
-            context_capture: None,
-        }
+    /// Panics if the static fixture stops decoding as a Verifier spec.
+    fn assert_verifier() -> VerifierSpec {
+        serde_json::from_value(serde_json::json!({
+            "inputs": {"answer": {"type": "json"}},
+            "requirements": [{
+                "id": "answered",
+                "statement": "The agent produced an answer.",
+                "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"},
+            }],
+        }))
+        .expect("static assert Verifier decodes")
     }
 
-    /// Build a deterministic Custom metric Drift spec for typed-state projection tests.
+    /// Build a deterministic Custom metric drift Verifier for typed-state
+    /// projection tests.
     ///
     /// # Panics
-    /// This pure constructor does not panic.
-    fn drift_spec() -> DriftSpec {
-        DriftSpec {
-            description: None,
-            method: DriftMethod::Custom,
-            signal: DriftSignal::Metric {
-                name: "score".to_owned(),
-            },
-            condition: DriftCondition::Statistical,
-            profile: Some(DriftProfile::Custom(CustomProfile {
-                metric_name: "score".to_owned(),
-                baseline_value: 0.5,
-                alert_threshold: 0.1,
-            })),
-        }
+    /// Panics if the static fixture stops decoding as a Verifier spec.
+    fn drift_verifier() -> VerifierSpec {
+        serde_json::from_value(serde_json::json!({
+            "description": "fixture drift",
+            "inputs": {"current": {"type": "samples", "features": ["score"]}},
+            "requirements": [{
+                "id": "score-stable",
+                "statement": "The score stays near its baseline.",
+                "check": {
+                    "kind": "drift",
+                    "on": "inputs.current",
+                    "method": "Custom",
+                    "signal": {"kind": "Metric", "name": "score"},
+                    "condition": {"kind": "Statistical"},
+                    "profile": {
+                        "kind": "Custom",
+                        "metric_name": "score",
+                        "baseline_value": 0.5,
+                        "alert_threshold": 0.1,
+                    },
+                },
+            }],
+        }))
+        .expect("static drift Verifier decodes")
     }
 
-    /// Build a binding that attaches `verifier` with an inline Trigger activation.
+    /// Build a binding that attaches `verifier`, with an inline Trigger
+    /// activation when one is given and explicit-only otherwise.
     ///
     /// # Panics
     /// This pure constructor does not panic.
     fn verification_binding(
         verifier: CardRef,
-        activation: TriggerActivation,
+        activation: Option<TriggerActivation>,
     ) -> VerificationBinding {
         VerificationBinding {
             verifier: Ref::Ref(verifier),
-            runs_on: Some(InlineableRef::Inline(Box::new(TriggerSpec {
-                description: None,
-                activation,
-            }))),
+            runs_on: activation.map(|activation| {
+                InlineableRef::Inline(Box::new(TriggerSpec {
+                    description: None,
+                    activation,
+                }))
+            }),
             on_failure: Vec::new(),
+            inputs: BTreeMap::new(),
         }
     }
 
@@ -2996,7 +3003,7 @@ pub(crate) mod tests {
     }
 
     /// Prove every runtime-relevant typed accessor returns its native Rust
-    /// projection while Verifier implementations remain borrowed envelope specs.
+    /// projection while Verifier specs remain borrowed envelope specs.
     ///
     /// # Panics
     /// Panics if typed-card loading, alias resolution, or projection assertions fail.
@@ -3021,20 +3028,19 @@ pub(crate) mod tests {
             state.prompt("triage_prompt").expect("prompt resolves").name,
             "triage"
         );
-        let eval = state
-            .verifier("quality_eval")
-            .expect("eval verifier resolves");
-        assert!(matches!(
-            &eval.implementation,
-            VerifierImplementation::Eval(spec) if spec.tasks.is_empty()
-        ));
+        assert_eq!(
+            state
+                .verifier("quality_eval")
+                .expect("assert verifier resolves"),
+            &assert_verifier()
+        );
         let drift = state
             .verifier("model_drift")
             .expect("drift verifier resolves");
         assert_eq!(drift.description.as_deref(), Some("fixture drift"));
         assert!(matches!(
-            drift.implementation,
-            VerifierImplementation::Drift(_)
+            drift.requirements.as_slice(),
+            [requirement] if matches!(requirement.check, Check::Drift(_))
         ));
     }
 

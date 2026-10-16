@@ -1,8 +1,9 @@
 """The canonical support desk, run from the checked-in example.
 
 The desk deploys, refuses a conflicting table and an under-privileged caller,
-answers every request, earns 100 ``answer-quality`` passes and 90
-``no-refund-promise`` passes with 10 failures, and explains a passing and a
+fails a refund promise immediately, answers every request, resumes each
+background ``policy-check`` by ID to 90 passes and 10 refund-promise failures
+that the judge, citing the policy, still passes, and explains a passing and a
 failing request from joined evidence.
 """
 
@@ -38,7 +39,16 @@ sys.modules["support_desk"] = desk_example
 _spec.loader.exec_module(desk_example)
 
 ANSWERS = (
-    ("Grade the support answer", '{"passed":true}'),
+    (
+        "list its refund rules",
+        '{"findings":[{"rule":"Refunds of up to 100 dollars are approved within 30 days.",'
+        '"page":1}]}',
+    ),
+    (
+        "Claim:",
+        '{"outcome":"passed","reason":"consistent with the policy",'
+        '"citations":[{"slot":"policy","locator":{"page":1}}]}',
+    ),
     ("refund", "You have a guaranteed refund."),
     ("Answer the customer", "Your order is on its way."),
 )
@@ -121,24 +131,31 @@ def test_support_desk_answers_verifies_and_explains_every_request(tmp_path: Path
             assert denied.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
             assert recorded.deliveries == [], "the refusal precedes upstream IO"
 
-            served = desk_example.serve(desk)
-            assert [request.passed for request in served] == [
-                "refund" not in desk_example.question(index)
-                for index in range(desk_example.REQUESTS)
+            promise = desk_example.check(desk, "You have a guaranteed refund.")
+            assert promise.verdict == "failed"
+            assert [(each["id"], each["outcome"]) for each in promise.requirements] == [
+                ("no-refund-promise", "failed"),
+                ("follows-policy", "passed"),
             ]
-            assert desk_example.wait_for_verdicts(admin, desk, timeout=180) == {
-                "answer-quality": (100, 0),
-                "no-refund-promise": (90, 10),
-            }
+            assert promise.requirements[1]["citations"] == [
+                {"slot": "policy", "locator": {"page": 1}}
+            ]
+
+            served = desk_example.serve(desk)
+            assert len(served) == desk_example.REQUESTS
+            results = desk_example.wait_for_verdicts(admin, served, timeout=180)
+            for index, result in enumerate(results):
+                refund = "refund" in desk_example.question(index)
+                assert result.verdict == ("failed" if refund else "passed"), index
+                assert result.run_id == served[index].run_id, index
 
             agent = desk.uid("support-agent")
-            for index, realtime in ((1, "passed"), (0, "failed")):
+            for index, verdict in ((1, "passed"), (0, "failed")):
                 explained = desk_example.explain(admin, served[index].run_id)
                 assert explained["run_id"] == served[index].run_id
                 assert explained["ticket_id"] == f"T-{index}"
                 assert explained["span"] == "support-desk.request"
                 assert explained["call_card_uid"] == agent
-                assert explained["continuous"] == "passed"
-                assert explained["realtime"] == realtime, explained
+                assert explained["verdict"] == verdict, explained
     finally:
         upstream.shutdown()

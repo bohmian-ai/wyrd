@@ -622,10 +622,6 @@ mod aggregate_inputs {
     /// # Panics
     /// Panics when equality drifts, excess does not, or a non-finite mean scores.
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the expected value is produced by exact arithmetic on fixed inputs"
-    )]
     fn custom_mean_equality_is_no_drift() {
         let profile = CustomProfile {
             metric_name: "latency".to_owned(),

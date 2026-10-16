@@ -2,58 +2,37 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { type ProxyTracerProvider, context, propagation, trace } from "@opentelemetry/api";
-import OpenAI from "openai";
+import { trace } from "@opentelemetry/api";
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
-import { Bifrost, Cards, Gateway, type SpanRecord, TableConfig, WyrdClient, WyrdState } from "wyrd-ai";
+import { Bifrost, Cards, type VerifierInputs, WyrdClient, WyrdState, verify } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
-import { configureGateway } from "../support/local-development.js";
-import {
-  type RegisteredRef,
-  ancestry,
-  columnValues,
-  fixture,
-  registered,
-  serverTest,
-  timeline,
-} from "../support/server.js";
+import { type Assistant, assistantAs, assistantTest, judgeCalls, type JudgeCall } from "../support/assistant.js";
+import { ancestry, binding, fixture, timeline } from "../support/server.js";
 
-vi.setConfig({ testTimeout: 120_000 });
+vi.setConfig({ testTimeout: 180_000 });
 
-/** The Chat Completions answer the local judge returns: the answer passes. */
-const JUDGE_PASSES = {
-  id: "chatcmpl-judge",
-  object: "chat.completion",
-  created: 1,
-  model: "gpt-4o",
-  choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: '{"passed":true}' } }],
-  usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
-};
+/** How long a test waits for a queued execution or a scheduled result. */
+const WAIT_MS = 90_000;
 
-/** One hundred latencies spread like the healthy baseline's 0 to 99 ms. */
-const HEALTHY_LATENCIES = Array.from({ length: 100 }, (_, row) => ({ latency: (row * 37) % 100 }));
-
-/** One hundred latencies all at the slow end of the baseline. */
-const SLOW_LATENCIES = Array.from({ length: 100 }, () => ({ latency: 99 }));
+/** The trace identity of a caller's W3C `traceparent`. */
+const CALLER_TRACE = "0af7651916cd43dd8448eb211c80319c";
+/** The caller's span identity within {@link CALLER_TRACE}. */
+const CALLER_SPAN = "b7ad6b7169203331";
 
 /** The stable refusal for a caller no grant authorizes. */
 const DENIED = { code: "WYRD_PERMISSION_403_DENIED_RBAC" };
 
-/** The `verifier:run` grant on exactly `verifier`. */
-function verifierRun(verifier: RegisteredRef): object {
-  return { resource: "verifier", action: "run", scope: { verifier: verifier.uid } };
-}
+/** A fresh deployment per test, as each Rust journey starts its own. */
+const test = assistantTest({ perTest: true });
 
-/** The key `issueKey` mints for a registered Service, with no Role grant. */
-async function serviceKey(name: string): Promise<string> {
-  const issued = await cli.issueKey({ kind: "Service", name, version: "1.0.0", space: "default" });
-  return issued.key;
-}
-
-/** The process-global tracer provider, installed once by the first traced test. */
+/**
+ * The process-global tracer provider, installed once by the first traced
+ * test. Later tests only need its active span context, which the SDK sends
+ * with each request whichever state installed the provider.
+ */
 let telemetry: Promise<unknown> | undefined;
 
 /** Install `state`'s telemetry unless an earlier test in this file already did. */
@@ -62,324 +41,276 @@ function startTelemetry(state: WyrdState): Promise<unknown> {
   return telemetry;
 }
 
-/** Export every ended span the process-global tracer provider still holds. */
-async function flushTelemetry(): Promise<void> {
-  const provider = (trace.getTracerProvider() as ProxyTracerProvider).getDelegate();
-  await (provider as unknown as { forceFlush(): Promise<void> }).forceFlush();
-}
+/** One verification result beside one judge call joined to it on the subject Card. */
+const ResultJudgeCall = z.object({
+  result_subject: z.string(),
+  result_actor: z.string(),
+  result_run: z.string().nullable(),
+  call_subject: z.string(),
+  call_actor: z.string(),
+  call_run: z.string().nullable(),
+});
 
-/** One `scope kind name` line per span, for a readable assertion message. */
-function outline(timeline: readonly SpanRecord[]): string {
-  return timeline.map((span) => `${span.scope.name} ${span.kind} ${span.name}`).join("\n");
-}
-
-/** Whether `names` holds every one of `steps` in order, gaps allowed. */
-function holdsInOrder(names: readonly string[], steps: readonly ((name: string) => boolean)[]): boolean {
-  let at = 0;
-  return steps.every((step) => {
-    while (at < names.length && !step(names[at])) {
-      at += 1;
-    }
-    at += 1;
-    return at <= names.length;
-  });
+/**
+ * Assert the result `executionId` wrote joins exactly one judge call on its
+ * verified Card, both for `principal` on `run`: the result is performed by
+ * `principal` itself, and the judge call inside it by SYSTEM.
+ */
+async function assertCalledAsSystem(executionId: string, principal: string, run: string | null): Promise<void> {
+  const joined = await (await Bifrost.connect()).sql(
+    `SELECT r.sub_principal_id AS result_subject, r.act_principal_id AS result_actor, r.run_id AS result_run,
+            c.sub_principal_id AS call_subject, c.act_principal_id AS call_actor, c.run_id AS call_run
+       FROM vala.verification.results r
+       JOIN vala.gateway.calls c ON c.card_uid = r.card_uid
+      WHERE r.execution_id = $1`,
+    [executionId],
+    ResultJudgeCall,
+  );
+  expect(joined).toEqual([
+    {
+      result_subject: principal,
+      result_actor: principal,
+      result_run: run,
+      call_subject: principal,
+      call_actor: expect.not.stringMatching(`^${principal}$`),
+      call_run: run,
+    },
+  ]);
 }
 
 /**
- * The assistant Service, registered after its latency baseline and Model,
- * and the unfitted assistant whose `tier-drift` baseline never fits, after the
- * judge model is deployed on the gateway its LLM judges call. Each test
- * gets a fresh offline state that verifies as its Service's own principal,
- * through a key `issueKey` minted with no Role grant.
+ * Judge the answer `yes` with `answer-judged` over plain HTTP the way an
+ * agent does, as the assistant Service with `traceparent` and no Run, and
+ * return the result's `execution_id`.
  */
-const test = serverTest({ provider: () => ({ status: 200, body: JUDGE_PASSES }), verificationRuntime: true }).extend<{
-  assistant: {
-    readonly bundle: string;
-    readonly latencyDrift: RegisteredRef;
-    readonly answerIsYes: RegisteredRef;
-    readonly answerCheck: RegisteredRef;
-  };
-  unfittedBundle: { readonly bundle: string; readonly key: string };
-  unfitted: WyrdState;
-  assistantKey: string;
-  state: WyrdState;
-}>({
-  assistant: [
-    async ({ server: _ }, use) => {
-      await configureGateway(WyrdClient.connect());
-      await (await Gateway.connect()).putCapturePolicy({ mode: "metadata", payload_fields: [] });
-      const cards = await Cards.connect();
-      await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
-      await cards.registerFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
-      const receipt = await cards.registerFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
-      const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-assistant-"));
-      await cards.hydrate(receipt.root, bundle);
-      await use({
-        bundle,
-        latencyDrift: registered(receipt, "latency-drift"),
-        answerIsYes: registered(receipt, "answer-is-yes"),
-        answerCheck: registered(receipt, "answer-check"),
-      });
-    },
-    { scope: "file" },
-  ],
-  assistantKey: [async ({ assistant: _ }, use) => use(await serviceKey("assistant")), { scope: "file" }],
-  unfittedBundle: [
-    async ({ assistant: _ }, use) => {
-      const cards = await Cards.connect();
-      const receipt = await cards.registerFromPath(fixture("cards/verify_in_real_time/unfitted-assistant.yaml"));
-      const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-unfitted-"));
-      await cards.hydrate(receipt.root, bundle);
-      await use({ bundle, key: await serviceKey("unfitted-assistant") });
-    },
-    { scope: "file" },
-  ],
-  unfitted: async ({ unfittedBundle }, use) =>
-    use(WyrdState.fromPath(unfittedBundle.bundle, { client: WyrdClient.connect({ credential: unfittedBundle.key }) })),
-  state: async ({ assistant, assistantKey }, use) =>
-    use(WyrdState.fromPath(assistant.bundle, { client: WyrdClient.connect({ credential: assistantKey }) })),
-});
-
-// `tier-drift` control-charts a text column, so its baseline never fits.
-test("verify before baseline ready is refused", async ({ unfitted }) => {
-  await expect(
-    unfitted.run("model").observe.verify("tier-drift", Array(5).fill({ tier: "gold" })),
-  ).rejects.toMatchObject({
-    code: "WYRD_VERIFICATION_409_BASELINE_NOT_READY",
+async function verifyOverHttp(baseUrl: string, assistant: Assistant, traceparent: string): Promise<string> {
+  const token = await WyrdClient.connect({ credential: assistant.key }).accessToken();
+  const response = await fetch(`${baseUrl}/v1/verification/execute`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-wyrd-access-token": `Bearer ${token}`, traceparent },
+    body: JSON.stringify({
+      verifier_card_uid: assistant.answerJudged.uid,
+      card_uid: assistant.agent.uid,
+      inputs: { answer: { kind: "json", value: "yes" } },
+    }),
   });
-});
+  const result = (await response.json()) as { execution_id: string; outcome: { verdict: string } };
+  expect(response.status, JSON.stringify(result)).toBe(200);
+  expect(result.outcome.verdict).toBe("passed");
+  return result.execution_id;
+}
+
+/** The gateway span of `call` in `spans`, joined on its call id. */
+function spanOf(call: z.infer<typeof JudgeCall>, spans: Awaited<ReturnType<typeof timeline>>) {
+  return spans.find((span) => span.attributes.gateway_call_id === call.call_id);
+}
 
 test("agent answer passes its verifier", async ({ state }) => {
-  const judgment = await state.run("agent").observe.verify("answer-is-yes", { answer: "yes" });
+  const run = state.run("agent");
 
-  expect(judgment).toMatchObject({
-    passed: true,
-    verdict: "passed",
-    kind: "eval_assertion",
-    verifier: { name: "answer-is-yes" },
-    subject: state.cardRef("agent"),
-  });
+  const result = await run.observe.verify("answer-check", { answer: "yes" });
+
+  expect(result.outcome.verdict).toBe("passed");
+  expect(result.verifier.name).toBe("answer-check");
+  expect(result.subject).toEqual(state.cardRef("agent"));
+  expect(result.run_id).toBe(run.runId);
+  expect(result.outcome.requirements.map((each) => [each.id, each.outcome])).toEqual([["says-yes", "passed"]]);
 });
 
 test("agent answer fails its verifier", async ({ state }) => {
-  const judgment = await state.run("agent").observe.verify("answer-is-yes", { answer: "no" });
+  const result = await state.run("agent").observe.verify("answer-check", { answer: "no" });
 
-  expect(judgment).toMatchObject({ passed: false, verdict: "failed", kind: "eval_assertion" });
+  expect(result.outcome.verdict).toBe("failed");
+  expect(result.outcome.requirements.map((each) => [each.outcome, each.actual])).toEqual([["failed", "no"]]);
 });
 
-test("agent answer is judged by its task check", async ({ state }) => {
-  const run = state.run("agent");
-  for (const [answer, verdict] of [
-    ["yes", "passed"],
-    ["no", "failed"],
-  ] as const) {
-    const judgment = await run.observe.verify("answer-check", { answer });
+test("positional object is the one answer, not its slots", async ({ state }) => {
+  const observe = state.run("agent").observe;
 
-    expect(judgment).toMatchObject({ verdict, kind: "task_assertion", verifier: { name: "answer-check" } });
-    expect(judgment.counts).toBeUndefined();
+  const positional = await observe.verify("answer-check", { answer: "yes" }, { positional: true });
+  const bare = await observe.verify("answer-check", "yes");
+
+  expect(positional.outcome.requirements.map((each) => [each.outcome, each.actual])).toEqual([
+    ["failed", { answer: "yes" }],
+  ]);
+  expect(positional.outcome.verdict).toBe("failed");
+  expect(bare.outcome.verdict).toBe("passed");
+});
+
+test("judged answer passes the agent check", async ({ provider, state }) => {
+  const result = await state.run("agent").observe.verify("answer-judged", { answer: "yes" });
+
+  expect(result.outcome.verdict).toBe("passed");
+  expect(result.outcome.requirements).toHaveLength(1);
+  const [requirement] = result.outcome.requirements;
+  expect(requirement?.outcome).toBe("passed");
+  expect(requirement?.citations).toEqual([{ slot: "answer", locator: { json_pointer: "" } }]);
+  expect(requirement?.provenance).toMatchObject({ kind: "agent", agent: { name: "judge-agent" } });
+  const judged = provider.received.filter((request) => request.path === "/v1/chat/completions");
+  expect(judged).toHaveLength(1);
+  expect(judged[0]?.body).toContain("Claim: The answer agrees with the customer");
+});
+
+test("judge call is attributed to the run and card", async ({ server, assistant, state }) => {
+  const run = state.run("agent");
+
+  const result = await run.observe.verify("answer-judged", { answer: "yes" });
+
+  const calls = await judgeCalls(server);
+  expect(
+    calls.every((call) => call.act_principal_id !== assistant.principal),
+    JSON.stringify(calls),
+  ).toBe(true);
+  expect(calls.map((call) => [call.sub_principal_id, call.run_id, call.card_uid])).toEqual([
+    [assistant.principal, run.runId, result.subject.uid],
+  ]);
+  await assertCalledAsSystem(result.execution_id, assistant.principal, run.runId);
+});
+
+test("judge call without a run joins the callers trace attributed to the card", async ({ server, assistant }) => {
+  const execution = await verifyOverHttp(server.baseUrl, assistant, `00-${CALLER_TRACE}-${CALLER_SPAN}-01`);
+
+  const calls = await judgeCalls(server);
+  expect(calls.map((call) => [call.sub_principal_id, call.run_id, call.card_uid])).toEqual([
+    [assistant.principal, null, assistant.agent.uid],
+  ]);
+  const spans = await timeline(server, CALLER_TRACE);
+  const span = calls[0] && spanOf(calls[0], spans);
+  expect(span, "the judge call joins the caller's trace").toBeDefined();
+  expect(span && ancestry(spans, span).at(-1)?.parent_span_id).toBe(CALLER_SPAN);
+  await assertCalledAsSystem(execution, assistant.principal, null);
+});
+
+test("traced sdk verify joins the callers trace", async ({ server, state }) => {
+  await startTelemetry(state);
+  const caller = await trace.getTracer("journey").startActiveSpan("caller", async (span) => {
+    await state.run("agent").observe.verify("answer-judged", { answer: "yes" });
+    span.end();
+    return span.spanContext();
+  });
+
+  const calls = await judgeCalls(server);
+  const spans = await timeline(server, caller.traceId);
+  expect(calls).toHaveLength(1);
+  expect(calls[0] && spanOf(calls[0], spans), JSON.stringify(calls)).toBeDefined();
+});
+
+test("traced sdk submit links its attempt to the callers trace", async ({ server, state }) => {
+  await startTelemetry(state);
+  const caller = await trace.getTracer("journey").startActiveSpan("caller", async (span) => {
+    const submitted = await state.run("agent").observe.submit("answer-judged", { answer: "yes" });
+    span.end();
+    if (submitted.kind !== "queued") {
+      throw new Error(`Run evidence queues an execution: ${JSON.stringify(submitted)}`);
+    }
+    await submitted.execution.wait({ timeoutMs: WAIT_MS });
+    return span.spanContext();
+  });
+
+  const calls = await judgeCalls(server);
+  const spans = await timeline(server, caller.traceId);
+  const attempts = spans.filter((span) => span.name === "verification.attempt");
+  expect(attempts, JSON.stringify(spans)).toHaveLength(1);
+  const [attempt] = attempts;
+  expect(attempt?.trace_id).not.toBe(caller.traceId);
+  expect(attempt?.links.map((link) => link.trace_id)).toEqual([caller.traceId]);
+  expect(calls).toHaveLength(1);
+  const judged = calls[0] && spanOf(calls[0], spans);
+  expect(judged, "the judge call is in the caller's timeline").toBeDefined();
+  expect(judged && ancestry(spans, judged).at(-1)?.span_id).toBe(attempt?.span_id);
+});
+
+test("malformed traceparent is ignored by the judge call", async ({ server, assistant }) => {
+  await verifyOverHttp(server.baseUrl, assistant, `00-${CALLER_TRACE}-${CALLER_SPAN}`);
+
+  expect(await judgeCalls(server)).toHaveLength(1);
+  expect(await timeline(server, CALLER_TRACE), "nothing joined the caller's trace").toEqual([]);
+});
+
+test("submitted answer is judged in the background and resumes by id", async ({ assistant, state }) => {
+  const run = state.run("agent");
+
+  const submitted = await run.observe.submit("answer-check", { answer: "no" });
+  if (submitted.kind !== "queued") {
+    throw new Error("Run evidence queues an execution");
   }
+  const waited = await submitted.execution.wait({ timeoutMs: WAIT_MS });
+  const resumed = await (
+    await verify.Execution.connect(submitted.execution.id, {
+      client: WyrdClient.connect({ credential: assistant.key }),
+    })
+  ).wait({ timeoutMs: WAIT_MS });
+
+  expect(waited.outcome.verdict).toBe("failed");
+  expect(waited.execution_id).toBe(submitted.execution.id);
+  expect(waited.run_id).toBe(run.runId);
+  expect(resumed).toEqual(waited);
 });
 
-test("graded answer passes the task llm judge", async ({ provider, state }) => {
-  const judgment = await state.run("agent").observe.verify("answer-graded", { answer: "yes" });
-
-  expect(judgment).toMatchObject({ passed: true, kind: "task_llm_judge" });
-  expect(judgment.counts).toBeUndefined();
-  const [graded] = await provider.requests(1);
-  expect(graded?.path).toBe("/v1/chat/completions");
-  expect(graded?.body).toContain("Grade the answer yes.");
-});
-
-test("judged answer passes the llm judge", async ({ provider, state }) => {
-  const judgment = await state.run("agent").observe.verify("answer-is-judged", { answer: "yes" });
-
-  expect(judgment).toMatchObject({ passed: true, kind: "eval_llm_judge" });
-  const [graded] = await provider.requests(1);
-  expect(graded?.path).toBe("/v1/chat/completions");
-  expect(graded?.body).toContain("Grade the answer yes.");
-});
-
-test("judge call is attributed to the run and card", async ({ server, state }) => {
-  const run = state.run("agent");
-
-  const judgment = await run.observe.verify("answer-graded", { answer: "yes" });
-  server.flushBifrost();
-
-  const calls = (
-    await (
-      await Bifrost.connect()
-    ).sql("SELECT sub_principal_id, act_principal_id, card_uid FROM vala.gateway.calls WHERE run_id = $1", [run.runId])
-  ).toArrow();
-  const issued = await cli.issueKey({ kind: "Service", name: "assistant", version: "1.0.0", space: "default" });
-  expect(columnValues(calls.getChild("sub_principal_id"))).toEqual([issued.principal_id]);
-  const actors = columnValues(calls.getChild("act_principal_id"));
-  expect(actors).toEqual([expect.any(String)]);
-  expect(actors).not.toEqual([issued.principal_id]);
-  expect(columnValues(calls.getChild("card_uid"))).toEqual([judgment.subject.uid]);
-});
-
-test("traced verify joins the caller's trace", async ({ server, state }) => {
-  await startTelemetry(state);
-  await (await Gateway.connect()).putCapturePolicy({ mode: "metadata", payload_fields: [] });
-  const caller = await trace.getTracer("journey").startActiveSpan("caller", async (span) => {
-    await state.run("agent").observe.verify("answer-graded", { answer: "yes" });
-    span.end();
-    return span.spanContext();
+test("another tenant cannot resume an execution", async ({ server, state }) => {
+  const submitted = await state.run("agent").observe.submit("answer-check", { answer: "yes" });
+  if (submitted.kind !== "queued") {
+    throw new Error("Run evidence queues an execution");
+  }
+  await submitted.execution.wait({ timeoutMs: WAIT_MS });
+  const foreign = WyrdClient.connect({
+    credential: server.bootstrapServiceInTenant(server.seedTenant("other-tenant"), ["admin"], "other_tenant_admin"),
   });
 
-  const spans = await timeline(server, caller.traceId);
-  const attempts = spans.filter((span) => span.scope.name === "wyrd.gateway");
-  expect(attempts).toHaveLength(1);
-  expect(ancestry(spans, attempts[0]).map((span) => span.parent_span_id)).toContain(caller.spanId);
-});
+  const resumed = await verify.Execution.connect(submitted.execution.id, { client: foreign });
 
-test("sdk requests carry the active trace", async ({ server, state }) => {
-  await startTelemetry(state);
-  const gateway = await Gateway.connect();
-  const caller = await trace.getTracer("journey").startActiveSpan("caller", async (span) => {
-    await gateway.putCapturePolicy({ mode: "metadata", payload_fields: [] });
-    span.end();
-    return span.spanContext();
+  await expect(resumed.wait({ timeoutMs: 2_000 })).rejects.toMatchObject({
+    code: "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT",
   });
-
-  const spans = await timeline(server, caller.traceId);
-  expect(spans.filter((span) => span.parent_span_id === caller.spanId).map((span) => span.name)).toEqual(["request"]);
 });
 
-test("service action timeline is one connected tree", async ({ server, state, assistantKey }) => {
-  await startTelemetry(state);
+test("window verifier records samples and refuses verify", async ({ state }) => {
   await state.startBifrost();
-  const actions = "vala.datasets.actions";
-  const admin = await Bifrost.connect({ table: TableConfig.fromJsonSchema(actions, z.object({ action: z.string() })) });
-  await admin.register();
-  await admin.shutdown();
-  const service = WyrdClient.connect({ credential: assistantKey });
-  const writer = await Bifrost.connect({ client: service });
-  await writer.useTableByName(actions);
-  const tracer = trace.getTracer("journey.service");
+  const observe = state.run("model").observe;
 
-  const action = await tracer.startActiveSpan("service.action", async (span) => {
-    tracer.startSpan("answer").end();
-    state.run("model").observe.drift({ latency: 12.5 });
-    writer.insert({ action: "answered" });
-    await tracer.startActiveSpan("model.ask", async (ask) => {
-      const headers: Record<string, string> = {};
-      propagation.inject(context.active(), headers);
-      await new OpenAI({
-        baseURL: `${service.serverUrl}/v1`,
-        apiKey: await service.accessToken(),
-        maxRetries: 0,
-      }).chat.completions.create({ model: "openai/gpt-4o", messages: [{ role: "user", content: "hi" }] }, { headers });
-      ask.end();
-    });
-    const judgment = await state.run("agent").observe.verify("answer-is-judged", { answer: "yes" });
-    expect(judgment.passed).toBe(true);
-    span.end();
-    return span.spanContext();
+  await expect(observe.verify("latency-drift", { latency: 12.5 })).rejects.toMatchObject({
+    code: "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED",
   });
-  await writer.shutdown();
+  expect(await observe.submit("latency-drift", { latency: 12.5 })).toEqual({ kind: "recorded" });
+});
+
+test("unfitted baseline is skipped on schedule", async ({ server }) => {
+  const cards = await Cards.connect();
+  await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
+  await cards.registerFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
+  const { root } = await cards.registerFromPath(fixture("cards/verify_in_real_time/unfitted-assistant.yaml"));
+  const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-unfitted-"));
+  await cards.hydrate(root, bundle);
+  const key = await cli.issueKey({ ...root, space: root.space ?? "default" });
+  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key.key }) });
+  await state.startBifrost();
+  const observe = state.run("model").observe;
+  for (let tier = 0; tier < 5; tier += 1) {
+    await observe.submit("tier-drift", { tier: "gold" });
+  }
   await state.shutdown();
-  await flushTelemetry();
+  const id = await binding(cards, root);
+  server.makeBindingDue(id);
+  const token = await WyrdClient.connect().accessToken();
+  const status = async (): Promise<{ next_run_at?: string; readiness: string; last_execution_id?: string }> => {
+    const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${id}`, {
+      headers: { "x-wyrd-access-token": `Bearer ${token}` },
+    });
+    expect(response.status).toBe(200);
+    return (await response.json()) as { next_run_at?: string; readiness: string; last_execution_id?: string };
+  };
+  const due = (await status()).next_run_at;
 
-  const read = await timeline(server, action.traceId);
-  const starts = read.map((span) => span.start_time);
-  expect(starts).toEqual([...starts].sort());
-  const spans = read.filter((span) => span.trace_id === action.traceId);
-  const linked = read.filter((span) => span.trace_id !== action.traceId);
-  const roots = spans.filter((span) => span.parent_span_id == null);
-  expect(
-    roots.map((root) => [root.name, root.scope.name]),
-    outline(spans),
-  ).toEqual([["service.action", "journey.service"]]);
-  for (const span of spans) {
-    expect(ancestry(spans, span).at(-1), span.name).toBe(roots[0]);
+  const deadline = Date.now() + WAIT_MS;
+  let skipped = await status();
+  while (skipped.next_run_at === due) {
+    expect(Date.now() < deadline, "the due occurrence was not scheduled").toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    skipped = await status();
   }
-  expect(spans.some((span) => span.name === "answer")).toBe(true);
-  const producers = spans.filter((span) => span.kind === "producer" && span.name === "bifrost.enqueue");
-  expect(producers.length, outline(spans)).toBeGreaterThanOrEqual(2);
-  for (const producer of producers) {
-    expect(
-      linked.some(
-        (consumer) =>
-          consumer.name === "bifrost.gate.write" &&
-          consumer.kind === "consumer" &&
-          (consumer.links ?? []).some(
-            (link) => link.trace_id === producer.trace_id && link.span_id === producer.span_id,
-          ),
-      ),
-      outline(linked),
-    ).toBe(true);
-  }
-  const attempts = spans
-    .filter((span) => span.scope.name === "wyrd.gateway")
-    .map((span) => ancestry(spans, span).map((each) => each.name));
-  expect(attempts).toHaveLength(2);
-  expect(
-    attempts.some((names) =>
-      holdsInOrder(names, [
-        (name) => name === "gateway.call",
-        (name) => name === "request",
-        (name) => name === "model.ask",
-      ]),
-    ),
-    JSON.stringify(attempts),
-  ).toBe(true);
-  expect(
-    attempts.some((names) =>
-      holdsInOrder(names, [
-        (name) => name === "gateway.call",
-        (name) => name.startsWith("verification."),
-        (name) => name === "request",
-        (name) => name === "service.action",
-      ]),
-    ),
-    JSON.stringify(attempts),
-  ).toBe(true);
-  const stamped = await (await Bifrost.connect()).sql(
-    `SELECT encode(span_id, 'hex') AS span_id, sub_principal_id, act_principal_id FROM vala.traces.spans WHERE trace_id = X'${action.traceId}'`,
-    [],
-    z.object({ span_id: z.string(), sub_principal_id: z.string(), act_principal_id: z.string() }),
-  );
-  const pairs = (selected: typeof spans) => [
-    ...new Set(
-      selected.map((span) => {
-        const row = stamped.find((each) => each.span_id === span.span_id);
-        return `${row?.sub_principal_id}/${row?.act_principal_id}`;
-      }),
-    ),
-  ];
-  const requests = pairs(spans.filter((span) => span.name === "request"));
-  const [subject] = (requests[0] ?? "").split("/");
-  expect(requests).toEqual([`${subject}/${subject}`]);
-  const judge = pairs(
-    spans.filter(
-      (span) =>
-        span.scope.name === "wyrd.gateway" &&
-        ancestry(spans, span).some((each) => each.name.startsWith("verification.")),
-    ),
-  );
-  expect(judge).toEqual([expect.stringMatching(new RegExp(`^${subject}/(?!${subject}$)[0-9a-f-]{36}$`))]);
-});
 
-test("model latency like the baseline passes its verifier", async ({ server, assistant, state }) => {
-  server.waitForBaseline(assistant.latencyDrift.uid, 90_000);
-
-  const judgment = await state.run("model").observe.verify("latency-drift", HEALTHY_LATENCIES);
-
-  expect(judgment).toMatchObject({ passed: true, kind: "drift_psi", subject: state.cardRef("model") });
-});
-
-test("model latency drift is judged failed", async ({ server, assistant, state }) => {
-  server.waitForBaseline(assistant.latencyDrift.uid, 90_000);
-
-  const judgment = await state.run("model").observe.verify("latency-drift", SLOW_LATENCIES);
-
-  expect(judgment).toMatchObject({
-    passed: false,
-    verdict: "failed",
-    kind: "drift_psi",
-    counts: { implementation: "drift", drifted_features: 1, total_features: 1 },
-  });
+  expect(skipped.readiness).toBe("baseline_not_ready");
+  expect(skipped.last_execution_id ?? null).toBeNull();
 });
 
 test("unbound verifier fails locally", async ({ state }) => {
@@ -388,53 +319,52 @@ test("unbound verifier fails locally", async ({ state }) => {
   });
 });
 
-test("input of the wrong shape fails locally", async ({ state }) => {
-  await expect(state.run("agent").observe.verify("answer-is-yes", [{ answer: "yes" }])).rejects.toMatchObject({
-    code: "WYRD_SDK_400_INVALID_OBSERVATION",
-  });
-});
+test("input that does not fit its slot fails locally", async ({ state }) => {
+  const observe = state.run("agent").observe;
 
-test("caller without the verifier grant is refused", async ({ server, assistant }) => {
-  const keys = [
-    server.scopedApiKey("ts_evals_only", ["evals:run"]),
-    server.scopedApiKey("ts_other_verifier", [verifierRun(assistant.answerIsYes)]),
-  ];
-  for (const credential of keys) {
-    const state = WyrdState.fromPath(assistant.bundle, { client: WyrdClient.connect({ credential }) });
-
-    await expect(state.run("agent").observe.verify("answer-check", { answer: "yes" })).rejects.toMatchObject(DENIED);
-  }
-});
-
-test("exact verifier grant verifies only that verifier", async ({ server, assistant }) => {
-  const credential = server.scopedApiKey("ts_exact_verifier", [verifierRun(assistant.answerCheck)]);
-  const run = WyrdState.fromPath(assistant.bundle, { client: WyrdClient.connect({ credential }) }).run("agent");
-
-  expect(await run.observe.verify("answer-check", { answer: "yes" })).toMatchObject({ passed: true });
-  await expect(run.observe.verify("answer-is-yes", { answer: "yes" })).rejects.toMatchObject(DENIED);
-});
-
-test("another tenant cannot verify the assistant", async ({ server, assistant }) => {
-  const otherTenant = server.seedTenant("other-tenant");
-  const other = WyrdClient.connect({
-    credential: server.bootstrapServiceInTenant(otherTenant, ["admin"], "other-service"),
-  });
-  const run = WyrdState.fromPath(assistant.bundle, { client: other }).run("agent");
-
-  for (const verifier of ["answer-is-yes", "answer-check"]) {
-    await expect(run.observe.verify(verifier, { answer: "yes" })).rejects.toMatchObject({
-      code: "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+  for (const inputs of [
+    { reply: "yes" },
+    { answer: verify.File.bytes(new TextEncoder().encode("yes")) },
+  ] as VerifierInputs[]) {
+    await expect(observe.verify("answer-check", inputs)).rejects.toMatchObject({
+      code: "WYRD_VERIFICATION_400_INPUT_INVALID",
     });
   }
 });
 
-test("verify records no observation", async ({ server, state }) => {
-  const run = state.run("agent");
+test("caller without the verifier grant is refused", async ({ server, assistant }) => {
+  const keys = [
+    server.scopedApiKey("evals_only", ["evals:run"]),
+    server.scopedApiKey("other_verifier", [
+      { resource: "verifier", action: "run", scope: { verifier: assistant.answerJudged.uid } },
+    ]),
+  ];
+  for (const credential of keys) {
+    const run = assistantAs(assistant, WyrdClient.connect({ credential })).run("agent");
 
-  await run.observe.verify("answer-is-yes", { answer: "yes" });
-  server.flushBifrost();
+    await expect(run.observe.verify("answer-check", { answer: "yes" })).rejects.toMatchObject(DENIED);
+  }
+});
 
-  const reader = await Bifrost.connect();
-  const observed = await reader.sql("SELECT record_id FROM vala.eval.observations WHERE run_id = $1", [run.runId]);
-  expect(observed.numRows).toBe(0);
+test("exact verifier grant verifies only that verifier", async ({ server, assistant }) => {
+  const credential = server.scopedApiKey("exact_verifier", [
+    { resource: "verifier", action: "run", scope: { verifier: assistant.answerCheck.uid } },
+  ]);
+  const run = assistantAs(assistant, WyrdClient.connect({ credential })).run("agent");
+
+  expect((await run.observe.verify("answer-check", { answer: "yes" })).outcome.verdict).toBe("passed");
+  await expect(run.observe.verify("answer-judged", { answer: "yes" })).rejects.toMatchObject(DENIED);
+});
+
+test("another tenant cannot verify the assistant", async ({ server, assistant }) => {
+  const foreign = WyrdClient.connect({
+    credential: server.bootstrapServiceInTenant(server.seedTenant("other-tenant"), ["admin"], "other_tenant_admin"),
+  });
+  const run = assistantAs(assistant, foreign).run("agent");
+
+  for (const verifier of ["answer-check", "answer-judged"]) {
+    await expect(run.observe.verify(verifier, { answer: "yes" })).rejects.toMatchObject({
+      code: "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+    });
+  }
 });

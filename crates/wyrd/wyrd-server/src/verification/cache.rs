@@ -11,27 +11,27 @@ use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::card::verifier::VerifierImplementation;
+use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::ids::CardUid;
 
 /// Total bytes of parsed Verifier Cards one process keeps.
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 
-/// One parsed Verifier Card's implementation.
+/// One parsed Verifier Card's spec.
 #[derive(Debug)]
 pub(crate) struct CachedVerifier {
-    /// The implementation the run executes.
-    pub(crate) implementation: VerifierImplementation,
+    /// The spec the execution runs, shared with each engine run.
+    pub(crate) spec: Arc<VerifierSpec>,
     /// The entry's charge against [`CACHE_BYTES`]: its serialized size.
     bytes: usize,
 }
 
 impl CachedVerifier {
-    /// Build an entry charged at the serialized size of `implementation`.
-    pub(crate) fn new(implementation: VerifierImplementation) -> Self {
-        let bytes = serde_json::to_vec(&implementation).map_or(0, |json| json.len());
+    /// Build an entry charged at the serialized size of `spec`.
+    pub(crate) fn new(spec: VerifierSpec) -> Self {
+        let bytes = serde_json::to_vec(&spec).map_or(0, |json| json.len());
         Self {
-            implementation,
+            spec: Arc::new(spec),
             bytes,
         }
     }
@@ -115,7 +115,7 @@ impl VerifierCache {
 #[cfg(test)]
 mod tests {
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::card::verifier::VerifierImplementation;
+    use wyrd_spec::card::verifier::VerifierSpec;
     use wyrd_spec::ids::CardUid;
 
     use super::{CachedVerifier, VerifierCache};
@@ -128,16 +128,20 @@ mod tests {
         CardUid::from_uuid(uuid::Uuid::now_v7()).expect("a UUIDv7 is a valid Card UID")
     }
 
-    /// A parsed Eval Verifier.
+    /// A parsed one-assertion Verifier.
     ///
     /// # Panics
     /// Panics when the static spec is invalid.
     fn verifier() -> CachedVerifier {
         CachedVerifier::new(
-            serde_json::from_value::<VerifierImplementation>(
-                serde_json::json!({ "kind": "eval", "spec": { "tasks": {} } }),
-            )
-            .expect("static Eval implementation"),
+            serde_json::from_value::<VerifierSpec>(serde_json::json!({
+                "requirements": [{
+                    "id": "valid",
+                    "statement": "The input is true.",
+                    "check": {"kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true}
+                }]
+            }))
+            .expect("static Verifier spec"),
         )
     }
 
@@ -161,10 +165,13 @@ mod tests {
         assert!(cache.get(tenant, &a).is_some() && cache.get(tenant, &c).is_some());
 
         let tiny = VerifierCache::with_capacity(size - 1);
-        assert!(matches!(
-            tiny.insert(tenant, a.clone(), verifier()).implementation,
-            VerifierImplementation::Eval(_)
-        ));
+        assert_eq!(
+            tiny.insert(tenant, a.clone(), verifier())
+                .spec
+                .requirements
+                .len(),
+            1
+        );
         assert!(
             tiny.get(tenant, &a).is_none(),
             "an oversized entry is not kept"

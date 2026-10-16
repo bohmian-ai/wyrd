@@ -68,28 +68,28 @@ pub const WYRD_STORAGE_OPERATION_DURATION_SECONDS: &str = "wyrd_storage_operatio
 
 /// Non-terminal Verifier runs and Operator dispatches, by `queue` and `status`.
 pub const VERIFICATION_QUEUE_DEPTH: &str = "wyrd_verification_queue_depth";
-/// Verifier executions currently in flight in this process, by `kind` and `mode`.
+/// Verifier executions currently in flight in this process, by `mode`.
 pub const VERIFICATION_ACTIVE_RUNS: &str = "wyrd_verification_active_runs";
-/// Claimed queued attempts and admitted direct executions, by `kind` and `mode`.
+/// Claimed queued attempts and admitted direct executions, by `mode`.
 pub const VERIFICATION_RUN_ATTEMPTS_TOTAL: &str = "wyrd_verification_run_attempts_total";
-/// Unsuccessful execution outcomes, by `kind`, `mode`, and `outcome`; a
+/// Unsuccessful execution outcomes, by `mode` and `outcome`; a
 /// completed failed judgment is not one.
 pub const VERIFICATION_RUN_FAILURES_TOTAL: &str = "wyrd_verification_run_failures_total";
-/// Queued claim-to-settlement or direct entry-to-result latency, by `kind`,
-/// `mode`, and `outcome`.
+/// Queued claim-to-settlement or direct entry-to-result latency, by
+/// `mode` and `outcome`.
 pub const VERIFICATION_RUN_DURATION_SECONDS: &str = "wyrd_verification_run_duration_seconds";
 /// How long a claimed Verifier run had been claimable before its claim, as
-/// PostgreSQL measured it, by `kind` and `origin`.
+/// PostgreSQL measured it, by `origin`.
 pub const VERIFICATION_QUEUE_WAIT_SECONDS: &str = "wyrd_verification_queue_wait_seconds";
-/// Run creation to durable terminal settlement, by `kind`, `origin`, and
+/// Run creation to durable terminal settlement, by `origin` and
 /// terminal `outcome`; its `_count` is the settled terminal runs.
 pub const VERIFICATION_TRIGGER_TO_TERMINAL_SECONDS: &str =
     "wyrd_verification_trigger_to_terminal_seconds";
-/// Overlapping phases of one execution, by `kind`, `mode`, and `phase`
-/// (`load`, `input_read`, `prepare`, `engine`, `publication`, `settlement`).
+/// Overlapping phases of one execution, by `mode` and `phase`
+/// (`load`, `input_read`, `prepare`, `engine`, `settlement`).
 pub const VERIFICATION_PHASE_DURATION_SECONDS: &str = "wyrd_verification_phase_duration_seconds";
-/// Engine elapsed time less the union of its measured waits, by `kind`,
-/// `mode`, and `outcome`; wall time, not CPU.
+/// Engine elapsed time less the union of its measured waits, by
+/// `mode` and `outcome`; wall time, not CPU.
 pub const VERIFICATION_ENGINE_OVERHEAD_SECONDS: &str = "wyrd_verification_engine_overhead_seconds";
 /// Scheduler occurrences processed, by `outcome`.
 pub const VERIFICATION_SCHEDULE_TICKS_TOTAL: &str = "wyrd_verification_schedule_ticks_total";

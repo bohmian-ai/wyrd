@@ -21,11 +21,7 @@ spec:
         space: wyrd-team
         name: retention-guardrail
         version: "1.0.0"
-      runs_on:
-        kind: Trigger
-        space: wyrd-team
-        name: retention-observations-ready
-        version: "1.0.0"
+      # Explicit-only: callers verify or submit evidence for it directly.
       on_failure:
         - kind: notify
           channel:
@@ -52,6 +48,10 @@ spec:
       verified_by:
         - verifier: ./model/drift.yaml
           runs_on: ./ops/trigger-drift-schedule.yaml
+          # The schedule reads these recorded features into the samples slot.
+          inputs:
+            current:
+              features: [tenure_months, monthly_charges, contract_type]
           on_failure:
             - ./ops/operator-slack.yaml
 
@@ -61,9 +61,6 @@ spec:
       ref: agent1/agent.yaml
       verified_by:
         - verifier: agent1/eval.yaml
-          # Inline activation: the binding owns its Trigger body.
-          runs_on:
-            kind: observations_ready
           on_failure:
             - ./ops/operator-slack.yaml
         - verifier: agent1/cohort-check.yaml
@@ -72,4 +69,3 @@ spec:
       ref: agent2/agent.yaml
       verified_by:
         - verifier: agent1/eval.yaml
-          runs_on: ./ops/trigger-eval-ready.yaml

@@ -121,7 +121,10 @@ async fn execute_trace(
     })
 }
 
-fn project_spans(trace_id: TraceId, spans: &[SpanRecord]) -> Value {
+/// Project a trace's spans into the JSON document span selectors read.
+///
+/// Shared by Eval trace assertions and Verifier `trace` checks.
+pub(crate) fn project_spans(trace_id: TraceId, spans: &[SpanRecord]) -> Value {
     let projected: Vec<Value> = spans.iter().map(project_one).collect();
     serde_json::json!({
         "trace_id": trace_id.to_hex(),
@@ -152,7 +155,12 @@ fn elapsed_ms(start: chrono::DateTime<chrono::Utc>) -> u64 {
 }
 
 #[cfg(test)]
-mod trace_executor {
+pub(crate) mod trace_executor {
+    //! Trace assertion executor tests and the shared span fixture.
+    //!
+    //! The [`span`] fixture is crate-visible so other engines' tests, such as
+    //! the Verifier engine's trace checks, project the same span shape the
+    //! trace executor reads instead of building their own.
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
@@ -160,10 +168,8 @@ mod trace_executor {
     use crate::context::ExecutionContext;
     use crate::executor::{EvalReport, Executors, TaskRunOutcome, execute_plan};
     use crate::store::TaskRegistry;
-    use crate::tasks::{
-        AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, TraceTaskExecutor,
-    };
-    use crate::{InMemoryTraceSource, MockJudgeInvoker, MockTraceSource, TraceUnavailable};
+    use crate::tasks::{AgentTaskExecutor, AssertionTaskExecutor, TraceTaskExecutor};
+    use crate::{InMemoryTraceSource, MockTraceSource, TraceUnavailable};
     use chrono::{TimeZone, Utc};
     use serde_json::{Value, json};
     use uuid::Uuid;
@@ -223,7 +229,9 @@ mod trace_executor {
         }
     }
 
-    fn span(trace: TraceId, span: SpanId, name: &str, scenario: &str) -> SpanRecord {
+    /// One finished span named `name`, tagged with an eval scenario. Shared
+    /// with the Verifier engine's trace-check tests.
+    pub(crate) fn span(trace: TraceId, span: SpanId, name: &str, scenario: &str) -> SpanRecord {
         let start_time = Utc
             .with_ymd_and_hms(2026, 6, 10, 12, 0, 0)
             .single()
@@ -268,11 +276,12 @@ mod trace_executor {
         }
     }
 
+    /// Build the executor bundle with trace assertions served from `source`
+    /// and a 250ms span-wait bound; the assertion and agent executors are
+    /// the production ones and need no IO.
     fn executors(source: Arc<dyn crate::TraceSource>) -> Executors {
-        let mock = MockJudgeInvoker::new(std::iter::empty());
         Executors {
             assertion: Arc::new(AssertionTaskExecutor::new()),
-            judge: Arc::new(JudgeTaskExecutor::new(mock)),
             trace: Arc::new(TraceTaskExecutor::new(source, Duration::from_millis(250))),
             agent: Arc::new(AgentTaskExecutor::new()),
         }

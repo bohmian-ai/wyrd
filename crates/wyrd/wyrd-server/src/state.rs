@@ -45,6 +45,8 @@ use crate::config::{
 use crate::oracle::SilentForwardPeer;
 use crate::postgres::ServerPostgres;
 use crate::verification::health::VerificationHealth;
+use crate::verification::hosted::blocks::HostedBlocks;
+use crate::verification::submissions::SubmissionOutbox;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::BifrostQueryRequest;
@@ -81,10 +83,6 @@ pub struct BifrostBuildInputs {
     pub cluster: Arc<ClusterRegistry>,
     /// Exact public and private request token verifier.
     pub token_verifier: Arc<TokenVerifier>,
-    /// Tenant token signing key; observation-triggered runs recover their
-    /// binding owner's authority through an issuer over it. `None` accepts no
-    /// observation run.
-    pub issuing_key: Option<Arc<wyrd_auth_issue::IssuingKey>>,
     /// Cluster mTLS identity loaded from `WYRD_PEER_TLS_DIR`.
     ///
     /// `Some` exactly in explicit peer mode. A process-local node has no
@@ -1554,9 +1552,9 @@ pub struct Bifrost {
     query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
     /// Lifecycle routing retained by every query ingress, regardless of local role.
     query_controls: Option<crate::oracle::RunningQueryControls>,
-    /// Run-request outbox Gate hands acknowledged Eval observations to;
-    /// `None` only for the ownerless unit-test shell.
-    observation_runs: Option<Arc<crate::verification::observations::ObservationRunOutbox>>,
+    /// Queue writer of submissions whose inputs Scribe acknowledged; `None`
+    /// only for the ownerless unit-test shell.
+    submissions: Option<Arc<SubmissionOutbox>>,
     /// Read-only proof handle for test-tier inspection of the production graph.
     #[cfg(feature = "test-support")]
     test_resources: Option<BifrostRoleResources>,
@@ -1611,8 +1609,8 @@ pub(crate) struct BifrostComposition {
     pub(crate) query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
     /// Shared local controls or remote-only routing for a forwarding ingress.
     pub(crate) query_controls: Option<crate::oracle::RunningQueryControls>,
-    /// Run-request outbox the Gate's observation acknowledgement stages on.
-    pub(crate) observation_runs: Arc<crate::verification::observations::ObservationRunOutbox>,
+    /// Queue writer acknowledged submissions are staged on.
+    pub(crate) submissions: Arc<SubmissionOutbox>,
     /// The process Scribe outbox, routed to the local or a peer Scribe.
     pub(crate) scribe_outbox: Arc<ScribeOutbox>,
     /// The one process membership poller for the shared cluster registry.
@@ -1635,7 +1633,7 @@ impl Bifrost {
             token_verifier,
             query_forwarder,
             query_controls,
-            observation_runs,
+            submissions,
             scribe_outbox,
             membership_poller,
             #[cfg(feature = "test-support")]
@@ -1651,7 +1649,7 @@ impl Bifrost {
             token_verifier,
             query_forwarder,
             query_controls,
-            observation_runs: Some(observation_runs),
+            submissions: Some(submissions),
             #[cfg(feature = "test-support")]
             test_resources: resources,
             #[cfg(feature = "test-support")]
@@ -1681,7 +1679,7 @@ impl Bifrost {
             token_verifier,
             query_forwarder: None,
             query_controls: None,
-            observation_runs: None,
+            submissions: None,
             test_resources: None,
             test_catalog: None,
             scribe_outbox: None,
@@ -1718,7 +1716,7 @@ impl Bifrost {
             token_verifier,
             query_forwarder: None,
             query_controls: None,
-            observation_runs: None,
+            submissions: None,
             test_resources: None,
             test_catalog: Some(catalog),
             scribe_outbox: None,
@@ -1806,16 +1804,14 @@ impl Bifrost {
         Arc::clone(&self.token_verifier)
     }
 
-    /// Borrows the Eval observation run-request outbox, absent only in the
-    /// ownerless unit-test shell.
+    /// Borrows the submission queue writer, absent only in the ownerless
+    /// unit-test shell.
     ///
-    /// Process shutdown drains it after Bifrost so requests staged by the last
-    /// acknowledged observations are written.
+    /// Process shutdown drains it after the Scribe outbox so submissions
+    /// whose inputs were acknowledged last are queued.
     #[must_use]
-    pub fn observation_runs(
-        &self,
-    ) -> Option<&Arc<crate::verification::observations::ObservationRunOutbox>> {
-        self.observation_runs.as_ref()
+    pub fn submissions(&self) -> Option<&Arc<SubmissionOutbox>> {
+        self.submissions.as_ref()
     }
 
     /// Borrows the retained ready-Oracle forwarder, when this process has one.
@@ -2233,6 +2229,10 @@ pub struct AppState {
     pub verification: Arc<VerificationHealth>,
     /// Key-encryption keys that seal and open Operator connection credentials.
     pub operator_keys: Arc<OperatorKeys>,
+    /// The process's hosted Verifier block capacity, which direct
+    /// verification and the queued runner build every engine over; `None`
+    /// until boot starts it, and then neither verification surface runs.
+    pub verification_blocks: Option<Arc<HostedBlocks>>,
     /// Optional deterministic stream truncation controller for test servers.
     #[cfg(feature = "test-support")]
     pub query_stream_fault: Option<QueryStreamFaultController>,
@@ -2290,9 +2290,17 @@ impl AppState {
             peer_plane: Arc::new(crate::app::peer_plane::PeerPlaneStatus::default()),
             verification: Arc::default(),
             operator_keys: Arc::new(OperatorKeys::default()),
+            verification_blocks: None,
             #[cfg(feature = "test-support")]
             query_stream_fault: None,
         }
+    }
+
+    /// Run every Verifier execution over `blocks`.
+    #[must_use]
+    pub fn with_verification_blocks(mut self, blocks: Arc<HostedBlocks>) -> Self {
+        self.verification_blocks = Some(blocks);
+        self
     }
 
     /// Register the test-support MCP context probe on this state.

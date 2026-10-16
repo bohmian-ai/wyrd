@@ -10,9 +10,8 @@
 //!
 //! - A direct arrival is one `POST /v1/verification/execute` call whose
 //!   verdict is checked against the input it sent.
-//! - A queued Drift arrival is one manual `POST /v1/verification/runs` over the tenant's
-//!   seeded window; a queued Eval arrival is one observation whose binding
-//!   activates the run.
+//! - A queued arrival is one `POST /v1/verification/enqueue` of the same
+//!   assertion input, acknowledged before the execution is durable.
 //! - An ingest arrival is one Drift observation of [`INGEST_FEATURES`]
 //!   features admitted to the tenant's `WyrdState` queue.
 //! - A query arrival is one Oracle SQL statement over the tenant's last
@@ -26,16 +25,15 @@ use reqwest::Method;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use wyrd_client::observe::EvalObservationOptions;
 use wyrd_client::state::WyrdState;
 use wyrd_client::{Bifrost, QueueConfig, WyrdClient};
-use wyrd_spec::verification::{
-    ExecuteVerificationRequest, Judgment, StartVerificationRunRequest,
-    StartVerificationRunResponse, VerificationRunInput, VerificationRunTarget, VerificationVerdict,
+use wyrd_spec::verification::VerificationVerdict;
+use wyrd_spec::verification::execution::{
+    EnqueueVerificationResponse, VerificationRequest, VerificationResult,
 };
 
 use crate::Result;
-use crate::fixture::{Kind, Tenant, context};
+use crate::fixture::{DRIFT_VERIFIER, Tenant, request};
 
 /// Driver permits: the most requests the driver keeps in flight at once.
 pub const MAX_IN_FLIGHT: usize = 2_048;
@@ -56,7 +54,7 @@ const QUERY_WINDOW: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
 pub enum Op {
     /// Synchronous supplied-input verification.
     Direct,
-    /// Durable verification runs.
+    /// Queued verification executions.
     Queued,
     /// Drift observations through the client queue into Scribe.
     Ingest,
@@ -82,10 +80,10 @@ impl Op {
 /// What one lane repeats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Work {
-    /// Direct execution of one verifier kind.
-    Direct(Kind),
-    /// Queued execution of one verifier kind.
-    Queued(Kind),
+    /// Direct execution of the assertion Verifier.
+    Direct,
+    /// Queued execution of the assertion Verifier.
+    Queued,
     /// One Drift observation of [`INGEST_FEATURES`] features.
     Ingest,
     /// The latest rows of one series: a selective lookup.
@@ -98,8 +96,8 @@ impl Work {
     /// The operation this work counts toward.
     pub fn op(self) -> Op {
         match self {
-            Self::Direct(_) => Op::Direct,
-            Self::Queued(_) => Op::Queued,
+            Self::Direct => Op::Direct,
+            Self::Queued => Op::Queued,
             Self::Ingest => Op::Ingest,
             Self::Lookup | Self::Aggregate => Op::Query,
         }
@@ -127,7 +125,7 @@ pub struct Tally {
     /// Requests sent.
     pub started: u64,
     /// Requests the server or client queue accepted: a judgment, an enqueued
-    /// run, an admitted observation, or a query answer.
+    /// execution, an admitted observation, or a query answer.
     pub accepted: u64,
     /// Refused or failed requests by stable error code.
     pub rejected: BTreeMap<String, u64>,
@@ -240,11 +238,9 @@ impl TenantClients {
 #[derive(Clone)]
 enum Request {
     /// Direct execution: the passing and the failing input.
-    Execute(Arc<[ExecuteVerificationRequest; 2]>),
-    /// Manual Drift run over the seeded window.
-    Start(Arc<StartVerificationRunRequest>),
-    /// Eval observation from the component `alias`.
-    Observe(&'static str),
+    Execute(Arc<[VerificationRequest; 2]>),
+    /// Queued execution: the passing and the failing input.
+    Enqueue(Arc<[VerificationRequest; 2]>),
     /// Drift observation of the Model.
     Ingest,
     /// Oracle read of one shape.
@@ -268,14 +264,14 @@ impl Lane {
     ///
     /// # Errors
     ///
-    /// Returns an error when the tenant does not run this lane's workload, a
+    /// Returns an error when the lane's request cannot be built, a
     /// request task panicked, or the drain flush fails.
     ///
     /// # Cancellation
     ///
     /// Dropping it aborts every in-flight request task and discards the
     /// tally. Requests that reached a replica keep their effects: enqueued
-    /// runs, admitted observations, and audit rows remain durable, and
+    /// executions, admitted observations, and audit rows remain durable, and
     /// observations admitted to the client queue are flushed by its owner's
     /// later flush or shutdown. Arrivals are never resent.
     pub async fn drive(
@@ -345,32 +341,17 @@ impl Lane {
     ///
     /// # Errors
     ///
-    /// Returns an error when `tenant` does not run the workload or has no
-    /// seeded window for a queued Drift lane.
+    /// Returns an error when the assertion input cannot be built.
     fn request(&self, tenant: &Tenant) -> Result<Request> {
+        let inputs = || -> Result<Arc<[VerificationRequest; 2]>> {
+            Ok(Arc::new([
+                request(&tenant.verifier, &tenant.subject, false)?,
+                request(&tenant.verifier, &tenant.subject, true)?,
+            ]))
+        };
         Ok(match self.work {
-            Work::Direct(kind) => {
-                let (verifier, subject) = tenant.target(kind)?;
-                let build = |failing| ExecuteVerificationRequest {
-                    verifier_card_uid: verifier.clone(),
-                    card_uid: subject.clone(),
-                    input: kind.input(0, failing),
-                    run_id: None,
-                };
-                Request::Execute(Arc::new([build(false), build(true)]))
-            }
-            Work::Queued(kind) if kind.is_drift() => {
-                let (verifier, subject) = tenant.target(kind)?;
-                let (start, end) = tenant.window.ok_or("a queued Drift lane needs a window")?;
-                Request::Start(Arc::new(StartVerificationRunRequest {
-                    target: VerificationRunTarget::Verifier {
-                        verifier_card_uid: verifier.clone(),
-                        card_uid: subject.clone(),
-                    },
-                    input: VerificationRunInput::DriftWindow { start, end },
-                }))
-            }
-            Work::Queued(kind) => Request::Observe(kind.agent_alias()),
+            Work::Direct => Request::Execute(inputs()?),
+            Work::Queued => Request::Enqueue(inputs()?),
             Work::Ingest => Request::Ingest,
             Work::Lookup | Work::Aggregate => Request::Query(self.work),
         })
@@ -383,7 +364,7 @@ impl Request {
     /// # Cancellation
     ///
     /// A request dropped after it reached the replica may still take
-    /// effect there (a judgment, an enqueued run, or audit rows); an
+    /// effect there (a judgment, an enqueued execution, or audit rows); an
     /// observation is admitted to the client queue synchronously, so it is
     /// either admitted or not. The driver never resends an arrival.
     async fn send(&self, clients: &TenantClients, replica: usize, sequence: u64) -> Outcome {
@@ -392,7 +373,7 @@ impl Request {
         match self {
             Self::Execute(inputs) => {
                 match clients.verification[replica]
-                    .request_json::<_, Judgment>(
+                    .request_json::<_, VerificationResult>(
                         Method::POST,
                         "/v1/verification/execute",
                         Some(&inputs[usize::from(failing)]),
@@ -406,40 +387,22 @@ impl Request {
                             VerificationVerdict::Passed
                         };
                         Outcome::Accepted {
-                            right: response.verdict == expected,
+                            right: response.outcome.verdict == expected,
                         }
                     }
                     Err(error) => Outcome::Rejected(error.code().to_owned()),
                 }
             }
-            Self::Start(request) => {
+            Self::Enqueue(inputs) => {
                 match clients.verification[replica]
-                    .submit_idempotent::<_, StartVerificationRunResponse>(
+                    .submit_idempotent::<_, EnqueueVerificationResponse>(
                         Method::POST,
-                        "/v1/verification/runs",
-                        &**request,
+                        "/v1/verification/enqueue",
+                        &inputs[usize::from(failing)],
                     )
                     .await
                 {
                     Ok(_) => accepted,
-                    Err(error) => Outcome::Rejected(error.code().to_owned()),
-                }
-            }
-            Self::Observe(alias) => {
-                let kind = if *alias == "judge" {
-                    Kind::Judge
-                } else {
-                    Kind::Assertion
-                };
-                let emitted = clients.states[replica]
-                    .run()
-                    .for_card(alias)
-                    .and_then(|view| {
-                        view.observe()
-                            .eval(&context(kind, failing), EvalObservationOptions::default())
-                    });
-                match emitted {
-                    Ok(()) => accepted,
                     Err(error) => Outcome::Rejected(error.code().to_owned()),
                 }
             }
@@ -450,15 +413,16 @@ impl Request {
                         (format!("f{feature}"), (value as f64).into())
                     })
                     .collect();
-                let emitted = clients.states[replica]
-                    .run()
-                    .for_card("model")
-                    .and_then(|view| {
+                let submitted = match clients.states[replica].run().for_card("model") {
+                    Ok(view) => {
                         view.observe()
-                            .drift(&serde_json::Value::Object(features), None)
-                    });
-                match emitted {
-                    Ok(()) => accepted,
+                            .submit(DRIFT_VERIFIER, serde_json::Value::Object(features))
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match submitted {
+                    Ok(_) => accepted,
                     Err(error) => Outcome::Rejected(error.code().to_owned()),
                 }
             }
@@ -500,38 +464,36 @@ fn query(shape: Work, sequence: u64, now: chrono::DateTime<chrono::Utc>) -> Stri
 }
 
 /// The REQ-171 mix at level `level`, spread evenly over `tenants` identical
-/// tenants: direct and queued verification at `level / 2` each across every
-/// [`Kind`] equally, ingest at `2.5 · level` observations, and queries at
+/// tenants: direct and queued verification at `level / 2` each, ingest at `2.5 · level` observations, and queries at
 /// `level / 2` split between [`Work::Lookup`] and [`Work::Aggregate`].
 pub fn mix(level: f64, tenants: usize) -> Vec<Lane> {
     let share = level / tenants as f64;
-    let verify = share / 2.0 / Kind::ALL.len() as f64;
     (0..tenants)
         .flat_map(|tenant| {
-            let kinds = Kind::ALL.into_iter().flat_map(move |kind| {
-                [Work::Direct(kind), Work::Queued(kind)].map(|work| Lane {
+            [Work::Direct, Work::Queued]
+                .map(|work| Lane {
                     tenant,
                     work,
-                    rate: verify,
+                    rate: share / 2.0,
                 })
-            });
-            kinds.chain([
-                Lane {
-                    tenant,
-                    work: Work::Ingest,
-                    rate: 2.5 * share,
-                },
-                Lane {
-                    tenant,
-                    work: Work::Lookup,
-                    rate: share / 4.0,
-                },
-                Lane {
-                    tenant,
-                    work: Work::Aggregate,
-                    rate: share / 4.0,
-                },
-            ])
+                .into_iter()
+                .chain([
+                    Lane {
+                        tenant,
+                        work: Work::Ingest,
+                        rate: 2.5 * share,
+                    },
+                    Lane {
+                        tenant,
+                        work: Work::Lookup,
+                        rate: share / 4.0,
+                    },
+                    Lane {
+                        tenant,
+                        work: Work::Aggregate,
+                        rate: share / 4.0,
+                    },
+                ])
         })
         .collect()
 }

@@ -20,6 +20,7 @@ use wyrd_testing::release_server::{LocalServer, Metrics};
 use crate::client_queue::Result;
 use crate::client_queue::fixture::Tenant;
 use crate::client_queue::proxy::DelayProxy;
+use crate::fixture::DRIFT_VERIFIER;
 
 /// Numeric features, and so durable rows, of one observation (AC-041).
 pub const FEATURES: usize = 100;
@@ -221,8 +222,12 @@ impl Bench<'_> {
                     .unwrap_or(0.0)
                     .into();
             }
-            match model.observe().drift(&features, None) {
-                Ok(()) => admitted += 1,
+            match model
+                .observe()
+                .submit(DRIFT_VERIFIER, serde_json::Value::Object(features.clone()))
+                .await
+            {
+                Ok(_) => admitted += 1,
                 Err(error) if error.code() == QUEUE_FULL => refusals += 1,
                 Err(error) => return Err(error.into()),
             }

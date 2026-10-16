@@ -51,8 +51,6 @@ spec:
       version: 1.0.0
       space: default
       uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b08
-    runs_on:
-      kind: observations_ready
 relationships:
   outbound:
   - default/Agent/inline@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b05

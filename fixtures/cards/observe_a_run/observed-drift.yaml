@@ -1,0 +1,20 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: observed-drift
+  version: 1.0.0
+  space: default
+spec:
+  description: Mean request latency stays near 10 ms.
+  inputs:
+    latency: {type: samples, features: [latency]}
+  requirements:
+    - id: latency-near-target
+      statement: Mean latency stays within 5 ms of 10 ms
+      check:
+        kind: drift
+        on: inputs.latency
+        method: Custom
+        signal: {kind: Metric, name: latency}
+        condition: {kind: Statistical}
+        profile: {kind: Custom, metric_name: latency, baseline_value: 10.0, alert_threshold: 5.0}

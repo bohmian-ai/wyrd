@@ -1,11 +1,14 @@
 """The support desk: an Agent-backed Service that answers customer questions,
-records each ticket, and is verified continuously and in real time.
+records each ticket, and checks every answer against its refund policy with
+the ``support/policy-check`` Verifier.
 
 ``deploy`` registers the checked-in Cards under ``service/``, which ensures the
 declared ``vala.datasets.tickets`` table, turns on metadata capture, and checks
 the Agent's model is deployed. ``serve`` answers every question in its own
-Agent Run. ``wait_for_verdicts`` waits for both Verifiers to judge every
-answer, and ``explain`` joins one Run's evidence over MCP.
+Agent Run and submits each answer for a background policy check.
+``wait_for_verdicts`` resumes each check from its execution ID alone and waits
+for its result, ``check`` judges one answer immediately, and ``explain`` joins
+one Run's evidence over MCP.
 
 Run it against a server: ``WYRD_SERVER_URL=... WYRD_API_KEY=... python support_desk.py``.
 """
@@ -23,8 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from opentelemetry import trace
-from pydantic import BaseModel
-from wyrd.bifrost import Bifrost
+from wyrd import verify
 from wyrd.cards import Cards, RegistrationReceipt
 from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
@@ -61,16 +63,13 @@ class Served:
     """One answered request."""
 
     run_id: str
-    passed: bool
-    """Whether ``no-refund-promise`` passed the answer in real time."""
+    execution_id: str
+    """The background policy check of the request's answer."""
 
 
-class VerdictCount(BaseModel):
-    """One verdict count row."""
-
-    verifier_card_uid: str
-    verdict: str
-    n: int
+def policy_check(answer: str) -> dict[str, Any]:
+    """The ``policy-check`` inputs for ``answer``: the answer and the checked-in policy PDF."""
+    return {"answer": answer, "policy": verify.File(SERVICE / "refund-policy.pdf")}
 
 
 def deploy(client: WyrdClient, bundle: Path) -> Desk:
@@ -109,8 +108,8 @@ def question(index: int) -> str:
 def serve(desk: Desk) -> list[Served]:
     """Answer ``REQUESTS`` questions, each in its own Agent Run inside a
     ``support-desk.request`` span: invoke the Agent through the gateway, record
-    the ticket, observe the answer for ``answer-quality``, and judge it with
-    ``no-refund-promise``. Telemetry and observations are flushed on return.
+    the ticket, and submit the answer for a background ``policy-check`` without
+    waiting for it. Telemetry and tickets are flushed on return.
     """
     state = desk.state
     state.start_bifrost()
@@ -131,49 +130,46 @@ def serve(desk: Desk) -> list[Served]:
                     "refund": "refund" in asked,
                 },
             )
-            run.observe.eval({"answer": answer})
-            judgment = run.observe.verify("no-refund-promise", {"answer": answer})
-        served.append(Served(run.run_id, judgment.passed))
+            execution = run.observe.submit("policy-check", **policy_check(answer))
+        if not isinstance(execution, verify.Execution):
+            raise TypeError("policy-check judges Run evidence, not a window")
+        served.append(Served(run.run_id, execution.id))
     state.shutdown()
     return served
 
 
-def wait_for_verdicts(client: WyrdClient, desk: Desk, timeout: float) -> dict[str, tuple[int, int]]:
-    """Wait until both Verifiers have judged every answer, then return their
-    ``(passed, failed)`` counts by Verifier name.
+def check(desk: Desk, answer: str) -> verify.VerificationResult:
+    """Judge ``answer`` with ``policy-check`` now, in a fresh Agent Run.
 
     Raises:
-        TimeoutError: when the verdicts are not all in within ``timeout`` seconds.
+        WyrdError: the local input refusal or the server's refusal of the execution.
     """
-    bifrost = Bifrost(client=client)
-    names = {desk.uid(name): name for name in ("answer-quality", "no-refund-promise")}
+    return desk.state.run("agent").observe.verify("policy-check", **policy_check(answer))
+
+
+def wait_for_verdicts(
+    client: WyrdClient, served: list[Served], timeout: float
+) -> list[verify.VerificationResult]:
+    """Resume every served request's background check from its execution ID
+    alone, as another process would, and wait for its result, in ``served`` order.
+
+    Raises:
+        WyrdError: the execution's own error, or
+            ``WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`` when the results are not
+            all in within ``timeout`` seconds.
+    """
     deadline = time.monotonic() + timeout
-    while True:
-        rows = bifrost.sql(
-            "SELECT verifier_card_uid, verdict, COUNT(*) AS n FROM vala.verification.results "
-            "WHERE card_uid = $1 GROUP BY verifier_card_uid, verdict",
-            [desk.uid("support-agent")],
-            model=VerdictCount,
+    return [
+        verify.Execution.connect(request.execution_id, client).wait(
+            max(deadline - time.monotonic(), 0.0)
         )
-        verdicts: dict[str, tuple[int, int]] = {}
-        for row in rows:
-            if name := names.get(row.verifier_card_uid):
-                passed, failed = verdicts.get(name, (0, 0))
-                verdicts[name] = (
-                    (passed + row.n, failed)
-                    if row.verdict == "passed"
-                    else (passed, failed + row.n)
-                )
-        if all(sum(verdicts.get(name, (0, 0))) >= REQUESTS for name in names.values()):
-            return verdicts
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"verdicts still incomplete after {timeout} s: {verdicts}")
-        time.sleep(1)
+        for request in served
+    ]
 
 
 def explain(client: WyrdClient, run_id: str) -> dict[str, Any]:
-    """Join every piece of evidence of Run ``run_id`` — its observation,
-    ticket, request span, gateway call, and both verdicts — through MCP
+    """Join every piece of evidence of Run ``run_id`` — its ticket, request
+    span, gateway call, and policy-check verdict — through MCP
     ``bifrost.query`` with a fresh access token, as column name to value.
 
     Raises:
@@ -184,15 +180,14 @@ def explain(client: WyrdClient, run_id: str) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9a-fA-F-]+", run_id):
         raise ValueError(f"malformed Run ID {run_id}")
     sql = (
-        "SELECT o.run_id, o.trace_id, t.ticket_id, t.answer, s.name AS span, "
-        "g.call_id, g.card_uid AS call_card_uid, c.verdict AS continuous, r.verdict AS realtime "
-        "FROM vala.eval.observations o "
-        "JOIN vala.datasets.tickets t ON t.run_id = o.run_id "
-        "JOIN vala.traces.spans s ON s.trace_id = o.trace_id AND s.run_id = o.run_id "
-        "JOIN vala.gateway.calls g ON g.run_id = o.run_id AND g.card_uid = o.card_uid "
-        "JOIN vala.verification.results c ON c.run_id = o.run_id AND c.binding_id IS NOT NULL "
-        "JOIN vala.verification.results r ON r.run_id = o.run_id AND r.binding_id IS NULL "
-        f"WHERE o.run_id = '{run_id}' AND s.name = 'support-desk.request'"
+        "SELECT t.run_id, s.trace_id, t.ticket_id, t.answer, s.name AS span, "
+        "g.call_id, g.card_uid AS call_card_uid, r.verdict "
+        "FROM vala.datasets.tickets t "
+        "JOIN vala.traces.spans s ON s.run_id = t.run_id "
+        "JOIN vala.gateway.calls g ON g.run_id = t.run_id "
+        "JOIN vala.verification.results r ON r.run_id = t.run_id "
+        f"WHERE t.run_id = '{run_id}' AND s.name = 'support-desk.request' "
+        "ORDER BY g.call_id LIMIT 1"
     )
     body = {
         "jsonrpc": "2.0",
@@ -245,16 +240,34 @@ def explain(client: WyrdClient, run_id: str) -> dict[str, Any]:
 
 
 def main() -> None:
-    """Deploy, serve, and print the verdicts and one passing and one failing explanation."""
+    """Deploy, judge one refund promise now, serve, wait for every background
+    check, resume the first failure by its ID alone, and explain one passing
+    and one failing request.
+    """
     client = WyrdClient()
     with tempfile.TemporaryDirectory() as bundle:
         desk = deploy(client, Path(bundle) / "bundle")
+        print(f"deployed support-agent {desk.uid('support-agent')}")
+        print(f"immediate check: {check(desk, 'You have a guaranteed refund.').verdict}")
         served = serve(desk)
-        print(wait_for_verdicts(client, desk, timeout=300))
-        for passed in (True, False):
-            run = next((request for request in served if request.passed is passed), None)
-            if run is not None:
-                print(explain(client, run.run_id))
+        results = wait_for_verdicts(client, served, timeout=300)
+        paired = list(zip(served, results, strict=True))
+        failed = next(
+            (request for request, result in paired if result.verdict == "failed"),
+            None,
+        )
+        if failed is not None:
+            # Any process can resume a check from its ID with the ambient client.
+            resumed = verify.Execution.connect(failed.execution_id).wait(30)
+            for requirement in resumed.requirements:
+                print(f"{requirement['id']}: {requirement['outcome']} ({requirement['reason']})")
+        for verdict in ("passed", "failed"):
+            request = next(
+                (request for request, result in paired if result.verdict == verdict),
+                None,
+            )
+            if request is not None:
+                print(explain(client, request.run_id))
 
 
 if __name__ == "__main__":

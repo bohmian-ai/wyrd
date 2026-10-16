@@ -99,13 +99,11 @@ mod agent_executor {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::InMemoryTraceSource;
     use crate::context::ExecutionContext;
     use crate::executor::{EvalReport, Executors, TaskRunOutcome, execute_plan};
     use crate::store::TaskRegistry;
-    use crate::tasks::{
-        AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, TraceTaskExecutor,
-    };
-    use crate::{InMemoryTraceSource, MockJudgeInvoker};
+    use crate::tasks::{AgentTaskExecutor, AssertionTaskExecutor, TraceTaskExecutor};
     use serde_json::{Value, json};
     use uuid::Uuid;
     use wyrd_spec::vala::eval::{
@@ -147,11 +145,12 @@ mod agent_executor {
         }
     }
 
+    /// Build the executor bundle these tests dispatch through: production
+    /// assertion and agent executors plus a trace executor over an empty
+    /// in-memory source, so trace tasks reach no external trace store.
     fn executors() -> Executors {
-        let mock = MockJudgeInvoker::new(std::iter::empty());
         Executors {
             assertion: Arc::new(AssertionTaskExecutor::new()),
-            judge: Arc::new(JudgeTaskExecutor::new(mock)),
             trace: Arc::new(TraceTaskExecutor::new(
                 Arc::new(InMemoryTraceSource::new()),
                 Duration::from_millis(250),

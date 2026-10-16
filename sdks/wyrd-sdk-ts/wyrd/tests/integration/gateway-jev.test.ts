@@ -1,15 +1,11 @@
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
 import OpenAI from "openai";
 import { expect, vi } from "vitest";
 
-import { Bifrost, Cards, Gateway, WyrdClient, WyrdState } from "wyrd-ai";
+import { Gateway, WyrdClient } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
-import { fixture, serverTest } from "../support/server.js";
+import { serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 120_000 });
 
@@ -24,20 +20,6 @@ const QUESTIONS = {
     type: "choice",
     instructions: "What is the tone of the reply?",
     criteria: { polite: "courteous", rude: "curt" },
-  },
-};
-
-/** The typed questions the native Jev judge Prompt asks about every reply. */
-const JUDGE_QUESTIONS = {
-  helpful: {
-    type: "noul",
-    instructions: "Does the reply help the customer?",
-    criteria: { true: "it resolves or advances the request", false: "it ignores or deflects the request" },
-  },
-  tone: {
-    type: "choice",
-    instructions: "What is the tone of the reply?",
-    criteria: { polite: "courteous and respectful", rude: "curt or dismissive" },
   },
 };
 
@@ -102,14 +84,9 @@ function chat(state: string): OpenAI.Chat.ChatCompletionMessageParam[] {
   ];
 }
 
-/**
- * A verification-capable server with one Jev deployment serving
- * `system_one` and the `chat_completions` pass-through, call metadata
- * captured so every judge call lands in Bifrost, and the hydrated
- * `reviewer` Service acting as its own Card-scoped key.
- */
-const test = serverTest({ provider: jev, verificationRuntime: true }).extend<{ reviewer: WyrdState }>({
-  reviewer: [
+/** A server with one Jev deployment serving `system_one` and the `chat_completions` pass-through. */
+const test = serverTest({ provider: jev }).extend<{ deployed: void }>({
+  deployed: [
     async ({ server: _ }, use) => {
       await cli.putProviderCredential({
         name: "jev-key",
@@ -122,19 +99,13 @@ const test = serverTest({ provider: jev, verificationRuntime: true }).extend<{ r
         auth: { bearer: { credential: "jev-key" } },
         capabilities: ["system_one", "chat_completions"],
       });
-      await (await Gateway.connect()).putCapturePolicy({ mode: "metadata", payload_fields: [] });
-      const cards = await Cards.connect();
-      const receipt = await cards.registerFromPath(fixture("cards/gateway_jev/reviewer.yaml"));
-      const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-reviewer-"));
-      await cards.hydrate(receipt.root, bundle);
-      const { key } = await cli.issueKey({ kind: "Service", name: "reviewer", version: "1.0.0", space: "default" });
-      await use(WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) }));
+      await use();
     },
     { scope: "file" },
   ],
 });
 
-test("native systemone answers relay intact", async ({ provider, reviewer: _ }) => {
+test("native systemone answers relay intact", async ({ provider, deployed: _ }) => {
   const before = provider.received.length;
   const body = { model: "jev-latest", state: "Thanks!", questions: QUESTIONS };
 
@@ -147,7 +118,7 @@ test("native systemone answers relay intact", async ({ provider, reviewer: _ }) 
   expect(JSON.parse(upstream?.body ?? "")).toEqual(body);
 });
 
-test("invalid jev questions are refused before jev", async ({ provider, reviewer: _ }) => {
+test("invalid jev questions are refused before jev", async ({ provider, deployed: _ }) => {
   const before = provider.received.length;
 
   for (const body of [
@@ -165,7 +136,7 @@ test("invalid jev questions are refused before jev", async ({ provider, reviewer
   expect(provider.received.slice(before)).toEqual([]);
 });
 
-test("chat completions pass typed jev requests through", async ({ provider, reviewer: _ }) => {
+test("chat completions pass typed jev requests through", async ({ provider, deployed: _ }) => {
   const before = provider.received.length;
   const openai = await openaiClient();
   const state = 'He said "thanks".\nAnything else?';
@@ -188,94 +159,6 @@ test("chat completions pass typed jev requests through", async ({ provider, revi
   expect(provider.received.length).toBe(before + 1);
 });
 
-test("jev judge passes a helpful polite reply", async ({ provider, reviewer }) => {
-  const before = provider.received.length;
-
-  const judgment = await reviewer
-    .run("agent")
-    .observe.verify("reply-quality", { question: "Where is my refund?", answer: "Your refund is on its way." });
-
-  expect(judgment).toMatchObject({ passed: true, verdict: "passed", kind: "eval_llm_judge" });
-  const [upstream] = provider.received.slice(before);
-  expect(JSON.parse(upstream?.body ?? "")).toMatchObject({
-    model: "jev-latest",
-    state: "Question: Where is my refund?\nAnswer: Your refund is on its way.",
-  });
-});
-
-test("jev judge fails an unhelpful rude reply", async ({ reviewer }) => {
-  const judgment = await reviewer
-    .run("agent")
-    .observe.verify("reply-quality", { question: "Where is my refund?", answer: "Go away." });
-
-  // The judge task itself passes; both threshold assertions fail.
-  expect(judgment).toMatchObject({
-    passed: false,
-    verdict: "failed",
-    counts: { implementation: "eval", passed_tasks: 1, failed_tasks: 2, total_tasks: 3 },
-  });
-});
-
-test("jev judge judges a reply with quotes and newlines", async ({ server, provider, reviewer }) => {
-  const before = provider.received.length;
-  // The file shares one server, so the judge's call is the one `system_one`
-  // call this verify adds. Correlating it to the judgment's Run is owned by
-  // the verify-attribution change, not by the Jev provider.
-  const systemOneCalls = async (): Promise<Array<Record<string, unknown>>> => {
-    server.flushBifrost();
-    return (
-      await (
-        await Bifrost.connect()
-      ).sql(
-        "SELECT call_id, outcome, CAST(attempt_count AS INT) AS attempt_count FROM vala.gateway.calls WHERE operation = 'system_one'",
-      )
-    )
-      .toArrow()
-      .toArray()
-      .map((row) => row.toJSON());
-  };
-  const earlier = new Set((await systemOneCalls()).map((call) => call.call_id));
-  const question = 'Is my "refund" done?\nOrder 7';
-  const reply = 'He said "your refund is on its way".\nAnything else?';
-
-  const judgment = await reviewer.run("agent").observe.verify("reply-quality", { question, answer: reply });
-
-  expect(judgment).toMatchObject({ passed: true, verdict: "passed" });
-  const [upstream, ...rest] = provider.received.slice(before);
-  expect(rest).toEqual([]);
-  expect(upstream?.headers.authorization).toBe(`Bearer ${JEV_KEY}`);
-  expect(JSON.parse(upstream?.body ?? "")).toEqual({
-    model: "jev-latest",
-    state: `Question: ${question}\nAnswer: ${reply}`,
-    questions: JUDGE_QUESTIONS,
-  });
-  const judged = (await systemOneCalls()).filter((call) => !earlier.has(call.call_id));
-  expect(judged.map(({ outcome, attempt_count }) => ({ outcome, attempt_count }))).toEqual([
-    { outcome: "succeeded", attempt_count: 1 },
-  ]);
-  const recorded = (
-    await (
-      await Bifrost.connect()
-    ).sql("SELECT implementation, verdict FROM vala.verification.results WHERE result_id = $1", [judgment.execution_id])
-  )
-    .toArrow()
-    .toArray()
-    .map((row) => row.toJSON());
-  expect(recorded).toEqual([{ implementation: "eval", verdict: "passed" }]);
-});
-
-test("jev judge refusal is a typed error without retry", async ({ provider, reviewer }) => {
-  const before = provider.received.length;
-
-  const refused = reviewer
-    .run("agent")
-    .observe.verify("reply-quality", { question: "Where is my refund?", answer: "refused-form" });
-
-  await expect(refused).rejects.toMatchObject({ code: "WYRD_VERIFICATION_502_DEPENDENCY_FAILED" });
-  await expect(refused).rejects.not.toThrow(JEV_KEY);
-  expect(provider.received.length).toBe(before + 1);
-});
-
 /** The OpenAI client error a Chat Completions call to the Jev model about `state` rejects with. */
 async function chatRefusal(openai: OpenAI, state: string): Promise<InstanceType<typeof OpenAI.APIError> | undefined> {
   return openai.chat.completions.create({ model: "jev/jev-latest", messages: chat(state) }).then(
@@ -291,7 +174,7 @@ async function chatRefusal(openai: OpenAI, state: string): Promise<InstanceType<
 // Every refusal relays exactly like every other provider's: the upstream
 // status with Jev's body natively and an OpenAI error envelope on Chat
 // Completions, the operator key removed, and no Wyrd code invented.
-test("jev refusals relay like other providers", async ({ provider, reviewer: _ }) => {
+test("jev refusals relay like other providers", async ({ provider, deployed: _ }) => {
   const openai = await openaiClient();
   const native = (state: string) => post("/v1/systemone", { model: "jev/jev-latest", state, questions: QUESTIONS });
 

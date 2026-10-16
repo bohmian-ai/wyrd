@@ -71,6 +71,17 @@ Locked cross-cutting decisions that any contributor must honor:
   authoring helpers, OTEL integration, agent workflow integration, and test
   tooling, but they must not move server-owned durable behavior out of the
   server or create language-specific durable contracts.
+- Wyrd runs on macOS and Linux, on both x86_64 and arm64. This is locked and
+  never open for discussion. Every feature, including isolation, resource
+  limits, and process management, must work identically on all four
+  targets. Never build on a platform-specific mechanism (cgroups,
+  namespaces, Landlock, seccomp, `/proc`, `prlimit`, setuid/credential
+  switching, sandbox-exec, or similar), never gate a feature behind
+  `cfg(target_os)`, and never treat a platform-specific mechanism as a
+  deployment prerequisite or a spec question. If a review, task, or spec
+  asks for one, implement the requirement portably in Rust or the
+  dependency's own cross-platform facilities, and report the platform-
+  specific request as invalid.
 - Wyrd must work both self-hosted and as a cloud SaaS product. SaaS and
   enterprise deployments require full tenant separation for identity, authz,
   storage, registry, policy, audit, observability, evaluation, and generated
@@ -85,8 +96,8 @@ Locked cross-cutting decisions that any contributor must honor:
   outer `kind: Card` wrapper. The v1 doctrine has 14 registrable native kinds:
   `Data`, `Model`, `Artifact`, `Experiment`, `Prompt`, `Agent`, `Mcp`,
   `Service`, `Policy`, `Audit`, `Verifier`, `Source`, `Trigger`, and
-  `Operator`. Drift and Eval are typed `Verifier`
-  implementations, not Card kinds. `CardKind::External` is a non-registrable
+  `Operator`. Drift and Agent judging are `Verifier` check kinds,
+  not Card or Verifier kinds. `CardKind::External` is a non-registrable
   discriminator for foreign schema descriptors; it has no `ExternalSpec`.
 - `Tool` is a Skald/runtime registry concept, not a Card kind.
 - Sub-agency is an Agent-to-Agent relationship, not a `SubAgent` Card kind.

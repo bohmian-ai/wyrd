@@ -128,6 +128,11 @@ id_type!(
     "Name of a `${media:id}` binding slot in a resolved judge Prompt.",
     validate_card_token
 );
+id_type!(
+    SlotName,
+    "Name of one Verifier input slot, addressed as `inputs.<slot>`.",
+    validate_identifier
+);
 id_type!(SplitName, "DataCard split label.", validate_card_token);
 id_type!(QueryName, "DataCard SQL query key.", validate_card_token);
 id_type!(
@@ -350,31 +355,23 @@ uuid7_id_type!(
 );
 
 uuid7_id_type!(
-    /// Durable identity of one Verifier run in `wyrd.verifier_runs`.
-    ///
-    /// The server mints it when scheduled, manual, or observation work is
-    /// enqueued. It is the managed `run_id` of every result and detail row the
-    /// run publishes and addresses the run's status and Operator dispatches.
-    /// Retries and lease reclaims keep it.
-    VerificationRunId
-);
-
-uuid7_id_type!(
     /// Durable identity of one canonical Verification Result.
     ///
-    /// The runner mints it for a completed run's result batches: the summary
-    /// row in `vala.verification.results` and every detail row join on
-    /// (`data_tenant_id`, `result_id`), and the settled run points at it.
+    /// Minted for a completed execution's result: the row in
+    /// `vala.verification.results` and every detail row join on
+    /// (`data_tenant_id`, `result_id`), and the settled execution points at it.
     VerificationResultId
 );
 
 uuid7_id_type!(
-    /// Transient identity of one direct Verifier execution.
+    /// Server-issued identity of one exact Verifier execution.
     ///
-    /// `POST /v1/verification/execute` mints it per request. It appears only
-    /// in that response, the request's audit decision, its trace, and as the
-    /// `result_id` of the execution's recorded result rows.
-    VerificationExecutionId
+    /// The server mints it for every real-time or queued execution. One
+    /// application Run can own many executions; scheduled executions have no
+    /// Run. It keys the execution's `wyrd.verifier_executions` row, its
+    /// result and input records, and its Operator dispatches. Retries and
+    /// lease reclaims keep it.
+    ExecutionId
 );
 
 uuid7_id_type!(
@@ -424,6 +421,20 @@ fn validate_token_with_min(value: &str, min_len: usize) -> Result<(), IdError> {
         Ok(())
     } else {
         Err(IdError::InvalidToken)
+    }
+}
+
+/// Accepts an identifier matching `[a-zA-Z_][a-zA-Z0-9_]{0,63}`.
+///
+/// # Errors
+///
+/// Returns [`IdError::InvalidIdentifier`] for an empty, over-long, or
+/// non-identifier value.
+fn validate_identifier(value: &str) -> Result<(), IdError> {
+    if value.len() <= 64 && crate::card::prompt::is_valid_parameter_name(value) {
+        Ok(())
+    } else {
+        Err(IdError::InvalidIdentifier)
     }
 }
 
@@ -495,4 +506,47 @@ pub enum IdError {
     /// Model identifier was empty, longer than 255 bytes, or held a control character.
     #[error("model identifier must be 1..=255 UTF-8 bytes without control characters")]
     InvalidModelId,
+    /// Identifier did not match `[a-zA-Z_][a-zA-Z0-9_]{0,63}`.
+    #[error("identifier must match [a-zA-Z_][a-zA-Z0-9_]{{0,63}}")]
+    InvalidIdentifier,
+}
+
+#[cfg(test)]
+mod tests {
+    //! Identifier grammar acceptance and refusal.
+
+    use super::*;
+
+    /// Slot names use the identifier grammar so every SDK can pass them as
+    /// named arguments and references can address them as dotted fields.
+    ///
+    /// # Panics
+    /// Panics when the identifier grammar accepts or refuses the wrong names.
+    #[test]
+    fn slot_name_uses_identifier_grammar() {
+        for valid in ["answer", "Policy_2", "_x"] {
+            SlotName::new(valid).expect(valid);
+        }
+        for invalid in ["", "2x", "a-b", "a.b", "a b", &"x".repeat(65)] {
+            assert!(SlotName::new(invalid).is_err(), "{invalid}");
+        }
+        assert!(serde_json::from_str::<SlotName>("\"a.b\"").is_err());
+    }
+
+    /// Execution identities are server-minted `UUIDv7` values.
+    ///
+    /// # Panics
+    /// Panics when a non-v7 UUID is accepted.
+    #[test]
+    fn execution_id_requires_uuid7() {
+        let minted = ExecutionId::new_v7();
+        assert_eq!(
+            minted
+                .to_string()
+                .parse::<ExecutionId>()
+                .expect("round trip"),
+            minted
+        );
+        assert!(Uuid::nil().to_string().parse::<ExecutionId>().is_err());
+    }
 }

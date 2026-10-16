@@ -417,7 +417,7 @@ pub fn bind_tenant_route(route: TenantSpanRoute) {
 /// `route`, apart from the rest of its request.
 ///
 /// An operation performed by a different actor than its request binds its
-/// own pair here, such as a judge call the tenant SYSTEM principal makes for
+/// own pair here, such as an agent-check call the tenant SYSTEM principal makes for
 /// the request's subject. The request and its other spans keep the pair
 /// [`bind_tenant_route`] bound. An unrouted span and the reserved system
 /// tenant are not routed.
@@ -495,7 +495,9 @@ impl SpanProcessor for TenantExport {
 /// Whether the behavior-span catalog names span `name`, which makes it
 /// eligible for a tenant copy.
 ///
-/// The catalog is the request span, `verification.*`, `dispatch`,
+/// The catalog is the request span, `verification.*`, the Agent loop's
+/// GenAI spans (`invoke_agent`, `chat`, `execute_tool`) that sit between a
+/// Verifier's Agent action and its gateway call, `dispatch`,
 /// `agent.gateway.call`, `gateway.*` except `gateway.attempt` (the gateway
 /// captures attempts as their own rows, so nothing below an attempt is
 /// copied either), `bifrost.gate.*`,
@@ -503,7 +505,13 @@ impl SpanProcessor for TenantExport {
 fn in_catalog(name: &str) -> bool {
     matches!(
         name,
-        "request" | "dispatch" | "agent.gateway.call" | "bifrost.oracle.query"
+        "request"
+            | "dispatch"
+            | "agent.gateway.call"
+            | "bifrost.oracle.query"
+            | "invoke_agent"
+            | "chat"
+            | "execute_tool"
     ) || name.starts_with("verification.")
         || name.starts_with("bifrost.gate.")
         || name.starts_with("otlp.")
@@ -1257,6 +1265,9 @@ mod tests {
             "dispatch",
             "agent.gateway.call",
             "verification.judge",
+            "invoke_agent",
+            "chat",
+            "execute_tool",
             "gateway.call",
             "bifrost.gate.write",
             "bifrost.oracle.query",

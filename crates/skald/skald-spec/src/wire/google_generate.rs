@@ -39,12 +39,19 @@ pub struct GoogleGenerateSettings {
     pub extra: Map<String, Value>,
 }
 
-/// One Google content turn.
+/// One Google content turn, in `contents` or as the `system_instruction`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GoogleContent {
+    /// Producer of the turn, `user` or `model`.
+    ///
+    /// Gemini makes the role optional, and a `system_instruction` normally
+    /// omits it, so an absent role decodes as empty and re-encodes as absent.
+    /// Role conversions treat an empty role as `user`, as Gemini does.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub role: String,
+    /// Ordered parts of the turn.
     pub parts: Vec<GooglePart>,
 }
 
@@ -53,7 +60,7 @@ pub struct GoogleContent {
 /// Distinct from [`GoogleContent`] because an answer is not a request: Gemini
 /// returns `{}` here when it truncates a candidate before the model speaks —
 /// a `MAX_TOKENS` candidate whose thinking consumed the whole output budget —
-/// so both members are optional. A request still requires its role and parts.
+/// so both members are optional. A request turn still requires its parts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -219,9 +226,14 @@ pub struct GoogleGenerationConfig {
     /// Response MIME type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_mime_type: Option<String>,
-    /// Response schema object.
+    /// Response schema in Gemini's OpenAPI-subset `Schema`, which refuses
+    /// `additionalProperties`. Accepted for native bodies; Skald never emits it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_schema: Option<Value>,
+    /// Response schema as JSON Schema, which Gemini and Vertex accept
+    /// natively. Skald emits this field for structured output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_json_schema: Option<Value>,
     /// Presence penalty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f32>,
@@ -283,10 +295,44 @@ pub struct GoogleTool {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GoogleFunctionDeclaration {
+    /// Function name the model calls.
     pub name: String,
+    /// What the function does, shown to the model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub parameters: Value,
+    /// Parameters in Gemini's OpenAPI-subset `Schema`, which refuses
+    /// `additionalProperties`. Accepted for native bodies; Skald never emits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Value>,
+    /// Parameters as JSON Schema, which Gemini and Vertex accept natively.
+    /// Skald emits this field, so a tool schema reaches the model as written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters_json_schema: Option<Value>,
+}
+
+impl GoogleFunctionDeclaration {
+    /// Declare a function whose parameters are a JSON Schema.
+    ///
+    /// Every Skald and gateway translation builds declarations here, so tool
+    /// schemas go to `parameters_json_schema` and keep keywords such as
+    /// `additionalProperties` that the OpenAPI-subset `parameters` refuses.
+    #[must_use]
+    pub fn json_schema(name: String, description: Option<String>, parameters: Value) -> Self {
+        Self {
+            name,
+            description,
+            parameters: None,
+            parameters_json_schema: Some(parameters),
+        }
+    }
+
+    /// The declared parameter schema, whichever field carries it.
+    #[must_use]
+    pub fn parameter_schema(&self) -> Option<&Value> {
+        self.parameters_json_schema
+            .as_ref()
+            .or(self.parameters.as_ref())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

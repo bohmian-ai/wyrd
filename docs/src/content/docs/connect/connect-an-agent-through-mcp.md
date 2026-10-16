@@ -4,7 +4,6 @@ description: Give Claude Code, Codex, Cursor, Copilot, Pi, or Hermes Agent Wyrd'
 pillar: wyrd
 section: Connect
 order: 3
-draft: true
 status: runnable
 ---
 

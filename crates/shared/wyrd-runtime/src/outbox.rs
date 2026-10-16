@@ -101,6 +101,23 @@ pub struct Outbox<S: OutboxSink> {
     sink: Arc<S>,
 }
 
+/// Names the outbox and its pending count, so values carrying a handle — a
+/// staged write that hands off to a second outbox — stay debuggable.
+impl<S: OutboxSink> std::fmt::Debug for Outbox<S> {
+    /// Write the sink's name and a relaxed snapshot of the pending count;
+    /// queued items and the sink itself are never formatted.
+    ///
+    /// # Errors
+    /// Returns the formatter's error when it rejects a write.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Outbox")
+            .field("name", &S::NAME)
+            .field("pending", &self.pending.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
 impl<S: OutboxSink> Outbox<S> {
     /// Creates the outbox around `sink` and starts its writer.
     ///

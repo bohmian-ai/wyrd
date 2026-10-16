@@ -17,13 +17,14 @@ use wyrd_spec::card::verifier::DriftBaselineState;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::registry::RegistrationOperationId;
+use wyrd_spec::vala::eval::ids::TaskId;
 use wyrd_spec::verification::VerificationError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
     NewCardRow, NewRegistrationOperation, insert_card_row, insert_registration_operation,
 };
 use wyrd_sql::queries::drift_baselines::{ClaimedBaseline, DriftBaselineQueue};
-use wyrd_sql::queries::verifier_runs::{RetryOutcome, Settlement};
+use wyrd_sql::queries::verifier_executions::{RetryOutcome, Settlement};
 use wyrd_sql::row_types::cards::CardStatus;
 
 /// A registering user principal in `tenant`; persistence queries do not authorize.
@@ -99,8 +100,25 @@ async fn insert_card(
     card_uid
 }
 
-/// Register an active PSI Verifier and its baseline Data Card, with the
-/// pending baseline row; return (Verifier UID, Data UID).
+/// The requirement ID of the one PSI drift check [`register_psi`] registers.
+///
+/// # Panics
+/// Never in practice: the literal matches the task-id grammar.
+fn psi_check() -> TaskId {
+    TaskId::new("latency_psi").expect("valid requirement id")
+}
+
+/// A stored Verifier requirement `id` whose check is a drift check by `method`.
+fn drift_requirement(id: &str, method: &str) -> Value {
+    json!({
+        "id": id,
+        "statement": "latency keeps its baseline distribution",
+        "check": { "kind": "drift", "method": method, "on": { "input": "current" } }
+    })
+}
+
+/// Register an active Verifier with one PSI drift check and its baseline Data
+/// Card, with the pending baseline row; return (Verifier UID, Data UID).
 ///
 /// # Panics
 /// Panics when a Card or the baseline row fails to insert.
@@ -115,11 +133,11 @@ async fn register_psi(
         actor,
         "Verifier",
         "psi",
-        json!({ "implementation": { "kind": "drift", "spec": { "method": "Psi" } } }),
+        json!({ "requirements": [drift_requirement("latency_psi", "Psi")] }),
     )
     .await;
     queue
-        .insert_pending(conn, &verifier, &data)
+        .insert_pending(conn, &verifier, &psi_check(), &data)
         .await
         .expect("pending baseline inserts");
     (verifier, data)
@@ -209,6 +227,7 @@ async fn pending_baseline_builds_then_becomes_ready() {
 
     let claimed = claim(&queue, &mut conn).await;
     assert_eq!(claimed.lease.verifier_uid, verifier);
+    assert_eq!(claimed.lease.requirement_id, psi_check());
     assert_eq!(claimed.data_card_uid, data);
     assert_eq!(claimed.attempt, 1);
     let building = queue
@@ -221,7 +240,7 @@ async fn pending_baseline_builds_then_becomes_ready() {
     );
     assert!(
         queue
-            .fitted(&mut conn, &verifier)
+            .fitted(&mut conn, &verifier, &psi_check())
             .await
             .expect("fitted reads")
             .is_none()
@@ -246,7 +265,7 @@ async fn pending_baseline_builds_then_becomes_ready() {
     );
     assert_eq!(
         queue
-            .fitted(&mut conn, &verifier)
+            .fitted(&mut conn, &verifier, &psi_check())
             .await
             .expect("fitted reads"),
         Some(profile)
@@ -397,11 +416,13 @@ async fn expired_leases_are_reclaimed_and_stale_tokens_fenced() {
     );
 }
 
-/// Custom Drift is ready without a baseline row, and baseline work and status
-/// are invisible across tenants while work discovery finds the owning tenant.
+/// Custom Drift is ready without a baseline row, a retired-contract Verifier
+/// is unavailable, and baseline work and status are invisible across tenants
+/// while work discovery finds the owning tenant.
 ///
 /// # Panics
-/// Panics when Custom needs a fit or another tenant can observe the baseline.
+/// Panics when Custom needs a fit, a retired Verifier is runnable, or another
+/// tenant can observe the baseline.
 #[tokio::test]
 async fn custom_needs_no_fit_and_baselines_are_tenant_isolated() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -421,10 +442,23 @@ async fn custom_needs_no_fit_and_baselines_are_tenant_isolated() {
         &actor,
         "Verifier",
         "custom",
-        json!({ "implementation": { "kind": "drift", "spec": { "method": "Custom" } } }),
+        json!({ "requirements": [drift_requirement("latency_custom", "Custom")] }),
     )
     .await;
     assert_eq!(readiness(&mut conn, &custom).await, "ready");
+    let retired = insert_card(
+        &mut conn,
+        &actor,
+        "Verifier",
+        "retired",
+        json!({ "implementation": { "kind": "drift", "spec": { "method": "Custom" } } }),
+    )
+    .await;
+    assert_eq!(
+        readiness(&mut conn, &retired).await,
+        "verifier_unavailable",
+        "a Verifier stored under the retired implementation contract cannot run"
+    );
     assert!(
         queue
             .status(&mut conn, &custom)
@@ -457,7 +491,7 @@ async fn custom_needs_no_fit_and_baselines_are_tenant_isolated() {
     );
     assert!(
         queue
-            .fitted(&mut foreign, &verifier)
+            .fitted(&mut foreign, &verifier, &psi_check())
             .await
             .expect("foreign fitted")
             .is_none()
@@ -471,9 +505,78 @@ async fn custom_needs_no_fit_and_baselines_are_tenant_isolated() {
     );
     assert!(
         queue
-            .insert_pending(&mut foreign, &verifier, &data)
+            .insert_pending(&mut foreign, &verifier, &psi_check(), &data)
             .await
             .is_err(),
         "a foreign tenant cannot attach a baseline to another tenant's Cards"
+    );
+}
+
+/// Every PSI or SPC drift check, at the Verifier or in a step, needs its own
+/// ready baseline: readiness and status follow the least-ready check, and a
+/// fitted profile is read per requirement.
+///
+/// # Panics
+/// Panics when one check's fit makes the Verifier ready, status hides the
+/// unfitted check, or a profile is read under the wrong requirement.
+#[tokio::test]
+async fn every_drift_check_needs_its_own_ready_baseline() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = DriftBaselineQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let data = insert_card(&mut conn, &actor, "Data", "baseline", json!({})).await;
+    let verifier = insert_card(
+        &mut conn,
+        &actor,
+        "Verifier",
+        "two-checks",
+        json!({
+            "requirements": [drift_requirement("latency_psi", "Psi")],
+            "steps": [{ "requirements": [drift_requirement("tokens_spc", "Spc")] }]
+        }),
+    )
+    .await;
+    let spc_check = TaskId::new("tokens_spc").expect("valid requirement id");
+    for check in [psi_check(), spc_check.clone()] {
+        queue
+            .insert_pending(&mut conn, &verifier, &check, &data)
+            .await
+            .expect("pending baseline inserts");
+    }
+
+    let first = claim(&queue, &mut conn).await;
+    let profile = json!({ "fitted": first.lease.requirement_id.as_str() });
+    queue
+        .complete(&mut conn, &first.lease, &profile)
+        .await
+        .expect("first fit completes");
+    assert_eq!(readiness(&mut conn, &verifier).await, "baseline_not_ready");
+    assert_eq!(
+        queue
+            .status(&mut conn, &verifier)
+            .await
+            .expect("status reads")
+            .map(|status| status.state),
+        Some(DriftBaselineState::Pending),
+        "status reports the check still waiting for its fit"
+    );
+
+    let second = claim(&queue, &mut conn).await;
+    assert_ne!(second.lease.requirement_id, first.lease.requirement_id);
+    queue
+        .complete(&mut conn, &second.lease, &json!({ "fitted": "second" }))
+        .await
+        .expect("second fit completes");
+    assert_eq!(readiness(&mut conn, &verifier).await, "ready");
+    assert_eq!(
+        queue
+            .fitted(&mut conn, &verifier, &first.lease.requirement_id)
+            .await
+            .expect("fitted reads"),
+        Some(profile)
     );
 }

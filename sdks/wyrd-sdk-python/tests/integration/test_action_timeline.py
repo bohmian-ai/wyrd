@@ -2,7 +2,7 @@
 
 The ``assistant`` Service, instrumented with ``start_telemetry``, records
 spans, writes a Run observation and a table row, calls a model through the
-Gateway, and verifies its answer with an Eval LLM judge, all in one span.
+Gateway, and verifies its answer with an Agent judge, all in one span.
 The timeline read returns that work as one connected, time-ordered tree.
 """
 
@@ -68,7 +68,7 @@ def test_service_action_timeline_is_one_connected_tree(
     with tracer.start_as_current_span("service.action") as action:
         with tracer.start_as_current_span("answer"):
             pass
-        state.run("model").observe.drift({"latency": 12.5})
+        state.run("model").observe.submit("latency-drift", {"latency": 12.5})
         writer.use_table_by_name(ACTIONS)
         writer.insert({"action": "answered"})
         with tracer.start_as_current_span("model.ask"):
@@ -83,8 +83,8 @@ def test_service_action_timeline_is_one_connected_tree(
                 messages=[{"role": "user", "content": "hi"}],
                 extra_headers=headers,
             )
-        judgment = state.run("agent").observe.verify("answer-is-judged", {"answer": "yes"})
-        assert judgment.passed
+        result = state.run("agent").observe.verify("answer-judged", "yes")
+        assert result.verdict == "passed"
     writer.shutdown()
     state.shutdown()
 

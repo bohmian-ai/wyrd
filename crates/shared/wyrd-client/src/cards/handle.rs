@@ -850,9 +850,13 @@ mod tests {
             (
                 CardKind::Verifier,
                 serde_json::json!({
-                    "implementation": {
-                        "kind": "drift",
-                        "spec": {
+                    "inputs": {"current": {"type": "samples", "features": ["feature"]}},
+                    "requirements": [{
+                        "id": "feature-stable",
+                        "statement": "The feature keeps its training distribution.",
+                        "check": {
+                            "kind": "drift",
+                            "on": "inputs.current",
                             "method": "Psi",
                             "signal": {
                                 "kind": "Distribution",
@@ -866,7 +870,7 @@ mod tests {
                                 "threshold": {"kind": "Fixed", "value": 0.25}
                             }
                         }
-                    }
+                    }]
                 }),
             ),
             (

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Refresh published API reference pages from repository metadata.
 
-This only rewrites pages that already exist in the content tree; publishing a
-page means adding its file.
+This only rewrites pages that already exist in the content tree; adding a
+page's file opts it in.
 """
 
 from __future__ import annotations
@@ -14,162 +14,127 @@ from pathlib import Path
 def md_escape(value: str) -> str:
     value = re.sub(r"[\n\r\t\x00-\x1f]", " ", value)
     value = value.replace("|", r"\|")
-    value = value.replace("`", r"\`")
+    # The docs style bans em dashes; a few source messages use them as pauses.
+    value = value.replace(" \u2014 ", "; ")
     value = value.replace("<", "&lt;").replace(">", "&gt;")
-    return value
+    # A brace outside a code span opens a Svelte expression, so code-format
+    # brace tokens such as `${media:name}`; code spans are escaped for Svelte.
+    parts = value.split("`")
+    parts[::2] = [re.sub(r"\$?\{+[^{}]*\}+", lambda m: f"`{m.group(0)}`", part) for part in parts[::2]]
+    return "`".join(parts)
 
 
 DOCS_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = DOCS_ROOT.parent
 OUT_DIR = DOCS_ROOT / "src" / "content" / "docs" / "api"
+
+STRING = r'"((?:[^"\\]|\\.)*)"'
+WYRD_ERROR = re.compile(r"#\[wyrd_error\((.*?)\)\]", re.S)
+
+
+def rust_string(literal: str) -> str:
+    """Undo Rust string escapes: line continuations, then escaped characters."""
+    literal = re.sub(r"\\\n\s*", "", literal)
+    return re.sub(r"\\(.)", r"\1", literal)
+
+
+def error_catalog() -> dict[str, tuple[int, str, str]]:
+    """Read every `#[wyrd_error(...)]` declared in crate and SDK sources.
+
+    The derive attributes are the catalog's single source; reading them keeps
+    this page from becoming a second, hand-maintained list. Test harness codes
+    and attributes without literal metadata (doc examples, delegates) are skipped.
+    """
+    catalog: dict[str, tuple[int, str, str]] = {}
+    for root in ("crates", "sdks"):
+        for path in sorted((REPO_ROOT / root).glob("**/src/**/*.rs")):
+            if "wyrd-error-derive" in path.parts:
+                continue
+            for body in WYRD_ERROR.findall(path.read_text(encoding="utf-8")):
+                fields = {
+                    key: re.search(rf"\b{key}\s*=\s*{pattern}", body, re.S)
+                    for key, pattern in (("code", STRING), ("status", r"(\d+)"), ("title", STRING), ("remediation", STRING))
+                }
+                if not all(fields.values()):
+                    continue
+                code = fields["code"].group(1)
+                if code.startswith("WYRD_TESTING_"):
+                    continue
+                catalog.setdefault(
+                    code,
+                    (int(fields["status"].group(1)), rust_string(fields["title"].group(1)), rust_string(fields["remediation"].group(1))),
+                )
+    return dict(sorted(catalog.items()))
 
 
 def render_openapi() -> str:
-    """Describe the one live OpenAPI contract and how tooling consumes it.
+    """Point at the one live OpenAPI document instead of restating it.
 
-    There is no repository OpenAPI file to summarize: the document is built by
-    `utoipa` from the server's own handlers and served at runtime, so anything
-    checked in here would be a second contract that can disagree with the first.
-    This page therefore explains where the real one lives rather than restating
-    a stale copy of it.
+    The document is built by `utoipa` from the server's own handlers and served
+    at runtime, so a checked-in copy would be a second contract that can drift.
     """
-    lines = [
-        "---",
-        "title: OpenAPI",
-        "description: Where the live Wyrd OpenAPI contract is served and how to consume it.",
-        "pillar: wyrd",
-        "section: Reference",
-        "order: 22",
-        "---",
-        "",
-        "# OpenAPI",
-        "",
-        "Wyrd serves one OpenAPI 3.1 document, and it is generated at runtime from the",
-        "server's own route handlers rather than checked into the repository. A running",
-        "server publishes it unauthenticated at `GET /openapi.json`, so the contract you",
-        "read is always the contract that deployment serves.",
-        "",
-        "## Consume it",
-        "",
-        "```bash",
-        "curl -s http://localhost:8080/openapi.json > openapi.json",
-        "```",
-        "",
-        "Any Swagger- or OpenAPI-compatible tool takes that URL or file directly:",
-        "point Swagger UI, Redoc, or an `openapi-generator` client at it, or load it",
-        "into Postman or Bruno to explore the API interactively.",
-        "",
-        "Every operation declares its authentication, typed request and response",
-        "bodies, `application/problem+json` error media type, and the stable Wyrd",
-        "error codes it can return.",
-        "",
-    ]
-    return "\n".join(lines)
-
-
-def render_errors() -> str:
     return "\n".join(
         [
             "---",
-            "title: Errors",
-            "description: Error handling guidance for Wyrd API clients and agents.",
+            "title: HTTP API",
+            "description: Where a Wyrd server serves its OpenAPI document and how to use it.",
             "pillar: wyrd",
             "section: Reference",
-            "order: 21",
+            "order: 22",
+            "status: runnable",
             "---",
             "",
-            "# Errors",
+            "Every Wyrd server serves its own OpenAPI 3.1 document at `GET /openapi.json`, without authentication. It is built from the routes that server mounts, so it always matches the version you are calling.",
             "",
-            "Wyrd returns errors as structured RFC 9457 Problem Details objects (`application/problem+json`). Agents and SDK clients must preserve the full structure and must not collapse errors into prose.",
+            "```bash",
+            "curl -s $WYRD_SERVER_URL/openapi.json > openapi.json",
+            "```",
             "",
-            "This page is the generated error catalog. For how an agent should act on these errors, see [Error remediation](/for-agents/error-remediation/).",
+            "Load the file or the URL into any OpenAPI tool, such as Swagger UI, Redoc, Postman, or a client generator.",
             "",
-            "## Client transport codes",
+            "Each operation declares its authentication, request and response bodies, and the Wyrd error codes it can return. Errors use `application/problem+json`; see [Error codes](/api/errors/).",
             "",
-            "| Code | Status | Title | Remediation |",
-            "|---|---:|---|---|",
-            "| `WYRD_CLIENT_400_CONFIG_INVALID` | 400 | Client transport configuration failed validation | Fix the `details.field` named on the error, then reconstruct the client. Not a retry path. |",
-            "| `WYRD_CLIENT_401_NO_CREDENTIALS` | 401 | Credential chain produced no usable credential | Set `WYRD_ACCESS_TOKEN`, `WYRD_WORKLOAD_TOKEN`+`WYRD_TENANT`, or `WYRD_API_KEY`. Not a retry path. |",
-            "| `WYRD_CLIENT_503_TRANSPORT_DOWN` | 503 | Client transport is unavailable | Retry with backoff once the network or server health recovers. |",
-            "",
-            "## Error fields",
-            "",
-            "| Field | Description |",
-            "| --- | --- |",
-            "| `type` | URI identifying the error class |",
-            "| `title` | Human-readable summary of the error class (stable across instances) |",
-            "| `status` | HTTP status code (integer) |",
-            "| `code` | Wyrd-specific machine-readable error code (string, stable) |",
-            "| `detail` | Instance-specific description of what went wrong |",
-            "| `remediation` | Actionable guidance for the caller or agent |",
-            "| `context` / `details` | Structured key/value map with operation-specific fields |",
-            "| `request_id` | Present when the server can correlate the request |",
-            "| `trace_id` | Present when distributed tracing is active |",
-            "| `instance` | URI identifying the specific resource or operation that failed (when applicable) |",
-            "",
-            "## Agent handling",
-            "",
-            "- Preserve all structured fields; do not collapse errors into prose.",
-            "- Use `code` for programmatic branching, not `title` or `detail` (those are for humans).",
-            "- Surface policy and audit failures as decisions (not generic transport failures).",
-            "- Keep retries bounded and tied to idempotent operations.",
-            "- Link remediation steps to the card or run that caused the error.",
-            "",
-            "## Skald agent codes",
-            "",
-            "| Code | Status | When |",
-            "| --- | --- | --- |",
-            "| `SKALD_AGENT_404_PROVIDER` | 404 | The provider registry returned no client for the agent's `ProviderName`. Bind the missing provider before constructing the agent, or correct the agent def. |",
-            "| `SKALD_AGENT_404_TOOL` | 404 | The provider response requested a tool name not registered for the agent. Add the tool to the agent's `ToolRegistry`, or remove the tool reference from the agent def. |",
-            "| `SKALD_AGENT_409_PROVIDER_MISMATCH` | 409 | `Agent::run_prompt` received prompt messages for a different provider than the agent's bound provider. Rebuild the prompt for the agent provider before running it. |",
-            "| `SKALD_AGENT_422_TOOL_ARGS` | 422 | A dispatched tool rejected the provider-emitted arguments. Inspect the tool's input schema and the response payload. |",
-            "| `SKALD_AGENT_422_SYSTEM_PROMPT` | 422 | The agent's system prompt failed to shape into native messages for the chosen provider. Custom providers must author the system content into the prompt body directly. |",
-            "| `SKALD_AGENT_422_PROMPT` | 422 | `Agent::run_prompt` received a prompt that cannot be sent by the agent's provider. Validate the prompt body and provider before dispatch. |",
-            "| `SKALD_AGENT_500_MAX_ITERATIONS` | 500 | The bounded tool loop exceeded `RunConfig::max_iterations`. Raise the cap or fix the agent and tool set so the model terminates. |",
-            "| `SKALD_AGENT_502_PROVIDER` | 502 | The underlying `skald-runtime` provider call failed. The chained `SKALD_RUNTIME_*` code identifies the transport or decode failure. |",
-            "",
-            "## Prompt and CLI authoring codes",
-            "",
-            "| Code | Status | When |",
-            "| --- | --- | --- |",
-            "| `WYRD_AGENT_422_STRUCTURED_DECODE` | 422 | Response text is not valid JSON when `Prompt.output` is set. |",
-            "| `WYRD_PROMPT_422_PYDANTIC_REQUIRED` | 422 | Pydantic is required for class-based `Prompt(output=Model)` schemas. |",
-            "| `WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA` | 422 | The `Prompt(output=...)` dict cannot be reduced to JSON Schema. |",
-            "| `WYRD_PROMPT_400_PROVIDER_MISMATCH` | 400 | A provider accessor was called on a different provider's response. |",
-            "| `WYRD_CLI_400_CARD_EXTENSION_UNSUPPORTED` | 400 | A card file extension is not `.json`, `.yaml`, or `.yml`. |",
-            "| `WYRD_CLI_500_IO` | 500 | Filesystem IO failed during a CLI operation. |",
-            "",
-            "## Server installation codes",
-            "",
-            "`wyrd server install` reports these. Every one leaves the previously installed server active.",
-            "",
-            "| Code | Status | When |",
-            "| --- | --- | --- |",
-            "| `WYRD_CLI_400_SERVER_HOST_UNSUPPORTED` | 400 | The host is not macOS or glibc Linux on x86_64 or aarch64, so no official bundle exists for it. |",
-            "| `WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE` | 503 | The release listing or a download failed, no stable release is published, or the newest release has no bundle for this host. |",
-            "| `WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED` | 422 | `checksums.txt` or its signature is missing or not signed by the Wyrd release key, the bundle's SHA-256 differs, or the bundle does not extract to a runnable server. |",
-            "| `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | 409 | The newest stable server is outside the CLI's compatible version line. Upgrade the CLI. |",
-            "",
-            "## MCP host codes",
-            "",
-            "`wyrd mcp install` and `wyrd mcp proxy` report these. Credential and endpoint failures use the shared client codes.",
-            "",
-            "| Code | Status | When |",
-            "| --- | --- | --- |",
-            "| `WYRD_CLI_400_MCP_HOST_SELECTION` | 400 | No host was selected: a non-interactive run named no `--host` (the message lists the detected hosts), or no supported host was detected for the prompt. Nothing changed. |",
-            "| `WYRD_CLI_409_MCP_HOST_INSTALL` | 409 | At least one selected host was not connected: not detected, a `wyrd` entry that does not run `wyrd mcp proxy`, a file that cannot be parsed or edited, or a file that cannot be written. Each host's line names the file and next step; that host's file is unchanged and other hosts still install. |",
-            "| `WYRD_CLI_503_MCP_PROXY` | 503 | The proxy could not establish its MCP session with the server's `/mcp`, or could not serve the host over stdio. |",
-            "",
-            "## Registry codes",
-            "",
-            "| Code | Status | When |",
-            "| --- | --- | --- |",
-            "| `WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID` | 400 | The `Idempotency-Key` header is malformed. Send a non-empty opaque key and retry the request. |",
-            "| `WYRD_SPEC_400_DUPLICATE_SUBMISSION` | 400 | Two submissions use the same `(kind, space, name)` identity. Submit each identity once per request. |",
-            "| `WYRD_REGISTRY_409_SPEC_DRIFT` | 409 | Re-apply with the same identity but a different `spec_hash`; same-version cards are immutable. |",
-            "| `WYRD_REGISTRY_410_OPERATION_EXPIRED` | 410 | The registration idempotency operation has expired. Start a new registration with a fresh idempotency key. |",
+            "The Rust, Python, and TypeScript SDKs call this same API, so you only need it for another language or for raw HTTP.",
             "",
         ]
     )
+
+
+def render_errors() -> str:
+    lines = [
+        "---",
+        "title: Error codes",
+        "description: Every stable Wyrd error code with its HTTP status, title, and fix.",
+        "pillar: wyrd",
+        "section: Reference",
+        "order: 21",
+        "status: runnable",
+        "---",
+        "",
+        "Every Wyrd error carries a stable `code`, such as `WYRD_SPEC_400_VALIDATION`: the area, the HTTP status, and the cause. Branch on `code`, never on the message. The same code reaches you over HTTP, MCP, the CLI, and every SDK.",
+        "",
+        "Over HTTP an error is an RFC 9457 `application/problem+json` body:",
+        "",
+        "| Field | Meaning |",
+        "| --- | --- |",
+        "| `code` | The stable code from the tables below |",
+        "| `status` | The HTTP status |",
+        "| `title` | A fixed summary of the code |",
+        "| `detail` | What went wrong in this request |",
+        "| `remediation` | What to do about it |",
+        "| `details` | Fields specific to the error, such as `rule` and `path` for a validation failure |",
+        "",
+        "This page is generated from the error definitions in the Wyrd source.",
+        "",
+    ]
+    groups: dict[str, list[tuple[str, int, str, str]]] = {}
+    for code, (status, title, remediation) in error_catalog().items():
+        groups.setdefault("_".join(code.split("_")[:2]), []).append((code, status, title, remediation))
+    for prefix, rows in groups.items():
+        lines += [f"## {prefix}", "", "| Code | Status | Title | Fix |", "| --- | ---: | --- | --- |"]
+        lines += [f"| `{code}` | {status} | {md_escape(title)} | {md_escape(fix)} |" for code, status, title, fix in rows]
+        lines.append("")
+    return "\n".join(lines)
 
 
 def main() -> None:

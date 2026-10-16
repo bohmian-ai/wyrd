@@ -6,8 +6,8 @@
 //! admission, routing, accounting, and capture exactly as a public ingress
 //! call does. Nothing about one call is stored on the caller, so concurrent
 //! calls cannot see each other's deadline. A caller built for a direct
-//! verification carries the Card, and optional Run, its judge calls are
-//! attributed to.
+//! verification carries the Card, and optional Run, its agent-check calls
+//! are attributed to.
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
@@ -89,7 +89,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
     /// the dialect's native response.
     ///
     /// The call's span and the gateway spans under it are routed to the
-    /// tenant under the captured caller's own pair, so a judge call SYSTEM
+    /// tenant under the captured caller's own pair, so an agent-check call SYSTEM
     /// performs for the request's subject is not recorded as the request.
     #[tracing::instrument(name = "agent.gateway.call", skip_all)]
     async fn call(

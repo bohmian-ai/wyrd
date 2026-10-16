@@ -1,10 +1,11 @@
 //! Per-execution verification telemetry: classification, phases, and waits.
 //!
 //! [`ExecutionTelemetry`] is the one owner of a Verifier execution's metric
-//! lifetime, whether a queued attempt or a direct request. It classifies the
-//! execution into the closed [`VerifierKind`] set once its exact Verifier is
-//! loaded, accumulates each [`Phase`]'s elapsed intervals, and records the
-//! dependency and provider waits measured inside the engine. Finishing emits
+//! lifetime, whether a queued attempt or a direct request. It counts the
+//! attempt when it starts, accumulates each [`Phase`]'s elapsed intervals, and
+//! records the dependency and provider waits measured inside the engine.
+//! Every Verifier runs through the one building-block engine, so series are
+//! labelled by `mode` only. Finishing emits
 //! one attempt observation and at most one sample per applicable phase;
 //! dropping it — on error, cancellation, or shutdown — still returns the
 //! active gauge exactly once. Engine overhead is the engine's elapsed time
@@ -17,8 +18,6 @@ use std::time::{Duration, Instant};
 
 use futures_util::FutureExt as _;
 use tracing::Instrument as _;
-
-use wyrd_spec::verification::VerifierKind;
 
 use crate::app::metrics::{
     VERIFICATION_ACTIVE_RUNS, VERIFICATION_ENGINE_OVERHEAD_SECONDS,
@@ -90,16 +89,8 @@ impl Phase {
     }
 }
 
-/// Mutable accounting of one execution, guarded by one short-held lock.
-#[derive(Debug)]
-struct Ledger {
-    /// The current classification, `Unknown` until the Verifier loads.
-    kind: VerifierKind,
-    /// Whether the attempt counter has been emitted.
-    counted: bool,
-    /// Measured intervals per phase, indexed like [`Phase::ALL`].
-    phases: [Vec<Interval>; 6],
-}
+/// Measured intervals per phase, indexed like [`Phase::ALL`].
+type Ledger = [Vec<Interval>; 5];
 
 /// Shareable recorder of one execution's dependency, evidence, and provider waits.
 ///
@@ -144,8 +135,8 @@ impl WaitSink {
 /// Owner of one verification execution's metrics lifetime.
 ///
 /// Created when a queued attempt is claimed or a direct request enters the
-/// runtime; it raises the active gauge at once and lowers it exactly once on
-/// drop, under whatever kind the execution then carries. A direct execution
+/// runtime; it counts the attempt and raises the active gauge at once and
+/// lowers the gauge exactly once on drop. A direct execution
 /// dropped before [`finish`](Self::finish) — a client disconnect — finishes
 /// as `cancelled`.
 #[derive(Debug)]
@@ -154,7 +145,7 @@ pub struct ExecutionTelemetry {
     mode: ExecutionMode,
     /// When the execution entered the runtime.
     started: Instant,
-    /// Classification and phases.
+    /// Measured phase intervals.
     ledger: Mutex<Ledger>,
     /// Waits measured inside the engine.
     waits: WaitSink,
@@ -163,23 +154,16 @@ pub struct ExecutionTelemetry {
 }
 
 impl ExecutionTelemetry {
-    /// Start accounting for one `mode` execution, initially `unknown`.
+    /// Start accounting for one `mode` execution: count the attempt and raise
+    /// the active gauge.
     #[must_use]
     pub fn start(mode: ExecutionMode) -> Self {
-        metrics::gauge!(
-            VERIFICATION_ACTIVE_RUNS,
-            "kind" => VerifierKind::Unknown.as_str(),
-            "mode" => mode.as_str()
-        )
-        .increment(1.0);
+        metrics::counter!(VERIFICATION_RUN_ATTEMPTS_TOTAL, "mode" => mode.as_str()).increment(1);
+        metrics::gauge!(VERIFICATION_ACTIVE_RUNS, "mode" => mode.as_str()).increment(1.0);
         Self {
             mode,
             started: Instant::now(),
-            ledger: Mutex::new(Ledger {
-                kind: VerifierKind::Unknown,
-                counted: false,
-                phases: Default::default(),
-            }),
+            ledger: Mutex::default(),
             waits: WaitSink::default(),
             finished: false,
         }
@@ -189,30 +173,6 @@ impl ExecutionTelemetry {
     #[must_use]
     pub const fn mode(&self) -> ExecutionMode {
         self.mode
-    }
-
-    /// The execution's current kind.
-    #[must_use]
-    pub fn kind(&self) -> VerifierKind {
-        self.lock().kind
-    }
-
-    /// Classify the execution once its exact Verifier is known.
-    ///
-    /// Moves the active gauge from the previous kind to `kind`, emits the
-    /// attempt counter the first time, and records `kind` on the current span.
-    pub fn classify(&self, kind: VerifierKind) {
-        let mut ledger = self.lock();
-        if ledger.kind != kind {
-            self.active(ledger.kind).decrement(1.0);
-            self.active(kind).increment(1.0);
-            ledger.kind = kind;
-        }
-        if !ledger.counted {
-            ledger.counted = true;
-            self.attempts(kind);
-        }
-        tracing::Span::current().record("kind", kind.as_str());
     }
 
     /// Await `future` as one interval of `phase`.
@@ -242,7 +202,7 @@ impl ExecutionTelemetry {
             .iter()
             .position(|candidate| *candidate == phase)
             .unwrap_or_default();
-        self.lock().phases[index].push((start, end));
+        self.lock()[index].push((start, end));
     }
 
     /// Await `future` as one dependency, evidence, or provider wait.
@@ -269,23 +229,21 @@ impl ExecutionTelemetry {
     /// Emit the outcome families of [`finish`](Self::finish).
     fn emit(&self, outcome: &'static str, failed: bool) {
         let ledger = self.lock();
-        let (kind, mode) = (ledger.kind.as_str(), self.mode.as_str());
-        for (phase, intervals) in Phase::ALL.iter().zip(&ledger.phases) {
+        let mode = self.mode.as_str();
+        for (phase, intervals) in Phase::ALL.iter().zip(ledger.iter()) {
             if !intervals.is_empty() {
                 metrics::histogram!(
                     VERIFICATION_PHASE_DURATION_SECONDS,
-                    "kind" => kind,
                     "mode" => mode,
                     "phase" => phase.as_str()
                 )
                 .record(union(intervals).as_secs_f64());
             }
         }
-        let engine = &ledger.phases[3];
+        let engine = &ledger[3];
         if !engine.is_empty() {
             metrics::histogram!(
                 VERIFICATION_ENGINE_OVERHEAD_SECONDS,
-                "kind" => kind,
                 "mode" => mode,
                 "outcome" => outcome
             )
@@ -294,7 +252,6 @@ impl ExecutionTelemetry {
         if failed {
             metrics::counter!(
                 VERIFICATION_RUN_FAILURES_TOTAL,
-                "kind" => kind,
                 "mode" => mode,
                 "outcome" => outcome
             )
@@ -302,30 +259,10 @@ impl ExecutionTelemetry {
         }
         metrics::histogram!(
             VERIFICATION_RUN_DURATION_SECONDS,
-            "kind" => kind,
             "mode" => mode,
             "outcome" => outcome
         )
         .record(self.started.elapsed().as_secs_f64());
-    }
-
-    /// The active gauge series of `kind` in this execution's mode.
-    fn active(&self, kind: VerifierKind) -> metrics::Gauge {
-        metrics::gauge!(
-            VERIFICATION_ACTIVE_RUNS,
-            "kind" => kind.as_str(),
-            "mode" => self.mode.as_str()
-        )
-    }
-
-    /// Emit one attempt observation under `kind`.
-    fn attempts(&self, kind: VerifierKind) {
-        metrics::counter!(
-            VERIFICATION_RUN_ATTEMPTS_TOTAL,
-            "kind" => kind.as_str(),
-            "mode" => self.mode.as_str()
-        )
-        .increment(1);
     }
 
     /// Lock the ledger, recovering it from a poisoned lock.
@@ -341,21 +278,12 @@ impl ExecutionTelemetry {
 
 impl Drop for ExecutionTelemetry {
     /// Finish an abandoned direct execution as `cancelled`, then lower the
-    /// active gauge exactly once and count an execution that was never
-    /// classified as `unknown`.
+    /// active gauge exactly once.
     fn drop(&mut self) {
         if !self.finished && self.mode == ExecutionMode::Direct {
             self.emit("cancelled", true);
         }
-        let ledger = self
-            .ledger
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (kind, counted) = (ledger.kind, ledger.counted);
-        self.active(kind).decrement(1.0);
-        if !counted {
-            self.attempts(kind);
-        }
+        metrics::gauge!(VERIFICATION_ACTIVE_RUNS, "mode" => self.mode.as_str()).decrement(1.0);
     }
 }
 
@@ -501,7 +429,7 @@ mod tests {
         let text = handle.render();
         assert!(
             text.contains(
-                r#"wyrd_verification_run_failures_total{kind="unknown",mode="direct",outcome="cancelled"} 1"#
+                r#"wyrd_verification_run_failures_total{mode="direct",outcome="cancelled"} 1"#
             ),
             "{text}"
         );

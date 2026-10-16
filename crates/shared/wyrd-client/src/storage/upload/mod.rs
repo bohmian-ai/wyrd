@@ -7,13 +7,15 @@ mod reader;
 mod single_put;
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::WyrdClient;
 use bytes::Bytes;
 use futures_util::stream::{BoxStream, StreamExt};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 use wyrd_spec::storage::{UploadCompleteRequest, UploadId, UploadPlan};
 
@@ -133,6 +135,31 @@ impl ArtifactSource for FileSource {
             }
         }
         .boxed()
+    }
+}
+
+/// Stream one local file and return its byte length and SHA-256 digest.
+///
+/// The file is read in 64 KiB buffers so large files are never loaded into
+/// memory. Artifact registration and verification evidence both pin files by
+/// this digest before any network call. Read-only; cancellation drops the
+/// open file handle.
+///
+/// # Errors
+///
+/// Returns an IO error when the file cannot be opened or read.
+pub(crate) async fn sha256_file(path: &Path) -> std::io::Result<(u64, [u8; 32])> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok((size, hasher.finalize().into()));
+        }
+        size += read as u64;
+        hasher.update(&buffer[..read]);
     }
 }
 

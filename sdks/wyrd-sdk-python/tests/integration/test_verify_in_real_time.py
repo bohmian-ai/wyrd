@@ -1,15 +1,20 @@
-"""A Service judges its components' behavior in real time with ``run.observe.verify``.
+"""A Service judges its components' behavior with ``run.observe.verify`` and ``submit``.
 
-The ``assistant`` Service binds two Eval Verifiers and two task Verifiers to
-its ``agent`` and a PSI Drift Verifier, fitted from the latency baseline, to its
-``model``. Only ``verifier:run`` on the named Verifier authorizes a verify.
+The ``assistant`` Service binds the ``answer-check`` assertion and the
+``answer-judged`` Agent check to its ``agent``, and the scheduled
+``latency-drift`` window Verifier to its ``model``. Only ``verifier:run`` on
+the named Verifier authorizes a verify; the local model provider stands in
+for the judge and agrees with every answer, citing it.
 """
 
+import secrets
+import time
 from pathlib import Path
 
+import httpx
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
-from wyrd import WyrdError
+from wyrd import WyrdError, verify
 from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
@@ -17,17 +22,28 @@ from wyrd.gateway import Gateway
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
-from .support import Count, Receiver, ancestry, client_of, hydrated, register, timeline
+from .support import (
+    BASELINE_TIMEOUT_SECONDS,
+    Receiver,
+    ancestry,
+    binding_ids,
+    binding_status,
+    client_of,
+    hydrated,
+    register,
+    service_key,
+    timeline,
+)
 
 pytestmark = pytest.mark.integration
 
-HEALTHY_LATENCY = [{"latency": (row * 37) % 100} for row in range(100)]
-"""One hundred latencies spread like the healthy baseline's 0 to 99 ms."""
-
-SLOW_LATENCY = [{"latency": 99}] * 100
-"""One hundred latencies all at the slow end of the baseline."""
+WAIT_SECONDS = 90.0
+"""How long a test waits for a queued execution."""
 
 DENIED = "WYRD_PERMISSION_403_DENIED_RBAC"
+
+CALLS = "/v1/chat/completions"
+"""The local model provider's route every judge call reaches."""
 
 
 def verifier_run(cards: Cards, verifier: str) -> dict[str, object]:
@@ -36,70 +52,175 @@ def verifier_run(cards: Cards, verifier: str) -> dict[str, object]:
     return {"resource": "verifier", "action": "run", "scope": {"verifier": str(uid)}}
 
 
+def principal() -> str:
+    """The ``assistant`` Service's principal id, which every judgment here is requested as."""
+    return cli.issue_key(
+        kind="Service", name="assistant", version="1.0.0", space="default"
+    ).principal_id
+
+
+def result_with_its_judge_calls(
+    bifrost: Bifrost, execution_id: str, run_id: str | None, call_id: str | None = None
+) -> list[dict]:
+    """The result ``execution_id`` wrote beside the judge calls it joins on its Card.
+
+    Calls are narrowed to ``run_id``, or to ``call_id`` for a judgment without
+    a Run, so other stories' calls on the same Card do not join.
+    """
+    on, value = ("c.run_id", run_id) if call_id is None else ("c.call_id", call_id)
+    return (
+        bifrost.sql(
+            "SELECT r.sub_principal_id AS result_subject, r.act_principal_id AS result_actor, "
+            "r.run_id AS result_run, c.sub_principal_id AS call_subject, "
+            "c.act_principal_id AS call_actor, c.run_id AS call_run "
+            "FROM vala.verification.results r "
+            "JOIN vala.gateway.calls c ON c.card_uid = r.card_uid "
+            f"WHERE r.execution_id = $1 AND {on} = $2",
+            [execution_id, value],
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+
+
+def assert_called_as_system(joined: list[dict], caller: str, run_id: str | None) -> None:
+    """Assert one result and judge call, both for ``caller``: the verify by ``caller``, the call by SYSTEM."""
+    [row] = joined
+    assert (row["result_subject"], row["call_subject"], row["result_run"], row["call_run"]) == (
+        caller,
+        caller,
+        run_id,
+        run_id,
+    ), row
+    assert row["result_actor"] == caller, "the caller performs its direct verify"
+    assert row["call_actor"] not in (None, caller), "SYSTEM performs the judgment"
+
+
+def verify_over_http(server: WyrdTestServer, cards: Cards, traceparent: str) -> str:
+    """Judge ``yes`` with ``answer-judged`` over plain HTTP as the Service, with no Run.
+
+    Returns the result's ``execution_id``.
+    """
+    registered = register(cards, "cards/verify_in_real_time/assistant.yaml")
+    token = WyrdClient(credential=service_key("assistant")).access_token()
+    response = httpx.post(
+        f"{server.base_url}/v1/verification/execute",
+        headers={"x-wyrd-access-token": f"Bearer {token}", "traceparent": traceparent},
+        json={
+            "verifier_card_uid": str(registered["answer-judged"].uid),
+            "card_uid": str(registered["assistant-agent"].uid),
+            "inputs": {"answer": {"kind": "json", "value": "yes"}},
+        },
+        timeout=60,
+    )
+    result = response.json()
+    assert response.status_code == 200, result
+    assert result["outcome"]["verdict"] == "passed", result
+    return result["execution_id"]
+
+
 def test_agent_answer_passes_its_verifier(assistant: WyrdState) -> None:
-    judgment = assistant.run("agent").observe.verify("answer-is-yes", {"answer": "yes"})
-    assert (judgment.verdict, judgment.passed, judgment.kind) == ("passed", True, "eval_assertion")
-    assert judgment.verifier.name == "answer-is-yes"
-    assert judgment.subject.uid == assistant.card_ref("agent").uid
+    run = assistant.run("agent")
+
+    result = run.observe.verify("answer-check", "yes")
+
+    assert result.verdict == "passed"
+    assert result.verifier.name == "answer-check"
+    assert result.subject == assistant.card_ref("agent")
+    assert result.run_id == run.run_id
+    [requirement] = result.requirements
+    assert (requirement["id"], requirement["outcome"]) == ("says-yes", "passed")
 
 
 def test_agent_answer_fails_its_verifier(assistant: WyrdState) -> None:
-    judgment = assistant.run("agent").observe.verify("answer-is-yes", {"answer": "no"})
-    assert (judgment.verdict, judgment.passed) == ("failed", False)
+    result = assistant.run("agent").observe.verify("answer-check", "no")
+
+    assert result.verdict == "failed"
+    [requirement] = result.requirements
+    assert (requirement["outcome"], requirement["actual"]) == ("failed", "no")
 
 
-def test_agent_answer_is_judged_by_its_task_check(assistant: WyrdState) -> None:
-    run = assistant.run("agent")
-    for answer, verdict in [("yes", "passed"), ("no", "failed")]:
-        judgment = run.observe.verify("answer-check", {"answer": answer})
-        assert (judgment.verdict, judgment.kind, judgment.counts) == (
-            verdict,
-            "task_assertion",
-            None,
-        )
-        assert judgment.verifier.name == "answer-check"
+def test_judged_answer_passes_the_agent_check(assistant: WyrdState, receiver: Receiver) -> None:
+    asked = len(receiver.to(CALLS))
 
+    result = assistant.run("agent").observe.verify("answer-judged", "yes")
 
-def test_graded_answer_passes_the_task_llm_judge(assistant: WyrdState, receiver: Receiver) -> None:
-    asked = len(receiver.to("/v1/chat/completions"))
-    judgment = assistant.run("agent").observe.verify("answer-graded", {"answer": "yes"})
-    assert (judgment.verdict, judgment.kind, judgment.counts) == ("passed", "task_llm_judge", None)
-    assert len(receiver.to("/v1/chat/completions")) == asked + 1
-
-
-def test_judged_answer_passes_the_llm_judge(assistant: WyrdState, receiver: Receiver) -> None:
-    asked = len(receiver.to("/v1/chat/completions"))
-    judgment = assistant.run("agent").observe.verify("answer-is-judged", {"answer": "yes"})
-    assert judgment.verdict == "passed"
-    assert len(receiver.to("/v1/chat/completions")) == asked + 1
+    assert result.verdict == "passed"
+    [requirement] = result.requirements
+    assert requirement["outcome"] == "passed"
+    assert requirement["citations"] == [{"slot": "answer", "locator": {"json_pointer": ""}}]
+    assert requirement["provenance"]["kind"] == "agent"
+    assert requirement["provenance"]["agent"]["name"] == "judge-agent"
+    [judged] = receiver.to(CALLS)[asked:]
+    assert "Claim: The answer agrees with the customer" in str(judged.body), judged.body
 
 
 def test_judge_call_is_attributed_to_the_run_and_card(
     assistant: WyrdState, wyrd_server: WyrdTestServer, bifrost: Bifrost, metadata_capture: None
 ) -> None:
     run = assistant.run("agent")
-    judgment = run.observe.verify("answer-graded", {"answer": "yes"})
+    result = run.observe.verify("answer-judged", "yes")
     wyrd_server.flush_bifrost()
 
-    calls = bifrost.sql(
-        "SELECT sub_principal_id, act_principal_id, card_uid FROM vala.gateway.calls "
-        "WHERE run_id = $1",
-        [run.run_id],
-    ).to_arrow()
-    principal = cli.issue_key(
-        kind="Service", name="assistant", version="1.0.0", space="default"
-    ).principal_id
-    [call] = calls.to_pylist()
-    assert (call["sub_principal_id"], call["card_uid"]) == (principal, str(judgment.subject.uid))
-    assert call["act_principal_id"] not in (None, principal)
+    caller = principal()
+    calls = (
+        bifrost.sql(
+            "SELECT sub_principal_id, act_principal_id, card_uid FROM vala.gateway.calls "
+            "WHERE run_id = $1",
+            [run.run_id],
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    [call] = calls
+    assert (call["sub_principal_id"], call["card_uid"]) == (caller, str(result.subject.uid))
+    assert call["act_principal_id"] not in (None, caller)
+    assert_called_as_system(
+        result_with_its_judge_calls(bifrost, result.execution_id, run.run_id), caller, run.run_id
+    )
 
 
-def test_traced_verify_joins_the_callers_trace(
+def test_judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card(
+    assistant_bundle: Path,
+    wyrd_server: WyrdTestServer,
+    cards: Cards,
+    bifrost: Bifrost,
+    metadata_capture: None,
+) -> None:
+    trace_id, span_id = secrets.token_hex(16), secrets.token_hex(8)
+
+    execution_id = verify_over_http(wyrd_server, cards, f"00-{trace_id}-{span_id}-01")
+
+    spans = timeline(wyrd_server, trace_id)
+    [attempt] = [span for span in spans if span["scope"]["name"] == "wyrd.gateway"]
+    assert ancestry(spans, attempt)[-1].get("parent_span_id") == span_id, spans
+    call_id = attempt["attributes"]["gateway_call_id"]
+    [call] = (
+        bifrost.sql(
+            "SELECT sub_principal_id, run_id, card_uid FROM vala.gateway.calls WHERE call_id = $1",
+            [call_id],
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    caller = principal()
+    agent = register(cards, "cards/verify_in_real_time/assistant.yaml")["assistant-agent"]
+    assert (call["sub_principal_id"], call["run_id"], call["card_uid"]) == (
+        caller,
+        None,
+        str(agent.uid),
+    )
+    assert_called_as_system(
+        result_with_its_judge_calls(bifrost, execution_id, None, call_id), caller, None
+    )
+
+
+def test_traced_sdk_verify_joins_the_callers_trace(
     assistant: WyrdState, wyrd_server: WyrdTestServer, metadata_capture: None
 ) -> None:
     tracer = TracerProvider().get_tracer("journey")
     with tracer.start_as_current_span("caller") as caller:
-        assistant.run("agent").observe.verify("answer-graded", {"answer": "yes"})
+        assistant.run("agent").observe.verify("answer-judged", "yes")
 
     context = caller.get_span_context()
     spans = timeline(wyrd_server, format(context.trace_id, "032x"))
@@ -108,6 +229,44 @@ def test_traced_verify_joins_the_callers_trace(
     assert ancestry(spans, attempts[0])[-1].get("parent_span_id") == format(
         context.span_id, "016x"
     ), [(span["name"], span["span_id"], span.get("parent_span_id")) for span in spans]
+
+
+def test_traced_sdk_submit_links_its_attempt_to_the_callers_trace(
+    assistant: WyrdState, wyrd_server: WyrdTestServer, metadata_capture: None
+) -> None:
+    tracer = TracerProvider().get_tracer("journey")
+    with tracer.start_as_current_span("caller") as caller:
+        execution = assistant.run("agent").observe.submit("answer-judged", "yes")
+    assert isinstance(execution, verify.Execution)
+    execution.wait(WAIT_SECONDS)
+
+    trace_id = format(caller.get_span_context().trace_id, "032x")
+    spans = timeline(wyrd_server, trace_id)
+    [attempt] = [span for span in spans if span["name"] == "verification.attempt"]
+    assert attempt["trace_id"] != trace_id, attempt
+    assert [link["trace_id"] for link in attempt["links"]] == [trace_id], attempt
+    judged = [span for span in spans if span["scope"]["name"] == "wyrd.gateway"]
+    assert len(judged) == 1, spans
+    assert ancestry(spans, judged[0])[-1]["span_id"] == attempt["span_id"], [
+        (span["name"], span["trace_id"], span["span_id"], span.get("parent_span_id"))
+        for span in spans
+    ]
+
+
+def test_malformed_traceparent_is_ignored_by_the_judge_call(
+    assistant_bundle: Path,
+    wyrd_server: WyrdTestServer,
+    cards: Cards,
+    receiver: Receiver,
+    metadata_capture: None,
+) -> None:
+    trace_id = secrets.token_hex(16)
+    asked = len(receiver.to(CALLS))
+
+    verify_over_http(wyrd_server, cards, f"00-{trace_id}-{secrets.token_hex(8)}")
+
+    assert len(receiver.to(CALLS)) == asked + 1
+    assert timeline(wyrd_server, trace_id) == [], "nothing joined the caller's trace"
 
 
 def test_sdk_requests_carry_the_active_trace(wyrd_server: WyrdTestServer) -> None:
@@ -127,45 +286,99 @@ def test_sdk_requests_carry_the_active_trace(wyrd_server: WyrdTestServer) -> Non
     ]
 
 
-def test_model_latency_like_the_baseline_passes_its_verifier(assistant: WyrdState) -> None:
-    judgment = assistant.run("model").observe.verify("latency-drift", HEALTHY_LATENCY)
-    assert (judgment.passed, judgment.kind) == (True, "drift_psi")
-    assert judgment.subject.uid == assistant.card_ref("model").uid
+def test_submitted_answer_is_judged_in_the_background_and_resumes_by_id(
+    assistant: WyrdState, assistant_key: str
+) -> None:
+    run = assistant.run("agent")
+
+    execution = run.observe.submit("answer-check", "no")
+    assert isinstance(execution, verify.Execution)
+    waited = execution.wait(WAIT_SECONDS)
+    resumed = verify.Execution.connect(execution.id, WyrdClient(credential=assistant_key)).wait(
+        WAIT_SECONDS
+    )
+
+    assert waited.verdict == "failed"
+    assert waited.execution_id == execution.id
+    assert waited.run_id == run.run_id
+    assert (resumed.execution_id, resumed.verdict, resumed.requirements) == (
+        waited.execution_id,
+        waited.verdict,
+        waited.requirements,
+    )
 
 
-def test_model_latency_drift_is_judged_failed(assistant: WyrdState) -> None:
-    judgment = assistant.run("model").observe.verify("latency-drift", SLOW_LATENCY)
-    assert (judgment.verdict, judgment.kind) == ("failed", "drift_psi")
-    assert judgment.subject.uid == assistant.card_ref("model").uid
+def test_another_tenant_cannot_resume_an_execution(
+    assistant: WyrdState, wyrd_server: WyrdTestServer, other_tenant: str
+) -> None:
+    execution = assistant.run("agent").observe.submit("answer-check", "yes")
+    assert isinstance(execution, verify.Execution)
+    execution.wait(WAIT_SECONDS)
+    foreign = wyrd_server.bootstrap_service_in_tenant(other_tenant, ["admin"], name="other-resumer")
+
+    with pytest.raises(WyrdError) as refused:
+        verify.Execution.connect(execution.id, WyrdClient(credential=foreign)).wait(2.0)
+    assert refused.value.code == "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT"
 
 
-def test_verify_before_baseline_ready_is_refused(unfitted_assistant: WyrdState) -> None:
-    with pytest.raises(WyrdError) as raised:
-        unfitted_assistant.run("model").observe.verify("tier-drift", [{"tier": "gold"}] * 5)
-    assert raised.value.code == "WYRD_VERIFICATION_409_BASELINE_NOT_READY"
+def test_window_verifier_records_samples_and_refuses_verify(assistant: WyrdState) -> None:
+    assistant.start_bifrost()
+    observe = assistant.run("model").observe
+
+    with pytest.raises(WyrdError) as refused:
+        observe.verify("latency-drift", {"latency": 12.5})
+    submitted = observe.submit("latency-drift", {"latency": 12.5})
+    assistant.shutdown()
+
+    assert refused.value.code == "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED"
+    assert isinstance(submitted, verify.Recorded)
+
+
+def test_unfitted_baseline_is_skipped_on_schedule(
+    unfitted_assistant: WyrdState, wyrd_server: WyrdTestServer, cards: Cards
+) -> None:
+    unfitted_assistant.start_bifrost()
+    observe = unfitted_assistant.run("model").observe
+    for _ in range(5):
+        observe.submit("tier-drift", "gold")
+    unfitted_assistant.shutdown()
+    [binding_id] = binding_ids(cards, unfitted_assistant.root_ref)
+    wyrd_server.make_binding_due(binding_id)
+    due = binding_status(wyrd_server, binding_id)["next_run_at"]
+
+    deadline = time.monotonic() + BASELINE_TIMEOUT_SECONDS
+    while (status := binding_status(wyrd_server, binding_id))["next_run_at"] == due:
+        assert time.monotonic() < deadline, "the due occurrence was not scheduled"
+        time.sleep(0.5)
+
+    assert status["readiness"] == "baseline_not_ready"
+    assert status.get("last_execution_id") is None
 
 
 def test_unbound_verifier_fails_locally(assistant: WyrdState) -> None:
     with pytest.raises(WyrdError) as raised:
-        assistant.run("agent").observe.verify("not-bound-here", {"answer": "yes"})
+        assistant.run("agent").observe.verify("not-bound-here", "yes")
     assert raised.value.code == "WYRD_SDK_404_UNKNOWN_VERIFIER"
 
 
-def test_input_of_the_wrong_shape_fails_locally(assistant: WyrdState) -> None:
-    with pytest.raises(WyrdError) as raised:
-        assistant.run("agent").observe.verify("answer-is-yes", [{"answer": "yes"}])
-    assert raised.value.code == "WYRD_SDK_400_INVALID_OBSERVATION"
+def test_input_that_does_not_fit_its_slot_fails_locally(assistant: WyrdState) -> None:
+    observe = assistant.run("agent").observe
+    with pytest.raises(WyrdError) as unknown:
+        observe.verify("answer-check", reply="yes")
+    with pytest.raises(WyrdError) as file:
+        observe.verify("answer-check", answer=verify.File(b"yes"))
+    assert unknown.value.code == file.value.code == "WYRD_VERIFICATION_400_INPUT_INVALID"
 
 
 def test_caller_without_the_verifier_grant_is_refused(
     assistant_bundle: Path, wyrd_server: WyrdTestServer, cards: Cards
 ) -> None:
     evals_only = wyrd_server.scoped_api_key("py_evals_only", ["evals:run"])
-    other = wyrd_server.scoped_api_key("py_other_verifier", [verifier_run(cards, "answer-is-yes")])
+    other = wyrd_server.scoped_api_key("py_other_verifier", [verifier_run(cards, "answer-judged")])
     for key in [evals_only, other]:
         state = hydrated(assistant_bundle, WyrdClient(credential=key))
         with pytest.raises(WyrdError) as raised:
-            state.run("agent").observe.verify("answer-check", {"answer": "yes"})
+            state.run("agent").observe.verify("answer-check", "yes")
         assert raised.value.code == DENIED
 
 
@@ -174,9 +387,9 @@ def test_exact_verifier_grant_verifies_only_that_verifier(
 ) -> None:
     key = wyrd_server.scoped_api_key("py_exact_verifier", [verifier_run(cards, "answer-check")])
     run = hydrated(assistant_bundle, WyrdClient(credential=key)).run("agent")
-    assert run.observe.verify("answer-check", {"answer": "yes"}).passed
+    assert run.observe.verify("answer-check", "yes").verdict == "passed"
     with pytest.raises(WyrdError) as raised:
-        run.observe.verify("answer-is-yes", {"answer": "yes"})
+        run.observe.verify("answer-judged", "yes")
     assert raised.value.code == DENIED
 
 
@@ -185,22 +398,7 @@ def test_another_tenant_cannot_verify_the_assistant(
 ) -> None:
     other = wyrd_server.bootstrap_service_in_tenant(other_tenant, ["admin"], name="other-service")
     run = hydrated(assistant_bundle, WyrdClient(credential=other)).run("agent")
-    for verifier in ["answer-is-yes", "answer-check"]:
+    for verifier in ["answer-check", "answer-judged"]:
         with pytest.raises(WyrdError) as raised:
-            run.observe.verify(verifier, {"answer": "yes"})
+            run.observe.verify(verifier, "yes")
         assert raised.value.code == "WYRD_VERIFICATION_404_TARGET_NOT_FOUND"
-
-
-def test_verify_records_no_observation(
-    assistant: WyrdState, wyrd_server: WyrdTestServer, bifrost: Bifrost
-) -> None:
-    run = assistant.run("agent")
-    run.observe.verify("answer-is-yes", {"answer": "yes"})
-    # Publish anything the judgment wrote so an observation would be visible.
-    wyrd_server.flush_bifrost()
-    [recorded] = bifrost.sql(
-        "SELECT COUNT(*) AS n FROM vala.eval.observations WHERE run_id = $1",
-        [run.run_id],
-        model=Count,
-    )
-    assert recorded.n == 0

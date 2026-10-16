@@ -6,15 +6,11 @@ use super::{GraphError, RootPick, identity_key, submission_card_ref};
 use crate::card::agent::AgentSpec;
 use crate::card::operator::OperatorSpec;
 use crate::card::trigger::TriggerSpec;
-use crate::card::verifier::{
-    OWNER_OCCURRENCE_KEY, TaskVerifierSpec, VerificationBinding, VerifierImplementation,
-    VerifierTask,
-};
+use crate::card::verifier::{OWNER_OCCURRENCE_KEY, VerificationBinding};
 use crate::envelope::{CardKind, Spec};
 use crate::error::WyrdError;
 use crate::reference::InlineableRef;
 use crate::registry::CardSubmission;
-use crate::vala::eval::{EvalSpec, EvalTask};
 
 /// Validate peer ownership and verification binding links in a submission graph.
 ///
@@ -283,7 +279,7 @@ impl Spec {
     /// Enumerate every `verified_by` list this spec carries, legal or not.
     ///
     /// Top-level sites are the three legal binding owners. Nested sites are the
-    /// inline Agent bodies an Eval LLM judge can hold; they
+    /// inline Agent bodies a Verifier's Agent steps and checks can hold; they
     /// are enumerated so that [`spec_binding_errors`] can refuse them instead
     /// of letting resolution, UID pinning, and relationship derivation run on a
     /// binding the contract does not allow.
@@ -312,19 +308,13 @@ impl Spec {
                     });
                 }
             }
-            Self::Verifier(verifier) => match &verifier.implementation {
-                VerifierImplementation::Eval(eval) => {
-                    push_nested_judges(eval, "spec.implementation.spec", &mut sites);
-                }
-                VerifierImplementation::Task(TaskVerifierSpec {
-                    definition: VerifierTask::LlmJudge(judge),
-                }) => {
-                    if let InlineableRef::Inline(agent) = &judge.judge_ref {
-                        push_nested_agent(agent, "spec.implementation.spec.judge_ref", &mut sites);
+            Self::Verifier(verifier) => {
+                for (prefix, call) in verifier.agent_calls() {
+                    if let InlineableRef::Inline(agent) = &call.agent {
+                        push_nested_agent(agent, &format!("{prefix}.agent"), &mut sites);
                     }
                 }
-                VerifierImplementation::Drift(_) | VerifierImplementation::Task(_) => {}
-            },
+            }
             Self::Data(_)
             | Self::Model(_)
             | Self::Prompt(_)
@@ -348,22 +338,6 @@ fn push_nested_agent<'a>(agent: &'a AgentSpec, prefix: &str, sites: &mut Vec<Bin
         bindings: &agent.verified_by,
         nested: true,
     });
-}
-
-/// Record every inline LLM-judge Agent body inside one Eval payload.
-fn push_nested_judges<'a>(eval: &'a EvalSpec, prefix: &str, sites: &mut Vec<BindingSite<'a>>) {
-    for (task_id, task) in &eval.tasks {
-        let EvalTask::LlmJudge(judge) = task else {
-            continue;
-        };
-        if let InlineableRef::Inline(agent) = &judge.judge_ref {
-            push_nested_agent(
-                agent,
-                &format!("{prefix}.tasks[{}].LlmJudge.judge_ref", task_id.as_str()),
-                sites,
-            );
-        }
-    }
 }
 
 /// Return every verification-binding error one submitted spec carries.
@@ -472,14 +446,22 @@ mod tests {
         json!({})
     }
 
-    /// Build the smallest valid Eval-backed Verifier body used by composition tests.
+    /// Build the smallest valid Verifier body used by composition tests: one
+    /// assertion over one JSON input.
     fn verifier_spec() -> serde_json::Value {
-        json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } })
+        json!({
+            "inputs": { "payload": { "type": "json" } },
+            "requirements": [{
+                "id": "present",
+                "statement": "The payload is present.",
+                "check": { "kind": "assert", "path": "inputs.payload", "operator": "is_not_null" },
+            }],
+        })
     }
 
     /// Build one `verified_by` entry binding `verifier` with an inline activation.
     fn binding(verifier: &CardRef) -> serde_json::Value {
-        json!({ "verifier": verifier, "runs_on": { "kind": "observations_ready" } })
+        json!({ "verifier": verifier, "runs_on": { "kind": "schedule", "cron": "0 * * * *" } })
     }
 
     /// Reject a Service whose components repeat an alias.
@@ -726,7 +708,7 @@ mod tests {
     fn binding_validation_rejects_non_operator_on_failure_ref() {
         let bindings: Vec<VerificationBinding> = serde_json::from_value(json!([{
             "verifier": card_ref(CardKind::Verifier, "quality"),
-            "runs_on": { "kind": "observations_ready" },
+            "runs_on": { "kind": "schedule", "cron": "0 * * * *" },
             "on_failure": [card_ref(CardKind::Agent, "rollback")],
         }]))
         .expect("binding fixture decodes");
@@ -747,7 +729,7 @@ mod tests {
         let operator = card_ref(CardKind::Operator, "page");
         let bindings: Vec<VerificationBinding> = serde_json::from_value(json!([{
             "verifier": card_ref(CardKind::Verifier, "quality"),
-            "runs_on": { "kind": "observations_ready" },
+            "runs_on": { "kind": "schedule", "cron": "0 * * * *" },
             "on_failure": [operator, operator],
         }]))
         .expect("binding fixture decodes");
@@ -811,7 +793,7 @@ mod tests {
         );
         let bindings: Vec<VerificationBinding> = serde_json::from_value(json!([{
             "verifier": card_ref(CardKind::Verifier, "quality"),
-            "runs_on": { "kind": "observations_ready" },
+            "runs_on": { "kind": "schedule", "cron": "0 * * * *" },
             "on_failure": [operator, uid_bearing],
         }]))
         .expect("binding fixture decodes");
@@ -846,7 +828,7 @@ mod tests {
         });
         let bindings: Vec<VerificationBinding> = serde_json::from_value(json!([{
             "verifier": card_ref(CardKind::Verifier, "quality"),
-            "runs_on": { "kind": "observations_ready" },
+            "runs_on": { "kind": "schedule", "cron": "0 * * * *" },
             "on_failure": [inline, inline],
         }]))
         .expect("binding fixture decodes");
@@ -857,39 +839,31 @@ mod tests {
         assert_eq!(errors[0].code(), "WYRD_SPEC_400_DUPLICATE_BINDING_OPERATOR");
     }
 
-    /// Refuse a binding carried by an Eval Verifier's inline LLM-judge Agent.
+    /// Refuse a binding carried by a Verifier Agent check's inline Agent.
     ///
     /// # Panics
     /// Panics when the Verifier spec fails to decode, or when the nested binding
     /// is not refused as the single stable invalid-card-spec error.
     #[test]
-    fn spec_binding_errors_refuse_an_eval_judge_inline_agent_binding() {
+    fn spec_binding_errors_refuse_an_agent_check_inline_agent_binding() {
         let spec = Spec::from_kind_and_value(
             &CardKind::Verifier,
             json!({
-                "implementation": {
-                    "kind": "eval",
-                    "spec": {
-                        "tasks": {
-                            "helpful": {
-                                "kind": "llm_judge",
-                                "id": "helpful",
-                                "judge_ref": {
-                                    "prompt": card_ref(CardKind::Prompt, "judge"),
-                                    "execution_route": {"kind": "native"},
-                                    "verified_by": [
-                                        binding(&card_ref(CardKind::Verifier, "quality"))
-                                    ],
-                                },
-                                "operator": "greater_than_or_equals",
-                                "expected": 0.5,
-                            },
+                "requirements": [{
+                    "id": "helpful",
+                    "statement": "The answer is helpful.",
+                    "check": {
+                        "kind": "agent",
+                        "agent": {
+                            "prompt": card_ref(CardKind::Prompt, "judge"),
+                            "execution_route": {"kind": "native"},
+                            "verified_by": [binding(&card_ref(CardKind::Verifier, "quality"))],
                         },
                     },
-                },
+                }],
             }),
         )
-        .expect("the inline judge Agent body still decodes");
+        .expect("the inline Agent body still decodes");
 
         let errors = spec_binding_errors(&spec);
 
@@ -897,7 +871,7 @@ mod tests {
         assert_eq!(errors[0].code(), "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
     }
 
-    /// Keep an inline judge Agent with no bindings acceptable.
+    /// Keep an inline check Agent with no bindings acceptable.
     ///
     /// # Panics
     /// Panics when the Verifier spec fails to decode, or when a binding-free
@@ -907,26 +881,20 @@ mod tests {
         let spec = Spec::from_kind_and_value(
             &CardKind::Verifier,
             json!({
-                "implementation": {
-                    "kind": "eval",
-                    "spec": {
-                        "tasks": {
-                            "helpful": {
-                                "kind": "llm_judge",
-                                "id": "helpful",
-                                "judge_ref": {
-                                    "prompt": card_ref(CardKind::Prompt, "judge"),
-                                    "execution_route": {"kind": "native"},
-                                },
-                                "operator": "greater_than_or_equals",
-                                "expected": 0.5,
-                            },
+                "requirements": [{
+                    "id": "helpful",
+                    "statement": "The answer is helpful.",
+                    "check": {
+                        "kind": "agent",
+                        "agent": {
+                            "prompt": card_ref(CardKind::Prompt, "judge"),
+                            "execution_route": {"kind": "native"},
                         },
                     },
-                },
+                }],
             }),
         )
-        .expect("the inline judge Agent body decodes");
+        .expect("the inline Agent body decodes");
 
         assert!(spec_binding_errors(&spec).is_empty());
     }

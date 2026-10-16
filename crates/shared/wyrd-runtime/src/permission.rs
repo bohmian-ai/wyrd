@@ -8,6 +8,7 @@ pub use wyrd_spec::auth::{
     BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, GatewayAccess, PermissionScope,
     PermissionScopeError,
 };
+use wyrd_spec::card::agent::BuiltinTool;
 use wyrd_spec::ids::CardUid;
 
 /// One operation/object authorization triple.
@@ -145,6 +146,12 @@ pub enum Resource {
     Gateway,
     /// Captured gateway request and response payload fields.
     GatewayPayload,
+    /// Built-in Agent tool invocation, optionally scoped to one tool.
+    ///
+    /// Invocation authority only: a tool's underlying Cards or Bifrost access
+    /// is checked separately against those resources, and holding them never
+    /// implies this one.
+    Tool,
     /// One of several resources.
     AnyOf(Vec<Resource>),
     /// All resources.
@@ -244,6 +251,7 @@ impl Resource {
             Self::BifrostPeer => "bifrost_peer",
             Self::Gateway => "gateway",
             Self::GatewayPayload => "gateway_payload",
+            Self::Tool => "tool",
             Self::Wildcard => "wildcard",
             Self::AnyOf(_) => return None,
         })
@@ -316,7 +324,8 @@ impl Permission {
     ///
     /// Bifrost object scope is meaningful only for Bifrost query reads and
     /// record writes, gateway object scope only for gateway invocation, and
-    /// Verifier object scope only for `verifier:run`. A wildcard or
+    /// Verifier object scope only for `verifier:run`, and tool object scope only
+    /// for `tool:invoke`. A wildcard or
     /// multi-resource grant on either axis keeps object-wide reach only with
     /// [`PermissionScope::All`], which is what stops a wildcard from inheriting
     /// one object's narrow authority.
@@ -328,8 +337,8 @@ impl Permission {
     /// object scope is attached to a resource that does not own that object, or
     /// with field `action` when a Bifrost scope is attached to an action other
     /// than [`Action::Read`] for query or [`Action::Write`] for record, a
-    /// gateway scope to any action other than [`Action::Invoke`], or a Verifier
-    /// scope to any action other than [`Action::Run`].
+    /// gateway or tool scope to any action other than [`Action::Invoke`], or a
+    /// Verifier scope to any action other than [`Action::Run`].
     pub fn validate(&self) -> Result<(), PermissionScopeError> {
         self.scope.validate()?;
         let (resource_accepts, required_action) = match &self.scope {
@@ -344,6 +353,7 @@ impl Permission {
             ),
             PermissionScope::Gateway(_) => (self.resource == Resource::Gateway, Action::Invoke),
             PermissionScope::Verifier(_) => (self.resource == Resource::Verifier, Action::Run),
+            PermissionScope::Tool(_) => (self.resource == Resource::Tool, Action::Invoke),
         };
         if !resource_accepts {
             return Err(PermissionScopeError::InvalidIdentifier {
@@ -770,6 +780,30 @@ impl Permission {
         }
     }
 
+    /// Invoke the one built-in Agent tool `tool`.
+    ///
+    /// The permission each tool call requires before it runs: only a grant of
+    /// this exact tool, [`Self::tool_invoke_any`], or a covering wildcard
+    /// covers it. It grants none of the tool's underlying data access.
+    #[must_use]
+    pub const fn tool_invoke(tool: BuiltinTool) -> Self {
+        Self {
+            resource: Resource::Tool,
+            action: Action::Invoke,
+            scope: PermissionScope::Tool(tool),
+        }
+    }
+
+    /// Invoke every built-in Agent tool.
+    #[must_use]
+    pub const fn tool_invoke_any() -> Self {
+        Self {
+            resource: Resource::Tool,
+            action: Action::Invoke,
+            scope: PermissionScope::All,
+        }
+    }
+
     /// All permissions.
     #[must_use]
     pub const fn wildcard() -> Self {
@@ -842,6 +876,7 @@ fn parse_resource(value: &str) -> Result<Resource, PermissionParseError> {
         "bifrost_query" => Resource::BifrostQuery,
         "gateway" => Resource::Gateway,
         "gateway_payload" => Resource::GatewayPayload,
+        "tool" => Resource::Tool,
         "wildcard" => Resource::Wildcard,
         _ => return Err(PermissionParseError),
     })
@@ -1358,6 +1393,95 @@ mod tests {
                 "{resource}:{action}"
             );
         }
+    }
+
+    /// Proves `tool:invoke` decodes in both approved wire forms, refuses
+    /// non-built-in names and misplaced tool scopes, covers and intersects by
+    /// exact name, and is neither implied by domain grants nor implies them.
+    ///
+    /// # Panics
+    /// Panics when a tool grant decodes, covers, or intersects incorrectly.
+    #[test]
+    fn tool_invoke_is_exact_name_scoped_and_independent() {
+        use wyrd_spec::card::agent::BuiltinTool;
+        let query = Permission::tool_invoke(BuiltinTool::BifrostQuery);
+        let read = Permission::tool_invoke(BuiltinTool::FsRead);
+        let global = Permission::tool_invoke_any();
+
+        let decode = |value: serde_json::Value| serde_json::from_value::<Permission>(value);
+        let global_json = json!({"resource": "tool", "action": "invoke", "scope": "all"});
+        let exact_json =
+            json!({"resource": "tool", "action": "invoke", "scope": {"tool": "bifrost.query"}});
+        assert_eq!(decode(global_json.clone()).expect("global"), global);
+        assert_eq!(decode(exact_json.clone()).expect("exact"), query);
+        assert_eq!(
+            serde_json::to_value(&global).expect("serialize"),
+            global_json
+        );
+        assert_eq!(serde_json::to_value(&query).expect("serialize"), exact_json);
+        assert_eq!("tool:invoke".parse::<Permission>().expect("parses"), global);
+        for tool in BuiltinTool::ALL {
+            let value =
+                json!({"resource": "tool", "action": "invoke", "scope": {"tool": tool.as_str()}});
+            assert_eq!(
+                decode(value).expect("built-in"),
+                Permission::tool_invoke(tool)
+            );
+        }
+        for name in [
+            "bifrost",
+            "bifrost.*",
+            "fs.read/etc",
+            "/usr/bin/python",
+            "FS.READ",
+            "http.fetch",
+        ] {
+            let value = json!({"resource": "tool", "action": "invoke", "scope": {"tool": name}});
+            assert!(decode(value).is_err(), "{name}");
+        }
+        for (resource, action) in [
+            ("tool", "read"),
+            ("tool", "run"),
+            ("cards", "invoke"),
+            ("bifrost_query", "read"),
+            ("wildcard", "invoke"),
+        ] {
+            let value =
+                json!({"resource": resource, "action": action, "scope": {"tool": "fs.read"}});
+            assert!(decode(value).is_err(), "{resource}:{action}");
+        }
+
+        assert!(global.covers(&query));
+        assert!(query.covers(&query));
+        assert!(!query.covers(&read));
+        assert!(!query.covers(&global));
+        assert!(Permission::wildcard().covers(&query));
+        for domain in [
+            Permission::card_read(),
+            Permission::bifrost_query_read(),
+            Permission::verifier_run_any(),
+        ] {
+            assert!(!domain.covers(&query), "{domain}");
+            assert!(!global.covers(&domain), "{domain}");
+        }
+
+        let set = |grants: &[Permission]| grants.iter().cloned().collect::<PermissionSet>();
+        let meet = |left: &[Permission], right: &[Permission]| {
+            set(left).intersection(&set(right)).expect("representable")
+        };
+        assert!(meet(std::slice::from_ref(&query), std::slice::from_ref(&read)).is_empty());
+        for (left, right) in [(&global, &query), (&query, &global)] {
+            let shared = meet(std::slice::from_ref(left), std::slice::from_ref(right));
+            assert_eq!(shared.iter().collect::<Vec<_>>(), vec![&query]);
+        }
+        let attenuated = meet(&[Permission::wildcard()], std::slice::from_ref(&query));
+        assert!(attenuated.contains(&query) && !attenuated.contains(&read));
+
+        let role: Vec<Permission> =
+            serde_json::from_value(json!([global_json, exact_json, {"resource": "bifrost_query", "action": "read", "scope": "all"}]))
+                .expect("role permissions decode");
+        let role = role.into_iter().collect::<PermissionSet>();
+        assert!(role.contains(&query) && role.contains(&read));
     }
 
     /// Proves an explicit gateway grant survives merging beside `all` in either

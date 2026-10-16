@@ -8,7 +8,6 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use secrecy::ExposeSecret as _;
 use serde_json::{Value, json};
-use vala_eval::executor::{EvalReport, TaskRunOutcome};
 use wyrd_client::Bifrost;
 use wyrd_client::bifrost::{Correlation, TableConfig};
 use wyrd_client::cards::Cards;
@@ -16,15 +15,17 @@ use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_runtime::Permission;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_server::scribe_outbox::ScribeWrite;
-use wyrd_server::verification::engines::VerifierReport;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_spec::auth::Attribution;
-use wyrd_spec::ids::VerificationResultId;
+use wyrd_spec::card::verifier::Check;
+use wyrd_spec::ids::ExecutionId;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::GetCardResponse;
-use wyrd_spec::vala::eval::AssertionResult;
+use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::execution::{
+    RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+};
 use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
-use wyrd_sql::queries::verifier_runs::RunInput;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::canonical_signals;
 
@@ -38,10 +39,10 @@ pub(super) struct EvidenceInvestigation {
     agent: RunningService<RoleClient, ()>,
     /// Exact subject Card whose evidence is investigated.
     subject: CardRef,
-    /// Drift result used as a detail pivot.
-    drift_result: VerificationResultId,
-    /// Eval result used as a detail pivot.
-    eval_result: VerificationResultId,
+    /// Drift execution, whose UUID is its result ID, used as a detail pivot.
+    drift_result: ExecutionId,
+    /// Assertion execution, whose UUID is its result ID, used as a pivot.
+    eval_result: ExecutionId,
     /// Exact Drift Verifier matching the retained feature report.
     drift_verifier: CardRef,
     /// Exact Eval Verifier from the shared assertion fixture.
@@ -118,8 +119,8 @@ impl EvidenceInvestigation {
             drift_verifier: drift.root,
             eval_verifier: eval.root,
             scope: signals.scope,
-            drift_result: VerificationResultId::new_v7(),
-            eval_result: VerificationResultId::new_v7(),
+            drift_result: ExecutionId::new_v7(),
+            eval_result: ExecutionId::new_v7(),
         };
         investigation.publish_results().await?;
         Ok(investigation)
@@ -132,49 +133,80 @@ impl EvidenceInvestigation {
     async fn publish_results(&self) -> Result<(), McpJourneyError> {
         let seed = self.server.verification_fixture().await?;
         let now = chrono::Utc::now();
-        let drift = VerifierReport::Drift(Some(serde_json::from_str(include_str!(
-            "../../../../../../../fixtures/cards/mcp_investigation/drift-report.json"
-        ))?));
-        let assertion: AssertionResult = serde_json::from_str(include_str!(
-            "../../../../../../../fixtures/cards/mcp_investigation/eval-assertion.json"
-        ))?;
-        let eval = VerifierReport::Eval {
-            report: EvalReport {
-                outcomes: vec![TaskRunOutcome::Ran(Box::new(assertion))],
-            },
-            verdict: VerificationVerdict::Failed,
-            run_id: None,
+        let failed = |id: &str, statement: &str, detail, check| -> Result<_, McpJourneyError> {
+            Ok(VerificationOutcome {
+                verdict: VerificationVerdict::Failed,
+                requirements: vec![RequirementResult {
+                    id: TaskId::new(id)?,
+                    step: None,
+                    statement: statement.to_owned(),
+                    outcome: RequirementOutcome::Failed,
+                    reason: "seeded failure".to_owned(),
+                    actual: None,
+                    citations: Vec::new(),
+                    detail,
+                    check: serde_json::from_value::<Check>(check)?,
+                    provenance: None,
+                }],
+                steps: Vec::new(),
+                evidence: std::collections::BTreeMap::new(),
+            })
         };
-        let drift_input = RunInput::DriftWindow(DriftWindow {
+        let drift = failed(
+            "latency-under-threshold",
+            "Mean latency stays at or under its alert threshold",
+            Some(RequirementDetail::Drift(serde_json::from_str(
+                include_str!(
+                    "../../../../../../../fixtures/cards/mcp_investigation/drift-report.json"
+                ),
+            )?)),
+            json!({
+                "kind": "drift", "on": "inputs.latency", "method": "Custom",
+                "signal": {"kind": "Metric", "name": "latency"},
+                "condition": {"kind": "Statistical"},
+                "profile": {"kind": "Custom", "metric_name": "latency", "baseline_value": 1.0, "alert_threshold": 1.0}
+            }),
+        )?;
+        let assertion = failed(
+            "no-refund-promise",
+            "The answer does not promise a guaranteed refund",
+            None,
+            json!({
+                "kind": "assert", "path": "inputs.answer",
+                "operator": "not_contains", "expected": "guaranteed refund"
+            }),
+        )?;
+        let window = DriftWindow {
             start: now - chrono::Duration::hours(1),
             end: now,
-        });
-        let eval_input = RunInput::EvalRecord {
-            record_id: "seeded-eval-record".to_owned(),
-            event_time: now,
         };
         let subject_uid = self
             .subject
             .uid
             .as_ref()
             .ok_or("registered subject has a UID")?;
-        for (result_id, report, input, reference) in [
-            (self.drift_result, drift, drift_input, &self.drift_verifier),
-            (self.eval_result, eval, eval_input, &self.eval_verifier),
+        for (execution_id, outcome, window, reference) in [
+            (
+                self.drift_result,
+                drift,
+                Some(&window),
+                &self.drift_verifier,
+            ),
+            (self.eval_result, assertion, None, &self.eval_verifier),
         ] {
             let version = reference.version.to_string();
             let uid = reference.uid.as_ref().ok_or("Verifier has a UID")?;
             let run = ResultRun {
+                execution_id,
                 run_id: None,
                 verifier_version: &version,
                 card_uid: subject_uid,
                 owner_card_uid: Some(subject_uid),
                 binding_id: None,
                 trigger: None,
-                input: &input,
+                window,
             };
-            let payload =
-                ResultPayloadBuilder::new(run, uid, result_id, now, now).build(&report)?;
+            let payload = ResultPayloadBuilder::new(run, uid, now, now).build(&outcome)?;
             self.server.state().scribe_outbox.stage(
                 self.server.data_tenant_id(),
                 ScribeWrite::Result {
@@ -235,7 +267,6 @@ impl EvidenceInvestigation {
             ("vala.datasets", "investigation_events", "value"),
             ("vala.verification", "results", "verifier_card_uid"),
             ("vala.drift", "result_features", "score"),
-            ("vala.eval", "result_items", "passed"),
         ] {
             assert!(
                 tables
@@ -276,7 +307,7 @@ impl EvidenceInvestigation {
         Ok(())
     }
 
-    /// A subject Card pivot selects judgments, whose result IDs select Drift and Eval details.
+    /// A subject Card pivot selects judgments, whose result ID selects the Drift detail.
     ///
     /// # Errors
     /// Returns MCP, SQL, or missing-identity failures.
@@ -294,12 +325,15 @@ impl EvidenceInvestigation {
             assert_eq!(response.card.metadata.uid, reference.uid);
         }
         let uid = self.subject.uid.as_ref().ok_or("subject UID")?;
-        let rows = self.query(&format!("SELECT implementation, verdict FROM vala.verification.results WHERE card_uid = '{uid}' ORDER BY implementation LIMIT 20")).await?;
-        assert_eq!(rows, json!([["drift", "failed"], ["eval", "failed"]]));
+        let rows = self.query(&format!("SELECT result_id, verdict FROM vala.verification.results WHERE card_uid = '{uid}' ORDER BY result_id LIMIT 20")).await?;
+        let mut expected = [self.drift_result.to_string(), self.eval_result.to_string()];
+        expected.sort();
+        assert_eq!(
+            rows,
+            json!(expected.map(|result_id| json!([result_id, "failed"])))
+        );
         let rows = self.query(&format!("SELECT feature, score, threshold, verdict FROM vala.drift.result_features WHERE result_id = '{}' LIMIT 20", self.drift_result)).await?;
         assert_eq!(rows, json!([["latency", 3.0, 1.0, "drift"]]));
-        let rows = self.query(&format!("SELECT task_id, outcome_kind, passed FROM vala.eval.result_items WHERE result_id = '{}' LIMIT 20", self.eval_result)).await?;
-        assert_eq!(rows, json!([["no_refund_promise", "ran", false]]));
         Ok(())
     }
 

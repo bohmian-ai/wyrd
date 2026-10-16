@@ -1,11 +1,16 @@
-"""Scoped observation emits, and fire-and-forget Vala telemetry.
+"""Scoped verification and observation, and fire-and-forget Vala telemetry.
 
-``Run``, ``Observe``, and ``Judgment`` are reached through ``WyrdState.run()``; they are not
-constructed directly. ``record`` below is the separate telemetry door that
+``Run`` and ``Observe`` are reached through ``WyrdState.run()``; they are not
+constructed directly. ``Observe.verify`` and ``Observe.submit`` take and return
+the ``wyrd.verify`` types. ``record`` below is the separate telemetry door that
 swallows queue-full instead of raising.
 """
 
-from .._wyrd.observe import Judgment, Observe, Run
+from .._wyrd.observe import Observe, Run
 from ._telemetry import record
 
-__all__ = ["Judgment", "Observe", "Run", "record"]
+__all__ = [
+    "Observe",
+    "Run",
+    "record",
+]

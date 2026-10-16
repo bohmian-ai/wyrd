@@ -36,12 +36,12 @@ pub mod verification;
 pub use audit::AuditLogTable;
 pub use drift::ObservationsTable;
 pub use drift::{ObservationsTable as DriftObservationsTable, ResultFeaturesTable};
-pub use eval::{ObservationsTable as EvalObservationsTable, ResultItemsTable};
+pub use eval::ResultItemsTable;
 pub use gateway::CallsTable;
 pub use logs::RecordsTable;
 pub use metrics::PointsTable;
 pub use traces::SpansTable;
-pub use verification::ResultsTable;
+pub use verification::{ExecutionInputsTable, ResultsTable};
 
 /// Errors from pure table schema and projection operations.
 #[derive(Debug, Error)]
@@ -1187,8 +1187,8 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 10] = [
     definition::<PointsTable>(),
     definition::<RecordsTable>(),
     definition::<DriftObservationsTable>(),
-    definition::<EvalObservationsTable>(),
     definition::<ResultsTable>(),
+    definition::<ExecutionInputsTable>(),
     definition::<ResultFeaturesTable>(),
     definition::<ResultItemsTable>(),
     definition::<AuditLogTable>(),
@@ -1228,7 +1228,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use verification::{EVAL_SUMMARY, ResultsTable};
     use wyrd_tonic::otlp::common::v1::any_value::Value;
     use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue};
 
@@ -1358,10 +1357,11 @@ mod tests {
                     ("time_unix_nano", TimeGranularityWire::Hour)
                 }
                 ("gateway", "calls") => ("started_at", TimeGranularityWire::Hour),
-                ("drift" | "eval", "observations") | ("system", "audit_log") => {
+                ("drift", "observations") | ("system", "audit_log") => {
                     ("created_at", TimeGranularityWire::Day)
                 }
                 ("verification", "results") => ("ended_at", TimeGranularityWire::Day),
+                ("verification", "execution_inputs") => ("recorded_at", TimeGranularityWire::Day),
                 ("drift", "result_features") | ("eval", "result_items") => {
                     (WYRD_INGESTED_AT, TimeGranularityWire::Day)
                 }
@@ -1427,26 +1427,27 @@ mod tests {
                 ],
                 blooms: &["series"],
             },
-            VerificationContract {
-                namespace: "eval",
-                name: "observations",
-                columns: vec![
-                    utf8("record_id", false),
-                    utf8("session_id", true),
-                    variant_field("context", false),
-                    fields::fixed_binary("trace_id", 16, true),
-                    fields::fixed_binary("span_id", 8, true),
-                    ts_us_utc("created_at", false),
-                    variant_field("media", true),
-                ],
-                blooms: &[],
-            },
             verification_results_contract(),
+            VerificationContract {
+                namespace: "verification",
+                name: "execution_inputs",
+                columns: vec![
+                    utf8("execution_id", false),
+                    utf8("verifier_card_uid", false),
+                    utf8("binding_id", true),
+                    boolean("queue_execution", false),
+                    variant_field("inputs", false),
+                    variant_field("activation", true),
+                    ts_us_utc("recorded_at", false),
+                ],
+                blooms: &["execution_id"],
+            },
             VerificationContract {
                 namespace: "drift",
                 name: "result_features",
                 columns: vec![
                     utf8("result_id", false),
+                    utf8("requirement_id", false),
                     utf8("owner_card_uid", true),
                     utf8("verifier_card_uid", false),
                     utf8("binding_id", true),
@@ -1487,16 +1488,15 @@ mod tests {
         ]
     }
 
-    /// The approved contract for `verification.results`, whose typed
-    /// summaries are nullable Structs written exclusively per implementation,
-    /// and whose task result is one nullable `AssertionResult` Variant.
+    /// The approved contract for `verification.results`, whose generic
+    /// outcome is one required `VerificationOutcome` Variant.
     fn verification_results_contract() -> VerificationContract {
         VerificationContract {
             namespace: "verification",
             name: "results",
             columns: vec![
                 utf8("result_id", false),
-                utf8("implementation", false),
+                utf8("execution_id", false),
                 utf8("execution_status", false),
                 utf8("verdict", false),
                 utf8("verifier_version", false),
@@ -1504,40 +1504,18 @@ mod tests {
                 utf8("verifier_card_uid", false),
                 utf8("binding_id", true),
                 utf8("trigger_identity", true),
-                utf8("source_record_id", true),
                 ts_us_utc("window_start", true),
                 ts_us_utc("window_end", true),
                 ts_us_utc("started_at", false),
                 ts_us_utc("ended_at", false),
-                Field::new(
-                    "drift_report",
-                    DataType::Struct(
-                        vec![
-                            utf8("method", true),
-                            variant_field("features", true),
-                            utf8("verdict", true),
-                        ]
-                        .into(),
-                    ),
-                    true,
-                ),
-                Field::new(
-                    "eval_summary",
-                    DataType::Struct(
-                        vec![
-                            int32("total_tasks", true),
-                            int32("passed_tasks", true),
-                            int32("failed_tasks", true),
-                            float64("pass_rate", true),
-                            int64("duration_ms", true),
-                        ]
-                        .into(),
-                    ),
-                    true,
-                ),
-                variant_field("assertion_result", true),
+                variant_field("outcome", false),
             ],
-            blooms: &["result_id", "verifier_card_uid", "binding_id"],
+            blooms: &[
+                "result_id",
+                "execution_id",
+                "verifier_card_uid",
+                "binding_id",
+            ],
         }
     }
 
@@ -1570,7 +1548,7 @@ mod tests {
     /// them and dashboards query them — so a reordered, retyped, renamed, or
     /// newly nullable column is a breaking change rather than an
     /// implementation detail. Pinning the whole physical list here, including
-    /// nullable `owner_card_uid` and the typed `drift_report`, is what makes that break
+    /// nullable `owner_card_uid` and the `outcome` Variant, is what makes that break
     /// fail in this crate instead of at a caller's insert.
     ///
     /// # Panics
@@ -1646,20 +1624,17 @@ mod tests {
     /// A raw observation names its subject Card and never a Verifier, a
     /// binding, or a user-authored correlation column.
     ///
-    /// `drift_ref` and `eval_ref` are the retired Verifier pointers, and
+    /// `drift_ref` is the retired Verifier pointer, and
     /// `run_id`/`card_uid` are managed correlation the queue appends. Any of
     /// them reappearing as an authored payload column would let one raw input
     /// be attributed to, or duplicated per, a Verifier binding.
     ///
     /// # Panics
     ///
-    /// Panics when either observation table authors a forbidden column.
+    /// Panics when the observation table authors a forbidden column.
     #[test]
     fn observation_tables_author_no_verifier_or_correlation_columns() {
-        for (namespace, forbidden) in [
-            ("drift", ["drift_ref", "run_id", "card_uid"]),
-            ("eval", ["eval_ref", "run_id", "card_uid"]),
-        ] {
+        for (namespace, forbidden) in [("drift", ["drift_ref", "run_id", "card_uid"])] {
             let authored: Vec<String> = (builtin_table(namespace, "observations")
                 .expect("observation table")
                 .arrow_fields)()
@@ -2853,8 +2828,8 @@ mod tests {
     /// A nullable Struct is admitted only wholly present or wholly absent.
     ///
     /// The helper is driven through all four parent/child validity states,
-    /// then the Results and Calls validators are shown to refuse a partial
-    /// value in their declared Struct columns.
+    /// then the Calls validator is shown to refuse a partial
+    /// value in its declared Struct column.
     ///
     /// # Panics
     ///
@@ -2917,15 +2892,6 @@ mod tests {
                 "{namespace}.{name}"
             );
         };
-        let summary = ResultsTable::eval_summary_fields();
-        let mut values: Vec<ArrayRef> = summary.iter().map(|f| filled(f.data_type())).collect();
-        values[0] = new_null_array(&DataType::Int32, 1);
-        refuses_partial(
-            "verification",
-            "results",
-            EVAL_SUMMARY,
-            Arc::new(StructArray::new(summary, values, None)),
-        );
         refuses_partial(
             "gateway",
             "calls",
@@ -2991,8 +2957,8 @@ mod tests {
     /// One test owns the persisted shapes a reader depends on: the `0x0d`
     /// fingerprint tag with no storage children, the fixed depth and size
     /// limits, each catalogued Variant error's code and detail fields, the
-    /// exact `drift_report`, `eval_summary`, and `resource_entity_refs`
-    /// layouts, and every built-in column revision 10 stores as Variant.
+    /// exact `resource_entity_refs` layouts, and every built-in column
+    /// revision 10 stores as Variant.
     ///
     /// # Panics
     ///
@@ -3000,7 +2966,6 @@ mod tests {
     #[test]
     fn variant_contract_and_builtin_schemas_are_stable() {
         assert_variant_identity_and_errors();
-        assert_result_struct_layouts();
         assert_builtin_variant_columns();
     }
 
@@ -3076,50 +3041,6 @@ mod tests {
         }
     }
 
-    /// Pins the exact `drift_report` and `eval_summary` Struct layouts of
-    /// `vala.verification.results` and the absence of a `details` column.
-    ///
-    /// # Panics
-    ///
-    /// Panics when either layout drifts or `details` reappears.
-    fn assert_result_struct_layouts() {
-        let results = (builtin_table("verification", "results")
-            .expect("verification results")
-            .schema)();
-        let layout = |name: &str| -> Vec<(String, bool, bool)> {
-            let field = results.field_with_name(name).expect("the Struct column");
-            assert!(field.is_nullable(), "{name} is a nullable Struct");
-            let DataType::Struct(children) = field.data_type() else {
-                panic!("{name} is a Struct");
-            };
-            children
-                .iter()
-                .map(|child| (child.name().clone(), child.is_nullable(), is_variant(child)))
-                .collect()
-        };
-        let owned = |entries: &[(&str, bool)]| -> Vec<(String, bool, bool)> {
-            entries
-                .iter()
-                .map(|(name, variant)| ((*name).to_owned(), true, *variant))
-                .collect()
-        };
-        assert_eq!(
-            layout("drift_report"),
-            owned(&[("method", false), ("features", true), ("verdict", false)])
-        );
-        assert_eq!(
-            layout("eval_summary"),
-            owned(&[
-                ("total_tasks", false),
-                ("passed_tasks", false),
-                ("failed_tasks", false),
-                ("pass_rate", false),
-                ("duration_ms", false),
-            ])
-        );
-        assert!(results.field_with_name("details").is_err());
-    }
-
     /// Pins every built-in column stored as Variant and the locked
     /// `resource_entity_refs` Struct list of each signal table.
     ///
@@ -3179,9 +3100,13 @@ mod tests {
                     "scope_attributes",
                 ][..],
             ),
-            ("eval", "observations", &["context", "media"][..]),
             ("eval", "result_items", &["actual", "expected"][..]),
-            ("verification", "results", &["assertion_result"][..]),
+            ("verification", "results", &["outcome"][..]),
+            (
+                "verification",
+                "execution_inputs",
+                &["inputs", "activation"][..],
+            ),
             (
                 "gateway",
                 "calls",

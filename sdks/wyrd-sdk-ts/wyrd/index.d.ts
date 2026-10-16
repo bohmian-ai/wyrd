@@ -319,6 +319,29 @@ export declare class NativeCards {
   delete(cardRef: string): Promise<NativeLifecycleResult>
 }
 
+/** Node-facing handle of one queued Verifier execution. */
+export declare class NativeExecution {
+  /** The server-issued execution ID. */
+  get id(): string
+  /**
+   * Reads the execution's status, terminal error, and visible result.
+   *
+   * # Errors
+   * Returns a napi error only when the state cannot be projected; read
+   * failures are returned in [`NativeLifecycleResult`].
+   */
+  status(): Promise<NativeLifecycleResult>
+  /**
+   * Polls until a result, the execution's terminal error, or `timeout_ms`.
+   *
+   * # Errors
+   * Returns a napi error only when the result cannot be projected; the
+   * terminal error and `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` are returned
+   * in [`NativeLifecycleResult`].
+   */
+  wait(timeoutMs: number): Promise<NativeLifecycleResult>
+}
+
 /**
  * Tenant gateway administration handle over the shared `wyrd_client` Gateway.
  *
@@ -632,44 +655,28 @@ export declare class NativeRun {
   /** An immutable sibling view scoped to a registered alias. */
   forCard(alias: string): NativeRunOpen
   /**
-   * Emits one Drift observation from its JSON feature object.
+   * Executes a bound Verifier now on slot values and returns its
+   * result.
    *
    * # Errors
    *
-   * Returns a napi error only when the outcome cannot be projected; a
-   * malformed feature map, the lifecycle refusals, and queue saturation are
-   * returned in [`NativeLifecycleResult`].
-   */
-  drift(featuresJson: string, sessionId?: string | undefined | null): NativeLifecycleResult
-  /**
-   * Emits one Eval observation from its JSON context and options.
-   *
-   * `media_json` is one JSON array of media descriptors; `trace_id` and
-   * `span_id` are lower-case hex and fall back to the active span when both
-   * are omitted.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the outcome cannot be projected; malformed
-   * identifiers, a span without its trace, the lifecycle refusals, and queue
-   * saturation are returned in [`NativeLifecycleResult`].
-   */
-  eval(contextJson: string, sessionId?: string | undefined | null, mediaJson?: string | undefined | null, traceId?: string | undefined | null, spanId?: string | undefined | null): NativeLifecycleResult
-  /**
-   * Judges this view's subject with a bound Verifier from JSON input.
-   *
-   * `input_json` is one Eval context object or one array of Drift feature
-   * rows; `media_json` is one JSON array of media descriptors. One server
-   * call, never replayed; nothing is observed, recorded, or dispatched.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the outcome cannot be projected; an
-   * unbound Verifier, input of the wrong shape, malformed media, and the
-   * server's verification refusals are returned in
+   * Returns a napi error only when the outcome cannot be projected; input
+   * refusals, a Window Verifier, and the server's refusals are returned in
    * [`NativeLifecycleResult`].
    */
-  verify(verifier: string, inputJson: string, mediaJson?: string | undefined | null): Promise<NativeLifecycleResult>
+  verify(verifier: string, inputs: Array<NativeVerifierInput>): Promise<NativeLifecycleResult>
+  /**
+   * Submits slot values: Window samples are recorded now on the
+   * JavaScript thread, so each queued sample write records its
+   * `bifrost.enqueue` PRODUCER span in Node's tracer; Run evidence is
+   * queued for one execution.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the outcome cannot be projected; input
+   * refusals and the server's refusals are returned in [`NativeSubmission`].
+   */
+  submit(verifier: string, inputs: Array<NativeVerifierInput>): Promise<NativeSubmission>
   /**
    * Invokes this view's tool-free Agent once with the string variables of
    * `variables_json` and returns its final text.
@@ -825,6 +832,14 @@ export declare class NativeWyrdClient {
    * Never returns a napi error; failures are carried in the result.
    */
   principals(): Promise<NativePrincipalsConnection>
+  /**
+   * Rebuilds the handle of execution `id` as this client's principal.
+   *
+   * # Errors
+   * Never returns a napi error; a malformed ID and a refused credential
+   * exchange are carried in the result.
+   */
+  connectExecution(id: string): Promise<NativeSubmission>
 }
 
 /**
@@ -1037,6 +1052,18 @@ export interface NativeCardsConnection {
   error?: NativeWyrdError
 }
 
+/** A local file for a `media` slot, read only when the call pins it. */
+export interface NativeFileInput {
+  /** A file on disk; exclusive with `bytes`. */
+  path?: string
+  /** In-memory contents; exclusive with `path`. */
+  bytes?: Buffer
+  /** Canonical format name, such as `pdf`; inferred when omitted. */
+  format?: string
+  /** Display name sent with the declaration. */
+  filename?: string
+}
+
 /**
  * Closed result of connecting one gateway administration handle: the handle or a
  * catalog error.
@@ -1157,6 +1184,17 @@ export interface NativeRunOpen {
 }
 
 /**
+ * Closed result of `submit` or `connect`: Recorded when both fields are
+ * absent, a queued execution handle, or a catalog error.
+ */
+export interface NativeSubmission {
+  /** The queued execution, for Run evidence. */
+  execution?: NativeExecution
+  /** Catalog failure otherwise. */
+  error?: NativeWyrdError
+}
+
+/**
  * One Bifrost table as it crosses the Node boundary.
  *
  * `configJson` is the authoritative value — the whole `TableConfig`, including
@@ -1186,6 +1224,23 @@ export interface NativeTableConfigResult {
   config?: NativeTableConfig
   /** Catalog failure when declaration or description failed. */
   error?: NativeWyrdError
+}
+
+/** One slot value: exactly one of `value_json`, `file`, or `artifact`. */
+export interface NativeVerifierInput {
+  /**
+   * The Verifier input slot this value fills; absent for the one
+   * positional value of a single-slot Verifier.
+   */
+  slot?: string
+  /** A JSON value for a `json`, `trace`, or `samples` slot. */
+  valueJson?: string
+  /** A local file for a `media` slot. */
+  file?: NativeFileInput
+  /** An exact Artifact Card reference, as text or JSON, for a `media` slot. */
+  artifact?: string
+  /** The file inside `artifact`, when it holds several. */
+  artifactPath?: string
 }
 
 /** Closed result of building or delegating one client: a handle or a catalog error. */

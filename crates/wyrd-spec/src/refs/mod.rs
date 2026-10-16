@@ -9,7 +9,6 @@ use crate::card::artifact::ArtifactSpec;
 use crate::card::audit::AuditSpec;
 use crate::card::data::{DataInterface, DataSpec, SplitStrategy};
 use crate::card::drift::{DriftSignal, DriftSpec};
-use crate::card::eval::EvalSpec;
 use crate::card::experiment::ExperimentSpec;
 use crate::card::mcp::McpSpec;
 use crate::card::model::ModelSpec;
@@ -17,11 +16,10 @@ use crate::card::operator::OperatorSpec;
 use crate::card::service::ServiceSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::card::verifier::{
-    VerificationBinding, VerifierImplementation, VerifierSpec, VerifierTask,
+    Action, AgentCall, Check, CodeCall, CodeSource, Requirement, VerificationBinding, VerifierSpec,
 };
 use crate::envelope::Spec;
 use crate::reference::{CardRef, InlineableRef, Ref};
-use crate::vala::eval::EvalTask;
 use skald_spec::Prompt;
 
 /// A yielded reference slot with metadata about its kind and a mutable handle.
@@ -251,47 +249,6 @@ impl Visit for AgentSpec {
     }
 }
 
-impl Visit for EvalSpec {
-    /// Visit the dataset reference and every LLM-judge Agent slot.
-    fn visit<F>(&mut self, f: &mut F)
-    where
-        F: FnMut(SlotEntry<'_>),
-    {
-        self.visit_at("spec.implementation.spec", f);
-    }
-}
-
-impl EvalSpec {
-    /// Visit this Eval payload's reference slots under an explicit path prefix.
-    ///
-    /// The payload is only reachable inside a Verifier implementation, so the
-    /// prefix names that enclosing slot rather than a bare `spec`.
-    fn visit_at<F>(&mut self, prefix: &str, f: &mut F)
-    where
-        F: FnMut(SlotEntry<'_>),
-    {
-        if let Some(dataset_ref) = &mut self.dataset {
-            f(SlotEntry {
-                path: format!("{prefix}.dataset"),
-                value: SlotValue::Durable(&mut dataset_ref.0),
-            });
-        }
-
-        for (task_id, task) in &mut self.tasks {
-            if let EvalTask::LlmJudge(llm_judge_task) = task {
-                let path = format!("{prefix}.tasks[{}].LlmJudge.judge_ref", task_id.as_str());
-                f(SlotEntry {
-                    path: path.clone(),
-                    value: SlotValue::InlineableAgent(&mut llm_judge_task.judge_ref),
-                });
-                if let InlineableRef::Inline(agent) = &mut llm_judge_task.judge_ref {
-                    visit_agent(agent, &path, f);
-                }
-            }
-        }
-    }
-}
-
 impl Visit for DriftSpec {
     /// Visit the baseline Data reference carried by a `Distribution` signal.
     fn visit<F>(&mut self, f: &mut F)
@@ -324,31 +281,70 @@ impl DriftSpec {
 }
 
 impl Visit for VerifierSpec {
-    /// Visit the reference slots owned by this Verifier's one implementation.
+    /// Visit every Agent, code Artifact, and drift baseline reference in the
+    /// Verifier's steps and requirements.
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
     {
-        match &mut self.implementation {
-            VerifierImplementation::Drift(drift) => {
-                drift.visit_at("spec.implementation.spec", f);
+        for (i, step) in self.steps.iter_mut().enumerate() {
+            let prefix = format!("spec.steps[{i}].action");
+            match &mut step.action {
+                Action::Extract { .. } => {}
+                Action::Agent(call) => visit_agent_call(call, &prefix, f),
+                Action::Code(call) => visit_code_call(call, &prefix, f),
             }
-            VerifierImplementation::Eval(eval) => {
-                eval.visit_at("spec.implementation.spec", f);
-            }
-            VerifierImplementation::Task(task) => {
-                if let VerifierTask::LlmJudge(judge) = &mut task.definition {
-                    let path = "spec.implementation.spec.judge_ref".to_owned();
-                    f(SlotEntry {
-                        path: path.clone(),
-                        value: SlotValue::InlineableAgent(&mut judge.judge_ref),
-                    });
-                    if let InlineableRef::Inline(agent) = &mut judge.judge_ref {
-                        visit_agent(agent, &path, f);
-                    }
-                }
-            }
+            visit_requirements(
+                &mut step.requirements,
+                &format!("spec.steps[{i}].requirements"),
+                f,
+            );
         }
+        visit_requirements(&mut self.requirements, "spec.requirements", f);
+    }
+}
+
+/// Visit the reference slots of each requirement check under `prefix`.
+fn visit_requirements<F>(requirements: &mut [Requirement], prefix: &str, f: &mut F)
+where
+    F: FnMut(SlotEntry<'_>),
+{
+    for (i, requirement) in requirements.iter_mut().enumerate() {
+        let prefix = format!("{prefix}[{i}].check");
+        match &mut requirement.check {
+            Check::Agent(call) => visit_agent_call(call, &prefix, f),
+            Check::Code(call) => visit_code_call(call, &prefix, f),
+            Check::Drift(drift) => drift.spec.visit_at(&prefix, f),
+            Check::Assert { .. } | Check::Trace(_) => {}
+        }
+    }
+}
+
+/// Visit one Agent call's Agent slot and, when inline, the Agent's own slots.
+fn visit_agent_call<F>(call: &mut AgentCall, prefix: &str, f: &mut F)
+where
+    F: FnMut(SlotEntry<'_>),
+{
+    let path = format!("{prefix}.agent");
+    f(SlotEntry {
+        path: path.clone(),
+        value: SlotValue::InlineableAgent(&mut call.agent),
+    });
+    if let InlineableRef::Inline(agent) = &mut call.agent {
+        visit_agent(agent, &path, f);
+    }
+}
+
+/// Visit one code call's Artifact source slot.
+fn visit_code_call<F>(call: &mut CodeCall, prefix: &str, f: &mut F)
+where
+    F: FnMut(SlotEntry<'_>),
+{
+    if let CodeSource::Artifact { card, .. } = &mut call.source {
+        f(SlotEntry {
+            path: format!("{prefix}.source.artifact.card"),
+            value: SlotValue::Durable(card),
+        });
     }
 }
 
@@ -469,6 +465,63 @@ where
 }
 
 #[cfg(test)]
+mod blocks_tests {
+    //! Reference visiting over staged Verifier building blocks.
+
+    use serde_json::json;
+
+    use super::{SlotValue, Visit};
+    use crate::card::verifier::VerifierSpec;
+
+    /// The staged Verifier yields every Agent, Artifact, Prompt, and
+    /// baseline slot at its authored path.
+    ///
+    /// # Panics
+    /// Panics when a slot is missing or yielded at the wrong path.
+    #[test]
+    fn blocks_verifier_yields_every_reference_slot() {
+        let agent =
+            json!({"kind": "Agent", "space": "support", "name": "judge", "version": "1.0.0"});
+        let inline = json!({
+            "prompt": {"kind": "Prompt", "space": "support", "name": "judge-prompt", "version": "1.0.0"},
+            "execution_route": {"kind": "wyrd_gateway", "deployment": "openai-primary"}
+        });
+        let mut spec: VerifierSpec = serde_json::from_value(json!({
+            "steps": [{"id": "a", "action": {"kind": "agent", "agent": inline},
+                "requirements": [{"id": "b", "statement": "s", "check": {"kind": "code", "entrypoint": "f",
+                    "source": {"artifact": {"card": {"kind": "Artifact", "space": "support", "name": "checks", "version": "1.0.0"}}}}}]}],
+            "requirements": [
+                {"id": "c", "statement": "s", "check": {"kind": "agent", "agent": agent}},
+                {"id": "d", "statement": "s", "check": {"kind": "drift", "on": "inputs.x", "method": "Spc",
+                    "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "space": "risk", "name": "train", "version": "1.0.0"}, "features": ["x"]},
+                    "condition": {"kind": "Statistical"}}}
+            ]
+        }))
+        .expect("staged Verifier");
+        let mut paths = Vec::new();
+        spec.visit(&mut |entry| {
+            let kind = match entry.value {
+                SlotValue::Durable(_) => "durable",
+                SlotValue::InlineablePrompt(_) => "prompt",
+                SlotValue::InlineableAgent(_) => "agent",
+                SlotValue::InlineableTrigger(_) | SlotValue::InlineableOperator(_) => "other",
+            };
+            paths.push(format!("{kind} {}", entry.path));
+        });
+        assert_eq!(
+            paths,
+            [
+                "agent spec.steps[0].action.agent",
+                "prompt spec.steps[0].action.agent.prompt",
+                "durable spec.steps[0].requirements[0].check.source.artifact.card",
+                "agent spec.requirements[0].check.agent",
+                "durable spec.requirements[1].check.signal.Distribution.baseline_ref",
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
 mod completeness_tests {
     use std::collections::{BTreeMap, HashMap};
 
@@ -494,12 +547,14 @@ mod completeness_tests {
     use crate::card::operator::OperatorSpec;
     use crate::card::service::{ServiceComponent, ServiceSpec};
     use crate::card::trigger::{TriggerActivation, TriggerSpec};
-    use crate::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
+    use crate::card::verifier::{
+        AgentCall, Check, Decide, DriftCheck, Reference, Requirement, VerificationBinding,
+        VerifierSpec,
+    };
     use crate::envelope::{CardKind, Spec};
     use crate::ids::{CardName, ColumnName, SpaceName};
     use crate::reference::{CardRef, InlineableRef, Ref};
     use crate::vala::eval::ids::TaskId;
-    use crate::vala::eval::{ComparisonOperator, DatasetRef, EvalSpec, EvalTask, LlmJudgeTask};
     use wyrd_semver::VersionBlock;
 
     fn card_ref(kind: CardKind, name: &str) -> CardRef {
@@ -605,19 +660,45 @@ mod completeness_tests {
         }
     }
 
-    fn eval() -> EvalSpec {
-        let task_id = TaskId::new("judge").expect("fixture task id is valid");
-        let judge = LlmJudgeTask::new(
-            task_id.clone(),
-            agent(),
-            ComparisonOperator::Equals,
-            json!(true),
-        )
-        .expect("fixture judge is valid");
-        let mut eval = EvalSpec::new(BTreeMap::from([(task_id, EvalTask::LlmJudge(judge))]))
-            .expect("fixture eval is valid");
-        eval.dataset = Some(DatasetRef(Ref::Ref(card_ref(CardKind::Data, "dataset"))));
-        eval
+    /// A Verifier whose one requirement is an Agent check of [`agent`].
+    ///
+    /// # Panics
+    /// Panics when the fixed requirement id stops validating.
+    fn agent_verifier() -> VerifierSpec {
+        VerifierSpec {
+            description: None,
+            inputs: BTreeMap::new(),
+            steps: Vec::new(),
+            requirements: vec![Requirement {
+                id: TaskId::new("judge").expect("fixture requirement id is valid"),
+                statement: "The answer is grounded.".to_owned(),
+                check: Check::Agent(AgentCall {
+                    agent: InlineableRef::Inline(Box::new(agent())),
+                    inputs: BTreeMap::new(),
+                    workspace: BTreeMap::new(),
+                }),
+            }],
+            decide: Decide::All,
+            context_capture: None,
+        }
+    }
+
+    /// A Verifier whose one requirement is a drift check of [`drift`].
+    ///
+    /// # Panics
+    /// Panics when the fixed requirement id or reference stops validating.
+    fn drift_verifier() -> VerifierSpec {
+        VerifierSpec {
+            requirements: vec![Requirement {
+                id: TaskId::new("stable").expect("fixture requirement id is valid"),
+                statement: "Inputs are stable.".to_owned(),
+                check: Check::Drift(DriftCheck {
+                    on: Reference::parse("inputs.current").expect("fixture reference is valid"),
+                    spec: drift(),
+                }),
+            }],
+            ..agent_verifier()
+        }
     }
 
     /// Build a PSI Drift payload whose baseline is the only reference slot.
@@ -666,6 +747,7 @@ mod completeness_tests {
                 InlineableRef::Ref(card_ref(CardKind::Operator, "page")),
                 InlineableRef::Inline(Box::new(notify_operator())),
             ],
+            inputs: BTreeMap::new(),
         }
     }
 
@@ -741,8 +823,8 @@ mod completeness_tests {
             },
         };
         let mut operator = notify_operator();
-        let mut drift = drift();
-        let mut eval = eval();
+        let mut drift = drift_verifier();
+        let mut eval = agent_verifier();
         let mut image = image;
         let mut text = text;
         let mut model = model();
@@ -755,14 +837,8 @@ mod completeness_tests {
             Spec::Model(model.clone()),
             Spec::Experiment(experiment.clone()),
             Spec::Agent(agent.clone()),
-            Spec::Verifier(VerifierSpec {
-                description: None,
-                implementation: VerifierImplementation::Eval(eval.clone()),
-            }),
-            Spec::Verifier(VerifierSpec {
-                description: None,
-                implementation: VerifierImplementation::Drift(drift.clone()),
-            }),
+            Spec::Verifier(eval.clone()),
+            Spec::Verifier(drift.clone()),
             Spec::Service(service.clone()),
             Spec::Mcp(mcp.clone()),
             Spec::Audit(audit.clone()),
@@ -772,7 +848,7 @@ mod completeness_tests {
         ] {
             count += visit_paths(spec).len();
         }
-        assert_eq!(count, 24);
+        assert_eq!(count, 23);
         assert!(visit_paths(Spec::Service(service.clone())).contains(&(
             "spec.components[0].verified_by[0].verifier".to_owned(),
             "durable"
@@ -812,29 +888,22 @@ mod completeness_tests {
         assert_eq!(actual, expected);
 
         assert_eq!(
-            visit_paths(Spec::Verifier(VerifierSpec {
-                description: None,
-                implementation: VerifierImplementation::Eval(eval()),
-            })),
+            visit_paths(Spec::Verifier(agent_verifier())),
             vec![
-                ("spec.implementation.spec.dataset".to_owned(), "durable"),
                 (
-                    "spec.implementation.spec.tasks[judge].LlmJudge.judge_ref".to_owned(),
+                    "spec.requirements[0].check.agent".to_owned(),
                     "inlineable_agent"
                 ),
                 (
-                    "spec.implementation.spec.tasks[judge].LlmJudge.judge_ref.prompt".to_owned(),
+                    "spec.requirements[0].check.agent.prompt".to_owned(),
                     "inlineable_prompt"
                 ),
             ]
         );
         assert_eq!(
-            visit_paths(Spec::Verifier(VerifierSpec {
-                description: None,
-                implementation: VerifierImplementation::Drift(drift()),
-            })),
+            visit_paths(Spec::Verifier(drift_verifier())),
             vec![(
-                "spec.implementation.spec.signal.Distribution.baseline_ref".to_owned(),
+                "spec.requirements[0].check.signal.Distribution.baseline_ref".to_owned(),
                 "durable"
             )]
         );

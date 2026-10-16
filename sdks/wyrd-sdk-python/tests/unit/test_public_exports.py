@@ -14,7 +14,6 @@ PUBLIC_MODULES = [
     "wyrd.client",
     "wyrd.config",
     "wyrd.data",
-    "wyrd.eval",
     "wyrd.gateway",
     "wyrd.model",
     "wyrd.observe",
@@ -24,6 +23,7 @@ PUBLIC_MODULES = [
     "wyrd.state",
     "wyrd.testing",
     "wyrd.testing.cli",
+    "wyrd.verify",
 ]
 
 

@@ -836,9 +836,9 @@ mod pg_tests {
                 "tenants",
             ),
             (
-                "CREATE POLICY widened ON wyrd.verifier_runs USING (true)",
-                "DROP POLICY widened ON wyrd.verifier_runs",
-                "verifier_runs",
+                "CREATE POLICY widened ON wyrd.verifier_executions USING (true)",
+                "DROP POLICY widened ON wyrd.verifier_executions",
+                "verifier_executions",
             ),
             (
                 "GRANT TRUNCATE ON wyrd.cards TO wyrd_tenant",

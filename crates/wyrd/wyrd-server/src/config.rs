@@ -28,6 +28,7 @@ use wyrd_telemetry::TelemetryConfig;
 use wyrd_utils::secret::read_secret_file;
 
 use crate::boot::data_root::DEFAULT_BIFROST_DATA_DIR;
+use crate::verification::hosted::HostedLimits;
 
 /// Errors raised during configuration loading or validation.
 #[derive(Debug, thiserror::Error)]
@@ -1688,6 +1689,13 @@ pub struct VerificationConfig {
     /// credentials come from.
     #[serde(default)]
     pub operator_keys: OperatorKeysConfig,
+    /// The Deployment limits, read only from `WYRD_VERIFICATION_*` at startup.
+    #[serde(skip)]
+    pub limits: HostedLimits,
+    /// The hardened Monty worker binary: `WYRD_VERIFICATION_MONTY_WORKER`,
+    /// else `wyrd-monty-worker` beside the running server binary.
+    #[serde(skip)]
+    pub monty_worker: Option<PathBuf>,
 }
 
 /// Serde default for [`VerificationConfig::enabled`].
@@ -1701,7 +1709,213 @@ impl Default for VerificationConfig {
         Self {
             enabled: default_verification_enabled(),
             operator_keys: OperatorKeysConfig::default(),
+            limits: HostedLimits::default(),
+            monty_worker: None,
         }
+    }
+}
+
+impl VerificationConfig {
+    /// Apply every `WYRD_VERIFICATION_*` Deployment limit and the Monty
+    /// worker path, then refuse inconsistent limits.
+    ///
+    /// Each limit is a positive integer; `_MIB`/`_KIB` are binary units and
+    /// `_MS` milliseconds. Unset variables keep the approved defaults.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::BadEnvVar`] naming a variable that is empty,
+    /// not a positive integer, or overflows its unit, and
+    /// [`ConfigError::Invalid`] naming the variables of an inconsistent pair.
+    fn apply_limits_env(&mut self) -> Result<(), ConfigError> {
+        /// One kibibyte.
+        const KIB: u64 = 1024;
+        /// One mebibyte.
+        const MIB: u64 = 1024 * KIB;
+        let limits = &mut self.limits;
+        set_scaled(
+            "WYRD_VERIFICATION_MONTY_MIN_WORKERS",
+            1,
+            &mut limits.monty_min_workers,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_MONTY_MAX_WORKERS",
+            1,
+            &mut limits.monty_max_workers,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_MONTY_MAX_WAITERS",
+            1,
+            &mut limits.monty_max_waiters,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_MONTY_MEMORY_MIB",
+            MIB,
+            &mut limits.monty_memory_bytes,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB",
+            MIB,
+            &mut limits.monty_process_memory_bytes,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB",
+            MIB,
+            &mut limits.monty_pool_memory_bytes,
+        )?;
+        set_millis(
+            "WYRD_VERIFICATION_CODE_TIMEOUT_MS",
+            &mut limits.code_timeout,
+        )?;
+        set_millis(
+            "WYRD_VERIFICATION_AGENT_CODE_BUDGET_MS",
+            &mut limits.agent_code_budget,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_FILE_MAX_MIB",
+            MIB,
+            &mut limits.file_max_bytes,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_FILES_MAX_MIB",
+            MIB,
+            &mut limits.files_max_bytes,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_ARCHIVE_MAX_MIB",
+            MIB,
+            &mut limits.archive_max_bytes,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_ARCHIVE_MAX_ENTRIES",
+            1,
+            &mut limits.archive_max_entries,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_ARCHIVE_MAX_RATIO",
+            1,
+            &mut limits.archive_max_ratio,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_EXTRACT_MAX_PAGES",
+            1,
+            &mut limits.extract_max_pages,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_EXTRACT_TEXT_MAX_MIB",
+            MIB,
+            &mut limits.extract_text_max_bytes,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_SCRATCH_MAX_MIB",
+            MIB,
+            &mut limits.scratch_max_bytes,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_WORK_WRITE_MAX_MIB",
+            MIB,
+            &mut limits.work_write_max_bytes,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB",
+            KIB,
+            &mut limits.tool_result_max_bytes,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_MAX_WORKSPACES",
+            1,
+            &mut limits.max_workspaces,
+        )?;
+        set_millis("WYRD_VERIFICATION_TIMEOUT_MS", &mut limits.verify_timeout)?;
+        let inconsistent = [
+            (
+                limits.monty_min_workers > limits.monty_max_workers,
+                "WYRD_VERIFICATION_MONTY_MIN_WORKERS exceeds WYRD_VERIFICATION_MONTY_MAX_WORKERS",
+            ),
+            (
+                limits.monty_memory_bytes >= limits.monty_process_memory_bytes,
+                "WYRD_VERIFICATION_MONTY_MEMORY_MIB must be below \
+                 WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB",
+            ),
+            (
+                limits.monty_pool_memory_bytes < limits.monty_process_memory_bytes,
+                "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB is below \
+                 WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB",
+            ),
+            (
+                limits.live_workers().is_none(),
+                "WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB cannot hold \
+                 WYRD_VERIFICATION_MONTY_MEMORY_MIB plus Monty's allocator headroom",
+            ),
+            (
+                limits.file_max_bytes > limits.files_max_bytes,
+                "WYRD_VERIFICATION_FILE_MAX_MIB exceeds WYRD_VERIFICATION_FILES_MAX_MIB",
+            ),
+            (
+                limits.work_write_max_bytes > limits.scratch_max_bytes,
+                "WYRD_VERIFICATION_WORK_WRITE_MAX_MIB exceeds WYRD_VERIFICATION_SCRATCH_MAX_MIB",
+            ),
+        ];
+        if let Some((_, message)) = inconsistent.into_iter().find(|(bad, _)| *bad) {
+            return Err(ConfigError::Invalid {
+                message: message.to_owned(),
+            });
+        }
+        self.monty_worker = env_opt("WYRD_VERIFICATION_MONTY_WORKER")?
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::current_exe()
+                    .ok()
+                    .map(|server| server.with_file_name("wyrd-monty-worker"))
+            });
+        Ok(())
+    }
+}
+
+/// Overwrite `target` with the positive integer in `key` times `unit`.
+///
+/// # Errors
+/// Returns [`ConfigError::BadEnvVar`] when the value is empty, not a positive
+/// integer, or overflows `T` once scaled.
+fn set_scaled<T: TryFrom<u64>>(key: &str, unit: u64, target: &mut T) -> Result<(), ConfigError> {
+    if let Some(value) = env_positive(key)? {
+        *target = value
+            .checked_mul(unit)
+            .and_then(|scaled| T::try_from(scaled).ok())
+            .ok_or_else(|| ConfigError::BadEnvVar {
+                key: key.to_owned(),
+                message: format!("{value} overflows the limit's range"),
+            })?;
+    }
+    Ok(())
+}
+
+/// Overwrite `target` with the positive millisecond count in `key`.
+///
+/// # Errors
+/// Returns [`ConfigError::BadEnvVar`] when the value is empty or not a
+/// positive integer.
+fn set_millis(key: &str, target: &mut Duration) -> Result<(), ConfigError> {
+    if let Some(millis) = env_positive(key)? {
+        *target = Duration::from_millis(millis);
+    }
+    Ok(())
+}
+
+/// The positive integer in `key`, or `None` when unset.
+///
+/// # Errors
+/// Returns [`ConfigError::BadEnvVar`] when the value is empty, zero, or not
+/// an unsigned integer.
+fn env_positive(key: &str) -> Result<Option<u64>, ConfigError> {
+    let Some(value) = env_opt(key)? else {
+        return Ok(None);
+    };
+    match value.parse::<u64>() {
+        Ok(parsed) if parsed > 0 => Ok(Some(parsed)),
+        _ => Err(ConfigError::BadEnvVar {
+            key: key.to_owned(),
+            message: format!("expected a positive integer, got {value:?}"),
+        }),
     }
 }
 
@@ -3007,6 +3221,7 @@ impl WyrdServerConfig {
 
         // verification.operator_keys (WYRD_OPERATOR_KEK_*)
         self.verification.operator_keys.apply_env()?;
+        self.verification.apply_limits_env()?;
 
         // readiness.tick_ms
         if let Some(val) = env_opt("WYRD_READINESS_TICK_MS")? {
@@ -4012,6 +4227,99 @@ maintenance_interval_secs = 45
                     file.clone().apply_env_overrides().is_err(),
                     "{key} must be a byte count"
                 );
+            });
+        }
+    }
+
+    /// Unset Deployment limits keep the approved defaults; set ones apply
+    /// in their binary units; malformed, zero, overflowing, and inconsistent
+    /// values refuse startup naming the variable.
+    ///
+    /// # Panics
+    /// Panics when a limit is misparsed or a bad value is accepted.
+    #[test]
+    fn verification_limits_env_applies_and_refuses() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let mut config = VerificationConfig::default();
+        temp_env::with_vars_unset(["WYRD_VERIFICATION_MONTY_WORKER"], || {
+            config.apply_limits_env().expect("defaults apply");
+        });
+        assert_eq!(config.limits, HostedLimits::default());
+        assert!(
+            config.monty_worker.is_some(),
+            "worker defaults beside the server"
+        );
+        temp_env::with_vars(
+            [
+                ("WYRD_VERIFICATION_FILE_MAX_MIB", Some("5")),
+                ("WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB", Some("8")),
+                ("WYRD_VERIFICATION_TIMEOUT_MS", Some("1500")),
+                ("WYRD_VERIFICATION_MONTY_WORKER", Some("/opt/worker")),
+            ],
+            || {
+                let mut config = VerificationConfig::default();
+                config.apply_limits_env().expect("overrides apply");
+                assert_eq!(config.limits.file_max_bytes, 5 * 1024 * 1024);
+                assert_eq!(config.limits.tool_result_max_bytes, 8 * 1024);
+                assert_eq!(config.limits.verify_timeout, Duration::from_millis(1500));
+                assert_eq!(config.monty_worker, Some(PathBuf::from("/opt/worker")));
+            },
+        );
+        for (key, value) in [
+            ("WYRD_VERIFICATION_MAX_WORKSPACES", "0"),
+            ("WYRD_VERIFICATION_CODE_TIMEOUT_MS", "ten"),
+            ("WYRD_VERIFICATION_SCRATCH_MAX_MIB", "-1"),
+            ("WYRD_VERIFICATION_FILES_MAX_MIB", "18446744073709551615"),
+        ] {
+            temp_env::with_vars([(key, Some(value))], || {
+                let error = VerificationConfig::default()
+                    .apply_limits_env()
+                    .expect_err("bad value refuses");
+                assert!(error.to_string().contains(key), "{key}: {error}");
+            });
+        }
+        for (vars, named) in [
+            (
+                [
+                    ("WYRD_VERIFICATION_MONTY_MIN_WORKERS", "9"),
+                    ("WYRD_VERIFICATION_MONTY_MAX_WORKERS", "8"),
+                ],
+                "WYRD_VERIFICATION_MONTY_MIN_WORKERS",
+            ),
+            (
+                [
+                    ("WYRD_VERIFICATION_MONTY_MEMORY_MIB", "384"),
+                    ("WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB", "384"),
+                ],
+                "WYRD_VERIFICATION_MONTY_MEMORY_MIB",
+            ),
+            (
+                [
+                    ("WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB", "100"),
+                    ("WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB", "384"),
+                ],
+                "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB",
+            ),
+            (
+                [
+                    ("WYRD_VERIFICATION_FILE_MAX_MIB", "200"),
+                    ("WYRD_VERIFICATION_FILES_MAX_MIB", "100"),
+                ],
+                "WYRD_VERIFICATION_FILE_MAX_MIB",
+            ),
+            (
+                [
+                    ("WYRD_VERIFICATION_WORK_WRITE_MAX_MIB", "300"),
+                    ("WYRD_VERIFICATION_SCRATCH_MAX_MIB", "250"),
+                ],
+                "WYRD_VERIFICATION_WORK_WRITE_MAX_MIB",
+            ),
+        ] {
+            temp_env::with_vars(vars.map(|(key, value)| (key, Some(value))), || {
+                let error = VerificationConfig::default()
+                    .apply_limits_env()
+                    .expect_err("inconsistent limits refuse");
+                assert!(error.to_string().contains(named), "{named}: {error}");
             });
         }
     }

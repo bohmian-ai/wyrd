@@ -8,5 +8,7 @@ spec:
   verified_by:
     - verifier: ./latency-shift.yaml
       runs_on: ./daily.yaml
+      inputs:
+        latency: {features: [latency]}
       on_failure:
         - ./alert-on-call.yaml

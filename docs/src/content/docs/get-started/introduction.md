@@ -4,7 +4,6 @@ description: Wyrd checks that an AI system behaves the way its declaration says 
 pillar: wyrd
 section: Get started
 order: 1
-draft: true
 ---
 
 Wyrd is open-source verification and assurance infrastructure for AI systems. You declare what an AI system should do, record what it actually does, and Wyrd returns a verdict on whether the two match. The system can be an individual LLM, a deployed agent service, or a traditional HTTP service, and the same declaration is checked before release and in production.

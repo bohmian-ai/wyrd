@@ -173,15 +173,18 @@ A registered Agent's inline Prompt is the one inline body that gains identity:
 registration materializes it as the Agent's own `<agent-name>-prompt` Prompt
 Card, so every hydrated Agent navigates to a registered Prompt Card.
 
-A Verifier is a reusable, subject-less peer with one typed Drift or Eval
-implementation; `Drift` and `Eval` are not Card kinds. Deployment composition
-binds it through versioned `verified_by` on a Service component, Service, or
-standalone Agent; runtime observations carry the subject identity used for
-evaluation and filtering. Each binding names one Verifier, one Trigger
-activation (`runs_on`), and zero or more `on_failure` Operators. The runtime
-direction is `binding activation -> Verifier run -> Verification Result ->
-zero or more on_failure dispatches`: Trigger decides when, the Verifier
-decides the verdict, and only a `failed` verdict dispatches Operators. There
+A Verifier is a reusable, subject-less declaration of named evidence inputs,
+optional preparation steps, requirements that each produce one verdict, and a
+decide rule; drift and Agent judging are check kinds, not Card or Verifier
+kinds. Deployment composition binds it through versioned `verified_by` on a
+Service component, Service, or standalone Agent, which supplies the subject.
+Each binding names one Verifier, an optional `schedule` Trigger (`runs_on`),
+and zero or more `on_failure` Operators. A caller judges evidence now with
+`verify` or queues it with `submit`; a schedule judges recorded drift samples
+per window. The direction is `verify | submit | schedule -> Verifier execution
+-> Verification Result -> zero or more on_failure dispatches`: the Verifier
+decides the verdict, and only a `failed` verdict of a queued execution
+dispatches Operators. There
 is no Alert resource and no standalone Trigger or monitor firing.
 
 ## Service boundaries

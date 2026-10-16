@@ -7,6 +7,7 @@ journey lanes, not here.
 
 import asyncio
 import importlib
+import json
 import sys
 import threading
 import time
@@ -18,17 +19,18 @@ from uuid import UUID
 
 import pytest
 import wyrd
+import wyrd.observe
 import wyrd.otel
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from pydantic import BaseModel
 from wyrd.client import WyrdClient
 from wyrd.observe import Observe, Run
 from wyrd.otel import install_run_correlation
 from wyrd.state import WyrdState
+from wyrd.verify import ArtifactRef, Execution, File
 
 
 def test_run_targets_the_root_service_with_a_uuidv7_identity(state: WyrdState) -> None:
@@ -61,86 +63,6 @@ def test_unknown_alias_is_refused(state: WyrdState) -> None:
     assert raised.value.code == "WYRD_SDK_404_UNKNOWN_ALIAS"
 
 
-def test_drift_refuses_a_payload_that_is_not_an_object(state: WyrdState) -> None:
-    """A sequence is not a feature map and is refused at the boundary."""
-    with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().observe.drift([1, 2, 3])
-    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
-
-
-def test_drift_refuses_a_nested_feature_value(state: WyrdState) -> None:
-    """Feature values are scalars; a nested object reports the offending key."""
-    with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().observe.drift({"nested": {"inner": 1}})
-    assert raised.value.code == "WYRD_SDK_400_INVALID_OBSERVATION"
-
-
-class _PydanticFeatures(BaseModel):
-    """Test-only Pydantic payload whose ``model_dump_json()`` reaches Rust as-is."""
-
-    latency: float
-    tier: str
-
-
-@pytest.mark.parametrize(
-    ("payload", "code"),
-    [
-        ({"Latency": 1.0}, "WYRD_SDK_400_INVALID_OBSERVATION"),
-        ({"has space": 1.0}, "WYRD_SDK_400_INVALID_OBSERVATION"),
-        ({"latency": None}, "WYRD_SDK_400_INVALID_OBSERVATION"),
-        ({"latency": [1.0]}, "WYRD_SDK_400_INVALID_OBSERVATION"),
-        ({"latency": float("nan")}, "WYRD_SPEC_400_VALIDATION"),
-        ({"latency": float("inf")}, "WYRD_SPEC_400_VALIDATION"),
-        (_PydanticFeatures(latency=float("nan"), tier="gold"), "WYRD_SDK_400_INVALID_OBSERVATION"),
-        ({"count": 2**53 + 1}, "WYRD_SDK_400_INVALID_OBSERVATION"),
-        ({"count": -(2**53) - 1}, "WYRD_SDK_400_INVALID_OBSERVATION"),
-        ({"count": 2**63}, "WYRD_SDK_400_INVALID_OBSERVATION"),
-        ({"count": 2**64}, "WYRD_SDK_400_INVALID_OBSERVATION"),
-        ({"count": -(2**64)}, "WYRD_SDK_400_INVALID_OBSERVATION"),
-    ],
-    ids=[
-        "uppercase-name",
-        "spaced-name",
-        "null",
-        "nested-array",
-        "nan",
-        "infinity",
-        "pydantic-nan",
-        "above-exact-float",
-        "below-exact-float",
-        "beyond-i64",
-        "beyond-u64",
-        "below-i64",
-    ],
-)
-def test_drift_refuses_unrepresentable_payloads_before_admission(
-    state: WyrdState, payload: object, code: str
-) -> None:
-    """Invalid names, null or nested values, and unrepresentable numbers fail first.
-
-    The state never started Bifrost, so reaching the queue would raise
-    ``WYRD_SDK_400_BIFROST_NOT_STARTED``; a validation code proves refusal
-    happened before admission.
-    """
-    with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().observe.drift(payload)
-    assert raised.value.code == code
-
-
-def test_drift_refuses_a_malformed_session_id(state: WyrdState) -> None:
-    """``session_id`` is a UUID and is parsed before anything is enqueued."""
-    with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().observe.drift({"score": 1.0}, session_id="not-a-uuid")
-    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
-
-
-def test_eval_refuses_a_span_without_its_trace(state: WyrdState) -> None:
-    """A span id is only meaningful inside its trace."""
-    with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().observe.eval({"answer": "yes"}, span_id="00f067aa0ba902b7")
-    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
-
-
 def test_record_refuses_a_table_outside_vala_datasets(state: WyrdState) -> None:
     """``record`` writes registered caller-owned tables only."""
     with pytest.raises(wyrd.WyrdError) as raised:
@@ -162,25 +84,10 @@ def test_shutdown_without_startup_succeeds(state: WyrdState) -> None:
 
 
 @pytest.mark.parametrize("key", [1, 1.5, True, None])
-def test_drift_refuses_a_non_string_mapping_key(state: WyrdState, key: object) -> None:
+def test_record_refuses_a_non_string_mapping_key(state: WyrdState, key: object) -> None:
     """``json.dumps`` would stringify the key, so it is refused before the writer."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().observe.drift({key: 1.0})
-    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
-
-
-def test_eval_refuses_a_non_string_mapping_key(state: WyrdState) -> None:
-    """Eval context keys are strings; ``json.dumps`` would silently stringify ``1``."""
-    with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().observe.eval({1: "yes"})
-    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
-
-
-def test_explicit_span_without_trace_is_refused_inside_an_active_span(state: WyrdState) -> None:
-    """An explicit id disables the active-span lookup, so it is never half-merged."""
-    tracer = TracerProvider().get_tracer("wyrd.tests.observe")
-    with tracer.start_as_current_span("unit"), pytest.raises(wyrd.WyrdError) as raised:
-        state.run().observe.eval({"answer": "yes"}, span_id="00f067aa0ba902b7")
+        state.run().observe.record("vala.datasets.latency", {key: 1.0})
     assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
@@ -219,11 +126,218 @@ def test_verify_refuses_an_unbound_verifier_before_any_network_call(state: WyrdS
     assert raised.value.code == "WYRD_SDK_404_UNKNOWN_VERIFIER"
 
 
-def test_verify_refuses_a_context_list_for_an_eval_verifier(state: WyrdState) -> None:
-    """An Eval Verifier judges one context object, so a list is refused locally."""
+@pytest.mark.parametrize(
+    ("args", "kwargs"),
+    [
+        (({"answer": "yes"},), {"answer": "yes"}),
+        (("one", "two"), {}),
+        ((float("nan"),), {}),
+        ((), {"answer": object()}),
+    ],
+    ids=["positional-and-keyword", "two-positional", "nan", "unrepresentable"],
+)
+def test_verify_and_submit_refuse_unconvertible_inputs_before_any_lookup(
+    state: WyrdState, args: tuple[object, ...], kwargs: dict[str, object]
+) -> None:
+    """Python values convert before the Verifier is resolved, so even an unbound name
+    reports the input refusal."""
+    observe = state.run().observe
+    for call in (observe.verify, observe.submit):
+        with pytest.raises(wyrd.WyrdError) as raised:
+            call("missing", *args, **kwargs)
+        assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
+
+
+def test_submit_refuses_an_unbound_verifier_before_any_network_call(state: WyrdState) -> None:
+    """``submit`` resolves the bound Verifier locally, like ``verify``."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().observe.verify("ok-check", [{"ok": True}])
-    assert raised.value.code == "WYRD_SDK_400_INVALID_OBSERVATION"
+        state.run("model").observe.submit("missing", answer="yes", policy=File("policy.pdf"))
+    assert raised.value.code == "WYRD_SDK_404_UNKNOWN_VERIFIER"
+
+
+def test_file_construction_reads_nothing(tmp_path: Path) -> None:
+    """A ``File`` names evidence lazily: a missing path, bytes, and ``PathLike`` all
+    construct without IO; only an unknown source type or format is refused."""
+    File(tmp_path / "absent.pdf")
+    File(str(tmp_path / "absent"), format="pdf", filename="policy.pdf")
+    File(b"%PDF-1.7", format="pdf")
+    for bad in ({"source": 1}, {"source": b"x", "format": "not-a-format"}):
+        with pytest.raises(wyrd.WyrdError) as raised:
+            File(**cast(Any, bad))
+        assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
+
+
+def test_artifact_ref_names_a_registered_artifact_file() -> None:
+    """``ArtifactRef`` takes the exact Artifact reference and an optional path."""
+    artifact = wyrd.CardRef("Artifact", "decks", "1.0.0", space="support")
+    ArtifactRef(artifact)
+    ArtifactRef(artifact, "q3.pdf")
+
+
+def test_execution_connect_refuses_a_malformed_id_before_resolving_a_client() -> None:
+    """An execution ID is parsed locally before any client or network work."""
+    with pytest.raises(wyrd.WyrdError) as raised:
+        Execution.connect("not-an-execution-id")
+    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
+
+
+EXECUTION_ID = "0190b2a4-0000-7000-8000-000000000000"
+
+
+class _ExecutionServer(BaseHTTPRequestHandler):
+    """A local Wyrd server for one execution: it refuses the API-key exchange
+    while ``refuse`` is set, answers it ``exchange_seconds`` late, and answers
+    the status read with ``running``."""
+
+    refuse = True
+    exchange_seconds = 0.0
+    requests: list[str] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server's handler name
+        self.rfile.read(int(self.headers.get("content-length", 0)))
+        type(self).requests.append(self.path)
+        time.sleep(type(self).exchange_seconds)
+        if type(self).refuse:
+            self._send(401, {"code": "WYRD_AUTH_401_UNAUTHENTICATED", "detail": "refused"})
+        else:
+            self._send(200, {"access_token": "t", "token_type": "Bearer", "expires_in": 3600})
+
+    def do_GET(self) -> None:  # noqa: N802 - http.server's handler name
+        type(self).requests.append(self.path)
+        self._send(200, {"execution_id": EXECUTION_ID, "status": "running"})
+
+    def _send(self, status: int, body: dict[str, object]) -> None:
+        payload = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: object) -> None:
+        """Keep the test output quiet."""
+
+
+@pytest.fixture
+def execution_server() -> Iterator[str]:
+    """Serve ``_ExecutionServer`` on a free port, refusing exchanges at first."""
+    _ExecutionServer.refuse, _ExecutionServer.requests = True, []
+    _ExecutionServer.exchange_seconds = 0.0
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ExecutionServer)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+
+
+def test_execution_constructs_offline_and_connects_on_first_read(execution_server: str) -> None:
+    """``Execution(id, client)`` sends nothing until its first read, which
+    exchanges the retained client's key; a refused first connection is
+    retried by the next read, and a connected handle is reused."""
+    execution = Execution(EXECUTION_ID, WyrdClient(execution_server, "wyrd_sk_t_v_s"))
+    assert execution.id == EXECUTION_ID
+    assert _ExecutionServer.requests == []
+
+    with pytest.raises(wyrd.WyrdError):
+        execution.status()
+    assert _ExecutionServer.requests == ["/auth/token"]
+
+    _ExecutionServer.refuse = False
+    assert execution.status()["status"] == "running"
+    assert execution.status()["status"] == "running"
+    status = f"/v1/verification/executions/{EXECUTION_ID}"
+    assert _ExecutionServer.requests == ["/auth/token", "/auth/token", status, status]
+
+
+def test_execution_connect_exchanges_now(execution_server: str) -> None:
+    """``Execution.connect`` connects eagerly: a refused exchange raises before
+    any read, and an accepted one completes before it returns."""
+    with pytest.raises(wyrd.WyrdError):
+        Execution.connect(EXECUTION_ID, WyrdClient(execution_server, "wyrd_sk_t_v_s"))
+    _ExecutionServer.refuse = False
+    Execution.connect(EXECUTION_ID, WyrdClient(execution_server, "wyrd_sk_t_v_s"))
+    assert _ExecutionServer.requests == ["/auth/token", "/auth/token"]
+
+
+SLOW_EXCHANGE_SECONDS = 3.0
+"""How late the slow exchange answers; far above every bounded wait below."""
+
+WAIT_BUDGET_SECONDS = 0.2
+"""The caller's wait budget, far below the slow exchange."""
+
+WAIT_TIMEOUT = "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT"
+
+
+def test_execution_zero_wait_starts_no_connection(execution_server: str) -> None:
+    """An expired budget times out before the first connection exchanges."""
+    execution = Execution(EXECUTION_ID, WyrdClient(execution_server, "wyrd_sk_t_v_s"))
+    with pytest.raises(wyrd.WyrdError) as raised:
+        execution.wait(0)
+    assert raised.value.code == WAIT_TIMEOUT
+    assert _ExecutionServer.requests == []
+
+
+def test_execution_first_wait_bounds_a_slow_exchange_and_retries_after(
+    execution_server: str,
+) -> None:
+    """A slow first exchange loses to the wait budget without a status read,
+    and the abandoned connection leaves the next read free to connect."""
+    _ExecutionServer.refuse, _ExecutionServer.exchange_seconds = False, SLOW_EXCHANGE_SECONDS
+    execution = Execution(EXECUTION_ID, WyrdClient(execution_server, "wyrd_sk_t_v_s"))
+    started = time.monotonic()
+    with pytest.raises(wyrd.WyrdError) as raised:
+        execution.wait(WAIT_BUDGET_SECONDS)
+    assert raised.value.code == WAIT_TIMEOUT
+    assert time.monotonic() - started < SLOW_EXCHANGE_SECONDS / 2
+    assert _ExecutionServer.requests == ["/auth/token"]
+
+    _ExecutionServer.exchange_seconds = 0.0
+    assert execution.status()["status"] == "running"
+    assert execution.status()["status"] == "running"
+    status = f"/v1/verification/executions/{EXECUTION_ID}"
+    assert _ExecutionServer.requests == ["/auth/token", "/auth/token", status, status]
+
+
+def test_execution_wait_behind_another_first_connection_keeps_its_budget(
+    execution_server: str,
+) -> None:
+    """A wait queued behind another caller's slow first connection times out
+    within its own budget instead of waiting for that connection."""
+    _ExecutionServer.refuse, _ExecutionServer.exchange_seconds = False, SLOW_EXCHANGE_SECONDS
+    execution = Execution(EXECUTION_ID, WyrdClient(execution_server, "wyrd_sk_t_v_s"))
+    first = threading.Thread(target=execution.status)
+    first.start()
+    while _ExecutionServer.requests != ["/auth/token"]:
+        time.sleep(0.01)
+    started = time.monotonic()
+    with pytest.raises(wyrd.WyrdError) as raised:
+        execution.wait(WAIT_BUDGET_SECONDS)
+    assert raised.value.code == WAIT_TIMEOUT
+    assert time.monotonic() - started < SLOW_EXCHANGE_SECONDS / 2
+    first.join()
+    assert _ExecutionServer.requests == [
+        "/auth/token",
+        f"/v1/verification/executions/{EXECUTION_ID}",
+    ]
+
+
+def test_verification_types_are_exported_and_judge_surfaces_are_gone() -> None:
+    """The verify/submit types live only in ``wyrd.verify``; Judgment, drift/eval
+    emits, and the Eval media module are removed with no alias."""
+    assert set(wyrd.verify.__all__) == {
+        "ArtifactRef",
+        "Execution",
+        "File",
+        "Recorded",
+        "VerificationResult",
+    }
+    for name in wyrd.verify.__all__:
+        assert not hasattr(wyrd, name)
+        assert not hasattr(wyrd.observe, name)
+    assert not hasattr(wyrd.observe, "Judgment")
+    assert not hasattr(Observe, "drift")
+    assert not hasattr(Observe, "eval")
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("wyrd.eval")
 
 
 def test_the_verification_module_is_not_importable() -> None:
@@ -499,10 +613,10 @@ def test_otel_imports_without_the_agents_sdk() -> None:
     importlib.reload(wyrd.otel)
 
 
-def _drift_reaches_the_ordinary_boundary(run: Run) -> None:
-    """Emit one explicit Drift observation and assert its ordinary offline error."""
+def _record_reaches_the_ordinary_boundary(run: Run) -> None:
+    """Record one explicit row and assert its ordinary offline error."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        run.observe.drift({"latency_ms": 1.0})
+        run.observe.record("vala.datasets.latency", {"latency_ms": 1.0})
     assert raised.value.code == "WYRD_SDK_400_BIFROST_NOT_STARTED"
 
 
@@ -519,13 +633,13 @@ def test_registration_and_attach_failures_never_block_observations(
     for provider in (object(), _Unmarkable(), _Raising()):
         monkeypatch.setattr(trace, "get_tracer_provider", lambda provider=provider: provider)
         with run as entered:
-            _drift_reaches_the_ordinary_boundary(entered)
+            _record_reaches_the_ordinary_boundary(entered)
         with pytest.raises(ValueError, match="app"), run:
             raise ValueError("app")
 
     monkeypatch.setattr(otel_context, "attach", _broken)
     with run as entered:
-        _drift_reaches_the_ordinary_boundary(entered)
+        _record_reaches_the_ordinary_boundary(entered)
 
 
 def test_failing_enrichment_never_blocks_spans_or_observations(
@@ -538,7 +652,7 @@ def test_failing_enrichment_never_blocks_spans_or_observations(
     with state.run() as entered, monkeypatch.context() as patch:
         patch.setattr(otel_context, "get_value", _broken)
         provider.get_tracer("framework").start_span("unenriched").end()
-        _drift_reaches_the_ordinary_boundary(entered)
+        _record_reaches_the_ordinary_boundary(entered)
     assert _correlation(exporter) == {"unenriched": None}
 
 
@@ -563,10 +677,10 @@ def test_exit_context_update_failure_never_blocks_observations(
     with monkeypatch.context() as patch:
         with model_run:
             patch.setattr(otel_context, "attach", _broken)
-        _drift_reaches_the_ordinary_boundary(model_run)
+        _record_reaches_the_ordinary_boundary(model_run)
         with pytest.raises(ValueError, match="app"), model_run:
             raise ValueError("app")
-        _drift_reaches_the_ordinary_boundary(model_run)
+        _record_reaches_the_ordinary_boundary(model_run)
 
 
 def test_mismatched_exit_changes_nothing(

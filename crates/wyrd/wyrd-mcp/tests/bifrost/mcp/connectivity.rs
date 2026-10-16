@@ -266,7 +266,7 @@ mod pg_tests {
                 "cards.list",
                 "cards.get_by_ref",
                 "verification.get_binding",
-                "verification.get_run",
+                "verification.get_execution",
                 "operator_connections.list",
                 "operator_connections.get",
                 "gateway.list_provider_credentials",
@@ -278,8 +278,9 @@ mod pg_tests {
                 "gateway.get_provider_deployment",
                 "wyrd.guide",
                 "principals.revoke_credential",
-                "verification.start_run",
+                "verification.evidence",
                 "verification.execute",
+                "verification.enqueue",
                 "operator_connections.create",
                 "operator_connections.update",
                 "operator_connections.disable",
@@ -346,7 +347,7 @@ mod pg_tests {
 
     /// A tool call carrying a `traceparent` runs under that inbound trace
     /// context even though the transport serves it on a task of its own, so
-    /// work the tool does — a judge call `verification.execute` makes — joins
+    /// work the tool does — a Verifier action `verification.execute` runs — joins
     /// the agent's trace.
     ///
     /// # Errors

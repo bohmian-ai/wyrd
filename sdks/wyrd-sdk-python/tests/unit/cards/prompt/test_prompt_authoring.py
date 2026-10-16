@@ -64,6 +64,27 @@ def test_model_is_literal_and_never_a_render_variable(model: str) -> None:
     assert prompt.variables == ["name"]
 
 
+@pytest.mark.parametrize(
+    ("authored", "field"),
+    [
+        pytest.param({"provider": "openai", "model": "gpt-4o"}, "messages", id="no-content"),
+        pytest.param(
+            {"provider": "openai", "model": "gpt-4o", "system": "hi", "settings": {"top_k": 1}},
+            "settings",
+            id="refused-setting",
+        ),
+    ],
+)
+def test_invalid_authored_json_is_a_prompt_field_refusal(
+    authored: dict[str, Any], field: str
+) -> None:
+    with pytest.raises(WyrdError) as refused:
+        Prompt.model_validate_json(json.dumps(authored))
+
+    assert refused.value.code == "WYRD_PROMPT_400_INVALID"
+    assert field in str(refused.value)
+
+
 def test_bind_media_replaces_native_media_placeholder() -> None:
     prompt = Prompt("What logo is this? ${media:logo}", "gpt-4o", provider="openai")
 

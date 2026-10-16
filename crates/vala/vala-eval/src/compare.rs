@@ -612,7 +612,7 @@ mod comparison_four_quadrant {
         aggregate_run(AggregationInput {
             identity: RunIdentity {
                 run_id: RunId::from_string(run_id.to_owned()),
-                eval_ref: eval_ref(),
+                eval_ref: Some(eval_ref()),
                 started_at: Utc::now(),
                 ended_at: Utc::now(),
             },
@@ -829,7 +829,7 @@ mod comparison_four_quadrant {
         let empty = aggregate_run(AggregationInput {
             identity: RunIdentity {
                 run_id: RunId::from_string("empty".to_owned()),
-                eval_ref: eval_ref(),
+                eval_ref: Some(eval_ref()),
                 started_at: Utc::now(),
                 ended_at: Utc::now(),
             },

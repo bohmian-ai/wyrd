@@ -1,7 +1,7 @@
 //! `vala.drift.result_features` — the per-feature detail of one Drift result.
 //!
-//! Owns the table's authored schema and physical layout only; the Drift
-//! engine writes it, and the shared verdict lives in
+//! Owns the table's authored schema and physical layout only; the server's
+//! result writer writes it, and the shared verdict lives in
 //! `vala.verification.results`.
 
 use arrow::datatypes::Field;
@@ -11,14 +11,16 @@ use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, 
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT;
 
-/// `vala.drift.result_features` — one row per scored feature of one Drift run.
+/// `vala.drift.result_features` — one row per scored feature of one drift check.
 ///
-/// These are the per-feature details of a row in `vala.verification.results`,
-/// joined on `result_id` inside the tenant's own namespace. The binding, owner, Verifier,
-/// window, and method are repeated on every row so a cross-run query over one
-/// feature or one method never has to join back to the parent result. The
-/// managed `run_id` is the Verifier run and the managed `card_uid` is the Card
-/// verified; the Verifier Card is the `verifier_card_uid` payload column.
+/// These are the per-feature details of a drift requirement in a row of
+/// `vala.verification.results`, joined on `result_id` and `requirement_id`
+/// inside the tenant's own namespace. The binding, owner, Verifier, window, and
+/// method are repeated on every row so a cross-execution query over one feature
+/// or one method never has to join back to the parent result. The managed
+/// `run_id` is the application Run, null for scheduled drift, and the managed
+/// `card_uid` is the Card verified; the Verifier Card is the
+/// `verifier_card_uid` payload column.
 pub struct ResultFeaturesTable;
 
 impl DomainTable for ResultFeaturesTable {
@@ -26,7 +28,7 @@ impl DomainTable for ResultFeaturesTable {
     const NAMESPACE: &'static str = "drift";
     /// Table segment of the fixed `vala.drift.result_features` FQN.
     const NAME: &'static str = "result_features";
-    /// The server appends and stamps the managed Verifier `run_id`, verified `card_uid`, and subject/actor pair.
+    /// The server appends and stamps the managed application `run_id`, verified `card_uid`, and subject/actor pair.
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     /// Feature scores are aggregate statistics, never raw captured payload.
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Standard;
@@ -35,6 +37,7 @@ impl DomainTable for ResultFeaturesTable {
     fn arrow_fields() -> Vec<Field> {
         vec![
             utf8("result_id", false),
+            utf8("requirement_id", false),
             utf8("owner_card_uid", true),
             utf8("verifier_card_uid", false),
             utf8("binding_id", true),

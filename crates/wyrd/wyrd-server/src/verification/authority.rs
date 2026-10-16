@@ -1,8 +1,10 @@
-//! The tokenless read authority every Verifier input read runs under.
+//! The tokenless read authority scheduled Drift retained-row reads run under.
 //!
-//! A Verifier reads its inputs in-process as its tenant's SYSTEM principal
-//! (REQ-086). The run's claim returns that principal's stable id from
-//! tenant-owned state, and [`SystemReadAuthority::resolve`] turns it into an
+//! A scheduled Drift Verifier reads its retained observation rows in-process
+//! as its tenant's SYSTEM principal (REQ-086); caller-submitted trace inputs
+//! are read under the submitting caller's own authorization, not here. The
+//! run's claim returns that principal's stable id from tenant-owned state,
+//! and [`SystemReadAuthority::resolve`] turns it into an
 //! authorized Oracle query context whose only permissions are
 //! `bifrost_query:read` grants scoped by registered table UID to exactly the
 //! tables the run reads. No token is minted or verified; Oracle's table
@@ -12,7 +14,7 @@
 //! run's accepted delegation chain as history, through
 //! [`SystemReadAuthority::serving`]; neither authorizes anything.
 //!
-//! LLM judge calls are not reads: they run under the run's accepted authority
+//! Agent-check calls are not reads: they run under the execution's accepted authority
 //! with SYSTEM as actor. [`BackgroundAuthority`] resolves that authority for
 //! the runs Wyrd starts itself.
 
@@ -32,7 +34,7 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::AuthMethod;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
-use wyrd_sql::queries::verifier_runs::RunAuthority;
+use wyrd_sql::queries::verifier_executions::ExecutionAuthority;
 use wyrd_sql::{SqlError, TenantConn};
 
 use crate::state::AppState;
@@ -200,7 +202,7 @@ impl SystemReadAuthority {
 
 /// Resolves the authority a background Verifier run is accepted under.
 ///
-/// Scheduled and observation runs serve their binding owner: at acceptance
+/// Scheduled runs serve their binding owner: at acceptance
 /// the owner's current authority is recovered through the tenant issuer's
 /// [`recover`](TenantTokenIssuer::recover), on the accepting transaction, and
 /// paired with the tenant SYSTEM principal as actor. An owner that is missing,
@@ -233,7 +235,7 @@ impl BackgroundAuthority {
         &self,
         conn: &mut TenantConn<'_>,
         owner: PrincipalId,
-    ) -> Result<Option<RunAuthority>, SqlError> {
+    ) -> Result<Option<ExecutionAuthority>, SqlError> {
         let Some(issuer) = &self.issuer else {
             tracing::warn!(%owner, "no tenant issuer is configured; background run not accepted");
             return Ok(None);
@@ -247,7 +249,7 @@ impl BackgroundAuthority {
             return Ok(None);
         };
         match issuer.recover(conn, owner.as_uuid()).await {
-            Ok(verified) => Ok(Some(RunAuthority::background(
+            Ok(verified) => Ok(Some(ExecutionAuthority::background(
                 AcceptedAuthority::new(&verified.principal, &verified.delegation_chain),
                 system,
             ))),

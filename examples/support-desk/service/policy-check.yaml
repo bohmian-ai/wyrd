@@ -1,0 +1,34 @@
+# The support desk's one Verifier: an Agent reads the refund policy PDF and
+# lists its rules with their pages, an assertion rejects any refund promise,
+# and a tool-less judge checks the answer against those rules, citing the
+# policy.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: policy-check
+  version: 1.0.0
+  space: support
+spec:
+  description: A support answer keeps to the refund policy.
+  inputs:
+    answer: {type: json}
+    policy: {type: media, formats: [pdf], max_bytes: 1048576}
+  steps:
+    - id: findings
+      action:
+        kind: agent
+        agent: ./policy-reader.yaml
+        workspace: {/inputs/policy.pdf: inputs.policy}
+  requirements:
+    - id: no-refund-promise
+      statement: The answer never promises a guaranteed refund
+      check: {kind: assert, path: inputs.answer, operator: not_contains, expected: guaranteed refund}
+    - id: follows-policy
+      statement: The answer agrees with the refund policy
+      check:
+        kind: agent
+        agent: ./policy-judge.yaml
+        inputs:
+          claim: requirement.statement
+          answer: inputs.answer
+          findings: steps.findings.output

@@ -13,7 +13,7 @@ from wyrd.prompt import PromptCard
 from wyrd.state import CardEnvelope, WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
-from .support import FIXTURES, binding_ids, download, hydrated, register
+from .support import FIXTURES, download, hydrated, register
 
 pytestmark = pytest.mark.integration
 
@@ -54,18 +54,19 @@ def test_latest_version_resolves_to_the_registered_card(
 def test_registering_the_graph_again_is_idempotent(
     cards: Cards, support_desk: dict[str, CardRef]
 ) -> None:
-    bindings = binding_ids(cards, support_desk["support-desk"])
-
     again = cards.register_from_path(FIXTURES / SUPPORT_DESK)
 
     assert again.root == support_desk["support-desk"]
-    assert binding_ids(cards, again.root) == bindings
+    status = cards.get(again.root).status
+    # The desk's only binding has no schedule Trigger, so none is projected.
+    assert status is not None and status.get("verification") is None
 
 
 def test_cards_get_returns_every_kind_as_envelope(
     cards: Cards, support_desk: dict[str, CardRef]
 ) -> None:
     baseline = register(cards, "cards/latency_baseline/latency-baseline.yaml")["latency-baseline"]
+    daily = register(cards, "cards/scheduled_drift_alerts_operator/daily.yaml")["daily"]
     refs = [
         (CardKind.Data, baseline),
         (CardKind.Model, support_desk["support-model"]),
@@ -73,7 +74,7 @@ def test_cards_get_returns_every_kind_as_envelope(
         (CardKind.Agent, support_desk["support-agent"]),
         (CardKind.Verifier, support_desk["no-refund-promise"]),
         (CardKind.Service, support_desk["support-desk"]),
-        (CardKind.Trigger, support_desk["every-batch"]),
+        (CardKind.Trigger, daily),
         (CardKind.Operator, support_desk["notify-support"]),
     ]
 
@@ -99,9 +100,9 @@ def test_cards_get_returns_every_kind_as_envelope(
     assert model.metadata["artifact_hash"]
     assert prompt.spec["model"] == "gpt-4o"
     assert agent.spec["run_config"]["max_iterations"] == 2
-    assert verifier.spec["implementation"]["kind"] == "eval"
+    assert verifier.spec["requirements"][0]["check"]["kind"] == "assert"
     assert service.spec["service_type"] == "agent"
-    assert trigger.spec["kind"] == "observations_ready"
+    assert trigger.spec["kind"] == "schedule"
     assert operator.spec["kind"] == "http"
 
 

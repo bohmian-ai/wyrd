@@ -4,7 +4,7 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityRequirement, Securi
 use utoipa::openapi::{Content, OpenApi as OpenApiDocument};
 use utoipa::{Modify, OpenApi};
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
-use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
+use wyrd_spec::card::verifier::{VerificationBinding, VerifierSpec};
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, CancelRunningQueryResponse, ListRunningQueriesResponse, QueryClass,
     RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary,
@@ -133,7 +133,6 @@ fn is_problem(content: Option<&Content>) -> bool {
         TriggerActivation,
         TriggerSpec,
         VerificationBinding,
-        VerifierImplementation,
         VerifierSpec
     )),
     tags(
@@ -229,7 +228,6 @@ mod tests {
         let mut pending: Vec<String> = [
             "VerifierSpec",
             "VerificationBinding",
-            "VerifierImplementation",
             "TriggerSpec",
             "TriggerActivation",
         ]

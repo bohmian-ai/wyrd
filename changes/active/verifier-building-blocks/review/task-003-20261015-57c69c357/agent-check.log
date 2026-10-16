@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.28s
+────────────
+ Nextest run ID 847e44f2-ff25-40bc-8d61-8439208b6e35 with nextest profile: default
+    Starting 9 tests across 1 binary (26 tests skipped)
+        PASS [   0.011s] (1/9) vala-eval::integration blocks_agent::step_agent_refuses_unknown_tool
+        PASS [   0.011s] (2/9) vala-eval::integration blocks_agent::agent_inputs_must_match_placeholders
+        PASS [   0.012s] (3/9) vala-eval::integration blocks_agent::step_agent_records_declared_tool_calls
+        PASS [   0.012s] (4/9) vala-eval::integration blocks_agent::route_override_replaces_declared_route
+        PASS [   0.018s] (5/9) vala-eval::integration blocks_agent::check_agent_refuses_tools
+        PASS [   0.018s] (6/9) vala-eval::integration blocks_agent::step_agent_rejects_schema_violation
+        PASS [   0.019s] (7/9) vala-eval::integration blocks_agent::check_agent_rejects_non_verdict
+        PASS [   0.019s] (8/9) vala-eval::integration blocks_agent::check_agent_keeps_only_valid_citations
+        PASS [   0.020s] (9/9) vala-eval::integration blocks_agent::step_agent_returns_structured_output
+────────────
+     Summary [   0.021s] 9 tests run: 9 passed, 26 skipped

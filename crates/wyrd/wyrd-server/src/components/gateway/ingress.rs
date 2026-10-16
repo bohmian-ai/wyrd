@@ -219,7 +219,12 @@ pub fn gateway_ingress_router(state: &AppState) -> OpenApiRouter<AppState> {
         .routes(routes!(routes::cancel_batch))
         .routes(routes!(jev_systemone));
     let anthropic = OpenApiRouter::new().routes(routes!(anthropic_messages));
-    let gemini = OpenApiRouter::new().routes(routes!(gemini_generate_content));
+    let gemini = OpenApiRouter::new()
+        .routes(routes!(gemini_generate_content))
+        .route(
+            "/v1beta/models/{target}",
+            axum::routing::post(gemini_generate_content_without_deployment),
+        );
     GatewayIngress::OpenAi
         .layer(openai, state)
         .merge(GatewayIngress::AnthropicMessages.layer(anthropic, state))
@@ -630,6 +635,23 @@ pub(crate) async fn gemini_generate_content(
         Ok(answer) => relay(answer.status, answer.body),
         Err(error) => GatewayIngress::GeminiGenerateContent.error(&error),
     }
+}
+
+/// `POST /v1beta/models/{model}:<method>`: a Gemini call that names no
+/// deployment, refused as an invalid `model`.
+///
+/// Google SDKs address `models/<model>`, but the gateway serves
+/// `<deployment>/<model>`. Routing the bare form under the Gemini ingress
+/// keeps its refusal in the Gemini protocol: the credential is read from
+/// `x-goog-api-key` and the error renders as a Google envelope, rather than
+/// the request falling through to Wyrd API authentication and a misleading
+/// missing-token 401. It is not documented in OpenAPI because it serves no
+/// call.
+async fn gemini_generate_content_without_deployment() -> Response {
+    GatewayIngress::GeminiGenerateContent.error(&invalid_request(GatewayContractError::new(
+        "model",
+        "must be <deployment>/<model>; address the call as /v1beta/models/<deployment>/<model>:<method>",
+    )))
 }
 
 /// Builds the governed call of a Gemini `target` (`<deployment>/<model>:<method>`) with

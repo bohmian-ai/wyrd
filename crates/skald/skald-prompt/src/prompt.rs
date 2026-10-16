@@ -1062,7 +1062,9 @@ impl Prompt {
     /// authored Prompt.
     #[staticmethod]
     pub fn model_validate_json(data: &str) -> WyrdPyResult<Self> {
-        Ok(Self::from_native(serde_json::from_str(data)?))
+        Ok(Self::from_native(
+            serde_json::from_str(data).map_err(invalid_authored_json)?,
+        ))
     }
 
     /// Load a bare prompt spec from JSON or YAML.
@@ -1268,9 +1270,10 @@ fn provider_request_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<ProviderRe
     if let Ok(request) = value.extract::<PyRef<'_, PyProviderRequest>>() {
         return Ok((*request.inner).clone());
     }
-    Ok(serde_json::from_value(wyrd_utils::py::pyobject_to_json(
-        value,
-    )?)?)
+    Ok(
+        serde_json::from_value(wyrd_utils::py::pyobject_to_json(value)?)
+            .map_err(invalid_authored_json)?,
+    )
 }
 
 #[cfg(feature = "python")]
@@ -1660,10 +1663,22 @@ where
     T: DeserializeOwned,
 {
     if value.is_array() {
-        Ok(serde_json::from_value(value)?)
+        Ok(serde_json::from_value(value).map_err(invalid_authored_json)?)
     } else {
-        Ok(vec![serde_json::from_value(value)?])
+        Ok(vec![
+            serde_json::from_value(value).map_err(invalid_authored_json)?,
+        ])
     }
+}
+
+/// Refuse caller-authored Prompt JSON that does not decode.
+///
+/// The decode error names the refused field, so it surfaces as the public
+/// `WYRD_PROMPT_400_INVALID` rather than the boundary's internal JSON failure,
+/// which is reserved for Wyrd's own serialization.
+#[cfg(feature = "python")]
+fn invalid_authored_json(error: serde_json::Error) -> PromptBuilderError {
+    PromptBuilderError::Validation(error.to_string())
 }
 
 #[cfg(feature = "python")]

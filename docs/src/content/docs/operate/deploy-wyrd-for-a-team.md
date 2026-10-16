@@ -4,7 +4,6 @@ description: Prepare PostgreSQL with a platform login and a tenant login, migrat
 pillar: wyrd
 section: Operate
 order: 1
-draft: true
 status: partial
 ---
 
@@ -12,7 +11,10 @@ A shared Wyrd server runs with two PostgreSQL logins. The platform login owns Wy
 
 The server keeps both logins connected while it runs. Treat both database URLs as secrets: anyone who can read the server's environment has platform access.
 
-This page covers the database, the server's persistent settings, and the first tenant. Sizing, TLS termination, and multi-replica topology are not documented yet.
+This page covers the database, the server's persistent settings, and the first tenant.
+[Configure the verification runtime](/operate/configure-verification-runtime/)
+covers the Python worker and the limits on Verifier execution.
+TLS termination and multi-replica topology are not documented yet.
 
 ## Prerequisites
 

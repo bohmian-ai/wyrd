@@ -13,28 +13,33 @@ use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
-use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
-use vala_drift::{DriftReport, DriftVerdict, FeatureDriftReport};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
 use wyrd_server::components::operators::keys::OperatorKeys;
 use wyrd_server::config::{OperatorKeySource, OperatorKeysConfig, VaultKeysConfig};
 use wyrd_server::state::AppState;
-use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
+use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::operators::ProviderEndpoints;
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::DriftMethod;
-use wyrd_spec::ids::{CardUid, FeatureName, VerificationRunId};
-use wyrd_spec::verification::{DriftWindow, FrozenTarget};
+use wyrd_spec::card::verifier::Check;
+use wyrd_spec::ids::{CardUid, ExecutionId, FeatureName};
+use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::execution::{
+    RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+};
+use wyrd_spec::verification::{
+    DriftReport, DriftVerdict, FeatureDriftReport, FrozenTarget, VerificationVerdict,
+};
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
@@ -230,6 +235,7 @@ impl Delivery {
                 &owner,
                 &self.verifier,
                 "0 2 * * *",
+                VerificationFixture::metric_inputs("latency_ms"),
                 operators
                     .iter()
                     .map(|uid| FrozenTarget::Uid((*uid).clone()))
@@ -248,18 +254,22 @@ impl Delivery {
         owner
     }
 
-    /// Poll until the scheduler created a run not in `known` and return it.
+    /// Poll until the scheduler created an execution not in `known` and
+    /// return it.
     ///
     /// # Panics
-    /// Panics when no new run appears within [`WAIT`].
-    async fn new_run(&self, known: &[VerificationRunId]) -> VerificationRunId {
+    /// Panics when no new execution appears within [`WAIT`].
+    async fn new_run(&self, known: &[ExecutionId]) -> ExecutionId {
         let deadline = tokio::time::Instant::now() + WAIT;
         loop {
-            let runs = self.seed.runs().await.expect("runs read");
+            let runs = self.seed.executions().await.expect("executions read");
             if let Some(run) = runs.into_iter().find(|run| !known.contains(run)) {
                 return run;
             }
-            assert!(tokio::time::Instant::now() < deadline, "no run scheduled");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no execution scheduled"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -299,6 +309,7 @@ impl Delivery {
                 &owner,
                 &verifier,
                 "0 2 * * *",
+                VerificationFixture::metric_inputs("latency_ms"),
                 vec![FrozenTarget::Uid(quick)],
             )
             .await
@@ -375,16 +386,16 @@ impl Delivery {
         Running { stop, task }
     }
 
-    /// Every dispatch of `run`, keyed by its Operator Card UID.
+    /// Every dispatch of the execution `run`, keyed by its Operator Card UID.
     ///
     /// # Panics
     /// Panics when the dispatch table cannot be read.
-    async fn dispatches(&self, run: VerificationRunId) -> BTreeMap<Uuid, DispatchRow> {
+    async fn dispatches(&self, run: ExecutionId) -> BTreeMap<Uuid, DispatchRow> {
         let rows: Vec<DispatchRow> = sqlx::query_as(
             "SELECT operator_uid, dispatch_id, status, attempts, \
                     last_error->>'code' AS error_code, \
                     EXTRACT(EPOCH FROM next_attempt_at - updated_at)::float8 AS delay \
-               FROM wyrd.operator_dispatches WHERE run_id = $1",
+               FROM wyrd.operator_dispatches WHERE execution_id = $1",
         )
         .bind(run.as_uuid())
         .fetch_all(&self.assertion)
@@ -401,7 +412,7 @@ impl Delivery {
     /// Panics when `done` never holds within [`WAIT`].
     async fn wait_dispatches(
         &self,
-        run: VerificationRunId,
+        run: ExecutionId,
         count: usize,
         done: impl Fn(&DispatchRow) -> bool,
     ) -> BTreeMap<Uuid, DispatchRow> {
@@ -423,10 +434,10 @@ impl Delivery {
     ///
     /// # Panics
     /// Panics when the update fails.
-    async fn make_retries_due(&self, run: VerificationRunId) {
+    async fn make_retries_due(&self, run: ExecutionId) {
         sqlx::query(
             "UPDATE wyrd.operator_dispatches SET next_attempt_at = statement_timestamp() \
-              WHERE run_id = $1 AND status = 'retrying'",
+              WHERE execution_id = $1 AND status = 'retrying'",
         )
         .bind(run.as_uuid())
         .execute(&self.assertion)
@@ -483,10 +494,11 @@ impl Running {
     }
 }
 
-/// A script whose next `runs` executions each return a failing Drift verdict.
+/// A script whose next `runs` executions each return a failed outcome whose
+/// one drift requirement scored `latency` as drifted.
 ///
 /// # Panics
-/// Panics when a static feature name is invalid.
+/// Panics when a static feature name, task id, or check is invalid.
 fn failing_script(runs: usize) -> EngineScript {
     let feature = FeatureName::new("latency").expect("feature name");
     let report = DriftReport {
@@ -495,8 +507,8 @@ fn failing_script(runs: usize) -> EngineScript {
             feature.clone(),
             FeatureDriftReport {
                 feature,
-                score: 3.0,
-                threshold: 1.0,
+                score: Some(3.0),
+                threshold: Some(1.0),
                 verdict: DriftVerdict::Drift,
                 evidence: None,
             },
@@ -505,13 +517,43 @@ fn failing_script(runs: usize) -> EngineScript {
         .collect(),
         verdict: DriftVerdict::Drift,
     };
+    let outcome = VerificationOutcome {
+        verdict: VerificationVerdict::Failed,
+        requirements: vec![RequirementResult {
+            id: TaskId::new("drift").expect("task id"),
+            step: None,
+            statement: "The window does not drift.".to_owned(),
+            outcome: RequirementOutcome::Failed,
+            reason: "latency drifted".to_owned(),
+            actual: None,
+            citations: Vec::new(),
+            detail: Some(RequirementDetail::Drift(report)),
+            check: serde_json::from_value::<Check>(json!({
+                "kind": "drift", "on": "inputs.samples", "method": "Custom",
+                "signal": { "kind": "Metric", "name": "latency_ms" },
+                "condition": { "kind": "Above", "limit": 250.0 }
+            }))
+            .expect("drift check decodes"),
+            provenance: None,
+        }],
+        steps: Vec::new(),
+        evidence: BTreeMap::new(),
+    };
     let script = EngineScript::default();
     for _ in 0..runs {
-        script.push(EngineOutcome::Completed(VerifierReport::Drift(Some(
-            report.clone(),
-        ))));
+        script.push(EngineOutcome::Completed(outcome.clone()));
     }
     script
+}
+
+/// A passed outcome with no requirements, which dispatches no Operator.
+fn passed_outcome() -> VerificationOutcome {
+    VerificationOutcome {
+        verdict: VerificationVerdict::Passed,
+        requirements: Vec::new(),
+        steps: Vec::new(),
+        evidence: BTreeMap::new(),
+    }
 }
 
 /// A Slack Operator posting to `channel_id`.
@@ -524,7 +566,7 @@ fn slack(channel_id: &str) -> Value {
 fn hook(origin: &str, route: &str) -> Value {
     json!({ "kind": "http", "method": "post", "url": format!("{origin}{route}"),
             "auth": { "scheme": "header", "name": "x-api-key", "connection": "ops-hooks" },
-            "body": { "verdict": "{{verdict}}", "run": "{{run_id}}" } })
+            "body": { "verdict": "{{verdict}}", "execution": "{{execution_id}}" } })
 }
 
 /// Poll `ready` until it holds.
@@ -702,11 +744,14 @@ async fn failed_verdict_fans_out_to_every_provider_independently() {
     );
     let hook_body: Value = hook_request.body_json().expect("hook JSON");
     assert_eq!(hook_body["verdict"], "failed");
-    assert_eq!(hook_body["run"], run.as_uuid().to_string());
+    assert_eq!(hook_body["execution"], run.as_uuid().to_string());
 
-    let settled_run = delivery.seed.run(run).await.expect("run reads");
+    let settled_run = delivery.seed.execution(run).await.expect("execution reads");
     assert_eq!(settled_run.status, "completed");
-    assert_eq!(delivery.seed.runs().await.expect("runs read"), vec![run]);
+    assert_eq!(
+        delivery.seed.executions().await.expect("executions read"),
+        vec![run]
+    );
 
     let logged = logs.text();
     assert!(
@@ -920,9 +965,17 @@ async fn slow_endpoint_exhausts_the_budget_and_shutdown_releases() {
         .await;
     running.stop().await;
     assert_eq!(rows[&slow.as_uuid()].attempts, 3);
-    assert_eq!(delivery.seed.runs().await.expect("runs read"), vec![run]);
     assert_eq!(
-        delivery.seed.run(run).await.expect("run reads").status,
+        delivery.seed.executions().await.expect("executions read"),
+        vec![run]
+    );
+    assert_eq!(
+        delivery
+            .seed
+            .execution(run)
+            .await
+            .expect("execution reads")
+            .status,
         "completed"
     );
 
@@ -984,7 +1037,7 @@ async fn slow_endpoint_exhausts_the_budget_and_shutdown_releases() {
         );
     }
     assert_eq!(
-        delivery.seed.runs().await.expect("runs read"),
+        delivery.seed.executions().await.expect("executions read"),
         vec![first, run],
         "redelivery never reruns the Verifier"
     );
@@ -1086,10 +1139,6 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
 /// # Panics
 /// Panics when the schedule, clipping, or deadline failure differs.
 #[tokio::test]
-#[expect(
-    clippy::float_cmp,
-    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
-)]
 async fn production_schedule_retries_within_the_delivery_deadline() {
     let delivery = Delivery::start().await;
     let origin = delivery.mock.uri();
@@ -1121,7 +1170,7 @@ async fn production_schedule_retries_within_the_delivery_deadline() {
                 "UPDATE wyrd.operator_dispatches \
                     SET created_at = created_at - make_interval(secs => $2), \
                         next_attempt_at = statement_timestamp() \
-                  WHERE run_id = $1",
+                  WHERE execution_id = $1",
             )
             .bind(run.as_uuid())
             .bind(f64::from(seconds))
@@ -1215,7 +1264,7 @@ async fn ambiguous_pagerduty_retry_reuses_the_dedup_key() {
         rows[&paged.as_uuid()].error_code.as_deref(),
         Some("attempt_timed_out")
     );
-    let before = delivery.seed.run(run).await.expect("run reads");
+    let before = delivery.seed.execution(run).await.expect("execution reads");
     assert_eq!(before.status, "completed");
     delivery.make_retries_due(run).await;
     let rows = delivery
@@ -1236,13 +1285,16 @@ async fn ambiguous_pagerduty_retry_reuses_the_dedup_key() {
         vec![json!(dispatch_id), json!(dispatch_id)],
         "both attempts carry the stable dispatch ID"
     );
-    let after = delivery.seed.run(run).await.expect("run reads");
+    let after = delivery.seed.execution(run).await.expect("execution reads");
     assert_eq!(
         (after.status, after.result_id),
         (before.status, before.result_id),
         "delivery never changes the Verifier result"
     );
-    assert_eq!(delivery.seed.runs().await.expect("runs read"), vec![run]);
+    assert_eq!(
+        delivery.seed.executions().await.expect("executions read"),
+        vec![run]
+    );
 
     let alert_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_name ILIKE '%alert%'",
@@ -1396,7 +1448,7 @@ async fn drift_counts_render_into_the_slack_message() {
     assert_eq!(
         sent,
         [json!({ "channel": "C0123456789",
-                 "text": "1/1 drifted | Drift verdict Drift: 1 of 1 features drifted." })]
+                 "text": "1/1 drifted | Verdict failed: 1 of 1 requirements failed." })]
     );
 }
 
@@ -1436,7 +1488,7 @@ async fn live_smoke_delivers_to_pagerduty() {
                 "integration_key": live_env("WYRD_LIVE_PAGERDUTY_KEY") }),
         json!({ "kind": "notify", "channel": { "kind": "pager_duty",
                 "connection": "ops-pagerduty", "route": "wyrd-live-smoke",
-                "severity": "info", "summary": "Wyrd live smoke {{run_id}}" } }),
+                "severity": "info", "summary": "Wyrd live smoke {{execution_id}}" } }),
     )
     .await;
 }
@@ -1573,13 +1625,13 @@ async fn operator_permits_cap_each_tenant_without_starving_another() {
     );
 }
 
-/// Running Verifier runs and running Operator dispatches of `tenant`.
+/// Running Verifier executions and running Operator dispatches of `tenant`.
 ///
 /// # Panics
 /// Panics when either table cannot be read.
 async fn running(pool: &PgPool, tenant: DataTenantId) -> (i64, i64) {
     sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM wyrd.verifier_runs \
+        "SELECT (SELECT COUNT(*) FROM wyrd.verifier_executions \
                   WHERE data_tenant_id = $1 AND status = 'running'), \
                 (SELECT COUNT(*) FROM wyrd.operator_dispatches \
                   WHERE data_tenant_id = $1 AND status = 'running')",
@@ -1668,20 +1720,15 @@ async fn verifiers_progress_while_operator_deliveries_are_capped() {
 
     script.hold();
     for _ in 0..8 {
-        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+        script.push(EngineOutcome::Completed(passed_outcome()));
     }
-    let now = Utc::now();
-    let window = || DriftWindow {
-        start: now - chrono::Duration::hours(1),
-        end: now,
-    };
     let mut held = Vec::new();
     for _ in 0..6 {
         held.push((
             &delivery.seed,
             delivery
                 .seed
-                .enqueue_direct(&delivery.verifier, &busy_owner, window())
+                .submit(&delivery.verifier, &busy_owner, BTreeMap::new())
                 .await
                 .expect("busy run enqueues"),
         ));
@@ -1691,7 +1738,7 @@ async fn verifiers_progress_while_operator_deliveries_are_capped() {
             &quiet.seed,
             quiet
                 .seed
-                .enqueue_direct(&quiet.verifier, &quiet.owner, window())
+                .submit(&quiet.verifier, &quiet.owner, BTreeMap::new())
                 .await
                 .expect("quiet run enqueues"),
         ));
@@ -1738,7 +1785,7 @@ async fn verifiers_progress_while_operator_deliveries_are_capped() {
     script.release();
     for (seed, run) in held {
         let deadline = tokio::time::Instant::now() + WAIT;
-        while seed.run(run).await.expect("run reads").status != "completed" {
+        while seed.execution(run).await.expect("execution reads").status != "completed" {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "held run never completed"

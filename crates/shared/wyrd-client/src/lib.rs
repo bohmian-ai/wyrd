@@ -30,6 +30,7 @@ pub mod saved_login;
 pub mod state;
 pub mod storage;
 pub mod transport;
+pub mod verify;
 
 pub use bifrost::{Bifrost, QueueConfig};
 pub use client::WyrdClient;

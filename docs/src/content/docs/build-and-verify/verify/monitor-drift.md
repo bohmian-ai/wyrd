@@ -5,16 +5,15 @@ pillar: wyrd
 section: Build and verify
 topic: Verify
 order: 3
-draft: true
 status: runnable
 ---
 
-A drift Verifier compares what a component sees in production with a baseline you register once. Bind it to a `schedule` Trigger and the server scores every window on its own, then runs your Operators when a feature shifts. The support desk has no trained model of its own, so this guide adds one: the `churn-classifier` from [Register Cards from code](/understand/cards-versions-and-relationships/#register-cards-from-code), which scores how likely a customer is to churn. Its inputs are checked against last quarter's healthy data every hour.
+A drift Verifier compares what a component sees in production with a baseline you register once. Your service records samples with `submit`; a `schedule` Trigger judges each window and runs your Operators when a feature shifts. Drift is never judged in real time. This guide checks a churn model's inputs against last quarter's healthy data every hour.
 
 ## Prerequisites
 
-- The `support-desk` declaration from [Cards, versions, and relationships](/understand/cards-versions-and-relationships/), with `churn-classifier@1.4.2` registered from code, and `editor` to register Cards.
-- A running service that records drift observations for the model, as in [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/).
+- A registered Model Card, here `churn-classifier@1.4.2` ([register one from code](/understand/cards-versions-and-relationships/#register-cards-from-code)), and `editor` to register Cards.
+- A running service that loads its bundle, as in [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/).
 - A sample of healthy inputs, with the same column names your service will record.
 
 ## 1. Register the baseline
@@ -40,6 +39,8 @@ Registration uploads the data and records its schema and statistics. Keep the co
 
 ## 2. Write the Verifier
 
+A drift Verifier has one `samples` slot naming the measurements it judges, and a `drift` check on that slot:
+
 ```yaml title="service/churn-input-drift.yaml"
 apiVersion: wyrd/v1
 kind: Verifier
@@ -49,19 +50,24 @@ metadata:
   version: 1.0.0
 spec:
   description: Churn model inputs stay distributed like the healthy baseline.
-  implementation:
-    kind: drift
-    spec:
-      method: Psi
-      signal:
-        kind: Distribution
-        baseline_ref: { kind: Data, name: churn-baseline, version: 1.0.0, space: default }
-        features: [tenure_months, monthly_spend]
-      condition: { kind: Statistical }
-      profile:
-        kind: Psi
-        binning_strategy: { kind: Quantile, n_bins: 10 }
-        threshold: { kind: Fixed, value: 0.25 }
+  inputs:
+    current: { type: samples, features: [tenure_months, monthly_spend] }
+  requirements:
+    - id: churn-inputs-stable
+      statement: No churn model input drifted from the healthy baseline
+      check:
+        kind: drift
+        on: inputs.current
+        method: Psi
+        signal:
+          kind: Distribution
+          baseline_ref: { kind: Data, name: churn-baseline, version: 1.0.0, space: default }
+          features: [tenure_months, monthly_spend]
+        condition: { kind: Statistical }
+        profile:
+          kind: Psi
+          binning_strategy: { kind: Quantile, n_bins: 10 }
+          threshold: { kind: Fixed, value: 0.25 }
 ```
 
 Pick the method by what you are watching:
@@ -72,29 +78,37 @@ Pick the method by what you are watching:
 | `Spc` | Control-chart signals on numeric features, for a value that should stay stable over time | `{ sample_size }`, at least 2 |
 | `Custom` | One metric you compute against a fixed number | `{ metric_name, baseline_value, alert_threshold }`, with `signal: { kind: Metric, name }` and `metric_name` equal to that name. Needs no baseline Data Card |
 
-`condition` must be `Statistical`. A feature is drifted when its score exceeds the threshold, and the window fails if any feature drifted. For PSI, 0.1 is a small shift and 0.25 a large one; start at 0.25 and tighten once you know how noisy your inputs are.
+`condition` must be `Statistical`. A feature is drifted when its score exceeds the threshold, and the requirement fails if any feature drifted. For PSI, 0.1 is a small shift and 0.25 a large one; start at 0.25 and tighten once you know how noisy your inputs are.
+
+Registration refuses a Verifier that mixes `samples` slots or `drift` checks with any other slot or check type: a window Verifier and a per-run Verifier are judged on different evidence.
 
 ## 3. Bind it to a schedule and register
 
-Add the model to the Service as a new component and bind the Verifier to it:
+List the model as a component of a Service and bind the Verifier to it. The binding's `inputs` map tells the schedule which recorded measurements fill each `samples` slot; names are never inferred:
 
-```yaml title="service/support-desk.yaml (excerpt)"
-- alias: churn_model
-  ref: { kind: Model, name: churn-classifier, version: 1.4.2 }
-  verified_by:
-    - verifier: ./churn-input-drift.yaml
-      runs_on: { kind: schedule, cron: "0 * * * *" }
-      on_failure:
-        - ./page-support-oncall.yaml
+```yaml title="service/churn-service.yaml"
+apiVersion: wyrd/v1
+kind: Service
+metadata: {name: churn-service, version: 1.0.0, space: default}
+spec:
+  service_type: model
+  components:
+    - alias: churn_model
+      ref: {kind: Model, name: churn-classifier, version: 1.4.2}
+      verified_by:
+        - verifier: ./churn-input-drift.yaml
+          runs_on: {kind: schedule, cron: "0 * * * *"}
+          inputs:
+            current: {features: [tenure_months, monthly_spend]}
 ```
+
+A `Custom` slot reads one metric instead, such as `latency: {metric: latency_p95}`. Every required `samples` slot needs an entry, and the names must match the slot's `features`. To page someone when it fails, see [Respond to a failed verification](/build-and-verify/verify/respond-to-a-failed-verification/).
 
 ```bash
-wyrd apply examples/support-desk/service/
+wyrd apply service/churn-service.yaml
 ```
 
-The new component changes the Service's content, so bump `metadata.version` in `support-desk.yaml` first, or `wyrd apply` fails with `WYRD_REGISTRY_409_SPEC_DRIFT`.
-
-`cron` is evaluated in UTC unless you set `tz`, such as `tz: America/Chicago`. Each due time scores the observations recorded since the previous one, so the hourly schedule above scores `[00:00, 01:00)` at 01:00.
+`schedule` is the only Trigger that runs a Verifier on its own. `cron` is evaluated in UTC unless you set `tz`, such as `tz: America/Chicago`. Each due time judges the samples recorded since the previous one, so the hourly schedule above judges `[00:00, 01:00)` at 01:00.
 
 ## 4. Wait for the baseline to fit
 
@@ -141,11 +155,11 @@ console.log(verifier.status?.verification?.baseline?.state); // pending, buildin
 </LangTab>
 </LangTabs>
 
-`failed` comes with `baseline.error` explaining why, usually a feature missing from the baseline or a text column under `Spc`, which only charts numbers. Fix the Card and register a new version. A real-time call before the baseline is `ready` returns `WYRD_VERIFICATION_409_BASELINE_NOT_READY`.
+`failed` comes with `baseline.error` explaining why, usually a feature missing from the baseline or a text column under `Spc`, which only charts numbers. Fix the Card and register a new version. A window judged before the baseline is `ready` is `inconclusive` and runs no Operator.
 
-## 5. Record drift observations
+## 5. Record samples
 
-Record one row of feature values per prediction, on the component the binding sits under:
+Submit one row of feature values per prediction, on the component the binding sits under:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -154,17 +168,23 @@ Record one row of feature values per prediction, on the component the binding si
 with state.run("churn_model") as run:
     features = {"tenure_months": customer.tenure_months, "monthly_spend": customer.monthly_spend}
     prediction = churn_classifier.predict(features)  # your model code
-    run.observe.drift(features)
+    run.observe.submit("churn-input-drift", current=features)
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
 ```rust
+use wyrd_ai::verify::{Input, Inputs, Submission};
+
 let run = state.run_for_card("churn_model")?;
 let features = json!({ "tenure_months": customer.tenure_months, "monthly_spend": customer.monthly_spend });
 let prediction = churn_classifier.predict(&features); // your model code
-run.observe().drift(&features, None)?;
+let submission = run
+    .observe()
+    .submit("churn-input-drift", Inputs::named([("current", Input::from(features))]))
+    .await?;
+assert!(matches!(submission, Submission::Recorded));
 ```
 
 </LangTab>
@@ -174,19 +194,19 @@ run.observe().drift(&features, None)?;
 const run = state.run("churn_model");
 const features = { tenure_months: customer.tenureMonths, monthly_spend: customer.monthlySpend };
 const prediction = churnClassifier.predict(features); // your model code
-run.observe.drift(features);
+await run.observe.submit("churn-input-drift", { current: features });
 ```
 
 </LangTab>
 </LangTabs>
 
-Values must be flat: strings, booleans, finite floats, or integers.
+Values must be flat: strings, booleans, finite floats, or integers. `submit` writes the row through the same buffered observation path as other telemetry and returns `Recorded`, not an execution: there is nothing to wait on, because the schedule judges the window later. `verify` on this Verifier is refused with `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` before anything is sent.
 
-A scheduled binding runs only while its Service is live. The server treats the binding as active when the Service's credential has authenticated in the last 24 hours, so a schedule on a Service that is not deployed does nothing. Missed windows, such as during a server outage, are skipped, not backfilled.
+A scheduled binding runs only while its Service is live. The server treats the binding as active when the Service's credential has authenticated in the last 24 hours, so a schedule on a Service that is not deployed does nothing. Missed windows, such as during a server outage, are skipped, not backfilled. Each window runs as the binding owner's authority.
 
 ## 6. Read the result
 
-Each scored window writes one row to `vala.verification.results` and one row per feature to `vala.drift.result_features`:
+Each judged window writes one row to `vala.verification.results`, tied to the binding and the window:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -196,10 +216,10 @@ from wyrd.bifrost import Bifrost
 
 rows = Bifrost().sql(
     """
-    SELECT window_start, window_end, feature, score, threshold, verdict
-    FROM vala.drift.result_features
+    SELECT window_start, window_end, verdict, verifier_version
+    FROM vala.verification.results
     WHERE binding_id = $1
-    ORDER BY window_start DESC, feature
+    ORDER BY window_start DESC
     LIMIT 20
     """,
     [binding_id],
@@ -216,10 +236,10 @@ use wyrd_ai::{Bifrost, bifrost::{BifrostOptions, QueryParam}};
 let rows = Bifrost::connect(BifrostOptions::default())
     .await?
     .sql(
-        "SELECT window_start, window_end, feature, score, threshold, verdict \
-         FROM vala.drift.result_features \
+        "SELECT window_start, window_end, verdict, verifier_version \
+         FROM vala.verification.results \
          WHERE binding_id = $1 \
-         ORDER BY window_start DESC, feature \
+         ORDER BY window_start DESC \
          LIMIT 20",
         &[QueryParam::String(binding_id.to_string())],
     )
@@ -234,10 +254,10 @@ import { Bifrost } from "wyrd-ai";
 
 const bifrost = await Bifrost.connect();
 const rows = await bifrost.sql(
-  `SELECT window_start, window_end, feature, score, threshold, verdict
-     FROM vala.drift.result_features
+  `SELECT window_start, window_end, verdict, verifier_version
+     FROM vala.verification.results
     WHERE binding_id = $1
-    ORDER BY window_start DESC, feature
+    ORDER BY window_start DESC
     LIMIT 20`,
   [bindingId],
 );
@@ -246,28 +266,15 @@ const rows = await bifrost.sql(
 </LangTab>
 </LangTabs>
 
-`binding_id` is in the Service's Card status (`status.verification.binding_ids`). A scheduled window has no `run_id`, because no application run produced it; filter on `binding_id` or `card_uid` instead.
-
-## Score a past window by hand
-
-To check a window right now, such as the hour after a deploy, start a run yourself. There is no SDK method for this yet; use MCP or HTTP with a credential that holds `verifier:run`:
-
-```json title="verification.start_run arguments"
-{
-  "target": { "kind": "binding", "binding_id": "<binding-id>" },
-  "input": { "kind": "drift_window", "start": "2026-10-12T14:00:00Z", "end": "2026-10-12T15:00:00Z" }
-}
-```
-
-The same body works for `POST /v1/verification/runs`. The window can span at most 31 days. A run that targets a binding behaves like a scheduled one: a `failed` verdict runs its Operators. To analyze without paging anyone, target the Verifier directly with `{ "kind": "verifier", "verifier_card_uid": "...", "card_uid": "..." }`. [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) covers following the run to its result.
+`binding_id` is in the Service's Card status (`status.verification.binding_ids`). A scheduled window has no `run_id`, because no application run produced it; filter on `binding_id` or `card_uid` instead. The `churn-inputs-stable` requirement's `detail` holds every feature's score, threshold, sample counts, and drift flag, with the window and baseline it used.
 
 ## What can go wrong
 
 | Symptom or code | Cause | Fix |
 | --- | --- | --- |
-| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` at `wyrd apply` | `observations_ready` on a drift Verifier | Use `schedule` |
+| Registration refuses the Verifier | It mixes `samples` or `drift` with other slot or check types | Split it into a window Verifier and a per-run Verifier |
+| Registration refuses the binding | A window Verifier without a `schedule` Trigger, or an `inputs` entry missing or naming other measurements than its slot | Bind with `runs_on: { kind: schedule, ... }` and one `inputs` entry per `samples` slot |
+| `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | `verify` on a window Verifier | Use `submit` |
 | Baseline stuck in `failed` | A scored feature is missing from the baseline, or is text under `Spc` | Read `baseline.error`, fix the Verifier or baseline, and register a new version |
-| `WYRD_VERIFICATION_409_BASELINE_NOT_READY` | The baseline has not finished fitting | Wait for `ready` |
-| No results on schedule | The Service has not authenticated in 24 hours, or no observations landed in the window | Deploy the Service; check `vala.drift.observations` for the window |
-| Every window `inconclusive` | The window had no observations for the features, or too few to score | Record on the bound component's alias, with the feature names the Verifier lists |
-| `WYRD_VERIFICATION_400_INVALID_WINDOW` on a manual run | The window is empty, inverted, or longer than 31 days | Send a shorter window with `start` before `end` |
+| No results on schedule | The Service has not authenticated in 24 hours, or no samples landed in the window | Deploy the Service; submit on the bound component's alias |
+| Every window `inconclusive` | The baseline was not ready, or the window had too few samples to score | Wait for `ready`; read the requirement `reason` |

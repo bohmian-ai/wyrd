@@ -2542,7 +2542,7 @@ mod envelope_roundtrip_tests {
             )),
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/verifier-eval.yaml"
+                "/tests/fixtures/verifier-assert.yaml"
             )),
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -2591,132 +2591,31 @@ mod envelope_roundtrip_tests {
 
 #[cfg(test)]
 mod verifier_card_tests {
-    //! Verifier Card envelope contract: the two registrable implementations
-    //! decode from real YAML, and removed kinds, unknown implementation kinds,
-    //! and unknown fields fail before validation or persistence.
+    //! Verifier Card envelope contract: building-block Verifiers decode from
+    //! real YAML, and removed implementation kinds, removed Card kinds, and
+    //! unknown fields fail before validation or persistence.
 
-    use std::collections::BTreeMap;
-
-    use crate::api_version::ApiVersion;
     use crate::card::drift::{DriftMethod, DriftSignal};
-    use crate::card::eval::EvalSpec;
-    use crate::card::verifier::{
-        TaskVerifierSpec, VerifierImplementation, VerifierSpec, VerifierTask,
-    };
-    use crate::envelope::{Card, CardKind, Metadata, Relationships, Spec};
+    use crate::card::verifier::Check;
+    use crate::envelope::{Card, CardKind, Spec};
     use crate::format;
-    use crate::ids::CardName;
-    use crate::vala::eval::{AssertionTask, ComparisonOperator, EvalTask, JsonPath, TaskId};
-    use wyrd_semver::VersionBlock;
 
-    /// Checked-in Drift Verifier fixture.
+    /// Checked-in drift Verifier fixture.
     const DRIFT_VERIFIER_YAML: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/verifier-drift.yaml"
     ));
 
-    /// Checked-in Eval Verifier fixture.
-    const EVAL_VERIFIER_YAML: &str = include_str!(concat!(
+    /// Checked-in single-assertion Verifier fixture.
+    const ASSERT_VERIFIER_YAML: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/verifier-eval.yaml"
+        "/tests/fixtures/verifier-assert.yaml"
     ));
 
-    /// Checked-in single-assertion `task` Verifier Card.
-    const TASK_ASSERTION_VERIFIER_YAML: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/verifier-task-assertion.yaml"
-    ));
-
-    /// Checked-in single-LLM-judge `task` Verifier Card.
-    const TASK_LLM_JUDGE_VERIFIER_YAML: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/verifier-task-llm-judge.yaml"
-    ));
-
-    /// Round-trip the Eval payload through JSON unchanged.
-    #[test]
-    fn card_body_eval_uses_vala_eval_shape() {
-        let spec = eval_spec();
-        let serialized = serde_json::to_string(&spec).unwrap();
-        let back: EvalSpec = serde_json::from_str(&serialized).unwrap();
-
-        assert_eq!(spec, back);
-    }
-
-    /// Wrap the Eval payload in a Verifier envelope and round-trip it as YAML.
-    #[test]
-    fn eval_verifier_envelope_round_trips_with_vala_eval_shape() {
-        let card = Card {
-            api_version: ApiVersion::v1(),
-            kind: CardKind::Verifier,
-            metadata: Metadata {
-                name: CardName::new("quality_eval").unwrap(),
-                version: Some(VersionBlock::parse("1.0.0").unwrap().into()),
-                bump: None,
-                space: None,
-                uid: None,
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-                spec_hash: None,
-                artifact_hash: None,
-                origin: None,
-            },
-            spec: Spec::Verifier(VerifierSpec {
-                description: None,
-                implementation: VerifierImplementation::Eval(eval_spec()),
-            }),
-            relationships: Relationships::default(),
-            status: None,
-        };
-
-        let yaml = format::yaml::to_string(&card).unwrap();
-        assert!(yaml.contains("kind: Verifier"));
-        assert!(yaml.contains("kind: eval"));
-        assert!(yaml.contains("tasks:"));
-        assert!(yaml.contains("kind: assertion"));
-        assert!(!yaml.contains("kind: Eval"));
-
-        let decoded: Card = format::yaml::from_str(&yaml).unwrap();
-        assert_eq!(decoded, card);
-    }
-
-    /// Refuse a sibling key beside `implementation.kind` and `implementation.spec`.
-    ///
-    /// The adjacently tagged union is the only place an implementation body is
-    /// named, so an extra key there is either a misplaced field or pasted
-    /// credential; accepting it would drop the content silently on re-serialization.
+    /// Decode the real drift Verifier YAML into a validated PSI drift check.
     ///
     /// # Panics
-    /// Panics when the sibling key is accepted, or when the refusal does not
-    /// name it.
-    #[test]
-    fn verifier_implementation_rejects_sibling_keys() {
-        let error = serde_json::from_value::<VerifierSpec>(serde_json::json!({
-            "implementation": {
-                "kind": "eval",
-                "spec": { "tasks": {} },
-                "api_token": "sk-live-not-a-real-token",
-            }
-        }))
-        .expect_err("a sibling key beside kind/spec is refused");
-        assert!(error.to_string().contains("api_token"), "{error}");
-    }
-
-    /// Reject the retired Eval profile shape.
-    #[test]
-    fn legacy_eval_profile_json_no_longer_deserializes() {
-        let legacy = r#"{
-            "eval_type": "judge",
-            "judge_refs": [],
-            "assertions": [{"name": "x", "rule": "$.x != null"}]
-        }"#;
-
-        let result: Result<EvalSpec, _> = serde_json::from_str(legacy);
-
-        assert!(result.is_err());
-    }
-
-    /// Decode the real Drift Verifier YAML into a validated PSI Distribution Verifier.
+    /// Panics when the fixture does not decode as one valid PSI drift check.
     #[test]
     fn drift_verifier_yaml_deserializes_as_verifier_card() {
         let card: Card = format::yaml::from_str(DRIFT_VERIFIER_YAML).unwrap();
@@ -2725,195 +2624,78 @@ mod verifier_card_tests {
         let Spec::Verifier(verifier) = &card.spec else {
             panic!("expected Verifier spec, got {:?}", card.spec);
         };
-        let VerifierImplementation::Drift(drift) = &verifier.implementation else {
-            panic!("expected drift implementation");
+        let Check::Drift(drift) = &verifier.requirements[0].check else {
+            panic!("expected a drift check");
         };
-        assert_eq!(drift.method, DriftMethod::Psi);
-        assert!(matches!(drift.signal, DriftSignal::Distribution { .. }));
+        assert_eq!(drift.spec.method, DriftMethod::Psi);
+        assert!(matches!(
+            drift.spec.signal,
+            DriftSignal::Distribution { .. }
+        ));
         verifier
             .validate()
-            .expect("fixture Drift Verifier is valid");
+            .expect("fixture drift Verifier is valid");
     }
 
-    /// Decode the real Eval Verifier YAML into an Eval Verifier with its task map.
-    #[test]
-    fn eval_verifier_yaml_deserializes_as_verifier_card() {
-        let card: Card = format::yaml::from_str(EVAL_VERIFIER_YAML).unwrap();
-
-        assert_eq!(card.kind, CardKind::Verifier);
-        let Spec::Verifier(verifier) = &card.spec else {
-            panic!("expected Verifier spec, got {:?}", card.spec);
-        };
-        let VerifierImplementation::Eval(eval) = &verifier.implementation else {
-            panic!("expected eval implementation");
-        };
-        assert!(
-            eval.tasks
-                .contains_key(&TaskId::new("lookup_called").unwrap())
-        );
-        verifier.validate().expect("fixture Eval Verifier is valid");
-    }
-
-    /// Decode both checked-in `task` Verifier Cards into their one check.
-    ///
-    /// `kind: task` selects [`TaskVerifierSpec`], never `EvalSpec`, and the
-    /// check's own `kind` selects the reused assertion or LLM-judge payload.
+    /// Decode and round-trip the assertion Verifier YAML.
     ///
     /// # Panics
-    /// Panics when either Card fails to decode or decodes as another shape.
+    /// Panics when the fixture fails to decode, validate, or round-trip.
     #[test]
-    fn task_verifier_yaml_deserializes_as_task_verifier_spec() {
-        let card: Card = format::yaml::from_str(TASK_ASSERTION_VERIFIER_YAML).unwrap();
+    fn assert_verifier_yaml_round_trips() {
+        let card: Card = format::yaml::from_str(ASSERT_VERIFIER_YAML).unwrap();
         let Spec::Verifier(verifier) = &card.spec else {
             panic!("expected Verifier spec, got {:?}", card.spec);
         };
-        let VerifierImplementation::Task(TaskVerifierSpec {
-            definition: VerifierTask::Assertion(assertion),
-        }) = &verifier.implementation
-        else {
-            panic!(
-                "expected an assertion task, got {:?}",
-                verifier.implementation
-            );
-        };
-        assert_eq!(assertion.id.as_str(), "cohort_valid");
-        verifier.validate().expect("task Verifier is valid");
-
-        let card: Card = format::yaml::from_str(TASK_LLM_JUDGE_VERIFIER_YAML).unwrap();
-        let Spec::Verifier(verifier) = &card.spec else {
-            panic!("expected Verifier spec, got {:?}", card.spec);
-        };
-        assert!(matches!(
-            &verifier.implementation,
-            VerifierImplementation::Task(TaskVerifierSpec {
-                definition: VerifierTask::LlmJudge(judge),
-            }) if judge.max_retries == 3
-        ));
+        assert_eq!(verifier.requirements[0].id.as_str(), "cohort-valid");
+        verifier.validate().expect("assertion Verifier is valid");
         let round_trip: Card =
             format::yaml::from_str(&format::yaml::to_string(&card).unwrap()).unwrap();
         assert_eq!(round_trip, card);
     }
 
-    /// Refuse Eval-graph fields, a nested `task:` wrapper, an Eval `tasks`
-    /// map, and an unsupported check kind inside a `task` Verifier.
+    /// Refuse every removed implementation-kind body and an unknown field.
     ///
     /// # Panics
-    /// Panics when any malformed body decodes.
+    /// Panics when a removed or unknown shape decodes.
     #[test]
-    fn task_verifier_rejects_graph_fields_wrappers_and_unknown_kinds() {
-        let check = "      kind: assertion\n      id: cohort_valid\n";
-        assert!(TASK_ASSERTION_VERIFIER_YAML.contains(check));
+    fn removed_implementation_kinds_and_unknown_fields_fail_to_deserialize() {
         for (case, yaml) in [
             (
-                "depends_on",
-                TASK_ASSERTION_VERIFIER_YAML.replace(
-                    check,
-                    &format!("{check}      depends_on: [lookup_called]\n"),
+                "implementation",
+                ASSERT_VERIFIER_YAML.replace(
+                    "spec:\n  inputs:",
+                    "spec:\n  implementation:\n    kind: eval\n    spec: {tasks: {}}\n  inputs:",
                 ),
             ),
             (
-                "condition",
-                TASK_ASSERTION_VERIFIER_YAML.replace(
-                    check,
-                    &format!(
-                        "{check}      condition: {{path: $.x, operator: equals, expected: 1}}\n"
-                    ),
-                ),
+                "unknown field",
+                ASSERT_VERIFIER_YAML
+                    .replace("spec:\n  inputs:", "spec:\n  thresholds: {}\n  inputs:"),
             ),
             (
-                "task wrapper",
-                TASK_ASSERTION_VERIFIER_YAML.replace(
-                    "    spec:\n      kind: assertion",
-                    "    spec:\n      task:\n        kind: assertion",
-                ),
-            ),
-            (
-                "tasks map",
-                TASK_ASSERTION_VERIFIER_YAML.replace(
-                    "    spec:\n      kind: assertion",
-                    "    spec:\n      tasks: {}\n      kind: assertion",
-                ),
-            ),
-            (
-                "trace assertion",
-                TASK_ASSERTION_VERIFIER_YAML.replace("kind: assertion", "kind: trace_assertion"),
+                "unknown check kind",
+                ASSERT_VERIFIER_YAML.replace("kind: assert", "kind: judge"),
             ),
         ] {
-            assert_ne!(yaml, TASK_ASSERTION_VERIFIER_YAML, "{case} edit applies");
+            assert_ne!(yaml, ASSERT_VERIFIER_YAML, "{case} edit applies");
             let result: Result<Card, _> = format::yaml::from_str(&yaml);
             assert!(result.is_err(), "{case} must not decode: {yaml}");
         }
-        let eval: Card = format::yaml::from_str(EVAL_VERIFIER_YAML).unwrap();
-        assert!(matches!(
-            eval.spec,
-            Spec::Verifier(VerifierSpec {
-                implementation: VerifierImplementation::Eval(_),
-                ..
-            })
-        ));
     }
 
     /// Reject `kind: Drift` and `kind: Eval` envelopes; neither is a Card kind.
+    ///
+    /// # Panics
+    /// Panics when a removed Card kind decodes.
     #[test]
     fn removed_drift_and_eval_card_kinds_fail_to_deserialize() {
-        let drift_body = DRIFT_VERIFIER_YAML.replace("kind: Verifier", "kind: Drift");
-        let eval_body = EVAL_VERIFIER_YAML.replace("kind: Verifier", "kind: Eval");
-
-        for yaml in [drift_body, eval_body] {
+        for kind in ["Drift", "Eval"] {
+            let yaml = DRIFT_VERIFIER_YAML.replace("kind: Verifier", &format!("kind: {kind}"));
             let result: Result<Card, _> = format::yaml::from_str(&yaml);
             assert!(result.is_err(), "removed kind must not decode: {yaml}");
+            assert!(serde_json::from_value::<CardKind>(serde_json::json!(kind)).is_err());
         }
-        assert!(serde_json::from_value::<CardKind>(serde_json::json!("Drift")).is_err());
-        assert!(serde_json::from_value::<CardKind>(serde_json::json!("Eval")).is_err());
-    }
-
-    /// Reject an `implementation.kind` outside the closed `drift | eval` set.
-    #[test]
-    fn unknown_implementation_kind_fails_to_deserialize() {
-        let yaml = EVAL_VERIFIER_YAML.replace("kind: eval", "kind: future");
-
-        let result: Result<Card, _> = format::yaml::from_str(&yaml);
-
-        assert!(
-            result.is_err(),
-            "future implementation kind must not decode"
-        );
-    }
-
-    /// Reject an unknown field directly inside `VerifierSpec`.
-    #[test]
-    fn unknown_verifier_spec_field_fails_to_deserialize() {
-        let yaml = EVAL_VERIFIER_YAML.replace(
-            "spec:\n  implementation:",
-            "spec:\n  thresholds: {}\n  implementation:",
-        );
-        assert_ne!(yaml, EVAL_VERIFIER_YAML, "fixture edit must apply");
-
-        let result: Result<Card, _> = format::yaml::from_str(&yaml);
-
-        assert!(
-            result.is_err(),
-            "unknown VerifierSpec field must not decode"
-        );
-    }
-
-    /// Build a one-assertion Eval payload.
-    fn eval_spec() -> EvalSpec {
-        let mut tasks = BTreeMap::new();
-        let id = TaskId::new("a").unwrap();
-        tasks.insert(
-            id.clone(),
-            EvalTask::Assertion(AssertionTask {
-                id,
-                context_path: Some(JsonPath::new("$.x").unwrap()),
-                item_context_path: None,
-                operator: ComparisonOperator::IsNotNull,
-                expected: serde_json::Value::Null,
-                depends_on: vec![],
-                condition: None,
-            }),
-        );
-        EvalSpec::new(tasks).expect("static eval spec is valid")
     }
 }
 

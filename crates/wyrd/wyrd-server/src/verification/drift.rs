@@ -1,9 +1,10 @@
 //! The production Drift arm of the closed Verifier dispatch.
 //!
-//! [`DriftEngine`] loads the run's exact fitted baseline, asks Oracle for
-//! fixed server-owned aggregates over the run's subject and frozen
+//! [`DriftEngine`] scores each drift requirement of a scheduled execution:
+//! it decodes the requirement's fitted baseline, asks Oracle for fixed
+//! server-owned aggregates over the execution's subject and frozen
 //! `created_at` window, and feeds only those aggregates to the existing
-//! `vala-drift` scorers. [`ObservationWindow`] renders the fixed SQL: the
+//! `vala-drift` scorers. The reports become the engine's [`DriftChecks`]. [`ObservationWindow`] renders the fixed SQL: the
 //! canonical `vala.drift.observations` table, the exact subject/series/window
 //! filter, and one method-specific aggregate. The subject UID, feature name,
 //! fitted edges and labels, and window bounds are escaped typed literals; a
@@ -30,6 +31,7 @@
 //! transient authority, query, or registry failure retries; a missing, legacy, or
 //! mismatched fitted baseline or a malformed aggregate terminates.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use arrow::array::{Array, Float64Array, Int64Array, RecordBatch};
@@ -44,18 +46,20 @@ use vala_drift::{
     DriftReport, DriftScoreError, FITTED_FORMAT, FittedBaseline, PsiBaseline, SpcBaseline,
     SpcScorer, score_custom_mean, score_psi_counts,
 };
+use vala_eval::blocks::DriftChecks;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::{DriftProfile, DriftSpec, PsiProfile};
+use wyrd_spec::card::verifier::{ScheduledInput, VerifierSpec};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, FeatureName};
+use wyrd_spec::ids::{CardUid, FeatureName, SlotName};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
+use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::verification::{DriftWindow, VerificationError};
-use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
-use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput, TerminalStatus};
+use wyrd_sql::queries::verifier_executions::{ClaimedExecution, TerminalStatus};
 
 use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
-use super::engines::{EngineOutcome, VerifierReport};
+use super::engines::EngineOutcome;
 use super::telemetry::{ExecutionTelemetry, Phase, StreamWaits};
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::state::AppState;
@@ -644,7 +648,7 @@ pub fn fold_custom(batch: &RecordBatch, row: &mut Option<Option<f64>>) -> Result
     Ok(())
 }
 
-/// Owner of Drift execution: baseline decoding, SYSTEM reads, scoring.
+/// Owner of scheduled drift scoring: baseline decoding, SYSTEM reads, scoring.
 pub struct DriftEngine {
     /// Server state owning the Bifrost catalog and the query service.
     state: AppState,
@@ -653,7 +657,8 @@ pub struct DriftEngine {
 }
 
 impl DriftEngine {
-    /// Build an engine reading through `state` as each run's SYSTEM principal.
+    /// Build an engine reading through `state` as each execution's SYSTEM
+    /// principal.
     #[must_use]
     pub fn new(state: AppState, query_timeout: Duration) -> Self {
         Self {
@@ -662,51 +667,68 @@ impl DriftEngine {
         }
     }
 
-    /// Execute one claimed Drift run for `tenant`.
+    /// Score every drift requirement of `spec` whose `on` slot the claimed
+    /// execution's frozen `slots` mapping supplies, over its scheduled
+    /// `window` for `tenant`.
     ///
-    /// Decodes the fitted baseline the claim returned (PSI/SPC) without a
-    /// registry connection, runs one fixed aggregate
-    /// statement under the tenant's tokenless SYSTEM read authority, and
-    /// scores the folded
-    /// aggregates. Baseline retrieval and statement construction are the
-    /// `prepare` phase, the streaming read is `input_read`, and the read
-    /// authority and gaps between streamed batches are waits on `telemetry`. Never fails: every failure is the [`EngineOutcome`] it
-    /// maps to.
-    pub async fn verify(
+    /// A requirement over an omitted optional slot is not scored, even when
+    /// rows for its measurements are retained: it gets no report, so the
+    /// engine's missing-evidence handling judges it inconclusive. Each
+    /// supplied requirement is scored on its own: its fitted baseline (PSI/SPC)
+    /// is the one the claim returned under its requirement ID, decoded
+    /// without a registry connection, and one fixed aggregate statement runs
+    /// under the tenant's tokenless SYSTEM read authority. An unscorable
+    /// window is the method's unscored report, which the engine judges
+    /// inconclusive. Baseline decoding and statement construction are the
+    /// `prepare` phase, each streaming read is `input_read`, and the read
+    /// authority and gaps between streamed batches are waits on `telemetry`.
+    ///
+    /// # Errors
+    /// Returns the terminal or retry [`EngineOutcome`] of the first
+    /// requirement that cannot be scored; the execution then settles without
+    /// a verdict.
+    pub async fn checks(
         &self,
         tenant: DataTenantId,
-        run: &ClaimedRun,
-        spec: &DriftSpec,
+        run: &ClaimedExecution,
+        spec: &VerifierSpec,
+        window: &DriftWindow,
+        slots: &BTreeMap<SlotName, ScheduledInput>,
         telemetry: &ExecutionTelemetry,
-    ) -> EngineOutcome {
-        match self.try_verify(tenant, run, spec, telemetry).await {
-            Ok(report) => EngineOutcome::Completed(VerifierReport::Drift(report)),
-            Err(outcome) => outcome,
+    ) -> Result<DriftChecks, EngineOutcome> {
+        let mut checks = DriftChecks::new(Some(*window), BTreeMap::new(), BTreeMap::new());
+        let supplied = spec
+            .drift_checks()
+            .filter(|(_, check)| check.on.slot().is_some_and(|slot| slots.contains_key(slot)));
+        for (requirement, check) in supplied {
+            let report = self
+                .score(tenant, run, requirement, &check.spec, window, telemetry)
+                .await?
+                .unwrap_or_else(|| DriftReport::unscored(check.spec.method));
+            checks = checks.with_report(requirement.clone(), report);
         }
+        Ok(checks)
     }
 
-    /// Execute a run, returning the scored report or `None` when unscorable.
+    /// Score one drift requirement, returning `None` when unscorable.
     ///
     /// # Errors
     /// Returns the terminal or retry outcome of the first failure.
-    async fn try_verify(
+    async fn score(
         &self,
         tenant: DataTenantId,
-        run: &ClaimedRun,
+        run: &ClaimedExecution,
+        requirement: &TaskId,
         spec: &DriftSpec,
+        window: &DriftWindow,
         telemetry: &ExecutionTelemetry,
-    ) -> Result<Option<vala_drift::DriftReport>, EngineOutcome> {
-        let RunInput::DriftWindow(window) = &run.input else {
-            return Err(terminal(
-                DRIFT_INVALID,
-                "a Drift run needs a drift window input",
-            ));
-        };
+    ) -> Result<Option<DriftReport>, EngineOutcome> {
         let window = ObservationWindow::new(&run.card_uid, window);
         let invalid = |message: String| terminal(DRIFT_INVALID, message);
-        let scored = |result: Result<vala_drift::DriftReport, vala_drift::DriftScoreError>| {
+        let scored = |result: Result<DriftReport, DriftScoreError>| {
             result.map(Some).map_err(|error| invalid(error.to_string()))
         };
+        let fitted = || decode_baseline(run.fitted_baselines.get(requirement).cloned());
         let reader = Reader {
             engine: self,
             tenant,
@@ -731,14 +753,12 @@ impl DriftEngine {
             Some(DriftProfile::Psi(profile)) => {
                 let (baseline, sql) = telemetry
                     .prepare(async {
-                        let FittedBaseline::Psi(baseline) =
-                            FittedBaselines::decode(run.fitted_baseline.clone())?
-                        else {
+                        let FittedBaseline::Psi(baseline) = fitted()? else {
                             return Err(invalid(
                                 "the fitted baseline is not a PSI baseline".to_owned(),
                             ));
                         };
-                        let sql = window.psi_statement(&baseline).map_err(&invalid)?;
+                        let sql = window.psi_statement(&baseline).map_err(invalid)?;
                         Ok((baseline, sql))
                     })
                     .await?;
@@ -750,14 +770,12 @@ impl DriftEngine {
             Some(DriftProfile::Spc(_)) => {
                 let (baseline, sql) = telemetry
                     .prepare(async {
-                        let FittedBaseline::Spc(baseline) =
-                            FittedBaselines::decode(run.fitted_baseline.clone())?
-                        else {
+                        let FittedBaseline::Spc(baseline) = fitted()? else {
                             return Err(invalid(
                                 "the fitted baseline is not an SPC baseline".to_owned(),
                             ));
                         };
-                        let sql = window.spc_statement(&baseline).map_err(&invalid)?;
+                        let sql = window.spc_statement(&baseline).map_err(invalid)?;
                         Ok((baseline, sql))
                     })
                     .await?;
@@ -766,106 +784,47 @@ impl DriftEngine {
                 let _score = tracing::info_span!("verification.score").entered();
                 fold.finish().map_err(|error| invalid(error.to_string()))
             }
-            None => Err(invalid("the Drift Verifier has no profile".to_owned())),
+            None => Err(invalid("the drift check has no profile".to_owned())),
         }
     }
 }
 
-/// Loader of ready fitted Drift baselines.
+/// Decode a stored fitted baseline, `None` when none is ready.
 ///
-/// Queued Drift runs and direct executions share its decoding, so both refuse a missing
-/// or legacy baseline identically.
-#[derive(Clone)]
-pub struct FittedBaselines {
-    /// Server state owning the Wyrd Postgres registry.
-    state: AppState,
-    /// Fitted baseline reads.
-    queue: DriftBaselineQueue,
+/// A PSI or SPC profile whose `format` is not [`FITTED_FORMAT`] was fitted
+/// under earlier semantics and is refused before decoding; it is never
+/// rescored or migrated.
+///
+/// # Errors
+/// Terminates with [`BASELINE_NOT_READY`] when no baseline is ready,
+/// [`BASELINE_LEGACY`] for an earlier format, and [`DRIFT_INVALID`] when the
+/// stored profile does not decode.
+pub fn decode_baseline(fitted: Option<serde_json::Value>) -> Result<FittedBaseline, EngineOutcome> {
+    let fitted =
+        fitted.ok_or_else(|| terminal(BASELINE_NOT_READY, "the Drift baseline is not fitted"))?;
+    let format = fitted
+        .as_object()
+        .and_then(|method| method.values().next())
+        .and_then(|profile| profile.get("format"))
+        .and_then(serde_json::Value::as_u64);
+    if format != Some(u64::from(FITTED_FORMAT)) {
+        return Err(terminal(
+            BASELINE_LEGACY,
+            "the Drift baseline was fitted before the conventional PSI/SPC semantics; \
+             register a new Verifier version to refit it",
+        ));
+    }
+    serde_json::from_value(fitted).map_err(|error| terminal(DRIFT_INVALID, error.to_string()))
 }
 
-impl FittedBaselines {
-    /// Build a loader reading through `state`.
-    #[must_use]
-    pub fn new(state: AppState) -> Self {
-        Self {
-            state,
-            queue: DriftBaselineQueue::default(),
-        }
-    }
-
-    /// Load the ready fitted baseline of `verifier_uid` for direct execution.
-    ///
-    /// The registry read is one wait on `telemetry`; decoding is
-    /// [`Self::decode`]. Queued runs never call this: their claim returns the
-    /// fitted baseline.
-    ///
-    /// # Errors
-    /// Retries a registry failure, and otherwise returns [`Self::decode`]'s
-    /// refusals.
-    pub async fn load(
-        &self,
-        tenant: DataTenantId,
-        verifier_uid: &CardUid,
-        telemetry: &ExecutionTelemetry,
-    ) -> Result<FittedBaseline, EngineOutcome> {
-        let unavailable =
-            |error: &dyn std::fmt::Display| retry(DRIFT_QUERY_FAILED, error.to_string());
-        let fitted = telemetry
-            .wait(async {
-                let mut conn = self
-                    .state
-                    .postgres
-                    .wyrd()
-                    .tenant_conn(tenant)
-                    .await
-                    .map_err(|error| unavailable(&error))?;
-                self.queue
-                    .fitted(&mut conn, verifier_uid)
-                    .await
-                    .map_err(|error| unavailable(&error))
-            })
-            .instrument(tracing::info_span!("verification.baseline"))
-            .await?;
-        Self::decode(fitted)
-    }
-
-    /// Decode a stored fitted baseline, `None` when none is ready.
-    ///
-    /// A PSI or SPC profile whose `format` is not [`FITTED_FORMAT`] was fitted
-    /// under earlier semantics and is refused before decoding; it is never
-    /// rescored or migrated.
-    ///
-    /// # Errors
-    /// Terminates with [`BASELINE_NOT_READY`] when no baseline is ready,
-    /// [`BASELINE_LEGACY`] for an earlier format, and [`DRIFT_INVALID`] when
-    /// the stored profile does not decode.
-    pub fn decode(fitted: Option<serde_json::Value>) -> Result<FittedBaseline, EngineOutcome> {
-        let fitted = fitted
-            .ok_or_else(|| terminal(BASELINE_NOT_READY, "the Drift baseline is not fitted"))?;
-        let format = fitted
-            .as_object()
-            .and_then(|method| method.values().next())
-            .and_then(|profile| profile.get("format"))
-            .and_then(serde_json::Value::as_u64);
-        if format != Some(u64::from(FITTED_FORMAT)) {
-            return Err(terminal(
-                BASELINE_LEGACY,
-                "the Drift baseline was fitted before the conventional PSI/SPC semantics; \
-                 register a new Verifier version to refit it",
-            ));
-        }
-        serde_json::from_value(fitted).map_err(|error| terminal(DRIFT_INVALID, error.to_string()))
-    }
-}
-
-/// The SYSTEM observation read of one run: its tenant and claimed run.
+/// The SYSTEM observation read of one execution: its tenant and claim.
 struct Reader<'a> {
     /// Engine owning the server state.
     engine: &'a DriftEngine,
     /// Run tenant every read is authorized in.
     tenant: DataTenantId,
-    /// The claimed run, carrying the tenant's SYSTEM principal.
-    run: &'a ClaimedRun,
+    /// The claimed execution, carrying the tenant's SYSTEM principal.
+    run: &'a ClaimedExecution,
     /// The execution whose input-read phase and waits this reader records.
     telemetry: &'a ExecutionTelemetry,
 }
@@ -1258,7 +1217,7 @@ mod tests {
     #[test]
     fn decode_refuses_missing_and_legacy_baselines() {
         let refused = |fitted| {
-            let Err(EngineOutcome::Terminal(_, error)) = FittedBaselines::decode(fitted) else {
+            let Err(EngineOutcome::Terminal(_, error)) = decode_baseline(fitted) else {
                 panic!("the baseline is refused as terminal");
             };
             error.code

@@ -1,0 +1,28 @@
+# A code check: sandboxed Python reads the ticket and names every field the
+# help desk needs that is missing. No model.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: ticket-complete
+  version: 1.0.0
+  space: support
+spec:
+  description: A support ticket carries the fields the help desk needs.
+  inputs:
+    ticket: {type: json}
+  requirements:
+    - id: ticket-complete
+      statement: The ticket has an answer and an order id
+      check:
+        kind: code
+        entrypoint: check
+        inputs: {ticket: inputs.ticket}
+        source:
+          inline: |
+            def check(ticket):
+                missing = [field for field in ("answer", "order_id") if not ticket.get(field)]
+                return {
+                    "outcome": "failed" if missing else "passed",
+                    "reason": "missing " + ", ".join(missing) if missing else "all fields present",
+                    "citations": [{"slot": "ticket", "locator": {"json_pointer": ""}}],
+                }

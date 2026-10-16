@@ -7,7 +7,7 @@
 //! ## Inputs
 //!
 //! - `left: &serde_json::Value` - the observed value extracted from a record,
-//!   trace, workflow record, or judge response.
+//!   trace, or workflow record.
 //! - `op: &ComparisonOperator` - the operator declared by the spec task.
 //! - `right: &serde_json::Value` - the expected payload. For parameterless
 //!   operators (`IsNull`, `IsPositive`, `IsTruthy`, etc.) the caller passes

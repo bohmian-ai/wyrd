@@ -14,6 +14,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::card::agent::BuiltinTool;
 use crate::ids::{CardUid, ModelId, ProviderDeploymentName};
 
 /// Longest accepted catalog or schema identifier segment.
@@ -50,6 +51,8 @@ pub enum PermissionScope {
     Gateway(GatewayAccess),
     /// One Verifier Card, by its exact UID.
     Verifier(CardUid),
+    /// One exact built-in Agent tool, never a prefix or path.
+    Tool(BuiltinTool),
 }
 
 /// The gateway deployment objects one invoke grant reaches.
@@ -146,7 +149,7 @@ impl PermissionScope {
     ///
     /// [`Self::All`] covers everything; a Bifrost scope never covers `All`,
     /// because "all objects" is strictly wider than any single schema or table.
-    /// A Verifier scope covers only the same Verifier UID.
+    /// A Verifier or tool scope covers only the same Verifier UID or tool.
     #[must_use]
     pub fn covers(&self, required: &Self) -> bool {
         match (self, required) {
@@ -154,7 +157,8 @@ impl PermissionScope {
             (Self::Bifrost(granted), Self::Bifrost(required)) => granted.covers(required),
             (Self::Gateway(granted), Self::Gateway(required)) => granted.covers(required),
             (Self::Verifier(granted), Self::Verifier(required)) => granted == required,
-            (Self::Bifrost(_) | Self::Gateway(_) | Self::Verifier(_), _) => false,
+            (Self::Tool(granted), Self::Tool(required)) => granted == required,
+            (Self::Bifrost(_) | Self::Gateway(_) | Self::Verifier(_) | Self::Tool(_), _) => false,
         }
     }
 
@@ -177,11 +181,11 @@ impl PermissionScope {
     /// Returns [`PermissionScopeError::InvalidIdentifier`] when a catalog or
     /// schema segment is empty, longer than 63 characters, or contains anything
     /// other than ASCII alphanumerics, `_`, or `-`. Gateway identities are
-    /// validated when their typed ids decode, so a gateway or Verifier scope is
-    /// always valid.
+    /// validated when their typed ids decode, so a gateway, Verifier, or tool
+    /// scope is always valid.
     pub fn validate(&self) -> Result<(), PermissionScopeError> {
         match self {
-            Self::All | Self::Gateway(_) | Self::Verifier(_) => Ok(()),
+            Self::All | Self::Gateway(_) | Self::Verifier(_) | Self::Tool(_) => Ok(()),
             Self::Bifrost(scope) => scope.validate(),
         }
     }

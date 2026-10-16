@@ -7,6 +7,9 @@
   // when inactive. SSR/prerender-safe: defaults to the first registered tab,
   // no browser API at the top level.
   let { children }: { children?: Snippet } = $props();
+  // Hydration-stable per-block prefix, so two blocks on one page can share a
+  // tab label without duplicate element ids.
+  const uid = $props.id();
 
   let tabs = $state<Array<{ id: string; label: string }>>([]);
   let activeId = $state('');
@@ -15,6 +18,7 @@
   let btns = $state<Record<string, HTMLButtonElement>>({});
 
   const ctx = {
+    uid,
     get activeId() {
       return activeId;
     },
@@ -51,14 +55,18 @@
 </script>
 
 <div class="tabs">
+  <!-- Panels render first so every <Tab> has registered before the strip
+       renders; a prerendered page then ships its full tab strip. CSS `order`
+       puts the strip back on top. -->
+  {@render children?.()}
   {#if tabs.length > 0}
     <div class="tabs-strip" role="tablist">
       {#each tabs as t (t.id)}
         <button
           type="button"
           role="tab"
-          id={`tab-${t.id}`}
-          aria-controls={`tabpanel-${t.id}`}
+          id={`${uid}-tab-${t.id}`}
+          aria-controls={`${uid}-tabpanel-${t.id}`}
           aria-selected={activeId === t.id}
           tabindex={activeId === t.id ? 0 : -1}
           class:active={activeId === t.id}
@@ -71,14 +79,19 @@
       {/each}
     </div>
   {/if}
-  {@render children?.()}
 </div>
 
 <style>
   .tabs {
+    display: flex;
+    flex-direction: column;
     margin: 1.5rem 0;
   }
   .tabs-strip {
+    order: -1;
+    align-self: flex-start;
+    max-width: 100%;
+    flex-wrap: wrap;
     display: inline-flex;
     gap: 0;
     border: 1px solid var(--border);

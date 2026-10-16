@@ -1252,6 +1252,24 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A verification execution did not settle within the caller's wait.
+    ///
+    /// The execution may still be queued or running, or its staged
+    /// submission may have been lost before queue acceptance; waiting never
+    /// invents a result from a status.
+    #[error("[WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT",
+        status = 504,
+        title = "Verification execution did not settle in time",
+        remediation = "Wait again with the same execution ID, or read its status; a submission lost before queue acceptance never settles and must be submitted again."
+    )]
+    SdkVerificationWaitTimedOut {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// A second `start_bifrost` was attempted on a state that already owns a
     /// connected writer.
     ///
@@ -1810,15 +1828,16 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
-    /// No Verifier run with this identity is visible to the caller's tenant.
-    #[error("[WYRD_VERIFICATION_404_RUN_NOT_FOUND] {message}")]
+    /// No Verifier execution with this identity is visible to the caller's
+    /// tenant.
+    #[error("[WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND] {message}")]
     #[wyrd_error(
-        code = "WYRD_VERIFICATION_404_RUN_NOT_FOUND",
+        code = "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND",
         status = 404,
-        title = "Verification run not found",
-        remediation = "Use the run_id returned by POST /v1/verification/runs in the same tenant."
+        title = "Verification execution not found",
+        remediation = "Use the execution_id returned by POST /v1/verification/enqueue in the same tenant; a just-accepted execution may take a moment to become visible."
     )]
-    VerificationRunNotFound {
+    VerificationExecutionNotFound {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -1872,7 +1891,7 @@ pub enum WyrdError {
         code = "WYRD_VERIFICATION_400_INPUT_INVALID",
         status = 400,
         title = "Invalid verification input",
-        remediation = "Send { verifier_card_uid, card_uid, input } with input.kind eval_record (a context object) or drift_samples (columns of number, string, or null values)."
+        remediation = "Send { verifier_card_uid, card_uid, inputs } where inputs maps each declared Verifier slot to a json, file, artifact, or trace value; run_id and execution_route_overrides are optional."
     )]
     VerificationInputInvalid {
         /// Human-readable error message.
@@ -1886,7 +1905,7 @@ pub enum WyrdError {
         code = "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
         status = 413,
         title = "Verification input too large",
-        remediation = "Keep the body within 1 MiB, drift_samples within 64 columns of 100,000 values, and eval_record.context within 256 KiB; split larger input across requests."
+        remediation = "Keep the request body and each evidence file within the Deployment's verification limits, or upload large files through verification.evidence and pass them by digest."
     )]
     VerificationInputTooLarge {
         /// Human-readable error message.
@@ -1950,13 +1969,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
-    /// The Verifier needs input direct execution cannot supply, such as a trace or agent run.
+    /// The Verifier judges a scheduled window, which direct execution cannot supply.
     #[error("[WYRD_VERIFICATION_422_INPUT_UNSUPPORTED] {message}")]
     #[wyrd_error(
         code = "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED",
         status = 422,
         title = "Verification input unsupported",
-        remediation = "Direct execution runs Drift and assertion or LLM-judge Evals only; run trace or agent assertion Evals through observations."
+        remediation = "Execute and enqueue run request-scoped Verifiers; a Verifier that judges a scheduled window runs only on its binding schedule."
     )]
     VerificationInputUnsupported {
         /// Human-readable error message.
@@ -1964,13 +1983,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
-    /// A judge provider failed after the task's own retry budget.
+    /// An agent check's provider failed after the check's own retry budget.
     #[error("[WYRD_VERIFICATION_502_DEPENDENCY_FAILED] {message}")]
     #[wyrd_error(
         code = "WYRD_VERIFICATION_502_DEPENDENCY_FAILED",
         status = 502,
         title = "Verification dependency failed",
-        remediation = "The judge provider failed after the task's own retries; retry the request deliberately once the provider recovers."
+        remediation = "The agent check's provider failed after its own retries; retry the request deliberately once the provider recovers."
     )]
     VerificationDependencyFailed {
         /// Human-readable error message.
@@ -2076,13 +2095,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
-    /// A binding's effective Trigger activation cannot run its Verifier's implementation.
+    /// A binding's effective Trigger activation cannot run its Verifier.
     #[error("[WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH] {message}")]
     #[wyrd_error(
         code = "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
         status = 400,
         title = "Trigger activation does not match Verifier",
-        remediation = "Use a schedule Trigger for a drift Verifier and an observations_ready Trigger for an eval Verifier."
+        remediation = "Attach a schedule Trigger only to a Verifier that judges recorded samples, and map its samples slots in the binding inputs; supply other evidence through verify or submit."
     )]
     SpecTriggerActivationMismatch {
         /// Human-readable error message.
@@ -3605,7 +3624,7 @@ impl WyrdError {
     /// lifecycle and observation variant, must be listed here so its body is
     /// built from one place; the wrapped `Storage` and `Vala` errors render
     /// their own `Display` text and serialized value instead.
-    fn message_details(&self) -> (Cow<'_, str>, serde_json::Value) {
+    pub(crate) fn message_details(&self) -> (Cow<'_, str>, serde_json::Value) {
         match self {
             Self::Validation { message, details }
             | Self::LoaderIo { message, details }
@@ -3734,6 +3753,7 @@ impl WyrdError {
             | Self::SdkInvalidStateBundle { message, details }
             | Self::SdkUnknownAlias { message, details }
             | Self::SdkUnknownVerifier { message, details }
+            | Self::SdkVerificationWaitTimedOut { message, details }
             | Self::SdkBifrostAlreadyStarted { message, details }
             | Self::SdkTelemetryProviderExists { message, details }
             | Self::SdkTelemetryFlushTimeout { message, details }
@@ -3772,7 +3792,7 @@ impl WyrdError {
             | Self::SpecInvalidBindingRefKind { message, details }
             | Self::SpecDuplicateBindingOperator { message, details }
             | Self::VerificationBindingNotFound { message, details }
-            | Self::VerificationRunNotFound { message, details }
+            | Self::VerificationExecutionNotFound { message, details }
             | Self::VerificationInvalidTarget { message, details }
             | Self::VerificationInvalidWindow { message, details }
             | Self::VerificationNotReady { message, details }

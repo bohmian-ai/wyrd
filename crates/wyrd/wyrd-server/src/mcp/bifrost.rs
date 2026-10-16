@@ -36,7 +36,7 @@ pub(super) const QUERY: &str = crate::query::collect::QUERY;
 /// Order is part of the contract an agent reads: discovery, then description,
 /// then the query those two exist to make writable.
 #[must_use]
-pub(super) fn descriptors() -> Vec<Tool> {
+pub(crate) fn descriptors() -> Vec<Tool> {
     vec![list_tables_tool(), describe_table_tool(), query_tool()]
 }
 
@@ -117,15 +117,15 @@ fn query_tool() -> Tool {
 /// Arguments accepted by [`DESCRIBE_TABLE`].
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DescribeTableArguments {
+pub(crate) struct DescribeTableArguments {
     /// Fully qualified Bifrost namespace as the catalog spells it.
-    namespace: String,
+    pub(crate) namespace: String,
     /// Table name within that namespace.
-    name: String,
+    pub(crate) name: String,
 }
 
 /// Project one catalog entry onto the three fields a listing carries.
-fn compact_entry(entry: &BifrostTableEntry) -> JsonValue {
+pub(crate) fn compact_entry(entry: &BifrostTableEntry) -> JsonValue {
     serde_json::json!({
         "namespace": entry.namespace,
         "name": entry.name,

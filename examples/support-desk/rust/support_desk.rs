@@ -1,27 +1,30 @@
 //! The support desk: an Agent-backed Service that answers customer questions,
-//! records each ticket, and is verified continuously and in real time.
+//! records each ticket, and checks every answer against its refund policy
+//! with the `support/policy-check` Verifier.
 //!
 //! [`deploy`] registers the checked-in Cards under `service/`, which ensures
 //! the declared `vala.datasets.tickets` table, turns on metadata capture, and
 //! checks the Agent's model is deployed. [`serve`] answers every question in
-//! its own Agent Run. [`wait_for_verdicts`] waits for both Verifiers to judge
-//! every answer, and [`explain`] joins one Run's evidence over MCP.
+//! its own Agent Run and submits each answer for a background policy check.
+//! [`wait_for_verdicts`] resumes each check from its execution ID alone and
+//! waits for its result, [`check`] judges one answer immediately, and
+//! [`explain`] joins one Run's evidence over MCP.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use wyrd_ai::bifrost::BifrostOptions;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::Instrument as _;
-use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::cards::{CardSelector, Cards, HydrationMode, RegistrationReceipt};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite, ModelId};
-use wyrd_ai::observe::EvalObservationOptions;
 use wyrd_ai::otel::start_telemetry;
 use wyrd_ai::state::WyrdState;
-use wyrd_ai::{Bifrost, ExecutionRoute, Gateway, Spec, WyrdClient, WyrdError};
+use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
+use wyrd_ai::{
+    ExecutionId, ExecutionRoute, Gateway, Spec, VerificationResult, WyrdClient, WyrdError,
+};
 
 /// The failure any support-desk step returns.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -65,8 +68,8 @@ impl Desk {
 pub struct Served {
     /// The request's application Run.
     pub run_id: String,
-    /// Whether `no-refund-promise` passed the answer in real time.
-    pub passed: bool,
+    /// The background policy check of the request's answer.
+    pub execution_id: ExecutionId,
 }
 
 /// One `vala.datasets.tickets` row.
@@ -82,11 +85,16 @@ struct TicketRow<'a> {
     refund: bool,
 }
 
-/// The context both Verifiers judge.
-#[derive(Serialize)]
-struct Answer<'a> {
-    /// The Agent's answer.
-    answer: &'a str,
+/// The `policy-check` inputs for `answer`: the answer text and the
+/// checked-in refund policy PDF.
+fn policy_check(answer: &str) -> Inputs {
+    Inputs::named([
+        ("answer", Input::from(json!(answer))),
+        (
+            "policy",
+            Input::from(File::path(service_dir().join("refund-policy.pdf"))),
+        ),
+    ])
 }
 
 /// Register and hydrate the Service into `bundle`, capture gateway call
@@ -158,8 +166,8 @@ pub fn question(index: usize) -> String {
 
 /// Answer [`REQUESTS`] questions, each in its own Agent Run inside a
 /// `support-desk.request` span: invoke the Agent through the gateway, record
-/// the ticket, observe the answer for `answer-quality`, and judge it with
-/// `no-refund-promise`. Telemetry and observations are flushed on return.
+/// the ticket, and submit the answer for a background `policy-check` without
+/// waiting for it. Telemetry and tickets are flushed on return.
 ///
 /// # Errors
 /// Returns the first refused step.
@@ -185,21 +193,23 @@ pub async fn serve(desk: &Desk) -> Result<Vec<Served>, Error> {
                     },
                 )
                 .await?;
-            observe.eval(
-                &Answer { answer: &answer },
-                EvalObservationOptions::default(),
-            )?;
-            let judgment = observe
-                .verify("no-refund-promise", &Answer { answer: &answer })
-                .await?;
-            Ok::<_, WyrdError>(judgment.passed())
+            match observe
+                .submit("policy-check", policy_check(&answer))
+                .await?
+            {
+                Submission::Queued(execution) => Ok(*execution.id()),
+                Submission::Recorded => Err(WyrdError::Internal {
+                    message: "policy-check judges Run evidence, not a window".to_owned(),
+                    details: json!({ "verifier": "policy-check" }),
+                }),
+            }
         };
-        let passed = run
+        let execution_id = run
             .scope(request.instrument(tracing::info_span!("support-desk.request")))
             .await?;
         served.push(Served {
             run_id: run.run_id().to_string(),
-            passed,
+            execution_id,
         });
     }
     telemetry.shutdown()?;
@@ -207,75 +217,45 @@ pub async fn serve(desk: &Desk) -> Result<Vec<Served>, Error> {
     Ok(served)
 }
 
-/// Verdict counts per Verifier name: `(passed, failed)`.
-pub type Verdicts = BTreeMap<String, (u64, u64)>;
-
-/// One verdict count row.
-#[derive(Deserialize)]
-struct VerdictCount {
-    /// The Verifier Card.
-    verifier_card_uid: String,
-    /// `passed`, `failed`, or `inconclusive`.
-    verdict: String,
-    /// Results with that verdict.
-    n: i64,
-}
-
-/// Wait until both Verifiers have judged every answer, then return their
-/// verdict counts.
+/// Judge `answer` with `policy-check` now, in a fresh Agent Run, and return
+/// its result with the verdict and each requirement's outcome.
 ///
 /// # Errors
-/// Returns a query refusal, or a timeout when the verdicts are not all in
+/// Returns the local input refusal or the server's refusal of the execution.
+pub async fn check(desk: &Desk, answer: &str) -> Result<VerificationResult, Error> {
+    Ok(desk
+        .state
+        .run_for_card("agent")?
+        .observe()
+        .verify("policy-check", policy_check(answer))
+        .await?)
+}
+
+/// Resume every served request's background check from its execution ID
+/// alone, as another process would, and wait for its result; results are in
+/// `served` order.
+///
+/// # Errors
+/// Returns the execution's own error, or
+/// `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` when the results are not all in
 /// within `timeout`.
 pub async fn wait_for_verdicts(
     client: &WyrdClient,
-    desk: &Desk,
+    served: &[Served],
     timeout: Duration,
-) -> Result<Verdicts, Error> {
-    let bifrost = Bifrost::connect_with(client, BifrostOptions::default()).await?;
-    let names = ["answer-quality", "no-refund-promise"].map(|name| (desk.uid(name), name));
+) -> Result<Vec<VerificationResult>, Error> {
     let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let rows: Vec<VerdictCount> = bifrost
-            .sql_as(
-                "SELECT verifier_card_uid, verdict, COUNT(*) AS n FROM vala.verification.results \
-                 WHERE card_uid = $1 GROUP BY verifier_card_uid, verdict",
-                &[QueryParam::String(desk.uid("support-agent"))],
-            )
-            .await?;
-        let mut verdicts = Verdicts::new();
-        for row in rows {
-            if let Some((_, name)) = names.iter().find(|(uid, _)| *uid == row.verifier_card_uid) {
-                let counts = verdicts.entry((*name).to_owned()).or_default();
-                let n = u64::try_from(row.n)?;
-                match row.verdict.as_str() {
-                    "passed" => counts.0 += n,
-                    _ => counts.1 += n,
-                }
-            }
-        }
-        let judged = |name: &str| {
-            verdicts
-                .get(name)
-                .map_or(0, |(passed, failed)| passed + failed)
-        };
-        if names
-            .iter()
-            .all(|(_, name)| judged(name) >= REQUESTS as u64)
-        {
-            return Ok(verdicts);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(
-                format!("verdicts still incomplete after {timeout:?}: {verdicts:?}").into(),
-            );
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut results = Vec::with_capacity(served.len());
+    for request in served {
+        let execution = Execution::connect_with(request.execution_id, client).await?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        results.push(execution.wait(remaining).await?);
     }
+    Ok(results)
 }
 
-/// One Run's joined evidence: its observation, ticket, request span, gateway
-/// call, and both verdicts, as column name to value.
+/// One Run's joined evidence: its ticket, request span, gateway call, and
+/// policy-check verdict, as column name to value.
 pub type Explanation = BTreeMap<String, Value>;
 
 /// Join every piece of evidence of Run `run_id` through MCP `bifrost.query`,
@@ -287,15 +267,14 @@ pub type Explanation = BTreeMap<String, Value>;
 pub async fn explain(client: &WyrdClient, run_id: &str) -> Result<Explanation, Error> {
     uuid_like(run_id)?;
     let sql = format!(
-        "SELECT o.run_id, o.trace_id, t.ticket_id, t.answer, s.name AS span, \
-         g.call_id, g.card_uid AS call_card_uid, c.verdict AS continuous, r.verdict AS realtime \
-         FROM vala.eval.observations o \
-         JOIN vala.datasets.tickets t ON t.run_id = o.run_id \
-         JOIN vala.traces.spans s ON s.trace_id = o.trace_id AND s.run_id = o.run_id \
-         JOIN vala.gateway.calls g ON g.run_id = o.run_id AND g.card_uid = o.card_uid \
-         JOIN vala.verification.results c ON c.run_id = o.run_id AND c.binding_id IS NOT NULL \
-         JOIN vala.verification.results r ON r.run_id = o.run_id AND r.binding_id IS NULL \
-         WHERE o.run_id = '{run_id}' AND s.name = 'support-desk.request'"
+        "SELECT t.run_id, s.trace_id, t.ticket_id, t.answer, s.name AS span, \
+         g.call_id, g.card_uid AS call_card_uid, r.verdict \
+         FROM vala.datasets.tickets t \
+         JOIN vala.traces.spans s ON s.run_id = t.run_id \
+         JOIN vala.gateway.calls g ON g.run_id = t.run_id \
+         JOIN vala.verification.results r ON r.run_id = t.run_id \
+         WHERE t.run_id = '{run_id}' AND s.name = 'support-desk.request' \
+         ORDER BY g.call_id LIMIT 1"
     );
     let token = client.access_token().await?;
     let reply = reqwest::Client::new()

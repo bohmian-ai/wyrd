@@ -170,7 +170,8 @@ const config = {
     // generator scripts write there. SvelteKit's default is static/.
     files: { assets: 'public' },
     prerender: {
-      handleHttpError: 'warn',
+      // A link to a missing or draft page is a dead link for readers.
+      handleHttpError: 'fail',
       // The content catch-all prerenders one entry per published page, so it is
       // unseen only while the content tree is empty — a valid, landing-only
       // site. Any other unseen route still fails the build.

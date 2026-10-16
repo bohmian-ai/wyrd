@@ -4,7 +4,6 @@ description: Every call to Wyrd is made as a principal whose roles decide what i
 pillar: wyrd
 section: Understand
 order: 5
-draft: true
 ---
 
 Every call to the Wyrd server is made as a principal: a person, an administrator, or a deployed Service or Agent. A principal belongs to exactly one tenant, holds roles, and those roles decide what it may read, write, and run. Wyrd checks the permission before the operation proceeds and records the decision in the audit log. Identity is not optional, and there is no anonymous access to tenant data.

@@ -217,7 +217,8 @@ impl ScheduledQueryCaller {
     /// Oracle refuses a statement over any resolved table the bound
     /// principal is not granted. That refusal is an authorization decision, so
     /// it is audited exactly as the public query entry audits it: one `denied`
-    /// row for the bound principal through [`QueryAuthority`].
+    /// row for the bound principal, with its SYSTEM executor as actor when
+    /// Wyrd performs the read, through [`QueryAuthority`].
     ///
     /// Returns `denial` unchanged.
     fn record_object_denial(&self, denial: WyrdError) -> WyrdError {
@@ -226,7 +227,7 @@ impl ScheduledQueryCaller {
             principal: self.context.principal.clone(),
             request_id: self.context.request_id.clone(),
             delegation_chain: self.context.delegation_chain.clone(),
-            executed_by: None,
+            executed_by: self.context.executed_by,
         };
         QueryAuthority::new(&self.state, &caller, "vala.query.sync", "vala.query")
             .record_object_denial(denial)

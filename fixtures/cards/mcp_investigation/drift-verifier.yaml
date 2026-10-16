@@ -5,17 +5,15 @@ metadata:
   version: 1.0.0
   space: default
 spec:
-  implementation:
-    kind: drift
-    spec:
-      method: Custom
-      signal:
-        kind: Metric
-        name: latency
-      condition:
-        kind: Statistical
-      profile:
-        kind: Custom
-        metric_name: latency
-        baseline_value: 1.0
-        alert_threshold: 1.0
+  inputs:
+    latency: {type: samples, features: [latency]}
+  requirements:
+    - id: latency-under-threshold
+      statement: Mean latency stays at or under its alert threshold
+      check:
+        kind: drift
+        on: inputs.latency
+        method: Custom
+        signal: {kind: Metric, name: latency}
+        condition: {kind: Statistical}
+        profile: {kind: Custom, metric_name: latency, baseline_value: 1.0, alert_threshold: 1.0}

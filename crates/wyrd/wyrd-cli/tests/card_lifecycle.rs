@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use wyrd_client::cards::Cards;
 use wyrd_client::state::WyrdState;
-use wyrd_spec::card::verifier::VerifierImplementation;
+use wyrd_spec::card::verifier::Check;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, unresolved_card_ref_paths};
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
@@ -415,10 +415,16 @@ metadata:
   version: 1.0.0
   space: default
 spec:
-  implementation:
-    kind: eval
-    spec:
-      tasks: {}
+  inputs:
+    answer:
+      type: json
+  requirements:
+    - id: answered
+      statement: The agent produced an answer.
+      check:
+        kind: assert
+        path: inputs.answer
+        operator: is_not_null
 ",
     )
     .expect("Verifier fixture writes");
@@ -1406,20 +1412,21 @@ mod pg_tests {
                 .expect("inline prompt serializes")
                 .contains("Inline triage")
         );
-        assert!(matches!(
-            &state
+        assert_eq!(
+            state
                 .verifier("default-Verifier-quality-1.0.0")
-                .expect("eval verifier resolves")
-                .implementation,
-            VerifierImplementation::Eval(spec) if spec.tasks.is_empty()
-        ));
+                .expect("assert verifier resolves")
+                .requirements
+                .len(),
+            1
+        );
         let drift = state
             .verifier("default-Verifier-model-drift-1.0.0")
             .expect("drift verifier resolves");
         assert_eq!(drift.description.as_deref(), Some("fixture drift"));
         assert!(matches!(
-            drift.implementation,
-            VerifierImplementation::Drift(_)
+            drift.requirements.as_slice(),
+            [requirement] if matches!(requirement.check, Check::Drift(_))
         ));
         assert_verified_artifact_bytes(&state);
         assert_all_refs_are_uid_pinned(&state);
@@ -1432,7 +1439,7 @@ mod pg_tests {
     ///
     /// The journey first plans the complete directory, registers the external
     /// Data and Model prerequisites exactly as separate user workflows would,
-    /// applies all eleven canonical submissions, and hydrates the reachable
+    /// applies every canonical submission, and hydrates the reachable
     /// Service graph through CLI `get`.
     ///
     /// # Panics
@@ -1451,7 +1458,6 @@ mod pg_tests {
             .join("tests/fixtures/loader/end_to_end_prerequisites");
         let data_path = prerequisites.join("churn-classifier-data.yaml");
         let verifier_path = prerequisites.join("retention-guardrail-verifier.yaml");
-        let trigger_path = prerequisites.join("retention-observations-trigger.yaml");
         let operator_path = prerequisites.join("retention-pager-operator.yaml");
         let model_path = fixture_root.join("model/card.yaml");
         let plan = run_cli_owned(vec![
@@ -1470,7 +1476,7 @@ mod pg_tests {
             String::from_utf8_lossy(&plan.stderr)
         );
         let plan: Value = serde_json::from_slice(&plan.stdout).expect("plan output is JSON");
-        assert_eq!(plan["cards"].as_array().map(Vec::len), Some(12));
+        assert_eq!(plan["cards"].as_array().map(Vec::len), Some(10));
 
         let server = WyrdTestServer::builder()
             .with_verification_runtime_for_test()
@@ -1529,13 +1535,7 @@ mod pg_tests {
             assert!(!view.to_string().contains("cli-journey"), "{view}");
         }
 
-        for path in [
-            &data_path,
-            &verifier_path,
-            &trigger_path,
-            &operator_path,
-            &model_path,
-        ] {
+        for path in [&data_path, &verifier_path, &operator_path, &model_path] {
             run_cli_json(
                 vec![
                     "apply".to_owned(),
@@ -1569,7 +1569,7 @@ mod pg_tests {
         )
         .await
         .expect("canonical authored directory applies");
-        assert_eq!(receipt["outcomes"].as_array().map(Vec::len), Some(13));
+        assert_eq!(receipt["outcomes"].as_array().map(Vec::len), Some(11));
         wait_baseline_ready(
             &public_cards_client(&base_url, &jwt).await,
             json!({
@@ -1593,7 +1593,7 @@ mod pg_tests {
         .await
         .expect("canonical Service graph hydrates");
         assert_eq!(summary["mode"], "complete");
-        assert_eq!(summary["card_count"], 17);
+        assert_eq!(summary["card_count"], 14);
 
         let metadata: Value = serde_yaml::from_slice(
             &std::fs::read(bundle.path().join("metadata.yaml"))
@@ -1608,7 +1608,7 @@ mod pg_tests {
             ("Verifier", "cohort-check"),
             ("Verifier", "churn-classifier-drift"),
             ("Verifier", "retention-guardrail"),
-            ("Trigger", "retention-observations-ready"),
+            ("Trigger", "churn-classifier-drift-schedule"),
             ("Operator", "retention-pager"),
         ] {
             assert!(
@@ -1639,14 +1639,7 @@ mod pg_tests {
                 .as_array()
                 .unwrap_or_else(|| panic!("{name} persisted its verified_by list"));
             assert_eq!(bindings.len(), binding_count, "{bindings:?}");
-            for leg in ["verifier", "runs_on"] {
-                assert!(
-                    bindings[0][leg]["uid"].is_string(),
-                    "{name}.{leg} persisted UID-pinned: {:?}",
-                    bindings[0][leg]
-                );
-            }
-            if let Some(explicit) = bindings.get(1) {
+            for explicit in bindings {
                 assert!(explicit["verifier"]["uid"].is_string(), "{explicit:?}");
                 assert!(explicit.get("runs_on").is_none(), "{explicit:?}");
             }
@@ -1665,12 +1658,12 @@ mod pg_tests {
             let outbound = relationships["outbound_refs"]
                 .as_array()
                 .unwrap_or_else(|| panic!("{name} derived outbound relationships"));
-            for kind in ["Verifier", "Trigger"] {
-                assert!(
-                    outbound.iter().any(|edge| edge["ref"]["kind"] == kind),
-                    "{name} derived a {kind} edge: {outbound:?}"
-                );
-            }
+            assert!(
+                outbound
+                    .iter()
+                    .any(|edge| edge["ref"]["kind"] == "Verifier"),
+                "{name} derived a Verifier edge: {outbound:?}"
+            );
         }
 
         server.shutdown().await.expect("test server shuts down");
@@ -2259,8 +2252,8 @@ mod pg_tests {
     ///
     /// `plan` and `apply` refuse the retired `kind: Drift` and `kind: Eval`
     /// Cards with the loader's stable envelope diagnostic and leave no Card on
-    /// the server; `kind: Verifier` Cards with `implementation.kind: drift`
-    /// and `eval` apply.
+    /// the server; building-block `kind: Verifier` Cards with a drift check
+    /// and an assert check apply.
     ///
     /// # Panics
     /// Panics when the server fails to start or stop, a bootstrap fails, a
@@ -2342,11 +2335,11 @@ mod pg_tests {
         for (name, contents) in [
             (
                 "cli-custom-verifier",
-                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-custom-verifier\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: drift\n    spec:\n      method: Custom\n      signal:\n        kind: Metric\n        name: score\n      condition:\n        kind: Statistical\n      profile:\n        kind: Custom\n        metric_name: score\n        baseline_value: 1.0\n        alert_threshold: 0.5\n",
+                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-custom-verifier\n  version: 1.0.0\n  space: default\nspec:\n  inputs:\n    current:\n      type: samples\n      features: [score]\n  requirements:\n    - id: score-stable\n      statement: The score stays near its baseline.\n      check:\n        kind: drift\n        on: inputs.current\n        method: Custom\n        signal:\n          kind: Metric\n          name: score\n        condition:\n          kind: Statistical\n        profile:\n          kind: Custom\n          metric_name: score\n          baseline_value: 1.0\n          alert_threshold: 0.5\n",
             ),
             (
                 "cli-eval-verifier",
-                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-eval-verifier\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: eval\n    spec:\n      tasks: {}\n",
+                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-eval-verifier\n  version: 1.0.0\n  space: default\nspec:\n  inputs:\n    answer:\n      type: json\n  requirements:\n    - id: answered\n      statement: The agent produced an answer.\n      check:\n        kind: assert\n        path: inputs.answer\n        operator: is_not_null\n",
             ),
         ] {
             let path = write_fixture(temp.path(), &format!("{name}.yaml"), contents);

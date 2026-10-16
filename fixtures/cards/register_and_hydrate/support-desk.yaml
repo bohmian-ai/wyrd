@@ -17,6 +17,5 @@ spec:
       ref: ./support-agent.yaml
       verified_by:
         - verifier: ./no-refund-promise.yaml
-          runs_on: ./every-batch.yaml
           on_failure:
             - ./notify-support.yaml

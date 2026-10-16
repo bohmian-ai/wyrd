@@ -1,105 +1,57 @@
-//! `vala.verification.results` — one row per completed Verifier run.
+//! `vala.verification.results` — one row per completed Verifier execution.
 //!
-//! Owns the shared verdict schema, its sensitive `drift_report` and
-//! `eval_summary` Struct payloads, and the Bloom columns a result lookup by id,
-//! Verifier, or binding prunes on.
+//! Owns the canonical result schema, its sensitive `outcome` Variant, and the
+//! Bloom columns a result lookup by id, execution, Verifier, or binding prunes
+//! on.
 
-use arrow::datatypes::{DataType, Field, Fields};
+use arrow::datatypes::Field;
 
 use wyrd_types::variant::variant_field;
 
-use crate::tables::fields::{float64, int32, int64, ts_us_utc, utf8};
+use crate::tables::fields::{ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
-/// `vala.verification.results` — exactly one row per completed Verifier run.
+/// `vala.verification.results` — exactly one row per completed Verifier execution.
 ///
-/// Drift, Eval, and task Verifiers share this table so a dashboard reads one
-/// verdict surface regardless of implementation; `implementation` selects
-/// which detail table and which summary column applies. Only `completed` runs
-/// appear: errored, timed-out, and still-running executions have no row here,
-/// so the presence of a row is itself the statement that the run produced a
-/// verdict.
-/// A scored Drift result sets only [`DRIFT_REPORT`], the typed `DriftReport`;
-/// a scored Eval result sets only [`EVAL_SUMMARY`], the typed
-/// `EvalWorkflowSummary`; a task result sets only [`ASSERTION_RESULT`], its one
-/// `AssertionResult` as a Variant, because a task has no detail table; a
-/// completed Drift execution that could not score valid input sets none, which
-/// is recorded rather than fabricated.
-/// The managed `run_id` is the application Run judged, null when there is
-/// none, as for scheduled Drift; the managed `card_uid` is the Card verified.
-/// The Verifier Card is the `verifier_card_uid` payload column; the binding
-/// owner is `owner_card_uid`, null for a direct Verifier run with no binding.
-/// The managed `sub_principal_id`/`act_principal_id` pair records whom the run
-/// served and who executed it.
+/// Every Verifier writes this one surface whatever its checks, so a dashboard
+/// reads one result contract. Only `completed` executions appear: errored,
+/// timed-out, and still-running executions have no row here, so the presence
+/// of a row is itself the statement that the execution produced a verdict.
+/// [`OUTCOME`] holds the typed `VerificationOutcome` — verdict, requirement
+/// breakdown, step results, and original evidence identities — as one Variant.
+/// `execution_id` is the Verifier execution; the managed `run_id` is the
+/// application Run judged, null when there is none, as for scheduled drift;
+/// the managed `card_uid` is the Card verified. The Verifier Card is the
+/// `verifier_card_uid` payload column; the binding owner is `owner_card_uid`
+/// and `binding_id` the binding, both null for an execution with no binding.
+/// The managed `sub_principal_id`/`act_principal_id` pair records whom the
+/// execution served and who executed it.
 pub struct ResultsTable;
 
-/// Typed `DriftReport` column: method, open per-feature reports, and verdict.
-pub const DRIFT_REPORT: &str = "drift_report";
-
-/// Typed `EvalWorkflowSummary` column: executed-task counts and duration.
-pub const EVAL_SUMMARY: &str = "eval_summary";
-
-/// Variant column holding a task Verifier's one `AssertionResult`.
+/// Variant column holding the result's typed `VerificationOutcome`.
 ///
-/// Only task results set it. The assertion's shape is the existing
-/// `AssertionResult` contract, whose expected and actual values are open, so
-/// it is stored as one Variant rather than a second typed summary.
-pub const ASSERTION_RESULT: &str = "assertion_result";
-
-impl ResultsTable {
-    /// Children of [`DRIFT_REPORT`] in persisted order.
-    ///
-    /// `method` and `verdict` hold the owning enums' serialized names;
-    /// `features` is a Variant because feature names are open. Every child is
-    /// nullable so a Parquet read keeps the null an absent report gives each
-    /// child: a required leaf would read back padded values, which `get_field`
-    /// exposes. The table validator refuses a partly present report.
-    #[must_use]
-    pub fn drift_report_fields() -> Fields {
-        Fields::from(vec![
-            utf8("method", true),
-            variant_field("features", true),
-            utf8("verdict", true),
-        ])
-    }
-
-    /// Children of [`EVAL_SUMMARY`] in persisted order.
-    ///
-    /// Every child is nullable for the reason given on
-    /// [`Self::drift_report_fields`].
-    #[must_use]
-    pub fn eval_summary_fields() -> Fields {
-        Fields::from(vec![
-            int32("total_tasks", true),
-            int32("passed_tasks", true),
-            int32("failed_tasks", true),
-            float64("pass_rate", true),
-            int64("duration_ms", true),
-        ])
-    }
-}
+/// The outcome carries open actual values, step outputs, and citations, so it
+/// is stored as one Variant and classified sensitive.
+pub const OUTCOME: &str = "outcome";
 
 impl DomainTable for ResultsTable {
     /// Lives in `vala.verification`, the namespace the catalog registers it under.
     const NAMESPACE: &'static str = "verification";
     /// Table segment of the fixed `vala.verification.results` FQN.
     const NAME: &'static str = "results";
-    /// The server appends and stamps the managed judged-Run `run_id`, verified `card_uid`, and subject/actor pair.
+    /// The server appends and stamps the managed application `run_id`, verified `card_uid`, and subject/actor pair.
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
-    /// The implementation summaries make projecting this table require the elevated payload permission.
+    /// The outcome makes projecting this table require the elevated payload permission.
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
-    /// The implementation-specific summary columns gated behind the elevated payload permission.
-    const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] =
-        &[DRIFT_REPORT, EVAL_SUMMARY, ASSERTION_RESULT];
-    /// A report or summary is written whole or not at all.
-    const WHOLE_STRUCTS: &'static [&'static str] = &[DRIFT_REPORT, EVAL_SUMMARY];
+    /// The outcome column gated behind the elevated payload permission.
+    const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[OUTCOME];
 
     /// Authored columns in order; managed correlation and system columns are appended by the catalog.
     fn arrow_fields() -> Vec<Field> {
         vec![
             utf8("result_id", false),
-            utf8("implementation", false),
+            utf8("execution_id", false),
             utf8("execution_status", false),
             utf8("verdict", false),
             utf8("verifier_version", false),
@@ -107,31 +59,25 @@ impl DomainTable for ResultsTable {
             utf8("verifier_card_uid", false),
             utf8("binding_id", true),
             utf8("trigger_identity", true),
-            utf8("source_record_id", true),
             ts_us_utc("window_start", true),
             ts_us_utc("window_end", true),
             ts_us_utc("started_at", false),
             ts_us_utc("ended_at", false),
-            Field::new(
-                DRIFT_REPORT,
-                DataType::Struct(Self::drift_report_fields()),
-                true,
-            ),
-            Field::new(
-                EVAL_SUMMARY,
-                DataType::Struct(Self::eval_summary_fields()),
-                true,
-            ),
-            variant_field(ASSERTION_RESULT, true),
+            variant_field(OUTCOME, false),
         ]
     }
 
-    /// Daily partitions sorted newest first, Bloom-pruned on result id, Verifier, and binding lookups.
+    /// Daily partitions sorted newest first, Bloom-pruned on result, execution, Verifier, and binding lookups.
     fn physical_layout() -> PhysicalLayoutWire {
         daily_layout(
             "ended_at",
             vec![sort_desc("ended_at")],
-            &["result_id", "verifier_card_uid", "binding_id"],
+            &[
+                "result_id",
+                "execution_id",
+                "verifier_card_uid",
+                "binding_id",
+            ],
         )
     }
 }

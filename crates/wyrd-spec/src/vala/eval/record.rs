@@ -1,17 +1,9 @@
-//! `EvalRecordObservation` — the typed observation an instrumented agent emits
-//! at evaluation points via `run.observe.eval(context, ...)`.
+//! `EvalRecordObservation` — one recorded scenario-evaluation context that
+//! `wyrd eval run --records` scores offline against an `EvalSpec`.
 //!
-//! The emitting principal comes from the verified credential; the Card the
-//! record anchors to is the scoped run's subject `card_ref` — client-asserted
-//! and server-authorized against that principal's signed Card scope. Neither
-//! the invocation id nor the subject is a field here: both travel as Bifrost
-//! row correlation, so the record carries no identity the server would have to
-//! re-derive or reconcile. See `wyrd-design.md`, "Observation identity —
-//! Card → Run → Observation".
-//!
-//! `session_id` is explicit at emit because run-to-session is many-to-many. A
-//! batch worker may be one run serving many sessions, so session is a fact about
-//! the observed interaction, not about the run.
+//! `session_id` is explicit because run-to-session is many-to-many. A batch
+//! worker may be one run serving many sessions, so session is a fact about the
+//! observed interaction, not about the run.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -21,15 +13,10 @@ use crate::error::WyrdError;
 use super::ids::{RecordId, SessionId, SpanId, TraceId};
 use super::media::MediaRef;
 
-/// The eval observation an instrumented agent emits at evaluation points.
+/// One recorded scenario-evaluation context scored offline.
 ///
-/// The record names neither the invocation nor a Verifier. The emitting run
-/// and the observed subject Card travel beside it as Bifrost row correlation;
-/// Scribe authorizes that asserted subject against the publisher's signed Card
-/// scope and stamps the resolved Card UID. Once the input is committed, the
-/// server activates every matching active `observations_ready` binding from
-/// that authorized identity, so one raw record is stored once rather than
-/// copied per binding.
+/// The record names neither the invocation nor a Verifier; offline scoring
+/// supplies the run identity and the `EvalSpec` it is scored against.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EvalRecordObservation {
@@ -40,9 +27,8 @@ pub struct EvalRecordObservation {
 
     /// Optional session identifier supplied explicitly at emit.
     ///
-    /// Run-to-session is many-to-many. The SDK surface is
-    /// `observe.eval(context, session_id=...)`. When the agent has no session
-    /// concept, pass `None`.
+    /// Run-to-session is many-to-many. When the agent has no session concept,
+    /// the record omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
 

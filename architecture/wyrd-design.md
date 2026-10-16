@@ -749,7 +749,7 @@ the server's `bifrost.gate.write` CONSUMER span links each batch's producers.
 
 The server continues a valid inbound trace as the parent of its request span
 (HTTP, gRPC, MCP, and the OpenAI-compatible gateway) and ignores a malformed
-one. Verification, its LLM judges, and their gateway calls stay in that
+one. Verification, its agent checks, and their gateway calls stay in that
 trace; deferred Verifier runs link to the request that enqueued them rather
 than becoming its children.
 

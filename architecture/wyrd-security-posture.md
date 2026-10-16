@@ -112,11 +112,11 @@ performs records the subject it serves as `sub_principal_id` and SYSTEM as
 in-process uses. It performs Verifier result writes, which the server's
 internal capture writer submits to Scribe like gateway capture, without a
 token or Gate; Gate refuses every public write to the result tables. It
-performs a Verifier's judge calls, which the gateway authorizes against the
-run's accepted authority, never SYSTEM's. And it carries a tokenless
-`bifrost_query:read` authority scoped by table UID to exactly one run's input
-tables (`vala.drift.observations` for Drift; `vala.eval.observations` and
-`vala.traces.spans` for Eval), recorded for the run's subject. That read
+performs a Verifier's agent-check calls, which the gateway authorizes against
+the execution's accepted authority, never SYSTEM's. And it carries a tokenless
+`bifrost_query:read` authority scoped by table UID to exactly the input table
+a scheduled window Verifier reads (`vala.drift.observations`), recorded for the
+execution's subject. That read
 authority is not a general Bifrost grant and is never inferred from the
 subject, and Oracle authorizes and audits every read under it like any
 caller's. The server never fabricates a user or other identity for its own

@@ -12,7 +12,7 @@
 //! run's accepted delegation chain as history, through
 //! [`SystemReadAuthority::serving`]; neither authorizes anything.
 //!
-//! LLM judge calls are not reads: they run under the run's accepted authority
+//! Agent-check calls are not reads: they run under the execution's accepted authority
 //! with SYSTEM as actor. [`BackgroundAuthority`] resolves that authority for
 //! the runs Wyrd starts itself.
 

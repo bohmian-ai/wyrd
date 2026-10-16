@@ -417,7 +417,7 @@ pub fn bind_tenant_route(route: TenantSpanRoute) {
 /// `route`, apart from the rest of its request.
 ///
 /// An operation performed by a different actor than its request binds its
-/// own pair here, such as a judge call the tenant SYSTEM principal makes for
+/// own pair here, such as an agent-check call the tenant SYSTEM principal makes for
 /// the request's subject. The request and its other spans keep the pair
 /// [`bind_tenant_route`] bound. An unrouted span and the reserved system
 /// tenant are not routed.

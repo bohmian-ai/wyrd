@@ -257,7 +257,7 @@ def assistant_bundle(
 ) -> Path:
     """The ``assistant`` Service, registered with a fitted latency baseline and downloaded.
 
-    Its LLM judges call the gateway, so the judge model is deployed there first.
+    Its agent checks call the gateway, so their model is deployed there first.
     """
     configure_gateway(WyrdClient())
     register(cards, "cards/latency_baseline/latency-baseline.yaml")

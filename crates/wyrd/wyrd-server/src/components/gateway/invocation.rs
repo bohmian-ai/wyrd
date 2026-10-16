@@ -112,7 +112,7 @@ pub enum GatewayCallAttribution {
     Requested(GatewayCallSubject),
     /// Derived by the server from an operation that already resolved the
     /// Card in the caller's tenant, such as the subject and optional Run of a
-    /// direct verification whose judge calls a model. Admission records it
+    /// direct verification whose agent check calls a model. Admission records it
     /// as is.
     Resolved(GatewayCallSubject),
 }

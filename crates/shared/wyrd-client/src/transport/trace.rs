@@ -3,7 +3,7 @@
 //! [`HttpTransport`](super::HttpTransport) and the Bifrost gRPC transport send
 //! the caller's active trace context as `traceparent`/`tracestate` on every
 //! Wyrd request through [`headers`], so server work
-//! done for the request — a gateway call, or a judge call a verification makes
+//! done for the request — a gateway call, or an agent-check call a verification makes
 //! — joins the caller's trace. [`outbound`] picks that context: one a foreign
 //! runtime handed over with [`with_caller_trace`] wins, because Python's and
 //! Node's OpenTelemetry contexts never become Rust's current `tracing` span;

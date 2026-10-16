@@ -1969,13 +1969,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
-    /// The Verifier needs input direct execution cannot supply, such as a trace or agent run.
+    /// The Verifier judges a scheduled window, which direct execution cannot supply.
     #[error("[WYRD_VERIFICATION_422_INPUT_UNSUPPORTED] {message}")]
     #[wyrd_error(
         code = "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED",
         status = 422,
         title = "Verification input unsupported",
-        remediation = "Direct execution runs Drift and assertion or LLM-judge Evals only; run trace or agent assertion Evals through observations."
+        remediation = "Execute and enqueue run request-scoped Verifiers; a Verifier that judges a scheduled window runs only on its binding schedule."
     )]
     VerificationInputUnsupported {
         /// Human-readable error message.
@@ -1983,13 +1983,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
-    /// A judge provider failed after the task's own retry budget.
+    /// An agent check's provider failed after the check's own retry budget.
     #[error("[WYRD_VERIFICATION_502_DEPENDENCY_FAILED] {message}")]
     #[wyrd_error(
         code = "WYRD_VERIFICATION_502_DEPENDENCY_FAILED",
         status = 502,
         title = "Verification dependency failed",
-        remediation = "The judge provider failed after the task's own retries; retry the request deliberately once the provider recovers."
+        remediation = "The agent check's provider failed after its own retries; retry the request deliberately once the provider recovers."
     )]
     VerificationDependencyFailed {
         /// Human-readable error message.

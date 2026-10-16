@@ -373,13 +373,44 @@ def test_input_that_does_not_fit_its_slot_fails_locally(assistant: WyrdState) ->
 def test_caller_without_the_verifier_grant_is_refused(
     assistant_bundle: Path, wyrd_server: WyrdTestServer, cards: Cards
 ) -> None:
-    evals_only = wyrd_server.scoped_api_key("py_evals_only", ["evals:run"])
+    operators_only = wyrd_server.scoped_api_key("py_operators_only", ["operators:invoke"])
     other = wyrd_server.scoped_api_key("py_other_verifier", [verifier_run(cards, "answer-judged")])
-    for key in [evals_only, other]:
+    for key in [operators_only, other]:
         state = hydrated(assistant_bundle, WyrdClient(credential=key))
         with pytest.raises(WyrdError) as raised:
             state.run("agent").observe.verify("answer-check", "yes")
         assert raised.value.code == DENIED
+
+
+def test_retired_verification_contracts_are_refused(
+    assistant_bundle: Path, wyrd_server: WyrdTestServer, bifrost: Bifrost
+) -> None:
+    for action in ["run", "invoke"]:
+        stale = wyrd_server.scoped_api_key(
+            f"py_evals_{action}", [{"resource": "evals", "action": action, "scope": "all"}]
+        )
+        state = hydrated(assistant_bundle, WyrdClient(credential=stale))
+        with pytest.raises(WyrdError) as raised:
+            state.run("agent").observe.verify("answer-check", "yes")
+        assert raised.value.code == "WYRD_SPEC_500_INTERNAL", action
+
+    assert all(table["namespace"] != "vala.eval" for table in bifrost.list_tables())
+
+    def refusals(namespace: str, name: str) -> list[str]:
+        codes = []
+        for call in (
+            lambda: bifrost.sql(f"SELECT * FROM {namespace}.{name}"),
+            lambda: bifrost.describe_table(namespace, name),
+            lambda: Bifrost().use_table_by_name(f"{namespace}.{name}"),
+        ):
+            with pytest.raises(WyrdError) as raised:
+                call()
+            codes.append(raised.value.code)
+        return codes
+
+    for name in ["result_items", "observations"]:
+        assert refusals("vala.eval", name) == refusals("vala.absent", name), name
+    bifrost.sql("SELECT COUNT(*) AS n FROM vala.verification.results")
 
 
 def test_exact_verifier_grant_verifies_only_that_verifier(

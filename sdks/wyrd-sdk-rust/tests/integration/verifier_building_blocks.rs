@@ -140,7 +140,7 @@ async fn script_investigator(upstream: &MockServer) {
         tool_call(
             "call-query",
             TOOLS[1],
-            &json!({ "sql": "SELECT execution_id FROM vala.verification.results", "max_rows": 1 }),
+            &json!({ "sql": "SELECT execution_id FROM vala.verification.results LIMIT 1", "max_rows": 1 }),
         ),
         tool_call("call-code", TOOLS[2], &json!({ "source": "6 * 7" })),
     ];

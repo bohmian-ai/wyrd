@@ -108,7 +108,7 @@ INVESTIGATE = {
             (
                 "call-query",
                 "bifrost.query",
-                {"sql": "SELECT execution_id FROM vala.verification.results", "max_rows": 1},
+                {"sql": "SELECT execution_id FROM vala.verification.results LIMIT 1", "max_rows": 1},
             ),
             ("call-code", "code.run", {"source": "6 * 7"}),
         )

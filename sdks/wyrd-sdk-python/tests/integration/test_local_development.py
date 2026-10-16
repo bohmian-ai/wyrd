@@ -93,9 +93,9 @@ def work(client: WyrdClient, bundle_home: Path) -> Worked:
     assert invoke(client) == "hi"
 
     run = state.run()
-    run.for_card("model").observe.drift({"latency": 12.5})
-    judgment = run.for_card("agent").observe.verify("answer-is-yes", {"answer": "yes"})
-    assert (judgment.passed, judgment.kind) == (True, "eval_assertion")
+    run.for_card("model").observe.submit("latency-drift", {"latency": 12.5})
+    result = run.for_card("agent").observe.verify("answer-check", "yes")
+    assert (result.verdict, result.verifier.name) == ("passed", "answer-check")
 
     state.start_telemetry()
     state.start_telemetry()

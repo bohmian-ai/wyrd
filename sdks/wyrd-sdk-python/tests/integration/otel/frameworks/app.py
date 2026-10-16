@@ -335,10 +335,10 @@ async def live(state: WyrdState, ask: Ask) -> dict[str, Any]:
 
 
 async def observed(state: WyrdState, ask: Ask) -> dict[str, Any]:
-    """One turn, then one drift observation through the state's native writer."""
+    """One turn, then one ``observed-drift`` sample through the state's native writer."""
     turn = (await run(state, ask))["run"]
     observation = state.run("model")
-    observation.observe.drift({"latency": 1.0})
+    observation.observe.submit("observed-drift", {"latency": 1.0})
     return {**turn, "observation": observation.run_id}
 
 

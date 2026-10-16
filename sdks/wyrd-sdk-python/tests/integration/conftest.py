@@ -11,9 +11,9 @@ import json
 import os
 import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 from wyrd.bifrost import Bifrost, TableConfig
@@ -22,7 +22,7 @@ from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
 from wyrd.operators import OperatorConnections
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer
+from wyrd.testing import WyrdTestServer, cli
 
 from .gateway.support import PROVIDER_KEY, Upstream
 from .support import (
@@ -31,6 +31,8 @@ from .support import (
     Delivery,
     QueryRow,
     Receiver,
+    Watch,
+    binding_ids,
     client_of,
     download,
     hydrated,
@@ -39,24 +41,69 @@ from .support import (
 )
 from .test_local_development import configure_gateway
 
-if TYPE_CHECKING:
-    from wyrd.operators import OperatorConnectionView
+AGREES = (
+    '{"outcome":"passed","reason":"it agrees",'
+    '"citations":[{"slot":"answer","locator":{"json_pointer":""}}]}'
+)
+"""The judge's Verdict for ``answer-judged``: passed, citing the whole answer."""
 
-JUDGE_VERDICT = {
-    "id": "chatcmpl-judge",
-    "object": "chat.completion",
-    "created": 1,
-    "model": "gpt-test",
-    "choices": [
+FOLLOWS = (
+    '{"outcome":"passed","reason":"within the policy",'
+    '"citations":[{"slot":"answer","locator":{"json_pointer":"/text"}}]}'
+)
+"""The policy judge's Verdict for an answer naming no scripted case: passed, citing its text."""
+
+BREAKS = (
+    '{"outcome":"failed","reason":"contradicts the policy",'
+    '"citations":[{"slot":"answer","locator":{"json_pointer":"/text"}}]}'
+)
+"""The policy judge's Verdict for an answer containing ``REFUSE-POLICY``: failed, citing its text."""
+
+UNCITED = '{"outcome":"passed","reason":"trust me","citations":[]}'
+"""The policy judge's Verdict for an answer containing ``UNCITED``: a pass citing nothing."""
+
+READ_POLICY = {
+    "role": "assistant",
+    "content": None,
+    "tool_calls": [
         {
-            "index": 0,
-            "finish_reason": "stop",
-            "message": {"role": "assistant", "content": '{"passed":true}'},
+            "id": "call-read-policy",
+            "type": "function",
+            "function": {"name": "fs.read", "arguments": '{"path":"/inputs/policy.pdf"}'},
         }
     ],
-    "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
 }
-"""The local LLM judge's answer: the graded answer passes."""
+"""The refund reader's first turn: read its workspace copy of the policy."""
+
+
+def completion(body: dict) -> dict:
+    """The local model's Chat Completions reply to ``body``.
+
+    The refund reader first calls ``fs.read`` and, once the tool result is
+    back, answers a 100-dollar limit. The policy judge (its prompt carries
+    ``Rules:``) fails ``REFUSE-POLICY``, passes ``UNCITED`` without a citation,
+    and otherwise passes citing the answer text; every other judge agrees.
+    """
+    text = json.dumps(body)
+    if "REFUND RULES" in text:
+        read = any(message.get("role") == "tool" for message in body.get("messages", []))
+        message = {"role": "assistant", "content": '{"max_refund":100}'} if read else READ_POLICY
+    else:
+        content = AGREES
+        if "Rules:" in text:
+            content = FOLLOWS
+            for marker, verdict in (("REFUSE-POLICY", BREAKS), ("UNCITED", UNCITED)):
+                if marker in text:
+                    content = verdict
+        message = {"role": "assistant", "content": content}
+    return {
+        "id": "chatcmpl-judge",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "gpt-test",
+        "choices": [{"index": 0, "finish_reason": "stop", "message": message}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+    }
 
 
 @pytest.fixture
@@ -73,9 +120,9 @@ def fresh_tracer_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
 
 
-@pytest.fixture(scope="session")
-def receiver() -> Iterator[Receiver]:
-    """Serve the session's judge provider and Operator hook endpoint."""
+@contextmanager
+def serving() -> Iterator[Receiver]:
+    """Serve the local model provider and Operator hook endpoint until exit."""
     server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
     received = Receiver(url=f"http://127.0.0.1:{server.server_address[1]}")
 
@@ -83,7 +130,7 @@ def receiver() -> Iterator[Receiver]:
         def do_POST(self) -> None:
             body = json.loads(self.rfile.read(int(self.headers["content-length"] or 0)) or b"{}")
             headers = {name.lower(): value for name, value in self.headers.items()}
-            reply = JUDGE_VERDICT if self.path == "/v1/chat/completions" else {}
+            reply = completion(body) if self.path == "/v1/chat/completions" else {}
             self.send_response(200)
             self.send_header("content-type", "application/json")
             self.end_headers()
@@ -99,6 +146,13 @@ def receiver() -> Iterator[Receiver]:
         yield received
     finally:
         server.shutdown()
+
+
+@pytest.fixture(scope="session")
+def receiver() -> Iterator[Receiver]:
+    """Serve the session's model provider and Operator hook endpoint."""
+    with serving() as received:
+        yield received
 
 
 @pytest.fixture(scope="session")
@@ -170,35 +224,43 @@ def unfitted_assistant(wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path
     return hydrated(bundle, WyrdClient(credential=service_key("unfitted-assistant")))
 
 
-@pytest.fixture(scope="session")
-def on_call_hooks(wyrd_server: WyrdTestServer, receiver: Receiver) -> OperatorConnectionView:
-    """The ``on-call-hooks`` HTTP connection: the receiver's origin and a bearer token."""
-    return OperatorConnections().create(
-        {
-            "provider": "http",
-            "name": "on-call-hooks",
-            "origin": receiver.url,
-            "auth": {"scheme": "bearer", "token": ON_CALL_TOKEN},
-        }
-    )
-
-
 @pytest.fixture
-def latency_watch(
-    wyrd_server: WyrdTestServer,
-    cards: Cards,
-    on_call_hooks: OperatorConnectionView,
-    tmp_path: Path,
-) -> Iterator[WyrdState]:
-    """The ``latency-watch`` Service, fitted and hydrated, with Bifrost started under its key."""
-    register(cards, "cards/latency_baseline/latency-baseline.yaml")
-    registered = register(cards, "cards/scheduled_drift_alerts_operator/latency-watch.yaml")
-    wyrd_server.wait_for_baseline(str(registered["latency-shift"].uid), BASELINE_TIMEOUT_SECONDS)
-    bundle = download(cards, "latency-watch", tmp_path)
-    state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("latency-watch")))
-    state.start_bifrost()
-    yield state
-    state.shutdown()
+def latency_watch(tmp_path: Path) -> Iterator[Watch]:
+    """The ``latency-watch`` Service on a server of its own, its baseline fitted.
+
+    The server's ``on-call-hooks`` connection points at a hook of its own, and
+    the Service is hydrated with Bifrost started under its own key.
+    """
+    with (
+        serving() as hooks,
+        WyrdTestServer(verification_runtime=True, mutate_env=False) as server,
+    ):
+        admin = client_of(server)
+        OperatorConnections(admin).create(
+            {
+                "provider": "http",
+                "name": "on-call-hooks",
+                "origin": hooks.url,
+                "auth": {"scheme": "bearer", "token": ON_CALL_TOKEN},
+            }
+        )
+        cards = Cards(admin)
+        register(cards, "cards/latency_baseline/latency-baseline.yaml")
+        registered = register(cards, "cards/scheduled_drift_alerts_operator/latency-watch.yaml")
+        server.wait_for_baseline(str(registered["latency-shift"].uid), BASELINE_TIMEOUT_SECONDS)
+        root = registered["latency-watch"]
+        key = cli.issue_key(
+            kind="Service", name="latency-watch", version="1.0.0", space="default", client=admin
+        ).key
+        state = WyrdState.from_path(
+            download(cards, "latency-watch", tmp_path), client_of(server, key)
+        )
+        state.start_bifrost()
+        [binding_id] = binding_ids(cards, root)
+        try:
+            yield Watch(server, state, root, binding_id, hooks)
+        finally:
+            state.shutdown()
 
 
 @pytest.fixture(scope="session")

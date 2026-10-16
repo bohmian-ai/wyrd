@@ -3,9 +3,8 @@
 Native ``POST /v1/systemone`` callers reach one Jev deployment with typed
 questions and get typed answers back, a stock OpenAI client reaches the same
 deployment on ``/v1/chat/completions`` by sending the typed Jev request as its
-last user message, and the ``reply-quality`` Verifier uses that deployment as
-its LLM judge through a native Jev Prompt. A local recording upstream stands
-in for ``api.typesafe.ai`` and sees only the operator's Jev key.
+last user message. A local recording upstream stands in for
+``api.typesafe.ai`` and sees only the operator's Jev key.
 """
 
 from __future__ import annotations
@@ -14,21 +13,16 @@ import json
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 
 import httpx
 import openai
 import pytest
 from openai.types.chat import ChatCompletionMessageParam
-from wyrd import WyrdError
-from wyrd.bifrost import Bifrost
-from wyrd.cards import Cards
 from wyrd.gateway import Gateway
-from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
-from .support import Delivery, Receiver, client_of, download, register
+from .support import Delivery, Receiver, client_of
 
 pytestmark = pytest.mark.integration
 
@@ -49,24 +43,6 @@ REFUSALS = {
     "bad-key": 401,
 }
 """State text → the status the upstream refuses it with."""
-
-
-JUDGE_QUESTIONS = {
-    "helpful": {
-        "type": "noul",
-        "instructions": "Does the reply help the customer?",
-        "criteria": {
-            "true": "it resolves or advances the request",
-            "false": "it ignores or deflects the request",
-        },
-    },
-    "tone": {
-        "type": "choice",
-        "instructions": "What is the tone of the reply?",
-        "criteria": {"polite": "courteous and respectful", "rude": "curt or dismissive"},
-    },
-}
-"""The typed questions the native Jev judge Prompt asks about every reply."""
 
 
 def answer(noul: float, tone: str) -> dict[str, Any]:
@@ -120,9 +96,7 @@ class JevUpstream(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def jev() -> Iterator[tuple[WyrdTestServer, Receiver]]:
-    """A verification-capable server with one Jev deployment on a local upstream.
-
-    The Gateway captures call metadata, so every judge call lands in Bifrost.
+    """A server with one Jev deployment on a local upstream.
 
     Each test gets its own server: an upstream refusal cools the deployment
     down, which must not leak into the next story.
@@ -134,9 +108,7 @@ def jev() -> Iterator[tuple[WyrdTestServer, Receiver]]:
     try:
         with pytest.MonkeyPatch.context() as env:
             env.setenv("WYRD_TEST_GATEWAY_PROVIDER_KEY", JEV_KEY)
-            with WyrdTestServer(
-                verification_runtime=True, provider_base_url=recorded.url, mutate_env=False
-            ) as server:
+            with WyrdTestServer(provider_base_url=recorded.url, mutate_env=False) as server:
                 admin = client_of(server)
                 cli.put_provider_credential(
                     {
@@ -154,27 +126,9 @@ def jev() -> Iterator[tuple[WyrdTestServer, Receiver]]:
                         "capabilities": ["system_one", "chat_completions"],
                     }
                 )
-                Gateway(admin).put_capture_policy({"mode": "metadata", "payload_fields": []})
                 yield server, recorded
     finally:
         upstream.shutdown()
-
-
-@pytest.fixture
-def reviewer_bundle(jev: tuple[WyrdTestServer, Receiver], tmp_path: Path) -> Path:
-    """The ``reviewer`` Service, registered and downloaded."""
-    server, _ = jev
-    cards = Cards(client_of(server))
-    register(cards, "cards/gateway_jev/reviewer.yaml")
-    return download(cards, "reviewer", tmp_path)
-
-
-def reviewer(server: WyrdTestServer, bundle: Path) -> WyrdState:
-    """The hydrated ``reviewer`` Service, acting as its own Card-scoped key."""
-    key = cli.issue_key(
-        kind="Service", name="reviewer", version="1.0.0", space="default", client=client_of(server)
-    ).key
-    return WyrdState.from_path(bundle, client_of(server, key))
 
 
 def post(server: WyrdTestServer, route: str, body: dict[str, Any]) -> httpx.Response:
@@ -311,114 +265,3 @@ def test_jev_refusals_relay_like_other_providers(jev: tuple[WyrdTestServer, Rece
         client.chat.completions.create(model="jev/jev-latest", messages=chat("rate-limited"))
     assert throttled.value.code is None
     assert JEV_KEY not in throttled.value.response.text
-
-
-def test_jev_judge_passes_a_helpful_polite_reply(
-    jev: tuple[WyrdTestServer, Receiver], reviewer_bundle: Path
-) -> None:
-    server, upstream = jev
-    asked = len(upstream.deliveries)
-
-    judgment = (
-        reviewer(server, reviewer_bundle)
-        .run("agent")
-        .observe.verify(
-            "reply-quality",
-            {"question": "Where is my refund?", "answer": "Your refund is on its way."},
-        )
-    )
-
-    assert (judgment.verdict, judgment.kind) == ("passed", "eval_llm_judge")
-    (delivery,) = upstream.deliveries[asked:]
-    assert (delivery.body["model"], delivery.body["state"]) == (
-        "jev-latest",
-        "Question: Where is my refund?\nAnswer: Your refund is on its way.",
-    )
-
-
-def test_jev_judge_fails_an_unhelpful_rude_reply(
-    jev: tuple[WyrdTestServer, Receiver], reviewer_bundle: Path
-) -> None:
-    server, _ = jev
-
-    judgment = (
-        reviewer(server, reviewer_bundle)
-        .run("agent")
-        .observe.verify("reply-quality", {"question": "Where is my refund?", "answer": "Go away."})
-    )
-
-    # The judge task itself passes; both threshold assertions fail.
-    assert (judgment.verdict, judgment.counts) == (
-        "failed",
-        {
-            "implementation": "eval",
-            "passed_tasks": 1,
-            "failed_tasks": 2,
-            "total_tasks": 3,
-            "pass_rate_percent": 33,
-        },
-    )
-
-
-def test_jev_judge_judges_a_reply_with_quotes_and_newlines(
-    jev: tuple[WyrdTestServer, Receiver], reviewer_bundle: Path
-) -> None:
-    """Quotes and newlines reach Jev as one escaped, typed request, and both rows record."""
-    server, upstream = jev
-    asked = len(upstream.deliveries)
-    question = 'Is my "refund" done?\nOrder 7'
-    reply = 'He said "your refund is on its way".\nAnything else?'
-
-    judgment = (
-        reviewer(server, reviewer_bundle)
-        .run("agent")
-        .observe.verify("reply-quality", {"question": question, "answer": reply})
-    )
-
-    assert judgment.verdict == "passed"
-    (delivery,) = upstream.deliveries[asked:]
-    assert delivery.headers["authorization"] == f"Bearer {JEV_KEY}"
-    assert delivery.body == {
-        "model": "jev-latest",
-        "state": f"Question: {question}\nAnswer: {reply}",
-        "questions": JUDGE_QUESTIONS,
-    }
-    server.flush_bifrost()
-    recorded = (
-        Bifrost(client=client_of(server))
-        .sql(
-            "SELECT r.implementation, r.verdict, c.operation, c.outcome, "
-            "CAST(c.attempt_count AS BIGINT) AS attempt_count "
-            "FROM vala.verification.results r CROSS JOIN vala.gateway.calls c "
-            "WHERE r.result_id = $1 AND c.operation = 'system_one'",
-            [judgment.execution_id],
-        )
-        .to_arrow()
-        .to_pylist()
-    )
-    assert recorded == [
-        {
-            "implementation": "eval",
-            "verdict": "passed",
-            "operation": "system_one",
-            "outcome": "succeeded",
-            "attempt_count": 1,
-        }
-    ]
-
-
-def test_jev_judge_refusal_is_a_typed_error_without_retry(
-    jev: tuple[WyrdTestServer, Receiver], reviewer_bundle: Path
-) -> None:
-    """A Jev 400 fails the verify with a typed error, and the judge never retries it."""
-    server, upstream = jev
-    asked = len(upstream.deliveries)
-
-    with pytest.raises(WyrdError) as raised:
-        reviewer(server, reviewer_bundle).run("agent").observe.verify(
-            "reply-quality", {"question": "Where is my refund?", "answer": "refused-form"}
-        )
-
-    assert raised.value.code == "WYRD_VERIFICATION_502_DEPENDENCY_FAILED"
-    assert JEV_KEY not in str(raised.value)
-    assert len(upstream.deliveries[asked:]) == 1

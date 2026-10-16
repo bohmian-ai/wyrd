@@ -21,7 +21,7 @@ use wyrd_ai::gateway::{
     ProviderDeploymentName, ProviderId,
 };
 use wyrd_ai::operator_connections::SecretBearer;
-use wyrd_ai::{ExecutionRoute, Gateway, WyrdClient};
+use wyrd_ai::{Gateway, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
 
 use wyrd_ai::state::WyrdState;
@@ -143,10 +143,77 @@ impl Inference {
     /// # Panics
     /// Panics when no token mints or the Gateway does not answer with JSON.
     async fn ask_openai_with(&self, client: &WyrdClient, headers: &[(&str, &str)]) -> (u16, Value) {
+        let body = json!({
+            "model": "openai/gpt-4o",
+            "max_completion_tokens": 16,
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        self.post(client, "/v1/chat/completions", &body, headers)
+            .await
+    }
+
+    /// Ask the `alias` Agent of `state` `hi` through `deployment`, the way an
+    /// application calls its model: render the Agent's Prompt, address
+    /// `<deployment>/<Prompt model>` on the gateway ingress the Prompt's
+    /// provider speaks, and correlate the call to a fresh Run of the Agent
+    /// with the `wyrd-run-id` and `wyrd-card-uid` headers. Returns the HTTP
+    /// status and JSON body.
+    ///
+    /// # Panics
+    /// Panics when the alias is not a hydrated Agent, its Prompt does not
+    /// render, no token mints, or the Gateway does not answer with JSON.
+    async fn ask_agent(&self, state: &WyrdState, alias: &str, deployment: &str) -> (u16, Value) {
+        let run = state.run_for_card(alias).expect("agent view resolves");
+        let prompt = &state.agent(alias).expect("agent").prompt().metadata.prompt;
+        let mut request = serde_json::to_value(
+            prompt
+                .render(&[("question", "hi")])
+                .expect("the Prompt renders"),
+        )
+        .expect("the request serializes");
+        let mut body = request["body"].take();
+        let model = format!("{deployment}/{}", prompt.model);
+        let path = match request["provider"].as_str() {
+            Some("anthropic_message") => "/v1/messages".to_owned(),
+            Some("jev_system_one") => "/v1/systemone".to_owned(),
+            Some("gemini_generate_content") => format!(
+                "/v1beta/models/{deployment}/{}:generateContent",
+                prompt.model.replace('/', "%2F")
+            ),
+            _ => "/v1/chat/completions".to_owned(),
+        };
+        if !path.starts_with("/v1beta") {
+            body["model"] = json!(model);
+        }
+        let correlation = [
+            ("wyrd-run-id", run.run_id().as_str()),
+            ("wyrd-card-uid", run.subject_uid().as_str()),
+        ];
+        self.post(
+            state.client().expect("the state has a client"),
+            &path,
+            &body,
+            &correlation,
+        )
+        .await
+    }
+
+    /// POST `body` to the Gateway at `path` with `client`'s access token and
+    /// each of `headers`, and return the HTTP status and JSON body.
+    ///
+    /// # Panics
+    /// Panics when no token mints or the Gateway does not answer with JSON.
+    async fn post(
+        &self,
+        client: &WyrdClient,
+        path: &str,
+        body: &Value,
+        headers: &[(&str, &str)],
+    ) -> (u16, Value) {
         let token = client.access_token().await.expect("access token mints");
         let mut request = reqwest::Client::new()
             .post(format!(
-                "{}/v1/chat/completions",
+                "{}{path}",
                 self.deployment
                     .server()
                     .base_url()
@@ -157,11 +224,7 @@ impl Inference {
             request = request.header(*name, *value);
         }
         let response = request
-            .json(&json!({
-                "model": "openai/gpt-4o",
-                "max_completion_tokens": 16,
-                "messages": [{ "role": "user", "content": "hi" }],
-            }))
+            .json(body)
             .send()
             .await
             .expect("the Gateway answers");
@@ -549,11 +612,11 @@ async fn cli_issues_a_card_scoped_key_and_writes_a_provider_credential() {
     inference.deployment.shutdown().await;
 }
 
-/// A Run over a hydrated Service's tool-free Agent, as the Service's own
-/// key, invokes it once through the Gateway and returns its final text; the upstream sees the provider key and no
+/// A hydrated Service's Agent, called as the Service's own key on its
+/// declared `openai` deployment with the Agent's Run correlation, is
+/// answered through the Gateway; the upstream sees the provider key and no
 /// Run or Card correlation header. A `viewer` without gateway invoke is
-/// refused with the gateway's own code before upstream IO, and the Service's own
-/// Run, which is not an Agent, is refused before any IO.
+/// refused with the gateway's own code before upstream IO.
 ///
 /// # Panics
 /// Panics when a step fails or an answer, refusal, or upstream request
@@ -573,14 +636,12 @@ async fn run_invokes_its_agent_through_the_gateway() {
     let service_client = inference
         .deployment
         .client(&inference.deployment.service_key(&service.root).await);
-    let answer = state(service_client.clone())
-        .run_for_card("agent")
-        .expect("agent view resolves")
-        .invoke(&[("question", "hi")])
-        .await
-        .expect("the Agent answers");
+    let (status, reply) = inference
+        .ask_agent(&state(service_client), "agent", "openai")
+        .await;
 
-    assert_eq!(answer, "hi");
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["choices"][0]["message"]["content"], "hi");
     let requests = inference
         .upstream
         .received_requests()
@@ -600,27 +661,11 @@ async fn run_invokes_its_agent_through_the_gateway() {
     let viewer = inference
         .deployment
         .client(&inference.deployment.key("agent_viewer", &["viewer"]).await);
-    let refused = state(viewer)
-        .run_for_card("agent")
-        .expect("agent view resolves")
-        .invoke(&[("question", "hi")])
-        .await
-        .expect_err("a caller without gateway invoke is refused");
+    let (status, refused) = inference.ask_agent(&state(viewer), "agent", "openai").await;
     assert_eq!(
-        refused.code(),
-        "WYRD_PERMISSION_403_DENIED_RBAC",
+        (status, &refused["error"]["code"]),
+        (403, &json!("WYRD_PERMISSION_403_DENIED_RBAC")),
         "{refused}"
-    );
-
-    let not_agent = state(service_client)
-        .run()
-        .invoke(&[("question", "hi")])
-        .await
-        .expect_err("a non-Agent Run is refused");
-    assert_eq!(
-        not_agent.code(),
-        "WYRD_SDK_400_CARD_KIND_MISMATCH",
-        "{not_agent}"
     );
     assert_eq!(
         inference
@@ -635,12 +680,10 @@ async fn run_invokes_its_agent_through_the_gateway() {
     inference.deployment.shutdown().await;
 }
 
-/// An Agent declaring the `openai` gateway route and a concurrent invocation
-/// overriding it with `openai-backup` each reach their own deployment's
-/// credential; the override changes neither the Agent's declared route nor
-/// the other invocation. An override to the `granted` deployment
-/// `openai-granted` is authorized on its own, so a caller holding only an
-/// unscoped gateway grant is refused before upstream IO.
+/// One Agent called concurrently on its declared `openai` deployment and
+/// on `openai-backup` reaches each deployment's own credential. The `granted`
+/// deployment `openai-granted` is authorized on its own, so a caller holding
+/// only an unscoped gateway grant is refused before upstream IO.
 ///
 /// # Panics
 /// Panics when a step fails or an answer, refusal, or upstream credential
@@ -673,23 +716,16 @@ async fn agent_routes_and_pre_run_overrides() {
         .client(&inference.deployment.service_key(&service.root).await);
     let state = WyrdState::from_path_with(bundle.path().join("bundle"), client)
         .expect("bundle loads offline");
-    let run = state.run_for_card("agent").expect("agent view resolves");
-    let route = |name: &str| ExecutionRoute::WyrdGateway {
-        deployment: ProviderDeploymentName::new(name).expect("deployment name"),
-    };
-    let question = [("question", "hi")];
 
-    let backup = route("openai-backup");
-    let (declared, overridden) =
-        tokio::join!(run.invoke(&question), run.invoke_on(&backup, &question));
-
-    assert_eq!(
-        (
-            declared.expect("declared route answers"),
-            overridden.expect("override answers")
-        ),
-        ("hi".to_owned(), "hi".to_owned())
+    let (declared, backup) = tokio::join!(
+        inference.ask_agent(&state, "agent", "openai"),
+        inference.ask_agent(&state, "agent", "openai-backup")
     );
+
+    for (status, reply) in [declared, backup] {
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["choices"][0]["message"]["content"], "hi");
+    }
     let mut credentials = inference.upstream_authorizations().await;
     credentials.sort();
     assert_eq!(
@@ -699,24 +735,11 @@ async fn agent_routes_and_pre_run_overrides() {
             Some(format!("Bearer {PROVIDER_KEY}"))
         ]
     );
-    assert_eq!(
-        state
-            .agent("agent")
-            .expect("agent")
-            .card()
-            .spec
-            .execution_route,
-        route("openai"),
-        "an override never changes the declared route"
-    );
 
-    let refused = run
-        .invoke_on(&route("openai-granted"), &question)
-        .await
-        .expect_err("a granted deployment needs its own grant");
+    let (status, refused) = inference.ask_agent(&state, "agent", "openai-granted").await;
     assert_eq!(
-        refused.code(),
-        "WYRD_PERMISSION_403_DENIED_RBAC",
+        (status, &refused["error"]["code"]),
+        (403, &json!("WYRD_PERMISSION_403_DENIED_RBAC")),
         "{refused}"
     );
     assert_eq!(
@@ -731,10 +754,9 @@ async fn agent_routes_and_pre_run_overrides() {
 /// `claude-prod`, `vertex` (a Gemini deployment), and `judge-pool` reach
 /// their native ingress with the full address: each upstream receives the
 /// complete Prompt model, including the Google model's slash, and the Jev
-/// Agent answers in one call with its keyed answers. A Vertex Prompt routed
-/// through the public gateway, and an OpenAI Agent overridden onto the
-/// Anthropic or Gemini deployment its Prompt is not compatible with, are refused
-/// before any upstream IO.
+/// Agent answers in one call with its keyed answers. An OpenAI Agent's
+/// Prompt addressed to the Anthropic or Gemini deployment it is not
+/// compatible with is refused before any upstream IO.
 ///
 /// # Panics
 /// Panics when a step fails or an answer, refusal, or upstream target
@@ -815,22 +837,21 @@ async fn agent_routes_reach_named_native_ingress() {
         .client(&inference.deployment.service_key(&service.root).await);
     let state = WyrdState::from_path_with(bundle.path().join("bundle"), client)
         .expect("bundle loads offline");
-    let invoke = |alias: &str| {
-        let run = state.run_for_card(alias).expect("agent view resolves");
-        async move { run.invoke(&[("question", "hi")]).await }
-    };
 
-    let vertex = invoke("vertex")
-        .await
-        .expect_err("a Vertex Prompt is refused locally");
-    assert_eq!(vertex.code(), "WYRD_AGENT_422_VALIDATION", "{vertex}");
-    assert_eq!(invoke("claude").await.expect("Claude answers"), "hi");
-    assert_eq!(invoke("gemini").await.expect("Gemini answers"), "hi");
-    let answers: Value =
-        serde_json::from_str(&invoke("jev").await.expect("Jev answers")).expect("answers JSON");
+    let (status, claude) = inference.ask_agent(&state, "claude", "claude-prod").await;
+    assert_eq!((status, &claude["content"][0]["text"]), (200, &json!("hi")));
+    let (status, gemini) = inference.ask_agent(&state, "gemini", "vertex").await;
     assert_eq!(
-        answers,
-        json!({ "helpful": { "type": "noul", "noul": 0.9 } })
+        (
+            status,
+            &gemini["candidates"][0]["content"]["parts"][0]["text"]
+        ),
+        (200, &json!("hi"))
+    );
+    let (status, jev) = inference.ask_agent(&state, "jev", "judge-pool").await;
+    assert_eq!(
+        (status, &jev["answers"]),
+        (200, &json!({ "helpful": { "type": "noul", "noul": 0.9 } }))
     );
 
     let asks = register(&cards, "cards/gateway_inference/ask-service.yaml").await;
@@ -841,18 +862,11 @@ async fn agent_routes_reach_named_native_ingress() {
             .client(&inference.deployment.service_key(&asks.root).await),
     )
     .expect("bundle loads offline");
-    let openai_agent = asks.run_for_card("agent").expect("agent view resolves");
     for deployment in ["claude-prod", "vertex"] {
-        let route = ExecutionRoute::WyrdGateway {
-            deployment: ProviderDeploymentName::new(deployment).expect("deployment name"),
-        };
-        let refused = openai_agent
-            .invoke_on(&route, &[("question", "hi")])
-            .await
-            .expect_err("an OpenAI Prompt cannot start on a non-OpenAI adapter");
+        let (status, refused) = inference.ask_agent(&asks, "agent", deployment).await;
         assert_eq!(
-            refused.code(),
-            "WYRD_GATEWAY_400_INVALID_REQUEST",
+            (status, &refused["error"]["code"]),
+            (400, &json!("WYRD_GATEWAY_400_INVALID_REQUEST")),
             "{deployment}: {refused}"
         );
     }

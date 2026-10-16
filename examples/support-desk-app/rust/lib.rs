@@ -11,9 +11,10 @@
 //!   returning its execution ID;
 //! - `GET /reviews/{id}` reads that check back by its ID alone.
 //!
-//! Every answer comes from the `support-agent` Card through `Run::invoke`, so
-//! the model call goes through the Wyrd gateway inside a Wyrd Run, and the
-//! Run's ticket, request span, gateway call, and verdicts share its `run_id`.
+//! Every answer renders the `support-agent` Card's Prompt and calls its model
+//! through the Wyrd gateway with the Run's `wyrd-run-id` and `wyrd-card-uid`
+//! headers, so the Run's ticket, request span, gateway call, and verdicts
+//! share its `run_id`.
 //! A Verifier is called on the view of the Card it is bound to: the Run
 //! itself for the Service, and `run.for_card("agent")` for the agent. Both
 //! views share one `run_id`.
@@ -36,8 +37,8 @@ use wyrd_ai::observe::Run;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
-    Bifrost, ExecutionId, Gateway, RequirementResult, VerificationResult, VerificationVerdict,
-    WyrdClient, WyrdError,
+    Bifrost, ExecutionId, ExecutionRoute, Gateway, RequirementResult, VerificationResult,
+    VerificationVerdict, WyrdClient, WyrdError,
 };
 
 /// The `service/` directory holding this app's Cards.
@@ -105,14 +106,54 @@ impl SupportDesk {
             .with_state(self)
     }
 
-    /// Answer `question` in `run` through the Wyrd gateway and record the
-    /// ticket in `vala.datasets.tickets`.
+    /// Answer `question` as `run`'s Agent through the Wyrd gateway and record
+    /// the ticket in `vala.datasets.tickets`.
+    ///
+    /// Renders the Agent's Prompt, sends it to `<deployment>/<model>` on the
+    /// OpenAI-compatible gateway ingress with a fresh access token, and tags
+    /// the call with the Run and Agent Card.
     ///
     /// # Errors
-    /// Returns the gateway's or the Bifrost writer's error.
-    async fn answer(&self, run: &Run, question: &str) -> Result<String, WyrdError> {
+    /// Returns the gateway's refusal with its own status and stable code, the
+    /// Bifrost writer's error, or a 500 for a Prompt render, token, or
+    /// transport failure.
+    async fn answer(&self, run: &Run, question: &str) -> Result<String, ApiError> {
         // ANCHOR: answer
-        let answer = run.invoke(&[("question", question)]).await?;
+        let agent = self.state.agent(run.alias())?;
+        let ExecutionRoute::WyrdGateway { deployment } = &agent.card().spec.execution_route else {
+            return Err(ApiError::internal(
+                "the Agent does not route through the Wyrd gateway",
+            ));
+        };
+        let prompt = &agent.prompt().metadata.prompt;
+        let rendered = prompt
+            .render(&[("question", question)])
+            .map_err(ApiError::internal)?;
+        let mut body = serde_json::to_value(rendered).map_err(ApiError::internal)?["body"].take();
+        body["model"] = json!(format!("{deployment}/{}", prompt.model));
+        let client = self.state.client()?;
+        // These headers tie the gateway's record of the call to this Run.
+        let reply = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", client.server_url()))
+            .bearer_auth(client.access_token().await?.expose())
+            .header("wyrd-run-id", run.run_id().as_str())
+            .header("wyrd-card-uid", run.subject_uid().as_str())
+            .json(&body)
+            .send()
+            .await
+            .map_err(ApiError::internal)?;
+        let status = reply.status().as_u16();
+        let reply: Value = reply.json().await.map_err(ApiError::internal)?;
+        if status != 200 {
+            return Err(ApiError {
+                status: StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                body: reply["error"].clone(),
+            });
+        }
+        let answer = reply["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("the gateway reply carries no text"))?
+            .to_owned();
         run.observe()
             .record(
                 "vala.datasets.tickets",
@@ -244,7 +285,7 @@ async fn ask(
                 Inputs::named([("ticket", Input::from(ticket))]),
             )
             .await?;
-        Ok::<_, WyrdError>((answer, promise, complete))
+        Ok::<_, ApiError>((answer, promise, complete))
     };
     let (answer, promise, complete) = run
         .scope(work.instrument(tracing::info_span!("support-desk.ask")))
@@ -273,14 +314,16 @@ async fn review(
 ) -> Result<Json<Value>, ApiError> {
     let run = desk.state.run_for_card("agent")?;
     let work = async {
-        let letter = desk.answer(&run, &format!("{LETTER}{}", body.question)).await?;
+        let letter = desk
+            .answer(&run, &format!("{LETTER}{}", body.question))
+            .await?;
         // ANCHOR: submit
         let submission = run
             .observe()
             .submit("follows-policy", letter_inputs(&letter))
             .await?;
         // ANCHOR_END: submit
-        Ok::<_, WyrdError>((letter, submission))
+        Ok::<_, ApiError>((letter, submission))
     };
     let (letter, submission) = run
         .scope(work.instrument(tracing::info_span!("support-desk.review")))
@@ -288,10 +331,9 @@ async fn review(
     // A Verifier that judges Run evidence is always queued; only a
     // window-scoped one is merely recorded.
     let Submission::Queued(execution) = submission else {
-        return Err(ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: json!({ "message": "follows-policy was recorded, not queued" }),
-        });
+        return Err(ApiError::internal(
+            "follows-policy was recorded, not queued",
+        ));
     };
     Ok(Json(json!({
         "run_id": run.run_id().to_string(),
@@ -334,6 +376,17 @@ pub struct ApiError {
     status: StatusCode,
     /// The JSON body.
     body: Value,
+}
+
+impl ApiError {
+    /// A 500 carrying `error`'s message, for a failure outside the Wyrd error
+    /// catalog.
+    fn internal(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: json!({ "message": error.to_string() }),
+        }
+    }
 }
 
 impl From<WyrdError> for ApiError {

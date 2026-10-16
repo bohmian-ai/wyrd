@@ -7,7 +7,6 @@ from pathlib import Path
 
 import openai
 import pytest
-from wyrd import WyrdError
 from wyrd.bifrost import Bifrost
 from wyrd.cards import CardRef, Cards
 from wyrd.client import WyrdClient
@@ -41,6 +40,15 @@ def openai_client(caller: WyrdClient) -> openai.OpenAI:
     return openai.OpenAI(
         base_url=f"{caller.server_url}/v1", api_key=caller.access_token(), max_retries=0
     )
+
+
+def answer(caller: WyrdClient, state: WyrdState, alias: str, deployment: str) -> str:
+    """Send Agent ``alias``'s rendered Prompt to ``deployment`` as the application's own call."""
+    prompt = state.agent(alias).prompt().prompt
+    completion = openai_client(caller).chat.completions.create(
+        model=f"{deployment}/{prompt.model}", messages=prompt.render(question="hi").messages
+    )
+    return completion.choices[0].message.content or ""
 
 
 @pytest.fixture
@@ -188,17 +196,14 @@ def test_agent_prompt_routes(
     key = cli.issue_key(
         kind="Service", name="ask-service", version="1.0.0", space="default", client=admin
     )
-    state = WyrdState.from_path(bundle, client_of(server, key.key))
-    backup = {"kind": "wyrd_gateway", "deployment": "openai-backup"}
+    caller = client_of(server, key.key)
+    state = WyrdState.from_path(bundle, caller)
 
     for alias in ("agent", "body-agent"):
-        run = state.run(alias)
-        assert run.invoke({"question": "hi"}) == "hi"
-        assert run.invoke({"question": "hi"}, route=backup) == "hi"
-        assert state.card(alias).spec["execution_route"] == {
-            "kind": "wyrd_gateway",
-            "deployment": "openai",
-        }, "an override never changes the declared route"
+        declared = state.card(alias).spec["execution_route"]["deployment"]
+        assert declared == "openai"
+        assert answer(caller, state, alias, declared) == "hi"
+        assert answer(caller, state, alias, "openai-backup") == "hi"
 
     assert [delivery.body["model"] for delivery in upstream.to("/v1/chat/completions")] == [
         "gpt-4o"
@@ -209,12 +214,7 @@ def test_agent_prompt_routes(
         "requested_model.deployment AS deployment",
     ) == [{"deployment": deployment} for deployment in ("openai", "openai-backup") * 2]
 
-    with pytest.raises(WyrdError) as refused:
-        state.run("agent").invoke(
-            {"question": "hi"}, route={"kind": "wyrd_gateway", "deployment": "openai-granted"}
-        )
+    with pytest.raises(openai.PermissionDeniedError) as refused:
+        answer(caller, state, "agent", "openai-granted")
     assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
-    with pytest.raises(WyrdError) as malformed:
-        state.run("agent").invoke({"question": "hi"}, route={"kind": "elsewhere"})
-    assert malformed.value.code == "WYRD_SPEC_400_VALIDATION"
-    assert model_calls(upstream) == 4, "both refusals precede upstream IO"
+    assert model_calls(upstream) == 4, "the refusal precedes upstream IO"

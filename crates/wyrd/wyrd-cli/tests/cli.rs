@@ -7,10 +7,6 @@ mod card_lifecycle;
 /// Provider-backed `wyrd auth login`, `status`, and `logout` journey.
 #[path = "cli_login_journey.rs"]
 mod cli_login_journey;
-#[path = "eval_local_records.rs"]
-mod eval_local_records;
-#[path = "eval_support/mod.rs"]
-mod eval_support;
 #[path = "gateway_server_journey.rs"]
 mod gateway_server_journey;
 #[path = "loader.rs"]
@@ -85,4 +81,44 @@ async fn mcp_install_changes_only_selected_hosts() {
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_external_server_preserves_global_endpoint() {
     mcp_journey::mcp_external_server_preserves_global_endpoint().await;
+}
+
+/// The retired `wyrd eval` command tree is gone: the shipped binary refuses
+/// it with clap's ordinary unknown-subcommand usage error, omits it from help,
+/// and never contacts the server it was pointed at.
+///
+/// A loopback listener stands in for the server; it must see no connection.
+///
+/// # Panics
+/// Panics when the binary accepts either command, exits with anything other
+/// than the usage code, lists `eval` in help, or connects to the listener.
+#[test]
+fn retired_command_is_unknown() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener binds");
+    listener
+        .set_nonblocking(true)
+        .expect("listener becomes non-blocking");
+    let server = format!("http://{}", listener.local_addr().expect("listener address"));
+    for command in [&["eval"][..], &["eval", "run"][..]] {
+        let argv = [command, &["--server", &server]].concat();
+        let output = principal_journey::run_cli_with_env(&argv, &[]);
+        assert_eq!(output.status.code(), Some(64), "{argv:?} is a usage error");
+        let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+        assert!(
+            stderr.contains("unrecognized subcommand 'eval'"),
+            "{argv:?} gets clap's unknown-subcommand refusal: {stderr}"
+        );
+    }
+    let help = principal_journey::run_cli_with_env(&["--help"], &[]);
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).expect("help is UTF-8");
+    assert!(
+        !help.lines().any(|line| line.trim_start().starts_with("eval")),
+        "help lists no eval command: {help}"
+    );
+    assert_eq!(
+        listener.accept().map(|_| ()).map_err(|error| error.kind()),
+        Err(std::io::ErrorKind::WouldBlock),
+        "the refused command never connects"
+    );
 }

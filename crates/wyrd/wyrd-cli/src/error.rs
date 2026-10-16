@@ -46,51 +46,6 @@ pub enum WyrdCliError {
         detail: String,
     },
 
-    /// Records JSONL parsing failed.
-    #[error("records JSONL parse failed for {path}: {detail}")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_RECORDS_PARSE",
-        status = 400,
-        title = "Records JSONL parse failed",
-        remediation = "Verify each non-empty line is one EvalRecordObservation JSON object."
-    )]
-    RecordsParse {
-        /// Path being parsed.
-        path: String,
-        /// Parser detail.
-        detail: String,
-    },
-
-    /// Generic JSON/YAML parse failure.
-    #[error("{kind} parse failed for {path}: {detail}")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_PARSE",
-        status = 400,
-        title = "CLI input parse failed",
-        remediation = "Check the file against the expected Wyrd YAML or JSON shape."
-    )]
-    Parse {
-        /// Input kind.
-        kind: &'static str,
-        /// Path being parsed.
-        path: String,
-        /// Parser detail.
-        detail: String,
-    },
-
-    /// Eval spec validation failed.
-    #[error("eval spec validation failed: {detail}")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_EVAL_SPEC_INVALID",
-        status = 400,
-        title = "Eval spec invalid",
-        remediation = "Fix the Eval spec file before running the evaluation."
-    )]
-    EvalSpecInvalid {
-        /// Validation detail.
-        detail: String,
-    },
-
     /// Filesystem IO failed.
     #[error("io failed: {source}")]
     #[wyrd_error(
@@ -103,34 +58,6 @@ pub enum WyrdCliError {
         /// Source error.
         #[source]
         source: std::io::Error,
-    },
-
-    /// Eval engine failed.
-    #[error("eval engine failed: {source}")]
-    #[wyrd_error(
-        code = "WYRD_CLI_500_EVAL_ENGINE",
-        status = 500,
-        title = "Eval engine failed",
-        remediation = "Inspect the Eval spec, records, scenarios, and CLI logs."
-    )]
-    EvalExec {
-        /// Source error.
-        #[source]
-        source: vala_eval::EvalExecError,
-    },
-
-    /// Orchestrator failed.
-    #[error("eval orchestrator failed: {source}")]
-    #[wyrd_error(
-        code = "WYRD_CLI_500_ORCHESTRATOR",
-        status = 500,
-        title = "Eval orchestrator failed",
-        remediation = "Inspect agent endpoint responses and scenario configuration."
-    )]
-    Orchestrator {
-        /// Source error.
-        #[source]
-        source: vala_eval::orchestrator::OrchestratorError,
     },
 
     /// A card CLI argument could not be parsed or does not satisfy the
@@ -414,17 +341,12 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
                 details: serde_json::json!({ "field": field }),
             },
             WyrdCliError::QueryConfig { .. }
-            | WyrdCliError::RecordsParse { .. }
-            | WyrdCliError::Parse { .. }
-            | WyrdCliError::EvalSpecInvalid { .. }
             | WyrdCliError::DeleteSelectorRequiresExact
             | WyrdCliError::ServerHostUnsupported { .. }
             | WyrdCliError::ServerVersionIncompatible { .. }
             | WyrdCliError::McpHostSelection { .. } => WyrdError::Validation { message, details },
             WyrdCliError::Query { .. }
             | WyrdCliError::Io { .. }
-            | WyrdCliError::EvalExec { .. }
-            | WyrdCliError::Orchestrator { .. }
             | WyrdCliError::Output { .. }
             | WyrdCliError::ServerReleaseUnverified { .. }
             | WyrdCliError::McpHostInstall { .. } => WyrdError::Internal { message, details },
@@ -468,6 +390,24 @@ impl From<wyrd_spec::error::WyrdError> for CliBoundaryError {
 }
 
 impl CliBoundaryError {
+    /// Prints one machine-readable problem followed by one human-readable stderr line.
+    ///
+    /// The method performs exactly two stderr writes and never writes stdout,
+    /// mutates durable state, or changes the originating error metadata.
+    pub fn print(&self) {
+        let json = serde_json::json!({
+            "kind": "wyrd_cli_error",
+            "code": self.code(),
+            "status": self.status(),
+            "title": self.title(),
+            "message": self.detail(),
+            "remediation": self.remediation(),
+            "details": self.details(),
+        });
+        eprintln!("{json}");
+        eprintln!("error: {}", self.detail());
+    }
+
     /// Returns the originating stable error code.
     #[must_use]
     pub fn code(&self) -> &str {

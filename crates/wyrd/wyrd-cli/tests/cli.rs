@@ -98,7 +98,10 @@ fn retired_command_is_unknown() {
     listener
         .set_nonblocking(true)
         .expect("listener becomes non-blocking");
-    let server = format!("http://{}", listener.local_addr().expect("listener address"));
+    let server = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
     for command in [&["eval"][..], &["eval", "run"][..]] {
         let argv = [command, &["--server", &server]].concat();
         let output = principal_journey::run_cli_with_env(&argv, &[]);
@@ -113,7 +116,9 @@ fn retired_command_is_unknown() {
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).expect("help is UTF-8");
     assert!(
-        !help.lines().any(|line| line.trim_start().starts_with("eval")),
+        !help
+            .lines()
+            .any(|line| line.trim_start().starts_with("eval")),
         "help lists no eval command: {help}"
     );
     assert_eq!(
@@ -121,4 +126,53 @@ fn retired_command_is_unknown() {
         Err(std::io::ErrorKind::WouldBlock),
         "the refused command never connects"
     );
+}
+
+/// The compiled `wyrd query` refuses the retired Eval tables exactly as it
+/// refuses a namespace that never existed, printing no rows, while the
+/// caller's current table still answers.
+///
+/// # Panics
+/// Panics when setup fails, a retired query succeeds or prints rows, its
+/// problem code differs from the never-existing namespace's, or the current
+/// table query fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn retired_tables_are_unknown() {
+    let server = wyrd_testing::WyrdTestServer::start_bound()
+        .await
+        .expect("test server starts");
+    let fixture = wyrd_testing::bifrost::seed_query_fixture(&server, "cli-retired")
+        .await
+        .expect("query fixture seeds");
+    let query = |sql: &str| {
+        principal_journey::run_cli_with_credential(
+            &["query", "--server", &fixture.endpoint, "--sql", sql],
+            "WYRD_ACCESS_TOKEN",
+            &fixture.token,
+        )
+    };
+    for name in ["result_items", "observations"] {
+        let codes = ["vala.eval", "vala.absent"].map(|namespace| {
+            let output = query(&format!("SELECT * FROM {namespace}.{name}"));
+            assert!(!output.status.success(), "{namespace}.{name} is refused");
+            assert!(
+                output.stdout.is_empty(),
+                "{namespace}.{name} prints no rows"
+            );
+            String::from_utf8(output.stderr)
+                .expect("stderr is UTF-8")
+                .lines()
+                .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .expect("the refusal is a structured problem")["code"]
+                .clone()
+        });
+        assert_eq!(codes[0], codes[1], "{name}");
+    }
+    assert!(
+        query(&format!("SELECT * FROM {}", fixture.table))
+            .status
+            .success(),
+        "the current table answers"
+    );
+    server.shutdown().await.expect("test server shuts down");
 }

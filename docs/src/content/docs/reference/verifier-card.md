@@ -8,7 +8,34 @@ draft: true
 status: runnable
 ---
 
-A Verifier spec has six fields. Every object on this page rejects keys it does not define, so a typo fails at `wyrd plan` instead of being ignored. For a walkthrough, see [Author a Verifier](/build-and-verify/verify/author-a-verifier/).
+A Verifier takes evidence from your app and decides whether it meets your requirements. Every object on this page rejects keys it does not define, so a typo fails at `wyrd plan` instead of being ignored. For a walkthrough, see [Author a Verifier](/build-and-verify/verify/author-a-verifier/).
+
+## How a Verifier works
+
+A Verifier is built from five parts:
+
+| Part | What it is | Example |
+| --- | --- | --- |
+| Input | A named piece of evidence your app sends | `letter`, a Markdown file |
+| Step | Optional work that prepares evidence before anything is judged | Read the text out of the letter |
+| Action | What one step does: `extract`, `agent`, or `code` | `extract` the letter |
+| Requirement | One claim that must be true, in words a reviewer reads | "The letter follows the refund policy" |
+| Check | How one requirement is decided: `assert`, `trace`, `agent`, `code`, or `drift` | Ask a judge Agent |
+
+When you call `verify` or `submit`, the server:
+
+1. Checks each input against its slot, such as a file's format and size.
+2. Runs the steps. A step starts once the steps it reads from are done, and steps that don't depend on each other may run at the same time. A step's own requirements are checked right after it, before anything that depends on it starts.
+3. Checks the top-level requirements, once every step has finished.
+4. Combines every requirement's outcome into one verdict with `decide`.
+
+Steps read and compute; they are not the place for side effects. To act when a Verifier fails, such as paging someone, attach an [Operator](/build-and-verify/verify/respond-to-a-failed-verification/) to the binding.
+
+A Verifier with no steps is common: one input and one `assert` requirement covers many checks.
+
+## Spec fields
+
+A Verifier spec has six fields.
 
 ```yaml
 apiVersion: wyrd/v1
@@ -35,7 +62,7 @@ Step and requirement `id`s share one namespace across the whole Verifier.
 
 ## Input slots
 
-Each slot has a `type` and `required`, which defaults to `true`.
+An input slot names one piece of evidence and the shape it must have. Your app fills it by name, as in `verify("follows-policy", letter=...)`, and steps and checks read it as `inputs.<slot>`. Each slot has a `type` and `required`, which defaults to `true`.
 
 | `type` | Extra fields | Accepts |
 | --- | --- | --- |
@@ -50,6 +77,8 @@ An `extract` step can read `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `do
 
 ## Steps
 
+A step prepares evidence a requirement needs but the caller did not send in usable form: text pulled out of a PDF, a value computed in Python, or an Agent's summary. Its result is `steps.<id>.output`. Skip steps when your requirements can read the inputs directly.
+
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `id` | string | required | Name used in references such as `steps.<id>.output` |
@@ -61,6 +90,8 @@ An `extract` step can read `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `do
 | `retries` | 0 to 5 | `0` | Attempts after the first |
 
 ### Actions
+
+The action is what a step does. Each step has exactly one.
 
 | `kind` | Fields | Output |
 | --- | --- | --- |
@@ -76,6 +107,8 @@ A step Agent can use these tools: `cards.list`, `cards.get`, `cards.get_by_ref`,
 
 ## Requirements
 
+A requirement is one claim the evidence must support, plus the check that decides it. Each requirement ends `passed`, `failed`, `inconclusive`, or `not_applicable`, and those outcomes become the verdict. Put a requirement on a step when it judges that step's output, so later steps can branch on it; otherwise list it at the top level.
+
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `id` | string | Name in results and in `steps.<id>.requirements.<rid>` |
@@ -83,6 +116,8 @@ A step Agent can use these tools: `cards.list`, `cards.get`, `cards.get_by_ref`,
 | `check` | [check](#checks) | How the claim is decided |
 
 ### Checks
+
+A check is the method that decides one requirement. Use the cheapest one that can decide it: `assert` and `trace` compare values with no model, `code` runs your Python, and `agent` asks a model.
 
 | `kind` | Fields | Decides by |
 | --- | --- | --- |
@@ -92,11 +127,11 @@ A step Agent can use these tools: `cards.list`, `cards.get`, `cards.get_by_ref`,
 | `code` | `runtime`, `source`, `entrypoint`, `inputs` | A Python function that returns a verdict |
 | `drift` | `on`, `method`, `signal`, `condition`, `profile` | Comparing a window of samples with a baseline; see [Monitor drift](/build-and-verify/verify/monitor-drift/) |
 
-`assert` and `trace` need no model and return in milliseconds.
+`assert` and `trace` return in milliseconds. A step whose `when` condition is false is skipped, and its requirements are `not_applicable`.
 
-## Operators
+## Comparison operators
 
-Write an operator as its name, such as `operator: not_contains`, or, when it takes parameters, as `{kind: <name>, ...}`.
+`assert`, `trace`, and `when` compare a value with an operator. Write an operator as its name, such as `operator: not_contains`, or, when it takes parameters, as `{kind: <name>, ...}`.
 
 | Group | Operators |
 | --- | --- |

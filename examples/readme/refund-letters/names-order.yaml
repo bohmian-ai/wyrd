@@ -1,0 +1,14 @@
+# refund-letters/names-order.yaml: parse the document, then check it
+apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: names-order, version: 1.0.0, space: default}
+spec:
+  inputs:
+    letter: {type: media, formats: [markdown]}
+  steps:
+    - id: read-letter
+      action: {kind: extract, from: inputs.letter}
+  requirements:
+    - id: names-order
+      statement: The letter states the order ID
+      check: {kind: assert, path: steps.read-letter.output.text, operator: contains, expected: "Order ID:"}

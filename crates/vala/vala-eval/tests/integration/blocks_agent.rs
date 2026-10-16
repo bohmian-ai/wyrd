@@ -23,7 +23,7 @@ use vala_eval::blocks::{
 };
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, ExecutionRoute};
-use wyrd_spec::card::blocks::{Action, AgentCall, Check};
+use wyrd_spec::card::verifier::{Action, AgentCall, Check};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::verification::VerificationVerdict;

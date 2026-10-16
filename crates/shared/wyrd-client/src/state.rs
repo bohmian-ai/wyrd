@@ -20,7 +20,7 @@ use wyrd_cards::model::ModelCard;
 use wyrd_cards::prompt::PromptCard;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::agent::AgentCard;
-use wyrd_spec::card::blocks;
+use wyrd_spec::card::verifier;
 use wyrd_spec::card::verifier::{VerificationBinding, VerifierSpec};
 use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
 use wyrd_spec::error::WyrdError;

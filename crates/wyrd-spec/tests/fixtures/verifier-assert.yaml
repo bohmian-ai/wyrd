@@ -1,0 +1,20 @@
+# Verifier Card - one deterministic assertion over a JSON input.
+
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  space: wyrd-team
+  name: cohort-check
+  version: "1.0.0"
+spec:
+  inputs:
+    cohort:
+      type: json
+  requirements:
+    - id: cohort-valid
+      statement: The cohort is a supported campaign cohort.
+      check:
+        kind: assert
+        path: inputs.cohort
+        operator: in
+        expected: [loyal_win_back, price_sensitive]

@@ -26,7 +26,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
 
-use wyrd_spec::card::blocks::{Action, Check, Decide, Requirement, Step, TraceCheck, VerifierSpec};
+use wyrd_spec::card::verifier::{Action, Check, Decide, Requirement, Step, TraceCheck, VerifierSpec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::vala::eval::result::EvalContextCapture;

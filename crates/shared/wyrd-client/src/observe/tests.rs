@@ -704,7 +704,7 @@ fn bearer_client(base_url: String, timeout_ms: u64) -> crate::WyrdClient {
 ///
 /// # Panics
 /// Panics when the fixture does not decode.
-fn run_verifier() -> wyrd_spec::card::blocks::VerifierSpec {
+fn run_verifier() -> wyrd_spec::card::verifier::VerifierSpec {
     serde_json::from_value(json!({
         "inputs": {
             "answer": { "type": "json" },
@@ -726,7 +726,7 @@ fn run_verifier() -> wyrd_spec::card::blocks::VerifierSpec {
 ///
 /// # Panics
 /// Panics when the fixed UIDs do not decode.
-fn target(spec: &wyrd_spec::card::blocks::VerifierSpec) -> crate::verify::Target<'_> {
+fn target(spec: &wyrd_spec::card::verifier::VerifierSpec) -> crate::verify::Target<'_> {
     crate::verify::Target {
         spec,
         verifier_card_uid: serde_json::from_value(json!("018f4d8e-0000-7000-8000-000000000001"))
@@ -742,7 +742,7 @@ fn target(spec: &wyrd_spec::card::blocks::VerifierSpec) -> crate::verify::Target
 /// # Panics
 /// Panics when the projection is refused or is Window evidence.
 fn run_evidence(
-    spec: &wyrd_spec::card::blocks::VerifierSpec,
+    spec: &wyrd_spec::card::verifier::VerifierSpec,
     inputs: crate::verify::Inputs,
 ) -> crate::verify::RunEvidence {
     match target(spec)
@@ -774,7 +774,7 @@ fn result_body(id: &wyrd_spec::ids::ExecutionId) -> Value {
 /// Panics when a projection differs or a refusal passes.
 #[test]
 fn values_project_onto_named_slots_by_slot_type() {
-    let window: wyrd_spec::card::blocks::VerifierSpec = serde_json::from_value(json!({
+    let window: wyrd_spec::card::verifier::VerifierSpec = serde_json::from_value(json!({
         "inputs": {
             "current": { "type": "samples", "features": ["income", "dti"] },
             "latency": { "type": "samples", "features": ["latency_p95"] },
@@ -795,14 +795,14 @@ fn values_project_onto_named_slots_by_slot_type() {
         json!({ "income": 52_000, "dti": 0.31, "latency_p95": 840 })
     );
 
-    let single: wyrd_spec::card::blocks::VerifierSpec =
+    let single: wyrd_spec::card::verifier::VerifierSpec =
         serde_json::from_value(json!({ "inputs": { "answer": { "type": "json" } } }))
             .expect("single-slot Verifier decodes");
     run_evidence(&single, json!("yes").into());
 
     let run = run_verifier();
     let refusals: [(
-        &wyrd_spec::card::blocks::VerifierSpec,
+        &wyrd_spec::card::verifier::VerifierSpec,
         crate::verify::Inputs,
     ); 7] = [
         (&run, crate::verify::Inputs::named([("missing", json!(1))])),

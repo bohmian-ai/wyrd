@@ -18,7 +18,7 @@ use quick_xml::events::Event;
 use serde_json::{Number, Value};
 use skald_spec::MediaFormat;
 use vala_eval::blocks::BlockError;
-use wyrd_spec::card::blocks::extract::{
+use wyrd_spec::card::verifier::extract::{
     CellValue, DocxBlock, ExtractOutput, PdfPage, PptxSlide, Table, XlsxCell, XlsxSheet,
 };
 use wyrd_spec::verification::execution::Locator;

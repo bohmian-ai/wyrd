@@ -48,7 +48,7 @@ use wyrd_spec::card::source::{
     TraceConnection,
 };
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
-use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
+use wyrd_spec::card::verifier::{VerificationBinding, VerifierSpec};
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
@@ -84,10 +84,10 @@ use wyrd_spec::vala::api::{
     SortDirectionWire, SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit,
 };
 use wyrd_spec::vala::trace::SpanRecord;
-use wyrd_spec::verification::execution::{VerificationExecutionState, VerificationResult};
-use wyrd_spec::verification::{
-    StartVerificationRunRequest, StartVerificationRunResponse, VerificationBindingStatus,
-    VerificationRunStatus,
+use wyrd_spec::verification::VerificationBindingStatus;
+use wyrd_spec::verification::execution::{
+    EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse,
+    VerificationExecutionState, VerificationRequest, VerificationResult,
 };
 
 /// Writes the consumed generated outputs, or prints the transient contract bundle.
@@ -173,7 +173,6 @@ fn contracts() -> Value {
         TriggerSpec,
         TriggerActivation,
         VerifierSpec,
-        VerifierImplementation,
         VerificationBinding,
         OperatorSpec,
         OperatorAction,
@@ -295,10 +294,11 @@ fn contracts() -> Value {
         AuditEvent,
         AuthMethod,
         AuditOutcome,
-        StartVerificationRunRequest,
-        StartVerificationRunResponse,
+        VerificationRequest,
+        EvidencePlanRequest,
+        EvidencePlanResponse,
+        EnqueueVerificationResponse,
         VerificationBindingStatus,
-        VerificationRunStatus,
         VerificationResult,
         VerificationExecutionState,
         CreateOperatorConnectionRequest,

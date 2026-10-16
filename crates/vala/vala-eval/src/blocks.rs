@@ -29,7 +29,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::time::Instant;
 
-use wyrd_spec::card::blocks::{Action, Check};
+use wyrd_spec::card::verifier::{Action, Check};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::verification::execution::{

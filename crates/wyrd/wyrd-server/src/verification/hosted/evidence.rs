@@ -21,7 +21,7 @@ use vala_eval::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallValue, EvidenceReader,
 };
 use wyrd_spec::auth::Sha256Hex;
-use wyrd_spec::card::blocks::Action;
+use wyrd_spec::card::verifier::Action;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::CardRef;
@@ -82,7 +82,7 @@ impl TenantEvidence {
     ) -> Result<Option<Vec<(Locator, String)>>, BlockError> {
         if let InputDeclaration::Json { value } = declaration {
             return Ok(Some(units(
-                &wyrd_spec::card::blocks::extract::ExtractOutput::Json {
+                &wyrd_spec::card::verifier::extract::ExtractOutput::Json {
                     value: value.clone(),
                 },
                 b"",

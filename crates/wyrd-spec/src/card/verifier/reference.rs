@@ -335,6 +335,25 @@ impl schemars::JsonSchema for Reference {
     }
 }
 
+#[cfg(feature = "server")]
+impl utoipa::PartialSchema for Reference {
+    /// Describes a reference as its authored string form.
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::schema::ObjectBuilder::new()
+            .schema_type(utoipa::openapi::schema::Type::String)
+            .description(Some(
+                "Scope reference: inputs.<slot>, steps.<id>.output, steps.<id>.status, \
+                 steps.<id>.requirements.<id>.outcome|reason, requirement.id, or \
+                 requirement.statement, with .field, [n], and (in assert each) [*] \
+                 selectors below inputs and step outputs.",
+            ))
+            .into()
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::ToSchema for Reference {}
+
 #[cfg(test)]
 mod tests {
     //! Reference text parsing, printing, and serde refusals.

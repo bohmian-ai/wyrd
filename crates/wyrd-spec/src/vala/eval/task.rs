@@ -13,7 +13,6 @@ use super::agent::AgentAssertionTask;
 use super::assertion::AssertionTask;
 use super::condition::EvalCondition;
 use super::ids::TaskId;
-use super::llm_judge::LlmJudgeTask;
 use super::trace::TraceAssertionTask;
 
 /// One task in an `EvalSpec` DAG. Adjacently-tagged on the wire by
@@ -23,8 +22,6 @@ use super::trace::TraceAssertionTask;
 pub enum EvalTask {
     /// Programmatic assertion against the workflow context.
     Assertion(AssertionTask),
-    /// LLM-as-judge evaluation via a `Prompt` card.
-    LlmJudge(LlmJudgeTask),
     /// Assertion over the assembled OTel trace document.
     TraceAssertion(TraceAssertionTask),
     /// Assertion over the assembled GenAI workflow envelope.
@@ -37,7 +34,6 @@ impl EvalTask {
     pub fn id(&self) -> &TaskId {
         match self {
             EvalTask::Assertion(task) => &task.id,
-            EvalTask::LlmJudge(task) => &task.id,
             EvalTask::TraceAssertion(task) => &task.id,
             EvalTask::AgentAssertion(task) => &task.id,
         }
@@ -48,7 +44,6 @@ impl EvalTask {
     pub fn depends_on(&self) -> &[TaskId] {
         match self {
             EvalTask::Assertion(task) => &task.depends_on,
-            EvalTask::LlmJudge(task) => &task.depends_on,
             EvalTask::TraceAssertion(task) => &task.depends_on,
             EvalTask::AgentAssertion(task) => &task.depends_on,
         }
@@ -60,7 +55,6 @@ impl EvalTask {
     pub fn condition(&self) -> Option<&EvalCondition> {
         match self {
             EvalTask::Assertion(task) => task.condition.as_ref(),
-            EvalTask::LlmJudge(task) => task.condition.as_ref(),
             EvalTask::TraceAssertion(task) => task.condition.as_ref(),
             EvalTask::AgentAssertion(task) => task.condition.as_ref(),
         }
@@ -72,7 +66,6 @@ impl EvalTask {
     pub fn discriminator(&self) -> &'static str {
         match self {
             EvalTask::Assertion(_) => "assertion",
-            EvalTask::LlmJudge(_) => "llm_judge",
             EvalTask::TraceAssertion(_) => "trace_assertion",
             EvalTask::AgentAssertion(_) => "agent_assertion",
         }

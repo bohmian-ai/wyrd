@@ -17,7 +17,7 @@ use serde_json::Value;
 use skald_tool::{AgentTool, ToolError, ToolRegistry};
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::agent::BuiltinTool;
-use wyrd_spec::card::blocks::Action;
+use wyrd_spec::card::verifier::Action;
 use wyrd_spec::verification::execution::ToolCallRecord;
 
 use super::{BlockCall, BlockError};

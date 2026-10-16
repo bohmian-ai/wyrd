@@ -16,11 +16,12 @@ use serde_json::Value;
 use skald_spec::MediaFormat;
 
 use super::{
-    DriftReport, DriftWindow, VerificationError, VerificationExecutionStatus, VerificationVerdict,
+    DriftReport, DriftWindow, OperatorDispatchState, VerificationError,
+    VerificationExecutionStatus, VerificationVerdict,
 };
 use crate::auth::Sha256Hex;
 use crate::card::agent::{BuiltinTool, ExecutionRoute};
-use crate::card::blocks::{Check, CodeRuntime};
+use crate::card::verifier::{Check, CodeRuntime};
 use crate::error::WyrdError;
 use crate::ids::{CardUid, ExecutionId, SlotName};
 use crate::reference::CardRef;
@@ -33,6 +34,7 @@ use crate::vala::ids::{RunId, TraceId};
 /// named input slot. Tenant and principal come from authentication, never
 /// from the body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct VerificationRequest {
     /// Exact Verifier Card version to execute.
@@ -53,6 +55,7 @@ pub struct VerificationRequest {
 /// What a caller supplies for one input slot. Execution results echo the
 /// pinned declarations as the original evidence identities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InputDeclaration {
     /// Bounded inline JSON for a `json` slot.
@@ -63,10 +66,12 @@ pub enum InputDeclaration {
     /// A file uploaded by digest through the evidence plan.
     File {
         /// SHA-256 of the file bytes.
+        #[cfg_attr(feature = "server", schema(value_type = String))]
         sha256: Sha256Hex,
         /// File length in bytes.
         size_bytes: u64,
         /// Declared canonical format.
+        #[cfg_attr(feature = "server", schema(value_type = String))]
         format: MediaFormat,
         /// Original filename, for display only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,9 +94,11 @@ pub enum InputDeclaration {
 
 /// One file the caller intends to reference by digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceFile {
     /// SHA-256 of the file bytes.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
     pub sha256: Sha256Hex,
     /// File length in bytes.
     pub size_bytes: u64,
@@ -99,6 +106,7 @@ pub struct EvidenceFile {
 
 /// `POST /v1/verification/evidence` request body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct EvidencePlanRequest {
     /// Files the caller is about to declare.
@@ -108,6 +116,7 @@ pub struct EvidencePlanRequest {
 /// `POST /v1/verification/evidence` response: upload plans only for files
 /// the server does not already hold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct EvidencePlanResponse {
     /// One plan per missing file; present files are omitted.
     pub uploads: Vec<EvidenceUpload>,
@@ -115,8 +124,10 @@ pub struct EvidencePlanResponse {
 
 /// How to upload one missing file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct EvidenceUpload {
     /// Digest of the file this plan uploads.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
     pub sha256: Sha256Hex,
     /// The upload plan.
     pub plan: UploadPlan,
@@ -125,6 +136,7 @@ pub struct EvidenceUpload {
 /// `202 Accepted` body of `POST /v1/verification/enqueue`. It confirms
 /// staging only; replay or conflict is decided when the queue accepts it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct EnqueueVerificationResponse {
     /// Identity to poll.
     pub execution_id: ExecutionId,
@@ -136,6 +148,7 @@ pub struct EnqueueVerificationResponse {
 /// idempotency-conflict code and never carries a result. `completed` may
 /// briefly lack a visible result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct VerificationExecutionState {
     /// The execution.
     pub execution_id: ExecutionId,
@@ -147,10 +160,16 @@ pub struct VerificationExecutionState {
     /// The result once completed and visible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<VerificationResult>,
+    /// Every Operator dispatch of a failed background binding execution, in
+    /// identity order; empty otherwise. Delivery completes independently of
+    /// the execution and never changes its verdict.
+    #[serde(default)]
+    pub dispatches: Vec<OperatorDispatchState>,
 }
 
 /// The attributable result of one Verifier execution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct VerificationResult {
     /// Server-issued execution identity.
     pub execution_id: ExecutionId,
@@ -167,6 +186,7 @@ pub struct VerificationResult {
 
 /// Overall verdict with its requirement and step breakdown.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct VerificationOutcome {
     /// The `decide` rule applied to every applicable requirement.
     pub verdict: VerificationVerdict,
@@ -180,6 +200,7 @@ pub struct VerificationOutcome {
 
 /// The judgment of one requirement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct RequirementResult {
     /// Requirement ID.
     pub id: TaskId,
@@ -211,6 +232,7 @@ pub struct RequirementResult {
 /// One requirement's outcome. Only `not_applicable` leaves the `decide`
 /// denominator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RequirementOutcome {
     /// The requirement held.
@@ -226,6 +248,7 @@ pub enum RequirementOutcome {
 
 /// Check-specific requirement detail.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RequirementDetail {
     /// Full per-feature statistics of a drift check.
@@ -234,6 +257,7 @@ pub enum RequirementDetail {
 
 /// What executed one Agent, code, extract, or drift block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CallProvenance {
     /// An Agent call.
@@ -250,6 +274,7 @@ pub enum CallProvenance {
     /// A sandboxed code call.
     Code {
         /// SHA-256 of the executed source.
+        #[cfg_attr(feature = "server", schema(value_type = String))]
         sha256: Sha256Hex,
         /// The runtime.
         runtime: CodeRuntime,
@@ -269,6 +294,7 @@ pub enum CallProvenance {
 
 /// The execution record of one step.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct StepResult {
     /// Step ID.
     pub id: TaskId,
@@ -294,6 +320,7 @@ pub struct StepResult {
 
 /// Final status of one step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
     /// The action produced output.
@@ -312,6 +339,7 @@ pub enum StepStatus {
 /// returned no output, such as one that failed, has no digest and zero
 /// returned bytes rather than a digest of nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ToolCallRecord {
     /// The built-in called.
     pub tool: BuiltinTool,
@@ -320,6 +348,7 @@ pub struct ToolCallRecord {
     /// SHA-256 of the bounded output returned to the model; absent when the
     /// call returned none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
     pub output_sha256: Option<Sha256Hex>,
     /// Bytes of output returned to the model; zero when it returned none.
     pub returned_bytes: u64,
@@ -330,6 +359,7 @@ pub struct ToolCallRecord {
 
 /// The closed schema every Agent and code check returns.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Verdict {
     /// The judgment.
@@ -343,6 +373,7 @@ pub struct Verdict {
 
 /// A location in an original input slot, never in scratch space.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Citation {
     /// The original input slot.
@@ -353,6 +384,7 @@ pub struct Citation {
 
 /// A typed location, serialized as a one-key object such as `{"page": 7}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Locator {
     /// One-based PDF page.

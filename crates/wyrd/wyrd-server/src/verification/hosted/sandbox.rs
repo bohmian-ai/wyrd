@@ -31,7 +31,7 @@ use vala_eval::blocks::{
     CheckOutput, EvidenceReader,
 };
 use wyrd_spec::auth::Sha256Hex;
-use wyrd_spec::card::blocks::{Action, Check, CodeCall, CodeSource};
+use wyrd_spec::card::verifier::{Action, Check, CodeCall, CodeSource};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::{CallProvenance, Verdict};
 

@@ -23,7 +23,7 @@ use skald_providers::ProviderError;
 use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
 use skald_spec::{MediaRef, ResponseType};
 use wyrd_spec::card::agent::{AgentSpec, BuiltinTool, ExecutionRoute};
-use wyrd_spec::card::blocks::{Action, AgentCall, Check};
+use wyrd_spec::card::verifier::{Action, AgentCall, Check};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::vala::eval::TaskId;

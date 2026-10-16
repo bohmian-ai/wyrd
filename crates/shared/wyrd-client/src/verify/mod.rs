@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use skald_spec::MediaFormat;
 use wyrd_spec::auth::Sha256Hex;
-use wyrd_spec::card::blocks::{InputSlot, VerifierSpec};
+use wyrd_spec::card::verifier::{InputSlot, VerifierSpec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::reference::CardRef;

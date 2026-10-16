@@ -48,7 +48,7 @@ use wyrd_server::verification::hosted::workspace::Workspaces;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex};
 use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, ExecutionRoute};
-use wyrd_spec::card::blocks::{Action, AgentCall, Check, CodeCall, CodeRuntime, CodeSource};
+use wyrd_spec::card::verifier::{Action, AgentCall, Check, CodeCall, CodeRuntime, CodeSource};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::reference::{CardRef, InlineableRef, Ref};

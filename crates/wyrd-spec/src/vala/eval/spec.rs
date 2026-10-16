@@ -127,9 +127,6 @@ impl EvalSpec {
         validate_dag(&self.tasks).map_err(EvalSpecError::Dag)?;
 
         for task in self.tasks.values() {
-            if let EvalTask::LlmJudge(task) = task {
-                task.validate().map_err(EvalSpecError::Wyrd)?;
-            }
             if let Some(condition) = task.condition() {
                 condition.validate().map_err(EvalSpecError::Wyrd)?;
             }
@@ -188,7 +185,6 @@ impl From<EvalSpecError> for WyrdError {
 fn validate_task_operator(task: &EvalTask) -> Result<(), WyrdError> {
     let operator = match task {
         EvalTask::Assertion(t) => &t.operator,
-        EvalTask::LlmJudge(t) => &t.operator,
         EvalTask::TraceAssertion(t) => &t.operator,
         EvalTask::AgentAssertion(t) => &t.operator,
     };

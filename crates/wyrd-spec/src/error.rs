@@ -2094,13 +2094,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
-    /// A binding's effective Trigger activation cannot run its Verifier's implementation.
+    /// A binding's effective Trigger activation cannot run its Verifier.
     #[error("[WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH] {message}")]
     #[wyrd_error(
         code = "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
         status = 400,
         title = "Trigger activation does not match Verifier",
-        remediation = "Use a schedule Trigger for a drift Verifier and an observations_ready Trigger for an eval Verifier."
+        remediation = "Attach a schedule Trigger only to a Verifier that judges recorded samples, and map its samples slots in the binding inputs; supply other evidence through verify or submit."
     )]
     SpecTriggerActivationMismatch {
         /// Human-readable error message.

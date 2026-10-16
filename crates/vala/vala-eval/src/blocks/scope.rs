@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use wyrd_spec::card::blocks::VerifierSpec;
-use wyrd_spec::card::blocks::{PathSegment, Reference, ReferenceRoot, Requirement, VerdictField};
+use wyrd_spec::card::verifier::VerifierSpec;
+use wyrd_spec::card::verifier::{PathSegment, Reference, ReferenceRoot, Requirement, VerdictField};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::verification::execution::{

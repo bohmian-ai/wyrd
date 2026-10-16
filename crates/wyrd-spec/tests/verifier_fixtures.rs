@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde_yaml::Value;
 use wyrd_spec::Prompt;
 use wyrd_spec::card::agent::AgentSpec;
-use wyrd_spec::card::blocks::{ResolvedAgent, ScheduledInput, VerifierSpec};
+use wyrd_spec::card::verifier::{ResolvedAgent, ScheduledInput, VerifierSpec};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::InlineableRef;
 

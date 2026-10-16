@@ -355,31 +355,12 @@ uuid7_id_type!(
 );
 
 uuid7_id_type!(
-    /// Durable identity of one Verifier run in `wyrd.verifier_runs`.
-    ///
-    /// The server mints it when scheduled, manual, or observation work is
-    /// enqueued. It is the managed `run_id` of every result and detail row the
-    /// run publishes and addresses the run's status and Operator dispatches.
-    /// Retries and lease reclaims keep it.
-    VerificationRunId
-);
-
-uuid7_id_type!(
     /// Durable identity of one canonical Verification Result.
     ///
-    /// The runner mints it for a completed run's result batches: the summary
-    /// row in `vala.verification.results` and every detail row join on
-    /// (`data_tenant_id`, `result_id`), and the settled run points at it.
+    /// Minted for a completed execution's result: the row in
+    /// `vala.verification.results` and every detail row join on
+    /// (`data_tenant_id`, `result_id`), and the settled execution points at it.
     VerificationResultId
-);
-
-uuid7_id_type!(
-    /// Transient identity of one direct Verifier execution.
-    ///
-    /// `POST /v1/verification/execute` mints it per request. It appears only
-    /// in that response, the request's audit decision, its trace, and as the
-    /// `result_id` of the execution's recorded result rows.
-    VerificationExecutionId
 );
 
 uuid7_id_type!(
@@ -387,7 +368,9 @@ uuid7_id_type!(
     ///
     /// The server mints it for every real-time or queued execution. One
     /// application Run can own many executions; scheduled executions have no
-    /// Run. It addresses the execution's status and its result.
+    /// Run. It keys the execution's `wyrd.verifier_executions` row, its
+    /// result and input records, and its Operator dispatches. Retries and
+    /// lease reclaims keep it.
     ExecutionId
 );
 

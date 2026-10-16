@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use vala_eval::blocks::{AgentToolset, BlockCall, BlockError, ToolSession};
 use wyrd_runtime::Permission;
 use wyrd_spec::card::agent::BuiltinTool;
-use wyrd_spec::card::blocks::Action;
+use wyrd_spec::card::verifier::Action;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::ListCardsRequest;
 use wyrd_spec::vala::eval::ids::TaskId;

@@ -84,6 +84,12 @@ pub const RESULT_INVALID: &str = "result_invalid";
 /// Stable error code when a block was refused process capacity, so the
 /// execution is deferred.
 pub const RUNTIME_BUSY: &str = "verification_runtime_busy";
+/// Stable error code when the submitted evidence does not conform to the
+/// Verifier's input slots or exceeds an input bound, so no block ran.
+pub const INPUT_INVALID: &str = "input_invalid";
+/// Stable error code when the evidence metadata admission needs could not
+/// be read, so no block ran.
+pub const EVIDENCE_UNAVAILABLE: &str = "evidence_unavailable";
 /// Stable error code when the tenant has no active `UUIDv7` SYSTEM principal
 /// to execute and attribute the result as.
 pub const SYSTEM_PRINCIPAL_MISSING: &str = "system_principal_missing";
@@ -833,9 +839,10 @@ fn result(
 
 /// The outcome of an engine run that returned no verdict.
 ///
-/// An expired deadline times out, an unplannable Verifier or an uncapturable
-/// actual value terminates `errored`, a stopped block task retries, and a
-/// block refused process capacity defers without spending an attempt.
+/// An expired deadline times out, an unplannable Verifier, an uncapturable
+/// actual value, or nonconforming evidence terminates `errored`, a stopped
+/// block task or unreadable evidence metadata retries, and a block refused
+/// process capacity defers without spending an attempt.
 fn engine_failure(run: &ClaimedExecution, error: &EngineError) -> EngineOutcome {
     tracing::warn!(execution_id = %run.lease.execution_id, %error, "the verification engine failed");
     match error {
@@ -858,6 +865,13 @@ fn engine_failure(run: &ClaimedExecution, error: &EngineError) -> EngineOutcome 
         EngineError::Busy(_) => EngineOutcome::Deferred(failure(
             RUNTIME_BUSY,
             "a verification block was refused process capacity",
+        )),
+        EngineError::InputInvalid(reason) | EngineError::InputTooLarge(reason) => {
+            EngineOutcome::Terminal(TerminalStatus::Errored, failure(INPUT_INVALID, reason))
+        }
+        EngineError::EvidenceUnavailable(_) => EngineOutcome::Retry(failure(
+            EVIDENCE_UNAVAILABLE,
+            "the verification evidence cannot be admitted now",
         )),
     }
 }

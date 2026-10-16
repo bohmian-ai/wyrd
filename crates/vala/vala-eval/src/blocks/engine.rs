@@ -27,7 +27,7 @@ use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
 
 use wyrd_spec::card::verifier::{
-    Action, Check, Decide, Requirement, Step, TraceCheck, VerifierSpec,
+    Action, Check, Decide, InputSlot, Requirement, Step, TraceCheck, VerifierSpec,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
@@ -43,7 +43,7 @@ use super::drift::DriftChecks;
 use super::scope::{Cause, Done, Missing, Scope, Settled};
 use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
-    CheckOutput, Position,
+    CheckOutput, EvidenceReader, Position,
 };
 use crate::context::extract_jsonpath_from;
 use crate::error::EvalExecError;
@@ -74,6 +74,21 @@ pub enum EngineError {
     /// exists, so the host may run the whole execution again later.
     #[error("a verification block was refused process capacity: {0}")]
     Busy(String),
+    /// The supplied evidence does not conform to the Verifier's declared
+    /// input slots: an undeclared slot, a declaration of another kind, a
+    /// JSON value violating its slot schema, a file in a format its media
+    /// slot does not accept, or evidence the host refuses to admit. No
+    /// block ran.
+    #[error("the verification input is invalid: {0}")]
+    InputInvalid(String),
+    /// The supplied evidence exceeds a media slot's `max_bytes` or the
+    /// host's combined input-file bound. No block ran.
+    #[error("the verification input is too large: {0}")]
+    InputTooLarge(String),
+    /// The host cannot read the evidence metadata admission needs now. No
+    /// block ran, so the whole execution may run again later.
+    #[error("the verification evidence cannot be admitted now: {0}")]
+    EvidenceUnavailable(String),
 }
 
 /// The engine of one Verifier execution, composed from injected capabilities.
@@ -92,6 +107,9 @@ pub struct VerificationEngine {
     drift: Arc<DriftChecks>,
     /// Bounds concurrently running actions and checks.
     permits: Arc<Semaphore>,
+    /// The host's evidence reader, asked to admit the pinned evidence
+    /// before any block runs; `None` admits what slot validation accepts.
+    evidence: Option<Arc<dyn EvidenceReader>>,
 }
 
 impl VerificationEngine {
@@ -113,7 +131,16 @@ impl VerificationEngine {
             traces,
             drift: Arc::new(DriftChecks::default()),
             permits: Arc::new(Semaphore::new(concurrency.get())),
+            evidence: None,
         }
+    }
+
+    /// Admit each execution's pinned evidence through `evidence` before any
+    /// block runs, after the engine's own slot validation.
+    #[must_use]
+    pub fn with_evidence(mut self, evidence: Arc<dyn EvidenceReader>) -> Self {
+        self.evidence = Some(evidence);
+        self
     }
 
     /// Use `drift` as the scheduled evidence of `drift` checks.
@@ -134,8 +161,17 @@ impl VerificationEngine {
     /// empty Verifier, never reports a verdict outside its budget; pending
     /// work is cancelled when the deadline passes.
     ///
+    /// Before any block runs, every supplied declaration must conform to its
+    /// declared slot (see [`conform`]) and the host's evidence reader, when
+    /// set, must admit the whole set. A declared slot left unsupplied is not
+    /// refused here: a required one leaves its dependents without evidence
+    /// and an optional one reads as null.
+    ///
     /// # Errors
-    /// Returns [`EngineError::Plan`] for an unplannable graph,
+    /// Returns [`EngineError::InputInvalid`] or [`EngineError::InputTooLarge`]
+    /// for nonconforming evidence and [`EngineError::EvidenceUnavailable`]
+    /// when the host cannot admit it now, [`EngineError::Plan`] for an
+    /// unplannable graph,
     /// [`EngineError::DeadlineExceeded`] when `deadline` is reached before
     /// the verdict, [`EngineError::Capture`] when an actual value cannot be
     /// hashed, [`EngineError::Join`] when a block task panics, and
@@ -156,10 +192,16 @@ impl VerificationEngine {
         if expired() {
             return Err(EngineError::DeadlineExceeded);
         }
+        conform(&spec, &evidence)?;
         let plan = spec.plan().map_err(EngineError::Plan)?;
-        let ledger = timeout_at(deadline, self.drive(&spec, &plan, &evidence, deadline))
-            .await
-            .map_err(|_| EngineError::DeadlineExceeded)??;
+        let ledger = timeout_at(deadline, async {
+            if let Some(reader) = &self.evidence {
+                reader.admit(&spec.inputs, &evidence).await?;
+            }
+            self.drive(&spec, &plan, &evidence, deadline).await
+        })
+        .await
+        .map_err(|_| EngineError::DeadlineExceeded)??;
         let (mut steps, mut requirements) = (Vec::new(), Vec::new());
         for (_, done) in ledger {
             match done {
@@ -859,6 +901,70 @@ fn decide(rule: Decide, outcomes: impl Iterator<Item = RequirementOutcome>) -> V
         _ if inconclusive > 0 => VerificationVerdict::Inconclusive,
         _ => VerificationVerdict::Failed,
     }
+}
+
+/// Refuse supplied `evidence` that does not conform to `spec`'s declared
+/// input slots.
+///
+/// Every supplied slot must be declared, and its declaration must be the
+/// slot's kind: inline JSON for a `json` slot, a file or Artifact for a
+/// `media` slot, and a trace for a `trace` slot; `samples` slots are filled
+/// only by a schedule. A JSON value must satisfy its slot schema, and a file
+/// must be in one of its media slot's formats and within its `max_bytes`.
+/// An Artifact's format and size are known only to the host, which checks
+/// them when it admits the evidence. Missing slots are not refused here.
+///
+/// # Errors
+/// Returns [`EngineError::InputTooLarge`] for a file above its slot's
+/// `max_bytes` and [`EngineError::InputInvalid`] for every other
+/// nonconformity, naming the slot.
+fn conform(
+    spec: &VerifierSpec,
+    evidence: &BTreeMap<SlotName, InputDeclaration>,
+) -> Result<(), EngineError> {
+    for (name, declaration) in evidence {
+        let invalid = |reason: &str| EngineError::InputInvalid(format!("input {name}: {reason}"));
+        let slot = spec
+            .inputs
+            .get(name)
+            .ok_or_else(|| invalid("the Verifier declares no such input"))?;
+        match (slot, declaration) {
+            (InputSlot::Json { schema, .. }, InputDeclaration::Json { value }) => {
+                if let Some(schema) = schema {
+                    let validator = jsonschema::validator_for(schema).map_err(|error| {
+                        invalid(&format!("the slot schema is invalid: {error}"))
+                    })?;
+                    if let Some(error) = validator.iter_errors(value).next() {
+                        return Err(invalid(&format!(
+                            "the value violates the slot schema at {}: {error}",
+                            error.instance_path()
+                        )));
+                    }
+                }
+            }
+            (
+                InputSlot::Media {
+                    formats, max_bytes, ..
+                },
+                InputDeclaration::File {
+                    format, size_bytes, ..
+                },
+            ) => {
+                if !formats.contains(format) {
+                    return Err(invalid(&format!("the slot does not accept {format}")));
+                }
+                if let Some(max) = max_bytes.filter(|max| size_bytes > max) {
+                    return Err(EngineError::InputTooLarge(format!(
+                        "input {name}: the file exceeds the slot's {max}-byte limit"
+                    )));
+                }
+            }
+            (InputSlot::Media { .. }, InputDeclaration::Artifact { .. })
+            | (InputSlot::Trace { .. }, InputDeclaration::Trace { .. }) => {}
+            _ => return Err(invalid("the declaration is not the slot's kind")),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

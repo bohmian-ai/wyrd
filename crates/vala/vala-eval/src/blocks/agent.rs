@@ -23,7 +23,7 @@ use skald_providers::ProviderError;
 use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
 use skald_spec::{MediaRef, ResponseType};
 use wyrd_spec::card::agent::{AgentSpec, BuiltinTool, ExecutionRoute};
-use wyrd_spec::card::verifier::{Action, AgentCall, Check};
+use wyrd_spec::card::verifier::{Action, AgentCall, Check, InputSlot};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::vala::eval::TaskId;
@@ -33,7 +33,7 @@ use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclarat
 use super::tools::{AgentToolset, ToolSession, finished};
 use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
-    CheckOutput, Position,
+    CheckOutput, EngineError, Position,
 };
 
 /// Resolves a registered Agent Card into its pure Agent spec.
@@ -84,6 +84,26 @@ pub trait EvidenceReader: Send + Sync {
         reachable: &BTreeSet<SlotName>,
         citations: Vec<Citation>,
     ) -> Result<Vec<Citation>, BlockError>;
+
+    /// Admit an execution's whole pinned `evidence` against its declared
+    /// `slots` before any block runs.
+    ///
+    /// [`VerificationEngine::run`](super::VerificationEngine::run) calls it
+    /// once, after its own slot validation, for checks only the host can
+    /// make, such as a registered Artifact file's format and size or a
+    /// combined input-file bound. The default admits everything.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::InputInvalid`] or [`EngineError::InputTooLarge`]
+    /// for evidence the host refuses and [`EngineError::EvidenceUnavailable`]
+    /// when it cannot decide now.
+    async fn admit(
+        &self,
+        _slots: &BTreeMap<SlotName, InputSlot>,
+        _evidence: &BTreeMap<SlotName, InputDeclaration>,
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
 }
 
 /// Runs Agent step actions and Agent requirement checks.

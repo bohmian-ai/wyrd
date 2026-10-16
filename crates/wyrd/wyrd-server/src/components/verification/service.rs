@@ -432,11 +432,16 @@ impl<'a> VerificationControl<'a> {
     /// the Verifier, [`WyrdError::VerificationTargetNotFound`] for an
     /// unknown, inactive, or non-Verifier target,
     /// [`WyrdError::VerificationInputUnsupported`] for a Window Verifier,
+    /// [`WyrdError::VerificationInputInvalid`] for evidence that does not
+    /// conform to the Verifier's input slots,
+    /// [`WyrdError::VerificationInputTooLarge`] for evidence past a slot or
+    /// combined input-file limit,
     /// [`WyrdError::VerificationExecutionTimedOut`] past the deadline,
     /// [`WyrdError::ServiceUnavailable`] when this process hosts no Verifier
-    /// blocks or a block is refused process capacity (a Python worker or a
-    /// workspace), a registry unavailability error when a read fails, and the
-    /// Verifier's planning refusal.
+    /// blocks, a block is refused process capacity (a Python worker or a
+    /// workspace), or evidence metadata cannot be read now, a registry
+    /// unavailability error when a read fails, and the Verifier's planning
+    /// refusal.
     #[tracing::instrument(
         name = "verification.execute",
         skip_all,
@@ -514,6 +519,27 @@ impl<'a> VerificationControl<'a> {
                 Err(WyrdError::ServiceUnavailable {
                     message: "the verification runtime has no capacity for this Verifier now"
                         .to_owned(),
+                    details: serde_json::json!({ "reason": reason }),
+                }),
+            ),
+            Err(EngineError::InputInvalid(reason)) => (
+                "refused",
+                Err(WyrdError::VerificationInputInvalid {
+                    message: reason.clone(),
+                    details: serde_json::json!({ "reason": reason }),
+                }),
+            ),
+            Err(EngineError::InputTooLarge(reason)) => (
+                "refused",
+                Err(WyrdError::VerificationInputTooLarge {
+                    message: reason.clone(),
+                    details: serde_json::json!({ "reason": reason }),
+                }),
+            ),
+            Err(EngineError::EvidenceUnavailable(reason)) => (
+                "unavailable",
+                Err(WyrdError::ServiceUnavailable {
+                    message: "the verification evidence cannot be admitted now".to_owned(),
                     details: serde_json::json!({ "reason": reason }),
                 }),
             ),

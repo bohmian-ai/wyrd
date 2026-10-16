@@ -823,6 +823,105 @@ async fn missing_and_optional_evidence_resolve_honestly() {
     );
 }
 
+/// Supplied evidence that does not conform to its declared slot is refused
+/// before any block runs: an undeclared slot, a declaration of another kind,
+/// a JSON value violating its slot schema, a file in an unaccepted format,
+/// and a file above its slot's `max_bytes`. Conforming evidence runs.
+///
+/// # Panics
+/// Panics when nonconforming evidence is not refused with the expected
+/// error, a block runs for it, or the conforming control does not pass.
+#[tokio::test(start_paused = true)]
+async fn nonconforming_evidence_is_refused_before_any_block() {
+    let spec = verifier(json!({
+        "inputs": {
+            "x": {"type": "json", "schema": {"type": "integer"}},
+            "policy": {"type": "media", "formats": ["pdf"], "max_bytes": 10, "required": false}
+        },
+        "steps": [{"id": "draft", "action": code_action(json!({"x": "inputs.x"}))}],
+        "requirements": [{"id": "x", "statement": "x", "check": {"kind": "assert", "path": "inputs.x", "operator": "is_not_null"}}]
+    }));
+    let file = |format: &str, size_bytes: u64| InputDeclaration::File {
+        sha256: wyrd_spec::auth::Sha256Hex::digest(b"policy"),
+        size_bytes,
+        format: format.parse().expect("format"),
+        filename: None,
+    };
+    let json_input = |value: Value| InputDeclaration::Json { value };
+    let slot = |name: &str| SlotName::new(name).expect("slot");
+    let cases = [
+        (
+            vec![("x", json_input(json!(1))), ("extra", json_input(json!(1)))],
+            "declares no such input",
+            false,
+        ),
+        (
+            vec![(
+                "x",
+                InputDeclaration::Trace {
+                    trace_id: TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").expect("trace"),
+                },
+            )],
+            "not the slot's kind",
+            false,
+        ),
+        (
+            vec![("x", json_input(json!("one")))],
+            "violates the slot schema",
+            false,
+        ),
+        (
+            vec![("x", json_input(json!(1))), ("policy", file("png", 5))],
+            "does not accept",
+            false,
+        ),
+        (
+            vec![("x", json_input(json!(1))), ("policy", file("pdf", 11))],
+            "10-byte limit",
+            true,
+        ),
+    ];
+    for (inputs, expected, too_large) in cases {
+        let script = Arc::new(Script::default());
+        let evidence = inputs
+            .into_iter()
+            .map(|(name, declaration)| (slot(name), declaration))
+            .collect();
+        let refused = engine(&script, InMemoryTraceSource::new(), 1)
+            .run(
+                Arc::clone(&spec),
+                evidence,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await;
+        let reason = match (&refused, too_large) {
+            (Err(EngineError::InputInvalid(reason)), false)
+            | (Err(EngineError::InputTooLarge(reason)), true) => reason,
+            _ => panic!("expected a refusal containing {expected:?}: {refused:?}"),
+        };
+        assert!(reason.contains(expected), "{reason}");
+        assert!(
+            script.calls().is_empty(),
+            "no block ran: {:?}",
+            script.calls()
+        );
+    }
+
+    let script = Arc::new(Script::default());
+    let outcome = engine(&script, InMemoryTraceSource::new(), 1)
+        .run(
+            Arc::clone(&spec),
+            BTreeMap::from([
+                (slot("x"), json_input(json!(1))),
+                (slot("policy"), file("pdf", 10)),
+            ]),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        .expect("conforming evidence runs");
+    assert_eq!(outcome.verdict, VerificationVerdict::Passed);
+}
+
 /// No requirements, or only not-applicable ones, is inconclusive.
 ///
 /// # Panics

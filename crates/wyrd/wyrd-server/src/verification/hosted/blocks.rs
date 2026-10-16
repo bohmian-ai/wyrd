@@ -95,7 +95,8 @@ impl HostedBlocks {
     /// Build the engine of one execution over `state`.
     ///
     /// The evidence reader, registry, code executor, built-in tools, and
-    /// gateway caller are all bound to `execution.caller`; Agent and Prompt
+    /// gateway caller are all bound to `execution.caller`; the evidence
+    /// reader also admits the pinned evidence before any block runs; Agent and Prompt
     /// Cards resolve through the caller's audited `card:read`, and every
     /// model call goes through the in-process gateway as that caller,
     /// attributed to `execution.subject`.
@@ -137,7 +138,7 @@ impl HostedBlocks {
         .with_route_overrides(execution.routes.clone());
         let blocks = Arc::new(Blocks {
             code: CodeExecutor::new(Arc::clone(&self.sandbox), Arc::clone(&evidence)),
-            evidence,
+            evidence: Arc::clone(&evidence),
             agent,
         });
         let traces = CallerTraces::new(state.clone(), caller.clone(), execution.accepted_at)?;
@@ -147,7 +148,8 @@ impl HostedBlocks {
             Arc::new(traces),
             STEP_CONCURRENCY,
         )
-        .with_drift(execution.drift))
+        .with_drift(execution.drift)
+        .with_evidence(evidence))
     }
 }
 

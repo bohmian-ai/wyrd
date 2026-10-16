@@ -1,9 +1,8 @@
 name: release
 
-# push to main = dry-run builds of the deliverables the change affects, chosen
-# by the same selector as lints-test (unknown impact builds every deliverable).
-# release published = every deliverable on every supported platform, built and
-# published from the release commit.
+# push to main = build every deliverable on every supported platform; publish
+# nothing.
+# release published = the same builds, then the publish jobs.
 # Each build job records the SHA-256 of its outputs after
 # its package checks pass; publication verifies those exact bytes, attests
 # their provenance for this commit, and fails closed on a missing record,
@@ -31,29 +30,6 @@ env:
   MISE_LOCKED: "true"
 
 jobs:
-  changes:
-    name: detect changes
-    if: github.event_name != 'release'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    outputs:
-      package_python: ${{ steps.filter.outputs.package_python }}
-      package_typescript: ${{ steps.filter.outputs.package_typescript }}
-      package_server: ${{ steps.filter.outputs.package_server }}
-      package_crates: ${{ steps.filter.outputs.package_crates }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Detect affected deliverables
-        id: filter
-        shell: bash
-        env:
-          WYRD_CHANGE_BASE: ${{ github.event.before }}
-          WYRD_CHANGE_HEAD: ${{ github.sha }}
-        run: .github/scripts/detect-changes.sh
-
   # ── Release commit ─────────────────────────────────────────────────────────
 
   # The release's one approval: every publish job needs this job, and the
@@ -83,8 +59,6 @@ jobs:
 
   build-sdist:
     name: python sdist
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_python == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -125,8 +99,6 @@ jobs:
 
   build-linux:
     name: python - ${{ matrix.target }}
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_python == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -193,8 +165,6 @@ jobs:
 
   build-macos:
     name: python - ${{ matrix.target }}
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_python == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -244,7 +214,6 @@ jobs:
   inspect-wheels:
     name: inspect wheels
     needs: [build-sdist, build-linux, build-macos]
-    if: ${{ !cancelled() && !failure() && needs.build-sdist.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -257,7 +226,6 @@ jobs:
   test-wheels:
     name: smoke - ${{ matrix.os }}
     needs: [build-sdist, build-linux, build-macos]
-    if: ${{ !cancelled() && !failure() && needs.build-sdist.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -288,8 +256,7 @@ jobs:
 
   publish-pypi:
     name: publish python
-    # The skipped `changes` job would skip this through the implicit success().
-    if: ${{ !cancelled() && !failure() && github.event_name == 'release' }}
+    if: github.event_name == 'release'
     needs: [release-commit, test-wheels]
     runs-on: ubuntu-latest
     environment: release
@@ -342,8 +309,6 @@ jobs:
 
   build-typescript:
     name: typescript - ${{ matrix.target }}
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_typescript == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -445,8 +410,7 @@ jobs:
   # after the four platform addons it optionally depends on.
   publish-npm:
     name: publish typescript
-    # The skipped `changes` job would skip this through the implicit success().
-    if: ${{ !cancelled() && !failure() && github.event_name == 'release' }}
+    if: github.event_name == 'release'
     needs: [release-commit, build-typescript]
     runs-on: ubuntu-latest
     environment: release
@@ -498,8 +462,6 @@ jobs:
   # for the ubuntu and debian images, rockylinux:9 for rocky.
   build-server:
     name: server - ${{ matrix.bundle }}
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_server == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -572,8 +534,7 @@ jobs:
   # on an arm runner, not under emulation.
   publish-docker:
     name: docker - ${{ matrix.distro }}-${{ matrix.arch }}
-    # The skipped `changes` job would skip this through the implicit success().
-    if: ${{ !cancelled() && !failure() && github.event_name == 'release' }}
+    if: github.event_name == 'release'
     needs: [release-commit, build-server]
     runs-on: ${{ matrix.runner }}
     environment: release
@@ -664,8 +625,7 @@ jobs:
   # distro, and the ubuntu image as the bare version and latest.
   publish-docker-manifests:
     name: docker manifests
-    # The skipped `changes` job would skip this through the implicit success().
-    if: ${{ !cancelled() && !failure() && github.event_name == 'release' }}
+    if: github.event_name == 'release'
     needs: publish-docker
     runs-on: ubuntu-24.04
     environment: release
@@ -695,8 +655,7 @@ jobs:
 
   publish-binaries:
     name: publish binaries
-    # The skipped `changes` job would skip this through the implicit success().
-    if: ${{ !cancelled() && !failure() && github.event_name == 'release' }}
+    if: github.event_name == 'release'
     needs: [release-commit, build-server]
     runs-on: ubuntu-latest
     environment: release
@@ -750,8 +709,6 @@ jobs:
 
   package-crates:
     name: rust crate package
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_crates == 'true') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -777,8 +734,7 @@ jobs:
 
   publish-crates:
     name: publish rust crates
-    # The skipped `changes` job would skip this through the implicit success().
-    if: ${{ !cancelled() && !failure() && github.event_name == 'release' }}
+    if: github.event_name == 'release'
     needs: [release-commit, package-crates, test-wheels, build-server]
     runs-on: ubuntu-24.04
     environment: release

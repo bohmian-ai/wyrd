@@ -172,14 +172,6 @@ def ci_jobs(sel, outputs):
     return jobs
 
 
-def published_crates(root):
-    """Return the crates release-plz.toml opts in to crates.io publishing."""
-    with open(os.path.join(root, "release-plz.toml"), "rb") as manifest:
-        return {
-            p["name"] for p in tomllib.load(manifest)["package"] if p.get("publish")
-        }
-
-
 def read_metadata(root):
     """Load the workspace graph without resolving registry dependencies."""
     override = os.environ.get("WYRD_CARGO_METADATA")
@@ -388,14 +380,8 @@ def select(paths, root):
     if hits := sorted(affected.keys() & IDENTITY_PACKAGES):
         sel.flag("identity", f"{hits[0]} is on the identity server boundary")
 
-    if "wyrd-sdk-python" in shipped or python:
-        sel.flag("package_python", "the Python package contents are affected")
-    if shipped & {"wyrd-sdk-ts"} or typescript:
-        sel.flag("package_typescript", "the TypeScript addon contents are affected")
     if "wyrd-server" in shipped:
         sel.flag("package_server", "the server binary is affected")
-    if shipped & published_crates(root):
-        sel.flag("package_crates", "a published crate is affected")
     return sel, outputs
 
 
@@ -431,10 +417,7 @@ def main():
         "rust_client",
         "storage",
         "identity",
-        "package_python",
-        "package_typescript",
         "package_server",
-        "package_crates",
     ]
     result = {
         "any": str(bool(paths)).lower(),

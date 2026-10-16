@@ -13,13 +13,12 @@ spec:
   prompt:
     provider: openai
     model: gpt-6-luna
+    system: |
+      You check refund decision letters against this refund policy:
+      1. Refunds of up to 100 dollars are approved within 30 days of purchase.
+      2. Larger refunds need a manager's approval.
+      Cite the lines of the letter your judgment rests on.
     messages:
-      - role: system
-        content: |
-          You check refund decision letters against this refund policy:
-          1. Refunds of up to 100 dollars are approved within 30 days of purchase.
-          2. Larger refunds need a manager's approval.
-          Cite the lines of the letter your judgment rests on.
       - role: user
         content: "Claim: {{claim}}. Letter: {{letter}}"
     response_format:

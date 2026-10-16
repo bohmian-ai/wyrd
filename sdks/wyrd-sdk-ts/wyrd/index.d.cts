@@ -666,8 +666,10 @@ export declare class NativeRun {
    */
   verify(verifier: string, inputs: Array<NativeVerifierInput>): Promise<NativeLifecycleResult>
   /**
-   * Submits slot values: Window samples are recorded, Run evidence
-   * is queued for one execution.
+   * Submits slot values: Window samples are recorded now on the
+   * JavaScript thread, so each queued sample write records its
+   * `bifrost.enqueue` PRODUCER span in Node's tracer; Run evidence is
+   * queued for one execution.
    *
    * # Errors
    *

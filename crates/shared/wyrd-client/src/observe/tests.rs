@@ -1149,6 +1149,74 @@ async fn wait_raises_terminal_errors_and_times_out_without_a_result() {
     assert_eq!(error.as_problem_json()["details"]["last_status"], "running");
 }
 
+/// The caller's deadline bounds the whole status read: a completed result
+/// that arrives after it, or a read stuck retrying 503s, still times out on
+/// time, and a zero budget starts no read at all.
+///
+/// # Panics
+/// Panics when a late result beats the deadline, a wait outlives it, or a
+/// zero-budget wait sends a request.
+#[tokio::test]
+async fn wait_deadline_bounds_slow_reads_and_starts_no_read_after_expiry() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let client = bearer_client(server.uri(), 10_000);
+    let [late, unavailable, unread] =
+        std::array::from_fn(|_| wyrd_spec::ids::ExecutionId::new_v7());
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/verification/executions/{late}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "execution_id": late, "status": "completed", "result": result_body(&late),
+                }))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/verification/executions/{unavailable}")))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    for id in [late, unavailable] {
+        let started = tokio::time::Instant::now();
+        let error = crate::verify::Execution::connect_with(id, &client)
+            .await
+            .expect("a bearer client connects without a request")
+            .wait(Duration::from_millis(200))
+            .await
+            .expect_err("the deadline wins");
+        assert_eq!(error.code(), "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait outlived its deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    let error = crate::verify::Execution::connect_with(unread, &client)
+        .await
+        .expect("a bearer client connects without a request")
+        .wait(Duration::ZERO)
+        .await
+        .expect_err("an expired budget times out");
+    assert_eq!(error.code(), "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT");
+    let unread_path = format!("/v1/verification/executions/{unread}");
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests recorded")
+            .iter()
+            .all(|request| request.url.path() != unread_path),
+        "no read starts after expiry"
+    );
+}
+
 /// A direct execution waits past a shorter configured `timeout_ms` so the
 /// server's own deadline answer reaches the caller, sent once.
 ///

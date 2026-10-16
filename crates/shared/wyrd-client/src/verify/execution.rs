@@ -89,7 +89,10 @@ impl Execution {
     /// Poll until the execution yields a result, fails, or `timeout` passes.
     ///
     /// Polls back off from 100 ms to at most 2 s and never sleep past the
-    /// deadline. Not-found and server-unavailable reads are retried until
+    /// deadline. The deadline also bounds each status read, including its
+    /// credential resolution, transport retries, and body decoding, and no
+    /// read starts once it has passed, so a zero `timeout` reads nothing.
+    /// Not-found and server-unavailable reads are retried until
     /// then, since a staged submission becomes visible only after the queue
     /// accepts it. A completed execution whose result is not visible yet
     /// keeps being polled: a result is never invented from a status.
@@ -110,7 +113,18 @@ impl Execution {
         let mut pause = FIRST_POLL;
         let mut last = None;
         loop {
-            match self.status().await {
+            let read = if Instant::now() < deadline {
+                tokio::time::timeout_at(deadline, self.status()).await.ok()
+            } else {
+                None
+            };
+            let Some(read) = read else {
+                return Err(WyrdError::SdkVerificationWaitTimedOut {
+                    message: format!("execution {} did not settle within {timeout:?}", self.id),
+                    details: json!({ "execution_id": self.id, "last_status": last }),
+                });
+            };
+            match read {
                 Ok(state) => match (state.status, state.result, state.error) {
                     (_, Some(result), _) => return Ok(result),
                     (
@@ -134,14 +148,7 @@ impl Execution {
                 Err(error) if error.status() == 404 || error.status() >= 500 => {}
                 Err(error) => return Err(error),
             }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(WyrdError::SdkVerificationWaitTimedOut {
-                    message: format!("execution {} did not settle within {timeout:?}", self.id),
-                    details: json!({ "execution_id": self.id, "last_status": last }),
-                });
-            }
-            tokio::time::sleep(pause.min(deadline - now)).await;
+            tokio::time::sleep_until(deadline.min(Instant::now() + pause)).await;
             pause = (pause * 2).min(MAX_POLL);
         }
     }

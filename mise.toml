@@ -842,9 +842,9 @@ description = "Build the hardened Monty worker the server spawns for sandboxed V
 run = "cargo build --release --locked -p wyrd-monty-worker"
 
 [tasks."test:verification:sandbox"]
-description = "Run the Verifier Python sandbox tests against the real hardened Monty worker"
+description = "Run the Verifier Python sandbox and registered-Artifact code tests against the real Monty worker and test Postgres"
 depends = ["build:monty-worker"]
-run = "cargo nextest run --locked -p wyrd-server --test integration --run-ignored=only -E 'test(/^sandbox_worker::/)'"
+run = "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-server --test integration --run-ignored=only -E 'test(/^(sandbox_worker|pg_hosted_artifacts)::/)'"
 
 [tasks."test:server:startup"]
 description = "Official image journeys: the development setup, then the team deployment"

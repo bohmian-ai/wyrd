@@ -4,8 +4,6 @@
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde_json::json;
-use wyrd_storage::handle::StorageHandle;
-use wyrd_storage::local::LocalSigner;
 
 use super::super::extract::tests::{docx, ooxml, pdf};
 use super::*;
@@ -352,42 +350,4 @@ fn workspace_refuses_bad_paths_and_limits() {
     assert!(workspace.read("/work/link.txt", 0).is_err());
     assert!(workspace.read("/work/../inputs/img.png", 0).is_err());
     assert!(workspace.list("/etc").is_err());
-}
-
-/// Dropping a workspace removes its directory and returns its admission.
-///
-/// # Panics
-/// Panics when the directory or permit outlives the workspace.
-#[tokio::test]
-async fn workspace_cleans_up_on_drop() {
-    let root = tempfile::tempdir().expect("temp dir");
-    let storage = Arc::new(StorageHandle::new(
-        LocalSigner::new(root.path().to_path_buf()).expect("local signer"),
-    ));
-    let limits = HostedLimits {
-        max_workspaces: 1,
-        ..HostedLimits::default()
-    };
-    let evidence = TenantEvidence::new(
-        storage,
-        wyrd_spec::DataTenantId::new_v7(),
-        BTreeMap::new(),
-        limits,
-    );
-    let workspaces = Workspaces::new(limits);
-    let files = BTreeMap::from([(
-        "/inputs/a.json".to_owned(),
-        CallInput {
-            value: CallValue::Json(json!({"a": 1})),
-            sources: BTreeSet::new(),
-        },
-    )]);
-
-    let workspace = workspaces.open(&files, &evidence).await.expect("opens");
-    let dir = workspace.inputs_dir();
-    assert!(dir.join("a.json").is_file());
-    assert_eq!(workspaces.permits.available_permits(), 0);
-    drop(workspace);
-    assert!(!dir.exists());
-    assert_eq!(workspaces.permits.available_permits(), 1);
 }

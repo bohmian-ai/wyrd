@@ -22,7 +22,7 @@ const NEEDS_WORKER: &str = "needs the Monty worker; run `mise run test:verificat
 ///
 /// # Panics
 /// Panics when the binary is missing.
-fn worker() -> PathBuf {
+pub(crate) fn worker() -> PathBuf {
     let path = std::env::var_os("WYRD_VERIFICATION_MONTY_WORKER").map_or_else(
         || {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))

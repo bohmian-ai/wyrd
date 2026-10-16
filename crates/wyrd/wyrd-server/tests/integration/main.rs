@@ -13,6 +13,8 @@ mod pg_card_registration_route;
 #[cfg(feature = "test-support")]
 mod pg_grpc_ingest_smoke;
 mod pg_grpc_smoke;
+/// Registered Artifact evidence and code through the hosted runtime.
+mod pg_hosted_artifacts;
 mod pg_merge_http_protected;
 mod pg_openapi_contract;
 mod pg_operator_connection_routes;

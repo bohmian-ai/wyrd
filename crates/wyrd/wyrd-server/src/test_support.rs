@@ -185,3 +185,34 @@ pub(crate) fn test_pool() -> sqlx::PgPool {
 pub(crate) fn test_tenant() -> wyrd_spec::DataTenantId {
     shared().fixture.data_tenant_id()
 }
+
+/// Server state over the shared fixture's Postgres, storage, and catalog.
+///
+/// # Panics
+/// Panics when the shared fixture cannot start.
+pub(crate) async fn test_state() -> AppState {
+    test_app_state(test_server_postgres(), test_storage(), test_catalog().await)
+}
+
+/// A fresh user in the fixture tenant holding exactly `permissions`.
+///
+/// # Panics
+/// Panics when the shared fixture tenant cannot be resolved.
+pub(crate) fn test_caller(
+    permissions: impl IntoIterator<Item = wyrd_runtime::Permission>,
+) -> crate::components::auth::Caller {
+    let tenant = test_tenant();
+    crate::components::auth::Caller {
+        data_tenant_id: tenant,
+        principal: wyrd_runtime::Principal::new(
+            wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+            wyrd_runtime::PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            wyrd_runtime::permission::PermissionSet::from_iter(permissions),
+        ),
+        request_id: wyrd_spec::request_id::RequestId::now_v7(),
+        delegation_chain: Vec::new(),
+        executed_by: None,
+    }
+}

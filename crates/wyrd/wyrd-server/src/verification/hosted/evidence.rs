@@ -1,16 +1,18 @@
 //! Pinned original evidence read from the execution tenant's storage.
 //!
-//! [`TenantEvidence`] is the one byte reader for file evidence and the one
-//! citation validator over an execution's pinned input slots. It reads
-//! `<tenant>/evidence/sha256/<digest>` bounded by the declared length and the
-//! file limit, and returns bytes only when their length, SHA-256, and sniffed
-//! format all match the declaration, so a mismatched file can never feed a
-//! pass. Extraction, workspaces, citations, and native media all read through
+//! [`TenantEvidence`] is the one byte reader for file evidence, registered
+//! Artifact files, and Artifact code, and the one citation validator over an
+//! execution's pinned input slots. A file is read from
+//! `<tenant>/evidence/sha256/<digest>`; an Artifact file is resolved through
+//! the registry's authorized, audited Card read and its server-owned
+//! inventory. Either read is bounded by the expected length and the file
+//! limit and returns bytes only when their length and SHA-256 match, and
+//! evidence also only when its sniffed format matches, so a mismatched file
+//! can never feed a pass. Extraction, workspaces, citations, and native media all read through
 //! it; it is also the Agent executor's [`EvidenceReader`] and the `extract`
 //! action's [`ActionExecutor`].
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -18,24 +20,31 @@ use skald_spec::{MediaFormat, MediaRef, MediaSource};
 use vala_eval::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallValue, EvidenceReader,
 };
-use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::blocks::Action;
+use wyrd_spec::envelope::CardKind;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
+use wyrd_spec::reference::CardRef;
 use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
 use wyrd_storage::error::StorageError;
-use wyrd_storage::handle::StorageHandle;
-use wyrd_storage::tenant_path;
+use wyrd_storage::tenant_path::{self, ValidatedPath};
 
 use super::HostedLimits;
 use super::extract::{EXTRACT_VERSION, Extraction, locates, units};
+use crate::components::auth::Caller;
+use crate::components::cards::routes::get_card_by_ref_for;
+use crate::components::cards::service::list_card_artifacts;
+use crate::state::AppState;
 
 /// Reads one execution's pinned evidence from its tenant's storage.
 pub struct TenantEvidence {
-    /// The server's storage handle.
-    storage: Arc<StorageHandle>,
-    /// Tenant whose evidence namespace every read uses.
-    tenant: DataTenantId,
+    /// Server state: the storage every read uses and the registry Artifact
+    /// reads resolve against.
+    state: AppState,
+    /// The authority every Artifact read is authorized and audited under;
+    /// its tenant is the evidence namespace.
+    caller: Caller,
     /// The execution's pinned input declarations, the only citable sources.
     slots: BTreeMap<SlotName, InputDeclaration>,
     /// File limits in force.
@@ -43,18 +52,18 @@ pub struct TenantEvidence {
 }
 
 impl TenantEvidence {
-    /// A reader of `tenant`'s evidence in `storage` whose citable sources
-    /// are the execution's pinned `slots`, under `limits`.
+    /// A reader of `caller`'s tenant evidence whose citable sources are the
+    /// execution's pinned `slots`, under `limits`.
     #[must_use]
     pub const fn new(
-        storage: Arc<StorageHandle>,
-        tenant: DataTenantId,
+        state: AppState,
+        caller: Caller,
         slots: BTreeMap<SlotName, InputDeclaration>,
         limits: HostedLimits,
     ) -> Self {
         Self {
-            storage,
-            tenant,
+            state,
+            caller,
             slots,
             limits,
         }
@@ -100,49 +109,154 @@ impl TenantEvidence {
         Ok(extracted.ok())
     }
 
-    /// The verified bytes and format of file `evidence`.
+    /// The verified bytes and format of file or Artifact `evidence`.
     ///
-    /// The declared length is checked against the file limit and the stored
-    /// object's length before the bounded read; the body's length, digest,
-    /// and sniffed format are checked after it.
+    /// A file is the tenant's pinned evidence object; an Artifact file is
+    /// loaded through [`Self::artifact`] and takes its format from its
+    /// stored content type. Either way the sniffed format must match.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a non-file declaration, a file
-    /// over the limit, an absent object, or any length, digest, or format
-    /// mismatch, and [`BlockError::Retryable`] for another storage failure.
+    /// Returns [`BlockError::Terminal`] for JSON or trace evidence, an
+    /// Artifact file with no supported content type, a format mismatch,
+    /// and [`Self::stored`] and [`Self::artifact`] refusals;
+    /// [`BlockError::Retryable`] for a transient storage or registry
+    /// failure.
     pub async fn read(
         &self,
         evidence: &InputDeclaration,
     ) -> Result<(Vec<u8>, MediaFormat), BlockError> {
-        let InputDeclaration::File {
-            sha256,
-            size_bytes,
-            format,
-            ..
-        } = evidence
-        else {
-            return Err(terminal("only uploaded file evidence has readable bytes"));
+        let (bytes, format) = match evidence {
+            InputDeclaration::File {
+                sha256,
+                size_bytes,
+                format,
+                ..
+            } => {
+                let path = tenant_path::evidence(self.caller.data_tenant_id, sha256);
+                (self.stored(&path, *size_bytes, sha256).await?, *format)
+            }
+            InputDeclaration::Artifact { artifact, path } => {
+                let (bytes, format) = self.artifact(artifact, path.as_deref()).await?;
+                let format = format.ok_or_else(|| {
+                    terminal("the Artifact file has no supported media content type")
+                })?;
+                (bytes, format)
+            }
+            InputDeclaration::Json { .. } | InputDeclaration::Trace { .. } => {
+                return Err(terminal(
+                    "only file and Artifact evidence have readable bytes",
+                ));
+            }
         };
-        if *size_bytes > self.limits.file_max_bytes {
+        if !sniffs_as(&bytes, format) {
+            return Err(BlockError::Terminal {
+                reason: format!("the file content is not {format}"),
+            });
+        }
+        Ok((bytes, format))
+    }
+
+    /// The verified bytes of one file of exact Artifact `card`, and the
+    /// media format its stored content type names.
+    ///
+    /// The Card is resolved through the registry's own authorized read, so
+    /// the caller's `card:read` decision is checked and audited and a
+    /// mismatched UID is refused. The file comes from the Card's
+    /// server-authoritative inventory: `path` names it, or the Artifact must
+    /// hold exactly one. Its bytes are then read through [`Self::stored`]
+    /// against the inventory's size and digest. Code sources and evidence
+    /// share this one loader.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] for a non-Artifact reference, a
+    /// refused or missing Card, a path the inventory does not hold, a
+    /// malformed inventory row, and [`Self::stored`] refusals;
+    /// [`BlockError::Retryable`] when the registry or storage is
+    /// unavailable.
+    pub async fn artifact(
+        &self,
+        card: &CardRef,
+        path: Option<&str>,
+    ) -> Result<(Vec<u8>, Option<MediaFormat>), BlockError> {
+        if card.kind != CardKind::Artifact {
+            return Err(terminal("the reference does not name an Artifact Card"));
+        }
+        let resolved = get_card_by_ref_for(&self.state, &self.caller, card)
+            .await
+            .map_err(|error| registry(&error))?;
+        let uid = resolved
+            .card
+            .metadata
+            .uid
+            .ok_or_else(|| terminal("the Artifact Card has no UID"))?;
+        let inventory = list_card_artifacts(&self.state, &self.caller, &uid)
+            .await
+            .map_err(|error| registry(&error))?
+            .artifacts;
+        let entry = match (path, inventory.as_slice()) {
+            (Some(path), entries) => entries
+                .iter()
+                .find(|entry| entry.relative_path.as_str() == path),
+            (None, [only]) => Some(only),
+            (None, _) => None,
+        }
+        .ok_or_else(|| terminal("the Artifact holds no such file; name one of its paths"))?;
+        let size = u64::try_from(entry.size_bytes)
+            .map_err(|_| terminal("the Artifact file has a negative stored size"))?;
+        let sha256 = base64::engine::general_purpose::STANDARD
+            .decode(&entry.sha256)
+            .ok()
+            .and_then(|digest| Sha256Hex::new(&hex::encode(digest)).ok())
+            .ok_or_else(|| terminal("the Artifact file has a malformed stored digest"))?;
+        let tenant = self.caller.data_tenant_id;
+        let object = tenant_path::validate(
+            &tenant_path::build(tenant, uid.as_str(), entry.relative_path.as_str()),
+            tenant,
+        )
+        .map_err(|_| terminal("the Artifact file path is not a valid tenant path"))?;
+        let bytes = self.stored(&object, size, &sha256).await?;
+        let format = entry
+            .content_type
+            .as_deref()
+            .and_then(|mime| mime.parse().ok());
+        Ok((bytes, format))
+    }
+
+    /// The bytes of stored object `path`, which must be `size` bytes long
+    /// and hash to `sha256`.
+    ///
+    /// The size is checked against the file limit and the stored object's
+    /// length before the read, which is bounded by `size`; the body's
+    /// length and digest are checked after it.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] for a file over the limit, an
+    /// absent object, or a length or digest mismatch, and
+    /// [`BlockError::Retryable`] for another storage failure.
+    async fn stored(
+        &self,
+        path: &ValidatedPath,
+        size: u64,
+        sha256: &Sha256Hex,
+    ) -> Result<Vec<u8>, BlockError> {
+        if size > self.limits.file_max_bytes {
             return Err(terminal("the file exceeds the input file limit"));
         }
-        let path = tenant_path::evidence(self.tenant, sha256);
-        let stored = self
-            .storage
-            .object_len(&path)
+        let storage = &self.state.storage;
+        let stored = storage
+            .object_len(path)
             .await
             .map_err(|error| self.failed(&error))?;
-        if stored != *size_bytes {
+        if stored != size {
             return Err(terminal(
                 "the stored file length does not match its declaration",
             ));
         }
-        let bytes = self
-            .storage
-            .get_object_bounded(&path, *size_bytes)
+        let bytes = storage
+            .get_object_bounded(path, size)
             .await
             .map_err(|error| self.failed(&error))?;
-        if u64::try_from(bytes.len()).ok() != Some(*size_bytes) {
+        if u64::try_from(bytes.len()).ok() != Some(size) {
             return Err(terminal(
                 "the stored file length does not match its declaration",
             ));
@@ -152,12 +266,7 @@ impl TenantEvidence {
                 "the stored file digest does not match its declaration",
             ));
         }
-        if !sniffs_as(&bytes, *format) {
-            return Err(BlockError::Terminal {
-                reason: format!("the file content is not {format}"),
-            });
-        }
-        Ok((bytes, *format))
+        Ok(bytes)
     }
 
     /// Classify a storage failure without exposing its key or backend text.
@@ -165,7 +274,7 @@ impl TenantEvidence {
         if matches!(error, StorageError::ObjectNotFound { .. }) {
             return terminal("the evidence file was never uploaded");
         }
-        tracing::warn!(backend = ?self.storage.backend(), "verification evidence read failed");
+        tracing::warn!(backend = ?self.state.storage.backend(), "verification evidence read failed");
         BlockError::Retryable {
             reason: "the evidence storage read failed".to_owned(),
         }
@@ -303,6 +412,17 @@ pub fn sniffs_as(bytes: &[u8], format: MediaFormat) -> bool {
     }
 }
 
+/// Classify a registry refusal: server-side failures may pass, anything
+/// the caller could fix or lacks permission for is terminal.
+fn registry(error: &WyrdError) -> BlockError {
+    let reason = format!("the Artifact cannot be read: {error}");
+    if error.status() >= 500 {
+        BlockError::Retryable { reason }
+    } else {
+        BlockError::Terminal { reason }
+    }
+}
+
 /// A terminal error with fixed `reason`.
 fn terminal(reason: &str) -> BlockError {
     BlockError::Terminal {
@@ -311,32 +431,55 @@ fn terminal(reason: &str) -> BlockError {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     //! Pinned evidence reads accept only exact, matching files.
+    //!
+    //! The reader owns server state, so these run over the shared Postgres
+    //! fixture on the process-wide runtime.
+
+    use std::future::Future;
 
     use vala_eval::blocks::{CallInput, Position};
     use wyrd_spec::vala::eval::TaskId;
-    use wyrd_storage::local::LocalSigner;
 
     use super::*;
+    use crate::test_support::{test_caller, test_state, test_tenant};
 
-    /// Evidence over a fresh local store holding `bytes` under their digest.
-    async fn stored(bytes: &[u8]) -> (tempfile::TempDir, TenantEvidence, Sha256Hex) {
-        let root = tempfile::tempdir().expect("temp dir");
-        let storage = Arc::new(StorageHandle::new(
-            LocalSigner::new(root.path().to_path_buf()).expect("local signer"),
-        ));
-        let tenant = DataTenantId::new_v7();
+    /// Drive `test` on the process-wide runtime the fixture's pool lives on.
+    fn run(test: impl Future<Output = ()>) {
+        wyrd_runtime::runtime().block_on(test);
+    }
+
+    /// Store `bytes` as fixture-tenant evidence and return their digest.
+    ///
+    /// # Panics
+    /// Panics when the write fails.
+    async fn put(bytes: &[u8]) -> Sha256Hex {
         let sha256 = Sha256Hex::digest(bytes);
-        storage
-            .put_object(&tenant_path::evidence(tenant, &sha256), bytes.to_vec())
+        crate::test_support::test_storage()
+            .put_object(
+                &tenant_path::evidence(test_tenant(), &sha256),
+                bytes.to_vec(),
+            )
             .await
             .expect("the evidence writes");
-        (
-            root,
-            TenantEvidence::new(storage, tenant, BTreeMap::new(), HostedLimits::default()),
-            sha256,
+        sha256
+    }
+
+    /// Evidence citing `slots` read by a caller with no grants.
+    async fn reader(slots: BTreeMap<SlotName, InputDeclaration>) -> TenantEvidence {
+        TenantEvidence::new(
+            test_state().await,
+            test_caller([]),
+            slots,
+            HostedLimits::default(),
         )
+    }
+
+    /// Evidence over the fixture tenant holding `bytes` under their digest.
+    async fn stored(bytes: &[u8]) -> (TenantEvidence, Sha256Hex) {
+        let sha256 = put(bytes).await;
+        (reader(BTreeMap::new()).await, sha256)
     }
 
     /// A file declaration.
@@ -354,46 +497,55 @@ mod tests {
     ///
     /// # Panics
     /// Panics when a mismatched read succeeds.
-    #[tokio::test]
-    async fn evidence_reads_only_matching_files() {
-        let (_root, evidence, sha256) = stored(b"%PDF-1.5 body").await;
-        let (bytes, format) = evidence
-            .read(&file(sha256, 13, MediaFormat::Pdf))
-            .await
-            .expect("the pinned file reads");
-        assert_eq!(
-            (bytes.as_slice(), format),
-            (&b"%PDF-1.5 body"[..], MediaFormat::Pdf)
-        );
+    #[test]
+    fn evidence_reads_only_matching_files() {
+        run(async {
+            let (evidence, sha256) = stored(b"%PDF-1.5 body").await;
+            let (bytes, format) = evidence
+                .read(&file(sha256, 13, MediaFormat::Pdf))
+                .await
+                .expect("the pinned file reads");
+            assert_eq!(
+                (bytes.as_slice(), format),
+                (&b"%PDF-1.5 body"[..], MediaFormat::Pdf)
+            );
 
-        for declaration in [
-            file(sha256, 12, MediaFormat::Pdf),
-            file(sha256, 13, MediaFormat::Png),
-            file(Sha256Hex::digest(b"other"), 13, MediaFormat::Pdf),
-            file(sha256, 21 * 1024 * 1024, MediaFormat::Pdf),
-            InputDeclaration::Json {
-                value: serde_json::json!(1),
-            },
-        ] {
-            let error = evidence.read(&declaration).await.expect_err("refused");
-            assert!(matches!(error, BlockError::Terminal { .. }), "{error}");
-        }
+            for declaration in [
+                file(sha256, 12, MediaFormat::Pdf),
+                file(sha256, 13, MediaFormat::Png),
+                file(Sha256Hex::digest(b"other"), 13, MediaFormat::Pdf),
+                file(sha256, 21 * 1024 * 1024, MediaFormat::Pdf),
+                InputDeclaration::Json {
+                    value: serde_json::json!(1),
+                },
+            ] {
+                let error = evidence.read(&declaration).await.expect_err("refused");
+                assert!(matches!(error, BlockError::Terminal { .. }), "{error}");
+            }
+        });
     }
 
     /// A stored body whose digest differs from its key is refused.
     ///
     /// # Panics
     /// Panics when the tampered body reads.
-    #[tokio::test]
-    async fn evidence_refuses_tampered_body() {
-        let (root, evidence, sha256) = stored(b"hello").await;
-        let key = tenant_path::evidence(evidence.tenant, &sha256).full;
-        std::fs::write(root.path().join(key), b"jello").expect("tamper");
-        let error = evidence
-            .read(&file(sha256, 5, MediaFormat::Text))
-            .await
-            .expect_err("digest mismatch");
-        assert!(error.to_string().contains("digest"), "{error}");
+    #[test]
+    fn evidence_refuses_tampered_body() {
+        run(async {
+            let (evidence, sha256) = stored(b"hello").await;
+            crate::test_support::test_storage()
+                .put_object(
+                    &tenant_path::evidence(test_tenant(), &sha256),
+                    b"jello".to_vec(),
+                )
+                .await
+                .expect("tamper");
+            let error = evidence
+                .read(&file(sha256, 5, MediaFormat::Text))
+                .await
+                .expect_err("digest mismatch");
+            assert!(error.to_string().contains("digest"), "{error}");
+        });
     }
 
     /// Native media is base64 with the format's MIME type; non-native
@@ -401,27 +553,29 @@ mod tests {
     ///
     /// # Panics
     /// Panics when media binding differs.
-    #[tokio::test]
-    async fn evidence_binds_native_media_only() {
-        let (_root, evidence, sha256) = stored(b"%PDF-1.5").await;
-        let media = evidence
-            .media(&file(sha256, 8, MediaFormat::Pdf))
-            .await
-            .expect("pdf is native");
-        assert_eq!(
-            media.source,
-            MediaSource::Base64 {
-                mime_type: "application/pdf".to_owned(),
-                data: "JVBERi0xLjU=".to_owned(),
-            }
-        );
-        let (_root, evidence, sha256) = stored(b"a,b").await;
-        assert!(
-            evidence
-                .media(&file(sha256, 3, MediaFormat::Csv))
+    #[test]
+    fn evidence_binds_native_media_only() {
+        run(async {
+            let (evidence, sha256) = stored(b"%PDF-1.5").await;
+            let media = evidence
+                .media(&file(sha256, 8, MediaFormat::Pdf))
                 .await
-                .is_err()
-        );
+                .expect("pdf is native");
+            assert_eq!(
+                media.source,
+                MediaSource::Base64 {
+                    mime_type: "application/pdf".to_owned(),
+                    data: "JVBERi0xLjU=".to_owned(),
+                }
+            );
+            let (evidence, sha256) = stored(b"a,b").await;
+            assert!(
+                evidence
+                    .media(&file(sha256, 3, MediaFormat::Csv))
+                    .await
+                    .is_err()
+            );
+        });
     }
 
     /// `extract` reads `from` evidence and returns the locked shape with
@@ -429,48 +583,51 @@ mod tests {
     ///
     /// # Panics
     /// Panics when the output or provenance differs.
-    #[tokio::test]
-    async fn extract_action_returns_locked_shape() {
-        let (_root, evidence, sha256) = stored(b"a,b\n1,2").await;
-        let id = TaskId::new("pull").expect("task id");
-        let block: Action =
-            serde_json::from_value(serde_json::json!({"kind": "extract", "from": "inputs.sheet"}))
-                .expect("extract action");
-        let call = |value| BlockCall {
-            id: &id,
-            position: Position::Step,
-            block: &block,
-            inputs: BTreeMap::from([(
-                "from".to_owned(),
-                CallInput {
-                    value,
-                    sources: std::collections::BTreeSet::new(),
-                },
-            )]),
-            workspace: BTreeMap::new(),
-            deadline: tokio::time::Instant::now(),
-        };
-        let output = ActionExecutor::execute(
-            &evidence,
-            call(CallValue::Evidence(file(sha256, 7, MediaFormat::Csv))),
-        )
-        .await
-        .expect("csv extracts");
-        assert_eq!(
-            output.output,
-            serde_json::json!({"format": "csv", "rows": [["a", "b"], ["1", "2"]]})
-        );
-        assert_eq!(
-            output.provenance,
-            Some(CallProvenance::Extract {
-                version: EXTRACT_VERSION.to_owned()
-            })
-        );
-        assert!(
-            ActionExecutor::execute(&evidence, call(CallValue::Json(serde_json::json!(1))))
-                .await
-                .is_err()
-        );
+    #[test]
+    fn extract_action_returns_locked_shape() {
+        run(async {
+            let (evidence, sha256) = stored(b"a,b\n1,2").await;
+            let id = TaskId::new("pull").expect("task id");
+            let block: Action = serde_json::from_value(
+                serde_json::json!({"kind": "extract", "from": "inputs.sheet"}),
+            )
+            .expect("extract action");
+            let call = |value| BlockCall {
+                id: &id,
+                position: Position::Step,
+                block: &block,
+                inputs: BTreeMap::from([(
+                    "from".to_owned(),
+                    CallInput {
+                        value,
+                        sources: std::collections::BTreeSet::new(),
+                    },
+                )]),
+                workspace: BTreeMap::new(),
+                deadline: tokio::time::Instant::now(),
+            };
+            let output = ActionExecutor::execute(
+                &evidence,
+                call(CallValue::Evidence(file(sha256, 7, MediaFormat::Csv))),
+            )
+            .await
+            .expect("csv extracts");
+            assert_eq!(
+                output.output,
+                serde_json::json!({"format": "csv", "rows": [["a", "b"], ["1", "2"]]})
+            );
+            assert_eq!(
+                output.provenance,
+                Some(CallProvenance::Extract {
+                    version: EXTRACT_VERSION.to_owned()
+                })
+            );
+            assert!(
+                ActionExecutor::execute(&evidence, call(CallValue::Json(serde_json::json!(1))))
+                    .await
+                    .is_err()
+            );
+        });
     }
 
     /// Only reachable, pinned slots with existing locations stay cited:
@@ -479,90 +636,83 @@ mod tests {
     ///
     /// # Panics
     /// Panics when a fabricated or unreachable citation survives.
-    #[tokio::test]
-    async fn citations_must_locate_reachable_evidence() {
-        let root = tempfile::tempdir().expect("temp dir");
-        let storage = Arc::new(StorageHandle::new(
-            LocalSigner::new(root.path().to_path_buf()).expect("local signer"),
-        ));
-        let tenant = DataTenantId::new_v7();
-        let mut slots = BTreeMap::new();
-        for (slot, bytes, format) in [
-            (
-                "deck",
-                super::super::extract::tests::pdf(&["one", "two"]),
-                MediaFormat::Pdf,
-            ),
-            (
-                "memo",
-                super::super::extract::tests::docx(),
-                MediaFormat::Docx,
-            ),
-            ("notes", b"alpha\nbeta\ngamma".to_vec(), MediaFormat::Text),
-        ] {
-            let sha256 = Sha256Hex::digest(&bytes);
-            storage
-                .put_object(&tenant_path::evidence(tenant, &sha256), bytes.clone())
-                .await
-                .expect("the evidence writes");
+    #[test]
+    fn citations_must_locate_reachable_evidence() {
+        run(async {
+            let mut slots = BTreeMap::new();
+            for (slot, bytes, format) in [
+                (
+                    "deck",
+                    super::super::extract::tests::pdf(&["one", "two"]),
+                    MediaFormat::Pdf,
+                ),
+                (
+                    "memo",
+                    super::super::extract::tests::docx(),
+                    MediaFormat::Docx,
+                ),
+                ("notes", b"alpha\nbeta\ngamma".to_vec(), MediaFormat::Text),
+            ] {
+                let sha256 = put(&bytes).await;
+                slots.insert(
+                    SlotName::new(slot).expect("slot"),
+                    file(sha256, bytes.len() as u64, format),
+                );
+            }
             slots.insert(
-                SlotName::new(slot).expect("slot"),
-                file(sha256, bytes.len() as u64, format),
-            );
-        }
-        slots.insert(
-            SlotName::new("facts").expect("slot"),
-            InputDeclaration::Json {
-                value: serde_json::json!({"rows": [{"days": 30}]}),
-            },
-        );
-        let evidence = TenantEvidence::new(storage, tenant, slots, HostedLimits::default());
-        let cite = |slot: &str, locator: Locator| Citation {
-            slot: SlotName::new(slot).expect("slot"),
-            locator,
-        };
-        let valid = vec![
-            cite("deck", Locator::Page(2)),
-            cite(
-                "deck",
-                Locator::Region {
-                    page: 1,
-                    x: 0.0,
-                    y: 0.0,
-                    width: 10.0,
-                    height: 10.0,
+                SlotName::new("facts").expect("slot"),
+                InputDeclaration::Json {
+                    value: serde_json::json!({"rows": [{"days": 30}]}),
                 },
-            ),
-            cite("notes", Locator::Lines { start: 2, end: 3 }),
-            cite("facts", Locator::JsonPointer("/rows/0/days".to_owned())),
-            cite("facts", Locator::JsonPointer("/rows/0".to_owned())),
-            cite("memo", Locator::JsonPointer("/blocks/0/text".to_owned())),
-        ];
-        let invalid = vec![
-            cite("deck", Locator::Page(3)),
-            cite("deck", Locator::Slide(1)),
-            cite("notes", Locator::Lines { start: 3, end: 4 }),
-            cite("notes", Locator::Lines { start: 0, end: 1 }),
-            cite("facts", Locator::JsonPointer("/rows/1".to_owned())),
-            cite("facts", Locator::JsonPointer("/ro".to_owned())),
-            cite("memo", Locator::JsonPointer("/format".to_owned())),
-            cite("ghost", Locator::Page(1)),
-        ];
-        let reachable: BTreeSet<SlotName> = ["deck", "memo", "notes", "facts", "ghost"]
-            .into_iter()
-            .map(|slot| SlotName::new(slot).expect("slot"))
-            .collect();
-        let mut all = valid.clone();
-        all.extend(invalid);
-        assert_eq!(evidence.cited(&reachable, all).await.expect("cited"), valid);
+            );
+            let evidence = reader(slots).await;
+            let cite = |slot: &str, locator: Locator| Citation {
+                slot: SlotName::new(slot).expect("slot"),
+                locator,
+            };
+            let valid = vec![
+                cite("deck", Locator::Page(2)),
+                cite(
+                    "deck",
+                    Locator::Region {
+                        page: 1,
+                        x: 0.0,
+                        y: 0.0,
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                ),
+                cite("notes", Locator::Lines { start: 2, end: 3 }),
+                cite("facts", Locator::JsonPointer("/rows/0/days".to_owned())),
+                cite("facts", Locator::JsonPointer("/rows/0".to_owned())),
+                cite("memo", Locator::JsonPointer("/blocks/0/text".to_owned())),
+            ];
+            let invalid = vec![
+                cite("deck", Locator::Page(3)),
+                cite("deck", Locator::Slide(1)),
+                cite("notes", Locator::Lines { start: 3, end: 4 }),
+                cite("notes", Locator::Lines { start: 0, end: 1 }),
+                cite("facts", Locator::JsonPointer("/rows/1".to_owned())),
+                cite("facts", Locator::JsonPointer("/ro".to_owned())),
+                cite("memo", Locator::JsonPointer("/format".to_owned())),
+                cite("ghost", Locator::Page(1)),
+            ];
+            let reachable: BTreeSet<SlotName> = ["deck", "memo", "notes", "facts", "ghost"]
+                .into_iter()
+                .map(|slot| SlotName::new(slot).expect("slot"))
+                .collect();
+            let mut all = valid.clone();
+            all.extend(invalid);
+            assert_eq!(evidence.cited(&reachable, all).await.expect("cited"), valid);
 
-        let only_notes = BTreeSet::from([SlotName::new("notes").expect("slot")]);
-        assert!(
-            evidence
-                .cited(&only_notes, vec![cite("deck", Locator::Page(1))])
-                .await
-                .expect("cited")
-                .is_empty()
-        );
+            let only_notes = BTreeSet::from([SlotName::new("notes").expect("slot")]);
+            assert!(
+                evidence
+                    .cited(&only_notes, vec![cite("deck", Locator::Page(1))])
+                    .await
+                    .expect("cited")
+                    .is_empty()
+            );
+        });
     }
 }

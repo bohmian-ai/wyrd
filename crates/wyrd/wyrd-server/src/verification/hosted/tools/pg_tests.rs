@@ -6,45 +6,13 @@ use std::path::PathBuf;
 
 use skald_spec::MediaFormat;
 use vala_eval::blocks::Position;
-use wyrd_runtime::permission::PermissionSet;
-use wyrd_runtime::{Principal, PrincipalKind};
-use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::eval::ids::TaskId;
 
 use super::super::workspace::Staged;
 use super::*;
 
-/// A caller in the fixture tenant holding exactly `permissions`.
-///
-/// # Panics
-/// Panics when the shared fixture tenant cannot be resolved.
-fn caller(permissions: impl IntoIterator<Item = Permission>) -> Caller {
-    let tenant = crate::test_support::test_tenant();
-    Caller {
-        data_tenant_id: tenant,
-        principal: Principal::new(
-            PrincipalId::new(uuid::Uuid::now_v7()),
-            PrincipalKind::User,
-            tenant,
-            Vec::new(),
-            PermissionSet::from_iter(permissions),
-        ),
-        request_id: RequestId::now_v7(),
-        delegation_chain: Vec::new(),
-        executed_by: None,
-    }
-}
-
-/// Server state over the shared fixture.
-async fn state() -> AppState {
-    crate::test_support::test_app_state(
-        crate::test_support::test_server_postgres(),
-        crate::test_support::test_storage(),
-        crate::test_support::test_catalog().await,
-    )
-}
+use crate::test_support::{test_caller as caller, test_state as state};
 
 /// A sandbox that never spawns a worker; no test here runs Python.
 ///
@@ -235,8 +203,8 @@ fn workspace_tools_need_a_declared_workspace() {
             state().await,
             caller([Permission::tool_invoke_any()]),
             Arc::new(TenantEvidence::new(
-                crate::test_support::test_storage(),
-                crate::test_support::test_tenant(),
+                state().await,
+                caller([]),
                 BTreeMap::new(),
                 limits,
             )),
@@ -282,8 +250,8 @@ fn retries_keep_their_actions_spent_time() {
             state().await,
             caller([]),
             Arc::new(TenantEvidence::new(
-                crate::test_support::test_storage(),
-                crate::test_support::test_tenant(),
+                state().await,
+                caller([]),
                 BTreeMap::new(),
                 limits,
             )),

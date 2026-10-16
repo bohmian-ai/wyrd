@@ -720,4 +720,6 @@ fn io(error: std::io::Error) -> BlockError {
 }
 
 #[cfg(test)]
+mod pg_tests;
+#[cfg(test)]
 mod tests;

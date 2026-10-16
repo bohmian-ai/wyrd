@@ -239,23 +239,33 @@ impl CodeExecutor {
     }
 
     /// Run `call` with the bound JSON `inputs` and no mounts, returning its
-    /// result and the provenance naming the executed source.
+    /// result and the provenance naming the executed source's digest.
+    ///
+    /// Inline source runs as written; an Artifact source is loaded through
+    /// the execution's [`TenantEvidence::artifact`] and must be UTF-8.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for an Artifact source or an
-    /// evidence input, plus [`Sandbox::run`] failures.
+    /// Returns [`BlockError::Terminal`] for an unresolved Artifact path
+    /// reference, non-UTF-8 Artifact source, or an evidence input, plus
+    /// [`TenantEvidence::artifact`] and [`Sandbox::run`] failures.
     async fn run(
         &self,
         call: &CodeCall,
         inputs: &BTreeMap<String, CallInput>,
         deadline: Instant,
     ) -> Result<(Value, CallProvenance), BlockError> {
-        let CodeSource::Inline(source) = &call.source else {
-            // ponytail: Artifact code sources need the Artifact file reader
-            // the execution composes; until then they are refused, never run.
-            return Err(terminal(
-                "Artifact code sources are not readable yet".to_owned(),
-            ));
+        let loaded;
+        let source = match &call.source {
+            CodeSource::Inline(source) => source.as_str(),
+            CodeSource::Artifact { card, path } => {
+                let card = card.as_card_ref().ok_or_else(|| {
+                    terminal("the Artifact code source was never resolved".to_owned())
+                })?;
+                let (bytes, _) = self.evidence.artifact(card, path.as_deref()).await?;
+                loaded = String::from_utf8(bytes)
+                    .map_err(|_| terminal("the Artifact code source is not UTF-8".to_owned()))?;
+                loaded.as_str()
+            }
         };
         let mut arguments = Map::new();
         for (name, input) in inputs {

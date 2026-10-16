@@ -1,6 +1,6 @@
 """Public Python package for Wyrd."""
 
-from . import cards, client, config, data, model, prompt, state
+from . import cards, client, config, data, model, prompt, state, verify
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError
 from .agent import (
     Agent,
@@ -20,7 +20,6 @@ from .client import WyrdClient
 from .config import WyrdConfig
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
-from .observe import ArtifactRef, File
 from .prompt import (
     AnthropicSettings,
     GeminiSettings,
@@ -43,13 +42,11 @@ __all__ = [
     "AgentError",
     "AgentRun",
     "AnthropicSettings",
-    "ArtifactRef",
     "Card",
     "CardKind",
     "CardRef",
     "Cards",
     "DataCard",
-    "File",
     "FinishReason",
     "GeminiSettings",
     "MediaRef",
@@ -87,6 +84,7 @@ __all__ = [
     "model",
     "prompt",
     "state",
+    "verify",
     "run_wyrd_cli",
     "tool",
     "WyrdConfig",

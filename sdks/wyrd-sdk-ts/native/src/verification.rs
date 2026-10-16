@@ -2,7 +2,7 @@
 //! handles.
 //!
 //! Slot projection, file pinning, routing, retry keys, and polling stay in
-//! `wyrd_client::observe`; this module only converts Node values into the
+//! `wyrd_client::verify`; this module only converts Node values into the
 //! shared [`Inputs`] and carries handles and catalog errors back.
 
 use std::time::Duration;
@@ -11,7 +11,7 @@ use napi::Env;
 use napi::bindgen_prelude::{Buffer, PromiseRaw};
 use napi_derive::napi;
 use serde_json::{Value, json};
-use wyrd_client::observe::{ArtifactRef, File, Input, Inputs, Submission, VerificationExecution};
+use wyrd_client::verify::{ArtifactRef, Execution, File, Input, Inputs, Submission};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::ExecutionId;
 
@@ -122,7 +122,7 @@ fn file_input(slot: &str, input: NativeFileInput) -> Result<File, WyrdError> {
 #[napi(object, object_from_js = false)]
 pub struct NativeSubmission {
     /// The queued execution, for Run evidence.
-    pub execution: Option<NativeVerificationExecution>,
+    pub execution: Option<NativeExecution>,
     /// Catalog failure otherwise.
     pub error: Option<NativeWyrdError>,
 }
@@ -144,9 +144,9 @@ impl NativeSubmission {
     }
 
     /// The result carrying one execution handle.
-    fn queued(execution: VerificationExecution) -> Self {
+    fn queued(execution: Execution) -> Self {
         Self {
-            execution: Some(NativeVerificationExecution { execution }),
+            execution: Some(NativeExecution { execution }),
             error: None,
         }
     }
@@ -154,13 +154,13 @@ impl NativeSubmission {
 
 /// Node-facing handle of one queued Verifier execution.
 #[napi]
-pub struct NativeVerificationExecution {
+pub struct NativeExecution {
     /// The shared handle owning the ID and client.
-    execution: VerificationExecution,
+    execution: Execution,
 }
 
 #[napi]
-impl NativeVerificationExecution {
+impl NativeExecution {
     /// The server-issued execution ID.
     #[napi(getter)]
     pub fn id(&self) -> String {
@@ -214,7 +214,7 @@ impl NativeWyrdClient {
     /// Never returns a napi error; a malformed ID and a refused credential
     /// exchange are carried in the result.
     #[napi]
-    pub fn verification_execution<'env>(
+    pub fn connect_execution<'env>(
         &self,
         env: &'env Env,
         id: String,
@@ -222,7 +222,7 @@ impl NativeWyrdClient {
         let client = self.client.clone();
         crate::trace::spawn(env, async move {
             let connected = match id.parse::<ExecutionId>() {
-                Ok(id) => VerificationExecution::connect_with(id, &client).await,
+                Ok(id) => Execution::connect_with(id, &client).await,
                 Err(error) => Err(WyrdError::Validation {
                     message: format!("execution ID is invalid: {error}"),
                     details: json!({ "field": "id" }),

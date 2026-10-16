@@ -23,6 +23,7 @@ PUBLIC_MODULES = [
     "wyrd.state",
     "wyrd.testing",
     "wyrd.testing.cli",
+    "wyrd.verify",
 ]
 
 
@@ -41,8 +42,6 @@ def test_every_listed_export_resolves(module_name: str) -> None:
         ("wyrd.config", "WyrdConfig"),
         ("wyrd.data", "DataCard"),
         ("wyrd.model", "ModelCard"),
-        ("wyrd.observe", "ArtifactRef"),
-        ("wyrd.observe", "File"),
         ("wyrd.prompt", "AnthropicSettings"),
         ("wyrd.prompt", "GeminiSettings"),
         ("wyrd.prompt", "OpenAISettings"),

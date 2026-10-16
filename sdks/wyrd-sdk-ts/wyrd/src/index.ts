@@ -83,7 +83,7 @@ import type {
   NativeBifrostQueryStream,
   NativeLifecycleResult,
   NativeQueryStep,
-  NativeVerificationExecution,
+  NativeExecution,
   NativeVerifierInput,
 } from "../index.cjs";
 
@@ -2081,56 +2081,12 @@ function otel(): typeof import("@opentelemetry/api") | null {
   return otelApi;
 }
 
-/** How a {@link File} declares its format and display name. */
-export interface FileOptions {
-  /** Canonical format name, such as `pdf`; omitted, the filename extension or the slot's only format decides. */
-  readonly format?: string;
-  /** Display name sent with the declaration; it selects no storage path. */
-  readonly filename?: string;
-}
-
-/**
- * A local file for a `media` slot. Constructing one reads nothing: `verify`
- * and `submit` hash it, upload it only when the server lacks its digest, and
- * pin it by SHA-256. It never becomes an Artifact Card.
- */
-export class File {
-  private constructor(
-    /** The file on disk, when it is one. */
-    readonly path: string | undefined,
-    /** The in-memory contents, when they are. */
-    readonly bytes: Uint8Array | undefined,
-    /** Declared format and display name. */
-    readonly options: FileOptions,
-  ) {}
-
-  /** A file on disk; its name supplies the filename and default format. */
-  static path(path: string, options: FileOptions = {}): File {
-    return new File(path, undefined, options);
-  }
-
-  /** In-memory bytes; declare `format` unless the slot accepts only one. */
-  static bytes(bytes: Uint8Array, options: FileOptions = {}): File {
-    return new File(undefined, bytes, options);
-  }
-}
-
-/** A registered Artifact's file for a `media` slot, read with its own identity and authorization. */
-export class ArtifactRef {
-  constructor(
-    /** The exact Artifact Card. */
-    readonly artifact: CardRef | string,
-    /** The file inside the Artifact, when it holds several. */
-    readonly path?: string,
-  ) {}
-}
-
 /**
  * One slot value: JSON for a `json` slot, a trace-ID string for a `trace`
  * slot, a feature object (or one metric value) for a `samples` slot, or a
- * {@link File} or {@link ArtifactRef} for a `media` slot.
+ * {@link verify.File} or {@link verify.ArtifactRef} for a `media` slot.
  */
-export type VerifierInput = JsonValue | File | ArtifactRef;
+export type VerifierInput = JsonValue | verify.File | verify.ArtifactRef;
 
 /** Slot values keyed by the Verifier's input slot names. */
 export type VerifierInputs = Readonly<Record<string, VerifierInput>>;
@@ -2138,16 +2094,16 @@ export type VerifierInputs = Readonly<Record<string, VerifierInput>>;
 /** What `submit` did: Window samples were recorded, or Run evidence was queued. */
 export type Submission =
   | { readonly kind: "recorded" }
-  | { readonly kind: "queued"; readonly execution: VerificationExecution };
+  | { readonly kind: "queued"; readonly execution: verify.Execution };
 
 /** Project named slot values onto the native boundary, refusing values JSON cannot carry exactly. */
 function nativeInputs(inputs: VerifierInputs): NativeVerifierInput[] {
   return Object.entries(inputs).map(([slot, value]): NativeVerifierInput => {
-    if (value instanceof File) {
+    if (value instanceof verify.File) {
       const bytes = value.bytes && Buffer.from(value.bytes.buffer, value.bytes.byteOffset, value.bytes.byteLength);
       return { slot, file: { path: value.path, bytes, ...value.options } };
     }
-    if (value instanceof ArtifactRef) {
+    if (value instanceof verify.ArtifactRef) {
       return { slot, artifact: cardRefText(value.artifact), artifactPath: value.path };
     }
     return { slot, valueJson: strictJson(`inputs.${slot}`, value) };
@@ -2155,61 +2111,111 @@ function nativeInputs(inputs: VerifierInputs): NativeVerifierInput[] {
 }
 
 /**
- * One queued Verifier execution, addressed by its server-issued ID.
- *
- * Any process can rebuild it with {@link VerificationExecution.connect}; the
- * queue, retries, and results stay server-owned.
+ * Evidence values for `media` slots and the handle of one queued Verifier
+ * execution: `verify.File`, `verify.ArtifactRef`, and `verify.Execution`.
  */
-export class VerificationExecution {
-  readonly #native: NativeVerificationExecution;
-
-  private constructor(native: NativeVerificationExecution) {
-    this.#native = native;
-  }
-
-  /** @internal Wrap one native execution handle. */
-  static fromNative(native: NativeVerificationExecution): VerificationExecution {
-    return new VerificationExecution(native);
+export namespace verify {
+  /** How a {@link File} declares its format and display name. */
+  export interface FileOptions {
+    /** Canonical format name, such as `pdf`; omitted, the filename extension or the slot's only format decides. */
+    readonly format?: string;
+    /** Display name sent with the declaration; it selects no storage path. */
+    readonly filename?: string;
   }
 
   /**
-   * Rebuild the handle of execution `id`, such as in another process.
-   *
-   * @param id - The execution ID `submit` returned.
-   * @param options - `client` to read as; omitted, the ambient client is resolved.
-   * @throws {@link WyrdError} for a malformed ID, or when the client cannot be
-   * resolved or its credential exchange is refused.
+   * A local file for a `media` slot. Constructing one reads nothing: `verify`
+   * and `submit` hash it, upload it only when the server lacks its digest, and
+   * pin it by SHA-256. It never becomes an Artifact Card.
    */
-  static async connect(id: string, options: ClientOptions = {}): Promise<VerificationExecution> {
-    const connection = await wyrdClientNative(clientOf(options)).verificationExecution(id);
-    return new VerificationExecution(nativeHandle(connection.execution, connection.error));
+  export class File {
+    private constructor(
+      /** The file on disk, when it is one. */
+      readonly path: string | undefined,
+      /** The in-memory contents, when they are. */
+      readonly bytes: Uint8Array | undefined,
+      /** Declared format and display name. */
+      readonly options: FileOptions,
+    ) {}
+
+    /** A file on disk; its name supplies the filename and default format. */
+    static path(path: string, options: FileOptions = {}): File {
+      return new File(path, undefined, options);
+    }
+
+    /** In-memory bytes; declare `format` unless the slot accepts only one. */
+    static bytes(bytes: Uint8Array, options: FileOptions = {}): File {
+      return new File(undefined, bytes, options);
+    }
   }
 
-  /** The execution ID. */
-  get id(): string {
-    return this.#native.id;
+  /** A registered Artifact's file for a `media` slot, read with its own identity and authorization. */
+  export class ArtifactRef {
+    constructor(
+      /** The exact Artifact Card. */
+      readonly artifact: CardRef | string,
+      /** The file inside the Artifact, when it holds several. */
+      readonly path?: string,
+    ) {}
   }
 
   /**
-   * Read the execution's status, terminal error, and visible result.
+   * One queued Verifier execution, addressed by its server-issued ID.
    *
-   * @throws {@link WyrdError} not-found for an execution not visible yet or at
-   * all, and the authorization or transport failure.
+   * Any process can rebuild it with {@link Execution.connect}; the
+   * queue, retries, and results stay server-owned.
    */
-  async status(): Promise<VerificationExecutionState> {
-    return lifecycleValue(await this.#native.status());
-  }
+  export class Execution {
+    readonly #native: NativeExecution;
 
-  /**
-   * Poll with capped backoff until a result, the execution's own error, or
-   * `timeoutMs`. A result is never invented from a status.
-   *
-   * @throws {@link WyrdError} the settled execution's error (including an
-   * asynchronous idempotency conflict), `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`,
-   * or a non-transient read failure.
-   */
-  async wait(options: { readonly timeoutMs: number }): Promise<VerificationResult> {
-    return lifecycleValue(await this.#native.wait(options.timeoutMs));
+    private constructor(native: NativeExecution) {
+      this.#native = native;
+    }
+
+    /** @internal Wrap one native execution handle. */
+    static fromNative(native: NativeExecution): Execution {
+      return new Execution(native);
+    }
+
+    /**
+     * Rebuild the handle of execution `id`, such as in another process.
+     *
+     * @param id - The execution ID `submit` returned.
+     * @param options - `client` to read as; omitted, the ambient client is resolved.
+     * @throws {@link WyrdError} for a malformed ID, or when the client cannot be
+     * resolved or its credential exchange is refused.
+     */
+    static async connect(id: string, options: ClientOptions = {}): Promise<Execution> {
+      const connection = await wyrdClientNative(clientOf(options)).connectExecution(id);
+      return new Execution(nativeHandle(connection.execution, connection.error));
+    }
+
+    /** The execution ID. */
+    get id(): string {
+      return this.#native.id;
+    }
+
+    /**
+     * Read the execution's status, terminal error, and visible result.
+     *
+     * @throws {@link WyrdError} not-found for an execution not visible yet or at
+     * all, and the authorization or transport failure.
+     */
+    async status(): Promise<VerificationExecutionState> {
+      return lifecycleValue(await this.#native.status());
+    }
+
+    /**
+     * Poll with capped backoff until a result, the execution's own error, or
+     * `timeoutMs`. A result is never invented from a status.
+     *
+     * @throws {@link WyrdError} the settled execution's error (including an
+     * asynchronous idempotency conflict), `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`,
+     * or a non-transient read failure.
+     */
+    async wait(options: { readonly timeoutMs: number }): Promise<VerificationResult> {
+      return lifecycleValue(await this.#native.wait(options.timeoutMs));
+    }
   }
 }
 
@@ -2277,7 +2283,7 @@ export class Observe {
       return { kind: "recorded" };
     }
     const execution = nativeHandle(submission.execution, submission.error);
-    return { kind: "queued", execution: VerificationExecution.fromNative(execution) };
+    return { kind: "queued", execution: verify.Execution.fromNative(execution) };
   }
 }
 
@@ -2845,11 +2851,11 @@ export class WyrdState {
   }
 
   /**
-   * Connect this state's one Bifrost writer and describe the fixed tables.
+   * Connect this state's one Bifrost writer and describe the fixed table.
    *
    * Runs as the state's client. Startup describes `vala.drift.observations`
-   * and `vala.eval.observations` before resolving, so a run can never enqueue
-   * against a missing, unauthorized, or incompatible system table.
+   * before resolving, so submitted samples can never enqueue against a
+   * missing, unauthorized, or incompatible system table.
    *
    * @param options - `table` keeps its {@link Bifrost.connect} meaning as the
    * active write binding and does not choose a run's destination.

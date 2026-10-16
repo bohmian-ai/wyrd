@@ -25,9 +25,10 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from wyrd.client import WyrdClient
-from wyrd.observe import ArtifactRef, File, Observe, Run, VerificationExecution
+from wyrd.observe import Observe, Run
 from wyrd.otel import install_run_correlation
 from wyrd.state import WyrdState
+from wyrd.verify import ArtifactRef, Execution, File
 
 
 def test_run_targets_the_root_service_with_a_uuidv7_identity(state: WyrdState) -> None:
@@ -174,15 +175,23 @@ def test_artifact_ref_names_a_registered_artifact_file() -> None:
 def test_execution_connect_refuses_a_malformed_id_before_resolving_a_client() -> None:
     """An execution ID is parsed locally before any client or network work."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        VerificationExecution.connect("not-an-execution-id")
+        Execution.connect("not-an-execution-id")
     assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
 def test_verification_types_are_exported_and_judge_surfaces_are_gone() -> None:
-    """The verify/submit types are public; Judgment, drift/eval emits, and the Eval
-    media module are removed with no alias."""
-    assert (wyrd.File, wyrd.ArtifactRef) == (File, ArtifactRef)
-    assert {"Recorded", "VerificationExecution", "VerificationResult"} <= set(wyrd.observe.__all__)
+    """The verify/submit types live only in ``wyrd.verify``; Judgment, drift/eval
+    emits, and the Eval media module are removed with no alias."""
+    assert set(wyrd.verify.__all__) == {
+        "ArtifactRef",
+        "Execution",
+        "File",
+        "Recorded",
+        "VerificationResult",
+    }
+    for name in wyrd.verify.__all__:
+        assert not hasattr(wyrd, name)
+        assert not hasattr(wyrd.observe, name)
     assert not hasattr(wyrd.observe, "Judgment")
     assert not hasattr(Observe, "drift")
     assert not hasattr(Observe, "eval")

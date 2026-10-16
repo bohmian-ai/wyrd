@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 
-import { ArtifactRef, File, Observe } from "wyrd-ai";
+import * as wyrd from "wyrd-ai";
+import { Observe, verify } from "wyrd-ai";
 
 type NativeRun = Parameters<typeof Observe.fromNative>[0];
 
@@ -62,9 +63,9 @@ describe("internal native run wrapper", () => {
 
     await observe.verify("policy-check", {
       answer: { text: "yes" },
-      policy: File.path("/does/not/exist/policy.pdf"),
-      deck: File.bytes(bytes, { format: "pdf", filename: "deck.pdf" }),
-      archive: new ArtifactRef({ kind: "Artifact", name: "decks", version: "1.0.0" }, "q3.pdf"),
+      policy: verify.File.path("/does/not/exist/policy.pdf"),
+      deck: verify.File.bytes(bytes, { format: "pdf", filename: "deck.pdf" }),
+      archive: new verify.ArtifactRef({ kind: "Artifact", name: "decks", version: "1.0.0" }, "q3.pdf"),
     });
 
     const [verifier, inputs] = calls[0] as [string, Record<string, unknown>[]];
@@ -82,7 +83,7 @@ describe("internal native run wrapper", () => {
   });
 
   test("constructing a File reads nothing", () => {
-    expect(File.path("/does/not/exist.pdf").path).toBe("/does/not/exist.pdf");
+    expect(verify.File.path("/does/not/exist.pdf").path).toBe("/does/not/exist.pdf");
   });
 
   test("submit returns Recorded for samples and a queued handle for Run evidence", async () => {
@@ -97,6 +98,13 @@ describe("internal native run wrapper", () => {
     await expect(refused.observe.submit("policy-check", { missing: 1 })).rejects.toMatchObject({
       code: "WYRD_VERIFICATION_400_INPUT_INVALID",
     });
+  });
+
+  test("verification values live only under the verify namespace", () => {
+    expect(Object.keys(verify).sort()).toEqual(["ArtifactRef", "Execution", "File"]);
+    for (const name of ["ArtifactRef", "Execution", "File", "VerificationExecution"]) {
+      expect(name in wyrd).toBe(false);
+    }
   });
 
   test("the observation emits are gone", () => {

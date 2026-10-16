@@ -319,6 +319,29 @@ export declare class NativeCards {
   delete(cardRef: string): Promise<NativeLifecycleResult>
 }
 
+/** Node-facing handle of one queued Verifier execution. */
+export declare class NativeExecution {
+  /** The server-issued execution ID. */
+  get id(): string
+  /**
+   * Reads the execution's status, terminal error, and visible result.
+   *
+   * # Errors
+   * Returns a napi error only when the state cannot be projected; read
+   * failures are returned in [`NativeLifecycleResult`].
+   */
+  status(): Promise<NativeLifecycleResult>
+  /**
+   * Polls until a result, the execution's terminal error, or `timeout_ms`.
+   *
+   * # Errors
+   * Returns a napi error only when the result cannot be projected; the
+   * terminal error and `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` are returned
+   * in [`NativeLifecycleResult`].
+   */
+  wait(timeoutMs: number): Promise<NativeLifecycleResult>
+}
+
 /**
  * Tenant gateway administration handle over the shared `wyrd_client` Gateway.
  *
@@ -683,29 +706,6 @@ export declare class NativeRun {
   record(table: string, rowJson: string): Promise<NativeLifecycleResult>
 }
 
-/** Node-facing handle of one queued Verifier execution. */
-export declare class NativeVerificationExecution {
-  /** The server-issued execution ID. */
-  get id(): string
-  /**
-   * Reads the execution's status, terminal error, and visible result.
-   *
-   * # Errors
-   * Returns a napi error only when the state cannot be projected; read
-   * failures are returned in [`NativeLifecycleResult`].
-   */
-  status(): Promise<NativeLifecycleResult>
-  /**
-   * Polls until a result, the execution's terminal error, or `timeout_ms`.
-   *
-   * # Errors
-   * Returns a napi error only when the result cannot be projected; the
-   * terminal error and `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` are returned
-   * in [`NativeLifecycleResult`].
-   */
-  wait(timeoutMs: number): Promise<NativeLifecycleResult>
-}
-
 /** Node-facing handle to one authenticated [`WyrdClient`]. */
 export declare class NativeWyrdClient {
   /**
@@ -837,7 +837,7 @@ export declare class NativeWyrdClient {
    * Never returns a napi error; a malformed ID and a refused credential
    * exchange are carried in the result.
    */
-  verificationExecution(id: string): Promise<NativeSubmission>
+  connectExecution(id: string): Promise<NativeSubmission>
 }
 
 /**
@@ -1187,7 +1187,7 @@ export interface NativeRunOpen {
  */
 export interface NativeSubmission {
   /** The queued execution, for Run evidence. */
-  execution?: NativeVerificationExecution
+  execution?: NativeExecution
   /** Catalog failure otherwise. */
   error?: NativeWyrdError
 }

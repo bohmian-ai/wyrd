@@ -12,7 +12,10 @@ A shared Wyrd server runs with two PostgreSQL logins. The platform login owns Wy
 
 The server keeps both logins connected while it runs. Treat both database URLs as secrets: anyone who can read the server's environment has platform access.
 
-This page covers the database, the server's persistent settings, and the first tenant. Sizing, TLS termination, and multi-replica topology are not documented yet.
+This page covers the database, the server's persistent settings, and the first tenant.
+The [verification runtime reference](/operate/configure-verification-runtime/)
+records approved, not-yet-implemented worker and resource settings.
+TLS termination and multi-replica topology are not documented yet.
 
 ## Prerequisites
 

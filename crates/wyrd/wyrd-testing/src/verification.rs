@@ -430,14 +430,16 @@ impl VerificationFixture {
         Ok(())
     }
 
-    /// Bring one armed schedule cursor to database statement time.
+    /// Bring one armed schedule cursor to now.
     ///
-    /// Dueness is PostgreSQL's decision, so a scheduling test places the
-    /// cursor at the database clock rather than moving a process clock. The
-    /// occurrence's window therefore ends now and holds every observation the
-    /// test already wrote; the scheduler claims it once PostgreSQL's clock is
-    /// 30 seconds past the cursor, so callers poll for the execution for longer
-    /// than that.
+    /// Dueness is PostgreSQL's decision, so the scheduler claims the
+    /// occurrence once PostgreSQL's clock is 30 seconds past the cursor and
+    /// callers poll for the execution for longer than that. The cursor is also
+    /// the occurrence's exclusive window end, and observations carry
+    /// producer-owned `created_at` stamped by this process's clock, which may
+    /// run ahead of the database's. The cursor is therefore the later of
+    /// `statement_timestamp()` and this process's `now`, so the window holds
+    /// every observation the test already wrote whatever the clock skew.
     ///
     /// # Errors
     /// Returns [`VerificationFixtureError`] when the update fails.
@@ -448,9 +450,10 @@ impl VerificationFixture {
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         sqlx::query(
             "UPDATE wyrd.verification_bindings \
-                SET next_run_at = statement_timestamp() WHERE binding_id = $1",
+                SET next_run_at = GREATEST(statement_timestamp(), $2) WHERE binding_id = $1",
         )
         .bind(binding.as_uuid())
+        .bind(chrono::Utc::now())
         .execute(&mut **conn.transaction())
         .await?;
         conn.commit().await?;

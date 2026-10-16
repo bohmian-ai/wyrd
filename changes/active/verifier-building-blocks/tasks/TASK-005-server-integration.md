@@ -504,6 +504,16 @@ Commits `f2a726c90..HEAD` on `change/verifier-building-blocks-task-005`.
   field that is serde-optional, so forwarded peers keep it. It is applied in
   `query_audit_event`, set by `oracle_context`, and carried by
   `record_object_denial` (`d8a7db603`).
+- **Rust custom drift `Inconclusive` in the gate (diag-custom-drift).**
+  Symptom: 6 of 13 isolated runs failed in clusters. Evidence: the row's
+  `created_at` was 6.6 ms past the window end, and Oracle file pruning opened
+  zero files. Cause: `make_binding_due` set the exclusive window end to the
+  Postgres VM clock. Observations carry producer `created_at` from the host
+  clock, which ran about 50-60 ms ahead (colima). Fix site: the shared fixture
+  `VerificationFixture::make_binding_due` sets the cursor to
+  `GREATEST(statement_timestamp(), harness now)`. Dueness stays Postgres's
+  decision, and the change covers every Rust, Python and TS caller. Afterward,
+  6 of 6 runs passed.
 - **Oracle `agent_runs_three_table_analytical_query_through_mcp`
   (intermittent).** A follower pod held 604 reserved bytes after teardown. The
   test passed when rerun alone. The cause is in the Oracle follower-stage

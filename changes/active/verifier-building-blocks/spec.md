@@ -1,6 +1,6 @@
 ---
 id: SPEC-verifier-building-blocks
-revision: 8
+revision: 9
 status: approved
 ---
 
@@ -43,6 +43,9 @@ Revision 8 records the owner's explicit approval ("I agree with the
 recommendations. Make revisions") of moving the developer example
 repositories into Task 005: refactor `wyrd-example-ts` and create
 `wyrd-example-py` and `wyrd-example-rs`.
+Revision 9 records the owner's explicit approval ("Approve the revision") of
+the local-backend evidence upload route in REQ-010/REQ-012, resolving
+FIND-TASK-005-6.
 The remaining approved behavior is unchanged.
 
 The five agreed simplifications remain: preserve missing results in aggregation;
@@ -528,6 +531,17 @@ multipart/upload metadata row. File contents never pass through Postgres or
 the verification request body. The server checks length, digest, and sniffed
 format when reading; mismatches cannot produce a pass.
 
+The local filesystem backend has no presigned URL a client can PUT to. On that
+backend only, the evidence plan is the existing `UploadPlan::LocalFs` shape and
+targets `PUT /v1/verification/evidence/local/{sha256}`. The server takes the
+tenant from the authenticated caller, never the path; requires the same
+operation-level `verifier:run` admission as `POST /v1/verification/evidence`;
+refuses a body over `WYRD_VERIFICATION_FILE_MAX_MIB` or one that hashes to a
+different digest before the object becomes readable; and writes to the same
+tenant-qualified `evidence/sha256/<digest>` key with no metadata row. A repeated
+upload of the same digest is idempotent. The route is not mounted on remote
+backends, which keep direct single-PUT plans.
+
 One shared `MediaFormat` vocabulary in `skald-spec` accepts short tokens and
 MIME aliases and serializes canonical short tokens. Preserve distinct legacy
 and OOXML formats: `ppt` is not `pptx`, `doc` is not `docx`, and `xls` is not
@@ -569,6 +583,7 @@ verification run/direct-execution identities without aliases.
 | HTTP route | Contract |
 | --- | --- |
 | `POST /v1/verification/evidence` | Declare files; receive missing-file single-PUT plans |
+| `PUT /v1/verification/evidence/local/{sha256}` | Local backend only: store one evidence body under REQ-010's rules; return 204 |
 | `POST /v1/verification/execute` | Submit exact verifier/subject, optional Run, named input declarations and route overrides; return 200 result |
 | `POST /v1/verification/enqueue` | Same Run evidence declaration; return 202 with execution ID |
 | `GET /v1/verification/executions/{execution_id}` | Authorized queued execution status and result when available |
@@ -1040,6 +1055,7 @@ solve for this delivery.
 | 6 | approved | Owner requires two independent authorization gates, both following Wyrd's global or exact scope permission rule: tool invocation and underlying domain/resource access. Extends the existing permission representation and preserves subject/delegation and audit on both decisions. |
 | 7 | approved | Owner approved the Task 004 handoff proposal. Names MCP tools and binding latest-execution identity; preserves dispatch reads and existing Operator plumbing; cuts templates over to execution identity; fixes the drift error contract; names published analytical correlation/time fields; requires affected lineage and connected-handle journey closure. Multi-check drift-count semantics must not be guessed. |
 | 8 | approved | Owner moved the developer example repositories into Task 005: fully refactor `wyrd-example-ts` and create `wyrd-example-py` and `wyrd-example-rs` as standalone, developer-friendly examples with their own Cards, using current Verifier, transport-hook (Rust: Wyrd Agent Run), and OTel conventions. Not production hardening. |
+| 9 | approved | Owner approved the local-backend evidence upload route (`PUT /v1/verification/evidence/local/{sha256}`) as a published, local-only verification operation with caller-derived tenant, operation-level `verifier:run`, size/digest refusal, idempotent same-digest writes, and no metadata row. Resolves FIND-TASK-005-6; served OpenAPI publishes it only when mounted. |
 
 Material sources beyond the governing authorities:
 

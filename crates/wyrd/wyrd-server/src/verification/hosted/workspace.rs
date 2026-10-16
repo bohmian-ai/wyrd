@@ -406,7 +406,11 @@ impl Workspace {
     /// # Errors
     /// Returns [`BlockError::Retryable`] when a mount directory cannot open.
     pub fn mounts(&self) -> Result<Vec<MountSpec>, BlockError> {
-        let held: u64 = walkdir(&self.work_dir()).iter().map(|(_, size)| size).sum();
+        let held: u64 = walkdir(&self.work_dir(), usize::MAX)
+            .0
+            .iter()
+            .map(|(_, size)| size)
+            .sum();
         let unopened = |error: monty_pool::PoolError| BlockError::Retryable {
             reason: format!("a workspace mount failed: {error}"),
         };
@@ -435,7 +439,12 @@ impl Workspace {
         self.inputs.get(path).map(|input| &input.sources)
     }
 
-    /// `fs.list`: every file under virtual directory `dir`, with its size.
+    /// `fs.list`: files under virtual directory `dir` with their sizes and,
+    /// for `/inputs` files, the original slots they came from.
+    ///
+    /// Collection stops at the tool result limit, and the `/work` walk at a
+    /// proportional entry count, so a tree of many small or empty files
+    /// costs no more than the result it fills; `truncated` says so.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a path outside the workspace.
@@ -444,61 +453,91 @@ impl Workspace {
         if prefix != "/inputs/" && prefix != "/work/" {
             self.host(&prefix)?;
         }
-        let mut files: Vec<Value> = Vec::new();
-        for path in self.inputs.keys().filter(|path| path.starts_with(&prefix)) {
+        let mut files = Collected::new(
+            &json!({"files": [], "truncated": false}),
+            self.limits.tool_result_max_bytes,
+        );
+        let mut truncated = false;
+        for (path, input) in self
+            .inputs
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+        {
             let size = std::fs::metadata(self.host(path)?).map_or(0, |meta| meta.len());
-            files.push(json!({"path": path, "size_bytes": size}));
+            if !files.push(json!({"path": path, "size_bytes": size, "sources": input.sources})) {
+                truncated = true;
+                break;
+            }
         }
-        if "/work/".starts_with(&prefix) || prefix.starts_with("/work/") {
-            for entry in walkdir(&self.work_dir()) {
-                let virtual_path = format!("/work/{}", entry.0);
-                if virtual_path.starts_with(&prefix) {
-                    files.push(json!({"path": virtual_path, "size_bytes": entry.1}));
+        if !truncated && ("/work/".starts_with(&prefix) || prefix.starts_with("/work/")) {
+            let (found, cut) = walkdir(&self.work_dir(), self.walk_limit());
+            truncated = cut;
+            for (path, size) in found {
+                let path = format!("/work/{path}");
+                if path.starts_with(&prefix)
+                    && !files.push(json!({"path": path, "size_bytes": size, "sources": []}))
+                {
+                    truncated = true;
+                    break;
                 }
             }
         }
-        Ok(json!({ "files": files }))
+        Ok(json!({"files": files.items, "truncated": truncated}))
     }
 
-    /// `fs.read`: located text units of `path` from unit `start`, bounded by
-    /// the tool result limit; `next` resumes a truncated read.
+    /// `fs.read`: located text units of `path` from piece `start`, bounded
+    /// by the tool result limit by their actual JSON size; `next` resumes.
+    ///
+    /// Units longer than an eighth of the result budget are split into
+    /// pieces that keep the unit's original locator, so every character of
+    /// a long line or page is reachable by following `next`. Piece indices
+    /// depend only on the file and the limits. `sources` names the original
+    /// slots of an `/inputs` file and is empty for `/work` files.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for an unknown, binary, linked, or
-    /// unreadable path.
+    /// unreadable path, or a path too long for any piece to fit the limit.
     pub fn read(&self, path: &str, start: usize) -> Result<Value, BlockError> {
         let owned;
-        let units = if let Some(input) = self.inputs.get(path) {
-            input.units.as_deref().ok_or_else(|| {
+        let (units, sources) = if let Some(input) = self.inputs.get(path) {
+            let units = input.units.as_deref().ok_or_else(|| {
                 terminal(format!("{path} is binary; bind it as native media instead"))
-            })?
+            })?;
+            (units, json!(input.sources))
         } else {
             owned = self.work_units(path)?;
-            &owned
+            (owned.as_slice(), json!([]))
         };
-        let budget = self.limits.tool_result_max_bytes.saturating_sub(256);
-        let mut used = 0;
-        let mut out = Vec::new();
+        let mut out = Collected::new(
+            &json!({"path": path, "sources": sources, "units": [], "next": usize::MAX}),
+            self.limits.tool_result_max_bytes,
+        );
+        let piece = (out.room() / 8).max(4);
         let mut next = None;
-        for (index, (locator, text)) in units.iter().enumerate().skip(start) {
-            used += text.len() + 64;
-            if used > budget && !out.is_empty() {
+        let pieces = units
+            .iter()
+            .flat_map(|(locator, text)| pieces(text, piece).map(move |text| (locator, text)));
+        for (index, (locator, text)) in pieces.enumerate().skip(start) {
+            if !out.push(json!({"locator": locator, "text": text})) {
+                if out.items.is_empty() {
+                    return Err(terminal(format!(
+                        "{path} cannot be read within the {}-byte tool result limit",
+                        self.limits.tool_result_max_bytes
+                    )));
+                }
                 next = Some(index);
                 break;
             }
-            let text = if used > budget {
-                &text[..text.floor_char_boundary(budget)]
-            } else {
-                text.as_str()
-            };
-            out.push(json!({"locator": locator, "text": text}));
         }
-        Ok(json!({"path": path, "units": out, "next": next}))
+        Ok(json!({"path": path, "sources": sources, "units": out.items, "next": next}))
     }
 
     /// `fs.search`: case-insensitive literal matches of `query` with their
-    /// locators, across `/inputs` and text files in `/work`, bounded by the
-    /// tool result limit.
+    /// locators and original slots, across `/inputs` and text files in
+    /// `/work`, bounded by the tool result limit.
+    ///
+    /// Files are visited lazily and the `/work` walk is capped like
+    /// [`Self::list`], so the search stops as soon as the result is full.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for an empty query.
@@ -507,36 +546,45 @@ impl Workspace {
         if needle.is_empty() {
             return Err(terminal("the search query is empty".to_owned()));
         }
-        let mut used = 0;
-        let mut matches = Vec::new();
-        let work: Vec<(String, Vec<(Locator, String)>)> = walkdir(&self.work_dir())
-            .into_iter()
-            .filter_map(|(path, _)| {
-                let path = format!("/work/{path}");
-                self.work_units(&path).ok().map(|units| (path, units))
-            })
-            .collect();
-        let inputs = self
-            .inputs
-            .iter()
-            .filter_map(|(path, input)| Some((path.as_str(), input.units.as_deref()?)));
-        let all = inputs.chain(
-            work.iter()
-                .map(|(path, units)| (path.as_str(), units.as_slice())),
+        let mut matches = Collected::new(
+            &json!({"matches": [], "truncated": false}),
+            self.limits.tool_result_max_bytes,
         );
-        for (path, units) in all {
-            for (locator, text) in units {
+        let (work, cut) = walkdir(&self.work_dir(), self.walk_limit());
+        let inputs = self.inputs.iter().filter_map(|(path, input)| {
+            Some((
+                path.clone(),
+                json!(input.sources),
+                std::borrow::Cow::Borrowed(input.units.as_deref()?),
+            ))
+        });
+        let work = work.into_iter().filter_map(|(path, _)| {
+            let path = format!("/work/{path}");
+            let units = self.work_units(&path).ok()?;
+            Some((path, json!([]), std::borrow::Cow::Owned(units)))
+        });
+        for (path, sources, units) in inputs.chain(work) {
+            for (locator, text) in units.iter() {
                 if let Some(at) = text.to_lowercase().find(&needle) {
-                    let snippet = snippet(text, at, needle.len());
-                    used += path.len() + snippet.len() + 96;
-                    if used > self.limits.tool_result_max_bytes {
-                        return Ok(json!({"matches": matches, "truncated": true}));
+                    let found = json!({
+                        "path": path,
+                        "locator": locator,
+                        "snippet": snippet(text, at, needle.len()),
+                        "sources": sources,
+                    });
+                    if !matches.push(found) {
+                        return Ok(json!({"matches": matches.items, "truncated": true}));
                     }
-                    matches.push(json!({"path": path, "locator": locator, "snippet": snippet}));
                 }
             }
         }
-        Ok(json!({"matches": matches, "truncated": false}))
+        Ok(json!({"matches": matches.items, "truncated": cut}))
+    }
+
+    /// Most `/work` entries a list or search visits: no result could show
+    /// more, since every listed entry takes more than 16 bytes.
+    const fn walk_limit(&self) -> usize {
+        self.limits.tool_result_max_bytes / 16
     }
 
     /// Line units of a UTF-8 `/work` file.
@@ -571,15 +619,22 @@ fn relative<'p>(path: &'p str, prefix: &str) -> Option<&'p str> {
 }
 
 /// Regular files under `dir` as `(relative path, size)`, never following
-/// links.
-fn walkdir(dir: &Path) -> Vec<(String, u64)> {
+/// links, sorted by path; stops after visiting `most` entries and then
+/// reports `true`.
+fn walkdir(dir: &Path, most: usize) -> (Vec<(String, u64)>, bool) {
     let mut found = Vec::new();
+    let mut visited = 0_usize;
     let mut pending = vec![dir.to_path_buf()];
     while let Some(next) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&next) else {
             continue;
         };
         for entry in entries.flatten() {
+            visited += 1;
+            if visited > most {
+                found.sort();
+                return (found, true);
+            }
             let Ok(meta) = entry.path().symlink_metadata() else {
                 continue;
             };
@@ -593,7 +648,57 @@ fn walkdir(dir: &Path) -> Vec<(String, u64)> {
         }
     }
     found.sort();
-    found
+    (found, false)
+}
+
+/// `text` in consecutive pieces of at most `size` bytes on character
+/// boundaries; empty text is one empty piece. `size` must be at least 4,
+/// the longest UTF-8 character.
+fn pieces(text: &str, size: usize) -> impl Iterator<Item = &str> {
+    let mut rest = Some(text);
+    std::iter::from_fn(move || {
+        let text = rest?;
+        let (head, tail) = text.split_at(text.floor_char_boundary(size));
+        rest = (!tail.is_empty()).then_some(tail);
+        Some(head)
+    })
+}
+
+/// JSON items gathered until their serialized size would overflow a tool
+/// result whose fixed envelope is already accounted for.
+struct Collected {
+    /// Items that fit.
+    items: Vec<Value>,
+    /// Bytes still free for items and their separators.
+    room: usize,
+}
+
+impl Collected {
+    /// Room for items in a `max`-byte result shaped like `envelope`, whose
+    /// item array is empty and whose other fields are at their largest.
+    fn new(envelope: &Value, max: usize) -> Self {
+        Self {
+            items: Vec::new(),
+            room: max.saturating_sub(envelope.to_string().len()),
+        }
+    }
+
+    /// Bytes still free for items.
+    const fn room(&self) -> usize {
+        self.room
+    }
+
+    /// Keep `item` when its serialized size and separator fit; `false`
+    /// once the result is full.
+    fn push(&mut self, item: Value) -> bool {
+        let size = item.to_string().len() + 1;
+        if size > self.room {
+            return false;
+        }
+        self.room -= size;
+        self.items.push(item);
+        true
+    }
 }
 
 /// About 80 bytes of `text` around the match at byte `at`.

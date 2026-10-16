@@ -82,7 +82,7 @@ fn workspace_reads_and_searches_located_units() {
     let found = workspace.search("costs").expect("search");
     assert_eq!(
         found["matches"],
-        json!([{"path": "/inputs/deck.pdf", "locator": loc(Locator::Page(2)), "snippet": "Costs fell"}])
+        json!([{"path": "/inputs/deck.pdf", "locator": loc(Locator::Page(2)), "snippet": "Costs fell", "sources": ["evidence"]}])
     );
     assert_eq!(
         workspace.read("/inputs/data.json", 0).expect("json")["units"][0]["locator"],
@@ -112,8 +112,138 @@ fn workspace_reads_and_searches_located_units() {
     let listed = workspace.list("/work").expect("list");
     assert_eq!(
         listed["files"],
-        json!([{"path": "/work/notes.txt", "size_bytes": 18}])
+        json!([{"path": "/work/notes.txt", "size_bytes": 18, "sources": []}])
     );
+}
+
+/// Tool output names the original slot behind an `/inputs` file even when
+/// the workspace path shares nothing with the slot name; `/work` files,
+/// being derived, name none.
+///
+/// # Panics
+/// Panics when a slot is missing, inferred, or attached to a work file.
+#[test]
+fn workspace_tools_name_original_slots() {
+    let workspace = open(vec![Staged {
+        path: "/inputs/manual.txt".to_owned(),
+        bytes: b"refunds within 30 days".to_vec(),
+        format: Some(MediaFormat::Text),
+        sources: BTreeSet::from([SlotName::new("policy").expect("slot")]),
+    }])
+    .expect("materializes");
+    std::fs::write(workspace.work_dir().join("copy.txt"), "refunds noted").expect("work");
+    assert_eq!(
+        workspace.read("/inputs/manual.txt", 0).expect("read")["sources"],
+        json!(["policy"])
+    );
+    assert_eq!(
+        workspace.list("/inputs").expect("list")["files"][0]["sources"],
+        json!(["policy"])
+    );
+    let found = workspace.search("refunds").expect("search");
+    assert_eq!(found["matches"][0]["sources"], json!(["policy"]));
+    assert_eq!(found["matches"][1]["sources"], json!([]));
+    assert_eq!(
+        workspace.read("/work/copy.txt", 0).expect("read")["sources"],
+        json!([])
+    );
+}
+
+/// A unit longer than the result limit is read whole by following `next`:
+/// its pieces keep the original locator, valid UTF-8, and every character,
+/// and each response's actual JSON size fits even when escaping inflates
+/// quote- and control-heavy text.
+///
+/// # Panics
+/// Panics when text is lost, a locator changes, or a response overflows.
+#[test]
+fn workspace_reads_long_units_in_pieces() {
+    let max = 512;
+    let line = "\"\u{1}é\\".repeat(400);
+    let workspace = Workspace::materialize(
+        vec![staged(
+            "/inputs/long.txt",
+            format!("{line}\nshort").into_bytes(),
+            MediaFormat::Text,
+        )],
+        HostedLimits {
+            tool_result_max_bytes: max,
+            ..HostedLimits::default()
+        },
+        None,
+    )
+    .expect("materializes");
+    let mut text = String::new();
+    let mut start = 0;
+    let mut reads = 0;
+    loop {
+        let read = workspace.read("/inputs/long.txt", start).expect("read");
+        assert!(read.to_string().len() <= max, "{}", read.to_string().len());
+        for unit in read["units"].as_array().expect("units") {
+            if unit["locator"] == loc(Locator::Lines { start: 1, end: 1 }) {
+                text.push_str(unit["text"].as_str().expect("text"));
+            } else {
+                assert_eq!(unit["text"], "short");
+            }
+        }
+        reads += 1;
+        match read["next"].as_u64() {
+            Some(next) => start = usize::try_from(next).expect("index"),
+            None => break,
+        }
+    }
+    assert_eq!(text, line);
+    assert!(reads > 1);
+
+    let cramped = Workspace::materialize(
+        vec![staged(
+            &format!("/inputs/{}.txt", "a".repeat(64)),
+            b"x".to_vec(),
+            MediaFormat::Text,
+        )],
+        HostedLimits {
+            tool_result_max_bytes: 96,
+            ..HostedLimits::default()
+        },
+        None,
+    )
+    .expect("materializes");
+    assert!(
+        cramped
+            .read(&format!("/inputs/{}.txt", "a".repeat(64)), 0)
+            .is_err()
+    );
+}
+
+/// Listing and searching a `/work` tree of many empty files stop at the
+/// result limit and say so, instead of collecting the whole tree.
+///
+/// # Panics
+/// Panics when a result overflows or hides its truncation.
+#[test]
+fn workspace_results_stop_at_the_limit() {
+    let max = 1024;
+    let workspace = Workspace::materialize(
+        Vec::new(),
+        HostedLimits {
+            tool_result_max_bytes: max,
+            ..HostedLimits::default()
+        },
+        None,
+    )
+    .expect("materializes");
+    for index in 0..2_000 {
+        let body = if index % 2 == 0 { "needle" } else { "" };
+        std::fs::write(workspace.work_dir().join(format!("f{index}.txt")), body)
+            .expect("work file");
+    }
+    for result in [
+        workspace.list("/work").expect("list"),
+        workspace.search("needle").expect("search"),
+    ] {
+        assert!(result.to_string().len() <= max);
+        assert_eq!(result["truncated"], true);
+    }
 }
 
 /// Archives unpack under their own path, typed by extension; links,

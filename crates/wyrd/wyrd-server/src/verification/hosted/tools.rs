@@ -13,10 +13,13 @@
 //! MCP catalog's, so both surfaces advertise one contract.
 
 use std::collections::BTreeMap;
+use std::fmt::{self, Write as _};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use monty_types::MontyObject;
+use monty_types::format::StringRepr;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -290,7 +293,8 @@ impl Invocation {
             .exec(source, Vec::new(), mounts, deadline)
             .await
             .map_err(|error| invocation(error.to_string()))?;
-        Ok(json!({"value": value.py_repr(), "output": output}))
+        let (repr, whole) = repr(&value, self.limits.tool_result_max_bytes);
+        Ok(json!({"value": repr, "value_truncated": !whole, "output": output}))
     }
 
     /// The attempt's workspace.
@@ -339,6 +343,57 @@ impl Drop for Reservation {
         let unused = self.reserved.saturating_sub(self.started.elapsed());
         *self.budget.lock().unwrap_or_else(PoisonError::into_inner) += unused;
     }
+}
+
+/// Text formatted up to `max` bytes; a write that would pass it keeps the
+/// part that fits and fails, which stops the formatter's traversal there.
+struct Capped {
+    /// What fit.
+    text: String,
+    /// Byte limit.
+    max: usize,
+}
+
+impl Capped {
+    /// Empty text limited to `max` bytes.
+    const fn new(max: usize) -> Self {
+        Self {
+            text: String::new(),
+            max,
+        }
+    }
+}
+
+impl fmt::Write for Capped {
+    /// Append `piece`, or the part of it that fits and fail.
+    ///
+    /// # Errors
+    /// Returns [`fmt::Error`] once the limit is reached.
+    fn write_str(&mut self, piece: &str) -> fmt::Result {
+        let room = self.max - self.text.len();
+        if piece.len() <= room {
+            self.text.push_str(piece);
+            return Ok(());
+        }
+        self.text
+            .push_str(&piece[..piece.floor_char_boundary(room)]);
+        Err(fmt::Error)
+    }
+}
+
+/// Python's `repr` of `value`, cut at `max` bytes, and whether it is whole.
+///
+/// Formats through Monty's borrowed `Display` (and [`StringRepr`] for
+/// strings, whose `Display` is `str`) into a [`Capped`] writer, so a large
+/// value stops formatting at the limit instead of building its full repr.
+fn repr(value: &MontyObject, max: usize) -> (String, bool) {
+    let mut text = Capped::new(max);
+    let whole = match value.as_ref().as_str() {
+        Some(string) => write!(text, "{}", StringRepr(string)),
+        None => write!(text, "{value}"),
+    }
+    .is_ok();
+    (text.text, whole)
 }
 
 /// One declared built-in bound to an invocation.
@@ -419,22 +474,26 @@ fn descriptor(tool: BuiltinTool) -> (String, Value) {
         json!({"type": "string", "description": "Absolute workspace path under /inputs or /work."});
     let (description, schema) = match tool {
         BuiltinTool::FsList => (
-            "List the files under a workspace directory.",
+            "List the files under a workspace directory with their sizes; each /inputs file \
+             names the original input slots it came from in `sources`.",
             json!({"type": "object", "properties": {"path": path}, "required": ["path"], "additionalProperties": false}),
         ),
         BuiltinTool::FsRead => (
             "Read a workspace file as located text units (page, slide, line, or JSON pointer), \
-             starting at unit `start`; follow `next` to continue.",
+             starting at unit `start`; follow `next` to continue, since long units arrive in \
+             pieces sharing one locator. Cite an /inputs file by one of its `sources` slots \
+             with the unit's locator.",
             json!({"type": "object", "properties": {"path": path, "start": {"type": "integer", "minimum": 0}}, "required": ["path"], "additionalProperties": false}),
         ),
         BuiltinTool::FsSearch => (
-            "Search every workspace file for text, case-insensitively, returning each match's path \
-             and locator.",
+            "Search every workspace file for text, case-insensitively, returning each match's path, \
+             locator, and the original input slots (`sources`) of /inputs files.",
             json!({"type": "object", "properties": {"query": {"type": "string", "minLength": 1}}, "required": ["query"], "additionalProperties": false}),
         ),
         BuiltinTool::CodeRun => (
             "Run sandboxed Python with /inputs read-only and /work writable; returns printed output \
-             and the repr of the last expression. No network, host files, or packages.",
+             and the repr of the last expression, both cut at the result limit. No network, host \
+             files, or packages.",
             json!({"type": "object", "properties": {"source": {"type": "string"}}, "required": ["source"], "additionalProperties": false}),
         ),
         _ => {
@@ -522,5 +581,24 @@ mod tests {
         drop(first);
         drop(second);
         assert_eq!(*budget.lock().expect("budget"), Duration::from_millis(500));
+    }
+
+    /// Reprs keep Python's quoting and stop at the limit on a character
+    /// boundary, for strings and containers alike.
+    ///
+    /// # Panics
+    /// Panics when a repr changes or overflows the limit.
+    #[test]
+    fn reprs_stop_at_the_limit() {
+        assert_eq!(
+            repr(&MontyObject::string("it's"), 64),
+            ("\"it's\"".to_owned(), true)
+        );
+        let big = MontyObject::list((0..100_000).map(|_| MontyObject::string("é\n")));
+        let (text, whole) = repr(&big, 64);
+        assert!(!whole);
+        assert!(text.len() <= 64 && text.starts_with("['é\\n', "), "{text}");
+        let (text, whole) = repr(&MontyObject::string("é".repeat(100)), 7);
+        assert_eq!((text.as_str(), whole), ("'ééé", false));
     }
 }

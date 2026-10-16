@@ -174,18 +174,26 @@ impl AgentTool for RecordedTool {
             error: None,
         };
         let result = self.inner.invoke(args).await.and_then(|output| {
-            let bytes = serde_json::to_vec(&output)
-                .map_err(|error| ToolError::OutputSerialization(error.to_string()))?;
-            if bytes.len() > self.max_result_bytes {
-                return Err(ToolError::Invocation {
-                    detail: format!(
-                        "result of {} bytes exceeds the {}-byte tool result limit",
-                        bytes.len(),
-                        self.max_result_bytes
-                    ),
-                    cause: None,
-                });
+            // Encoding stops at the limit, so an oversized result never
+            // allocates more than the limit.
+            let mut writer = Capped {
+                bytes: Vec::new(),
+                max: self.max_result_bytes,
+            };
+            match serde_json::to_writer(&mut writer, &output) {
+                Ok(()) => {}
+                Err(error) if error.is_io() => {
+                    return Err(ToolError::Invocation {
+                        detail: format!(
+                            "the result exceeds the {}-byte tool result limit",
+                            self.max_result_bytes
+                        ),
+                        cause: None,
+                    });
+                }
+                Err(error) => return Err(ToolError::OutputSerialization(error.to_string())),
             }
+            let bytes = writer.bytes;
             record.output_sha256 = Some(Sha256Hex::digest(&bytes));
             record.returned_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             Ok(output)
@@ -208,4 +216,35 @@ pub(crate) fn finished(records: &Mutex<Vec<Option<ToolCallRecord>>>) -> Vec<Tool
         .flatten()
         .cloned()
         .collect()
+}
+
+/// Encoded bytes limited to `max`; a write past the limit fails without
+/// growing the buffer.
+struct Capped {
+    /// What fit.
+    bytes: Vec<u8>,
+    /// Byte limit.
+    max: usize,
+}
+
+impl std::io::Write for Capped {
+    /// Append `buf` whole, or fail when it would pass the limit.
+    ///
+    /// # Errors
+    /// Returns an IO error once the limit would be passed.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() > self.max - self.bytes.len() {
+            return Err(std::io::Error::other("the tool result limit is reached"));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    /// Nothing is buffered.
+    ///
+    /// # Errors
+    /// Never.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }

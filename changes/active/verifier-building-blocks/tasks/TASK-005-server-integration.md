@@ -1,7 +1,7 @@
 ---
 id: TASK-005
 kind: implementation
-status: proposed
+status: review
 spec: SPEC-verifier-building-blocks
 spec_revision: 8
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008, AC-001, AC-003, AC-005, AC-006, AC-007, AC-008, AC-009, AC-010]

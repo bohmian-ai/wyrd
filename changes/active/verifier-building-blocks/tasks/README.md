@@ -1,29 +1,34 @@
 # Verifier building blocks: execution and proof
 
-Authority: [SPEC-verifier-building-blocks r8, approved](../spec.md).
+Authority: [SPEC-verifier-building-blocks r9, approved](../spec.md).
 The change has exactly five implementation tasks. This page coordinates their
 seams, coverage, execution status, and final proof; it is not a sixth task.
 Git staging, commits, worktrees, branch scheduling, and merges remain caller-
 owned.
 
-## Execution status — 2026-10-15
+## Execution status — 2026-10-16
 
 The owner approved Task 001 and its final remediation at
-`a02055b5561b889fa9d934038109f3028b0ecb1d`. Tasks 002–004 can now execute
-in parallel from that shared contract handoff. The owner approved Task 004
-at `b4226148e9f962d0508ba46edb9c07676cad48ba`.
+`a02055b5561b889fa9d934038109f3028b0ecb1d` and Task 004 at
+`b4226148e9f962d0508ba46edb9c07676cad48ba`. Tasks 002, 003, and 004 are
+merged into `change/verifier-building-blocks`; Task 005 builds on that
+integrated result.
 
 | Task | Status | Next step |
 | --- | --- | --- |
-| [001 — contracts](TASK-001-verifier-contract.md) | Complete; owner-approved | Shared handoff available |
-| [002 — engine](TASK-002-verification-engine.md) | Ready | Execute alongside 003 and 004 |
-| [003 — hosted runtime](TASK-003-hosted-check-runtime.md) | Ready | Execute alongside 002 and 004 |
-| [004 — SDKs, examples, docs](TASK-004-sdks-examples-and-docs.md) | Complete; owner-approved | Journeys run at merged-change review |
-| [005 — integration](TASK-005-server-integration.md) | Proposed; awaiting 002–004 | Compose their integrated result, then run final proof |
+| [001 — contracts](TASK-001-verifier-contract.md) | Complete; owner-approved | None |
+| [002 — engine](TASK-002-verification-engine.md) | Merged; review `task-002-r1` FIX_REQUIRED, remediation TASK-002-R2 (rustdoc only) implemented | Fresh `$wyrd-task-review` of TASK-002 |
+| [003 — hosted runtime](TASK-003-hosted-check-runtime.md) | Merged with remediation TASK-003-R1; review `task-003` FIX_REQUIRED | Fresh `$wyrd-task-review` of TASK-003 |
+| [004 — SDKs, examples, docs](TASK-004-sdks-examples-and-docs.md) | Complete; owner-approved; merged | Journeys run at merged-change review |
+| [005 — integration](TASK-005-server-integration.md) | In progress; review `task-005` FIX_REQUIRED, remediation TASK-005-R1 implemented at `b4f0db306`; TASK-005-S1 smoke tests committed, live sweep not yet run | Fresh `$wyrd-task-review` of TASK-005; run and record the S1 live sweep |
 
-This records direct owner acceptance, not a new independent review PASS.
-Prior immutable verdicts are preserved. Full integration and journey tests
-remain due after all five tasks are merged.
+Owner approval is direct acceptance, not an independent review PASS. No
+remediation above has yet passed a fresh independent review, and prior
+immutable verdicts are preserved. Full integration and journey tests remain
+due once at merged-change review.
+
+The owner approved r9 on 2026-10-16: the local-backend evidence upload route
+in REQ-010/REQ-012, resolving FIND-TASK-005-6.
 
 The owner approved r8 on 2026-10-15: Task 005 owns the standalone
 `wyrd-example-ts` refactor and new `wyrd-example-py`/`wyrd-example-rs`

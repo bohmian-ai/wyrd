@@ -19,6 +19,23 @@ pub mod tools;
 pub mod traces;
 pub mod workspace;
 
+/// `caller` under a fresh request ID, for one Oracle statement.
+///
+/// The Oracle tracks running queries by tenant and request ID, and one
+/// execution issues statements concurrently: parallel trace checks and the
+/// Agent loop's concurrent `bifrost.query` calls. Each statement therefore
+/// runs under its own request ID while keeping the caller's tenant,
+/// principal, delegation chain, and executor.
+#[must_use]
+pub(crate) fn statement_caller(
+    caller: &crate::components::auth::Caller,
+) -> crate::components::auth::Caller {
+    crate::components::auth::Caller {
+        request_id: wyrd_spec::request_id::RequestId::now_v7(),
+        ..caller.clone()
+    }
+}
+
 /// The Deployment limits the hosted capabilities enforce.
 ///
 /// Defaults are the approved Deployment limits; server startup may lower or

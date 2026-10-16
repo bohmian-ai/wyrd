@@ -238,7 +238,11 @@ impl Invocation {
                 // ponytail: never cancelled; the engine drops the call at its
                 // deadline and the query keeps its own `deadline_ms`.
                 BoundedQuery::new(self.state.clone())
-                    .run(self.caller.clone(), &args, &CancellationToken::new())
+                    .run(
+                        super::statement_caller(&self.caller),
+                        &args,
+                        &CancellationToken::new(),
+                    )
                     .await
                     .map_err(|error| structured(&error))
             }

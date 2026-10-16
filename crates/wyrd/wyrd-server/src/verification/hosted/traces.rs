@@ -39,8 +39,12 @@ const SPANS_NOT_CREATED: &str = "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND";
 
 /// Reads one execution's trace inputs as its accepted caller.
 pub struct CallerTraces {
-    /// The caller every span query is authorized and audited as.
-    query: ScheduledQueryCaller,
+    /// Server state each span query runs against.
+    state: AppState,
+    /// The caller every span query is authorized and audited as; each
+    /// statement runs under its own request ID ([`super::statement_caller`]),
+    /// since an execution's trace checks fetch concurrently.
+    caller: Caller,
     /// When the execution was accepted; spans are read from
     /// [`LOOKBACK`] before it through one day after it, so retries read the
     /// same pruned range.
@@ -58,8 +62,10 @@ impl CallerTraces {
         caller: Caller,
         anchor: DateTime<Utc>,
     ) -> Result<Self, wyrd_spec::error::WyrdError> {
+        crate::query::service::oracle_context(&caller)?;
         Ok(Self {
-            query: ScheduledQueryCaller::authenticated(state, caller, CancellationToken::new())?,
+            state,
+            caller,
             anchor,
         })
     }
@@ -105,7 +111,13 @@ impl TraceSource for CallerTraces {
             sql: self.statement(trace_id),
             deadline_ms: i64::try_from(deadline.as_millis()).ok(),
         };
-        let read = self.query.run_with(request, |batch| {
+        let query = ScheduledQueryCaller::authenticated(
+            self.state.clone(),
+            super::statement_caller(&self.caller),
+            CancellationToken::new(),
+        )
+        .map_err(|error| failed(error.to_string()))?;
+        let read = query.run_with(request, |batch| {
             batches.push(batch);
             Ok(())
         });

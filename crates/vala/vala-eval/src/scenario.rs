@@ -444,6 +444,9 @@ mod scenario_execution {
     }
 
     /// Build one completed scenario record with a trace binding.
+    ///
+    /// # Panics
+    /// Panics when `trace_hex` is not a valid 32-hex-digit trace id.
     fn record(id: u128, trace_hex: &str, context: Value) -> ScenarioRecord {
         ScenarioRecord {
             record_id: RecordId(Uuid::from_u128(id)),

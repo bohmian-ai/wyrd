@@ -651,7 +651,8 @@ impl<'a> VerificationControl<'a> {
     /// Stage a completed direct execution's inputs and result on the Scribe
     /// outbox.
     ///
-    /// The result takes the execution's identity. Its rows name the subject
+    /// The payload mints its own result identity and correlates with the
+    /// execution through `execution_id`. Its rows name the subject
     /// as `card_uid` and the exact Verifier as `verifier_card_uid`, are
     /// attributed to the caller, carry the caller's application Run, and have
     /// no owner, binding, or Trigger. The inputs row never queues work. The

@@ -801,6 +801,9 @@ mod end_to_end {
     // ---- spec construction -----------------------------------------------------
 
     /// Build the six-task spec sketched in the module doc above.
+    ///
+    /// # Panics
+    /// Panics when a fixed task id or JSON path fixture fails to parse.
     fn full_spec() -> EvalSpec {
         // Stage 0: hits the record and the trace; no upstream deps.
         let agent_response_nonempty = EvalTask::AgentAssertion(AgentAssertionTask {

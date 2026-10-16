@@ -1,4 +1,4 @@
-//! `vala.verification.results` — one row per completed Verifier execution.
+//! `vala.verification.results` — one row per produced Verifier result payload.
 //!
 //! Owns the canonical result schema, its sensitive `outcome` Variant, and the
 //! Bloom columns a result lookup by id, execution, Verifier, or binding prunes
@@ -12,12 +12,14 @@ use crate::tables::fields::{ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
-/// `vala.verification.results` — exactly one row per completed Verifier execution.
+/// `vala.verification.results` — one row per produced Verifier result payload.
 ///
 /// Every Verifier writes this one surface whatever its checks, so a dashboard
-/// reads one result contract. Only `completed` executions appear: errored,
-/// timed-out, and still-running executions have no row here, so the presence
-/// of a row is itself the statement that the execution produced a verdict.
+/// reads one result contract. Each payload carries its own `result_id`, and
+/// `execution_id` correlates it with its execution. A queued result is staged
+/// before its execution completes, so an execution that is later abandoned or
+/// recovered can leave a row that is not its outcome; the queue's selected
+/// `result_id` on the completed execution is authoritative.
 /// [`OUTCOME`] holds the typed `VerificationOutcome` — verdict, requirement
 /// breakdown, step results, and original evidence identities — as one Variant.
 /// `execution_id` is the Verifier execution; the managed `run_id` is the

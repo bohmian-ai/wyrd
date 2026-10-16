@@ -777,7 +777,8 @@ impl VerifierRunner {
 
 /// Build `outcome`'s result payload once into the write that completes `run`.
 ///
-/// The result ID reuses the execution's, and `ended_at`, the results table's
+/// The payload mints its own result ID, which the completing settlement
+/// records as the execution's selected result, and `ended_at`, the results table's
 /// time column, is a result fact this process observes, not a coordination
 /// instant. The write is attributed to the execution's subject with `system`
 /// as actor, and returned rather than staged: only a settlement that still

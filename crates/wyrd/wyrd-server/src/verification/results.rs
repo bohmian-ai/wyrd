@@ -140,8 +140,9 @@ struct Activation<'a> {
 /// lease so the mapping can be exercised without a claim.
 #[derive(Debug, Clone, Copy)]
 pub struct ResultRun<'a> {
-    /// The Verifier execution, recorded as `execution_id`; the result
-    /// identity reuses its UUID, since one execution has one result.
+    /// The Verifier execution, recorded as `execution_id`. It correlates
+    /// result rows with their execution; each built payload mints its own
+    /// result identity.
     pub execution_id: ExecutionId,
     /// The application Run judged, stored as the managed `run_id`; `None`
     /// when there is none, as for scheduled drift.

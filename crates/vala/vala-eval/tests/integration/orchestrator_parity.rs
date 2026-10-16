@@ -131,6 +131,10 @@ async fn drive(
 
 /// A scripted multi-turn walk scores every turn's record and reaches the
 /// fixture's expected pass rate.
+///
+/// # Panics
+/// Panics when the fixture's expected pass rate is not 1.0, or when the walk
+/// does not score both turns' records as passing at that rate.
 #[tokio::test(flavor = "multi_thread")]
 async fn scripted_walk_parity() {
     let fixture = fixture_value(include_str!("fixtures/parity/scripted_walk.json"));

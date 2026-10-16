@@ -30,11 +30,34 @@ const WAIT_MS = 90_000;
 const QUIET_MS = 5_000;
 
 /**
+ * Create the `on-call-hooks` connection that gives a path-only Operator an
+ * origin, register the baseline and the story's `service` Card after it, and
+ * wait for the real fitter to fit its scheduled `verifier`'s baseline.
+ */
+async function startWatch(
+  server: NativeWyrdTestServer,
+  hooks: Receiver,
+  cards: Cards,
+  service: string,
+  verifier: string,
+): Promise<RegistrationReceipt> {
+  await (await OperatorConnections.connect()).create({
+    provider: "http",
+    name: "on-call-hooks",
+    origin: hooks.url,
+    auth: { scheme: "bearer", token: ON_CALL_TOKEN },
+  });
+  await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
+  const watch = await cards.registerFromPath(fixture(`cards/scheduled_drift_alerts_operator/${service}`));
+  server.waitForBaseline(registered(watch, verifier).uid, WAIT_MS);
+  return watch;
+}
+
+/**
  * The latency watch Service on a fresh server per test, so each window is
- * judged alone, registered after its
- * baseline and after the `on-call-hooks` connection that gives its path-only
- * Operator an origin, with the `latency-shift` baseline already fitted by the
- * real fitter.
+ * judged alone, registered after its baseline and after the `on-call-hooks`
+ * connection, with the `latency-shift` baseline already fitted by the real
+ * fitter.
  */
 const test = serverTest({ verificationRuntime: true, perTest: true }).extend<{
   hooks: Receiver;
@@ -47,33 +70,29 @@ const test = serverTest({ verificationRuntime: true, perTest: true }).extend<{
     await hooks.close();
   },
   cards: async ({ server: _ }, use) => use(await Cards.connect()),
-  watch: async ({ server, hooks, cards }, use) => {
-    await (await OperatorConnections.connect()).create({
-      provider: "http",
-      name: "on-call-hooks",
-      origin: hooks.url,
-      auth: { scheme: "bearer", token: ON_CALL_TOKEN },
-    });
-    await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
-    const watch = await cards.registerFromPath(fixture("cards/scheduled_drift_alerts_operator/latency-watch.yaml"));
-    server.waitForBaseline(registered(watch, "latency-shift").uid, WAIT_MS);
-    await use(watch);
-  },
+  watch: async ({ server, hooks, cards }, use) =>
+    use(await startWatch(server, hooks, cards, "latency-watch.yaml", "latency-shift")),
 });
 
 /**
- * Submit every latency as the Service, assert each was recorded for the
- * schedule rather than judged, and drain the samples.
+ * Submit every latency to `verifier` as the Service, assert each was recorded
+ * for the schedule rather than judged, and drain the samples.
  */
-async function submit(server: NativeWyrdTestServer, cards: Cards, watch: RegistrationReceipt, latencies: number[]) {
+async function submit(
+  server: NativeWyrdTestServer,
+  cards: Cards,
+  watch: RegistrationReceipt,
+  latencies: number[],
+  verifier = "latency-shift",
+) {
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-latency-watch-"));
   await cards.hydrate(watch.root, bundle);
-  const watchKey = await cli.issueKey({ kind: "Service", name: "latency-watch", version: "1.0.0", space: "default" });
+  const watchKey = await cli.issueKey({ ...watch.root, space: watch.root.space ?? "default" });
   const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: watchKey.key }) });
   await state.startBifrost();
   const run = state.run();
   for (const latency of latencies) {
-    expect(await run.observe.submit("latency-shift", { latency })).toEqual({ kind: "recorded" });
+    expect(await run.observe.submit(verifier, { latency })).toEqual({ kind: "recorded" });
   }
   await state.shutdown();
   server.flushBifrost();
@@ -148,6 +167,31 @@ test("empty window is inconclusive and alerts no one", async ({ server, hooks, c
 
   expect(result.outcome.verdict).toBe("inconclusive");
   await assertQuiet(hooks);
+});
+
+test("ready spc baseline charts a scheduled window", async ({ server, hooks, cards }) => {
+  const steady = await startWatch(server, hooks, cards, "latency-steady.yaml", "latency-control");
+  await submit(
+    server,
+    cards,
+    steady,
+    Array.from({ length: 20 }, () => 99),
+    "latency-control",
+  );
+
+  const result = await judge(server, cards, steady);
+
+  expect(result.outcome.verdict).toBe("failed");
+  expect(result.verifier.name).toBe("latency-control");
+  expect(result.outcome.requirements).toHaveLength(1);
+  const [requirement] = result.outcome.requirements;
+  expect([requirement?.id, requirement?.outcome]).toEqual(["latency-in-control", "failed"]);
+  expect(requirement?.check).toMatchObject({ method: "Spc" });
+  const latency = requirement?.detail?.drift.features.latency;
+  expect([latency?.score, latency?.threshold], JSON.stringify(latency)).toEqual([4, 0]);
+  expect(latency?.evidence).toMatchObject({
+    Spc: { subgroup_size: 5, subgroups: 4, x_bar: { center: 49.5, signals: 4 }, s: { signals: 0 } },
+  });
 });
 
 test("path only operator without connection is refused", async ({ server: _ }) => {

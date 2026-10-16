@@ -111,6 +111,19 @@ test("agent answer fails its verifier", async ({ state }) => {
   expect(result.outcome.requirements.map((each) => [each.outcome, each.actual])).toEqual([["failed", "no"]]);
 });
 
+test("positional object is the one answer, not its slots", async ({ state }) => {
+  const observe = state.run("agent").observe;
+
+  const positional = await observe.verify("answer-check", { answer: "yes" }, { positional: true });
+  const bare = await observe.verify("answer-check", "yes");
+
+  expect(positional.outcome.requirements.map((each) => [each.outcome, each.actual])).toEqual([
+    ["failed", { answer: "yes" }],
+  ]);
+  expect(positional.outcome.verdict).toBe("failed");
+  expect(bare.outcome.verdict).toBe("passed");
+});
+
 test("judged answer passes the agent check", async ({ provider, state }) => {
   const result = await state.run("agent").observe.verify("answer-judged", { answer: "yes" });
 

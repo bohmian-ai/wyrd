@@ -118,7 +118,7 @@
 pub use wyrd_client::{
     Bifrost, Gateway, GlobalConfig, OperatorConnections, Platform, Principals, QueueConfig,
     WyrdClient, bifrost, cards, client, config, environment, error, gateway, global_config,
-    observe, operator_connections, platform, state,
+    observe, operator_connections, platform, state, verify,
 };
 
 /// Tenant principal administration: the [`auth::Principals`] handle and its
@@ -165,15 +165,22 @@ pub use wyrd_spec::envelope::{Card, Spec};
 /// replaceable whole for one invocation with `Run::invoke_on`.
 pub use wyrd_spec::ExecutionRoute;
 
-/// How a Verifier Card judges: an Eval or a Drift implementation.
-pub use wyrd_spec::card::verifier::VerifierImplementation;
+/// The result `observe().verify` and `Execution::wait` return:
+/// the decided verdict, one result per requirement and step, and the
+/// evidence each input slot resolved to.
+pub use wyrd_spec::verification::VerificationVerdict;
+pub use wyrd_spec::verification::execution::{
+    CallProvenance, Citation, Locator, RequirementDetail, RequirementOutcome, RequirementResult,
+    StepResult, StepStatus, VerificationOutcome, VerificationResult,
+};
 
-/// The count rollup a [`Judgment`] carries.
-pub use wyrd_spec::card::operator::VerifierCounts;
+/// The identity of one queued Verifier execution, as `submit` returns it and
+/// `Execution::connect` takes it.
+pub use wyrd_spec::ids::ExecutionId;
 
-/// The judgment `observe().verify` returns, with its verdict and Verifier
-/// classification.
-pub use wyrd_spec::verification::{Judgment, VerificationVerdict, VerifierKind};
+/// The document or image format a media input slot accepts, declared on a
+/// `File` with `with_format` when its path or bytes do not imply it.
+pub use skald_spec::MediaFormat;
 
 /// The session an emitted observation belongs to.
 pub use wyrd_spec::vala::ids::SessionId;
@@ -222,6 +229,10 @@ mod tests {
             TableConfig::describe_with(client, fqn)
         };
         let _ = super::WyrdClient::with_config;
+        let _ = super::verify::Execution::connect;
+        let _ = super::verify::Execution::connect_with;
+        let _ =
+            |bytes: Vec<u8>| super::verify::File::bytes(bytes).with_format(super::MediaFormat::Pdf);
         let _ = super::WyrdError::code;
     }
 

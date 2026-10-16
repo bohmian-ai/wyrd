@@ -8,6 +8,7 @@ import { afterEach, expect, vi } from "vitest";
 import { Bifrost, Cards, Gateway, WyrdClient, WyrdState } from "wyrd-ai";
 
 import {
+  check,
   deploy,
   explain,
   question,
@@ -23,12 +24,19 @@ vi.setConfig({ testTimeout: 300_000 });
 
 /** Upstream answers by the first marker the request body contains. */
 const ANSWERS = [
-  ["Grade the support answer", '{"passed":true}'],
+  [
+    "list its refund rules",
+    '{"findings":[{"rule":"Refunds of up to 100 dollars are approved within 30 days.","page":1}]}',
+  ],
+  [
+    "Claim:",
+    '{"outcome":"passed","reason":"consistent with the policy","citations":[{"slot":"policy","locator":{"page":1}}]}',
+  ],
   ["refund", "You have a guaranteed refund."],
   ["Answer the customer", "Your order is on its way."],
 ] as const;
 
-/** A deployment that verifies continuously and answers every Gateway call by body marker. */
+/** A verification-capable deployment that answers every Gateway call by body marker. */
 const test = serverTest({
   verificationRuntime: true,
   provider: ({ body }) => {
@@ -78,17 +86,25 @@ test("support desk answers, verifies, and explains every request", async ({ serv
   ).rejects.toMatchObject({ code: "WYRD_PERMISSION_403_DENIED_RBAC" });
   expect(provider.received, "the refusal precedes upstream IO").toEqual([]);
 
+  const promise = await check(desk, "You have a guaranteed refund.");
+  expect(promise.outcome.verdict).toBe("failed");
+  expect(promise.outcome.requirements.map((requirement) => [requirement.id, requirement.outcome])).toEqual([
+    ["no-refund-promise", "failed"],
+    ["follows-policy", "passed"],
+  ]);
+  expect(promise.outcome.requirements.find(({ id }) => id === "follows-policy")?.citations).toEqual([
+    { slot: "policy", locator: { page: 1 } },
+  ]);
+
   const served = await serve(desk);
-  expect(served.map((request) => request.passed)).toEqual(
-    Array.from({ length: REQUESTS }, (_, index) => !question(index).includes("refund")),
+  expect(served).toHaveLength(REQUESTS);
+  const results = await waitForVerdicts(admin, served, 180_000);
+  expect(results.map((result) => [result.outcome.verdict, result.run_id])).toEqual(
+    served.map((request, index) => [question(index).includes("refund") ? "failed" : "passed", request.runId]),
   );
-  expect(await waitForVerdicts(admin, desk, 180_000)).toEqual({
-    "answer-quality": [100, 0],
-    "no-refund-promise": [90, 10],
-  });
 
   const agent = uid(desk, "support-agent");
-  for (const [index, realtime] of [
+  for (const [index, verdict] of [
     [1, "passed"],
     [0, "failed"],
   ] as const) {
@@ -98,8 +114,7 @@ test("support desk answers, verifies, and explains every request", async ({ serv
       ticket_id: `T-${index}`,
       span: "support-desk.request",
       call_card_uid: agent,
-      continuous: "passed",
-      realtime,
+      verdict,
     });
   }
 });

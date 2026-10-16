@@ -76,9 +76,10 @@ WIRE_ROOTS = [
     "ProviderDeployment",
     # Verification and Operator connections.
     "CreateOperatorConnectionRequest",
-    "Judgment",
     "OperatorConnectionView",
     "UpdateOperatorConnectionRequest",
+    "VerificationExecutionState",
+    "VerificationResult",
 ]
 
 # Wire roots the SDK sends. Every definition reachable from one of these or

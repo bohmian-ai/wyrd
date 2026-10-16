@@ -1,6 +1,6 @@
 //! The one Bifrost lifetime a [`crate::state::WyrdState`] owns.
 //!
-//! A state starts Bifrost once, describes both fixed observation tables before
+//! A state starts Bifrost once, describes the fixed Drift observation table before
 //! reporting success, and then serves every scoped run from that one facade.
 //! The phase machine exists because `WyrdState` is `Clone` over a shared
 //! `Arc`: two clones must not race into two writers, and a caller must not be
@@ -15,21 +15,17 @@ use crate::bifrost::{Bifrost, WriterTable};
 
 /// The fixed Drift observation table every state describes at startup.
 pub const DRIFT_OBSERVATIONS_TABLE: &str = "vala.drift.observations";
-/// The fixed Eval observation table every state describes at startup.
-pub const EVAL_OBSERVATIONS_TABLE: &str = "vala.eval.observations";
 
-/// The connected writer plus the two fixed destinations resolved with it.
+/// The connected writer plus the fixed Drift destination resolved with it.
 ///
 /// Holding a [`WriterTable`] is the proof that its table was described for this
-/// writer's lifetime, which is what makes `observe.drift` and `observe.eval`
-/// synchronous projection-and-enqueue calls.
+/// writer's lifetime, which is what makes recording Window samples a
+/// synchronous projection-and-enqueue call.
 pub struct StartedBifrost {
     /// The one state-owned facade: transport, pooled producers, and queries.
     pub bifrost: Bifrost,
     /// `vala.drift.observations`, described once at startup.
     pub drift: WriterTable,
-    /// `vala.eval.observations`, described once at startup.
-    pub eval: WriterTable,
 }
 
 /// Where one state's Bifrost lifetime currently sits.
@@ -38,7 +34,7 @@ enum Phase {
     NotStarted,
     /// A start is in flight and holds the claim; a second start is refused.
     Starting,
-    /// One connected writer with both fixed tables described.
+    /// One connected writer with the fixed Drift table described.
     Started(Arc<StartedBifrost>),
     /// A shutdown succeeded — after a drain, or before any writer existed;
     /// this state never starts or writes again.
@@ -164,22 +160,23 @@ pub struct StartClaim<'a> {
 }
 
 impl StartClaim<'_> {
-    /// Describe both fixed observation tables, then publish the started writer.
+    /// Describe the fixed Drift observation table, then publish the started
+    /// writer.
     ///
-    /// The describes happen inside the claim so a state whose fixed tables are
+    /// The describe happens inside the claim so a state whose fixed table is
     /// missing, unauthorized, or unreachable never reaches `Started`, and no
     /// run can enqueue an observation the server would refuse per row.
     ///
     /// # Arguments
-    /// * `bifrost` - The started client whose writer is published once both
-    ///   fixed observation tables describe.
+    /// * `bifrost` - The started client whose writer is published once the
+    ///   fixed observation table describes.
     ///
     /// # Errors
     /// Returns the server's not-found, authentication, authorization, or
-    /// availability error for either fixed table, a validation error when a
+    /// availability error for the fixed table, a validation error when a
     /// described table does not carry the projected observation columns, and
     /// `WYRD_SDK_409_BIFROST_CLOSED` when a shutdown won the race while the
-    /// describes were in flight; that writer is dropped, never installed.
+    /// describe was in flight; that writer is dropped, never installed.
     ///
     /// # Panics
     /// Panics if the phase lock is poisoned.
@@ -188,15 +185,7 @@ impl StartClaim<'_> {
             .resolve_writer_table(DRIFT_OBSERVATIONS_TABLE)
             .await?;
         crate::observe::drift::require_projection_columns(&drift)?;
-        let eval = bifrost
-            .resolve_writer_table(EVAL_OBSERVATIONS_TABLE)
-            .await?;
-        crate::observe::eval::require_projection_columns(&eval)?;
-        let started = Arc::new(StartedBifrost {
-            bifrost,
-            drift,
-            eval,
-        });
+        let started = Arc::new(StartedBifrost { bifrost, drift });
         let mut phase = self
             .lifecycle
             .phase

@@ -9325,6 +9325,7 @@ dependencies = [
  "wyrd-auth-verify",
  "wyrd-cli",
  "wyrd-client",
+ "wyrd-skald-spec",
  "wyrd-spec",
  "wyrd-testing",
 ]
@@ -9821,6 +9822,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "url",
  "wyrd-auth-verify",

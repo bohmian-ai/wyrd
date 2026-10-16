@@ -43,14 +43,13 @@ Wyrd serves MCP protocol revision 2026-07-28 only. Its MCP tool names contain do
 | `cards.list` | Read; `cards:read` | List filters and optional cursor → `{items, next_cursor}` | Discover metadata summaries by kind, name, space, version range, lifecycle status, or metadata filter |
 | `cards.get_by_ref` | Read; `cards:read` | `{card_ref}` → `{card, created_at, updated_at}` | Resolve exact kind, name, version, and space |
 | `cards.get` | Read; `cards:read` | `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card when you already have its kind and UID |
-| `verification.get_binding` | Read; `cards:read` | `{binding_id}` → binding status | Inspect owner, subject, Verifier, readiness, and last run |
-| `verification.get_run` | Read; `cards:read` | `{run_id}` → run status | Inspect execution, result ID, errors, and Operator dispatches |
-| `verification.start_run` | Write; `verifier:run` on selected Verifier | `{target, input, idempotency_key?}` → run creation response | Enqueue a bounded manual Drift window; retry key preserves run identity |
-| `verification.execute` | Execute; `verifier:run` on exact Verifier | ExecuteVerificationRequest → Judgment | Return a judgment in the same call and store its result; creates no run or Operator dispatch |
+| `verification.get_binding` | Read; `cards:read` | `{binding_id}` → binding status | Inspect owner, subject, Verifier, readiness, and latest admitted `last_execution_id` |
+| `verification.get_execution` | Read; `cards:read` | `{execution_id}` → execution status | Inspect state, result, error, and Operator dispatches of one execution |
+| `verification.execute` | Execute; `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Return the result in the same call and store it; creates no queued execution or Operator dispatch |
 
 `cards.list.filter` is a metadata query string, not a JSON object: for example `labels.env = "prod"`, `labels.tier in ["gold","silver"]`, or `labels.deprecated not exists`, combined with `and`, `or`, and `not`. Fields are `labels.<key>`, `annotations.<key>`, and `attributes.<key>`; a query may hold up to 64 predicates. A syntax error returns `WYRD_QUERY_400_INVALID_SYNTAX`. Preserve `next_cursor` unchanged alongside the same filters. A missing version or malformed cursor is invalid; no implicit newest-version or fuzzy selection occurs. Missing and foreign-tenant Cards are indistinguishable. Relationship edges in `outbound_refs` and `inbound_refs` carry exact identities under `ref`.
 
-`verification.start_run.target` is tagged `binding` (with `binding_id`) or `verifier` (with `verifier_card_uid` and `card_uid`). `input` is tagged `drift_window` with UTC `start` and `end`. Invalid windows, absent targets, or unavailable baselines are refused. `verification.execute` supports the current scoring and direct assertion forms; unsupported execution forms are refused. Follow the [verification procedure](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) to read persisted results.
+`verification.execute` refuses a Verifier that judges a scheduled window; drift is judged only by its schedule. Follow the [verification procedure](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) to read persisted results.
 
 ## Bifrost
 

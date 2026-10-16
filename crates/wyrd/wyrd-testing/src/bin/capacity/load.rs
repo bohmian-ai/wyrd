@@ -26,7 +26,6 @@ use reqwest::Method;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use wyrd_client::observe::EvalObservationOptions;
 use wyrd_client::state::WyrdState;
 use wyrd_client::{Bifrost, QueueConfig, WyrdClient};
 use wyrd_spec::verification::{
@@ -35,7 +34,7 @@ use wyrd_spec::verification::{
 };
 
 use crate::Result;
-use crate::fixture::{Kind, Tenant, context};
+use crate::fixture::{DRIFT_VERIFIER, Kind, Tenant, context};
 
 /// Driver permits: the most requests the driver keeps in flight at once.
 pub const MAX_IN_FLIGHT: usize = 2_048;
@@ -426,20 +425,21 @@ impl Request {
                 }
             }
             Self::Observe(alias) => {
-                let kind = if *alias == "judge" {
-                    Kind::Judge
+                let (kind, verifier) = if *alias == "judge" {
+                    (Kind::Judge, "capacity-judge")
                 } else {
-                    Kind::Assertion
+                    (Kind::Assertion, "capacity-assert")
                 };
-                let emitted = clients.states[replica]
-                    .run()
-                    .for_card(alias)
-                    .and_then(|view| {
+                let submitted = match clients.states[replica].run().for_card(alias) {
+                    Ok(view) => {
                         view.observe()
-                            .eval(&context(kind, failing), EvalObservationOptions::default())
-                    });
-                match emitted {
-                    Ok(()) => accepted,
+                            .submit(verifier, serde_json::Value::Object(context(kind, failing)))
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match submitted {
+                    Ok(_) => accepted,
                     Err(error) => Outcome::Rejected(error.code().to_owned()),
                 }
             }
@@ -450,15 +450,16 @@ impl Request {
                         (format!("f{feature}"), (value as f64).into())
                     })
                     .collect();
-                let emitted = clients.states[replica]
-                    .run()
-                    .for_card("model")
-                    .and_then(|view| {
+                let submitted = match clients.states[replica].run().for_card("model") {
+                    Ok(view) => {
                         view.observe()
-                            .drift(&serde_json::Value::Object(features), None)
-                    });
-                match emitted {
-                    Ok(()) => accepted,
+                            .submit(DRIFT_VERIFIER, serde_json::Value::Object(features))
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match submitted {
+                    Ok(_) => accepted,
                     Err(error) => Outcome::Rejected(error.code().to_owned()),
                 }
             }

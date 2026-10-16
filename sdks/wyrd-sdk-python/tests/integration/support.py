@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from pydantic import BaseModel
+from wyrd import verify
 from wyrd.bifrost import Bifrost, SpanRecord
 from wyrd.cards import CardRef, Cards
 from wyrd.client import WyrdClient
@@ -155,3 +157,56 @@ def binding_ids(cards: Cards, ref: CardRef) -> list[str]:
     # Status and its verification block stay empty until the server derives them.
     assert status is not None and status.get("verification") is not None
     return status["verification"]["binding_ids"]
+
+
+class Retained(BaseModel):
+    """One ``vala.verification.results`` row's execution identity."""
+
+    execution_id: str
+
+
+def scheduled_result(
+    server: WyrdTestServer, binding_id: str, timeout: float
+) -> verify.VerificationResult:
+    """Make ``binding_id`` due and read back the result the scheduler retains for it.
+
+    Results the binding already retained are skipped, so a binding made due
+    again yields its newest judgment. Rows are published until a new one
+    names an execution, whose typed result is then read by its ID.
+    """
+    admin = client_of(server)
+    bifrost = Bifrost(client=admin)
+    query = "SELECT execution_id FROM vala.verification.results WHERE binding_id = $1"
+
+    def retained() -> set[str]:
+        server.flush_bifrost()
+        return {row.execution_id for row in bifrost.sql(query, [binding_id], model=Retained)}
+
+    earlier = retained()
+    server.make_binding_due(binding_id)
+    deadline = time.monotonic() + timeout
+    while not (new := retained() - earlier):
+        assert time.monotonic() < deadline, (
+            f"binding {binding_id} retained no result in {timeout} s"
+        )
+        time.sleep(0.5)
+    [execution_id] = new
+    return verify.Execution.connect(execution_id, admin).wait(timeout)
+
+
+@dataclass
+class Watch:
+    """The deployment of one scheduled-drift story.
+
+    A server of its own, since a scheduled window spans every sample since
+    the last cron boundary, with the Service hydrated under its own key, the
+    ``on-call-hooks`` connection pointing at ``hooks``, and every sample
+    submitted to the scheduled ``verifier``.
+    """
+
+    server: WyrdTestServer
+    state: WyrdState
+    root: CardRef
+    binding_id: str
+    hooks: Receiver
+    verifier: str

@@ -92,54 +92,6 @@ export interface ArrowMeta {
 }
 
 /**
- * Result of one evaluated task.
- *
- * Emitted by `vala-eval` per task per workflow run; persisted to the OLAP `eval_task_results` table.
- */
-export interface AssertionResult {
-  /**
-   * JSON value extracted at the task's context path.
-   *
-   * `None` when [`EvalContextCapture::Redact`] is set on the enclosing spec. A SHA-256 hex digest string when [`EvalContextCapture::Hash`]. Populated verbatim when [`EvalContextCapture::Full`] or when `context_capture` is absent.
-   */
-  readonly actual?: JsonValue;
-  /**
-   * Wall-clock duration in milliseconds.
-   */
-  readonly duration_ms: number;
-  /**
-   * Right-hand side the task declared.
-   */
-  readonly expected: JsonValue;
-  /**
-   * Optional human-readable detail, such as a regex mismatch position.
-   */
-  readonly message?: string;
-  /**
-   * Operator the task declared.
-   */
-  readonly operator: ComparisonOperator;
-  /**
-   * True iff the assertion compared favorably and no error occurred.
-   */
-  readonly passed: boolean;
-  /**
-   * Topological stage, 0-indexed, within the execution plan.
-   *
-   * Useful for stage-aligned visualisations of long runs.
-   */
-  readonly stage: number;
-  /**
-   * Wall-clock start of the assertion's evaluation step.
-   */
-  readonly started_at: string;
-  /**
-   * Identifier of the evaluated task.
-   */
-  readonly task_id: TaskId;
-}
-
-/**
  * Public synchronous Oracle query request.
  *
  * Every query reads the same sources: its pinned published cut plus best-effort live rows from selected online Scribes. There is no caller source, freshness, or class selector, and unknown fields are rejected so a client that still sends one learns the contract changed instead of silently receiving different semantics.
@@ -249,6 +201,74 @@ export interface BifrostTableEntry {
  * Where an image or document block's media comes from.
  */
 export type BlockSource = string | MediaSource;
+
+/**
+ * One server-owned built-in Agent tool.
+ *
+ * The closed catalog a Verifier step Agent may name in [`AgentSpec::tool_names`] and the exact object a `tool:invoke` permission may be scoped to. Registration and authorization share this one vocabulary, so a name is either a built-in everywhere or nowhere.
+ */
+export type BuiltinTool = "cards.list" | "cards.get" | "cards.get_by_ref" | "bifrost.list_tables" | "bifrost.describe_table" | "bifrost.query" | "fs.list" | "fs.read" | "fs.search" | "code.run";
+
+/**
+ * What executed one Agent, code, extract, or drift block.
+ */
+export type CallProvenance = CallProvenanceAgent | CallProvenanceCode | CallProvenanceExtract | CallProvenanceDrift;
+
+/**
+ * An Agent call.
+ */
+export interface CallProvenanceAgent {
+  /**
+   * Exact Agent Card; absent when declared inline in the Verifier.
+   */
+  readonly agent?: CardRef | null;
+  readonly kind: "agent";
+  /**
+   * Exact Prompt Card; absent when declared inline.
+   */
+  readonly prompt?: CardRef | null;
+  /**
+   * The effective route after overrides.
+   */
+  readonly route: ExecutionRoute;
+}
+
+/**
+ * A sandboxed code call.
+ */
+export interface CallProvenanceCode {
+  readonly kind: "code";
+  /**
+   * The runtime.
+   */
+  readonly runtime: CodeRuntime;
+  /**
+   * SHA-256 of the executed source.
+   */
+  readonly sha256: Sha256Hex;
+}
+
+/**
+ * A drift check.
+ */
+export interface CallProvenanceDrift {
+  readonly kind: "drift";
+  /**
+   * The scored sample window, for scheduled evidence.
+   */
+  readonly window?: DriftWindow | null;
+}
+
+/**
+ * An extraction.
+ */
+export interface CallProvenanceExtract {
+  readonly kind: "extract";
+  /**
+   * Extractor version that produced the output.
+   */
+  readonly version: string;
+}
 
 /**
  * Idempotent cancellation result for one active Oracle query.
@@ -416,6 +436,179 @@ export interface CatboostMeta {
    * Concrete model subtype, when known.
    */
   readonly model_subtype?: string | null;
+}
+
+/**
+ * A verdict-producing requirement check.
+ */
+export type Check = CheckAssert | CheckTrace | CheckAgent | CheckCode | CheckDrift;
+
+/**
+ * A tool-less Agent returning the Verdict schema.
+ */
+export interface CheckAgent {
+  /**
+   * The Agent, inline, file-authored, or registered.
+   */
+  readonly agent: InlineableRef_for_AgentSpec;
+  /**
+   * Injected values keyed by the Prompt's text and media placeholders.
+   */
+  readonly inputs?: Readonly<Record<string, Reference>>;
+  readonly kind: "agent";
+  /**
+   * Files under `/inputs/...` for the Agent's tools; step position only.
+   */
+  readonly workspace?: Readonly<Record<string, Reference>>;
+}
+
+/**
+ * Typed comparison over one value (`path`) or every wildcard match (`each`); exactly one is set.
+ */
+export interface CheckAssert {
+  /**
+   * Every value selected through `[*]`.
+   */
+  readonly each?: Reference | null;
+  /**
+   * Right-hand side of the comparison.
+   */
+  readonly expected?: JsonValue;
+  readonly kind: "assert";
+  /**
+   * Comparison operator.
+   */
+  readonly operator: ComparisonOperator;
+  /**
+   * One value.
+   */
+  readonly path?: Reference | null;
+}
+
+/**
+ * Sandboxed code returning the Verdict schema.
+ */
+export interface CheckCode {
+  /**
+   * Function called with the bound inputs as keyword arguments.
+   */
+  readonly entrypoint: string;
+  /**
+   * Values passed to the entrypoint.
+   */
+  readonly inputs?: Readonly<Record<string, Reference>>;
+  readonly kind: "code";
+  /**
+   * Execution runtime.
+   */
+  readonly runtime?: CodeRuntime;
+  /**
+   * Immutable source.
+   */
+  readonly source: CodeSource;
+}
+
+/**
+ * Statistical drift over a samples slot.
+ */
+export interface CheckDrift {
+  /**
+   * When a sample becomes an emittable observation.
+   */
+  readonly condition: DriftCondition;
+  /**
+   * Free-text description authored on the card.
+   */
+  readonly description?: string | null;
+  readonly kind: "drift";
+  /**
+   * Drift detection method. Drives which `DriftProfile` variant is allowed.
+   */
+  readonly method: DriftMethod;
+  /**
+   * The samples slot, as `inputs.<slot>`.
+   */
+  readonly on: Reference;
+  /**
+   * Method-specific math configuration. Required for every executable method/signal pair and must match `method`.
+   */
+  readonly profile?: DriftProfile | null;
+  /**
+   * How the measurement enters the monitor.
+   */
+  readonly signal: DriftSignal;
+}
+
+/**
+ * Trace assertion over a trace slot.
+ */
+export interface CheckTrace {
+  /**
+   * Right-hand side of the comparison.
+   */
+  readonly expected?: JsonValue;
+  readonly kind: "trace";
+  /**
+   * The trace slot, as `inputs.<slot>`.
+   */
+  readonly on: Reference;
+  /**
+   * Comparison operator.
+   */
+  readonly operator: ComparisonOperator;
+  /**
+   * JSONPath into the assembled trace document.
+   */
+  readonly span_selector: JsonPath;
+}
+
+/**
+ * A location in an original input slot, never in scratch space.
+ */
+export interface Citation {
+  /**
+   * Where in that slot.
+   */
+  readonly locator: Locator;
+  /**
+   * The original input slot.
+   */
+  readonly slot: SlotName;
+}
+
+/**
+ * A code execution runtime.
+ */
+export type CodeRuntime = "python";
+
+/**
+ * Immutable code source.
+ */
+export type CodeSource = CodeSourceInline | CodeSourceArtifact;
+
+/**
+ * A file inside an exact Artifact Card version.
+ */
+export interface CodeSourceArtifact {
+  readonly artifact: CodeSourceArtifactArtifact;
+}
+
+export interface CodeSourceArtifactArtifact {
+  /**
+   * The Artifact Card.
+   */
+  readonly card: Ref;
+  /**
+   * File path inside the Artifact, when it holds more than one file.
+   */
+  readonly path?: string | null;
+}
+
+/**
+ * Source text embedded in the Verifier version.
+ */
+export interface CodeSourceInline {
+  readonly inline: string;
 }
 
 /**
@@ -1258,6 +1451,22 @@ export interface DriftSpec {
 export type DriftVerdict = "NoDrift" | "Drift" | "Inconclusive";
 
 /**
+ * A half-open UTC Drift comparison window `[start, end)`.
+ *
+ * Scheduled runs derive it from the due cron occurrence; manual runs supply it and validate it with [`DriftWindow::validate_manual`].
+ */
+export interface DriftWindow {
+  /**
+   * Exclusive window end.
+   */
+  readonly end: string;
+  /**
+   * Inclusive window start.
+   */
+  readonly start: string;
+}
+
+/**
  * A typed predicate evaluated against one JSON value extracted from workflow context or scenario payload.
  *
  * To chain conditions, set both [`EvalCondition::combinator`] and [`EvalCondition::subsequent`]. The whole chain is evaluated left-to-right with `AND` short-circuit on false and `OR` short-circuit on true.
@@ -1330,20 +1539,6 @@ export interface EvalPassGatePerJudgePassRate {
    * Minimum accepted per-task pass rate in `[0.0, 1.0]`.
    */
   readonly threshold: number;
-}
-
-/**
- * The Eval engine's report of one direct execution.
- */
-export interface EvalReport {
-  /**
-   * The result of every task that ran, in stage order.
-   */
-  readonly results: readonly AssertionResult[];
-  /**
-   * Every task that did not run, with its reason.
-   */
-  readonly skipped: readonly SkippedTask[];
 }
 
 /**
@@ -2270,6 +2465,71 @@ export interface InlineableRef_for_TriggerSpecSibling {
 }
 
 /**
+ * What a caller supplies for one input slot. Execution results echo the pinned declarations as the original evidence identities.
+ */
+export type InputDeclaration = InputDeclarationJson | InputDeclarationFile | InputDeclarationArtifact | InputDeclarationTrace;
+
+/**
+ * A registered Artifact Card's file.
+ */
+export interface InputDeclarationArtifact {
+  /**
+   * Exact Artifact Card reference.
+   */
+  readonly artifact: CardRef;
+  readonly kind: "artifact";
+  /**
+   * File path inside the Artifact; required when it holds several.
+   */
+  readonly path?: string | null;
+}
+
+/**
+ * A file uploaded by digest through the evidence plan.
+ */
+export interface InputDeclarationFile {
+  /**
+   * Original filename, for display only.
+   */
+  readonly filename?: string | null;
+  /**
+   * Declared canonical format.
+   */
+  readonly format: MediaFormat;
+  readonly kind: "file";
+  /**
+   * SHA-256 of the file bytes.
+   */
+  readonly sha256: Sha256Hex;
+  /**
+   * File length in bytes.
+   */
+  readonly size_bytes: number;
+}
+
+/**
+ * Bounded inline JSON for a `json` slot.
+ */
+export interface InputDeclarationJson {
+  readonly kind: "json";
+  /**
+   * The supplied value.
+   */
+  readonly value: JsonValue;
+}
+
+/**
+ * A recorded trace for a `trace` slot.
+ */
+export interface InputDeclarationTrace {
+  readonly kind: "trace";
+  /**
+   * The trace to judge.
+   */
+  readonly trace_id: TraceId;
+}
+
+/**
  * OTel-canonical instrumentation scope.
  *
  * Fields:
@@ -2329,46 +2589,6 @@ export interface JsonlMeta {
    * Optional number of lines written per local file.
    */
   readonly lines_per_file?: number | null;
-}
-
-/**
- * The judgment of one direct execution: `200 OK` to `POST /v1/verification/execute`, and what `observe.verify` returns.
- *
- * A `failed` verdict is a successful response. Nothing here is persisted.
- */
-export interface Judgment {
-  /**
-   * Count-only rollup of a Drift or Eval judgment; absent for a task Verifier, whose one check is fully described by `verdict`.
-   */
-  readonly counts?: VerifierCounts;
-  /**
-   * The engine report.
-   */
-  readonly detail: VerificationExecutionDetail;
-  /**
-   * Transient identity of this execution, shared with its audit and trace.
-   */
-  readonly execution_id: string;
-  /**
-   * Classification of the Verifier.
-   */
-  readonly kind: VerifierKind;
-  /**
-   * The exact subject judged.
-   */
-  readonly subject: CardRef;
-  /**
-   * Bounded human-readable summary of the verdict.
-   */
-  readonly summary: string;
-  /**
-   * The common verdict.
-   */
-  readonly verdict: VerificationVerdict;
-  /**
-   * The exact Verifier executed.
-   */
-  readonly verifier: CardRef;
 }
 
 /**
@@ -2459,6 +2679,82 @@ export interface ListCardsResponse {
    */
   readonly next_cursor: string | null;
 }
+
+/**
+ * A typed location, serialized as a one-key object such as `{"page": 7}`.
+ */
+export type Locator = LocatorPage | LocatorSlide | LocatorLines | LocatorJsonPointer | LocatorRegion;
+
+/**
+ * RFC 6901 pointer into JSON input or canonical extracted JSON.
+ */
+export interface LocatorJsonPointer {
+  readonly json_pointer: string;
+}
+
+/**
+ * One-based inclusive text line range.
+ */
+export interface LocatorLines {
+  readonly lines: LocatorLinesLines;
+}
+
+export interface LocatorLinesLines {
+  /**
+   * Last line.
+   */
+  readonly end: number;
+  /**
+   * First line.
+   */
+  readonly start: number;
+}
+
+/**
+ * One-based PDF page.
+ */
+export interface LocatorPage {
+  readonly page: number;
+}
+
+/**
+ * A rectangle on a one-based page, in page coordinates.
+ */
+export interface LocatorRegion {
+  readonly region: LocatorRegionRegion;
+}
+
+export interface LocatorRegionRegion {
+  /**
+   * Height.
+   */
+  readonly height: number;
+  /**
+   * Page.
+   */
+  readonly page: number;
+  /**
+   * Width.
+   */
+  readonly width: number;
+  /**
+   * Left edge.
+   */
+  readonly x: number;
+  /**
+   * Top edge.
+   */
+  readonly y: number;
+}
+
+/**
+ * One-based PPTX slide.
+ */
+export interface LocatorSlide {
+  readonly slide: number;
+}
+
+export type MediaFormat = "png" | "jpeg" | "gif" | "webp" | "pdf" | "text" | "markdown" | "csv" | "json" | "html" | "docx" | "xlsx" | "pptx" | "doc" | "xls" | "ppt" | "tar_gz" | "zip";
 
 /**
  * Concrete payload for a [`MediaRef`].
@@ -3828,6 +4124,11 @@ export interface RefSibling {
 }
 
 /**
+ * Scope reference: inputs.<slot>, steps.<id>.output, steps.<id>.status, steps.<id>.requirements.<id>.outcome|reason, requirement.id, or requirement.statement, with .field, [n], and (in assert each) [*] selectors below inputs and step outputs.
+ */
+export type Reference = string;
+
+/**
  * Registered `Agent` Card envelope.
  */
 export interface RegisteredAgentCard {
@@ -4306,6 +4607,69 @@ export interface Relationships {
 export type RequestId = string;
 
 /**
+ * Check-specific requirement detail.
+ */
+export type RequirementDetail = RequirementDetailDrift;
+
+/**
+ * Full per-feature statistics of a drift check.
+ */
+export interface RequirementDetailDrift {
+  readonly drift: DriftReport;
+}
+
+/**
+ * One requirement's outcome. Only `not_applicable` leaves the `decide` denominator.
+ */
+export type RequirementOutcome = "passed" | "failed" | "inconclusive" | "not_applicable";
+
+/**
+ * The judgment of one requirement.
+ */
+export interface RequirementResult {
+  /**
+   * The compared actual value, when capture permits it.
+   */
+  readonly actual?: JsonValue;
+  /**
+   * The exact check configuration that ran.
+   */
+  readonly check: Check;
+  /**
+   * Validated original-evidence citations.
+   */
+  readonly citations?: readonly Citation[];
+  /**
+   * Check-specific detail.
+   */
+  readonly detail?: RequirementDetail | null;
+  /**
+   * Requirement ID.
+   */
+  readonly id: TaskId;
+  /**
+   * The outcome.
+   */
+  readonly outcome: RequirementOutcome;
+  /**
+   * What executed the check, for Agent, code, and drift checks.
+   */
+  readonly provenance?: CallProvenance | null;
+  /**
+   * Why the outcome holds.
+   */
+  readonly reason: string;
+  /**
+   * The requirement statement.
+   */
+  readonly statement: string;
+  /**
+   * Owning step of a step requirement.
+   */
+  readonly step?: TaskId | null;
+}
+
+/**
  * OTel-canonical resource projection.
  *
  * Fields:
@@ -4642,27 +5006,9 @@ export interface ServiceTable {
 }
 
 /**
- * Why an Eval task did not run.
+ * SHA-256 digest as exactly 64 lowercase hexadecimal characters.
  */
-export type SkipReason = "condition_false" | "dependency_skipped";
-
-/**
- * One Eval task that did not run.
- */
-export interface SkippedTask {
-  /**
-   * Why it did not run.
-   */
-  readonly reason: SkipReason;
-  /**
-   * The skipped task.
-   */
-  readonly task_id: TaskId;
-  /**
-   * The skipped upstream task that caused a `dependency_skipped` skip.
-   */
-  readonly upstream_task_id?: TaskId;
-}
+export type Sha256Hex = string;
 
 /**
  * Config for the Sklearn model interface.
@@ -4677,6 +5023,11 @@ export interface SklearnMeta {
    */
   readonly model_subtype?: string | null;
 }
+
+/**
+ * Name of one Verifier input slot, addressed as `inputs.<slot>`.
+ */
+export type SlotName = string;
 
 /**
  * Sort direction of one declared physical sort key.
@@ -5025,6 +5376,49 @@ export interface Status {
 }
 
 /**
+ * The execution record of one step.
+ */
+export interface StepResult {
+  /**
+   * Attempts made, retries included; zero when skipped.
+   */
+  readonly attempts: number;
+  /**
+   * Wall-clock duration across attempts.
+   */
+  readonly duration_ms: number;
+  /**
+   * Step ID.
+   */
+  readonly id: TaskId;
+  /**
+   * The action output, when capture permits it.
+   */
+  readonly output?: JsonValue;
+  /**
+   * What executed the action.
+   */
+  readonly provenance?: CallProvenance | null;
+  /**
+   * Why the step failed or was skipped.
+   */
+  readonly reason?: string | null;
+  /**
+   * Final status, as `steps.<id>.status` reads it.
+   */
+  readonly status: StepStatus;
+  /**
+   * Tools an Agent action called, in call order.
+   */
+  readonly tool_calls?: readonly ToolCallRecord[];
+}
+
+/**
+ * Final status of one step.
+ */
+export type StepStatus = "succeeded" | "failed" | "skipped";
+
+/**
  * Lifecycle status of a registered Bifrost table.
  */
 export type TableStatus = "Active" | "Deprecated" | "Quarantined";
@@ -5172,6 +5566,34 @@ export type TimeUnit = "Second" | "Millisecond" | "Microsecond" | "Nanosecond";
  * Every directly issued token is [`Self::Wyrd`] and is accepted on every tenant surface. A [`Self::Bifrost`] token is accepted only on the Bifrost surfaces, so a token delegated for Bifrost cannot be replayed elsewhere.
  */
 export type TokenAudience = "wyrd" | "bifrost";
+
+/**
+ * One tool call an Agent action made.
+ *
+ * Records what the model received, never the raw tool output: the digest and size describe the bounded output actually returned. A call that returned no output, such as one that failed, has no digest and zero returned bytes rather than a digest of nothing.
+ */
+export interface ToolCallRecord {
+  /**
+   * Call arguments.
+   */
+  readonly arguments: JsonValue;
+  /**
+   * Error the tool returned, when it failed.
+   */
+  readonly error?: string | null;
+  /**
+   * SHA-256 of the bounded output returned to the model; absent when the call returned none.
+   */
+  readonly output_sha256?: Sha256Hex | null;
+  /**
+   * Bytes of output returned to the model; zero when it returned none.
+   */
+  readonly returned_bytes: number;
+  /**
+   * The built-in called.
+   */
+  readonly tool: BuiltinTool;
+}
 
 /**
  * Torch interface metadata.
@@ -5363,38 +5785,82 @@ export interface VerificationError {
 }
 
 /**
- * The engine report of a direct execution, by implementation.
+ * `GET /v1/verification/executions/{execution_id}` response.
  *
- * Serialized as `{ "drift": DriftReport }`, `{ "eval": EvalReport }`, or `{ "task": { "result": AssertionResult } }`.
+ * A conflicting idempotent replay settles as `errored` with the idempotency-conflict code and never carries a result. `completed` may briefly lack a visible result.
  */
-export type VerificationExecutionDetail = VerificationExecutionDetailDrift | VerificationExecutionDetailEval | VerificationExecutionDetailTask;
-
-/**
- * The Drift report of a Drift Verifier.
- */
-export interface VerificationExecutionDetailDrift {
-  readonly drift: DriftReport;
-}
-
-/**
- * The ran and skipped tasks of an Eval Verifier.
- */
-export interface VerificationExecutionDetailEval {
-  readonly eval: EvalReport;
-}
-
-/**
- * The one check result of a task Verifier.
- */
-export interface VerificationExecutionDetailTask {
-  readonly task: VerificationExecutionDetailTaskTask;
-}
-
-export interface VerificationExecutionDetailTaskTask {
+export interface VerificationExecutionState {
   /**
-   * The assertion or judge result of the one check, boxed because it is far larger than the other variants.
+   * Terminal error of an `errored`, `cancelled`, or `timed_out` execution.
    */
-  readonly result: AssertionResult;
+  readonly error?: VerificationError | null;
+  /**
+   * The execution.
+   */
+  readonly execution_id: string;
+  /**
+   * The result once completed and visible.
+   */
+  readonly result?: VerificationResult | null;
+  /**
+   * Lifecycle status, independent of the verdict.
+   */
+  readonly status: VerificationExecutionStatus;
+}
+
+/**
+ * Execution state of one Verifier run.
+ *
+ * Independent of the verdict: only `completed` has one, and it lives in the Bifrost result the run points at. `cancelled`, `timed_out`, and `errored` never carry a verdict or dispatch an Operator.
+ */
+export type VerificationExecutionStatus = "pending" | "running" | "retrying" | "completed" | "cancelled" | "timed_out" | "errored";
+
+/**
+ * Overall verdict with its requirement and step breakdown.
+ */
+export interface VerificationOutcome {
+  /**
+   * The pinned original evidence, by slot.
+   */
+  readonly evidence: Readonly<Record<string, InputDeclaration>>;
+  /**
+   * Every requirement, step requirements included.
+   */
+  readonly requirements: readonly RequirementResult[];
+  /**
+   * Every step in plan order.
+   */
+  readonly steps: readonly StepResult[];
+  /**
+   * The `decide` rule applied to every applicable requirement.
+   */
+  readonly verdict: VerificationVerdict;
+}
+
+/**
+ * The attributable result of one Verifier execution.
+ */
+export interface VerificationResult {
+  /**
+   * Server-issued execution identity.
+   */
+  readonly execution_id: string;
+  /**
+   * Verdict, breakdown, and evidence.
+   */
+  readonly outcome: VerificationOutcome;
+  /**
+   * The caller's application Run, when there is one.
+   */
+  readonly run_id?: string | null;
+  /**
+   * The exact subject judged.
+   */
+  readonly subject: CardRef;
+  /**
+   * The exact Verifier executed.
+   */
+  readonly verifier: CardRef;
 }
 
 /**
@@ -5421,51 +5887,6 @@ export interface VerificationStatus {
  * Carried by the Bifrost result and used by settlement to decide Operator dispatch; Run GET never returns it.
  */
 export type VerificationVerdict = "passed" | "failed" | "inconclusive";
-
-/**
- * Aggregate, count-only numbers of one failed run, per Verifier implementation.
- *
- * Frozen into the failure context beside `summary` and derived from the same acknowledged result, so the two never disagree. Carries counts only: no feature names, feature rows, task inputs or outputs, or assertion detail. Templates reach these values as `drift.*` or `eval.*` fields, and a binding may only reference the block of its own Verifier implementation.
- */
-export type VerifierCounts = VerifierCountsDrift | VerifierCountsEval;
-
-/**
- * Counts of a failed Drift run.
- */
-export interface VerifierCountsDrift {
-  /**
-   * Features whose own verdict is `drift`.
-   */
-  readonly drifted_features: number;
-  readonly implementation: "drift";
-  /**
-   * Features scored in the report.
-   */
-  readonly total_features: number;
-}
-
-/**
- * Counts of a failed Eval run.
- */
-export interface VerifierCountsEval {
-  /**
-   * Tasks that ran and did not pass.
-   */
-  readonly failed_tasks: number;
-  readonly implementation: "eval";
-  /**
-   * `floor(100 * passed / total)`, or `0` when no task ran.
-   */
-  readonly pass_rate_percent: number;
-  /**
-   * Tasks that passed.
-   */
-  readonly passed_tasks: number;
-  /**
-   * Tasks that ran.
-   */
-  readonly total_tasks: number;
-}
 
 /**
  * The closed set of Verifier implementations.
@@ -5497,13 +5918,6 @@ export interface VerifierImplementationTask {
   readonly kind: "task";
   readonly spec: TaskVerifierSpec;
 }
-
-/**
- * The closed `kind` of a Verifier execution.
- *
- * Classifies an exact Verifier by its Drift profile or Eval task graph. It is the `kind` label of every verification execution metric and the `kind` of a direct execution response.
- */
-export type VerifierKind = "drift_psi" | "drift_spc" | "drift_custom" | "eval_assertion" | "eval_llm_judge" | "eval_other" | "task_assertion" | "task_llm_judge" | "unknown";
 
 /**
  * Verifier Card spec body.

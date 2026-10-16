@@ -1,64 +1,144 @@
-import { TraceFlags, context, trace } from "@opentelemetry/api";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { describe, expect, test } from "vitest";
 
-import { type EvalMediaRef, Observe } from "wyrd-ai";
-
-import { StorageContextManager } from "../support/otel-context.js";
+import * as wyrd from "wyrd-ai";
+import { Observe, verify } from "wyrd-ai";
 
 type NativeRun = Parameters<typeof Observe.fromNative>[0];
 
-/** One emit the fake native run recorded, as the arguments it received. */
-type Emit = readonly (string | undefined)[];
+/** One call the fake native run recorded, as the arguments it received. */
+type Call = readonly unknown[];
 
 /**
- * A fake native run that records its arguments and answers one envelope.
+ * A fake native run that records its arguments and answers fixed envelopes.
  *
- * These tests cover the wrapper's refusals, error projection, and span capture.
- * Integration readback in `observe-a-run` covers the happy path.
+ * These tests cover the wrapper's input projection, refusals, and result
+ * projection. The real-server journeys cover execution.
  */
-function fakeRun(result: Record<string, unknown> = { valueJson: "null" }) {
-  const emits: Emit[] = [];
-  const record = (...args: Emit) => {
-    emits.push(args);
-    return result;
-  };
-  const native = { drift: record, eval: record, record: async (...args: Emit) => record(...args) };
-  return { observe: Observe.fromNative(native as unknown as NativeRun), emits };
+function fakeRun(result: Record<string, unknown> = { valueJson: "null" }, submission: Record<string, unknown> = {}) {
+  const calls: Call[] = [];
+  const answer =
+    (value: unknown) =>
+    async (...args: Call) => {
+      calls.push(args);
+      return value;
+    };
+  const native = { record: answer(result), verify: answer(result), submit: answer(submission) };
+  return { observe: Observe.fromNative(native as unknown as NativeRun), calls };
 }
 
-/** Every emit method, called with `value`, so a refusal must hold for each. */
-function everyEmit(observe: Observe, value: () => unknown): (() => unknown)[] {
+/** Every JSON-carrying method, called with `value`, so a refusal must hold for each. */
+function everyCall(observe: Observe, value: () => unknown): (() => Promise<unknown>)[] {
   return [
-    () => observe.drift(value() as Record<string, number>),
-    () => observe.eval(value()),
     () => observe.record("vala.datasets.events", value()),
+    () => observe.verify("policy-check", { answer: value() as never }),
+    () => observe.submit("policy-check", { answer: value() as never }),
   ];
 }
 
-/** The JSON payload an emit sent native, whichever method recorded it. */
-function payload(emit: Emit): string | undefined {
-  return emit[0] === "vala.datasets.events" ? emit[1] : emit[0];
-}
-
-/** The trace and span ids an `eval` emit sent native. */
-function ids(emit: Emit | undefined): [string | undefined, string | undefined] {
-  return [emit?.[3], emit?.[4]];
+/** The JSON payload a call sent native, whichever method recorded it. */
+function payload(call: Call): unknown {
+  return call[0] === "vala.datasets.events" ? call[1] : (call[1] as { valueJson: string }[])[0].valueJson;
 }
 
 // Internal: these drive the TypeScript wrapper over a fake native run, which
-// no user constructs; the `observe-a-run` journey proves the public path.
+// no user constructs; the real-server journeys prove the public path.
 describe("internal native run wrapper", () => {
-  test("emit refused by native raises its projected catalog error", () => {
+  test("a refusal from native raises its projected catalog error", async () => {
     const { observe } = fakeRun({
-      errorCode: "WYRD_SDK_400_BIFROST_NOT_STARTED",
-      errorStatus: 400,
-      errorTitle: "Bifrost is not started",
-      errorDetail: "call start_bifrost before observing",
+      errorCode: "WYRD_SDK_404_UNKNOWN_VERIFIER",
+      errorStatus: 404,
+      errorTitle: "Unknown Verifier",
+      errorDetail: "no Verifier named policy-check is bound",
     });
 
-    expect(() => observe.drift({ score: 1 })).toThrow(
-      expect.objectContaining({ code: "WYRD_SDK_400_BIFROST_NOT_STARTED", status: 400 }),
-    );
+    await expect(observe.verify("policy-check", { answer: "yes" })).rejects.toMatchObject({
+      code: "WYRD_SDK_404_UNKNOWN_VERIFIER",
+      status: 404,
+    });
+  });
+
+  test("slot values cross as JSON, lazy files, and Artifact references", async () => {
+    const { observe, calls } = fakeRun();
+    const bytes = new Uint8Array([0, 37, 80, 68, 70]).subarray(1);
+
+    await observe.verify("policy-check", {
+      answer: { text: "yes" },
+      policy: verify.File.path("/does/not/exist/policy.pdf"),
+      deck: verify.File.bytes(bytes, { format: "pdf", filename: "deck.pdf" }),
+      archive: new verify.ArtifactRef({ kind: "Artifact", name: "decks", version: "1.0.0" }, "q3.pdf"),
+    });
+
+    const [verifier, inputs] = calls[0] as [string, Record<string, unknown>[]];
+    expect(verifier).toBe("policy-check");
+    expect(inputs[0]).toEqual({ slot: "answer", valueJson: '{"text":"yes"}' });
+    expect(inputs[1]).toMatchObject({ slot: "policy", file: { path: "/does/not/exist/policy.pdf" } });
+    const deck = inputs[2] as { file: { bytes: Buffer; format: string; filename: string } };
+    expect([...deck.file.bytes]).toEqual([37, 80, 68, 70]);
+    expect(deck.file).toMatchObject({ format: "pdf", filename: "deck.pdf" });
+    expect(inputs[3]).toEqual({
+      slot: "archive",
+      artifact: '{"kind":"Artifact","name":"decks","version":"1.0.0"}',
+      artifactPath: "q3.pdf",
+    });
+  });
+
+  test("a lone non-record value, or an object marked positional, crosses without a slot", async () => {
+    const { observe, calls } = fakeRun();
+    const artifact = { kind: "Artifact", name: "decks", version: "1.0.0" } as const;
+
+    await observe.verify("answer-check", "yes");
+    await observe.verify("answer-check", 7);
+    await observe.verify("answer-check", null);
+    await observe.verify("answer-check", ["a", 1]);
+    await observe.verify("answer-check", verify.File.path("/does/not/exist/policy.pdf"));
+    await observe.verify("answer-check", new verify.ArtifactRef(artifact));
+    await observe.verify("answer-check", { answer: "yes" }, { positional: true });
+    await observe.submit("answer-check", { answer: "yes" }, { positional: true });
+    await observe.verify("answer-check", { answer: "yes" });
+
+    const sent = calls.map((call) => (call[1] as Record<string, unknown>[])[0]);
+    expect(sent.slice(0, 4)).toEqual([
+      { slot: undefined, valueJson: '"yes"' },
+      { slot: undefined, valueJson: "7" },
+      { slot: undefined, valueJson: "null" },
+      { slot: undefined, valueJson: '["a",1]' },
+    ]);
+    expect(sent[4]).toMatchObject({ slot: undefined, file: { path: "/does/not/exist/policy.pdf" } });
+    expect(sent[5]).toMatchObject({ slot: undefined, artifact: JSON.stringify(artifact) });
+    expect(sent[6]).toEqual({ slot: undefined, valueJson: '{"answer":"yes"}' });
+    expect(sent[7]).toEqual({ slot: undefined, valueJson: '{"answer":"yes"}' });
+    expect(sent[8]).toEqual({ slot: "answer", valueJson: '"yes"' });
+    expect(calls.every((call) => (call[1] as unknown[]).length === 1)).toBe(true);
+  });
+
+  test("constructing a File reads nothing", () => {
+    expect(verify.File.path("/does/not/exist.pdf").path).toBe("/does/not/exist.pdf");
+  });
+
+  test("submit returns Recorded for samples and a queued handle for Run evidence", async () => {
+    const recorded = fakeRun();
+    expect(await recorded.observe.submit("latency-watch", { latency: 840 })).toEqual({ kind: "recorded" });
+
+    const queued = fakeRun({}, { execution: { id: "01890f28-7c4a-7cc3-98e7-4f4a3c2d1bff" } });
+    const submission = await queued.observe.submit("policy-check", { answer: "yes" });
+    expect(submission.kind === "queued" && submission.execution.id).toBe("01890f28-7c4a-7cc3-98e7-4f4a3c2d1bff");
+
+    const refused = fakeRun({}, { error: { errorCode: "WYRD_VERIFICATION_400_INPUT_INVALID", errorStatus: 400 } });
+    await expect(refused.observe.submit("policy-check", { missing: 1 })).rejects.toMatchObject({
+      code: "WYRD_VERIFICATION_400_INPUT_INVALID",
+    });
+  });
+
+  test("verification values live only under the verify namespace", () => {
+    expect(Object.keys(verify).sort()).toEqual(["ArtifactRef", "Execution", "File"]);
+    for (const name of ["ArtifactRef", "Execution", "File", "VerificationExecution"]) {
+      expect(name in wyrd).toBe(false);
+    }
+  });
+
+  test("the observation emits are gone", () => {
+    expect("drift" in Observe.prototype).toBe(false);
+    expect("eval" in Observe.prototype).toBe(false);
   });
 
   /** A value that `JSON.stringify` would silently drop. */
@@ -94,12 +174,12 @@ describe("internal native run wrapper", () => {
     ["Date", () => ({ a: new Date(0) })],
     ["cycle", cycle],
   ])("%s is refused before native", async ([, value]) => {
-    const { observe, emits } = fakeRun();
+    const { observe, calls } = fakeRun();
 
-    for (const emit of everyEmit(observe, value)) {
-      await expect(Promise.resolve().then(emit)).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
+    for (const call of everyCall(observe, value)) {
+      await expect(Promise.resolve().then(call)).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
     }
-    expect(emits).toEqual([]);
+    expect(calls).toEqual([]);
   });
 
   /** Counts reads of an accessor that answers `first` once, then `undefined`. */
@@ -115,94 +195,23 @@ describe("internal native run wrapper", () => {
     ["array accessor", (d) => Object.defineProperty([0], 0, d), ["yes"]],
     ["nested array accessor", (d) => ({ b: Object.defineProperty([0], 0, d) }), { b: ["yes"] }],
   ])("%s is read once and native gets its first value", async ([, input, expected]) => {
-    const { observe, emits } = fakeRun();
+    const { observe, calls } = fakeRun();
     const accessors = [readOnce("yes"), readOnce("yes"), readOnce("yes")];
     let next = 0;
 
-    for (const [index, emit] of everyEmit(observe, () => input(accessors[next++].descriptor)).entries()) {
-      await emit();
+    for (const [index, call] of everyCall(observe, () => input(accessors[next++].descriptor)).entries()) {
+      await call();
       expect(accessors[index].counter.reads).toBe(1);
     }
-    expect(emits.map(payload)).toEqual(Array(3).fill(JSON.stringify(expected)));
+    expect(calls.map(payload)).toEqual(Array(3).fill(JSON.stringify(expected)));
   });
 
   test("accessor whose first value is unsupported is read once and refused", async () => {
-    const { observe, emits } = fakeRun();
+    const { observe, calls } = fakeRun();
 
-    for (const emit of everyEmit(observe, () => ({ b: Object.defineProperty({}, "a", readOnce(1n).descriptor) }))) {
-      await expect(Promise.resolve().then(emit)).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
+    for (const call of everyCall(observe, () => ({ b: Object.defineProperty({}, "a", readOnce(1n).descriptor) }))) {
+      await expect(Promise.resolve().then(call)).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
     }
-    expect(emits).toEqual([]);
-  });
-
-  const PAGE = { id: "page", kind: "document", uri: "s3://bucket/page.pdf" } as const;
-
-  test.for<readonly [string, object]>([
-    ["undeclared key", { ...PAGE, extra: 1 }],
-    ["symbol key", { ...PAGE, [Symbol("k")]: 1 }],
-    ["non-enumerable key", Object.defineProperty({ ...PAGE }, "mediaType", { value: "a/b" })],
-    ["non-string uri", { ...PAGE, uri: Symbol("u") }],
-  ])("media descriptor with a %s is refused before native", ([, item]) => {
-    const { observe, emits } = fakeRun();
-
-    expect(() => observe.eval({ n: 1 }, { media: [item as EvalMediaRef] })).toThrow(
-      expect.objectContaining({ code: "WYRD_SPEC_400_VALIDATION" }),
-    );
-    expect(emits).toEqual([]);
-  });
-
-  test("media descriptor accessor is read once", () => {
-    const { observe, emits } = fakeRun();
-    const { counter, descriptor } = readOnce("application/pdf");
-
-    observe.eval({ n: 1 }, { media: [Object.defineProperty({ ...PAGE }, "mediaType", descriptor) as EvalMediaRef] });
-
-    expect(counter.reads).toBe(1);
-    expect(emits.map((emit) => emit[2])).toEqual([JSON.stringify([{ ...PAGE, media_type: "application/pdf" }])]);
-  });
-
-  const ACTIVE = { traceId: "4bf92f3577b34da6a3ce929d0e0e4736", spanId: "00f067aa0ba902b7" };
-  const EXPLICIT = { traceId: "0af7651916cd43dd8448eb211c80319c", spanId: "b7ad6b7169203331" };
-  const INVALID = { traceId: "00000000000000000000000000000000", spanId: "0000000000000000" };
-
-  /** Run `emit` with a span holding `span`'s ids active, the way an instrumented app would. */
-  function within(span: typeof ACTIVE, emit: () => void): void {
-    const flags = span === INVALID ? TraceFlags.NONE : TraceFlags.SAMPLED;
-    context.with(trace.setSpan(context.active(), trace.wrapSpanContext({ ...span, traceFlags: flags })), emit);
-  }
-
-  beforeAll(() => {
-    context.setGlobalContextManager(new StorageContextManager());
-  });
-  afterAll(() => {
-    context.disable();
-  });
-
-  test("active span supplies both ids", () => {
-    const { observe, emits } = fakeRun();
-
-    observe.eval({ n: 0 });
-    within(ACTIVE, () => observe.eval({ n: 1 }));
-
-    expect(emits.map(ids)).toEqual([
-      [undefined, undefined],
-      [ACTIVE.traceId, ACTIVE.spanId],
-    ]);
-  });
-
-  test("explicit ids win over the active span", () => {
-    const { observe, emits } = fakeRun();
-
-    within(ACTIVE, () => observe.eval({ n: 2 }, EXPLICIT));
-
-    expect(ids(emits[0])).toEqual([EXPLICIT.traceId, EXPLICIT.spanId]);
-  });
-
-  test("invalid active span supplies no ids", () => {
-    const { observe, emits } = fakeRun();
-
-    within(INVALID, () => observe.eval({ n: 3 }));
-
-    expect(ids(emits[0])).toEqual([undefined, undefined]);
+    expect(calls).toEqual([]);
   });
 });

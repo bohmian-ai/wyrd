@@ -10,14 +10,17 @@
 //! [`Deployment::client`] and passes it to the SDK or CLI call explicitly.
 
 use std::path::{Path, PathBuf};
-use wyrd_ai::bifrost::BifrostOptions;
+use std::time::Duration;
+use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
 
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_ai::cards::{CardRef, CardSelector, Cards, HydrationMode, RegistrationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::config::ClientConfig;
 use wyrd_ai::transport::{GrpcConfig, HttpConfig};
-use wyrd_ai::{Bifrost, SpanRecord, TraceId, WyrdClient};
+use wyrd_ai::verify::Execution;
+use wyrd_ai::{Bifrost, ExecutionId, SpanRecord, TraceId, VerificationResult, WyrdClient};
+use wyrd_spec::ids::BindingId;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
@@ -180,6 +183,17 @@ impl Deployment {
     /// Panics when a grant does not parse or the role or principal cannot be
     /// seeded.
     pub async fn granted_key(&self, name: &str, grants: &[serde_json::Value]) -> String {
+        api_key(self.granted(name, grants).await)
+    }
+
+    /// Seed role `name` with exactly `grants` as [`Self::granted_key`] does
+    /// and return the bootstrapped principal, whose id a story compares with
+    /// retained subject and actor attribution.
+    ///
+    /// # Panics
+    /// Panics when a grant does not parse or the role or principal cannot be
+    /// seeded.
+    pub async fn granted(&self, name: &str, grants: &[serde_json::Value]) -> Bootstrap {
         let grants = grants
             .iter()
             .map(|grant| {
@@ -190,7 +204,10 @@ impl Deployment {
             .seed_role(name, &grants)
             .await
             .expect("role seeds");
-        self.key(name, &[name]).await
+        self.server
+            .bootstrap_service(name, &[name])
+            .await
+            .expect("principal bootstraps")
     }
 
     /// Issue a key for the principal registration projected for the Service
@@ -247,6 +264,79 @@ impl Deployment {
             .trace_timeline(TraceId::from_hex(trace).expect("trace id"))
             .await
             .expect("the timeline reads")
+    }
+
+    /// The one verification binding `owner` declares, read from its served
+    /// status.
+    ///
+    /// # Panics
+    /// Panics when the read fails or `owner` declares no binding.
+    pub async fn binding(&self, owner: &CardRef) -> BindingId {
+        self.cards()
+            .await
+            .get(CardSelector::exact(owner.clone()))
+            .await
+            .expect("the owner reads")
+            .status
+            .and_then(|status| status.verification)
+            .expect("the owner serves verification status")
+            .binding_ids
+            .into_iter()
+            .next()
+            .expect("the owner has one binding")
+    }
+
+    /// The first retained result of `binding`, read back as the
+    /// administrator: publish captured rows until `vala.verification.results`
+    /// names one, then wait for that execution's typed result by its ID.
+    ///
+    /// # Panics
+    /// Panics when no result is retained within `timeout`, a read fails, or
+    /// the execution settles without a result.
+    pub async fn scheduled_result(
+        &self,
+        binding: &BindingId,
+        timeout: Duration,
+    ) -> VerificationResult {
+        /// One `vala.verification.results` row's execution identity.
+        #[derive(serde::Deserialize)]
+        struct Retained {
+            /// The execution the result belongs to.
+            execution_id: String,
+        }
+        let admin = self.admin();
+        let bifrost = Bifrost::connect_with(&admin, BifrostOptions::default())
+            .await
+            .expect("Bifrost connects");
+        let deadline = tokio::time::Instant::now() + timeout;
+        let id = loop {
+            self.server.flush_bifrost().await.expect("rows publish");
+            let rows: Vec<Retained> = bifrost
+                .sql_as(
+                    "SELECT execution_id FROM vala.verification.results WHERE binding_id = $1",
+                    &[QueryParam::String(binding.to_string())],
+                )
+                .await
+                .expect("results read back");
+            if let Some(row) = rows.into_iter().next() {
+                break row.execution_id;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "binding {binding} retained no result within {timeout:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        Execution::connect_with(
+            id.parse::<ExecutionId>()
+                .expect("the row names an execution ID"),
+            &admin,
+        )
+        .await
+        .expect("the execution handle connects")
+        .wait(timeout)
+        .await
+        .expect("the retained result reads")
     }
 
     /// Stop the server.

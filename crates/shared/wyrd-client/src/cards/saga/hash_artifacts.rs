@@ -4,8 +4,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, BufReader};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::{CardSubmission, RelativeArtifactPath};
 
@@ -77,42 +75,14 @@ pub(crate) async fn validate_and_stamp(
 /// SHA-256 digest, the two values compared against the manifest entry by
 /// [`validate_and_stamp`].
 ///
-/// The file is read in 64 KiB buffers so large artifacts are never loaded
-/// into memory. The operation is read-only; cancellation simply drops the
-/// open file handle.
-///
 /// # Errors
 ///
-/// Returns an IO error when the file cannot be opened or read, and
-/// `RegistrySpecTooLarge` when the cumulative size overflows `u64`.
-///
-/// # Panics
-///
-/// Panics only if a buffer length (at most 64 KiB) does not fit in `u64`,
-/// which cannot happen on supported targets.
+/// Returns an IO error when the file cannot be opened or read.
 async fn hash_source(source: &Path) -> Result<(u64, String), RegistryEngineError> {
-    let file = tokio::fs::File::open(source).await?;
-    let mut reader = BufReader::new(file);
-    let mut hasher = Sha256::new();
-    let mut size = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        let read_u64 = u64::try_from(read).expect("invariant: read buffer length fits u64");
-        size = size.checked_add(read_u64).ok_or_else(|| {
-            RegistryEngineError::Wyrd(WyrdError::RegistrySpecTooLarge {
-                message: "local artifact exceeds the supported size range".to_owned(),
-                details: serde_json::json!({ "source": source }),
-            })
-        })?;
-        hasher.update(&buffer[..read]);
-    }
+    let (size, digest) = crate::storage::upload::sha256_file(source).await?;
     Ok((
         size,
-        base64::engine::general_purpose::STANDARD.encode(hasher.finalize()),
+        base64::engine::general_purpose::STANDARD.encode(digest),
     ))
 }
 

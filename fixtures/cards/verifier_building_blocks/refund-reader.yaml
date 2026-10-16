@@ -1,0 +1,22 @@
+# Reads the refund policy from its workspace and returns its refund limit.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: refund-reader
+  version: 1.0.0
+  space: default
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  tool_names: [fs.read]
+  run_config: {max_iterations: 4}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "REFUND RULES: read /inputs/policy.pdf. Outline: {{outline}}. Answer under review: {{answer}}. Return the largest refund approved without a manager."
+    response_format:
+      type: object
+      properties: {max_refund: {type: number}}
+      required: [max_refund]
+      additionalProperties: false

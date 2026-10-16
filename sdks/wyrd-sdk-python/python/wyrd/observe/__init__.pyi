@@ -1,9 +1,8 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from types import TracebackType
 from typing import Any, Literal
 
-from ..cards import CardRef
-from ..eval import MediaRef
+from ..verify import Execution, Recorded, VerificationResult
 from ._telemetry import record
 
 class Run:
@@ -105,168 +104,63 @@ class Run:
         """
         ...
 
-class Judgment:
-    """One direct verification judgment, returned by :meth:`Observe.verify`.
-
-    A ``failed`` verdict is an ordinary return value, not an exception.
-    """
-
-    @property
-    def passed(self) -> bool:
-        """Whether the expectations held: true only for a ``passed`` verdict."""
-        ...
-
-    @property
-    def execution_id(self) -> str:
-        """Transient identity of this execution, shared with its audit and trace."""
-        ...
-
-    @property
-    def verifier(self) -> CardRef:
-        """The exact Verifier executed."""
-        ...
-
-    @property
-    def subject(self) -> CardRef:
-        """The exact subject judged."""
-        ...
-
-    @property
-    def kind(
-        self,
-    ) -> Literal[
-        "drift_psi",
-        "drift_spc",
-        "drift_custom",
-        "eval_assertion",
-        "eval_llm_judge",
-        "eval_other",
-        "task_assertion",
-        "task_llm_judge",
-        "unknown",
-    ]:
-        """The Verifier classification: method family and profile."""
-        ...
-
-    @property
-    def verdict(self) -> Literal["passed", "failed", "inconclusive"]:
-        """The common verdict."""
-        ...
-
-    @property
-    def summary(self) -> str:
-        """Bounded human-readable summary of the verdict."""
-        ...
-
-    @property
-    def counts(self) -> dict[str, Any] | None:
-        """Count-only rollup of a Drift or Eval judgment; ``None`` for a task Verifier."""
-        ...
-
-    @property
-    def detail(self) -> dict[str, Any]:
-        """The engine report: ``{"drift": ...}``, ``{"eval": ...}``, or ``{"task": {"result": ...}}``."""
-        ...
-
 class Observe:
-    """The emits and the direct judgment available on one scoped run.
+    """Verification and caller-table records on one scoped run.
 
-    Returning from an emit is queue admission, not a durable acknowledgement.
-    ``WyrdState.shutdown()`` is the durability barrier.
+    Returning from ``record`` is queue admission, not a durable
+    acknowledgement. ``WyrdState.shutdown()`` is the durability barrier.
     """
 
-    def drift(
-        self,
-        features: Mapping[str, Any] | Any,
-        *,
-        session_id: str | None = None,
-    ) -> None:
-        """Emit one Drift observation as one row per feature.
+    def verify(self, verifier: str, /, *value: Any, **inputs: Any) -> VerificationResult:
+        """Execute the bound Verifier ``verifier`` on this view's subject now.
 
-        Args:
-            features: a non-empty flat mapping with ``str`` feature-name keys,
-                a dataclass instance, or a Pydantic model instance whose
-                values are strings, integers no larger in magnitude than
-                ``2**53``, finite floats, or booleans. It is converted here,
-                before admission.
-            session_id: a UUID naming the observed interaction's session.
-                Omitted, the rows carry no session.
-
-        Raises:
-            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an input of another
-                shape, a non-``str`` key, a non-finite float, or a
-                ``session_id`` that is not a UUID;
-                ``WYRD_SDK_400_INVALID_OBSERVATION`` for an empty input, an
-                invalid feature name, or a ``None``, nested, or out-of-range
-                value; ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
-                ``WYRD_SDK_409_BIFROST_CLOSED``, or
-                ``WYRD_CLIENT_429_QUEUE_FULL``.
-        """
-        ...
-
-    def eval(
-        self,
-        context: Mapping[str, Any] | Any,
-        *,
-        session_id: str | None = None,
-        media: Sequence[MediaRef] | None = None,
-        trace_id: str | None = None,
-        span_id: str | None = None,
-    ) -> None:
-        """Emit one Eval observation carrying its context and identity.
-
-        Args:
-            context: the observed interaction the Eval judges score, as a
-                mapping with ``str`` keys, a dataclass instance, or a Pydantic
-                model instance; nested JSON values are allowed.
-            session_id: as for ``drift()``.
-            media: a ``list`` of ``wyrd.eval.MediaRef`` descriptors for the
-                judge Prompt's ``${media:id}`` slots. Omitted, none.
-            trace_id: the 32-hex-character OpenTelemetry trace id.
-            span_id: the 16-hex-character span id within ``trace_id``. When
-                both ids are omitted, Python's active OpenTelemetry span
-                supplies them if there is one.
-
-        Raises:
-            WyrdError: As ``drift()``, plus ``WYRD_SPEC_400_VALIDATION`` for a
-                ``media`` value that is not a list of valid descriptors, a
-                malformed or all-zero trace or span id, or a ``span_id``
-                without ``trace_id``.
-        """
-        ...
-
-    def verify(
-        self,
-        verifier: str,
-        input: Mapping[str, Any] | Sequence[Mapping[str, Any]] | Any,
-        *,
-        media: Sequence[MediaRef] | None = None,
-    ) -> Judgment:
-        """Judge this view's subject with a bound Verifier and return its judgment.
-
-        ``verifier`` names a Verifier bound in ``verified_by`` to this view's
-        subject. An Eval Verifier takes one context mapping, dataclass instance,
-        or Pydantic model plus optional ``media``; a Drift Verifier takes a
-        list of flat feature rows. Blocks for the one server call. Nothing is
-        observed, recorded, enqueued, or dispatched, and Bifrost need not be
-        started.
+        Pass one positional value for a single-slot Verifier, or one keyword
+        per input slot. The slot's type decides each value's form: JSON
+        values fill ``json`` slots, a 32-hex trace ID fills a ``trace`` slot,
+        and a ``wyrd.verify.File`` or ``ArtifactRef`` fills a ``media`` slot. Files are
+        hashed and uploaded during this call. Blocks for the execution.
 
         Args:
             verifier: the name of a Verifier bound to this view's subject.
-            input: one context mapping, dataclass, or Pydantic model for an
-                Eval Verifier; a list of flat feature rows for a Drift
-                Verifier.
-            media: ``MediaRef`` items for an Eval judge Prompt's media slots.
+            *value: the one value of a single-slot Verifier.
+            **inputs: values keyed by input slot name.
 
         Returns:
-            The Verifier's judgment.
+            The execution's result.
 
         Raises:
             WyrdError: ``WYRD_SDK_404_UNKNOWN_VERIFIER`` for an unbound
-                Verifier and ``WYRD_SDK_400_INVALID_OBSERVATION`` for input of
-                the wrong shape, both before any network IO, and otherwise the
-                server's verification refusal such as
-                ``WYRD_VERIFICATION_409_BASELINE_NOT_READY``.
+                Verifier; ``WYRD_SPEC_400_VALIDATION`` for both positional and
+                keyword values or a value JSON cannot represent;
+                ``WYRD_VERIFICATION_400_INPUT_INVALID`` for an unknown slot, a
+                value of the wrong kind, or an unreadable or unaccepted file;
+                ``WYRD_VERIFICATION_413_INPUT_TOO_LARGE`` for a file above its
+                slot's ``max_bytes``; ``WYRD_VERIFICATION_422_INPUT_UNSUPPORTED``
+                for a scheduled-window Verifier; otherwise the server's refusal.
+        """
+        ...
+
+    def submit(self, verifier: str, /, *value: Any, **inputs: Any) -> Execution | Recorded:
+        """Submit evidence for the bound Verifier ``verifier`` without waiting.
+
+        Run evidence is staged for one queued ``wyrd.verify.Execution`` and
+        its handle is returned; acceptance confirms staging only, and an idempotency
+        conflict surfaces later through ``wait``. Scheduled-window samples are
+        recorded for the Verifier's schedule and ``Recorded`` is returned.
+
+        Args:
+            verifier: the name of a Verifier bound to this view's subject.
+            *value: the one value of a single-slot Verifier.
+            **inputs: values keyed by input slot name.
+
+        Returns:
+            The queued execution, or ``Recorded`` for window samples.
+
+        Raises:
+            WyrdError: As ``verify`` for Run evidence; for window samples,
+                ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
+                ``WYRD_SDK_409_BIFROST_CLOSED``, or
+                ``WYRD_CLIENT_429_QUEUE_FULL``.
         """
         ...
 
@@ -279,15 +173,22 @@ class Observe:
 
         Args:
             table: the registered ``"vala.datasets.<name>"`` table.
-            row: the row, in any shape ``drift()`` accepts for ``features``,
-                with any JSON values.
+            row: a mapping with ``str`` keys, a dataclass instance, or a
+                Pydantic model instance, with any JSON values.
 
         Raises:
-            WyrdError: As ``drift()`` for the row's shape, lifecycle, and
-                queue, plus ``WYRD_SDK_400_INVALID_OBSERVATION`` for a table outside
-                ``vala.datasets``, and the server's error for a table that is
-                unknown, unauthorized, or unavailable.
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a row of another
+                shape, a non-``str`` key, or a non-finite float;
+                ``WYRD_SDK_400_INVALID_OBSERVATION`` for a table outside
+                ``vala.datasets``; ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
+                ``WYRD_SDK_409_BIFROST_CLOSED``, or
+                ``WYRD_CLIENT_429_QUEUE_FULL``; and the server's error for a
+                table that is unknown, unauthorized, or unavailable.
         """
         ...
 
-__all__ = ["Judgment", "Observe", "Run", "record"]
+__all__ = [
+    "Observe",
+    "Run",
+    "record",
+]

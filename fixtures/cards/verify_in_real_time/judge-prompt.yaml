@@ -7,20 +7,26 @@ metadata:
 spec:
   provider: openai
   model: gpt-4o
-  format: chat_completion
-  body:
-    messages:
-    - role: user
-      content: Grade the answer ${answer}.
-    response_format:
-      type: json_schema
-      json_schema:
-        name: judge_result
-        schema:
+  messages:
+  - role: user
+    content: "Claim: {{claim}}. Answer: {{answer}}. Cite the answer."
+  response_format:
+    type: object
+    properties:
+      outcome: {type: string, enum: [passed, failed, inconclusive]}
+      reason: {type: string}
+      citations:
+        type: array
+        items:
           type: object
           properties:
-            passed:
-              type: boolean
-          required:
-          - passed
+            slot: {type: string}
+            locator:
+              type: object
+              properties: {json_pointer: {type: string}}
+              required: [json_pointer]
+              additionalProperties: false
+          required: [slot, locator]
           additionalProperties: false
+    required: [outcome, reason, citations]
+    additionalProperties: false

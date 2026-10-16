@@ -52,9 +52,10 @@ export async function work(client: WyrdClient): Promise<Worked> {
   expect(await invoke(client)).toBe("hi");
 
   const run = state.run();
-  run.forCard("model").observe.drift({ latency: 12.5 });
-  const judgment = await run.forCard("agent").observe.verify("answer-is-yes", { answer: "yes" });
-  expect(judgment).toMatchObject({ passed: true, kind: "eval_assertion" });
+  expect(await run.forCard("model").observe.submit("latency-drift", { latency: 12.5 })).toEqual({ kind: "recorded" });
+  const result = await run.forCard("agent").observe.verify("answer-check", { answer: "yes" });
+  expect(result.outcome.verdict).toBe("passed");
+  expect(result.verifier.name).toBe("answer-check");
 
   await state.startTelemetry();
   await state.startTelemetry();

@@ -1,37 +1,30 @@
-//! A Service's run emits observations for the Cards it composes; they read
-//! back by run id, stamped with the Card and run they belong to.
+//! A Service's run submits samples for the Cards it composes; they read back
+//! by run id, stamped with the Card and run they belong to.
 
-use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde_json::json;
 use tempfile::TempDir;
 use wyrd_ai::bifrost::BifrostOptions;
 use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::state::WyrdState;
-use wyrd_ai::{Bifrost, QueueConfig, SessionId, WyrdClient};
+use wyrd_ai::verify::Submission;
+use wyrd_ai::{Bifrost, QueueConfig, RequirementDetail, VerificationVerdict, WyrdClient};
+use wyrd_testing::server::WyrdTestServer;
 
 use crate::support::{Deployment, hydrate, register};
-
-/// The session the drift emit belongs to.
-const SESSION: &str = "0190f5a4-8c3e-7b21-9d4f-3a6b2c1d0e9f";
-
-/// The drift features one emit projects into one row each.
-#[derive(Serialize)]
-struct Features {
-    /// A numeric series.
-    latency: f64,
-    /// A categorical series.
-    tier: &'static str,
-}
 
 /// One `vala.drift.observations` row, as read back.
 #[derive(Debug, PartialEq, Deserialize)]
 struct DriftRow {
     /// The feature name.
     series: String,
-    /// The numeric projection; `None` for a categorical series.
+    /// The numeric projection.
     num_value: Option<f64>,
     /// The canonical text projection.
     str_value: Option<String>,
-    /// The session the emit named.
+    /// The session of the sample; `submit` names none.
     session_id: Option<String>,
     /// The observed Card.
     card_uid: String,
@@ -80,8 +73,9 @@ async fn service_client(deployment: &Deployment, dir: &TempDir) -> WyrdClient {
     deployment.client(&deployment.service_key(&service).await)
 }
 
-/// A drift emit on the run's Model view reads back by run id, one row per
-/// feature, stamped with the Model and the session.
+/// Samples submitted for the `observed-drift` Verifier bound to the run's
+/// Model are recorded for its schedule rather than judged, and read back by
+/// run id stamped with the Model.
 ///
 /// # Panics
 /// Panics when a step fails or the rows differ.
@@ -93,18 +87,15 @@ async fn run_observations_read_back_by_run_id() {
     state.start_bifrost().await.expect("Bifrost starts");
     let run = state.run();
 
-    run.for_card("model")
+    let submitted = run
+        .for_card("model")
         .expect("model view resolves")
         .observe()
-        .drift(
-            &Features {
-                latency: 12.5,
-                tier: "gold",
-            },
-            Some(SessionId(SESSION.parse().expect("session parses"))),
-        )
-        .expect("drift emits");
-    state.shutdown().await.expect("emits drain");
+        .submit("observed-drift", json!({ "latency": 12.5 }))
+        .await
+        .expect("the samples are submitted");
+    assert!(matches!(submitted, Submission::Recorded), "{submitted:?}");
+    state.shutdown().await.expect("samples drain");
     deployment
         .server()
         .flush_bifrost()
@@ -129,20 +120,74 @@ async fn run_observations_read_back_by_run_id() {
         .as_ref()
         .expect("hydrated Card carries its UID")
         .to_string();
-    let row = |series: &str, num_value, str_value: &str| DriftRow {
-        series: series.to_owned(),
-        num_value,
-        str_value: Some(str_value.to_owned()),
-        session_id: Some(SESSION.to_owned()),
-        card_uid: model.clone(),
-        run_id: run_id.clone(),
-    };
     assert_eq!(
         rows,
-        [
-            row("latency", Some(12.5), "12.5"),
-            row("tier", None, "gold")
-        ]
+        [DriftRow {
+            series: "latency".to_owned(),
+            num_value: Some(12.5),
+            str_value: Some("12.5".to_owned()),
+            session_id: None,
+            card_uid: model,
+            run_id,
+        }]
+    );
+    deployment.shutdown().await;
+}
+
+/// A latency far from the Custom drift target, submitted for the Model, fails
+/// `observed-drift` when its schedule comes due; the result carries the
+/// Custom delta for the latency metric.
+///
+/// # Panics
+/// Panics when a step fails or the result differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn custom_drift_judges_the_submitted_window_on_schedule() {
+    let deployment =
+        Deployment::start_with(WyrdTestServer::builder().with_verification_runtime_for_test())
+            .await;
+    let cards = deployment.cards().await;
+    register(&cards, "cards/observe_a_run/observed-model.yaml").await;
+    let service = register(&cards, "cards/observe_a_run/observed-service.yaml").await;
+    let dir = hydrate(&cards, &service.root).await;
+    let state = state_as(&dir, service_client(&deployment, &dir).await);
+    state.start_bifrost().await.expect("Bifrost starts");
+    state
+        .run_for_card("model")
+        .expect("model run opens")
+        .observe()
+        .submit("observed-drift", json!({ "latency": 30.0 }))
+        .await
+        .expect("the sample is recorded");
+    state.shutdown().await.expect("samples drain");
+    let binding = deployment.binding(&service.root).await;
+    deployment
+        .server()
+        .make_binding_due(binding)
+        .await
+        .expect("the binding comes due");
+
+    let result = deployment
+        .scheduled_result(&binding, Duration::from_secs(90))
+        .await;
+
+    assert_eq!(result.outcome.verdict, VerificationVerdict::Failed);
+    assert_eq!(
+        &result.subject,
+        state.card_ref("model").expect("model resolves")
+    );
+    let [requirement] = &result.outcome.requirements[..] else {
+        panic!("one requirement: {:?}", result.outcome.requirements);
+    };
+    let Some(RequirementDetail::Drift(report)) = &requirement.detail else {
+        panic!("a drift requirement carries its report: {requirement:?}");
+    };
+    assert!(
+        report
+            .features
+            .values()
+            .any(|feature| feature.score.is_some_and(|delta| delta > 5.0)),
+        "{report:?}"
     );
     deployment.shutdown().await;
 }
@@ -172,7 +217,7 @@ async fn run_view_exposes_its_alias() {
 }
 
 /// A key whose Card scope does not cover the Model cannot write the Model's
-/// observations; the refusal surfaces when the emit drains.
+/// samples; the refusal surfaces when the submission drains.
 ///
 /// # Panics
 /// Panics when the drain succeeds or is refused with another code.
@@ -187,14 +232,9 @@ async fn card_scoped_key_cannot_write_another_cards_observations() {
         .run_for_card("model")
         .expect("model run opens")
         .observe()
-        .drift(
-            &Features {
-                latency: 12.5,
-                tier: "gold",
-            },
-            None,
-        )
-        .expect("drift enqueues");
+        .submit("observed-drift", json!({ "latency": 12.5 }))
+        .await
+        .expect("the samples enqueue");
     let refused = state.shutdown().await.expect_err("the write is refused");
 
     assert_eq!(refused.code(), "WYRD_VALA_403_BIFROST_CARD_SCOPE");

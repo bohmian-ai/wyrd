@@ -2,33 +2,28 @@
 //! `POST /v1/systemone` callers reach one Jev deployment with typed questions
 //! and get typed answers back, OpenAI-shaped callers reach the same deployment
 //! on `/v1/chat/completions` by sending the typed Jev request as their last
-//! user message, and a Verifier uses that deployment as its LLM judge through
-//! a native Jev Prompt. The local upstream stands in for `api.typesafe.ai` and
-//! sees only the operator's Jev key.
+//! user message. The local upstream stands in for `api.typesafe.ai` and sees
+//! only the operator's Jev key.
 //!
 //! No Jev or OpenAI SDK is a dependency: each caller is a plain JSON POST with
 //! a bearer token, which is the whole of what such a client sends.
 
 use std::collections::BTreeSet;
-use wyrd_ai::bifrost::BifrostOptions;
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_ai::bifrost::QueryParam;
+use wyrd_ai::Gateway;
 use wyrd_ai::cli;
 use wyrd_ai::gateway::{
-    DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation,
-    ProviderAdapter, ProviderAuth, ProviderCredentialName, ProviderCredentialWrite,
-    ProviderCredentialWriteSource, ProviderDeployment, ProviderDeploymentName, ProviderId,
+    DeploymentAccess, GatewayOperation, ProviderAdapter, ProviderAuth, ProviderCredentialName,
+    ProviderCredentialWrite, ProviderCredentialWriteSource, ProviderDeployment,
+    ProviderDeploymentName, ProviderId,
 };
 use wyrd_ai::operator_connections::SecretBearer;
-use wyrd_ai::state::WyrdState;
-use wyrd_ai::{Bifrost, Gateway, VerificationVerdict, VerifierCounts, VerifierKind, WyrdError};
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::support::{Deployment, hydrate, register};
+use crate::support::Deployment;
 
 /// The Jev key the operator submits; only the upstream may see it.
 const JEV_KEY: &str = "jev-operator-key";
@@ -64,57 +59,11 @@ fn chat(state: &str) -> Value {
     ]})
 }
 
-/// One customer question and the agent's reply, the input `reply-quality`
-/// judges.
-#[derive(Serialize)]
-struct Reply {
-    /// The customer's question.
-    question: &'static str,
-    /// The reply text.
-    answer: &'static str,
-}
-
-/// The `state` the native Jev Prompt renders from a [`Reply`].
-fn rendered(reply: &Reply) -> String {
-    format!("Question: {}\nAnswer: {}", reply.question, reply.answer)
-}
-
-/// The typed questions the native Jev Prompt asks about every reply.
-fn judge_questions() -> Value {
-    json!({
-        "helpful": {"type": "noul", "instructions": "Does the reply help the customer?",
-                    "criteria": {"true": "it resolves or advances the request",
-                                 "false": "it ignores or deflects the request"}},
-        "tone": {"type": "choice", "instructions": "What is the tone of the reply?",
-                 "criteria": {"polite": "courteous and respectful",
-                              "rude": "curt or dismissive"}},
-    })
-}
-
-/// A judgment's verification result beside the deployment's one Jev
-/// `system_one` call: each journey owns its deployment, so the judge's call
-/// is the only one. Correlating the call to the judgment's Run is owned by
-/// the verify-attribution change, not by the Jev provider.
-#[derive(Debug, PartialEq, Deserialize)]
-struct JudgedCall {
-    /// The result's Verifier implementation.
-    implementation: String,
-    /// The result's verdict.
-    verdict: String,
-    /// The Gateway operation the judge called.
-    operation: String,
-    /// The Gateway call's outcome.
-    outcome: String,
-    /// How many upstream attempts the Gateway call made.
-    attempt_count: i64,
-}
-
 /// A Gateway with one Jev deployment in front of a local Jev upstream.
 ///
 /// The upstream answers a helpful, polite verdict unless the state names a
-/// scripted case: `Go away` is judged unhelpful and rude, `refused-form` is
-/// refused with 400, `rate-limited` is throttled with 429, and `bad-key`
-/// answers 401. Every refusal body echoes the operator key after `key cred`.
+/// scripted case: `refused-form` is refused with 400, `rate-limited` is
+/// throttled with 429, and `bad-key` answers 401. Every refusal body echoes the operator key after `key cred`.
 struct Jev {
     /// The deployment.
     deployment: Deployment,
@@ -123,11 +72,9 @@ struct Jev {
 }
 
 impl Jev {
-    /// Start the upstream and a verification-capable server, write the
-    /// `jev-key` credential with the CLI as the administrator, deploy
-    /// `jev/jev-latest` serving `system_one` and the `chat_completions`
-    /// pass-through, and capture call metadata so every Gateway call lands
-    /// in Bifrost.
+    /// Start the upstream and the server, write the `jev-key` credential with
+    /// the CLI as the administrator, and deploy `jev/jev-latest` serving
+    /// `system_one` and the `chat_completions` pass-through.
     ///
     /// # Panics
     /// Panics when a setup step fails.
@@ -151,22 +98,13 @@ impl Jev {
         }
         Mock::given(method("POST"))
             .and(path("/v1/systemone"))
-            .and(body_string_contains("Go away"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(answer(0.12, "rude")))
-            .with_priority(1)
-            .mount(&upstream)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/systemone"))
             .respond_with(ResponseTemplate::new(200).set_body_json(answer(0.93, "polite")))
             .mount(&upstream)
             .await;
         let deployment = Deployment::start_with(
-            WyrdTestServer::builder()
-                .with_verification_runtime_for_test()
-                .with_gateway_provider_root_for_test(
-                    upstream.uri().parse().expect("upstream URL parses"),
-                ),
+            WyrdTestServer::builder().with_gateway_provider_root_for_test(
+                upstream.uri().parse().expect("upstream URL parses"),
+            ),
         )
         .await;
         cli::put_provider_credential(
@@ -199,15 +137,6 @@ impl Jev {
             })
             .await
             .expect("deployment puts");
-        Gateway::connect_with(&deployment.admin())
-            .await
-            .expect("handle connects")
-            .put_capture_policy(&GatewayCapturePolicyWrite {
-                mode: GatewayCaptureMode::Metadata,
-                payload_fields: BTreeSet::new(),
-            })
-            .await
-            .expect("the capture policy puts");
         Self {
             deployment,
             upstream,
@@ -266,49 +195,6 @@ impl Jev {
                 )
             })
             .collect()
-    }
-
-    /// Publish every captured row, then read the verification result
-    /// `execution_id` wrote beside each `system_one` Gateway call this
-    /// deployment made.
-    ///
-    /// # Panics
-    /// Panics when the flush or the read fails.
-    async fn judged_calls(&self, execution_id: &str) -> Vec<JudgedCall> {
-        self.deployment
-            .server()
-            .flush_bifrost()
-            .await
-            .expect("rows publish");
-        Bifrost::connect_with(&self.deployment.admin(), BifrostOptions::default())
-            .await
-            .expect("Bifrost connects")
-            .sql_as(
-                "SELECT r.implementation, r.verdict, c.operation, c.outcome, \
-                        CAST(c.attempt_count AS BIGINT) AS attempt_count \
-                   FROM vala.verification.results r \
-                  CROSS JOIN vala.gateway.calls c \
-                  WHERE r.result_id = $1 AND c.operation = 'system_one'",
-                &[QueryParam::String(execution_id.to_owned())],
-            )
-            .await
-            .expect("the result and the Jev calls read")
-    }
-
-    /// Register and hydrate the `reviewer` Service, and load it acting as
-    /// its own Card-scoped key.
-    ///
-    /// # Panics
-    /// Panics when registration, hydration, key issue, or loading fails.
-    async fn reviewer(&self) -> (WyrdState, tempfile::TempDir) {
-        let cards = self.deployment.cards().await;
-        let reviewer = register(&cards, "cards/gateway_jev/reviewer.yaml").await;
-        let bundle = hydrate(&cards, &reviewer.root).await;
-        let key = self.deployment.service_key(&reviewer.root).await;
-        let state =
-            WyrdState::from_path_with(bundle.path().join("bundle"), self.deployment.client(&key))
-                .expect("bundle loads offline");
-        (state, bundle)
     }
 }
 
@@ -472,179 +358,5 @@ async fn jev_refusals_relay_like_other_providers() {
     assert_eq!(answered, 429, "{reply}");
     assert_eq!(reply["error"]["code"], Value::Null, "no Wyrd code: {reply}");
     assert!(!reply.to_string().contains(JEV_KEY), "{reply}");
-    jev.deployment.shutdown().await;
-}
-
-/// A helpful, polite reply passes the `reply-quality` Verifier whose LLM
-/// judge is the Jev deployment, asked through its native Jev Prompt.
-///
-/// # Panics
-/// Panics when the verify fails, the judgment differs, or Jev did not
-/// receive the reply as its state.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn jev_judge_passes_a_helpful_polite_reply() {
-    let jev = Jev::start().await;
-    let (state, _bundle) = jev.reviewer().await;
-
-    let judgment = state
-        .run_for_card("agent")
-        .expect("agent run opens")
-        .observe()
-        .verify(
-            "reply-quality",
-            &Reply {
-                question: "Where is my refund?",
-                answer: "Your refund is on its way.",
-            },
-        )
-        .await
-        .expect("the reply is judged");
-
-    assert_eq!(
-        (judgment.verdict, judgment.kind),
-        (VerificationVerdict::Passed, VerifierKind::EvalLlmJudge)
-    );
-    let received = jev.received().await;
-    assert_eq!(received.len(), 1);
-    assert_eq!(received[0].1["model"], "jev-latest");
-    assert_eq!(
-        received[0].1["state"],
-        "Question: Where is my refund?\nAnswer: Your refund is on its way."
-    );
-    assert_eq!(
-        received[0].1["questions"]["tone"]["criteria"]["polite"],
-        "courteous and respectful"
-    );
-    jev.deployment.shutdown().await;
-}
-
-/// An unhelpful, rude reply fails the same Verifier: Jev's `noul` falls
-/// below 0.5 and its `choice` is not `polite`.
-///
-/// # Panics
-/// Panics when the verify fails or the judgment differs.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn jev_judge_fails_an_unhelpful_rude_reply() {
-    let jev = Jev::start().await;
-    let (state, _bundle) = jev.reviewer().await;
-
-    let judgment = state
-        .run_for_card("agent")
-        .expect("agent run opens")
-        .observe()
-        .verify(
-            "reply-quality",
-            &Reply {
-                question: "Where is my refund?",
-                answer: "Go away.",
-            },
-        )
-        .await
-        .expect("the reply is judged");
-
-    // The judge task itself passes; both threshold assertions fail.
-    assert_eq!(
-        (judgment.verdict, judgment.counts),
-        (
-            VerificationVerdict::Failed,
-            Some(VerifierCounts::Eval {
-                passed_tasks: 1,
-                failed_tasks: 2,
-                total_tasks: 3,
-                pass_rate_percent: 33
-            })
-        )
-    );
-    jev.deployment.shutdown().await;
-}
-
-/// A question and reply holding quotes and newlines are judged: the native
-/// Jev Prompt renders both into the typed `state` as escaped JSON text, so
-/// Jev receives exactly the typed request the Prompt declares, with the
-/// operator key. The judgment's verification result and the judge's one
-/// `system_one` Gateway call are both recorded.
-///
-/// # Panics
-/// Panics when the reply is not judged, Jev receives a different request,
-/// or either row is missing.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn jev_judge_judges_a_reply_with_quotes_and_newlines() {
-    let jev = Jev::start().await;
-    let (state, _bundle) = jev.reviewer().await;
-    let reply = Reply {
-        question: "Is my \"refund\" done?\nOrder 7",
-        answer: "He said \"your refund is on its way\".\nAnything else?",
-    };
-
-    let judgment = state
-        .run_for_card("agent")
-        .expect("agent run opens")
-        .observe()
-        .verify("reply-quality", &reply)
-        .await
-        .expect("a reply with quotes and newlines is judged");
-    state.shutdown().await.expect("the reviewer stops");
-
-    assert_eq!(judgment.verdict, VerificationVerdict::Passed);
-    let received = jev.received().await;
-    assert_eq!(received.len(), 1);
-    assert_eq!(received[0].0.as_deref(), Some("Bearer jev-operator-key"));
-    assert_eq!(
-        received[0].1,
-        json!({"model": "jev-latest", "state": rendered(&reply), "questions": judge_questions()})
-    );
-    assert_eq!(
-        jev.judged_calls(&judgment.execution_id.to_string()).await,
-        [JudgedCall {
-            implementation: "eval".to_owned(),
-            verdict: "passed".to_owned(),
-            operation: "system_one".to_owned(),
-            outcome: "succeeded".to_owned(),
-            attempt_count: 1,
-        }]
-    );
-    jev.deployment.shutdown().await;
-}
-
-/// Jev refusing the judge's request with 400 fails the verify with the
-/// typed verification dependency failure, without relaying Jev's body, and
-/// the judge does not retry the terminal refusal although `reply-quality`
-/// allows two retries: Jev is asked exactly once.
-///
-/// # Panics
-/// Panics when the verify succeeds, the error is untyped, or Jev is asked
-/// again.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn jev_judge_refusal_is_a_typed_error_without_retry() {
-    let jev = Jev::start().await;
-    let (state, _bundle) = jev.reviewer().await;
-
-    let refused = state
-        .run_for_card("agent")
-        .expect("agent run opens")
-        .observe()
-        .verify(
-            "reply-quality",
-            &Reply {
-                question: "Where is my refund?",
-                answer: "refused-form",
-            },
-        )
-        .await;
-
-    assert!(
-        matches!(&refused, Err(WyrdError::VerificationDependencyFailed { message, .. })
-            if !message.contains("key cred")),
-        "{refused:?}"
-    );
-    assert_eq!(
-        jev.received().await.len(),
-        1,
-        "a refused judge is never retried"
-    );
     jev.deployment.shutdown().await;
 }

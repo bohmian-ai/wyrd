@@ -1,0 +1,24 @@
+# One Agent action whose investigator calls the built-in Card, Bifrost, and
+# code tools as the verifying principal; each call needs its own tool grant
+# and the capability's own grant.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: tool-review
+  version: 1.0.0
+  space: default
+spec:
+  description: The investigator answers a question with the built-in tools it is granted.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  steps:
+    - id: investigate
+      action:
+        kind: agent
+        agent: ./investigator.yaml
+        inputs: {question: inputs.question}
+        workspace: {/inputs/question.json: inputs.question}
+  requirements:
+    - id: investigated
+      statement: The investigator finished
+      check: {kind: assert, path: steps.investigate.output.done, operator: equals, expected: true}

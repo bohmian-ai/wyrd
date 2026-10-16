@@ -23,12 +23,12 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use wyrd_ai::bifrost::{Correlation, TableConfig};
 use wyrd_ai::otel::span_exporter;
-use wyrd_ai::{Bifrost, SpanRecord, TraceId, WyrdClient};
+use wyrd_ai::{Bifrost, SpanRecord, TraceId, VerificationVerdict, WyrdClient};
 use wyrd_spec::vala::trace::SpanKind;
 use wyrd_testing::bifrost::shared_process_telemetry_for_test;
 
 use crate::support::{Deployment, ancestry};
-use crate::verify_in_real_time::{Answer, Assistant};
+use crate::verify_in_real_time::Assistant;
 
 /// Instrumentation scope of the Service's own spans.
 const SERVICE_SCOPE: &str = "journey.service";
@@ -46,7 +46,7 @@ const CALLER_SPAN: &str = "10f067aa0ba902b7";
 ///
 /// # Panics
 /// Panics when the exporter cannot be built.
-fn service_telemetry(client: &WyrdClient) -> (tracing::Dispatch, SdkTracerProvider) {
+pub(crate) fn service_telemetry(client: &WyrdClient) -> (tracing::Dispatch, SdkTracerProvider) {
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(span_exporter(client).expect("the span exporter builds"))
         .build();
@@ -197,8 +197,9 @@ async fn service_action_timeline_is_one_connected_tree() {
             .run_for_card("model")
             .expect("model run opens")
             .observe()
-            .drift(&json!({ "latency": 12.5 }), None)
-            .expect("drift emits");
+            .submit("latency-drift", json!({ "latency": 12.5 }))
+            .await
+            .expect("the latency is submitted");
         writer
             .use_table_by_name(ACTIONS)
             .await
@@ -212,14 +213,14 @@ async fn service_action_timeline_is_one_connected_tree() {
         ask_the_gateway(&assistant.deployment, &service)
             .instrument(tracing::info_span!("model.ask"))
             .await;
-        let judgment = state
+        let result = state
             .run_for_card("agent")
             .expect("agent run opens")
             .observe()
-            .verify("answer-is-judged", &Answer { answer: "yes" })
+            .verify("answer-judged", json!("yes"))
             .await
             .expect("the answer is judged");
-        assert!(judgment.passed());
+        assert_eq!(result.outcome.verdict, VerificationVerdict::Passed);
     }
     .instrument(action)
     .with_subscriber(dispatch)

@@ -464,8 +464,8 @@ description = "Tier-1 journeys: Verifiers judge in real time, and a failed sched
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:drift:inner'"
 [tasks."test:bifrost:journey:drift:inner"]
 hide = true
-description = "wyrd-ai verify_in_real_time and scheduled_drift_alerts_operator stories"
-run = "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(verify_in_real_time|scheduled_drift_alerts_operator)::/)'"
+description = "wyrd-ai verify_in_real_time, verifier_building_blocks, and scheduled_drift_alerts_operator stories"
+run = "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(verify_in_real_time|verifier_building_blocks|scheduled_drift_alerts_operator)::/)'"
 
 [tasks."test:bifrost:journey:forge"]
 description = "Tier-1 journeys: compaction, maintenance, publication recovery, lease reclaim"
@@ -646,7 +646,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m 'integration and not local_dev' tests/integration/bifrost tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_local_development.py tests/integration/test_support_desk.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py tests/integration/otel/frameworks"
+run = "uv run python -m pytest -q -m 'integration and not local_dev' tests/integration/bifrost tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_verifier_building_blocks.py tests/integration/test_local_development.py tests/integration/test_support_desk.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py tests/integration/otel/frameworks"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -657,7 +657,7 @@ hide = true
 description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
-run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integration/query-results.test.ts tests/integration/variant-tables.test.ts tests/integration/every-iceberg-column-type.test.ts tests/integration/register-a-table-from-a-model.test.ts tests/integration/three-timestamp-types.test.ts tests/integration/table-time-column.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/otel-signals.test.ts tests/integration/agents-trace-processor.test.ts tests/integration/observe-a-run.test.ts tests/integration/observation-surface.test.ts tests/integration/verify-in-real-time.test.ts tests/integration/local-development.test.ts tests/integration/support-desk.test.ts tests/integration/scheduled-drift-alerts-operator.test.ts tests/integration/operator-connections.test.ts tests/integration/operator-connection-refusals.test.ts"
+run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integration/query-results.test.ts tests/integration/variant-tables.test.ts tests/integration/every-iceberg-column-type.test.ts tests/integration/register-a-table-from-a-model.test.ts tests/integration/three-timestamp-types.test.ts tests/integration/table-time-column.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/otel-signals.test.ts tests/integration/agents-trace-processor.test.ts tests/integration/observe-a-run.test.ts tests/integration/observation-surface.test.ts tests/integration/verify-in-real-time.test.ts tests/integration/verifier-building-blocks.test.ts tests/integration/action-timeline.test.ts tests/integration/local-development.test.ts tests/integration/support-desk.test.ts tests/integration/scheduled-drift-alerts-operator.test.ts tests/integration/operator-connections.test.ts tests/integration/operator-connection-refusals.test.ts"
 
 [tasks."verify:bifrost"]
 description = "Complete Bifrost change gate: fmt, Clippy, dependency and tenant-isolation checks, plus every Bifrost test tier and language surface."

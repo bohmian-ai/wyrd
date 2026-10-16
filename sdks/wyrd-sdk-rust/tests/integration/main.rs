@@ -9,7 +9,7 @@
 mod action_timeline;
 mod gateway_admin;
 mod gateway_inference;
-/// TypeSafe Jev through the Gateway, natively and as a Verifier's judge.
+/// TypeSafe Jev through the Gateway, natively and through Chat Completions.
 mod gateway_jev;
 /// The admin-key local workflow, start to finish, without a publication flush.
 mod local_development;
@@ -31,4 +31,6 @@ mod signed_in_development;
 mod support;
 /// The canonical support desk, from the checked-in example.
 mod support_desk;
+/// Every Verifier action and Run check kind, and every extractable format.
+mod verifier_building_blocks;
 mod verify_in_real_time;

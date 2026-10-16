@@ -1,39 +1,141 @@
 ---
 title: How verification works
-description: Verifiers, bindings, and Triggers; real-time checks versus the verifier runtime; verdicts, results, and Operators.
+description: Inputs, steps, requirements, and decide; verify versus submit; executions, verdicts, results, and Operators.
 pillar: wyrd
 section: Understand
 order: 2
 draft: true
 ---
 
-A Verifier judges behavior against a standard and returns a verdict: `passed`, `failed`, or `inconclusive`. Wyrd runs a Verifier in one of two ways. Your code can call it while a request is in flight and act on the answer, or the server's verifier runtime can run it for you, on a schedule or as observations arrive, and react to failure without your code. Both write the result to the same Bifrost table, tied to the exact Card versions that ran.
+A Verifier checks declared requirements against evidence and returns a verdict: `passed`, `failed`, or `inconclusive`. Every Verifier is built from the same four parts, whether it checks one request, reviews a PDF, inspects an agent trace, or watches a feature distribution drift:
+
+```text
+inputs → optional preparation steps → requirements → verdict
+```
+
+Your code runs a Verifier now with `verify` and acts on the result, or hands it to the server's queue with `submit`. Scheduled drift runs on its own. Every path uses the same engine and writes the same result, tied to the exact Card versions that ran.
 
 <WyrdSequence name="verification-paths" />
 
-The examples continue the `support-desk` service from [Cards, versions, and relationships](/understand/cards-versions-and-relationships/).
+The examples use the `support-desk` service from [Cards, versions, and relationships](/understand/cards-versions-and-relationships/) and its `policy-check` Verifier, which checks a support answer against a refund-policy PDF.
 
-## Three kinds of Verifier
+## Four parts of a Verifier
 
-A Verifier is a Card. Its `implementation.kind` decides what it can judge and how it can run:
+A Verifier is a Card with a normal `wyrd/v1` envelope. It never names what it checks; a binding supplies the subject, so one Verifier can check any number of components.
 
-| Kind | Judges | Real time | Verifier runtime |
-| --- | --- | --- | --- |
-| `eval` | One observed record against a set of tasks and a pass gate | Yes, pass the record | Yes, with an `observations_ready` Trigger: once per eval observation |
-| `drift` | A measured signal, such as a feature distribution, against a baseline | Yes, pass a batch of rows | Yes, with a `schedule` Trigger: once per time window |
-| `task` | One assertion or LLM judgment on the context you pass | Yes, only this way | No |
+```yaml title="service/policy-check.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata: { space: support, name: policy-check, version: 1.0.0 }
+spec:
+  description: A support answer follows the refund policy.
+  inputs:
+    answer: { type: json }                          # { "text": "..." }
+    policy: { type: media, formats: [pdf] }
+  steps:
+    - id: findings
+      action:
+        kind: agent
+        agent: ./policy-reader.yaml                 # tool_names: [fs.read]
+        inputs: { answer: inputs.answer }           # injected through {{answer}}
+        workspace: { /inputs/policy.pdf: inputs.policy }
+  requirements:
+    - id: no-guaranteed-refund
+      statement: The answer never promises a guaranteed refund
+      check: { kind: assert, path: inputs.answer.text, operator: not_contains, expected: guaranteed refund }
+    - id: follows-policy
+      statement: The answer is consistent with the refund policy
+      check:
+        kind: agent
+        agent: ./policy-judge.yaml                  # no tools; returns the Verdict schema
+        inputs:
+          claim: requirement.statement
+          answer: inputs.answer
+          findings: steps.findings.output
+  decide: all
+```
 
-A Verifier never names what it checks. The binding supplies the subject, so one `answer-quality` Verifier can check any number of agents.
+| Part | Holds |
+| --- | --- |
+| `inputs` | Named evidence slots. Each has a `type` and is required unless `required: false` |
+| `steps` | Optional preparation. Each step runs one action and produces data |
+| `requirements` | Each has a unique `id`, a `statement`, and one `check`, and produces one verdict. Attach them to a step or to the whole Verifier |
+| `decide` | How requirement verdicts combine: `all` (the default) or `{ pass_rate: { threshold } }` |
 
-Eval and task Verifiers share the same checks. A check is either an `assertion`, which compares a value in the context with an operator such as `equals`, `contains`, `is_subset`, or `matches_regex`, or an `llm_judge`, which asks an Agent for a structured judgment. Eval adds two checks that read recorded execution: `trace_assertion` (which spans ran) and `agent_assertion` (a field of the agent's workflow record). Those two need a recorded trace, so they run only in the verifier runtime.
+A Verifier may have no steps. With no requirements, every result is `inconclusive`, never a pass. Every step and requirement ID is unique across the whole Verifier; registration refuses duplicates.
 
-Prefer an assertion whenever the check is deterministic. It is faster, costs nothing, and gives the same answer every time. Use an LLM judge for what an assertion cannot express, such as whether an answer is grounded in what the tool returned.
+### Input slots
 
-[Evaluate agent behavior](/build-and-verify/verify/evaluate-agent-behavior/) and [Monitor drift](/build-and-verify/verify/monitor-drift/) show complete Verifier Cards for each kind.
+| `type` | Evidence | Caller supplies |
+| --- | --- | --- |
+| `json` | JSON, optionally constrained by `schema` (JSON Schema) | An ordinary value |
+| `media` | A pinned file in one of `formats`, with an optional lower `max_bytes` | A `File` (local path or bytes) or an `ArtifactRef` to a registered Artifact |
+| `trace` | A trace, read through tenant-scoped trace reads | A 32-hex-digit trace ID |
+| `samples` | Feature measurements or metric samples for a scheduled window | A flat object of the declared `features`, or one value when the slot declares one |
+
+Unknown slot names, wrong value types, invalid trace IDs, and values outside a declared schema or size are refused before anything runs. A missing required slot is not refused: it is missing evidence, and every check that needs it is `inconclusive`. An omitted optional slot is `null`.
+
+Files are evidence, not Cards. Constructing a `File` reads nothing. During `verify` or `submit`, the SDK hashes the file, asks the server which digests it lacks, and uploads only those, straight to tenant object storage. Files are pinned by SHA-256 and never pass through the verification request. The server checks length, digest, and format when it reads them; a mismatch cannot produce a pass. An `ArtifactRef` selects a file of an existing registered Artifact, with that Artifact's normal authorization.
+
+### Steps and actions
+
+| Action `kind` | Does |
+| --- | --- |
+| `extract` | Reads a `media` slot (`from: inputs.<slot>`) and returns a fixed JSON document per format. See [Extraction output](/reference/extraction-output/) |
+| `agent` | Invokes an inline, file-authored, or registered Agent. Output follows its Prompt's response schema, or is text |
+| `code` | Runs immutable Python (`runtime: python`) from `source.inline` or an exact Artifact, calling `entrypoint` with explicitly bound `inputs`. Returns JSON |
+
+Actions read and compute. They never write to external systems, register Cards, or dispatch Operators. A step can set `timeout_seconds` and `retries`; every attempt stays visible, and retries never hide the final failure.
+
+An Agent step has two input channels. `inputs` values are injected into the model request through the Prompt's placeholders, and the keys must match those placeholders exactly. `workspace` maps virtual `/inputs/...` paths to media, JSON, or step outputs; the Agent reads them with the built-in tools named on its Agent Card. `/inputs` is read-only, `/work` is empty scratch for that call, and both are removed when the call ends. [Agent tools and authorization](/reference/agent-tools-and-authorization/) lists the tools.
+
+### Requirements and checks
+
+| Check `kind` | Judges |
+| --- | --- |
+| `assert` | A typed comparison over one value (`path`) or every match of a `[*]` selector (`each`), against `expected` |
+| `trace` | Span existence, order, and attributes in a `trace` slot (`on`, `span_selector`, `operator`, `expected`) |
+| `agent` | A tool-less Agent returning the Verdict schema: `outcome`, `reason`, `citations` |
+| `code` | Sandboxed Python returning the same Verdict schema |
+| `drift` | PSI, SPC, or Custom over a `samples` slot (`on`), with full statistics |
+
+Prefer `assert` whenever the check is deterministic. It is free and gives the same answer every time. Use an `agent` check for what an assertion cannot express, and pass the requirement text explicitly with `claim: requirement.statement`. A check-position Agent has no tools and no workspace; registration refuses one that does.
+
+A citation names an original input `slot` and a locator: `page`, `slide`, `lines`, `json_pointer`, or `region`. A step can return citations in its ordinary output, and a downstream judge can reuse them through its input bindings. The server checks that every cited location exists in the pinned evidence. An `agent` check that says `passed` without a valid citation becomes `inconclusive`.
+
+### References and order
+
+| Reference | Means |
+| --- | --- |
+| `inputs.<slot>…` | What the caller sent for that slot |
+| `steps.<id>.output…` | What that step returned |
+| `steps.<id>.status` | `succeeded`, `failed`, or `skipped` |
+| `steps.<id>.requirements.<rid>.outcome` / `.reason` | A step requirement's verdict. Readable by actions and `when`, never by checks |
+| `requirement.id`, `requirement.statement` | The requirement being checked, inside its check |
+
+Child fields use dots; array indexes are zero-based (`slides[0]`). Wildcards (`[*]`) work only in an assertion's `each`. There is no `$.` prefix.
+
+A reference in an action or `when` makes a dependency; `depends_on` adds order without data. Independent steps run concurrently. A step runs its action, then its own requirements, before anything that depends on it starts. Whole-Verifier requirements run after every step. Requirements never feed each other, and each verdict reaches `decide` exactly once. Registration refuses cycles, unknown references, and references a position cannot read.
+
+### Skips, missing evidence, and decide
+
+| Situation | Requirement outcome |
+| --- | --- |
+| Its step was skipped by a false `when`, or only by an intentionally skipped dependency | `not_applicable` |
+| Its step failed or timed out, or a dependency was blocked by such a failure | `inconclusive` |
+| It needs output from an intentionally skipped step | `not_applicable` |
+| It needs failed output or any other missing required value | `inconclusive`; the check is not called |
+
+When both apply, failure wins. Provider errors, malformed output, and infrastructure failures inside one check are `inconclusive` with a reason, never a judgment that the subject failed.
+
+`decide` ignores only `not_applicable` requirements. With none left, the verdict is `inconclusive`.
+
+- `all`: any `failed` → failed; otherwise any `inconclusive` → inconclusive; otherwise passed.
+- `pass_rate`: passed divided by every applicable requirement, inconclusive ones included. At or above `threshold` (greater than 0, at most 1) passes. Below it, the verdict is `inconclusive` if any applicable result is inconclusive, otherwise `failed`. One pass and nine inconclusive results is 10%, not 100%.
 
 ## Bindings attach Verifiers to what they check
 
-A binding lives in the Service declaration under `verified_by`. It names the Verifier, optionally the Trigger that runs it, and the Operators that run when a triggered check fails:
+A binding lives in the declaration under `verified_by`. It names the Verifier, optionally the schedule that runs it, and the Operators that react to a failed background verdict:
 
 ```yaml title="service/support-desk.yaml (excerpt)"
 spec:
@@ -41,52 +143,47 @@ spec:
     - alias: agent
       ref: ./support-agent.yaml
       verified_by:
-        - verifier: ./answer-quality.yaml
-          runs_on: {kind: observations_ready}
-        - verifier: ./no-refund-promise.yaml
-```
-
-The desk binds two Verifiers to its agent. `answer-quality` is an LLM judge the server runs on every eval observation. `no-refund-promise` has no `runs_on`, so only your code calls it. A Verifier that should page someone adds `on_failure`; this is how [Monitor drift](/build-and-verify/verify/monitor-drift/) binds a drift Verifier to a model it adds to the desk:
-
-```yaml
-    - alias: churn_model
-      ref: { kind: Model, name: churn-classifier, version: 1.4.2 }
-      verified_by:
-        - verifier: ./churn-input-drift.yaml
-          runs_on: { kind: schedule, cron: "0 * * * *" }
+        - verifier: ./policy-check.yaml
           on_failure:
             - ./page-support-oncall.yaml
 ```
 
-The subject of a binding is the component it sits under. You can also put `verified_by` on the Service itself, or on a standalone Agent. Because bindings are part of the declaration, changing what gets verified creates a new Service version, and every verdict records the version it was checked under.
+The subject is the component the binding sits under; you can also bind on the Service itself or on a standalone Agent. Changing a binding creates a new Service version, and every result records the version it checked.
 
 | Field | Holds | If you leave it out |
 | --- | --- | --- |
 | `verifier` | A Verifier Card, by path or exact reference | Required |
-| `runs_on` | A Trigger, inline or as a Trigger Card | The verifier runtime never runs this binding; only your code can call the Verifier |
+| `runs_on` | A `schedule` Trigger | The server never runs this binding on its own |
+| `inputs` | For a scheduled Verifier, the source of each `samples` slot: `{ features: [...] }` or `{ metric: <name> }` | Required for every required slot of a scheduled Verifier |
 | `on_failure` | Operators, inline or as Operator Cards | A failed verdict is stored, and nobody is notified |
 
-Only two Trigger pairings are valid, and registration rejects anything else with `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH`:
+`schedule` is the only automatic Trigger. [Monitor drift](/build-and-verify/verify/monitor-drift/) shows a scheduled binding.
 
-| Trigger | Runs | Pairs with |
+## Run evidence and window evidence
+
+The check kinds decide how evidence arrives. Registration refuses a Verifier that mixes the two, or mixes `samples` with other slot types.
+
+| Evidence | `verify` | `submit` |
 | --- | --- | --- |
-| `schedule` (`cron`, optional `tz`, UTC by default) | One run per binding per due window | `drift` |
-| `observations_ready` | One run per committed eval observation for the subject | `eval` |
+| Run (`json`, `media`, `trace`; assert, trace, agent, code checks) | Runs now and returns the result | Queues one execution and returns its handle |
+| Window (`samples`; drift checks) | Refused: use `submit` | Records the samples and returns `Recorded` |
 
-A `task` Verifier takes no Trigger at all. Any Verifier bound without `runs_on`, like `no-refund-promise`, is never run by the server; it is bound to `agent` so your code can call it by name.
-
-## Real time: your code asks, and gets the answer back
-
-Call a bound Verifier from a run view, and the server judges the input inside the same request:
+### verify: run now
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
 ```python
+import wyrd
+
 with state.run("agent") as run:
     answer = run.invoke({"question": question})
-    judgment = run.observe.verify("no-refund-promise", {"answer": answer})
-    if not judgment.passed:
+    result = run.observe.verify(
+        "policy-check",
+        answer={"text": answer},
+        policy=wyrd.verify.File("refund-policy.pdf"),
+    )
+    if result.outcome.verdict != "passed":
         answer = hand_to_person(ticket_id)  # your fallback
 ```
 
@@ -94,10 +191,22 @@ with state.run("agent") as run:
 <LangTab lang="rust">
 
 ```rust
+use wyrd_ai::observe::{File, Input, Inputs};
+use wyrd_ai::VerificationVerdict;
+
 let run = state.run_for_card("agent")?;
 let mut answer = run.invoke(&[("question", question)]).await?;
-let judgment = run.observe().verify("no-refund-promise", &json!({ "answer": answer })).await?;
-if !judgment.passed() {
+let result = run
+    .observe()
+    .verify(
+        "policy-check",
+        Inputs::named([
+            ("answer", Input::from(json!({ "text": answer }))),
+            ("policy", File::path("refund-policy.pdf").into()),
+        ]),
+    )
+    .await?;
+if result.outcome.verdict != VerificationVerdict::Passed {
     answer = hand_to_person(ticket_id); // your fallback
 }
 ```
@@ -106,10 +215,15 @@ if !judgment.passed() {
 <LangTab lang="typescript">
 
 ```typescript
+import { File } from "wyrd-ai";
+
 const run = state.run("agent");
 let answer = await run.invoke({ question });
-const judgment = await run.observe.verify("no-refund-promise", { answer });
-if (!judgment.passed) {
+const result = await run.observe.verify("policy-check", {
+  answer: { text: answer },
+  policy: File.path("refund-policy.pdf"),
+});
+if (result.outcome.verdict !== "passed") {
   answer = await handToPerson(ticketId); // your fallback
 }
 ```
@@ -117,66 +231,45 @@ if (!judgment.passed) {
 </LangTab>
 </LangTabs>
 
-The call is synchronous from your code's point of view: it blocks until the verdict comes back, for up to 60 seconds. A `failed` verdict is an ordinary return value, not an exception. The server stores the result in `vala.verification.results`, tied to this run, but it never runs Operators for a real-time call. Your code already has the verdict and decides what to do.
+`verify` returns within its 60-second deadline. A `failed` verdict is an ordinary value, not an exception. The server stores the inputs and result after it answers, but these inputs never start queued work and never run Operators. [Verify a request in real time](/build-and-verify/verify/verify-a-request-in-real-time/) covers it end to end.
 
-Use real time when the answer should change what your service does next: block a response, fall back to a human, retry with a different prompt. [Verify a request in real time](/build-and-verify/verify/verify-a-request-in-real-time/) has the code in all three SDKs.
+### submit: queue it
 
-## Verifier runtime: the server runs it for you
+`submit` uploads missing files, stages the evidence, and returns a `verify.Execution` with a server-issued execution ID. The same engine runs it later. [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) follows one from submission to result, including from another process.
 
-For a binding with a Trigger, the server does the work. When the Trigger fires, it creates a run, executes the Verifier against the stored observations, writes the result, and on a `failed` verdict starts every Operator in `on_failure`. Your service only records observations; it never waits on a check.
+`202` means the server staged the evidence in memory, not that the queue has durably accepted it. The SDK sends one `Idempotency-Key` and reuses it on every transport retry. A conflicting reuse of a key is refused when the queue writer accepts the request, and you see it as an `errored` execution with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`. Evidence lost before the queue accepts it, such as on an abrupt restart, has no outcome; `wait` ends with a timeout rather than an invented result.
 
-A runtime run has an execution status separate from its verdict. The execution status says whether the check ran; the verdict says what it found.
+## Executions and verdicts
 
-| Execution status | Means |
+An execution's status says whether the check ran; its verdict says what the check found.
+
+| Status | Means |
 | --- | --- |
-| `pending`, `running`, `retrying` | Not finished. A run gets 3 attempts, each with a 5-minute limit |
-| `completed` | The Verifier ran and produced a verdict, stored as a result |
-| `timed_out`, `errored`, `cancelled` | No verdict exists. The run records the error |
-
-Only a `completed` run has a verdict. A run that errored is not a failure of your service; it is a failure to check it, and it never starts Operators.
+| `pending`, `running`, `retrying` | Not finished. An execution gets 3 attempts, each with a 5-minute limit |
+| `completed` | The Verifier produced a verdict. The result may become visible shortly after |
+| `timed_out`, `errored`, `cancelled` | No verdict exists. The execution records the error |
 
 <WyrdDiagram name="run-lifecycle" />
 
-You can also start a drift run by hand for a specific window, through MCP or HTTP. A manual run of a binding behaves like a scheduled one and runs its Operators on failure; a manual run that names a Verifier and subject directly only analyzes. [Monitor drift](/build-and-verify/verify/monitor-drift/#score-a-past-window-by-hand) shows how.
-
-## Verdicts
-
 | Verdict | Means | Runs Operators |
 | --- | --- | --- |
-| `passed` | The behavior met the standard | No |
-| `failed` | The behavior violated the standard | Yes, for a run of a binding |
+| `passed` | The evidence met the standard | No |
+| `failed` | The evidence violated the standard | Yes, for background work of a binding |
 | `inconclusive` | No judgment was possible | No |
 
-`inconclusive` is never a pass. The common causes are worth knowing because they look like silence:
-
-- An eval Verifier with no `pass_gate`. Its tasks run, but nothing turns them into a verdict. Always set one.
-- Every eval task was skipped, or sampling dropped the record.
-- A drift window with too little data to score.
+Each requirement in the breakdown is `passed`, `failed`, `inconclusive`, or `not_applicable`, with its reason, citations, permitted actual value, check-specific detail such as drift statistics, and the exact check, Agent, Prompt, or code that judged it. Each step reports status, attempts, duration, failure reason, and tool calls.
 
 ## Results are evidence
 
-Every completed check, real time or runtime, writes one row to `vala.verification.results`. Drift writes one more row per feature to `vala.drift.result_features`; eval writes one row per task to `vala.eval.result_items`.
+Every result carries the execution ID, the application `run_id` when there is one, the exact Verifier and subject, the verdict, the requirement and step breakdown, and the digest of every input. It is written to `vala.verification.results`; pinned input declarations go to `vala.verification.execution_inputs`. Code hashes, extraction versions, Agent and Prompt versions, effective routes, and drift baselines and windows are recorded with the result.
 
-| Column | Identifies |
-| --- | --- |
-| `result_id` | This result |
-| `card_uid` | The Card that was judged. Every judge model call the check makes is recorded in `vala.gateway.calls` with this Card as its `card_uid` |
-| `verifier_card_uid` | The Verifier that judged |
-| `verifier_version` | Its exact version |
-| `sub_principal_id` | Who the check was for: the caller of a real-time or manual check (the delegating principal when an agent acts for someone), or the binding owner for work Wyrd starts itself (a scheduled window or an observation-triggered check) |
-| `act_principal_id` | Who performed it. A real-time check records its caller (the agent, when one acts for someone). A check Wyrd runs from its queue (a manual run, a scheduled window, or an observation-triggered check) records the tenant's system principal; the manual run's own record keeps the requesting actor. What started internal work is recorded only as references: `run_id`, `card_uid`, `source_record_id`, and the binding |
-| `owner_card_uid`, `binding_id` | The binding that ran it. Both are null for a real-time call |
-| `run_id` | Your application's run: the run that recorded the observation, or the run that called `verify`. Null for a scheduled drift window |
-| `source_record_id` | For eval, the `record_id` of the observation it judged |
-| `verdict` | `passed`, `failed`, or `inconclusive` |
+Agent output is attributable evidence, not a promise that the same call would say the same thing again. Deterministic checks always give the same answer.
 
-<WyrdDiagram name="evidence-joins" />
-
-Results are queryable SQL, so "which version was running when this failed, and what did it see?" is one join. [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/#query-the-evidence) shows the join from observations to verdicts.
+`run_id` is your application's run; one run can have many executions. `execution_id` names one Verifier execution. Scheduled work has no `run_id`.
 
 ## Operators react to failure
 
-An Operator is what happens when a binding's check fails. Each binding's `on_failure` list can hold any number:
+An Operator runs when background work of a binding fails. A direct `verify`, an `inconclusive` verdict, and an execution error never dispatch.
 
 | Operator `kind` | Does |
 | --- | --- |
@@ -200,21 +293,17 @@ spec:
     summary: "{{verifier_ref}} failed for {{subject_ref}}"
 ```
 
-Text fields accept `{{...}}` placeholders filled from the result: `verifier_ref`, `subject_ref`, `verdict`, `summary`, `result_id`, `run_id`, `binding_id`, `completed_at`, and `dispatch_id` for any Verifier; `drift.drifted_features` and `drift.total_features` on drift bindings; `eval.passed_tasks`, `eval.failed_tasks`, `eval.total_tasks`, and `eval.pass_rate_percent` on eval bindings. Any other placeholder is rejected at registration.
-
-Secrets never go on the Card. An Operator names an operator connection, which a tenant administrator creates once and which holds the Slack token, PagerDuty key, or HTTP credential. Registration fails if the connection does not exist or is disabled.
-
-Each Operator is delivered on its own, at least once: up to 3 attempts within 5 minutes, retrying network errors, `408`, `429`, and `5xx`. One failing Operator does not stop the others or change the verdict.
+Secrets never go on the Card. An Operator names an operator connection, which a tenant administrator creates once. Each Operator is delivered on its own, at least once: up to 3 attempts within 5 minutes. A replayed queue request never causes a second logical dispatch, and one failing Operator does not stop the others or change the verdict.
 
 ## What can go wrong at registration
 
 | Error code | Cause |
 | --- | --- |
-| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | The Trigger cannot run that Verifier: `schedule` with `eval`, `observations_ready` with `drift`, or any Trigger on a `task` Verifier |
 | `WYRD_SPEC_400_INVALID_VERIFIER_REF_KIND` | `verifier:` points at a Card that is not a Verifier |
 | `WYRD_SPEC_400_INVALID_BINDING_REF_KIND` | `runs_on:` is not a Trigger, or an `on_failure` entry is not an Operator |
 | `WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING` | The same Verifier version is bound twice to one subject |
-| `WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION` | An `on_failure` entry is a `workflow` Operator, which the runtime does not run |
 | `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` | The named operator connection is missing or disabled |
 
-Verifiers judge observations, so the next page covers how they get recorded: [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/).
+Registration also refuses duplicate block IDs, unknown or cyclic references, a check-position Agent with tools, and a Verifier that mixes run and window evidence, each with a structured error naming the offending field.
+
+Verifiers judge recorded evidence, so the next page covers what a run records: [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/).

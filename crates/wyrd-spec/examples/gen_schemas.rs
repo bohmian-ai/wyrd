@@ -84,8 +84,9 @@ use wyrd_spec::vala::api::{
     SortDirectionWire, SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit,
 };
 use wyrd_spec::vala::trace::SpanRecord;
+use wyrd_spec::verification::execution::{VerificationExecutionState, VerificationResult};
 use wyrd_spec::verification::{
-    Judgment, StartVerificationRunRequest, StartVerificationRunResponse, VerificationBindingStatus,
+    StartVerificationRunRequest, StartVerificationRunResponse, VerificationBindingStatus,
     VerificationRunStatus,
 };
 
@@ -298,7 +299,8 @@ fn contracts() -> Value {
         StartVerificationRunResponse,
         VerificationBindingStatus,
         VerificationRunStatus,
-        Judgment,
+        VerificationResult,
+        VerificationExecutionState,
         CreateOperatorConnectionRequest,
         UpdateOperatorConnectionRequest,
         OperatorConnectionView,

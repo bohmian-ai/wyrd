@@ -215,11 +215,11 @@ async function drift(server: NativeWyrdTestServer, runId: string): Promise<numbe
 /** One `vala.drift.observations` value. */
 const Drift = z.object({ num_value: z.number() });
 
-/** One turn, then one drift observation through the state's native writer. */
+/** One turn, then one drift sample submitted through the state's native writer. */
 async function observed(state: WyrdState, ask: Ask) {
   const result = await turn(state, ask);
   const observation = state.run("model");
-  observation.observe.drift({ latency: 1 });
+  await observation.observe.submit("observed-drift", { latency: 1 });
   return { ...result, observation: observation.runId };
 }
 

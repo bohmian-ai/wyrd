@@ -3,20 +3,29 @@
 One Agent-backed Service, the same story in Rust, Python, and TypeScript.
 
 `service/` holds the Cards. `support-desk` declares the
-`vala.datasets.tickets` table and binds two Verifiers to its `support-agent`:
+`vala.datasets.tickets` table and binds one Verifier, `policy-check`, to its
+`support-agent`. `policy-check` takes the `answer` and the `policy` PDF
+(`refund-policy.pdf`):
 
-- `answer-quality` is an LLM judge that runs continuously on every Eval
-  observation.
-- `no-refund-promise` is an assertion that `serve` calls in real time.
+- the `findings` step runs `policy-reader`, an Agent that reads the PDF with
+  `fs.read` and lists its refund rules with their pages;
+- `no-refund-promise` asserts the answer never says "guaranteed refund";
+- `follows-policy` asks `policy-judge`, a tool-less Agent, whether the answer
+  follows those findings, citing the policy page.
 
-Each language exports four steps and a runnable main:
+Each language exports five steps and a runnable main:
 
 | Step | What it does |
 |---|---|
 | `deploy` | Registers and hydrates the Service, which creates `tickets`. Turns on gateway metadata capture and checks that the Agent's model is deployed. |
-| `serve` | Answers 100 questions, each in its own Agent Run inside a `support-desk.request` span. For each one it invokes the Agent through the gateway, records the ticket, observes the answer, and verifies it. Every tenth question asks for a refund. |
-| `wait_for_verdicts` | Waits until both Verifiers have judged every answer. |
-| `explain` | Joins one Run's observation, ticket, span, gateway call, and both verdicts through MCP `bifrost.query`. |
+| `check` | Verifies one answer immediately with `verify` and returns its result. The main checks "You have a guaranteed refund.", which fails `no-refund-promise`. |
+| `serve` | Answers 100 questions, each in its own Agent Run inside a `support-desk.request` span. For each one it invokes the Agent through the gateway, records the ticket, and `submit`s `policy-check` in the background, keeping the execution ID. Every tenth question asks for a refund, and its answer fails. |
+| `wait_for_verdicts` | Resumes every execution by its ID and waits for its result. |
+| `explain` | Joins one Run's ticket, span, gateway call, and verdict through MCP `bifrost.query`. |
+
+The main also resumes the first failed check by its ID alone, as another
+process would (`verify::Execution::connect(id).wait(...)` in Rust), and
+prints each requirement's outcome and reason.
 
 Run it against a server that has a `gpt-4o` deployment, with `WYRD_SERVER_URL`
 and `WYRD_API_KEY` set:

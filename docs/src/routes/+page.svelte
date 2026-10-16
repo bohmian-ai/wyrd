@@ -84,7 +84,7 @@
 <span class="ln">9</span>      <span class="k">ref</span>: ./agents/triage.yaml
 <span class="ln">10</span>      <span class="k">verified_by</span>:
 <span class="ln">11</span>        - <span class="k">verifier</span>: ./verifiers/triage-quality.yaml
-<span class="ln">12</span>          <span class="k">runs_on</span>: {'{'} kind: observations_ready {'}'}</pre>
+<span class="ln">12</span>          <span class="k">on_failure</span>: [./operators/page-oncall.yaml]</pre>
       </figure>
     </section>
   {/if}

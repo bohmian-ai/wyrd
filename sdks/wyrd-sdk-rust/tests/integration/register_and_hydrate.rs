@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, RegistrationReceipt};
 use wyrd_ai::cli::{self, SelectorArgs};
 use wyrd_ai::state::{HydratedCard, WyrdState};
-use wyrd_ai::{Card, Spec, VerifierImplementation};
+use wyrd_ai::{Card, Spec};
 
 use crate::support::{Deployment, fixture, hydrate, register, registered};
 
@@ -221,7 +221,7 @@ async fn registering_the_graph_again_is_idempotent() {
     deployment.shutdown().await;
 }
 
-/// `cards.get` returns each of the eight kinds the fixtures register as its
+/// `cards.get` returns each of the seven kinds the fixtures register as its
 /// typed spec.
 ///
 /// # Panics
@@ -258,15 +258,10 @@ async fn cards_get_returns_every_kind_typed() {
         CardKind::Operator,
         CardKind::Prompt,
         CardKind::Service,
-        CardKind::Trigger,
         CardKind::Verifier,
     ];
     expected.sort();
     assert_eq!(kinds, expected);
-    assert!(read.iter().any(|card| matches!(
-        &card.spec,
-        Spec::Verifier(verifier) if matches!(verifier.implementation, VerifierImplementation::Eval(_))
-    )));
     assert!(read.iter().any(|card| matches!(
         &card.spec,
         Spec::Data(data) if data.stats.row_count == Some(100)

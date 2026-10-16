@@ -1,6 +1,7 @@
 * text=auto eol=lf
 *.png binary
 *.jpg binary
+*.pdf binary
 *.svg text
 *.lock linguist-generated=true
 Cargo.lock linguist-generated=true

@@ -559,7 +559,7 @@ mod pg_tests {
         Ok(())
     }
 
-    /// Emit Drift observations of `service_ref` whose `score` averages 2.0
+    /// Submit Drift samples of `service_ref` whose `score` averages 2.0
     /// against the fixture's 1.0 baseline, through one `WyrdState` lifetime.
     ///
     /// The Service's graph is hydrated into a temporary bundle with `admin`'s
@@ -603,7 +603,8 @@ mod pg_tests {
         let run = state.run();
         for score in [1.5_f64, 2.5, 1.5, 2.5] {
             run.observe()
-                .drift(&serde_json::json!({ "score": score }), None)?;
+                .submit("mcp-run-drift", serde_json::json!({ "score": score }))
+                .await?;
         }
         state.shutdown().await?;
         server.flush_bifrost().await?;
@@ -1031,7 +1032,7 @@ mod pg_tests {
         let fixture = register_fixture(&cards).await?;
         let judged = Box::pin(cards.register_from_path(Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../fixtures/cards/verify_in_real_time/answer-is-judged.yaml"
+            "/../../../fixtures/cards/verify_in_real_time/answer-judged.yaml"
         ))))
         .await?;
         server

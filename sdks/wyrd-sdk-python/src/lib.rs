@@ -27,6 +27,8 @@ mod testing;
 mod testing_cli;
 #[cfg(feature = "python")]
 mod trace;
+#[cfg(feature = "python")]
+mod verify;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -132,6 +134,11 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     observe::register_run(&observe)?;
     m.add_submodule(&observe)?;
     register_submodule(py, "wyrd._wyrd.observe", &observe)?;
+
+    let verify = PyModule::new(py, "verify")?;
+    verify::register(&verify)?;
+    m.add_submodule(&verify)?;
+    register_submodule(py, "wyrd._wyrd.verify", &verify)?;
 
     let operators = PyModule::new(py, "operators")?;
     operators::register(&operators)?;

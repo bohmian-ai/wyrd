@@ -1,0 +1,13 @@
+# Control-charts latency on the daily schedule; no Operator reacts.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: latency-steady
+  version: 1.0.0
+  space: default
+spec:
+  verified_by:
+    - verifier: ./latency-control.yaml
+      runs_on: ./daily.yaml
+      inputs:
+        latency: {features: [latency]}

@@ -42,7 +42,7 @@ Every row carries managed columns Wyrd fills in: `card_uid`, `run_id`, `sub_prin
 
 | Path | Use it from | Rows carry | Writes to |
 | --- | --- | --- | --- |
-| The observations API, `run.observe.*` | Your running service | The run and Card that produced them | Drift and eval observations, and your `vala.datasets` tables |
+| The observations API, `run.observe.*` | Your running service | The run and Card that produced them | Drift samples, verification inputs and results, and your `vala.datasets` tables |
 | The Bifrost client, `Bifrost` | Batch jobs, backfills, notebooks, analysis | No run, unless you pass a correlation | Your `vala.datasets` tables |
 
 They share one writer underneath, and both read with the same SQL. The difference is attribution. The observations API stamps every row with the exact Card version and run from the bundle your service loaded, which is what lets a verdict point back to what ran. The Bifrost client is for data that did not come from a run, and for reading anything you have access to.
@@ -78,7 +78,7 @@ The SDKs check the terminal for you and raise on `failed`. The `QueryResult` kee
 - **No SQL writes.** `INSERT`, `UPDATE`, `DELETE`, and `CREATE TABLE AS` are refused. Write through the observations API or the Bifrost client.
 - **No schema changes.** A table's columns and layout are fixed at registration. A new schema needs a new table.
 - **No dropping tables.** Data is removed by retention, not by you.
-- **No writes outside `vala.datasets`.** Drift, eval, verification, telemetry, gateway, and audit tables are written only by Wyrd.
+- **No writes outside `vala.datasets`.** Drift, verification, telemetry, gateway, and audit tables are written only by Wyrd.
 
 ## Permissions
 

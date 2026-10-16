@@ -9,5 +9,3 @@ spec:
   components:
     - alias: agent
       ref: ./reviewer-agent.yaml
-      verified_by:
-        - verifier: ./reply-quality.yaml

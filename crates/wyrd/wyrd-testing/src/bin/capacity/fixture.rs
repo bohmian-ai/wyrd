@@ -62,6 +62,10 @@ const PADDING: usize = 1_980;
 /// How long a baseline fit or the seeded window may take to settle.
 const SETTLE: Duration = Duration::from_mins(5);
 
+/// The Window Verifier whose `samples` slot records the model's Drift
+/// observations through `observe.submit`.
+pub const DRIFT_VERIFIER: &str = "capacity-psi";
+
 /// The five measured verifier workloads, in report order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
@@ -410,8 +414,12 @@ impl Tenant {
             features.insert("score".to_owned(), 1.2.into());
             let features = serde_json::Value::Object(features);
             loop {
-                match model.observe().drift(&features, None) {
-                    Ok(()) => break,
+                match model
+                    .observe()
+                    .submit(DRIFT_VERIFIER, features.clone())
+                    .await
+                {
+                    Ok(_) => break,
                     Err(error) if error.code() == "WYRD_CLIENT_429_QUEUE_FULL" => {
                         state.flush().await?;
                     }

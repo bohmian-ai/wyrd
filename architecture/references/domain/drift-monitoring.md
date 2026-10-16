@@ -1,23 +1,27 @@
 # Drift and monitoring
 
-Load for Drift-backed Verifiers, versioned baselines, windows, statistical
+Load for Verifier `drift` checks, `samples` evidence, versioned baselines, windows, statistical
 methods, thresholds, alert quality, or reactions to observed change.
 
 ## Declare the signal first
 
-Drift is a `Verifier` implementation (`implementation.kind: drift`), not a
-Card kind. The Verifier is reusable and subject-less and declares one typed
-signal, one method, one resolved condition, and a method-specific profile. A
-deployment `verified_by` binding pairs it with a `schedule` Trigger, and
-runtime observation identity supplies the subject. Select statistics only
+Drift is a `drift` check on a Verifier requirement, not a Card or Verifier
+kind. The check reads one `samples` input slot and declares one typed signal,
+one method, one resolved condition, and a method-specific profile. A Verifier
+with `samples` slots and drift checks judges a scheduled window: a
+`verified_by` binding pairs it with a `schedule` Trigger and an explicit
+`inputs` map naming the recorded features or metric that fill each slot, and
+the binding's subject is the subject. Callers record samples with
+`submit`, which returns `Recorded`; `verify` refuses a Window Verifier, and
+there is no immediate drift-scoring route. Select statistics only
 after defining the signal's unit, population, sampling grain, completeness,
 delay, and failure semantics.
 
 - **Data drift** compares a versioned baseline distribution with a bounded
   comparison window. Preserve feature set, bin edges or sketch configuration,
   missingness, sample count, and cohort identity.
-- **Concept or performance drift** compares delayed labels, outcomes, or Eval
-  scores against the same subject, cohort, and time basis.
+- **Concept or performance drift** compares delayed labels, outcomes, or
+  verification scores against the same subject, cohort, and time basis.
 - **Operational drift** measures latency, errors, token use, cost, tool calls,
   or workflow behavior from authorized telemetry with stable deployment and
   resource dimensions.
@@ -30,7 +34,7 @@ drift protocol.
 
 The baseline is a versioned Data Card, immutable observation selection, or
 typed source query whose identity and selection parameters are persisted with
-the Drift result. It is never "the rows in a mutable table at evaluation
+the drift requirement's detail. It is never "the rows in a mutable table at evaluation
 time." Record baseline and comparison-window boundaries, watermarks, late-data policy, cohort,
 schema fingerprint, method/profile version, threshold, and source snapshot or
 query identity.
@@ -60,11 +64,11 @@ a new comparable regime and does not rewrite prior observations.
 
 ## Scheduling and reaction
 
-The binding's `schedule` Trigger decides when a Drift run happens; the Drift
-implementation decides the verdict; only a `failed` verdict creates one
+The binding's `schedule` Trigger decides when a window is judged; the drift
+check decides the requirement outcome and `decide` the verdict; only a `failed` verdict creates one
 dispatch per `on_failure` Operator, and each Operator owns one reaction. There
 is no Alert resource or mutable alert state. Keep notification, rollback,
-retraining, and workflow dispatch out of the Drift evaluator.
+retraining, and workflow dispatch out of the drift check.
 
 Reaction policy uses hysteresis, cooldown, minimum consecutive breaches,
 deduplication key, and recovery conditions appropriate to the signal. It
@@ -84,13 +88,13 @@ subject drift so a broken pipeline cannot look healthy.
 Reject global thresholds across heterogeneous tenants, mutable implicit
 baselines, mixed deployment cohorts, windows evaluated before completeness,
 silent baseline rebasing, unbounded segmentation, schedules or notification
-code inside Drift, an unversioned subject, and statistical significance treated
+code inside a drift check, an unversioned subject, and statistical significance treated
 as causality or business impact.
 
 ## Stable Wyrd anchors
 
-- Drift contract: `architecture/wyrd-design.md` §Verifier (Drift implementation).
-- Drift types: `crates/wyrd-spec/src/vala/drift/`.
+- Drift check contract: `architecture/wyrd-design.md` §Verifier (Drift checks).
+- Drift types: `crates/wyrd-spec/src/card/drift.rs`.
 - Trigger and Operator: `architecture/wyrd-design.md` §§Trigger and Operator.
 - Observation store: `crates/vala/`.
 

@@ -1,6 +1,6 @@
 import { bifrostParts, bifrostPods, bifrostWriteRead } from './bifrost';
 import type { FigureSpec } from './types';
-import { evidenceJoins, runLifecycle, verificationPaths } from './verification';
+import { runLifecycle, verificationPaths } from './verification';
 
 /** Every diagram a docs page can name, e.g. `<WyrdDiagram name="bifrost-parts" />`. */
 export const DIAGRAMS: Record<string, FigureSpec> = {
@@ -8,8 +8,7 @@ export const DIAGRAMS: Record<string, FigureSpec> = {
   'bifrost-pods': bifrostPods,
   'bifrost-write-read': bifrostWriteRead,
   'verification-paths': verificationPaths,
-  'run-lifecycle': runLifecycle,
-  'evidence-joins': evidenceJoins
+  'run-lifecycle': runLifecycle
 };
 
 /** Looks up a diagram by name and type, failing the build on a typo. */

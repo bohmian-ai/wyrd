@@ -10,11 +10,12 @@ export interface ReceivedRequest {
   readonly body: string;
 }
 
-/** The answer a {@link Receiver} sends: JSON for an object, verbatim for a string. */
+/** The answer a {@link Receiver} sends: JSON for an object, verbatim for a string, after `delayMs` when set. */
 export interface Reply {
   readonly status: number;
   readonly body?: unknown;
   readonly contentType?: string;
+  readonly delayMs?: number;
 }
 
 /**
@@ -43,12 +44,14 @@ export class Receiver {
           headers: request.headers,
           body: Buffer.concat(chunks).toString(),
         };
-        const { status, body, contentType } = reply(served);
+        const { status, body, contentType, delayMs } = reply(served);
         const text = body === undefined || typeof body === "string" ? body : JSON.stringify(body);
-        response.writeHead(status, { "content-type": contentType ?? "application/json" });
-        response.end(text);
-        receiver?.received.push(served);
-        server.emit("served");
+        setTimeout(() => {
+          response.writeHead(status, { "content-type": contentType ?? "application/json" });
+          response.end(text);
+          receiver?.received.push(served);
+          server.emit("served");
+        }, delayMs ?? 0);
       });
     });
     server.listen(0, "127.0.0.1");

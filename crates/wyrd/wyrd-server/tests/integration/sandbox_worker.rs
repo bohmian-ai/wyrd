@@ -226,10 +226,12 @@ async fn write(sandbox: &Sandbox, workspace: &Workspace, source: &str) -> Result
 
 /// `/work` writes are limited across calls, not per call: each call gets
 /// only the space earlier calls left, counting files a failed call wrote,
-/// overwrites, concurrent writers, and the scratch inputs already use.
+/// overwrites, concurrent writers, a cancelled writer, and the scratch
+/// inputs already use.
 ///
 /// # Panics
-/// Panics when writes together exceed the limit or earlier files are lost.
+/// Panics when writes together exceed the limit, earlier files are lost, or
+/// a cancelled writer keeps the lock.
 #[tokio::test]
 #[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn workspace_writes_share_one_budget() {
@@ -302,6 +304,20 @@ async fn workspace_writes_share_one_budget() {
     write(&sandbox, &tight, &put("a", 12, ""))
         .await
         .expect("fits");
+
+    // A writer cancelled mid-call frees the writer lock; whatever it wrote
+    // still counts, and the next writer gets only what is left.
+    let fresh = Workspace::materialize(Vec::new(), limits, None).expect("workspace");
+    let cancelled = tokio::time::timeout(
+        Duration::from_secs(3),
+        write(&sandbox, &fresh, &put("a", 8, "while True:\n    pass")),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the endless writer was cancelled");
+    assert!(write(&sandbox, &fresh, &put("b", 9, "")).await.is_err());
+    write(&sandbox, &fresh, &put("b", 8, ""))
+        .await
+        .expect("the lock is free and the rest fits");
 }
 
 /// Memory and time breaches end only the offending operation; the sandbox

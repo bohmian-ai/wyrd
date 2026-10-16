@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use futures_util::FutureExt;
 use serde_json::json;
 use vala_eval::blocks::{CallInput, CallValue};
 
@@ -37,6 +38,46 @@ fn workspace_cleans_up_on_drop() {
         assert_eq!(workspaces.permits.available_permits(), 0);
         drop(workspace);
         assert!(!dir.exists());
+        assert_eq!(workspaces.permits.available_permits(), 1);
+    });
+}
+
+/// Dropping `open` while it waits for admission or while its blocking
+/// materialization runs leaks no admission: once the started task returns,
+/// its workspace drops and every permit comes back.
+///
+/// # Panics
+/// Panics when the first poll completes or a permit never returns.
+#[test]
+fn cancelled_open_returns_its_admission() {
+    wyrd_runtime::runtime().block_on(async {
+        let limits = HostedLimits {
+            max_workspaces: 1,
+            ..HostedLimits::default()
+        };
+        let evidence =
+            TenantEvidence::new(test_state().await, test_caller([]), BTreeMap::new(), limits);
+        let workspaces = Workspaces::new(limits);
+        let files = BTreeMap::from([(
+            "/inputs/a.txt".to_owned(),
+            CallInput {
+                value: CallValue::Json(json!("line\n".repeat(10_000))),
+                sources: BTreeSet::new(),
+            },
+        )]);
+
+        // Cancelled while materializing on the blocking pool.
+        let mut open = Box::pin(workspaces.open(&files, &evidence));
+        assert!((&mut open).now_or_never().is_none());
+        drop(open);
+        drop(workspaces.permits.acquire().await.expect("permit returns"));
+
+        // Cancelled while waiting behind a held admission.
+        let held = workspaces.open(&files, &evidence).await.expect("opens");
+        let mut waiting = Box::pin(workspaces.open(&files, &evidence));
+        assert!((&mut waiting).now_or_never().is_none());
+        drop(waiting);
+        drop(held);
         assert_eq!(workspaces.permits.available_permits(), 1);
     });
 }

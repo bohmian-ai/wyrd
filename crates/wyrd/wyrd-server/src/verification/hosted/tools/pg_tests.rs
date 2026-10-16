@@ -122,9 +122,10 @@ fn tools_require_their_exact_invoke_grant() {
 
 /// A tool grant gives no data access and data access gives no tool grant.
 ///
-/// The query's own table decision is Oracle's and needs a live Oracle, so
-/// the merged-pass regression proves it; here the query proves only that
-/// data access without a tool grant is refused.
+/// The query's own table decision is Oracle's and needs a live Oracle;
+/// `pg_hosted_artifacts::recovered_authority_bounds_every_agent_tool`
+/// proves it. Here the query proves only that data access without a tool
+/// grant is refused.
 ///
 /// # Panics
 /// Panics when either grant alone reaches Card or Bifrost data.

@@ -1,5 +1,6 @@
 //! Registered Artifact evidence and code through the hosted runtime's one
-//! authorized loader, against a real bound server and the real Monty worker.
+//! authorized loader, and a hosted Agent's tools under recovered authority,
+//! against a real bound server, its Oracle, and the real Monty worker.
 //!
 //! The Artifact is registered through the SDK registration saga, so its Card
 //! blob, inventory, and stored bytes are exactly what production reads.
@@ -11,10 +12,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::SecretString;
-use serde_json::json;
+use serde_json::{Value, json};
+use skald_prompt::{OpenAiChatOptions, Prompt, ResponseFormat, openai_chat};
+use skald_runtime::{MockProvider, ProviderRegistry};
+use skald_spec::wire::openai_chat::{
+    OpenAiChatChoice, OpenAiChatMessage, OpenAiChatResponse, OpenAiMessageContent, OpenAiToolCall,
+    OpenAiToolFunctionCall,
+};
+use skald_spec::{ProviderName, ProviderResponse};
 use tokio::time::Instant;
 use vala_eval::blocks::{
-    ActionExecutor, BlockCall, BlockError, CallInput, CallValue, EvidenceReader, Position,
+    ActionExecutor, AgentCardResolver, AgentExecutor, BlockCall, BlockError, CallInput, CallValue,
+    CheckExecutor, EvidenceReader, Position, PromptCardResolver,
 };
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
@@ -25,20 +34,26 @@ use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_loader::{build_registration_input, load};
 use wyrd_runtime::permission::PermissionSet;
-use wyrd_runtime::{Permission, Principal, PrincipalKind};
+use wyrd_runtime::{
+    AcceptedAuthority, BifrostPermissionScope, BifrostTableScope, DelegationStep, Permission,
+    PermissionScope, Principal, PrincipalKind, PrincipalRef,
+};
 use wyrd_server::components::auth::Caller;
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
 use wyrd_server::verification::hosted::sandbox::{CodeExecutor, Sandbox};
+use wyrd_server::verification::hosted::tools::HostedTools;
 use wyrd_server::verification::hosted::workspace::Workspaces;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, Sha256Hex};
-use wyrd_spec::card::blocks::{Action, CodeCall, CodeRuntime, CodeSource};
+use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex};
+use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, ExecutionRoute};
+use wyrd_spec::card::blocks::{Action, AgentCall, Check, CodeCall, CodeRuntime, CodeSource};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardUid, SlotName};
-use wyrd_spec::reference::{CardRef, Ref};
+use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -347,4 +362,326 @@ async fn artifact_reads_refuse_before_use() {
             .expect("tamper");
         refused(readable.artifact(card, Some("notes.txt")).await);
     }
+}
+
+/// Refuses every registry lookup; the Agent here is authored inline.
+struct NoRegistry;
+
+#[async_trait::async_trait]
+impl AgentCardResolver for NoRegistry {
+    /// Always refuses.
+    ///
+    /// # Errors
+    /// Always [`BlockError::Terminal`].
+    async fn resolve(&self, _agent_ref: &CardRef) -> Result<AgentSpec, BlockError> {
+        Err(BlockError::Terminal {
+            reason: "no registry".to_owned(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl PromptCardResolver for NoRegistry {
+    /// Always refuses.
+    ///
+    /// # Errors
+    /// Always [`BlockError::Terminal`].
+    async fn resolve(&self, _prompt_ref: &CardRef) -> Result<Prompt, BlockError> {
+        Err(BlockError::Terminal {
+            reason: "no registry".to_owned(),
+        })
+    }
+}
+
+/// One scripted OpenAI answer: `text`, or else the `calls` it requests.
+fn answer(text: Option<&str>, calls: &[(&str, Value)]) -> ProviderResponse {
+    let tool_calls = (!calls.is_empty()).then(|| {
+        calls
+            .iter()
+            .enumerate()
+            .map(|(index, (name, args))| OpenAiToolCall {
+                id: format!("call_{index}"),
+                kind: "function".to_owned(),
+                function: OpenAiToolFunctionCall {
+                    name: (*name).to_owned(),
+                    arguments: args.to_string(),
+                },
+            })
+            .collect()
+    });
+    ProviderResponse::OpenAiChatCompletion(OpenAiChatResponse {
+        id: "resp".to_owned(),
+        object: "chat.completion".to_owned(),
+        created: 0,
+        model: "gpt-test".to_owned(),
+        choices: vec![OpenAiChatChoice {
+            index: 0,
+            message: OpenAiChatMessage {
+                role: "assistant".to_owned(),
+                content: text.map(|text| OpenAiMessageContent::Text(text.to_owned())),
+                tool_calls,
+                ..Default::default()
+            },
+            finish_reason: Some(
+                if calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                }
+                .to_owned(),
+            ),
+            logprobs: None,
+        }],
+        usage: None,
+        system_fingerprint: None,
+        service_tier: None,
+    })
+}
+
+/// A native-route Agent answering any JSON object about `{{document}}`,
+/// declaring `tools`.
+fn reviewer(tools: &[&str]) -> AgentCall {
+    let prompt = openai_chat(
+        "gpt-test",
+        OpenAiChatOptions {
+            messages: vec!["Review: {{document}}".to_owned()],
+            output: Some(
+                ResponseFormat::json_schema("review", json!({"type": "object"})).expect("schema"),
+            ),
+            ..OpenAiChatOptions::default()
+        },
+    )
+    .expect("static prompt is valid");
+    AgentCall {
+        agent: InlineableRef::Inline(Box::new(AgentSpec {
+            prompt: InlineableRef::Inline(Box::new(prompt.into_native())),
+            execution_route: ExecutionRoute::Native {},
+            tool_names: tools.iter().map(|&name| name.to_owned()).collect(),
+            run_config: AgentRunConfigSpec::default(),
+            verified_by: Vec::new(),
+        })),
+        inputs: BTreeMap::new(),
+        workspace: BTreeMap::new(),
+    }
+}
+
+/// The `document` input carrying `value`, sourced from the `notes` slot.
+fn document(value: Value) -> BTreeMap<String, CallInput> {
+    BTreeMap::from([(
+        "document".to_owned(),
+        CallInput {
+            value: CallValue::Json(value),
+            sources: BTreeSet::from([notes()]),
+        },
+    )])
+}
+
+/// A queued run's recovered authority drives a hosted Agent step and check.
+///
+/// The accepted principal was delegated, holds every tool grant, and reads
+/// only `vala.logs.records`. Rebuilt through [`Caller::accepted`], its
+/// query, code, and file calls run and are recorded, yet Oracle refuses the
+/// other table and a join reaching it: tool grants never widen data scope.
+/// The located line the file tool returned becomes the step's citation, and
+/// a tool-less check judged by the real evidence reader keeps it and drops a
+/// fabricated one. A call to a tool the Agent did not declare fails the step.
+///
+/// # Panics
+/// Panics when a scope widens, a call goes unrecorded, an invalid citation
+/// survives, or an undeclared tool is accepted.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
+async fn recovered_authority_bounds_every_agent_tool() {
+    const LOGS: &str = "SELECT severity_text FROM vala.logs.records";
+    const SPANS: &str = "SELECT name FROM vala.traces.spans";
+    const MIXED: &str = "SELECT r.severity_text, s.name \
+         FROM vala.logs.records r JOIN vala.traces.spans s ON r.trace_id = s.trace_id";
+    let registered = Registered::start().await;
+    let state = registered.server.state().clone();
+    let tenant = registered.server.data_tenant_id();
+    let catalog = registered.server.bifrost_catalog();
+    let mut uids = Vec::new();
+    for (namespace, name) in [("logs", "records"), ("traces", "spans")] {
+        let definition =
+            vala_bifrost_redux::tables::builtin_table(namespace, name).expect("canonical built-in");
+        uids.push(
+            catalog
+                .ensure_builtin(tenant, definition, Attribution::unresolved())
+                .await
+                .expect("built-in registers"),
+        );
+    }
+    let logs_only = Permission {
+        scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
+            catalog: "vala".to_owned(),
+            schema: "logs".to_owned(),
+            table_uid: uuid::Uuid::from_bytes(*uids[0].as_bytes()),
+        })),
+        ..Permission::bifrost_query_read()
+    };
+    let principal = Principal::new(
+        PrincipalId::new(uuid::Uuid::now_v7()),
+        PrincipalKind::User,
+        tenant,
+        Vec::new(),
+        PermissionSet::from_iter([
+            Permission::tool_invoke_any(),
+            Permission::card_read(),
+            logs_only,
+        ]),
+    );
+    let initiator = Principal::new(
+        PrincipalId::new(uuid::Uuid::now_v7()),
+        PrincipalKind::User,
+        tenant,
+        Vec::new(),
+        PermissionSet::from_iter([Permission::bifrost_query_read()]),
+    );
+    let authority = AcceptedAuthority::new(
+        &principal,
+        &[DelegationStep {
+            principal: PrincipalRef::from_principal(&initiator),
+        }],
+    );
+    let caller = Caller::accepted(&authority, PrincipalId::new(uuid::Uuid::now_v7()));
+
+    let limits = HostedLimits {
+        monty_min_workers: 0,
+        ..HostedLimits::default()
+    };
+    let declaration = registered.file("notes.txt");
+    let evidence = Arc::new(TenantEvidence::new(
+        state.clone(),
+        caller.clone(),
+        BTreeMap::from([(notes(), declaration.clone())]),
+        limits,
+    ));
+    let tools = HostedTools::new(
+        state,
+        caller,
+        Arc::clone(&evidence),
+        Arc::new(Workspaces::new(limits)),
+        Arc::new(Sandbox::start(worker(), limits).await.expect("pool starts")),
+        limits,
+    );
+    let read = json!({"path": "/inputs/notes.txt", "start": 0});
+    let code = json!({"source": "from pathlib import Path\nPath('/inputs/notes.txt').read_text()"});
+    let cited = json!({"slot": "notes", "locator": {"lines": {"start": 1, "end": 1}}});
+    let mock = MockProvider::new(ProviderName::OpenAi);
+    for response in [
+        answer(
+            None,
+            &[
+                ("bifrost_query", json!({"sql": LOGS})),
+                ("bifrost_query", json!({"sql": SPANS})),
+                ("bifrost_query", json!({"sql": MIXED})),
+                ("code_run", code.clone()),
+                ("fs_read", read.clone()),
+            ],
+        ),
+        answer(
+            Some(&json!({"finding": "alpha", "citations": [cited]}).to_string()),
+            &[],
+        ),
+        answer(
+            Some(
+                &json!({"outcome": "passed", "reason": "grounded", "citations": [
+                    cited,
+                    {"slot": "notes", "locator": {"lines": {"start": 9, "end": 9}}}
+                ]})
+                .to_string(),
+            ),
+            &[],
+        ),
+        answer(None, &[("cards_list", json!({}))]),
+    ] {
+        mock.push_response(response);
+    }
+    let mut providers = ProviderRegistry::new();
+    providers.register(Arc::new(mock));
+    let executor = AgentExecutor::new(
+        Arc::new(providers),
+        Arc::new(NoRegistry),
+        Arc::new(NoRegistry),
+    )
+    .with_toolset(Arc::new(tools))
+    .with_evidence(evidence);
+
+    let declared = reviewer(&["bifrost.query", "code.run", "fs.read"]);
+    let id = TaskId::new("review").expect("task id");
+    let (executor, id, registered) = (&executor, &id, &registered);
+    let step = |action: Action| async move {
+        ActionExecutor::execute(
+            executor,
+            BlockCall {
+                id,
+                position: Position::Step,
+                block: &action,
+                inputs: document(json!("the notes")),
+                workspace: BTreeMap::from([(
+                    "/inputs/notes.txt".to_owned(),
+                    CallInput {
+                        value: CallValue::Evidence(registered.file("notes.txt")),
+                        sources: BTreeSet::from([notes()]),
+                    },
+                )]),
+                deadline: Instant::now() + Duration::from_secs(60),
+            },
+        )
+        .await
+    };
+    let output = step(Action::Agent(declared.clone()))
+        .await
+        .expect("the step runs");
+    let error = |tool: BuiltinTool, args: &Value| {
+        let record = output
+            .tool_calls
+            .iter()
+            .find(|record| record.tool == tool && &record.arguments == args)
+            .expect("the call is recorded");
+        record.error.clone()
+    };
+    assert_eq!(output.tool_calls.len(), 5);
+    assert_eq!(
+        error(BuiltinTool::BifrostQuery, &json!({"sql": LOGS})),
+        None
+    );
+    for sql in [SPANS, MIXED] {
+        let refused = error(BuiltinTool::BifrostQuery, &json!({"sql": sql}));
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|reason| reason.contains("query forbidden")),
+            "{sql}: {refused:?}"
+        );
+    }
+    assert_eq!(error(BuiltinTool::CodeRun, &code), None);
+    assert_eq!(error(BuiltinTool::FsRead, &read), None);
+    assert_eq!(output.output["citations"], json!([cited]));
+
+    let check = Check::Agent(reviewer(&[]));
+    let verdict = CheckExecutor::execute(
+        executor,
+        BlockCall {
+            id,
+            position: Position::VerifierCheck,
+            block: &check,
+            inputs: document(output.output.clone()),
+            workspace: BTreeMap::new(),
+            deadline: Instant::now() + Duration::from_secs(60),
+        },
+    )
+    .await
+    .expect("the check runs")
+    .verdict;
+    assert_eq!(verdict.outcome, VerificationVerdict::Passed);
+    assert_eq!(
+        serde_json::to_value(&verdict.citations).expect("citations"),
+        json!([cited])
+    );
+
+    let refused = step(Action::Agent(declared))
+        .await
+        .expect_err("cards.list was not declared");
+    assert!(matches!(refused, BlockError::Terminal { .. }), "{refused}");
 }

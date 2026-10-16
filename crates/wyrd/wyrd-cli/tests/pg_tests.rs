@@ -77,6 +77,12 @@ impl LocalDev {
             "build the production wyrd-server binary through mise first"
         );
         symlink(&binary, installed.join("wyrd-server")).expect("installed executable fixture");
+        let worker = binary.with_file_name("wyrd-monty-worker");
+        assert!(
+            worker.is_file(),
+            "build the wyrd-monty-worker the bundle ships beside wyrd-server through mise first"
+        );
+        symlink(&worker, installed.join("wyrd-monty-worker")).expect("installed worker fixture");
         symlink(format!("versions/{version}"), root.join("current")).expect("active version");
         Self {
             child: None,

@@ -1439,7 +1439,7 @@ mod pg_tests {
     ///
     /// The journey first plans the complete directory, registers the external
     /// Data and Model prerequisites exactly as separate user workflows would,
-    /// applies all eleven canonical submissions, and hydrates the reachable
+    /// applies every canonical submission, and hydrates the reachable
     /// Service graph through CLI `get`.
     ///
     /// # Panics
@@ -1476,7 +1476,7 @@ mod pg_tests {
             String::from_utf8_lossy(&plan.stderr)
         );
         let plan: Value = serde_json::from_slice(&plan.stdout).expect("plan output is JSON");
-        assert_eq!(plan["cards"].as_array().map(Vec::len), Some(12));
+        assert_eq!(plan["cards"].as_array().map(Vec::len), Some(10));
 
         let server = WyrdTestServer::builder()
             .with_verification_runtime_for_test()
@@ -1569,7 +1569,7 @@ mod pg_tests {
         )
         .await
         .expect("canonical authored directory applies");
-        assert_eq!(receipt["outcomes"].as_array().map(Vec::len), Some(13));
+        assert_eq!(receipt["outcomes"].as_array().map(Vec::len), Some(11));
         wait_baseline_ready(
             &public_cards_client(&base_url, &jwt).await,
             json!({
@@ -1593,7 +1593,7 @@ mod pg_tests {
         .await
         .expect("canonical Service graph hydrates");
         assert_eq!(summary["mode"], "complete");
-        assert_eq!(summary["card_count"], 17);
+        assert_eq!(summary["card_count"], 14);
 
         let metadata: Value = serde_yaml::from_slice(
             &std::fs::read(bundle.path().join("metadata.yaml"))
@@ -1639,14 +1639,7 @@ mod pg_tests {
                 .as_array()
                 .unwrap_or_else(|| panic!("{name} persisted its verified_by list"));
             assert_eq!(bindings.len(), binding_count, "{bindings:?}");
-            for leg in ["verifier", "runs_on"] {
-                assert!(
-                    bindings[0][leg]["uid"].is_string(),
-                    "{name}.{leg} persisted UID-pinned: {:?}",
-                    bindings[0][leg]
-                );
-            }
-            if let Some(explicit) = bindings.get(1) {
+            for explicit in bindings {
                 assert!(explicit["verifier"]["uid"].is_string(), "{explicit:?}");
                 assert!(explicit.get("runs_on").is_none(), "{explicit:?}");
             }
@@ -1665,12 +1658,12 @@ mod pg_tests {
             let outbound = relationships["outbound_refs"]
                 .as_array()
                 .unwrap_or_else(|| panic!("{name} derived outbound relationships"));
-            for kind in ["Verifier", "Trigger"] {
-                assert!(
-                    outbound.iter().any(|edge| edge["ref"]["kind"] == kind),
-                    "{name} derived a {kind} edge: {outbound:?}"
-                );
-            }
+            assert!(
+                outbound
+                    .iter()
+                    .any(|edge| edge["ref"]["kind"] == "Verifier"),
+                "{name} derived a Verifier edge: {outbound:?}"
+            );
         }
 
         server.shutdown().await.expect("test server shuts down");

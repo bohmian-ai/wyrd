@@ -555,6 +555,7 @@ jobs:
         run: |
           tar -czf "$BUNDLE" -C release .
           tar -tzf "$BUNDLE" | grep -qx './wyrd-server'
+          tar -tzf "$BUNDLE" | grep -qx './wyrd-monty-worker'
           shasum -a 256 "$BUNDLE" > SHA256SUMS.wyrd-server-${{ matrix.bundle }}
 
       - uses: actions/upload-artifact@v7

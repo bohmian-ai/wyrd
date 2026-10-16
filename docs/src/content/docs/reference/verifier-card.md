@@ -73,7 +73,7 @@ An input slot names one piece of evidence and the shape it must have. Your app f
 
 Media formats: `png`, `jpeg`, `gif`, `webp`, `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, `pptx`, `doc`, `xls`, `ppt`, `tar_gz`, `zip`.
 
-An `extract` step can read `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, and `pptx`. Its output shapes are in [Extraction output](/reference/extraction-output/).
+An `extract` step can read `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, and `pptx`. See [extract](#extract) for what each extractor returns.
 
 ## Steps
 
@@ -101,9 +101,9 @@ The action is what a step does. Each step has exactly one.
 
 #### extract
 
-`extract` reads one `media` input and returns its text and structure as JSON. Use it whenever a check or an Agent needs what is inside a file. An Agent's text placeholders and an `assert` path cannot read a raw file, so a PDF, DOCX, or spreadsheet always goes through `extract` first.
+`extract` runs one of Wyrd's built-in extractors on a `media` input and returns the file's text and structure as JSON. Checks and Agent placeholders read JSON and text, not raw files, so any PDF, Office document, or data file you want to judge goes through `extract` first.
 
-It takes one field, `from`, which names a `media` slot:
+It takes one field, `from`, naming a `media` slot. The extractor is picked by the file's format; you don't choose one.
 
 ```yaml
 spec:
@@ -121,25 +121,123 @@ spec:
       check: {kind: assert, path: "steps.policy-text.output.pages[0].text", operator: contains, expected: "30 days"}
 ```
 
-The app sends the file, and the server extracts it before any requirement runs:
-
 ```python
 from wyrd import verify
 
 run.observe.verify("policy-check", policy=verify.File("policy.pdf"))
 ```
 
-For a two-page PDF, `steps.policy-text.output` is:
+##### Built-in extractors
 
-```json
-{"format": "pdf", "pages": [{"number": 1, "text": "Refund policy\nRefunds are issued within 30 days."}, {"number": 2, "text": "Exceptions"}]}
+Every output has a `format` field naming the extractor that produced it, and every other field is always present: an empty list is `[]`, empty text is `""`, and `null` appears only where the type allows it. There is no `page_count` or `slide_count`; use the list's length.
+
+| Format | Reads | Output |
+| --- | --- | --- |
+| `pdf` | The text layer of each page | `pages` |
+| `docx` | Paragraphs with their style, and tables, in document order | `blocks` |
+| `pptx` | Each slide's title, body paragraphs, tables, and speaker notes | `slides` |
+| `xlsx` | Every non-empty cell of every sheet: value, formula, and error | `sheets` |
+| `csv` | Every row, including the header, as strings | `rows` |
+| `json` | The parsed document | `value` |
+| `text`, `markdown`, `html` | The source text, unchanged | `text` |
+
+**PDF**
+
+```typescript
+{ format: "pdf"; pages: { number: number; text: string }[] }
 ```
 
-The shape depends on the format: `pages` for PDF, `slides` for PPTX, `blocks` for DOCX, `sheets` for XLSX, `rows` for CSV, `value` for JSON, and `text` for text, Markdown, and HTML. Every shape is in [Extraction output](/reference/extraction-output/).
+```json
+{"format": "pdf", "pages": [{"number": 1, "text": "Refund policy\nRefunds are issued within 30 days."}, {"number": 2, "text": ""}]}
+```
 
-To hand the file to a judge, pass the whole output to an Agent placeholder, as in `inputs: {policy: steps.policy-text.output}`. Citations still point at the original file by slot and page or line, not at the step.
+`number` is one-based. A page with no text layer, such as a scan, has `text: ""`. An encrypted PDF fails the step.
 
-Extraction reads text only: there is no OCR, so a scanned PDF extracts as empty pages. The `has-text` requirement above catches that. `png`, `jpeg`, `gif`, `webp`, `doc`, `xls`, `ppt`, `tar_gz`, and `zip` cannot be extracted, and a slot that accepts any of them fails `wyrd plan` with rule `extract_format`.
+**DOCX**
+
+```typescript
+{ format: "docx"; blocks: ({ kind: "paragraph"; text: string; style: string | null } | { kind: "table"; rows: string[][] })[] }
+```
+
+```json
+{"format": "docx", "blocks": [{"kind": "paragraph", "text": "Refund policy", "style": "Heading1"}, {"kind": "table", "rows": [["Window", "Days"], ["Standard", "30"]]}]}
+```
+
+`style` is Word's stored style ID, such as `Heading1`, or `null` for an unstyled paragraph. Text inside content controls is included.
+
+**PPTX**
+
+```typescript
+{ format: "pptx"; slides: { number: number; title: string | null; paragraphs: string[]; tables: { rows: string[][] }[]; notes: string }[] }
+```
+
+```json
+{"format": "pptx", "slides": [{"number": 1, "title": "Q3 refunds", "paragraphs": ["Refund rate fell to 2%"], "tables": [{"rows": [["Region", "Rate"], ["US", "2%"]]}], "notes": ""}]}
+```
+
+Slides are in presentation order and `number` is one-based. `title` is `null` when the slide has no title placeholder; `notes` is `""` when it has no speaker notes.
+
+**XLSX**
+
+```typescript
+{ format: "xlsx"; sheets: { name: string; cells: { address: string; value: string | number | boolean | null; formula: string | null; error: string | null }[] }[] }
+```
+
+```json
+{"format": "xlsx", "sheets": [{"name": "Refunds", "cells": [{"address": "A1", "value": "Days", "formula": null, "error": null}, {"address": "B2", "value": 30, "formula": "=15*2", "error": null}]}]}
+```
+
+Cells are in row, then column, order, and empty cells are left out, so look a cell up by `address`, not by its position in `cells`. `value` is the stored value or the result Excel last saved for a formula; Wyrd never recalculates. Dates stay Excel serial numbers. An error cell has `value: null` and the error, such as `#DIV/0!`, in `error`.
+
+**CSV**
+
+```typescript
+{ format: "csv"; rows: string[][] }
+```
+
+```json
+{"format": "csv", "rows": [["region", "rate"], ["US", "0.02"]]}
+```
+
+The first row is kept as data and no types are inferred, so `"0.02"` is a string. Rows may have different lengths.
+
+**JSON**
+
+```typescript
+{ format: "json"; value: any }
+```
+
+```json
+{"format": "json", "value": {"refund_days": 30, "regions": ["US", "EU"]}}
+```
+
+**Text, Markdown, HTML**
+
+```typescript
+{ format: "text" | "markdown" | "html"; text: string }
+```
+
+```json
+{"format": "markdown", "text": "# Refund policy\n\nRefunds are issued within 30 days.\n"}
+```
+
+The file must be UTF-8. Markdown and HTML are not parsed; you get the source.
+
+In every table, from DOCX or PPTX, a merged cell's text is in its top-left position and the positions it covers are `""`, so every row of a table has the same length.
+
+##### Use the output
+
+Read fields with a path, as in the example: `steps.<id>.output.pages[0].text`. Indexes are zero-based, even though PDF `number` and PPTX `number` start at 1. `[*]` works only in an `assert` check's `each`.
+
+To give the whole file to an Agent, pass the output to a placeholder: `inputs: {policy: steps.policy-text.output}`. A citation still points at the original file by slot, using `page` for PDF, `slide` for PPTX, `lines` for text, Markdown, HTML, and CSV, and `json_pointer` into this output for DOCX, XLSX, and JSON. [Extraction output](/reference/extraction-output/) has a citation example for each.
+
+##### What extract does not do
+
+- Read images. There is no OCR and no rendering. `png`, `jpeg`, `gif`, and `webp` can't be extracted; give them to an Agent as a `media` input instead.
+- Read legacy Office files. `doc`, `xls`, and `ppt` are separate formats; convert them to `docx`, `xlsx`, or `pptx`.
+- Open archives. `zip` and `tar_gz` go to a step Agent's `workspace` instead.
+
+A slot that accepts a format `extract` can't read fails `wyrd plan` with rule `extract_format`. At run time the step fails, and the requirements that need it are `inconclusive`, when the file doesn't parse as its format, a PDF is encrypted, a text file isn't UTF-8, or the file exceeds `WYRD_VERIFICATION_EXTRACT_MAX_PAGES` or `WYRD_VERIFICATION_EXTRACT_TEXT_MAX_MIB` ([limits](/reference/verification-runtime-limits/)). Each result records the extractor version, `wyrd-extract/1`, so a verdict shows which extractor read the file.
 
 #### agent
 

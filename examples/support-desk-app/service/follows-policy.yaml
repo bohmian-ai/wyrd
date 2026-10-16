@@ -1,0 +1,30 @@
+# An Agent reads the refund policy PDF and lists its rules with their pages,
+# then a tool-less judge checks the answer against those rules, citing the
+# policy. Both call a model, so the app runs this one in the background.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: follows-policy
+  version: 1.0.0
+  space: support
+spec:
+  description: A support answer agrees with the refund policy.
+  inputs:
+    answer: {type: json}
+    policy: {type: media, formats: [pdf], max_bytes: 1048576}
+  steps:
+    - id: findings
+      action:
+        kind: agent
+        agent: ./policy-reader.yaml
+        workspace: {/inputs/policy.pdf: inputs.policy}
+  requirements:
+    - id: follows-policy
+      statement: The answer agrees with the refund policy
+      check:
+        kind: agent
+        agent: ./policy-judge.yaml
+        inputs:
+          claim: requirement.statement
+          answer: inputs.answer
+          findings: steps.findings.output

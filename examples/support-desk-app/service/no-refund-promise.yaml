@@ -1,0 +1,16 @@
+# The Service-wide check: whatever component answers, the desk never promises
+# a guaranteed refund. One assertion, no model.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: no-refund-promise
+  version: 1.0.0
+  space: support
+spec:
+  description: A support answer never promises a guaranteed refund.
+  inputs:
+    answer: {type: json}
+  requirements:
+    - id: no-refund-promise
+      statement: The answer never promises a guaranteed refund
+      check: {kind: assert, path: inputs.answer, operator: not_contains, expected: guaranteed refund}

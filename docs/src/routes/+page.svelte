@@ -18,8 +18,9 @@
     Reference: { blurb: 'Card schemas, APIs, CLI commands, errors, and configuration.', kicker: 'Look up' }
   };
   const doors = navGroups().map((group) => ({ label: group.label, path: group.items[0].path, ...DOORS[group.label] }));
-  const start = firstPage('Get started');
   const startPages = navGroups().find((group) => group.label === 'Get started')?.items ?? [];
+  // The CTA opens the quickstart once it is published, else the first Get started page.
+  const start = startPages.find((item) => item.path === '/get-started/quickstart/') ?? firstPage('Get started');
 </script>
 
 <svelte:head>
@@ -64,7 +65,7 @@
       <div>
         <p class="eyebrow">Get started</p>
         <h2 id="qs-h">From intent to evidence.</h2>
-        <p class="sub">Learn what Wyrd verifies, then run a local server and connect a client.</p>
+        <p class="sub">Run a local server, then verify a support agent's answers with three Verifiers.</p>
         <nav class="links" aria-label="Get started">
           {#each startPages as item (item.path)}
             <a href={`${base}${item.path}`}>{item.label}</a>
@@ -76,15 +77,16 @@
         <pre><span class="ln">1</span><span class="k">apiVersion</span>: wyrd/v1
 <span class="ln">2</span><span class="k">kind</span>: Service
 <span class="ln">3</span><span class="k">metadata</span>:
-<span class="ln">4</span>  <span class="k">space</span>: retention
-<span class="ln">5</span>  <span class="k">name</span>: support-copilot
-<span class="ln">6</span><span class="k">spec</span>:
-<span class="ln">7</span>  <span class="k">components</span>:
-<span class="ln">8</span>    - <span class="k">alias</span>: triage
-<span class="ln">9</span>      <span class="k">ref</span>: ./agents/triage.yaml
-<span class="ln">10</span>      <span class="k">verified_by</span>:
-<span class="ln">11</span>        - <span class="k">verifier</span>: ./verifiers/triage-quality.yaml
-<span class="ln">12</span>          <span class="k">on_failure</span>: [./operators/page-oncall.yaml]</pre>
+<span class="ln">4</span>  <span class="k">name</span>: support-desk
+<span class="ln">5</span><span class="k">spec</span>:
+<span class="ln">6</span>  <span class="k">verified_by</span>:
+<span class="ln">7</span>    - <span class="k">verifier</span>: ./no-refund-promise.yaml
+<span class="ln">8</span>  <span class="k">components</span>:
+<span class="ln">9</span>    - <span class="k">alias</span>: agent
+<span class="ln">10</span>      <span class="k">ref</span>: ./support-agent.yaml
+<span class="ln">11</span>      <span class="k">verified_by</span>:
+<span class="ln">12</span>        - <span class="k">verifier</span>: ./ticket-complete.yaml
+<span class="ln">13</span>        - <span class="k">verifier</span>: ./follows-policy.yaml</pre>
       </figure>
     </section>
   {/if}

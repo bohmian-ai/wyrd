@@ -1,0 +1,27 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: support-desk
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  # The Service's own Verifier checks every answer the desk gives.
+  verified_by:
+    - verifier: ./no-refund-promise.yaml
+  tables:
+    - name: tickets
+      schema:
+        type: object
+        properties:
+          question: {type: string}
+          answer: {type: string}
+        required: [question, answer]
+  components:
+    - alias: agent
+      ref: ./support-agent.yaml
+      verified_by:
+        - verifier: ./ticket-complete.yaml
+        - verifier: ./follows-policy.yaml
+    - alias: prompt
+      ref: ./support-prompt.yaml

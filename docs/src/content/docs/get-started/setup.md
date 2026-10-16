@@ -135,4 +135,4 @@ A failed run stops the server. Migrations and tenant creation that already commi
 
 ## Next
 
-[Set up the LLM gateway](/connect/set-up-the-llm-gateway/) to call a model through Wyrd with this credential.
+[Verify your first agent](/get-started/quickstart/): run a support agent against this server and get verdicts on its answers.

@@ -9,6 +9,7 @@
 ## Get started
 
 - [Set up Wyrd](https://bohmian-ai.github.io/wyrd/get-started/setup/): Run a Wyrd server on your machine, save its first credential, and make an authenticated request.
+- [Verify your first agent](https://bohmian-ai.github.io/wyrd/get-started/quickstart/): Run the support-desk API against your local server, get verdicts from three Verifiers, and query the evidence behind them.
 
 ## Connect
 

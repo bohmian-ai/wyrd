@@ -1,234 +1,159 @@
 # <img src="docs/src/assets/wyrd-mark.svg" alt="" width="30" height="30"> Wyrd
 
-**Open-source verification and assurance infrastructure for AI systems.**
+## Overview
 
-Wyrd checks whether an AI service behaves as declared. Define the service and
-what you expect, record what happens during real runs, and verify the results
-against that declaration. Wyrd keeps each result tied to the evidence and
-component versions behind it.
+**Open Source Verification Infrastructure for AI Systems**
 
-[Getting started](docs/src/content/docs/get-started/index.svx) ·
-[Architecture](architecture/wyrd-design.md) ·
-[Release tracker](https://github.com/orgs/bohmian-ai/projects/2) ·
-[Contributing](CONTRIBUTING.md)
+Wyrd gives you the primitives to build your own verification factory, so you
+can verify, understand, and control your AI systems. Declare your service and
+its requirements, observe what happens in real time, and verify its output
+against the declared requirements.
 
-**Coming this week:** Wyrd `v0.1.0` is targeted for September 25, 2026. The
-verification example below shows the approved interface; its end-to-end path
-is still being completed.
+**Coming this week:** Wyrd `v0.2.0` is targeted for October 16, 2026, with the
+full verification primitive suite. Next release: the UI.
 
-## Planned verification workflow: Pydantic AI service
+## Declare
 
-Define the service once. This bundle contains one Agent and its Prompt, an Eval
-Verifier, and the Slack Operator to run when verification fails.
+One Service with one Agent, two Verifiers bound to that Agent, and one Bifrost
+table:
 
 ```yaml
-# service.yaml
+# refund-letters/service.yaml
 apiVersion: wyrd/v1
 kind: Service
-metadata:
-  name: support-service
-  version: "1.0.0"
-  space: default
+metadata: {name: refund-letters, version: 1.0.0, space: default}
 spec:
   service_type: agent
+  tables:
+    - name: letters
+      schema:
+        type: object
+        properties:
+          order_id: {type: string}
+          letter: {type: string}
+        required: [order_id, letter]
   components:
-    - alias: support_agent
+    - alias: agent
       ref: ./agent.yaml
       verified_by:
-        - verifier: ./verifier.yaml
-          runs_on:
-            kind: observations_ready
-          on_failure:
-            - kind: notify
-              channel:
-                kind: slack
-                connection: primary-workspace
-                channel_id: C0123456789
-                text: Support Agent verification failed.
+        - verifier: ./no-refund-promise.yaml
+        - verifier: ./names-order.yaml
 ---
-# agent.yaml
+# refund-letters/agent.yaml
 apiVersion: wyrd/v1
 kind: Agent
-metadata:
-  name: support-agent
-  version: "1.0.0"
-  space: default
+metadata: {name: letter-writer, version: 1.0.0, space: default}
 spec:
-  prompt: ./prompt.yaml
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "Write a refund decision letter for order {{order_id}}: {{question}}"
+  execution_route: {kind: native}
   tool_names: []
-  run_config:
-    max_iterations: 1
 ---
-# prompt.yaml
-apiVersion: wyrd/v1
-kind: Prompt
-metadata:
-  name: support-prompt
-  version: "1.0.0"
-  space: default
-spec:
-  provider: openai
-  model: gpt-5.6-sol
-  system: Answer questions using the published refund policy.
-  messages:
-    - "{{question}}"
----
-# verifier.yaml
+# refund-letters/no-refund-promise.yaml: a simple assertion
 apiVersion: wyrd/v1
 kind: Verifier
-metadata:
-  name: support-agent-eval
-  version: "1.0.0"
-  space: default
+metadata: {name: no-refund-promise, version: 1.0.0, space: default}
 spec:
-  implementation:
-    kind: eval
-    pass_gate:
-      kind: all_pass
-    tasks:
-      explains_refunds:
-        kind: assertion
-        id: explains_refunds
-        context_path: $.answer
-        operator: contains_ignore_case
-        expected: refund
+  inputs:
+    letter: {type: json}
+  requirements:
+    - id: no-refund-promise
+      statement: The letter never promises a guaranteed refund
+      check: {kind: assert, path: inputs.letter, operator: not_contains, expected: guaranteed refund}
+---
+# refund-letters/names-order.yaml: parse the document, then check it
+apiVersion: wyrd/v1
+kind: Verifier
+metadata: {name: names-order, version: 1.0.0, space: default}
+spec:
+  inputs:
+    letter: {type: media, formats: [markdown]}
+  steps:
+    - id: read-letter
+      action: {kind: extract, from: inputs.letter}
+  requirements:
+    - id: names-order
+      statement: The letter states the order ID
+      check: {kind: assert, path: steps.read-letter.output.text, operator: contains, expected: "Order ID:"}
 ```
 
-Register the graph and hydrate its exact versions for the application:
+Register it, then download the registered versions for your app:
 
 ```bash
-wyrd apply ./support-service
-wyrd get --kind Service --space default --name support-service \
-  --version 1.0.0 --output-dir ./support-service-bundle
+wyrd apply refund-letters/service.yaml
+wyrd get --kind Service --space default --name refund-letters --version 1.0.0 --output-dir .wyrd-bundle
 ```
 
-Load the Agent and Prompt into Pydantic AI, then record what happened:
+## Observe - Wyrd ships python, typescript and rust SDKs
 
 ```python
-from pydantic import BaseModel
-from pydantic_ai import Agent
-from wyrd import WyrdState
+from wyrd import WyrdState, verify
 
-
-class SupportExchange(BaseModel):
-    question: str
-    answer: str
-
-
-state = WyrdState.from_path("./support-service-bundle")
+state = WyrdState.from_path(".wyrd-bundle")
 state.start_bifrost()
 
-declared_agent = state.agent("support_agent")
-declared_prompt = declared_agent.prompt
-instructions = "\n".join(
-    message["content"] for message in declared_prompt.system_messages
-)
-agent = Agent(
-    f"{declared_prompt.provider}:{declared_prompt.model}",
-    instructions=instructions,
-)
+def letter_writer(order_id: str) -> str:  # mock agent call
+    return f"# Refund decision\n\nOrder ID: {order_id}\n\nYour $40 refund is approved.\n"
 
-question = "What is the refund policy?"
-result = agent.run_sync(question)
+letter = letter_writer("A-1001")
 
-with state.run(card="support_agent") as run:
-    run.observe.eval(
-        SupportExchange(question=question, answer=result.output),
-        session_id="support-session-123",
-    )
-state.shutdown()
+run = state.run()
+agent = run.for_card("agent")
+
+# Verify now and wait for the verdict
+result = agent.observe.verify("no-refund-promise", letter=letter)
+print(result.verdict)  # passed
+
+# Submit the document check to run in the background
+execution = agent.observe.submit("names-order", letter=verify.File(letter.encode(), filename="letter.md"))
+
+# Record the letter to the Service's Bifrost table
+run.observe.record("vala.datasets.letters", {"order_id": "A-1001", "letter": letter})
+
+state.shutdown()  # flush everything recorded
 ```
 
-Wyrd ties the observation to the exact Service, Agent, Prompt, and Verifier
-versions. The Eval runs asynchronously after the observation is committed. A
-failed verdict is retained as evidence and dispatches the configured Slack
-Operator.
+## Verify
 
-Nothing above builds a client. The SDKs find the server and credential the
-same way the CLI does, from `WYRD_SERVER_URL` and `WYRD_API_KEY` or the config
-`wyrd server dev` saves. Every server-facing handle opens with `connect` in
-Rust, Python, and TypeScript, and Python also accepts the plain constructor,
-such as `Cards()`, which connects on first use. Pass a client
-only for tests, unusual configuration, or acting on someone's behalf. See
-[Connect from an SDK](docs/src/content/docs/get-started/setup.md#connect-from-an-sdk).
+The letter and both verdicts land in Bifrost under the same `run_id`, so one
+join shows each verdict next to the letter it judged. The submitted check runs
+in the background, so its verdict can arrive a moment after the first one:
 
-## Why Wyrd exists
+```python
+from wyrd.bifrost import Bifrost
 
-An AI service can remain available and return valid responses while its quality,
-safety, or intended behavior quietly degrades. Its behavior depends on changing
-data, model versions, prompts, tools, providers, and runtime context, so testing
-the application once is not enough.
-
-Teams often respond with separate evaluation scripts, telemetry pipelines,
-drift monitors, registries, policy checks, and audit systems. Each represents
-the system differently, making verification inconsistent, difficult to
-reproduce, and expensive to maintain.
-
-Wyrd makes verification a shared infrastructure capability instead of something
-every team rebuilds.
-
-## How Wyrd verifies AI systems
-
-```text
-Declare the system and its expected behavior
-        ↓
-Observe real executions
-        ↓
-Evaluate behavior with Verifiers
-        ↓
-Record evidence and lineage
-        ↓
-Enforce policy or trigger action
+rows = Bifrost().sql(
+    """
+    SELECT
+      l.order_id,
+      r.execution_id,
+      r.verdict
+    FROM vala.datasets.letters l
+    JOIN vala.verification.results r
+      ON r.run_id = l.run_id
+    WHERE l.run_id = $1
+    """,
+    [run.run_id],
+)
+print(rows.to_polars())
 ```
 
-- **Cards** identify the exact data, models, prompts, agents, and
-  services being verified.
-- **Verifiers** define reusable Drift and Agent Eval checks.
-- **Runs and Observations** record what happened during execution.
-- **Lineage** connects verification evidence to exact component versions.
-- **Bifrost** stores and queries the evidence produced by verification.
-- **Policy and Audit** govern consequential decisions and record
-  accountability.
-- **Operators** respond when verification fails.
+To run Wyrd locally, start with [Set up Wyrd](https://bohmian-ai.github.io/wyrd/get-started/setup/),
+then [Verify your first agent](https://bohmian-ai.github.io/wyrd/get-started/quickstart/).
 
-## How the platform fits together
+## What the heck are you waiting for??????
 
-- **Wyrd** is the control plane for Cards, registry, lineage, identity, policy,
-  and audit.
-- **Vala** owns observations, Drift and Agent Eval execution, and the Bifrost
-  warehouse.
-- **Skald** owns LLM providers, prompts, tools, and agents.
-
-## Release status
-
-> **Pre-release:** Wyrd `v0.1.0` is targeted for September 25, 2026. It will
-> be the first public release. Wyrd will remain pre-1.0, so APIs and persisted
-> schemas may change between minor versions; `v0.1.0` will not include upgrade
-> migrations.
-
-Today, a source checkout supports local Card authoring and a development
-server. `v0.1.0` adds the complete self-hosted verification path, public Rust,
-Python, and TypeScript SDKs, and Linux Docker images. Windows is not part of
-this release.
-
-Follow release progress in the repository's releases and documentation.
-
-## Documentation
-
-- [Get started](docs/src/content/docs/get-started/index.svx)
-- [Wyrd architecture](architecture/wyrd-design.md)
-- [Bifrost architecture](architecture/bifrost-design.md)
-- [Self-hosting](docs/src/content/docs/self-hosting/index.svx)
-- [Security policy](SECURITY.md)
+Start verifying your system with Wyrd now!
 
 ## Contributing
 
 Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md)
-before starting a substantial change so maintainers can coordinate overlapping
-work.
-
-Report vulnerabilities privately through [SECURITY.md](SECURITY.md), not
-through a public issue.
+before starting a substantial change. Report vulnerabilities privately through
+[SECURITY.md](SECURITY.md).
 
 ## License
 

@@ -1,6 +1,11 @@
 {
   "name": "wyrd-ai-darwin-arm64",
-  "version": "0.1.0",
+  "version": "0.1.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bohmian-ai/wyrd.git",
+    "directory": "sdks/wyrd-sdk-ts/wyrd-darwin-arm64"
+  },
   "description": "Native napi addon for wyrd-ai-darwin-arm64.",
   "license": "Apache-2.0",
   "os": [

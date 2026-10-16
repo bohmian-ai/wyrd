@@ -20,7 +20,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.94.0"
@@ -30,48 +30,48 @@ authors = ["Thorrester <sjforrester32@gmail.com>"]
 [workspace.dependencies]
 # Crates release-plz.toml never publishes carry no version, so cargo strips them
 # from published manifests where they appear only as dev-dependencies.
-wyrd-spec = { path = "crates/wyrd-spec", version = "0.1.0" }
-wyrd-client = { path = "crates/shared/wyrd-client", version = "0.1.0" }
-wyrd-cli = { path = "crates/wyrd/wyrd-cli", version = "0.1.0" }
-wyrd-mcp = { path = "crates/wyrd/wyrd-mcp", version = "0.1.0" }
-wyrd-loader = { path = "crates/shared/wyrd-loader", version = "0.1.0" }
-skald-spec = { package = "wyrd-skald-spec", path = "crates/skald/skald-spec", version = "0.1.0" }
-skald-cache = { package = "wyrd-skald-cache", path = "crates/skald/skald-cache", version = "0.1.0" }
-skald-tool = { package = "wyrd-skald-tool", path = "crates/skald/skald-tool", version = "0.1.0" }
-skald-providers = { package = "wyrd-skald-providers", path = "crates/skald/skald-providers", version = "0.1.0" }
-skald-runtime = { package = "wyrd-skald-runtime", path = "crates/skald/skald-runtime", version = "0.1.0" }
-skald-prompt = { package = "wyrd-skald-prompt", path = "crates/skald/skald-prompt", version = "0.1.0" }
-skald-agent = { package = "wyrd-skald-agent", path = "crates/skald/skald-agent", version = "0.1.0" }
+wyrd-spec = { path = "crates/wyrd-spec", version = "0.1.1" }
+wyrd-client = { path = "crates/shared/wyrd-client", version = "0.1.1" }
+wyrd-cli = { path = "crates/wyrd/wyrd-cli", version = "0.1.1" }
+wyrd-mcp = { path = "crates/wyrd/wyrd-mcp", version = "0.1.1" }
+wyrd-loader = { path = "crates/shared/wyrd-loader", version = "0.1.1" }
+skald-spec = { package = "wyrd-skald-spec", path = "crates/skald/skald-spec", version = "0.1.1" }
+skald-cache = { package = "wyrd-skald-cache", path = "crates/skald/skald-cache", version = "0.1.1" }
+skald-tool = { package = "wyrd-skald-tool", path = "crates/skald/skald-tool", version = "0.1.1" }
+skald-providers = { package = "wyrd-skald-providers", path = "crates/skald/skald-providers", version = "0.1.1" }
+skald-runtime = { package = "wyrd-skald-runtime", path = "crates/skald/skald-runtime", version = "0.1.1" }
+skald-prompt = { package = "wyrd-skald-prompt", path = "crates/skald/skald-prompt", version = "0.1.1" }
+skald-agent = { package = "wyrd-skald-agent", path = "crates/skald/skald-agent", version = "0.1.1" }
 vala-bifrost-redux = { path = "crates/vala/vala-bifrost-redux" }
-vala-sql = { path = "crates/vala/vala-sql", version = "0.1.0" }
-vala-ingest = { path = "crates/vala/vala-ingest", version = "0.1.0" }
-vala-drift = { path = "crates/vala/vala-drift", version = "0.1.0" }
-vala-eval = { path = "crates/vala/vala-eval", version = "0.1.0" }
-wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.1.0" }
-wyrd-version = { path = "crates/shared/wyrd-version", version = "0.1.0" }
-wyrd-error-derive = { path = "crates/shared/wyrd-error-derive", version = "0.1.0" }
-wyrd-config = { path = "crates/wyrd/wyrd-config", version = "0.1.0" }
-wyrd-crypt = { path = "crates/shared/wyrd-crypt", version = "0.1.0" }
-wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.1.0" }
-wyrd-cards = { path = "crates/wyrd/wyrd-cards", version = "0.1.0" }
-wyrd-runtime = { path = "crates/shared/wyrd-runtime", version = "0.1.0" }
-wyrd-queue = { path = "crates/shared/wyrd-queue", version = "0.1.0" }
-wyrd-types = { path = "crates/shared/wyrd-types", version = "0.1.0" }
-wyrd-auth-issue = { path = "crates/shared/wyrd-auth-issue", version = "0.1.0" }
-wyrd-auth-oidc = { path = "crates/shared/wyrd-auth-oidc", version = "0.1.0" }
+vala-sql = { path = "crates/vala/vala-sql", version = "0.1.1" }
+vala-ingest = { path = "crates/vala/vala-ingest", version = "0.1.1" }
+vala-drift = { path = "crates/vala/vala-drift", version = "0.1.1" }
+vala-eval = { path = "crates/vala/vala-eval", version = "0.1.1" }
+wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.1.1" }
+wyrd-version = { path = "crates/shared/wyrd-version", version = "0.1.1" }
+wyrd-error-derive = { path = "crates/shared/wyrd-error-derive", version = "0.1.1" }
+wyrd-config = { path = "crates/wyrd/wyrd-config", version = "0.1.1" }
+wyrd-crypt = { path = "crates/shared/wyrd-crypt", version = "0.1.1" }
+wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.1.1" }
+wyrd-cards = { path = "crates/wyrd/wyrd-cards", version = "0.1.1" }
+wyrd-runtime = { path = "crates/shared/wyrd-runtime", version = "0.1.1" }
+wyrd-queue = { path = "crates/shared/wyrd-queue", version = "0.1.1" }
+wyrd-types = { path = "crates/shared/wyrd-types", version = "0.1.1" }
+wyrd-auth-issue = { path = "crates/shared/wyrd-auth-issue", version = "0.1.1" }
+wyrd-auth-oidc = { path = "crates/shared/wyrd-auth-oidc", version = "0.1.1" }
 wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify" }
-wyrd-auth = { path = "crates/wyrd/wyrd-auth", version = "0.1.0" }
+wyrd-auth = { path = "crates/wyrd/wyrd-auth", version = "0.1.1" }
 wyrd-dev-fixtures = { path = "crates/shared/wyrd-dev-fixtures" }
-wyrd-bench = { path = "crates/shared/wyrd-bench", version = "0.1.0" }
+wyrd-bench = { path = "crates/shared/wyrd-bench", version = "0.1.1" }
 wyrd-sql = { path = "crates/wyrd/wyrd-sql" }
-wyrd-gateway = { path = "crates/wyrd/wyrd-gateway", version = "0.1.0" }
+wyrd-gateway = { path = "crates/wyrd/wyrd-gateway", version = "0.1.1" }
 wyrd-storage = { path = "crates/wyrd/wyrd-storage" }
 wyrd-server = { path = "crates/wyrd/wyrd-server" }
 wyrd-testing = { path = "crates/wyrd/wyrd-testing" }
-wyrd-tonic = { path = "crates/wyrd/wyrd-tonic", version = "0.1.0" }
-wyrd-tls = { path = "crates/shared/wyrd-tls", version = "0.1.0" }
-wyrd-vault = { path = "crates/shared/wyrd-vault", version = "0.1.0" }
-wyrd-semver = { path = "crates/shared/wyrd-semver", version = "0.1.0" }
+wyrd-tonic = { path = "crates/wyrd/wyrd-tonic", version = "0.1.1" }
+wyrd-tls = { path = "crates/shared/wyrd-tls", version = "0.1.1" }
+wyrd-vault = { path = "crates/shared/wyrd-vault", version = "0.1.1" }
+wyrd-semver = { path = "crates/shared/wyrd-semver", version = "0.1.1" }
 # Hakari feature-unification crate; members take it as a path-only dev-dependency.
 workspace-hack = { path = "crates/shared/workspace-hack" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
@@ -194,7 +194,7 @@ toml = "0.8"
 toml_edit = "0.22"
 shellexpand = "3"
 ipnetwork = "0.20"
-wyrd-telemetry = { path = "crates/shared/wyrd-telemetry", version = "0.1.0" }
+wyrd-telemetry = { path = "crates/shared/wyrd-telemetry", version = "0.1.1" }
 arc-swap = "1.7"
 # Client-safe baseline (no `transport`/`server` → no axum). `wyrd-tonic` adds the
 # client `channel`/`tls` features and gates `tonic/server` behind its `server`

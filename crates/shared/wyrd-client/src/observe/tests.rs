@@ -726,8 +726,8 @@ fn run_verifier() -> wyrd_spec::card::blocks::VerifierSpec {
 ///
 /// # Panics
 /// Panics when the fixed UIDs do not decode.
-fn target(spec: &wyrd_spec::card::blocks::VerifierSpec) -> super::verify::Target<'_> {
-    super::verify::Target {
+fn target(spec: &wyrd_spec::card::blocks::VerifierSpec) -> crate::verify::Target<'_> {
+    crate::verify::Target {
         spec,
         verifier_card_uid: serde_json::from_value(json!("018f4d8e-0000-7000-8000-000000000001"))
             .expect("Verifier UID"),
@@ -743,14 +743,14 @@ fn target(spec: &wyrd_spec::card::blocks::VerifierSpec) -> super::verify::Target
 /// Panics when the projection is refused or is Window evidence.
 fn run_evidence(
     spec: &wyrd_spec::card::blocks::VerifierSpec,
-    inputs: super::Inputs,
-) -> super::verify::RunEvidence {
+    inputs: crate::verify::Inputs,
+) -> crate::verify::RunEvidence {
     match target(spec)
         .project(inputs)
         .expect("values fit their slots")
     {
-        super::verify::Projected::Run(run) => run,
-        super::verify::Projected::Window(_) => panic!("expected Run evidence"),
+        crate::verify::Projected::Run(run) => run,
+        crate::verify::Projected::Window(_) => panic!("expected Run evidence"),
     }
 }
 
@@ -782,12 +782,12 @@ fn values_project_onto_named_slots_by_slot_type() {
     }))
     .expect("window Verifier decodes");
     let projected = target(&window)
-        .project(super::Inputs::named([
+        .project(crate::verify::Inputs::named([
             ("current", json!({ "income": 52_000, "dti": 0.31 })),
             ("latency", json!(840)),
         ]))
         .expect("samples fit their slots");
-    let super::verify::Projected::Window(features) = projected else {
+    let crate::verify::Projected::Window(features) = projected else {
         panic!("samples are Window evidence");
     };
     assert_eq!(
@@ -801,26 +801,32 @@ fn values_project_onto_named_slots_by_slot_type() {
     run_evidence(&single, json!("yes").into());
 
     let run = run_verifier();
-    let refusals: [(&wyrd_spec::card::blocks::VerifierSpec, super::Inputs); 7] = [
-        (&run, super::Inputs::named([("missing", json!(1))])),
+    let refusals: [(
+        &wyrd_spec::card::blocks::VerifierSpec,
+        crate::verify::Inputs,
+    ); 7] = [
+        (&run, crate::verify::Inputs::named([("missing", json!(1))])),
         (
             &run,
-            super::Inputs::named([("policy", json!("policy.pdf"))]),
+            crate::verify::Inputs::named([("policy", json!("policy.pdf"))]),
         ),
         (
             &run,
-            super::Inputs::named([("answer", super::File::bytes(vec![1]))]),
+            crate::verify::Inputs::named([("answer", crate::verify::File::bytes(vec![1]))]),
         ),
         (
             &run,
-            super::Inputs::named([("trace", json!("not-a-trace"))]),
+            crate::verify::Inputs::named([("trace", json!("not-a-trace"))]),
         ),
         (&run, json!("positional needs one slot").into()),
         (
             &window,
-            super::Inputs::named([("current", json!({ "age": 1 }))]),
+            crate::verify::Inputs::named([("current", json!({ "age": 1 }))]),
         ),
-        (&window, super::Inputs::named([("current", json!(1))])),
+        (
+            &window,
+            crate::verify::Inputs::named([("current", json!(1))]),
+        ),
     ];
     for (spec, inputs) in refusals {
         let error = target(spec)
@@ -887,20 +893,26 @@ async fn execute_pins_files_and_uploads_only_missing_digests() {
     let spec = run_verifier();
     let run = run_evidence(
         &spec,
-        super::Inputs::named([
-            ("answer", super::Input::from(json!({ "text": "yes" }))),
+        crate::verify::Inputs::named([
+            (
+                "answer",
+                crate::verify::Input::from(json!({ "text": "yes" })),
+            ),
             ("trace", json!("0af7651916cd43dd8448eb211c80319c").into()),
-            ("policy", super::File::path(&policy).into()),
+            ("policy", crate::verify::File::path(&policy).into()),
             (
                 "deck",
-                super::File::bytes(&b"%PDF-deck"[..])
+                crate::verify::File::bytes(&b"%PDF-deck"[..])
                     .with_format(skald_spec::MediaFormat::Pdf)
                     .into(),
             ),
-            ("copy", super::File::bytes(&b"%PDF-policy"[..]).into()),
+            (
+                "copy",
+                crate::verify::File::bytes(&b"%PDF-policy"[..]).into(),
+            ),
             (
                 "archive",
-                super::ArtifactRef::new(artifact, Some("q3.pdf".to_owned())).into(),
+                crate::verify::ArtifactRef::new(artifact, Some("q3.pdf".to_owned())).into(),
             ),
         ]),
     );
@@ -953,19 +965,19 @@ async fn file_refusals_happen_locally_before_any_request() {
     let spec = run_verifier();
     for (file, code) in [
         (
-            super::File::path("/no/such/policy.pdf"),
+            crate::verify::File::path("/no/such/policy.pdf"),
             "WYRD_VERIFICATION_400_INPUT_INVALID",
         ),
         (
-            super::File::bytes(&b"text"[..]).with_filename("policy.txt"),
+            crate::verify::File::bytes(&b"text"[..]).with_filename("policy.txt"),
             "WYRD_VERIFICATION_400_INPUT_INVALID",
         ),
         (
-            super::File::bytes(vec![0_u8; 65]),
+            crate::verify::File::bytes(vec![0_u8; 65]),
             "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
         ),
     ] {
-        let run = run_evidence(&spec, super::Inputs::named([("policy", file)]));
+        let run = run_evidence(&spec, crate::verify::Inputs::named([("policy", file)]));
         let error = target(&spec)
             .execute(&client, run)
             .await
@@ -974,7 +986,7 @@ async fn file_refusals_happen_locally_before_any_request() {
     }
     let run = run_evidence(
         &spec,
-        super::Inputs::named([("deck", super::File::bytes(vec![1]))]),
+        crate::verify::Inputs::named([("deck", crate::verify::File::bytes(vec![1]))]),
     );
     let error = target(&spec)
         .execute(&client, run)
@@ -1040,7 +1052,10 @@ async fn enqueue_replays_its_key_and_wait_returns_only_a_real_result() {
         .mount(&server)
         .await;
     let spec = run_verifier();
-    let run = run_evidence(&spec, super::Inputs::named([("answer", json!("yes"))]));
+    let run = run_evidence(
+        &spec,
+        crate::verify::Inputs::named([("answer", json!("yes"))]),
+    );
 
     let execution = target(&spec)
         .enqueue(&bearer_client(server.uri(), 5_000), run)
@@ -1115,7 +1130,7 @@ async fn wait_raises_terminal_errors_and_times_out_without_a_result() {
     let wait = |id: wyrd_spec::ids::ExecutionId, timeout: Duration| {
         let client = client.clone();
         async move {
-            super::VerificationExecution::connect_with(id, &client)
+            crate::verify::Execution::connect_with(id, &client)
                 .await
                 .expect("a bearer client connects without a request")
                 .wait(timeout)
@@ -1159,7 +1174,10 @@ async fn execute_outlives_the_configured_timeout() {
         .mount(&server)
         .await;
     let spec = run_verifier();
-    let run = run_evidence(&spec, super::Inputs::named([("answer", json!("yes"))]));
+    let run = run_evidence(
+        &spec,
+        crate::verify::Inputs::named([("answer", json!("yes"))]),
+    );
 
     let error = target(&spec)
         .execute(&bearer_client(server.uri(), 20), run)

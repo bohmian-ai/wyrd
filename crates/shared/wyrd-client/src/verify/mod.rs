@@ -1,5 +1,5 @@
-//! `observe.verify` and `observe.submit`: named caller values → one Verifier
-//! execution.
+//! Verifier inputs and executions: what `observe.verify` and `observe.submit`
+//! take and return, and the [`Execution`] handle any process can reconnect to.
 //!
 //! The hydrated Verifier's slots decide each value's wire form: an ordinary
 //! JSON value fills a `json` slot, a trace-ID string a `trace` slot, a
@@ -33,9 +33,12 @@ use wyrd_spec::verification::execution::{
 };
 
 use crate::client::WyrdClient;
-use crate::observe::execution::VerificationExecution;
+
+mod execution;
+
 use crate::storage::upload::sha256_file;
 use crate::storage::{FileSource, WyrdStorageClient};
+pub use execution::Execution;
 
 /// Time an execute response may take to arrive after the server's
 /// [`EXECUTION_DEADLINE`] elapses: upload, audit, and the 504 answer itself.
@@ -262,7 +265,7 @@ pub enum Submission {
     /// window later, so there is no execution to poll.
     Recorded,
     /// Run evidence was staged for one queued execution.
-    Queued(VerificationExecution),
+    Queued(Execution),
 }
 
 /// One Verifier execution target resolved from a hydrated graph.
@@ -437,17 +440,14 @@ impl Target<'_> {
         &self,
         client: &WyrdClient,
         run: RunEvidence,
-    ) -> Result<VerificationExecution, WyrdError> {
+    ) -> Result<Execution, WyrdError> {
         let request = self.request(run.pin(client).await?);
         let key = format!("verification-submit-{}", uuid::Uuid::now_v7());
         let response: EnqueueVerificationResponse = client
             .http
             .submit_with_idempotency_key(Method::POST, "/v1/verification/enqueue", &request, &key)
             .await?;
-        Ok(VerificationExecution::new(
-            response.execution_id,
-            client.clone(),
-        ))
+        Ok(Execution::new(response.execution_id, client.clone()))
     }
 
     /// The wire request for this target and pinned declarations.

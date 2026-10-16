@@ -17,8 +17,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::cards::CardRef;
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
-use wyrd_ai::observe::{File, Inputs, Submission, VerificationExecution};
 use wyrd_ai::state::WyrdState;
+use wyrd_ai::verify::{Execution, File, Inputs, Submission};
 use wyrd_ai::{
     Bifrost, CallProvenance, Citation, Gateway, Locator, RequirementOutcome, SpanRecord,
     VerificationVerdict, WyrdClient, cli,
@@ -677,13 +677,12 @@ async fn submitted_answer_is_judged_in_the_background_and_resumes_by_id() {
     };
     let waited = execution.wait(WAIT).await.expect("the execution settles");
     let key = assistant.deployment.service_key(&assistant.service).await;
-    let resumed =
-        VerificationExecution::connect_with(*execution.id(), &assistant.deployment.client(&key))
-            .await
-            .expect("the handle rebuilds from its ID")
-            .wait(WAIT)
-            .await
-            .expect("the resumed handle reads the result");
+    let resumed = Execution::connect_with(*execution.id(), &assistant.deployment.client(&key))
+        .await
+        .expect("the handle rebuilds from its ID")
+        .wait(WAIT)
+        .await
+        .expect("the resumed handle reads the result");
 
     assert_eq!(waited.outcome.verdict, VerificationVerdict::Failed);
     assert_eq!(&waited.execution_id, execution.id());
@@ -718,15 +717,12 @@ async fn another_tenant_cannot_resume_an_execution() {
         .other_tenant_admin("other-tenant")
         .await;
 
-    let refused = VerificationExecution::connect_with(
-        *execution.id(),
-        &assistant.deployment.client(&foreign),
-    )
-    .await
-    .expect("the handle rebuilds from its ID")
-    .wait(Duration::from_secs(2))
-    .await
-    .expect_err("another tenant sees no execution");
+    let refused = Execution::connect_with(*execution.id(), &assistant.deployment.client(&foreign))
+        .await
+        .expect("the handle rebuilds from its ID")
+        .wait(Duration::from_secs(2))
+        .await
+        .expect_err("another tenant sees no execution");
 
     assert_eq!(refused.code(), "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT");
     assistant.deployment.shutdown().await;

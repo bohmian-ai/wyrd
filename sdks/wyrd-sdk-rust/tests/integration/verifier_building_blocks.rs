@@ -21,8 +21,8 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::cards::CardRef;
-use wyrd_ai::observe::{File, Input, Inputs, Submission, VerificationExecution};
 use wyrd_ai::state::WyrdState;
+use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
     CallProvenance, Citation, Locator, MediaFormat, RequirementOutcome, RequirementResult,
     StepResult, StepStatus, VerificationResult, VerificationVerdict, WyrdClient,
@@ -586,7 +586,7 @@ async fn submitted_review_is_judged_in_the_background() {
     else {
         panic!("Run evidence queues an execution");
     };
-    let result = VerificationExecution::connect_with(*execution.id(), &desk.client)
+    let result = Execution::connect_with(*execution.id(), &desk.client)
         .await
         .expect("the handle rebuilds from its ID")
         .wait(WAIT)

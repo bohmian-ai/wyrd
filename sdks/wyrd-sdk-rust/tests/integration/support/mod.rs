@@ -17,8 +17,8 @@ use secrecy::{ExposeSecret, SecretString};
 use wyrd_ai::cards::{CardRef, CardSelector, Cards, HydrationMode, RegistrationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::config::ClientConfig;
-use wyrd_ai::observe::VerificationExecution;
 use wyrd_ai::transport::{GrpcConfig, HttpConfig};
+use wyrd_ai::verify::Execution;
 use wyrd_ai::{Bifrost, ExecutionId, SpanRecord, TraceId, VerificationResult, WyrdClient};
 use wyrd_spec::ids::BindingId;
 use wyrd_testing::Bootstrap;
@@ -313,7 +313,7 @@ impl Deployment {
             );
             tokio::time::sleep(Duration::from_millis(500)).await;
         };
-        VerificationExecution::connect_with(
+        Execution::connect_with(
             id.parse::<ExecutionId>()
                 .expect("result ID is an execution ID"),
             &admin,

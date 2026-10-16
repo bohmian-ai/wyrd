@@ -13,12 +13,12 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use wyrd_ai::cards::RegistrationReceipt;
-use wyrd_ai::observe::Submission;
 use wyrd_ai::operator_connections::{
     ConnectionName, CreateOperatorConnectionRequest, HttpConnectionAuth, HttpsOrigin,
     OperatorConnections, SecretBearer,
 };
 use wyrd_ai::state::WyrdState;
+use wyrd_ai::verify::Submission;
 use wyrd_ai::{
     CallProvenance, RequirementDetail, RequirementOutcome, VerificationResult, VerificationVerdict,
 };

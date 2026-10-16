@@ -16,12 +16,10 @@
 //! into three projections.
 
 pub mod drift;
-mod execution;
 mod invoke;
 pub mod lifecycle;
 #[cfg(test)]
 mod tests;
-mod verify;
 
 use arrow_schema::DataType;
 use serde::Serialize;
@@ -35,11 +33,9 @@ use wyrd_spec::verification::execution::VerificationResult;
 
 use crate::bifrost::{Correlation, WriterTable};
 use crate::state::{BoundVerifier, WyrdState};
-use verify::{Projected, Target};
+use crate::verify::{Inputs, Projected, Submission, Target};
 
-pub use execution::VerificationExecution;
 pub use lifecycle::DRIFT_OBSERVATIONS_TABLE;
-pub use verify::{ArtifactRef, File, Input, Inputs, Submission};
 
 /// The only namespace `observe.record` may write.
 ///
@@ -339,7 +335,7 @@ impl Observe<'_> {
     /// subject without waiting for a judgment.
     ///
     /// Run evidence is staged for one queued execution and returns its
-    /// [`VerificationExecution`]; a `202` confirms staging, not queue
+    /// [`Execution`]; a `202` confirms staging, not queue
     /// acceptance, so a replay conflict or a loss before acceptance surfaces
     /// through the handle. Window samples are recorded through this state's
     /// Bifrost Drift observation path and return [`Submission::Recorded`]:

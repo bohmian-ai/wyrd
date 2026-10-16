@@ -7,7 +7,7 @@ mod support_desk;
 
 use std::time::Duration;
 
-use wyrd_ai::observe::VerificationExecution;
+use wyrd_ai::verify::Execution;
 use wyrd_ai::{VerificationVerdict, WyrdClient};
 
 /// Deploys the support desk, judges one refund promise immediately, serves
@@ -36,7 +36,7 @@ async fn main() -> Result<(), support_desk::Error> {
         .find(|(_, result)| result.outcome.verdict == VerificationVerdict::Failed);
     if let Some((request, _)) = failed {
         // Any process can resume a check from its ID with the ambient client.
-        let resumed = VerificationExecution::connect(request.execution_id)
+        let resumed = Execution::connect(request.execution_id)
             .await?
             .wait(Duration::from_secs(30))
             .await?;

@@ -1,4 +1,4 @@
-//! [`VerificationExecution`]: the handle of one queued Verifier execution.
+//! [`Execution`]: the handle of one queued Verifier execution.
 //!
 //! `submit` returns it for Run evidence, and any process can rebuild it
 //! from the execution ID with `connect`. It holds only the ID and one shared
@@ -26,14 +26,14 @@ const MAX_POLL: Duration = Duration::from_secs(2);
 
 /// One queued Verifier execution, addressed by its server-issued ID.
 #[derive(Debug, Clone)]
-pub struct VerificationExecution {
+pub struct Execution {
     /// The execution identity.
     id: ExecutionId,
     /// The client every status read goes through.
     client: WyrdClient,
 }
 
-impl VerificationExecution {
+impl Execution {
     /// The handle of `id`, read through `client`.
     pub(crate) fn new(id: ExecutionId, client: WyrdClient) -> Self {
         Self { id, client }

@@ -8,8 +8,8 @@ use serde_json::json;
 use tempfile::TempDir;
 use wyrd_ai::bifrost::BifrostOptions;
 use wyrd_ai::bifrost::QueryParam;
-use wyrd_ai::observe::Submission;
 use wyrd_ai::state::WyrdState;
+use wyrd_ai::verify::Submission;
 use wyrd_ai::{Bifrost, QueueConfig, RequirementDetail, VerificationVerdict, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
 

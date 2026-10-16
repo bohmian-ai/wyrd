@@ -19,9 +19,9 @@ use serde_json::{Value, json};
 use tracing::Instrument as _;
 use wyrd_ai::cards::{CardSelector, Cards, HydrationMode, RegistrationReceipt};
 use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite, ModelId};
-use wyrd_ai::observe::{File, Input, Inputs, Submission, VerificationExecution};
 use wyrd_ai::otel::start_telemetry;
 use wyrd_ai::state::WyrdState;
+use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
     ExecutionId, ExecutionRoute, Gateway, Spec, VerificationResult, WyrdClient, WyrdError,
 };
@@ -247,7 +247,7 @@ pub async fn wait_for_verdicts(
     let deadline = tokio::time::Instant::now() + timeout;
     let mut results = Vec::with_capacity(served.len());
     for request in served {
-        let execution = VerificationExecution::connect_with(request.execution_id, client).await?;
+        let execution = Execution::connect_with(request.execution_id, client).await?;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         results.push(execution.wait(remaining).await?);
     }

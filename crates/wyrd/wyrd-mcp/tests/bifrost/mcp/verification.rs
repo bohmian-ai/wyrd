@@ -411,7 +411,9 @@ mod pg_tests {
         /// # Errors
         /// Returns principal, transport, or response failures.
         async fn enforce_permissions(&self) -> Result<(), McpJourneyError> {
-            self.server.seed_role("mcp_no_cards", &[]).await?;
+            self.server
+                .seed_role::<serde_json::Value>("mcp_no_cards", &[])
+                .await?;
             let principal = self
                 .server
                 .bootstrap_service("denied", &["mcp_no_cards"])

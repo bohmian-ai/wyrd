@@ -183,11 +183,13 @@ impl NativeWyrdTestServer {
     /// permission projection (`resource`, `action`, `scope`), which expresses
     /// object scope such as one Verifier. This is the door a journey uses to
     /// prove an access gate from the caller's side: it seeds one role carrying
-    /// only those grants and bootstraps a service onto it.
+    /// only those grants and bootstraps a service onto it. A permission object is
+    /// stored as given, so one the current schema rejects reaches the server and
+    /// is refused by its own issuance decode.
     ///
     /// # Errors
     ///
-    /// Returns a napi error for an unparsable permission, or when the harness
+    /// Returns a napi error for an unparsable permission string, or when the harness
     /// is closed or role seeding or bootstrapping fails.
     #[napi]
     pub fn scoped_api_key(
@@ -224,16 +226,15 @@ impl NativeWyrdTestServer {
         let parsed = permissions
             .iter()
             .map(|value| match value {
-                serde_json::Value::String(token) => {
-                    token.parse::<wyrd_runtime::Permission>().map_err(|_| {
+                serde_json::Value::String(token) => token
+                    .parse::<wyrd_runtime::Permission>()
+                    .map(|permission| serde_json::json!(permission))
+                    .map_err(|_| {
                         napi::Error::from_reason(format!(
                             "`{token}` is not a resource:action permission"
                         ))
-                    })
-                }
-                typed => serde_json::from_value(typed.clone()).map_err(|error| {
-                    napi::Error::from_reason(format!("invalid permission {typed}: {error}"))
-                }),
+                    }),
+                typed => Ok(typed.clone()),
             })
             .collect::<Result<Vec<_>>>()?;
         let bootstrap = wyrd_runtime::runtime()

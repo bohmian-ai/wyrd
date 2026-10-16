@@ -15,8 +15,6 @@ pub enum BifrostNamespace {
     Metrics,
     /// `vala.logs` — OpenTelemetry log records.
     Logs,
-    /// `vala.eval` — Eval observations and per-task result items.
-    Eval,
     /// `vala.drift` — Drift observations and per-feature result details.
     Drift,
     /// `vala.verification` — the shared per-run Verifier verdict table.
@@ -30,20 +28,19 @@ pub enum BifrostNamespace {
 impl BifrostNamespace {
     /// All known namespaces. Adding a variant here causes a compile error at every
     /// `match` that is missing a branch — the exhaustiveness guard.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 9] = [
         Self::Audit,
         Self::Bifrost,
         Self::Traces,
         Self::Metrics,
         Self::Logs,
-        Self::Eval,
         Self::Drift,
         Self::Verification,
         Self::Datasets,
         Self::Gateway,
     ];
 
-    /// The wire namespace string (e.g. `"vala.eval"`) every FQN is built from.
+    /// The wire namespace string (e.g. `"vala.traces"`) every FQN is built from.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Audit => "vala.system",
@@ -51,7 +48,6 @@ impl BifrostNamespace {
             Self::Traces => "vala.traces",
             Self::Metrics => "vala.metrics",
             Self::Logs => "vala.logs",
-            Self::Eval => "vala.eval",
             Self::Drift => "vala.drift",
             Self::Verification => "vala.verification",
             Self::Datasets => "vala.datasets",
@@ -74,7 +70,6 @@ impl BifrostNamespace {
             "traces" => Some(Self::Traces),
             "metrics" => Some(Self::Metrics),
             "logs" => Some(Self::Logs),
-            "eval" => Some(Self::Eval),
             "drift" => Some(Self::Drift),
             "verification" => Some(Self::Verification),
             "datasets" => Some(Self::Datasets),

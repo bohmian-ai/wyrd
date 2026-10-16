@@ -42,7 +42,7 @@ use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecy
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::{LogicalIdentity, correlation_data_identity};
 use crate::tables::{
-    CallsTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable, ResultItemsTable,
+    CallsTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable,
     ResultsTable, TableError,
 };
 use wyrd_spec::auth::Attribution;
@@ -1070,7 +1070,6 @@ fn is_verification_result_table(table: &TableRef) -> bool {
         (ResultsTable::NAMESPACE, ResultsTable::NAME),
         (ExecutionInputsTable::NAMESPACE, ExecutionInputsTable::NAME),
         (ResultFeaturesTable::NAMESPACE, ResultFeaturesTable::NAME),
-        (ResultItemsTable::NAMESPACE, ResultItemsTable::NAME),
     ]
     .into_iter()
     .any(|(namespace, name)| {
@@ -2645,7 +2644,6 @@ mod tests {
             "vala.verification.results",
             "vala.verification.execution_inputs",
             "vala.drift.result_features",
-            "vala.eval.result_items",
         ] {
             for (label, auth) in &principals {
                 let scribe_calls = Arc::new(AtomicUsize::new(0));

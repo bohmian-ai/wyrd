@@ -23,7 +23,6 @@ use wyrd_types::variant::is_variant;
 
 pub mod audit;
 pub mod drift;
-pub mod eval;
 pub mod fields;
 pub mod gateway;
 pub mod logs;
@@ -36,7 +35,6 @@ pub mod verification;
 pub use audit::AuditLogTable;
 pub use drift::ObservationsTable;
 pub use drift::{ObservationsTable as DriftObservationsTable, ResultFeaturesTable};
-pub use eval::ResultItemsTable;
 pub use gateway::CallsTable;
 pub use logs::RecordsTable;
 pub use metrics::PointsTable;
@@ -65,7 +63,7 @@ pub enum TableError {
 /// Correlation columns appended to a built-in table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CorrelationPolicy {
-    /// Traces, metrics, logs, `GenAI`, eval, and drift rows.
+    /// Traces, metrics, logs, `GenAI`, verification, and drift rows.
     Observation,
     /// Audit content has its own identity columns.
     None,
@@ -1182,7 +1180,7 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
 }
 
 /// The single canonical list of ten server-owned built-in tables.
-pub static BUILTIN_TABLES: [BuiltinTableDefinition; 10] = [
+pub static BUILTIN_TABLES: [BuiltinTableDefinition; 9] = [
     definition::<SpansTable>(),
     definition::<PointsTable>(),
     definition::<RecordsTable>(),
@@ -1190,14 +1188,13 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 10] = [
     definition::<ResultsTable>(),
     definition::<ExecutionInputsTable>(),
     definition::<ResultFeaturesTable>(),
-    definition::<ResultItemsTable>(),
     definition::<AuditLogTable>(),
     definition::<CallsTable>(),
 ];
 
 /// Return all immutable built-in definitions.
 #[must_use]
-pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 10] {
+pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 9] {
     &BUILTIN_TABLES
 }
 
@@ -1232,7 +1229,7 @@ mod tests {
     use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue};
 
     use super::*;
-    use fields::{boolean, float64, int32, int64, ts_us_utc, utf8};
+    use fields::{boolean, float64, ts_us_utc, utf8};
     use wyrd_queue::variant::VariantViolation;
     use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
     use wyrd_spec::vala::{ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT};
@@ -1271,6 +1268,8 @@ mod tests {
             ("genai", "memory"),
             ("eval", "runs"),
             ("eval", "assertions"),
+            ("eval", "result_items"),
+            ("eval", "observations"),
         ] {
             assert!(
                 builtin_table(namespace, name).is_none(),
@@ -1362,7 +1361,7 @@ mod tests {
                 }
                 ("verification", "results") => ("ended_at", TimeGranularityWire::Day),
                 ("verification", "execution_inputs") => ("recorded_at", TimeGranularityWire::Day),
-                ("drift", "result_features") | ("eval", "result_items") => {
+                ("drift", "result_features") => {
                     (WYRD_INGESTED_AT, TimeGranularityWire::Day)
                 }
                 _ => panic!("{fqn} declares no pinned time column"),
@@ -1458,30 +1457,6 @@ mod tests {
                     float64("score", true),
                     float64("threshold", true),
                     utf8("verdict", false),
-                ],
-                blooms: &["result_id"],
-            },
-            VerificationContract {
-                namespace: "eval",
-                name: "result_items",
-                columns: vec![
-                    utf8("result_id", false),
-                    utf8("owner_card_uid", true),
-                    utf8("verifier_card_uid", false),
-                    utf8("binding_id", true),
-                    utf8("source_record_id", false),
-                    utf8("task_id", false),
-                    utf8("outcome_kind", false),
-                    boolean("passed", true),
-                    variant_field("actual", true),
-                    variant_field("expected", true),
-                    utf8("operator", true),
-                    utf8("message", true),
-                    int32("stage", true),
-                    ts_us_utc("started_at", true),
-                    int64("duration_ms", true),
-                    utf8("skip_reason", true),
-                    utf8("upstream_task_id", true),
                 ],
                 blooms: &["result_id"],
             },
@@ -3100,7 +3075,6 @@ mod tests {
                     "scope_attributes",
                 ][..],
             ),
-            ("eval", "result_items", &["actual", "expected"][..]),
             ("verification", "results", &["outcome"][..]),
             (
                 "verification",

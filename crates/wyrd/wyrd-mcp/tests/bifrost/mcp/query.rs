@@ -1128,6 +1128,134 @@ mod pg_tests {
         Ok(())
     }
 
+    /// The retired verification contracts are unknown to an agent: a stale
+    /// `evals` role cannot obtain a token, no tool names the retired Eval
+    /// workflow, and a stale development registration of
+    /// `vala.eval.result_items` is listed nowhere and refused for describe and
+    /// query exactly as a never-existing namespace is, while the current table
+    /// still answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture, SQL, transport, tool-call, or shutdown failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a retired contract is accepted, a refusal differs from the
+    /// never-existing namespace's, or the current table does not answer.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn retired_verification_contracts_are_refused() -> Result<(), McpJourneyError> {
+        let server = WyrdTestServer::start_bound().await?;
+        let fixture = seed_query_fixture(&server, "mcp-retired").await?;
+        for action in ["run", "invoke"] {
+            let role = format!("evals_{action}");
+            server
+                .seed_role(
+                    &role,
+                    &[serde_json::json!({"resource": "evals", "action": action, "scope": "all"})],
+                )
+                .await?;
+            let stale = server.bootstrap_service(&role, &[&role]).await?;
+            assert!(
+                server
+                    .exchange_api_key(stale.api_key().ok_or("a service carries a key")?)
+                    .await
+                    .is_err(),
+                "a stale {role} grant obtains no token"
+            );
+        }
+
+        let mut conn = server.tenant_conn_for(server.data_tenant_id()).await?;
+        let stale = sqlx::query(
+            "INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,status,\
+             physical_layout,origin,sub_principal_id,act_principal_id) \
+             SELECT data_tenant_id,decode(md5(fqn),'hex'),'vala.eval.result_items',fingerprint,\
+             status,physical_layout,origin,sub_principal_id,act_principal_id \
+             FROM vala.bifrost_tables WHERE fqn = $1",
+        )
+        .bind(&fixture.table)
+        .execute(&mut **conn.transaction())
+        .await?;
+        conn.commit().await?;
+        assert_eq!(stale.rows_affected(), 1, "the stale registration seeds");
+
+        let client = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::BearerToken(fixture.token.clone().into()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+        let tools = client.list_all_tools().await?;
+        assert!(
+            tools.iter().all(|tool| !tool
+                .name
+                .split(['.', '_'])
+                .any(|word| word == "eval" || word == "evals")),
+            "no tool names the retired Eval workflow"
+        );
+        let listed = structured(
+            client
+                .call_tool(CallToolRequestParams::new("bifrost.list_tables"))
+                .await?,
+        )?;
+        assert!(
+            listed["tables"]
+                .as_array()
+                .ok_or("list_tables returns a tables array")?
+                .iter()
+                .all(|table| table["namespace"] != "vala.eval"),
+            "a stale registration is never listed: {listed}"
+        );
+        for name in ["result_items", "observations"] {
+            let mut refusals = Vec::new();
+            for namespace in ["vala.eval", "vala.absent"] {
+                let described = client
+                    .call_tool(
+                        CallToolRequestParams::new("bifrost.describe_table").with_arguments(
+                            serde_json::json!({"namespace": namespace, "name": name})
+                                .as_object()
+                                .ok_or("describe arguments are an object")?
+                                .clone(),
+                        ),
+                    )
+                    .await;
+                let described = match described {
+                    Ok(result) => problem(result)?["code"].clone(),
+                    Err(error) => serde_json::json!(error.to_string().replace(namespace, "_")),
+                };
+                let queried = problem(
+                    client
+                        .call_tool(query(
+                            serde_json::json!({"sql": format!("SELECT * FROM {namespace}.{name}")}),
+                        ))
+                        .await?,
+                )?;
+                assert!(
+                    queried.get("rows").is_none(),
+                    "{namespace}.{name}: {queried}"
+                );
+                refusals.push((described, queried["code"].clone()));
+            }
+            assert_eq!(refusals[0], refusals[1], "{name}");
+        }
+        structured(
+            client
+                .call_tool(query(
+                    serde_json::json!({"sql": format!("SELECT * FROM {}", fixture.table)}),
+                ))
+                .await?,
+        )?;
+
+        client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// Connect one MCP client whose principal holds exactly `permissions`.
     ///
     /// # Errors

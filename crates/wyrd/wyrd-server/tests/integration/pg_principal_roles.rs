@@ -295,7 +295,7 @@ async fn role_writes_require_tenant_administration() {
     server
         .seed_role(
             "credential_admin",
-            &["service_accounts:write".parse().expect("permission parses")],
+            &["service_accounts:write".parse::<wyrd_runtime::Permission>().expect("permission parses")],
         )
         .await
         .expect("role seeds");

@@ -3315,14 +3315,19 @@ impl WyrdTestServer {
     /// the same way tenant seeding does, through the shared upsert, so a
     /// principal granted it is issued exactly that permission set.
     ///
+    /// Each permission is stored exactly as it serializes: a typed
+    /// [`Permission`] or a raw JSON document. The raw form lets a journey
+    /// seed a grant the current schema rejects so the server's own issuance
+    /// decode, not this fixture, refuses it.
+    ///
     /// # Errors
     ///
     /// Returns an error when the permissions cannot be serialized, when the
     /// name collides with a builtin role, or when the tenant write fails.
-    pub async fn seed_role(
+    pub async fn seed_role<P: serde::Serialize>(
         &self,
         name: &str,
-        permissions: &[Permission],
+        permissions: &[P],
     ) -> Result<(), WyrdTestServerError> {
         let payload = serde_json::to_value(permissions)
             .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;

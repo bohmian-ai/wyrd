@@ -1155,7 +1155,6 @@ async fn public_result_writes_are_refused_over_grpc() {
     for table in [
         "vala.verification.results",
         "vala.drift.result_features",
-        "vala.eval.result_items",
     ] {
         for (kind, jwt) in &writers {
             let refused = insert_as(

@@ -61,6 +61,81 @@ mod pg_tests {
             drift_alerts.0,
             "the retired vala.drift_alerts table is absent after vala migrate"
         );
+        let namespaces: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE conname = 'forge_tasks_namespace_name_check'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("Forge namespace constraint reads");
+        assert!(
+            !namespaces.contains("vala.eval") && namespaces.contains("vala.verification"),
+            "Forge admits only current namespaces: {namespaces}"
+        );
+    }
+
+    /// The forward migration retiring `vala.eval` upgrades a schema still
+    /// holding Eval Forge tasks: it deletes only those tasks, keeps every
+    /// other namespace's task, and then refuses a new `vala.eval` task.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the old state cannot be restored, the migration fails, an
+    /// Eval task survives, another task is lost, or `vala.eval` is admitted.
+    #[tokio::test]
+    async fn retired_verification_namespace_upgrades() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let pool = fixture.superuser_pool().expect("superuser pool");
+        sqlx::raw_sql(
+            "ALTER TABLE vala.forge_tasks DROP CONSTRAINT forge_tasks_namespace_name_check, \
+             ADD CONSTRAINT forge_tasks_namespace_name_check CHECK (namespace_name IN \
+             ('vala.system','vala.bifrost','vala.traces','vala.metrics','vala.logs','vala.eval',\
+             'vala.drift','vala.verification','vala.dev','vala.datasets','vala.gateway'))",
+        )
+        .execute(&pool)
+        .await
+        .expect("the pre-retirement namespace constraint restores");
+        let insert = |namespace: &'static str| {
+            let task_id = uuid::Uuid::now_v7();
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,\
+                     table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,\
+                     estimated_bytes,state,ready_at) VALUES ($1,$2,'wyrd-redux',$3,'t',\
+                     'small_files',1,'{}'::jsonb,decode(repeat('00',32),'hex'),1,1,'ready',now())",
+                )
+                .bind(task_id)
+                .bind(uuid::Uuid::now_v7())
+                .bind(namespace)
+                .execute(&pool)
+                .await
+                .map(|_| task_id)
+            }
+        };
+        let retired = insert("vala.eval").await.expect("old Eval task inserts");
+        let current = insert("vala.verification")
+            .await
+            .expect("current task inserts");
+
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261016000000_retire_eval_namespace.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("the retirement migration applies");
+
+        let remaining: Vec<uuid::Uuid> =
+            sqlx::query_scalar("SELECT task_id FROM vala.forge_tasks WHERE task_id = ANY($1)")
+                .bind(vec![retired, current])
+                .fetch_all(&pool)
+                .await
+                .expect("tasks read");
+        assert_eq!(remaining, vec![current]);
+        assert!(
+            insert("vala.eval").await.is_err(),
+            "a new vala.eval task is refused"
+        );
     }
 
     /// Exact migration 13 upgrades a real pre-Oracle schema and Scribe row.

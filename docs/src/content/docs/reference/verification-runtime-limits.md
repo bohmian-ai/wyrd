@@ -64,7 +64,7 @@ A process hosts the runtime when `WYRD_VERIFICATION_ENABLED` is `1` and its role
 - Each Python operation gets a fresh worker, which is killed when the operation ends. Files in `/work` persist across the `code.run` calls of one step attempt; nothing persists across attempts, steps, or executions.
 - At most `MONTY_MAX_WORKERS` operations run, after the memory cap below, and `MONTY_MAX_WAITERS` more wait. An operation beyond that is refused at once; nothing queues in memory.
 - An operation waits for a worker only within its own remaining deadline, at most `CODE_TIMEOUT_MS`.
-- A refused operation, or one that found no worker in time, is retryable: a `code` step spends one of its `retries`, a `code` check is `inconclusive`, and `code.run` returns the error to the Agent.
+- A refused operation, one that found no worker in time, or a step that found every workspace (`MAX_WORKSPACES`) taken means the process is busy, not that the code failed. Nothing is judged and no `retries` are spent: the whole execution stops. A queued execution stays queued under the same ID, its attempt is not counted, and it runs again when capacity frees. A direct `verify` call answers `WYRD_SERVER_503_SERVICE_UNAVAILABLE`; retry it later or on another process. An Agent's `code.run` refusal ends the Agent step the same way, cancelling its other pending tool calls.
 - `AGENT_CODE_BUDGET_MS` is reserved before each `code.run` call waits, and does not reset across tool calls or step retries. Once it is spent, `code.run` returns an error to the Agent.
 - A Python exception, memory exhaustion, a timeout while running, or a crashed worker fails the operation without a retry. The server keeps running.
 
@@ -92,4 +92,5 @@ Always on, whatever the settings, and identical on macOS and Linux:
 | --- | --- |
 | A file over its slot or `FILE_MAX_MIB`, or a request over `FILES_MAX_MIB` | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` before anything runs |
 | `TIMEOUT_MS` in `verify` | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` |
-| Any other limit inside a step or check | The step fails or the check is `inconclusive`, with the limit in its `reason` |
+| No Python worker or workspace free | Queued: the execution stays queued and its attempt is refunded. Direct: `WYRD_SERVER_503_SERVICE_UNAVAILABLE` |
+| Any other limit inside a step or check, including a spent `AGENT_CODE_BUDGET_MS` | The step fails or the check is `inconclusive`, with the limit in its `reason` |

@@ -35,7 +35,7 @@ Each process has its own pool and its own limits; settings do not add up across 
 
 - `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB / WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB`, rounded down, caps live workers. At the defaults that is 5.
 - `WYRD_VERIFICATION_MONTY_MAX_WORKERS` caps them further.
-- `WYRD_VERIFICATION_MONTY_MAX_WAITERS` operations may wait beyond that. Anything more is refused at once and fails as retryable.
+- `WYRD_VERIFICATION_MONTY_MAX_WAITERS` operations may wait beyond that. Anything more is refused at once as busy: a queued execution stays queued with its attempt refunded, and a direct `verify` call answers `WYRD_SERVER_503_SERVICE_UNAVAILABLE`. Neither spends step retries or produces a verdict.
 
 To run more Python at once, raise the pool ceiling and the worker cap together. Raise `WYRD_VERIFICATION_MONTY_MEMORY_MIB` only with `WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB`, which must exceed it by at least 4 MiB.
 

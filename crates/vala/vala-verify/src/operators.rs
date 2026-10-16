@@ -1,5 +1,5 @@
 //! Runtime semantics for every frozen variant of
-//! [`wyrd_spec::vala::eval::operator::ComparisonOperator`].
+//! [`wyrd_spec::verification::ComparisonOperator`].
 //!
 //! This module is the deterministic core of `vala-eval`: one pure function over
 //! `(left, op, right)` with typed failures and no side effects.
@@ -37,7 +37,7 @@ use regex::Regex;
 use serde_json::Value;
 use uuid::Uuid;
 
-use wyrd_spec::vala::eval::operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
+use wyrd_spec::verification::{ComparisonOperator, DivergenceMetric, JsonValueType};
 
 use crate::error::ExecError;
 
@@ -821,7 +821,7 @@ fn metric_str(m: DivergenceMetric) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wyrd_spec::vala::eval::operator::ComparisonOperator as Op;
+    use wyrd_spec::verification::ComparisonOperator as Op;
 
     fn run(left: Value, op: Op, right: Value) -> OperatorVerdict {
         evaluate_operator(&left, &op, &right).expect("operator evaluation should succeed")

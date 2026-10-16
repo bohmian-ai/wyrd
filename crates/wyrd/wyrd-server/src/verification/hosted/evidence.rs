@@ -535,7 +535,7 @@ mod pg_tests {
     use std::future::Future;
 
     use vala_verify::blocks::{CallInput, Position};
-    use wyrd_spec::vala::eval::TaskId;
+    use wyrd_spec::verification::TaskId;
 
     use super::*;
     use crate::test_support::{test_caller, test_state, test_tenant};

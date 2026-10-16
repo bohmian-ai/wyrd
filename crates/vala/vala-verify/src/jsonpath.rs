@@ -2,7 +2,7 @@
 
 use jsonpath_rust::JsonPathValue;
 use serde_json::Value;
-use wyrd_spec::vala::eval::JsonPath;
+use wyrd_spec::verification::JsonPath;
 
 use crate::error::ExecError;
 

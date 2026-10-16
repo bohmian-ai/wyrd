@@ -25,7 +25,7 @@ use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::verifier::{Action, Check};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::InputDeclaration;
 
 use super::HostedLimits;

@@ -959,7 +959,7 @@ mod tests {
         AuditEvent, AuditOutcome, ClusterCapabilities, ClusterNodeKey, ClusterRole,
         ClusterRoleLease, NodeId, ScribeCapabilitiesV1,
     };
-    use wyrd_spec::vala::eval::ids::TaskId;
+    use wyrd_spec::verification::TaskId;
     use wyrd_spec::verification::execution::{
         RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
     };

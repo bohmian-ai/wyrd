@@ -24,7 +24,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::card::verifier::{DriftBaselineState, DriftBaselineStatus};
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::vala::eval::ids::TaskId;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationError;
 
 use crate::queries::verifier_executions::{

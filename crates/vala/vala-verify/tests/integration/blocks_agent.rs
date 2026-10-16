@@ -24,7 +24,7 @@ use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, Executi
 use wyrd_spec::card::verifier::{Action, AgentCall, Check};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
-use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
 

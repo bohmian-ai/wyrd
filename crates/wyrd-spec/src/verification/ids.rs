@@ -1,10 +1,4 @@
-//! Eval-scoped identifier and path types.
-//!
-//! Vala-wide ids live in [`crate::vala::ids`] and are re-exported here so
-//! existing `wyrd_spec::vala::eval::ids::*` imports continue to resolve.
-
-pub use crate::ids::DataTenantId;
-pub use crate::vala::ids::{EntityUid, RecordId, RunId, SessionId, SpanId, TraceId, WorkflowUid};
+//! Verifier step and requirement identifiers and evidence paths.
 
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -14,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::WyrdError;
 
-/// Validated task identifier used as the task-map key inside an eval spec.
+/// Validated identifier of a Verifier step or requirement.
 ///
 /// Task IDs must match `^[a-zA-Z_][a-zA-Z0-9_-]*$` and have length `1..=128`.
 /// Deserialization goes through [`TaskId::new`] so wire payloads cannot bypass
@@ -61,70 +55,6 @@ impl<'de> Deserialize<'de> for TaskId {
 impl schemars::JsonSchema for TaskId {
     fn schema_name() -> String {
         "TaskId".to_string()
-    }
-
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, SchemaObject, SingleOrVec, StringValidation};
-
-        SchemaObject {
-            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-            string: Some(Box::new(StringValidation {
-                max_length: Some(128),
-                min_length: Some(1),
-                pattern: Some(r"^[a-zA-Z_][a-zA-Z0-9_-]*$".to_string()),
-            })),
-            ..Default::default()
-        }
-        .into()
-    }
-}
-
-/// Validated scenario identifier used by eval-scenario payloads.
-///
-/// Scenario IDs share the same grammar as [`TaskId`] but keep a distinct type
-/// because they occupy a different namespace and may diverge later.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(transparent)]
-pub struct ScenarioId(String);
-
-impl ScenarioId {
-    /// Constructs a validated scenario identifier.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] when the identifier is empty, longer
-    /// than 128 characters, or does not match the shared scenario-id grammar.
-    pub fn new(value: impl Into<String>) -> Result<Self, WyrdError> {
-        let value = value.into();
-        validate_id_grammar("scenario_id", &value)?;
-        Ok(Self(value))
-    }
-
-    /// Borrows the validated identifier as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for ScenarioId {
-    type Err = WyrdError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::new(value)
-    }
-}
-
-impl<'de> Deserialize<'de> for ScenarioId {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-impl schemars::JsonSchema for ScenarioId {
-    fn schema_name() -> String {
-        "ScenarioId".to_string()
     }
 
     fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
@@ -287,4 +217,148 @@ fn task_id_regex() -> &'static Regex {
         Ok(regex) => regex,
         Err(error) => panic!("task_id regex is static and valid: {error}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JsonPath, TaskId};
+
+    #[test]
+    fn task_id_accepts_simple_identifier() {
+        let id = TaskId::new("step_one").expect("valid task id");
+        assert_eq!(id.as_str(), "step_one");
+    }
+
+    #[test]
+    fn task_id_accepts_hyphen_after_first_char() {
+        TaskId::new("step-one").expect("valid task id");
+    }
+
+    #[test]
+    fn task_id_rejects_leading_digit() {
+        assert!(TaskId::new("1step").is_err());
+    }
+
+    #[test]
+    fn task_id_rejects_empty() {
+        assert!(TaskId::new("").is_err());
+    }
+
+    #[test]
+    fn task_id_rejects_overlong() {
+        let long = "a".repeat(129);
+        assert!(TaskId::new(long).is_err());
+    }
+
+    #[test]
+    fn task_id_serde_transparent() {
+        let id = TaskId::new("alpha").expect("valid task id");
+        let json = serde_json::to_string(&id).expect("task id serializes");
+        assert_eq!(json, "\"alpha\"");
+        let round_trip: TaskId = serde_json::from_str(&json).expect("task id deserializes");
+        assert_eq!(id, round_trip);
+    }
+
+    #[test]
+    fn task_id_deserialize_rejects_leading_digit() {
+        let result: Result<TaskId, _> = serde_json::from_str("\"1step\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn task_id_deserialize_rejects_overlong() {
+        let long = format!("\"{}\"", "a".repeat(129));
+        let result: Result<TaskId, _> = serde_json::from_str(&long);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn task_id_deserialize_rejects_empty_string() {
+        let result: Result<TaskId, _> = serde_json::from_str("\"\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn task_id_deserialize_rejects_disallowed_char() {
+        let result: Result<TaskId, _> = serde_json::from_str("\"has space\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn json_path_accepts_root() {
+        JsonPath::new("$").expect("valid json path");
+    }
+
+    #[test]
+    fn json_path_accepts_dot_segments() {
+        JsonPath::new("$.response.message").expect("valid json path");
+    }
+
+    #[test]
+    fn json_path_accepts_bracket_indices() {
+        JsonPath::new("$.docs[0].title").expect("valid json path");
+    }
+
+    #[test]
+    fn json_path_accepts_quoted_keys() {
+        JsonPath::new("$['weird key'].value").expect("valid json path");
+    }
+
+    #[test]
+    fn json_path_rejects_missing_dollar() {
+        assert!(JsonPath::new("response").is_err());
+    }
+
+    #[test]
+    fn json_path_rejects_unbalanced_bracket() {
+        assert!(JsonPath::new("$.docs[0").is_err());
+    }
+
+    #[test]
+    fn json_path_rejects_unbalanced_quote() {
+        assert!(JsonPath::new("$['unterminated").is_err());
+    }
+
+    #[test]
+    fn json_path_rejects_control_char() {
+        assert!(JsonPath::new("$.a\nb").is_err());
+    }
+
+    #[test]
+    fn json_path_deserialize_rejects_missing_dollar() {
+        let result: Result<JsonPath, _> = serde_json::from_str("\"response\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn json_path_deserialize_rejects_unbalanced_bracket() {
+        let result: Result<JsonPath, _> = serde_json::from_str("\"$.docs[0\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn json_path_accepts_key_ending_in_escaped_backslash() {
+        // $['a\\'] means the key "a\" (backslash at end).
+        // Old code rejected this: the second `\` was `previous`, so it mistakenly
+        // treated the closing `'` as escaped and never closed in_single_quote.
+        // New code (escaped boolean) correctly toggles in_single_quote on the `'`.
+        JsonPath::new(r"$['a\\']").expect("key ending with escaped backslash is valid");
+    }
+
+    #[test]
+    fn json_path_accepts_escaped_backslash_then_bracket() {
+        JsonPath::new(r"$['a\\'][0]").expect("escaped backslash then bracket is valid");
+    }
+
+    #[test]
+    fn json_path_deserialize_rejects_unbalanced_quote() {
+        let result: Result<JsonPath, _> = serde_json::from_str("\"$['unterminated\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn json_path_deserialize_rejects_control_char() {
+        let result: Result<JsonPath, _> = serde_json::from_str("\"$.a\\nb\"");
+        assert!(result.is_err());
+    }
 }

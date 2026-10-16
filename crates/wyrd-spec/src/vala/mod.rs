@@ -22,7 +22,6 @@ pub mod audit_detail;
 pub mod drift;
 /// Public Bifrost error catalog for HTTP, MCP, and Python SDK boundaries.
 pub mod error;
-pub mod eval;
 pub mod ids;
 /// Log observation records (faithful OTel LogRecord).
 pub mod logs;

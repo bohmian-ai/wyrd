@@ -554,7 +554,7 @@ mod completeness_tests {
     use crate::envelope::{CardKind, Spec};
     use crate::ids::{CardName, ColumnName, SpaceName};
     use crate::reference::{CardRef, InlineableRef, Ref};
-    use crate::vala::eval::ids::TaskId;
+    use crate::verification::TaskId;
     use wyrd_semver::VersionBlock;
 
     fn card_ref(kind: CardKind, name: &str) -> CardRef {

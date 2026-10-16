@@ -1,19 +1,16 @@
-//! Spec-load DAG validation. Pure function; no IO.
+//! Verifier step-graph planning. Pure function; no IO.
 //!
 //! Uses `petgraph::algo::tarjan_scc` for cycle-witness recovery so the
 //! validation path can return the smallest deterministic cycle witness.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use petgraph::algo::tarjan_scc;
 use petgraph::graphmap::DiGraphMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::error::WyrdError;
-
 use super::ids::TaskId;
-use super::task::EvalTask;
 
 /// Topologically sorted task DAG.
 ///
@@ -70,45 +67,6 @@ pub enum DagError {
         /// The task with the self-dependency.
         task: TaskId,
     },
-}
-
-impl From<DagError> for WyrdError {
-    fn from(error: DagError) -> Self {
-        let details = match &error {
-            DagError::Cycle { cycle } => serde_json::json!({
-                "kind": "cycle",
-                "cycle": cycle.iter().map(TaskId::as_str).collect::<Vec<_>>(),
-            }),
-            DagError::MissingDependency { task, dep } => serde_json::json!({
-                "kind": "missing_dependency",
-                "task": task.as_str(),
-                "dep": dep.as_str(),
-            }),
-            DagError::SelfLoop { task } => serde_json::json!({
-                "kind": "self_loop",
-                "task": task.as_str(),
-            }),
-        };
-
-        WyrdError::ValaTaskDagInvalid {
-            message: error.to_string(),
-            details,
-        }
-    }
-}
-
-/// Validate the task map as a DAG.
-///
-/// Returns the topologically sorted execution plan or a typed DAG error.
-/// Complexity is O(V + E). The cycle-witness phase only runs on the unfinished
-/// subgraph and allocates one `DiGraphMap` over that subset.
-///
-/// # Errors
-/// Returns [`DagError::MissingDependency`] when a task references an absent
-/// dependency, [`DagError::SelfLoop`] when a task depends on itself, and
-/// [`DagError::Cycle`] when the remaining dependency graph has a cycle.
-pub fn validate_dag(tasks: &BTreeMap<TaskId, EvalTask>) -> Result<ExecutionPlan, DagError> {
-    plan_stages(tasks.iter().map(|(id, task)| (id, task.depends_on())))
 }
 
 /// Plans dependency stages for any graph of uniquely named nodes.
@@ -282,4 +240,107 @@ fn smallest_cycle<'a>(
 
 fn self_loops_to(adj: &HashMap<&TaskId, Vec<&TaskId>>, vertex: &TaskId) -> bool {
     adj.get(vertex).is_some_and(|edges| edges.contains(&vertex))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plans `nodes`, each named with the ids it depends on.
+    fn plan(nodes: &[(&str, &[&str])]) -> Result<ExecutionPlan, DagError> {
+        let id = |value: &str| TaskId::new(value).expect("static task id is valid");
+        let nodes: Vec<(TaskId, Vec<TaskId>)> = nodes
+            .iter()
+            .map(|(node, deps)| (id(node), deps.iter().map(|dep| id(dep)).collect()))
+            .collect();
+        plan_stages(nodes.iter().map(|(node, deps)| (node, deps.iter())))
+    }
+
+    /// Stage task ids as strings.
+    fn names(stage: &Stage) -> Vec<&str> {
+        stage.tasks.iter().map(TaskId::as_str).collect()
+    }
+
+    /// A three-node cycle yields a closed witness starting and ending at the
+    /// smallest id.
+    #[test]
+    fn triangle_cycle_returns_witness() {
+        match plan(&[("a", &["c"]), ("b", &["a"]), ("c", &["b"])]) {
+            Err(DagError::Cycle { cycle }) => {
+                let names: Vec<&str> = cycle.iter().map(TaskId::as_str).collect();
+                assert_eq!(names.first(), Some(&"a"));
+                assert_eq!(names.last(), Some(&"a"));
+                assert_eq!(cycle.len() - 1, 3);
+            }
+            other => panic!("expected Cycle, got {other:?}"),
+        }
+    }
+
+    /// With two cycles, the witness is the smaller one.
+    #[test]
+    fn smallest_cycle_witness_picks_3_over_5() {
+        let nodes: [(&str, &[&str]); 8] = [
+            ("a", &["c"]),
+            ("b", &["a"]),
+            ("c", &["b"]),
+            ("v", &["w"]),
+            ("w", &["z"]),
+            ("x", &["v"]),
+            ("y", &["x"]),
+            ("z", &["y"]),
+        ];
+        match plan(&nodes) {
+            Err(DagError::Cycle { cycle }) => {
+                assert_eq!(cycle.len() - 1, 3, "smallest cycle is 3, got {cycle:?}");
+            }
+            other => panic!("expected Cycle, got {other:?}"),
+        }
+    }
+
+    /// A chain plans one node per stage in dependency order.
+    #[test]
+    fn linear_three_stages() {
+        let plan = plan(&[("a", &[]), ("b", &["a"]), ("c", &["b"])]).expect("plans");
+        assert_eq!(plan.task_count, 3);
+        let stages: Vec<Vec<&str>> = plan.stages.iter().map(names).collect();
+        assert_eq!(stages, vec![vec!["a"], vec!["b"], vec!["c"]]);
+    }
+
+    /// Independent middle nodes share one sorted stage.
+    #[test]
+    fn diamond_three_stages_parallel_middle() {
+        let plan = plan(&[("a", &[]), ("b", &["a"]), ("c", &["a"]), ("d", &["b", "c"])])
+            .expect("plans");
+        assert_eq!(plan.stages.len(), 3);
+        assert_eq!(names(&plan.stages[1]), vec!["b", "c"]);
+    }
+
+    /// Disconnected roots share stage zero.
+    #[test]
+    fn disconnected_components_share_stage_zero() {
+        let plan = plan(&[("a", &[]), ("b", &[])]).expect("plans");
+        assert_eq!(plan.stages.len(), 1);
+        assert_eq!(names(&plan.stages[0]), vec!["a", "b"]);
+    }
+
+    /// A dependency on an absent node is refused with both ids.
+    #[test]
+    fn unknown_dependency_rejected() {
+        match plan(&[("a", &["ghost"])]) {
+            Err(DagError::MissingDependency { task, dep }) => {
+                assert_eq!(task.as_str(), "a");
+                assert_eq!(dep.as_str(), "ghost");
+            }
+            other => panic!("expected MissingDependency, got {other:?}"),
+        }
+    }
+
+    /// A node depending on itself is refused.
+    #[test]
+    fn task_depending_on_itself_rejected() {
+        match plan(&[("loop", &["loop"])]) {
+            Err(DagError::SelfLoop { task }) => assert_eq!(task.as_str(), "loop"),
+            other => panic!("expected SelfLoop, got {other:?}"),
+        }
+    }
 }

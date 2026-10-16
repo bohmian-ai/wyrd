@@ -409,7 +409,7 @@ async fn context_capture_hashes_or_redacts_actual_values() {
         (
             "hash",
             Some(Value::String(
-                crate::assertion::capture_actual(Some(json!(4)), EvalContextCapture::Hash)
+                crate::assertion::capture_actual(Some(json!(4)), ContextCapture::Hash)
                     .expect("hash")
                     .and_then(|v| v.as_str().map(str::to_owned))
                     .expect("digest"),

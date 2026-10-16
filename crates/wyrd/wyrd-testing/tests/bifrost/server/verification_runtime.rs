@@ -62,7 +62,7 @@ use wyrd_spec::vala::api::{
     AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, VARIANT_MAX_DEPTH,
     VARIANT_MAX_ENCODED_BYTES,
 };
-use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::vala::managed_columns::{
     ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT,
 };

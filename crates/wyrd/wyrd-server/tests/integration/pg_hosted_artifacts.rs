@@ -59,7 +59,7 @@ use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
 use wyrd_testing::logs::LogCapture;

@@ -31,8 +31,8 @@ use wyrd_spec::card::verifier::{
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::vala::eval::result::EvalContextCapture;
-use wyrd_spec::vala::eval::{ExecutionPlan, Stage, TaskId};
+use wyrd_spec::verification::ContextCapture;
+use wyrd_spec::verification::{ExecutionPlan, Stage, TaskId};
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{
     CallProvenance, Citation, InputDeclaration, RequirementDetail, RequirementOutcome,
@@ -744,7 +744,7 @@ impl Judged {
     /// Panics when `key` does not name a requirement of `spec`.
     fn report(self, spec: &VerifierSpec, key: Key) -> Result<Done, EngineError> {
         let requirement = requirement_at(spec, key);
-        let capture = spec.context_capture.unwrap_or(EvalContextCapture::Full);
+        let capture = spec.context_capture.unwrap_or(ContextCapture::Full);
         Ok(Done::Requirement(Box::new(RequirementResult {
             id: requirement.id.clone(),
             step: key.0.map(|index| spec.steps[index].id.clone()),

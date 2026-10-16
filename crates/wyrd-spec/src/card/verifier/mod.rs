@@ -28,8 +28,8 @@ use crate::card::prompt::ParameterName;
 use crate::card::trigger::TriggerSpec;
 use crate::ids::{BindingId, FeatureName, SlotName};
 use crate::reference::{CardRef, InlineableRef, Ref};
-use crate::vala::eval::result::EvalContextCapture;
-use crate::vala::eval::{ComparisonOperator, JsonPath, TaskId};
+use crate::verification::ContextCapture;
+use crate::verification::{ComparisonOperator, JsonPath, TaskId};
 use crate::verification::VerificationError;
 
 pub mod extract;
@@ -66,7 +66,7 @@ pub struct VerifierSpec {
     /// How permitted `actual` values are stored; absent means full capture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "server", schema(value_type = Option<Object>))]
-    pub context_capture: Option<EvalContextCapture>,
+    pub context_capture: Option<ContextCapture>,
 }
 
 impl VerifierSpec {

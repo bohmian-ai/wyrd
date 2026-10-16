@@ -26,7 +26,7 @@ use crate::error::WyrdError;
 use crate::ids::{CardUid, ExecutionId, SlotName};
 use crate::reference::CardRef;
 use crate::storage::upload::UploadPlan;
-use crate::vala::eval::ids::TaskId;
+use crate::verification::TaskId;
 use crate::vala::ids::{RunId, TraceId};
 
 /// `POST /v1/verification/execute` and `POST /v1/verification/enqueue`

@@ -23,8 +23,7 @@
 //! - `gen_ai_eval_result` — one evaluation result attached to a GenAI span.
 //! - `gen_ai_span` — `GenAiSpanRecord` (full OTel GenAI semconv surface).
 //!
-//! Trace and span ids live in [`crate::vala::ids`] (commit 02 of the
-//! trace-primitive plan promotes them from `vala::eval::ids`).
+//! Trace and span ids live in [`crate::vala::ids`].
 
 use chrono::{DateTime, Utc};
 
@@ -231,27 +230,6 @@ mod ids_tests {
     fn span_id_deserialize_byte_array_rejects_all_zero() {
         let result: Result<SpanId, _> = serde_json::from_str("[0,0,0,0,0,0,0,0]");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn vala_eval_ids_traceid_resolves_to_vala_ids_traceid() {
-        let a: crate::vala::eval::ids::TraceId =
-            TraceId::from_hex("0123456789abcdef0123456789abcdef").expect("valid trace id");
-        let b: crate::vala::ids::TraceId =
-            TraceId::from_hex("0123456789abcdef0123456789abcdef").expect("valid trace id");
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn vala_eval_ids_dataclass_ids_still_resolve() {
-        let _: crate::vala::eval::ids::SessionId =
-            crate::vala::eval::ids::SessionId(uuid::Uuid::nil());
-        let _: crate::vala::eval::ids::RecordId =
-            crate::vala::eval::ids::RecordId(uuid::Uuid::nil());
-        let _: crate::vala::eval::ids::WorkflowUid =
-            crate::vala::eval::ids::WorkflowUid(uuid::Uuid::nil());
-        let _: crate::vala::eval::ids::EntityUid =
-            crate::vala::eval::ids::EntityUid::new("u").expect("valid entity uid");
     }
 
     #[test]

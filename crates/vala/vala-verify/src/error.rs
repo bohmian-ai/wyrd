@@ -7,7 +7,7 @@
 //! [`crate::blocks::EngineError::Capture`].
 
 use thiserror::Error;
-use wyrd_spec::vala::eval::ids::TaskId;
+use wyrd_spec::verification::TaskId;
 
 /// A comparison or capture that could not produce a value.
 #[derive(Debug, Error)]

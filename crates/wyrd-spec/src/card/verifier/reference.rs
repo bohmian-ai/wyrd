@@ -13,7 +13,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::ids::SlotName;
-use crate::vala::eval::TaskId;
+use crate::verification::TaskId;
 
 /// One parsed scope reference.
 #[derive(Debug, Clone, PartialEq, Eq)]

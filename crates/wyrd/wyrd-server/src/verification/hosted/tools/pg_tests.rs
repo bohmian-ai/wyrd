@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use skald_spec::MediaFormat;
 use vala_verify::blocks::Position;
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::vala::eval::ids::TaskId;
+use wyrd_spec::verification::TaskId;
 
 use super::super::workspace::Staged;
 use super::*;

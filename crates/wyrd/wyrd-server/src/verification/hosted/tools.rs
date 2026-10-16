@@ -32,7 +32,7 @@ use wyrd_spec::card::agent::BuiltinTool;
 use wyrd_spec::card::verifier::Action;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::ListCardsRequest;
-use wyrd_spec::vala::eval::ids::TaskId;
+use wyrd_spec::verification::TaskId;
 
 use super::HostedLimits;
 use super::evidence::TenantEvidence;

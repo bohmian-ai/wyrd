@@ -21,7 +21,7 @@ use wyrd_spec::card::verifier::Check;
 use wyrd_spec::ids::{ExecutionId, VerificationResultId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::GetCardResponse;
-use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
     RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
 };

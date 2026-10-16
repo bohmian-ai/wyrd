@@ -2,8 +2,8 @@
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use wyrd_spec::vala::eval::result::EvalContextCapture;
-use wyrd_spec::vala::eval::{ComparisonOperator, TaskId};
+use wyrd_spec::verification::ContextCapture;
+use wyrd_spec::verification::{ComparisonOperator, TaskId};
 
 use crate::error::ExecError;
 use crate::operators;
@@ -106,15 +106,15 @@ pub(crate) fn evaluate_item_mode(
 /// Returns `ContextHashFailed` if hashing cannot serialize the value.
 pub fn capture_actual(
     actual: Option<serde_json::Value>,
-    capture: EvalContextCapture,
+    capture: ContextCapture,
 ) -> Result<Option<serde_json::Value>, ExecError> {
     match capture {
-        EvalContextCapture::Full => Ok(actual),
-        EvalContextCapture::Hash => actual
+        ContextCapture::Full => Ok(actual),
+        ContextCapture::Hash => actual
             .as_ref()
             .map(|value| hash_context_value(value).map(serde_json::Value::String))
             .transpose(),
-        EvalContextCapture::Redact => Ok(None),
+        ContextCapture::Redact => Ok(None),
     }
 }
 
@@ -137,7 +137,7 @@ mod tests {
     /// `full` keeps the actual value verbatim.
     #[test]
     fn context_capture_full_keeps_actual_verbatim() {
-        let actual = capture_actual(Some(json!({"x": 1})), EvalContextCapture::Full)
+        let actual = capture_actual(Some(json!({"x": 1})), ContextCapture::Full)
             .expect("context capture succeeds");
         assert_eq!(actual, Some(json!({"x": 1})));
     }
@@ -145,7 +145,7 @@ mod tests {
     /// `hash` replaces the actual value with its lowercase SHA-256 hex digest.
     #[test]
     fn context_capture_hash_replaces_with_sha256_hex() {
-        let actual = capture_actual(Some(json!({"x": 1, "y": "v"})), EvalContextCapture::Hash)
+        let actual = capture_actual(Some(json!({"x": 1, "y": "v"})), ContextCapture::Hash)
             .expect("context capture succeeds")
             .expect("actual is present");
         let hex = actual.as_str().expect("actual is hash string");
@@ -159,7 +159,7 @@ mod tests {
     /// `redact` drops the actual value.
     #[test]
     fn context_capture_redact_drops_actual() {
-        let actual = capture_actual(Some(json!("pii")), EvalContextCapture::Redact)
+        let actual = capture_actual(Some(json!("pii")), ContextCapture::Redact)
             .expect("context capture succeeds");
         assert!(actual.is_none());
     }

@@ -31,7 +31,7 @@ use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, SlotName, VerificationResultId};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::UTC_TIME_ZONE;
-use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::vala::managed_columns::{CARD_UID, RUN_ID};
 use wyrd_spec::verification::execution::{
@@ -600,7 +600,7 @@ mod tests {
     use wyrd_spec::card::drift::DriftMethod;
     use wyrd_spec::card::verifier::Check;
     use wyrd_spec::ids::FeatureName;
-    use wyrd_spec::vala::eval::TaskId;
+    use wyrd_spec::verification::TaskId;
     use wyrd_spec::verification::execution::RequirementOutcome;
 
     use super::*;

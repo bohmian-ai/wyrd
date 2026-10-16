@@ -1,8 +1,8 @@
 //! Canonical id newtypes shared across the vala surface.
 //!
-//! This module owns ids that more than one vala submodule consumes. Eval-scoped
-//! ids such as `TaskId`, `ScenarioId`, and `JsonPath` remain in
-//! [`crate::vala::eval::ids`].
+//! This module owns ids that more than one vala submodule consumes. Verifier-scoped
+//! ids such as `TaskId` and `JsonPath` live in
+//! [`crate::verification::ids`].
 
 use std::str::FromStr;
 
@@ -443,5 +443,60 @@ fn hex_char(nibble: u8) -> char {
         (b'0' + nibble) as char
     } else {
         (b'a' + nibble - 10) as char
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EntityUid, RecordId, SessionId, SpanId, TraceId, WorkflowUid};
+
+    #[test]
+    fn id_uuid_types_serde_round_trip() {
+        let uuid = uuid::Uuid::nil();
+        let session = SessionId(uuid);
+        let record = RecordId(uuid);
+        let workflow = WorkflowUid(uuid);
+
+        assert_eq!(
+            serde_json::to_string(&session).expect("session id serializes"),
+            format!("\"{uuid}\"")
+        );
+        assert_eq!(
+            session,
+            serde_json::from_str(&format!("\"{uuid}\"")).expect("session id")
+        );
+        assert_eq!(
+            record,
+            serde_json::from_str(&format!("\"{uuid}\"")).expect("record id")
+        );
+        assert_eq!(
+            workflow,
+            serde_json::from_str(&format!("\"{uuid}\"")).expect("workflow id")
+        );
+    }
+
+    #[test]
+    fn entity_uid_serde_round_trip() {
+        let entity = EntityUid::new("customer-123").expect("valid entity uid");
+        let json = serde_json::to_string(&entity).expect("entity uid serializes");
+        assert_eq!(json, "\"customer-123\"");
+        let round_trip: EntityUid = serde_json::from_str(&json).expect("entity uid deserializes");
+        assert_eq!(entity, round_trip);
+    }
+
+    #[test]
+    fn trace_id_deserializes_legacy_byte_array_and_serializes_hex() {
+        let trace: TraceId = serde_json::from_str("[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]")
+            .expect("legacy byte array deserializes");
+        let json = serde_json::to_string(&trace).expect("trace id serializes");
+        assert_eq!(json, "\"0102030405060708090a0b0c0d0e0f10\"");
+    }
+
+    #[test]
+    fn span_id_deserializes_legacy_byte_array_and_serializes_hex() {
+        let span: SpanId =
+            serde_json::from_str("[1,2,3,4,5,6,7,8]").expect("legacy byte array deserializes");
+        let json = serde_json::to_string(&span).expect("span id serializes");
+        assert_eq!(json, "\"0102030405060708\"");
     }
 }

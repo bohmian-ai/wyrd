@@ -31,7 +31,7 @@ use tokio::time::Instant;
 
 use wyrd_spec::card::verifier::{Action, Check};
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
     CallProvenance, InputDeclaration, RequirementDetail, ToolCallRecord, Verdict,
 };

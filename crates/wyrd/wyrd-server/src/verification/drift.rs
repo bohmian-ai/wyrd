@@ -54,7 +54,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, FeatureName, SlotName};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::{DriftWindow, VerificationError};
 use wyrd_sql::queries::verifier_executions::{ClaimedExecution, TerminalStatus};
 

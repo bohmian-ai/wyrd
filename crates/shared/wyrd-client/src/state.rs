@@ -2444,7 +2444,7 @@ pub(crate) mod tests {
         /// Panics if the agent-check fixture cannot be built, rewritten, or
         /// serialized.
         fn with_nested_prompt(&mut self, prompt_ref: CardRef, sibling: bool) -> CardRef {
-            use wyrd_spec::vala::eval::TaskId;
+            use wyrd_spec::verification::TaskId;
 
             let verifier_ref = test_ref(CardKind::Verifier, "judge", 4);
             let check = Check::Agent(AgentCall {

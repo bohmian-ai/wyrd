@@ -17,7 +17,7 @@ use std::pin::Pin;
 
 use tokio::task::{JoinError, JoinSet};
 use tracing::Instrument as _;
-use wyrd_spec::vala::eval::{Stage, TaskId};
+use wyrd_spec::verification::{Stage, TaskId};
 
 /// Per-run state shared by every stage-walking execution: each settled task
 /// by id, in the order the stage walk settled it.

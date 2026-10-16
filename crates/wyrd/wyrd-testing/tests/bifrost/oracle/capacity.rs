@@ -2450,10 +2450,6 @@ async fn saturated_query_waits_on_http_and_grpc() {
 ///
 /// Panics when a production queue, active, wait, or admission series
 /// disagrees with the admission owner or the queries' observed endings.
-#[expect(
-    clippy::float_cmp,
-    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
-)]
 async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec(
         BifrostClusterSpec::three_oracles_one_scribe()

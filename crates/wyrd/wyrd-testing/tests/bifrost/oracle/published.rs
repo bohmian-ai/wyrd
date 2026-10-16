@@ -428,10 +428,6 @@ const RETIRED_QUERY_FAMILIES: [&str; 6] = [
 ///
 /// # Panics
 /// Panics when an emitted fact disagrees with the stream the client observed.
-#[expect(
-    clippy::float_cmp,
-    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
-)]
 async fn prove_query_stream_telemetry(
     cluster: &WyrdTestCluster,
     server: &WyrdTestServer,

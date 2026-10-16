@@ -1094,10 +1094,6 @@ mod tests {
     ///
     /// Panics when the sum includes the wrong series.
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
-    )]
     fn metrics_sum_selects_family_and_labels() {
         let metrics = Metrics::parse(
             "# HELP x\noracle_queries_queued{class=\"a\"} 3\noracle_queries_queued{class=\"b\"} 4\n\

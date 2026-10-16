@@ -490,7 +490,7 @@ impl BifrostCatalog {
         // `FileIO`, so the reacquisition sees the production error shape.
         #[cfg(any(test, feature = "test-support"))]
         if TEST_METADATA_NOT_FOUND_FAULTS
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |remaining| remaining.checked_sub(1),

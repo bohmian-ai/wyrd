@@ -1308,10 +1308,6 @@ async fn prove_remote_live_scribe_release() -> Result<(), PeerJourneyError> {
 /// # Panics
 ///
 /// Panics when an emitted fact disagrees with the ending the client observed.
-#[expect(
-    clippy::float_cmp,
-    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
-)]
 async fn assert_remote_query_telemetry(
     cluster: &PeerCluster,
     window: &BifrostTelemetryCheckpoint,

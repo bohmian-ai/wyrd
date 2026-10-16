@@ -177,10 +177,6 @@ async fn termination_signal_parity() {
 
 /// Per-subject outcomes roll up exactly as the fixture expects.
 #[tokio::test(flavor = "multi_thread")]
-#[expect(
-    clippy::float_cmp,
-    reason = "the expected value is produced by exact arithmetic on fixed inputs"
-)]
 async fn subject_aggregation_parity() {
     let fixture = fixture_value(include_str!("fixtures/parity/subject_rollup.json"));
     assert_eq!(fixture["expected_subject_pass_rate"], json!(1.0));

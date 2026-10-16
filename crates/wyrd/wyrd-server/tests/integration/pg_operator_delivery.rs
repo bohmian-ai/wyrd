@@ -1086,10 +1086,6 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
 /// # Panics
 /// Panics when the schedule, clipping, or deadline failure differs.
 #[tokio::test]
-#[expect(
-    clippy::float_cmp,
-    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
-)]
 async fn production_schedule_retries_within_the_delivery_deadline() {
     let delivery = Delivery::start().await;
     let origin = delivery.mock.uri();

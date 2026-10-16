@@ -1,16 +1,11 @@
-# Standalone workspace: Monty's interpreter graph declares pyo3 0.29, whose
-# `links = "python"` cannot resolve beside the Python SDK's pyo3 in the main
-# workspace. Build with `--manifest-path crates/wyrd/wyrd-monty-worker/Cargo.toml`.
-[workspace]
-
 [package]
 name = "wyrd-monty-worker"
-version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0"
-rust-version = "1.96"
-repository = "https://github.com/bohmian-ai/wyrd"
-authors = ["Thorrester <sjforrester32@gmail.com>"]
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
 description = "Hardened Monty Python worker process for hosted Verifier code."
 publish = false
 
@@ -21,14 +16,11 @@ path = "src/main.rs"
 [dependencies]
 monty-alloc = "=1.1.0"
 monty-proto = { version = "=1.1.0", features = ["worker"] }
-monty-types = "=1.1.0"
+monty-types = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
 nix = { version = "0.31", default-features = false, features = ["process", "resource", "sched"] }
 
-[lints.rust]
-unsafe_code = "deny"
-
-[lints.clippy]
-pedantic = { level = "warn", priority = -1 }
+[lints]
+workspace = true

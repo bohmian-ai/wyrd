@@ -289,7 +289,7 @@ impl<G: Send + Sync + 'static> BatchSink<G> for MockSink {
         }
         if self
             .terminal_next
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             return Err(SinkError::Terminal(WyrdError::Validation {

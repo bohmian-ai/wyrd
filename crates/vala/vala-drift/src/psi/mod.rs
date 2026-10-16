@@ -637,10 +637,6 @@ mod psi_fit {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the expected value is produced by exact arithmetic on fixed inputs"
-    )]
     fn all_equal_numeric_fit_uses_single_infinite_bin() {
         let batch = numeric_batch("score", vec![Some(5.0); 12]);
         let profile = fixed_profile(PsiBinningStrategy::EqualWidth { n_bins: 10 });
@@ -1128,10 +1124,6 @@ mod psi_score {
     /// # Panics
     /// Panics when a zero bin breaks the score or the threshold ignores `other`.
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the expected value is produced by exact arithmetic on fixed inputs"
-    )]
     fn psi_zero_bins_and_other_count_toward_the_threshold() {
         let baseline_batch = numeric_batch("x", (0..1000).map(f64::from).collect());
         let target_batch = numeric_batch("x", vec![5.0; 200]);

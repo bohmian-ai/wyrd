@@ -27,7 +27,7 @@ fn worker() -> PathBuf {
     let path = std::env::var_os("WYRD_VERIFICATION_MONTY_WORKER").map_or_else(
         || {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../target/monty-worker/release/wyrd-monty-worker")
+                .join("../../../target/release/wyrd-monty-worker")
         },
         PathBuf::from,
     );

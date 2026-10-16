@@ -738,7 +738,7 @@ impl DriftEngine {
                                 "the fitted baseline is not a PSI baseline".to_owned(),
                             ));
                         };
-                        let sql = window.psi_statement(&baseline).map_err(&invalid)?;
+                        let sql = window.psi_statement(&baseline).map_err(invalid)?;
                         Ok((baseline, sql))
                     })
                     .await?;
@@ -757,7 +757,7 @@ impl DriftEngine {
                                 "the fitted baseline is not an SPC baseline".to_owned(),
                             ));
                         };
-                        let sql = window.spc_statement(&baseline).map_err(&invalid)?;
+                        let sql = window.spc_statement(&baseline).map_err(invalid)?;
                         Ok((baseline, sql))
                     })
                     .await?;

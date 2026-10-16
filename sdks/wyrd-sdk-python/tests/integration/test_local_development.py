@@ -250,7 +250,7 @@ def call_agent(client: WyrdClient, state: WyrdState, alias: str, run_id: str) ->
     deployment = state.card(alias).spec["execution_route"]["deployment"]
     prompt = state.agent(alias).prompt().prompt
     path, _ = INGRESS[prompt.provider]
-    body = prompt.render(question="hi").model_dump()
+    body = prompt.render(question="hi").model_dump()["body"]
     if prompt.provider == "google":
         model = f"{deployment}/{quote(prompt.model, safe='')}"
     else:

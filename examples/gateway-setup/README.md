@@ -79,7 +79,7 @@ fixtures.
    for alias in ("openai", "anthropic", "google", "jev"):
        deployment = state.card(alias).spec["execution_route"]["deployment"]
        prompt = state.agent(alias).prompt().prompt
-       body = prompt.render(question="Is Wyrd running?").model_dump()
+       body = prompt.render(question="Is Wyrd running?").model_dump()["body"]
        path = {
            "openai": "/v1/chat/completions",
            "anthropic": "/v1/messages",

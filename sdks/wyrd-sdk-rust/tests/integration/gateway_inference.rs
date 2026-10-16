@@ -156,8 +156,11 @@ impl Inference {
     /// application calls its model: render the Agent's Prompt, address
     /// `<deployment>/<Prompt model>` on the gateway ingress the Prompt's
     /// provider speaks, and correlate the call to a fresh Run of the Agent
-    /// with the `wyrd-run-id` and `wyrd-card-uid` headers. Returns the HTTP
-    /// status and JSON body.
+    /// with the `wyrd-run-id` and `wyrd-card-uid` headers. The
+    /// `wyrd-prompt-provider` header marks it an Agent call, so a deployment
+    /// whose adapter the Prompt's provider is incompatible with refuses it
+    /// before dispatch instead of translating it. Returns the HTTP status and
+    /// JSON body.
     ///
     /// # Panics
     /// Panics when the alias is not a hydrated Agent, its Prompt does not
@@ -185,9 +188,11 @@ impl Inference {
         if !path.starts_with("/v1beta") {
             body["model"] = json!(model);
         }
+        let provider = prompt.provider();
         let correlation = [
             ("wyrd-run-id", run.run_id().as_str()),
             ("wyrd-card-uid", run.subject_uid().as_str()),
+            ("wyrd-prompt-provider", provider.as_str()),
         ];
         self.post(
             state.client().expect("the state has a client"),

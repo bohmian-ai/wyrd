@@ -17,43 +17,44 @@ Your code runs a Verifier now with `verify` and acts on the result, or hands it 
 
 <WyrdSequence name="verification-paths" />
 
-The examples use the `support-desk` service from [Cards, versions, and relationships](/understand/cards-versions-and-relationships/) and its `policy-check` Verifier, which checks a support answer against a refund-policy PDF.
+The examples use the `support-desk` service from the [quickstart](/get-started/quickstart/) and its three Verifiers.
 
 ## Four parts of a Verifier
 
 A Verifier is a Card with a normal `wyrd/v1` envelope. It never names what it checks; a binding supplies the subject, so one Verifier can check any number of components.
 
-```yaml title="service/policy-check.yaml"
-apiVersion: wyrd/v1
-kind: Verifier
-metadata: { space: support, name: policy-check, version: 1.0.0 }
-spec:
-  description: A support answer follows the refund policy.
-  inputs:
-    answer: { type: json }                          # { "text": "..." }
-    policy: { type: media, formats: [pdf] }
-  steps:
-    - id: findings
-      action:
-        kind: agent
-        agent: ./policy-reader.yaml                 # tool_names: [fs.read]
-        inputs: { answer: inputs.answer }           # injected through {{answer}}
-        workspace: { /inputs/policy.pdf: inputs.policy }
-  requirements:
-    - id: no-guaranteed-refund
-      statement: The answer never promises a guaranteed refund
-      check: { kind: assert, path: inputs.answer.text, operator: not_contains, expected: guaranteed refund }
-    - id: follows-policy
-      statement: The answer is consistent with the refund policy
-      check:
-        kind: agent
-        agent: ./policy-judge.yaml                  # no tools; returns the Verdict schema
-        inputs:
-          claim: requirement.statement
-          answer: inputs.answer
-          findings: steps.findings.output
-  decide: all
-```
+The support desk has three, and between them they use every common building block. Switch tabs to follow each reference: `follows-policy` names `./policy-judge.yaml`, and that Agent carries its prompt, including the refund policy, inline.
+
+<Tabs>
+<Tab label="follows-policy.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/follows-policy.yaml" lang="yaml" title="service/follows-policy.yaml" />
+
+</Tab>
+<Tab label="policy-judge.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/policy-judge.yaml" lang="yaml" title="service/policy-judge.yaml" />
+
+</Tab>
+<Tab label="no-refund-promise.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/no-refund-promise.yaml" lang="yaml" title="service/no-refund-promise.yaml" />
+
+</Tab>
+<Tab label="ticket-complete.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/ticket-complete.yaml" lang="yaml" title="service/ticket-complete.yaml" />
+
+</Tab>
+</Tabs>
+
+| Verifier | Shows |
+| --- | --- |
+| `no-refund-promise` | The smallest Verifier: one `json` input and one `assert` check |
+| `ticket-complete` | A `code` check: inline Python that returns a verdict |
+| `follows-policy` | A `media` input, an `extract` step, and an `agent` check that judges the step's output |
+
+In `follows-policy`, the caller uploads one file: the refund decision letter the agent wrote. The `read-letter` step extracts its text. The check then hands `policy-judge` two values through its prompt placeholders: the requirement's own statement, and the extracted letter as `steps.read-letter.output`. The policy itself is in the judge's prompt, so it is fixed by the judge's version instead of being sent with every request. The judge has no tools, and its `response_format` is the closed Verdict schema, so it can only answer with an outcome, a reason, and citations to lines of the letter.
 
 | Part | Holds |
 | --- | --- |
@@ -94,7 +95,7 @@ An Agent step has two input channels. `inputs` values are injected into the mode
 | Check `kind` | Judges |
 | --- | --- |
 | `assert` | A typed comparison over one value (`path`) or every match of a `[*]` selector (`each`), against `expected` |
-| `trace` | Span existence, order, and attributes in a `trace` slot (`on`, `span_selector`, `operator`, `expected`) |
+| `trace` | The spans in a `trace` slot that a JSONPath `span_selector` matches, compared with `operator` and `expected` (`on` names the slot) |
 | `agent` | A tool-less Agent returning the Verdict schema: `outcome`, `reason`, `citations` |
 | `code` | Sandboxed Python returning the same Verdict schema |
 | `drift` | PSI, SPC, or Custom over a `samples` slot (`on`), with full statistics |
@@ -115,7 +116,7 @@ A citation names an original input `slot` and a locator: `page`, `slide`, `lines
 
 Child fields use dots; array indexes are zero-based (`slides[0]`). Wildcards (`[*]`) work only in an assertion's `each`. There is no `$.` prefix.
 
-A reference in an action or `when` makes a dependency; `depends_on` adds order without data. Independent steps run concurrently. A step runs its action, then its own requirements, before anything that depends on it starts. Whole-Verifier requirements run after every step. Requirements never feed each other, and each verdict reaches `decide` exactly once. Registration refuses cycles, unknown references, and references a position cannot read.
+A step's optional `when` is a condition with the same shape as an assertion, `{path, operator, expected}`, not an expression language; when it is false, the step is skipped. A reference in an action or `when` makes a dependency; `depends_on` adds order without data. Independent steps run concurrently. A step runs its action, then its own requirements, before anything that depends on it starts. Whole-Verifier requirements run after every step. Requirements never feed each other, and each verdict reaches `decide` exactly once. Registration refuses cycles, unknown references, and references a position cannot read.
 
 ### Skips, missing evidence, and decide
 
@@ -135,18 +136,25 @@ When both apply, failure wins. Provider errors, malformed output, and infrastruc
 
 ## Bindings attach Verifiers to what they check
 
-A binding lives in the declaration under `verified_by`. It names the Verifier, optionally the schedule that runs it, and the Operators that react to a failed background verdict:
+A binding lives in the declaration under `verified_by`. It names the Verifier, optionally the schedule that runs it, and the Operators that react to a failed background verdict. The support desk binds `no-refund-promise` to the whole Service and the other two to its `agent` component:
 
-```yaml title="service/support-desk.yaml (excerpt)"
-spec:
-  components:
-    - alias: agent
-      ref: ./support-agent.yaml
-      verified_by:
-        - verifier: ./policy-check.yaml
-          on_failure:
-            - ./page-support-oncall.yaml
-```
+<Tabs>
+<Tab label="support-desk.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/support-desk.yaml" lang="yaml" title="service/support-desk.yaml" />
+
+</Tab>
+<Tab label="support-agent.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/support-agent.yaml" lang="yaml" title="service/support-agent.yaml" />
+
+</Tab>
+<Tab label="support-prompt.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/support-prompt.yaml" lang="yaml" title="service/support-prompt.yaml" />
+
+</Tab>
+</Tabs>
 
 The subject is the component the binding sits under; you can also bind on the Service itself or on a standalone Agent. Changing a binding creates a new Service version, and every result records the version it checked.
 
@@ -157,7 +165,7 @@ The subject is the component the binding sits under; you can also bind on the Se
 | `inputs` | For a scheduled Verifier, the source of each `samples` slot: `{ features: [...] }` or `{ metric: <name> }` | Required for every required slot of a scheduled Verifier |
 | `on_failure` | Operators, inline or as Operator Cards | A failed verdict is stored, and nobody is notified |
 
-`schedule` is the only automatic Trigger. [Monitor drift](/build-and-verify/verify/monitor-drift/) shows a scheduled binding.
+`schedule` is the only automatic Trigger. [Bind a Verifier](/build-and-verify/declare/bind-a-verifier/#bind-a-verifier-to-a-schedule) shows a scheduled binding with its Trigger and Operator.
 
 ## Run evidence and window evidence
 
@@ -170,63 +178,22 @@ The check kinds decide how evidence arrives. Registration refuses a Verifier tha
 
 ### verify: run now
 
+The support desk runs its two model-free Verifiers on every answer before it replies:
+
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
-```python
-import wyrd
-
-with state.run("agent") as run:
-    answer = run.invoke({"question": question})
-    result = run.observe.verify(
-        "policy-check",
-        answer={"text": answer},
-        policy=wyrd.verify.File("refund-policy.pdf"),
-    )
-    if result.outcome.verdict != "passed":
-        answer = hand_to_person(ticket_id)  # your fallback
-```
+<CodeFromFile file="examples/support-desk-app/python/desk.py" lang="python" region="check" title="desk.py" />
 
 </LangTab>
 <LangTab lang="rust">
 
-```rust
-use wyrd_ai::observe::{File, Input, Inputs};
-use wyrd_ai::VerificationVerdict;
-
-let run = state.run_for_card("agent")?;
-let mut answer = run.invoke(&[("question", question)]).await?;
-let result = run
-    .observe()
-    .verify(
-        "policy-check",
-        Inputs::named([
-            ("answer", Input::from(json!({ "text": answer }))),
-            ("policy", File::path("refund-policy.pdf").into()),
-        ]),
-    )
-    .await?;
-if result.outcome.verdict != VerificationVerdict::Passed {
-    answer = hand_to_person(ticket_id); // your fallback
-}
-```
+<CodeFromFile file="examples/support-desk-app/rust/lib.rs" lang="rust" region="check" title="lib.rs" />
 
 </LangTab>
 <LangTab lang="typescript">
 
-```typescript
-import { File } from "wyrd-ai";
-
-const run = state.run("agent");
-let answer = await run.invoke({ question });
-const result = await run.observe.verify("policy-check", {
-  answer: { text: answer },
-  policy: File.path("refund-policy.pdf"),
-});
-if (result.outcome.verdict !== "passed") {
-  answer = await handToPerson(ticketId); // your fallback
-}
-```
+<CodeFromFile file="examples/support-desk-app/typescript/server.ts" lang="typescript" region="check" title="server.ts" />
 
 </LangTab>
 </LangTabs>
@@ -235,7 +202,7 @@ if (result.outcome.verdict !== "passed") {
 
 ### submit: queue it
 
-`submit` uploads missing files, stages the evidence, and returns a `verify.Execution` with a server-issued execution ID. The same engine runs it later. [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) follows one from submission to result, including from another process.
+`submit` uploads missing files, stages the evidence, and returns a `verify.Execution` with a server-issued execution ID. The support desk submits `follows-policy`, which calls a model twice, this way: see [Submit for later](/build-and-verify/observe/record-a-run-and-observations/#submit-for-later). The same engine runs it later. [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) follows one from submission to result, including from another process.
 
 `202` means the server staged the evidence in memory, not that the queue has durably accepted it. The SDK sends one `Idempotency-Key` and reuses it on every transport retry. A conflicting reuse of a key is refused when the queue writer accepts the request, and you see it as an `errored` execution with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`. Evidence lost before the queue accepts it, such as on an abrupt restart, has no outcome; `wait` ends with a timeout rather than an invented result.
 
@@ -276,7 +243,7 @@ An Operator runs when background work of a binding fails. A direct `verify`, an 
 | `notify` | Sends a Slack message or a PagerDuty event |
 | `http` | Calls a URL you choose: `get`, `post`, `put`, `patch`, or `delete`, with optional bearer, basic, or header auth |
 
-```yaml title="service/page-support-oncall.yaml"
+```yaml title="page-support-oncall.yaml"
 apiVersion: wyrd/v1
 kind: Operator
 metadata:

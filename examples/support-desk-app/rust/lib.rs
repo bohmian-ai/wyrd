@@ -6,9 +6,9 @@
 //! - `POST /ask` answers a question and runs the two model-free Verifiers
 //!   now with `verify`: the Service's `no-refund-promise` and the agent's
 //!   `ticket-complete`;
-//! - `POST /reviews` answers a question and `submit`s the answer to the
-//!   agent's model-judged `follows-policy` Verifier, returning its execution
-//!   ID;
+//! - `POST /reviews` has the agent write a refund decision letter and
+//!   `submit`s it to the agent's model-judged `follows-policy` Verifier,
+//!   returning its execution ID;
 //! - `GET /reviews/{id}` reads that check back by its ID alone.
 //!
 //! Every answer comes from the `support-agent` Card through `Run::invoke`, so
@@ -40,7 +40,7 @@ use wyrd_ai::{
     WyrdClient, WyrdError,
 };
 
-/// The `service/` directory holding this app's Cards and the policy PDF.
+/// The `service/` directory holding this app's Cards.
 #[must_use]
 pub fn service_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("service")
@@ -168,16 +168,16 @@ pub async fn evidence(client: &WyrdClient, run_id: &str) -> Result<Vec<Evidence>
         .await?)
 }
 
-/// The `follows-policy` inputs: the answer text and the policy PDF.
-fn policy_inputs(answer: &str) -> Inputs {
-    Inputs::named([
-        ("answer", Input::from(json!(answer))),
-        (
-            "policy",
-            Input::from(File::path(service_dir().join("refund-policy.pdf"))),
-        ),
-    ])
+/// The `follows-policy` input: the agent's Markdown letter, uploaded as a file.
+fn letter_inputs(letter: &str) -> Inputs {
+    Inputs::named([(
+        "letter",
+        Input::from(File::bytes(letter.to_owned()).with_filename("letter.md")),
+    )])
 }
+
+/// What `POST /reviews` asks the agent for: a document, not a chat reply.
+const LETTER: &str = "Write the customer a refund decision letter in Markdown. Their request: ";
 
 /// The body of `POST /ask` and `POST /reviews`.
 #[derive(Deserialize)]
@@ -260,8 +260,9 @@ async fn ask(
     })))
 }
 
-/// `POST /reviews`: answer the question in a new Run and submit the answer to
-/// `follows-policy`, returning the check's execution ID without waiting.
+/// `POST /reviews`: have the agent write a refund decision letter in a new Run
+/// and submit it to `follows-policy`, returning the check's execution ID
+/// without waiting.
 ///
 /// # Errors
 /// Returns the Wyrd error of the model call, the ticket write, or the
@@ -272,16 +273,16 @@ async fn review(
 ) -> Result<Json<Value>, ApiError> {
     let run = desk.state.run_for_card("agent")?;
     let work = async {
-        let answer = desk.answer(&run, &body.question).await?;
+        let letter = desk.answer(&run, &format!("{LETTER}{}", body.question)).await?;
         // ANCHOR: submit
         let submission = run
             .observe()
-            .submit("follows-policy", policy_inputs(&answer))
+            .submit("follows-policy", letter_inputs(&letter))
             .await?;
         // ANCHOR_END: submit
-        Ok::<_, WyrdError>((answer, submission))
+        Ok::<_, WyrdError>((letter, submission))
     };
-    let (answer, submission) = run
+    let (letter, submission) = run
         .scope(work.instrument(tracing::info_span!("support-desk.review")))
         .await?;
     // A Verifier that judges Run evidence is always queued; only a
@@ -294,7 +295,7 @@ async fn review(
     };
     Ok(Json(json!({
         "run_id": run.run_id().to_string(),
-        "answer": answer,
+        "letter": letter,
         "execution_id": execution.id().to_string(),
     })))
 }

@@ -2,7 +2,7 @@
  * The support API, on Node's `http`:
  *
  *   POST /ask {"question": "...", "order_id": "..."}     answer, run the two model-free checks now
- *   POST /reviews {"question": "...", "order_id": "..."}  answer now, queue `follows-policy`; reply with the execution ID
+ *   POST /reviews {"question": "..."}                    the agent writes a refund decision letter; queue `follows-policy` on it
  *   GET /reviews/<execution_id>                           the review's status and, once done, its breakdown
  *
  * Every question is one Wyrd Run of the Service: the agent's spans, its
@@ -17,7 +17,7 @@ import type OpenAI from "openai";
 import { type Run, type VerificationResult, verify, WyrdClient, WyrdError, WyrdState } from "wyrd-ai";
 
 import { answer, gateway } from "./agent.ts";
-import { BUNDLE_DIR, TICKETS, POLICY } from "./wyrd.ts";
+import { BUNDLE_DIR, TICKETS } from "./wyrd.ts";
 
 /** What a customer gets instead of an answer that promises a refund. */
 export const HANDOFF = "I've passed your question to our billing team. They reply within one business day.";
@@ -74,15 +74,19 @@ export function ask(support: Support, question: string, orderId?: string) {
   });
 }
 
-/** Answer now and queue `follows-policy`; the reply carries the execution ID to read it back by. */
+/** What `POST /reviews` asks the agent for: a document, not a chat reply. */
+export const LETTER = "Write the customer a refund decision letter in Markdown. Their request: ";
+
+/** Have the agent write a letter and queue `follows-policy` on it; the reply carries the execution ID to read it back by. */
 export function review(support: Support, question: string) {
-  return answerInRun(support, question, async (wyrdRun, text) => {
+  return answerInRun(support, LETTER + question, async (wyrdRun, text) => {
     // ANCHOR: submit
-    const inputs = { answer: text, policy: verify.File.path(POLICY) };
+    const letter = verify.File.bytes(new TextEncoder().encode(text), { filename: "letter.md" });
+    const inputs = { letter };
     const submitted = await wyrdRun.forCard("agent").observe.submit("follows-policy", inputs);
     if (submitted.kind !== "queued") throw new Error("follows-policy judges Run evidence, so submit queues it");
     // ANCHOR_END: submit
-    return { run_id: wyrdRun.runId, answer: text, execution_id: submitted.execution.id };
+    return { run_id: wyrdRun.runId, letter: text, execution_id: submitted.execution.id };
   });
 }
 

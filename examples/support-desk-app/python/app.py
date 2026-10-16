@@ -2,8 +2,8 @@
 
 - ``POST /ask`` answers a question and runs the two model-free checks before
   replying.
-- ``POST /reviews`` answers a question and queues the model-judged
-  ``follows-policy`` check in the background.
+- ``POST /reviews`` has the agent write a refund decision letter and queues
+  the model-judged ``follows-policy`` check on it in the background.
 - ``GET /reviews/{execution_id}`` reads a queued check's status and, once it
   is done, its requirement breakdown.
 
@@ -35,6 +35,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
 app = FastAPI(title="support-desk", lifespan=lifespan)
 
+# What `POST /reviews` asks the agent for: a document, not a chat reply.
+LETTER = "Write the customer a refund decision letter in Markdown. Their request: {question}"
+
 
 class Question(BaseModel):
     question: str
@@ -64,9 +67,9 @@ async def ask(body: Question, request: Request) -> dict[str, Any]:
 @app.post("/reviews")
 async def review(body: Question, request: Request) -> dict[str, Any]:
     desk: Desk = request.app.state.desk
-    run, answer = await desk.answer(body.question)
-    execution = await asyncio.to_thread(desk.submit, run, answer)
-    return {"run_id": run.run_id, "answer": answer, "execution_id": execution.id}
+    run, letter = await desk.answer(LETTER.format(question=body.question))
+    execution = await asyncio.to_thread(desk.submit, run, letter)
+    return {"run_id": run.run_id, "letter": letter, "execution_id": execution.id}
 
 
 @app.get("/reviews/{execution_id}")

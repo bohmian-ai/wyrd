@@ -110,7 +110,7 @@ export function embedCodeFromFile(content) {
   const code = content.replace(/<CodeFromFile\b([^>]*?)\/>/g, (tag, attrs) => {
     if (attrs.includes('{')) throw new Error(`CodeFromFile: attributes must be literal strings: ${tag}`);
     const props = Object.fromEntries([...attrs.matchAll(/(\w+)="([^"]*)"/g)].map((m) => [m[1], m[2]]));
-    const tail = props.file?.match(/(?:crates|examples|python|sdks)\/.*$/)?.[0];
+    const tail = props.file?.match(/(?:crates|examples|fixtures|python|sdks)\/.*$/)?.[0];
     if (!tail || !props.lang) throw new Error(`CodeFromFile: needs a repo "file" and a "lang": ${tag}`);
     const abs = path.join(REPO_ROOT, tail);
     if (path.relative(REPO_ROOT, abs).startsWith('..')) throw new Error(`CodeFromFile: file not found: ${props.file}`);

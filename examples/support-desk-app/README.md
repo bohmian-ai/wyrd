@@ -6,7 +6,7 @@ repositories, so the docs can embed the same code with `<CodeFromFile>`.
 
 | Path | Holds |
 | --- | --- |
-| `service/` | The Cards: the `support-desk` Service, its Agent and Prompt, three Verifiers, and the refund policy PDF |
+| `service/` | The Cards: the `support-desk` Service, its Agent and Prompt, and three Verifiers |
 | `python/` | The FastAPI app, deploy script, and evidence query |
 | `rust/lib.rs` | The axum app, from `wyrd-example-rs` |
 | `typescript/` | The Node app, deploy script, and evidence query, from `wyrd-example-ts` |

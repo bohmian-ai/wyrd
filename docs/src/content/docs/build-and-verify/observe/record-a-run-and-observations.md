@@ -351,7 +351,7 @@ Keep `verify` for checks that are quick. Each call blocks the request for the wh
 
 ### Submit for later
 
-Use `submit` when a slower check, such as a model judge, should run in the background. It uploads the inputs, queues one execution on the server, and returns at once:
+Use `submit` when a slower check, such as a model judge, should run in the background. It uploads the inputs, queues one execution on the server, and returns at once. The support desk submits the refund decision letter its agent wrote:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -371,7 +371,7 @@ Use `submit` when a slower check, such as a model judge, should run in the backg
 </LangTab>
 </LangTabs>
 
-`verify.File(path)` fills a `media` input slot; the file is hashed and uploaded during the call. The handle's `id` is all anyone needs to read the result later. Store it, return it to your caller, or hand it to a worker:
+`verify.File` fills a `media` input slot, from a path or, as here, from bytes; the file is hashed and uploaded during the call. The handle's `id` is all anyone needs to read the result later. Store it, return it to your caller, or hand it to a worker:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">

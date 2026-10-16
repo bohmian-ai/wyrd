@@ -13,7 +13,7 @@ You will run `support-desk`, a small customer-support API, against the local ser
 | --- | --- | --- | --- |
 | `no-refund-promise` | The Service | The answer never contains `guaranteed refund` | Your code calls it and waits; no model |
 | `ticket-complete` | The agent | The ticket has an answer and an order ID | Your code calls it and waits; sandboxed Python, no model |
-| `follows-policy` | The agent | The answer agrees with a refund policy PDF | Your code queues it; the server runs two model calls in the background |
+| `follows-policy` | The agent | A refund decision letter the agent writes follows the refund policy | Your code queues it; the server runs a model judge in the background |
 
 At the end you have a verdict for every check, each tied to the exact Card versions that ran, and one SQL query that joins it to the ticket, the trace, and the model call.
 
@@ -22,7 +22,7 @@ The code is the same app in Python, Rust, and TypeScript. This page runs the Pyt
 ## Prerequisites
 
 - A local server running from [Set up Wyrd](/get-started/setup/), in another terminal. The app reads the endpoint and credential that setup saved, so you export nothing.
-- An OpenAI API key with access to `gpt-4o` (the agent) and `gpt-6-luna` (the policy reader and judge).
+- An OpenAI API key with access to `gpt-4o` (the agent) and `gpt-6-luna` (the policy judge).
 - Python 3.11+ and `git`.
 
 ## 1. Get the example
@@ -55,11 +55,11 @@ Wyrd calls OpenAI for you, so your code never holds the OpenAI key. The server n
    JSON
    ```
 
-Both commands print the stored document, with the secret redacted. Agents now reach OpenAI models as `openai/<model>`, and every Agent Card in the example asks for exactly that with `execution_route: {kind: wyrd_gateway, deployment: openai}`. [Set up the LLM gateway](/connect/set-up-the-llm-gateway/) uses the same two commands for other providers.
+Both commands print the stored document, with the secret redacted. Agents now reach OpenAI models as `openai/<model>`, and both Agent Cards in the example ask for exactly that with `execution_route: {kind: wyrd_gateway, deployment: openai}`. [Set up the LLM gateway](/connect/set-up-the-llm-gateway/) uses the same two commands for other providers.
 
 ## 3. Read what is declared
 
-The example is eight Cards in `service/`. The Service names the others by relative path, such as `ref: ./support-agent.yaml`, so switch tabs to follow each reference:
+The example is seven Cards in `service/`. The Service names the others by relative path, such as `ref: ./support-agent.yaml`, so switch tabs to follow each reference:
 
 <Tabs>
 <Tab label="support-desk.yaml">
@@ -92,11 +92,6 @@ The example is eight Cards in `service/`. The Service names the others by relati
 <CodeFromFile file="examples/support-desk-app/service/follows-policy.yaml" lang="yaml" title="service/follows-policy.yaml" />
 
 </Tab>
-<Tab label="policy-reader.yaml">
-
-<CodeFromFile file="examples/support-desk-app/service/policy-reader.yaml" lang="yaml" title="service/policy-reader.yaml" />
-
-</Tab>
 <Tab label="policy-judge.yaml">
 
 <CodeFromFile file="examples/support-desk-app/service/policy-judge.yaml" lang="yaml" title="service/policy-judge.yaml" />
@@ -111,11 +106,10 @@ The example is eight Cards in `service/`. The Service names the others by relati
 | `support-prompt.yaml` | The prompt and model the agent runs |
 | `no-refund-promise.yaml` | Bound to the Service. One assertion, no model |
 | `ticket-complete.yaml` | Bound to the agent. A sandboxed Python check, no model |
-| `follows-policy.yaml` | Bound to the agent. Reads the policy PDF with `policy-reader`, then asks `policy-judge` |
-| `policy-reader.yaml` | An Agent that reads the PDF from its workspace and lists the rules with their pages |
-| `policy-judge.yaml` | A tool-less Agent that returns a verdict citing a policy page |
+| `follows-policy.yaml` | Bound to the agent. Extracts the text of the agent's letter, then asks `policy-judge` |
+| `policy-judge.yaml` | A tool-less Agent with the refund policy in its prompt. Returns a verdict citing lines of the letter |
 
-`verified_by` on the Service binds `no-refund-promise` to every Run of the Service. `verified_by` on the `agent` component binds the other two to the agent alone. Registering the Service registers every Card it references, so the next step registers all eight.
+`verified_by` on the Service binds `no-refund-promise` to every Run of the Service. `verified_by` on the `agent` component binds the other two to the agent alone. Registering the Service registers every Card it references, so the next step registers all seven.
 
 ## 4. Deploy the Cards
 
@@ -123,7 +117,7 @@ The example is eight Cards in `service/`. The Service names the others by relati
 python deploy.py
 ```
 
-This registers all eight Cards, which creates the `vala.datasets.tickets` table. It then downloads the registered versions into `.wyrd-bundle/`, so the app runs exactly what the server holds, and turns on gateway metadata capture, so each model call is recorded with its Run:
+This registers all seven Cards, which creates the `vala.datasets.tickets` table. It then downloads the registered versions into `.wyrd-bundle/`, so the app runs exactly what the server holds, and turns on gateway metadata capture, so each model call is recorded with its Run:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -220,7 +214,7 @@ curl -s localhost:8000/ask -H 'content-type: application/json' \
 
 ## 6. Queue a policy review
 
-`follows-policy` reads a PDF and calls a model twice, so the app doesn't make the customer wait for it. `POST /reviews` answers, queues the check, and replies at once with an execution ID:
+Some answers are documents. `POST /reviews` asks the agent to write a refund decision letter in Markdown, uploads the letter as the evidence for `follows-policy`, and replies at once with an execution ID. The judge calls a model, so the customer doesn't wait for it:
 
 ```bash
 curl -s localhost:8000/reviews -H 'content-type: application/json' \
@@ -245,7 +239,7 @@ curl -s localhost:8000/reviews -H 'content-type: application/json' \
 </LangTab>
 </LangTabs>
 
-The server runs it: a `policy-reader` Agent reads the PDF and lists its rules with their pages, then a tool-less `policy-judge` Agent decides whether the answer agrees and cites the page it relied on. Read the result back by its ID:
+The server runs it: an `extract` step turns the letter into text, then the tool-less `policy-judge` Agent, whose prompt holds the refund policy, decides whether the letter follows it and cites the lines it relied on. The policy never travels with the request; changing it means a new judge version, so every verdict names the policy it applied. Read the result back by its ID:
 
 ```bash
 curl -s localhost:8000/reviews/<execution-id>
@@ -269,7 +263,7 @@ curl -s localhost:8000/reviews/<execution-id>
 </LangTab>
 </LangTabs>
 
-`status` moves from `pending` to `running` to `completed`. Once it is `completed`, the reply carries the verdict and a requirement whose `citations` point at a page of `refund-policy.pdf`. `errored` or `timed_out` carries an `error` with a stable code instead.
+`status` moves from `pending` to `running` to `completed`. Once it is `completed`, the reply carries the verdict and a requirement whose `citations` point at lines of the letter, such as `{"slot": "letter", "locator": {"lines": {"start": 3, "end": 4}}}`. `errored` or `timed_out` carries an `error` with a stable code instead.
 
 Nothing about the ID is tied to the process that queued it. Any process with the credential can read it.
 

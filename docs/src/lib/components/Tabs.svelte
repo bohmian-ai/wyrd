@@ -7,6 +7,9 @@
   // when inactive. SSR/prerender-safe: defaults to the first registered tab,
   // no browser API at the top level.
   let { children }: { children?: Snippet } = $props();
+  // Hydration-stable per-block prefix, so two blocks on one page can share a
+  // tab label without duplicate element ids.
+  const uid = $props.id();
 
   let tabs = $state<Array<{ id: string; label: string }>>([]);
   let activeId = $state('');
@@ -15,6 +18,7 @@
   let btns = $state<Record<string, HTMLButtonElement>>({});
 
   const ctx = {
+    uid,
     get activeId() {
       return activeId;
     },
@@ -61,8 +65,8 @@
         <button
           type="button"
           role="tab"
-          id={`tab-${t.id}`}
-          aria-controls={`tabpanel-${t.id}`}
+          id={`${uid}-tab-${t.id}`}
+          aria-controls={`${uid}-tabpanel-${t.id}`}
           aria-selected={activeId === t.id}
           tabindex={activeId === t.id ? 0 : -1}
           class:active={activeId === t.id}

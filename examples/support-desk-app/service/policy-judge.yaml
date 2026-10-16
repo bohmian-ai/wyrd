@@ -1,5 +1,6 @@
-# A tool-less judge: it sees only the claim, the answer, and the policy
-# findings, and returns a Verdict citing the policy page it relied on.
+# A tool-less judge. The refund policy lives in its prompt, so every verdict
+# names the exact policy it applied. It returns a Verdict that cites the
+# lines of the letter it relied on.
 apiVersion: wyrd/v1
 kind: Agent
 metadata:
@@ -13,8 +14,14 @@ spec:
     provider: openai
     model: gpt-6-luna
     messages:
+      - role: system
+        content: |
+          You check refund decision letters against this refund policy:
+          1. Refunds of up to 100 dollars are approved within 30 days of purchase.
+          2. Larger refunds need a manager's approval.
+          Cite the lines of the letter your judgment rests on.
       - role: user
-        content: "Claim: {{claim}}. Answer: {{answer}}. Policy findings: {{findings}}. Cite the policy page."
+        content: "Claim: {{claim}}. Letter: {{letter}}"
     response_format:
       type: object
       properties:
@@ -28,8 +35,15 @@ spec:
               slot: {type: string}
               locator:
                 type: object
-                properties: {page: {type: integer}}
-                required: [page]
+                properties:
+                  lines:
+                    type: object
+                    properties:
+                      start: {type: integer}
+                      end: {type: integer}
+                    required: [start, end]
+                    additionalProperties: false
+                required: [lines]
                 additionalProperties: false
             required: [slot, locator]
             additionalProperties: false

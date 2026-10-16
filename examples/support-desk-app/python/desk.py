@@ -25,7 +25,6 @@ from wyrd.state import WyrdState
 ROOT = Path(__file__).resolve().parents[1]
 SERVICE = ROOT / "service"
 BUNDLE = ROOT / ".wyrd-bundle"
-POLICY = SERVICE / "refund-policy.pdf"
 TICKETS = "vala.datasets.tickets"
 
 tracer = trace.get_tracer("support-desk")
@@ -90,11 +89,11 @@ class Desk:
         }
         # ANCHOR_END: check
 
-    def submit(self, run: Run, answer: str) -> verify.Execution:
-        """Queue ``follows-policy`` on ``answer`` and return its execution, without waiting."""
+    def submit(self, run: Run, letter: str) -> verify.Execution:
+        """Queue ``follows-policy`` on the Markdown ``letter`` and return its execution, without waiting."""
         # ANCHOR: submit
         execution = run.for_card("agent").observe.submit(
-            "follows-policy", answer=answer, policy=verify.File(POLICY)
+            "follows-policy", letter=verify.File(letter.encode(), filename="letter.md")
         )
         assert isinstance(execution, verify.Execution)  # Run evidence always queues one
         # ANCHOR_END: submit

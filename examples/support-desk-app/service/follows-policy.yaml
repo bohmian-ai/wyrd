@@ -1,6 +1,8 @@
-# An Agent reads the refund policy PDF and lists its rules with their pages,
-# then a tool-less judge checks the answer against those rules, citing the
-# policy. Both call a model, so the app runs this one in the background.
+# The support agent writes a refund decision letter; this Verifier checks the
+# letter against the refund policy. The policy is fixed in policy-judge's
+# prompt, so the letter is the only evidence the app sends, and a new policy
+# means a new judge and Verifier version. The judge calls a model, so the app
+# runs this one in the background.
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
@@ -8,23 +10,19 @@ metadata:
   version: 1.0.0
   space: support
 spec:
-  description: A support answer agrees with the refund policy.
+  description: A refund decision letter follows the refund policy.
   inputs:
-    answer: {type: json}
-    policy: {type: media, formats: [pdf], max_bytes: 1048576}
+    letter: {type: media, formats: [markdown], max_bytes: 1048576}
   steps:
-    - id: findings
-      action:
-        kind: agent
-        agent: ./policy-reader.yaml
-        workspace: {/inputs/policy.pdf: inputs.policy}
+    # Turn the uploaded file into text the judge can read and cite by line.
+    - id: read-letter
+      action: {kind: extract, from: inputs.letter}
   requirements:
     - id: follows-policy
-      statement: The answer agrees with the refund policy
+      statement: The letter's refund decision follows the refund policy
       check:
         kind: agent
         agent: ./policy-judge.yaml
         inputs:
           claim: requirement.statement
-          answer: inputs.answer
-          findings: steps.findings.output
+          letter: steps.read-letter.output

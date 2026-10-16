@@ -1,6 +1,6 @@
 ---
 title: Verify a request in real time
-description: Call a bound Verifier from your service while a request is in flight, with JSON and file evidence, and act on the requirement breakdown.
+description: Call a bound Verifier from your service while a request is in flight, act on the verdict, and read the requirement breakdown.
 pillar: wyrd
 section: Build and verify
 topic: Verify
@@ -9,64 +9,85 @@ draft: true
 status: runnable
 ---
 
-Call `observe.verify` inside a run, get the result back in the same request, and decide what your service does next. Here the support desk checks every answer against its refund-policy PDF before it goes out, and hands the ticket to a person when the answer fails.
+Call `observe.verify` inside a run, get the result back in the same request, and decide what your service does next. Here the support desk checks every answer with two model-free Verifiers before it replies, and replaces an answer that promises a refund with a handoff to billing.
 
 ## Prerequisites
 
 - A running service that loads its bundle, as in [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/).
-- The `policy-check` Verifier from [How verification works](/understand/how-verification-works/#four-parts-of-a-verifier), bound to the component you call it on:
+- Verifiers bound to the Card you call them on. The support desk binds `no-refund-promise` to the Service and `ticket-complete` to its `agent` component:
 
-  ```yaml title="service/support-desk.yaml (excerpt)"
-  - alias: agent
-    ref: ./support-agent.yaml
-    verified_by:
-      - verifier: ./policy-check.yaml
-  ```
+<Tabs>
+<Tab label="support-desk.yaml">
 
-- `verifier:run` on that Verifier. The `workload` role a registered Service gets includes it. The Verifier's Agent steps also need their own permissions; see [Agent tools and authorization](/reference/agent-tools-and-authorization/).
+<CodeFromFile file="examples/support-desk-app/service/support-desk.yaml" lang="yaml" title="service/support-desk.yaml" />
 
-## 1. Call the Verifier and act on the verdict
+</Tab>
+<Tab label="no-refund-promise.yaml">
 
-Pass one named value per input slot. JSON is ordinary data; a file is a `File` from a path or bytes.
+<CodeFromFile file="examples/support-desk-app/service/no-refund-promise.yaml" lang="yaml" title="service/no-refund-promise.yaml" />
+
+</Tab>
+<Tab label="ticket-complete.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/ticket-complete.yaml" lang="yaml" title="service/ticket-complete.yaml" />
+
+</Tab>
+<Tab label="support-agent.yaml">
+
+<CodeFromFile file="examples/support-desk-app/service/support-agent.yaml" lang="yaml" title="service/support-agent.yaml" />
+
+</Tab>
+</Tabs>
+
+- `verifier:run` on those Verifiers. The `workload` role a registered Service gets includes it.
+
+## 1. Call the Verifiers
+
+Pass one keyword per input slot the Verifier declares. JSON is ordinary data; a file is a `verify.File`, covered [below](#files).
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+<CodeFromFile file="examples/support-desk-app/python/desk.py" lang="python" region="check" title="desk.py" />
+
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/support-desk-app/rust/lib.rs" lang="rust" region="check" title="lib.rs" />
+
+</LangTab>
+<LangTab lang="typescript">
+
+<CodeFromFile file="examples/support-desk-app/typescript/server.ts" lang="typescript" region="check" title="server.ts" />
+
+</LangTab>
+</LangTabs>
+
+The name is the Verifier's Card name. The SDK looks it up among the Verifiers bound to the view's Card in your loaded bundle: `no-refund-promise` on the run itself, which is the Service, and `ticket-complete` on `run.for_card("agent")`. A Verifier with exactly one slot also takes one positional value instead of a keyword.
+
+Python blocks until the result arrives; Rust and TypeScript await it. The server allows 60 seconds.
+
+## 2. Act on the verdict
+
+A `failed` verdict is an ordinary return value, so read it rather than catching an exception:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
 ```python
-import wyrd
-
-with state.run("agent") as run:
-    answer = run.invoke({"question": question})
-    result = run.observe.verify(
-        "policy-check",
-        answer={"text": answer},
-        policy=wyrd.verify.File("refund-policy.pdf"),
-    )
-    if result.outcome.verdict != "passed":
-        answer = hand_to_person(ticket_id)  # your fallback
+results = desk.check(run, ticket)
+if results["no-refund-promise"].verdict != "passed":
+    answer = HANDOFF  # "I've passed your question to our billing team..."
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
 ```rust
-use wyrd_ai::observe::{File, Input, Inputs};
 use wyrd_ai::VerificationVerdict;
 
-let run = state.run_for_card("agent")?;
-let mut answer = run.invoke(&[("question", question)]).await?;
-let result = run
-    .observe()
-    .verify(
-        "policy-check",
-        Inputs::named([
-            ("answer", Input::from(json!({ "text": answer }))),
-            ("policy", File::path("refund-policy.pdf").into()),
-        ]),
-    )
-    .await?;
-if result.outcome.verdict != VerificationVerdict::Passed {
-    answer = hand_to_person(ticket_id); // your fallback
+if promise.outcome.verdict != VerificationVerdict::Passed {
+    answer = HANDOFF.to_owned();
 }
 ```
 
@@ -74,46 +95,35 @@ if result.outcome.verdict != VerificationVerdict::Passed {
 <LangTab lang="typescript">
 
 ```typescript
-import { File } from "wyrd-ai";
-
-const run = state.run("agent");
-let answer = await run.invoke({ question });
-const result = await run.observe.verify("policy-check", {
-  answer: { text: answer },
-  policy: File.path("refund-policy.pdf"),
-});
-if (result.outcome.verdict !== "passed") {
-  answer = await handToPerson(ticketId); // your fallback
-}
+const promised = promise.outcome.verdict !== "passed";
+return { run_id: wyrdRun.runId, answer: promised ? HANDOFF : text, checks };
 ```
 
 </LangTab>
 </LangTabs>
 
-The name is the Verifier's Card name. The SDK looks it up among the Verifiers bound to `agent` in your loaded bundle, so a Verifier bound only to another component is not callable from this view. A Verifier with exactly one slot also takes one positional value instead of names.
-
-Python blocks until the result arrives; Rust and TypeScript await it. The server allows 60 seconds. A `failed` verdict is an ordinary return value, so read the verdict rather than catching an exception.
+`inconclusive` means no judgment was possible, such as a missing input. Treat it as not passed.
 
 ### Files
 
-`File` reads nothing when you create it. During the call the SDK hashes it, asks the server which digests it is missing, uploads only those directly to your tenant's object storage, and sends the digest in the request. The same policy file uploads once and is reused by every later call. Format comes from the file extension, from the slot when it accepts one format, or from what you declare:
+`File` reads nothing when you create it. During the call the SDK hashes it, asks the server which digests it is missing, uploads only those directly to your tenant's object storage, and sends the digest in the request. The same file uploads once and is reused by every later call. Format comes from the file extension, from the slot when it accepts one format, or from what you declare:
 
 | Language | From a path | From bytes |
 | --- | --- | --- |
-| Python | `wyrd.verify.File("refund-policy.pdf")` | `wyrd.verify.File(data, format="pdf", filename="policy.pdf")` |
-| Rust | `verify::File::path("refund-policy.pdf")` | `verify::File::bytes(data).with_format(MediaFormat::Pdf)` |
-| TypeScript | `verify.File.path("refund-policy.pdf")` | `verify.File.bytes(data, { format: "pdf" })` |
+| Python | `wyrd.verify.File("letter.md")` | `wyrd.verify.File(data, format="pdf", filename="policy.pdf")` |
+| Rust | `wyrd_ai::verify::File::path("letter.md")` | `wyrd_ai::verify::File::bytes(data).with_format(MediaFormat::Pdf)` |
+| TypeScript | `verify.File.path("letter.md")` | `verify.File.bytes(data, { format: "pdf" })` |
 
-To use a file already registered as an Artifact, pass an `ArtifactRef` instead: `wyrd.verify.ArtifactRef(card_ref, path="refund-policy.pdf")`, `verify::ArtifactRef::new(card_ref, Some(path))`, or `new verify.ArtifactRef(cardRef, { path })`. It is read with the Artifact's own authorization.
+To use a file already registered as an Artifact, pass an `ArtifactRef` instead: `wyrd.verify.ArtifactRef(card_ref, path="refund-policy.pdf")`, `verify::ArtifactRef::new(card_ref, Some(path))`, or `new verify.ArtifactRef(cardRef, "refund-policy.pdf")`. It is read with the Artifact's own authorization.
 
-## 2. Read the breakdown
+## 3. Read the breakdown
 
 | Field | Holds |
 | --- | --- |
 | `execution_id` | The server-issued ID of this execution |
 | `run_id` | Your run |
 | `verifier`, `subject` | The exact Verifier and Card versions |
-| `outcome.verdict` | `passed`, `failed`, or `inconclusive` |
+| `outcome.verdict` | `passed`, `failed`, or `inconclusive`. Python also exposes it as `result.verdict` |
 | `outcome.requirements` | One entry per requirement: `id`, `step`, `statement`, `outcome`, `reason`, `actual`, `citations`, `detail`, and the check's provenance |
 | `outcome.steps` | One entry per step: `id`, `status`, `output`, `attempts`, `duration_ms`, `reason`, `tool_calls` |
 | `outcome.evidence` | The pinned input declarations, by slot, with file digests |
@@ -122,10 +132,9 @@ To use a file already registered as an Artifact, pass an `ArtifactRef` instead: 
 <LangTab lang="python">
 
 ```python
-for requirement in result.outcome.requirements:
-    print(requirement.id, requirement.outcome, requirement.reason)
-# no-guaranteed-refund  failed  "found 'guaranteed refund'"
-# follows-policy        failed  "policy allows refunds within 30 days only"  policy p.2
+for requirement in result.requirements:
+    print(requirement["id"], requirement["outcome"], requirement["reason"])
+# ticket-complete failed missing order_id
 ```
 
 </LangTab>
@@ -149,9 +158,9 @@ for (const requirement of result.outcome.requirements) {
 </LangTab>
 </LangTabs>
 
-Each citation names an original input slot and a location in it, such as `{ "slot": "policy", "locator": { "page": 2 } }`. A judge that passes without a valid citation is reported as `inconclusive`.
+Each citation names an original input slot and a location in it, such as `{ "slot": "ticket", "locator": { "json_pointer": "" } }` from `ticket-complete`, or `{ "slot": "policy", "locator": { "page": 2 } }` from a judge reading a PDF. A judge that passes without a valid citation is reported as `inconclusive`.
 
-## 3. Confirm the result was stored
+## 4. Confirm the result was stored
 
 After it answers, the server stores the pinned inputs and the result in `vala.verification.results`, tied to your run, with `binding_id` null. A `verify` call never starts queued work and never runs Operators.
 
@@ -206,7 +215,7 @@ The row appears shortly after the call returns. The server stores it in the back
 
 ## Checks that do not belong on the request path
 
-A Verifier with `samples` slots and `drift` checks judges a scheduled window, so `verify` refuses it; record its samples with `submit` as in [Monitor drift](/build-and-verify/verify/monitor-drift/). A slow review, such as an Agent reading a large document, can be queued with `submit` instead of holding the request; see [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/).
+A Verifier with `samples` slots and `drift` checks judges a scheduled window, so `verify` refuses it; record its samples with `submit` as in [Monitor drift](/build-and-verify/verify/monitor-drift/). A slow review, such as the support desk's `follows-policy`, which reads a PDF and calls a model twice, belongs in `submit` instead of holding the request; see [Submit for later](/build-and-verify/observe/record-a-run-and-observations/#submit-for-later).
 
 ## What can go wrong
 

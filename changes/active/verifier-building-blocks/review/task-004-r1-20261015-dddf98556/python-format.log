@@ -1,0 +1,2 @@
+[py:format:check] $ uv run ruff format --check python/wyrd tests scripts
+168 files already formatted

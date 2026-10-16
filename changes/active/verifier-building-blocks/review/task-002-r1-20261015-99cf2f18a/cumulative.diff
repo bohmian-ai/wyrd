@@ -1,0 +1,3878 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 078bc585b..603a77304 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -8535,6 +8535,7 @@ dependencies = [
+  "tokio-util",
+  "tracing",
+  "uuid",
++ "vala-drift",
+  "workspace-hack",
+  "wyrd-error-derive",
+  "wyrd-semver",
+diff --git a/changes/active/verifier-building-blocks/tasks/TASK-002-verification-engine.md b/changes/active/verifier-building-blocks/tasks/TASK-002-verification-engine.md
+new file mode 100644
+index 000000000..8962e87ae
+--- /dev/null
++++ b/changes/active/verifier-building-blocks/tasks/TASK-002-verification-engine.md
+@@ -0,0 +1,275 @@
++---
++id: TASK-002
++kind: implementation
++status: ready
++spec: SPEC-verifier-building-blocks
++spec_revision: 6
++requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-014, REQ-015, INV-001, INV-005, INV-006, INV-007, INV-008, AC-002, AC-003, AC-007, AC-010]
++depends_on: [TASK-001]
++---
++
++# An independently testable verification engine
++
++## Outcome and Value
++
++Given resolved evidence and injected action/check implementations, the Vala
++engine evaluates the complete approved Verifier graph and returns an honest,
++attributable breakdown. It is usable without a server, registry, database,
++object store, real provider, or language interpreter lifetime.
++
++## Owners, Scope, Consumers, and Prohibited Changes
++
++Own the Vala graph planner/driver, scope, requirement execution, aggregation,
++assertion/trace checks, and drift-check composition. Keep statistical math and
++fitted baselines owned by `vala-drift`. Task 3 owns Agent/code/extraction
++implementations; task 5 owns authorization, evidence reads, persistence,
++scheduling, and composing those implementations into hosted runs.
++
++Reuse `TaskExecutor`/`Executors`, the stage driver, scope/context, and registry
++rather than adding a second graph or scheduler. Consume task 1's shared
++boundary; do not edit that boundary privately during the parallel wave.
++Adapt existing scenario consumers necessary to keep this crate buildable;
++do not remove scenario evaluation or add a new scenario action. Do not touch
++server routes, SQL, SDKs, or task 3's hosted runtime.
++
++## Source-backed Reuse Map
++
++| Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
++| --- | --- | --- | --- | --- | --- |
++| Graph execution | `vala-eval/src/executor.rs::execute_plan`, `execute_stage`, `Executors`, `RunLedger`; `store.rs::TaskRegistry` | `executor.rs` unit modules, assertion/judge/trace executors, scenario consumers | Driver assumes every task is a check and aborts on errors | Generalize existing stages to actions plus step/final requirements and cause-preserving skips | No new graph store or orchestration owner |
++| Scoped values | `context.rs::ContextSnapshot`, `ExecutionContext`, `TaskOutput`; existing required-selector handling | Assertion/trace task executors and context tests | Context carries kind-specific task outputs, not the approved scope | Extend the existing scope into task 1's reference model | Replace the internal representation in its owner; no second selector language |
++| Deterministic checks | `tasks/assertion.rs::AssertionTaskExecutor`; `tasks/trace.rs::TraceTaskExecutor`; `TraceSource` | Their in-module tests and executor composition | Check input/outputs are EvalTask/AssertionResult-specific | Reuse comparators and injected trace access under generic requirements | New check adapters only where old task contracts cannot express the new requirement |
++| Drift composition | `vala-drift::score_drift`, `fit_baseline`, report types; server `DriftEngine::verify` is the current IO host | Drift public-surface/scoring tests; server drift completeness tests | Multiple drift requirements need distinct state and generic detail | Add the requirement-level adapter over resolved samples/fitted state; keep IO outside | Adapter earns its place; statistical engines remain unchanged |
++
++## Approach
++
++1. Consume the contract handoff and revalidate driver/context/scenario callers.
++2. Evolve the existing DAG execution into data preparation and two requirement
++   positions using injected executors.
++3. Preserve dependency cause, retry/deadline/cancellation bounds, and visible
++   execution attempts without turning engine failures into subject failures.
++4. Reuse deterministic and statistical executors and aggregate exactly once.
++5. Prove the module with in-memory inputs, scripted executors, and deterministic
++   synchronization; hand task 5 one cohesive callable engine.
++
++## Ordered Implementation Scenarios
++
++### Scenario 1 — A Verifier with no preparation can judge inputs
++
++**Behavior.** Assertions and trace checks use declared evidence, return one
++result per requirement, distinguish a failed assertion from an execution
++failure, and retain permitted actual/provenance values (REQ-002/005/015).
++
++**RED.** Add focused IO-free engine tests in the existing Vala library target.
++Use in-memory trace data and explicit inputs. Observe the missing generic
++check/result behavior before implementation; collect and record exact names.
++
++**GREEN.** Adapt existing comparison and trace execution to the generic
++contracts; return complete results without requiring a hosted service.
++
++**REFACTOR.** Keep pure selection/comparison synchronous and consolidate
++shared behavior in its existing cohesive owner.
++
++### Scenario 2 — Data and judgments run in the right order
++
++**Behavior.** References establish dependencies; independent actions overlap
++within budgets; a dependent waits for the upstream action and its step
++requirements; final requirements run once after every stage (REQ-003/004).
++
++**RED.** Add focused driver tests using scripted executors and explicit
++barriers/notifications. Prove overlap and ordering without sleeps, artificial
++host load, real providers, or test-thread inflation.
++
++**GREEN.** Extend the existing driver and scope to execute the two positions.
++Rerun scenarios 1 and 2; preserve deterministic output/declaration ordering
++where callers rely on it.
++
++**REFACTOR.** Remove obsolete task-kind dispatch duplication. Keep injected
++capabilities narrow and state on meaningful owning types.
++
++### Scenario 3 — Failure cannot disappear through a skipped dependency
++
++**Behavior.** Intentional skips are not applicable; failure/timeouts and their
++blocked descendants are inconclusive; failure wins when causes mix. Missing
++values do not call checks. All-skipped/empty is inconclusive; pass rate counts
++inconclusive requirements and each verdict only once (REQ-006).
++
++**RED.** Add focused table-driven engine tests for direct/transitive and
++mixed-cause dependencies, optional/null and missing required evidence, both
++decision rules, and threshold boundaries. Fail for the wrong observable
++outcome, not an absent provider.
++
++**GREEN.** Preserve causes through the existing ledger/scope and implement
++the approved rollup. Rerun all earlier scenarios after each change.
++
++**REFACTOR.** Eliminate duplicate skip/aggregation decisions rather than
++introducing a fallback that silently passes missing evidence.
++
++### Scenario 4 — Drift and runtime budgets remain honest
++
++**Behavior.** PSI/SPC/Custom adapters retain statistical detail, requirement-
++specific fitted state, minimum-sample/readiness behavior, and inconclusive
++insufficient data. Bounded retries/timeouts stop work and retain attempts;
++unrelated requirements may finish (REQ-004/005/014/015).
++
++**RED.** Add focused tests using existing drift fixtures, fitted in-memory
++state, and scripted retry/cancellation behavior. Tests require no SQL,
++external file reads, model calls, or Python/Node lifetime.
++
++**GREEN.** Compose existing scorers through the generic engine seam and
++apply execution budgets. Rerun all earlier scenarios and affected scenario
++simulator regressions.
++
++**REFACTOR.** Remove superseded executor logic once its local consumers move;
++hand any remaining old live-server consumer removal to task 5 explicitly.
++
++## Contract Handoff From TASK-001
++
++- Drive steps and Agent/code checks through `vala_eval::blocks::ActionExecutor`
++  and `CheckExecutor`. Both return `vala_eval::blocks::BlockError`.
++- Retry rule: `BlockError::is_retryable()` (only `Retryable`) spends the step's
++  `retries` budget; `Terminal`, or `Retryable` after the budget is spent, makes
++  the step `failed` and its dependents follow the REQ-006 skip table. A check
++  error makes that requirement `inconclusive` with the error text as `reason`.
++- The engine owns the deadline: race each attempt against `BlockCall::deadline`
++  and drop the future on expiry; executors never report timeouts. Record an
++  expired step as `failed` with reason `timed out`.
++- The LLM judge is not kept (owner decision). Do not call, extend, or depend on
++  `JudgeInvoker`, `JudgeError`, `JudgeTaskExecutor`, `Executors::judge`, or
++  `EvalTask::LlmJudge` from new engine code. Leave them compiling until
++  TASK-005 deletes them with their last consumers (removal map in TASK-005).
++
++## Acceptance Criteria
++
++- The same engine handles no-step and multi-step Verifiers without server IO.
++- Scripted capabilities prove isolation, overlap, ordering, cancellation,
++  retries, failure causes, and complete result provenance.
++- Existing drift math is reused unchanged; assertions remain deterministic.
++- No SDK, persistence, policy, or reaction logic moves into the engine.
++- Task 5 can compose task 3's implementations through the shared boundary;
++  no special production engine is created just for tests.
++
++## Expected Write Set and Consumer Closure
++
++`crates/vala/vala-eval` executor, scope/context, registry/planning integration,
++existing deterministic tasks, result/capture adapters, and their local tests;
++`vala-drift` only for a necessary existing-owner adapter or regression.
++Preserve unrelated offline/scenario entry points. Own the Vala root re-exports
++and its crate manifest; task 3 owns orchestrator invoker internals and server
++runtime dependencies. Coordinate lockfile effects through README ownership.
++
++## Verification and Evidence
++
++All new runtime logic uses ordered TDD. Record each actual focused test selector
++before GREEN; this packet intentionally does not invent future function names.
++The following are isolated owner-level checks, not the final integrated gate:
++
++```bash
++mise exec -- cargo nextest run --locked -p vala-eval --lib
++mise exec -- cargo nextest run --locked -p vala-drift --lib
++mise exec -- cargo clippy --locked -p vala-eval -p vala-drift --all-features --lib -- -D warnings
++mise run fmt
++mise run check:deps
++```
++
++Do not run the Vala integration target or full journey suites here; keep their
++existing consumers compiling and supply any required regression changes for
++the once-integrated run. No network credentials are required.
++
++## Material Stop Conditions
++
++A new graph runtime/store, altered statistical algorithm or baseline policy,
++new source selection, changes to verdict semantics, unbounded concurrency,
++external writes, or a new public format requires spec authority. Routine
++private context/driver organization stays implementation-owned.
++
++## Authority Links
++
++- [Approved specification r6](../spec.md), [supporting proposal](../proposal.md),
++  [worked examples](../example.md), and [flow diagram](../architecture/verification-flow.html).
++- [AGENTS.md](../../../../AGENTS.md), [agent rules](../../../../architecture/agent-rules.md),
++  [Wyrd design](../../../../architecture/wyrd-design.md), and
++  [Bifrost design](../../../../architecture/bifrost-design.md).
++- [Execution and final proof coordination](README.md). Ready after owner-approved
++  completion of TASK-001; execute independently alongside the other parallel tasks.
++
++## Implementation Evidence
++
++Commits: `d646b27ec` (engine, scope, drift adapter, shared-helper extraction,
++scenario 1–3 and runtime-budget tests), `450ac96c1` (drift requirements).
++
++TDD order note: the engine was drafted before its tests within the same
++working session, so no isolated RED run was captured per scenario. The first
++test run did go red on two real defects: `requirement_at` eagerly indexed the
++whole-Verifier list (`map_or` default) and panicked for step requirements, and
++the `each` fixture reused step IDs as requirement IDs. Both were fixed before
++GREEN.
++
++### Reuse map revalidation
++
++| Capability | Existing owner | Gap found | Extension taken |
++| --- | --- | --- | --- |
++| Graph planning | `VerifierSpec::plan()` (TASK-001, shared planner over `ExecutionPlan`) | `execute_plan` drives `EvalTask`s only and aborts on errors | `blocks::engine::VerificationEngine` walks the same `plan()` stages; no second planner/graph store. `execute_plan`/`ContextSnapshot` stay for scenario consumers (task 5 removal map) |
++| Scoped values | `context.rs::extract_jsonpath_from`, TASK-001 `Reference`/`PathSegment` | `ContextSnapshot` holds Eval task outputs, not Verifier steps/verdicts or gap causes | `blocks::scope::Scope` resolves TASK-001 references with `Cause` (skip vs failure); no new selector language |
++| Comparisons | `tasks/assertion.rs::evaluate_single`, `evaluate_item_mode` | Took `&AssertionTask` | Narrowed to `(id, operator, expected, observed)`; Eval path unchanged |
++| Trace checks | `tasks/trace.rs::project_spans`, `TraceSource` | Private | Made `pub(crate)`; engine reuses projection + `extract_jsonpath_from` |
++| Context capture | `results.rs::apply_context_capture` | Bound to Eval results | Extracted `capture_actual`; Eval path delegates to it |
++| Drift | `vala-drift::score_drift`, `fit_baseline`, `FittedBaseline` | No requirement-level adapter | `blocks::drift::DriftChecks` selects per-requirement fitted state and per-slot samples, calls `score_drift` unchanged, serde-converts the report as the server does |
++| Concurrency/deadline | tokio `JoinSet`, `Semaphore`, `timeout_at` | — | One bounded semaphore per engine; per-attempt timeout capped by the execution deadline |
++
++### Acceptance
++
++| Acceptance criterion | Implementation evidence | Verification evidence | Result |
++|---|---|---|---|
++| Same engine handles no-step and multi-step Verifiers without server IO | `blocks/engine.rs::VerificationEngine::run` | `no_step_verifier_judges_inputs_and_traces`, `dependents_wait_for_upstream_step_requirements` | PASS |
++| Assertions/trace distinguish failure from execution failure, keep actual | `engine.rs::judge`, `Judged::compared` | `no_step_verifier_judges_inputs_and_traces`, `each_assertion_compares_every_wildcard_match`, `context_capture_hashes_or_redacts_actual_values` | PASS |
++| Overlap within the bound; ordering of action → step requirements → dependent → final | `run_steps`, `run_requirements`, `drive` | `independent_actions_overlap_within_the_concurrency_bound` (barrier), `dependents_wait_for_upstream_step_requirements` (call log) | PASS |
++| REQ-006 causes: skip → not_applicable, failure/blocked → inconclusive, failure wins, no check on missing values, status-only reads | `blocks/scope.rs::{Cause, Missing, Settled}`, `engine.rs::prepare` | `skip_causes_propagate_and_failure_wins`, `missing_and_optional_evidence_resolve_honestly`, `select_distinguishes_absent_from_null` | PASS |
++| Empty/all-skipped inconclusive; pass rate counts inconclusive, inclusive threshold, each verdict once | `engine.rs::decide` | `empty_and_all_skipped_verifiers_are_inconclusive`, `decide_rules_count_inconclusive_requirements` | PASS |
++| Retries, timeouts, cancellation, visible attempts; unrelated work finishes | `engine.rs::attempt`, `run` | `retries_spend_the_budget_and_keep_attempts_visible`, `step_timeouts_fail_the_step_and_let_unrelated_work_finish`, `execution_deadline_cancels_running_work` | PASS |
++| Agent/code citations limited to reachable evidence | `Judged::cited` | `hosted_check_passes_need_reachable_citations` | PASS |
++| Drift math reused unchanged; per-requirement fitted state; readiness/insufficient data inconclusive; detail + provenance kept | `blocks/drift.rs::DriftChecks` | `drift_requirements_score_through_vala_drift`; `vala-drift` lib unchanged (75 pass) | PASS |
++| No SDK, persistence, policy, or reaction logic in the engine; no test-only engine | Write set limited to `crates/vala/vala-eval` + lockfile line | `git diff --stat`, `mise run check:deps` | PASS |
++| Task 5 composes task 3 implementations through the shared boundary | `VerificationEngine::new(Arc<dyn ActionExecutor>, Arc<dyn CheckExecutor>, Arc<dyn TraceSource>, NonZeroUsize).with_drift(..)`, exported from `vala_eval::blocks` | Scripted executors in tests use the same trait seam | PASS |
++
++### Non-goals kept excluded
++
++No server routes, SQL, SDKs, task 3 hosted runtime, or TASK-001 `wyrd-spec`
++boundary edits. No dependency on `JudgeInvoker`, `JudgeError`,
++`JudgeTaskExecutor`, `Executors::judge`, or `EvalTask::LlmJudge`. Old
++`execute_plan` and scenario evaluation preserved; their removal remains with
++task 5. `vala-drift` unchanged.
++
++### Commands
++
++```bash
++mise exec -- cargo nextest run --locked -p vala-eval --lib            # 120 passed
++mise exec -- cargo nextest run --locked -p vala-drift --lib           # 75 passed
++mise exec -- cargo clippy --locked -p vala-eval -p vala-drift --all-features --lib -- -D warnings  # clean
++mise exec -- cargo clippy --locked -p vala-eval --all-features --lib --tests -- -D warnings        # clean
++mise run fmt                                                          # clean
++mise run check:deps                                                   # exit 0
++git diff --check                                                      # clean
++# Focused, each 1 passed:
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::scope::tests::select_distinguishes_absent_from_null)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::no_step_verifier_judges_inputs_and_traces)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::context_capture_hashes_or_redacts_actual_values)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::independent_actions_overlap_within_the_concurrency_bound)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::dependents_wait_for_upstream_step_requirements)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::each_assertion_compares_every_wildcard_match)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::skip_causes_propagate_and_failure_wins)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::missing_and_optional_evidence_resolve_honestly)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::empty_and_all_skipped_verifiers_are_inconclusive)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::decide_rules_count_inconclusive_requirements)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::retries_spend_the_budget_and_keep_attempts_visible)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::step_timeouts_fail_the_step_and_let_unrelated_work_finish)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::execution_deadline_cancels_running_work)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::hosted_check_passes_need_reachable_citations)'
++mise exec -- cargo nextest run --locked -p vala-eval --lib -E 'test(=blocks::engine::tests::drift_requirements_score_through_vala_drift)'
++```
++
++Material limit: the Vala integration target and journey suites were not run
++(per task); scenario consumers still compile against the preserved
++`execute_plan`.
++
++Status: IMPLEMENTED.
+diff --git a/crates/vala/vala-eval/Cargo.toml b/crates/vala/vala-eval/Cargo.toml
+index 246bd4558..c6b5e145a 100644
+--- a/crates/vala/vala-eval/Cargo.toml
++++ b/crates/vala/vala-eval/Cargo.toml
+@@ -31,6 +31,7 @@ thiserror = { workspace = true }
+ tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
+ tracing = { workspace = true }
+ uuid = { workspace = true }
++vala-drift = { workspace = true }
+ wyrd-error-derive = { workspace = true }
+ wyrd-spec = { workspace = true }
+ wyrd-utils = { workspace = true }
+diff --git a/crates/vala/vala-eval/src/blocks.rs b/crates/vala/vala-eval/src/blocks.rs
+index 8907b57d7..1654b2ca3 100644
+--- a/crates/vala/vala-eval/src/blocks.rs
++++ b/crates/vala/vala-eval/src/blocks.rs
+@@ -28,6 +28,13 @@ use wyrd_spec::verification::execution::{
+     CallProvenance, InputDeclaration, RequirementDetail, ToolCallRecord, Verdict,
+ };
+ 
++mod drift;
++mod engine;
++mod scope;
++
++pub use drift::DriftChecks;
++pub use engine::{EngineError, VerificationEngine};
++
+ /// Where a block sits in the Verifier, which fixes what it may read and do.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Position<'a> {
+diff --git a/crates/vala/vala-eval/src/blocks/drift.rs b/crates/vala/vala-eval/src/blocks/drift.rs
+new file mode 100644
+index 000000000..9cb8602d8
+--- /dev/null
++++ b/crates/vala/vala-eval/src/blocks/drift.rs
+@@ -0,0 +1,147 @@
++//! Requirement-level adapter from Verifier `drift` checks to `vala-drift`.
++//!
++//! The statistical engines, fitted baselines, minimum-sample rules, and
++//! insufficient-data behavior stay owned by `vala-drift`; this adapter only
++//! selects the requirement's own fitted state and its slot's samples, scores
++//! them with [`vala_drift::score_drift`], and projects the report onto the
++//! requirement result. Reading samples and fitted state is IO and stays with
++//! the caller, which builds one [`DriftChecks`] per execution.
++
++use std::collections::BTreeMap;
++
++use arrow::record_batch::RecordBatch;
++use vala_drift::{DriftReport, DriftVerdict, FittedBaseline, score_drift};
++use wyrd_spec::card::blocks::DriftCheck;
++use wyrd_spec::card::drift::{DriftMethod, DriftProfile};
++use wyrd_spec::ids::SlotName;
++use wyrd_spec::vala::eval::TaskId;
++use wyrd_spec::verification::execution::{CallProvenance, RequirementDetail, Verdict};
++use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
++
++use super::CheckOutput;
++
++/// The resolved scheduled evidence of one execution's drift checks.
++#[derive(Debug, Clone, Default)]
++pub struct DriftChecks {
++    /// The scored sample window, recorded as each check's provenance.
++    window: Option<DriftWindow>,
++    /// Fitted state keyed by the globally unique requirement ID.
++    baselines: BTreeMap<TaskId, FittedBaseline>,
++    /// Window samples keyed by samples slot.
++    samples: BTreeMap<SlotName, RecordBatch>,
++}
++
++impl DriftChecks {
++    /// Evidence for one window: fitted state per requirement and samples per
++    /// slot. A requirement without fitted state is unready, except Custom,
++    /// which has no fit phase.
++    #[must_use]
++    pub fn new(
++        window: Option<DriftWindow>,
++        baselines: BTreeMap<TaskId, FittedBaseline>,
++        samples: BTreeMap<SlotName, RecordBatch>,
++    ) -> Self {
++        Self {
++            window,
++            baselines,
++            samples,
++        }
++    }
++
++    /// Judge one drift requirement.
++    ///
++    /// Missing samples, an unready baseline, and any scoring refusal are
++    /// inconclusive with the cause as reason; a scored report maps `NoDrift`
++    /// to passed, `Drift` to failed, and `Inconclusive` to inconclusive.
++    /// A Custom window with a null measurement of its configured metric is
++    /// the unscored report, since the Custom scorer would otherwise average
++    /// only the non-null rows; nulls in other columns do not matter.
++    #[must_use]
++    pub fn judge(&self, requirement: &TaskId, check: &DriftCheck) -> CheckOutput {
++        let Some(samples) = check.on.slot().and_then(|slot| self.samples.get(slot)) else {
++            return self.inconclusive(format!("no samples were recorded for `{}`", check.on));
++        };
++        if let Some(DriftProfile::Custom(profile)) = &check.spec.profile
++            && samples
++                .column_by_name(&profile.metric_name)
++                .is_some_and(|column| column.null_count() > 0)
++        {
++            return self.scored(&DriftReport::unscored(check.spec.method));
++        }
++        let custom = FittedBaseline::Custom;
++        let baseline = match check.spec.method {
++            DriftMethod::Custom => &custom,
++            DriftMethod::Psi | DriftMethod::Spc => match self.baselines.get(requirement) {
++                Some(baseline) => baseline,
++                None => {
++                    return self.inconclusive(format!(
++                        "the fitted baseline of `{}` is not ready",
++                        requirement.as_str()
++                    ));
++                }
++            },
++        };
++        match score_drift(baseline, samples, &check.spec) {
++            Ok(report) => self.scored(&report),
++            Err(error) => self.inconclusive(error.to_string()),
++        }
++    }
++
++    /// Project a scored report, keeping its full statistics as detail.
++    ///
++    /// Callers that score outside [`DriftChecks::judge`], such as a
++    /// pre-aggregated window read, use this to produce the same result.
++    #[must_use]
++    pub fn scored(&self, report: &DriftReport) -> CheckOutput {
++        // The wire report mirrors the engine report; a non-finite score of an
++        // inconclusive feature becomes an absent value.
++        let Ok(wire) = serde_json::to_value(report).and_then(serde_json::from_value) else {
++            return self.inconclusive("the drift report cannot be encoded".to_owned());
++        };
++        let drifted = report
++            .features
++            .values()
++            .filter(|feature| feature.verdict == DriftVerdict::Drift)
++            .count();
++        let outcome = match report.verdict {
++            DriftVerdict::NoDrift => VerificationVerdict::Passed,
++            DriftVerdict::Drift => VerificationVerdict::Failed,
++            DriftVerdict::Inconclusive => VerificationVerdict::Inconclusive,
++        };
++        CheckOutput {
++            verdict: Verdict {
++                outcome,
++                reason: format!(
++                    "{drifted} of {} features drifted ({:?})",
++                    report.features.len(),
++                    report.verdict
++                ),
++                citations: Vec::new(),
++            },
++            actual: None,
++            detail: Some(RequirementDetail::Drift(wire)),
++            provenance: Some(self.provenance()),
++        }
++    }
++
++    /// An inconclusive drift result with `reason` and no statistics.
++    fn inconclusive(&self, reason: String) -> CheckOutput {
++        CheckOutput {
++            verdict: Verdict {
++                outcome: VerificationVerdict::Inconclusive,
++                reason,
++                citations: Vec::new(),
++            },
++            actual: None,
++            detail: None,
++            provenance: Some(self.provenance()),
++        }
++    }
++
++    /// The drift provenance naming the scored window.
++    fn provenance(&self) -> CallProvenance {
++        CallProvenance::Drift {
++            window: self.window,
++        }
++    }
++}
+diff --git a/crates/vala/vala-eval/src/blocks/engine.rs b/crates/vala/vala-eval/src/blocks/engine.rs
+new file mode 100644
+index 000000000..11638e256
+--- /dev/null
++++ b/crates/vala/vala-eval/src/blocks/engine.rs
+@@ -0,0 +1,834 @@
++//! The Verifier driver: data preparation, then judgments, then one verdict.
++//!
++//! [`VerificationEngine::run`] walks the stages [`VerifierSpec::plan`]
++//! derives from references and `depends_on`. Within a stage, every runnable
++//! step's action runs concurrently under the engine's concurrency bound;
++//! after the stage's actions settle, their step requirements are judged, so a
++//! dependent never starts before its upstream action and step requirements
++//! finish. Whole-Verifier requirements run once after the last stage. Each
++//! requirement is judged exactly once and reaches the `decide` rule once.
++//!
++//! Bindings are resolved against the [`Scope`] before any executor runs.
++//! A value that cannot be supplied never reaches an executor: the dependent
++//! step is skipped, or the requirement takes the outcome of the gap's cause,
++//! so a failure cannot hide behind a skipped dependency. Executor and
++//! check-isolated failures become step failures or inconclusive requirements,
++//! never subject failures; only the execution-wide deadline and orchestration
++//! faults surface as [`EngineError`].
++
++use std::collections::{BTreeMap, BTreeSet, HashMap};
++use std::num::NonZeroUsize;
++use std::sync::Arc;
++use std::time::Duration;
++
++use serde_json::Value;
++use thiserror::Error;
++use tokio::sync::Semaphore;
++use tokio::time::{Instant, timeout_at};
++
++use wyrd_spec::card::blocks::{Action, Check, Decide, Requirement, Step, TraceCheck, VerifierSpec};
++use wyrd_spec::error::WyrdError;
++use wyrd_spec::ids::SlotName;
++use wyrd_spec::vala::eval::result::EvalContextCapture;
++use wyrd_spec::vala::eval::{ExecutionPlan, Stage, TaskId};
++use wyrd_spec::verification::VerificationVerdict;
++use wyrd_spec::verification::execution::{
++    CallProvenance, Citation, InputDeclaration, RequirementDetail, RequirementOutcome,
++    RequirementResult, StepResult, StepStatus, VerificationOutcome,
++};
++
++use super::drift::DriftChecks;
++use super::scope::{Cause, Done, Missing, Scope, Settled};
++use super::{
++    ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
++    CheckOutput, Position,
++};
++use crate::context::extract_jsonpath_from;
++use crate::error::EvalExecError;
++use crate::executor::{Prepared, RunLedger, walk};
++use crate::operators;
++use crate::results::capture_actual;
++use crate::tasks::assertion::{Compared, evaluate_item_mode, evaluate_single};
++use crate::tasks::trace::project_spans;
++use crate::trace_source::TraceSource;
++
++/// An execution-wide failure: no verdict was produced.
++#[derive(Debug, Error)]
++pub enum EngineError {
++    /// The Verifier's step graph cannot be planned.
++    #[error("the Verifier cannot be planned: {0}")]
++    Plan(WyrdError),
++    /// The execution deadline expired; unfinished work was cancelled.
++    #[error("the verification deadline expired")]
++    DeadlineExceeded,
++    /// A requirement's actual value could not be captured.
++    #[error("a requirement actual value cannot be captured: {0}")]
++    Capture(#[from] EvalExecError),
++    /// A block task panicked or was aborted.
++    #[error("a verification block task stopped unexpectedly: {0}")]
++    Join(String),
++}
++
++/// The engine of one Verifier execution, composed from injected capabilities.
++///
++/// Built per execution with executors that carry the accepted caller
++/// authority. Cloning shares the same executors and concurrency bound.
++#[derive(Clone)]
++pub struct VerificationEngine {
++    /// Runs step actions.
++    actions: Arc<dyn ActionExecutor>,
++    /// Runs Agent and code checks.
++    checks: Arc<dyn CheckExecutor>,
++    /// Reads declared trace evidence for `trace` checks.
++    traces: Arc<dyn TraceSource>,
++    /// Scheduled evidence for `drift` checks.
++    drift: Arc<DriftChecks>,
++    /// Bounds concurrently running actions and checks.
++    permits: Arc<Semaphore>,
++}
++
++impl VerificationEngine {
++    /// An engine running at most `concurrency` blocks at once, with no
++    /// scheduled drift evidence.
++    ///
++    /// # Panics
++    /// Panics when `concurrency` exceeds [`Semaphore::MAX_PERMITS`].
++    #[must_use]
++    pub fn new(
++        actions: Arc<dyn ActionExecutor>,
++        checks: Arc<dyn CheckExecutor>,
++        traces: Arc<dyn TraceSource>,
++        concurrency: NonZeroUsize,
++    ) -> Self {
++        Self {
++            actions,
++            checks,
++            traces,
++            drift: Arc::new(DriftChecks::default()),
++            permits: Arc::new(Semaphore::new(concurrency.get())),
++        }
++    }
++
++    /// Use `drift` as the scheduled evidence of `drift` checks.
++    #[must_use]
++    pub fn with_drift(mut self, drift: DriftChecks) -> Self {
++        self.drift = Arc::new(drift);
++        self
++    }
++
++    /// Execute `spec` over the pinned `evidence` before `deadline`.
++    ///
++    /// Returns the verdict, every requirement in plan order (step
++    /// requirements by step, then whole-Verifier requirements in declaration
++    /// order), every step in plan order, and the evidence unchanged.
++    ///
++    /// The deadline is checked before any work and again before the verdict
++    /// is published, so work that completes without suspending, such as an
++    /// empty Verifier, never reports a verdict outside its budget; pending
++    /// work is cancelled when the deadline passes.
++    ///
++    /// # Errors
++    /// Returns [`EngineError::Plan`] for an unplannable graph,
++    /// [`EngineError::DeadlineExceeded`] when `deadline` is reached before
++    /// the verdict, [`EngineError::Capture`] when an actual value cannot be
++    /// hashed, and [`EngineError::Join`] when a block task panics.
++    ///
++    /// # Cancellation
++    /// Dropping the future, or the deadline expiring, aborts every running
++    /// action and check; executors release their resources on drop and no
++    /// partial result is returned.
++    pub async fn run(
++        &self,
++        spec: Arc<VerifierSpec>,
++        evidence: BTreeMap<SlotName, InputDeclaration>,
++        deadline: Instant,
++    ) -> Result<VerificationOutcome, EngineError> {
++        let expired = || Instant::now() >= deadline;
++        if expired() {
++            return Err(EngineError::DeadlineExceeded);
++        }
++        let plan = spec.plan().map_err(EngineError::Plan)?;
++        let ledger = timeout_at(deadline, self.drive(&spec, &plan, &evidence, deadline))
++            .await
++            .map_err(|_| EngineError::DeadlineExceeded)??;
++        let (mut steps, mut requirements) = (Vec::new(), Vec::new());
++        for (_, done) in ledger {
++            match done {
++                Done::Step { result, .. } => steps.push(*result),
++                Done::Requirement(result) => requirements.push(*result),
++            }
++        }
++        let verdict = decide(
++            spec.decide,
++            requirements.iter().map(|result| result.outcome),
++        );
++        if expired() {
++            return Err(EngineError::DeadlineExceeded);
++        }
++        Ok(VerificationOutcome {
++            verdict,
++            requirements,
++            steps,
++            evidence,
++        })
++    }
++
++    /// Walk every plan stage's steps, then that stage's step requirements,
++    /// then the whole-Verifier requirements, through the shared stage walk.
++    ///
++    /// `plan` must be `spec.plan()`, so every planned id names a declared
++    /// step; requirement ids are globally unique, so steps and requirements
++    /// share one ledger.
++    ///
++    /// # Errors
++    /// Returns [`EngineError::Capture`] or [`EngineError::Join`].
++    ///
++    /// # Panics
++    /// Panics when `plan` names a step `spec` does not declare.
++    async fn drive(
++        &self,
++        spec: &Arc<VerifierSpec>,
++        plan: &ExecutionPlan,
++        evidence: &BTreeMap<SlotName, InputDeclaration>,
++        deadline: Instant,
++    ) -> Result<RunLedger<Done>, EngineError> {
++        let mut blocks: HashMap<&TaskId, Block> = HashMap::new();
++        for (index, step) in spec.steps.iter().enumerate() {
++            blocks.insert(&step.id, Block::Step(index));
++            for (at, requirement) in step.requirements.iter().enumerate() {
++                blocks.insert(&requirement.id, Block::Requirement((Some(index), at)));
++            }
++        }
++        for (at, requirement) in spec.requirements.iter().enumerate() {
++            blocks.insert(&requirement.id, Block::Requirement((None, at)));
++        }
++        let mut stages = Vec::with_capacity(plan.stages.len() * 2 + 1);
++        for stage in &plan.stages {
++            stages.push(stage.clone());
++            stages.push(requirement_stage(stage.tasks.iter().flat_map(
++                |id| match blocks.get(id) {
++                    Some(Block::Step(index)) => spec.steps[*index].requirements.as_slice(),
++                    _ => panic!("the plan names only declared steps"),
++                },
++            )));
++        }
++        stages.push(requirement_stage(spec.requirements.iter()));
++        walk(
++            &stages,
++            |ledger: &RunLedger<Done>, stage| {
++                let scope = Scope::new(spec, evidence, ledger);
++                stage
++                    .tasks
++                    .iter()
++                    .map(|id| match blocks.get(id) {
++                        Some(Block::Step(index)) => Ok(self.step(spec, &scope, *index, deadline)),
++                        Some(Block::Requirement(key)) => {
++                            self.requirement(spec, &scope, *key, deadline)
++                        }
++                        None => panic!("the plan names only declared steps"),
++                    })
++                    .collect()
++            },
++            |error| EngineError::Join(error.to_string()),
++        )
++        .await
++    }
++
++    /// Prepare one step: a step whose bindings or `when` leave a gap is
++    /// skipped with that gap, otherwise its action runs under the
++    /// concurrency bound.
++    ///
++    /// # Panics
++    /// Panics when `index` is not a declared step of `spec`.
++    fn step(
++        &self,
++        spec: &Arc<VerifierSpec>,
++        scope: &Scope<'_>,
++        index: usize,
++        deadline: Instant,
++    ) -> Prepared<Done, EngineError> {
++        let step = &spec.steps[index];
++        match prepare(scope, step) {
++            Err(gap) => Prepared::Settled(skipped(step, gap)),
++            Ok(bindings) => {
++                let engine = self.clone();
++                let spec = Arc::clone(spec);
++                Prepared::Run(Box::pin(async move {
++                    let step = &spec.steps[index];
++                    let attempted = engine.attempt(step, &bindings, deadline).await;
++                    Ok(attempted.settle(step, bindings.sources()))
++                }))
++            }
++        }
++    }
++
++    /// Prepare one requirement at `key`.
++    ///
++    /// Its evidence gaps are the containing step's missing output, if any,
++    /// and every explicit binding gap; the strongest cause wins, so a failed
++    /// binding is never hidden behind an intentionally skipped owner. A
++    /// requirement with a gap takes the gap's outcome without calling its
++    /// check; otherwise the check runs under the concurrency bound.
++    ///
++    /// # Errors
++    /// Returns [`EngineError::Capture`] when an actual value cannot be
++    /// hashed.
++    ///
++    /// # Panics
++    /// Panics when `key` does not name a requirement of `spec`.
++    fn requirement(
++        &self,
++        spec: &Arc<VerifierSpec>,
++        scope: &Scope<'_>,
++        key: Key,
++        deadline: Instant,
++    ) -> Result<Prepared<Done, EngineError>, EngineError> {
++        let requirement = requirement_at(spec, key);
++        let owner = key
++            .0
++            .and_then(|index| match scope.step(&spec.steps[index].id) {
++                Some(Settled::NoOutput { gap, .. }) => Some(gap.clone()),
++                _ => None,
++            });
++        let (gap, inputs) = match check_bindings(scope, requirement) {
++            Ok(inputs) => (owner, Some(inputs)),
++            Err(gap) => (Missing::strongest(owner.into_iter().chain([gap])), None),
++        };
++        match (gap, inputs) {
++            (None, Some(inputs)) => {
++                let engine = self.clone();
++                let spec = Arc::clone(spec);
++                Ok(Prepared::Run(Box::pin(async move {
++                    let requirement = requirement_at(&spec, key);
++                    let step = key.0.map(|index| &spec.steps[index].id);
++                    let judged = engine.judge(requirement, step, inputs, deadline).await;
++                    judged.report(&spec, key)
++                })))
++            }
++            (gap, _) => {
++                Judged::missing(gap.unwrap_or_else(|| Missing::failed("a binding did not resolve")))
++                    .report(spec, key)
++                    .map(Prepared::Settled)
++            }
++        }
++    }
++
++    /// Run one step's action, retrying retryable failures and per-attempt
++    /// timeouts within its retry budget.
++    ///
++    /// A step `timeout_seconds` earlier than the execution deadline bounds
++    /// each attempt; otherwise the execution deadline governs and its expiry
++    /// surfaces as [`EngineError::DeadlineExceeded`] instead of a step
++    /// failure.
++    async fn attempt(&self, step: &Step, bindings: &Bindings, deadline: Instant) -> Attempted {
++        let _permit = self.permits.acquire().await;
++        let started = Instant::now();
++        let mut attempts = 0;
++        loop {
++            attempts += 1;
++            let timeout = step
++                .timeout_seconds
++                .map(|seconds| Instant::now() + Duration::from_secs(u64::from(seconds)))
++                .filter(|at| *at < deadline);
++            let call = BlockCall {
++                id: &step.id,
++                position: Position::Step,
++                block: &step.action,
++                inputs: bindings.inputs.clone(),
++                workspace: bindings.workspace.clone(),
++                deadline: timeout.unwrap_or(deadline),
++            };
++            let result = match timeout {
++                Some(at) => timeout_at(at, self.actions.execute(call))
++                    .await
++                    .unwrap_or_else(|_| {
++                        Err(BlockError::Retryable {
++                            reason: "timed out".to_owned(),
++                        })
++                    }),
++                None => self.actions.execute(call).await,
++            };
++            match result {
++                Err(error) if error.is_retryable() && attempts <= step.retries => {
++                    tracing::debug!(step = step.id.as_str(), attempts, %error, "retrying step");
++                }
++                result => {
++                    return Attempted {
++                        attempts,
++                        duration: started.elapsed(),
++                        result: result.map_err(|error| reason(&error)),
++                    };
++                }
++            }
++        }
++    }
++
++    /// Run one requirement's check over its resolved bindings.
++    async fn judge(
++        &self,
++        requirement: &Requirement,
++        step: Option<&TaskId>,
++        inputs: BTreeMap<String, CallInput>,
++        deadline: Instant,
++    ) -> Judged {
++        let _permit = self.permits.acquire().await;
++        match &requirement.check {
++            Check::Assert {
++                each,
++                operator,
++                expected,
++                ..
++            } => {
++                let observed = inputs.get("value").map_or(Value::Null, json);
++                let compare = if each.is_some() {
++                    evaluate_item_mode
++                } else {
++                    evaluate_single
++                };
++                Judged::compared(compare(&requirement.id, operator, expected, &observed))
++            }
++            Check::Trace(trace) => self.trace(&requirement.id, trace, &inputs, deadline).await,
++            Check::Agent(_) | Check::Code(_) => {
++                let sources: BTreeSet<SlotName> = inputs
++                    .values()
++                    .flat_map(|input| input.sources.iter().cloned())
++                    .collect();
++                let call = BlockCall {
++                    id: &requirement.id,
++                    position: step
++                        .map_or(Position::VerifierCheck, |step| Position::StepCheck { step }),
++                    block: &requirement.check,
++                    inputs,
++                    workspace: BTreeMap::new(),
++                    deadline,
++                };
++                match self.checks.execute(call).await {
++                    Ok(output) => Judged::cited(output, &sources),
++                    Err(error) => Judged::inconclusive(reason(&error)),
++                }
++            }
++            Check::Drift(drift) => Judged::checked(self.drift.judge(&requirement.id, drift)),
++        }
++    }
++
++    /// Compare the selected span value of the declared trace.
++    ///
++    /// A trace that is not supplied or cannot be read is inconclusive; a
++    /// selector matching nothing compares `null`, as Eval trace tasks do.
++    async fn trace(
++        &self,
++        id: &TaskId,
++        trace: &TraceCheck,
++        inputs: &BTreeMap<String, CallInput>,
++        deadline: Instant,
++    ) -> Judged {
++        let Some(CallValue::Evidence(InputDeclaration::Trace { trace_id })) =
++            inputs.get("on").map(|input| &input.value)
++        else {
++            return Judged::inconclusive(format!("`{}` supplied no trace", trace.on));
++        };
++        let wait = deadline.saturating_duration_since(Instant::now());
++        let spans = match self.traces.fetch(*trace_id, wait).await {
++            Ok(spans) => spans,
++            Err(error) => return Judged::inconclusive(error.to_string()),
++        };
++        let document = project_spans(*trace_id, &spans);
++        Judged::compared(
++            extract_jsonpath_from(&document, &trace.span_selector).and_then(|observed| {
++                evaluate_single(id, &trace.operator, &trace.expected, &observed)
++            }),
++        )
++    }
++}
++
++/// A step's resolved action bindings.
++struct Bindings {
++    /// Values by authored input name; an extract source is `from`.
++    inputs: BTreeMap<String, CallInput>,
++    /// Workspace files by authored path.
++    workspace: BTreeMap<String, CallInput>,
++}
++
++impl Bindings {
++    /// The original slots every binding derives from.
++    fn sources(&self) -> BTreeSet<SlotName> {
++        self.inputs
++            .values()
++            .chain(self.workspace.values())
++            .flat_map(|input| input.sources.iter().cloned())
++            .collect()
++    }
++}
++
++/// Resolve a step's `when` and action bindings and evaluate `when`.
++///
++/// # Errors
++/// Returns the strongest gap among the `when` and action bindings; when every
++/// value resolves, a false `when` is an intentional skip, an unevaluable
++/// `when` or an extract source without evidence is a failure.
++fn prepare(scope: &Scope<'_>, step: &Step) -> Result<Bindings, Missing> {
++    let when = step
++        .when
++        .as_ref()
++        .map(|when| scope.resolve(&when.path, None))
++        .transpose();
++    let empty = || Ok(BTreeMap::new());
++    let (inputs, workspace) = match &step.action {
++        Action::Extract { from } => (scope.resolve_all([("from", from)], None), empty()),
++        Action::Agent(call) => (
++            scope.resolve_all(&call.inputs, None),
++            scope.resolve_all(&call.workspace, None),
++        ),
++        Action::Code(call) => (scope.resolve_all(&call.inputs, None), empty()),
++    };
++    let (when, inputs, workspace) = match (when, inputs, workspace) {
++        (Ok(when), Ok(inputs), Ok(workspace)) => (when, inputs, workspace),
++        (when, inputs, workspace) => {
++            let gaps = [when.err(), inputs.err(), workspace.err()]
++                .into_iter()
++                .flatten();
++            return Err(Missing::strongest(gaps)
++                .unwrap_or_else(|| Missing::failed("a binding did not resolve")));
++        }
++    };
++    if let Action::Extract { from } = &step.action
++        && !matches!(
++            inputs.get("from").map(|input| &input.value),
++            Some(CallValue::Evidence(_))
++        )
++    {
++        return Err(Missing::failed(format!("`{from}` supplied no evidence")));
++    }
++    if let (Some(condition), Some(observed)) = (&step.when, when) {
++        let path = &condition.path;
++        match operators::evaluate_operator(
++            &json(&observed),
++            &condition.operator,
++            &condition.expected,
++        ) {
++            Ok(verdict) if verdict.passed => {}
++            Ok(_) => {
++                return Err(Missing {
++                    cause: Cause::Skipped,
++                    reason: format!("when `{path}` was false"),
++                });
++            }
++            Err(error) => {
++                return Err(Missing::failed(format!(
++                    "when `{path}` cannot be evaluated: {error}"
++                )));
++            }
++        }
++    }
++    Ok(Bindings { inputs, workspace })
++}
++
++/// Resolve the bindings a check reads; drift reads its executor's window.
++///
++/// # Errors
++/// Returns the strongest gap among the bindings.
++fn check_bindings(
++    scope: &Scope<'_>,
++    requirement: &Requirement,
++) -> Result<BTreeMap<String, CallInput>, Missing> {
++    let current = Some(requirement);
++    match &requirement.check {
++        Check::Assert { path, each, .. } => {
++            scope.resolve_all(path.iter().chain(each).map(|path| ("value", path)), current)
++        }
++        Check::Trace(trace) => scope.resolve_all([("on", &trace.on)], current),
++        Check::Agent(call) => scope.resolve_all(&call.inputs, current),
++        Check::Code(call) => scope.resolve_all(&call.inputs, current),
++        Check::Drift(_) => Ok(BTreeMap::new()),
++    }
++}
++
++/// Where a Verifier block is declared.
++#[derive(Clone, Copy)]
++enum Block {
++    /// The step at this index of `steps`.
++    Step(usize),
++    /// The requirement at this key.
++    Requirement(Key),
++}
++
++/// A requirement's declaration: the index of its containing step, or `None`
++/// for a whole-Verifier requirement, and its index in that list.
++type Key = (Option<usize>, usize);
++
++/// The stage judging `requirements`, in their declaration order.
++///
++/// Its index is unused: Verifier blocks never read their stage index.
++fn requirement_stage<'r>(requirements: impl Iterator<Item = &'r Requirement>) -> Stage {
++    Stage {
++        index: 0,
++        tasks: requirements
++            .map(|requirement| requirement.id.clone())
++            .collect(),
++    }
++}
++
++/// The result and settled state of a step that did not run.
++fn skipped(step: &Step, gap: Missing) -> Done {
++    let result = StepResult {
++        id: step.id.clone(),
++        status: StepStatus::Skipped,
++        output: None,
++        attempts: 0,
++        duration_ms: 0,
++        reason: Some(gap.reason.clone()),
++        provenance: None,
++        tool_calls: Vec::new(),
++    };
++    let state = Settled::NoOutput {
++        status: StepStatus::Skipped,
++        gap,
++    };
++    Done::Step {
++        result: Box::new(result),
++        state,
++    }
++}
++
++/// The final attempt of one step action.
++struct Attempted {
++    /// Attempts made, retries included.
++    attempts: u32,
++    /// Wall time across every attempt.
++    duration: Duration,
++    /// The output, or the final failure reason.
++    result: Result<ActionOutput, String>,
++}
++
++impl Attempted {
++    /// The step's result and the state later blocks read.
++    fn settle(self, step: &Step, sources: BTreeSet<SlotName>) -> Done {
++        let duration_ms = u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX);
++        let (result, state) = match self.result {
++            Ok(output) => (
++                StepResult {
++                    id: step.id.clone(),
++                    status: StepStatus::Succeeded,
++                    output: Some(output.output.clone()),
++                    attempts: self.attempts,
++                    duration_ms,
++                    reason: None,
++                    provenance: output.provenance,
++                    tool_calls: output.tool_calls,
++                },
++                Settled::Succeeded {
++                    output: output.output,
++                    sources,
++                },
++            ),
++            Err(reason) => (
++                StepResult {
++                    id: step.id.clone(),
++                    status: StepStatus::Failed,
++                    output: None,
++                    attempts: self.attempts,
++                    duration_ms,
++                    reason: Some(reason.clone()),
++                    provenance: None,
++                    tool_calls: Vec::new(),
++                },
++                Settled::NoOutput {
++                    status: StepStatus::Failed,
++                    gap: Missing::failed(reason),
++                },
++            ),
++        };
++        Done::Step {
++            result: Box::new(result),
++            state,
++        }
++    }
++}
++
++/// One requirement's judgment before capture and attribution.
++struct Judged {
++    /// The outcome.
++    outcome: RequirementOutcome,
++    /// Why it holds.
++    reason: String,
++    /// The compared actual value.
++    actual: Option<Value>,
++    /// Citations of reachable original evidence.
++    citations: Vec<Citation>,
++    /// Check-specific detail.
++    detail: Option<RequirementDetail>,
++    /// What executed the check.
++    provenance: Option<CallProvenance>,
++}
++
++impl Judged {
++    /// The reported result of the requirement at `key`, its actual value
++    /// captured under the Verifier's context-capture mode.
++    ///
++    /// # Errors
++    /// Returns [`EngineError::Capture`] when the actual value cannot be
++    /// hashed.
++    ///
++    /// # Panics
++    /// Panics when `key` does not name a requirement of `spec`.
++    fn report(self, spec: &VerifierSpec, key: Key) -> Result<Done, EngineError> {
++        let requirement = requirement_at(spec, key);
++        let capture = spec.context_capture.unwrap_or(EvalContextCapture::Full);
++        Ok(Done::Requirement(Box::new(RequirementResult {
++            id: requirement.id.clone(),
++            step: key.0.map(|index| spec.steps[index].id.clone()),
++            statement: requirement.statement.clone(),
++            outcome: self.outcome,
++            reason: self.reason,
++            actual: capture_actual(self.actual, capture)?,
++            citations: self.citations,
++            detail: self.detail,
++            check: requirement.check.clone(),
++            provenance: self.provenance,
++        })))
++    }
++
++    /// The outcome of evidence that could not be supplied.
++    fn missing(gap: Missing) -> Self {
++        Self::bare(gap.cause.outcome(), gap.reason)
++    }
++
++    /// An inconclusive judgment, such as an isolated check failure.
++    fn inconclusive(reason: String) -> Self {
++        Self::bare(RequirementOutcome::Inconclusive, reason)
++    }
++
++    /// A judgment with only an outcome and reason.
++    fn bare(outcome: RequirementOutcome, reason: String) -> Self {
++        Self {
++            outcome,
++            reason,
++            actual: None,
++            citations: Vec::new(),
++            detail: None,
++            provenance: None,
++        }
++    }
++
++    /// A deterministic comparison: passed or failed, or inconclusive when the
++    /// values cannot be compared.
++    fn compared(compared: Result<Compared, EvalExecError>) -> Self {
++        match compared {
++            Ok((passed, actual, _, message)) => {
++                let outcome = if passed {
++                    RequirementOutcome::Passed
++                } else {
++                    RequirementOutcome::Failed
++                };
++                Self {
++                    actual,
++                    ..Self::bare(
++                        outcome,
++                        message.unwrap_or_else(|| "the comparison held".to_owned()),
++                    )
++                }
++            }
++            Err(error) => Self::inconclusive(error.to_string()),
++        }
++    }
++
++    /// An executor's judgment, unchanged.
++    fn checked(output: CheckOutput) -> Self {
++        let outcome = match output.verdict.outcome {
++            VerificationVerdict::Passed => RequirementOutcome::Passed,
++            VerificationVerdict::Failed => RequirementOutcome::Failed,
++            VerificationVerdict::Inconclusive => RequirementOutcome::Inconclusive,
++        };
++        Self {
++            outcome,
++            reason: output.verdict.reason,
++            actual: output.actual,
++            citations: output.verdict.citations,
++            detail: output.detail,
++            provenance: output.provenance,
++        }
++    }
++
++    /// An Agent or code judgment: citations outside the call's original
++    /// `sources` are dropped, and a pass left without a citation is
++    /// inconclusive.
++    fn cited(output: CheckOutput, sources: &BTreeSet<SlotName>) -> Self {
++        let mut judged = Self::checked(output);
++        judged
++            .citations
++            .retain(|citation| sources.contains(&citation.slot));
++        if judged.outcome == RequirementOutcome::Passed && judged.citations.is_empty() {
++            judged.outcome = RequirementOutcome::Inconclusive;
++            judged.reason = format!(
++                "passed without a citation of reachable original evidence: {}",
++                judged.reason
++            );
++        }
++        judged
++    }
++}
++
++/// The requirement at `key`: a step's requirement, or a whole-Verifier one.
++///
++/// # Panics
++/// Panics when `key` does not index a declared requirement; keys come only
++/// from `spec`'s own declarations.
++fn requirement_at(spec: &VerifierSpec, (step, at): Key) -> &Requirement {
++    match step {
++        Some(index) => &spec.steps[index].requirements[at],
++        None => &spec.requirements[at],
++    }
++}
++
++/// The JSON a comparison reads: evidence compares as its declaration.
++fn json(input: &CallInput) -> Value {
++    match &input.value {
++        CallValue::Json(value) => value.clone(),
++        CallValue::Evidence(declaration) => {
++            serde_json::to_value(declaration).unwrap_or(Value::Null)
++        }
++    }
++}
++
++/// The bounded cause a block error carries.
++fn reason(error: &BlockError) -> String {
++    match error {
++        BlockError::Retryable { reason } | BlockError::Terminal { reason } => reason.clone(),
++    }
++}
++
++/// Apply `rule` to the requirement outcomes.
++///
++/// Not-applicable outcomes leave the denominator; none applicable is
++/// inconclusive. `all` fails on any failure, else is inconclusive on any
++/// inconclusive. `pass_rate` passes when passed / applicable reaches the
++/// threshold, counting inconclusive outcomes as applicable; below it, any
++/// inconclusive outcome makes it inconclusive, otherwise it fails.
++fn decide(rule: Decide, outcomes: impl Iterator<Item = RequirementOutcome>) -> VerificationVerdict {
++    let (mut passed, mut failed, mut inconclusive) = (0_u32, 0_u32, 0_u32);
++    for outcome in outcomes {
++        match outcome {
++            RequirementOutcome::Passed => passed += 1,
++            RequirementOutcome::Failed => failed += 1,
++            RequirementOutcome::Inconclusive => inconclusive += 1,
++            RequirementOutcome::NotApplicable => {}
++        }
++    }
++    let applicable = passed + failed + inconclusive;
++    if applicable == 0 {
++        return VerificationVerdict::Inconclusive;
++    }
++    let reached = match rule {
++        Decide::All => failed == 0 && inconclusive == 0,
++        Decide::PassRate { threshold } => f64::from(passed) / f64::from(applicable) >= threshold,
++    };
++    match rule {
++        Decide::All if failed > 0 => VerificationVerdict::Failed,
++        _ if reached => VerificationVerdict::Passed,
++        _ if inconclusive > 0 => VerificationVerdict::Inconclusive,
++        _ => VerificationVerdict::Failed,
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/vala/vala-eval/src/blocks/engine/tests.rs b/crates/vala/vala-eval/src/blocks/engine/tests.rs
+new file mode 100644
+index 000000000..d16b89532
+--- /dev/null
++++ b/crates/vala/vala-eval/src/blocks/engine/tests.rs
+@@ -0,0 +1,1353 @@
++//! IO-free engine behavior over scripted executors and in-memory evidence.
++//!
++//! Time is paused, so a block that waits forever makes its timeout or the
++//! execution deadline fire at once instead of sleeping; overlap is proven
++//! with barriers that only open when blocks really run together.
++
++use std::collections::HashMap;
++use std::sync::Mutex;
++
++use async_trait::async_trait;
++use serde_json::json;
++use tokio::sync::{Barrier, Notify};
++use wyrd_spec::vala::ids::{SpanId, TraceId};
++use wyrd_spec::verification::DriftWindow;
++use wyrd_spec::verification::execution::Verdict;
++
++use super::*;
++use crate::InMemoryTraceSource;
++use crate::tasks::trace::trace_executor::span;
++
++/// What a scripted block does when called.
++enum Behavior {
++    /// Return these errors on successive attempts, then this output.
++    Attempts(Vec<BlockError>, Value),
++    /// Wait for every sibling at the barrier, then return this output.
++    Together(Arc<Barrier>, Value),
++    /// Never finish; notify when the call is dropped.
++    Hang(Arc<Notify>),
++}
++
++/// Notifies when the hanging call that owns it is dropped.
++struct DropSignal(Arc<Notify>);
++
++impl Drop for DropSignal {
++    /// Signal that the engine cancelled the call.
++    fn drop(&mut self) {
++        self.0.notify_one();
++    }
++}
++
++/// Scripted action and check executor recording every call in order.
++#[derive(Default)]
++struct Script {
++    /// Action behavior by step ID; unscripted steps output `{}`.
++    actions: HashMap<&'static str, Behavior>,
++    /// Check result by requirement ID; unscripted checks error.
++    checks: HashMap<&'static str, Result<CheckOutput, BlockError>>,
++    /// `action:<id>` / `check:<id>` in call order.
++    log: Mutex<Vec<String>>,
++    /// Attempts made per step.
++    attempts: Mutex<HashMap<String, usize>>,
++}
++
++impl Script {
++    /// The calls made so far.
++    ///
++    /// # Panics
++    /// Panics when a recording call panicked while holding the log lock.
++    fn calls(&self) -> Vec<String> {
++        self.log.lock().expect("log").clone()
++    }
++
++    /// Record one call.
++    ///
++    /// # Panics
++    /// Panics when another recording call panicked while holding the log
++    /// lock.
++    fn record(&self, entry: String) {
++        self.log.lock().expect("log").push(entry);
++    }
++}
++
++#[async_trait]
++impl ActionExecutor for Script {
++    /// Run the step's scripted behavior.
++    ///
++    /// # Errors
++    /// Returns the scripted error of the current attempt.
++    ///
++    /// # Panics
++    /// Panics when another call panicked while holding the log or attempts
++    /// lock.
++    ///
++    /// # Cancellation
++    /// A `Together` call waits at its barrier and a `Hang` call never
++    /// finishes; dropping either is safe, and a dropped `Hang` call notifies
++    /// its signal.
++    async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
++        let id = call.id.as_str().to_owned();
++        self.record(format!("action:{id}"));
++        let attempt = {
++            let mut attempts = self.attempts.lock().expect("attempts");
++            let count = attempts.entry(id.clone()).or_default();
++            *count += 1;
++            *count - 1
++        };
++        let output = |output: &Value| ActionOutput {
++            output: output.clone(),
++            provenance: None,
++            tool_calls: Vec::new(),
++        };
++        match self.actions.get(id.as_str()) {
++            None => Ok(output(&json!({}))),
++            Some(Behavior::Attempts(errors, value)) => match errors.get(attempt) {
++                Some(error) => Err(error.clone()),
++                None => Ok(output(value)),
++            },
++            Some(Behavior::Together(barrier, value)) => {
++                barrier.wait().await;
++                Ok(output(value))
++            }
++            Some(Behavior::Hang(dropped)) => {
++                let _signal = DropSignal(Arc::clone(dropped));
++                std::future::pending().await
++            }
++        }
++    }
++}
++
++#[async_trait]
++impl CheckExecutor for Script {
++    /// Return the requirement's scripted result.
++    ///
++    /// # Errors
++    /// Returns the scripted error, or a terminal error when unscripted.
++    ///
++    /// # Panics
++    /// Panics when another call panicked while holding the log lock.
++    async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
++        self.record(format!("check:{}", call.id.as_str()));
++        self.checks
++            .get(call.id.as_str())
++            .cloned()
++            .unwrap_or_else(|| {
++                Err(BlockError::Terminal {
++                    reason: "unscripted check".to_owned(),
++                })
++            })
++    }
++}
++
++/// A validated Verifier.
++///
++/// # Panics
++/// Panics when `body` is not a valid Verifier spec.
++fn verifier(body: Value) -> Arc<VerifierSpec> {
++    let spec: VerifierSpec = serde_json::from_value(body).expect("Verifier");
++    spec.validate().expect("valid Verifier");
++    Arc::new(spec)
++}
++
++/// An engine over `script`, `traces`, and a concurrency bound.
++///
++/// # Panics
++/// Panics when `concurrency` is zero or exceeds the semaphore's permit
++/// limit.
++fn engine(
++    script: &Arc<Script>,
++    traces: InMemoryTraceSource,
++    concurrency: usize,
++) -> VerificationEngine {
++    VerificationEngine::new(
++        Arc::clone(script) as Arc<dyn ActionExecutor>,
++        Arc::clone(script) as Arc<dyn CheckExecutor>,
++        Arc::new(traces),
++        NonZeroUsize::new(concurrency).expect("positive"),
++    )
++}
++
++/// Run `spec` with JSON inputs and a 60-second deadline.
++///
++/// Each key of the `inputs` object becomes a JSON evidence slot.
++///
++/// # Errors
++/// Returns the engine's [`EngineError`] unchanged, including
++/// [`EngineError::DeadlineExceeded`] once the 60-second deadline passes,
++/// which cancels the running blocks.
++///
++/// # Panics
++/// Panics when `inputs` is not an object or a key is not a valid slot name.
++async fn run(
++    engine: &VerificationEngine,
++    spec: &Arc<VerifierSpec>,
++    inputs: Value,
++) -> Result<VerificationOutcome, EngineError> {
++    let evidence = inputs
++        .as_object()
++        .expect("object")
++        .iter()
++        .map(|(slot, value)| {
++            (
++                SlotName::new(slot).expect("slot"),
++                InputDeclaration::Json {
++                    value: value.clone(),
++                },
++            )
++        })
++        .collect();
++    engine
++        .run(
++            Arc::clone(spec),
++            evidence,
++            Instant::now() + Duration::from_secs(60),
++        )
++        .await
++}
++
++/// Outcome and reason of each requirement by ID.
++fn outcomes(outcome: &VerificationOutcome) -> BTreeMap<&str, RequirementOutcome> {
++    outcome
++        .requirements
++        .iter()
++        .map(|result| (result.id.as_str(), result.outcome))
++        .collect()
++}
++
++/// The result of one requirement.
++///
++/// # Panics
++/// Panics when `outcome` has no requirement `id`.
++fn requirement<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a RequirementResult {
++    outcome
++        .requirements
++        .iter()
++        .find(|result| result.id.as_str() == id)
++        .expect("requirement result")
++}
++
++/// The result of one step.
++///
++/// # Panics
++/// Panics when `outcome` has no step `id`.
++fn step<'a>(outcome: &'a VerificationOutcome, id: &str) -> &'a StepResult {
++    outcome
++        .steps
++        .iter()
++        .find(|result| result.id.as_str() == id)
++        .expect("step result")
++}
++
++/// A code check over `inputs`.
++fn code_check(inputs: Value) -> Value {
++    json!({"kind": "code", "entrypoint": "check", "source": {"inline": "def check(**kw): pass"}, "inputs": inputs})
++}
++
++/// A code action over `inputs`.
++fn code_action(inputs: Value) -> Value {
++    json!({"kind": "code", "entrypoint": "run", "source": {"inline": "def run(**kw): pass"}, "inputs": inputs})
++}
++
++/// A scripted Verdict.
++///
++/// # Panics
++/// Panics when `citations` is not a JSON array of valid citations.
++fn verdict(outcome: VerificationVerdict, citations: Value) -> CheckOutput {
++    CheckOutput {
++        verdict: Verdict {
++            outcome,
++            reason: "scripted".to_owned(),
++            citations: serde_json::from_value(citations).expect("citations"),
++        },
++        actual: None,
++        detail: None,
++        provenance: None,
++    }
++}
++
++/// A no-step Verifier judges declared inputs: a failed assertion is a
++/// normal result with its actual value, an incomparable value is
++/// inconclusive rather than failed, and trace checks read declared trace
++/// evidence, including a trace that cannot be found.
++///
++/// # Panics
++/// Panics when an outcome, actual value, or verdict differs.
++#[tokio::test(start_paused = true)]
++async fn no_step_verifier_judges_inputs_and_traces() {
++    let trace = TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").expect("trace");
++    let absent = TraceId::from_hex("1af7651916cd43dd8448eb211c80319c").expect("trace");
++    let traces = InMemoryTraceSource::new();
++    traces
++        .insert(
++            trace,
++            vec![span(
++                trace,
++                SpanId::from_hex("b7ad6b7169203331").expect("span id"),
++                "retrieve",
++                "s",
++            )],
++        )
++        .await;
++    let assert = |path: &str, operator: &str, expected: Value| json!({"kind": "assert", "path": path, "operator": operator, "expected": expected});
++    let trace_check = |slot: &str, expected: &str| json!({"kind": "trace", "on": format!("inputs.{slot}"), "span_selector": "$.spans[0].name", "operator": "equals", "expected": expected});
++    let spec = verifier(json!({
++        "inputs": {"answer": {"type": "json"}, "trace": {"type": "trace"}, "lost": {"type": "trace"}},
++        "requirements": [
++            {"id": "no-guarantee", "statement": "No guarantees", "check": assert("inputs.answer.text", "not_contains", json!("guaranteed refund"))},
++            {"id": "short", "statement": "Short", "check": assert("inputs.answer.words", "less_than", json!(10))},
++            {"id": "typed", "statement": "Typed", "check": assert("inputs.answer.text", "greater_than", json!(1))},
++            {"id": "retrieved", "statement": "Retrieved", "check": trace_check("trace", "retrieve")},
++            {"id": "ranked", "statement": "Ranked", "check": trace_check("trace", "rank")},
++            {"id": "lost", "statement": "Lost", "check": trace_check("lost", "retrieve")}
++        ]
++    }));
++    let script = Arc::new(Script::default());
++    let evidence = BTreeMap::from([
++        (
++            SlotName::new("answer").expect("slot"),
++            InputDeclaration::Json {
++                value: json!({"text": "A guaranteed refund applies.", "words": 4}),
++            },
++        ),
++        (
++            SlotName::new("trace").expect("slot"),
++            InputDeclaration::Trace { trace_id: trace },
++        ),
++        (
++            SlotName::new("lost").expect("slot"),
++            InputDeclaration::Trace { trace_id: absent },
++        ),
++    ]);
++    let outcome = engine(&script, traces, 4)
++        .run(
++            Arc::clone(&spec),
++            evidence.clone(),
++            Instant::now() + Duration::from_secs(60),
++        )
++        .await
++        .expect("outcome");
++    assert_eq!(
++        outcomes(&outcome),
++        BTreeMap::from([
++            ("no-guarantee", RequirementOutcome::Failed),
++            ("short", RequirementOutcome::Passed),
++            ("typed", RequirementOutcome::Inconclusive),
++            ("retrieved", RequirementOutcome::Passed),
++            ("ranked", RequirementOutcome::Failed),
++            ("lost", RequirementOutcome::Inconclusive),
++        ])
++    );
++    let failed = requirement(&outcome, "no-guarantee");
++    assert_eq!(failed.actual, Some(json!("A guaranteed refund applies.")));
++    assert_eq!(failed.check, spec.requirements[0].check);
++    assert!(requirement(&outcome, "lost").reason.contains("not found"));
++    assert_eq!(outcome.verdict, VerificationVerdict::Failed);
++    assert_eq!(outcome.evidence, evidence);
++    assert!(outcome.steps.is_empty());
++    assert!(
++        script.calls().is_empty(),
++        "deterministic checks call no executor"
++    );
++}
++
++/// Context capture applies the existing rule to actual values: `hash`
++/// stores the digest and `redact` stores nothing, without changing outcomes.
++///
++/// # Panics
++/// Panics when a captured actual value differs.
++#[tokio::test(start_paused = true)]
++async fn context_capture_hashes_or_redacts_actual_values() {
++    let script = Arc::new(Script::default());
++    for (capture, expected) in [
++        (
++            "hash",
++            Some(Value::String(
++                crate::results::capture_actual(Some(json!(4)), EvalContextCapture::Hash)
++                    .expect("hash")
++                    .and_then(|v| v.as_str().map(str::to_owned))
++                    .expect("digest"),
++            )),
++        ),
++        ("redact", None),
++    ] {
++        let spec = verifier(json!({
++            "inputs": {"answer": {"type": "json"}},
++            "requirements": [{"id": "count", "statement": "Count", "check": {"kind": "assert", "path": "inputs.answer", "operator": "equals", "expected": 4}}],
++            "context_capture": capture
++        }));
++        let outcome = run(
++            &engine(&script, InMemoryTraceSource::new(), 1),
++            &spec,
++            json!({"answer": 4}),
++        )
++        .await
++        .expect("outcome");
++        assert_eq!(outcome.verdict, VerificationVerdict::Passed);
++        assert_eq!(requirement(&outcome, "count").actual, expected, "{capture}");
++    }
++}
++
++/// Independent actions overlap: two steps meet at a barrier only when they
++/// run together, so the bound of one concurrent block makes them miss the
++/// deadline instead.
++///
++/// # Panics
++/// Panics when the steps do not overlap under the wider bound, or overlap
++/// under the bound of one.
++#[tokio::test(start_paused = true)]
++async fn independent_actions_overlap_within_the_concurrency_bound() {
++    let spec = verifier(json!({
++        "inputs": {"answer": {"type": "json"}},
++        "steps": [
++            {"id": "a", "action": code_action(json!({"x": "inputs.answer"}))},
++            {"id": "b", "action": code_action(json!({"x": "inputs.answer"}))}
++        ],
++        "requirements": [{"id": "both", "statement": "Both ran", "check": {"kind": "assert", "path": "steps.b.output.ok", "operator": "equals", "expected": true}}]
++    }));
++    let script = || {
++        let barrier = Arc::new(Barrier::new(2));
++        Arc::new(Script {
++            actions: HashMap::from([
++                (
++                    "a",
++                    Behavior::Together(Arc::clone(&barrier), json!({"ok": true})),
++                ),
++                ("b", Behavior::Together(barrier, json!({"ok": true}))),
++            ]),
++            ..Script::default()
++        })
++    };
++    let outcome = run(
++        &engine(&script(), InMemoryTraceSource::new(), 2),
++        &spec,
++        json!({"answer": 1}),
++    )
++    .await
++    .expect("overlapping steps finish");
++    assert_eq!(outcome.verdict, VerificationVerdict::Passed);
++    let serial = run(
++        &engine(&script(), InMemoryTraceSource::new(), 1),
++        &spec,
++        json!({"answer": 1}),
++    )
++    .await;
++    assert!(
++        matches!(serial, Err(EngineError::DeadlineExceeded)),
++        "{serial:?}"
++    );
++}
++
++/// A dependent waits for its upstream action and that step's requirements;
++/// whole-Verifier requirements run once after every stage and every
++/// verdict reaches the result exactly once, in plan order.
++///
++/// # Panics
++/// Panics when calls run out of order or a verdict is missing or repeated.
++#[tokio::test(start_paused = true)]
++async fn dependents_wait_for_upstream_step_requirements() {
++    let spec = verifier(json!({
++        "inputs": {"answer": {"type": "json"}},
++        "steps": [
++            {"id": "draft", "action": code_action(json!({"x": "inputs.answer"})),
++             "requirements": [{"id": "draft-ok", "statement": "Draft ok", "check": code_check(json!({"draft": "steps.draft.output"}))}]},
++            {"id": "review", "action": code_action(json!({"draft": "steps.draft.output", "gate": "steps.draft.requirements.draft-ok.outcome"})),
++             "requirements": [{"id": "review-ok", "statement": "Review ok", "check": code_check(json!({"review": "steps.review.output"}))}]}
++        ],
++        "requirements": [{"id": "final", "statement": "Final", "check": code_check(json!({"review": "steps.review.output", "answer": "inputs.answer"}))}]
++    }));
++    let cited = json!([{"slot": "answer", "locator": {"json_pointer": "/text"}}]);
++    let script = Arc::new(Script {
++        actions: HashMap::from([
++            (
++                "draft",
++                Behavior::Attempts(Vec::new(), json!({"text": "draft"})),
++            ),
++            (
++                "review",
++                Behavior::Attempts(Vec::new(), json!({"score": 5})),
++            ),
++        ]),
++        checks: HashMap::from([
++            (
++                "draft-ok",
++                Ok(verdict(VerificationVerdict::Passed, cited.clone())),
++            ),
++            (
++                "review-ok",
++                Ok(verdict(VerificationVerdict::Passed, cited.clone())),
++            ),
++            ("final", Ok(verdict(VerificationVerdict::Passed, cited))),
++        ]),
++        ..Script::default()
++    });
++    let outcome = run(
++        &engine(&script, InMemoryTraceSource::new(), 4),
++        &spec,
++        json!({"answer": {"text": "hi"}}),
++    )
++    .await
++    .expect("outcome");
++    assert_eq!(
++        script.calls(),
++        [
++            "action:draft",
++            "check:draft-ok",
++            "action:review",
++            "check:review-ok",
++            "check:final"
++        ]
++    );
++    let ids: Vec<_> = outcome
++        .requirements
++        .iter()
++        .map(|r| (r.id.as_str(), r.step.as_ref().map(TaskId::as_str)))
++        .collect();
++    assert_eq!(
++        ids,
++        [
++            ("draft-ok", Some("draft")),
++            ("review-ok", Some("review")),
++            ("final", None)
++        ]
++    );
++    let steps: Vec<_> = outcome
++        .steps
++        .iter()
++        .map(|s| (s.id.as_str(), s.status, s.attempts))
++        .collect();
++    assert_eq!(
++        steps,
++        [
++            ("draft", StepStatus::Succeeded, 1),
++            ("review", StepStatus::Succeeded, 1)
++        ]
++    );
++    assert_eq!(step(&outcome, "review").output, Some(json!({"score": 5})));
++    assert_eq!(outcome.verdict, VerificationVerdict::Passed);
++}
++
++/// Each selector compares every wildcard match of a step output; an empty
++/// selection passes, and a failing element fails the requirement.
++///
++/// # Panics
++/// Panics when an `each` outcome differs.
++#[tokio::test(start_paused = true)]
++async fn each_assertion_compares_every_wildcard_match() {
++    let each = |id: &str| json!({"id": format!("{id}-ok"), "statement": "No cell errors", "check": {"kind": "assert", "each": format!("steps.{id}.output.sheets[*].cells[*].error"), "operator": "is_null"}});
++    let spec = verifier(json!({
++        "inputs": {"answer": {"type": "json"}},
++        "steps": [
++            {"id": "clean", "action": code_action(json!({"x": "inputs.answer"})), "requirements": [each("clean")]},
++            {"id": "broken", "action": code_action(json!({"x": "inputs.answer"})), "requirements": [each("broken")]},
++            {"id": "empty", "action": code_action(json!({"x": "inputs.answer"})), "requirements": [each("empty")]}
++        ]
++    }));
++    let sheets = |errors: Value| json!({"sheets": [{"cells": errors}]});
++    let script = Arc::new(Script {
++        actions: HashMap::from([
++            (
++                "clean",
++                Behavior::Attempts(
++                    Vec::new(),
++                    sheets(json!([{"error": null}, {"error": null}])),
++                ),
++            ),
++            (
++                "broken",
++                Behavior::Attempts(
++                    Vec::new(),
++                    sheets(json!([{"error": null}, {"error": "#REF!"}])),
++                ),
++            ),
++            (
++                "empty",
++                Behavior::Attempts(Vec::new(), json!({"sheets": []})),
++            ),
++        ]),
++        ..Script::default()
++    });
++    let outcome = run(
++        &engine(&script, InMemoryTraceSource::new(), 4),
++        &spec,
++        json!({"answer": 1}),
++    )
++    .await
++    .expect("outcome");
++    assert_eq!(
++        outcomes(&outcome),
++        BTreeMap::from([
++            ("clean-ok", RequirementOutcome::Passed),
++            ("broken-ok", RequirementOutcome::Failed),
++            ("empty-ok", RequirementOutcome::Passed),
++        ])
++    );
++}
++
++/// Intentional skips are not applicable through dependent steps, failures
++/// and their blocked descendants are inconclusive, failure wins when both
++/// causes reach one check, missing values never call a check, and a
++/// status-only read is still judged.
++///
++/// # Panics
++/// Panics when an outcome, step status, or call differs.
++#[tokio::test(start_paused = true)]
++async fn skip_causes_propagate_and_failure_wins() {
++    let assert_present = |id: &str, path: &str| json!({"id": id, "statement": id, "check": {"kind": "assert", "path": path, "operator": "is_not_null"}});
++    let spec = verifier(json!({
++        "inputs": {"answer": {"type": "json"}},
++        "steps": [
++            {"id": "gated", "when": {"path": "inputs.answer.draft", "operator": "equals", "expected": true},
++             "action": code_action(json!({"x": "inputs.answer"})),
++             "requirements": [assert_present("gated-ok", "steps.gated.output")]},
++            {"id": "after-gated", "action": code_action(json!({"x": "steps.gated.output"})),
++             "requirements": [assert_present("after-gated-ok", "inputs.answer")]},
++            {"id": "broken", "action": code_action(json!({"x": "inputs.answer"})),
++             "requirements": [assert_present("broken-ok", "inputs.answer")]},
++            {"id": "after-broken", "action": code_action(json!({"x": "steps.broken.output"}))},
++            {"id": "transitive", "action": code_action(json!({"x": "steps.after-broken.output"})),
++             "requirements": [assert_present("transitive-ok", "inputs.answer")]}
++        ],
++        "requirements": [
++            assert_present("needs-gated", "steps.after-gated.output"),
++            {"id": "mixed", "statement": "mixed", "check": code_check(json!({"a": "steps.after-gated.output", "b": "steps.transitive.output"}))},
++            {"id": "status-read", "statement": "status", "check": {"kind": "assert", "path": "steps.broken.status", "operator": "equals", "expected": "failed"}},
++            {"id": "skipped-status", "statement": "status", "check": {"kind": "assert", "path": "steps.after-broken.status", "operator": "equals", "expected": "skipped"}}
++        ]
++    }));
++    let script = Arc::new(Script {
++        actions: HashMap::from([(
++            "broken",
++            Behavior::Attempts(
++                vec![BlockError::Terminal {
++                    reason: "provider rejected".to_owned(),
++                }],
++                json!({}),
++            ),
++        )]),
++        ..Script::default()
++    });
++    let outcome = run(
++        &engine(&script, InMemoryTraceSource::new(), 4),
++        &spec,
++        json!({"answer": {"draft": false}}),
++    )
++    .await
++    .expect("outcome");
++    assert_eq!(
++        outcomes(&outcome),
++        BTreeMap::from([
++            ("gated-ok", RequirementOutcome::NotApplicable),
++            ("after-gated-ok", RequirementOutcome::NotApplicable),
++            ("broken-ok", RequirementOutcome::Inconclusive),
++            ("transitive-ok", RequirementOutcome::Inconclusive),
++            ("needs-gated", RequirementOutcome::NotApplicable),
++            ("mixed", RequirementOutcome::Inconclusive),
++            ("status-read", RequirementOutcome::Passed),
++            ("skipped-status", RequirementOutcome::Passed),
++        ])
++    );
++    let statuses: BTreeMap<_, _> = outcome
++        .steps
++        .iter()
++        .map(|s| (s.id.as_str(), s.status))
++        .collect();
++    assert_eq!(
++        statuses,
++        BTreeMap::from([
++            ("gated", StepStatus::Skipped),
++            ("after-gated", StepStatus::Skipped),
++            ("broken", StepStatus::Failed),
++            ("after-broken", StepStatus::Skipped),
++            ("transitive", StepStatus::Skipped),
++        ])
++    );
++    assert_eq!(
++        step(&outcome, "broken").reason.as_deref(),
++        Some("provider rejected")
++    );
++    assert!(
++        requirement(&outcome, "transitive-ok")
++            .reason
++            .contains("provider rejected")
++    );
++    assert!(
++        !script.calls().iter().any(|call| call.starts_with("check:")),
++        "no check runs on missing evidence: {:?}",
++        script.calls()
++    );
++    assert_eq!(outcome.verdict, VerificationVerdict::Inconclusive);
++}
++
++/// A requirement on an intentionally skipped step still sees its explicit
++/// evidence gaps: reading a failed ancestor's output or an omitted required
++/// slot is inconclusive with the failure's reason, never a quiet
++/// not-applicable that lets `all` pass, while a requirement with no other
++/// gap keeps the owner's skip. No check runs on missing evidence.
++///
++/// # Panics
++/// Panics when an outcome, reason, verdict, or check call differs.
++#[tokio::test(start_paused = true)]
++async fn skipped_owner_keeps_failed_check_evidence() {
++    let assert_present = |id: &str, path: &str| json!({"id": id, "statement": id, "check": {"kind": "assert", "path": path, "operator": "is_not_null"}});
++    let spec = verifier(json!({
++        "inputs": {"answer": {"type": "json"}, "note": {"type": "json"}},
++        "steps": [
++            {"id": "broken", "action": code_action(json!({"x": "inputs.answer"}))},
++            {"id": "gated", "depends_on": ["broken"],
++             "when": {"path": "inputs.answer.draft", "operator": "equals", "expected": true},
++             "action": code_action(json!({"x": "inputs.answer"})),
++             "requirements": [
++                 {"id": "reads-broken", "statement": "reads-broken", "check": code_check(json!({"x": "steps.broken.output"}))},
++                 assert_present("reads-missing", "inputs.note"),
++                 assert_present("pure-skip", "inputs.answer")
++             ]}
++        ],
++        "requirements": [assert_present("independent", "inputs.answer")]
++    }));
++    let script = Arc::new(Script {
++        actions: HashMap::from([(
++            "broken",
++            Behavior::Attempts(
++                vec![BlockError::Terminal {
++                    reason: "provider rejected".to_owned(),
++                }],
++                json!({}),
++            ),
++        )]),
++        ..Script::default()
++    });
++    let outcome = run(
++        &engine(&script, InMemoryTraceSource::new(), 4),
++        &spec,
++        json!({"answer": {"draft": false}}),
++    )
++    .await
++    .expect("outcome");
++    assert_eq!(
++        outcomes(&outcome),
++        BTreeMap::from([
++            ("reads-broken", RequirementOutcome::Inconclusive),
++            ("reads-missing", RequirementOutcome::Inconclusive),
++            ("pure-skip", RequirementOutcome::NotApplicable),
++            ("independent", RequirementOutcome::Passed),
++        ])
++    );
++    assert!(
++        requirement(&outcome, "reads-broken")
++            .reason
++            .contains("provider rejected")
++    );
++    assert!(
++        requirement(&outcome, "reads-missing")
++            .reason
++            .contains("`note` was not supplied")
++    );
++    assert!(
++        !script.calls().iter().any(|call| call.starts_with("check:")),
++        "no check runs on missing evidence: {:?}",
++        script.calls()
++    );
++    assert_eq!(outcome.verdict, VerificationVerdict::Inconclusive);
++}
++
++/// An elapsed deadline refuses work that would complete without
++/// suspending, such as an empty Verifier or one whose only requirement
++/// lacks evidence, instead of publishing a verdict outside the budget.
++///
++/// # Panics
++/// Panics when an elapsed-deadline execution returns a verdict.
++#[tokio::test(start_paused = true)]
++async fn elapsed_deadline_refuses_ready_work() {
++    let script = Arc::new(Script::default());
++    let engine = engine(&script, InMemoryTraceSource::new(), 1);
++    let missing = verifier(json!({
++        "inputs": {"answer": {"type": "json"}},
++        "requirements": [{"id": "r", "statement": "r", "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}}]
++    }));
++    for spec in [verifier(json!({})), missing] {
++        let result = engine.run(spec, BTreeMap::new(), Instant::now()).await;
++        assert!(
++            matches!(result, Err(EngineError::DeadlineExceeded)),
++            "{result:?}"
++        );
++    }
++}
++
++/// A missing required slot is inconclusive, an omitted optional slot is
++/// `null` for an explicit null assertion, and a child of an omitted slot or
++/// an absent output field is missing rather than `null`.
++///
++/// # Panics
++/// Panics when an outcome differs.
++#[tokio::test(start_paused = true)]
++async fn missing_and_optional_evidence_resolve_honestly() {
++    let assert = |id: &str, path: &str, operator: &str| json!({"id": id, "statement": id, "check": {"kind": "assert", "path": path, "operator": operator}});
++    let spec = verifier(json!({
++        "inputs": {"answer": {"type": "json"}, "note": {"type": "json", "required": false}, "policy": {"type": "media", "formats": ["pdf"]}},
++        "steps": [{"id": "pages", "action": {"kind": "extract", "from": "inputs.policy"},
++                   "requirements": [assert("has-pages", "steps.pages.output.pages", "is_not_null")]}],
++        "requirements": [
++            assert("no-note", "inputs.note", "is_null"),
++            assert("note-text", "inputs.note.text", "is_null"),
++            assert("absent-field", "inputs.answer.missing", "is_null"),
++            assert("present", "inputs.answer.text", "is_not_null")
++        ]
++    }));
++    let script = Arc::new(Script::default());
++    let outcome = run(
++        &engine(&script, InMemoryTraceSource::new(), 4),
++        &spec,
++        json!({"answer": {"text": "hi"}}),
++    )
++    .await
++    .expect("outcome");
++    assert_eq!(
++        outcomes(&outcome),
++        BTreeMap::from([
++            ("has-pages", RequirementOutcome::Inconclusive),
++            ("no-note", RequirementOutcome::Passed),
++            ("note-text", RequirementOutcome::Inconclusive),
++            ("absent-field", RequirementOutcome::Inconclusive),
++            ("present", RequirementOutcome::Passed),
++        ])
++    );
++    assert!(
++        step(&outcome, "pages")
++            .reason
++            .as_deref()
++            .is_some_and(|r| r.contains("`policy` was not supplied"))
++    );
++    assert!(
++        script.calls().is_empty(),
++        "extract without evidence is never called"
++    );
++}
++
++/// No requirements, or only not-applicable ones, is inconclusive.
++///
++/// # Panics
++/// Panics when an empty or all-skipped Verifier does not stay inconclusive.
++#[tokio::test(start_paused = true)]
++async fn empty_and_all_skipped_verifiers_are_inconclusive() {
++    let script = Arc::new(Script::default());
++    let engine = engine(&script, InMemoryTraceSource::new(), 1);
++    let empty = run(&engine, &verifier(json!({})), json!({}))
++        .await
++        .expect("outcome");
++    assert_eq!(empty.verdict, VerificationVerdict::Inconclusive);
++    let skipped = verifier(json!({
++        "inputs": {"answer": {"type": "json"}},
++        "steps": [{"id": "never", "when": {"path": "inputs.answer", "operator": "equals", "expected": 2},
++                   "action": code_action(json!({"x": "inputs.answer"})),
++                   "requirements": [{"id": "r", "statement": "r", "check": {"kind": "assert", "path": "inputs.answer", "operator": "equals", "expected": 1}}]}]
++    }));
++    let outcome = run(&engine, &skipped, json!({"answer": 1}))
++        .await
++        .expect("outcome");
++    assert_eq!(
++        outcomes(&outcome),
++        BTreeMap::from([("r", RequirementOutcome::NotApplicable)])
++    );
++    assert_eq!(outcome.verdict, VerificationVerdict::Inconclusive);
++}
++
++/// `all` and `pass_rate` count each applicable verdict once, keep
++/// inconclusive results in the pass-rate denominator, and treat the
++/// threshold as inclusive.
++///
++/// # Panics
++/// Panics when a rollup differs from the approved rule.
++#[test]
++fn decide_rules_count_inconclusive_requirements() {
++    use RequirementOutcome::{Failed as F, Inconclusive as I, NotApplicable as N, Passed as P};
++    use VerificationVerdict::{Failed, Inconclusive, Passed};
++    let rate = |threshold| Decide::PassRate { threshold };
++    let mut one_of_ten = vec![P];
++    one_of_ten.extend([I; 9]);
++    for (rule, outcomes, expected) in [
++        (Decide::All, vec![P, P, N], Passed),
++        (Decide::All, vec![P, I, N], Inconclusive),
++        (Decide::All, vec![P, I, F], Failed),
++        (Decide::All, vec![N, N], Inconclusive),
++        (Decide::All, vec![], Inconclusive),
++        (rate(0.75), vec![P, P, P, F], Passed),
++        (rate(0.75), vec![P, P, F, F], Failed),
++        (rate(0.75), vec![P, P, I, F], Inconclusive),
++        (rate(0.5), vec![P, F, N, N], Passed),
++        (rate(1.0), vec![P, P, N], Passed),
++        (rate(0.5), one_of_ten.clone(), Inconclusive),
++        (rate(0.1), one_of_ten, Passed),
++        (rate(0.5), vec![N], Inconclusive),
++    ] {
++        assert_eq!(
++            decide(rule, outcomes.clone().into_iter()),
++            expected,
++            "{rule:?} {outcomes:?}"
++        );
++    }
++}
++
++/// Retryable failures spend the retry budget, terminal failures do not
++/// retry, and attempts stay visible whether the step finally succeeds or
++/// fails.
++///
++/// # Panics
++/// Panics when an attempt count, status, or reason differs.
++#[tokio::test(start_paused = true)]
++async fn retries_spend_the_budget_and_keep_attempts_visible() {
++    let retryable = || BlockError::Retryable {
++        reason: "provider unavailable".to_owned(),
++    };
++    let spec = verifier(json!({
++        "inputs": {"answer": {"type": "json"}},
++        "steps": [
++            {"id": "recovers", "retries": 2, "action": code_action(json!({"x": "inputs.answer"}))},
++            {"id": "exhausts", "retries": 1, "action": code_action(json!({"x": "inputs.answer"}))},
++            {"id": "terminal", "retries": 3, "action": code_action(json!({"x": "inputs.answer"}))}
++        ]
++    }));
++    let script = Arc::new(Script {
++        actions: HashMap::from([
++            (
++                "recovers",
++                Behavior::Attempts(vec![retryable(), retryable()], json!({"ok": true})),
++            ),
++            (
++                "exhausts",
++                Behavior::Attempts(vec![retryable(), retryable()], json!({})),
++            ),
++            (
++                "terminal",
++                Behavior::Attempts(
++                    vec![BlockError::Terminal {
++                        reason: "malformed output".to_owned(),
++                    }],
++                    json!({}),
++                ),
++            ),
++        ]),
++        ..Script::default()
++    });
++    let outcome = run(
++        &engine(&script, InMemoryTraceSource::new(), 4),
++        &spec,
++        json!({"answer": 1}),
++    )
++    .await
++    .expect("outcome");
++    let steps: BTreeMap<_, _> = outcome
++        .steps
++        .iter()
++        .map(|s| (s.id.as_str(), (s.status, s.attempts, s.reason.clone())))
++        .collect();
++    assert_eq!(
++        steps,
++        BTreeMap::from([
++            ("recovers", (StepStatus::Succeeded, 3, None)),
++            (
++                "exhausts",
++                (
++                    StepStatus::Failed,
++                    2,
++                    Some("provider unavailable".to_owned())
++                )
++            ),
++            (
++                "terminal",
++                (StepStatus::Failed, 1, Some("malformed output".to_owned()))
++            ),
++        ])
++    );
++}
++
++/// A step timeout ends and retries a hung attempt, the expired step fails
++/// as `timed out` with its attempts, and an unrelated requirement still
++/// finishes.
++///
++/// # Panics
++/// Panics when the timed-out step or the unrelated requirement differs.
++#[tokio::test(start_paused = true)]
++async fn step_timeouts_fail_the_step_and_let_unrelated_work_finish() {
++    let hung = Arc::new(Notify::new());
++    let spec = verifier(json!({
++        "inputs": {"answer": {"type": "json"}},
++        "steps": [{"id": "slow", "timeout_seconds": 5, "retries": 1, "action": code_action(json!({"x": "inputs.answer"})),
++                   "requirements": [{"id": "slow-ok", "statement": "s", "check": {"kind": "assert", "path": "steps.slow.output", "operator": "is_not_null"}}]}],
++        "requirements": [{"id": "unrelated", "statement": "u", "check": {"kind": "assert", "path": "inputs.answer", "operator": "equals", "expected": 1}}]
++    }));
++    let script = Arc::new(Script {
++        actions: HashMap::from([("slow", Behavior::Hang(Arc::clone(&hung)))]),
++        ..Script::default()
++    });
++    let outcome = run(
++        &engine(&script, InMemoryTraceSource::new(), 4),
++        &spec,
++        json!({"answer": 1}),
++    )
++    .await
++    .expect("outcome");
++    let slow = step(&outcome, "slow");
++    assert_eq!(
++        (slow.status, slow.attempts, slow.reason.as_deref()),
++        (StepStatus::Failed, 2, Some("timed out"))
++    );
++    assert_eq!(slow.duration_ms, 10_000);
++    assert_eq!(
++        outcomes(&outcome),
++        BTreeMap::from([
++            ("slow-ok", RequirementOutcome::Inconclusive),
++            ("unrelated", RequirementOutcome::Passed)
++        ])
++    );
++}
++
++/// The execution deadline is an execution error, not a fabricated check
++/// failure, and it cancels the running action.
++///
++/// # Panics
++/// Panics when the deadline does not surface or the hung call is not dropped.
++#[tokio::test(start_paused = true)]
++async fn execution_deadline_cancels_running_work() {
++    let dropped = Arc::new(Notify::new());
++    let spec = verifier(json!({
++        "inputs": {"answer": {"type": "json"}},
++        "steps": [{"id": "hung", "action": code_action(json!({"x": "inputs.answer"}))}]
++    }));
++    let script = Arc::new(Script {
++        actions: HashMap::from([("hung", Behavior::Hang(Arc::clone(&dropped)))]),
++        ..Script::default()
++    });
++    let result = run(
++        &engine(&script, InMemoryTraceSource::new(), 1),
++        &spec,
++        json!({"answer": 1}),
++    )
++    .await;
++    assert!(
++        matches!(result, Err(EngineError::DeadlineExceeded)),
++        "{result:?}"
++    );
++    tokio::time::timeout(Duration::from_secs(1), dropped.notified())
++        .await
++        .expect("the hung action is dropped on cancellation");
++}
++
++/// Agent and code passes need a citation of evidence the call could reach;
++/// unreachable citations are dropped, a citation-less pass is inconclusive,
++/// a check error is inconclusive with its reason, and a failed verdict is
++/// kept as data.
++///
++/// # Panics
++/// Panics when a citation outcome differs.
++#[tokio::test(start_paused = true)]
++async fn hosted_check_passes_need_reachable_citations() {
++    let check = |id: &str| json!({"id": id, "statement": id, "check": code_check(json!({"answer": "inputs.answer", "claim": "requirement.statement"}))});
++    let spec = verifier(json!({
++        "inputs": {"answer": {"type": "json"}, "policy": {"type": "json"}},
++        "requirements": [check("cited"), check("uncited"), check("elsewhere"), check("errored"), check("rejected")]
++    }));
++    let answer = json!([{"slot": "answer", "locator": {"json_pointer": "/text"}}]);
++    let policy = json!([{"slot": "policy", "locator": {"page": 1}}]);
++    let script = Arc::new(Script {
++        checks: HashMap::from([
++            (
++                "cited",
++                Ok(verdict(VerificationVerdict::Passed, answer.clone())),
++            ),
++            (
++                "uncited",
++                Ok(verdict(VerificationVerdict::Passed, json!([]))),
++            ),
++            (
++                "elsewhere",
++                Ok(verdict(VerificationVerdict::Passed, policy)),
++            ),
++            (
++                "errored",
++                Err(BlockError::Terminal {
++                    reason: "invalid verdict".to_owned(),
++                }),
++            ),
++            (
++                "rejected",
++                Ok(verdict(VerificationVerdict::Failed, json!([]))),
++            ),
++        ]),
++        ..Script::default()
++    });
++    let outcome = run(
++        &engine(&script, InMemoryTraceSource::new(), 4),
++        &spec,
++        json!({"answer": {"text": "hi"}, "policy": {}}),
++    )
++    .await
++    .expect("outcome");
++    assert_eq!(
++        outcomes(&outcome),
++        BTreeMap::from([
++            ("cited", RequirementOutcome::Passed),
++            ("uncited", RequirementOutcome::Inconclusive),
++            ("elsewhere", RequirementOutcome::Inconclusive),
++            ("errored", RequirementOutcome::Inconclusive),
++            ("rejected", RequirementOutcome::Failed),
++        ])
++    );
++    assert_eq!(requirement(&outcome, "cited").citations.len(), 1);
++    assert!(requirement(&outcome, "elsewhere").citations.is_empty());
++    assert_eq!(requirement(&outcome, "errored").reason, "invalid verdict");
++}
++
++/// A one-column numeric sample batch.
++fn samples(
++    column: &str,
++    values: impl IntoIterator<Item = f64>,
++) -> arrow::record_batch::RecordBatch {
++    use arrow::array::Float64Array;
++    use arrow::datatypes::{DataType, Field, Schema};
++    let schema = Schema::new(vec![Field::new(column, DataType::Float64, true)]);
++    let values: Float64Array = values.into_iter().collect::<Vec<_>>().into();
++    arrow::record_batch::RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values)])
++        .expect("sample batch")
++}
++
++/// A drift requirement over `inputs.<slot>` with the given method fields.
++///
++/// # Panics
++/// Panics when `method` is not a JSON object.
++fn drift_requirement(id: &str, slot: &str, method: Value) -> Value {
++    let mut check = json!({"kind": "drift", "on": format!("inputs.{slot}"), "condition": {"kind": "Statistical"}});
++    check
++        .as_object_mut()
++        .expect("object")
++        .extend(method.as_object().expect("object").clone());
++    json!({"id": id, "statement": id, "check": check})
++}
++
++/// Drift requirements score through `vala-drift`: Custom compares the
++/// window mean, PSI scores against fitted state and keeps the report as
++/// detail, and missing samples, unready baselines, and too few rows are
++/// inconclusive with the scorer's reason, all with drift provenance.
++///
++/// # Panics
++/// Panics when a drift outcome, detail, or provenance differs.
++#[tokio::test(start_paused = true)]
++async fn drift_requirements_score_through_vala_drift() {
++    let custom = |id: &str, baseline: f64| {
++        drift_requirement(
++            id,
++            "latency",
++            json!({"method": "Custom", "signal": {"kind": "Metric", "name": "ms"},
++            "profile": {"kind": "Custom", "metric_name": "ms", "baseline_value": baseline, "alert_threshold": 5.0}}),
++        )
++    };
++    let psi = |id: &str, slot: &str| {
++        drift_requirement(
++            id,
++            slot,
++            json!({"method": "Psi",
++            "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "space": "risk", "name": "train", "version": "1.0.0"}, "features": ["x"]},
++            "profile": {"kind": "Psi", "binning_strategy": {"kind": "EqualWidth", "n_bins": 4}, "threshold": {"kind": "Fixed", "value": 0.2}}}),
++        )
++    };
++    let spec = verifier(json!({
++        "inputs": {
++            "latency": {"type": "samples", "features": ["ms"]},
++            "shifted": {"type": "samples", "features": ["x"]},
++            "few": {"type": "samples", "features": ["x"]},
++            "unrecorded": {"type": "samples", "features": ["x"]}
++        },
++        "requirements": [
++            custom("steady", 100.0), custom("slow", 50.0),
++            psi("psi-shift", "shifted"), psi("psi-unready", "shifted"), psi("psi-few", "few"), psi("psi-none", "unrecorded")
++        ]
++    }));
++    let check = |id: &str| match &spec
++        .requirements
++        .iter()
++        .find(|r| r.id.as_str() == id)
++        .expect("requirement")
++        .check
++    {
++        Check::Drift(check) => check.spec.clone(),
++        other => panic!("not a drift check: {other:?}"),
++    };
++    let baseline = vala_drift::fit_baseline(
++        &samples("x", (0..200).map(|i| f64::from(i % 100))),
++        &check("psi-shift"),
++    )
++    .expect("fitted baseline");
++    let drift = DriftChecks::new(
++        None,
++        BTreeMap::from([
++            (TaskId::new("psi-shift").expect("id"), baseline.clone()),
++            (TaskId::new("psi-few").expect("id"), baseline),
++        ]),
++        BTreeMap::from([
++            (
++                SlotName::new("latency").expect("slot"),
++                samples("ms", [99.0, 101.0, 100.0]),
++            ),
++            (
++                SlotName::new("shifted").expect("slot"),
++                samples("x", (0..200).map(|i| f64::from(75 + i % 25))),
++            ),
++            (
++                SlotName::new("few").expect("slot"),
++                samples("x", (0..10).map(f64::from)),
++            ),
++        ]),
++    );
++    let script = Arc::new(Script::default());
++    let outcome = engine(&script, InMemoryTraceSource::new(), 4)
++        .with_drift(drift)
++        .run(
++            Arc::clone(&spec),
++            BTreeMap::new(),
++            Instant::now() + Duration::from_secs(60),
++        )
++        .await
++        .expect("outcome");
++    assert_eq!(
++        outcomes(&outcome),
++        BTreeMap::from([
++            ("steady", RequirementOutcome::Passed),
++            ("slow", RequirementOutcome::Failed),
++            ("psi-shift", RequirementOutcome::Failed),
++            ("psi-unready", RequirementOutcome::Inconclusive),
++            ("psi-few", RequirementOutcome::Inconclusive),
++            ("psi-none", RequirementOutcome::Inconclusive),
++        ])
++    );
++    let shifted = requirement(&outcome, "psi-shift");
++    assert!(
++        matches!(shifted.detail, Some(RequirementDetail::Drift(_))),
++        "{shifted:?}"
++    );
++    assert!(
++        requirement(&outcome, "psi-unready")
++            .reason
++            .contains("not ready")
++    );
++    assert!(
++        requirement(&outcome, "psi-none")
++            .reason
++            .contains("no samples")
++    );
++    assert!(
++        outcome
++            .requirements
++            .iter()
++            .all(|r| r.provenance == Some(CallProvenance::Drift { window: None })),
++        "every drift result names its window"
++    );
++    assert!(script.calls().is_empty());
++}
++
++/// A Custom drift window with a null measurement of its configured metric
++/// is unscored and inconclusive, keeping its window and empty report, rather
++/// than passing on the non-null mean; nulls in unrelated columns do not
++/// matter, complete windows still pass or fail, and a missing metric column
++/// is still the scorer's refusal.
++///
++/// # Panics
++/// Panics when a Custom outcome, detail, or provenance differs.
++#[tokio::test(start_paused = true)]
++async fn custom_drift_needs_complete_measurements() {
++    use arrow::array::{Float64Array, StringArray};
++    use arrow::datatypes::{DataType, Field, Schema};
++    use chrono::{TimeZone, Utc};
++    let custom = |id: &str, slot: &str, baseline: f64| {
++        drift_requirement(
++            id,
++            slot,
++            json!({"method": "Custom", "signal": {"kind": "Metric", "name": "ms"},
++            "profile": {"kind": "Custom", "metric_name": "ms", "baseline_value": baseline, "alert_threshold": 5.0}}),
++        )
++    };
++    let spec = verifier(json!({
++        "inputs": {
++            "holes": {"type": "samples", "features": ["ms"]},
++            "noted": {"type": "samples", "features": ["ms"]},
++            "renamed": {"type": "samples", "features": ["ms"]}
++        },
++        "requirements": [
++            custom("holes", "holes", 100.0), custom("noted", "noted", 100.0),
++            custom("noted-slow", "noted", 50.0), custom("renamed", "renamed", 100.0)
++        ]
++    }));
++    let schema = Schema::new(vec![
++        Field::new("ms", DataType::Float64, true),
++        Field::new("note", DataType::Utf8, true),
++    ]);
++    let noted = arrow::record_batch::RecordBatch::try_new(
++        Arc::new(schema),
++        vec![
++            Arc::new(Float64Array::from(vec![99.0, 101.0])),
++            Arc::new(StringArray::from(vec![None::<&str>, None])),
++        ],
++    )
++    .expect("noted batch");
++    let holes = arrow::record_batch::RecordBatch::try_new(
++        Arc::new(Schema::new(vec![Field::new("ms", DataType::Float64, true)])),
++        vec![Arc::new(Float64Array::from(vec![Some(100.0), None]))],
++    )
++    .expect("holes batch");
++    let window = DriftWindow {
++        start: Utc
++            .with_ymd_and_hms(2026, 10, 1, 0, 0, 0)
++            .single()
++            .expect("start"),
++        end: Utc
++            .with_ymd_and_hms(2026, 10, 2, 0, 0, 0)
++            .single()
++            .expect("end"),
++    };
++    let drift = DriftChecks::new(
++        Some(window),
++        BTreeMap::new(),
++        BTreeMap::from([
++            (SlotName::new("holes").expect("slot"), holes),
++            (SlotName::new("noted").expect("slot"), noted),
++            (
++                SlotName::new("renamed").expect("slot"),
++                samples("latency", [100.0]),
++            ),
++        ]),
++    );
++    let script = Arc::new(Script::default());
++    let outcome = engine(&script, InMemoryTraceSource::new(), 4)
++        .with_drift(drift)
++        .run(
++            Arc::clone(&spec),
++            BTreeMap::new(),
++            Instant::now() + Duration::from_secs(60),
++        )
++        .await
++        .expect("outcome");
++    assert_eq!(
++        outcomes(&outcome),
++        BTreeMap::from([
++            ("holes", RequirementOutcome::Inconclusive),
++            ("noted", RequirementOutcome::Passed),
++            ("noted-slow", RequirementOutcome::Failed),
++            ("renamed", RequirementOutcome::Inconclusive),
++        ])
++    );
++    assert_eq!(outcome.verdict, VerificationVerdict::Failed);
++    let holes = requirement(&outcome, "holes");
++    assert!(
++        matches!(&holes.detail, Some(RequirementDetail::Drift(report)) if report.features.is_empty()),
++        "{holes:?}"
++    );
++    assert!(
++        requirement(&outcome, "renamed").reason.contains("ms"),
++        "the scorer's missing-feature refusal is kept"
++    );
++    assert!(
++        outcome.requirements.iter().all(|r| r.provenance
++            == Some(CallProvenance::Drift {
++                window: Some(window)
++            })),
++        "every drift result names its window"
++    );
++}
+diff --git a/crates/vala/vala-eval/src/blocks/scope.rs b/crates/vala/vala-eval/src/blocks/scope.rs
+new file mode 100644
+index 000000000..0d7421d9b
+--- /dev/null
++++ b/crates/vala/vala-eval/src/blocks/scope.rs
+@@ -0,0 +1,360 @@
++//! The execution scope Verifier references resolve against.
++//!
++//! The scope reads the original evidence declarations and the shared
++//! [`RunLedger`] of the stage walk, which holds each settled step's status
++//! and output and each settled step requirement's verdict. The driver
++//! resolves every binding a block declares here before handing the block to
++//! an executor, so executors only ever see values. A value that cannot be
++//! supplied resolves to [`Missing`], which keeps the cause of the gap so an
++//! intentional skip is never confused with a failure.
++
++use std::collections::{BTreeMap, BTreeSet};
++
++use serde_json::Value;
++
++use wyrd_spec::card::blocks::VerifierSpec;
++use wyrd_spec::card::blocks::{PathSegment, Reference, ReferenceRoot, Requirement, VerdictField};
++use wyrd_spec::ids::SlotName;
++use wyrd_spec::vala::eval::TaskId;
++use wyrd_spec::verification::execution::{
++    InputDeclaration, RequirementOutcome, RequirementResult, StepResult, StepStatus,
++};
++
++use super::{CallInput, CallValue};
++use crate::executor::RunLedger;
++
++/// Why a value is missing. Ordered so the stronger cause is the greater:
++/// when causes mix, failure wins.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++pub(super) enum Cause {
++    /// An intentional skip: a false `when`, or blocked only by one.
++    Skipped,
++    /// A failure, timeout, or otherwise missing required value.
++    Failed,
++}
++
++impl Cause {
++    /// The outcome of a requirement whose evidence is missing for this cause.
++    pub(super) const fn outcome(self) -> RequirementOutcome {
++        match self {
++            Self::Skipped => RequirementOutcome::NotApplicable,
++            Self::Failed => RequirementOutcome::Inconclusive,
++        }
++    }
++}
++
++/// A value that could not be supplied, with its cause and a bounded reason.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(super) struct Missing {
++    /// Why the value is missing.
++    pub cause: Cause,
++    /// Human-readable explanation recorded on the dependent block.
++    pub reason: String,
++}
++
++impl Missing {
++    /// A missing value caused by a failure or absent required evidence.
++    pub(super) fn failed(reason: impl Into<String>) -> Self {
++        Self {
++            cause: Cause::Failed,
++            reason: reason.into(),
++        }
++    }
++
++    /// Fold several gaps into one: the strongest cause wins, keeping the
++    /// first reason recorded for that cause.
++    pub(super) fn strongest(gaps: impl IntoIterator<Item = Self>) -> Option<Self> {
++        gaps.into_iter()
++            .fold(None, |best: Option<Self>, gap| match best {
++                Some(best) if best.cause >= gap.cause => Some(best),
++                _ => Some(gap),
++            })
++    }
++}
++
++/// The final state of one step as later blocks read it.
++#[derive(Debug, Clone, PartialEq)]
++pub(super) enum Settled {
++    /// The action produced `output`, derived from the `sources` slots.
++    Succeeded {
++        /// The action output.
++        output: Value,
++        /// Original slots the action read.
++        sources: BTreeSet<SlotName>,
++    },
++    /// The step failed or was skipped, so it has no output.
++    NoOutput {
++        /// `failed` or `skipped`, as `steps.<id>.status` reads it.
++        status: StepStatus,
++        /// Why there is no output; a skip blocked by a failure carries the
++        /// failure cause.
++        gap: Missing,
++    },
++}
++
++impl Settled {
++    /// The status `steps.<id>.status` reads.
++    pub(super) const fn status(&self) -> StepStatus {
++        match self {
++            Self::Succeeded { .. } => StepStatus::Succeeded,
++            Self::NoOutput { status, .. } => *status,
++        }
++    }
++}
++
++/// One settled Verifier block in the shared [`RunLedger`].
++///
++/// Results are boxed because they are an order of magnitude larger than the
++/// settled state, and the ledger holds every block.
++#[derive(Debug)]
++pub(super) enum Done {
++    /// A step: its reported result and the state later blocks read.
++    Step {
++        /// The reported step result.
++        result: Box<StepResult>,
++        /// The state `steps.<id>` references read.
++        state: Settled,
++    },
++    /// A judged requirement, as reported.
++    Requirement(Box<RequirementResult>),
++}
++
++/// The scope document of one stage: the original evidence plus every block
++/// earlier stages settled. Read-only; the stage walk owns the ledger.
++pub(super) struct Scope<'a> {
++    /// The executing Verifier, for slot declarations.
++    spec: &'a VerifierSpec,
++    /// The pinned original evidence by slot.
++    evidence: &'a BTreeMap<SlotName, InputDeclaration>,
++    /// Blocks settled by earlier stages.
++    ledger: &'a RunLedger<Done>,
++}
++
++impl<'a> Scope<'a> {
++    /// The scope over the original evidence and the blocks in `ledger`.
++    pub(super) fn new(
++        spec: &'a VerifierSpec,
++        evidence: &'a BTreeMap<SlotName, InputDeclaration>,
++        ledger: &'a RunLedger<Done>,
++    ) -> Self {
++        Self {
++            spec,
++            evidence,
++            ledger,
++        }
++    }
++
++    /// Returns a settled step's state.
++    pub(super) fn step(&self, step: &TaskId) -> Option<&Settled> {
++        match self.ledger.get(step) {
++            Some(Done::Step { state, .. }) => Some(state),
++            _ => None,
++        }
++    }
++
++    /// Returns a settled step requirement's verdict.
++    fn verdict(&self, requirement: &TaskId) -> Option<&RequirementResult> {
++        match self.ledger.get(requirement) {
++            Some(Done::Requirement(result)) => Some(result),
++            _ => None,
++        }
++    }
++
++    /// Resolve every named binding, returning the values or the strongest
++    /// gap among them.
++    ///
++    /// # Errors
++    /// Returns the strongest [`Missing`] when any binding cannot be supplied.
++    pub(super) fn resolve_all<'r, K: ToString + 'r>(
++        &self,
++        bindings: impl IntoIterator<Item = (K, &'r Reference)>,
++        requirement: Option<&Requirement>,
++    ) -> Result<BTreeMap<String, CallInput>, Missing> {
++        let mut resolved = BTreeMap::new();
++        let mut gaps = Vec::new();
++        for (name, reference) in bindings {
++            match self.resolve(reference, requirement) {
++                Ok(input) => {
++                    resolved.insert(name.to_string(), input);
++                }
++                Err(gap) => gaps.push(gap),
++            }
++        }
++        Missing::strongest(gaps).map_or(Ok(resolved), Err)
++    }
++
++    /// Resolve one reference, with `requirement` as the current requirement
++    /// during its check.
++    ///
++    /// A JSON input or step output is navigated by the reference's child
++    /// selectors; a whole media or trace slot resolves to its pinned
++    /// declaration. An omitted optional slot is `null`. Step statuses and
++    /// verdict fields resolve to their wire strings.
++    ///
++    /// # Errors
++    /// Returns [`Missing`] carrying the upstream cause for the output of a
++    /// step that produced none, and a failure for an omitted required slot,
++    /// an unsettled step or verdict, or a selector that matches nothing.
++    pub(super) fn resolve(
++        &self,
++        reference: &Reference,
++        requirement: Option<&Requirement>,
++    ) -> Result<CallInput, Missing> {
++        let unresolved = || Missing::failed(format!("`{reference}` has no value"));
++        let constant = |text: &str| Ok(json_input(Value::String(text.to_owned()), BTreeSet::new()));
++        match &reference.root {
++            ReferenceRoot::Input(slot) => {
++                let sources = BTreeSet::from([slot.clone()]);
++                match self.evidence.get(slot) {
++                    Some(InputDeclaration::Json { value }) => select(value, &reference.path)
++                        .map(|value| json_input(value, sources))
++                        .ok_or_else(unresolved),
++                    Some(declaration) if reference.path.is_empty() => Ok(CallInput {
++                        value: CallValue::Evidence(declaration.clone()),
++                        sources,
++                    }),
++                    Some(_) => Err(unresolved()),
++                    None if self
++                        .spec
++                        .inputs
++                        .get(slot)
++                        .is_some_and(|slot| !slot.required()) =>
++                    {
++                        select(&Value::Null, &reference.path)
++                            .map(|value| json_input(value, sources))
++                            .ok_or_else(unresolved)
++                    }
++                    None => Err(Missing::failed(format!(
++                        "required input `{slot}` was not supplied"
++                    ))),
++                }
++            }
++            ReferenceRoot::StepOutput(step) => match self.step(step) {
++                Some(Settled::Succeeded { output, sources }) => select(output, &reference.path)
++                    .map(|value| json_input(value, sources.clone()))
++                    .ok_or_else(unresolved),
++                Some(Settled::NoOutput { gap, .. }) => Err(Missing {
++                    cause: gap.cause,
++                    reason: format!(
++                        "step `{}` produced no output: {}",
++                        step.as_str(),
++                        gap.reason
++                    ),
++                }),
++                None => Err(unresolved()),
++            },
++            ReferenceRoot::StepStatus(step) => {
++                let settled = self.step(step).ok_or_else(unresolved)?;
++                Ok(json_input(wire(&settled.status()), BTreeSet::new()))
++            }
++            ReferenceRoot::StepVerdict {
++                requirement: id,
++                field,
++                ..
++            } => {
++                let verdict = self.verdict(id).ok_or_else(unresolved)?;
++                let value = match field {
++                    VerdictField::Outcome => wire(&verdict.outcome),
++                    VerdictField::Reason => Value::String(verdict.reason.clone()),
++                };
++                Ok(json_input(value, BTreeSet::new()))
++            }
++            ReferenceRoot::RequirementId => {
++                requirement.map_or_else(|| Err(unresolved()), |req| constant(req.id.as_str()))
++            }
++            ReferenceRoot::RequirementStatement => {
++                requirement.map_or_else(|| Err(unresolved()), |req| constant(&req.statement))
++            }
++        }
++    }
++}
++
++/// A JSON binding value.
++fn json_input(value: Value, sources: BTreeSet<SlotName>) -> CallInput {
++    CallInput {
++        value: CallValue::Json(value),
++        sources,
++    }
++}
++
++/// The serde wire form of a status or outcome enum, such as `"succeeded"`.
++fn wire<T: serde::Serialize>(value: &T) -> Value {
++    serde_json::to_value(value).unwrap_or(Value::Null)
++}
++
++/// Apply child selectors to `value`.
++///
++/// Fields and indexes select one child; a `[*]` wildcard maps the remaining
++/// selectors over every array element and yields the array of results.
++/// Returns `None` when any selected field, index, or wildcard target is
++/// absent, so a missing value is never mistaken for `null`.
++fn select(value: &Value, path: &[PathSegment]) -> Option<Value> {
++    let Some((segment, rest)) = path.split_first() else {
++        return Some(value.clone());
++    };
++    match segment {
++        PathSegment::Field(name) => select(value.get(name)?, rest),
++        PathSegment::Index(index) => select(value.get(index)?, rest),
++        PathSegment::Wildcard => {
++            // A later wildcard already yields an array of matches; flatten
++            // it so `a[*].b[*]` is one array.
++            let nested = rest.contains(&PathSegment::Wildcard);
++            let mut matches = Vec::new();
++            for item in value.as_array()? {
++                match select(item, rest)? {
++                    Value::Array(inner) if nested => matches.extend(inner),
++                    other => matches.push(other),
++                }
++            }
++            Some(Value::Array(matches))
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    //! Reference selection over the scope document.
++
++    use serde_json::json;
++
++    use super::*;
++
++    /// Parse a reference's child selectors.
++    ///
++    /// # Panics
++    /// Panics when `inputs.x<text>` is not a valid reference.
++    fn path(text: &str) -> Vec<PathSegment> {
++        Reference::parse(&format!("inputs.x{text}"))
++            .expect("reference")
++            .path
++    }
++
++    /// Fields, indexes, and nested wildcards select values; absent targets
++    /// are missing while an explicit null is a value.
++    ///
++    /// # Panics
++    /// Panics when a selection result differs from the expected value.
++    #[test]
++    fn select_distinguishes_absent_from_null() {
++        let doc = json!({"sheets": [
++            {"cells": [{"error": null}, {"error": "#DIV/0!"}]},
++            {"cells": [{"error": null}]}
++        ], "none": null});
++        assert_eq!(
++            select(&doc, &path(".sheets[0].cells[1].error")),
++            Some(json!("#DIV/0!"))
++        );
++        assert_eq!(
++            select(&doc, &path(".sheets[*].cells[*].error")),
++            Some(json!([null, "#DIV/0!", null]))
++        );
++        assert_eq!(select(&doc, &path(".none")), Some(Value::Null));
++        assert_eq!(select(&doc, &path(".absent")), None);
++        assert_eq!(select(&doc, &path(".sheets[5]")), None);
++        assert_eq!(select(&doc, &path(".none.child")), None);
++        assert_eq!(
++            select(&json!({"rows": []}), &path(".rows[*]")),
++            Some(json!([]))
++        );
++    }
++}
+diff --git a/crates/vala/vala-eval/src/executor.rs b/crates/vala/vala-eval/src/executor.rs
+index 2c8860b01..247c7c959 100644
+--- a/crates/vala/vala-eval/src/executor.rs
++++ b/crates/vala/vala-eval/src/executor.rs
+@@ -1,32 +1,35 @@
+-//! Stage-walking driver for `ExecutionPlan`.
++//! Stage-walking driver for `ExecutionPlan`s.
+ //!
+-//! The driver:
++//! [`walk`] is the one stage lifecycle every `vala-eval` execution shares:
+ //!
+-//! 1. Walks `ExecutionPlan::stages` in topological order, threading an
+-//!    [`Arc<ContextSnapshot>`] through each stage.
+-//! 2. Per stage: resolves dependency-skip and condition-gate skips
+-//!    sequentially (no IO), then buckets the runnable tasks by
+-//!    [`crate::store::EvalTaskKind`] and fans the four buckets out
+-//!    concurrently via `tokio::JoinSet` coordinated by `tokio::try_join!`.
+-//! 3. At each stage barrier: rebuilds the next snapshot by extending the
+-//!    prior one with the new [`crate::context::TaskOutput`]s. The rebuild is
+-//!    a sequence of `Arc::clone` bumps; no JSON deep-clones happen here.
+-//! 4. Maintains a single-threaded [`RunLedger`] for per-run state (skip set
+-//!    plus outcome stream). [`crate::store::TaskRegistry`] stays immutable.
++//! 1. Walks the stages in topological order, settling every task into one
++//!    [`RunLedger`].
++//! 2. Per stage: the caller's `prepare` classifies each task synchronously
++//!    (no IO) against the ledger of earlier stages, settling skips without
++//!    running and handing back runnable futures.
++//! 3. Fans the runnable tasks out concurrently on one `tokio::JoinSet`.
++//! 4. At the stage barrier: appends the stage's settlements to the ledger in
++//!    declaration order.
++//!
++//! [`execute_plan`] drives Eval task plans through it: each stage's
++//! [`ContextSnapshot`] extends the record context with every earlier output
++//! (a sequence of `Arc::clone` bumps, no JSON deep-clones), and each task runs
++//! on its kind's executor. Verifier executions drive the same walk through
++//! `crate::blocks::VerificationEngine`.
+ //!
+ //! An executor error aborts the run and propagates to the caller: an error is
+ //! an execution failure, never a subject failure, so it is never recorded as a
+ //! Failed `AssertionResult`. Only a completed comparison produces a result.
+-//!
+-//! The four-bucket fan-out shape keeps task kinds concurrent within a stage.
+ //! Executors return outputs rather than writing into shared state, so no locks
+ //! are needed across the stage barrier.
+ 
+-use std::collections::{BTreeMap, BTreeSet, HashMap};
++use std::collections::HashMap;
++use std::future::Future;
++use std::pin::Pin;
+ use std::sync::Arc;
+ 
+ use async_trait::async_trait;
+-use tokio::task::JoinSet;
++use tokio::task::{JoinError, JoinSet};
+ use tracing::Instrument as _;
+ 
+ use wyrd_spec::vala::eval::{
+@@ -143,22 +146,130 @@ impl EvalReport {
+     }
+ }
+ 
+-/// Output of the task-classification pass: runnable buckets by kind and skip outcomes in declaration order.
+-type ClassifiedStage = (BTreeMap<EvalTaskKind, Vec<EvalTask>>, Vec<TaskRunOutcome>);
++/// Per-run state shared by every stage-walking execution: each settled task
++/// by id, in the order the stage walk settled it.
++///
++/// [`walk`] owns it and appends one stage at a time in declaration order, so
++/// iteration order is stage order and, within a stage, declaration order.
++/// Preparation of a later stage reads earlier settlements through
++/// [`RunLedger::get`]; nothing mutates a settled entry.
++#[derive(Debug, Clone)]
++pub struct RunLedger<O> {
++    /// Settled tasks in settlement order.
++    entries: Vec<(TaskId, O)>,
++    /// Position of each settled task in `entries`.
++    index: HashMap<TaskId, usize>,
++}
+ 
+-/// Per-run state owned by the driver. Single-threaded — no locks.
++impl<O> Default for RunLedger<O> {
++    /// An empty ledger: nothing has settled.
++    fn default() -> Self {
++        Self {
++            entries: Vec::new(),
++            index: HashMap::new(),
++        }
++    }
++}
++
++impl<O> RunLedger<O> {
++    /// The settlement of `task`, when an earlier stage settled it.
++    #[must_use]
++    pub fn get(&self, task: &TaskId) -> Option<&O> {
++        self.index.get(task).map(|&at| &self.entries[at].1)
++    }
++
++    /// Every settlement, in settlement order.
++    pub fn iter(&self) -> impl Iterator<Item = (&TaskId, &O)> + '_ {
++        self.entries.iter().map(|(id, settled)| (id, settled))
++    }
++
++    /// Record `task`'s settlement after every earlier one.
++    fn push(&mut self, task: TaskId, settled: O) {
++        self.index.insert(task.clone(), self.entries.len());
++        self.entries.push((task, settled));
++    }
++}
++
++impl<O> IntoIterator for RunLedger<O> {
++    type Item = (TaskId, O);
++    type IntoIter = std::vec::IntoIter<(TaskId, O)>;
++
++    /// Every settlement, in settlement order.
++    fn into_iter(self) -> Self::IntoIter {
++        self.entries.into_iter()
++    }
++}
++
++/// A pending task future spawned by [`walk`].
++pub(crate) type Running<O, E> = Pin<Box<dyn Future<Output = Result<O, E>> + Send>>;
++
++/// How one planned task proceeds, decided before its stage fans out.
++pub(crate) enum Prepared<O, E> {
++    /// Settled without running, such as a skip.
++    Settled(O),
++    /// Runs concurrently with the rest of its stage.
++    Run(Running<O, E>),
++}
++
++/// Walk `stages` in order, settling every task into one [`RunLedger`].
+ ///
+-/// `skipped` is the cumulative skip set used for `DependencySkipped`
+-/// propagation across stages. `outcomes` is the stream consumed by the
+-/// final [`EvalReport`].
+-#[derive(Debug, Default, Clone)]
+-pub struct RunLedger {
+-    /// Task ids that were skipped during this run, in any order.
+-    pub skipped: BTreeSet<TaskId>,
+-    /// Outcomes in the order the stage loop produced them.
+-    pub outcomes: Vec<TaskRunOutcome>,
++/// This is the single stage lifecycle of `vala-eval`: per stage, `prepare`
++/// sees the ledger of every earlier stage and returns one [`Prepared`] per
++/// stage task, in declaration order; settled tasks are recorded as is, and
++/// runnable ones are spawned on one `JoinSet` inside the caller's current
++/// span, so a task's work stays in the caller's trace. At the stage barrier
++/// the settlements are appended in declaration order. Contract-specific
++/// classification, budgets and results stay in `prepare`.
++///
++/// # Errors
++/// Returns the first `prepare` error, the first task error in completion
++/// order, or `joined` applied to a task that panicked or was aborted.
++///
++/// # Cancellation
++/// Returning early or dropping the future drops the `JoinSet`, which aborts
++/// every task of the stage still running; the stage yields no partial
++/// settlements. Work an aborted task already performed is not rolled back.
++pub(crate) async fn walk<'s, O, E>(
++    stages: impl IntoIterator<Item = &'s Stage>,
++    mut prepare: impl FnMut(&RunLedger<O>, &Stage) -> Result<Vec<Prepared<O, E>>, E>,
++    joined: fn(JoinError) -> E,
++) -> Result<RunLedger<O>, E>
++where
++    O: Send + 'static,
++    E: Send + 'static,
++{
++    let mut ledger = RunLedger::default();
++    for stage in stages {
++        let mut settled = HashMap::new();
++        let mut running = JoinSet::new();
++        for (at, prepared) in prepare(&ledger, stage)?.into_iter().enumerate() {
++            match prepared {
++                Prepared::Settled(done) => {
++                    settled.insert(at, done);
++                }
++                Prepared::Run(task) => {
++                    running.spawn(
++                        async move { (at, task.await) }.instrument(tracing::Span::current()),
++                    );
++                }
++            }
++        }
++        while let Some(done) = running.join_next().await {
++            let (at, done) = done.map_err(joined)?;
++            settled.insert(at, done?);
++        }
++        for (at, task) in stage.tasks.iter().enumerate() {
++            if let Some(done) = settled.remove(&at) {
++                ledger.push(task.clone(), done);
++            }
++        }
++    }
++    Ok(ledger)
+ }
+ 
++/// One Eval task's settlement: the executor output, or why it was skipped.
++type EvalSettled = Result<Arc<TaskOutput>, SkipReason>;
++
+ /// Per-variant task execution.
+ #[async_trait]
+ pub trait TaskExecutor: Send + Sync {
+@@ -191,267 +302,118 @@ pub struct Executors {
+     pub agent: Arc<dyn TaskExecutor>,
+ }
+ 
++impl Executors {
++    /// The executor that runs tasks of `kind`.
++    fn of(&self, kind: EvalTaskKind) -> &Arc<dyn TaskExecutor> {
++        match kind {
++            EvalTaskKind::Assertion => &self.assertion,
++            EvalTaskKind::LlmJudge => &self.judge,
++            EvalTaskKind::TraceAssertion => &self.trace,
++            EvalTaskKind::AgentAssertion => &self.agent,
++        }
++    }
++}
++
+ /// Walk `plan.stages` in order, returning the per-run report.
+ /// This is the main entry point for the driver.
+ ///
++/// Each stage runs through [`walk`]: its snapshot extends the record context
++/// with every earlier output, dependency and condition skips settle without
++/// running, and every other task runs concurrently on its kind's executor.
++///
+ /// # Errors
+ /// Returns [`EvalExecError::DagInvalid`] when a plan references a task absent
+-/// from the registry, and any condition-evaluation or task-executor error
+-/// unchanged; no error is converted into a Failed result.
++/// from the registry or a task panics, and any condition-evaluation or
++/// task-executor error unchanged; no error is converted into a Failed result.
+ pub async fn execute_plan(
+     plan: &ExecutionPlan,
+     cx: &ExecutionContext,
+     registry: &TaskRegistry,
+     executors: &Executors,
+ ) -> Result<EvalReport, EvalExecError> {
+-    let mut snapshot = Arc::clone(cx.snapshot());
+-    let mut ledger = RunLedger::default();
+-    for stage in &plan.stages {
+-        snapshot = execute_stage(stage, snapshot, registry, executors, &mut ledger).await?;
+-    }
++    let base = cx.snapshot();
++    let ledger = walk(
++        &plan.stages,
++        |ledger: &RunLedger<EvalSettled>, stage| {
++            let outputs = ledger.iter().filter_map(|(id, settled)| {
++                settled
++                    .as_ref()
++                    .ok()
++                    .map(|output| (id.clone(), Arc::clone(output)))
++            });
++            let snapshot = Arc::new(base.extend(outputs));
++            stage
++                .tasks
++                .iter()
++                .map(|id| prepare_task(id, stage, &snapshot, registry, executors, ledger))
++                .collect()
++        },
++        |error| EvalExecError::DagInvalid {
++            reason: format!("task join failure: {error}"),
++        },
++    )
++    .await?;
+     Ok(EvalReport {
+-        outcomes: ledger.outcomes,
++        outcomes: ledger
++            .into_iter()
++            .map(|(task_id, settled)| match settled {
++                Ok(output) => TaskRunOutcome::Ran(Box::new(output.result().clone())),
++                Err(reason) => TaskRunOutcome::Skipped { task_id, reason },
++            })
++            .collect(),
+     })
+ }
+ 
+-/// Execute one stage: classify tasks, fan out concurrently, and extend the snapshot.
+-///
+-/// Returns the new snapshot to thread into the next stage.
+-async fn execute_stage(
+-    stage: &Stage,
+-    snapshot: Arc<ContextSnapshot>,
+-    registry: &TaskRegistry,
+-    executors: &Executors,
+-    ledger: &mut RunLedger,
+-) -> Result<Arc<ContextSnapshot>, EvalExecError> {
+-    // prepare the tasks: resolve skips and bucket the runnable tasks by kind
+-    let (buckets, skips) = classify_stage_tasks(stage, &snapshot, registry, ledger)?;
+-
+-    // run the buckets concurrently and collect their outputs flat; no ordering guarantees within the stage yet
+-    let outputs =
+-        fan_out_all_buckets(buckets, Arc::clone(&snapshot), executors, stage.index).await?;
+-    let by_id: HashMap<TaskId, TaskOutput> = outputs.into_iter().collect();
+-
+-    // merge the skips and outputs back into declaration order, extending the ledger and preparing the snapshot extension
+-    let (ordered, new_outputs) = order_stage_outcomes(stage, skips, by_id);
+-    ledger.outcomes.extend(ordered);
+-    Ok(Arc::new(snapshot.extend(new_outputs)))
+-}
+-
+-/// First pass: resolve skips synchronously and bucket the runnable tasks by kind.
+-///
+-/// Dependency-skip propagation and condition-gate evaluation are both pure
+-/// (no IO). `ledger.skipped` is extended in place so later stages — and later
+-/// tasks in this same stage — can propagate skips transitively.
++/// Classify one Eval task of `stage`: a skipped dependency or a false
++/// condition settles it as skipped, otherwise it runs on its kind's executor
++/// against the stage `snapshot`.
+ ///
+-/// Returns the runnable-task buckets and the skip outcomes in declaration order.
+-fn classify_stage_tasks(
++/// # Errors
++/// Returns [`EvalExecError::DagInvalid`] when the registry lacks the task and
++/// the condition-evaluation error of an unevaluable condition.
++fn prepare_task(
++    task_id: &TaskId,
+     stage: &Stage,
+-    snapshot: &ContextSnapshot,
++    snapshot: &Arc<ContextSnapshot>,
+     registry: &TaskRegistry,
+-    ledger: &mut RunLedger,
+-) -> Result<ClassifiedStage, EvalExecError> {
+-    let mut buckets: BTreeMap<EvalTaskKind, Vec<EvalTask>> = BTreeMap::new();
+-    let mut skips: Vec<TaskRunOutcome> = Vec::new();
+-
+-    for task_id in &stage.tasks {
+-        let task = registry
+-            .get(task_id)
+-            .ok_or_else(|| EvalExecError::DagInvalid {
+-                reason: format!(
+-                    "plan stage {} references unknown task {:?}",
+-                    stage.index,
+-                    task_id.as_str()
+-                ),
+-            })?;
+-
+-        if let Some(upstream) = first_skipped_dependency(task, ledger) {
+-            ledger.skipped.insert(task_id.clone());
+-            skips.push(TaskRunOutcome::Skipped {
+-                task_id: task_id.clone(),
+-                reason: SkipReason::DependencySkipped { upstream },
+-            });
+-            continue;
+-        }
+-
+-        if let Some(condition) = task.condition()
+-            && !evaluate_condition(task_id, task.depends_on(), condition, snapshot)?
+-        {
+-            ledger.skipped.insert(task_id.clone());
+-            skips.push(TaskRunOutcome::Skipped {
+-                task_id: task_id.clone(),
+-                reason: SkipReason::ConditionFalse,
+-            });
+-            continue;
+-        }
+-
+-        buckets
+-            .entry(EvalTaskKind::from_task(task))
+-            .or_default()
+-            .push(task.clone());
+-    }
+-
+-    Ok((buckets, skips))
+-}
+-
+-/// Second pass: run all four task-kind buckets concurrently and return their outputs flat.
+-///
+-/// `tokio::try_join!` keeps the four kinds parallel. Within each kind,
+-/// [`fan_out_bucket`] spawns one Tokio task per eval task via `JoinSet`.
+-/// The flat output vec arrives in assertion → judge → trace → agent order;
+-/// declaration order is restored by [`order_stage_outcomes`].
+-async fn fan_out_all_buckets(
+-    mut buckets: BTreeMap<EvalTaskKind, Vec<EvalTask>>,
+-    snapshot: Arc<ContextSnapshot>,
+     executors: &Executors,
+-    stage_index: u32,
+-) -> Result<Vec<(TaskId, TaskOutput)>, EvalExecError> {
+-    let assertion_tasks = buckets.remove(&EvalTaskKind::Assertion).unwrap_or_default();
+-    let judge_tasks = buckets.remove(&EvalTaskKind::LlmJudge).unwrap_or_default();
+-    let trace_tasks = buckets
+-        .remove(&EvalTaskKind::TraceAssertion)
+-        .unwrap_or_default();
+-    let agent_tasks = buckets
+-        .remove(&EvalTaskKind::AgentAssertion)
+-        .unwrap_or_default();
+-
+-    let (assertion_out, judge_out, trace_out, agent_out) = tokio::try_join!(
+-        fan_out_bucket(
+-            assertion_tasks,
+-            Arc::clone(&snapshot),
+-            Arc::clone(&executors.assertion),
+-            stage_index
+-        ),
+-        fan_out_bucket(
+-            judge_tasks,
+-            Arc::clone(&snapshot),
+-            Arc::clone(&executors.judge),
+-            stage_index
+-        ),
+-        fan_out_bucket(
+-            trace_tasks,
+-            Arc::clone(&snapshot),
+-            Arc::clone(&executors.trace),
+-            stage_index
+-        ),
+-        fan_out_bucket(
+-            agent_tasks,
+-            Arc::clone(&snapshot),
+-            Arc::clone(&executors.agent),
+-            stage_index
+-        ),
+-    )?;
+-
+-    Ok(assertion_out
+-        .into_iter()
+-        .chain(judge_out)
+-        .chain(trace_out)
+-        .chain(agent_out)
+-        .collect())
+-}
+-
+-/// Merge skip outcomes and task outputs into stage-declaration order.
+-///
+-/// Skips arrived in declaration order from [`classify_stage_tasks`]; they are
+-/// re-indexed by task id so the single pass over `stage.tasks` can interleave
+-/// them with ran outputs without a second linear scan.
+-///
+-/// Returns the ordered outcomes (for the ledger) and the new outputs (for
+-/// snapshot extension).
+-fn order_stage_outcomes(
+-    stage: &Stage,
+-    skips: Vec<TaskRunOutcome>,
+-    mut by_id: HashMap<TaskId, TaskOutput>,
+-) -> (Vec<TaskRunOutcome>, Vec<(TaskId, Arc<TaskOutput>)>) {
+-    let mut skips_by_id: HashMap<TaskId, TaskRunOutcome> = skips
+-        .into_iter()
+-        .map(|outcome| (outcome_task_id(&outcome).clone(), outcome))
+-        .collect();
+-
+-    let mut ordered: Vec<TaskRunOutcome> = Vec::with_capacity(stage.tasks.len());
+-    let mut new_outputs: Vec<(TaskId, Arc<TaskOutput>)> = Vec::new();
+-
+-    for task_id in &stage.tasks {
+-        if let Some(skip) = skips_by_id.remove(task_id) {
+-            ordered.push(skip);
+-        } else if let Some(output) = by_id.remove(task_id) {
+-            ordered.push(TaskRunOutcome::Ran(Box::new(output.result().clone())));
+-            new_outputs.push((task_id.clone(), Arc::new(output)));
+-        }
+-    }
+-
+-    (ordered, new_outputs)
+-}
+-
+-/// Run every task of one task-kind bucket concurrently on its shared executor.
+-///
+-/// [`fan_out_all_buckets`] calls this once per kind (assertion, judge, trace,
+-/// agent) for one stage. Each task gets its own Tokio task on a `JoinSet`
+-/// sharing `snapshot` and `executor`, running inside the caller's current
+-/// span so a task's work (a judge's gateway call) stays in the caller's
+-/// trace; outputs are collected in completion
+-/// order, and [`order_stage_outcomes`] later restores declaration order. An
+-/// empty bucket returns immediately without spawning.
+-///
+-/// # Errors
+-/// Returns the first error observed in completion order: the executor's own
+-/// [`EvalExecError`] unchanged, so an executor failure aborts the run rather
+-/// than becoming a failed result, or [`EvalExecError::DagInvalid`] when a
+-/// spawned task panicked or was cancelled.
+-///
+-/// # Cancellation
+-/// Returning early drops the `JoinSet`, which aborts every sibling task of
+-/// this bucket still running; their outputs, and any already collected, are
+-/// discarded, so the stage yields no partial results. Dropping this future
+-/// (including when `tokio::try_join!` in [`fan_out_all_buckets`] short-circuits
+-/// on another bucket's error) aborts the bucket's tasks the same way. Work an
+-/// aborted executor already performed, such as a provider call, is not
+-/// rolled back.
+-async fn fan_out_bucket(
+-    tasks: Vec<EvalTask>,
+-    snapshot: Arc<ContextSnapshot>,
+-    executor: Arc<dyn TaskExecutor>,
+-    stage: u32,
+-) -> Result<Vec<(TaskId, TaskOutput)>, EvalExecError> {
+-    if tasks.is_empty() {
+-        return Ok(Vec::new());
++    ledger: &RunLedger<EvalSettled>,
++) -> Result<Prepared<EvalSettled, EvalExecError>, EvalExecError> {
++    let task = registry
++        .get(task_id)
++        .ok_or_else(|| EvalExecError::DagInvalid {
++            reason: format!(
++                "plan stage {} references unknown task {:?}",
++                stage.index,
++                task_id.as_str()
++            ),
++        })?;
++    if let Some(upstream) = first_skipped_dependency(task, ledger) {
++        return Ok(Prepared::Settled(Err(SkipReason::DependencySkipped {
++            upstream,
++        })));
+     }
+-
+-    let mut set: JoinSet<Result<(TaskId, TaskOutput), EvalExecError>> = JoinSet::new();
+-    for task in tasks {
+-        let snapshot = Arc::clone(&snapshot);
+-        let executor = Arc::clone(&executor);
+-        set.spawn(
+-            async move {
+-                let output = executor.execute(&task, &snapshot, stage).await?;
+-                Ok((task.id().clone(), output))
+-            }
+-            .instrument(tracing::Span::current()),
+-        );
+-    }
+-
+-    let mut collected = Vec::new();
+-    while let Some(joined) = set.join_next().await {
+-        match joined {
+-            Ok(Ok(pair)) => collected.push(pair),
+-            Ok(Err(error)) => return Err(error),
+-            Err(join_err) => {
+-                return Err(EvalExecError::DagInvalid {
+-                    reason: format!("task join failure: {join_err}"),
+-                });
+-            }
+-        }
++    if let Some(condition) = task.condition()
++        && !evaluate_condition(task_id, task.depends_on(), condition, snapshot)?
++    {
++        return Ok(Prepared::Settled(Err(SkipReason::ConditionFalse)));
+     }
+-    Ok(collected)
++    let task = task.clone();
++    let snapshot = Arc::clone(snapshot);
++    let executor = Arc::clone(executors.of(EvalTaskKind::from_task(&task)));
++    let stage = stage.index;
++    Ok(Prepared::Run(Box::pin(async move {
++        let output = executor.execute(&task, &snapshot, stage).await?;
++        Ok(Ok(Arc::new(output)))
++    })))
+ }
+ 
+-fn first_skipped_dependency(task: &EvalTask, ledger: &RunLedger) -> Option<TaskId> {
+-    for dep in task.depends_on() {
+-        if ledger.skipped.contains(dep) {
+-            return Some(dep.clone());
+-        }
+-    }
+-    None
++/// The first declared dependency of `task` that settled as skipped.
++fn first_skipped_dependency(task: &EvalTask, ledger: &RunLedger<EvalSettled>) -> Option<TaskId> {
++    task.depends_on()
++        .iter()
++        .find(|dep| matches!(ledger.get(dep), Some(Err(_))))
++        .cloned()
+ }
+ 
+ fn evaluate_condition(
+@@ -503,13 +465,6 @@ fn evaluate_condition(
+     Ok(acc.unwrap_or(true))
+ }
+ 
+-fn outcome_task_id(outcome: &TaskRunOutcome) -> &TaskId {
+-    match outcome {
+-        TaskRunOutcome::Ran(result) => &result.task_id,
+-        TaskRunOutcome::Skipped { task_id, .. } => task_id,
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use std::collections::BTreeMap;
+@@ -602,8 +557,8 @@ mod tests {
+         let plan = wyrd_spec::vala::eval::validate_dag(&map)?;
+         let registry = TaskRegistry::from_plan(&plan, map.clone())?;
+         let mut ledger = RunLedger::default();
+-        ledger.skipped.insert(tid("b")?);
+-        ledger.skipped.insert(tid("a")?);
++        ledger.push(tid("b")?, Err(SkipReason::ConditionFalse));
++        ledger.push(tid("a")?, Err(SkipReason::ConditionFalse));
+ 
+         let task_c = tid("c")?;
+         let task = registry.get(&task_c).expect("task c registered");
+diff --git a/crates/vala/vala-eval/src/results.rs b/crates/vala/vala-eval/src/results.rs
+index 961dba2f3..f605f7dd6 100644
+--- a/crates/vala/vala-eval/src/results.rs
++++ b/crates/vala/vala-eval/src/results.rs
+@@ -333,21 +333,29 @@ pub fn apply_context_capture(
+     mut result: AssertionResult,
+     capture: EvalContextCapture,
+ ) -> Result<AssertionResult, EvalExecError> {
++    result.actual = capture_actual(result.actual, capture)?;
++    Ok(result)
++}
++
++/// Apply `capture` to one stored `actual` value: kept verbatim for `full`,
++/// replaced by its SHA-256 hex digest for `hash`, and dropped for `redact`.
++///
++/// The one capture rule shared by Eval results and Verifier requirement
++/// results.
++///
++/// # Errors
++/// Returns `ContextHashFailed` if hashing cannot serialize the value.
++pub fn capture_actual(
++    actual: Option<serde_json::Value>,
++    capture: EvalContextCapture,
++) -> Result<Option<serde_json::Value>, EvalExecError> {
+     match capture {
+-        EvalContextCapture::Full => Ok(result),
+-        EvalContextCapture::Hash => {
+-            result.actual = result
+-                .actual
+-                .as_ref()
+-                .map(hash_context_value)
+-                .transpose()?
+-                .map(serde_json::Value::String);
+-            Ok(result)
+-        }
+-        EvalContextCapture::Redact => {
+-            result.actual = None;
+-            Ok(result)
+-        }
++        EvalContextCapture::Full => Ok(actual),
++        EvalContextCapture::Hash => actual
++            .as_ref()
++            .map(|value| hash_context_value(value).map(serde_json::Value::String))
++            .transpose(),
++        EvalContextCapture::Redact => Ok(None),
+     }
+ }
+ 
+diff --git a/crates/vala/vala-eval/src/tasks/assertion.rs b/crates/vala/vala-eval/src/tasks/assertion.rs
+index 9725390f2..a39b10f5e 100644
+--- a/crates/vala/vala-eval/src/tasks/assertion.rs
++++ b/crates/vala/vala-eval/src/tasks/assertion.rs
+@@ -7,7 +7,9 @@ use async_trait::async_trait;
+ use chrono::Utc;
+ use serde_json::Value;
+ 
+-use wyrd_spec::vala::eval::{AssertionResult, AssertionTask, EvalTask, JsonPath, TaskId};
++use wyrd_spec::vala::eval::{
++    AssertionResult, AssertionTask, ComparisonOperator, EvalTask, JsonPath, TaskId,
++};
+ 
+ use crate::context::{ContextSnapshot, TaskOutput, extract_required_jsonpath_from};
+ use crate::error::EvalExecError;
+@@ -69,6 +71,21 @@ impl TaskExecutor for AssertionTaskExecutor {
+     }
+ }
+ 
++/// Judge one assertion task against `snapshot`.
++///
++/// Selects the observed value from the task's scoped view (the record
++/// context plus the declared dependencies' outputs under `$.task`), using
++/// the item path in item mode or the context path otherwise; without a path
++/// it compares the whole view, or the bare record when there are no
++/// dependencies. Item mode
++/// compares every selected item, single mode the one selected value. The
++/// result is attributed to the task at `stage` with its start time and
++/// duration; a false comparison is a Failed result, not an error.
++///
++/// # Errors
++/// Returns the [`EvalExecError`] of a selection that cannot be extracted
++/// (an invalid or missing required path) and of an operator that cannot
++/// compare the selected value's type, unchanged.
+ fn execute_assertion(
+     task: &AssertionTask,
+     snapshot: &ContextSnapshot,
+@@ -78,8 +95,8 @@ fn execute_assertion(
+     let view = snapshot.build_scoped_view(&task.depends_on);
+     let observed = resolve_observed(task, &view, snapshot)?;
+     let (passed, actual, expected, message) = match &task.item_context_path {
+-        Some(_) => evaluate_item_mode(task, &observed)?,
+-        None => evaluate_single(task, &observed)?,
++        Some(_) => evaluate_item_mode(&task.id, &task.operator, &task.expected, &observed)?,
++        None => evaluate_single(&task.id, &task.operator, &task.expected, &observed)?,
+     };
+ 
+     Ok(AssertionResult {
+@@ -119,51 +136,73 @@ fn extract(value: &Value, path: &JsonPath, task_id: &TaskId) -> Result<Value, Ev
+     extract_required_jsonpath_from(value, path, task_id)
+ }
+ 
+-fn evaluate_single(
+-    task: &AssertionTask,
++/// The compared outcome of one assertion: passed, observed actual, the
++/// expected value compared, and a failure message.
++pub(crate) type Compared = (bool, Option<Value>, Value, Option<String>);
++
++/// Compare one `observed` value with `expected` under `operator`.
++///
++/// Shared by Eval assertion tasks and Verifier `assert` checks over a `path`.
++///
++/// # Errors
++/// Returns [`EvalExecError::OperatorTypeMismatch`] for `task_id` when the
++/// operator cannot compare the values.
++pub(crate) fn evaluate_single(
++    task_id: &TaskId,
++    operator: &ComparisonOperator,
++    expected: &Value,
+     observed: &Value,
+-) -> Result<(bool, Option<Value>, Value, Option<String>), EvalExecError> {
+-    let verdict = operators::evaluate_operator(observed, &task.operator, &task.expected).map_err(
+-        |error| EvalExecError::OperatorTypeMismatch {
+-            task_id: task.id.clone(),
+-            operator: format!("{:?}", task.operator),
++) -> Result<Compared, EvalExecError> {
++    let verdict = operators::evaluate_operator(observed, operator, expected).map_err(|error| {
++        EvalExecError::OperatorTypeMismatch {
++            task_id: task_id.clone(),
++            operator: format!("{operator:?}"),
+             reason: error.to_string(),
+-        },
+-    )?;
++        }
++    })?;
+     let message = if verdict.passed {
+         None
+     } else {
+-        Some(format!("operator {:?} returned false", task.operator))
++        Some(format!("operator {operator:?} returned false"))
+     };
+     Ok((
+         verdict.passed,
+         verdict.observed,
+-        verdict.expected.unwrap_or_else(|| task.expected.clone()),
++        verdict.expected.unwrap_or_else(|| expected.clone()),
+         message,
+     ))
+ }
+ 
+-fn evaluate_item_mode(
+-    task: &AssertionTask,
++/// Compare every element of the `observed` array with `expected`; the
++/// assertion passes only when every element passes, so an empty array passes.
++///
++/// Shared by Eval item-mode assertions and Verifier `assert` checks over an
++/// `each` selector.
++///
++/// # Errors
++/// Returns [`EvalExecError::OperatorTypeMismatch`] for `task_id` when
++/// `observed` is not an array or the operator cannot compare an element.
++pub(crate) fn evaluate_item_mode(
++    task_id: &TaskId,
++    operator: &ComparisonOperator,
++    expected: &Value,
+     observed: &Value,
+-) -> Result<(bool, Option<Value>, Value, Option<String>), EvalExecError> {
++) -> Result<Compared, EvalExecError> {
++    let mismatch = |reason: String| EvalExecError::OperatorTypeMismatch {
++        task_id: task_id.clone(),
++        operator: format!("{operator:?}"),
++        reason,
++    };
+     let Value::Array(items) = observed else {
+-        return Err(EvalExecError::OperatorTypeMismatch {
+-            task_id: task.id.clone(),
+-            operator: format!("{:?}", task.operator),
+-            reason: "item_context_path resolved to a non-array value".to_string(),
+-        });
++        return Err(mismatch(
++            "item_context_path resolved to a non-array value".to_string(),
++        ));
+     };
+ 
+     let mut failures = 0_usize;
+     for item in items {
+-        let verdict = operators::evaluate_operator(item, &task.operator, &task.expected).map_err(
+-            |error| EvalExecError::OperatorTypeMismatch {
+-                task_id: task.id.clone(),
+-                operator: format!("{:?}", task.operator),
+-                reason: error.to_string(),
+-            },
+-        )?;
++        let verdict = operators::evaluate_operator(item, operator, expected)
++            .map_err(|error| mismatch(error.to_string()))?;
+         if !verdict.passed {
+             failures += 1;
+         }
+@@ -173,15 +212,14 @@ fn evaluate_item_mode(
+         None
+     } else {
+         Some(format!(
+-            "{failures}/{} items failed operator {:?}",
++            "{failures}/{} items failed operator {operator:?}",
+             items.len(),
+-            task.operator
+         ))
+     };
+     Ok((
+         failures == 0,
+         Some(observed.clone()),
+-        task.expected.clone(),
++        expected.clone(),
+         message,
+     ))
+ }
+diff --git a/crates/vala/vala-eval/src/tasks/trace.rs b/crates/vala/vala-eval/src/tasks/trace.rs
+index e021e93b6..eb262206f 100644
+--- a/crates/vala/vala-eval/src/tasks/trace.rs
++++ b/crates/vala/vala-eval/src/tasks/trace.rs
+@@ -121,7 +121,10 @@ async fn execute_trace(
+     })
+ }
+ 
+-fn project_spans(trace_id: TraceId, spans: &[SpanRecord]) -> Value {
++/// Project a trace's spans into the JSON document span selectors read.
++///
++/// Shared by Eval trace assertions and Verifier `trace` checks.
++pub(crate) fn project_spans(trace_id: TraceId, spans: &[SpanRecord]) -> Value {
+     let projected: Vec<Value> = spans.iter().map(project_one).collect();
+     serde_json::json!({
+         "trace_id": trace_id.to_hex(),
+@@ -152,7 +155,12 @@ fn elapsed_ms(start: chrono::DateTime<chrono::Utc>) -> u64 {
+ }
+ 
+ #[cfg(test)]
+-mod trace_executor {
++pub(crate) mod trace_executor {
++    //! Trace assertion executor tests and the shared span fixture.
++    //!
++    //! The [`span`] fixture is crate-visible so other engines' tests, such as
++    //! the Verifier engine's trace checks, project the same span shape the
++    //! trace executor reads instead of building their own.
+     use std::collections::BTreeMap;
+     use std::sync::Arc;
+     use std::time::Duration;
+@@ -223,7 +231,9 @@ mod trace_executor {
+         }
+     }
+ 
+-    fn span(trace: TraceId, span: SpanId, name: &str, scenario: &str) -> SpanRecord {
++    /// One finished span named `name`, tagged with an eval scenario. Shared
++    /// with the Verifier engine's trace-check tests.
++    pub(crate) fn span(trace: TraceId, span: SpanId, name: &str, scenario: &str) -> SpanRecord {
+         let start_time = Utc
+             .with_ymd_and_hms(2026, 6, 10, 12, 0, 0)
+             .single()

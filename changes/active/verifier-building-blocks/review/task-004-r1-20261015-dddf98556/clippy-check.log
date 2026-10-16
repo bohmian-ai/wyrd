@@ -1,0 +1,25 @@
+   Compiling pyo3-build-config v0.28.3
+   Compiling pyo3-macros-backend v0.28.3
+   Compiling pyo3-ffi v0.28.3
+   Compiling pyo3 v0.28.3
+   Compiling pyo3-macros v0.28.3
+    Checking wyrd-utils v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/shared/wyrd-utils)
+    Checking wyrd-skald-runtime v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/skald/skald-runtime)
+    Checking wyrd-interfaces v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/wyrd/wyrd-interfaces)
+    Checking wyrd-skald-tool v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/skald/skald-tool)
+    Checking wyrd-gateway v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/wyrd/wyrd-gateway)
+    Checking wyrd-skald-prompt v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/skald/skald-prompt)
+    Checking wyrd-config v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/wyrd/wyrd-config)
+    Checking wyrd-loader v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/shared/wyrd-loader)
+    Checking wyrd-skald-agent v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/skald/skald-agent)
+    Checking wyrd-cards v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/wyrd/wyrd-cards)
+    Checking wyrd-client v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/shared/wyrd-client)
+    Checking vala-eval v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/vala/vala-eval)
+    Checking wyrd-mcp v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/wyrd/wyrd-mcp)
+    Checking wyrd-server v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/wyrd/wyrd-server)
+    Checking wyrd-cli v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/wyrd/wyrd-cli)
+    Checking wyrd-sdk-ts v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/sdks/wyrd-sdk-ts/native)
+    Checking wyrd-ai v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/sdks/wyrd-sdk-rust)
+    Checking wyrd-testing v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/crates/wyrd/wyrd-testing)
+    Checking wyrd-sdk-python v0.1.0 (/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-building-blocks-task-004/sdks/wyrd-sdk-python)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.71s

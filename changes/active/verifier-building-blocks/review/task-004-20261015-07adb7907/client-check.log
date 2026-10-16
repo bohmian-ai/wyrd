@@ -1,0 +1,34 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
+────────────
+ Nextest run ID 2f3f9cb5-05c5-469c-9ce8-34051a067e94 with nextest profile: default
+    Starting 28 tests across 1 binary (233 tests skipped)
+        PASS [   0.013s] ( 1/28) wyrd-client observe::tests::drift_refuses_unsupported_inputs
+        PASS [   0.014s] ( 2/28) wyrd-client observe::tests::drift_projects_one_tall_row_per_feature
+        PASS [   0.015s] ( 3/28) wyrd-client observe::tests::values_project_onto_named_slots_by_slot_type
+        PASS [   0.016s] ( 4/28) wyrd-client observe::tests::drift_numeric_str_value_matches_arrow_cast
+        PASS [   0.018s] ( 5/28) wyrd-client observe::tests::unknown_alias_fails_without_network_io
+        PASS [   0.018s] ( 6/28) wyrd-client observe::tests::scoped_views_share_one_invocation_and_keep_their_subjects
+        PASS [   0.019s] ( 7/28) wyrd-client observe::tests::each_run_is_its_own_invocation
+        PASS [   0.018s] ( 8/28) wyrd-client observe::tests::run_for_card_refuses_an_unknown_alias_without_network_io
+        PASS [   0.021s] ( 9/28) wyrd-client observe::tests::run_for_card_selects_the_initial_view_and_shares_its_invocation
+        PASS [   0.060s] (10/28) wyrd-client observe::tests::missing_fixed_table_fails_startup
+        PASS [   0.060s] (11/28) wyrd-client observe::tests::execute_pins_files_and_uploads_only_missing_digests
+        PASS [   0.060s] (12/28) wyrd-client observe::tests::shutdown_during_start_stays_closed
+        PASS [   0.061s] (13/28) wyrd-client observe::tests::record_refuses_an_unknown_dataset_table
+        PASS [   0.063s] (14/28) wyrd-client observe::tests::startup_describes_the_fixed_table_once
+        PASS [   0.064s] (15/28) wyrd-client observe::tests::file_refusals_happen_locally_before_any_request
+        PASS [   0.065s] (16/28) wyrd-client observe::tests::record_refuses_reserved_and_system_tables
+        PASS [   0.066s] (17/28) wyrd-client observe::tests::shutdown_without_startup_closes_permanently
+        PASS [   0.067s] (18/28) wyrd-client observe::tests::concurrent_first_records_describe_each_table_once
+        PASS [   0.069s] (19/28) wyrd-client observe::tests::record_describes_a_dataset_table_once
+        PASS [   0.072s] (20/28) wyrd-client observe::tests::a_state_created_with_a_client_keeps_it_for_every_server_call
+        PASS [   0.095s] (21/28) wyrd-client observe::tests::failed_startup_may_be_retried
+        PASS [   0.096s] (22/28) wyrd-client observe::tests::second_startup_is_refused
+        PASS [   0.100s] (23/28) wyrd-client observe::tests::shutdown_closes_the_state_permanently
+        PASS [   0.112s] (24/28) wyrd-client observe::tests::ambiguous_shutdown_retries_the_same_batch_on_the_same_state
+        PASS [   0.172s] (25/28) wyrd-client observe::tests::incompatible_fixed_table_fails_startup
+        PASS [   0.254s] (26/28) wyrd-client observe::tests::execute_outlives_the_configured_timeout
+        PASS [   0.363s] (27/28) wyrd-client observe::tests::wait_raises_terminal_errors_and_times_out_without_a_result
+        PASS [   0.874s] (28/28) wyrd-client observe::tests::enqueue_replays_its_key_and_wait_returns_only_a_real_result
+────────────
+     Summary [   0.875s] 28 tests run: 28 passed, 233 skipped

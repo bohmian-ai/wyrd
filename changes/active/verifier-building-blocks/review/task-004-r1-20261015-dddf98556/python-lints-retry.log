@@ -1,0 +1,3 @@
+[py:lints] $ uv run ruff check python/wyrd tests scripts
+All checks passed!
+[py:lints] $ uv run python scripts/check_stubs.py

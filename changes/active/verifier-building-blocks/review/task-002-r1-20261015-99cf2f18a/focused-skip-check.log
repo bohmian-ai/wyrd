@@ -1,0 +1,7 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+────────────
+ Nextest run ID a0a9f3a6-1df6-4334-8ebc-3119a1108f77 with nextest profile: default
+    Starting 1 test across 1 binary (122 tests skipped)
+        PASS [   0.005s] (1/1) vala-eval blocks::engine::tests::skipped_owner_keeps_failed_check_evidence
+────────────
+     Summary [   0.005s] 1 test run: 1 passed, 122 skipped

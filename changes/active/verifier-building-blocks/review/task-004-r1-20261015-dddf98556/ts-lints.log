@@ -1,0 +1,4 @@
+[ts:lints] $ pnpm exec biome lint --error-on-warnings
+[ERROR] unable to open database file
+For help, run: pnpm help exec
+[ts:lints] ERROR task failed

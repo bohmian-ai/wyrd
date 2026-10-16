@@ -1,0 +1,201 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+────────────
+ Nextest run ID 2eb8e718-e2fb-4dcd-8564-a9ffec9eebb8 with nextest profile: default
+    Starting 195 tests across 2 binaries
+        PASS [   0.006s] (  1/195) vala-drift baseline::dispatch_errors::score_drift_cross_method_mismatch
+        PASS [   0.006s] (  2/195) vala-drift psi::binning::tests::assign_bin_uses_left_open_right_closed_intervals
+        PASS [   0.006s] (  3/195) vala-drift custom::custom_score::custom_empty_column_errors
+        PASS [   0.006s] (  4/195) vala-drift custom::custom_score::custom_missing_column_errors
+        PASS [   0.006s] (  5/195) vala-drift psi::psi_fit::numeric_fit_rejects_non_finite_values
+        PASS [   0.006s] (  6/195) vala-drift baseline::aggregate_inputs::custom_mean_equality_is_no_drift
+        PASS [   0.006s] (  7/195) vala-drift psi::binning::tests::equal_width_degenerate_all_equal
+        PASS [   0.006s] (  8/195) vala-drift psi::binning::tests::equal_width_simple_uniform
+        PASS [   0.006s] (  9/195) vala-drift psi::psi_fit::categorical_fit_sorts_bins_and_reserves_other
+        PASS [   0.007s] ( 10/195) vala-drift baseline::aggregate_inputs::psi_counts_match_raw_scoring_and_small_windows_are_inconclusive
+        PASS [   0.007s] ( 11/195) vala-drift baseline::aggregate_inputs::spc_subgroups_match_raw_scoring_and_partial_targets_are_inconclusive
+        PASS [   0.006s] ( 12/195) vala-drift psi::psi_fit::empty_numeric_column_returns_typed_error
+        PASS [   0.007s] ( 13/195) vala-drift psi::binning::tests::quantile_r7_quartiles_eight_values
+        PASS [   0.007s] ( 14/195) vala-drift psi::binning::tests::quantile_dedups_skewed_input
+        PASS [   0.007s] ( 15/195) vala-drift custom::custom_score::custom_within_threshold_is_no_drift
+        PASS [   0.007s] ( 16/195) vala-drift custom::custom_score::custom_invalid_metric_name_errors
+        PASS [   0.007s] ( 17/195) vala-drift baseline::dispatch_errors::fit_baseline_signal_shape_mismatch
+        PASS [   0.007s] ( 18/195) vala-drift baseline::end_to_end::custom_dispatch_scores_report_shape
+        PASS [   0.007s] ( 19/195) vala-drift baseline::aggregate_inputs::psi_categorical_unknowns_land_in_the_other_bin
+        PASS [   0.007s] ( 20/195) vala-drift psi::psi_fit::integer_numeric_fit_casts_to_float_values
+        PASS [   0.007s] ( 21/195) vala-drift baseline::end_to_end::spc_distribution_dispatch_scores_report_shape
+        PASS [   0.007s] ( 22/195) vala-drift baseline::end_to_end::psi_dispatch_scores_report_shape
+        PASS [   0.007s] ( 23/195) vala-drift custom::custom_score::custom_non_numeric_column_errors
+        PASS [   0.007s] ( 24/195) vala-drift psi::psi_fit::all_equal_numeric_fit_uses_single_infinite_bin
+        PASS [   0.007s] ( 25/195) vala-drift baseline::aggregate_inputs::fitted_baselines_round_trip_through_json
+        PASS [   0.005s] ( 26/195) vala-drift smoke::public_surface_is_visible
+        PASS [   0.005s] ( 27/195) vala-drift psi::score::tests::psi_handles_zero_bin_with_epsilon
+        PASS [   0.005s] ( 28/195) vala-drift psi::psi_score::psi_shifted_distribution_drift
+        PASS [   0.006s] ( 29/195) vala-drift psi::psi_score::psi_one_insufficient_feature_unscores_the_report
+        PASS [   0.006s] ( 30/195) vala-drift psi::psi_score::psi_categorical_target_type_mismatch_errors
+        PASS [   0.005s] ( 31/195) vala-drift psi::threshold::tests::chisquare_default_alpha_is_positive_finite
+        PASS [   0.005s] ( 32/195) vala-drift psi::threshold::tests::rejects_zero_target_sample
+        PASS [   0.005s] ( 33/195) vala-drift psi::threshold::tests::rejects_n_bins_below_two
+        PASS [   0.005s] ( 34/195) vala-drift psi::psi_score::psi_target_too_small_is_unscored
+        PASS [   0.005s] ( 35/195) vala-drift psi::threshold::tests::normal_default_alpha_is_positive_finite
+        PASS [   0.005s] ( 36/195) vala-drift psi::threshold::tests::fixed_returns_value
+        PASS [   0.006s] ( 37/195) vala-drift psi::psi_score::psi_numeric_target_type_mismatch_errors
+        PASS [   0.006s] ( 38/195) vala-drift psi::score::tests::psi_shifted_distribution_is_positive
+        PASS [   0.006s] ( 39/195) vala-drift psi::score::tests::psi_identical_distributions_is_zero
+        PASS [   0.006s] ( 40/195) vala-drift psi::psi_score::psi_categorical_drift
+        PASS [   0.006s] ( 41/195) vala-drift psi::psi_score::psi_zero_bins_and_other_count_toward_the_threshold
+        PASS [   0.006s] ( 42/195) vala-drift psi::psi_score::psi_identical_distributions_no_drift
+        PASS [   0.006s] ( 43/195) vala-drift psi::psi_score::psi_incomplete_targets_are_unscored
+        PASS [   0.006s] ( 44/195) vala-drift psi::psi_score::psi_null_typed_target_is_unscored
+        PASS [   0.006s] ( 45/195) vala-drift psi::psi_score::psi_fixed_threshold_is_used
+        PASS [   0.006s] ( 46/195) vala-drift psi::psi_score::psi_unseen_categories_land_in_the_other_bin
+        PASS [   0.006s] ( 47/195) vala-drift psi::psi_score::psi_selected_null_only_row_makes_the_target_unscored
+        PASS [   0.006s] ( 48/195) vala-drift psi::psi_score::psi_threshold_boundary_is_strict
+        PASS [   0.007s] ( 49/195) vala-drift spc::spc_score::a_signal_beside_an_incomplete_feature_is_unscored
+        PASS [   0.007s] ( 50/195) vala-drift spc::spc_score::each_chart_signals_independently
+        PASS [   0.007s] ( 51/195) vala-drift spc::control_limits::tests::x_bar_s_fixture_includes_sqrt_n
+        PASS [   0.020s] ( 52/195) vala-drift psi::psi_fit::missing_feature_returns_typed_error
+        PASS [   0.008s] ( 53/195) vala-drift spc::control_limits::tests::c4_nist_table_regression
+        PASS [   0.008s] ( 54/195) vala-drift spc::spc_fit::null_and_non_finite_baseline_values_fail
+        PASS [   0.007s] ( 55/195) vala-drift spc::spc_score::empty_and_partial_targets_are_inconclusive
+        PASS [   0.007s] ( 56/195) vala-drift spc::spc_score::incomplete_targets_are_unscored
+        PASS [   0.013s] ( 57/195) vala-drift spc::control_limits::tests::c4_n3_equals_sqrt_pi_over_2
+        PASS [   0.008s] ( 58/195) vala-drift spc::control_limits::tests::limits_reproduce_published_a3_b3_b4_constants
+        PASS [   0.008s] ( 59/195) vala-drift spc::spc_fit::column_errors_are_typed
+        PASS [   0.020s] ( 60/195) vala-drift custom::custom_score::custom_outside_threshold_is_drift
+        PASS [   0.020s] ( 61/195) vala-drift psi::psi_fit::null_baseline_values_fail_the_fit
+        PASS [   0.008s] ( 62/195) vala-drift spc::control_limits::tests::rejects_degenerate_fits
+        PASS [   0.007s] ( 63/195) vala-drift spc::spc_score::non_numeric_target_errors
+        PASS [   0.008s] ( 64/195) vala-drift spc::control_limits::tests::equality_at_the_limit_does_not_signal
+        PASS [   0.008s] ( 65/195) vala-drift psi::psi_fit::equal_width_numeric_fit_computes_bin_proportions
+        PASS [   0.008s] ( 66/195) vala-drift spc::spc_fit::twenty_complete_subgroups_fit
+        PASS [   0.007s] ( 67/195) vala-drift spc::spc_score::in_control_target_passes_with_evidence
+        PASS [   0.020s] ( 68/195) vala-drift psi::psi_fit::string_feature_not_declared_categorical_returns_numeric_error
+        PASS [   0.008s] ( 69/195) vala-drift spc::spc_fit::short_or_ragged_baselines_fail_visibly
+        PASS [   0.020s] ( 70/195) vala-drift custom::custom_score::custom_non_finite_column_errors
+        PASS [   0.008s] ( 71/195) vala-drift spc::spc_score::equality_at_the_limits_is_in_control
+        PASS [   0.008s] ( 72/195) vala-drift spc::spc_score::null_typed_target_is_unscored
+        PASS [   0.014s] ( 73/195) vala-drift spc::control_limits::tests::c4_n2_equals_sqrt_2_over_pi
+        PASS [   0.009s] ( 74/195) vala-eval blocks::engine::tests::decide_rules_count_inconclusive_requirements
+        PASS [   0.011s] ( 75/195) vala-drift spc::spc_score::scorer_rejects_invalid_pushes
+        PASS [   0.012s] ( 76/195) vala-eval blocks::engine::tests::context_capture_hashes_or_redacts_actual_values
+        PASS [   0.012s] ( 77/195) vala-eval blocks::engine::tests::each_assertion_compares_every_wildcard_match
+        PASS [   0.012s] ( 78/195) vala-eval blocks::engine::tests::dependents_wait_for_upstream_step_requirements
+        PASS [   0.013s] ( 79/195) vala-eval blocks::engine::tests::drift_requirements_score_through_vala_drift
+        PASS [   0.010s] ( 80/195) vala-eval compare::comparison_four_quadrant::regression_detected_on_pass_rate_drop_above_threshold
+        PASS [   0.010s] ( 81/195) vala-eval blocks::scope::tests::select_distinguishes_absent_from_null
+        PASS [   0.010s] ( 82/195) vala-eval compare::comparison_four_quadrant::huge_threshold_never_flags
+        PASS [   0.010s] ( 83/195) vala-eval compare::comparison_four_quadrant::new_and_removed_subjects_surfaced
+        PASS [   0.010s] ( 84/195) vala-eval compare::comparison_four_quadrant::missing_tasks_surfaced_in_both_directions
+        PASS [   0.010s] ( 85/195) vala-eval compare::comparison_four_quadrant::stable_run_produces_no_regression
+        PASS [   0.010s] ( 86/195) vala-eval compare::comparison_four_quadrant::task_status_change_surfaced
+        PASS [   0.010s] ( 87/195) vala-eval compare::comparison_four_quadrant::improvement_detected_on_pass_rate_rise_above_threshold
+        PASS [   0.010s] ( 88/195) vala-eval compare::comparison_four_quadrant::threshold_exact_boundary_does_not_flag
+        PASS [   0.010s] ( 89/195) vala-eval blocks::tests::action_tool_calls_carry_into_step_results
+        PASS [   0.009s] ( 90/195) vala-eval context::tests::extend_uses_arc_bumps_not_data_clones
+        PASS [   0.009s] ( 91/195) vala-eval context::tests::extracts_nested_array_from_base_context
+        PASS [   0.010s] ( 92/195) vala-eval compare::comparison_four_quadrant::empty_baseline_comparison_yields_zero_deltas_and_no_panic
+        PASS [   0.011s] ( 93/195) vala-eval blocks::engine::tests::empty_and_all_skipped_verifiers_are_inconclusive
+        PASS [   0.010s] ( 94/195) vala-eval blocks::tests::action_executor_receives_resolved_inputs
+        PASS [   0.011s] ( 95/195) vala-eval blocks::engine::tests::independent_actions_overlap_within_the_concurrency_bound
+        PASS [   0.011s] ( 96/195) vala-eval blocks::engine::tests::hosted_check_passes_need_reachable_citations
+        PASS [   0.011s] ( 97/195) vala-eval compare::comparison_four_quadrant::comparison_save_load_round_trip
+        PASS [   0.011s] ( 98/195) vala-eval blocks::engine::tests::execution_deadline_cancels_running_work
+        PASS [   0.010s] ( 99/195) vala-eval compare::comparison_four_quadrant::zero_threshold_flags_any_movement
+        PASS [   0.011s] (100/195) vala-eval blocks::engine::tests::step_timeouts_fail_the_step_and_let_unrelated_work_finish
+        PASS [   0.011s] (101/195) vala-eval blocks::engine::tests::retries_spend_the_budget_and_keep_attempts_visible
+        PASS [   0.011s] (102/195) vala-eval compare::comparison_four_quadrant::new_and_removed_scenarios_surfaced
+        PASS [   0.012s] (103/195) vala-eval blocks::engine::tests::no_step_verifier_judges_inputs_and_traces
+        PASS [   0.008s] (104/195) vala-eval context::tests::identity_accessors_round_trip
+        PASS [   0.008s] (105/195) vala-eval context::tests::missing_path_returns_null_not_error
+        PASS [   0.014s] (106/195) vala-eval blocks::engine::tests::skip_causes_propagate_and_failure_wins
+        PASS [   0.010s] (107/195) vala-eval context::tests::extracts_scalar_from_base_context
+        PASS [   0.013s] (108/195) vala-eval blocks::engine::tests::missing_and_optional_evidence_resolve_honestly
+        PASS [   0.010s] (109/195) vala-eval context::tests::invalid_runtime_path_surfaces_typed_error
+        PASS [   0.010s] (110/195) vala-eval context::tests::scoped_view_exposes_dep_outputs_under_task_namespace
+        PASS [   0.007s] (111/195) vala-eval operators::tests::is_uuid_validates_canonical_form
+        PASS [   0.008s] (112/195) vala-eval operators::tests::greater_than_rejects_non_numeric_with_typed_error
+        PASS [   0.009s] (113/195) vala-eval operators::tests::contains_ignore_case_matches_lower_case_needle
+        PASS [   0.009s] (114/195) vala-eval error::tests::judge_unavailable_serde_tag
+        PASS [   0.009s] (115/195) vala-eval error::smoke::public_surface_is_visible
+        PASS [   0.009s] (116/195) vala-eval operators::tests::approximately_equals_respects_tolerance
+        PASS [   0.009s] (117/195) vala-eval operators::tests::empty_array_is_empty
+        PASS [   0.009s] (118/195) vala-eval error::tests::dag_invalid_translates_with_reason_detail
+        PASS [   0.009s] (119/195) vala-eval operators::tests::between_percentiles_rejects_invalid_bounds
+        PASS [   0.008s] (120/195) vala-eval operators::tests::is_type_matches_declared_kind
+        PASS [   0.009s] (121/195) vala-eval operators::tests::in_membership_uses_json_equality
+        PASS [   0.009s] (122/195) vala-eval operators::tests::in_range_rejects_inverted_bounds
+        PASS [   0.009s] (123/195) vala-eval operators::tests::is_truthy_matches_runtime_semantics
+        PASS [   0.010s] (124/195) vala-eval error::smoke::exec_error_translates_into_eval_error
+        PASS [   0.010s] (125/195) vala-eval error::smoke::eval_error_carries_wyrd_code
+        PASS [   0.009s] (126/195) vala-eval operators::tests::equals_matches_across_numeric_types
+        PASS [   0.009s] (127/195) vala-eval operators::tests::divergence_kl_identical_distributions_below_threshold
+        PASS [   0.007s] (128/195) vala-eval operators::tests::matches_regex_compile_failure_is_typed_error
+        PASS [   0.009s] (129/195) vala-eval operators::tests::is_subset_handles_empty_left
+        PASS [   0.009s] (130/195) vala-eval operators::tests::cosine_similarity_at_least_one_for_identical_vectors
+        PASS [   0.010s] (131/195) vala-eval context::tests::scoped_view_omits_dep_outputs_not_declared_in_depends_on
+        PASS [   0.007s] (132/195) vala-eval operators::tests::nan_operator_parameter_never_satisfies_threshold
+        PASS [   0.010s] (133/195) vala-eval executor::tests::evaluate_condition_handles_and_or_chains
+        PASS [   0.010s] (134/195) vala-eval executor::tests::executor_error_propagates_and_false_comparison_fails
+        PASS [   0.007s] (135/195) vala-eval operators::tests::unique_values_detects_duplicates
+        PASS [   0.008s] (136/195) vala-eval operators::tests::matches_regex_passes_on_match
+        PASS [   0.012s] (137/195) vala-eval executor::tests::first_skipped_dependency_returns_declaration_order
+        PASS [   0.006s] (138/195) vala-eval results::results_aggregation::context_capture_full_keeps_actual_verbatim
+        PASS [   0.007s] (139/195) vala-eval results::results_aggregation::aggregation_pass_rates_match_per_level
+        PASS [   0.007s] (140/195) vala-eval operators::tests::within_pct_tolerance_handles_zero_baseline
+        PASS [   0.013s] (141/195) vala-eval executor::end_to_end::full_spec_against_in_memory_record_and_spans_aggregates_correctly
+        PASS [   0.009s] (142/195) vala-eval store::tests::judge_outcome_round_trip_is_value_type
+        PASS [   0.009s] (143/195) vala-eval scenario::scenario_loader::malformed_json_errors_typed
+        PASS [   0.010s] (144/195) vala-eval results::results_aggregation::pass_gate_all_pass_on_zero_tasks_fails
+        PASS [   0.008s] (145/195) vala-eval store::tests::registry_rejects_duplicate_ids
+        PASS [   0.010s] (146/195) vala-eval scenario::scenario_loader::missing_file_errors_typed
+        PASS [   0.010s] (147/195) vala-eval results::results_aggregation::report_pass_gate_matches_shared_gate_semantics
+        PASS [   0.011s] (148/195) vala-eval results::results_aggregation::context_capture_redact_drops_actual
+        PASS [   0.009s] (149/195) vala-eval store::tests::registry_rejects_unknown_dependency
+        PASS [   0.010s] (150/195) vala-eval scenario::scenario_loader::unknown_extension_errors_typed
+        PASS [   0.009s] (151/195) vala-eval store::tests::registry_indexes_by_id_and_kind
+        PASS [   0.010s] (152/195) vala-eval scenario::scenario_loader::empty_collection_errors_typed
+        PASS [   0.010s] (153/195) vala-eval results::results_aggregation::report_capture_changes_evidence_only
+        PASS [   0.011s] (154/195) vala-eval results::results_aggregation::pass_gate_overall_threshold_edge
+        PASS [   0.010s] (155/195) vala-eval scenario::scenario_loader::loads_json_collection
+        PASS [   0.010s] (156/195) vala-eval scenario::scenario_loader::malformed_jsonl_carries_line_number
+        PASS [   0.009s] (157/195) vala-eval tasks::agent::agent_executor::agent_assertion_collection_operator_on_tools_called
+        PASS [   0.011s] (158/195) vala-eval scenario::scenario_execution::one_pass_emits_mechanic_and_passenger_results
+        PASS [   0.011s] (159/195) vala-eval results::results_aggregation::pass_gate_all_pass_on_all_skipped_subject_set_fails
+        PASS [   0.012s] (160/195) vala-eval results::results_aggregation::empty_run_aggregation_does_not_panic
+        PASS [   0.008s] (161/195) vala-eval tasks::agent::agent_executor::agent_assertion_missing_field_records_message
+        PASS [   0.011s] (162/195) vala-eval scenario::scenario_loader::loads_jsonl_collection
+        PASS [   0.011s] (163/195) vala-eval results::results_aggregation::context_capture_hash_replaces_with_sha256_hex
+        PASS [   0.008s] (164/195) vala-eval tasks::agent::agent_executor::agent_assertion_passes_on_envelope_field
+        PASS [   0.011s] (165/195) vala-eval scenario::scenario_loader::duplicate_scenario_id_errors_typed_before_generic_validator
+        PASS [   0.011s] (166/195) vala-eval scenario::scenario_loader::loads_yaml_collection
+        PASS [   0.011s] (167/195) vala-eval sampling::tests::sampling_policies_are_stable_per_record
+        PASS [   0.008s] (168/195) vala-eval tasks::assertion::assertion_stage::cross_task_isolation_via_scoped_view
+        PASS [   0.011s] (169/195) vala-eval scenario::scenario_execution::passenger_pass_runs_even_when_no_records
+        PASS [   0.008s] (170/195) vala-eval tasks::assertion::assertion_stage::conditional_false_skips_task_with_condition_false_reason
+        PASS [   0.012s] (171/195) vala-eval results::results_aggregation::save_load_json_round_trip_preserves_everything
+        PASS [   0.008s] (172/195) vala-eval tasks::assertion::assertion_stage::malformed_plan_surfaces_dag_invalid
+        PASS [   0.007s] (173/195) vala-eval tasks::assertion::assertion_stage::operator_type_mismatch_propagates_typed_error
+        PASS [   0.007s] (174/195) vala-eval tasks::judge::llm_judge_executor::invalid_structured_output_short_circuits
+        PASS [   0.007s] (175/195) vala-eval tasks::judge::llm_judge_executor::context_path_narrows_invoker_input
+        PASS [   0.008s] (176/195) vala-eval tasks::assertion::assertion_stage::dependency_skip_propagation
+        PASS [   0.008s] (177/195) vala-eval tasks::assertion::assertion_stage::missing_jsonpath_propagates_typed_error
+        PASS [   0.007s] (178/195) vala-eval tasks::trace::trace_executor::trace_assertion_unavailable_errors
+        PASS [   0.008s] (179/195) vala-eval tasks::assertion::assertion_stage::dependency_skip_propagates_across_stages_via_ledger
+        PASS [   0.008s] (180/195) vala-eval tasks::judge::llm_judge_executor::retries_then_succeeds
+        PASS [   0.008s] (181/195) vala-eval tasks::assertion::assertion_stage::multi_stage_dependency_chain_reads_a_result
+        PASS [   0.007s] (182/195) vala-eval tasks::judge::llm_judge_executor::retry_budget_exhausted_errors
+        PASS [   0.007s] (183/195) vala-eval tasks::trace::trace_executor::trace_assertion_trace_id_missing_errors
+        PASS [   0.008s] (184/195) vala-eval tasks::assertion::assertion_stage::multi_stage_judge_then_assertion_reads_judge_output
+        PASS [   0.008s] (185/195) vala-eval tasks::judge::llm_judge_executor::missing_invoker_is_construction_concern_not_runtime
+        PASS [   0.008s] (186/195) vala-eval tasks::judge::llm_judge_executor::happy_path_stores_verdict_addressable_downstream
+        PASS [   0.008s] (187/195) vala-eval tasks::assertion::assertion_stage::happy_path_single_assertion_stage_all_operator_families
+        PASS [   0.008s] (188/195) vala-eval tasks::assertion::assertion_stage::false_comparison_message_omits_observed_value
+        PASS [   0.008s] (189/195) vala-eval tasks::media::media_binding::required_media_id_unbound_errors_without_invoking_judge
+        PASS [   0.007s] (190/195) vala-eval tasks::trace::trace_executor::unresolved_selector_marks_failed_with_message
+        PASS [   0.008s] (191/195) vala-eval tasks::media::media_binding::bound_media_reaches_invoker_as_binding_not_context_text
+        PASS [   0.007s] (192/195) vala-eval tasks::trace::trace_executor::engine_surfaces_all_spans_received_orchestrator_scopes_by_attribute
+        PASS [   0.007s] (193/195) vala-eval tasks::trace::trace_executor::trace_assertion_passes_on_resolved_selector
+        PASS [   0.110s] (194/195) vala-eval tasks::assertion::assertion_stage::concurrent_same_stage_judges_complete_in_parallel
+        PASS [   0.202s] (195/195) vala-drift baseline::cancellation::cancellation_after_fit_starts_stops_inside_the_feature
+────────────
+     Summary [   0.203s] 195 tests run: 195 passed, 0 skipped

@@ -424,7 +424,7 @@ spec:
   model: string
   system?: string
   messages: [{ role: user | assistant, content: string | [ContentBlock] }]
-  settings?: PortableSettings      # temperature, top_p, max_output_tokens, top_k, stop_sequences, seed, presence_penalty, frequency_penalty
+  settings?: PortableSettings      # temperature, top_p, max_output_tokens, top_k, stop_sequences, seed, presence_penalty, frequency_penalty, reasoning_effort (chat_completion only)
   response_format?: JsonSchema
 # Native form: one protocol body passed through unchanged.
 spec:

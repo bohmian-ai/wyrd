@@ -3412,7 +3412,7 @@ export interface PortableMessage {
 export type PortableRole = "user" | "assistant";
 
 /**
- * The eight portable generation settings.
+ * The nine portable generation settings.
  *
  * A setting the destination protocol cannot carry is refused, never dropped.
  */
@@ -3429,6 +3429,12 @@ export interface PortableSettings {
    * Presence penalty.
    */
   readonly presence_penalty?: number | null;
+  /**
+   * Reasoning effort for reasoning models; Chat Completions only.
+   *
+   * `none` also lets a model that refuses function tools while reasoning accept them.
+   */
+  readonly reasoning_effort?: ReasoningEffort | null;
   /**
    * Best-effort reproducibility seed.
    */
@@ -3985,6 +3991,13 @@ export type QueryTerminalOutcome = "success" | "degraded" | "failed";
  * Closed warnings emitted by the Oracle protocol.
  */
 export type QueryWarning = "live_tail_unavailable" | "stale_cut_replanned";
+
+/**
+ * How much a reasoning model reasons before it answers.
+ *
+ * The levels are the Chat Completions `reasoning_effort` values; a destination without an effort control refuses the setting.
+ */
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 /**
  * A reference position that requires durable identity.

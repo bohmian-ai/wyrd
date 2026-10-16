@@ -113,7 +113,7 @@ pub enum WyrdCliError {
         title = "Eval engine failed",
         remediation = "Inspect the Eval spec, records, scenarios, and CLI logs."
     )]
-    EvalEngine {
+    EvalExec {
         /// Source error.
         #[source]
         source: vala_eval::EvalExecError,
@@ -423,7 +423,7 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
             | WyrdCliError::McpHostSelection { .. } => WyrdError::Validation { message, details },
             WyrdCliError::Query { .. }
             | WyrdCliError::Io { .. }
-            | WyrdCliError::EvalEngine { .. }
+            | WyrdCliError::EvalExec { .. }
             | WyrdCliError::Orchestrator { .. }
             | WyrdCliError::Output { .. }
             | WyrdCliError::ServerReleaseUnverified { .. }

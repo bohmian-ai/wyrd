@@ -63,7 +63,7 @@ pub fn load_comparison(
     baseline
         .map(|path| {
             let baseline =
-                EvalResults::load(path).map_err(|source| WyrdCliError::EvalEngine { source })?;
+                EvalResults::load(path).map_err(|source| WyrdCliError::EvalExec { source })?;
             Ok(compare(
                 &baseline,
                 run,
@@ -89,11 +89,11 @@ pub fn write_results(
     });
     std::fs::create_dir_all(&out_dir).map_err(|source| WyrdCliError::Io { source })?;
     run.save(&out_dir.join("results.json"))
-        .map_err(|source| WyrdCliError::EvalEngine { source })?;
+        .map_err(|source| WyrdCliError::EvalExec { source })?;
     if let Some(comparison) = comparison {
         comparison
             .save(&out_dir.join("comparison.json"))
-            .map_err(|source| WyrdCliError::EvalEngine { source })?;
+            .map_err(|source| WyrdCliError::EvalExec { source })?;
     }
     Ok(out_dir)
 }

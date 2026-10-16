@@ -479,7 +479,7 @@ def test_hosted_tools_need_the_tool_and_domain_grants(
     for name, extra, allowed in (
         ("all_tools", ["tool:invoke", "cards:read", "bifrost_query:read"], TOOLS),
         ("no_tool_grant", ["cards:read", "bifrost_query:read"], ()),
-        ("no_domain_grant", ["tool:invoke"], (TOOLS[2],)),
+        ("no_domain_grant", ["tool:invoke", "cards:read"], (TOOLS[0], TOOLS[2])),
     ):
         key = wyrd_server.scoped_api_key(name, [*VERIFIES, *extra])
         result = investigate(policy_desk_bundle, WyrdClient(credential=key), name)

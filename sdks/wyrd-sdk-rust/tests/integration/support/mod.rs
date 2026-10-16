@@ -286,6 +286,36 @@ impl Deployment {
             .expect("the owner has one binding")
     }
 
+    /// `binding`'s status, read as the administrator through
+    /// `GET /v1/verification/bindings/{binding_id}`.
+    ///
+    /// # Panics
+    /// Panics when the token exchange or the read fails.
+    pub async fn binding_status(
+        &self,
+        binding: &BindingId,
+    ) -> wyrd_spec::verification::VerificationBindingStatus {
+        let token = self
+            .admin()
+            .access_token()
+            .await
+            .expect("the administrator token mints");
+        reqwest::Client::new()
+            .get(format!(
+                "{}/v1/verification/bindings/{binding}",
+                self.server.base_url().expect("bound server has a URL")
+            ))
+            .bearer_auth(token.expose())
+            .send()
+            .await
+            .expect("the server answers")
+            .error_for_status()
+            .expect("the binding reads")
+            .json()
+            .await
+            .expect("the binding status decodes")
+    }
+
     /// The first retained result of `binding`, read back as the
     /// administrator: publish captured rows until `vala.verification.results`
     /// names one, then wait for that execution's typed result by its ID.

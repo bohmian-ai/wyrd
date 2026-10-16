@@ -1104,8 +1104,9 @@ async fn code_check_fails_with_citations_and_is_inconclusive_otherwise() {
 /// The hosted investigator's Card, Bifrost, and code tools each need both a
 /// covering tool grant and the capability's own grant: a principal holding
 /// both reads all three; one without the tool grant is denied every call
-/// even with its Card and query reads; one without the Card and query reads
-/// may only run code; and an exact `cards.get_by_ref` tool grant covers no
+/// even with its Card and query reads; one without the query read (it keeps
+/// the Card read that resolving the investigator Agent needs) may read Cards
+/// and run code but is denied the query; and an exact `cards.get_by_ref` tool grant covers no
 /// other tool. A denied call returns nothing to the model.
 ///
 /// # Panics
@@ -1122,7 +1123,11 @@ async fn hosted_tools_need_the_tool_and_domain_grants() {
             &TOOLS,
         ),
         ("no_tool_grant", &["cards:read", "bifrost_query:read"], &[]),
-        ("no_domain_grant", &["tool:invoke"], &[TOOLS[2]]),
+        (
+            "no_domain_grant",
+            &["tool:invoke", "cards:read"],
+            &[TOOLS[0], TOOLS[2]],
+        ),
     ];
 
     for (name, extra, allowed) in cases {

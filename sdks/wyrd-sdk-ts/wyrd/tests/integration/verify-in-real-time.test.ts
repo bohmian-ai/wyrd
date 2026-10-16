@@ -10,7 +10,7 @@ import { Bifrost, Cards, type VerifierInputs, WyrdClient, WyrdState, verify } fr
 import { cli } from "@wyrd/testing";
 
 import { type Assistant, assistantAs, assistantTest, judgeCalls, type JudgeCall } from "../support/assistant.js";
-import { ancestry, binding, fixture, scheduledResult, timeline } from "../support/server.js";
+import { ancestry, binding, fixture, timeline } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -236,7 +236,7 @@ test("window verifier records samples and refuses verify", async ({ state }) => 
   expect(await observe.submit("latency-drift", { latency: 12.5 })).toEqual({ kind: "recorded" });
 });
 
-test("unfitted baseline is judged inconclusive on schedule", async ({ server }) => {
+test("unfitted baseline is skipped on schedule", async ({ server }) => {
   const cards = await Cards.connect();
   const { root } = await cards.registerFromPath(fixture("cards/verify_in_real_time/unfitted-assistant.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-unfitted-"));
@@ -251,11 +251,26 @@ test("unfitted baseline is judged inconclusive on schedule", async ({ server }) 
   await state.shutdown();
   const id = await binding(cards, root);
   server.makeBindingDue(id);
+  const token = await WyrdClient.connect().accessToken();
+  const status = async (): Promise<{ next_run_at?: string; readiness: string; last_execution_id?: string }> => {
+    const response = await fetch(`${server.baseUrl}/v1/verification/bindings/${id}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.status).toBe(200);
+    return (await response.json()) as { next_run_at?: string; readiness: string; last_execution_id?: string };
+  };
+  const due = (await status()).next_run_at;
 
-  const result = await scheduledResult(server, id, WAIT_MS);
+  const deadline = Date.now() + WAIT_MS;
+  let skipped = await status();
+  while (skipped.next_run_at === due) {
+    expect(Date.now() < deadline, "the due occurrence was not scheduled").toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    skipped = await status();
+  }
 
-  expect(result.outcome.verdict).toBe("inconclusive");
-  expect(result.verifier.name).toBe("tier-drift");
+  expect(skipped.readiness).toBe("baseline_not_ready");
+  expect(skipped.last_execution_id ?? null).toBeNull();
 });
 
 test("unbound verifier fails locally", async ({ state }) => {

@@ -8,6 +8,7 @@ for the judge and agrees with every answer, citing it.
 """
 
 import secrets
+import time
 from pathlib import Path
 
 import httpx
@@ -26,10 +27,10 @@ from .support import (
     Receiver,
     ancestry,
     binding_ids,
+    binding_status,
     client_of,
     hydrated,
     register,
-    scheduled_result,
     service_key,
     timeline,
 )
@@ -311,7 +312,7 @@ def test_window_verifier_records_samples_and_refuses_verify(assistant: WyrdState
     assert isinstance(submitted, verify.Recorded)
 
 
-def test_unfitted_baseline_is_judged_inconclusive_on_schedule(
+def test_unfitted_baseline_is_skipped_on_schedule(
     unfitted_assistant: WyrdState, wyrd_server: WyrdTestServer, cards: Cards
 ) -> None:
     unfitted_assistant.start_bifrost()
@@ -320,11 +321,16 @@ def test_unfitted_baseline_is_judged_inconclusive_on_schedule(
         observe.submit("tier-drift", "gold")
     unfitted_assistant.shutdown()
     [binding_id] = binding_ids(cards, unfitted_assistant.root_ref)
+    wyrd_server.make_binding_due(binding_id)
+    due = binding_status(wyrd_server, binding_id)["next_run_at"]
 
-    result = scheduled_result(wyrd_server, binding_id, BASELINE_TIMEOUT_SECONDS)
+    deadline = time.monotonic() + BASELINE_TIMEOUT_SECONDS
+    while (status := binding_status(wyrd_server, binding_id))["next_run_at"] == due:
+        assert time.monotonic() < deadline, "the due occurrence was not scheduled"
+        time.sleep(0.5)
 
-    assert result.verdict == "inconclusive"
-    assert result.verifier.name == "tier-drift"
+    assert status["readiness"] == "baseline_not_ready"
+    assert status.get("last_execution_id") is None
 
 
 def test_unbound_verifier_fails_locally(assistant: WyrdState) -> None:

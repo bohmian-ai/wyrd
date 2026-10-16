@@ -23,6 +23,7 @@ use wyrd_ai::{
     Bifrost, CallProvenance, Citation, Gateway, Locator, RequirementOutcome, SpanRecord,
     VerificationVerdict, WyrdClient, cli,
 };
+use wyrd_spec::verification::VerifierReadiness;
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::local_development::configure_gateway;
@@ -756,14 +757,17 @@ async fn window_verifier_records_samples_and_refuses_verify() {
     assistant.deployment.shutdown().await;
 }
 
-/// An SPC drift Verifier whose baseline can never fit is judged inconclusive
-/// when its schedule comes due, never passed.
+/// An SPC drift Verifier whose baseline can never fit is skipped when its
+/// schedule comes due: the scheduler advances the cursor without admitting
+/// an execution, so nothing is judged and no result is retained, and the
+/// binding reports the baseline as not ready.
 ///
 /// # Panics
-/// Panics when a step fails or the verdict differs.
+/// Panics when a step fails, the occurrence is not skipped in time, or the
+/// binding admitted an execution.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn unfitted_baseline_is_judged_inconclusive_on_schedule() {
+async fn unfitted_baseline_is_skipped_on_schedule() {
     let assistant = Assistant::start().await;
     let cards = assistant.deployment.cards().await;
     let unfitted = register(&cards, "cards/verify_in_real_time/unfitted-assistant.yaml").await;
@@ -791,11 +795,27 @@ async fn unfitted_baseline_is_judged_inconclusive_on_schedule() {
         .make_binding_due(binding)
         .await
         .expect("the binding comes due");
+    let due = assistant
+        .deployment
+        .binding_status(&binding)
+        .await
+        .next_run_at;
 
-    let result = assistant.deployment.scheduled_result(&binding, WAIT).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let status = loop {
+        let status = assistant.deployment.binding_status(&binding).await;
+        if status.next_run_at > due {
+            break status;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the due occurrence was not scheduled within {WAIT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
 
-    assert_eq!(result.outcome.verdict, VerificationVerdict::Inconclusive);
-    assert_eq!(result.verifier.name.as_str(), "tier-drift");
+    assert_eq!(status.readiness, VerifierReadiness::BaselineNotReady);
+    assert_eq!(status.last_execution_id, None, "no execution is admitted");
     assistant.deployment.shutdown().await;
 }
 

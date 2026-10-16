@@ -581,7 +581,7 @@ test("hosted tools need the tool and domain grants", async ({ server, provider, 
   for (const [name, extra, allowed] of [
     ["all_tools", ["tool:invoke", "cards:read", "bifrost_query:read"], TOOLS],
     ["no_tool_grant", ["cards:read", "bifrost_query:read"], []],
-    ["no_domain_grant", ["tool:invoke"], [TOOLS[2]]],
+    ["no_domain_grant", ["tool:invoke", "cards:read"], [TOOLS[0], TOOLS[2]]],
   ] as const) {
     const credential = server.scopedApiKey(name, [...VERIFIES, ...extra]);
 

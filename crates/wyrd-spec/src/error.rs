@@ -1891,7 +1891,7 @@ pub enum WyrdError {
         code = "WYRD_VERIFICATION_400_INPUT_INVALID",
         status = 400,
         title = "Invalid verification input",
-        remediation = "Send { verifier_card_uid, card_uid, input } with input.kind eval_record (a context object) or drift_samples (columns of number, string, or null values)."
+        remediation = "Send { verifier_card_uid, card_uid, inputs } where inputs maps each declared Verifier slot to a json, file, artifact, or trace value; run_id and execution_route_overrides are optional."
     )]
     VerificationInputInvalid {
         /// Human-readable error message.
@@ -1905,7 +1905,7 @@ pub enum WyrdError {
         code = "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
         status = 413,
         title = "Verification input too large",
-        remediation = "Keep the body within 1 MiB, drift_samples within 64 columns of 100,000 values, and eval_record.context within 256 KiB; split larger input across requests."
+        remediation = "Keep the request body and each evidence file within the Deployment's verification limits, or upload large files through verification.evidence and pass them by digest."
     )]
     VerificationInputTooLarge {
         /// Human-readable error message.

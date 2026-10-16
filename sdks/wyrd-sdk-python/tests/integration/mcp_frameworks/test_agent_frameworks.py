@@ -72,7 +72,7 @@ HIDDEN_WRITE = "verification.execute"
 HIDDEN_WRITE_ARGUMENTS = {
     "card_uid": "01890a5d-ac96-774b-bcce-b302099a8057",
     "verifier_card_uid": "01890a5d-ac96-774b-bcce-b302099a8058",
-    "input": {"kind": "task_context", "context": {}},
+    "inputs": {"answer": {"kind": "json", "value": "yes"}},
 }
 """Well-formed ``verification.execute`` arguments, so only authorization can refuse them."""
 

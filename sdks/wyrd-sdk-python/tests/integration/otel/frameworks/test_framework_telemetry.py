@@ -269,7 +269,7 @@ def test_ambient_auth_gateway_telemetry(
     report = launch(app_env, "openai_agents", "managed", "gateway")
 
     turn = report["run"]
-    assert turn["output"] == '{"passed":true}'
+    assert json.loads(turn["output"])["outcome"] == "passed"
     (upstream,) = receiver.to("/v1/chat/completions")[before:]
     assert upstream.headers["authorization"] == "Bearer sk-local-upstream"
     assert not any(name.startswith("x-wyrd") for name in upstream.headers)

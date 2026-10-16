@@ -610,7 +610,7 @@ impl<'a> Parts<'a> {
     ) -> Result<Self, BlockError> {
         zip_guard(bytes, limits).map_err(|error| match error {
             BlockError::Terminal { reason } => terminal(format!("{format}: {reason}")),
-            retryable @ BlockError::Retryable { .. } => retryable,
+            other @ (BlockError::Retryable { .. } | BlockError::Busy { .. }) => other,
         })?;
         let archive =
             ZipArchive::new(Cursor::new(bytes)).map_err(|error| refused(format, &error))?;

@@ -25,7 +25,7 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::registry::RegistrationOperationId;
-use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
 use wyrd_spec::verification::{
     DriftWindow, OperatorDispatchStatus, VerificationError, VerificationExecutionStatus,
@@ -42,9 +42,9 @@ use wyrd_sql::queries::verification::{
     FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
 };
 use wyrd_sql::queries::verifier_executions::{
-    ClaimedExecution, EnqueueOutcome, EnqueueRefusal, ExecutionAuthority, ExecutionInput,
+    Cause, ClaimedExecution, EnqueueOutcome, EnqueueRefusal, ExecutionAuthority, ExecutionInput,
     ExecutionOrigin, ExecutionStatus, QueueCounts, RetryOutcome, ScheduleOutcome, ScheduleSkip,
-    ScheduleTick, Settlement, Submission, SubmissionOutcome, TerminalStatus, TraceWaitOutcome,
+    ScheduleTick, Settlement, Submission, SubmissionOutcome, TerminalStatus,
     VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
@@ -1442,6 +1442,48 @@ async fn reclaimed_lease_fences_the_stale_token() {
     assert_eq!(status.state.error, None);
 }
 
+/// A submission's enqueuing cause, including the caller's sampling
+/// decision, is returned unchanged by its first claim and by the reclaim of
+/// an expired lease, so every attempt links back to the same caller.
+///
+/// # Panics
+/// Panics when the submission is refused, nothing is claimable, or either
+/// claim returns a different cause.
+#[tokio::test]
+async fn every_attempt_claims_the_submissions_cause() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let actor = actor(tenant);
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (subject, _) = register_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "custom", custom_drift()).await;
+    let cause = Cause {
+        trace_id: TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").expect("trace id parses"),
+        span_id: SpanId::from_hex("00f067aa0ba902b7").expect("span id parses"),
+        sampled: true,
+    };
+    let caused = Submission::new(
+        tenant,
+        authority(&actor),
+        request(&verifier, &subject),
+        Some(cause),
+        None,
+    )
+    .expect("request canonicalizes");
+    let execution = submitted(&queue, &mut conn, &caused).await;
+
+    let first = claim(&queue, &mut conn).await;
+    assert_eq!(first.cause, Some(cause));
+    expire_deadlines(&mut conn, execution).await;
+    let reclaimed = claim(&queue, &mut conn).await;
+    assert_eq!(reclaimed.attempt, 2);
+    assert_eq!(reclaimed.cause, Some(cause));
+}
+
 /// A retryable failure backs off 30 then 60 seconds on the same execution and input;
 /// the third failure exhausts the budget and settles `errored` with the
 /// structured error, no result, and no dispatch.
@@ -1821,101 +1863,6 @@ async fn claim_reports_postgres_measured_queue_wait_and_age() {
         "{:?}",
         reclaimed.queue_wait
     );
-}
-
-/// Waiting for a trace refunds the attempt and requeues after the poll delay;
-/// once the fixed deadline measured from the execution's creation passes, the execution
-/// settles `timed_out` with no result, and a stale token changes nothing.
-///
-/// # Panics
-/// Panics when a wait consumes an attempt, the deadline does not time the execution
-/// out, or a stale token settles.
-#[tokio::test]
-async fn trace_wait_requeues_until_deadline_then_times_out() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierExecutionQueue::default();
-    let mut conn = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
-    let verifier = register_verifier(&mut conn, &actor, "judge", custom_drift()).await;
-    let execution = submitted(
-        &queue,
-        &mut conn,
-        &submission(
-            fixture.data_tenant_id(),
-            authority(&actor),
-            request(&verifier, &owner),
-            None,
-        ),
-    )
-    .await;
-    let waiting = VerificationError {
-        code: "trace_not_landed".to_owned(),
-        message: "the required trace has not landed".to_owned(),
-    };
-
-    let first = claim(&queue, &mut conn).await;
-    let TraceWaitOutcome::Requeued(due) = queue
-        .await_trace(
-            &mut conn,
-            first.lease,
-            Duration::seconds(5),
-            Duration::hours(1),
-            &waiting,
-        )
-        .await
-        .expect("wait answers")
-    else {
-        panic!("a execution inside its deadline must requeue");
-    };
-    assert!(due > database_now(&mut conn).await);
-    expire_deadlines(&mut conn, execution).await;
-    let second = claim(&queue, &mut conn).await;
-    assert_eq!(second.attempt, 1, "waiting must not consume an attempt");
-    assert_eq!(second.input, first.input);
-    assert_eq!(
-        queue
-            .await_trace(
-                &mut conn,
-                first.lease,
-                Duration::seconds(5),
-                Duration::hours(1),
-                &waiting
-            )
-            .await
-            .expect("stale wait answers"),
-        TraceWaitOutcome::StaleLease
-    );
-
-    sqlx::query("UPDATE wyrd.verifier_executions SET created_at = created_at - INTERVAL '2 hours' WHERE execution_id = $1")
-        .bind(execution.as_uuid())
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("execution ages");
-    assert_eq!(
-        queue
-            .await_trace(
-                &mut conn,
-                second.lease,
-                Duration::seconds(5),
-                Duration::hours(1),
-                &waiting
-            )
-            .await
-            .expect("deadline answers"),
-        TraceWaitOutcome::TimedOut
-    );
-    let status = queue
-        .execution_status(&mut conn, execution)
-        .await
-        .expect("status reads")
-        .expect("execution exists");
-    assert_eq!(status.state.status, VerificationExecutionStatus::TimedOut);
-    assert_eq!(status.result_id, None);
-    assert_eq!(status.state.error, Some(waiting));
 }
 
 /// Runs, dispatches, and status reads are invisible to another tenant, which

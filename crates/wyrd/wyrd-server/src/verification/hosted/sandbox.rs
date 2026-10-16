@@ -97,9 +97,9 @@ impl Sandbox {
     /// [`Self::exec`].
     ///
     /// # Errors
-    /// Returns [`BlockError::Retryable`] when admission is full, no worker
-    /// frees up in time, or the pool fails, and [`BlockError::Terminal`] for
-    /// an invalid entrypoint, a Python error (including memory exhaustion),
+    /// Returns [`BlockError::Busy`] when admission is full or no worker frees
+    /// up in time, [`BlockError::Retryable`] when the pool fails, and
+    /// [`BlockError::Terminal`] for an invalid entrypoint, a Python error (including memory exhaustion),
     /// a crashed or killed worker, a timeout while running, or a result
     /// that is not JSON.
     pub async fn run(
@@ -145,10 +145,14 @@ impl Sandbox {
     /// the code can reach; every other OS call, host function, or undefined
     /// name is refused inside the sandbox. The worker is killed afterwards.
     ///
+    /// Admission refusal and a worker wait that ends unserved are
+    /// [`BlockError::Busy`]: the process, not the code, lacked capacity, so
+    /// the engine defers the whole execution instead of judging it.
+    ///
     /// # Errors
-    /// Returns [`BlockError::Retryable`] when admission is full, no worker
-    /// frees up in time, or the pool fails, and [`BlockError::Terminal`] for
-    /// a Python error (including memory exhaustion), a crashed or killed
+    /// Returns [`BlockError::Busy`] when admission is full or no worker frees
+    /// up in time, [`BlockError::Retryable`] when the pool fails, and
+    /// [`BlockError::Terminal`] for a Python error (including memory exhaustion), a crashed or killed
     /// worker, or a timeout while running.
     pub async fn exec(
         &self,
@@ -160,7 +164,7 @@ impl Sandbox {
         let _admitted = self
             .admission
             .try_acquire()
-            .map_err(|_| retryable("the Python sandbox is at capacity".to_owned()))?;
+            .map_err(|_| busy("the Python sandbox is at capacity".to_owned()))?;
         let deadline = deadline.min(Instant::now() + self.limits.code_timeout);
         let repl = ReplConfig {
             limits: Some(ResourceLimits {
@@ -171,7 +175,7 @@ impl Sandbox {
         };
         let mut checkout = tokio::time::timeout_at(deadline, self.pool.checkout(&repl))
             .await
-            .map_err(|_| retryable("no Python worker was free before the deadline".to_owned()))?
+            .map_err(|_| busy("no Python worker was free before the deadline".to_owned()))?
             .map_err(|error| failed(&error))?;
         let budget = self.limits.tool_result_max_bytes;
         let mut output = String::new();
@@ -348,10 +352,11 @@ impl CheckExecutor for CodeExecutor {
     }
 }
 
-/// Classify a pool failure: capacity and transport are retryable; anything
-/// the code itself caused is terminal.
+/// Classify a pool failure: an exhausted pool is busy, transport is
+/// retryable, and anything the code itself caused is terminal.
 fn failed(error: &PoolError) -> BlockError {
     match error {
+        PoolError::Exhausted => busy("no Python worker was free".to_owned()),
         PoolError::Runtime(exception) => terminal(format!("Python raised {exception}")),
         PoolError::Typing(message) => terminal(format!("Python failed to compile: {message}")),
         PoolError::Crashed { .. } => terminal("the Python worker stopped".to_owned()),
@@ -368,4 +373,9 @@ const fn terminal(reason: String) -> BlockError {
 /// A retryable error with `reason`.
 const fn retryable(reason: String) -> BlockError {
     BlockError::Retryable { reason }
+}
+
+/// A process-capacity refusal with `reason`.
+const fn busy(reason: String) -> BlockError {
+    BlockError::Busy { reason }
 }

@@ -206,19 +206,14 @@ impl<'a> ResultPayloadBuilder<'a> {
         }
     }
 
-    /// The result identity: the execution's UUID.
+    /// Map `outcome` to its ordered batches under a newly minted result
+    /// identity.
     ///
-    /// # Panics
-    /// Never in practice: an [`ExecutionId`] is a `UUIDv7`, which is always a
-    /// valid [`VerificationResultId`].
-    fn result_id(&self) -> VerificationResultId {
-        VerificationResultId::new(self.run.execution_id.as_uuid())
-            .expect("an ExecutionId is a UUIDv7, so it is a VerificationResultId")
-    }
-
-    /// Map `outcome` to its ordered batches.
-    ///
-    /// Every drift requirement writes one `result_features` row per scored
+    /// Each call produces a distinct [`VerificationResultId`], carried by
+    /// every row of the payload, so two attempts of one execution never share
+    /// a result identity; the execution correlates them through
+    /// `execution_id`. Retrying the staged payload resends the same rows and
+    /// identity. Every drift requirement writes one `result_features` row per scored
     /// feature, keyed by its `requirement_id`, all in one batch before the
     /// summary. The one `results` row records the overall verdict and the
     /// whole outcome as the `outcome` Variant.
@@ -228,26 +223,25 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// do not name each table field exactly once,
     /// [`ResultPayloadError::Variant`] when the outcome exceeds a Variant
     /// limit, and a JSON or Arrow error when encoding fails.
-    ///
-    /// # Panics
-    /// Never: the result identity reuses a UUIDv7 execution identity.
     pub fn build(
         &self,
         outcome: &VerificationOutcome,
     ) -> Result<ResultPayload, ResultPayloadError> {
+        let result_id = VerificationResultId::new_v7();
         let mut batches = Vec::with_capacity(2);
-        if let Some(features) = self.drift_features(&outcome.requirements)? {
+        if let Some(features) = self.drift_features(result_id, &outcome.requirements)? {
             batches.push(self.finish::<ResultFeaturesTable>(features)?);
         }
-        batches.push(self.finish::<ResultsTable>(self.summary(outcome)?)?);
+        batches.push(self.finish::<ResultsTable>(self.summary(result_id, outcome)?)?);
         Ok(ResultPayload {
-            result_id: self.result_id(),
+            result_id,
             verdict: outcome.verdict,
             batches,
         })
     }
 
-    /// Author the named columns of the one `vala.verification.results` row.
+    /// Author the named columns of the one `vala.verification.results` row
+    /// identified by `result_id`.
     ///
     /// # Errors
     /// Returns a JSON error when the Trigger or outcome cannot be encoded and
@@ -255,6 +249,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// limit.
     fn summary(
         &self,
+        result_id: VerificationResultId,
         outcome: &VerificationOutcome,
     ) -> Result<Vec<NamedColumn>, ResultPayloadError> {
         let trigger = self.run.trigger.map(canonical_json).transpose()?;
@@ -262,7 +257,7 @@ impl<'a> ResultPayloadBuilder<'a> {
         let outcome = serde_json::to_value(outcome)?;
         let window = self.run.window;
         Ok(vec![
-            ("result_id", text([Some(self.result_id().to_string())])),
+            ("result_id", text([Some(result_id.to_string())])),
             (
                 "execution_id",
                 text([Some(self.run.execution_id.to_string())]),
@@ -353,7 +348,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     }
 
     /// Author the named `vala.drift.result_features` columns: one row per
-    /// scored feature of every drift requirement.
+    /// scored feature of every drift requirement, each keyed by `result_id`.
     ///
     /// A row's window is its requirement's scored window, else the
     /// execution's scheduled window, else the execution interval. Returns
@@ -364,6 +359,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// Returns a JSON error when a method or verdict cannot be encoded.
     fn drift_features(
         &self,
+        result_id: VerificationResultId,
         requirements: &[RequirementResult],
     ) -> Result<Option<Vec<NamedColumn>>, ResultPayloadError> {
         let mut rows: Vec<DriftRow<'_>> = Vec::new();
@@ -401,10 +397,7 @@ impl<'a> ResultPayloadBuilder<'a> {
         Ok(Some(vec![
             (
                 "result_id",
-                text(std::iter::repeat_n(
-                    Some(self.result_id().to_string()),
-                    count,
-                )),
+                text(std::iter::repeat_n(Some(result_id.to_string()), count)),
             ),
             (
                 "requirement_id",
@@ -744,8 +737,9 @@ mod tests {
     }
 
     /// Drift feature rows carry their requirement and precede the summary,
-    /// a non-finite score is null, and the summary stores the whole outcome
-    /// under the execution's identity.
+    /// a non-finite score is null, and the summary stores the whole outcome;
+    /// every row carries the payload's result identity, and the summary also
+    /// names the execution.
     ///
     /// # Panics
     /// Panics when the outcome maps to other rows.
@@ -767,6 +761,10 @@ mod tests {
                 Some("income_stable")
             );
             assert_eq!(cell(rows, "method", row).as_deref(), Some("Psi"));
+            assert_eq!(
+                cell(rows, "result_id", row),
+                Some(payload.result_id().to_string())
+            );
         }
         assert_eq!(cell(rows, "feature", 0).as_deref(), Some("dti"));
         assert_eq!(cell(rows, "verdict", 1).as_deref(), Some("drift"));
@@ -778,7 +776,10 @@ mod tests {
         assert!((scores.value(1) - 0.4).abs() < f64::EPSILON);
         let summary = &summary.batch;
         let execution = run.execution_id.to_string();
-        assert_eq!(cell(summary, "result_id", 0), Some(execution.clone()));
+        assert_eq!(
+            cell(summary, "result_id", 0),
+            Some(payload.result_id().to_string())
+        );
         assert_eq!(cell(summary, "execution_id", 0), Some(execution));
         assert_eq!(cell(summary, "verdict", 0).as_deref(), Some("failed"));
         assert_eq!(
@@ -812,6 +813,28 @@ mod tests {
         assert_eq!(payload.verdict(), VerificationVerdict::Failed);
     }
 
+    /// Two attempts of one execution each mint their own result identity
+    /// while naming the same execution, so a reclaimed attempt's result can
+    /// never be read in place of the winning one.
+    ///
+    /// # Panics
+    /// Panics when the two payloads share a result identity or name
+    /// different executions.
+    #[test]
+    fn each_built_payload_mints_its_own_result_identity() {
+        let run = TestRun::new();
+        let outcome = outcome();
+        let first = run.builder().build(&outcome).expect("outcome maps");
+        let second = run.builder().build(&outcome).expect("outcome maps");
+        assert_ne!(first.result_id(), second.result_id());
+        let execution = |payload: &ResultPayload| {
+            let summary = payload.batches().last().expect("a summary batch");
+            cell(&summary.batch, "execution_id", 0)
+        };
+        assert_eq!(execution(&first), Some(run.execution_id.to_string()));
+        assert_eq!(execution(&first), execution(&second));
+    }
+
     /// One refusal case: the expected problem, the mutation applied to valid
     /// summary columns, and the column name the refusal reports.
     type ColumnCase = (&'static str, fn(&mut Vec<NamedColumn>), &'static str);
@@ -843,7 +866,9 @@ mod tests {
             ),
         ];
         for (expected_problem, mutate, expected_column) in cases {
-            let mut columns = builder.summary(&outcome()).expect("summary authors");
+            let mut columns = builder
+                .summary(VerificationResultId::new_v7(), &outcome())
+                .expect("summary authors");
             mutate(&mut columns);
             let error = builder
                 .finish::<ResultsTable>(columns)

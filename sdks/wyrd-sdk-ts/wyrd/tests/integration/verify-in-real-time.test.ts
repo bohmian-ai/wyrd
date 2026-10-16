@@ -28,6 +28,19 @@ const DENIED = { code: "WYRD_PERMISSION_403_DENIED_RBAC" };
 /** A fresh deployment per test, as each Rust journey starts its own. */
 const test = assistantTest({ perTest: true });
 
+/**
+ * The process-global tracer provider, installed once by the first traced
+ * test. Later tests only need its active span context, which the SDK sends
+ * with each request whichever state installed the provider.
+ */
+let telemetry: Promise<unknown> | undefined;
+
+/** Install `state`'s telemetry unless an earlier test in this file already did. */
+function startTelemetry(state: WyrdState): Promise<unknown> {
+  telemetry ??= state.startTelemetry();
+  return telemetry;
+}
+
 /** One verification result beside one judge call joined to it on the subject Card. */
 const ResultJudgeCall = z.object({
   result_subject: z.string(),
@@ -169,7 +182,7 @@ test("judge call without a run joins the callers trace attributed to the card", 
 });
 
 test("traced sdk verify joins the callers trace", async ({ server, state }) => {
-  await state.startTelemetry();
+  await startTelemetry(state);
   const caller = await trace.getTracer("journey").startActiveSpan("caller", async (span) => {
     await state.run("agent").observe.verify("answer-judged", { answer: "yes" });
     span.end();
@@ -180,6 +193,31 @@ test("traced sdk verify joins the callers trace", async ({ server, state }) => {
   const spans = await timeline(server, caller.traceId);
   expect(calls).toHaveLength(1);
   expect(calls[0] && spanOf(calls[0], spans), JSON.stringify(calls)).toBeDefined();
+});
+
+test("traced sdk submit links its attempt to the callers trace", async ({ server, state }) => {
+  await startTelemetry(state);
+  const caller = await trace.getTracer("journey").startActiveSpan("caller", async (span) => {
+    const submitted = await state.run("agent").observe.submit("answer-judged", { answer: "yes" });
+    span.end();
+    if (submitted.kind !== "queued") {
+      throw new Error(`Run evidence queues an execution: ${JSON.stringify(submitted)}`);
+    }
+    await submitted.execution.wait({ timeoutMs: WAIT_MS });
+    return span.spanContext();
+  });
+
+  const calls = await judgeCalls(server);
+  const spans = await timeline(server, caller.traceId);
+  const attempts = spans.filter((span) => span.name === "verification.attempt");
+  expect(attempts, JSON.stringify(spans)).toHaveLength(1);
+  const [attempt] = attempts;
+  expect(attempt?.trace_id).not.toBe(caller.traceId);
+  expect(attempt?.links.map((link) => link.trace_id)).toEqual([caller.traceId]);
+  expect(calls).toHaveLength(1);
+  const judged = calls[0] && spanOf(calls[0], spans);
+  expect(judged, "the judge call is in the caller's timeline").toBeDefined();
+  expect(judged && ancestry(spans, judged).at(-1)?.span_id).toBe(attempt?.span_id);
 });
 
 test("malformed traceparent is ignored by the judge call", async ({ server, assistant }) => {

@@ -276,7 +276,10 @@ impl Invocation {
     ///
     /// # Errors
     /// Returns [`ToolError::Invocation`] when the budget is spent, a mount
-    /// cannot open, or the sandbox refuses or fails the code.
+    /// cannot open, or the sandbox refuses or fails the code. A sandbox
+    /// capacity refusal keeps its [`BlockError::Busy`] as the typed cause, so
+    /// the Agent session stops the invocation busy rather than handing the
+    /// refusal to the model.
     async fn run(&self, source: String) -> Result<Value, ToolError> {
         let workspace = Arc::clone(self.workspace()?);
         let reservation = Reservation::take(&self.code_budget, self.limits.code_timeout)
@@ -296,7 +299,13 @@ impl Invocation {
             .sandbox
             .exec(source, Vec::new(), mounts, deadline)
             .await
-            .map_err(|error| invocation(error.to_string()))?;
+            .map_err(|error| match error {
+                BlockError::Busy { .. } => ToolError::Invocation {
+                    detail: error.to_string(),
+                    cause: Some(Box::new(error)),
+                },
+                error => invocation(error.to_string()),
+            })?;
         let (repr, whole) = repr(&value, self.limits.tool_result_max_bytes);
         Ok(json!({"value": repr, "value_truncated": !whole, "output": output}))
     }

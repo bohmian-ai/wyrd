@@ -15,7 +15,8 @@ use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use vala_eval::blocks::{DriftChecks, EngineError};
-use wyrd_runtime::{AcceptedAuthority, Permission};
+use wyrd_runtime::permission::{Action, Resource};
+use wyrd_runtime::{AcceptedAuthority, CardAttribution, Permission};
 use wyrd_spec::auth::{PrincipalId, Sha256Hex};
 use wyrd_spec::card::verifier::{CheckEvidence, VerifierSpec};
 use wyrd_spec::envelope::Spec;
@@ -32,7 +33,7 @@ use wyrd_spec::verification::execution::{
 };
 use wyrd_sql::queries::auth::system_principal_id;
 use wyrd_sql::queries::cards::get_card_by_uid;
-use wyrd_sql::queries::verifier_executions::{Submission, VerifierExecutionQueue};
+use wyrd_sql::queries::verifier_executions::{Cause, Submission, VerifierExecutionQueue};
 use wyrd_sql::{CardStatus, ParsedCardRow, TenantConn};
 use wyrd_storage::StorageError;
 use wyrd_storage::tenant_path;
@@ -302,7 +303,7 @@ impl<'a> VerificationControl<'a> {
 
     /// Plan uploads of the caller's evidence files that storage lacks.
     ///
-    /// Authorizes and audits `verifier:run` on any Verifier, refuses a file
+    /// Admits and audits any `verifier:run` grant, refuses a file
     /// or request larger than the Deployment limits, and returns one
     /// single-PUT plan for each digest whose object
     /// `<tenant>/evidence/sha256/<digest>` is absent or of another length.
@@ -310,7 +311,7 @@ impl<'a> VerificationControl<'a> {
     /// check digest and length again.
     ///
     /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:run`,
+    /// Returns [`WyrdError::PermissionDeniedRbac`] without any `verifier:run` grant,
     /// [`WyrdError::VerificationInputTooLarge`] past a limit,
     /// [`WyrdError::ServiceUnavailable`] when this process hosts no Verifier
     /// blocks, and the storage error when a lookup or signature fails.
@@ -320,13 +321,7 @@ impl<'a> VerificationControl<'a> {
         request: &EvidencePlanRequest,
     ) -> Result<EvidencePlanResponse, WyrdError> {
         let limits = *self.blocks()?.limits();
-        audit::authorize(
-            self.state,
-            caller,
-            &Permission::verifier_run_any(),
-            EVIDENCE,
-            "verification.evidence",
-        )?;
+        self.authorize_evidence(caller, EVIDENCE)?;
         let total: u64 = request.files.iter().map(|file| file.size_bytes).sum();
         if let Some(file) = request
             .files
@@ -379,13 +374,13 @@ impl<'a> VerificationControl<'a> {
     /// Store one evidence body on the local backend, where an evidence plan
     /// is the authenticated route rather than a presigned URL.
     ///
-    /// Authorizes and audits `verifier:run` on any Verifier like
+    /// Admits and audits any `verifier:run` grant like
     /// [`Self::evidence`], reads at most the Deployment `file_max_bytes`, and
     /// writes the body to `<tenant>/evidence/sha256/<digest>` only when it
     /// hashes to `sha256`. Writes nothing to Postgres.
     ///
     /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:run`,
+    /// Returns [`WyrdError::PermissionDeniedRbac`] without any `verifier:run` grant,
     /// [`WyrdError::VerificationInputTooLarge`] past `file_max_bytes`,
     /// [`WyrdError::ServiceUnavailable`] when this process hosts no Verifier
     /// blocks, the storage `Sha256Mismatch` error for a body of another
@@ -397,13 +392,7 @@ impl<'a> VerificationControl<'a> {
         body: axum::body::Body,
     ) -> Result<(), WyrdError> {
         let max_bytes = self.blocks()?.limits().file_max_bytes;
-        audit::authorize(
-            self.state,
-            caller,
-            &Permission::verifier_run_any(),
-            EVIDENCE_UPLOAD,
-            "verification.evidence",
-        )?;
+        self.authorize_evidence(caller, EVIDENCE_UPLOAD)?;
         let too_large = || WyrdError::VerificationInputTooLarge {
             message: format!("evidence files may be at most {max_bytes} bytes"),
             details: serde_json::json!({ "sha256": sha256, "max_bytes": max_bytes }),
@@ -445,7 +434,8 @@ impl<'a> VerificationControl<'a> {
     /// [`WyrdError::VerificationInputUnsupported`] for a Window Verifier,
     /// [`WyrdError::VerificationExecutionTimedOut`] past the deadline,
     /// [`WyrdError::ServiceUnavailable`] when this process hosts no Verifier
-    /// blocks, a registry unavailability error when a read fails, and the
+    /// blocks or a block is refused process capacity (a Python worker or a
+    /// workspace), a registry unavailability error when a read fails, and the
     /// Verifier's planning refusal.
     #[tracing::instrument(
         name = "verification.execute",
@@ -466,7 +456,7 @@ impl<'a> VerificationControl<'a> {
             "verifier:{}/subject:{}/execution:{execution_id}",
             request.verifier_card_uid, request.card_uid
         );
-        self.authorize_run(caller, &request.verifier_card_uid, EXECUTE, &resource)?;
+        self.authorize_run(caller, &request.verifier_card_uid, None, EXECUTE, &resource)?;
         let telemetry = ExecutionTelemetry::start(ExecutionMode::Direct);
         let target = telemetry
             .phase(
@@ -519,6 +509,14 @@ impl<'a> VerificationControl<'a> {
                 }),
             ),
             Err(EngineError::Plan(error)) => ("errored", Err(error)),
+            Err(EngineError::Busy(reason)) => (
+                "unavailable",
+                Err(WyrdError::ServiceUnavailable {
+                    message: "the verification runtime has no capacity for this Verifier now"
+                        .to_owned(),
+                    details: serde_json::json!({ "reason": reason }),
+                }),
+            ),
             Err(error) => ("errored", Err(WyrdError::internal(error.to_string()))),
         };
         span.record("outcome", label);
@@ -543,12 +541,15 @@ impl<'a> VerificationControl<'a> {
     /// Scribe acknowledges the inputs, the submission is queued through the
     /// batched writer, which decides replay, conflict, and refusal; until
     /// then status reads not found. Reads and writes no Postgres. The
-    /// execution runs as the caller, never as a binding owner.
+    /// execution runs as the caller, never as a binding owner. The request's
+    /// span and the caller's own sampled flag become the execution's
+    /// [`Cause`], which its attempts link to.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:run` on
-    /// the Verifier, [`WyrdError::VerificationInputTooLarge`] for inputs past
-    /// a Variant limit, and [`WyrdError::ServiceUnavailable`] when this
+    /// the Verifier or when a Card-bound caller's signed scope does not carry
+    /// the subject's UID, [`WyrdError::VerificationInputTooLarge`] for inputs
+    /// past a Variant limit, and [`WyrdError::ServiceUnavailable`] when this
     /// process hosts no Verifier queue.
     pub(crate) fn enqueue(
         &self,
@@ -566,12 +567,19 @@ impl<'a> VerificationControl<'a> {
             "verifier:{}/subject:{}",
             request.verifier_card_uid, request.card_uid
         );
-        self.authorize_run(caller, &request.verifier_card_uid, ENQUEUE, &resource)?;
+        self.authorize_run(
+            caller,
+            &request.verifier_card_uid,
+            Some(&request.card_uid),
+            ENQUEUE,
+            &resource,
+        )?;
         let cause = wyrd_telemetry::current_context().and_then(|context| {
-            Some((
-                TraceId::from_hex(&context.trace_id).ok()?,
-                SpanId::from_hex(&context.span_id).ok()?,
-            ))
+            Some(Cause {
+                trace_id: TraceId::from_hex(&context.trace_id).ok()?,
+                span_id: SpanId::from_hex(&context.span_id).ok()?,
+                sampled: wyrd_telemetry::caller_sampled(),
+            })
         });
         let submission = Submission::new(
             caller.data_tenant_id,
@@ -762,12 +770,19 @@ impl<'a> VerificationControl<'a> {
     /// Evaluate `verifier:run` on `verifier` for `operation` and stage the
     /// single allow or deny decision without waiting for its commit.
     ///
+    /// When `subject` is given, a Card-bound caller must also carry that UID
+    /// in its signed Card scope; this is the same in-memory rule the gateway
+    /// applies to attribution, so no registry read is needed. A caller bound
+    /// to no Card is decided by RBAC alone.
+    ///
     /// # Errors
-    /// Returns the [`WyrdError::PermissionDeniedRbac`] refusal.
+    /// Returns [`WyrdError::PermissionDeniedRbac`] when RBAC refuses the
+    /// Verifier or the signed scope does not carry `subject`.
     fn authorize_run(
         &self,
         caller: &Caller,
         verifier: &CardUid,
+        subject: Option<&CardUid>,
         operation: &str,
         resource: &str,
     ) -> Result<(), WyrdError> {
@@ -777,7 +792,20 @@ impl<'a> VerificationControl<'a> {
             .authz
             .permission_check
             .check(&caller.principal, &required)
-            .into_result();
+            .into_result()
+            .map_err(permission_deny_reason_to_wyrd)
+            .and_then(|()| match (subject, caller.principal.card_attribution()) {
+                (Some(subject), CardAttribution::Scoped(scope))
+                    if !scope.uids().contains(subject) =>
+                {
+                    Err(WyrdError::PermissionDeniedRbac {
+                        message: "the caller's Card scope does not cover the verified subject"
+                            .to_owned(),
+                        details: serde_json::json!({ "resource": resource }),
+                    })
+                }
+                _ => Ok(()),
+            });
         let outcome = if decision.is_ok() {
             AuditOutcome::Allowed
         } else {
@@ -787,7 +815,52 @@ impl<'a> VerificationControl<'a> {
             caller.data_tenant_id,
             audit::audit_event(caller, operation, resource, &required.to_string(), outcome),
         );
-        decision.map_err(permission_deny_reason_to_wyrd)
+        decision
+    }
+
+    /// Admit evidence staging for `operation` and stage the single allow or
+    /// deny decision without waiting for its commit.
+    ///
+    /// Staging selects no Verifier and cannot execute one, so any
+    /// `verifier:run` grant admits it, including one scoped to a single
+    /// Verifier UID. The exact Verifier is authorized later by
+    /// [`Self::authorize_run`] when execute or enqueue names it.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::PermissionDeniedRbac`] when the caller holds no
+    /// `verifier:run` grant of any scope.
+    fn authorize_evidence(&self, caller: &Caller, operation: &str) -> Result<(), WyrdError> {
+        let required = Permission::verifier_run_any();
+        let allowed = caller
+            .principal
+            .effective_permissions
+            .covers_operation(&Resource::Verifier, &Action::Run);
+        let outcome = if allowed {
+            AuditOutcome::Allowed
+        } else {
+            AuditOutcome::Denied
+        };
+        self.state.scribe_outbox.stage(
+            caller.data_tenant_id,
+            audit::audit_event(
+                caller,
+                operation,
+                "verification.evidence",
+                &required.to_string(),
+                outcome,
+            ),
+        );
+        if allowed {
+            Ok(())
+        } else {
+            Err(WyrdError::PermissionDeniedRbac {
+                message: format!(
+                    "principal {} lacks any verifier:run grant",
+                    caller.principal.id
+                ),
+                details: serde_json::json!({ "required": required, "principal": caller.principal.id.to_string() }),
+            })
+        }
     }
 
     /// Read one Card of the caller's tenant, or `None` when it is absent.

@@ -631,6 +631,94 @@ async fn traced_sdk_verify_joins_the_callers_trace() {
     assistant.deployment.shutdown().await;
 }
 
+/// A Run's `submit` made inside a sampled caller span queues its judgment,
+/// and the background attempt is a trace of its own that links back to the
+/// caller's span: the caller's timeline returns that linked
+/// `verification.attempt` and, below it in the attempt's trace, the judge
+/// call's gateway span.
+///
+/// # Panics
+/// Panics when the submission is not queued, the wait, flush, or read fails,
+/// or the attempt or its judge call is missing from the caller's timeline.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn traced_sdk_submit_links_its_attempt_to_the_callers_trace() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry::trace::{
+        SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId, TraceState,
+    };
+    use tracing::Instrument as _;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    const SUBMIT_TRACE: &str = "1af7651916cd43dd8448eb211c80319c";
+    let assistant = Assistant::start().await;
+    let state = assistant.state().await;
+    let run = state.run_for_card("agent").expect("agent run opens");
+    let traced = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(
+                opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                    .build()
+                    .tracer("journey"),
+            ),
+        ),
+    );
+    let caller = tracing::dispatcher::with_default(&traced, || tracing::info_span!("caller"));
+    caller
+        .set_parent(
+            opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+                TraceId::from_hex(SUBMIT_TRACE).expect("trace id"),
+                SpanId::from_hex(CALLER_SPAN).expect("span id"),
+                TraceFlags::SAMPLED,
+                true,
+                TraceState::default(),
+            )),
+        )
+        .expect("the caller span joins the caller's trace");
+
+    let Submission::Queued(execution) = run
+        .observe()
+        .submit("answer-judged", json!("yes"))
+        .instrument(caller)
+        .with_subscriber(traced)
+        .await
+        .expect("the answer is submitted")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    execution.wait(WAIT).await.expect("the execution settles");
+    state.shutdown().await.expect("Bifrost stops");
+
+    let calls = assistant.judge_calls().await;
+    let timeline = assistant.deployment.timeline(SUBMIT_TRACE).await;
+    let attempt = timeline
+        .iter()
+        .find(|span| span.name == "verification.attempt")
+        .unwrap_or_else(|| panic!("the caller's timeline links the attempt: {timeline:#?}"));
+    assert_ne!(attempt.trace_id.to_hex(), SUBMIT_TRACE, "{attempt:#?}");
+    assert!(
+        attempt
+            .links
+            .iter()
+            .any(|link| link.trace_id.to_hex() == SUBMIT_TRACE),
+        "the attempt links to the caller's trace: {attempt:#?}"
+    );
+    let [call] = calls.as_slice() else {
+        panic!("exactly one judge call: {calls:?}");
+    };
+    let judged = call
+        .span(&timeline)
+        .unwrap_or_else(|| panic!("the judge call is in the timeline: {timeline:#?}"));
+    assert_eq!(
+        ancestry(&timeline, judged).last().map(|root| root.span_id),
+        Some(attempt.span_id),
+        "the judge call descends from the attempt: {timeline:#?}"
+    );
+    assistant.deployment.shutdown().await;
+}
+
 /// A malformed `traceparent` is ignored: the judgment succeeds and its judge
 /// call keeps a trace of its own.
 ///

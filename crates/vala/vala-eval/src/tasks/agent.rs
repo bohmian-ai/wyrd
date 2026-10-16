@@ -145,6 +145,9 @@ mod agent_executor {
         }
     }
 
+    /// Build the executor bundle these tests dispatch through: production
+    /// assertion and agent executors plus a trace executor over an empty
+    /// in-memory source, so trace tasks reach no external trace store.
     fn executors() -> Executors {
         Executors {
             assertion: Arc::new(AssertionTaskExecutor::new()),

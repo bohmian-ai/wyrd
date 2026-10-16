@@ -66,7 +66,8 @@ telemetry causality. Preserve both; never overload one as the other.
 - Verifier execution telemetry has one owner per execution
   (`wyrd-server` `verification::telemetry::ExecutionTelemetry`). It is shared by
   queued attempts and direct requests and labels series only by the closed
-  `kind`, `mode`, `origin`, `phase`, and `outcome` sets. Phases overlap:
+  `mode`, `phase`, and `outcome` sets; the queued runner's queue-wait and
+  trigger-to-terminal series add only the closed `origin` set. Phases overlap:
   `engine` contains `input_read` and `prepare`, so phase samples are never
   summed and aggregate percentiles are never subtracted. Engine overhead is
   computed per execution as engine elapsed time minus the union of measured

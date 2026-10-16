@@ -1529,6 +1529,134 @@ async fn expired_lease_is_reclaimed_and_the_stale_holder_is_fenced() {
     fresh.stop().await;
 }
 
+/// The `result_id` every row of one submitted result batch carries.
+///
+/// # Panics
+/// Panics when the batch is not an Arrow IPC stream with a `result_id`
+/// column, or its rows name more than one result.
+fn sent_result_id(sent: &SentBatch) -> String {
+    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&sent.bytes), None)
+        .expect("a sent batch is an Arrow IPC stream");
+    let mut ids = std::collections::BTreeSet::new();
+    for batch in reader {
+        let batch = batch.expect("the stream decodes");
+        let column = batch
+            .column_by_name("result_id")
+            .expect("a result_id column");
+        for row in 0..batch.num_rows() {
+            ids.insert(
+                arrow::util::display::array_value_to_string(column, row)
+                    .expect("result_id renders"),
+            );
+        }
+    }
+    assert_eq!(ids.len(), 1, "one batch names one result: {ids:?}");
+    ids.pop_first().expect("one result identity")
+}
+
+/// An attempt whose result was staged but whose settlement never commits
+/// loses to the reclaiming attempt: each produced result carries its own
+/// identity, the execution selects the winner's, and its status read returns
+/// the winner's verdict and none of the abandoned attempt's drift detail.
+///
+/// A test-only deferred constraint trigger fails every completing commit made
+/// under the first attempt's lease token, so its result reaches Scribe while
+/// its settlement rolls back; the lease is then expired and a fresh runner
+/// reclaims and completes the execution with a different verdict.
+///
+/// # Panics
+/// Panics when the fault cannot be installed, the execution does not complete
+/// on its reclaim, the attempts share a result identity, or the status read
+/// returns the abandoned attempt's outcome.
+#[tokio::test]
+async fn reclaimed_attempt_after_a_failed_settlement_selects_its_own_result() {
+    let harness = Harness::start().await;
+    let abandoned = EngineScript::default();
+    abandoned.hold();
+    abandoned.push(EngineOutcome::Completed(drifting_report()));
+    let stale = harness.spawn(&Harness::limits(), &abandoned);
+    let run = harness.submit().await;
+    wait_until("the first claim", || abandoned.entered() == 1).await;
+    let (Some(token), _) = harness.lease(run).await else {
+        panic!("the first attempt holds a lease");
+    };
+    for statement in [
+        "CREATE OR REPLACE FUNCTION public.fail_settlement() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected settlement failure'; END $$"
+            .to_owned(),
+        format!(
+            "CREATE CONSTRAINT TRIGGER fail_settlement AFTER UPDATE ON wyrd.verifier_executions \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
+             WHEN (NEW.status = 'completed' AND OLD.lease_token = '{token}'::uuid) \
+             EXECUTE FUNCTION public.fail_settlement()"
+        ),
+    ] {
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&harness.assertion)
+            .await
+            .expect("the settlement fault installs");
+    }
+    abandoned.release();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !harness.writes().await.iter().any(|table| table == RESULTS) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the abandoned result to be staged"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    stale.stop.cancel();
+    harness.expire(run).await;
+    let winner = EngineScript::default();
+    winner.push(EngineOutcome::Completed(unscored_report()));
+    let fresh = harness.spawn(&Harness::limits(), &winner);
+    let row = harness.wait_execution(run, status("completed")).await;
+    assert_eq!(row.attempts, 2, "the reclaim is the second attempt");
+    stale.stop().await;
+    fresh.stop().await;
+
+    let summaries = sent_to(&harness.fault, RESULTS).await;
+    assert_eq!(summaries.len(), 2, "both attempts published a summary");
+    let (lost, won) = (sent_result_id(&summaries[0]), sent_result_id(&summaries[1]));
+    assert_ne!(lost, won, "each produced result has its own identity");
+    assert_eq!(row.result_id.map(|id| id.to_string()), Some(won.clone()));
+    let features = sent_to(&harness.fault, FEATURES).await;
+    assert!(
+        features.iter().all(|sent| sent_result_id(sent) == lost),
+        "only the abandoned attempt wrote drift detail"
+    );
+
+    harness.durable_rows().await;
+    let reader = harness
+        .server
+        .bootstrap_user("result-reader", &["viewer"])
+        .await
+        .expect("reader bootstraps");
+    let wyrd_testing::Bootstrap::User { jwt, .. } = reader else {
+        panic!("a user bootstraps as a user");
+    };
+    let response = harness
+        .server
+        .oneshot_authenticated(
+            &jwt,
+            axum::http::Request::builder()
+                .uri(format!("/v1/verification/executions/{run}"))
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("status read responds");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("status body reads");
+    let state: serde_json::Value = serde_json::from_slice(&body).expect("status is JSON");
+    assert_eq!(
+        state["result"]["outcome"]["verdict"], "inconclusive",
+        "the winner's verdict is read: {state}"
+    );
+}
+
 /// A crashed runner degrades health, is restarted, and — once the lost lease
 /// expires — reclaims and completes the run exactly once. The exit is visible
 /// through health, one structured `verification capability crashed` error
@@ -2798,42 +2926,13 @@ async fn manual_run_links_to_its_enqueuing_request() {
     };
     let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
     let checkpoint = traces.checkpoint();
-    let body = serde_json::json!({
-        "verifier_card_uid": verifier,
-        "card_uid": harness.subject,
-        "inputs": { "x": { "kind": "json", "value": 1 } },
-    });
-    let response = harness
-        .server
-        .oneshot_authenticated(
-            &jwt,
-            axum::http::Request::builder()
-                .method(axum::http::Method::POST)
-                .uri("/v1/verification/enqueue")
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .header(
-                    "traceparent",
-                    format!("00-{ENQUEUE_CALLER_TRACE}-b7ad6b7169203333-01"),
-                )
-                .body(axum::body::Body::from(body.to_string()))
-                .expect("enqueue request builds"),
-        )
-        .await
-        .expect("enqueue request responds");
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("enqueue body reads");
-    let accepted: serde_json::Value = serde_json::from_slice(&bytes).expect("enqueue body is JSON");
-    let execution_id = accepted["execution_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the request is accepted: {accepted}"))
-        .to_owned();
-    harness
-        .wait_execution(
-            execution_id.parse().expect("the execution id parses"),
-            |row| !matches!(row.status.as_str(), "pending" | "running" | "retrying"),
-        )
-        .await;
+    let execution_id = traced_enqueue(
+        &harness,
+        &jwt,
+        &verifier,
+        &format!("00-{ENQUEUE_CALLER_TRACE}-b7ad6b7169203333-01"),
+    )
+    .await;
     runtime.stop().await;
 
     let spans = traces.finished_since(checkpoint);
@@ -2871,12 +2970,212 @@ async fn manual_run_links_to_its_enqueuing_request() {
     );
 }
 
+/// Enqueues the `x == 1` assertion `verifier` against the harness subject as
+/// `jwt` under `traceparent`, waits until the runtime settles it, and returns
+/// its execution id.
+///
+/// # Panics
+/// Panics when the request fails, is not accepted, or the execution never
+/// leaves the queue.
+async fn traced_enqueue(
+    harness: &Harness,
+    jwt: &str,
+    verifier: &CardUid,
+    traceparent: &str,
+) -> String {
+    let body = serde_json::json!({
+        "verifier_card_uid": verifier,
+        "card_uid": harness.subject,
+        "inputs": { "x": { "kind": "json", "value": 1 } },
+    });
+    let response = harness
+        .server
+        .oneshot_authenticated(
+            jwt,
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/verification/enqueue")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("traceparent", traceparent)
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("enqueue request builds"),
+        )
+        .await
+        .expect("enqueue request responds");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("enqueue body reads");
+    let accepted: serde_json::Value = serde_json::from_slice(&bytes).expect("enqueue body is JSON");
+    let execution_id = accepted["execution_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the request is accepted: {accepted}"))
+        .to_owned();
+    harness
+        .wait_execution(
+            execution_id.parse().expect("the execution id parses"),
+            |row| !matches!(row.status.as_str(), "pending" | "running" | "retrying"),
+        )
+        .await;
+    execution_id
+}
+
+/// Under an accepting operator policy, a queued attempt inherits its
+/// enqueuing caller's sampling decision through its link: a sampled caller's
+/// attempt and its descendants reach the tenant's trace copy, and an
+/// unsampled caller's attempt does not.
+///
+/// # Panics
+/// Panics when [`assert_queued_copies`] does.
+#[tokio::test]
+async fn queued_attempt_follows_its_callers_sampling_decision() {
+    assert_queued_copies(wyrd_telemetry::TelemetryConfig::default()).await;
+}
+
+/// Under a rejecting operator policy, a sampled caller's queued attempt still
+/// reaches its tenant, so the operator's decision never removes the caller's.
+///
+/// # Panics
+/// Panics when [`assert_queued_copies`] does, or the operator exports any
+/// span of the queued attempts.
+#[tokio::test]
+async fn operator_rejected_queued_attempt_still_reaches_a_sampled_caller() {
+    let operator = assert_queued_copies(wyrd_telemetry::TelemetryConfig {
+        sample_ratio: Some(0.0),
+        ..wyrd_telemetry::TelemetryConfig::default()
+    })
+    .await;
+    assert!(
+        operator
+            .iter()
+            .all(|span| !span.name.starts_with("verification.")),
+        "the operator policy rejects the queued attempts: {operator:#?}"
+    );
+}
+
+/// Installs telemetry under `config`, enqueues one execution under a sampled
+/// and one under an unsampled caller trace, and asserts each tenant copy
+/// against its caller's decision; returns the operator's captured spans.
+///
+/// The sampled caller's tenant copy holds exactly one `verification.attempt`
+/// root, linked to the caller's trace, whose copied trace is that attempt
+/// and its `verification.*` descendants, each stamped with the enqueuing
+/// writer as subject and SYSTEM as actor. The unsampled caller's trace links
+/// no copied attempt. Attempts are found through their copied link, so the
+/// proof holds whether or not the operator also exports them.
+///
+/// # Panics
+/// Panics when telemetry, the server, seeding, or the runtime fails, an
+/// execution never settles, or either tenant copy diverges from its caller.
+async fn assert_queued_copies(
+    config: wyrd_telemetry::TelemetryConfig,
+) -> Vec<wyrd_telemetry::CapturedSpan> {
+    let (_telemetry, traces) =
+        wyrd_server::install_capture_runtime(config).expect("production-shaped telemetry installs");
+    let harness = Harness::start().await;
+    let tenant = harness.server.pg_fixture().data_tenant_id();
+    let verifier = harness
+        .seed
+        .verifier("sampled-assertion", &assertion_spec())
+        .await
+        .expect("assertion Verifier registers");
+    let wyrd_testing::Bootstrap::User { id, jwt } = harness
+        .server
+        .bootstrap_user("sampled-run-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
+    let checkpoint = traces.checkpoint();
+    let callers = [
+        ("7bf92f3577b34da6a3ce929d0e0e4736", true),
+        ("8bf92f3577b34da6a3ce929d0e0e4736", false),
+    ];
+    for (trace, sampled) in callers {
+        let flags = if sampled { "01" } else { "00" };
+        traced_enqueue(
+            &harness,
+            &jwt,
+            &verifier,
+            &format!("00-{trace}-00f067aa0ba902b7-{flags}"),
+        )
+        .await;
+    }
+    runtime.stop().await;
+
+    let system = harness.seed.system_principal().to_string();
+    for (caller, sampled) in callers {
+        let attempts = linked_attempts(&harness.server, tenant, caller).await;
+        if !sampled {
+            assert_eq!(attempts, Vec::<String>::new(), "unsampled caller {caller}");
+            continue;
+        }
+        let [attempt_trace] = attempts.as_slice() else {
+            panic!("the sampled caller links one copied attempt: {attempts:#?}");
+        };
+        let copy = tenant_spans(&harness.server, tenant, attempt_trace).await;
+        let roots: Vec<&TenantSpan> = copy
+            .iter()
+            .filter(|span| span.parent_span_id.is_empty())
+            .collect();
+        let [root] = roots.as_slice() else {
+            panic!("the copied attempt trace has one root: {copy:#?}");
+        };
+        assert_eq!(root.name, "verification.attempt", "{copy:#?}");
+        assert!(
+            copy.len() > 1,
+            "the attempt's descendants are copied: {copy:#?}"
+        );
+        for span in &copy {
+            assert!(span.name.starts_with("verification."), "{span:#?}");
+            assert_eq!(span.sub_principal_id, id.to_string(), "{span:#?}");
+            assert_eq!(span.act_principal_id, system, "{span:#?}");
+        }
+    }
+    traces.finished_since(checkpoint)
+}
+
+/// Returns the hex trace ids of `tenant`'s copied `verification.attempt`
+/// spans whose first link points into caller trace `caller`.
+///
+/// # Panics
+/// Panics when Scribe cannot flush or the tenant copy cannot be read.
+async fn linked_attempts(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    caller: &str,
+) -> Vec<String> {
+    server.flush_bifrost().await.expect("Scribe flushes");
+    server
+        .retained_span_records(
+            tenant,
+            "encode(trace_id, 'hex')",
+            &format!(
+                "name = 'verification.attempt' \
+                 AND get_field(array_element(links, 1), 'trace_id') = X'{caller}'"
+            ),
+        )
+        .await
+        .expect("tenant attempts read")
+        .into_iter()
+        .map(|row| {
+            let [Some(trace)] = <[Option<String>; 1]>::try_from(row).expect("one projected column")
+            else {
+                panic!("a copied attempt has no trace id");
+            };
+            trace
+        })
+        .collect()
+}
+
 /// One span a tenant reads back from its own `vala.traces.spans`.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct TenantSpan {
     /// Hex span id, equal to the operator's id for the same span.
     span_id: String,
-    /// Hex parent span id; the caller's span for the request span.
+    /// Hex parent span id; the caller's span for the request span, and empty
+    /// for a root span such as a queued attempt.
     parent_span_id: String,
     /// Span name.
     name: String,
@@ -2995,7 +3294,7 @@ async fn tenant_spans(
         .map(|row| {
             let [
                 Some(span_id),
-                Some(parent_span_id),
+                parent_span_id,
                 Some(name),
                 Some(sub_principal_id),
                 Some(act_principal_id),
@@ -3004,6 +3303,7 @@ async fn tenant_spans(
             else {
                 panic!("a tenant span row is missing a column");
             };
+            let parent_span_id = parent_span_id.unwrap_or_default();
             let attributes = attributes
                 .map(|json| {
                     serde_json::from_str::<serde_json::Value>(&json).expect("attributes are JSON")

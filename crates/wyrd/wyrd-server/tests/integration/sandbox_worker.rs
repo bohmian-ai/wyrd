@@ -387,7 +387,8 @@ async fn sandbox_contains_runaway_code() {
 }
 
 /// Beyond `max_workers + max_waiters` operations are refused at once, and a
-/// waiter gives up at its deadline; both are retryable.
+/// waiter gives up at its deadline; both are busy, the process-capacity
+/// refusal the engine defers rather than retries or judges.
 ///
 /// # Panics
 /// Panics when admission or the checkout deadline is not enforced.
@@ -412,8 +413,8 @@ async fn sandbox_bounds_workers_and_waiters() {
     terminal(busy);
     for (result, expected) in [(waiting, "deadline"), (refused, "capacity")] {
         match result {
-            Err(BlockError::Retryable { reason }) => assert!(reason.contains(expected), "{reason}"),
-            other => panic!("expected a retryable {expected} failure, got {other:?}"),
+            Err(BlockError::Busy { reason }) => assert!(reason.contains(expected), "{reason}"),
+            other => panic!("expected a busy {expected} refusal, got {other:?}"),
         }
     }
 }

@@ -1391,3 +1391,85 @@ async fn custom_drift_needs_complete_measurements() {
         "every drift result names its window"
     );
 }
+
+/// A block refused process capacity stops the whole execution busy: a busy
+/// action spends none of its authored retries and leaves no step result,
+/// and a busy check is never judged inconclusive. A retryable failure keeps
+/// its authored retry.
+///
+/// # Panics
+/// Panics when a busy block is retried, judged, or settled, or a retryable
+/// failure loses its retry.
+#[tokio::test(start_paused = true)]
+async fn capacity_refusal_stops_the_execution_without_judging() {
+    let busy = || BlockError::Busy {
+        reason: "no worker".to_owned(),
+    };
+    let stepped = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [{"id": "draft", "action": code_action(json!({"x": "inputs.answer"})), "retries": 2}]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([(
+            "draft",
+            Behavior::Attempts(vec![busy(), busy(), busy()], json!({})),
+        )]),
+        ..Script::default()
+    });
+    let refused = run(
+        &engine(&script, InMemoryTraceSource::new(), 1),
+        &stepped,
+        json!({"answer": "a"}),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(EngineError::Busy(ref reason)) if reason == "no worker"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        script.calls(),
+        ["action:draft"],
+        "a busy action is not retried"
+    );
+
+    let checked = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "requirements": [{"id": "judged", "statement": "Judged", "check": code_check(json!({"x": "inputs.answer"}))}]
+    }));
+    let script = Arc::new(Script {
+        checks: HashMap::from([("judged", Err(busy()))]),
+        ..Script::default()
+    });
+    let refused = run(
+        &engine(&script, InMemoryTraceSource::new(), 1),
+        &checked,
+        json!({"answer": "a"}),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(EngineError::Busy(_))),
+        "a busy check is not judged: {refused:?}"
+    );
+
+    let script = Arc::new(Script {
+        actions: HashMap::from([(
+            "draft",
+            Behavior::Attempts(
+                vec![BlockError::Retryable {
+                    reason: "provider".to_owned(),
+                }],
+                json!({}),
+            ),
+        )]),
+        ..Script::default()
+    });
+    let retried = run(
+        &engine(&script, InMemoryTraceSource::new(), 1),
+        &stepped,
+        json!({"answer": "a"}),
+    )
+    .await
+    .expect("a retryable failure keeps its retry");
+    assert_eq!(script.calls(), ["action:draft", "action:draft"]);
+    assert_eq!(step(&retried, "draft").attempts, 2);
+}

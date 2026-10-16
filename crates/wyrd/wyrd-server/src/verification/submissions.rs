@@ -56,8 +56,13 @@ impl SubmissionSink {
 }
 
 impl OutboxSink for SubmissionSink {
+    /// One accepted caller submission, staged once Scribe acknowledged its
+    /// pinned inputs and written into its tenant's execution queue.
     type Item = Submission;
+    /// The Postgres failure of one tenant batch; the outbox retries the
+    /// batch, and replay makes the retry idempotent.
     type Error = SqlError;
+    /// The outbox name in logs, metrics, and `Debug` output.
     const NAME: &'static str = "verifier_submissions";
 
     /// Accept `submissions` into the tenant's queue in one transaction and

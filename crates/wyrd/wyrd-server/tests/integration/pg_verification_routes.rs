@@ -17,7 +17,9 @@ use axum::http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Value, json};
 use uuid::Uuid;
 use wyrd_runtime::Permission;
+use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::ids::{BindingId, CardUid, DataTenantId, ExecutionId};
+use wyrd_spec::reference::CardRef;
 use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -538,6 +540,257 @@ async fn enqueue_refusals_fail_before_staging() {
     let (status, problem) = get(&server, &jwt, "/v1/verification/executions/not-a-uuid").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
     assert_eq!(fixture.queued().await, 0, "no refusal staged a submission");
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A Card-bound caller may enqueue only a subject its signed Card scope
+/// carries: holding `verifier:run` on exactly the selected Verifier, the
+/// subject's own Service principal is accepted, while an unrelated Card-bound
+/// Service, and an editor Service acting on its behalf, are refused with
+/// one audited denial each before anything is staged. A caller bound to no
+/// Card is decided by RBAC alone.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any status, code, queue, or audit expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn enqueue_admits_only_signed_scope_subjects() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let body = fixture.request(&fixture.assertion, json!(1));
+    server
+        .seed_role(
+            "vq_exact_verifier",
+            &[
+                Permission::card_read(),
+                Permission::verifier_run(fixture.assertion.clone()),
+            ],
+        )
+        .await
+        .expect("role seeds");
+
+    let subject_ref: CardRef = serde_json::from_value(json!({
+        "kind": "Service", "name": "vr-service", "version": "1.0.0", "space": "default"
+    }))
+    .expect("subject ref decodes");
+    let owner = server
+        .credential_registered_service(&subject_ref, &["vq_exact_verifier"])
+        .await
+        .expect("subject Service is credentialed");
+    let owner_jwt = machine_jwt(&server, &owner).await;
+    let (status, accepted) = enqueue(&server, &owner_jwt, &body, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    visible_execution(&server, &owner_jwt, execution_id(&accepted)).await;
+    assert_eq!(
+        decisions(&server, "verification.enqueue", owner.id().as_uuid()).await,
+        vec![run_decision("allowed")]
+    );
+
+    let foreign = server
+        .bootstrap_service("vq-foreign-service", &["vq_exact_verifier"])
+        .await
+        .expect("unrelated Card-bound Service bootstraps");
+    let foreign_jwt = machine_jwt(&server, &foreign).await;
+    let (status, problem) = enqueue(&server, &foreign_jwt, &body, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+
+    let actor = server
+        .bootstrap_service("vq-editor-actor", &["editor"])
+        .await
+        .expect("editor actor bootstraps");
+    let delegated = server
+        .delegate(
+            &foreign_jwt,
+            &machine_jwt(&server, &actor).await,
+            TokenAudience::Wyrd,
+        )
+        .await
+        .expect("editor acts on the unrelated Service's behalf");
+    let (status, problem) = enqueue(&server, &delegated, &body, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert_eq!(
+        decisions(&server, "verification.enqueue", foreign.id().as_uuid()).await,
+        vec![run_decision("denied"); 2],
+        "the direct and the delegated refusal"
+    );
+
+    let (_, editor_jwt) = user(&server, "vq-editor", &["editor"]).await;
+    let (status, accepted) = enqueue(&server, &editor_jwt, &body, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    visible_execution(&server, &editor_jwt, execution_id(&accepted)).await;
+    assert_eq!(fixture.queued().await, 2, "no refusal staged a submission");
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A Verifier judging one uploaded JSON document: its extracted `answer`
+/// must equal `1`.
+fn document_answer_is_one() -> Value {
+    json!({
+        "inputs": { "doc": { "type": "media", "formats": ["json"] } },
+        "steps": [{
+            "id": "read",
+            "action": { "kind": "extract", "from": "inputs.doc" },
+            "requirements": [{
+                "id": "answer-is-one",
+                "statement": "The document's answer is one.",
+                "check": { "kind": "assert", "path": "steps.read.output.value.answer",
+                           "operator": "equals", "expected": 1 }
+            }]
+        }]
+    })
+}
+
+/// PUT `body` to the local evidence route for `sha256` as `jwt`.
+///
+/// # Panics
+/// Panics when the request cannot be built or the route fails to respond.
+async fn put_evidence(
+    server: &WyrdTestServer,
+    jwt: &str,
+    sha256: &str,
+    body: &'static [u8],
+) -> StatusCode {
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri(format!("/v1/verification/evidence/local/{sha256}"))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(body))
+        .expect("request builds");
+    server
+        .oneshot_authenticated(jwt, request)
+        .await
+        .expect("request responds")
+        .status()
+}
+
+/// Evidence staging is admitted by any `verifier:run` grant: a caller holding
+/// it for exactly one Verifier plans and uploads a missing local file, sees it
+/// held on a second plan, then verifies and submits it with that Verifier,
+/// while another Verifier stays refused. A caller with no `verifier:run`
+/// grant is refused with one audited denial on each staging route, and a body
+/// of another digest is refused.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any status, code, plan, verdict, or audit expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn exact_verifier_grant_stages_local_evidence() {
+    const DOCUMENT: &[u8] = br#"{"answer":1}"#;
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let document = fixture
+        .seed
+        .verifier("vr-document", &document_answer_is_one())
+        .await
+        .expect("document Verifier registers");
+    server
+        .seed_role(
+            "ve_exact_verifier",
+            &[
+                Permission::card_read(),
+                Permission::verifier_run(document.clone()),
+            ],
+        )
+        .await
+        .expect("role seeds");
+    let (exact, exact_jwt) = user(&server, "ve-exact", &["ve_exact_verifier"]).await;
+    let sha256 = wyrd_spec::auth::Sha256Hex::digest(DOCUMENT).to_string();
+    let plan = json!({ "files": [{ "sha256": sha256, "size_bytes": DOCUMENT.len() }] });
+
+    let (status, planned) = send(
+        &server,
+        &exact_jwt,
+        Method::POST,
+        "/v1/verification/evidence",
+        Some(&plan),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{planned}");
+    assert_eq!(
+        planned["uploads"].as_array().map(Vec::len),
+        Some(1),
+        "{planned}"
+    );
+    assert_eq!(
+        put_evidence(&server, &exact_jwt, &sha256, br#"{"answer":2}"#).await,
+        StatusCode::BAD_REQUEST,
+        "a body of another digest is refused"
+    );
+    assert_eq!(
+        put_evidence(&server, &exact_jwt, &sha256, DOCUMENT).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        put_evidence(&server, &exact_jwt, &sha256, DOCUMENT).await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, held) = send(
+        &server,
+        &exact_jwt,
+        Method::POST,
+        "/v1/verification/evidence",
+        Some(&plan),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+    assert_eq!(held["uploads"], json!([]), "the uploaded file is held");
+
+    let request = |verifier: &CardUid| {
+        json!({
+            "verifier_card_uid": verifier,
+            "card_uid": fixture.service,
+            "inputs": { "doc": { "kind": "file", "sha256": sha256,
+                                 "size_bytes": DOCUMENT.len(), "format": "json" } }
+        })
+    };
+    let (status, judged) = execute(&server, &exact_jwt, request(&document).to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{judged}");
+    assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+    let (status, accepted) = enqueue(&server, &exact_jwt, &request(&document), None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let (status, problem) =
+        execute(&server, &exact_jwt, request(&fixture.assertion).to_string()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    let allowed = vec![run_decision("allowed"); 2];
+    assert_eq!(
+        decisions(&server, "verification.evidence", exact).await,
+        allowed
+    );
+    assert_eq!(
+        decisions(&server, "verification.evidence.upload", exact).await,
+        vec![run_decision("allowed"); 3]
+    );
+
+    let (outsider, outsider_jwt) = user(&server, "ve-outsider", &["viewer"]).await;
+    let (status, problem) = send(
+        &server,
+        &outsider_jwt,
+        Method::POST,
+        "/v1/verification/evidence",
+        Some(&plan),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert_eq!(
+        put_evidence(&server, &outsider_jwt, &sha256, DOCUMENT).await,
+        StatusCode::FORBIDDEN
+    );
+    let denied = vec![run_decision("denied")];
+    assert_eq!(
+        decisions(&server, "verification.evidence", outsider).await,
+        denied
+    );
+    assert_eq!(
+        decisions(&server, "verification.evidence.upload", outsider).await,
+        denied
+    );
     server.shutdown().await.expect("test server shuts down");
 }
 

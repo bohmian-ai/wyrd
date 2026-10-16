@@ -1,7 +1,7 @@
 //! Bounded per-call scratch workspaces for step Agents and code.
 //!
 //! [`Workspaces`] admits at most [`HostedLimits::max_workspaces`] concurrent
-//! workspaces per process. [`Workspaces::open`] reads each declared file
+//! workspaces per process and refuses, rather than queues, the next one. [`Workspaces::open`] reads each declared file
 //! through [`TenantEvidence`], then materializes it under a fresh temporary
 //! directory: files and JSON under `inputs/`, archives unpacked in place
 //! after [`zip_guard`] or the equivalent tar.gz checks, and an empty
@@ -49,24 +49,27 @@ impl Workspaces {
 
     /// Materialize `files`, keyed by `/inputs/...` path, for one invocation.
     ///
-    /// Waits for admission; the engine's deadline cancels the wait by
-    /// dropping this future. Evidence is read and verified first, then
-    /// written and extracted on the blocking pool.
+    /// Admission never waits: with every workspace taken the open is refused
+    /// at once, so no waiter queue can grow toward execution deadlines and
+    /// the execution is deferred instead. Evidence is read and verified
+    /// first, then written and extracted on the blocking pool.
     ///
     /// # Errors
-    /// Returns the evidence reader's errors, [`BlockError::Terminal`] for an
-    /// invalid path, combined input bytes over the limit, or any
-    /// materialization refusal, and [`BlockError::Retryable`] when the
-    /// blocking task fails.
+    /// Returns [`BlockError::Busy`] when every workspace is taken, the
+    /// evidence reader's errors, [`BlockError::Terminal`] for an invalid
+    /// path, combined input bytes over the limit, or any materialization
+    /// refusal, and [`BlockError::Retryable`] when the blocking task fails.
     pub async fn open(
         &self,
         files: &BTreeMap<String, CallInput>,
         evidence: &TenantEvidence,
     ) -> Result<Workspace, BlockError> {
-        let permit = Arc::clone(&self.permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| terminal("workspace admission is closed".to_owned()))?;
+        let permit =
+            Arc::clone(&self.permits)
+                .try_acquire_owned()
+                .map_err(|_| BlockError::Busy {
+                    reason: "every workspace is in use".to_owned(),
+                })?;
         let mut staged = Vec::with_capacity(files.len());
         let mut total = 0_u64;
         for (path, input) in files {

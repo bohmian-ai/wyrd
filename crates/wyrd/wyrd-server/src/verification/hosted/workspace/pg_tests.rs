@@ -42,12 +42,14 @@ fn workspace_cleans_up_on_drop() {
     });
 }
 
-/// Dropping `open` while it waits for admission or while its blocking
-/// materialization runs leaks no admission: once the started task returns,
-/// its workspace drops and every permit comes back.
+/// Dropping `open` while its blocking materialization runs leaks no
+/// admission: once the started task returns, its workspace drops and every
+/// permit comes back. An open behind a held admission never waits: it is
+/// refused busy at once and takes no permit.
 ///
 /// # Panics
-/// Panics when the first poll completes or a permit never returns.
+/// Panics when the first poll completes, the open behind a held admission is
+/// not refused busy, or a permit never returns.
 #[test]
 fn cancelled_open_returns_its_admission() {
     wyrd_runtime::runtime().block_on(async {
@@ -72,11 +74,16 @@ fn cancelled_open_returns_its_admission() {
         drop(open);
         drop(workspaces.permits.acquire().await.expect("permit returns"));
 
-        // Cancelled while waiting behind a held admission.
+        // Refused, not queued, behind a held admission.
         let held = workspaces.open(&files, &evidence).await.expect("opens");
-        let mut waiting = Box::pin(workspaces.open(&files, &evidence));
-        assert!((&mut waiting).now_or_never().is_none());
-        drop(waiting);
+        let refused = workspaces
+            .open(&files, &evidence)
+            .now_or_never()
+            .expect("admission never waits");
+        assert!(
+            matches!(refused, Err(BlockError::Busy { .. })),
+            "a full workspace admission is busy"
+        );
         drop(held);
         assert_eq!(workspaces.permits.available_permits(), 1);
     });

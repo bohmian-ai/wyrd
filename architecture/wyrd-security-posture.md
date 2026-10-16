@@ -123,14 +123,18 @@ caller's. The server never fabricates a user or other identity for its own
 reads.
 
 A Verifier run is accepted under one authority that execution never widens.
-A manual run keeps the caller's verified effective principal and delegation
-chain. A scheduled or observation-triggered run keeps its binding owner's
-authority, recovered from current grants in the run's tenant when the run is
-accepted; a missing, inactive, or foreign owner, or a tenant without SYSTEM,
-accepts no run and nothing falls back to the observation writer or SYSTEM.
-The accepted authority is stored server-side with no credential, survives
-claim, retry, and restart, and is not refreshed by later grant changes; every
-protected downstream action still checks its own permission against it.
+Queued work is activated only by a binding schedule or a caller's `submit`.
+A submitted run keeps the caller's verified effective principal and
+delegation chain; its inputs row is staged on the Scribe outbox, and only
+after Scribe acknowledges that row is the submission handed to the queue
+writer, so an unacknowledged row queues nothing. A scheduled run keeps its
+binding owner's authority, recovered from current grants in the run's tenant
+when the run is accepted; a missing, inactive, or foreign owner, or a tenant
+without SYSTEM, accepts no run and nothing falls back to another identity or
+SYSTEM. The accepted authority is stored server-side with no credential,
+survives claim, retry, and restart, and is not refreshed by later grant
+changes; every protected downstream action still checks its own permission
+against it.
 
 A tenant administrator is created once, during tenant provisioning, and is the
 tenant's headless root of trust: it holds credentials and roles, federates no
@@ -205,11 +209,14 @@ credential.
   and reads no store, holds no cache, and resolves no roles.
 - Internal verification work mints no token. Results are staged on the
   process Scribe outbox under the operation's pair: a direct request's
-  verified caller, or a queued run's subject with SYSTEM as actor. Drift and
-  Eval input reads use the credentialless SYSTEM read authority described
-  above, granted `bifrost_query:read` only on the run's registered input table
-  UIDs; a missing SYSTEM principal or unreadable table identity fails closed
-  before any row is returned.
+  verified caller, or a queued run's subject with SYSTEM as actor. Trace
+  input reads are ordinary Bifrost queries of `vala.traces.spans` under the
+  execution's accepted caller, so Oracle authorizes and audits them like any
+  query that caller makes. Scheduled drift window reads use the credentialless
+  SYSTEM read authority described above, granted `bifrost_query:read` only on
+  the registered `vala.drift.observations` table UID; a missing SYSTEM
+  principal or unreadable table identity fails closed before any row is
+  returned.
 - Revoking a credential, suspending or deleting a principal, suspending a
   tenant, or changing grants refuses the next issuance immediately. A tenant
   token already issued keeps its snapshot authority until its five-minute

@@ -81,6 +81,9 @@ pub const VERIFIER_INVALID: &str = "verifier_invalid";
 pub const EXECUTION_INTERRUPTED: &str = "execution_interrupted";
 /// Stable error code when a completed result could not be encoded.
 pub const RESULT_INVALID: &str = "result_invalid";
+/// Stable error code when a block was refused process capacity, so the
+/// execution is deferred.
+pub const RUNTIME_BUSY: &str = "verification_runtime_busy";
 /// Stable error code when the tenant has no active `UUIDv7` SYSTEM principal
 /// to execute and attribute the result as.
 pub const SYSTEM_PRINCIPAL_MISSING: &str = "system_principal_missing";
@@ -112,7 +115,8 @@ pub enum Transition {
     /// Return the run to its queue with its attempt refunded.
     Release,
     /// Return the run to its queue with its attempt refunded, due after one
-    /// poll interval, because an input read met admission backpressure.
+    /// poll interval, because an input read or a hosted block met admission
+    /// backpressure.
     Defer(VerificationError),
     /// The lease is no longer held; another claimant owns the run, so nothing
     /// is settled.
@@ -170,6 +174,31 @@ pub struct VerifierRunner {
 }
 
 impl VerifierRunner {
+    /// Tie the not-yet-started attempt `span` of a manual `run` to the
+    /// request that enqueued it.
+    ///
+    /// The span links to the request's span, carrying the caller's own
+    /// sampled flag, and starts under this server's tenant span sink, so a
+    /// sampled caller's attempt and its catalog descendants reach the
+    /// tenant's trace copy as a trace linked to the request, while the
+    /// operator samples the attempt by its own policy. The attempt is marked
+    /// continued, so a gateway call inside it captures its attempt spans in
+    /// the attempt's trace. Scheduled runs have no cause and stay out of the
+    /// tenant copy. This must run before the span is first entered;
+    /// afterwards it does nothing.
+    fn trace(&self, span: &tracing::Span, run: &ClaimedExecution) {
+        let Some(cause) = &run.cause else {
+            return;
+        };
+        wyrd_telemetry::serve_linked_work(
+            span,
+            &cause.trace_id,
+            &cause.span_id,
+            cause.sampled,
+            self.state.bifrost.tenant_span_sink().as_ref(),
+        );
+    }
+
     /// Build a runner over `state`'s Wyrd Postgres owner, the operator pool,
     /// and the hosted `blocks`.
     ///
@@ -360,10 +389,10 @@ impl VerifierRunner {
         }
         let (no_inputs, no_routes) = (BTreeMap::new(), BTreeMap::new());
         let (drift, evidence, routes, run_id) = match &run.input {
-            ExecutionInput::Scheduled { window, .. } => {
+            ExecutionInput::Scheduled { window, slots } => {
                 match self
                     .drift
-                    .checks(tenant, run, spec, window, telemetry)
+                    .checks(tenant, run, spec, window, slots, telemetry)
                     .await
                 {
                     Ok(drift) => (drift, &no_inputs, &no_routes, None),
@@ -495,7 +524,7 @@ impl VerifierRunner {
                     execution_id = %lease.execution_id,
                     code = %error.code,
                     message = %error.message,
-                    "verification input read deferred by admission backpressure"
+                    "verification execution deferred by admission backpressure"
                 );
                 let delay = chrono::Duration::from_std(self.limits.poll_interval)
                     .unwrap_or_else(|_| chrono::Duration::seconds(1));
@@ -532,10 +561,16 @@ impl LeasedWork for VerifierRunner {
     /// Claim the tenant's next runnable run under a fresh lease and resolve
     /// its Verifier in the same transaction.
     ///
-    /// Opens the run's `verification.attempt` span before the claim statement
-    /// and records the claimed run's scrubbed identity on it, linking it to
-    /// the request that enqueued a manual run; the span then travels with the
-    /// claim to settlement.
+    /// The run's `verification.attempt` span and its `claim` span are
+    /// created before the claim statement but neither is entered, because
+    /// what the attempt links to and where its tenant copy goes come from the
+    /// claimed row and must be fixed before it starts. Once the row is
+    /// claimed, the attempt records the run's scrubbed identity,
+    /// [`VerifierRunner::trace`] installs its link and sink, and the `claim`
+    /// span joins it with its original start time, so one trace still covers
+    /// claim to settlement. The Verifier then resolves inside the attempt,
+    /// which travels with the claim to settlement. A failed or empty claim
+    /// still closes its `claim` span inside the bare attempt span.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the claim or the Verifier read fails.
@@ -553,32 +588,42 @@ impl LeasedWork for VerifierRunner {
             error_code = Empty,
             otel.status_code = Empty,
         );
-        let claimed = async {
-            let Some(run) = self.queue.claim(conn, lease).await? else {
-                return Ok::<_, SqlError>(None);
-            };
-            let resolving = Instant::now();
-            let verifier = self
-                .resolve(conn, &run)
-                .instrument(tracing::info_span!("verification.load"))
-                .await?;
-            Ok(Some((run, verifier, (resolving, Instant::now()))))
-        }
-        .instrument(span.clone())
-        .await?;
-        Ok(claimed.map(|(run, verifier, loaded)| {
-            if let Some((trace_id, span_id)) = &run.cause {
-                wyrd_telemetry::link_remote_span(&span, trace_id, span_id, true);
-            }
+        let claiming = tracing::info_span!(
+            parent: None,
+            "claim",
+            operation = "verification.executions.claim"
+        );
+        let claimed = self.queue.claim(conn, lease).await;
+        if let Ok(Some(run)) = &claimed {
             span.record("execution_id", display(run.lease.execution_id));
             span.record("attempt", run.attempt);
             span.record("origin", run.origin.as_str());
-            AttemptClaim {
-                run,
-                verifier,
-                loaded,
-                span,
+            self.trace(&span, run);
+        }
+        wyrd_telemetry::adopt_span(&claiming, &span);
+        drop(claiming);
+        let Some(run) = claimed? else {
+            return Ok(None);
+        };
+        let resolving = Instant::now();
+        let verifier = async {
+            if let Ok(system) = system_principal(&run) {
+                wyrd_telemetry::bind_tenant_route(wyrd_telemetry::TenantSpanRoute {
+                    tenant: run.authority.principal.tenant_id,
+                    attribution: Caller::accepted(&run.authority, system).attribution(),
+                });
             }
+            self.resolve(conn, &run)
+                .instrument(tracing::info_span!("verification.load"))
+                .await
+        }
+        .instrument(span.clone())
+        .await?;
+        Ok(Some(AttemptClaim {
+            run,
+            verifier,
+            loaded: (resolving, Instant::now()),
+            span,
         }))
     }
 
@@ -789,7 +834,8 @@ fn result(
 /// The outcome of an engine run that returned no verdict.
 ///
 /// An expired deadline times out, an unplannable Verifier or an uncapturable
-/// actual value terminates `errored`, and a stopped block task retries.
+/// actual value terminates `errored`, a stopped block task retries, and a
+/// block refused process capacity defers without spending an attempt.
 fn engine_failure(run: &ClaimedExecution, error: &EngineError) -> EngineOutcome {
     tracing::warn!(execution_id = %run.lease.execution_id, %error, "the verification engine failed");
     match error {
@@ -808,6 +854,10 @@ fn engine_failure(run: &ClaimedExecution, error: &EngineError) -> EngineOutcome 
         EngineError::Join(_) => EngineOutcome::Retry(failure(
             EXECUTION_INTERRUPTED,
             "a verification block task stopped unexpectedly",
+        )),
+        EngineError::Busy(_) => EngineOutcome::Deferred(failure(
+            RUNTIME_BUSY,
+            "a verification block was refused process capacity",
         )),
     }
 }

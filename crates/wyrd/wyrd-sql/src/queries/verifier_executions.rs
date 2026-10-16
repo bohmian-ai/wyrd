@@ -120,14 +120,14 @@ const INSERT_SUBMISSION_SQL: &str = r"
         origin, run_id, inputs, route_overrides,
         sub_principal_id, act_principal_id, authority, cause_trace_id, cause_span_id,
         idempotency_key, request_sha256, status, error, max_attempts,
-        next_attempt_at, settled_at, created_at, updated_at
+        next_attempt_at, settled_at, created_at, updated_at, cause_sampled
     )
     SELECT $1, wyrd.current_tenant(), v.card_uid, v.version, s.card_uid,
            'manual', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
            CASE WHEN $15::jsonb IS NULL THEN 'pending' ELSE 'errored' END, $15, $14,
            CASE WHEN $15::jsonb IS NULL THEN statement_timestamp() END,
            CASE WHEN $15::jsonb IS NOT NULL THEN statement_timestamp() END,
-           statement_timestamp(), statement_timestamp()
+           statement_timestamp(), statement_timestamp(), $16
       FROM wyrd.cards v, wyrd.cards s
      WHERE v.card_uid = $2 AND s.card_uid = $3
     ON CONFLICT DO NOTHING
@@ -240,6 +240,7 @@ const CLAIM_SQL: &str = r"
               e.run_id, e.inputs, e.route_overrides,
               e.sub_principal_id, e.act_principal_id, e.authority, e.attempts,
               e.max_attempts, e.lease_expires_at, e.cause_trace_id, e.cause_span_id,
+              e.cause_sampled,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - e.created_at)
@@ -364,23 +365,6 @@ const RELEASE_SQL: &str = r"
            next_attempt_at = statement_timestamp() + ($3::bigint * INTERVAL '1 millisecond'),
            updated_at = statement_timestamp()
      WHERE execution_id = $1 AND lease_token = $2 AND status = 'running'
-";
-
-/// Requeue a leased execution whose required trace has not landed, refunding
-/// its attempt, while PostgreSQL's statement time is still before the
-/// execution's creation plus the fixed trace deadline.
-///
-/// `$3` is the poll delay and `$4` the deadline, both in milliseconds; both
-/// instants are derived from the database clock and the stored deadline anchor.
-const AWAIT_TRACE_SQL: &str = r"
-    UPDATE wyrd.verifier_executions
-       SET status = CASE WHEN attempts > 1 THEN 'retrying' ELSE 'pending' END,
-           attempts = attempts - 1, error = $5, lease_expires_at = NULL,
-           next_attempt_at = statement_timestamp() + ($3::bigint * INTERVAL '1 millisecond'),
-           updated_at = statement_timestamp()
-     WHERE execution_id = $1 AND lease_token = $2 AND status = 'running'
-       AND created_at + ($4::bigint * INTERVAL '1 millisecond') > statement_timestamp()
-    RETURNING next_attempt_at
 ";
 
 /// Read one execution's control-plane status.
@@ -665,6 +649,22 @@ impl RequestKey {
     }
 }
 
+/// The request span a manual execution was submitted under, which its
+/// attempts link to without adopting as their parent.
+///
+/// `sampled` is the caller's own sampling decision for the span that request
+/// continued, not the server's: it decides whether the linked attempts reach
+/// the tenant's trace copy, while the operator samples them by its own policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cause {
+    /// Trace of the submitting request.
+    pub trace_id: TraceId,
+    /// The submitting request's span.
+    pub span_id: SpanId,
+    /// Whether the caller sampled the trace the request continued.
+    pub sampled: bool,
+}
+
 /// One staged caller submission, handed to the batched queue writer once
 /// Scribe has acknowledged its inputs.
 ///
@@ -678,9 +678,10 @@ pub struct Submission {
     pub authority: AcceptedAuthority,
     /// The exact Verifier, subject, optional Run, inputs, and route overrides.
     pub request: VerificationRequest,
-    /// Trace and span of the submitting request, which the execution links
-    /// to; `None` when the request had no recorded span.
-    pub cause: Option<(TraceId, SpanId)>,
+    /// The submitting request's span and its caller's sampling decision,
+    /// which the execution links to; `None` when the request had no recorded
+    /// span.
+    pub cause: Option<Cause>,
     /// The request's `Idempotency-Key`, when it carried one.
     pub key: Option<RequestKey>,
 }
@@ -698,7 +699,7 @@ impl Submission {
         tenant: DataTenantId,
         authority: AcceptedAuthority,
         request: VerificationRequest,
-        cause: Option<(TraceId, SpanId)>,
+        cause: Option<Cause>,
         key: Option<String>,
     ) -> Result<Self, serde_json::Error> {
         let key = key.map(|key| RequestKey::new(key, &request)).transpose()?;
@@ -881,10 +882,10 @@ pub struct ClaimedExecution {
     /// The effective authority accepted with the execution; every Agent call
     /// runs under it, never under a later lookup of the subject.
     pub authority: AcceptedAuthority,
-    /// Trace and span of the request that submitted the execution, which the
-    /// attempt links to without adopting as its parent; `None` for scheduled
-    /// work and submissions without a recorded span.
-    pub cause: Option<(TraceId, SpanId)>,
+    /// The request that submitted the execution, which the attempt links to
+    /// without adopting as its parent; `None` for scheduled work and
+    /// submissions without a recorded span.
+    pub cause: Option<Cause>,
     /// How long the execution had been claimable when this claim took it:
     /// the claim statement's PostgreSQL instant less its due time, or its
     /// lease expiry for a reclaim. Telemetry only; never a coordination input.
@@ -921,17 +922,6 @@ pub enum RetryOutcome {
     /// now `errored`, a dispatch `failed`.
     Exhausted,
     /// The lease token no longer holds the work; nothing changed.
-    StaleLease,
-}
-
-/// Outcome of requeueing an execution whose required trace has not landed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TraceWaitOutcome {
-    /// The execution is queued again, attempt refunded, due at this time.
-    Requeued(DateTime<Utc>),
-    /// The fixed trace deadline passed; the execution is now `timed_out`.
-    TimedOut,
-    /// The lease token no longer holds the execution; nothing changed.
     StaleLease,
 }
 
@@ -1199,18 +1189,19 @@ impl VerifierExecutionQueue {
                 submission
                     .cause
                     .as_ref()
-                    .map(|(trace, _)| trace.as_bytes().as_slice()),
+                    .map(|cause| cause.trace_id.as_bytes().as_slice()),
             )
             .bind(
                 submission
                     .cause
                     .as_ref()
-                    .map(|(_, span)| span.as_bytes().as_slice()),
+                    .map(|cause| cause.span_id.as_bytes().as_slice()),
             )
             .bind(key.map(|key| key.key.as_str()))
             .bind(key.map(|key| key.request_sha256.as_slice()))
             .bind(self.retry.max_attempts)
             .bind(error.map(Json))
+            .bind(submission.cause.as_ref().map(|cause| cause.sampled))
             .execute(&mut **conn.transaction())
             .await?;
         Ok(())
@@ -1448,12 +1439,13 @@ impl VerifierExecutionQueue {
     /// expired, with `SKIP LOCKED`; marks it `running` with a new lease token
     /// expiring `lease_for` after that same database instant; and counts the
     /// attempt. Returns `None` when nothing is runnable. The caller commits
-    /// before executing.
+    /// before executing. The statement opens no span of its own: the runner
+    /// times it on a `claim` span it can parent to the attempt only once the
+    /// claimed row names the attempt's cause.
     ///
     /// # Errors
     /// Returns the database error when a statement fails, or a decode error
     /// when the claimed row's identities or frozen input are malformed.
-    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.claim"))]
     pub async fn claim(
         &self,
         conn: &mut TenantConn<'_>,
@@ -1627,48 +1619,6 @@ impl VerifierExecutionQueue {
             .execute(&mut **conn.transaction())
             .await?;
         Ok(settlement(result.rows_affected()))
-    }
-
-    /// Requeue a claimed execution whose required trace has not landed yet.
-    ///
-    /// Waiting is not a failed attempt: while PostgreSQL's statement time is
-    /// before the execution's `created_at` plus `deadline`, it keeps its
-    /// identity and frozen input, has this attempt refunded, records `error`
-    /// as its waiting reason, and becomes due `poll` after that same database
-    /// instant. Once the deadline has passed it settles `timed_out` with
-    /// `error`, no result, and no dispatch.
-    ///
-    /// # Errors
-    /// Returns the database error when a statement fails.
-    #[tracing::instrument(skip(self, conn, error), fields(operation = "verification.executions.await_trace", execution_id = %lease.execution_id))]
-    pub async fn await_trace(
-        &self,
-        conn: &mut TenantConn<'_>,
-        lease: ExecutionLease,
-        poll: Duration,
-        deadline: Duration,
-        error: &VerificationError,
-    ) -> Result<TraceWaitOutcome, SqlxError> {
-        let next_attempt_at: Option<DateTime<Utc>> = sqlx::query_scalar(AWAIT_TRACE_SQL)
-            .bind(lease.execution_id.as_uuid())
-            .bind(lease.token.0)
-            .bind(poll.num_milliseconds())
-            .bind(deadline.num_milliseconds())
-            .bind(Json(error))
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        if let Some(next_attempt_at) = next_attempt_at {
-            return Ok(TraceWaitOutcome::Requeued(next_attempt_at));
-        }
-        Ok(
-            match self
-                .terminate(conn, lease, TerminalStatus::TimedOut, error)
-                .await?
-            {
-                Settlement::Applied => TraceWaitOutcome::TimedOut,
-                Settlement::StaleLease => TraceWaitOutcome::StaleLease,
-            },
-        )
     }
 
     /// Return a claimed execution to the queue with its attempt refunded.
@@ -1957,6 +1907,8 @@ struct ClaimedRow {
     cause_trace_id: Option<Vec<u8>>,
     /// Submitting request's span id, 8 bytes.
     cause_span_id: Option<Vec<u8>>,
+    /// Whether the submitting request's caller sampled it.
+    cause_sampled: Option<bool>,
     /// Milliseconds the execution was claimable before this claim.
     queue_wait_ms: i64,
     /// Milliseconds since the execution was admitted.
@@ -2035,11 +1987,12 @@ impl ClaimedRow {
                 PrincipalId::new(self.act_principal_id),
             ),
             authority: self.authority.0,
-            cause: match (self.cause_trace_id, self.cause_span_id) {
-                (Some(trace), Some(span)) => Some((
-                    stored(TraceId::from_bytes(fixed_width(trace)?))?,
-                    stored(SpanId::from_bytes(fixed_width(span)?))?,
-                )),
+            cause: match (self.cause_trace_id, self.cause_span_id, self.cause_sampled) {
+                (Some(trace), Some(span), Some(sampled)) => Some(Cause {
+                    trace_id: stored(TraceId::from_bytes(fixed_width(trace)?))?,
+                    span_id: stored(SpanId::from_bytes(fixed_width(span)?))?,
+                    sampled,
+                }),
                 _ => None,
             },
             queue_wait: std::time::Duration::from_millis(stored(u64::try_from(
@@ -2193,7 +2146,13 @@ mod tests {
         assert_eq!(policy.delay_after(0), Duration::seconds(30));
     }
 
-    /// Build a request for `verifier` against a fixed subject.
+    /// Build an input-free request for `verifier` against a fresh subject Card
+    /// UID per call, so two requests differ in subject unless a test overrides
+    /// it.
+    ///
+    /// # Panics
+    /// Panics only if a freshly generated `UUIDv7` is rejected as a Card UID,
+    /// which would break the `CardUid` invariant.
     fn request(verifier: CardUid) -> VerificationRequest {
         VerificationRequest {
             verifier_card_uid: verifier,

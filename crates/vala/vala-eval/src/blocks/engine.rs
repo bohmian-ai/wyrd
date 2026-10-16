@@ -69,6 +69,11 @@ pub enum EngineError {
     /// A block task panicked or was aborted.
     #[error("a verification block task stopped unexpectedly: {0}")]
     Join(String),
+    /// A block was refused process capacity at admission
+    /// ([`BlockError::Busy`]); unfinished work was cancelled and no verdict
+    /// exists, so the host may run the whole execution again later.
+    #[error("a verification block was refused process capacity: {0}")]
+    Busy(String),
 }
 
 /// The engine of one Verifier execution, composed from injected capabilities.
@@ -133,7 +138,9 @@ impl VerificationEngine {
     /// Returns [`EngineError::Plan`] for an unplannable graph,
     /// [`EngineError::DeadlineExceeded`] when `deadline` is reached before
     /// the verdict, [`EngineError::Capture`] when an actual value cannot be
-    /// hashed, and [`EngineError::Join`] when a block task panics.
+    /// hashed, [`EngineError::Join`] when a block task panics, and
+    /// [`EngineError::Busy`] when any action or check is refused process
+    /// capacity.
     ///
     /// # Cancellation
     /// Dropping the future, or the deadline expiring, aborts every running
@@ -183,7 +190,8 @@ impl VerificationEngine {
     /// share one ledger.
     ///
     /// # Errors
-    /// Returns [`EngineError::Capture`] or [`EngineError::Join`].
+    /// Returns [`EngineError::Capture`], [`EngineError::Join`], or
+    /// [`EngineError::Busy`].
     ///
     /// # Panics
     /// Panics when `plan` names a step `spec` does not declare.
@@ -238,7 +246,8 @@ impl VerificationEngine {
 
     /// Prepare one step: a step whose bindings or `when` leave a gap is
     /// skipped with that gap, otherwise its action runs under the
-    /// concurrency bound.
+    /// concurrency bound. A running action refused process capacity fails the
+    /// stage with [`EngineError::Busy`].
     ///
     /// # Panics
     /// Panics when `index` is not a declared step of `spec`.
@@ -257,7 +266,7 @@ impl VerificationEngine {
                 let spec = Arc::clone(spec);
                 Prepared::Run(Box::pin(async move {
                     let step = &spec.steps[index];
-                    let attempted = engine.attempt(step, &bindings, deadline).await;
+                    let attempted = engine.attempt(step, &bindings, deadline).await?;
                     Ok(attempted.settle(step, bindings.sources()))
                 }))
             }
@@ -274,7 +283,8 @@ impl VerificationEngine {
     ///
     /// # Errors
     /// Returns [`EngineError::Capture`] when an actual value cannot be
-    /// hashed.
+    /// hashed; the prepared check fails with [`EngineError::Busy`] when it is
+    /// refused process capacity.
     ///
     /// # Panics
     /// Panics when `key` does not name a requirement of `spec`.
@@ -303,7 +313,7 @@ impl VerificationEngine {
                 Ok(Prepared::Run(Box::pin(async move {
                     let requirement = requirement_at(&spec, key);
                     let step = key.0.map(|index| &spec.steps[index].id);
-                    let judged = engine.judge(requirement, step, inputs, deadline).await;
+                    let judged = engine.judge(requirement, step, inputs, deadline).await?;
                     judged.report(&spec, key)
                 })))
             }
@@ -322,7 +332,16 @@ impl VerificationEngine {
     /// each attempt; otherwise the execution deadline governs and its expiry
     /// surfaces as [`EngineError::DeadlineExceeded`] instead of a step
     /// failure.
-    async fn attempt(&self, step: &Step, bindings: &Bindings, deadline: Instant) -> Attempted {
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Busy`] as soon as an attempt is refused process
+    /// capacity, without spending the step's retries or settling the step.
+    async fn attempt(
+        &self,
+        step: &Step,
+        bindings: &Bindings,
+        deadline: Instant,
+    ) -> Result<Attempted, EngineError> {
         let _permit = self.permits.acquire().await;
         let started = Instant::now();
         let mut attempts = 0;
@@ -351,30 +370,37 @@ impl VerificationEngine {
                 None => self.actions.execute(call).await,
             };
             match result {
+                Err(BlockError::Busy { reason }) => return Err(EngineError::Busy(reason)),
                 Err(error) if error.is_retryable() && attempts <= step.retries => {
                     tracing::debug!(step = step.id.as_str(), attempts, %error, "retrying step");
                 }
                 result => {
-                    return Attempted {
+                    return Ok(Attempted {
                         attempts,
                         duration: started.elapsed(),
                         result: result.map_err(|error| reason(&error)),
-                    };
+                    });
                 }
             }
         }
     }
 
     /// Run one requirement's check over its resolved bindings.
+    ///
+    /// A failed Agent or code check is inconclusive.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Busy`] when an Agent or code check is refused
+    /// process capacity, which is never judged.
     async fn judge(
         &self,
         requirement: &Requirement,
         step: Option<&TaskId>,
         inputs: BTreeMap<String, CallInput>,
         deadline: Instant,
-    ) -> Judged {
+    ) -> Result<Judged, EngineError> {
         let _permit = self.permits.acquire().await;
-        match &requirement.check {
+        Ok(match &requirement.check {
             Check::Assert {
                 each,
                 operator,
@@ -406,11 +432,12 @@ impl VerificationEngine {
                 };
                 match self.checks.execute(call).await {
                     Ok(output) => Judged::cited(output, &sources),
+                    Err(BlockError::Busy { reason }) => return Err(EngineError::Busy(reason)),
                     Err(error) => Judged::inconclusive(reason(&error)),
                 }
             }
             Check::Drift(drift) => Judged::checked(self.drift.judge(&requirement.id, drift)),
-        }
+        })
     }
 
     /// Compare the selected span value of the declared trace.
@@ -795,7 +822,9 @@ fn json(input: &CallInput) -> Value {
 /// The bounded cause a block error carries.
 fn reason(error: &BlockError) -> String {
     match error {
-        BlockError::Retryable { reason } | BlockError::Terminal { reason } => reason.clone(),
+        BlockError::Retryable { reason }
+        | BlockError::Terminal { reason }
+        | BlockError::Busy { reason } => reason.clone(),
     }
 }
 

@@ -27,9 +27,10 @@ pub enum EngineOutcome {
     /// A transient failure; the same execution and frozen input may be
     /// attempted again.
     Retry(VerificationError),
-    /// Bifrost refused an input read at admission. That is backpressure from
-    /// shared query capacity, not a failure of this execution, so it waits one
-    /// poll interval and tries again without spending an attempt.
+    /// Bifrost refused an input read, or the process refused a hosted block
+    /// a Python worker or workspace, at admission. That is backpressure from
+    /// shared capacity, not a failure of this execution, so it waits one poll
+    /// interval and tries again without spending an attempt.
     Deferred(VerificationError),
     /// A terminal failure that carries no verdict.
     Terminal(TerminalStatus, VerificationError),
@@ -99,6 +100,10 @@ mod tests {
     use super::*;
 
     /// One failed requirement with optional drift detail.
+    ///
+    /// # Panics
+    /// Panics when `id` is not a valid task id; every caller passes a static
+    /// identifier literal.
     fn requirement(id: &str, detail: Option<RequirementDetail>) -> RequirementResult {
         RequirementResult {
             id: TaskId::new(id).expect("valid task id"),

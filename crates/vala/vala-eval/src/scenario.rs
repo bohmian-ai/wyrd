@@ -379,6 +379,10 @@ mod scenario_execution {
 
     /// Build a second record-level assertion that checks `$.response` is a
     /// string, so each record runs two mechanic tasks.
+    ///
+    /// # Panics
+    /// Panics only if the static `$.response` JSONPath stops parsing, which
+    /// would be a JSONPath grammar regression.
     fn response_task() -> EvalTask {
         EvalTask::Assertion(AssertionTask {
             id: tid("assert_response"),
@@ -448,6 +452,13 @@ mod scenario_execution {
         }
     }
 
+    /// One scenario pass over two records runs both record-level assertions
+    /// per record (four mechanic results) and one passenger result that sees
+    /// the agent's final response.
+    ///
+    /// # Panics
+    /// Panics when the fixture spec fails to plan or register, execution
+    /// fails, or any mechanic or passenger expectation does not hold.
     #[tokio::test]
     async fn one_pass_emits_mechanic_and_passenger_results() {
         let spec = spec_of(vec![assertion_task(), response_task()]);
@@ -489,6 +500,12 @@ mod scenario_execution {
         assert_eq!(results.passenger[0].actual, Some(final_response.clone()));
     }
 
+    /// A scenario that produced no records still runs its passenger pass
+    /// against the final response, with no mechanic results.
+    ///
+    /// # Panics
+    /// Panics when the fixture spec fails to plan or register, execution
+    /// fails, or the empty-mechanic and passing-passenger expectations fail.
     #[tokio::test]
     async fn passenger_pass_runs_even_when_no_records() {
         let spec = spec_of(vec![assertion_task(), response_task()]);

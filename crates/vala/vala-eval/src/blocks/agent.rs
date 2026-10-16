@@ -30,7 +30,7 @@ use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Verdict};
 
-use super::tools::{AgentToolset, finished};
+use super::tools::{AgentToolset, ToolSession, finished};
 use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
     CheckOutput, Position,
@@ -268,11 +268,14 @@ impl AgentExecutor {
     ///
     /// Check calls must declare neither tools nor a workspace. Step calls get
     /// exactly their declared built-ins from the toolset, which holds the
-    /// invocation's workspace until the run ends.
+    /// invocation's workspace until the run ends. The first tool refused
+    /// process capacity ends the loop before its next model call, and the
+    /// invocation then fails busy.
     ///
     /// # Errors
     /// Returns resolution, binding, route, tool, and run failures as
-    /// [`BlockError`]s.
+    /// [`BlockError`]s, and [`BlockError::Busy`] when the workspace or a tool
+    /// is refused process capacity.
     async fn invoke(
         &self,
         id: &TaskId,
@@ -324,12 +327,19 @@ impl AgentExecutor {
         if let Some(caller) = &self.gateway {
             agent = agent.with_gateway_caller(Arc::clone(caller));
         }
+        if let Some(session) = &session {
+            agent = agent.before_model(session.halt_on_refusal());
+        }
         let borrowed: Vec<(&str, &str)> = vars
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
         let run = agent.run_prompt(&self.providers, &prompt, &borrowed).await;
+        let refused = session.as_ref().and_then(ToolSession::refused);
         drop(session);
+        if let Some(reason) = refused {
+            return Err(BlockError::Busy { reason });
+        }
         let run = run.map_err(block_error)?;
         Ok(Invoked {
             structured: run.structured_output,

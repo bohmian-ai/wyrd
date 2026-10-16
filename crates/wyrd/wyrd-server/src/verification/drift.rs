@@ -49,9 +49,9 @@ use vala_drift::{
 use vala_eval::blocks::DriftChecks;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::{DriftProfile, DriftSpec, PsiProfile};
-use wyrd_spec::card::verifier::VerifierSpec;
+use wyrd_spec::card::verifier::{ScheduledInput, VerifierSpec};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, FeatureName};
+use wyrd_spec::ids::{CardUid, FeatureName, SlotName};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::eval::TaskId;
@@ -667,10 +667,14 @@ impl DriftEngine {
         }
     }
 
-    /// Score every drift requirement of `spec` over the scheduled `window`
-    /// of a claimed execution for `tenant`.
+    /// Score every drift requirement of `spec` whose `on` slot the claimed
+    /// execution's frozen `slots` mapping supplies, over its scheduled
+    /// `window` for `tenant`.
     ///
-    /// Each requirement is scored on its own: its fitted baseline (PSI/SPC)
+    /// A requirement over an omitted optional slot is not scored, even when
+    /// rows for its measurements are retained: it gets no report, so the
+    /// engine's missing-evidence handling judges it inconclusive. Each
+    /// supplied requirement is scored on its own: its fitted baseline (PSI/SPC)
     /// is the one the claim returned under its requirement ID, decoded
     /// without a registry connection, and one fixed aggregate statement runs
     /// under the tenant's tokenless SYSTEM read authority. An unscorable
@@ -689,10 +693,14 @@ impl DriftEngine {
         run: &ClaimedExecution,
         spec: &VerifierSpec,
         window: &DriftWindow,
+        slots: &BTreeMap<SlotName, ScheduledInput>,
         telemetry: &ExecutionTelemetry,
     ) -> Result<DriftChecks, EngineOutcome> {
         let mut checks = DriftChecks::new(Some(*window), BTreeMap::new(), BTreeMap::new());
-        for (requirement, check) in spec.drift_checks() {
+        let supplied = spec
+            .drift_checks()
+            .filter(|(_, check)| check.on.slot().is_some_and(|slot| slots.contains_key(slot)));
+        for (requirement, check) in supplied {
             let report = self
                 .score(tenant, run, requirement, &check.spec, window, telemetry)
                 .await?

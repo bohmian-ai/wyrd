@@ -49,6 +49,17 @@ struct TestOutcome {
     run: EvalResults,
 }
 
+/// Drive one scenario through `RunState` the way the hosted orchestrator does:
+/// answer each agent turn from `replies` in order, score each completed
+/// scenario through [`ScenarioScoring`], and finalize the run aggregate.
+///
+/// The loop ends at `RunComplete`; scoring uses in-memory traces, so no IO
+/// leaves the process.
+///
+/// # Panics
+/// Panics when scoring cannot be built from `tasks`, the state machine refuses
+/// a directive or submission, the scripted agent runs out of replies, the
+/// scenario requests a simulated user turn, or scoring and finalization fail.
 async fn drive(
     tasks: Vec<EvalTask>,
     input_scenario: EvalScenario,

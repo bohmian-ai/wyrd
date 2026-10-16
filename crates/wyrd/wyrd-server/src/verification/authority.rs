@@ -1,8 +1,10 @@
-//! The tokenless read authority every Verifier input read runs under.
+//! The tokenless read authority scheduled Drift retained-row reads run under.
 //!
-//! A Verifier reads its inputs in-process as its tenant's SYSTEM principal
-//! (REQ-086). The run's claim returns that principal's stable id from
-//! tenant-owned state, and [`SystemReadAuthority::resolve`] turns it into an
+//! A scheduled Drift Verifier reads its retained observation rows in-process
+//! as its tenant's SYSTEM principal (REQ-086); caller-submitted trace inputs
+//! are read under the submitting caller's own authorization, not here. The
+//! run's claim returns that principal's stable id from tenant-owned state,
+//! and [`SystemReadAuthority::resolve`] turns it into an
 //! authorized Oracle query context whose only permissions are
 //! `bifrost_query:read` grants scoped by registered table UID to exactly the
 //! tables the run reads. No token is minted or verified; Oracle's table
@@ -200,7 +202,7 @@ impl SystemReadAuthority {
 
 /// Resolves the authority a background Verifier run is accepted under.
 ///
-/// Scheduled and observation runs serve their binding owner: at acceptance
+/// Scheduled runs serve their binding owner: at acceptance
 /// the owner's current authority is recovered through the tenant issuer's
 /// [`recover`](TenantTokenIssuer::recover), on the accepting transaction, and
 /// paired with the tenant SYSTEM principal as actor. An owner that is missing,

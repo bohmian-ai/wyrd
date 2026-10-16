@@ -48,8 +48,10 @@ $$;
 -- acts for A); a scheduled or observation run takes the binding owner's
 -- principal and current authority with the tenant SYSTEM principal as actor.
 -- The authority snapshot holds no credential and is never projected to a view.
--- A manual run also records the span of the request that enqueued it, so its
--- execution, which runs later in a trace of its own, links to its cause.
+-- A manual run also records the span of the request that enqueued it and the
+-- caller's own sampled flag, so its execution, which runs later in a trace of
+-- its own, links to its cause and reaches the tenant's trace copy only when
+-- the caller sampled.
 -- Input: a Drift window [window_start, window_end) or an Eval record plus its
 -- committed server event time — never both.
 -- Execution: pending/retrying rows are due at next_attempt_at; a running row
@@ -78,6 +80,7 @@ CREATE TABLE wyrd.verifier_runs (
     authority                 JSONB       NOT NULL,
     cause_trace_id            BYTEA,
     cause_span_id             BYTEA,
+    cause_sampled             BOOLEAN,
     status                    TEXT        NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending','running','retrying','completed',
                           'cancelled','timed_out','errored')),
@@ -113,9 +116,9 @@ CREATE TABLE wyrd.verifier_runs (
     CHECK (jsonb_typeof(authority) = 'object'),
     -- Only a manual run has an enqueuing request span.
     CHECK (
-        (cause_trace_id IS NULL AND cause_span_id IS NULL)
+        (cause_trace_id IS NULL AND cause_span_id IS NULL AND cause_sampled IS NULL)
         OR (origin = 'manual' AND octet_length(cause_trace_id) = 16
-            AND octet_length(cause_span_id) = 8)
+            AND octet_length(cause_span_id) = 8 AND cause_sampled IS NOT NULL)
     ),
     -- Exactly one input shape; observation runs and only they use a record.
     CHECK (

@@ -6,14 +6,18 @@
 //! that releases the invocation's resources when dropped. The Agent executor
 //! resolves each declared name through the registry, wraps every tool in a
 //! [`RecordedTool`] that records the call for provenance, and attaches the
-//! tools to the ordinary Skald Agent loop. Nothing here is shared between
-//! invocations.
+//! tools to the ordinary Skald Agent loop. A tool whose failure's cause is
+//! [`BlockError::Busy`] raises the session's refusal; the session's
+//! `before_model` hook then ends the loop before the model sees the refusal,
+//! so the Agent fails busy. Nothing here is
+//! shared between invocations.
 
 use std::any::Any;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use async_trait::async_trait;
 use serde_json::Value;
+use skald_agent::{BeforeModelFn, CallbackOutcome};
 use skald_tool::{AgentTool, ToolError, ToolRegistry};
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::agent::BuiltinTool;
@@ -38,7 +42,8 @@ pub trait AgentToolset: Send + Sync {
     /// # Errors
     /// Returns [`BlockError::Terminal`] when a tool needs a workspace the call
     /// does not declare or the workspace cannot be materialized within its
-    /// limits, and [`BlockError::Retryable`] for a transient evidence read.
+    /// limits, [`BlockError::Retryable`] for a transient evidence read, and
+    /// [`BlockError::Busy`] when the process has no workspace to admit.
     async fn open(
         &self,
         call: &BlockCall<'_, Action>,
@@ -54,6 +59,8 @@ pub struct ToolSession {
     max_result_bytes: usize,
     /// Released when the session drops, such as the invocation workspace.
     _guard: Box<dyn Any + Send + Sync>,
+    /// Raised by the first tool refused process capacity.
+    refusal: Refusal,
 }
 
 impl ToolSession {
@@ -69,7 +76,29 @@ impl ToolSession {
             registry,
             max_result_bytes,
             _guard: guard,
+            refusal: Refusal::default(),
         }
+    }
+
+    /// The reason of the first tool call refused process capacity, if any.
+    ///
+    /// The Agent executor reads it once the loop ends: a raised refusal
+    /// makes the invocation [`BlockError::Busy`] whatever the loop returned.
+    pub(crate) fn refused(&self) -> Option<String> {
+        self.refusal.reason.get().cloned()
+    }
+
+    /// A `before_model` hook that aborts the Agent loop once any tool of this
+    /// session is refused process capacity, so the refusal never reaches the
+    /// model and no further model call is made.
+    pub(crate) fn halt_on_refusal(&self) -> BeforeModelFn {
+        let refusal = self.refusal.clone();
+        Arc::new(move |_, _| match refusal.reason.get() {
+            Some(reason) => CallbackOutcome::Abort(wyrd_spec::error::WyrdError::internal(format!(
+                "a tool was refused process capacity: {reason}"
+            ))),
+            None => CallbackOutcome::Continue,
+        })
     }
 
     /// Resolve every declared built-in into a recording tool for the loop.
@@ -100,6 +129,7 @@ impl ToolSession {
                     inner,
                     max_result_bytes: self.max_result_bytes,
                     records: Arc::clone(records),
+                    refusal: self.refusal.clone(),
                 }) as Arc<dyn AgentTool>)
             })
             .collect()
@@ -115,6 +145,28 @@ pub fn provider_tool_name(tool: BuiltinTool) -> String {
     tool.as_str().replace('.', "_")
 }
 
+/// One session's capacity refusal: the first reason wins and stays raised.
+#[derive(Clone, Default)]
+struct Refusal {
+    /// The first refused call's bounded reason; unset until one is refused.
+    reason: Arc<OnceLock<String>>,
+}
+
+impl Refusal {
+    /// Raise the refusal when `error`'s cause is [`BlockError::Busy`], the
+    /// typed cause a host attaches to a tool refused process capacity; any
+    /// other failure is the model's to see.
+    fn observe(&self, error: &ToolError) {
+        if let ToolError::Invocation {
+            cause: Some(cause), ..
+        } = error
+            && let Some(BlockError::Busy { reason }) = cause.downcast_ref::<BlockError>()
+        {
+            let _ = self.reason.set(reason.clone());
+        }
+    }
+}
+
 /// A built-in that records each call as a [`ToolCallRecord`].
 struct RecordedTool {
     /// The built-in the record names.
@@ -128,6 +180,8 @@ struct RecordedTool {
     /// The invocation's records; a slot is reserved when a call starts so the
     /// list keeps call order under concurrent tool calls.
     records: Arc<Mutex<Vec<Option<ToolCallRecord>>>>,
+    /// The session's capacity refusal this tool raises.
+    refusal: Refusal,
 }
 
 #[async_trait]
@@ -157,6 +211,8 @@ impl AgentTool for RecordedTool {
     /// A failed call records its error prefixed with its stable Wyrd code, so
     /// a denied call names `WYRD_PERMISSION_403_DENIED_RBAC`. A result larger than the session limit is replaced by an error, so
     /// the model never receives it and the record shows no returned bytes.
+    /// A failure caused by [`BlockError::Busy`] also raises the session's
+    /// refusal.
     ///
     /// # Errors
     /// Returns the bound tool's error, or [`ToolError::Invocation`] for an
@@ -200,6 +256,7 @@ impl AgentTool for RecordedTool {
             Ok(output)
         });
         if let Err(error) = &result {
+            self.refusal.observe(error);
             let code = wyrd_spec::error::WyrdError::from(error).code();
             record.error = Some(format!("{code}: {error}"));
         }

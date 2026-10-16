@@ -935,6 +935,13 @@ mod end_to_end {
 
     // ---- the test -------------------------------------------------------------
 
+    /// A six-task spec over one in-memory record and one span runs five tasks,
+    /// skips the false-condition task, scopes each task to its declared view,
+    /// and aggregates the outcomes.
+    ///
+    /// # Panics
+    /// Panics when the fixture spec fails to plan or register, plan execution
+    /// fails, or any outcome, skip, or aggregate expectation does not hold.
     #[tokio::test]
     async fn full_spec_against_in_memory_record_and_spans_aggregates_correctly() {
         // Arrange: in-memory record JSON + one span on the trace. The fixture is deliberately a happy path so the

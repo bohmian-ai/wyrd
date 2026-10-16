@@ -294,6 +294,8 @@ mod assertion_stage {
         }
     }
 
+    /// Build the executor bundle these tests dispatch through, with the
+    /// production assertion executor and inert trace and agent executors.
     fn executors() -> Executors {
         executors_with_assertion(Arc::new(AssertionTaskExecutor::new()))
     }

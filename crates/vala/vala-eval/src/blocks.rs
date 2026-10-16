@@ -138,6 +138,18 @@ pub enum BlockError {
         /// Bounded, secret-free cause.
         reason: String,
     },
+    /// The process refused the block a shared resource, such as a Python
+    /// worker or a workspace, at admission.
+    ///
+    /// That is pressure on the host, not a failure of the block, so it spends
+    /// no authored retry and is never judged: the engine stops the whole
+    /// execution with [`EngineError::Busy`]
+    /// so its host can run it again later.
+    #[error("block refused process capacity: {reason}")]
+    Busy {
+        /// Bounded, secret-free cause.
+        reason: String,
+    },
 }
 
 impl BlockError {

@@ -21,6 +21,7 @@ use skald_spec::wire::openai_chat::{
 };
 use skald_spec::{ProviderName, ProviderResponse};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use vala_eval::blocks::{
     ActionExecutor, AgentCardResolver, AgentExecutor, BlockCall, BlockError, CallInput, CallValue,
     CheckExecutor, EvidenceReader, Position, PromptCardResolver,
@@ -40,11 +41,13 @@ use wyrd_runtime::{
 };
 use wyrd_server::components::auth::Caller;
 use wyrd_server::verification::hosted::HostedLimits;
+use wyrd_server::verification::hosted::blocks::HostedBlocks;
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
 use wyrd_server::verification::hosted::registry::TenantRegistry;
 use wyrd_server::verification::hosted::sandbox::{CodeExecutor, Sandbox};
 use wyrd_server::verification::hosted::tools::HostedTools;
 use wyrd_server::verification::hosted::workspace::Workspaces;
+use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex};
 use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, ExecutionRoute};
@@ -56,6 +59,8 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
+use wyrd_testing::logs::LogCapture;
+use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 use crate::sandbox_worker::worker;
@@ -728,6 +733,7 @@ async fn card_resolution_is_the_callers_read() {
     let reason = |error: BlockError| match error {
         BlockError::Terminal { reason } => reason,
         BlockError::Retryable { reason } => panic!("retryable: {reason}"),
+        BlockError::Busy { reason } => panic!("busy: {reason}"),
     };
 
     let readable = registry(Some(user(tenant, [Permission::card_read()])));
@@ -756,4 +762,299 @@ async fn card_resolution_is_the_callers_read() {
         );
         assert!(!refused.contains("is not an Agent"), "{refused}");
     }
+}
+
+/// Hosted limits of a one-worker pool with no waiters and one workspace, so
+/// a single held admission saturates each.
+fn saturable() -> HostedLimits {
+    HostedLimits {
+        monty_min_workers: 0,
+        monty_max_workers: 1,
+        monty_max_waiters: 0,
+        max_workspaces: 1,
+        code_timeout: Duration::from_secs(2),
+        ..HostedLimits::default()
+    }
+}
+
+/// The notes file as one `/inputs` workspace entry.
+fn notes_workspace(registered: &Registered) -> BTreeMap<String, CallInput> {
+    BTreeMap::from([(
+        "/inputs/notes.txt".to_owned(),
+        CallInput {
+            value: CallValue::Evidence(registered.file("notes.txt")),
+            sources: BTreeSet::from([notes()]),
+        },
+    )])
+}
+
+/// Process-capacity refusal stays busy through every hosted consumer: a
+/// code action, a code check, an Agent step's `code.run`, and an Agent step
+/// whose workspace finds every workspace taken. None is reported as a
+/// retryable or terminal block failure, the Agent never answers the model
+/// with the refusal, and the refused workspace open never waits. Once the
+/// held worker admission and workspace drop, the same code runs.
+///
+/// # Panics
+/// Panics when a refusal is not busy, a refused call waits, or capacity
+/// does not return.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
+async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
+    let registered = Registered::start().await;
+    let limits = saturable();
+    let evidence = Arc::new(registered.evidence(
+        registered.server.data_tenant_id(),
+        [Permission::card_read(), Permission::tool_invoke_any()],
+        BTreeMap::from([(notes(), registered.file("notes.txt"))]),
+        limits,
+    ));
+    let sandbox = Arc::new(Sandbox::start(worker(), limits).await.expect("pool starts"));
+    let workspaces = Arc::new(Workspaces::new(limits));
+    let none = serde_json::Map::new();
+    let far = Instant::now() + Duration::from_secs(30);
+    // One admitted operation holds the only worker admission while pending.
+    let mut held = Box::pin(sandbox.run("def f():\n    return 1", "f", &none, Vec::new(), far));
+    assert!(
+        futures_util::FutureExt::now_or_never(&mut held).is_none(),
+        "the held operation waits for its worker"
+    );
+
+    let busy = |result: Result<(), BlockError>, consumer: &str| match result {
+        Err(BlockError::Busy { .. }) => {}
+        other => panic!("{consumer} must be refused busy, got {other:?}"),
+    };
+    let id = TaskId::new("bump").expect("task id");
+    let call = CodeCall {
+        runtime: CodeRuntime::Python,
+        source: CodeSource::Inline("def main(x):\n    return x + 1".to_owned()),
+        entrypoint: "main".to_owned(),
+        inputs: BTreeMap::new(),
+    };
+    let one = || {
+        BTreeMap::from([(
+            "x".to_owned(),
+            CallInput {
+                value: CallValue::Json(json!(1)),
+                sources: BTreeSet::new(),
+            },
+        )])
+    };
+    let code = CodeExecutor::new(Arc::clone(&sandbox), Arc::clone(&evidence));
+    let action = Action::Code(call.clone());
+    let act = || {
+        ActionExecutor::execute(
+            &code,
+            BlockCall {
+                id: &id,
+                position: Position::Step,
+                block: &action,
+                inputs: one(),
+                workspace: BTreeMap::new(),
+                deadline: far,
+            },
+        )
+    };
+    busy(act().await.map(drop), "a code action");
+    let check = Check::Code(call);
+    busy(
+        CheckExecutor::execute(
+            &code,
+            BlockCall {
+                id: &id,
+                position: Position::VerifierCheck,
+                block: &check,
+                inputs: one(),
+                workspace: BTreeMap::new(),
+                deadline: far,
+            },
+        )
+        .await
+        .map(drop),
+        "a code check",
+    );
+
+    let mock = Arc::new(MockProvider::new(ProviderName::OpenAi));
+    mock.push_response(answer(None, &[("code_run", json!({"source": "1"}))]));
+    mock.push_response(answer(Some("{}"), &[]));
+    let mut providers = ProviderRegistry::new();
+    providers.register(Arc::clone(&mock) as _);
+    let agent = AgentExecutor::new(
+        Arc::new(providers),
+        Arc::new(NoRegistry),
+        Arc::new(NoRegistry),
+    )
+    .with_toolset(Arc::new(HostedTools::new(
+        registered.server.state().clone(),
+        user(
+            registered.server.data_tenant_id(),
+            [Permission::card_read(), Permission::tool_invoke_any()],
+        ),
+        Arc::clone(&evidence),
+        Arc::clone(&workspaces),
+        Arc::clone(&sandbox),
+        limits,
+    )))
+    .with_evidence(Arc::clone(&evidence) as Arc<dyn EvidenceReader>);
+    let step = |tools: &[&str]| {
+        let action = Action::Agent(reviewer(tools));
+        let (agent, id, registered) = (&agent, &id, &registered);
+        async move {
+            ActionExecutor::execute(
+                agent,
+                BlockCall {
+                    id,
+                    position: Position::Step,
+                    block: &action,
+                    inputs: document(json!("the notes")),
+                    workspace: notes_workspace(registered),
+                    deadline: Instant::now() + Duration::from_secs(30),
+                },
+            )
+            .await
+            .map(drop)
+        }
+    };
+    busy(step(&["code.run"]).await, "an Agent's code.run");
+    assert_eq!(
+        mock.remaining(),
+        1,
+        "the refusal ends the loop before the model is called again"
+    );
+
+    let taken = workspaces
+        .open(&notes_workspace(&registered), &evidence)
+        .await
+        .expect("the only workspace opens");
+    // A waiting open would never finish while `taken` is held.
+    busy(step(&["fs.read"]).await, "an Agent's workspace");
+
+    drop(taken);
+    drop(held);
+    let ran = act().await.expect("capacity returns once released");
+    assert_eq!(ran.output, json!(2));
+}
+
+/// A queued execution refused the only Python worker returns to the queue
+/// with its attempt refunded and runs once capacity frees.
+///
+/// The runtime hosts a one-worker pool with no waiters. The first queued
+/// execution's code spins for the whole code timeout, holding the worker;
+/// the second, claimed meanwhile, is refused busy and deferred rather than
+/// failed, retried, or judged. Once the spinner ends, the second completes
+/// on its first counted attempt with its real verdict.
+///
+/// # Panics
+/// Panics when the server, seeding, or runtime fails, the second execution
+/// is never deferred, or it settles other than `completed` on one attempt.
+#[tokio::test]
+#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
+async fn busy_queued_execution_is_deferred_until_capacity_frees() {
+    let logs = LogCapture::install();
+    let registered = Registered::start().await;
+    let tenant = registered.server.data_tenant_id();
+    registered
+        .server
+        .ensure_builtin_tables_for_test(tenant)
+        .await
+        .expect("tenant receives every built-in table");
+    let state = registered
+        .server
+        .state()
+        .clone()
+        .with_verification_blocks(Arc::new(
+            HostedBlocks::start(worker(), saturable())
+                .await
+                .expect("pool starts"),
+        ));
+    let seed = VerificationFixture::provision(state.postgres.wyrd(), tenant)
+        .await
+        .expect("tenant provisions");
+    let (subject, _) = seed
+        .service("busy-subject")
+        .await
+        .expect("subject registers");
+    let code = |name: &str, source: &str, expected: Value| {
+        json!({
+            "inputs": { "x": { "type": "json" } },
+            "steps": [{
+                "id": name,
+                "action": { "kind": "code", "entrypoint": "f", "source": { "inline": source },
+                            "inputs": { "x": "inputs.x" } },
+                "requirements": [{ "id": format!("{name}-ok"), "statement": "The code answers.",
+                    "check": { "kind": "assert", "path": format!("steps.{name}.output"),
+                               "operator": "equals", "expected": expected } }]
+            }]
+        })
+    };
+    let spinner = seed
+        .verifier(
+            "busy-spinner",
+            &code("spin", "def f(x):\n    while True:\n        pass", json!(0)),
+        )
+        .await
+        .expect("spinner registers");
+    let adder = seed
+        .verifier(
+            "busy-adder",
+            &code("add", "def f(x):\n    return x + 1", json!(2)),
+        )
+        .await
+        .expect("adder registers");
+    let one = || {
+        BTreeMap::from([(
+            SlotName::new("x").expect("slot"),
+            InputDeclaration::Json { value: json!(1) },
+        )])
+    };
+    let spinning = seed
+        .submit(&spinner, &subject, one())
+        .await
+        .expect("spinner queues");
+    let deferred = seed
+        .submit(&adder, &subject, one())
+        .await
+        .expect("adder queues");
+
+    let runtime = VerificationRuntime::builder(&state)
+        .limits(RuntimeLimits {
+            lease: Duration::from_mins(1),
+            execution_timeout: Duration::from_secs(20),
+            poll_interval: Duration::from_millis(50),
+            ..RuntimeLimits::default()
+        })
+        .build()
+        .expect("the runtime composes");
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let settled = loop {
+        let row = seed.execution(deferred).await.expect("execution reads");
+        if !matches!(row.status.as_str(), "pending" | "running" | "retrying") {
+            break row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the deferred execution never settled"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    stop.cancel();
+    task.await.expect("the runtime stops");
+
+    let text = logs.text();
+    assert!(
+        text.lines()
+            .any(|line| line.contains("deferred by admission backpressure")
+                && line.contains(&deferred.to_string())),
+        "the adder was refused the busy worker and deferred:\n{text}"
+    );
+    assert_eq!(
+        (settled.status.as_str(), settled.attempts),
+        ("completed", 1),
+        "a deferral spends no attempt: {settled:?}"
+    );
+    assert!(settled.result_id.is_some(), "{settled:?}");
+    let spun = seed.execution(spinning).await.expect("spinner reads");
+    assert_eq!(spun.status, "completed", "{spun:?}");
 }

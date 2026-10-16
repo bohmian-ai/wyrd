@@ -591,6 +591,202 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     Ok(())
 }
 
+/// An omitted optional scheduled slot is never scored, even over retained
+/// rows, while mapping that slot restores its real judgment.
+///
+/// One Verifier has a required `samples` slot measuring `score` and an
+/// optional `extra` slot measuring `latency`, with one Custom Drift
+/// requirement per slot: `score` is steady and `latency` drifts over the
+/// one client observation, which retains rows for both. One binding maps
+/// only `samples`; the other maps both. The omitted binding's `latency`
+/// requirement has no scored feature row and its result is inconclusive,
+/// not failed, so it alone cannot dispatch a failed Operator. The fully
+/// mapped binding scores `latency` from the same rows and fails.
+///
+/// # Errors
+/// Returns cluster, seeding, client, runtime, or query errors, or a
+/// description of the first expectation that does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn omitted_optional_slot_is_not_scored_from_retained_rows() -> Result<(), ServerJourneyError>
+{
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated()).await?;
+    let tenant = cluster.data_tenant_id();
+    let oracle = cluster.server(0).ok_or("missing Oracle node")?;
+    let scribe = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("the cluster composed no Scribe")?;
+    let seed = VerificationFixture::provision(oracle.state().postgres.wyrd(), tenant).await?;
+    let Bootstrap::Machine {
+        id: client,
+        api_key,
+        card_ref: subject_ref,
+    } = scribe
+        .bootstrap_service_in_tenant(tenant, "optional-subject", &["admin"])
+        .await?
+    else {
+        return Err("a service bootstrap returned a user".into());
+    };
+    let subject = subject_ref
+        .uid
+        .clone()
+        .ok_or("the subject Card has no UID")?;
+    let custom = |slot: &str, metric: &str, threshold: f64| {
+        json!({
+            "id": metric,
+            "statement": format!("The {metric} window does not drift."),
+            "check": {
+                "kind": "drift",
+                "on": format!("inputs.{slot}"),
+                "method": "Custom",
+                "signal": { "kind": "Metric", "name": metric },
+                "condition": { "kind": "Statistical" },
+                "profile": {
+                    "kind": "Custom",
+                    "metric_name": metric,
+                    "baseline_value": 1.0,
+                    "alert_threshold": threshold
+                }
+            }
+        })
+    };
+    let spec = json!({
+        "inputs": {
+            "samples": { "type": "samples", "features": ["score"] },
+            "extra": { "type": "samples", "features": ["latency"], "required": false }
+        },
+        "requirements": [custom("samples", "score", 100.0), custom("extra", "latency", 0.5)]
+    });
+    // One binding per Verifier and subject, so the two mappings bind two
+    // registrations of the one spec.
+    let mut bindings = Vec::new();
+    for (name, slots) in [
+        (
+            "optional-omitted",
+            json!({ "samples": { "metric": "score" } }),
+        ),
+        (
+            "optional-explicit",
+            json!({ "samples": { "metric": "score" }, "extra": { "metric": "latency" } }),
+        ),
+    ] {
+        let verifier = seed.verifier(name, &spec).await?;
+        bindings.push(
+            seed.bind_schedule(
+                &subject,
+                &subject,
+                &verifier,
+                MONTHLY,
+                serde_json::from_value(slots)?,
+                Vec::new(),
+            )
+            .await?,
+        );
+    }
+    let [omitted, explicit] = bindings[..] else {
+        return Err("expected two bindings".into());
+    };
+    scribe
+        .ensure_builtin_table_for_test(tenant, "drift", "observations")
+        .await?;
+    let record = format!("optional-{}", uuid::Uuid::now_v7());
+    let writer = wyrd_client::bifrost::client_from_options(
+        scribe.base_url(),
+        Some(api_key.expose_secret()),
+        scribe.grpc_url().as_deref(),
+    )?;
+    Bifrost::connect_with(&writer, BifrostOptions::default())
+        .await?
+        .write_batch(
+            "vala.drift.observations",
+            &observation_batch(&record, &subject, observed_in_current_month(Utc::now())?)?,
+        )
+        .await?;
+    seed.activate(client).await?;
+    for binding in [omitted, explicit] {
+        seed.make_binding_due(binding).await?;
+    }
+    scribe.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    let runtime = VerificationRuntime::builder(oracle.state())
+        .build()
+        .ok_or("the runtime did not compose")?;
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let executions = seed.executions().await?;
+        let mut settled = 0;
+        for execution in &executions {
+            let row = seed.execution(*execution).await?;
+            if !matches!(row.status.as_str(), "pending" | "running" | "retrying") {
+                if row.status != "completed" || row.result_id.is_none() {
+                    return Err(format!("a binding execution settled {row:?}").into());
+                }
+                settled += 1;
+            }
+        }
+        if executions.len() == 2 && settled == 2 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                format!("expected two settled binding executions, saw {executions:?}").into(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    scribe.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    for (binding, verdict, scored) in [
+        (
+            omitted,
+            "inconclusive",
+            vec![vec![Some("score".to_owned())]],
+        ),
+        (
+            explicit,
+            "failed",
+            vec![
+                vec![Some("latency".to_owned())],
+                vec![Some("score".to_owned())],
+            ],
+        ),
+    ] {
+        let verdicts = query_texts(
+            oracle,
+            tenant,
+            format!("SELECT verdict FROM vala.verification.results WHERE binding_id = '{binding}'"),
+        )
+        .await?;
+        if verdicts != vec![vec![Some(verdict.to_owned())]] {
+            return Err(format!("binding {binding} must be {verdict}, saw {verdicts:?}").into());
+        }
+        let features = query_texts(
+            oracle,
+            tenant,
+            format!(
+                "SELECT requirement_id FROM vala.drift.result_features \
+                 WHERE binding_id = '{binding}' ORDER BY requirement_id"
+            ),
+        )
+        .await?;
+        if features != scored {
+            return Err(format!(
+                "binding {binding} must score exactly {scored:?}, saw {features:?}"
+            )
+            .into());
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
 /// One Drift observation `record` of the Card `card_uid` at `event_time`: a
 /// drifting `score` and a `latency` feature, as the SDK's tall projection
 /// writes them.

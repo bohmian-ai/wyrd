@@ -764,7 +764,12 @@ Server spans export twice from one tracer provider:
   span, and parent ids. A continued request's spans therefore form one tree
   with the client's, and a queued write's `bifrost.gate.write` CONSUMER span,
   which reaches the server with its producers as links and no `traceparent`,
-  reads back as a trace linked to them. The tenant copy carries only the
+  reads back as a trace linked to them. A queued Verifier run stores its
+  enqueuing span and that span's sampled flag with the execution, so every
+  attempt, including a reclaimed one, starts a trace linked to it that is
+  attributed to the enqueuing principal with SYSTEM as actor; a sampled
+  caller's attempt, its catalog descendants, and its gateway calls' captured
+  attempts read back from the enqueuing trace's timeline. The tenant copy carries only the
   behavior-span catalog — the request span, `verification.*`, the Agent
   loop's `invoke_agent`, `chat`, and `execute_tool`, `dispatch`,
   `agent.gateway.call`, `gateway.*` except `gateway.attempt`,
@@ -817,8 +822,9 @@ Service view is `root`); the state returns the exact typed `CardRef` for an
 alias. `run.observe.verify(verifier, inputs)` and
 `run.observe.submit(verifier, inputs)` judge the view's subject: the client
 resolves the named Verifier among those bound in `verified_by` to that subject
-in the hydrated graph, validates named inputs against its slots, hashes and
-uploads missing files through `POST /v1/verification/evidence`, and calls
+in the hydrated graph, validates named inputs against its slots, hashes
+files, obtains plans for missing ones from `POST /v1/verification/evidence`
+and sends each missing body to its plan's target, and calls
 `POST /v1/verification/execute` (once, without replay, returning the typed
 `VerificationResult`) or `POST /v1/verification/enqueue` (returning a
 `VerificationExecution` handle). `submit` on a Window Verifier records its
@@ -1271,18 +1277,30 @@ execution; scheduled executions have no `run_id`.
 | Route | Contract |
 |---|---|
 | `POST /v1/verification/evidence` | Declare files by digest, length, and format; receive single-PUT plans for missing ones under the tenant's `evidence/sha256/<digest>` namespace |
+| `PUT /v1/verification/evidence/local/{sha256}` | Local storage backend only: store one evidence body under the caller's tenant → `204` |
 | `POST /v1/verification/execute` | Exact Verifier and subject, optional Run, named input declarations, optional route overrides → `200 VerificationResult` |
 | `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` |
 | `GET /v1/verification/executions/{execution_id}` | Status, terminal error, and result when visible |
 
-File contents never pass through Postgres or a request body; an uploaded file
-does not become a Card. `ArtifactRef` selects a registered Artifact under its
+File contents never pass through Postgres or a verification request body; an
+uploaded file does not become a Card. Remote storage backends return direct
+single-PUT plans to tenant object storage and do not mount the local route.
+The local filesystem backend has no presigned target, so its plans point at
+`PUT /v1/verification/evidence/local/{sha256}`: the server takes the tenant
+from the authenticated caller, never the path; refuses a body over
+`WYRD_VERIFICATION_FILE_MAX_MIB` or one that hashes to another digest before
+the object becomes readable; and writes the same tenant-qualified
+`evidence/sha256/<digest>` key with no metadata row. A repeated upload of one
+digest is idempotent. `ArtifactRef` selects a registered Artifact under its
 own authorization.
 
 Public invocation checks `verifier:run` against the selected Verifier's exact
 Card UID. `PermissionScope::Verifier(CardUid)` names one UID; `All` covers
 every Verifier in the tenant. Permission is checked before execution and the
 decision is audited. A binding does not replace the invocation permission.
+Both evidence routes stage bytes and select no Verifier, so they require only
+operation-level `verifier:run` admission: any `verifier:run` grant, exact or
+`All`, admits them, and the decision is audited the same way.
 
 Neither Run entry point writes Postgres on the request path. `verify` runs
 inline and stages its pinned inputs and result on the process Scribe outbox.

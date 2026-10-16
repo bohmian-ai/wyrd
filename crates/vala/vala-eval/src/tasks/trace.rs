@@ -276,6 +276,9 @@ pub(crate) mod trace_executor {
         }
     }
 
+    /// Build the executor bundle with trace assertions served from `source`
+    /// and a 250ms span-wait bound; the assertion and agent executors are
+    /// the production ones and need no IO.
     fn executors(source: Arc<dyn crate::TraceSource>) -> Executors {
         Executors {
             assertion: Arc::new(AssertionTaskExecutor::new()),

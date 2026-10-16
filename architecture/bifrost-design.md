@@ -230,9 +230,11 @@ typed columns:
   attributes and `body_text` (the body when it is a string) on logs.
 - `vala.verification.results` carries the generic outcome of one execution:
   execution, Run, Verifier, subject, and binding identity, the verdict, and the
-  requirement, step, evidence, and provenance breakdown as Variant. The
-  nullable Struct `drift_report` (`method`, Variant `features`, `verdict`) is
-  set when the Verifier has a drift check.
+  requirement, step, evidence, and provenance breakdown as the `outcome`
+  Variant. A drift requirement's typed detail lives in that outcome; its
+  per-feature method, score, threshold, and verdict are also projected one row
+  per feature into `vala.drift.result_features`, joined on `result_id` and
+  `requirement_id`.
   Published correlation columns are `execution_id`, nullable `binding_id`,
   and nullable application `run_id`; result timing remains `started_at` and
   `ended_at`. A verification execution is never relabelled as an application
@@ -244,11 +246,10 @@ typed columns:
   Its published input timestamp is `recorded_at`, the server-recorded input
   time, distinct from execution timing or sample/window time. It uses the
   same execution/binding/application-Run correlation names where applicable.
-- Every nullable built-in Struct — `drift_report`, the
-  `vala.metrics.points` bucket sets, and `vala.gateway.calls`
-  `resolved_model` — has nullable children, because a required Parquet leaf
-  under a null parent reads back as another row's value through a field
-  query. The Struct is whole or absent: a present one sets every child its
+- Every nullable built-in Struct — the `vala.metrics.points` bucket sets and
+  `vala.gateway.calls` `resolved_model` — has nullable children, because a
+  required Parquet leaf under a null parent reads back as another row's value
+  through a field query. The Struct is whole or absent: a present one sets every child its
   shape requires and an absent one nulls every child, so `s['child']` reads
   SQL null for an absent Struct on hot and published data alike. Admission
   refuses a batch with a partial Struct before ACK with
@@ -1006,8 +1007,9 @@ rather than days.
 The four verification tables — `vala.drift.observations`,
 `vala.verification.execution_inputs`, `vala.verification.results`, and
 `vala.drift.result_features` — also partition by UTC day on each table's time
-column — `created_at` for observations, `ended_at` for results, and
-`wyrd_ingested_at` for execution inputs and result features —
+column — `created_at` for observations, `ended_at` for results,
+`recorded_at` for execution inputs, and `wyrd_ingested_at` for result
+features —
 never by Verifier, subject, binding, or tenant ID. A Drift schedule window does
 not determine partition size.
 

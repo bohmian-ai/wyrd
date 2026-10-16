@@ -231,6 +231,28 @@ def test_traced_sdk_verify_joins_the_callers_trace(
     ), [(span["name"], span["span_id"], span.get("parent_span_id")) for span in spans]
 
 
+def test_traced_sdk_submit_links_its_attempt_to_the_callers_trace(
+    assistant: WyrdState, wyrd_server: WyrdTestServer, metadata_capture: None
+) -> None:
+    tracer = TracerProvider().get_tracer("journey")
+    with tracer.start_as_current_span("caller") as caller:
+        execution = assistant.run("agent").observe.submit("answer-judged", "yes")
+    assert isinstance(execution, verify.Execution)
+    execution.wait(WAIT_SECONDS)
+
+    trace_id = format(caller.get_span_context().trace_id, "032x")
+    spans = timeline(wyrd_server, trace_id)
+    [attempt] = [span for span in spans if span["name"] == "verification.attempt"]
+    assert attempt["trace_id"] != trace_id, attempt
+    assert [link["trace_id"] for link in attempt["links"]] == [trace_id], attempt
+    judged = [span for span in spans if span["scope"]["name"] == "wyrd.gateway"]
+    assert len(judged) == 1, spans
+    assert ancestry(spans, judged[0])[-1]["span_id"] == attempt["span_id"], [
+        (span["name"], span["trace_id"], span["span_id"], span.get("parent_span_id"))
+        for span in spans
+    ]
+
+
 def test_malformed_traceparent_is_ignored_by_the_judge_call(
     assistant_bundle: Path,
     wyrd_server: WyrdTestServer,

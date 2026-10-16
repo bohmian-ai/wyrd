@@ -8,7 +8,7 @@ language, or domain references.
 - `wyrd` is the control plane: registry, storage, lineage, policy,
   install, audit, server, CLI, MCP.
 - `vala` owns observability and analytical storage: observations, traces,
-  drift, eval execution, archival query, background data-plane behavior,
+  drift, Verifier execution, archival query, background data-plane behavior,
   the Bifrost engine (Iceberg + DataFusion).
 - `skald` owns LLM runtime behavior: providers, prompt execution, agents,
   workflows, orchestration, provider-specific wire handling.

@@ -388,7 +388,7 @@ export interface NativeIssueKey {
 export interface NativeTestServerOptions {
   /**
    * Roots built-in gateway adapters at a local mock upstream; its `/v1`
-   * segment also serves the verification runtime's `OpenAI` Eval judge,
+   * segment also serves the verification runtime's `OpenAI` judge,
    * which calls `<providerBaseUrl>/v1/chat/completions`.
    */
   providerBaseUrl?: string

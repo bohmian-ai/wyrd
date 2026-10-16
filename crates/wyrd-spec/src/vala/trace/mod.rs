@@ -2823,7 +2823,10 @@ mod otel_proto_parity_tests {
         assert!(obj.contains_key("provider_name"), "missing provider_name");
         assert!(obj.contains_key("operation_name"), "missing operation_name");
         assert!(obj.contains_key("request_model"), "missing request_model");
-        assert!(obj.contains_key("evaluation_results"), "missing evaluation_results");
+        assert!(
+            obj.contains_key("evaluation_results"),
+            "missing evaluation_results"
+        );
         assert!(obj.contains_key("extra"), "missing extra");
         assert!(obj.contains_key("resource"), "missing resource");
         assert!(obj.contains_key("status"), "missing status");

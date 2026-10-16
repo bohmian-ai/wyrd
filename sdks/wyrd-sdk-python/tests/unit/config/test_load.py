@@ -39,9 +39,9 @@ def test_apply_defaults_card_value_wins(tmp_path: Path) -> None:
     cfg_file = tmp_path / "wyrd.toml"
     cfg_file.write_text('[defaults]\nspace = "prod"\n')
     cfg = WyrdConfig.load(cfg_file)
-    meta: dict[str, Any] = {"name": "churn", "space": "eval"}
+    meta: dict[str, Any] = {"name": "churn", "space": "review"}
     cfg.apply_defaults(meta, "Model")
-    assert meta["space"] == "eval"
+    assert meta["space"] == "review"
 
 
 def test_apply_defaults_unknown_kind_raises_typed(tmp_path: Path) -> None:

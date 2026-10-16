@@ -14,7 +14,7 @@ pub(crate) type Compared = (bool, Option<Value>, Value, Option<String>);
 
 /// Compare one `observed` value with `expected` under `operator`.
 ///
-/// Shared by Eval assertion tasks and Verifier `assert` checks over a `path`.
+/// Shared by Verifier `assert` checks over a `path`.
 ///
 /// # Errors
 /// Returns [`ExecError::OperatorTypeMismatch`] for `task_id` when the
@@ -48,8 +48,7 @@ pub(crate) fn evaluate_single(
 /// Compare every element of the `observed` array with `expected`; the
 /// assertion passes only when every element passes, so an empty array passes.
 ///
-/// Shared by Eval item-mode assertions and Verifier `assert` checks over an
-/// `each` selector.
+/// Shared by item-mode Verifier `assert` checks over an `each` selector.
 ///
 /// # Errors
 /// Returns [`ExecError::OperatorTypeMismatch`] for `task_id` when
@@ -99,8 +98,7 @@ pub(crate) fn evaluate_item_mode(
 /// Apply `capture` to one stored `actual` value: kept verbatim for `full`,
 /// replaced by its SHA-256 hex digest for `hash`, and dropped for `redact`.
 ///
-/// The one capture rule shared by Eval results and Verifier requirement
-/// results.
+/// The one capture rule shared by Verifier requirement results.
 ///
 /// # Errors
 /// Returns `ContextHashFailed` if hashing cannot serialize the value.

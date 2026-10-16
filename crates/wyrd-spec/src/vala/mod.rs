@@ -1,4 +1,4 @@
-//! Vala primitive types — drift, eval, records, transport, trace, bifrost,
+//! Vala primitive types — drift, verification, records, transport, trace, bifrost,
 //! and OLAP shapes.
 //!
 //! `vala` is Wyrd's drift-monitoring engine, agent-evaluation runtime, OTel

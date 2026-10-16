@@ -244,13 +244,13 @@ mod merge_tests {
         cfg.kind_overrides.insert(CardKind::Model, ko);
 
         let mut meta = fresh_meta("churn");
-        meta.space = Some(SpaceName::new("eval").unwrap());
+        meta.space = Some(SpaceName::new("review").unwrap());
         meta.labels.insert(lk("team"), lv("ml-team"));
 
         let orig_version = meta.version.clone();
         apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
-        assert_eq!(meta.space.as_ref().map(SpaceName::as_str), Some("eval"));
+        assert_eq!(meta.space.as_ref().map(SpaceName::as_str), Some("review"));
         assert_eq!(meta.version, orig_version);
         assert_eq!(
             meta.labels.get(&lk("team")).map(LabelValue::as_str),
@@ -300,10 +300,10 @@ mod merge_tests {
         cfg.defaults.space = Some(SpaceName::new("prod").unwrap());
 
         let mut meta = fresh_meta("card");
-        meta.space = Some(SpaceName::new("eval").unwrap());
+        meta.space = Some(SpaceName::new("review").unwrap());
         apply_defaults(&mut meta, &CardKind::Model, &cfg);
 
-        assert_eq!(meta.space.as_ref().map(SpaceName::as_str), Some("eval"));
+        assert_eq!(meta.space.as_ref().map(SpaceName::as_str), Some("review"));
     }
 
     #[test]

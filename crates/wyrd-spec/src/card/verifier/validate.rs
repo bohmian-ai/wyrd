@@ -24,8 +24,8 @@ use crate::envelope::CardKind;
 use crate::error::WyrdError;
 use crate::ids::{FeatureName, SlotName};
 use crate::reference::InlineableRef;
-use crate::verification::{ExecutionPlan, TaskId, plan_stages};
 use crate::verification::execution::Verdict;
+use crate::verification::{ExecutionPlan, TaskId, plan_stages};
 
 /// An Agent and its Prompt, resolved by the caller for validation.
 #[derive(Debug, Clone, Copy)]

@@ -539,7 +539,7 @@ impl NativeWyrdTestServer {
 #[napi(object)]
 pub struct NativeTestServerOptions {
     /// Roots built-in gateway adapters at a local mock upstream; its `/v1`
-    /// segment also serves the verification runtime's `OpenAI` Eval judge,
+    /// segment also serves the verification runtime's `OpenAI` judge,
     /// which calls `<providerBaseUrl>/v1/chat/completions`.
     pub provider_base_url: Option<String>,
     /// `true` runs Drift baseline fitting and Verifier runs.

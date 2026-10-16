@@ -4191,7 +4191,7 @@ impl WyrdTestServerBuilder {
     /// `OpenAI` is served under `root`'s `/v1` segment; Anthropic, Gemini,
     /// Vertex, and Jev at `root` itself, where each provider's native paths
     /// begin.
-    /// Delegates to [`Self::with_gateway_endpoints_for_test`]. Eval judges
+    /// Delegates to [`Self::with_gateway_endpoints_for_test`]. Verifier judges
     /// call the gateway too, so a language journey roots every model path at
     /// one local mock.
     #[must_use]

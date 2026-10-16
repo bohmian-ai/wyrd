@@ -9,7 +9,7 @@ policy and release decisions.
 A `Verifier` declares named evidence `inputs`, optional preparation `steps`
 (`extract`, `agent`, `code`), `requirements` that each produce one verdict
 through an `assert`, `trace`, `agent`, `code`, or `drift` check, and a `decide`
-rule. There is no Eval Card or Verifier kind. A Service component, Service,
+rule. Evaluation is not a separate Card or Verifier kind. A Service component, Service,
 or standalone Agent binds it through versioned `verified_by`; the caller runs
 it with `verify` (inline result) or `submit` (queued execution), and a
 `schedule` Trigger runs Window Verifiers. Every execution records one

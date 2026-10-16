@@ -1889,13 +1889,17 @@ mod tests {
                 "any_of evals:{action}"
             );
         }
-        let verifier = "verifier:run".parse::<Permission>().expect("verifier:run parses");
+        let verifier = "verifier:run"
+            .parse::<Permission>()
+            .expect("verifier:run parses");
         assert_eq!(verifier, Permission::verifier_run_any());
         assert!(verifier.covers(&Permission::verifier_run(
             wyrd_spec::ids::CardUid::new("01927b4c-0000-7000-8000-000000000001").expect("uid")
         )));
         assert_eq!(
-            "operators:invoke".parse::<Permission>().expect("unrelated grant parses"),
+            "operators:invoke"
+                .parse::<Permission>()
+                .expect("unrelated grant parses"),
             Permission::operator_invoke()
         );
     }

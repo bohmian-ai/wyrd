@@ -8,13 +8,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use chrono::TimeZone as _;
 use serde_json::json;
 use tokio::sync::{Barrier, Notify};
-use chrono::TimeZone as _;
 use wyrd_spec::vala::ids::{SpanId, TraceId};
-use wyrd_spec::vala::trace::{
-    InstrumentationScope, Resource, SpanKind, SpanRecord, SpanStatus,
-};
+use wyrd_spec::vala::trace::{InstrumentationScope, Resource, SpanKind, SpanRecord, SpanStatus};
 use wyrd_spec::verification::DriftWindow;
 use wyrd_spec::verification::execution::Verdict;
 

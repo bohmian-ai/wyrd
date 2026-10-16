@@ -29,8 +29,8 @@ use crate::card::trigger::TriggerSpec;
 use crate::ids::{BindingId, FeatureName, SlotName};
 use crate::reference::{CardRef, InlineableRef, Ref};
 use crate::verification::ContextCapture;
-use crate::verification::{ComparisonOperator, JsonPath, TaskId};
 use crate::verification::VerificationError;
+use crate::verification::{ComparisonOperator, JsonPath, TaskId};
 
 pub mod extract;
 pub mod reference;

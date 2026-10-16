@@ -1361,9 +1361,7 @@ mod tests {
                 }
                 ("verification", "results") => ("ended_at", TimeGranularityWire::Day),
                 ("verification", "execution_inputs") => ("recorded_at", TimeGranularityWire::Day),
-                ("drift", "result_features") => {
-                    (WYRD_INGESTED_AT, TimeGranularityWire::Day)
-                }
+                ("drift", "result_features") => (WYRD_INGESTED_AT, TimeGranularityWire::Day),
                 _ => panic!("{fqn} declares no pinned time column"),
             };
             let declared = (definition.physical_layout)();

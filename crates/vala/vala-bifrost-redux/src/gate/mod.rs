@@ -42,8 +42,7 @@ use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecy
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::{LogicalIdentity, correlation_data_identity};
 use crate::tables::{
-    CallsTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable,
-    ResultsTable, TableError,
+    CallsTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable, ResultsTable, TableError,
 };
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::DataTenantId;

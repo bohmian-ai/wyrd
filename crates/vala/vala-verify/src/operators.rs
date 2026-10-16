@@ -1,7 +1,7 @@
 //! Runtime semantics for every frozen variant of
 //! [`wyrd_spec::verification::ComparisonOperator`].
 //!
-//! This module is the deterministic core of `vala-eval`: one pure function over
+//! This module is the deterministic core of `vala-verify`: one pure function over
 //! `(left, op, right)` with typed failures and no side effects.
 //!
 //! ## Inputs
@@ -550,12 +550,11 @@ fn require_numbers(
 }
 
 fn require_number_left(op: &ComparisonOperator, left: &Value) -> Result<f64, ExecError> {
-    left.as_f64()
-        .ok_or_else(|| ExecError::OperatorMismatch {
-            op: op.discriminator().to_string(),
-            left_kind: json_kind(left),
-            right_kind: "null",
-        })
+    left.as_f64().ok_or_else(|| ExecError::OperatorMismatch {
+        op: op.discriminator().to_string(),
+        left_kind: json_kind(left),
+        right_kind: "null",
+    })
 }
 
 fn check_range_bounds(op: &ComparisonOperator, min: f64, max: f64) -> Result<(), ExecError> {
@@ -580,16 +579,12 @@ fn require_strings<'a>(
     }
 }
 
-fn require_string_left<'a>(
-    op: &ComparisonOperator,
-    left: &'a Value,
-) -> Result<&'a str, ExecError> {
-    left.as_str()
-        .ok_or_else(|| ExecError::OperatorMismatch {
-            op: op.discriminator().to_string(),
-            left_kind: json_kind(left),
-            right_kind: "null",
-        })
+fn require_string_left<'a>(op: &ComparisonOperator, left: &'a Value) -> Result<&'a str, ExecError> {
+    left.as_str().ok_or_else(|| ExecError::OperatorMismatch {
+        op: op.discriminator().to_string(),
+        left_kind: json_kind(left),
+        right_kind: "null",
+    })
 }
 
 fn compile_regex(op: &ComparisonOperator, pattern: &str) -> Result<Regex, ExecError> {
@@ -633,25 +628,22 @@ fn require_array_left<'a>(
     op: &ComparisonOperator,
     left: &'a Value,
 ) -> Result<&'a Vec<Value>, ExecError> {
-    left.as_array()
-        .ok_or_else(|| ExecError::OperatorMismatch {
-            op: op.discriminator().to_string(),
-            left_kind: json_kind(left),
-            right_kind: "null",
-        })
+    left.as_array().ok_or_else(|| ExecError::OperatorMismatch {
+        op: op.discriminator().to_string(),
+        left_kind: json_kind(left),
+        right_kind: "null",
+    })
 }
 
 fn require_array_right<'a>(
     op: &ComparisonOperator,
     right: &'a Value,
 ) -> Result<&'a Vec<Value>, ExecError> {
-    right
-        .as_array()
-        .ok_or_else(|| ExecError::OperatorMismatch {
-            op: op.discriminator().to_string(),
-            left_kind: "null",
-            right_kind: json_kind(right),
-        })
+    right.as_array().ok_or_else(|| ExecError::OperatorMismatch {
+        op: op.discriminator().to_string(),
+        left_kind: "null",
+        right_kind: json_kind(right),
+    })
 }
 
 fn require_arrays<'a>(
@@ -756,11 +748,10 @@ fn to_float_vec(
     values
         .iter()
         .map(|v| {
-            v.as_f64()
-                .ok_or_else(|| ExecError::OperatorInvalidConfig {
-                    op: op.discriminator().to_string(),
-                    message: format!("{side} vector contains non-numeric entry: {v}"),
-                })
+            v.as_f64().ok_or_else(|| ExecError::OperatorInvalidConfig {
+                op: op.discriminator().to_string(),
+                message: format!("{side} vector contains non-numeric entry: {v}"),
+            })
         })
         .collect()
 }

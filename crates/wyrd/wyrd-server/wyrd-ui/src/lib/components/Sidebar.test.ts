@@ -11,7 +11,7 @@ test('renders grouped nav items and marks the active one', () => {
           label: 'registry',
           items: [
             { label: 'cards', href: '/cards', active: true },
-            { label: 'evals', href: '/evals' }
+            { label: 'verification', href: '/verification' }
           ]
         }
       ]

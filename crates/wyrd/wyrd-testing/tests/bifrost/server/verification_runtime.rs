@@ -10,8 +10,8 @@
 //! hosts no Oracle, so its observation read must be forwarded to a peer
 //! Oracle under the tenant's tokenless SYSTEM read authority and audited
 //! there. A third
-//! journey proves every built-in typed payload — verification summaries, Eval
-//! items, gateway payloads, and audit detail — reads back as the producer's
+//! journey proves every built-in typed payload — verification summaries, drift
+//! features, gateway payloads, and audit detail — reads back as the producer's
 //! native JSON. A fourth journey sends raw Arrow IPC with malformed Variant
 //! columns to built-ins and proves each is refused before any ACK.
 
@@ -62,11 +62,11 @@ use wyrd_spec::vala::api::{
     AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, VARIANT_MAX_DEPTH,
     VARIANT_MAX_ENCODED_BYTES,
 };
-use wyrd_spec::verification::TaskId;
 use wyrd_spec::vala::managed_columns::{
     ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT,
 };
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
     RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
 };

@@ -88,7 +88,9 @@ impl GenAiEvaluationResult {
             && !value.is_finite()
         {
             return Err(WyrdError::Validation {
-                message: format!("gen_ai_evaluation_result.score_value must be finite, got {value}"),
+                message: format!(
+                    "gen_ai_evaluation_result.score_value must be finite, got {value}"
+                ),
                 details: serde_json::Value::Null,
             });
         }

@@ -82,7 +82,7 @@ test('Overview is the default: one assessment, separated channels, dominant tren
   // header's status chip (the label survives only in the data payload).
   expect(html).not.toContain('</span>Needs attention');
   // The range control's scope is stated, not implied.
-  expect(html).toContain('drift and eval signals keep their own windows');
+  expect(html).toContain('drift and verification signals keep their own windows');
   // Four separated state channels — never one collapsed badge.
   for (const channel of ['CARD STATE', 'DEPLOYMENT', 'OPERATIONAL', 'FRESHNESS'])
     expect(html).toContain(channel);
@@ -142,7 +142,7 @@ test('partial authorization refuses drift visibly, keeps the subject and the res
   expect(html).toContain('observe:drift');
   expect(html).toContain('subject stays visible: ranker (model_primary · Model v12)');
   expect(html).toContain('MAY BE INCOMPLETE');
-  // The eval panel stays current; the drift investigation names its scope.
+  // The verification panel stays current; the drift investigation names its scope.
   expect(html).toContain('✓ PASSING');
   expect(html).toContain('(scope required)');
 });
@@ -166,7 +166,7 @@ test('the saved custom chart and the restrained Add-chart slot render as opt-in 
   expect(html).toContain('Opt-in, never filler');
 });
 
-test('drift/eval intelligence keeps subject, version, threshold and scope-preserving Observe links', async () => {
+test('drift/verification intelligence keeps subject, version, threshold and scope-preserving Observe links', async () => {
   const html = await get(CARD);
   expect(html).toContain('MODEL-DRIFT (Verifier v3)');
   expect(html).toContain('✕ BREACHED');
@@ -175,12 +175,12 @@ test('drift/eval intelligence keeps subject, version, threshold and scope-preser
   expect(html).toContain('threshold 0.20');
   expect(html).toContain('baseline txns-2026q3 (Data v3)');
   expect(html).toContain('/t/acme/observe/drift?service=checkout-api&amp;driftCard=card_drift_01');
-  expect(html).toContain('CHECKOUT-AGENT-EVAL (Verifier v4)');
+  expect(html).toContain('CHECKOUT-AGENT-CHECK (Verifier v4)');
   expect(html).toContain('subject checkout-agent (agent_triage · Agent v6)');
   expect(html).toContain('pass ≥ 95%');
   expect(html).toContain('96.4%');
   // The breached signal precedes the passing one, and attention names it.
-  expect(html.indexOf('MODEL-DRIFT')).toBeLessThan(html.indexOf('CHECKOUT-AGENT-EVAL'));
+  expect(html.indexOf('MODEL-DRIFT')).toBeLessThan(html.indexOf('CHECKOUT-AGENT-CHECK'));
   expect(html).toContain('ATTENTION — 1 ACTIVE');
   expect(html).toContain('model-drift breach on ranker');
 });

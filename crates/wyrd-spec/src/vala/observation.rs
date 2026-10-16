@@ -1,8 +1,8 @@
 //! Observation forward contract for the Vala ingest surface.
 //!
 //! Stage-3 ships a single observation kind: `Record` — a columnar record batch
-//! routed to a named Bifrost table. Drift and Eval variants arrive in later
-//! stages via explicit versioned contract changes.
+//! routed to a named Bifrost table. Drift and verification variants arrive in
+//! later stages via explicit versioned contract changes.
 //!
 //! The envelope has **no Stage-3 wire consumer**: schemas are codegen'd for
 //! downstream tooling, but no transport path is defined here. The C1 ingest
@@ -38,7 +38,7 @@ pub struct ObservationEnvelope {
 ///
 /// Variants map one-to-one to the `BatchSink`/gRPC-service pairs that ingest
 /// them (`Record` → `BifrostIngestSink` → `wyrd.v1.BifrostIngestService`).
-/// Drift and Eval variants arrive in later stages; this enum is intentionally
+/// Drift and verification variants arrive in later stages; this enum is intentionally
 /// **not** `#[non_exhaustive]` — new variants require an explicit versioned
 /// contract change (review M-01).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

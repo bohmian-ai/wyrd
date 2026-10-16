@@ -371,7 +371,7 @@ impl HttpTransport {
     /// request id, retry, and `application/problem+json` mapping — and applies
     /// `headers` verbatim on every attempt. It exists for a route whose
     /// authorization needs a second credential beside the caller's Wyrd token,
-    /// such as the eval pull protocol's per-run lease.
+    /// such as a per-run lease.
     ///
     /// Deliberately crate-visible: header assembly is the transport's job, so a
     /// capability handle inside this crate owns the header name and value while
@@ -965,7 +965,7 @@ impl HttpTransport {
     /// and control responses always finish or fail within a finite wait.
     ///
     /// `extra_headers` are request-scoped headers applied verbatim on every
-    /// attempt, used for a secondary credential such as an eval run lease.
+    /// attempt, used for a secondary credential such as a per-run lease.
     ///
     /// Policy:
     /// - Fetches a fresh bearer before each attempt.

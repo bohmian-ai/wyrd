@@ -309,8 +309,8 @@ mod tests {
     /// Independent middle nodes share one sorted stage.
     #[test]
     fn diamond_three_stages_parallel_middle() {
-        let plan = plan(&[("a", &[]), ("b", &["a"]), ("c", &["a"]), ("d", &["b", "c"])])
-            .expect("plans");
+        let plan =
+            plan(&[("a", &[]), ("b", &["a"]), ("c", &["a"]), ("d", &["b", "c"])]).expect("plans");
         assert_eq!(plan.stages.len(), 3);
         assert_eq!(names(&plan.stages[1]), vec!["b", "c"]);
     }

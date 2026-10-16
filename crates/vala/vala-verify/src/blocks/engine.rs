@@ -32,12 +32,12 @@ use wyrd_spec::card::verifier::{
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::ContextCapture;
-use wyrd_spec::verification::{ExecutionPlan, Stage, TaskId};
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{
     CallProvenance, Citation, InputDeclaration, RequirementDetail, RequirementOutcome,
     RequirementResult, StepResult, StepStatus, VerificationOutcome,
 };
+use wyrd_spec::verification::{ExecutionPlan, Stage, TaskId};
 
 use super::drift::DriftChecks;
 use super::scope::{Cause, Done, Missing, Scope, Settled};
@@ -45,14 +45,14 @@ use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
     CheckOutput, EvidenceReader, Position,
 };
-use crate::jsonpath::extract_jsonpath_from;
-use crate::error::ExecError;
-use crate::walk::{Prepared, RunLedger, walk};
-use crate::operators;
 use crate::assertion::capture_actual;
 use crate::assertion::{Compared, evaluate_item_mode, evaluate_single};
-use crate::trace_source::project_spans;
+use crate::error::ExecError;
+use crate::jsonpath::extract_jsonpath_from;
+use crate::operators;
 use crate::trace_source::TraceSource;
+use crate::trace_source::project_spans;
+use crate::walk::{Prepared, RunLedger, walk};
 
 /// An execution-wide failure: no verdict was produced.
 #[derive(Debug, Error)]
@@ -485,7 +485,7 @@ impl VerificationEngine {
     /// Compare the selected span value of the declared trace.
     ///
     /// A trace that is not supplied or cannot be read is inconclusive; a
-    /// selector matching nothing compares `null`, as Eval trace tasks do.
+    /// selector matching nothing compares `null`.
     async fn trace(
         &self,
         id: &TaskId,

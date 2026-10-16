@@ -35,8 +35,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{
     BindingId, CardUid, ExecutionId, OperatorDispatchId, SlotName, VerificationResultId,
 };
-use wyrd_spec::verification::TaskId;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
     InputDeclaration, VerificationExecutionState, VerificationRequest,
 };

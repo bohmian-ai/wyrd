@@ -60,7 +60,7 @@ spec:
       # resolved identity at wire assembly.
       ref: agent1/agent.yaml
       verified_by:
-        - verifier: agent1/eval.yaml
+        - verifier: agent1/verifier.yaml
           on_failure:
             - ./ops/operator-slack.yaml
         - verifier: agent1/cohort-check.yaml
@@ -68,4 +68,4 @@ spec:
     - alias: agent2
       ref: agent2/agent.yaml
       verified_by:
-        - verifier: agent1/eval.yaml
+        - verifier: agent1/verifier.yaml

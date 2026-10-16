@@ -1,18 +1,18 @@
-//! Read-only trace source abstraction for trace assertion tasks.
+//! Read-only trace source abstraction for trace checks.
 //!
-//! The eval engine never reaches into a span store directly. The orchestrator
-//! injects a [`TraceSource`], and that source decides whether spans live in an
-//! in-memory capture buffer, an archive reader, or a future server-backed store.
+//! The verification engine never reaches into a span store directly. Its
+//! caller injects a [`TraceSource`], and that source decides whether spans live
+//! in an in-memory capture buffer, an archive reader, or a server-backed store.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use wyrd_spec::vala::ids::TraceId;
-use serde_json::Value;
 use wyrd_spec::vala::trace::SpanRecord;
 
 /// Failure returned by a trace source when spans cannot be supplied yet or at
@@ -47,7 +47,7 @@ pub enum TraceUnavailable {
     },
 }
 
-/// Read-only handle from the eval engine into a trace store.
+/// Read-only handle from the verification engine into a trace store.
 #[async_trait]
 pub trait TraceSource: Send + Sync {
     /// Fetch all spans visible for `trace_id`.

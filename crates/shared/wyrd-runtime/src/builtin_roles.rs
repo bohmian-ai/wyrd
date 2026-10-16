@@ -232,7 +232,7 @@ mod tests {
         workload.extend([
             Permission::bifrost_table_write(),
             Permission::bifrost_record_write(),
-                    Permission::verifier_run_any(),
+            Permission::verifier_run_any(),
             Permission::trigger_write(),
             Permission::operator_invoke(),
             Permission::gateway_invoke_any(),

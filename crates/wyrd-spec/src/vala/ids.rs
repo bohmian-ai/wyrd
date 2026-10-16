@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::WyrdError;
 
-/// Session-scoped identifier grouping related eval, record, and observation records.
+/// Session-scoped identifier grouping related verification, record, and observation records.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(transparent)]
@@ -92,7 +92,7 @@ pub struct RecordId(pub uuid::Uuid);
 #[serde(transparent)]
 pub struct WorkflowUid(pub uuid::Uuid);
 
-/// Stable user-facing entity identifier for the eval subject or observation subject.
+/// Stable user-facing entity identifier for the verification subject or observation subject.
 ///
 /// Entity UIDs must be non-empty and no longer than 512 characters.
 /// Deserialization goes through [`EntityUid::new`] so wire payloads cannot bypass
@@ -166,7 +166,7 @@ impl schemars::JsonSchema for EntityUid {
 /// Sixteen-byte OpenTelemetry trace identifier.
 ///
 /// Wire format is a 32-character lower-case hex string. Deserialization also
-/// accepts the legacy byte-array shape so existing eval callers can continue
+/// accepts the legacy byte-array shape so existing callers can continue
 /// to read older payloads. The all-zero id is the OTel invalid sentinel and is
 /// rejected by public constructors and deserialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -297,7 +297,7 @@ impl FromStr for TraceId {
 /// Eight-byte OpenTelemetry span identifier.
 ///
 /// Wire format is a 16-character lower-case hex string. Deserialization also
-/// accepts the legacy byte-array shape so existing eval callers can continue
+/// accepts the legacy byte-array shape so existing callers can continue
 /// to read older payloads. The all-zero id is the OTel invalid sentinel and is
 /// rejected by public constructors and deserialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

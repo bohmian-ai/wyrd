@@ -824,7 +824,7 @@ mod completeness_tests {
         };
         let mut operator = notify_operator();
         let mut drift = drift_verifier();
-        let mut eval = agent_verifier();
+        let mut check = agent_verifier();
         let mut image = image;
         let mut text = text;
         let mut model = model();
@@ -837,7 +837,7 @@ mod completeness_tests {
             Spec::Model(model.clone()),
             Spec::Experiment(experiment.clone()),
             Spec::Agent(agent.clone()),
-            Spec::Verifier(eval.clone()),
+            Spec::Verifier(check.clone()),
             Spec::Verifier(drift.clone()),
             Spec::Service(service.clone()),
             Spec::Mcp(mcp.clone()),
@@ -865,7 +865,7 @@ mod completeness_tests {
             &mut experiment,
             &mut agent,
         );
-        let _ = (&mut eval, &mut drift, &mut service, &mut mcp);
+        let _ = (&mut check, &mut drift, &mut service, &mut mcp);
         let _ = (&mut audit, &mut artifact, &mut trigger, &mut operator);
     }
 

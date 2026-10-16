@@ -2328,6 +2328,7 @@ mod tests {
             permission: wyrd_runtime::Permission::bifrost_query_read(),
             delegation_chain: auth.delegation_chain,
             served_subject: None,
+            executed_by: None,
         }
     }
 

@@ -354,3 +354,67 @@ implementation-owned. No renewed naming or compatibility approval is needed.
 - [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md),
   [implementation execution](../../../../architecture/references/languages/implementation-execution.md),
   [testing workflows](../../../../architecture/references/languages/testing-workflows.md).
+
+## Implementation Evidence
+
+Status: `IMPLEMENTED`. Candidate: commits `f711c6834`..`72d0fe4e0` on
+`change/verifier-building-blocks-task-005` (the evidence commit follows).
+
+### Acceptance matrix
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-009 consumers and docs | Live contracts in `wyrd_spec::verification` (`ContextCapture`); unused Eval specs, errors, OpenAPI `Eval` tag, UI Evaluations routes/mocks, Python CLI eval tests and their fixtures removed; design, doctrine, references, docsite, skills, brand renders reworded; TS card/error types regenerated | `codegen:check`, `docs:check`, `check:examples`, `py:typecheck`, `ts:typecheck`, `ts:napi:check`, UI `pnpm run check` (0 errors / 724 files), served OpenAPI test | PASS |
+| AC-010 gates | — | `fmt`, `lints`, `py:format`, `py:lints`, `ts:format`, `ts:lints`, `check:deps`, `check:tenant-isolation`, `codegen:check`, suites below | PASS |
+| AC-011 vocabulary rule | `scripts/checks/deps.sh` vocabulary block: one regex over current surfaces; exempts `changes/`, applied migrations, refusal-test files, line-scoped refusal literals in production files with inline tests, and shell `eval`/`literal_eval`/`eval_metric`; authorities record the owner exception (AGENTS.md §12, architecture-constraints, testing-workflows) | RED probes each failed: `EvalScore` (Rust), `"evals:run"` (TS), `"vala.eval.runs"` (Python), `wyrd eval` (docs), `WYRD_EVAL_404_TASK_NOT_FOUND` (Rust), `// Resource::Evals` appended to the line-exempt `permission.rs`; legitimate-word probe (`evaluate_operator`, `retrieval`, `revalidate`, `WireValue`, `RETRIEVAL`, `gen_ai.evaluation.result`, `GenAiEvaluationResult`, `evaluation_results`) passed; `mise run check:deps` PASS | PASS |
+| AC-012 refusals | CLI command deleted; `Resource::Evals` deleted; `vala.eval` tables/namespace removed; `list_tables` hides stale catalog rows | P1a, P1b, P2, P4, P5, P6, P7 | PASS |
+| AC-013 retained behavior | `vala-eval` renamed `vala-verify`, live engine closure kept | P9, P10, `vala-verify --lib` 49/49 | PASS |
+| AC-014 generated/served | `GenAiEvaluationResult` / `evaluation_results`; served OpenAPI rejects retired identifiers (RED: restoring the removed `Eval` tag failed the test; "Evaluation" passed) | P8a–c, `wyrd-spec --lib` 758/758, `test:principals:integration` PASS, P7 catalog assertion | PASS |
+| AC-015 migration | `20261016000000_retire_eval_namespace.sql` deletes eval Forge claims/tasks, then re-adds the namespace constraint without `vala.eval` | P3, migration module 3/3 | PASS |
+| AC-016 prose | Docs/architecture/UI mocks/SDK prose swept; vocabulary rule passes repository-wide | `docs:check`, `check:deps` | PASS |
+
+### Commands run (all exit 0)
+
+| Proof | Result |
+|---|---|
+| `cargo build -p wyrd-monty-worker`, `py:setup`, `ts:build`, `ts:build:testing` | built |
+| P1a `retired_command_is_unknown` | 1 passed |
+| P1b `retired_tables_are_unknown` | 1 passed |
+| P2 `permission::tests::retired_permission_is_unknown` | 1 passed |
+| P3 `pg_migration::pg_tests::retired_verification_namespace_upgrades` | 1 passed |
+| P4 Rust `verify_in_real_time::retired_verification_contracts_are_refused` | 1 passed |
+| P5 Python `test_retired_verification_contracts_are_refused` | 1 passed |
+| P6 TS `retired verification contracts are refused` | 1 passed |
+| P7 MCP `query::pg_tests::retired_verification_contracts_are_refused` | 1 passed |
+| P8a / P8b / P8c GenAI projection and canonical event | 1 passed each |
+| P9 `blocks::engine::tests::no_step_verifier_judges_inputs_and_traces` | 1 passed |
+| P10 `submitted_answer_is_judged_in_the_background_and_resumes_by_id` | 1 passed |
+| `vala-verify --lib` / `wyrd-spec --lib` / `wyrd-runtime` `permission::tests::` | 49 / 758 / 27 passed |
+| `pg_migration::pg_tests::` module | 3 passed |
+| `pg_openapi_contract::verification_contract_publishes_five_typed_operations_and_the_local_upload`; `test:principals:integration` | passed |
+| `wyrd-cli --test cli` `loader::` / `card_lifecycle::` (renamed fixtures); `wyrd-config --lib` | 2 / 19 / 47 passed |
+| `py:test:unit` | 633 passed |
+| `fmt`, `lints`, `py:format`, `py:lints`, `py:typecheck`, `ts:format`, `ts:lints`, `ts:typecheck`, `ts:napi:check` | pass |
+| `codegen:regen`, `codegen:check`, `check:deps`, `check:tenant-isolation`, `docs:check`, `check:examples` | pass |
+| UI `pnpm --dir crates/wyrd/wyrd-server/wyrd-ui run check`, UI `pnpm test` (178 tests) | pass |
+
+### Non-goals and limits
+
+- Non-goals held: no engine rewrite, algorithm change, compatibility alias,
+  permission alias, table view, historical reader, or checker framework.
+- P2's RED was not captured before the resource was deleted; the test proves
+  the refusal on the final tree.
+- The migration's Forge-claim delete path has no seeded claim in P3; the task
+  and constraint paths are covered.
+- A stale role holding `evals:*` fails token issuance as
+  `WYRD_PERMISSION_500_ROLE_CORRUPT`, which the OAuth `/auth/token` mapping
+  renders publicly as `WYRD_SPEC_500_INTERNAL`; the journeys assert that
+  public code.
+- Retired-table SQL reports the same refusal as a never-existing namespace
+  (`vala.absent`), which is `WYRD_VALA_400_QUERY_INVALID_SQL`, not a 404; the
+  journeys assert equality with that baseline.
+- `ts:format` (the repository's TS format task) was run in place of the
+  task's `ts:format:check`, which does not exist; its only change was
+  committed. Full `test:sql` and full journey suites were not run; they belong
+  to change review.
+- Brand SVG text renames were not visually inspected for overflow.

@@ -42,11 +42,11 @@ pub(super) struct EvidenceInvestigation {
     /// Drift result published for the subject, used as a detail pivot.
     drift_result: VerificationResultId,
     /// Assertion result published for the subject, used as a pivot.
-    eval_result: VerificationResultId,
+    assertion_result: VerificationResultId,
     /// Exact Drift Verifier matching the retained feature report.
     drift_verifier: CardRef,
-    /// Exact Eval Verifier from the shared assertion fixture.
-    eval_verifier: CardRef,
+    /// Exact assertion Verifier from the shared `no-refund-promise` fixture.
+    assertion_verifier: CardRef,
     /// Instrumentation scope isolating the canonical signals.
     scope: String,
 }
@@ -85,7 +85,7 @@ impl EvidenceInvestigation {
             cards.register_from_path(&fixtures.join("mcp_investigation/drift-verifier.yaml")),
         )
         .await?;
-        let eval = Box::pin(
+        let assertion = Box::pin(
             cards.register_from_path(&fixtures.join("register_and_hydrate/no-refund-promise.yaml")),
         )
         .await?;
@@ -112,24 +112,24 @@ impl EvidenceInvestigation {
                 discover(),
             )
             .await?;
-        let [drift_result, eval_result] =
-            Self::publish_results(&server, &receipt.root, &drift.root, &eval.root).await?;
+        let [drift_result, assertion_result] =
+            Self::publish_results(&server, &receipt.root, &drift.root, &assertion.root).await?;
         Ok(Self {
             server,
             agent,
             subject: receipt.root,
             drift_verifier: drift.root,
-            eval_verifier: eval.root,
+            assertion_verifier: assertion.root,
             scope: signals.scope,
             drift_result,
-            eval_result,
+            assertion_result,
         })
     }
 
     /// Reuse the native result mapper and shared Scribe outbox; no parallel row schema.
     ///
     /// Publishes one failed drift result from `drift_verifier` and one failed
-    /// assertion result from `eval_verifier` for `subject`, each under its own
+    /// assertion result from `assertion_verifier` for `subject`, each under its own
     /// execution, and flushes them to Bifrost.
     ///
     /// Returns the drift and assertion result IDs the payloads minted, in
@@ -141,7 +141,7 @@ impl EvidenceInvestigation {
         server: &WyrdTestServer,
         subject: &CardRef,
         drift_verifier: &CardRef,
-        eval_verifier: &CardRef,
+        assertion_verifier: &CardRef,
     ) -> Result<[VerificationResultId; 2], McpJourneyError> {
         let seed = server.verification_fixture().await?;
         let now = chrono::Utc::now();
@@ -196,7 +196,7 @@ impl EvidenceInvestigation {
         let mut result_ids = Vec::with_capacity(2);
         for (execution_id, outcome, window, reference) in [
             (ExecutionId::new_v7(), drift, Some(&window), drift_verifier),
-            (ExecutionId::new_v7(), assertion, None, eval_verifier),
+            (ExecutionId::new_v7(), assertion, None, assertion_verifier),
         ] {
             let version = reference.version.to_string();
             let uid = reference.uid.as_ref().ok_or("Verifier has a UID")?;
@@ -319,7 +319,7 @@ impl EvidenceInvestigation {
     /// # Errors
     /// Returns MCP, SQL, or missing-identity failures.
     pub(super) async fn follow_subject_and_results(&self) -> Result<(), McpJourneyError> {
-        for reference in [&self.drift_verifier, &self.eval_verifier] {
+        for reference in [&self.drift_verifier, &self.assertion_verifier] {
             let response: GetCardResponse = serde_json::from_value(structured(
                 self.agent
                     .call_tool(Self::request(
@@ -333,7 +333,10 @@ impl EvidenceInvestigation {
         }
         let uid = self.subject.uid.as_ref().ok_or("subject UID")?;
         let rows = self.query(&format!("SELECT result_id, verdict FROM vala.verification.results WHERE card_uid = '{uid}' ORDER BY result_id LIMIT 20")).await?;
-        let mut expected = [self.drift_result.to_string(), self.eval_result.to_string()];
+        let mut expected = [
+            self.drift_result.to_string(),
+            self.assertion_result.to_string(),
+        ];
         expected.sort();
         assert_eq!(
             rows,

@@ -22,8 +22,8 @@ use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
 use wyrd_spec::vala::eval::{
-    AssertionTask, ComparisonOperator, EvalScenario, EvalSpec, EvalTask, JsonPath, LlmJudgeTask,
-    RecordId, ScenarioId, ScenarioTask, TaskId,
+    AssertionTask, ComparisonOperator, EvalScenario, EvalSpec, EvalTask, JsonPath, RecordId,
+    ScenarioId, ScenarioTask, TaskId,
 };
 
 pub fn tid(value: &str) -> TaskId {
@@ -50,10 +50,6 @@ pub fn eval_ref() -> CardRef {
 
 pub fn subject_ref() -> CardRef {
     card_ref(CardKind::Agent, "agent-under-test")
-}
-
-pub fn judge_ref() -> CardRef {
-    card_ref(CardKind::Agent, "judge")
 }
 
 pub fn scenario(
@@ -87,19 +83,6 @@ pub fn assertion_task(id: &str) -> EvalTask {
         operator: ComparisonOperator::Equals,
         expected: json!(true),
         depends_on: Vec::new(),
-        condition: None,
-    })
-}
-
-pub fn judge_task(id: &str) -> EvalTask {
-    EvalTask::LlmJudge(LlmJudgeTask {
-        id: tid(id),
-        judge_ref: judge_ref().into(),
-        context_path: None,
-        expected: json!({"passed": true}),
-        operator: ComparisonOperator::Equals,
-        depends_on: Vec::new(),
-        max_retries: 0,
         condition: None,
     })
 }

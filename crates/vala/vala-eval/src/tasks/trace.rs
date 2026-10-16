@@ -168,10 +168,8 @@ pub(crate) mod trace_executor {
     use crate::context::ExecutionContext;
     use crate::executor::{EvalReport, Executors, TaskRunOutcome, execute_plan};
     use crate::store::TaskRegistry;
-    use crate::tasks::{
-        AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, TraceTaskExecutor,
-    };
-    use crate::{InMemoryTraceSource, MockJudgeInvoker, MockTraceSource, TraceUnavailable};
+    use crate::tasks::{AgentTaskExecutor, AssertionTaskExecutor, TraceTaskExecutor};
+    use crate::{InMemoryTraceSource, MockTraceSource, TraceUnavailable};
     use chrono::{TimeZone, Utc};
     use serde_json::{Value, json};
     use uuid::Uuid;
@@ -279,10 +277,8 @@ pub(crate) mod trace_executor {
     }
 
     fn executors(source: Arc<dyn crate::TraceSource>) -> Executors {
-        let mock = MockJudgeInvoker::new(std::iter::empty());
         Executors {
             assertion: Arc::new(AssertionTaskExecutor::new()),
-            judge: Arc::new(JudgeTaskExecutor::new(mock)),
             trace: Arc::new(TraceTaskExecutor::new(source, Duration::from_millis(250))),
             agent: Arc::new(AgentTaskExecutor::new()),
         }

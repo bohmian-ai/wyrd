@@ -296,8 +296,6 @@ pub trait TaskExecutor: Send + Sync {
 pub struct Executors {
     /// Assertion executor.
     pub assertion: Arc<dyn TaskExecutor>,
-    /// LLM judge executor.
-    pub judge: Arc<dyn TaskExecutor>,
     /// Trace assertion executor.
     pub trace: Arc<dyn TaskExecutor>,
     /// Agent assertion executor.
@@ -309,7 +307,6 @@ impl Executors {
     fn of(&self, kind: EvalTaskKind) -> &Arc<dyn TaskExecutor> {
         match kind {
             EvalTaskKind::Assertion => &self.assertion,
-            EvalTaskKind::LlmJudge => &self.judge,
             EvalTaskKind::TraceAssertion => &self.trace,
             EvalTaskKind::AgentAssertion => &self.agent,
         }
@@ -620,7 +617,6 @@ mod tests {
         let unused: Arc<dyn TaskExecutor> = Arc::new(UnavailableExecutor);
         let executors = Executors {
             assertion: assertion_executor,
-            judge: Arc::clone(&unused),
             trace: Arc::clone(&unused),
             agent: unused,
         };
@@ -668,17 +664,17 @@ mod end_to_end {
     //!                    │
     //!     Stage 1 (depend on stage 0)
     //!       ┌────────────▼───────────────┐    ┌────────────▼───────────────┐
-    //!       │ score_clears_threshold     │    │ judge_response             │
-    //!       │   (Assertion)              │    │   (LlmJudge)               │
-    //!       │   $.score >= 0.5           │    │   judge → {"passed": true} │
+    //!       │ score_clears_threshold     │    │ response_is_string         │
+    //!       │   (Assertion)              │    │   (Assertion)              │
+    //!       │   $.score >= 0.5           │    │   $.response is a string   │
     //!       └────────────┬───────────────┘    └────────────┬───────────────┘
     //!                    │                                 │
     //!     Stage 2 (depend on stage 1; read prior outputs)
     //!       ┌────────────▼───────────────┐    ┌────────────▼───────────────┐
-    //!       │ regression_branch_skipped  │    │ propagate_judge_verdict    │
+    //!       │ regression_branch_skipped  │    │ propagate_response_verdict │
     //!       │   (Assertion, condition:   │    │   (Assertion)              │
-    //!       │     score_clears_threshold │    │   $.task.judge_response    │
-    //!       │     .passed == false)      │    │     .parsed.passed == true │
+    //!       │     score_clears_threshold │    │   $.task.response_is_string│
+    //!       │     .passed == false)      │    │     .passed == true        │
     //!       │   → ConditionFalse skip    │    │   reads upstream output    │
     //!       └────────────────────────────┘    └────────────────────────────┘
     //! ```
@@ -688,11 +684,11 @@ mod end_to_end {
     //! 5-of-5 run-level pass that clears the configured `OverallPassRate` gate.
     //!
     //! What this test pins:
-    //! - All four `EvalTask` variants run inside one plan (Assertion,
-    //!   LlmJudge, TraceAssertion, AgentAssertion).
+    //! - All three `EvalTask` variants run inside one plan (Assertion,
+    //!   TraceAssertion, AgentAssertion).
     //! - The DAG has multiple stages, and stage-2 tasks read outputs of stage-1
-    //!   tasks via the `$.task.<id>.*` scoped view (`propagate_judge_verdict`
-    //!   reads the judge's `parsed.passed`).
+    //!   tasks via the `$.task.<id>.*` scoped view
+    //!   (`propagate_response_verdict` reads `response_is_string`'s `passed`).
     //! - Conditional skip propagates correctly: a task whose condition resolves
     //!   to `false` is recorded as `SkipReason::ConditionFalse` and does NOT
     //!   inflate the denominator of the run-level metrics.
@@ -709,13 +705,10 @@ mod end_to_end {
     use crate::context::ExecutionContext;
     use crate::executor::{Executors, TaskRunOutcome, execute_plan};
     use crate::store::TaskRegistry;
-    use crate::tasks::{
-        AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, TraceTaskExecutor,
-    };
+    use crate::tasks::{AgentTaskExecutor, AssertionTaskExecutor, TraceTaskExecutor};
     use crate::{
-        AggregationInput, EvalResults, InMemoryTraceSource, MechanicSubjectInput, MockJudgeInvoker,
-        ResultsConfig, RunIdentity, ScenarioAggregationInput, SkipReason, SubjectKey,
-        aggregate_run,
+        AggregationInput, EvalResults, InMemoryTraceSource, MechanicSubjectInput, ResultsConfig,
+        RunIdentity, ScenarioAggregationInput, SkipReason, SubjectKey, aggregate_run,
     };
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
@@ -723,8 +716,8 @@ mod end_to_end {
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::vala::eval::{
         AgentAssertionTask, AssertionResult, AssertionTask, ComparisonOperator, EvalCondition,
-        EvalPassGate, EvalSpec, EvalTask, JsonPath, LlmJudgeTask, RecordId, RunId, ScenarioId,
-        TaskId, TraceAssertionTask,
+        EvalPassGate, EvalSpec, EvalTask, JsonPath, RecordId, RunId, ScenarioId, TaskId,
+        TraceAssertionTask,
     };
     use wyrd_spec::vala::ids::{SpanId, TraceId};
     use wyrd_spec::vala::trace::{
@@ -751,16 +744,8 @@ mod end_to_end {
         }
     }
 
-    fn eval_ref() -> CardRef {
-        card_ref(CardKind::Verifier, "end-to-end-rubric")
-    }
-
     fn subject_ref() -> CardRef {
         card_ref(CardKind::Agent, "agent-under-test")
-    }
-
-    fn judge_ref() -> CardRef {
-        card_ref(CardKind::Agent, "judge")
     }
 
     fn trace_id() -> TraceId {
@@ -845,27 +830,26 @@ mod end_to_end {
             depends_on: vec![tid("agent_response_nonempty")],
             condition: None,
         });
-        let judge_response = EvalTask::LlmJudge(LlmJudgeTask {
-            id: tid("judge_response"),
-            judge_ref: judge_ref().into(),
-            context_path: None,
-            operator: ComparisonOperator::Equals,
-            expected: json!({"passed": true}),
+        let response_is_string = EvalTask::Assertion(AssertionTask {
+            id: tid("response_is_string"),
+            context_path: Some(jp("$.response")),
+            item_context_path: None,
+            operator: ComparisonOperator::IsString,
+            expected: json!(null),
             depends_on: vec![tid("agent_response_nonempty")],
-            max_retries: 0,
             condition: None,
         });
 
-        // Stage 2 (a): consume the prior judge's parsed verdict through the
-        // `$.task.<id>.parsed.*` scoped view. This is the real cross-task
-        // dataflow the engine guarantees.
-        let propagate_judge_verdict = EvalTask::Assertion(AssertionTask {
-            id: tid("propagate_judge_verdict"),
-            context_path: Some(jp("$.task.judge_response.parsed.passed")),
+        // Stage 2 (a): consume the prior assertion's verdict through the
+        // `$.task.<id>.*` scoped view. This is the real cross-task dataflow
+        // the engine guarantees.
+        let propagate_response_verdict = EvalTask::Assertion(AssertionTask {
+            id: tid("propagate_response_verdict"),
+            context_path: Some(jp("$.task.response_is_string.passed")),
             item_context_path: None,
             operator: ComparisonOperator::Equals,
             expected: json!(true),
-            depends_on: vec![tid("judge_response")],
+            depends_on: vec![tid("response_is_string")],
             condition: None,
         });
 
@@ -893,8 +877,8 @@ mod end_to_end {
             agent_response_nonempty,
             trace_call_recorded,
             score_clears_threshold,
-            judge_response,
-            propagate_judge_verdict,
+            response_is_string,
+            propagate_response_verdict,
             regression_branch_skipped,
         ] {
             tasks.insert(task.id().clone(), task);
@@ -909,12 +893,10 @@ mod end_to_end {
         }
     }
 
+    /// Build the executor bundle with trace assertions served from `source`.
     fn executors_with_trace_source(source: Arc<dyn crate::TraceSource>) -> Executors {
-        // One scripted judge response: deterministic verdict for this fixture.
-        let judge = MockJudgeInvoker::new([Ok(json!({"passed": true}))]);
         Executors {
             assertion: Arc::new(AssertionTaskExecutor::new()),
-            judge: Arc::new(JudgeTaskExecutor::new(judge)),
             trace: Arc::new(TraceTaskExecutor::new(source, Duration::from_millis(250))),
             agent: Arc::new(AgentTaskExecutor::new()),
         }
@@ -955,8 +937,7 @@ mod end_to_end {
 
     #[tokio::test]
     async fn full_spec_against_in_memory_record_and_spans_aggregates_correctly() {
-        // Arrange: in-memory record JSON + one span on the trace + one scripted
-        // judge response. The fixture is deliberately a happy path so the
+        // Arrange: in-memory record JSON + one span on the trace. The fixture is deliberately a happy path so the
         // engine's structural guarantees (skips, scoped view, aggregation) are
         // the only thing this assertion is measuring.
         let spec = full_spec();
@@ -984,8 +965,8 @@ mod end_to_end {
             "agent_response_nonempty",
             "trace_call_recorded",
             "score_clears_threshold",
-            "judge_response",
-            "propagate_judge_verdict",
+            "response_is_string",
+            "propagate_response_verdict",
         ] {
             let result = ran
                 .get(&tid(id))
@@ -1005,11 +986,11 @@ mod end_to_end {
 
         // The stage-2 → stage-1 cross-task read is the engine guarantee
         // that's easiest to silently lose; pin it explicitly.
-        let propagate = &ran[&tid("propagate_judge_verdict")];
+        let propagate = &ran[&tid("propagate_response_verdict")];
         assert_eq!(
             propagate.actual.as_ref(),
             Some(&json!(true)),
-            "stage-2 assertion must have read true out of the judge's parsed verdict",
+            "stage-2 assertion must have read true out of the upstream verdict",
         );
 
         // Fold the engine outcomes into the per-scenario aggregation input.
@@ -1045,7 +1026,7 @@ mod end_to_end {
         let aggregated = aggregate_run(AggregationInput {
             identity: RunIdentity {
                 run_id: RunId::from_string("run-end-to-end".to_owned()),
-                eval_ref: eval_ref(),
+                eval_ref: None,
                 started_at: Utc::now(),
                 ended_at: Utc::now(),
             },

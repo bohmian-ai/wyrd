@@ -20,7 +20,6 @@ use crate::error::{EvalExecError, EvalPlanError};
 use crate::executor::{Executors, TaskRunOutcome, execute_plan};
 use crate::operators;
 use crate::store::TaskRegistry;
-use crate::tasks::MediaBindings;
 
 /// Engine-local thin wrapper around scenario rows.
 #[derive(Debug, Clone, PartialEq)]
@@ -134,19 +133,16 @@ fn validate_collection(
     Ok(EvalScenarioCollection { scenarios })
 }
 
-/// One eval record plus media and trace bindings supplied by the orchestrator.
+/// One completed scenario record plus its trace binding, supplied by the
+/// orchestrator; each record runs the mechanic task DAG once.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RecordWithMedia {
+pub struct ScenarioRecord {
     /// Record identity.
     pub record_id: RecordId,
     /// Optional trace id for trace assertion tasks.
     pub trace_id: Option<TraceId>,
     /// Per-record JSON context.
     pub context: Value,
-    /// Media bindings visible to judge tasks.
-    pub media: MediaBindings,
-    /// Media ids that must be bound before judge tasks invoke.
-    pub required_media: Vec<String>,
 }
 
 /// One mechanic task result associated with its record.
@@ -169,7 +165,7 @@ pub struct ScenarioExecutionInputs<'a> {
     /// Injected executor bundle.
     pub executors: &'a Executors,
     /// Completed records for the scenario.
-    pub records: &'a [RecordWithMedia],
+    pub records: &'a [ScenarioRecord],
     /// Final response produced by the orchestrator.
     pub final_response: &'a Value,
     /// Run id shared by all records in this scenario execution.
@@ -205,8 +201,6 @@ pub async fn execute_scenario(
         };
         let mut snapshot = ContextSnapshot::new(Arc::new(record.context.clone()), identity);
         snapshot.trace_id = record.trace_id;
-        snapshot.media = Arc::new(record.media.clone());
-        snapshot.required_media = Arc::new(record.required_media.clone());
 
         let cx = ExecutionContext::from_snapshot(Arc::new(snapshot));
         let report = execute_plan(inputs.plan, &cx, inputs.registry, inputs.executors).await?;
@@ -349,22 +343,15 @@ mod scenario_execution {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::scenario::{RecordWithMedia, ScenarioExecutionInputs, execute_scenario};
+    use crate::scenario::{ScenarioExecutionInputs, ScenarioRecord, execute_scenario};
     use crate::store::TaskRegistry;
-    use crate::tasks::{
-        AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, MediaBindings,
-        TraceTaskExecutor,
-    };
-    use crate::{Executors, InMemoryTraceSource, MockJudgeInvoker};
+    use crate::tasks::{AgentTaskExecutor, AssertionTaskExecutor, TraceTaskExecutor};
+    use crate::{Executors, InMemoryTraceSource};
     use serde_json::{Value, json};
     use uuid::Uuid;
-    use wyrd_semver::VersionBlock;
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::CardRef;
     use wyrd_spec::vala::eval::{
-        AssertionTask, ComparisonOperator, EvalScenario, EvalSpec, EvalTask, LlmJudgeTask,
-        RecordId, RunId, ScenarioId, ScenarioTask, TaskId,
+        AssertionTask, ComparisonOperator, EvalScenario, EvalSpec, EvalTask, RecordId, RunId,
+        ScenarioId, ScenarioTask, TaskId,
     };
     use wyrd_spec::vala::ids::TraceId;
 
@@ -374,16 +361,6 @@ mod scenario_execution {
 
     fn sid(value: &str) -> ScenarioId {
         ScenarioId::new(value).expect("static scenario id is valid")
-    }
-
-    fn judge_card_ref() -> CardRef {
-        CardRef {
-            kind: CardKind::Agent,
-            name: CardName::new("scenario-judge").expect("static card name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("default").expect("valid space")),
-            uid: None,
-        }
     }
 
     fn assertion_task() -> EvalTask {
@@ -400,15 +377,19 @@ mod scenario_execution {
         })
     }
 
-    fn judge_task() -> EvalTask {
-        EvalTask::LlmJudge(LlmJudgeTask {
-            id: tid("judge_response"),
-            judge_ref: judge_card_ref().into(),
-            context_path: None,
-            expected: json!({"passed": true}),
-            operator: ComparisonOperator::Equals,
+    /// Build a second record-level assertion that checks `$.response` is a
+    /// string, so each record runs two mechanic tasks.
+    fn response_task() -> EvalTask {
+        EvalTask::Assertion(AssertionTask {
+            id: tid("assert_response"),
+            context_path: Some(
+                wyrd_spec::vala::eval::JsonPath::new("$.response")
+                    .expect("static JSONPath is valid"),
+            ),
+            item_context_path: None,
+            operator: ComparisonOperator::IsString,
+            expected: json!(true),
             depends_on: Vec::new(),
-            max_retries: 0,
             condition: None,
         })
     }
@@ -446,10 +427,10 @@ mod scenario_execution {
         }
     }
 
-    fn executors(mock: Arc<MockJudgeInvoker>) -> Executors {
+    /// Build the executor bundle the scenario tests run with.
+    fn executors() -> Executors {
         Executors {
             assertion: Arc::new(AssertionTaskExecutor::new()),
-            judge: Arc::new(JudgeTaskExecutor::new(mock)),
             trace: Arc::new(TraceTaskExecutor::new(
                 Arc::new(InMemoryTraceSource::new()),
                 Duration::from_millis(250),
@@ -458,34 +439,21 @@ mod scenario_execution {
         }
     }
 
-    fn media() -> MediaBindings {
-        MediaBindings::from_refs([wyrd_spec::vala::eval::media::MediaRef {
-            id: wyrd_spec::ids::MediaBindingId::new("screenshot")
-                .expect("static binding id is valid"),
-            kind: wyrd_spec::vala::eval::media::MediaKind::Image,
-            uri: "file:///tmp/screenshot.png".to_owned(),
-            media_type: Some("image/png".to_owned()),
-        }])
-    }
-
-    fn record(id: u128, trace_hex: &str, context: Value) -> RecordWithMedia {
-        RecordWithMedia {
+    /// Build one completed scenario record with a trace binding.
+    fn record(id: u128, trace_hex: &str, context: Value) -> ScenarioRecord {
+        ScenarioRecord {
             record_id: RecordId(Uuid::from_u128(id)),
             trace_id: Some(TraceId::from_hex(trace_hex).expect("static trace id is valid")),
             context,
-            media: media(),
-            required_media: vec!["screenshot".to_owned()],
         }
     }
 
     #[tokio::test]
     async fn one_pass_emits_mechanic_and_passenger_results() {
-        let spec = spec_of(vec![assertion_task(), judge_task()]);
+        let spec = spec_of(vec![assertion_task(), response_task()]);
         let plan = spec.execution_plan().expect("test spec has valid DAG");
         let registry = TaskRegistry::from_plan(&plan, spec.tasks.clone()).expect("registry builds");
-        let mock =
-            MockJudgeInvoker::new([Ok(json!({"passed": true})), Ok(json!({"passed": true}))]);
-        let executors = executors(Arc::clone(&mock));
+        let executors = executors();
         let scenario = scenario();
         let records = vec![
             record(
@@ -519,19 +487,14 @@ mod scenario_execution {
         assert_eq!(results.passenger.len(), 1);
         assert!(results.passenger[0].passed);
         assert_eq!(results.passenger[0].actual, Some(final_response.clone()));
-
-        let media_calls = mock.media_calls().await;
-        assert_eq!(media_calls.len(), 2);
-        assert!(media_calls.iter().all(|seen| seen == &media()));
     }
 
     #[tokio::test]
     async fn passenger_pass_runs_even_when_no_records() {
-        let spec = spec_of(vec![assertion_task(), judge_task()]);
+        let spec = spec_of(vec![assertion_task(), response_task()]);
         let plan = spec.execution_plan().expect("test spec has valid DAG");
         let registry = TaskRegistry::from_plan(&plan, spec.tasks.clone()).expect("registry builds");
-        let mock = MockJudgeInvoker::new([]);
-        let executors = executors(Arc::clone(&mock));
+        let executors = executors();
         let scenario = scenario();
         let final_response = json!("hello after a crash");
 
@@ -551,7 +514,6 @@ mod scenario_execution {
         assert_eq!(results.passenger.len(), 1);
         assert!(results.passenger[0].passed);
         assert_eq!(results.passenger[0].actual, Some(final_response));
-        assert_eq!(mock.calls().await.len(), 0);
     }
 }
 

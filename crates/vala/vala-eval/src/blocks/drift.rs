@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 
 use arrow::record_batch::RecordBatch;
 use vala_drift::{DriftReport, DriftVerdict, FittedBaseline, score_drift};
-use wyrd_spec::card::verifier::DriftCheck;
 use wyrd_spec::card::drift::{DriftMethod, DriftProfile};
+use wyrd_spec::card::verifier::DriftCheck;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::verification::execution::{CallProvenance, RequirementDetail, Verdict};

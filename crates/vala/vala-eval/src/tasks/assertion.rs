@@ -235,27 +235,21 @@ mod assertion_stage {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::InMemoryTraceSource;
     use crate::context::{ContextSnapshot, ExecutionContext, TaskOutput};
     use crate::error::EvalExecError;
     use crate::executor::{
         EvalReport, Executors, SkipReason, TaskExecutor, TaskRunOutcome, execute_plan,
     };
-    use crate::store::{JudgeOutcome, TaskRegistry};
-    use crate::tasks::{
-        AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, TraceTaskExecutor,
-    };
-    use crate::{InMemoryTraceSource, JudgeError, MockJudgeInvoker};
+    use crate::store::TaskRegistry;
+    use crate::tasks::{AgentTaskExecutor, AssertionTaskExecutor, TraceTaskExecutor};
     use async_trait::async_trait;
     use serde_json::{Value, json};
     use tokio::time::Instant;
     use uuid::Uuid;
-    use wyrd_semver::VersionBlock;
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::CardRef;
     use wyrd_spec::vala::eval::{
-        AssertionResult, AssertionTask, ComparisonOperator, EvalCondition, EvalSpec, EvalTask,
-        ExecutionPlan, JsonPath, LlmJudgeTask, RecordId, RunId, Stage, TaskId,
+        AssertionTask, ComparisonOperator, EvalCondition, EvalSpec, EvalTask, ExecutionPlan,
+        JsonPath, RecordId, RunId, Stage, TaskId,
     };
 
     fn tid(value: &str) -> TaskId {
@@ -285,29 +279,6 @@ mod assertion_stage {
         })
     }
 
-    fn judge_card_ref() -> CardRef {
-        CardRef {
-            kind: CardKind::Agent,
-            name: CardName::new("test-judge").expect("static name valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version valid"),
-            space: Some(SpaceName::new("default").expect("valid space")),
-            uid: None,
-        }
-    }
-
-    fn llm_judge(id: &str, expected: Value, op: ComparisonOperator, deps: &[&str]) -> EvalTask {
-        EvalTask::LlmJudge(LlmJudgeTask {
-            id: tid(id),
-            judge_ref: judge_card_ref().into(),
-            context_path: None,
-            expected,
-            operator: op,
-            depends_on: deps.iter().map(|dep| tid(dep)).collect(),
-            max_retries: 0,
-            condition: None,
-        })
-    }
-
     fn spec_of(tasks: Vec<EvalTask>) -> EvalSpec {
         let mut map = BTreeMap::new();
         for task in tasks {
@@ -324,24 +295,13 @@ mod assertion_stage {
     }
 
     fn executors() -> Executors {
-        let mock = MockJudgeInvoker::new([Err(JudgeError::Terminal {
-            reason: "default assertion-stage judge mock was invoked".to_owned(),
-        })]);
-        Executors {
-            assertion: Arc::new(AssertionTaskExecutor::new()),
-            judge: Arc::new(JudgeTaskExecutor::new(mock)),
-            trace: Arc::new(TraceTaskExecutor::new(
-                Arc::new(InMemoryTraceSource::new()),
-                Duration::from_millis(250),
-            )),
-            agent: Arc::new(AgentTaskExecutor::new()),
-        }
+        executors_with_assertion(Arc::new(AssertionTaskExecutor::new()))
     }
 
-    fn executors_with_judge(judge: Arc<dyn TaskExecutor>) -> Executors {
+    /// Build the executor bundle with `assertion` serving assertion tasks.
+    fn executors_with_assertion(assertion: Arc<dyn TaskExecutor>) -> Executors {
         Executors {
-            assertion: Arc::new(AssertionTaskExecutor::new()),
-            judge,
+            assertion,
             trace: Arc::new(TraceTaskExecutor::new(
                 Arc::new(InMemoryTraceSource::new()),
                 Duration::from_millis(250),
@@ -689,148 +649,60 @@ mod assertion_stage {
 
     // --- New shared-context-across-stages tests ---
 
-    #[derive(Default)]
-    struct StubJudgeExecutor {
-        parsed_verdict: Value,
-    }
-
-    #[async_trait]
-    impl TaskExecutor for StubJudgeExecutor {
-        async fn execute(
-            &self,
-            task: &EvalTask,
-            _snapshot: &ContextSnapshot,
-            stage: u32,
-        ) -> Result<TaskOutput, EvalExecError> {
-            let EvalTask::LlmJudge(judge) = task else {
-                return Err(EvalExecError::DagInvalid {
-                    reason: format!(
-                        "stub judge invoked on non-judge task {:?}",
-                        task.id().as_str()
-                    ),
-                });
-            };
-            let outcome = JudgeOutcome {
-                raw: json!({"choices": [{"parsed": self.parsed_verdict.clone()}]}),
-                parsed: self.parsed_verdict.clone(),
-                judge_ref: judge.judge_ref.as_card_ref().cloned(),
-            };
-            let result = AssertionResult {
-                task_id: judge.id.clone(),
-                passed: true,
-                actual: Some(self.parsed_verdict.clone()),
-                expected: judge.expected.clone(),
-                operator: judge.operator.clone(),
-                message: None,
-                stage,
-                started_at: chrono::Utc::now(),
-                duration_ms: 0,
-            };
-            Ok(TaskOutput::Judge {
-                result,
-                outcome: Box::new(outcome),
-            })
-        }
-    }
-
-    struct SleepingJudgeExecutor {
+    /// Assertion executor that sleeps before delegating, so a test can tell
+    /// concurrent same-stage fan-out from serial execution by wall clock.
+    struct SleepingAssertionExecutor {
+        /// Delay before each delegated assertion.
         sleep: Duration,
     }
 
     #[async_trait]
-    impl TaskExecutor for SleepingJudgeExecutor {
+    impl TaskExecutor for SleepingAssertionExecutor {
+        /// Sleep for `self.sleep`, then judge `task` with the real assertion
+        /// executor.
+        ///
+        /// # Errors
+        /// Returns whatever [`AssertionTaskExecutor`] returns for `task`.
         async fn execute(
             &self,
             task: &EvalTask,
-            _snapshot: &ContextSnapshot,
+            snapshot: &ContextSnapshot,
             stage: u32,
         ) -> Result<TaskOutput, EvalExecError> {
             tokio::time::sleep(self.sleep).await;
-            let EvalTask::LlmJudge(judge) = task else {
-                return Err(EvalExecError::DagInvalid {
-                    reason: format!(
-                        "sleeping judge invoked on non-judge task {:?}",
-                        task.id().as_str()
-                    ),
-                });
-            };
-            let parsed = json!({"verdict": "pass"});
-            let outcome = JudgeOutcome {
-                raw: parsed.clone(),
-                parsed: parsed.clone(),
-                judge_ref: judge.judge_ref.as_card_ref().cloned(),
-            };
-            let result = AssertionResult {
-                task_id: judge.id.clone(),
-                passed: true,
-                actual: Some(parsed),
-                expected: judge.expected.clone(),
-                operator: judge.operator.clone(),
-                message: None,
-                stage,
-                started_at: chrono::Utc::now(),
-                duration_ms: 0,
-            };
-            Ok(TaskOutput::Judge {
-                result,
-                outcome: Box::new(outcome),
-            })
+            AssertionTaskExecutor::new()
+                .execute(task, snapshot, stage)
+                .await
         }
     }
 
+    /// Four same-stage tasks that each sleep ~100ms run concurrently under the
+    /// per-task-type `JoinSet` fan-out: wall clock ~100ms, not ~400ms.
+    ///
+    /// # Panics
+    /// Panics when the plan fails, a task does not run, or the stage runs
+    /// serially.
     #[test]
-    fn multi_stage_judge_then_assertion_reads_judge_output() {
-        // Stage 0 runs a stub judge producing parsed = {"verdict": "pass"}.
-        // Stage 1 has an assertion with depends_on=["J"] reading $.task.J.parsed.verdict.
-        // The shared-context model must propagate the judge's parsed payload via
-        // ContextSnapshot::extend so the downstream JSONPath resolves.
-        let spec = spec_of(vec![
-            llm_judge("J", json!("pass"), ComparisonOperator::Equals, &[]),
-            assertion(
-                "A",
-                Some("$.task.J.parsed.verdict"),
-                ComparisonOperator::Equals,
-                json!("pass"),
-                &["J"],
-                None,
-            ),
-        ]);
-        let stub = Arc::new(StubJudgeExecutor {
-            parsed_verdict: json!({"verdict": "pass"}),
-        });
-        let executors = executors_with_judge(stub);
-        let report = drive_with_executors(spec, json!({ "score": 1.0 }), executors);
-        assert_eq!(report.outcomes.len(), 2);
-        let a = report
-            .outcomes
-            .iter()
-            .find_map(|outcome| match outcome {
-                TaskRunOutcome::Ran(result) if result.task_id == tid("A") => Some(result),
-                _ => None,
-            })
-            .expect("A ran");
-        assert!(
-            a.passed,
-            "A must read judge's parsed output via $.task.J.parsed.verdict, got message: {:?}",
-            a.message
+    fn concurrent_same_stage_tasks_complete_in_parallel() {
+        let spec = spec_of(
+            ["t0", "t1", "t2", "t3"]
+                .into_iter()
+                .map(|id| {
+                    assertion(
+                        id,
+                        None,
+                        ComparisonOperator::IsNotNull,
+                        json!(null),
+                        &[],
+                        None,
+                    )
+                })
+                .collect(),
         );
-    }
-
-    #[test]
-    fn concurrent_same_stage_judges_complete_in_parallel() {
-        // Four judges in stage 0, each sleeping ~100ms. With per-task-type
-        // JoinSet fan-out, the four should run concurrently — wall-clock ~100ms
-        // not ~400ms.
-        let spec = spec_of(vec![
-            llm_judge("j0", json!("pass"), ComparisonOperator::Equals, &[]),
-            llm_judge("j1", json!("pass"), ComparisonOperator::Equals, &[]),
-            llm_judge("j2", json!("pass"), ComparisonOperator::Equals, &[]),
-            llm_judge("j3", json!("pass"), ComparisonOperator::Equals, &[]),
-        ]);
-        let sleeper = Arc::new(SleepingJudgeExecutor {
+        let sleeper = Arc::new(SleepingAssertionExecutor {
             sleep: Duration::from_millis(100),
         });
-        let executors = executors_with_judge(sleeper);
+        let executors = executors_with_assertion(sleeper);
         let plan = spec.execution_plan().expect("spec dag valid");
         let registry = registry_for(&spec, &plan);
         let cx = context(json!({}));
@@ -852,7 +724,7 @@ mod assertion_stage {
         });
         assert!(
             elapsed < Duration::from_millis(400),
-            "four 100ms judges should complete in parallel, took {elapsed:?}"
+            "four 100ms tasks should complete in parallel, took {elapsed:?}"
         );
     }
 

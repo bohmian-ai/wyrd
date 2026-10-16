@@ -38,25 +38,6 @@ pub enum EvalExecError {
     #[error("task {task_id} depends on {depends_on}, which has no recorded result")]
     DependencyMissing { task_id: String, depends_on: String },
 
-    /// The injected `JudgeInvoker` could not be reached or returned a terminal
-    /// failure after retry budget.
-    #[error("judge invoker unavailable: {reason}")]
-    JudgeUnavailable { reason: String },
-
-    /// All retry attempts for an `LlmJudge` task were exhausted.
-    #[error(
-        "llm_judge task {task_id:?}: judge failed after {attempts} attempt(s); last error: {last_error}"
-    )]
-    JudgeRetriesExhausted {
-        task_id: TaskId,
-        attempts: u32,
-        last_error: String,
-    },
-
-    /// The judge returned malformed structured output.
-    #[error("llm_judge task {task_id:?}: judge returned invalid structured output: {reason}")]
-    JudgeInvalidOutput { task_id: TaskId, reason: String },
-
     /// `TraceSource::fetch` returned `Err` or timed out before the deadline.
     #[error("trace {trace_id} unavailable: {reason}")]
     TraceUnavailable { trace_id: String, reason: String },
@@ -74,15 +55,6 @@ pub enum EvalExecError {
     /// A trace task ran without a trace id on the current snapshot.
     #[error("trace_assertion task {task_id:?}: no trace_id on record")]
     TraceIdMissing { task_id: TaskId },
-
-    /// An `LlmJudge` task declared a media variable that the record did not
-    /// supply.
-    #[error("media binding {binding} missing for judge invocation")]
-    MediaBindingMissing { binding: String },
-
-    /// A required media id was absent from the record binding set.
-    #[error("llm_judge task {task_id:?}: required media id {media_id:?} not bound to the record")]
-    MediaBindingMissingForTask { task_id: TaskId, media_id: String },
 
     /// Operator received an input whose JSON kind it cannot evaluate.
     #[error("operator {op} is not defined on inputs of kind ({left_kind}, {right_kind})")]
@@ -264,19 +236,6 @@ pub enum EvalError {
         details: serde_json::Value,
     },
 
-    /// The injected `JudgeInvoker` is unavailable past retry budget.
-    #[error("[WYRD_EVAL_503_JUDGE_UNAVAILABLE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_EVAL_503_JUDGE_UNAVAILABLE",
-        status = 503,
-        title = "LLM judge unavailable",
-        remediation = "Retry after the provider recovers, or raise LlmJudge.max_retries; for tests, register a JudgeInvoker mock."
-    )]
-    JudgeUnavailable {
-        message: String,
-        details: serde_json::Value,
-    },
-
     /// `TraceSource::fetch` returned no span set before the deadline.
     #[error("[WYRD_EVAL_504_TRACE_UNAVAILABLE] {message}")]
     #[wyrd_error(
@@ -286,19 +245,6 @@ pub enum EvalError {
         remediation = "Wait for trace ingestion to land the spans, raise the per-call deadline, or schedule a retry via the AwaitingTrace lifecycle."
     )]
     TraceUnavailable {
-        message: String,
-        details: serde_json::Value,
-    },
-
-    /// An `LlmJudge` task referenced a media variable the record did not bind.
-    #[error("[WYRD_EVAL_422_MEDIA_BINDING_MISSING] {message}")]
-    #[wyrd_error(
-        code = "WYRD_EVAL_422_MEDIA_BINDING_MISSING",
-        status = 422,
-        title = "Media binding missing",
-        remediation = "Supply every media variable the judge prompt declares before invoking the eval record."
-    )]
-    MediaBindingMissing {
         message: String,
         details: serde_json::Value,
     },
@@ -392,9 +338,7 @@ impl EvalError {
             Self::DagInvalid { message, details }
             | Self::TaskNotFound { message, details }
             | Self::DependencyMissing { message, details }
-            | Self::JudgeUnavailable { message, details }
             | Self::TraceUnavailable { message, details }
-            | Self::MediaBindingMissing { message, details }
             | Self::OperatorMismatch { message, details }
             | Self::RecordMissing { message, details }
             | Self::ScenarioLoaderFailure { message, details }
@@ -426,29 +370,6 @@ impl From<EvalExecError> for EvalError {
                     "depends_on": depends_on,
                 }),
             },
-            EvalExecError::JudgeUnavailable { reason } => Self::JudgeUnavailable {
-                message,
-                details: serde_json::json!({ "reason": reason }),
-            },
-            EvalExecError::JudgeRetriesExhausted {
-                task_id,
-                attempts,
-                last_error,
-            } => Self::JudgeUnavailable {
-                message,
-                details: serde_json::json!({
-                    "task_id": task_id.as_str(),
-                    "attempts": attempts,
-                    "last_error": last_error,
-                }),
-            },
-            EvalExecError::JudgeInvalidOutput { task_id, reason } => Self::JudgeUnavailable {
-                message,
-                details: serde_json::json!({
-                    "task_id": task_id.as_str(),
-                    "reason": reason,
-                }),
-            },
             EvalExecError::TraceUnavailable { trace_id, reason } => Self::TraceUnavailable {
                 message,
                 details: serde_json::json!({
@@ -470,19 +391,6 @@ impl From<EvalExecError> for EvalError {
                     "reason": "trace_id missing on record",
                 }),
             },
-            EvalExecError::MediaBindingMissing { binding } => Self::MediaBindingMissing {
-                message,
-                details: serde_json::json!({ "binding": binding }),
-            },
-            EvalExecError::MediaBindingMissingForTask { task_id, media_id } => {
-                Self::MediaBindingMissing {
-                    message,
-                    details: serde_json::json!({
-                        "task_id": task_id.as_str(),
-                        "binding": media_id,
-                    }),
-                }
-            }
             EvalExecError::OperatorMismatch {
                 op,
                 left_kind,
@@ -626,16 +534,6 @@ mod tests {
         assert_eq!(problem["status"], 422);
         assert_eq!(problem["details"]["reason"], "cycle: t1 -> t2 -> t1");
     }
-
-    #[test]
-    fn judge_unavailable_serde_tag() {
-        let public = EvalError::JudgeUnavailable {
-            message: "provider 503".to_owned(),
-            details: serde_json::json!({ "reason": "provider 503" }),
-        };
-        let value = serde_json::to_value(public).expect("serializes");
-        assert_eq!(value["kind"], "judge_unavailable");
-    }
 }
 
 #[cfg(test)]
@@ -654,12 +552,12 @@ mod smoke {
 
     #[test]
     fn eval_error_carries_wyrd_code() {
-        let error = EvalError::JudgeUnavailable {
-            message: "mock provider down".to_owned(),
-            details: serde_json::json!({ "reason": "mock provider down" }),
+        let error = EvalError::TraceUnavailable {
+            message: "trace source down".to_owned(),
+            details: serde_json::json!({ "reason": "trace source down" }),
         };
-        assert_eq!(error.code(), "WYRD_EVAL_503_JUDGE_UNAVAILABLE");
-        assert_eq!(error.status(), 503);
+        assert_eq!(error.code(), "WYRD_EVAL_504_TRACE_UNAVAILABLE");
+        assert_eq!(error.status(), 504);
     }
 
     #[test]

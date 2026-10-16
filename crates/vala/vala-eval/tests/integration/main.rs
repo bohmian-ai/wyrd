@@ -7,7 +7,6 @@
 mod orchestrator_support;
 
 mod blocks_agent;
-mod orchestrator_judge_skald;
 mod orchestrator_parity;
 mod orchestrator_simulator_template;
 mod orchestrator_state_machine;

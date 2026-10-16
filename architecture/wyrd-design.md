@@ -1300,6 +1300,21 @@ resubmitted. `VerificationExecution.wait` polls with capped backoff, tolerates
 not-found and delayed results within its deadline, and returns only a real
 result, the terminal error, or `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`.
 
+Execution status includes the existing Operator `dispatches` projection:
+dispatch ID, exact Operator, delivery status, and optional error. Delivery
+statuses are `pending`, `running`, `retrying`, `delivered`, or `failed`;
+delivery completion is independent of execution completion and never changes
+the verdict. Reuse the existing Operator queue/worker and tenant-authorized
+status assembly rather than a separate dispatch resource. Binding inspection
+uses `last_execution_id` for its latest admitted execution, not an application
+Run or an unaccepted staged submission.
+
+MCP projects the HTTP contracts as `verification.evidence`,
+`verification.execute`, `verification.enqueue`, and
+`verification.get_execution`, with retained `verification.get_binding`.
+The old `verification.start_run` and `verification.get_run` have no aliases.
+Read tools remain discoverable; write scopes supplement domain authorization.
+
 Execution status is `pending`, `running`, `retrying`, `completed`,
 `cancelled`, `timed_out`, or `errored`, separate from the verdict. The runner
 drains `wyrd.verifier_executions` in claim rounds. Each round considers every
@@ -1667,9 +1682,9 @@ templates, and other 4xx fail terminally. Delivery is at least once.
 applies to `Http.url` and to text fields in `NotifyChannel` variants.
 
 Templating context is one bounded, immutable failure context derived from
-the failed Verification Result: dispatch, run, result, and binding IDs; the
+the failed Verification Result: dispatch, execution, result, and binding IDs; the
 exact Verifier and subject Card identities; the `failed` verdict; completion
-time; a bounded result summary; and one count block for the failed run's
+time; a bounded result summary; and one count block for the failed execution's
 Verifier's drift checks when it has any. It never
 carries raw input context, media, feature rows, feature names, step output,
 or secret material, and registration rejects unknown template fields.
@@ -1677,10 +1692,19 @@ Exact field schema lives in OpenAPI.
 
 | Applies to | Template fields |
 |---|---|
-| any | `dispatch_id`, `run_id`, `result_id`, `binding_id`, `verifier_ref`, `verifier_card_uid`, `subject_ref`, `subject_uid`, `verdict`, `completed_at`, `summary` |
+| any | `dispatch_id`, `execution_id`, `result_id`, `binding_id`, `verifier_ref`, `verifier_card_uid`, `subject_ref`, `subject_uid`, `verdict`, `completed_at`, `summary` |
 | Verifiers with a drift check | `drift.drifted_features`, `drift.total_features` |
 
+The old verification `run_id` template field has no alias; `run_id` remains
+reserved for the optional application Run and is not a template field.
+Obsolete `eval.*` fields are rejected. Freeze the bounded generic result
+summary and completion time with the existing failure context before delivery;
+all retries retain that context. Adapt existing dispatch foreign keys, claim
+joins, and deduplication to execution identity alongside this projection.
+
 Counts render as base-10 digits and come from the same result as `summary`.
+Multiple drift checks must not silently introduce an aggregate count meaning;
+an ambiguous count projection requires an explicit semantic decision.
 A binding refuses an attached Operator (inline or referenced) that uses
 `drift.*` fields for a Verifier without a drift check, naming the binding
 field path.

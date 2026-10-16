@@ -233,10 +233,17 @@ typed columns:
   requirement, step, evidence, and provenance breakdown as Variant. The
   nullable Struct `drift_report` (`method`, Variant `features`, `verdict`) is
   set when the Verifier has a drift check.
+  Published correlation columns are `execution_id`, nullable `binding_id`,
+  and nullable application `run_id`; result timing remains `started_at` and
+  `ended_at`. A verification execution is never relabelled as an application
+  Run.
 - `vala.verification.execution_inputs` holds each execution's pinned input
   declarations (JSON values, file digests, Artifact and trace references) and
   its server-owned `queue_execution` marker: false for `verify`, true for
   `submit`. Only a `true` record activates queued work.
+  Its published input timestamp is `recorded_at`, the server-recorded input
+  time, distinct from execution timing or sample/window time. It uses the
+  same execution/binding/application-Run correlation names where applicable.
 - Every nullable built-in Struct — `drift_report`, the
   `vala.metrics.points` bucket sets, and `vala.gateway.calls`
   `resolved_model` — has nullable children, because a required Parquet leaf

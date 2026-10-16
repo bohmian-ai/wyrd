@@ -1,158 +1,55 @@
 ---
 title: Configure the verification runtime
-description: Approved startup settings for Python workers, verification deadlines, file extraction, and scratch workspaces.
+description: Install the Python worker, choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
 pillar: wyrd
 section: Operate
 order: 4
 draft: true
-status: partial
+status: runnable
 ---
 
-This reference records the approved configuration for the verifier building
-blocks change. **These environment variables are planned; they are not yet
-implemented server settings.** Availability and parity must be checked against
-the server configuration when the change ships.
+The verification runtime runs Verifier steps and checks inside `wyrd-server`: file extraction, scratch workspaces, Agent tools, and Python code in a pool of `wyrd-monty-worker` processes. Every setting, default, and startup rule is in [Verification runtime limits](/reference/verification-runtime-limits/); this page covers the decisions an operator makes. For database and server setup, see [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/).
 
-## Startup settings
+## Install the worker
 
-| Environment variable | Default | Meaning |
-| --- | ---: | --- |
-| `WYRD_VERIFICATION_MONTY_MIN_WORKERS` | 2 | Prewarmed worker processes. |
-| `WYRD_VERIFICATION_MONTY_MAX_WORKERS` | 8 | Maximum live worker processes. |
-| `WYRD_VERIFICATION_MONTY_MAX_WAITERS` | 16 | Maximum in-process operations waiting for a worker. |
-| `WYRD_VERIFICATION_MONTY_MEMORY_MIB` | 256 | Monty allocation budget per Python operation. |
-| `WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB` | 384 | Hard memory ceiling for one worker process, including overhead. |
-| `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB` | 2048 | Hard combined memory ceiling for all worker processes. |
-| `WYRD_VERIFICATION_CODE_TIMEOUT_MS` | 10000 | Complete Python operation, including checkout wait, compilation, execution, and parent-serviced filesystem calls. |
-| `WYRD_VERIFICATION_AGENT_CODE_BUDGET_MS` | 60000 | Cumulative Python-operation wall time within one Agent invocation. |
-| `WYRD_VERIFICATION_FILE_MAX_MIB` | 20 | Maximum bytes in one input file. |
-| `WYRD_VERIFICATION_FILES_MAX_MIB` | 100 | Maximum combined input-file bytes per execution. |
-| `WYRD_VERIFICATION_ARCHIVE_MAX_MIB` | 200 | Maximum decompressed bytes per archive. |
-| `WYRD_VERIFICATION_ARCHIVE_MAX_ENTRIES` | 10000 | Maximum entries per archive. |
-| `WYRD_VERIFICATION_ARCHIVE_MAX_RATIO` | 100 | Maximum decompressed/compressed size ratio. |
-| `WYRD_VERIFICATION_EXTRACT_MAX_PAGES` | 500 | Maximum PDF pages or PPTX slides per extraction. |
-| `WYRD_VERIFICATION_EXTRACT_TEXT_MAX_MIB` | 10 | Maximum extracted text bytes. |
-| `WYRD_VERIFICATION_SCRATCH_MAX_MIB` | 250 | Maximum scratch bytes per invocation. |
-| `WYRD_VERIFICATION_WORK_WRITE_MAX_MIB` | 50 | Cumulative writable /work budget per invocation. |
-| `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` | 64 | Maximum tool-result bytes, bounded while collecting output. |
-| `WYRD_VERIFICATION_MAX_WORKSPACES` | 16 | Maximum concurrent scratch workspaces per server process. |
-| `WYRD_VERIFICATION_TIMEOUT_MS` | 60000 | Overall immediate verify deadline. |
+`wyrd-server` runs Python in a separate `wyrd-monty-worker` binary. Release bundles ship it beside `wyrd-server`, and the official images install both in `/usr/local/bin`, so the default needs no setting.
 
-## Capacity, deadlines, and isolation
+If you install the binaries yourself, keep the two side by side, or point the server at the worker:
 
-Read these variables once during server startup. Unset variables use the
-defaults; changing a value requires a server restart. Values are positive
-integers; `_MIB` and `_KIB` use binary units and `_MS` uses milliseconds.
-Refuse startup for invalid/overflowing values or inconsistent settings:
-minimum workers above maximum, allocation budget at or above the process
-ceiling, pool ceiling below the process ceiling, file limit above combined
-file limit, or writable-work budget above scratch limit. Report the offending
-variable clearly; never silently disable a limit. Slot limits may lower, never
-raise, the configured deployment limits. Agent/step/request deadlines still
-apply; the earliest deadline wins.
-
-One Monty pool belongs to each verification-runtime server process, shared
-across tenants without sharing interpreter state. Only `code` actions/checks
-and explicitly enabled Agent-action `code.run` calls acquire workers. Agent
-checks, model waits, and non-Python tools do not reserve a worker. Each Python
-operation uses a fresh interpreter session; workspace files may persist only
-within the owning invocation. Discard a session after any resource-limit
-breach; kill/replace crashed, hung, or compromised workers.
-
-Worker checkout waits within the operation's remaining deadline, also bounded
-by the enclosing caller deadline. There is no independent one-second checkout
-timeout. Bound waiting operations with `MONTY_MAX_WAITERS`; when full, refuse
-additional in-process admission through the existing capacity/error path.
-Background executions remain in the existing queue until runtime capacity is
-available rather than occupying an unbounded in-memory waiting list. Preserve
-leases/fencing and cancellation while coordinating capacity; add no second
-queue or scheduler. Python waiting/execution budgets do not reset across tool
-calls or retries within the enclosing invocation.
-
-The default 2 GiB worker-group ceiling remains in force with up to eight
-workers. It does not promise eight workers can each consume their full
-individual allocation budget simultaneously. Enforce aggregate and process
-memory independently of Monty's allocator accounting; count idle workers too.
-Server, extraction, model-response, and parent-side filesystem/output buffers
-are outside the worker-group ceiling and need separate deployment headroom.
-Worker termination under memory pressure must fail the affected operation
-safely, never take down the parent server or fabricate a passing verdict.
-
-Security remains mandatory: a separate unprivileged worker identity, empty
-credential environment, OS-enforced network denial, per-invocation read-only
-`/inputs` and bounded writable `/work`, parent-serviced capability-scoped file
-access, no arbitrary host callbacks/subprocesses/host Python packages, and no
-cross-invocation interpreter state. Environment settings cannot disable these
-protections. The implementation must prove the selected runtime and host enforcement can
-provide them; unsupported isolation is not silently accepted.
-
-For database and server setup, see [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/).
-
-## Built-in Agent tools
-
-The approved hosted Agent harness resolves `AgentSpec.tool_names` automatically
-at runtime. Authors do not upload callables, register SDK-local functions, or
-configure an MCP connection to use these built-ins:
-
-| Tools | Capability |
-| --- | --- |
-| `cards.list`, `cards.get`, `cards.get_by_ref` | Discover Cards and read their exact versions. |
-| `bifrost.list_tables`, `bifrost.describe_table`, `bifrost.query` | Discover schemas and run bounded read-only queries. |
-| `fs.list`, `fs.read`, `fs.search` | Read the invocation's declared workspace. |
-| `code.run` | Run Python against that workspace using the shared Monty pool. |
-
-Only explicitly declared tools attach to a preparation Agent. Unknown names
-and missing required workspaces fail explicitly. Agent checks have no tools.
-Built-in tool names can be saved on registered Agents; arbitrary client-local
-callables cannot be uploaded as server tools.
-
-Tool calls use existing authorized Rust operations directly. A tool's global
-availability grants no resource permission: each protected invocation uses the
-verification's accepted original subject or valid delegated permissions from
-that subject. Delegation cannot widen its accepted authority. Background work
-preserves those permissions through retry/restart; SYSTEM execution changes
-attribution, not permission. Tool arguments cannot override identity. Caller
-context and scratch stay isolated between invocations; credentials never enter
-model prompts or Python workers. Permission checks and audit remain in the
-existing capability owners.
-
-This hosted tool wiring is planned with the verifier change and has not yet
-been implemented.
-
-### Tool invocation and resource permissions
-
-Wyrd uses the same rule for every resource: **global or exact scope
-permission**. Existing scope coverage applies, including a Bifrost schema
-grant covering its tables. Tools use this permission model too.
-
-Every call needs invoke permission on its tool resource, including `code.run`
-and `fs.search`. For example, grant global invocation permission:
-
-```json
-{"resource":"tool","action":"invoke","scope":"all"}
+```bash
+export WYRD_VERIFICATION_MONTY_WORKER=/opt/wyrd/bin/wyrd-monty-worker
 ```
 
-Or permission scoped to one built-in:
+Use the worker from the same release as the server. A server that runs Verifiers refuses to start when the worker is missing or cannot start:
 
-```json
-{"resource":"tool","action":"invoke","scope":{"tool":"bifrost.query"}}
+```text
+hosted Verifier blocks could not start: ...
 ```
 
-This adds a resource scope to the existing permission model, not a separate
-authorization rule. The tool
-scope accepts an exact built-in name. A declaration in `tool_names` grants no
-permission. After the tool gate allows execution, the underlying operation
-still checks resource access. For example:
+## Choose which processes run Verifiers
 
-- Tool grant plus read access to the queried tables: the query can proceed.
-- Bifrost read access without a tool grant: the tool call is denied.
-- Tool grant without Bifrost read access: the query is denied.
-- Global tool access plus read access to one table: other tables remain denied,
-  including when a query joins an allowed table to a forbidden one.
+Every process whose role serves the API runs Verifiers by default. To keep a process out, set `WYRD_VERIFICATION_ENABLED=0` (or `enabled = false` under `[verification]` in TOML). That process starts no worker, and its verification routes answer `WYRD_SERVER_503_SERVICE_UNAVAILABLE`, so route verification traffic to processes that keep it on.
 
-Both checks use the accepted original subject or its valid delegated
-permissions. They retain existing tenant isolation, scoped grant intersection,
-and permission audit. A tool denial prevents execution; a resource denial
-returns no partial data. Code and filesystem grants do not expand their
-sandbox mounts or resource limits. These grants and checks are planned with
-the hosted tool implementation, not available server configuration today.
+## Size the worker pool
+
+Each process has its own pool and its own limits; settings do not add up across replicas. Three settings decide how many Python operations run at once:
+
+- `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB / WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB`, rounded down, caps live workers. At the defaults that is 5.
+- `WYRD_VERIFICATION_MONTY_MAX_WORKERS` caps them further.
+- `WYRD_VERIFICATION_MONTY_MAX_WAITERS` operations may wait beyond that. Anything more is refused at once and fails as retryable.
+
+To run more Python at once, raise the pool ceiling and the worker cap together. Raise `WYRD_VERIFICATION_MONTY_MEMORY_MIB` only with `WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB`, which must exceed it by at least 4 MiB.
+
+The pool ceiling covers the workers only. Leave memory for the server itself, file extraction, model responses, and tool buffers on top of it. Each open workspace also uses up to `WYRD_VERIFICATION_SCRATCH_MAX_MIB` of the server's temporary directory, with at most `WYRD_VERIFICATION_MAX_WORKSPACES` open at once.
+
+## Change a setting
+
+The server reads these settings once at startup, so a change takes a restart. A bad value stops startup with the variable's name, for example:
+
+```text
+environment variable WYRD_VERIFICATION_FILE_MAX_MIB could not be parsed: expected a positive integer, got "0"
+```
+
+A pair of settings that contradict each other, such as `WYRD_VERIFICATION_FILE_MAX_MIB` above `WYRD_VERIFICATION_FILES_MAX_MIB`, stops startup with both names. The [startup rules](/reference/verification-runtime-limits/#startup-rules) list every pair.
+
+Settings can tighten or loosen limits, but never turn off a limit or the worker isolation. Built-in Agent tools and the permissions they need are in [Agent tools and authorization](/reference/agent-tools-and-authorization/).

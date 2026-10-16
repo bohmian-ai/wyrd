@@ -3,7 +3,7 @@ id: TASK-005
 kind: implementation
 status: proposed
 spec: SPEC-verifier-building-blocks
-spec_revision: 7
+spec_revision: 8
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008, AC-001, AC-003, AC-005, AC-006, AC-007, AC-008, AC-009, AC-010]
 depends_on: [TASK-002, TASK-003, TASK-004]
 ---
@@ -25,7 +25,10 @@ HTTP/MCP projection, registration and bindings, Scribe input/result publication,
 acknowledgment-to-request batching, queue/SQL migrations, scheduling/baselines,
 runner settlement, and affected CLI/UI consumers. Compose tasks 2/3 through
 the shared task 1 boundary; consume task 4's client and examples unchanged in
-meaning. Keep modules independently callable with explicit dependencies; do
+meaning. Own the standalone developer example repositories (r8 REQ-016):
+fully refactor `wyrd-example-ts` and create `wyrd-example-py` and
+`wyrd-example-rs`; discard Task 4's uncommitted partial `wyrd-example-ts`
+update rather than building on it. Keep modules independently callable with explicit dependencies; do
 not build one AppState-coupled god object that cannot be exercised in isolation.
 
 No per-request Postgres write: r7 preserves approved batching. Replay/conflict
@@ -168,8 +171,8 @@ without adding a second scheduler or statistical implementation.
 ### Scenario 5 — All real surfaces tell the same story
 
 **Behavior.** HTTP/MCP/SDKs/CLI/UI consume the new identity/result contract;
-all three language examples and the TypeScript app execute against the built
-server; no old `/runs`/kind/observation workflow remains. Integrated negative
+all three language examples and the three standalone example repositories
+execute against the built server; no old `/runs`/kind/observation workflow remains. Integrated negative
 and edge behavior satisfies every shared acceptance obligation. Execute every
 row of the README action/check coverage matrix through all three real SDKs;
 reused executors must be exercised through the new contracts too.
@@ -278,6 +281,13 @@ and switch points" table.
 - All eight README action/check rows have passing real journey evidence in
   Rust, Python, and TypeScript, including the required negative/edge cases,
   all extraction formats, and all supported drift methods.
+- `wyrd-example-ts`, `wyrd-example-py`, and `wyrd-example-rs` each own their
+  Cards and sample evidence, follow the shared layout and REQ-016 conventions
+  (transport hook in TypeScript/Python, Wyrd Agent Run in Rust, SDK OTel
+  exporters, `verify`/`submit`/`verify.Execution`), contain no hand-built
+  credential headers or exporter wiring, work from their README quickstart,
+  and pass their tests against the merged candidate with a deterministic
+  provider.
 - The merged candidate closes AC-001–010 with the shared evidence inventory;
   local-only proof is not reported as journey/integration completion.
 
@@ -290,7 +300,9 @@ Bifrost fixed-table/admission/ACK and canonical query projection; existing CLI
 and UI verification consumers; minimum shared-contract switches and final old-
 type deletion; actual generated artifacts from their owners. Existing managed
 Postgres/runtime fixtures and server/SDK/MCP journey targets receive necessary
-closure changes. Coordinate with task 4 on doc/schema/SDK fixes instead of
+closure changes. External `../wyrd-example-ts`, `../wyrd-example-py`, and
+`../wyrd-example-rs` source, `service/` Cards, scripts, tests, and
+package/build setup. Coordinate with task 4 on doc/schema/SDK fixes instead of
 copying their logic into server helpers.
 
 ## Verification and Evidence

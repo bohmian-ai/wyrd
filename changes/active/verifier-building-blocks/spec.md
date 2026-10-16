@@ -1,6 +1,6 @@
 ---
 id: SPEC-verifier-building-blocks
-revision: 7
+revision: 8
 status: approved
 ---
 
@@ -39,6 +39,10 @@ its underlying resource permissions. Revision 7 records the owner's explicit
 approval ("agree. make the changes") of the Task 004 handoff proposal: named
 MCP tools, execution-based binding and dispatch reads, existing Operator
 plumbing reuse, template identity cutover, and analytical correlation fields.
+Revision 8 records the owner's explicit approval ("I agree with the
+recommendations. Make revisions") of moving the developer example
+repositories into Task 005: refactor `wyrd-example-ts` and create
+`wyrd-example-py` and `wyrd-example-rs`.
 The remaining approved behavior is unchanged.
 
 The five agreed simplifications remain: preserve missing results in aggregation;
@@ -92,7 +96,8 @@ In scope:
 - Rust, Python, and TypeScript SDKs over the shared client, HTTP, MCP, and
   affected CLI/UI consumers, schemas, errors, and documentation.
 - Matching runnable support-policy examples in all three languages, the
-  working `wyrd-example-ts` application, and docsite/architecture updates.
+  standalone `wyrd-example-ts`, `wyrd-example-py`, and `wyrd-example-rs`
+  developer example repositories, and docsite/architecture updates.
 
 Out of scope: nested Verifiers, loops, a new Workflow Card or application
 runtime, human verdict submission, scenario simulation as a new graph action,
@@ -751,10 +756,10 @@ timestamp, distinct from execution start/completion and sample/window time.
 These named query fields are consumer contracts. Other private columns,
 layout, and queries remain implementation-owned within the approved tables.
 
-### REQ-016 Matched runnable examples and demo
+### REQ-016 Matched runnable examples and developer example repositories
 
 Use the existing `examples/support-desk` story and shared versioned Cards to
-show the same workflow in Rust, Python, and TypeScript. Extend the existing
+show the same workflow in Rust, Python, and TypeScript. Within this repository, extend the existing
 language entry points rather than introducing a new application framework.
 The Python and TypeScript examples must differ only where language idioms
 require it; the Rust example demonstrates the same capability.
@@ -768,12 +773,35 @@ policy. All languages demonstrate registration/hydration, `verify`,
 `submit`, execution-ID reuse in another process, bounded waiting, and reading
 the requirement breakdown, including a failing answer.
 
-The application in `wyrd-example-ts` must run this same scenario against the
-integrated server using a real built SDK, not a temporary-checkout symlink.
-Its request flow returns the immediate verdict; its background-review flow
-returns an execution ID and exposes the resulting breakdown. Include shared
-sample evidence, setup/run instructions, and checks sufficient to reproduce
-the demonstration. A screenshot or mocked UI alone is not completion.
+`wyrd-example-ts` (fully refactored), `wyrd-example-py` (new), and
+`wyrd-example-rs` (new) are simple, developer-friendly example applications
+that show how Wyrd verification works inside a small real app. They are
+teaching examples, not production hardening. Each repository is standalone:
+it owns its own Cards, Verifier, and sample evidence, and shares none with the
+other repositories or a Wyrd checkout. All three follow the same layout
+(`README.md`, `service/`, `src/`, `scripts/`, `test/`) and the same
+support-policy scenario, differing only where language idioms require it.
+
+Each uses current Wyrd conventions: Cards registered and hydrated from its
+`service/`; model calls through the Wyrd gateway authenticated by the SDK
+transport hook (`fetch: wyrd.httpAuth` with the OpenAI Agents SDK in
+TypeScript, `http_auth` with the OpenAI Agents SDK in Python) or, in Rust, the
+Wyrd Agent Run implementation (`Run::invoke`); telemetry through the SDK's
+Wyrd OTel exporters and Run correlation; `verify` for the immediate check and
+`submit` plus `verify.Execution` (`connect`, `status`, `wait`) for background
+review, reading the requirement breakdown including a failing answer. No
+repository hand-builds credential headers or OTel exporter wiring. HTTP is
+Node `http` in TypeScript, FastAPI in Python, and axum in Rust.
+
+Each app exposes an ask request returning the answer and immediate verdict, a
+review request returning an execution ID, a review-status request returning
+status and, once available, the breakdown, and a script that reads one Run's
+joined evidence through Bifrost. Each consumes a real built SDK, not a
+temporary-checkout symlink, and includes a quickstart README and an automated
+test against the integrated server using a deterministic local
+OpenAI-compatible provider so no model API key is required; live-provider
+setup is documented separately. A screenshot or mocked UI alone is not
+completion.
 
 ### REQ-017 Docsite, architecture, and consumer completion
 
@@ -960,7 +988,7 @@ when the full suites run, not the required coverage.
 | AC-005 | Real SDK → server → SDK journeys in Rust, Python, and TypeScript for REQ-011–013/015: inline JSON and file verification, background submission, status/wait, reconnect from an ID, persisted attributable breakdown, failed verdict as data, and delayed result visibility. |
 | AC-006 | Cross-boundary negative/edge evidence: permission and cross-tenant refusal, wrong digest/format/schema, unavailable Agent/model, absent required evidence, stable-key replay/conflict, no activation from recorded `verify`, no duplicate logical dispatch, bounded admission/backpressure, cancellation, and outbox-loss/timeout semantics. Controlled loss injections may be supporting unit/integration tests where end-to-end forcing adds no boundary proof. |
 | AC-007 | Scheduled drift integration/journey evidence for REQ-014: correct slot/source selection and cron window, all existing methods, baseline/readiness and insufficient data, full statistical detail, failed-only Operators, and preserved accepted authority on queued retry/restart. |
-| AC-008 | Runnable matched Rust/Python/TypeScript support-policy examples and working `wyrd-example-ts` against the built SDK/server, covering both immediate and background flows and failing answers. Provider mocks support reproducible automated journeys; live-provider demo setup is explicit and not required by unit tests. |
+| AC-008 | Runnable matched Rust/Python/TypeScript support-policy examples, and standalone `wyrd-example-ts`, `wyrd-example-py`, and `wyrd-example-rs` repositories that build against the real SDK, follow the shared layout and REQ-016 conventions, and pass their automated tests against the integrated server, covering immediate pass/fail verdicts, a background review read back by execution ID, and the requirement breakdown. Provider mocks support reproducible automated journeys; live-provider demo setup is explicit and not required by unit tests. |
 | AC-009 | Consumer and documentation evidence for REQ-017/INV-008: served OpenAPI and runtime MCP schemas/behavior; typed exports, authored Python stubs, generated TypeScript declarations/errors; affected CLI/UI; no obsolete active contract/examples; aligned design, doctrine, references, and Bifrost descriptions. Docsite checks/build and example checks pass. |
 | AC-010 | Format/lint, dependency and tenant-boundary checks, contract generation, relevant Rust/Python/TypeScript suites and journeys pass under repository verification policy. Evidence names the commands actually run; aggregate claims reflect `mise.toml`. No new permanent check is required merely to police this change's prose or task count. |
 
@@ -987,8 +1015,8 @@ one is not a reason to add a new public primitive.
 
 ## Open material decisions
 
-Revision 7's handoff decisions are approved by the owner's explicit instruction
-recorded above. No new multi-check drift-count meaning is approved: if adapting
+Revision 7's handoff decisions and revision 8's example-repository scope are
+approved by the owner's explicit instructions recorded above. No new multi-check drift-count meaning is approved: if adapting
 the existing fields requires one, stop that adaptation for a semantic revision.
 Sandbox feasibility and preservation of the asynchronous replay
 contract through acknowledgment must be demonstrated in implementation;
@@ -1011,6 +1039,7 @@ solve for this delivery.
 
 | 6 | approved | Owner requires two independent authorization gates, both following Wyrd's global or exact scope permission rule: tool invocation and underlying domain/resource access. Extends the existing permission representation and preserves subject/delegation and audit on both decisions. |
 | 7 | approved | Owner approved the Task 004 handoff proposal. Names MCP tools and binding latest-execution identity; preserves dispatch reads and existing Operator plumbing; cuts templates over to execution identity; fixes the drift error contract; names published analytical correlation/time fields; requires affected lineage and connected-handle journey closure. Multi-check drift-count semantics must not be guessed. |
+| 8 | approved | Owner moved the developer example repositories into Task 005: fully refactor `wyrd-example-ts` and create `wyrd-example-py` and `wyrd-example-rs` as standalone, developer-friendly examples with their own Cards, using current Verifier, transport-hook (Rust: Wyrd Agent Run), and OTel conventions. Not production hardening. |
 
 Material sources beyond the governing authorities:
 

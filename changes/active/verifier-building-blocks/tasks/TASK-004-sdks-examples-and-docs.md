@@ -23,7 +23,7 @@ the new server engine or hosted checks.
 Own `wyrd-client` projection and storage-upload reuse; the Rust/Python/TypeScript
 SDK wrappers, authored typing, generated declaration sources, exports, and
 language-runtime tests; shared support-policy example assets and all three
-entry points; `wyrd-example-ts`; docsite and architecture updates including
+entry points; `wyrd-example-ts` (moved to TASK-005 by r8); docsite and architecture updates including
 the HTML flow diagram. Task 5 owns HTTP/MCP/CLI/UI live-server cutover.
 
 Implement client behavior once in the shared Rust owner. Python and TypeScript
@@ -218,7 +218,8 @@ and authored wrapper/declaration sources; owning unit and journey files;
 `examples/support-desk`, its tasks when needed; `docs` guides/navigation and
 source-generated references; architecture/reference/AGENTS contract prose;
 `changes/active/verifier-building-blocks/architecture/verification-flow.html`;
-external `wyrd-example-ts` source, service Cards, tests, package/build setup.
+external `wyrd-example-ts` source, service Cards, tests, package/build setup
+(moved to TASK-005 by r8).
 
 Own authored SDK/docs/example changes during the parallel wave. Coordinate
 contract generator publication with task 1 and final served-schema regeneration
@@ -294,7 +295,7 @@ projection (`observe/drift.rs`). The handle follows the design's
 | Named inputs, lazy upload, submit routing, replay key, status, wait, reconnect covered in owner | `crates/shared/wyrd-client/src/observe/tests.rs` (wiremock) | `nextest -p wyrd-client --lib 'test(/^observe::\|^verify::/)'`: 28 passed | PASS |
 | Journeys exercise all action and check kinds in every language (README matrix) | `sdks/wyrd-sdk-rust/tests/integration/verifier_building_blocks.rs`, `sdks/wyrd-sdk-python/tests/integration/test_verifier_building_blocks.py`, `sdks/wyrd-sdk-ts/wyrd/tests/integration/verifier-building-blocks.test.ts`; lanes in `mise.toml` | compiled, linted, and typechecked; not run (see limits) | PASS (authored) |
 | Negative/edge journeys authored; reconnect exercises `status()` and `wait()` (r7) | Same files plus `verify_in_real_time` and `action-timeline` journeys; cross-tenant reconnect refusal; status after wait equals the waited result | as above | PASS (authored) |
-| Examples/demo and docs describe async acceptance and result loss | `examples/support-desk/{service,rust,python,typescript,README.md}`; external `wyrd-example-ts` (uncommitted in that repo); `docs/src/content/docs/build-and-verify/verify/*` | `check:examples`, `docs:check` | PASS |
+| Examples/demo and docs describe async acceptance and result loss | `examples/support-desk/{service,rust,python,typescript,README.md}`; `docs/src/content/docs/build-and-verify/verify/*`. External demo moved to TASK-005 (r8) | `check:examples`, `docs:check` | PASS |
 | REQ-004 output reference | `docs/src/content/docs/reference/extraction-output.md` | `docs:check` | PASS |
 | Runtime configuration, REQ-008 catalog, tool grants | `docs/src/content/docs/reference/verification-runtime-limits.md`, `reference/agent-tools-and-authorization.md`, `operate/grant-and-inspect-permissions.md` | `docs:check` | PASS |
 | Generated artifacts source-driven; old flows removed | Workflow examples, judge/observation emits and Cards, `File`/`ArtifactRef` root exports removed; MCP table names the r7 tools | `codegen:check`, `check:deps`, `py:test:unit` export tests, `ts:test:unit` | PASS |
@@ -318,4 +319,5 @@ Limits and TASK-005 handoff (approved r7):
 - Not yet covered by journeys: agent schema/timeout and code-timeout refusals.
 - Python support-desk deploy raises `LookupError`, whereas Rust raises
   `WYRD_GATEWAY_404_MODEL_UNAVAILABLE`.
-- `wyrd-example-ts` changes are uncommitted in that external repository.
+- r8 moved the external example repositories to TASK-005; the uncommitted
+  partial `wyrd-example-ts` update is discarded, not handed off.

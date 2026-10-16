@@ -1,6 +1,6 @@
 # Verifier building blocks: execution and proof
 
-Authority: [SPEC-verifier-building-blocks r7, approved](../spec.md).
+Authority: [SPEC-verifier-building-blocks r8, approved](../spec.md).
 The change has exactly five implementation tasks. This page coordinates their
 seams, coverage, execution status, and final proof; it is not a sixth task.
 Git staging, commits, worktrees, branch scheduling, and merges remain caller-
@@ -23,6 +23,10 @@ in parallel from that shared contract handoff.
 This records direct owner acceptance, not a new independent review PASS.
 Prior immutable verdicts are preserved. Full integration and journey tests
 remain due after all five tasks are merged.
+
+The owner approved r8 on 2026-10-15: Task 005 owns the standalone
+`wyrd-example-ts` refactor and new `wyrd-example-py`/`wyrd-example-rs`
+repositories (REQ-016).
 
 The owner approved the Task 004 handoff as r7 on 2026-10-15. Task 005 owns
 the execution-based MCP/binding/dispatch cutover, existing Operator plumbing
@@ -66,8 +70,8 @@ substitute for the required real SDK/server and persistence evidence.
 | Task 1 | Foundation contracts, media vocabulary, error/schema sources, staged exports, and minimal existing Vala executor/invoker signature changes. Handoff records reference positions, cause/outcome rules, resolved-input/provenance/deadline shapes, public messages, and the exact final live switch points. |
 | Task 2 | Vala driver/context/registry and deterministic/statistical composition, Vala root exports and its crate manifest. No hosted tools, workspace implementation, server lifecycle, or SDK logic. |
 | Task 3 | Existing invoker internals and hosted evidence/extraction/tools/sandbox. Own server/runtime dependency selection and workspace manifest/lockfile changes. Coordinate any Vala root export with task 2; do not change task 1's contract privately. |
-| Task 4 | Shared client, language wrappers/exports/stubs/declaration sources, matched example assets, external TypeScript demo, docsite, and architecture/diagram prose. Own authored documentation while other tasks produce implementation facts. |
-| Task 5 | Server/control, registry/bindings, SQL/migrations, Scribe/table/ACK/outbox, queue/runner/schedule/baseline/result composition, HTTP/MCP/CLI/UI cutover, and final obsolete-code removal. Regenerate final served/generated contracts and coordinate SDK/doc fixes through their actual owner. |
+| Task 4 | Shared client, language wrappers/exports/stubs/declaration sources, matched example assets, docsite, and architecture/diagram prose. Own authored documentation while other tasks produce implementation facts. |
+| Task 5 | Server/control, registry/bindings, SQL/migrations, Scribe/table/ACK/outbox, queue/runner/schedule/baseline/result composition, HTTP/MCP/CLI/UI cutover, the three standalone example repositories, and final obsolete-code removal. Regenerate final served/generated contracts and coordinate SDK/doc fixes through their actual owner. |
 
 Paths in tasks identify behavioral owners, not strict private file allowlists.
 One shared Cargo.lock or root-manifest update must be integrated before another
@@ -93,7 +97,7 @@ the behavior; task 5 integrates it rather than reimplementing it.
 | REQ-011–013: verify/submit, identity/status, batched lifecycle | Task 4 (client), task 5 (server/queue) | Task 1 locks common types and r6 asynchronous conflict semantics |
 | REQ-014: drift windows, baselines, reactions | Task 2 (scoring adapter), task 5 (data/lifecycle integration) | Task 1 maps bindings; task 4 emits samples and explains results |
 | REQ-015: attributable result | Tasks 1/2/3 (contract/content), task 5 (retention/status) | Task 4 projects and documents it |
-| REQ-016: matched examples and working TypeScript app | Task 4 | Task 5 supplies real-server completion evidence |
+| REQ-016: matched examples and standalone example repositories | Task 4 (in-repo examples), task 5 (example repositories) | Task 5 supplies real-server completion evidence |
 | REQ-017: docsite, architecture, all consumers | Task 4 (docs/examples/SDKs), task 5 (HTTP/MCP/CLI/UI) | Task 1 supplies generation sources; final drift/build checks |
 | INV-001/002: durable owners and one shared client | Tasks 1–5 within their assigned boundaries | Dependency checks and final composition review |
 | INV-003/004: tenancy, authority, audit and durability | Task 3 (capability enforcement), task 5 (admission/queue/storage) | Task 4 preserves context/errors; real negative journeys |
@@ -110,7 +114,7 @@ the behavior; task 5 integrates it rather than reimplementing it.
 | AC-005 | Task 4 authors three-language journeys; task 5 integrated execution |
 | AC-006 | Tasks 1–4 author their local negative branches; task 5 real cross-boundary negative/edge proof, including asynchronous replay conflicts |
 | AC-007 | Task 2 drift composition; task 5 actual windows/baselines/queue/Operator integration |
-| AC-008 | Task 4 owns matched runnable examples/demo; task 5 final real-server proof |
+| AC-008 | Task 4 owns in-repo matched runnable examples; task 5 owns the example repositories and final real-server proof |
 | AC-009 | Task 4 typing/docs/examples/architecture; task 5 served OpenAPI/MCP and live consumer cutover |
 | AC-010 | Each task focused proof; final integrated checks executed once after all five merge |
 
@@ -296,12 +300,13 @@ does not permit leaving a red test or skipping the eventual passing proof.
 ### Proof outside the repository aggregate
 
 `gate` builds example binaries but does not run the three live support-desk
-example tasks, and it does not enter the separate `wyrd-example-ts` repository.
+example tasks, and it does not enter the separate `wyrd-example-ts`,
+`wyrd-example-py`, or `wyrd-example-rs` repositories.
 These are the only planned extra final obligations; do not duplicate the
 aggregate's SDK/docsite lanes.
 
 With the server, tenant, registered components, and provider setup supplied by
-the task 4 instructions/repository-managed fixture (never production secrets):
+the task 4/5 instructions/repository-managed fixture (never production secrets):
 
 ```bash
 mise run examples:rust:support-desk
@@ -309,10 +314,12 @@ mise run examples:python:support-desk
 mise run examples:typescript:support-desk
 mise exec -- npm --prefix ../wyrd-example-ts run typecheck
 mise exec -- npm --prefix ../wyrd-example-ts run test
+mise exec -- uv run --directory ../wyrd-example-py pytest
+mise exec -- cargo test --manifest-path ../wyrd-example-rs/Cargo.toml
 ```
 
-The external demo's existing test starts its own application but expects the
-Wyrd server to exist. Task 4 must document/compose that prerequisite and the
+Each example repository's test starts its own application but expects the
+Wyrd server to exist. Task 5 must document/compose that prerequisite and the
 real SDK package build; do not run it blind or count a missing-service failure
 as proof of behavior. Its startup/shutdown and expected failing-answer checks
 remain mandatory. Use a deterministic local provider for automated proof;

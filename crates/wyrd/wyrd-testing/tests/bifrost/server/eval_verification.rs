@@ -267,6 +267,10 @@ async fn start_state(bundle: &Path, client: &WyrdClient) -> WyrdState {
 /// `openai` provider needs; the observation writer holds it to judge.
 const JUDGE_ROLE: &str = "eval_judge_invoker";
 
+/// Role granting only Card reads: the judge's Agent and Prompt Cards resolve
+/// as their reader, but no model is invocable.
+const CARD_READER_ROLE: &str = "eval_card_reader";
+
 /// Boot a bound server whose gateway serves every model call, LLM judges
 /// included, from the local `provider`.
 ///
@@ -2839,7 +2843,7 @@ async fn refused_owners(
 ///
 /// Services A through E bind the same Agent to the gated LLM-judge Eval. Only
 /// A's owner may invoke the judge model; B's owner authenticates, then holds
-/// no role; C's owner is suspended; D's owner principal is gone; and E's
+/// only Card reads; C's owner is suspended; D's owner principal is gone; and E's
 /// owner principal now exists only in another tenant. An unbound
 /// administrator writes one record about the Agent. The tenant's seeded
 /// SYSTEM principal is active, so A and B each get one run, accepted as
@@ -2945,14 +2949,15 @@ async fn background_owner_subject_system_actor() -> Result<(), ServerJourneyErro
     .execute(&superuser)
     .await?;
     let mut owners = Vec::new();
+    let mut principals = Vec::new();
     for (receipt, roles, bundle) in [
         (&receipt_a, &[JUDGE_ROLE][..], &bundles[0]),
         (&receipt_b, &[][..], &bundles[1]),
     ] {
-        let Bootstrap::Machine { id, api_key, .. } = server
+        let principal = server
             .credential_registered_service(&receipt.root, roles)
-            .await?
-        else {
+            .await?;
+        let Bootstrap::Machine { id, api_key, .. } = &principal else {
             return Err("a registered Service bootstraps a machine principal".into());
         };
         start_state(bundle, &connect(&server, api_key.expose_secret()))
@@ -2960,13 +2965,19 @@ async fn background_owner_subject_system_actor() -> Result<(), ServerJourneyErro
             .shutdown()
             .await?;
         owners.push(id.to_string());
+        principals.push(principal);
     }
-    // B's owner keeps no role at all, so no judge model is inside its
-    // authority; the built-in workload role alone would permit invoking it.
+    // B's owner keeps only Card reads, so it resolves the judge's Cards but
+    // no judge model is inside its authority; the built-in workload role
+    // alone would permit invoking it.
     sqlx::query("DELETE FROM wyrd.auth_service_account_roles WHERE service_account_id = $1")
         .bind(uuid::Uuid::parse_str(&owners[1])?)
         .execute(&superuser)
         .await?;
+    server
+        .seed_role(CARD_READER_ROLE, &[wyrd_runtime::Permission::card_read()])
+        .await?;
+    server.grant_role(&principals[1], CARD_READER_ROLE).await?;
 
     let checkpoint = capture.checkpoint()?;
     let state = start_state(&bundles[0], &admin).await;

@@ -41,6 +41,7 @@ use wyrd_runtime::{
 use wyrd_server::components::auth::Caller;
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
+use wyrd_server::verification::hosted::registry::TenantRegistry;
 use wyrd_server::verification::hosted::sandbox::{CodeExecutor, Sandbox};
 use wyrd_server::verification::hosted::tools::HostedTools;
 use wyrd_server::verification::hosted::workspace::Workspaces;
@@ -124,20 +125,12 @@ impl Registered {
         slots: BTreeMap<SlotName, InputDeclaration>,
         limits: HostedLimits,
     ) -> TenantEvidence {
-        let caller = Caller {
-            data_tenant_id: tenant,
-            principal: Principal::new(
-                PrincipalId::new(uuid::Uuid::now_v7()),
-                PrincipalKind::User,
-                tenant,
-                Vec::new(),
-                PermissionSet::from_iter(permissions),
-            ),
-            request_id: RequestId::now_v7(),
-            delegation_chain: Vec::new(),
-            executed_by: None,
-        };
-        TenantEvidence::new(self.server.state().clone(), caller, slots, limits)
+        TenantEvidence::new(
+            self.server.state().clone(),
+            user(tenant, permissions),
+            slots,
+            limits,
+        )
     }
 
     /// Evidence the server's own tenant may read, citing `slots`.
@@ -156,6 +149,23 @@ impl Registered {
             artifact: self.card.clone(),
             path: Some(path.to_owned()),
         }
+    }
+}
+
+/// A fresh user of `tenant` holding exactly `permissions`.
+fn user(tenant: DataTenantId, permissions: impl IntoIterator<Item = Permission>) -> Caller {
+    Caller {
+        data_tenant_id: tenant,
+        principal: Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            PermissionSet::from_iter(permissions),
+        ),
+        request_id: RequestId::now_v7(),
+        delegation_chain: Vec::new(),
+        executed_by: None,
     }
 }
 
@@ -693,4 +703,57 @@ async fn recovered_authority_bounds_every_agent_tool() {
         .await
         .expect_err("cards.list was not declared");
     assert!(matches!(refused, BlockError::Terminal { .. }), "{refused}");
+}
+
+/// Agent and Prompt Card resolution is the caller's audited `card:read`:
+/// a caller with the grant reaches the Card (and is then told it is not an
+/// Agent or Prompt), while no grant, another tenant, or no caller at all
+/// refuses before the Card is read.
+///
+/// # Panics
+/// Panics when a lookup reads a Card its caller may not read.
+#[tokio::test]
+#[ignore = "needs a bound server; run `mise run test:verification:sandbox`"]
+async fn card_resolution_is_the_callers_read() {
+    let registered = Registered::start().await;
+    let state = registered.server.state().clone();
+    let tenant = registered.server.data_tenant_id();
+    let other = registered
+        .server
+        .seed_tenant("hosted-registry-other")
+        .await
+        .expect("the other tenant seeds");
+    let card = &registered.card;
+    let registry = |caller: Option<Caller>| TenantRegistry::new(state.clone(), caller);
+    let reason = |error: BlockError| match error {
+        BlockError::Terminal { reason } => reason,
+        BlockError::Retryable { reason } => panic!("retryable: {reason}"),
+    };
+
+    let readable = registry(Some(user(tenant, [Permission::card_read()])));
+    let read = reason(
+        AgentCardResolver::resolve(&readable, card)
+            .await
+            .expect_err("an Artifact is not an Agent"),
+    );
+    assert!(read.contains("is not an Agent"), "{read}");
+    let read = reason(
+        PromptCardResolver::resolve(&readable, card)
+            .await
+            .expect_err("an Artifact is not a Prompt"),
+    );
+    assert!(read.contains("is not a Prompt"), "{read}");
+
+    for caller in [
+        Some(user(tenant, [])),
+        Some(user(other, [Permission::card_read()])),
+        None,
+    ] {
+        let refused = reason(
+            AgentCardResolver::resolve(&registry(caller), card)
+                .await
+                .expect_err("refused"),
+        );
+        assert!(!refused.contains("is not an Agent"), "{refused}");
+    }
 }

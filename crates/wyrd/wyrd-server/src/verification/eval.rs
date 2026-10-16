@@ -24,10 +24,8 @@ use tracing::Instrument as _;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 
-use vala_eval::blocks::BlockError;
 use vala_eval::orchestrator::{
-    AgentCardResolver, MediaResolver, OrchestratorError, PromptCardResolver, ScenarioScoring,
-    SkaldJudgeInvoker,
+    AgentCardResolver, MediaResolver, OrchestratorError, ScenarioScoring, SkaldJudgeInvoker,
 };
 use vala_eval::sampling::RecordSample;
 use vala_eval::{
@@ -40,10 +38,8 @@ use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::eval::EvalSpec;
-use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::VerificationRunId;
-use wyrd_spec::reference::CardRef;
 use wyrd_spec::reference::InlineableRef;
 use wyrd_spec::storage::StorageBackendKind;
 use wyrd_spec::vala::api::BifrostQueryRequest;
@@ -54,13 +50,13 @@ use wyrd_spec::vala::eval::{EvalSampling, EvalTask};
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::vala::trace::SpanRecord;
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
-use wyrd_sql::queries::cards::{get_card_by_ref, get_card_by_uid};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput, TerminalStatus};
 use wyrd_storage::tenant_path;
 use wyrd_storage::{StorageError, StorageHandle};
 
 use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use super::engines::{EngineOutcome, VerifierReport};
+use super::hosted::registry::TenantRegistry;
 use super::telemetry::{ExecutionTelemetry, Phase, WaitSink};
 use crate::components::auth::Caller;
 use crate::components::gateway::{GatewayCallSubject, ServerWyrdGatewayCaller};
@@ -325,10 +321,7 @@ impl EvalEngine {
         subject: Option<GatewayCallSubject>,
         telemetry: &ExecutionTelemetry,
     ) -> Arc<dyn JudgeInvoker> {
-        let registry = Arc::new(TenantRegistry {
-            state: self.state.clone(),
-            tenant,
-        });
+        let registry = Arc::new(TenantRegistry::new(self.state.clone(), caller.cloned()));
         let media = Arc::new(TenantMedia {
             storage: Arc::clone(&self.state.storage),
             tenant,
@@ -804,92 +797,6 @@ impl JudgeInvoker for TimedJudge {
             .wait(self.inner.invoke(judge, context, media))
             .instrument(tracing::info_span!("verification.judge"))
             .await
-    }
-}
-
-/// Resolves Agent and Prompt Cards from the run tenant's registry.
-struct TenantRegistry {
-    /// Server state owning the Wyrd Postgres registry.
-    state: AppState,
-    /// Tenant every lookup is scoped to.
-    tenant: DataTenantId,
-}
-
-impl TenantRegistry {
-    /// Load the Card `reference` names, by UID when pinned.
-    ///
-    /// # Errors
-    /// Returns [`BlockError::Retryable`] for a connection failure and
-    /// [`BlockError::Terminal`] for an unpinned reference without a space or
-    /// an absent or unparseable Card.
-    async fn spec(&self, reference: &CardRef) -> Result<Spec, BlockError> {
-        let mut conn = self
-            .state
-            .postgres
-            .wyrd()
-            .tenant_conn(self.tenant)
-            .await
-            .map_err(|error| BlockError::Retryable {
-                reason: error.to_string(),
-            })?;
-        let card = match (&reference.uid, &reference.space) {
-            (Some(uid), _) => get_card_by_uid(&mut conn, uid).await,
-            (None, Some(space)) => {
-                get_card_by_ref(
-                    &mut conn,
-                    reference.kind.clone(),
-                    space,
-                    &reference.name,
-                    &reference.version,
-                )
-                .await
-            }
-            (None, None) => {
-                return Err(BlockError::Terminal {
-                    reason: format!("reference {reference} names no space or uid"),
-                });
-            }
-        };
-        card.map(|card| card.spec)
-            .map_err(|error| BlockError::Terminal {
-                reason: error.to_string(),
-            })
-    }
-}
-
-#[async_trait]
-impl AgentCardResolver for TenantRegistry {
-    /// Resolve an Agent Card of this tenant.
-    ///
-    /// # Errors
-    /// Returns the registry's [`BlockError::Retryable`] connection failure
-    /// or [`BlockError::Terminal`] lookup failure, and
-    /// [`BlockError::Terminal`] when the Card is not an Agent.
-    async fn resolve(&self, agent_ref: &CardRef) -> Result<AgentSpec, BlockError> {
-        match self.spec(agent_ref).await? {
-            Spec::Agent(spec) => Ok(spec),
-            _ => Err(BlockError::Terminal {
-                reason: format!("card {agent_ref} is not an Agent"),
-            }),
-        }
-    }
-}
-
-#[async_trait]
-impl PromptCardResolver for TenantRegistry {
-    /// Resolve a Prompt Card of this tenant into its runtime prompt.
-    ///
-    /// # Errors
-    /// Returns the registry's [`BlockError::Retryable`] connection failure
-    /// or [`BlockError::Terminal`] lookup failure, and
-    /// [`BlockError::Terminal`] when the Card is not a Prompt.
-    async fn resolve(&self, prompt_ref: &CardRef) -> Result<skald_prompt::Prompt, BlockError> {
-        match self.spec(prompt_ref).await? {
-            Spec::Prompt(spec) => Ok(skald_prompt::Prompt::from_native(spec.prompt)),
-            _ => Err(BlockError::Terminal {
-                reason: format!("card {prompt_ref} is not a Prompt"),
-            }),
-        }
     }
 }
 

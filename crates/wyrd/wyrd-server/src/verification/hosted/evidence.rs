@@ -23,7 +23,6 @@ use vala_eval::blocks::{
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::blocks::Action;
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
@@ -32,6 +31,7 @@ use wyrd_storage::tenant_path::{self, ValidatedPath};
 
 use super::HostedLimits;
 use super::extract::{EXTRACT_VERSION, Extraction, locates, units};
+use super::registry::refusal;
 use crate::components::auth::Caller;
 use crate::components::cards::routes::get_card_by_ref_for;
 use crate::components::cards::service::list_card_artifacts;
@@ -183,7 +183,7 @@ impl TenantEvidence {
         }
         let resolved = get_card_by_ref_for(&self.state, &self.caller, card)
             .await
-            .map_err(|error| registry(&error))?;
+            .map_err(|error| refusal(&error))?;
         let uid = resolved
             .card
             .metadata
@@ -191,7 +191,7 @@ impl TenantEvidence {
             .ok_or_else(|| terminal("the Artifact Card has no UID"))?;
         let inventory = list_card_artifacts(&self.state, &self.caller, &uid)
             .await
-            .map_err(|error| registry(&error))?
+            .map_err(|error| refusal(&error))?
             .artifacts;
         let entry = match (path, inventory.as_slice()) {
             (Some(path), entries) => entries
@@ -409,17 +409,6 @@ pub fn sniffs_as(bytes: &[u8], format: MediaFormat) -> bool {
         | MediaFormat::Html
         | MediaFormat::Csv
         | MediaFormat::Json => std::str::from_utf8(bytes).is_ok(),
-    }
-}
-
-/// Classify a registry refusal: server-side failures may pass, anything
-/// the caller could fix or lacks permission for is terminal.
-fn registry(error: &WyrdError) -> BlockError {
-    let reason = format!("the Artifact cannot be read: {error}");
-    if error.status() >= 500 {
-        BlockError::Retryable { reason }
-    } else {
-        BlockError::Terminal { reason }
     }
 }
 

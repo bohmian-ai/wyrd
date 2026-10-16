@@ -56,9 +56,12 @@ jobs:
 
   # ── Release commit ─────────────────────────────────────────────────────────
 
+  # The release's one approval: every publish job needs this job, and the
+  # release-approval environment's reviewer approves it once.
   release-commit:
     name: release commit
     if: github.event_name == 'release'
+    environment: release-approval
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

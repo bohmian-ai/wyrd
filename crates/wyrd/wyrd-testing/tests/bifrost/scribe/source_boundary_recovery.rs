@@ -272,7 +272,8 @@ async fn assert_no_leaked_scribe_ownership(server: &WyrdTestServer, boundary: &s
         assert_eq!(
             memory[category as usize], audit_bytes,
             "{boundary} must retain no {category:?} generation bytes beyond audit_log: \
-             {memory:?}"
+             {memory:?} buckets {:?}",
+            snapshot.memory_by_bucket
         );
     }
 }

@@ -13,8 +13,7 @@ publish_no_verify = true
 # Opt-in crates for crates.io publishing: the Rust SDK (`wyrd-ai`) and every
 # workspace crate it depends on, since crates.io requires each dependency of a
 # published crate, optional ones included, to be published too. The release
-# workflow reads this list, and .github/scripts/check-crate-publish.py fails
-# the build when it misses a dependency.
+# workflow reads this list.
 # Server-tier crates (wyrd-server, wyrd-sql, wyrd-storage, wyrd-testing,
 # wyrd-auth) stay unpublished.
 

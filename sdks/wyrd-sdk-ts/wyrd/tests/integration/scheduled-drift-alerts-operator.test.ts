@@ -163,6 +163,8 @@ test("passing window alerts no one", async ({ server, hooks, cards, watch }) => 
 });
 
 test("empty window is inconclusive and alerts no one", async ({ server, hooks, cards, watch }) => {
+  // The Service authenticates, so its binding is active, but submits nothing.
+  await submit(server, cards, watch, []);
   const result = await judge(server, cards, watch);
 
   expect(result.outcome.verdict).toBe("inconclusive");

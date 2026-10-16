@@ -4,7 +4,7 @@ import { z } from "zod";
 import { Cards, WyrdClient, WyrdState } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
-import { observedService, observedServiceTest as test } from "../support/observed-service.js";
+import { observedService } from "../support/observed-service.js";
 import { binding, scheduledResult } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
@@ -18,8 +18,11 @@ const DriftRow = z.object({
   run_id: z.string(),
 });
 
-/** The observed Service on its own server that runs scheduled Verifiers. */
-const scheduled = observedService({ verificationRuntime: true });
+/**
+ * The observed Service on one file-scoped server that also runs scheduled
+ * Verifiers; vitest shares file-scoped fixtures by name, so the file uses one.
+ */
+const test = observedService({ verificationRuntime: true });
 
 test("run observations read back by run id", async ({ server, reader, state }) => {
   await state.startBifrost();
@@ -47,7 +50,7 @@ test("run observations read back by run id", async ({ server, reader, state }) =
   ]);
 });
 
-scheduled("custom drift judges the submitted window on schedule", async ({ server, state }) => {
+test("custom drift judges the submitted window on schedule", async ({ server, state }) => {
   await state.startBifrost();
   await state.run("model").observe.submit("observed-drift", { latency: 30 });
   await state.shutdown();

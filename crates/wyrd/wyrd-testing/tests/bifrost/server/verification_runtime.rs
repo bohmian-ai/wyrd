@@ -22,8 +22,8 @@ use std::time::Duration;
 use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Float64Array, Int32Array, ListArray,
-    StringArray, StructArray, TimestampMicrosecondArray,
+    Array, ArrayRef, AsArray, BinaryArray, Float64Array, Int32Array, ListArray, StringArray,
+    StructArray, TimestampMicrosecondArray,
 };
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -39,7 +39,6 @@ use vala_bifrost_redux::catalog::{TableRef, TableUid};
 use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use vala_bifrost_redux::oracle::AuthorizedQueryContext;
 use vala_bifrost_redux::scribe::ScribeImpl;
-use vala_bifrost_redux::tables::{DomainTable, ExecutionInputsTable};
 use wyrd_client::Bifrost;
 use wyrd_client::bifrost::TableConfig;
 use wyrd_queue::variant::{EncodedVariant, WyrdJsonEncoderFactory};
@@ -60,7 +59,7 @@ use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, VerificationResultId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, UTC_TIME_ZONE, VARIANT_MAX_DEPTH,
+    AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, VARIANT_MAX_DEPTH,
     VARIANT_MAX_ENCODED_BYTES,
 };
 use wyrd_spec::vala::eval::TaskId;
@@ -1268,10 +1267,10 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 }
 
 /// Raw Arrow IPC that bypasses every client-side Variant check reaches Scribe
-/// admission for a non-signal built-in and a nested signal Variant, and each
-/// malformed frame is refused with its exact catalogued error before any ACK.
+/// admission for a top-level and a nested signal Variant, and each malformed
+/// frame is refused with its exact catalogued error before any ACK.
 ///
-/// `vala.verification.execution_inputs` covers a missing and a foreign extension marker,
+/// `vala.logs.records` covers a missing and a foreign extension marker,
 /// the Variant marker with foreign extension metadata, invalid bytes, one
 /// container past the depth limit, a compact value nested 20,000 levels deep
 /// that is refused for depth without taking the server down, and one byte
@@ -1287,13 +1286,14 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 /// outranks each of invalid, over-deep, and oversized Variant bytes. A JSON
 /// row whose Variant holds an out-of-range integer beside an over-deep branch
 /// is refused for numeric range in both key orders, and also when the integer
-/// sits inside the over-deep branch, before any ACK.
+/// sits inside the over-deep branch, before any ACK; that JSON row encodes
+/// against `vala.verification.execution_inputs` on the client.
 /// `vala.traces.spans` covers the Variant nested in `events`, with a missing
 /// marker and with foreign extension metadata, named by its top-level column.
-/// A non-Variant type change stays a fingerprint mismatch. Afterward the same
-/// server accepts the valid sentinel frames and only they are readable, so no
-/// refused frame persisted a row; the accepted trace's scale-zero `u64::MAX`
-/// decimal reads back with every digit.
+/// A non-Variant type change on a signal column is refused as an unsupported
+/// type. Afterward the same server accepts the valid sentinel frames and only
+/// they are readable, so no refused frame persisted a row; the accepted log
+/// record's scale-zero `u64::MAX` decimal reads back with every digit.
 ///
 /// # Errors
 ///
@@ -1329,20 +1329,20 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             ),
         ]))
     };
-    let inputs = || variant_field("inputs", false);
-    let activation = || variant_field("activation", true);
+    let inputs = || variant_field("attributes", false);
+    let activation = || variant_field("body", true);
     let limit = usize::try_from(VARIANT_MAX_ENCODED_BYTES)?;
     let unsupported = |field: &str| BifrostError::UnsupportedType {
         field: field.to_owned(),
         data_type: variant_storage_type().to_string(),
     };
     let invalid_inputs = BifrostError::VariantInvalidJson {
-        field: "inputs".to_owned(),
+        field: "attributes".to_owned(),
         row: 0,
         path: String::new(),
     };
     let out_of_range = |path: &str, numeric_kind: &str| BifrostError::VariantNumericOutOfRange {
-        field: "inputs".to_owned(),
+        field: "attributes".to_owned(),
         row: 0,
         path: path.to_owned(),
         numeric_kind: numeric_kind.to_owned(),
@@ -1365,7 +1365,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     EncodedVariant::from_bytes(&EMPTY_METADATA, &deepest)
         .map_err(|violation| format!("the depth-limit fixture is invalid: {violation:?}"))?;
     let too_deep = BifrostError::VariantTooDeep {
-        field: "inputs".to_owned(),
+        field: "attributes".to_owned(),
         row: 0,
         path: "/0".repeat(usize::try_from(VARIANT_MAX_DEPTH)?),
         depth: VARIANT_MAX_DEPTH + 1,
@@ -1375,18 +1375,18 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     let frames = [
         (
             "missing extension",
-            (storage_only("inputs", false), valid()?),
-            unsupported("inputs"),
+            (storage_only("attributes", false), valid()?),
+            unsupported("attributes"),
         ),
         (
             "foreign extension",
-            (foreign("inputs"), valid()?),
-            unsupported("inputs"),
+            (foreign("attributes"), valid()?),
+            unsupported("attributes"),
         ),
         (
             "foreign extension metadata",
-            (foreign_metadata("inputs"), valid()?),
-            unsupported("inputs"),
+            (foreign_metadata("attributes"), valid()?),
+            unsupported("attributes"),
         ),
         (
             "invalid bytes",
@@ -1558,7 +1558,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             "an oversized malformed value reports its size",
             (inputs(), raw_variant(&[0xff], &vec![0xff; limit])?),
             BifrostError::VariantTooLarge {
-                field: "inputs".to_owned(),
+                field: "attributes".to_owned(),
                 row: 0,
                 bytes: VARIANT_MAX_ENCODED_BYTES + 1,
                 limit: VARIANT_MAX_ENCODED_BYTES,
@@ -1566,40 +1566,40 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         ),
     ];
     for (what, inputs, expected) in frames {
-        let frame = admission.inputs_frame(&refused, inputs, (activation(), valid()?))?;
-        admission
-            .refuse(what, EXECUTION_INPUTS, &frame, &expected)
-            .await?;
+        let frame = admission.records_frame(&refused, inputs, (activation(), valid()?))?;
+        admission.refuse(what, RECORDS, &frame, &expected).await?;
     }
-    let frame = admission.inputs_frame(
+    let frame = admission.records_frame(
         &refused,
         (inputs(), invalid()?),
-        (storage_only("activation", true), valid()?),
+        (storage_only("body", true), valid()?),
     )?;
     admission
         .refuse(
             "a wrong marker outranks invalid bytes",
-            EXECUTION_INPUTS,
+            RECORDS,
             &frame,
-            &unsupported("activation"),
+            &unsupported("body"),
         )
         .await?;
-    let binary_execution_id = |frame: RecordBatch| -> Result<RecordBatch, ServerJourneyError> {
+    let wide_severity = |frame: RecordBatch| -> Result<RecordBatch, ServerJourneyError> {
         let fields = frame
             .schema()
             .fields()
             .iter()
             .map(|field| match field.name().as_str() {
-                "execution_id" => Arc::new(Field::new("execution_id", DataType::Binary, false)),
+                "severity_number" => {
+                    Arc::new(field.as_ref().clone().with_data_type(DataType::Int64))
+                }
                 _ => Arc::clone(field),
             })
             .collect::<Vec<_>>();
         let mut columns = frame.columns().to_vec();
-        columns[frame.schema().index_of("execution_id")?] = cast(
+        columns[frame.schema().index_of("severity_number")?] = cast(
             frame
-                .column_by_name("execution_id")
-                .ok_or("no execution_id")?,
-            &DataType::Binary,
+                .column_by_name("severity_number")
+                .ok_or("no severity_number")?,
+            &DataType::Int64,
         )?;
         Ok(RecordBatch::try_new(
             Arc::new(Schema::new(fields)),
@@ -1616,15 +1616,20 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             columns,
         )?)
     };
-    let frame = admission.inputs_frame(&refused, (inputs(), valid()?), (activation(), valid()?))?;
-    let error = admission
-        .refusal(EXECUTION_INPUTS, &binary_execution_id(frame)?)
+    let frame =
+        admission.records_frame(&refused, (inputs(), valid()?), (activation(), valid()?))?;
+    let retyped = BifrostError::UnsupportedType {
+        field: "severity_number".to_owned(),
+        data_type: DataType::Int64.to_string(),
+    };
+    admission
+        .refuse(
+            "a non-Variant type change",
+            RECORDS,
+            &wide_severity(frame)?,
+            &retyped,
+        )
         .await?;
-    expect_eq(
-        "a non-Variant type change",
-        &error.code(),
-        &"WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
-    )?;
     let variant_defects = [
         ("invalid", invalid()?),
         (
@@ -1635,7 +1640,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     ];
     for (defect, bytes) in variant_defects {
         let frame = || {
-            admission.inputs_frame(
+            admission.records_frame(
                 &refused,
                 (inputs(), Arc::clone(&bytes)),
                 (activation(), valid()?),
@@ -1644,7 +1649,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         admission
             .refuse(
                 &format!("an undeclared column outranks {defect} Variant bytes"),
-                EXECUTION_INPUTS,
+                RECORDS,
                 &undeclared(frame()?)?,
                 &BifrostError::UndeclaredField {
                     field: "undeclared".to_owned(),
@@ -1652,14 +1657,14 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
                 },
             )
             .await?;
-        let error = admission
-            .refusal(EXECUTION_INPUTS, &binary_execution_id(frame()?)?)
+        admission
+            .refuse(
+                &format!("a non-Variant type change outranks {defect} Variant bytes"),
+                RECORDS,
+                &wide_severity(frame()?)?,
+                &retyped,
+            )
             .await?;
-        expect_eq(
-            &format!("a non-Variant type change outranks {defect} Variant bytes"),
-            &error.code(),
-            &"WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
-        )?;
     }
     admission.refuse_json_rows().await?;
 
@@ -1731,10 +1736,10 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         )
         .await?;
 
-    // The accepted inputs row carries the one decimal form the exact numeric
+    // The accepted log record carries the one decimal form the exact numeric
     // domain admits, which must read back with every digit, and a finite float.
     let accepted = admission.session("accepted");
-    let sentinel = admission.inputs_frame(
+    let sentinel = admission.records_frame(
         &accepted,
         (
             inputs(),
@@ -1748,7 +1753,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             )?,
         ),
     )?;
-    admission.accept(EXECUTION_INPUTS, &sentinel).await?;
+    admission.accept(RECORDS, &sentinel).await?;
     admission
         .accept(SPANS, &admission.spans_frame(&accepted))
         .await?;
@@ -1759,12 +1764,12 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
 
     let suffix = &admission.run;
     expect_eq(
-        "stored execution inputs",
+        "stored log records",
         &admission
             .journey
             .rows(format!(
-                "SELECT verifier_card_uid, count(*) FROM {EXECUTION_INPUTS} \
-                 WHERE verifier_card_uid LIKE '%{suffix}' GROUP BY verifier_card_uid"
+                "SELECT scope_name, count(*) FROM {RECORDS} \
+                 WHERE scope_name LIKE '%{suffix}' GROUP BY scope_name"
             ))
             .await?,
         &vec![vec![json!(accepted), json!(1)]],
@@ -1774,8 +1779,8 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         &admission
             .journey
             .rows(format!(
-                "SELECT inputs, activation FROM {EXECUTION_INPUTS} \
-                 WHERE verifier_card_uid = '{accepted}'"
+                "SELECT attributes, body FROM {RECORDS} \
+                 WHERE scope_name = '{accepted}'"
             ))
             .await?,
         &vec![vec![json!(u64::MAX), json!(1.5)]],
@@ -1807,8 +1812,12 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     Ok(())
 }
 
-/// The non-signal built-in the Variant admission journey writes: a required
-/// `inputs` and a nullable `activation` Variant beside fixed scalar columns.
+/// The client-writable built-in whose top-level Variants the journey writes:
+/// a required `attributes` and a nullable `body`.
+const RECORDS: &str = "vala.logs.records";
+
+/// The server-written built-in the public JSON-row facade encodes against;
+/// its Variant refusals surface on the client before anything is queued.
 const EXECUTION_INPUTS: &str = "vala.verification.execution_inputs";
 
 /// The signal built-in whose nested `events` Variant the journey writes.
@@ -1864,6 +1873,8 @@ struct VariantAdmissionJourney {
     ingest: RawIngest,
     /// Admin client the public Bifrost facade writes JSON rows through.
     client: wyrd_client::WyrdClient,
+    /// The described `vala.logs.records` user schema.
+    records: SchemaRef,
     /// The described `vala.traces.spans` user schema.
     spans: SchemaRef,
     /// The described `vala.metrics.points` user schema.
@@ -1882,7 +1893,7 @@ impl VariantAdmissionJourney {
     async fn start() -> Result<Self, ServerJourneyError> {
         let journey = TypedPayloadJourney::start().await?;
         for (namespace, name) in [
-            ("verification", "execution_inputs"),
+            ("logs", "records"),
             ("traces", "spans"),
             ("metrics", "points"),
         ] {
@@ -1905,6 +1916,11 @@ impl VariantAdmissionJourney {
             Some(api_key.expose_secret()),
             journey.gateway.server.grpc_url().as_deref(),
         )?;
+        let records = Arc::clone(
+            TableConfig::describe_with(&client, RECORDS)
+                .await?
+                .user_schema(),
+        );
         let spans = Arc::clone(
             TableConfig::describe_with(&client, SPANS)
                 .await?
@@ -1919,6 +1935,7 @@ impl VariantAdmissionJourney {
             ingest: RawIngest::connect(&client).await?,
             client,
             journey,
+            records,
             spans,
             points,
             run: uuid::Uuid::now_v7().simple().to_string(),
@@ -2036,43 +2053,34 @@ impl VariantAdmissionJourney {
         format!("{outcome}-{}", self.run)
     }
 
-    /// One direct execution's inputs row under `session` with the given
-    /// Variant columns.
+    /// The canonical log record under scope `scope` with the given
+    /// `attributes` and `body` Variant columns.
     ///
-    /// The row carries a fresh `execution_id`, `session` as its
-    /// `verifier_card_uid`, no binding, and `queue_execution` false, so its
-    /// ACK can never queue work. Every other column takes a fixed valid
-    /// value, so a refusal can come only from the two supplied fields or a
-    /// deliberate schema change.
+    /// Every other column keeps the canonical fixture's valid value, so a
+    /// refusal can come only from the two supplied fields or a deliberate
+    /// schema change.
     ///
     /// # Errors
     ///
     /// Returns the Arrow error when the columns do not form a batch, or an
     /// error when a supplied field is undeclared.
-    fn inputs_frame(
+    fn records_frame(
         &self,
-        session: &str,
-        inputs: (Field, ArrayRef),
-        activation: (Field, ArrayRef),
+        scope: &str,
+        attributes: (Field, ArrayRef),
+        body: (Field, ArrayRef),
     ) -> Result<RecordBatch, ServerJourneyError> {
-        let now = Utc::now().timestamp_micros();
-        let text = |value: &str| Arc::new(StringArray::from(vec![value])) as ArrayRef;
-        let mut fields = ExecutionInputsTable::arrow_fields();
-        let columns: Vec<ArrayRef> = vec![
-            text(&format!("{session}-{}", uuid::Uuid::now_v7().simple())),
-            text(session),
-            Arc::new(StringArray::from(vec![None::<&str>])),
-            Arc::new(BooleanArray::from(vec![false])),
-            inputs.1,
-            activation.1,
-            Arc::new(TimestampMicrosecondArray::from(vec![now]).with_timezone(UTC_TIME_ZONE)),
-        ];
-        for field in [inputs.0, activation.0] {
-            let index = fields
-                .iter()
-                .position(|declared| declared.name() == field.name())
-                .ok_or("an execution inputs field is undeclared")?;
-            fields[index] = field;
+        let record = canonical_signals::logs(
+            &self.records,
+            scope,
+            Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        );
+        let mut fields = record.schema().fields().to_vec();
+        let mut columns = record.columns().to_vec();
+        for (field, column) in [attributes, body] {
+            let index = record.schema().index_of(field.name())?;
+            fields[index] = Arc::new(field);
+            columns[index] = column;
         }
         Ok(RecordBatch::try_new(
             Arc::new(Schema::new(fields)),

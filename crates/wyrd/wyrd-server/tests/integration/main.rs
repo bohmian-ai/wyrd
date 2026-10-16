@@ -13,6 +13,8 @@ mod pg_card_registration_route;
 #[cfg(feature = "test-support")]
 mod pg_grpc_ingest_smoke;
 mod pg_grpc_smoke;
+/// Registered Artifact evidence and code through the hosted runtime.
+mod pg_hosted_artifacts;
 mod pg_merge_http_protected;
 mod pg_openapi_contract;
 mod pg_operator_connection_routes;
@@ -26,5 +28,7 @@ mod pg_verification_routes;
 mod pg_verification_runtime;
 #[cfg(feature = "test-support")]
 mod platform_admin_e2e;
+/// The Python sandbox against the real hardened worker.
+mod sandbox_worker;
 #[cfg(feature = "storage-emulator")]
 mod storage_e2e;

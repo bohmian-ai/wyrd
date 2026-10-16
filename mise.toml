@@ -19,7 +19,7 @@
 [tools]
 node = "26.2.0"
 uv = "0.11.16"
-rust    = "1.98.1"
+rust    = "1.99.0"
 "npm:pnpm" = "11.4.0"
 cmake = "3.26.4"
 protoc = "33.2"
@@ -835,6 +835,16 @@ mise run ts:build:testing
 hide = true
 description = "Build the wyrd-server release binary"
 run = "cargo build --release --locked -p wyrd-server --features cloud"
+
+[tasks."build:monty-worker"]
+hide = true
+description = "Build the hardened Monty worker the server spawns for sandboxed Verifier Python"
+run = "cargo build --release --locked -p wyrd-monty-worker"
+
+[tasks."test:verification:sandbox"]
+description = "Run the Verifier Python sandbox and registered-Artifact code tests against the real Monty worker and test Postgres"
+depends = ["build:monty-worker"]
+run = "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-server --test integration --run-ignored=only -E 'test(/^(sandbox_worker|pg_hosted_artifacts)::/)'"
 
 [tasks."test:server:startup"]
 description = "Official image journeys: the development setup, then the team deployment"

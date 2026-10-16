@@ -37,8 +37,8 @@ use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::middleware::trace_context;
 use crate::state::AppState;
 
-mod bifrost;
-mod cards;
+pub(crate) mod bifrost;
+pub(crate) mod cards;
 mod gateway;
 mod guide;
 mod operators;

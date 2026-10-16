@@ -218,14 +218,14 @@ The LLM judge is not kept anywhere, including offline `wyrd eval run`
 alias, flag, or compatibility path. Its replacement is an `agent` check
 executed through `vala_eval::blocks::CheckExecutor` (TASK-003) returning
 `BlockError`. Removal map at staging time (`git grep -nE
-"JudgeError|JudgeInvoker|JudgeTaskExecutor|LlmJudge|llm_judge|judge_mock|judge-mock|JudgeOutcome|TimedJudge"`
+"JudgeError|JudgeInvoker|JudgeTaskExecutor|LlmJudge|llm_judge|judge_mock|judge-mock|JudgeOutcome|TimedJudge|EvalEngine|TenantMedia"`
 must return nothing outside `changes/` when done):
 
 | Area | Delete |
 | --- | --- |
 | Contracts (`wyrd-spec`) | `vala/eval/llm_judge.rs` (`LlmJudgeTask`), `EvalTask::LlmJudge` in `vala/eval/task.rs` and its `mod.rs`/`spec.rs`/`result.rs` uses; `VerifierTask::LlmJudge` in `card/verifier.rs`; judge `VerifierKind` variants in `verification.rs`; judge handling in `refs/mod.rs`, `graph/composition.rs`, `reference.rs` tests; fixture `tests/fixtures/verifier-task-llm-judge.yaml` |
 | Engine (`vala-eval`) | `judge.rs` (`JudgeError`, `JudgeInvoker`, `MockJudgeInvoker`); `tasks/judge.rs` (`JudgeTaskExecutor`); `orchestrator/judge.rs` (`SkaldJudgeInvoker`, after TASK-003 moved any reused helper); `Executors::judge` and `EvalTaskKind` judge kind (`executor.rs`, `store.rs`); judge variants in `error.rs`; judge media binding in `tasks/media.rs`; judge parameters of `orchestrator/scoring.rs::ScenarioScoring`; judge cases in `scenario.rs`, `context.rs`, `tasks/{assertion,trace,agent}.rs` tests; integration module `tests/integration/orchestrator_judge_skald.rs` and judge cases in `orchestrator_parity.rs`/`orchestrator_support` |
-| Server | `wyrd-server/src/verification/eval.rs` (`EvalEngine`, `TimedJudge`) and its uses in `verification/{direct,mod}.rs`; judge cases in `tests/integration/{pg_verification_routes,pg_verification_runtime,pg_card_registration_route}.rs` |
+| Server | The whole of `wyrd-server/src/verification/eval.rs` (`EvalEngine`, `TimedJudge`, `BifrostReader` over the deleted `vala.eval.observations` input, `TenantMedia` and its `supported`/media limit, and the Eval-only helpers) and its uses in `verification/{direct,mod}.rs`; judge cases in `tests/integration/{pg_verification_routes,pg_verification_runtime,pg_card_registration_route}.rs`. `TenantRegistry` is the one server Agent/Prompt Card resolver the `agent` action and check need: TASK-003 moves it to `verification/hosted/registry.rs` and authorizes every lookup as the accepted caller's audited `card:read`; TASK-005 composes it into `AgentExecutor`. No `eval` module, type, or file name remains in `verification/`. |
 | CLI | `--judge-mock`, `judge_for_spec`, `has_llm_judge` in `wyrd-cli/src/eval/run.rs`; `WyrdCliError::JudgeMockRequired`; judge plumbing in `eval/local_records.rs`; judge fixtures/support in `tests/eval_support`, `tests/eval_local_records.rs`, `tests/fixtures/loader/end_to_end/agent1/eval.yaml` |
 | Client/testing | `LlmJudgeTask` test in `wyrd-client/src/state.rs`; `Kind::Judge` and `eval_llm_judge` cells in `wyrd-testing/src/bin/capacity/{fixture,report}.rs`; `wyrd-testing/tests/bifrost/server/eval_verification.rs` judge cases |
 | SDK/docs/fixtures | Owned by TASK-004 (listed there); coordinate so generated SDK types drop judge kinds when the contracts do |

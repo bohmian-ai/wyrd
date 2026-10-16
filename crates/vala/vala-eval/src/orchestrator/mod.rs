@@ -11,8 +11,9 @@ pub mod scoring;
 pub mod simulator;
 pub mod state;
 
+pub use crate::blocks::{AgentCardResolver, PromptCardResolver};
 pub use error::OrchestratorError;
-pub use judge::{AgentCardResolver, MediaResolver, PromptCardResolver, SkaldJudgeInvoker};
+pub use judge::{MediaResolver, SkaldJudgeInvoker};
 pub use scoring::ScenarioScoring;
 pub use simulator::{SIMULATOR_PROMPT_TEMPLATE, ServerSimulatedUser, SimulatorPrompt};
 pub use state::{NextDirective, RunState, RunStatus, ScenarioCursor, SharedRun, SubmissionOutcome};

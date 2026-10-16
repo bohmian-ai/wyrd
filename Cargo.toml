@@ -12,7 +12,6 @@ members = [
     "sdks/wyrd-sdk-ts/native",
     "sdks/wyrd-sdk-ts/native-testing",
 ]
-exclude = []
 default-members = [
     "crates/wyrd/wyrd-server",
     "crates/wyrd/wyrd-cli",
@@ -23,7 +22,7 @@ default-members = [
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.94.0"
+rust-version = "1.99.0"
 repository = "https://github.com/bohmian-ai/wyrd"
 authors = ["Thorrester <sjforrester32@gmail.com>"]
 
@@ -139,6 +138,16 @@ chrono-tz = "0.10"
 croner = { version = "4", default-features = false, features = ["chrono"] }
 dashmap = "6.1"
 flate2 = "1.*"
+# Verifier extraction and workspace archives; server-hosted runtime only.
+calamine = { version = "0.36", default-features = false }
+csv = "1.4"
+lopdf = { version = "0.45", default-features = false }
+quick-xml = "0.41"
+# Sandboxed Verifier Python pool and the hardened worker binary it spawns.
+monty-pool = "1.1"
+monty-types = "1.1"
+tar = { version = "0.4", default-features = false }
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 zstd = "0.13"
 walkdir = "2.*"
 sha2 = "0.10"
@@ -189,7 +198,7 @@ arrow-schema = "60.0"
 statrs = "0.18"
 jsonpath-rust = "0.7"
 tracing-opentelemetry = "0.32"
-pyo3 = { version = "0.28", features = ["abi3-py310", "chrono", "py-clone"] }
+pyo3 = { version = "0.29", features = ["abi3-py310", "chrono", "py-clone"] }
 toml = "0.8"
 toml_edit = "0.22"
 shellexpand = "3"
@@ -322,6 +331,9 @@ cast_precision_loss = "allow"
 unwrap_used = "warn"
 # Every lint suppression states why it is sound.
 allow_attributes_without_reason = "warn"
+# 1.99 asks for `assert_eq!(x, [] as [T; 0])`, which spells out the element
+# type at every site and reads worse than the `is_empty` assertion it replaces.
+assert_is_empty = "allow"
 
 # Dev and test binaries keep file:line tables for backtraces but drop full
 # debug info. Every test binary statically links the whole dependency cone, so

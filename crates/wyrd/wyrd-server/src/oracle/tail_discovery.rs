@@ -242,7 +242,7 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
         }
         #[cfg(feature = "test-support")]
         if STALE_LISTINGS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                 left.checked_sub(1)
             })
             .is_ok()

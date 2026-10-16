@@ -4324,10 +4324,6 @@ impl<'a> MakeWriter<'a> for TraceBuffer {
 /// Panics when a fixture fails or a leak, label, gauge, correlation, capture,
 /// or terminal-result assertion differs.
 #[tokio::test]
-#[expect(
-    clippy::float_cmp,
-    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
-)]
 async fn gateway_observations_are_bounded_correlated_and_secret_free() {
     use std::fmt::Write as _;
     const CANARY: &str = "sk-gateway-canary-5e1d";

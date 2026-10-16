@@ -26,4 +26,5 @@ platforms = [
 # share artifacts with the Rust test graph; keeping them out stops binding-only
 # features (for example PyO3 extension-module) leaking into test binaries.
 [traversal-excludes]
-workspace-members = ["wyrd-sdk-python", "wyrd-sdk-ts", "wyrd-sdk-ts-testing"]
+# The hardened Monty worker keeps its own minimal dependency cone.
+workspace-members = ["wyrd-sdk-python", "wyrd-sdk-ts", "wyrd-sdk-ts-testing", "wyrd-monty-worker"]

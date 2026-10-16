@@ -415,7 +415,7 @@ mod tests {
                             .expect("recorder lock is healthy")
                             .push(headers);
                         let refuse = refusals
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                                 left.checked_sub(1)
                             })
                             .is_ok();

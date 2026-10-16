@@ -279,3 +279,51 @@ to foundation/client owners requires spec authority.
   [Bifrost design](../../../../architecture/bifrost-design.md).
 - [Execution and final proof coordination](README.md). Ready after owner-approved
   completion of TASK-001; execute independently alongside the other parallel tasks.
+
+## Implementation Evidence
+
+Commits: `689109c79`, `50597593c`, `d7f23fe5b`, `688e34d3c`, `57c69c357`
+(Scenario 1 landed before these).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Agents run on declared route; step tools, tool-less checks, Verdict schema | `vala-eval/src/blocks/agent.rs`, `blocks/tools.rs` | `blocks_agent::*` (11 cases, incl. `route_override_replaces_declared_route`, `check_agent_refuses_tools`, `step_agent_records_declared_tool_calls`, `step_agent_refuses_unknown_tool`) | PASS |
+| Extraction matches REQ-004; legacy/wrong formats refused | `verification/hosted/extract.rs`; `impl ActionExecutor for TenantEvidence` | `extract::tests::*` (9), `evidence::tests::extract_action_returns_locked_shape` | PASS |
+| Bounded workspace: read-only inputs, budgeted work, no escapes, cleanup | `verification/hosted/workspace.rs` | `workspace::tests::*` (4) | PASS |
+| Citations validated against reachable pinned evidence; uncited pass → inconclusive | `EvidenceReader::cited`, `extract::locates` | `evidence::tests::citations_must_locate_reachable_evidence`, `blocks_agent::check_agent_keeps_only_valid_citations` | PASS |
+| Python isolation: no host files/env/callbacks, mounts only, no cross-call state, identical on every platform | `crates/wyrd/wyrd-monty-worker`, `verification/hosted/sandbox.rs` | `sandbox_worker::sandbox_reaches_only_its_mounts`, `sandbox_runs_entrypoints_without_shared_state` | PASS |
+| Pool limits: workers, 16 waiters, 256 MiB alloc / 384 MiB per process / 2 GiB pool, 10 s op incl. wait, output bound, recovery | `Sandbox` (admission semaphore, `live_workers`, `timeout_at`), `HostedLimits` | `sandbox_worker::sandbox_contains_runaway_code`, `sandbox_bounds_workers_and_waiters` | PASS |
+| Built-ins resolve with exact/global `tool:invoke` + audit before dispatch; domain checks retained; forged args refused; workspace required | `verification/hosted/tools.rs` (`audit::authorize`, MCP descriptors reused) | `tools::tests::*` (4) | PASS |
+
+Commands (all passing):
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --offline -p wyrd-server --lib -E 'test(/verification::hosted::/)'"   # 21 passed
+mise run test:verification:sandbox   # builds the worker; 5 passed
+mise exec -- cargo nextest run --offline -p vala-eval --test integration -E 'test(/^(blocks_agent|orchestrator_judge_skald)::/)'
+mise exec -- cargo clippy --offline -p wyrd-server -p vala-eval --all-features --lib --tests -- -D warnings
+mise run lints   # includes wyrd-monty-worker
+mise run fmt
+mise run check:deps
+mise run check:workspace-hack
+git diff --check
+```
+
+Material limits and handoff to TASK-005:
+
+- The worker is a workspace member kept out of the workspace-hack; the
+  workspace moved to Rust 1.99.0 (monty 1.1.0 does not compile on 1.98) and
+  pyo3 0.29 (monty's pyo3 `links = "python"`). `mise run build:monty-worker`
+  builds it; TASK-005 owns the worker-path configuration, server wiring, and
+  the container build.
+- Memory is bounded portably (macOS and Linux, x86_64 and arm64): Monty's
+  allocator ceiling per operation and `HostedLimits::live_workers` (pool ÷
+  per-process ceiling) worker admission. No OS-specific mechanism is used.
+  Warm workers are not replenished after use (monty-pool spawns on demand).
+- Artifact code and evidence are read through the authorized registry; see
+  the R1 remediation evidence.
+- Oracle table refusal through `bifrost.query` is proven by
+  `pg_hosted_artifacts::recovered_authority_bounds_every_agent_tool`.
+- TASK-005 constructs `HostedTools::new(state, caller, evidence, workspaces,
+  sandbox, limits)`, `CodeExecutor::new(sandbox, evidence)`, and
+  `Sandbox::start(worker_path, limits)`.

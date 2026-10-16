@@ -20,6 +20,7 @@ pub mod eval;
 pub mod fault;
 pub mod fitter;
 pub mod health;
+pub mod hosted;
 mod leases;
 pub mod observations;
 pub mod operators;

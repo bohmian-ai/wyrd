@@ -3,9 +3,7 @@
 //! Ignored in the fast lane because they need the worker binary; `mise run
 //! test:verification:sandbox` builds it and runs them.
 
-use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use monty_pool::{MountSpec, MountSpecMode};
@@ -80,48 +78,6 @@ fn terminal(result: Result<CodeRun, BlockError>) -> String {
         Err(BlockError::Terminal { reason }) => reason,
         other => panic!("expected a terminal failure, got {other:?}"),
     }
-}
-
-/// The worker confines itself before serving: new user, network, and IPC
-/// namespaces, and `no_new_privs`.
-///
-/// # Panics
-/// Panics when any confinement is missing.
-#[test]
-#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
-fn worker_enters_isolation_before_serving() {
-    let mut child = Command::new(worker())
-        .arg("subprocess")
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("worker spawns");
-    // An undecodable frame draws a protocol-violation reply, which the
-    // worker can only send after confinement.
-    let mut stdin = child.stdin.take().expect("stdin");
-    stdin.write_all(&[1, 0, 0, 0, 0xff]).expect("frame written");
-    let mut reply = [0_u8; 4];
-    child
-        .stdout
-        .as_mut()
-        .expect("stdout")
-        .read_exact(&mut reply)
-        .expect("worker replies");
-
-    let pid = child.id();
-    for namespace in ["user", "net", "ipc"] {
-        let ours = std::fs::read_link(format!("/proc/self/ns/{namespace}")).expect("own ns");
-        let its = std::fs::read_link(format!("/proc/{pid}/ns/{namespace}")).expect("worker ns");
-        assert_ne!(ours, its, "{namespace} namespace is shared");
-    }
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("status");
-    assert!(
-        status.lines().any(|line| line == "NoNewPrivs:\t1"),
-        "{status}"
-    );
-    drop(stdin);
-    assert!(child.wait().expect("worker exits").success());
 }
 
 /// Entry points receive JSON inputs, return JSON, and keep bounded prints;
@@ -229,11 +185,12 @@ async fn sandbox_reaches_only_its_mounts() {
     );
 }
 
-/// Memory, time, and group-memory breaches end only the offending
-/// operation; the sandbox keeps serving.
+/// Memory and time breaches end only the offending operation; the sandbox
+/// keeps serving, and limits that cannot hold one worker refuse to start.
 ///
 /// # Panics
-/// Panics when a breach succeeds or poisons the pool.
+/// Panics when a breach succeeds, poisons the pool, or impossible limits
+/// start.
 #[tokio::test]
 #[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
 async fn sandbox_contains_runaway_code() {
@@ -270,21 +227,18 @@ async fn sandbox_contains_runaway_code() {
         json!(1)
     );
 
-    let starved = start(HostedLimits {
-        monty_pool_memory_bytes: 1,
-        ..HostedLimits::default()
-    })
-    .await;
-    let reason = terminal(
-        run(
-            &starved,
-            "def f():\n    while True:\n        pass",
-            "f",
-            json!({}),
-        )
-        .await,
-    );
-    assert!(reason.contains("stopped"), "{reason}");
+    for limits in [
+        HostedLimits {
+            monty_pool_memory_bytes: 1,
+            ..HostedLimits::default()
+        },
+        HostedLimits {
+            monty_process_memory_bytes: HostedLimits::default().monty_memory_bytes,
+            ..HostedLimits::default()
+        },
+    ] {
+        assert!(Sandbox::start(worker(), limits).await.is_err());
+    }
 }
 
 /// Beyond `max_workers + max_waiters` operations are refused at once, and a

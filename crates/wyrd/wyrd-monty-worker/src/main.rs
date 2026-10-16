@@ -1,25 +1,17 @@
-//! Wyrd's hardened Monty worker process.
+//! Wyrd's Monty worker process.
 //!
 //! The server's Monty pool spawns this binary as `wyrd-monty-worker
 //! subprocess` with an empty environment and speaks Monty's framed protocol
-//! over stdio. Before reading any request the process confines itself, and it
-//! refuses to serve when any step fails, so missing isolation is never
-//! silently accepted:
+//! over stdio. Isolation is Monty's own and identical on every platform:
+//! sandboxed Python has no host files, network, subprocesses, environment, or
+//! host callbacks; every OS call is a protocol event the parent answers from
+//! the call's mounts or refuses. [`ALLOC`] bounds the whole process heap at
+//! the session's memory budget plus Monty's headroom, so the parent's
+//! per-worker ceiling holds without OS-specific limits.
 //!
-//! 1. new user, network, and IPC namespaces without ID mappings: the worker
-//!    runs as the overflow `nobody` identity with no capability outside its
-//!    namespace, and has no usable network interface;
-//! 2. no core dumps, no regular-file writes, and a small descriptor table;
-//! 3. `no_new_privs` and a Landlock ruleset that handles every filesystem,
-//!    TCP, and scope right with no exceptions, so no host path can be opened
-//!    or executed, no TCP socket bound or connected, and no outside process
-//!    signalled;
-//! 4. once the interpreter thread runs, no process or thread creation.
-//!
-//! Sandbox file access is serviced by the parent from per-call mounts, so the
-//! worker never needs a host path. The serve loop mirrors `monty-runtime`'s
-//! `subprocess` shell over [`monty_proto::worker::Child`]. Each worker serves
-//! one checkout and exits, so no interpreter state crosses invocations.
+//! The serve loop mirrors `monty-runtime`'s `subprocess` shell over
+//! [`monty_proto::worker::Child`]. Each worker serves one checkout and exits,
+//! so no interpreter state crosses invocations.
 
 use std::io;
 use std::process::ExitCode;
@@ -43,21 +35,14 @@ const EX_USAGE: u8 = 64;
 /// `sysexits.h` protocol error: the frame stream desynchronized.
 const EX_PROTOCOL: u8 = 76;
 
-/// `sysexits.h` configuration error: isolation could not be established.
+/// `sysexits.h` configuration error: the interpreter thread could not start.
 const EX_CONFIG: u8 = 78;
 
-/// Most open descriptors: stdio plus Monty's own needs.
-const MAX_FILES: u64 = 16;
-
-/// Confine the process, then serve the protocol on a dedicated thread.
+/// Serve the protocol on a dedicated interpreter thread.
 fn main() -> ExitCode {
     if !std::env::args().skip(1).eq(["subprocess".to_owned()]) {
         eprintln!("usage: wyrd-monty-worker subprocess");
         return ExitCode::from(EX_USAGE);
-    }
-    if let Err(reason) = confine() {
-        eprintln!("wyrd-monty-worker refused to serve: {reason}");
-        return ExitCode::from(EX_CONFIG);
     }
     thread::Builder::new()
         .name("monty-worker".to_owned())
@@ -68,81 +53,9 @@ fn main() -> ExitCode {
         })
 }
 
-/// Enter the namespaces, limits, and Landlock domain described in the crate
-/// docs. Runs while the process is still single-threaded, which unsharing a
-/// user namespace requires; threads created later inherit every restriction.
-///
-/// # Errors
-/// Returns the failed step when the kernel refuses any restriction or does
-/// not enforce Landlock.
-#[cfg(target_os = "linux")]
-fn confine() -> Result<(), String> {
-    use landlock::{
-        ABI, Access, AccessFs, AccessNet, Ruleset, RulesetAttr, RulesetCreated, RulesetStatus,
-        Scope,
-    };
-    use nix::sched::{CloneFlags, unshare};
-    use nix::sys::resource::{Resource, setrlimit};
-
-    unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWIPC)
-        .map_err(|error| format!("namespaces: {error}"))?;
-    for (resource, limit) in [
-        (Resource::RLIMIT_CORE, 0),
-        (Resource::RLIMIT_FSIZE, 0),
-        (Resource::RLIMIT_NOFILE, MAX_FILES),
-    ] {
-        setrlimit(resource, limit, limit).map_err(|error| format!("{resource:?}: {error}"))?;
-    }
-    nix::sys::prctl::set_no_new_privs().map_err(|error| format!("no_new_privs: {error}"))?;
-    let abi = ABI::V6;
-    let status = Ruleset::default()
-        .handle_access(AccessFs::from_all(abi))
-        .and_then(|ruleset| ruleset.handle_access(AccessNet::from_all(abi)))
-        .and_then(|ruleset| ruleset.scope(Scope::from_all(abi)))
-        .and_then(Ruleset::create)
-        .and_then(RulesetCreated::restrict_self)
-        .map_err(|error| format!("landlock: {error}"))?;
-    if status.ruleset == RulesetStatus::NotEnforced {
-        return Err("landlock: this kernel does not enforce Landlock".to_owned());
-    }
-    Ok(())
-}
-
-/// Isolation exists only on Linux; elsewhere the worker never serves.
-///
-/// # Errors
-/// Always.
-#[cfg(not(target_os = "linux"))]
-fn confine() -> Result<(), String> {
-    Err("worker isolation requires Linux namespaces and Landlock".to_owned())
-}
-
-/// Forbid process and thread creation for the rest of the worker's life.
-///
-/// # Errors
-/// Returns the refused limit.
-#[cfg(target_os = "linux")]
-fn seal() -> Result<(), String> {
-    use nix::sys::resource::{Resource, setrlimit};
-    setrlimit(Resource::RLIMIT_NPROC, 0, 0).map_err(|error| format!("RLIMIT_NPROC: {error}"))
-}
-
-/// Nothing to seal where the worker never serves.
-///
-/// # Errors
-/// Never.
-#[cfg(not(target_os = "linux"))]
-fn seal() -> Result<(), String> {
-    Ok(())
-}
-
 /// The protocol loop: one request in, its events out, until EOF, `Shutdown`,
 /// or a fatal error.
 fn serve() -> ExitCode {
-    if let Err(reason) = seal() {
-        eprintln!("wyrd-monty-worker refused to serve: {reason}");
-        return ExitCode::from(EX_CONFIG);
-    }
     install_panic_hook();
     let mut reader = FrameReader::new(io::stdin().lock());
     let mut child = Child::default();

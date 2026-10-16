@@ -6,7 +6,7 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
-description = "Hardened Monty Python worker process for hosted Verifier code."
+description = "Monty Python worker process for hosted Verifier code."
 publish = false
 
 [[bin]]
@@ -17,10 +17,6 @@ path = "src/main.rs"
 monty-alloc = "=1.1.0"
 monty-proto = { version = "=1.1.0", features = ["worker"] }
 monty-types = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-landlock = "0.4.7"
-nix = { version = "0.31", default-features = false, features = ["process", "resource", "sched"] }
 
 [lints]
 workspace = true

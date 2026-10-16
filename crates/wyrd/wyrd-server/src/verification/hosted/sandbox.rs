@@ -1,15 +1,14 @@
 //! The shared Python sandbox behind `code` blocks and the `code.run` tool.
 //!
-//! [`Sandbox`] owns one process-wide Monty pool of hardened
+//! [`Sandbox`] owns one process-wide Monty pool of
 //! `wyrd-monty-worker` processes (see that crate for the in-worker
 //! isolation). Each [`Sandbox::run`] admits at most `max_workers +
 //! max_waiters` operations, checks out a fresh worker within the operation's
-//! deadline, caps the worker's address space, feeds the source plus one
+//! deadline, feeds the source plus one
 //! entrypoint call, answers every suspension (mounted file calls from the
 //! call's mounts, everything else refused), and drops the checkout, which
 //! kills the worker: no interpreter state or process survives into another
-//! operation. A watchdog kills the largest busy worker while the combined
-//! resident memory of all workers exceeds the pool ceiling.
+//! operation. Memory limits hold on every platform: see [`Sandbox::start`].
 //!
 //! [`CodeExecutor`] runs `code` actions and checks on the sandbox. Values
 //! cross the boundary as JSON text through the sandbox's `json` module, so
@@ -17,18 +16,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use monty_pool::{
     MountSpec, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync,
 };
 use monty_types::{MontyObject, ResourceLimits};
-use rustix::process::{Pid, Resource, Rlimit};
 use serde_json::{Map, Value};
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use vala_eval::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
@@ -41,9 +37,6 @@ use wyrd_spec::verification::execution::{CallProvenance, Verdict};
 
 use super::HostedLimits;
 use super::evidence::TenantEvidence;
-
-/// How often the watchdog samples worker memory.
-const WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The sandbox global holding the JSON-encoded entrypoint arguments.
 const INPUTS_GLOBAL: &str = "_wyrd_inputs";
@@ -63,41 +56,40 @@ pub struct Sandbox {
     pool: Arc<Pool>,
     /// Admission: one permit per running or waiting operation.
     admission: Semaphore,
-    /// PIDs of checked-out workers, which the watchdog may kill.
-    busy: Arc<Mutex<BTreeSet<u32>>>,
     /// Limits in force.
     limits: HostedLimits,
-    /// The group-memory watchdog, stopped on drop.
-    watchdog: JoinHandle<()>,
 }
 
 impl Sandbox {
     /// Start the pool over the worker binary at `worker`, prewarming
-    /// `monty_min_workers`, and start the memory watchdog.
+    /// `monty_min_workers`.
+    ///
+    /// Memory is bounded portably: each worker's global allocator stops its
+    /// whole heap at the operation budget plus Monty's headroom, which must
+    /// fit the process ceiling, and live workers are capped so that their
+    /// process ceilings together fit the pool ceiling. Idle workers count,
+    /// because the cap is on live processes.
     ///
     /// # Errors
-    /// Returns [`PoolError::Spawn`] when a prewarmed worker cannot start.
+    /// Returns [`PoolError::Spawn`] when the limits cannot hold even one
+    /// worker within its ceilings or a prewarmed worker cannot start.
     pub async fn start(worker: PathBuf, limits: HostedLimits) -> Result<Self, PoolError> {
+        let workers = limits.live_workers().ok_or_else(|| {
+            PoolError::Spawn(
+                "the Monty memory limits cannot hold one worker within its ceilings".into(),
+            )
+        })?;
         let mut config = PoolConfig::subprocess(worker);
-        config.min_processes = limits.monty_min_workers;
-        config.max_processes = limits.monty_max_workers;
+        config.min_processes = limits.monty_min_workers.min(workers);
+        config.max_processes = workers;
         // One checkout per process: a worker never serves a second operation.
         config.max_checkouts_per_worker = Some(1);
         // ponytail: replacements spawn on demand, so the warm set shrinks to
         // zero under load; prewarm replacements if spawn latency matters.
-        let pool = Arc::new(Pool::new(config).await?);
-        let busy = Arc::new(Mutex::new(BTreeSet::new()));
-        let watchdog = tokio::spawn(watch(
-            Arc::clone(&pool),
-            Arc::clone(&busy),
-            limits.monty_pool_memory_bytes,
-        ));
         Ok(Self {
-            pool,
-            admission: Semaphore::new(limits.monty_max_workers + limits.monty_max_waiters),
-            busy,
+            pool: Arc::new(Pool::new(config).await?),
+            admission: Semaphore::new(workers + limits.monty_max_waiters),
             limits,
-            watchdog,
         })
     }
 
@@ -181,14 +173,6 @@ impl Sandbox {
             .await
             .map_err(|_| retryable("no Python worker was free before the deadline".to_owned()))?
             .map_err(|error| failed(&error))?;
-        let pid = checkout.pid();
-        if let Some(pid) = pid {
-            self.cap(pid)?;
-            self.busy
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(pid);
-        }
         let budget = self.limits.tool_result_max_bytes;
         let mut output = String::new();
         let mut on_print = on_print_sync(|_, text: &str| {
@@ -232,12 +216,6 @@ impl Sandbox {
             }
         })
         .await;
-        if let Some(pid) = pid {
-            self.busy
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&pid);
-        }
         drop(checkout);
         drop(on_print);
         let value = ran
@@ -245,85 +223,6 @@ impl Sandbox {
             .map_err(|error| failed(&error))?;
         Ok((value, output))
     }
-
-    /// Cap worker `pid`'s address space at the process ceiling before it
-    /// runs any code.
-    ///
-    /// # Errors
-    /// Returns [`BlockError::Retryable`] when the limit cannot be applied;
-    /// the worker then never runs code.
-    fn cap(&self, pid: u32) -> Result<(), BlockError> {
-        let limit = Some(self.limits.monty_process_memory_bytes);
-        i32::try_from(pid)
-            .ok()
-            .and_then(Pid::from_raw)
-            .ok_or_else(|| retryable("the Python worker has no process id".to_owned()))
-            .and_then(|pid| {
-                rustix::process::prlimit(
-                    Some(pid),
-                    Resource::As,
-                    Rlimit {
-                        current: limit,
-                        maximum: limit,
-                    },
-                )
-                .map_err(|error| retryable(format!("the worker memory cap failed: {error}")))
-            })
-            .map(drop)
-    }
-}
-
-impl Drop for Sandbox {
-    /// Stop the watchdog; the pool kills its workers when dropped.
-    fn drop(&mut self) {
-        self.watchdog.abort();
-    }
-}
-
-/// Kill the largest busy worker whenever all workers together hold more
-/// than `ceiling` resident bytes; idle workers count toward the total.
-///
-/// ponytail: sampled every [`WATCHDOG_INTERVAL`], so a burst can overshoot
-/// between samples; a cgroup `memory.max` on the worker group is the hard
-/// upgrade path when the deployment can delegate cgroups.
-async fn watch(pool: Arc<Pool>, busy: Arc<Mutex<BTreeSet<u32>>>, ceiling: u64) {
-    let mut ticks = tokio::time::interval(WATCHDOG_INTERVAL);
-    loop {
-        ticks.tick().await;
-        let busy: Vec<u32> = busy
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .copied()
-            .collect();
-        let idle: u64 = pool.idle_worker_pids().into_iter().map(resident).sum();
-        let sizes: Vec<(u64, u32)> = busy.into_iter().map(|pid| (resident(pid), pid)).collect();
-        let total = idle + sizes.iter().map(|(bytes, _)| bytes).sum::<u64>();
-        if total > ceiling
-            && let Some((_, pid)) = sizes.iter().max()
-            && let Some(pid) = i32::try_from(*pid).ok().and_then(Pid::from_raw)
-        {
-            tracing::warn!(
-                total,
-                ceiling,
-                "killing the largest Python worker over the pool memory ceiling"
-            );
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-        }
-    }
-}
-
-/// Resident bytes of process `pid`, or zero once it is gone.
-fn resident(pid: u32) -> u64 {
-    std::fs::read_to_string(format!("/proc/{pid}/status"))
-        .ok()
-        .and_then(|status| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix("VmRSS:"))
-                .and_then(|kib| kib.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-        })
-        .map_or(0, |kib| kib * 1024)
 }
 
 /// Runs `code` actions and checks for one execution.

@@ -74,7 +74,7 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 quick-xml = { workspace = true }
 rand = { workspace = true }
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true }
 secrecy = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 schemars = { workspace = true }

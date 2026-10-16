@@ -12,11 +12,11 @@
 //! data access. Card and Bifrost descriptions and argument schemas are the
 //! MCP catalog's, so both surfaces advertise one contract.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use monty_pool::{MountSpec, MountSpecMode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -29,6 +29,7 @@ use wyrd_spec::card::agent::BuiltinTool;
 use wyrd_spec::card::blocks::Action;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::ListCardsRequest;
+use wyrd_spec::vala::eval::ids::TaskId;
 
 use super::HostedLimits;
 use super::evidence::TenantEvidence;
@@ -58,12 +59,16 @@ pub struct HostedTools {
     workspaces: Arc<Workspaces>,
     /// The process-wide Python sandbox.
     sandbox: Arc<Sandbox>,
+    /// Python time left per Agent action, kept across its attempts so a
+    /// retry never restores spent time.
+    code_budgets: Mutex<BTreeMap<TaskId, Arc<Mutex<Duration>>>>,
     /// Limits in force.
     limits: HostedLimits,
 }
 
 impl HostedTools {
-    /// Tools running as `caller` over `evidence`.
+    /// Tools running as `caller` over `evidence` for one execution; each
+    /// action's Python budget starts full here and only ever shrinks.
     #[must_use]
     pub const fn new(
         state: AppState,
@@ -79,8 +84,20 @@ impl HostedTools {
             evidence,
             workspaces,
             sandbox,
+            code_budgets: Mutex::new(BTreeMap::new()),
             limits,
         }
+    }
+
+    /// The Python budget of action `id`, created full on its first attempt.
+    fn code_budget(&self, id: &TaskId) -> Arc<Mutex<Duration>> {
+        Arc::clone(
+            self.code_budgets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(self.limits.agent_code_budget))),
+        )
     }
 }
 
@@ -120,7 +137,7 @@ impl AgentToolset for HostedTools {
             workspace,
             sandbox: Arc::clone(&self.sandbox),
             deadline: call.deadline,
-            code_budget: Mutex::new(self.limits.agent_code_budget),
+            code_budget: self.code_budget(call.id),
             limits: self.limits,
         });
         let registry = ToolRegistry::new();
@@ -157,8 +174,9 @@ struct Invocation {
     sandbox: Arc<Sandbox>,
     /// When the engine cancels the attempt.
     deadline: Instant,
-    /// Python time left for `code.run` in this attempt.
-    code_budget: Mutex<Duration>,
+    /// Python time left for `code.run` in this action, shared with its
+    /// other attempts.
+    code_budget: Arc<Mutex<Duration>>,
     /// Limits in force.
     limits: HostedLimits,
 }
@@ -241,47 +259,37 @@ impl Invocation {
     }
 
     /// Run `source` with `/inputs` read-only and `/work` writable, charging
-    /// its time to the attempt's Python budget.
+    /// its time to the action's Python budget.
+    ///
+    /// Time is reserved before waiting for `/work` or a worker, so
+    /// concurrent calls never share the same remainder; the [`Reservation`]
+    /// returns the unused part when the call ends or is cancelled. `/work`
+    /// writers run one at a time, each limited to the space
+    /// [`Workspace::mounts`] measures before it starts.
     ///
     /// # Errors
     /// Returns [`ToolError::Invocation`] when the budget is spent, a mount
     /// cannot open, or the sandbox refuses or fails the code.
     async fn run(&self, source: String) -> Result<Value, ToolError> {
-        let workspace = self.workspace()?;
-        let budget = *self
-            .code_budget
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if budget.is_zero() {
-            return Err(invocation(
-                "this call's Python time budget is spent".to_owned(),
-            ));
-        }
-        let mount = |path: &str, host, mode| {
-            MountSpec::new(path, host, mode).map_err(|error| invocation(error.to_string()))
+        let workspace = Arc::clone(self.workspace()?);
+        let reservation = Reservation::take(&self.code_budget, self.limits.code_timeout)
+            .ok_or_else(|| invocation("this call's Python time budget is spent".to_owned()))?;
+        let deadline = self
+            .deadline
+            .min(reservation.started + reservation.reserved);
+        let _writer = workspace.writer().await;
+        let mounts = {
+            let workspace = Arc::clone(&workspace);
+            tokio::task::spawn_blocking(move || workspace.mounts())
+                .await
+                .map_err(|error| invocation(error.to_string()))?
+                .map_err(|error| invocation(error.to_string()))?
         };
-        let mut work = mount("/work", workspace.work_dir(), MountSpecMode::ReadWrite)?;
-        work.write_bytes_limit = Some(self.limits.work_write_max_bytes);
-        let mounts = vec![
-            mount("/inputs", workspace.inputs_dir(), MountSpecMode::ReadOnly)?,
-            work,
-        ];
-        let started = Instant::now();
-        let ran = self
+        let (value, output) = self
             .sandbox
-            .exec(
-                source,
-                Vec::new(),
-                mounts,
-                self.deadline.min(started + budget),
-            )
-            .await;
-        let mut left = self
-            .code_budget
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *left = left.saturating_sub(started.elapsed());
-        let (value, output) = ran.map_err(|error| invocation(error.to_string()))?;
+            .exec(source, Vec::new(), mounts, deadline)
+            .await
+            .map_err(|error| invocation(error.to_string()))?;
         Ok(json!({"value": value.py_repr(), "output": output}))
     }
 
@@ -294,6 +302,42 @@ impl Invocation {
         self.workspace
             .as_ref()
             .ok_or_else(|| invocation("this call has no workspace".to_owned()))
+    }
+}
+
+/// Python time taken from an action's budget for one `code.run`.
+struct Reservation {
+    /// The action's remaining budget.
+    budget: Arc<Mutex<Duration>>,
+    /// Time taken out of it.
+    reserved: Duration,
+    /// When the reservation was taken.
+    started: Instant,
+}
+
+impl Reservation {
+    /// Take up to `most` from `budget`, or `None` when it is spent.
+    fn take(budget: &Arc<Mutex<Duration>>, most: Duration) -> Option<Self> {
+        let mut left = budget.lock().unwrap_or_else(PoisonError::into_inner);
+        let reserved = left.min(most);
+        if reserved.is_zero() {
+            return None;
+        }
+        *left -= reserved;
+        Some(Self {
+            budget: Arc::clone(budget),
+            reserved,
+            started: Instant::now(),
+        })
+    }
+}
+
+impl Drop for Reservation {
+    /// Return the unused part; elapsed time stays spent whether the call
+    /// finished, failed, or was cancelled.
+    fn drop(&mut self) {
+        let unused = self.reserved.saturating_sub(self.started.elapsed());
+        *self.budget.lock().unwrap_or_else(PoisonError::into_inner) += unused;
     }
 }
 
@@ -452,3 +496,31 @@ fn invocation(detail: String) -> ToolError {
 
 #[cfg(test)]
 mod pg_tests;
+
+/// Python time is reserved before a call and settled when it ends.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Concurrent reservations split the budget instead of each seeing all
+    /// of it; dropping one returns only its unused time.
+    ///
+    /// # Panics
+    /// Panics when reservations overbook the budget or refund spent time.
+    #[tokio::test(start_paused = true)]
+    async fn reservations_never_overbook_the_budget() {
+        let budget = Arc::new(Mutex::new(Duration::from_secs(3)));
+        let most = Duration::from_secs(2);
+        let first = Reservation::take(&budget, most).expect("first");
+        let second = Reservation::take(&budget, most).expect("second");
+        assert_eq!(
+            (first.reserved, second.reserved),
+            (most, Duration::from_secs(1))
+        );
+        assert!(Reservation::take(&budget, most).is_none());
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        drop(first);
+        drop(second);
+        assert_eq!(*budget.lock().expect("budget"), Duration::from_millis(500));
+    }
+}

@@ -12,6 +12,7 @@ use tokio::time::Instant;
 use vala_eval::blocks::BlockError;
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::sandbox::{CodeRun, Sandbox};
+use wyrd_server::verification::hosted::workspace::{Staged, Workspace};
 
 /// Why every test here is ignored in the fast lane.
 const NEEDS_WORKER: &str = "needs the Monty worker; run `mise run test:verification:sandbox`";
@@ -210,6 +211,97 @@ async fn sandbox_reaches_only_its_mounts() {
         std::fs::read_to_string(inputs.path().join("a.txt")).expect("input"),
         "hello"
     );
+}
+
+/// Run `source` in `workspace` the way `code.run` does: as the only `/work`
+/// writer, with the mounts measured when its turn comes.
+async fn write(sandbox: &Sandbox, workspace: &Workspace, source: &str) -> Result<(), BlockError> {
+    let _writer = workspace.writer().await;
+    let mounts = workspace.mounts()?;
+    sandbox
+        .exec(source.to_owned(), Vec::new(), mounts, far())
+        .await
+        .map(drop)
+}
+
+/// `/work` writes are limited across calls, not per call: each call gets
+/// only the space earlier calls left, counting files a failed call wrote,
+/// overwrites, concurrent writers, and the scratch inputs already use.
+///
+/// # Panics
+/// Panics when writes together exceed the limit or earlier files are lost.
+#[tokio::test]
+#[ignore = "needs the Monty worker; run `mise run test:verification:sandbox`"]
+async fn workspace_writes_share_one_budget() {
+    let limits = HostedLimits {
+        work_write_max_bytes: 16,
+        scratch_max_bytes: 24,
+        ..HostedLimits::default()
+    };
+    let sandbox = start(limits).await;
+    let workspace = Workspace::materialize(
+        vec![Staged {
+            path: "/inputs/a.bin".to_owned(),
+            bytes: vec![0; 4],
+            format: None,
+            sources: std::collections::BTreeSet::new(),
+        }],
+        limits,
+        None,
+    )
+    .expect("workspace");
+    let put = |name: &str, size: usize, then: &str| {
+        format!("from pathlib import Path\nPath('/work/{name}').write_text('x' * {size})\n{then}")
+    };
+    // Written, then the call fails: the bytes still count.
+    assert!(
+        write(&sandbox, &workspace, &put("a", 8, "1 / 0"))
+            .await
+            .is_err()
+    );
+    // 16 allowed, 8 held: overwriting `a` with 8 more does not fit.
+    assert!(write(&sandbox, &workspace, &put("a", 9, "")).await.is_err());
+    write(&sandbox, &workspace, &put("b", 4, ""))
+        .await
+        .expect("fits");
+    let (c, d) = (put("c", 4, ""), put("d", 4, ""));
+    let (left, right) = tokio::join!(
+        write(&sandbox, &workspace, &c),
+        write(&sandbox, &workspace, &d),
+    );
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    let work = workspace.mounts().expect("mounts")[1]
+        .host_path()
+        .to_owned();
+    let held: u64 = std::fs::read_dir(&work)
+        .expect("work")
+        .map(|entry| entry.expect("entry").metadata().expect("meta").len())
+        .sum();
+    assert_eq!(held, 16);
+    assert_eq!(
+        std::fs::read_to_string(work.join("a")).expect("a"),
+        "x".repeat(8)
+    );
+
+    // Inputs leave 20 bytes of scratch, so /work gets 12 of its 16.
+    let tight = Workspace::materialize(
+        vec![Staged {
+            path: "/inputs/a.bin".to_owned(),
+            bytes: vec![0; 12],
+            format: None,
+            sources: std::collections::BTreeSet::new(),
+        }],
+        HostedLimits {
+            scratch_max_bytes: 24,
+            ..limits
+        },
+        None,
+    )
+    .expect("workspace");
+    assert!(write(&sandbox, &tight, &put("a", 13, "")).await.is_err());
+    write(&sandbox, &tight, &put("a", 12, ""))
+        .await
+        .expect("fits");
 }
 
 /// Memory and time breaches end only the offending operation; the sandbox

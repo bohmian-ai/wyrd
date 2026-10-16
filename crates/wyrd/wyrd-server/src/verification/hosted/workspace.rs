@@ -16,6 +16,7 @@ use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use monty_pool::{MountSpec, MountSpecMode};
 use serde_json::{Value, json};
 use skald_spec::MediaFormat;
 use tempfile::TempDir;
@@ -125,6 +126,11 @@ pub struct Workspace {
     root: TempDir,
     /// Materialized `/inputs` files by virtual path.
     inputs: BTreeMap<String, Input>,
+    /// Bytes the materialized inputs take from the scratch limit.
+    inputs_bytes: u64,
+    /// Held by one `/work` writer at a time, so each sees the space the
+    /// others left.
+    writer: tokio::sync::Mutex<()>,
     /// Limits in force.
     limits: HostedLimits,
     /// Admission held until drop.
@@ -150,6 +156,8 @@ impl Workspace {
         let mut workspace = Self {
             root,
             inputs: BTreeMap::new(),
+            inputs_bytes: 0,
+            writer: tokio::sync::Mutex::new(()),
             limits,
             _permit: permit.into(),
         };
@@ -169,6 +177,7 @@ impl Workspace {
                 )?,
             }
         }
+        workspace.inputs_bytes = scratch;
         Ok(workspace)
     }
 
@@ -376,6 +385,48 @@ impl Workspace {
     #[must_use]
     pub fn work_dir(&self) -> PathBuf {
         self.root.path().join("work")
+    }
+
+    /// Wait to be the only `/work` writer; dropping the guard lets the next
+    /// one in. Cancelling the wait gives up the turn.
+    pub async fn writer(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.writer.lock().await
+    }
+
+    /// The sandbox mounts: `/inputs` read-only and `/work` writable up to
+    /// the space `/work` may still grow by, which is the smaller of the
+    /// `/work` write limit and the scratch left after inputs, less what
+    /// `/work` holds now.
+    ///
+    /// Measured from disk, so a write that later fails or is cancelled
+    /// still counts and an overwrite counts once. Opens and walks host
+    /// directories, so call it on the blocking pool while holding
+    /// [`Self::writer`]; otherwise concurrent writers share the remainder.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Retryable`] when a mount directory cannot open.
+    pub fn mounts(&self) -> Result<Vec<MountSpec>, BlockError> {
+        let held: u64 = walkdir(&self.work_dir()).iter().map(|(_, size)| size).sum();
+        let unopened = |error: monty_pool::PoolError| BlockError::Retryable {
+            reason: format!("a workspace mount failed: {error}"),
+        };
+        let mut work =
+            MountSpec::new("/work", self.work_dir(), MountSpecMode::ReadWrite).map_err(unopened)?;
+        work.write_bytes_limit = Some(
+            self.limits
+                .work_write_max_bytes
+                .min(
+                    self.limits
+                        .scratch_max_bytes
+                        .saturating_sub(self.inputs_bytes),
+                )
+                .saturating_sub(held),
+        );
+        Ok(vec![
+            MountSpec::new("/inputs", self.inputs_dir(), MountSpecMode::ReadOnly)
+                .map_err(unopened)?,
+            work,
+        ])
     }
 
     /// Original slots behind `/inputs` file `path`.

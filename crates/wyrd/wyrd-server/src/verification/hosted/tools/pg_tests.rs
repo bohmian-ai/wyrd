@@ -83,7 +83,7 @@ async fn invocation(caller: Caller, limits: HostedLimits) -> Invocation {
         workspace: Some(Arc::new(workspace)),
         sandbox: idle_sandbox(limits).await,
         deadline: Instant::now() + Duration::from_secs(30),
-        code_budget: Mutex::new(limits.agent_code_budget),
+        code_budget: Arc::new(Mutex::new(limits.agent_code_budget)),
         limits,
     }
 }
@@ -265,6 +265,44 @@ fn workspace_tools_need_a_declared_workspace() {
                 .open(&call(), &[BuiltinTool::CardsGet, BuiltinTool::BifrostQuery])
                 .await
                 .is_ok()
+        );
+    });
+}
+
+/// An action's Python budget survives its attempts; other actions start
+/// full.
+///
+/// # Panics
+/// Panics when a retry restores spent time or actions share a budget.
+#[test]
+fn retries_keep_their_actions_spent_time() {
+    wyrd_runtime::runtime().block_on(async {
+        let limits = HostedLimits::default();
+        let tools = HostedTools::new(
+            state().await,
+            caller([]),
+            Arc::new(TenantEvidence::new(
+                crate::test_support::test_storage(),
+                crate::test_support::test_tenant(),
+                BTreeMap::new(),
+                limits,
+            )),
+            Arc::new(Workspaces::new(limits)),
+            idle_sandbox(limits).await,
+            limits,
+        );
+        let review = TaskId::new("review").expect("task id");
+        *tools.code_budget(&review).lock().expect("budget") = Duration::from_secs(1);
+        assert_eq!(
+            *tools.code_budget(&review).lock().expect("budget"),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            *tools
+                .code_budget(&TaskId::new("other").expect("task id"))
+                .lock()
+                .expect("budget"),
+            limits.agent_code_budget
         );
     });
 }

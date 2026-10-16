@@ -401,10 +401,10 @@ Commits `f2a726c90..HEAD` on `change/verifier-building-blocks-task-005`.
 | Stable-key replay and delayed conflict | `142ea3d46` | `093a77ba7` server integration replay/conflict cases | PASS |
 | Direct recording never activates the runner; failed-only Operator; leases | `c01c9739a` | `pg_operator_delivery` 17/17; `passing_window_alerts_no_one`, `empty_window_is_inconclusive_and_alerts_no_one` | PASS |
 | Generic input/results replace old live contracts without history deletion | `f210fef96` (additive migration), `ac9539734` | `test:sql`; `pg_migration::migrations_apply_and_are_idempotent` | PASS |
-| README scheduled drift lifecycle in all three SDKs, unseeded, through the scheduler | `a36c01870`, `b3316b1d5`, `50e4ed235` | Rust `scheduled_drift_alerts_operator::*` and `verify_in_real_time::unfitted_baseline_is_skipped_on_schedule`; Python/TS mirrors (see Proof below) | see Proof |
-| Eight README action/check rows in Rust, Python and TypeScript | `5690c6452`, `a36c01870` | Rust `verifier_building_blocks::*` 20/20; Python/TS mirrors (see Proof below) | see Proof |
+| README scheduled drift lifecycle in all three SDKs, unseeded, through the scheduler | `a36c01870`, `b3316b1d5`, `50e4ed235` | Rust `scheduled_drift_alerts_operator::*` and `verify_in_real_time::unfitted_baseline_is_skipped_on_schedule`; Python/TS mirrors in the gate (Proof) | PASS |
+| Eight README action/check rows in Rust, Python and TypeScript | `5690c6452`, `a36c01870` | Rust `verifier_building_blocks::*` 20/20; Python/TS mirrors in the gate (Proof) | PASS |
 | External examples own Cards, follow REQ-016, pass against the candidate | `wyrd-example-rs` `f7647cf`; `wyrd-example-py` `5b2e1e9`, `a9a6327`; `wyrd-example-ts` branch `verifier-building-blocks` `79ea206`, `0e45152` | `cargo test` 1/1; `pytest` 5/5; `npm run typecheck && npm run test` 5/5 | PASS (README quickstarts not run live) |
-| Merged candidate closes AC-001–010 | — | `mise run gate` (see Proof below) | see Proof |
+| Merged candidate closes AC-001–010 | — | `mise run gate` exit 0 (Proof) | PASS |
 
 ### Diagnoses
 
@@ -518,7 +518,8 @@ Commits `f2a726c90..HEAD` on `change/verifier-building-blocks-task-005`.
   (intermittent).** A follower pod held 604 reserved bytes after teardown. The
   test passed when rerun alone. The cause is in the Oracle follower-stage
   memory release (`resources.rs:2797-2830`), which this change does not touch.
-  The Monty prewarm load may widen the window. Not fixed here; see Proof.
+  The Monty prewarm load may widen the window. Not fixed here; it passed in
+  the final gate.
 - **CLI canonical journey count (11 vs 13).** Cause: the installed
   server did not ship the Monty worker. Fix: `2c55785e1`. Rerun passes.
 
@@ -555,3 +556,17 @@ added. Files outside the write set: `wyrd-telemetry` span catalog and
   Breaking ties parent-before-child would be a server or spec decision.
 
 ### Proof
+
+Candidate `03712af5e`. Postgres suites ran sequentially under one `flock`.
+
+| Command | Result |
+|---|---|
+| `mise run gate` | exit 0, 2550 s. Includes wyrd-testing server suite 35/35, TS integration 31/31 files, Python integration 278 passed / 2 skipped, Rust SDK journeys, and `codegen:check`, `docs:check`, `check:deps`, `check:tenant-isolation` |
+| Rust `scheduled_drift_alerts_operator::*` (custom drift), repeated after `03712af5e` | 6/6 (6 of 13 failed before the fixture fix) |
+| `mise run examples:{rust,python,typescript}:support-desk` | Live mains exit `NoCredentials` with no `WYRD_SERVER_URL`/`WYRD_API_KEY`/gpt-4o deployment. Not counted as proof. The same code paths pass in the gate's SDK support-desk journeys with a deterministic wiremock provider |
+| `npm --prefix ../wyrd-example-ts run typecheck` / `run test` (vendored candidate build) | OK / 5/5 |
+| `scripts/postgres/with-test-postgres.sh -- uv run --directory ../wyrd-example-py pytest` (rebuilt wheel) | 5 passed |
+| `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo test --manifest-path ../wyrd-example-rs/Cargo.toml -- --ignored` | 1/1 (`answers_are_verified_now_and_in_the_background`) |
+
+Limit: the README quickstarts were not run against a live provider. The
+vendored candidate builds in the external repos are local and not committed.

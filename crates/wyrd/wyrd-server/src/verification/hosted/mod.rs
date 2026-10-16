@@ -62,6 +62,8 @@ pub struct HostedLimits {
     pub code_timeout: Duration,
     /// Cumulative Python-operation time within one Agent invocation.
     pub agent_code_budget: Duration,
+    /// Overall deadline of one immediate `verify` request.
+    pub verify_timeout: Duration,
 }
 
 impl HostedLimits {
@@ -111,6 +113,7 @@ impl Default for HostedLimits {
             monty_pool_memory_bytes: 2048 * MIB,
             code_timeout: Duration::from_secs(10),
             agent_code_budget: Duration::from_secs(60),
+            verify_timeout: Duration::from_secs(60),
         }
     }
 }

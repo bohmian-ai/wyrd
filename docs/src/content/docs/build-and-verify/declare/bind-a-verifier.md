@@ -48,7 +48,7 @@ This is the support desk's full Service. It binds one Verifier to the whole Serv
 | The Service's `verified_by` | `no-refund-promise` | Every Run of the Service, as `run.observe.verify(...)` |
 | The `agent` component's `verified_by` | `ticket-complete`, `follows-policy` | The agent's view of a Run, as `run.for_card("agent").observe.verify(...)` |
 
-None of these bindings has `runs_on`, so nothing runs them on its own. Your code calls `verify` or `submit` with the evidence; [Verify inside the run](/build-and-verify/observe/record-a-run-and-observations/#4-verify-inside-the-run) shows both. That is the right default for anything that judges one request.
+None of these bindings has `runs_on`, so nothing runs them on its own. Your code calls `verify` or `submit` with the evidence; [Verify inside the run](/build-and-verify/observe/record-a-run-and-observations/#3-record-verify-and-submit) shows both. That is the right default for anything that judges one request.
 
 ## Bind a Verifier to a schedule
 

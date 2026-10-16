@@ -202,7 +202,7 @@ The support desk runs its two model-free Verifiers on every answer before it rep
 
 ### submit: queue it
 
-`submit` uploads missing files, stages the evidence, and returns a `verify.Execution` with a server-issued execution ID. The support desk submits `follows-policy`, which calls a model twice, this way: see [Submit for later](/build-and-verify/observe/record-a-run-and-observations/#submit-for-later). The same engine runs it later. [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) follows one from submission to result, including from another process.
+`submit` uploads missing files, stages the evidence, and returns a `verify.Execution` with a server-issued execution ID. The support desk submits `follows-policy`, which calls a model twice, this way: see [Submit for later](/build-and-verify/observe/record-a-run-and-observations/#3-record-verify-and-submit). The same engine runs it later. [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) follows one from submission to result, including from another process.
 
 `202` means the server staged the evidence in memory, not that the queue has durably accepted it. The SDK sends one `Idempotency-Key` and reuses it on every transport retry. A conflicting reuse of a key is refused when the queue writer accepts the request, and you see it as an `errored` execution with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`. Evidence lost before the queue accepts it, such as on an abrupt restart, has no outcome; `wait` ends with a timeout rather than an invented result.
 

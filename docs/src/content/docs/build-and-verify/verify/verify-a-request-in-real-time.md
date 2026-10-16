@@ -215,7 +215,7 @@ The row appears shortly after the call returns. The server stores it in the back
 
 ## Checks that do not belong on the request path
 
-A Verifier with `samples` slots and `drift` checks judges a scheduled window, so `verify` refuses it; record its samples with `submit` as in [Monitor drift](/build-and-verify/verify/monitor-drift/). A slow review, such as the support desk's `follows-policy`, which reads a PDF and calls a model twice, belongs in `submit` instead of holding the request; see [Submit for later](/build-and-verify/observe/record-a-run-and-observations/#submit-for-later).
+A Verifier with `samples` slots and `drift` checks judges a scheduled window, so `verify` refuses it; record its samples with `submit` as in [Monitor drift](/build-and-verify/verify/monitor-drift/). A slow review, such as the support desk's `follows-policy`, which reads a PDF and calls a model twice, belongs in `submit` instead of holding the request; see [Submit for later](/build-and-verify/observe/record-a-run-and-observations/#3-record-verify-and-submit).
 
 ## What can go wrong
 

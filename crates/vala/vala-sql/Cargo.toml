@@ -21,7 +21,7 @@ sqlx = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wyrd-spec = { workspace = true }
-wyrd-sql = { path = "../../wyrd/wyrd-sql", version = "0.2.0" }
+wyrd-sql = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true

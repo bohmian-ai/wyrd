@@ -90,12 +90,15 @@ function parseLines(spec) {
 }
 
 /**
- * Replace every `<CodeFromFile file lang [title] [range] [highlight] />` tag with the
- * highlighted `<CodeBlock>` for that repository file. `file` is a repo path
- * under crates/, examples/, python/, or sdks/ (leading `../` or `/` is
- * tolerated); `range` is an inclusive 1-based line span such as `5-10`;
+ * Replace every `<CodeFromFile file lang [title] [region|range] [highlight] />` tag
+ * with the highlighted `<CodeBlock>` for that repository file. `file` is a repo
+ * path under crates/, examples/, python/, or sdks/ (leading `../` or `/` is
+ * tolerated). `region` names the lines between mdBook-style `ANCHOR: name` and
+ * `ANCHOR_END: name` comments, so an embed follows its code as the file
+ * changes; `range` is an inclusive 1-based line span such as `5-10`.
  * `highlight` marks lines, counted within the embedded span, such as `2,4-6`.
- * Throws, failing the build, for a missing file, a bad range, or a
+ * Anchor comment lines never appear in the output. Throws, failing the build,
+ * for a missing file, a missing region, a range past the end of the file, or a
  * non-literal attribute. Returns the embedded files so Vite rebuilds the page
  * when one changes.
  * @param {string} content
@@ -118,7 +121,9 @@ export function embedCodeFromFile(content) {
       throw new Error(`CodeFromFile: file not found: ${props.file}`);
     }
     dependencies.push(abs);
-    return codeBlock(props.range ? sliceRange(src, props.range) : src, props.lang, props.title ?? path.basename(tail), props.highlight);
+    if (props.region && props.range) throw new Error(`CodeFromFile: use "region" or "range", not both: ${tag}`);
+    const body = props.region ? sliceRegion(src, props.region, tail) : props.range ? sliceRange(src, props.range) : src;
+    return codeBlock(stripAnchors(body), props.lang, props.title ?? path.basename(tail), props.highlight);
   });
   return { code, dependencies };
 }
@@ -134,5 +139,43 @@ function sliceRange(src, range) {
   if (!Number.isFinite(start) || !Number.isFinite(end) || start < 1 || end < start) {
     throw new Error(`CodeFromFile: invalid range "${range}"`);
   }
-  return src.split('\n').slice(start - 1, end).join('\n');
+  const lines = src.split('\n');
+  if (end > lines.length) throw new Error(`CodeFromFile: range "${range}" ends past line ${lines.length}`);
+  return lines.slice(start - 1, end).join('\n');
+}
+
+const ANCHOR = /\bANCHOR(_END)?:\s*([\w-]+)/;
+
+/**
+ * The lines strictly between `ANCHOR: name` and `ANCHOR_END: name`.
+ * @param {string} src
+ * @param {string} name
+ * @param {string} file
+ */
+function sliceRegion(src, name, file) {
+  const lines = src.split('\n');
+  const at = (end) => lines.findIndex((l) => {
+    const m = l.match(ANCHOR);
+    return m !== null && m[2] === name && Boolean(m[1]) === end;
+  });
+  const start = at(false);
+  const end = at(true);
+  if (start < 0 || end <= start) throw new Error(`CodeFromFile: region "${name}" not found in ${file}`);
+  return dedent(lines.slice(start + 1, end));
+}
+
+/** @param {string} body */
+function stripAnchors(body) {
+  return body.split('\n').filter((l) => !ANCHOR.test(l)).join('\n');
+}
+
+/**
+ * Remove the indentation every non-blank line shares, so a region cut from a
+ * function body reads as top-level code.
+ * @param {string[]} lines
+ */
+function dedent(lines) {
+  const indents = lines.filter((l) => l.trim()).map((l) => l.match(/^\s*/)[0].length);
+  const cut = indents.length ? Math.min(...indents) : 0;
+  return lines.map((l) => l.slice(cut)).join('\n');
 }

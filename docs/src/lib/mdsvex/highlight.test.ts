@@ -1,5 +1,24 @@
-import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { describe, expect, it, vi } from 'vitest';
 import { embedCodeFromFile, fenceBlock } from './highlight.js';
+
+// One example file stands in for an anchored source; every other path reads
+// the real repository.
+const ANCHORED = [
+  'def serve():',
+  '    # ANCHOR: ask',
+  '    answer = run.invoke(question)',
+  '    if answer:',
+  '        return answer',
+  '    # ANCHOR_END: ask',
+  ''
+].join('\n');
+vi.mock('node:fs', async (real) => {
+  const fs = await real<typeof import('node:fs')>();
+  const read = ((file: string, ...rest: unknown[]) =>
+    String(file).endsWith('examples/anchored.py') ? ANCHORED : (fs.readFileSync as Function)(file, ...rest)) as typeof readFileSync;
+  return { ...fs, readFileSync: read };
+});
 
 // Embeds resolve at build time, so a page carries only the highlighted sample,
 // never the repository source tree.
@@ -25,6 +44,22 @@ describe('embedCodeFromFile', () => {
       embedCodeFromFile('<CodeFromFile file="sdks/wyrd-sdk-ts/wyrd/src/index.ts" lang="text" range="9-2" />')
     ).toThrow(/invalid range/);
     expect(() => embedCodeFromFile('<CodeFromFile file={path} lang="text" />')).toThrow(/literal/);
+  });
+
+  it('embeds a named region dedented, without its anchor comments', () => {
+    const { code } = embedCodeFromFile('<CodeFromFile file="examples/anchored.py" lang="text" region="ask" />');
+    expect(code.match(/class="line"/g)).toHaveLength(3);
+    expect(code).not.toContain('ANCHOR');
+    expect(code).toContain('<span class="line"><span>answer = run.invoke(question)');
+  });
+
+  it('fails the build for a missing region or a range past the end of the file', () => {
+    expect(() => embedCodeFromFile('<CodeFromFile file="examples/anchored.py" lang="text" region="gone" />')).toThrow(
+      /region "gone" not found/
+    );
+    expect(() => embedCodeFromFile('<CodeFromFile file="examples/anchored.py" lang="text" range="1-99" />')).toThrow(
+      /ends past line 7/
+    );
   });
 });
 

@@ -130,16 +130,16 @@ const bySlug = new Map<string, DocModule>(
   })
 );
 
-// Drafts are excluded from allSlugs() (and thus prerender/sitemap) in
-// production builds; surfaced in dev. Single branch — no env sprawl.
+// Drafts exist only in dev. A production build cannot look one up, so a
+// published page that links to a draft fails the prerender instead of
+// shipping the draft. Single branch — no env sprawl.
 const isDev = import.meta.env?.DEV ?? false;
 
 export function getEntry(slug: string): DocModule | undefined {
-  return bySlug.get(slug);
+  const entry = bySlug.get(slug);
+  return isDev || !entry?.metadata.draft ? entry : undefined;
 }
 
 export function allSlugs(): string[] {
-  return [...bySlug.keys()].filter(
-    (slug) => isDev || !bySlug.get(slug)?.metadata.draft
-  );
+  return [...bySlug.keys()].filter((slug) => getEntry(slug) !== undefined);
 }

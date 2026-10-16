@@ -65,7 +65,7 @@ Skip this step and the example stops before calling anything: `the support Agent
 
 The Service declaration is the contract. It names the agent, the table it records tickets into, and the Verifiers bound to the agent:
 
-<CodeFromFile file="examples/support-desk/service/support-desk.yaml" lang="yaml" range="1-27" />
+<CodeFromFile file="examples/support-desk/service/support-desk.yaml" lang="yaml" />
 
 The two bindings differ in one line:
 

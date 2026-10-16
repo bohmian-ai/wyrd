@@ -4,32 +4,23 @@ description: Run a Wyrd server on your machine, save its first credential, and m
 pillar: wyrd
 section: Get started
 order: 2
-draft: true
-status: partial
+status: runnable
 ---
-
-<Aside type="tip" title="Setting up Wyrd for a team?">
-
-This page runs a server on your own machine. To run a shared server, or to deploy the `bohmian/wyrd` container, follow [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/). If you just want to try Wyrd locally, stay here.
-
-</Aside>
 
 `wyrd server dev --tenant acme` starts a local Wyrd server, creates the `acme` tenant, and saves its credential and endpoint so every CLI and SDK process on your machine can call it. You supply PostgreSQL; the command does the rest.
 
-<Aside type="caution" title="Needs a published release">On first run the command downloads the newest stable server release. Until the first official release is published, that download fails, and the CLI does not build a server from a source checkout.</Aside>
-
 ## Prerequisites
 
-- macOS or glibc Linux, on x86_64 or arm64.
+- macOS on Apple silicon, or glibc Linux on x86_64 or arm64.
 - The `wyrd` CLI, which ships in the Python and TypeScript packages:
 
   ```bash
-  pip install wyrd-ai          # or: npm install wyrd-ai
+  pip install wyrd-ai          # or: npm install -g wyrd-ai
   ```
 
 - PostgreSQL 16 with an ordinary login that owns the `wyrd` database. The server refuses superuser and `BYPASSRLS` logins.
 
-If you have Docker, this gives you a suitable database. The image's `postgres` user is a superuser, so the commands create a separate `wyrd` login:
+With Docker, this gives you a suitable database. The image's `postgres` user is a superuser, so the commands create a separate `wyrd` login:
 
 ```bash
 docker run -d --name wyrd-postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
@@ -38,8 +29,6 @@ CREATE ROLE wyrd LOGIN PASSWORD 'wyrd';
 CREATE DATABASE wyrd OWNER wyrd;
 SQL
 ```
-
-A local server uses this one login for everything. A shared deployment splits it into a platform login and a tenant login; see [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/).
 
 ## Start local Wyrd
 
@@ -50,41 +39,39 @@ export WYRD_DATABASE_URL="postgresql://wyrd:wyrd@127.0.0.1:5432/wyrd"
 wyrd server dev --tenant acme
 ```
 
-The command migrates the database, starts the server, waits until it is ready, and creates the `acme` tenant. When it finishes you see:
+The first run downloads the newest server release, migrates the database, starts the server, and creates the `acme` tenant. It ends with:
 
 ```text
+Migrating the installed Wyrd server <version>.
+Tenant acme (<tenant-id>) is active; saving local client configuration.
 Local Wyrd ready at http://127.0.0.1:8080 for tenant acme. The saved endpoint and credential are available to fresh clients; press Ctrl-C to stop.
 ```
 
-The server listens on `127.0.0.1:8080` for HTTP and `127.0.0.1:50051` for gRPC. To change them, set `WYRD_SERVER_BIND` or `WYRD_GRPC_BIND` to another loopback address before starting.
+The server listens on `127.0.0.1:8080` for HTTP and `127.0.0.1:50051` for gRPC; set `WYRD_SERVER_BIND` or `WYRD_GRPC_BIND` to another loopback address to change them.
 
-What it saved, in your Wyrd config directory (`WYRD_CONFIG_HOME`, else `$XDG_CONFIG_HOME/wyrd`, else `~/.config/wyrd`):
+The first run also creates the platform root, whose credential administers tenants. It is printed once, to your terminal only, never to stdout or stderr. Store it somewhere safe: it is how you recover a lost tenant credential.
+
+Interactive runs then offer to connect the coding agents they find, such as Claude Code or Codex, through MCP. Accept, or skip and run `wyrd mcp install` later.
+
+What the command saved, in your Wyrd config directory (`WYRD_CONFIG_HOME`, else `$XDG_CONFIG_HOME/wyrd`, else `~/.config/wyrd`):
 
 | File | Holds |
 | --- | --- |
 | `credentials.toml` | The tenant administrator's API key, as `[default].api_key`, readable only by you |
 | `config.toml` | The HTTP and gRPC endpoints, as `[client].http_url` and `[client].grpc_url` |
-| `server/sealing.key` | The server's sealing key, which encrypts stored secrets such as gateway provider keys, readable only by you |
-
-Other settings in those files are left alone, and an existing key for a different tenant is never overwritten. To run a second local deployment, give it its own `WYRD_CONFIG_HOME`.
-
-The first run also creates the platform root, whose credential administers tenants. It is printed once, to your terminal only, never to stdout or stderr. Store it somewhere safe; you need it to recover a lost tenant credential.
-
-Interactive runs then offer to connect the coding agents they detect, such as Claude Code or Codex, through MCP. Accept, or skip and run [`wyrd mcp install`](/connect/connect-an-agent-through-mcp/) later. In a script, name the agents explicitly: `wyrd server dev --tenant acme --host codex`.
+| `server/sealing.key` | The key that encrypts stored secrets such as gateway provider keys, readable only by you |
 
 ## Check it works
 
-Keep the server running. In a second terminal with the same config directory:
+Keep the server running. In a second terminal:
 
 ```bash
 wyrd list
 ```
 
-A new tenant has no Cards, so the list is empty, and the command exits 0. You did not export a key or URL; the CLI read both from the saved config. If you have `WYRD_API_KEY`, `WYRD_ACCESS_TOKEN`, or `WYRD_SERVER_URL` exported from other work, unset them first. They take precedence over the saved config.
+A new tenant has no Cards, so the list is empty and the command exits 0. You exported no key or URL; the CLI read both from the saved config.
 
-## Connect from an SDK
-
-The SDKs read the same saved config, so code needs no client, URL, or key either. Every server-facing handle (`Bifrost`, `Cards`, `Gateway`, `Principals`, `OperatorConnections`) opens with `connect`:
+The SDKs read the same config, so code needs no URL or key either:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -121,30 +108,31 @@ console.log((await bifrost.listTables()).map((table) => table.name));
 </LangTab>
 </LangTabs>
 
-Even a new tenant lists Wyrd's built-in tables. In Rust, `Cards::connect()` and the other handles take no arguments; only Bifrost takes its `BifrostOptions`.
-
-`connect` fails fast. It resolves the credential, exchanges an API key for a token, and opens Bifrost's gRPC connection before it returns. No credential anywhere raises `WYRD_CLIENT_401_NO_CREDENTIALS`, and a refused key fails at `connect`, not on your first call. A bearer token you pass directly is not checked until the first request that uses it.
-
-Each handle resolves the config once and keeps that client, so changing the environment afterward does not move an open handle. Its token still renews on its own.
-
-Python also keeps the plain constructor: `Bifrost()`, `Cards()`, and `Principals()` do no IO and connect on the first call that needs the server. The errors are the same; only the timing differs. `AsyncBifrost()` is lazy the same way, and `await AsyncBifrost.connect()` is its eager form. We use `connect` in setup scripts and smoke tests, where failing at startup is the point.
-
-Pass a client only when you need one: a test pointing at a specific server, configuration the environment cannot express, or [acting on behalf of someone](/understand/identity-and-authorization/#acting-on-behalf-of-someone). That is `client=` in Python, `{ client }` in TypeScript, and `connect_with(&client)` in Rust. A handle given a client uses it as given. The lookup order for credentials is in [How a caller proves who it is](/understand/identity-and-authorization/#how-a-caller-proves-who-it-is).
+Even a new tenant lists Wyrd's built-in tables. `connect` checks the credential before it returns, so a missing or refused key fails here, not on your first real call.
 
 ## Stop and restart
 
-Press Ctrl-C in the server terminal. The CLI stops the server and waits for it to drain. To restart, run the same command from the same directory, with the same database and config directory:
+Press Ctrl-C in the server terminal. To restart, run the same command from the same directory:
 
 ```bash
 wyrd server dev --tenant acme
 ```
 
-Migrations are safe to rerun, and an existing tenant keeps its key. To keep your data, keep all three: the PostgreSQL database, `.wyrd/`, and the config directory.
-
-The sealing key is created on the first run and reused on every later one, so provider keys you stored with `wyrd gateway credential put` keep working. Lose it and the stored provider keys can no longer be decrypted; put them again. To supply your own key instead, set `WYRD_SEALING_KEY_FILE` before starting.
-
-Access tokens are signed with a key generated at startup unless you set `WYRD_SIGNING_KEY_FILE`, so a restart invalidates tokens issued before it. The CLI and SDKs exchange the saved API key for a new token on their next call; you do nothing.
+Migrations are safe to rerun, and an existing tenant keeps its key. Your data lives in three places; keep all of them: the PostgreSQL database, `.wyrd/`, and the config directory. Lose `server/sealing.key` and stored provider keys can no longer be decrypted, so you would put them again.
 
 ## If it fails
 
-A failed run prints `WYRD_CLI_503_SERVER_DEV`, names the stage that failed, and stops the server. Migrations and tenant creation that already committed stay. [Troubleshoot a deployment](/operate/troubleshoot-a-deployment/#local-startup) lists the fix for each stage, including how to recover a lost tenant credential.
+| You see | Cause | Fix |
+| --- | --- | --- |
+| `WYRD_CLI_503_SERVER_DEV` naming the `migration` stage | The database is unreachable, or the login does not own it | Check `WYRD_DATABASE_URL` and the `OWNER` of the `wyrd` database, then rerun |
+| `WYRD_CLI_503_SERVER_DEV` naming the `listener` stage | Port 8080 is taken | Set `WYRD_SERVER_BIND` to a free loopback address and rerun |
+| `is a superuser` or `BYPASSRLS` | `WYRD_DATABASE_URL` names an administrator login | Use the `wyrd` login created above |
+| `WYRD_CLI_400_SERVER_HOST_UNSUPPORTED` | No server release exists for this machine | Use a supported host from the prerequisites |
+| `WYRD_CLIENT_401_NO_CREDENTIALS` from `wyrd list` or `connect` | No saved credential is visible to this process | Use the same `WYRD_CONFIG_HOME` as the server terminal |
+| Calls go to the wrong server, or a key is refused | `WYRD_API_KEY`, `WYRD_ACCESS_TOKEN`, or `WYRD_SERVER_URL` is exported from other work, and it wins over the saved config | Unset them |
+
+A failed run stops the server. Migrations and tenant creation that already committed stay, so rerunning the same command picks up where it stopped.
+
+## Next
+
+[Set up the LLM gateway](/connect/set-up-the-llm-gateway/) to call a model through Wyrd with this credential.

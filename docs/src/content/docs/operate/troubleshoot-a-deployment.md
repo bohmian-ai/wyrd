@@ -19,7 +19,7 @@ Match the code or message you see below. This page covers server installation, l
 | `WYRD_CLI_400_SERVER_HOST_UNSUPPORTED` | Wyrd publishes servers only for macOS on arm64 and glibc Linux on x86_64 or arm64 | Run the server on a supported host, or use the `bohmian/wyrd` container image |
 | `WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE` | GitHub could not be reached, a download broke off, no stable release is published, or the newest release has no bundle for this machine | Check access to `github.com` and retry. The message says which one |
 | `WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED` | The signature on `checksums.txt` is missing or wrong, the download does not match its signed SHA-256, or the bundle did not unpack into a runnable server | Retry once. If it fails again, do not work around it: report the release |
-| `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | The newest server is on a different version line than your `wyrd` CLI | Upgrade the CLI (`pip install -U wyrd` or `npm install wyrd-ai@latest`), then rerun |
+| `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | The newest server is on a different version line than your `wyrd` CLI | Upgrade the CLI (`pip install -U wyrd-ai` or `npm install -g wyrd-ai@latest`), then rerun |
 
 ## Local startup
 

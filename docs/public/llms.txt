@@ -6,6 +6,10 @@
 
 - [Wyrd docs](https://bohmian-ai.github.io/wyrd/): the docs home, with a link to each published section.
 
+## Get started
+
+- [Set up Wyrd](https://bohmian-ai.github.io/wyrd/get-started/setup/): Run a Wyrd server on your machine, save its first credential, and make an authenticated request.
+
 ## Connect
 
 - [Set up the LLM gateway](https://bohmian-ai.github.io/wyrd/connect/set-up-the-llm-gateway/): Store a provider key with the Wyrd server, name a deployment for it, and call the model through Wyrd with your Wyrd credential.

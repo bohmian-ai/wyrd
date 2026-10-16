@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -76,6 +76,8 @@ use wyrd_server::state::{
     BifrostBuildInputs, BifrostShutdownReport, BifrostTestControls, ComposedBifrost,
     QueryStreamFault, QueryStreamFaultController, ScribeCoordinationRuntime,
 };
+use wyrd_server::verification::hosted::HostedLimits;
+use wyrd_server::verification::hosted::blocks::HostedBlocks;
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
@@ -5088,6 +5090,7 @@ impl WyrdTestServerBuilder {
             wyrd_server::components::operators::keys::OperatorKeys::new(operator_keys)
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
+        state = state.with_verification_blocks(Arc::new(test_verification_blocks().await?));
         let router = build_router(state.clone());
 
         Ok(WyrdTestServer {
@@ -6048,4 +6051,28 @@ mod tests {
             &TYPESCRIPT_SETUP,
         );
     }
+}
+
+/// Hosted Verifier blocks for a test server: the default Deployment limits
+/// with no prewarmed worker, so only a Verifier that runs Python spawns the
+/// Monty worker at `WYRD_VERIFICATION_MONTY_WORKER`, else the
+/// `build:monty-worker` output.
+///
+/// # Errors
+/// Returns [`WyrdTestServerError::Start`] when the sandbox pool cannot start.
+async fn test_verification_blocks() -> Result<HostedBlocks, WyrdTestServerError> {
+    let worker = std::env::var_os("WYRD_VERIFICATION_MONTY_WORKER").map_or_else(
+        || {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../target/release/wyrd-monty-worker")
+        },
+        PathBuf::from,
+    );
+    let limits = HostedLimits {
+        monty_min_workers: 0,
+        ..HostedLimits::default()
+    };
+    HostedBlocks::start(worker, limits)
+        .await
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))
 }

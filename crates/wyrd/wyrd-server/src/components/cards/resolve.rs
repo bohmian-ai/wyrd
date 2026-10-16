@@ -276,10 +276,9 @@ impl EffectiveSpecs {
         };
         if let (Some(Spec::Verifier(verifier)), Some(Spec::Trigger(trigger))) =
             (&verifier, &trigger)
+            && matches!(trigger.activation, TriggerActivation::Schedule { .. })
         {
-            if matches!(trigger.activation, TriggerActivation::Schedule { .. }) {
-                check_activation(verifier, binding, field)?;
-            }
+            check_activation(verifier, binding, field)?;
         }
         if let Some(Spec::Trigger(TriggerSpec {
             activation: TriggerActivation::Schedule { cron, tz },

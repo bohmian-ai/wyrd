@@ -7,8 +7,8 @@
 //! Coordination deadlines are PostgreSQL's, so a test that needs one to elapse
 //! places the row itself in the past through the fixture. Results are staged
 //! on a Scribe outbox writing to the server's own Scribe, wrapped in a
-//! [`PublicationFault`] that records every submitted batch; run state is
-//! read back from `wyrd.verifier_runs` and audit from the tenant's retained
+//! [`PublicationFault`] that records every submitted batch; execution state is
+//! read back from `wyrd.verifier_executions` and audit from the tenant's retained
 //! `vala.system.audit_log` history.
 
 use std::collections::BTreeMap;
@@ -27,32 +27,35 @@ use sqlx::{AssertSqlSafe, PgPool, Postgres, Transaction};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use vala_drift::{DriftReport, DriftVerdict, FeatureDriftReport};
-use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_server::verification::drift::DRIFT_INVALID;
-use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
+use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::fault::{PublicationFault, SentBatch};
 use wyrd_server::verification::fitter::{BaselineFitter, FitGate};
 use wyrd_server::verification::health::RuntimeCapability;
-use wyrd_server::verification::observations::ObservationRunSink;
 use wyrd_server::verification::runner::{EngineScript, VERIFIER_UNAVAILABLE};
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::DriftMethod;
-use wyrd_spec::card::verifier::DriftBaselineState;
-use wyrd_spec::ids::{BindingId, CardUid, FeatureName, VerificationRunId};
-use wyrd_spec::verification::{DriftWindow, VerificationError};
+use wyrd_spec::card::verifier::{Check, DriftBaselineState};
+use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, FeatureName};
+use wyrd_spec::vala::eval::TaskId;
+use wyrd_spec::verification::execution::{
+    RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+};
+use wyrd_spec::verification::{
+    DriftReport, DriftVerdict, FeatureDriftReport, VerificationError, VerificationVerdict,
+};
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::artifact_metadata::{self, NewArtifactMetadata};
-use wyrd_sql::queries::verifier_runs::{ObservationRecord, TerminalStatus};
+use wyrd_sql::queries::verifier_executions::TerminalStatus;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::logs::LogCapture;
-use wyrd_testing::verification::{RunRow, VerificationFixture};
+use wyrd_testing::verification::{ExecutionRow, VerificationFixture};
 
 /// Upper bound on every wait for the runtime to make progress.
 ///
 /// A due binding's occurrence is claimed only 30 seconds after its window
-/// ends, so a scheduled-run wait must outlast that claim delay.
+/// ends, so a scheduled-execution wait must outlast that claim delay.
 const WAIT: Duration = Duration::from_mins(1);
 
 /// Summary table every completed result ends with.
@@ -67,11 +70,11 @@ struct Harness {
     server: WyrdTestServer,
     /// Seeded verification state of the fixture tenant.
     seed: VerificationFixture,
-    /// Active Service Card the runs verify.
+    /// Active Service Card the executions verify.
     subject: CardUid,
-    /// Active Custom Drift Verifier Card the runs execute.
+    /// Active Custom Drift Verifier Card the executions run.
     verifier: CardUid,
-    /// Superuser pool for run-state assertions and fault injection.
+    /// Superuser pool for execution-state assertions and fault injection.
     assertion: PgPool,
     /// Faults and the submitted-batch record every runtime writes through.
     fault: PublicationFault,
@@ -148,23 +151,69 @@ impl Harness {
         RunningRuntime::spawn(self.runtime(limits, script, &CapabilityCrash::default()))
     }
 
-    /// Enqueue one manual direct run over the hour before now.
+    /// Accept one caller submission of the harness Verifier about the
+    /// harness subject, with no inputs, into the queue.
+    ///
+    /// Scripted engine outcomes replace the engine, so the inputs are never
+    /// read.
     ///
     /// # Panics
-    /// Panics when the queue refuses the run.
-    async fn enqueue(&self) -> VerificationRunId {
-        let now = Utc::now();
+    /// Panics when the queue does not accept the submission.
+    async fn submit(&self) -> ExecutionId {
         self.seed
-            .enqueue_direct(
-                &self.verifier,
-                &self.subject,
-                DriftWindow {
-                    start: now - chrono::Duration::hours(1),
-                    end: now,
-                },
+            .submit(&self.verifier, &self.subject, BTreeMap::new())
+            .await
+            .expect("submission is accepted")
+    }
+
+    /// Schedule `verifier` over the harness subject's `metric` series for a
+    /// fresh active owner and return the execution the scheduler creates for
+    /// its now-due occurrence.
+    ///
+    /// The scheduler claims an occurrence 30 seconds after its window ends,
+    /// so this waits up to [`WAIT`]; a runtime must be running.
+    ///
+    /// # Panics
+    /// Panics when the owner, binding, or activation write fails, or no new
+    /// execution appears within [`WAIT`].
+    async fn schedule(&self, owner: &str, verifier: &CardUid, metric: &str) -> ExecutionId {
+        let before = self.seed.executions().await.expect("executions read");
+        let (owner, principal) = self.seed.service(owner).await.expect("owner registers");
+        let binding = self
+            .seed
+            .bind_schedule(
+                &owner,
+                &owner,
+                verifier,
+                "0 2 * * *",
+                VerificationFixture::metric_inputs(metric),
+                Vec::new(),
             )
             .await
-            .expect("run enqueues")
+            .expect("binding projects");
+        self.seed
+            .activate(principal)
+            .await
+            .expect("owner activates");
+        self.make_due(binding).await;
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let created = self
+                .seed
+                .executions()
+                .await
+                .expect("executions read")
+                .into_iter()
+                .find(|execution| !before.contains(execution));
+            if let Some(execution) = created {
+                return execution;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the scheduled occurrence never created an execution"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Bring `binding`'s schedule cursor due in the database.
@@ -178,26 +227,30 @@ impl Harness {
             .expect("binding is due");
     }
 
-    /// Bring `run`'s lease or retry deadline due in the database.
+    /// Bring `execution`'s lease or retry deadline due in the database.
     ///
     /// The queue's deadlines are PostgreSQL's, so a test that needs one to
     /// elapse moves the row instead of a process clock.
     ///
     /// # Panics
     /// Panics when the update fails.
-    async fn expire(&self, run: VerificationRunId) {
+    async fn expire(&self, execution: ExecutionId) {
         self.seed
-            .expire_deadlines(run)
+            .expire_deadlines(execution)
             .await
             .expect("deadlines expire");
     }
 
-    /// Poll `run` until `done` holds, returning its final state.
+    /// Poll `execution` until `done` holds, returning its final state.
     ///
     /// # Panics
-    /// Panics when the run cannot be read or `done` never holds within [`WAIT`].
-    async fn wait_run(&self, run: VerificationRunId, done: impl Fn(&RunRow) -> bool) -> RunRow {
-        wait_run_in(&self.seed, run, done).await
+    /// Panics when `done` never holds within [`WAIT`].
+    async fn wait_execution(
+        &self,
+        execution: ExecutionId,
+        done: impl Fn(&ExecutionRow) -> bool,
+    ) -> ExecutionRow {
+        wait_execution_in(&self.seed, execution, done).await
     }
 
     /// The destination table of every result batch the runtime submitted to
@@ -249,8 +302,8 @@ impl Harness {
     /// Open a superuser transaction holding `SHARE` on `table`.
     ///
     /// Reads still proceed, but every insert or update of `table` blocks until
-    /// the returned transaction ends. On `wyrd.verifier_runs` this parks a
-    /// scheduler occurrence transaction at its enqueue and a runner claim
+    /// the returned transaction ends. On `wyrd.verifier_executions` this parks
+    /// a scheduler occurrence transaction at its enqueue and a runner claim
     /// transaction at its first update; on `wyrd.drift_baselines` it parks a
     /// fitter claim transaction. Each stays inside its uncommitted tenant
     /// transaction.
@@ -372,18 +425,19 @@ impl Harness {
         }
     }
 
-    /// The stored lease of `run`: `(lease_token, lease_expires_at)`.
+    /// The stored lease of `execution`: `(lease_token, lease_expires_at)`.
     ///
     /// # Panics
-    /// Panics when the run cannot be read.
-    async fn lease(&self, run: VerificationRunId) -> (Option<Uuid>, Option<DateTime<Utc>>) {
+    /// Panics when the execution cannot be read.
+    async fn lease(&self, execution: ExecutionId) -> (Option<Uuid>, Option<DateTime<Utc>>) {
         sqlx::query_as(
-            "SELECT lease_token, lease_expires_at FROM wyrd.verifier_runs WHERE run_id = $1",
+            "SELECT lease_token, lease_expires_at FROM wyrd.verifier_executions \
+             WHERE execution_id = $1",
         )
-        .bind(run.as_uuid())
+        .bind(execution.as_uuid())
         .fetch_one(&self.assertion)
         .await
-        .expect("run lease reads")
+        .expect("execution lease reads")
     }
 
     /// Every retained audit operation of the tenant in decision order, once
@@ -460,24 +514,27 @@ async fn seed_tenant(
     (seed, subject, verifier)
 }
 
-/// Poll `run` in `seed` until `done` holds.
+/// Poll `execution` in `seed` until `done` holds.
+///
+/// An execution not yet readable counts as not done, so a caller can wait on
+/// an identity the queue accepts asynchronously, such as an enqueue's.
 ///
 /// # Panics
-/// Panics when the run cannot be read or `done` never holds within [`WAIT`].
-async fn wait_run_in(
+/// Panics when `done` never holds within [`WAIT`].
+async fn wait_execution_in(
     seed: &VerificationFixture,
-    run: VerificationRunId,
-    done: impl Fn(&RunRow) -> bool,
-) -> RunRow {
+    execution: ExecutionId,
+    done: impl Fn(&ExecutionRow) -> bool,
+) -> ExecutionRow {
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
-        let row = seed.run(run).await.expect("run reads");
-        if done(&row) {
-            return row;
+        let row = seed.execution(execution).await.ok();
+        if let Some(row) = row.as_ref().filter(|row| done(row)) {
+            return row.clone();
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "run never reached the expected state; last {row:?}"
+            "execution never reached the expected state; last {row:?}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -498,11 +555,46 @@ async fn wait_until(what: &str, ready: impl Fn() -> bool) {
     }
 }
 
-/// A Drift report over two features, one drifting, so the verdict fails.
+/// An outcome of the fixture Verifier's one `drift` requirement judged
+/// `outcome` from `report`.
+///
+/// # Panics
+/// Panics when the static requirement ID or drift check is invalid.
+fn drift_outcome(
+    verdict: VerificationVerdict,
+    outcome: RequirementOutcome,
+    report: DriftReport,
+) -> VerificationOutcome {
+    VerificationOutcome {
+        verdict,
+        requirements: vec![RequirementResult {
+            id: drift_requirement(),
+            step: None,
+            statement: "The window does not drift.".to_owned(),
+            outcome,
+            reason: "scripted".to_owned(),
+            actual: None,
+            citations: Vec::new(),
+            detail: Some(RequirementDetail::Drift(report)),
+            check: serde_json::from_value::<Check>(serde_json::json!({
+                "kind": "drift", "on": "inputs.samples", "method": "Custom",
+                "signal": { "kind": "Metric", "name": "latency_ms" },
+                "condition": { "kind": "Above", "limit": 250.0 }
+            }))
+            .expect("the fixture drift check decodes"),
+            provenance: None,
+        }],
+        steps: Vec::new(),
+        evidence: BTreeMap::new(),
+    }
+}
+
+/// A failed Drift outcome over two scored features, one drifting, so the
+/// execution writes two feature rows before its summary.
 ///
 /// # Panics
 /// Panics when a static feature name is invalid.
-fn drifting_report() -> VerifierReport {
+fn drifting_report() -> VerificationOutcome {
     let features = [
         ("latency", 3.0, DriftVerdict::Drift),
         ("tokens", 0.1, DriftVerdict::NoDrift),
@@ -514,23 +606,52 @@ fn drifting_report() -> VerifierReport {
             feature.clone(),
             FeatureDriftReport {
                 feature,
-                score,
-                threshold: 1.0,
+                score: Some(score),
+                threshold: Some(1.0),
                 verdict,
                 evidence: None,
             },
         )
     })
     .collect::<BTreeMap<_, _>>();
-    VerifierReport::Drift(Some(DriftReport {
-        method: DriftMethod::Custom,
-        features,
-        verdict: DriftVerdict::Drift,
-    }))
+    drift_outcome(
+        VerificationVerdict::Failed,
+        RequirementOutcome::Failed,
+        DriftReport {
+            method: DriftMethod::Custom,
+            features,
+            verdict: DriftVerdict::Drift,
+        },
+    )
+}
+
+/// An inconclusive Drift outcome that scored no feature, so the execution
+/// writes its summary only.
+///
+/// # Panics
+/// Panics when the static drift check is invalid.
+fn unscored_report() -> VerificationOutcome {
+    drift_outcome(
+        VerificationVerdict::Inconclusive,
+        RequirementOutcome::Inconclusive,
+        DriftReport {
+            method: DriftMethod::Custom,
+            features: BTreeMap::new(),
+            verdict: DriftVerdict::Inconclusive,
+        },
+    )
+}
+
+/// The requirement ID of the fixture Verifier's one drift check.
+///
+/// # Panics
+/// Panics when the static ID is invalid.
+fn drift_requirement() -> TaskId {
+    TaskId::new("drift").expect("the fixture requirement ID is valid")
 }
 
 /// Whether `row` has reached `status`.
-fn status(status: &'static str) -> impl Fn(&RunRow) -> bool {
+fn status(status: &'static str) -> impl Fn(&ExecutionRow) -> bool {
     move |row| row.status == status
 }
 
@@ -559,9 +680,9 @@ async fn completed_run_publishes_details_then_summary_and_records_metrics() {
     let script = EngineScript::default();
     script.push(EngineOutcome::Completed(drifting_report()));
     let runtime = harness.spawn(&Harness::limits(), &script);
-    let run = harness.enqueue().await;
+    let run = harness.submit().await;
 
-    let row = harness.wait_run(run, status("completed")).await;
+    let row = harness.wait_execution(run, status("completed")).await;
     assert_eq!(row.attempts, 1);
     assert!(
         row.result_id.is_some(),
@@ -590,8 +711,7 @@ async fn completed_run_publishes_details_then_summary_and_records_metrics() {
         assert!(rendered.contains(name), "{name} is exported:\n{rendered}");
     }
     assert!(
-        rendered
-            .contains(r#"wyrd_verification_run_attempts_total{kind="unknown",mode="queued"} 1"#),
+        rendered.contains(r#"wyrd_verification_run_attempts_total{mode="queued"} 1"#),
         "{rendered}"
     );
 }
@@ -601,9 +721,9 @@ async fn completed_run_publishes_details_then_summary_and_records_metrics() {
 /// latency once, and each attempt is one correlated `verification.attempt`
 /// trace spanning claim, load, evidence read, engine, and settlement with only bounded, scrubbed attributes.
 ///
-/// Run one retries and then completes, run two is cancelled by the engine,
-/// and run three executes the real Drift engine, which reads its evidence
-/// through Bifrost.
+/// Submission one retries and then completes, submission two is cancelled by
+/// the engine, and a scheduled occurrence executes the real Drift engine,
+/// which reads its evidence through Bifrost.
 ///
 /// # Panics
 /// Panics when a series count differs from the attempts that produced it,
@@ -630,32 +750,22 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
     ));
     let runtime = harness.spawn(&Harness::limits(), &script);
 
-    let retried = harness.enqueue().await;
-    harness.wait_run(retried, status("retrying")).await;
+    let retried = harness.submit().await;
+    harness.wait_execution(retried, status("retrying")).await;
     harness.expire(retried).await;
-    harness.wait_run(retried, status("completed")).await;
-    let cancelled = harness.enqueue().await;
-    harness.wait_run(cancelled, status("cancelled")).await;
+    harness.wait_execution(retried, status("completed")).await;
+    let cancelled = harness.submit().await;
+    harness.wait_execution(cancelled, status("cancelled")).await;
     let profiled = harness
         .seed
         .custom_drift_verifier("telemetry-drift", "score", 1.0, 0.5)
         .await
         .expect("profiled verifier registers");
-    let now = Utc::now();
     let real = harness
-        .seed
-        .enqueue_direct(
-            &profiled,
-            &harness.subject,
-            DriftWindow {
-                start: now - chrono::Duration::hours(1),
-                end: now,
-            },
-        )
-        .await
-        .expect("run enqueues");
+        .schedule("telemetry-owner", &profiled, "score")
+        .await;
     let real_row = harness
-        .wait_run(real, |row| {
+        .wait_execution(real, |row| {
             !matches!(row.status.as_str(), "pending" | "running" | "retrying")
         })
         .await;
@@ -668,73 +778,71 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
             .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
             .map_or(0, |value| value.parse().expect("a count is an integer"))
     };
-    // The scripted attempts execute the fixture's profile-less Drift
-    // Verifier, which cannot be classified; the real run is a Custom Drift.
+    // The scripted attempts are manual submissions; the real attempt is the
+    // scheduled occurrence, the only one that reads evidence and prepares.
     let real_published = u64::from(real_row.result_id.is_some());
-    for (kind, attempts, completed) in [("unknown", 3, 1), ("drift_custom", 1, real_published)] {
-        let manual = format!(r#"kind="{kind}",origin="manual""#);
-        let queued = format!(r#"kind="{kind}",mode="queued""#);
+    let queued = r#"mode="queued""#;
+    for (origin, attempts, completed) in [("manual", 3, 1), ("schedule", 1, real_published)] {
         assert_eq!(
             count(&format!(
-                "wyrd_verification_queue_wait_seconds_count{{{manual}}}"
+                r#"wyrd_verification_queue_wait_seconds_count{{origin="{origin}"}}"#
             )),
             attempts,
-            "one queue wait per {kind} attempt:\n{rendered}"
-        );
-        assert_eq!(
-            count(&format!("wyrd_verification_run_attempts_total{{{queued}}}")),
-            attempts,
-            "one {kind} attempt per claim:\n{rendered}"
-        );
-        for phase in ["load", "engine", "settlement"] {
-            assert_eq!(
-                count(&format!(
-                    r#"wyrd_verification_phase_duration_seconds_count{{{queued},phase="{phase}"}}"#
-                )),
-                attempts,
-                "{kind} {phase} is timed once per attempt:\n{rendered}"
-            );
-        }
-        for phase in ["input_read", "prepare"] {
-            assert_eq!(
-                count(&format!(
-                    r#"wyrd_verification_phase_duration_seconds_count{{{queued},phase="{phase}"}}"#
-                )),
-                u64::from(kind == "drift_custom"),
-                "only the real engine reads evidence and prepares:\n{rendered}"
-            );
-        }
-        let overhead: u64 = ["completed", "retrying", "cancelled"]
-            .iter()
-            .map(|outcome| {
-                count(&format!(
-                    r#"wyrd_verification_engine_overhead_seconds_count{{{queued},outcome="{outcome}"}}"#
-                ))
-            })
-            .sum();
-        assert_eq!(
-            overhead, attempts,
-            "every {kind} engine execution reports its overhead once:\n{rendered}"
-        );
-        assert!(
-            rendered
-                .lines()
-                .any(|line| line == format!("wyrd_verification_active_runs{{{queued}}} 0")),
-            "the {kind} active gauge returns to zero:\n{rendered}"
+            "one queue wait per {origin} attempt:\n{rendered}"
         );
         assert_eq!(
             count(&format!(
-                r#"wyrd_verification_trigger_to_terminal_seconds_count{{{manual},outcome="completed"}}"#
+                r#"wyrd_verification_trigger_to_terminal_seconds_count{{origin="{origin}",outcome="completed"}}"#
             )),
             completed,
             "{rendered}"
         );
     }
-    let unknown = r#"kind="unknown",mode="queued""#;
+    assert_eq!(
+        count(&format!("wyrd_verification_run_attempts_total{{{queued}}}")),
+        4,
+        "one attempt per claim:\n{rendered}"
+    );
+    for phase in ["load", "engine", "settlement"] {
+        assert_eq!(
+            count(&format!(
+                r#"wyrd_verification_phase_duration_seconds_count{{{queued},phase="{phase}"}}"#
+            )),
+            4,
+            "{phase} is timed once per attempt:\n{rendered}"
+        );
+    }
+    for phase in ["input_read", "prepare"] {
+        assert_eq!(
+            count(&format!(
+                r#"wyrd_verification_phase_duration_seconds_count{{{queued},phase="{phase}"}}"#
+            )),
+            1,
+            "only the real engine reads evidence and prepares:\n{rendered}"
+        );
+    }
+    let overhead: u64 = ["completed", "retrying", "cancelled"]
+        .iter()
+        .map(|outcome| {
+            count(&format!(
+                r#"wyrd_verification_engine_overhead_seconds_count{{{queued},outcome="{outcome}"}}"#
+            ))
+        })
+        .sum();
+    assert_eq!(
+        overhead, 4,
+        "every engine execution reports its overhead once:\n{rendered}"
+    );
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line == format!("wyrd_verification_active_runs{{{queued}}} 0")),
+        "the active gauge returns to zero:\n{rendered}"
+    );
     for outcome in ["retrying", "cancelled"] {
         assert_eq!(
             count(&format!(
-                r#"wyrd_verification_run_failures_total{{{unknown},outcome="{outcome}"}}"#
+                r#"wyrd_verification_run_failures_total{{{queued},outcome="{outcome}"}}"#
             )),
             1,
             "{outcome} is an unsuccessful execution outcome:\n{rendered}"
@@ -742,7 +850,7 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
     }
     let terminal = |outcome: &str| {
         count(&format!(
-            r#"wyrd_verification_trigger_to_terminal_seconds_count{{kind="unknown",origin="manual",outcome="{outcome}"}}"#
+            r#"wyrd_verification_trigger_to_terminal_seconds_count{{origin="manual",outcome="{outcome}"}}"#
         ))
     };
     assert_eq!(terminal("cancelled"), 1, "{rendered}");
@@ -764,15 +872,15 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
     );
 
     let spans = traces.finished_since(0);
-    let attempt = |run: VerificationRunId, attempt: &str| {
+    let attempt = |execution: ExecutionId, attempt: &str| {
         spans
             .iter()
             .find(|span| {
                 span.name == "verification.attempt"
-                    && span.attributes.get("run_id") == Some(&run.to_string())
+                    && span.attributes.get("execution_id") == Some(&execution.to_string())
                     && span.attributes.get("attempt").map(String::as_str) == Some(attempt)
             })
-            .unwrap_or_else(|| panic!("attempt {attempt} of {run} is traced: {spans:#?}"))
+            .unwrap_or_else(|| panic!("attempt {attempt} of {execution} is traced: {spans:#?}"))
     };
     let children = |root: &wyrd_telemetry::CapturedSpan| -> Vec<&str> {
         spans
@@ -807,10 +915,6 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
     assert_eq!(
         completed.attributes.get("origin").map(String::as_str),
         Some("manual")
-    );
-    assert_eq!(
-        completed.attributes.get("kind").map(String::as_str),
-        Some("unknown")
     );
     assert_eq!(
         completed.attributes.get("mode").map(String::as_str),
@@ -852,8 +956,8 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
     ));
     let real_attempt = attempt(real, "1");
     assert_eq!(
-        real_attempt.attributes.get("kind").map(String::as_str),
-        Some("drift_custom")
+        real_attempt.attributes.get("origin").map(String::as_str),
+        Some("schedule")
     );
     let real_children = children(real_attempt);
     for child in ["verification.evidence_read", "verification.prepare"] {
@@ -886,28 +990,31 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
 async fn unscored_drift_publishes_only_the_summary() {
     let harness = Harness::start().await;
     let script = EngineScript::default();
-    script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    script.push(EngineOutcome::Completed(unscored_report()));
     let runtime = harness.spawn(&Harness::limits(), &script);
-    let run = harness.enqueue().await;
+    let run = harness.submit().await;
 
-    harness.wait_run(run, status("completed")).await;
+    harness.wait_execution(run, status("completed")).await;
     assert_eq!(harness.writes().await, vec![RESULTS.to_owned()]);
     runtime.stop().await;
 }
 
-/// Without a scripted outcome the real Drift engine refuses the fixture
-/// Verifier, which declares no profile, settling the run `errored` with
-/// `drift_invalid` and publishing nothing.
+/// Without a scripted outcome the real Drift engine refuses a scheduled
+/// occurrence of the fixture Verifier, which declares no profile, settling
+/// the execution `errored` with `drift_invalid` and publishing nothing.
 ///
 /// # Panics
-/// Panics when the run is not errored with that code or anything is written.
+/// Panics when the execution is not errored with that code or anything is
+/// written.
 #[tokio::test]
 async fn unscorable_verifier_errors_without_publishing() {
     let harness = Harness::start().await;
     let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
-    let run = harness.enqueue().await;
+    let run = harness
+        .schedule("unscorable-owner", &harness.verifier, "latency_ms")
+        .await;
 
-    let row = harness.wait_run(run, status("errored")).await;
+    let row = harness.wait_execution(run, status("errored")).await;
     assert_eq!(row.error_code.as_deref(), Some(DRIFT_INVALID));
     assert_eq!(row.result_id, None, "no verdict is fabricated");
     assert!(harness.writes().await.is_empty());
@@ -935,9 +1042,9 @@ async fn lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplica
         &script,
         &CapabilityCrash::default(),
     ));
-    let run = harness.enqueue().await;
+    let run = harness.submit().await;
 
-    let row = harness.wait_run(run, status("completed")).await;
+    let row = harness.wait_execution(run, status("completed")).await;
     assert_eq!(row.attempts, 1, "staging settles the run in one attempt");
     assert!(row.result_id.is_some());
     let summaries = sent_to(fault, RESULTS).await;
@@ -994,18 +1101,18 @@ async fn retryable_engine_failures_exhaust_to_errored() {
         }));
     }
     let runtime = harness.spawn(&Harness::limits(), &script);
-    let run = harness.enqueue().await;
+    let run = harness.submit().await;
 
     for attempt in 1..=2 {
         let row = harness
-            .wait_run(run, move |row| {
+            .wait_execution(run, move |row| {
                 row.status == "retrying" && row.attempts == attempt
             })
             .await;
         assert_eq!(row.error_code.as_deref(), Some("engine_unavailable"));
         harness.expire(run).await;
     }
-    let row = harness.wait_run(run, status("errored")).await;
+    let row = harness.wait_execution(run, status("errored")).await;
     assert_eq!(row.attempts, 3);
     assert_eq!(row.error_code.as_deref(), Some("engine_unavailable"));
     assert!(harness.writes().await.is_empty());
@@ -1030,9 +1137,9 @@ async fn deferred_engine_admission_requeues_without_spending_attempts() {
     }
     script.push(EngineOutcome::Completed(drifting_report()));
     let runtime = harness.spawn(&Harness::limits(), &script);
-    let run = harness.enqueue().await;
+    let run = harness.submit().await;
 
-    let row = harness.wait_run(run, status("completed")).await;
+    let row = harness.wait_execution(run, status("completed")).await;
     assert_eq!(row.attempts, 1, "no deferral is charged an attempt");
     assert_eq!(row.error_code, None);
     runtime.stop().await;
@@ -1061,14 +1168,14 @@ async fn cancellation_and_deadline_settle_without_a_verdict() {
         },
         &script,
     );
-    let cancelled = harness.enqueue().await;
-    let row = harness.wait_run(cancelled, status("cancelled")).await;
+    let cancelled = harness.submit().await;
+    let row = harness.wait_execution(cancelled, status("cancelled")).await;
     assert_eq!(row.result_id, None);
 
     script.hold();
-    script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
-    let slow = harness.enqueue().await;
-    let row = harness.wait_run(slow, status("timed_out")).await;
+    script.push(EngineOutcome::Completed(unscored_report()));
+    let slow = harness.submit().await;
+    let row = harness.wait_execution(slow, status("timed_out")).await;
     assert_eq!(row.error_code.as_deref(), Some("execution_timed_out"));
     assert_eq!(row.result_id, None);
     script.release();
@@ -1095,25 +1202,17 @@ async fn verifier_runs_execute_beyond_the_former_permit_ceilings() {
     let script = EngineScript::default();
     script.hold();
     for _ in 0..22 {
-        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+        script.push(EngineOutcome::Completed(unscored_report()));
     }
     let mut busy = Vec::new();
     for _ in 0..20 {
-        busy.push(harness.enqueue().await);
+        busy.push(harness.submit().await);
     }
-    let now = Utc::now();
     let mut quiet = Vec::new();
     for _ in 0..2 {
         quiet.push(
             other
-                .enqueue_direct(
-                    &other_verifier,
-                    &other_subject,
-                    DriftWindow {
-                        start: now - chrono::Duration::hours(1),
-                        end: now,
-                    },
-                )
+                .submit(&other_verifier, &other_subject, BTreeMap::new())
                 .await
                 .expect("second tenant run enqueues"),
         );
@@ -1125,19 +1224,27 @@ async fn verifier_runs_execute_beyond_the_former_permit_ceilings() {
     .await;
     for run in &busy {
         assert_eq!(
-            harness.seed.run(*run).await.expect("run reads").status,
+            harness
+                .seed
+                .execution(*run)
+                .await
+                .expect("execution reads")
+                .status,
             "running"
         );
     }
     for run in &quiet {
-        assert_eq!(other.run(*run).await.expect("run reads").status, "running");
+        assert_eq!(
+            other.execution(*run).await.expect("execution reads").status,
+            "running"
+        );
     }
     script.release();
     for run in busy {
-        harness.wait_run(run, status("completed")).await;
+        harness.wait_execution(run, status("completed")).await;
     }
     for run in quiet {
-        wait_run_in(&other, run, status("completed")).await;
+        wait_execution_in(&other, run, status("completed")).await;
     }
     runtime.stop().await;
 }
@@ -1167,7 +1274,7 @@ async fn two_replicas_claim_each_queued_run_exactly_once() {
     for script in &scripts {
         script.hold();
         for _ in 0..RUNS {
-            script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+            script.push(EngineOutcome::Completed(unscored_report()));
         }
     }
     let replicas = [
@@ -1176,7 +1283,7 @@ async fn two_replicas_claim_each_queued_run_exactly_once() {
     ];
     let mut runs = Vec::new();
     for _ in 0..RUNS {
-        runs.push(harness.enqueue().await);
+        runs.push(harness.submit().await);
     }
     let executed = || scripts[0].entered() + scripts[1].entered();
     wait_until("every run claimed", || executed() == RUNS).await;
@@ -1190,7 +1297,7 @@ async fn two_replicas_claim_each_queued_run_exactly_once() {
         script.release();
     }
     for run in runs {
-        let row = harness.wait_run(run, status("completed")).await;
+        let row = harness.wait_execution(run, status("completed")).await;
         assert_eq!(row.attempts, 1, "one claim per run: {row:?}");
     }
     assert_eq!(executed(), RUNS, "no run executes twice");
@@ -1233,31 +1340,23 @@ async fn a_flooding_tenant_does_not_delay_another_tenants_run() {
     let (quiet, quiet_subject, quiet_verifier) = seed_tenant(&harness.server, quiet_tenant).await;
     let mut flood = Vec::new();
     for _ in 0..FLOOD {
-        flood.push(harness.enqueue().await);
+        flood.push(harness.submit().await);
     }
-    let now = Utc::now();
     let quiet_run = quiet
-        .enqueue_direct(
-            &quiet_verifier,
-            &quiet_subject,
-            DriftWindow {
-                start: now - chrono::Duration::hours(1),
-                end: now,
-            },
-        )
+        .submit(&quiet_verifier, &quiet_subject, BTreeMap::new())
         .await
         .expect("quiet run enqueues");
     let script = EngineScript::default();
     script.hold();
     for _ in 0..=FLOOD {
-        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+        script.push(EngineOutcome::Completed(unscored_report()));
     }
     let runtime = harness.spawn(&Harness::limits(), &script);
     wait_until("every run claimed", || script.entered() == FLOOD + 1).await;
 
     let (_, quiet_lease) = harness.lease(quiet_run).await;
     let ahead: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM wyrd.verifier_runs \
+        "SELECT COUNT(*) FROM wyrd.verifier_executions \
          WHERE data_tenant_id = $1 AND lease_expires_at < $2",
     )
     .bind(harness.seed.tenant().as_uuid())
@@ -1271,9 +1370,9 @@ async fn a_flooding_tenant_does_not_delay_another_tenants_run() {
     );
 
     script.release();
-    wait_run_in(&quiet, quiet_run, status("completed")).await;
+    wait_execution_in(&quiet, quiet_run, status("completed")).await;
     for run in flood {
-        harness.wait_run(run, status("completed")).await;
+        harness.wait_execution(run, status("completed")).await;
     }
     runtime.stop().await;
 }
@@ -1296,7 +1395,7 @@ async fn pending_baseline(
         .await
         .expect("tenant connection opens");
     DriftBaselineQueue::default()
-        .insert_pending(&mut conn, verifier, data)
+        .insert_pending(&mut conn, verifier, &drift_requirement(), data)
         .await
         .expect("baseline inserts");
     conn.commit().await.expect("baseline commits");
@@ -1347,8 +1446,8 @@ async fn baseline_fits_do_not_wait_for_verifier_executions() {
     script.hold();
     let mut busy = Vec::new();
     for _ in 0..4 {
-        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
-        busy.push(harness.enqueue().await);
+        script.push(EngineOutcome::Completed(unscored_report()));
+        busy.push(harness.submit().await);
     }
     let runtime = harness.spawn(&Harness::limits(), &script);
     wait_until("four executions", || script.entered() == 4).await;
@@ -1383,7 +1482,7 @@ async fn baseline_fits_do_not_wait_for_verifier_executions() {
     }
     script.release();
     for run in busy {
-        harness.wait_run(run, status("completed")).await;
+        harness.wait_execution(run, status("completed")).await;
     }
     runtime.stop().await;
 }
@@ -1400,9 +1499,9 @@ async fn expired_lease_is_reclaimed_and_the_stale_holder_is_fenced() {
     let harness = Harness::start().await;
     let stale_script = EngineScript::default();
     stale_script.hold();
-    stale_script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    stale_script.push(EngineOutcome::Completed(unscored_report()));
     let stale = harness.spawn(&Harness::limits(), &stale_script);
-    let run = harness.enqueue().await;
+    let run = harness.submit().await;
     wait_until("the first claim", || stale_script.entered() == 1).await;
 
     // Close the stale runner's claim loop while its held attempt drains, so
@@ -1410,9 +1509,9 @@ async fn expired_lease_is_reclaimed_and_the_stale_holder_is_fenced() {
     stale.stop.cancel();
     harness.expire(run).await;
     let fresh_script = EngineScript::default();
-    fresh_script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    fresh_script.push(EngineOutcome::Completed(unscored_report()));
     let fresh = harness.spawn(&Harness::limits(), &fresh_script);
-    let row = harness.wait_run(run, status("completed")).await;
+    let row = harness.wait_execution(run, status("completed")).await;
     assert_eq!(row.attempts, 2, "the reclaim is the second attempt");
 
     stale_script.release();
@@ -1423,7 +1522,7 @@ async fn expired_lease_is_reclaimed_and_the_stale_holder_is_fenced() {
         "only the fresh claimant's result reaches Bifrost"
     );
     assert_eq!(
-        harness.seed.run(run).await.expect("run reads"),
+        harness.seed.execution(run).await.expect("execution reads"),
         row,
         "the stale holder changes nothing"
     );
@@ -1447,8 +1546,8 @@ async fn crashed_runner_restarts_and_reclaims_without_duplicates() {
     let harness = Harness::start().await;
     let script = EngineScript::default();
     script.hold();
-    script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
-    script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    script.push(EngineOutcome::Completed(unscored_report()));
+    script.push(EngineOutcome::Completed(unscored_report()));
     let crash = CapabilityCrash::default();
     let runtime = RunningRuntime::spawn(harness.runtime(&Harness::limits(), &script, &crash));
     let health = std::sync::Arc::clone(&harness.server.state().verification);
@@ -1456,7 +1555,7 @@ async fn crashed_runner_restarts_and_reclaims_without_duplicates() {
         health.is_composed() && !health.is_degraded()
     })
     .await;
-    let run = harness.enqueue().await;
+    let run = harness.submit().await;
     wait_until("the first claim", || script.entered() == 1).await;
 
     crash.crash_next(RuntimeCapability::Runner);
@@ -1465,12 +1564,17 @@ async fn crashed_runner_restarts_and_reclaims_without_duplicates() {
     wait_until("runner restarted", || !health.is_degraded()).await;
     script.release();
     assert_eq!(
-        harness.seed.run(run).await.expect("run reads").status,
+        harness
+            .seed
+            .execution(run)
+            .await
+            .expect("execution reads")
+            .status,
         "running"
     );
 
     harness.expire(run).await;
-    let row = harness.wait_run(run, status("completed")).await;
+    let row = harness.wait_execution(run, status("completed")).await;
     assert_eq!(row.attempts, 2);
     assert_eq!(harness.writes().await, vec![RESULTS.to_owned()]);
 
@@ -1517,7 +1621,7 @@ async fn shutdown_stops_claims_drains_bounded_and_restart_recovers_identity() {
     let script = EngineScript::default();
     script.hold();
     for _ in 0..3 {
-        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+        script.push(EngineOutcome::Completed(unscored_report()));
     }
     let grace = Duration::from_secs(1);
     let runtime = harness.spawn(
@@ -1527,12 +1631,12 @@ async fn shutdown_stops_claims_drains_bounded_and_restart_recovers_identity() {
         },
         &script,
     );
-    let inflight = harness.enqueue().await;
+    let inflight = harness.submit().await;
     wait_until("the in-flight claim", || script.entered() == 1).await;
 
     let started = tokio::time::Instant::now();
     let stopping = tokio::spawn(runtime.stop());
-    let late = harness.enqueue().await;
+    let late = harness.submit().await;
     stopping.await.expect("the runtime stops");
     let drained = started.elapsed();
     assert!(
@@ -1541,7 +1645,7 @@ async fn shutdown_stops_claims_drains_bounded_and_restart_recovers_identity() {
     );
     assert_eq!(script.entered(), 1, "no execution starts after shutdown");
     for run in [inflight, late] {
-        let row = harness.seed.run(run).await.expect("run reads");
+        let row = harness.seed.execution(run).await.expect("execution reads");
         assert_eq!(
             (row.status.as_str(), row.attempts),
             ("pending", 0),
@@ -1558,12 +1662,17 @@ async fn shutdown_stops_claims_drains_bounded_and_restart_recovers_identity() {
     script.release();
     let restarted = harness.spawn(&Harness::limits(), &script);
     for run in [inflight, late] {
-        let row = harness.wait_run(run, status("completed")).await;
+        let row = harness.wait_execution(run, status("completed")).await;
         assert_eq!(row.attempts, 1, "{run} completes on one charged attempt");
         assert!(row.result_id.is_some());
     }
     assert_eq!(
-        harness.seed.runs().await.expect("runs read").len(),
+        harness
+            .seed
+            .executions()
+            .await
+            .expect("executions read")
+            .len(),
         2,
         "recovery reuses the durable identities rather than enqueueing anew"
     );
@@ -1580,7 +1689,7 @@ async fn shutdown_releases_runs_still_in_flight_after_the_grace() {
     let harness = Harness::start().await;
     let script = EngineScript::default();
     script.hold();
-    script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    script.push(EngineOutcome::Completed(unscored_report()));
     let runtime = harness.spawn(
         &RuntimeLimits {
             drain_grace: Duration::from_millis(300),
@@ -1588,11 +1697,11 @@ async fn shutdown_releases_runs_still_in_flight_after_the_grace() {
         },
         &script,
     );
-    let run = harness.enqueue().await;
+    let run = harness.submit().await;
     wait_until("the claim", || script.entered() == 1).await;
 
     runtime.stop().await;
-    let row = harness.seed.run(run).await.expect("run reads");
+    let row = harness.seed.execution(run).await.expect("execution reads");
     assert_eq!((row.status.as_str(), row.attempts), ("pending", 0));
     assert!(
         !harness
@@ -1614,16 +1723,16 @@ async fn shutdown_drains_runs_that_finish_within_the_grace() {
     let harness = Harness::start().await;
     let script = EngineScript::default();
     script.hold();
-    script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    script.push(EngineOutcome::Completed(unscored_report()));
     let runtime = harness.spawn(&Harness::limits(), &script);
-    let run = harness.enqueue().await;
+    let run = harness.submit().await;
     wait_until("the claim", || script.entered() == 1).await;
 
     let stopping = tokio::spawn(runtime.stop());
     tokio::time::sleep(Duration::from_millis(200)).await;
     script.release();
     stopping.await.expect("the runtime stops");
-    let row = harness.seed.run(run).await.expect("run reads");
+    let row = harness.seed.execution(run).await.expect("execution reads");
     assert_eq!(row.status, "completed");
     assert_eq!(harness.writes().await, vec![RESULTS.to_owned()]);
 }
@@ -1645,7 +1754,14 @@ async fn schedulers_create_one_run_per_occurrence_across_ticks_and_restart() {
         .expect("owner registers");
     let binding = harness
         .seed
-        .bind_schedule(&owner, &owner, &harness.verifier, "0 2 * * *", Vec::new())
+        .bind_schedule(
+            &owner,
+            &owner,
+            &harness.verifier,
+            "0 2 * * *",
+            VerificationFixture::metric_inputs("latency_ms"),
+            Vec::new(),
+        )
         .await
         .expect("binding projects");
     harness
@@ -1665,7 +1781,13 @@ async fn schedulers_create_one_run_per_occurrence_across_ticks_and_restart() {
     let first = RunningRuntime::spawn(first);
     let second = RunningRuntime::spawn(runtime());
     let deadline = tokio::time::Instant::now() + WAIT;
-    while harness.seed.runs().await.expect("runs read").is_empty() {
+    while harness
+        .seed
+        .executions()
+        .await
+        .expect("executions read")
+        .is_empty()
+    {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the occurrence was never scheduled"
@@ -1680,10 +1802,10 @@ async fn schedulers_create_one_run_per_occurrence_across_ticks_and_restart() {
     let restarted = RunningRuntime::spawn(runtime());
     tokio::time::sleep(Duration::from_millis(300)).await;
     restarted.stop().await;
-    let runs = harness.seed.runs().await.expect("runs read");
+    let runs = harness.seed.executions().await.expect("executions read");
     assert_eq!(runs.len(), 1, "one run per occurrence");
     let pair: (Uuid, Uuid) =
-        sqlx::query_as("SELECT sub_principal_id, act_principal_id FROM wyrd.verifier_runs")
+        sqlx::query_as("SELECT sub_principal_id, act_principal_id FROM wyrd.verifier_executions")
             .fetch_one(&harness.assertion)
             .await
             .expect("the run's pair reads");
@@ -1748,7 +1870,14 @@ async fn cancelled_scheduler_rolls_back_its_blocked_occurrence() {
         .expect("owner registers");
     let binding = harness
         .seed
-        .bind_schedule(&owner, &owner, &harness.verifier, "0 2 * * *", Vec::new())
+        .bind_schedule(
+            &owner,
+            &owner,
+            &harness.verifier,
+            "0 2 * * *",
+            VerificationFixture::metric_inputs("latency_ms"),
+            Vec::new(),
+        )
         .await
         .expect("binding projects");
     harness
@@ -1760,14 +1889,16 @@ async fn cancelled_scheduler_rolls_back_its_blocked_occurrence() {
     let armed = harness.cursor(binding).await;
     assert!(armed.is_some(), "activation armed the schedule cursor");
 
-    let blocker = harness.block_writes("wyrd.verifier_runs").await;
+    let blocker = harness.block_writes("wyrd.verifier_executions").await;
     let runtime = RunningRuntime::spawn(
         VerificationRuntime::builder(harness.server.state())
             .limits(Harness::limits())
             .build()
             .expect("the scheduler composes"),
     );
-    let pid = harness.wait_blocked_writer("wyrd.verifier_runs").await;
+    let pid = harness
+        .wait_blocked_writer("wyrd.verifier_executions")
+        .await;
     let holds_binding: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND granted \
          AND relation = 'wyrd.verification_bindings'::regclass)",
@@ -1786,7 +1917,12 @@ async fn cancelled_scheduler_rolls_back_its_blocked_occurrence() {
     harness.wait_backend_settled(pid).await;
 
     assert!(
-        harness.seed.runs().await.expect("runs read").is_empty(),
+        harness
+            .seed
+            .executions()
+            .await
+            .expect("executions read")
+            .is_empty(),
         "no run commits after cancellation"
     );
     assert_eq!(
@@ -1822,7 +1958,14 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
         bindings.push(
             harness
                 .seed
-                .bind_schedule(&owner, &owner, &harness.verifier, "0 2 * * *", Vec::new())
+                .bind_schedule(
+                    &owner,
+                    &owner,
+                    &harness.verifier,
+                    "0 2 * * *",
+                    VerificationFixture::metric_inputs("latency_ms"),
+                    Vec::new(),
+                )
                 .await
                 .expect("binding projects"),
         );
@@ -1851,7 +1994,7 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
         .expect("hold function grants");
     sqlx::query(AssertSqlSafe(format!(
         "CREATE CONSTRAINT TRIGGER test_hold_schedule_commit \
-         AFTER INSERT ON wyrd.verifier_runs \
+         AFTER INSERT ON wyrd.verifier_executions \
          DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
          EXECUTE FUNCTION wyrd.test_hold_schedule_commit('{SCHEDULE_COMMIT_LOCK}')"
     )))
@@ -1892,7 +2035,7 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
         .expect("commit lock releases");
     runtime.stop().await;
 
-    let runs = harness.seed.runs().await.expect("runs read");
+    let runs = harness.seed.executions().await.expect("executions read");
     assert_eq!(
         runs.len(),
         1,
@@ -1911,7 +2054,7 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
         "one atomic cursor advance, no later occurrence: {cursors:?} from {armed:?}"
     );
 
-    sqlx::query("DROP TRIGGER test_hold_schedule_commit ON wyrd.verifier_runs")
+    sqlx::query("DROP TRIGGER test_hold_schedule_commit ON wyrd.verifier_executions")
         .execute(&harness.assertion)
         .await
         .expect("hold trigger drops");
@@ -1921,7 +2064,14 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
         .expect("hold function drops");
     let restarted = RunningRuntime::spawn(scheduler_only());
     let deadline = tokio::time::Instant::now() + WAIT;
-    while harness.seed.runs().await.expect("runs read").len() < 2 {
+    while harness
+        .seed
+        .executions()
+        .await
+        .expect("executions read")
+        .len()
+        < 2
+    {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the untouched occurrence was never scheduled"
@@ -1929,7 +2079,7 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     restarted.stop().await;
-    let after = harness.seed.runs().await.expect("runs read");
+    let after = harness.seed.executions().await.expect("executions read");
     assert_eq!(after.len(), 2, "one run per occurrence across restart");
     assert!(
         after.contains(&runs[0]),
@@ -1953,19 +2103,21 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
 #[tokio::test]
 async fn cancelled_runner_rolls_back_its_blocked_claim() {
     let harness = Harness::start().await;
-    let run = harness.enqueue().await;
+    let run = harness.submit().await;
     let script = EngineScript::default();
-    script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    script.push(EngineOutcome::Completed(unscored_report()));
 
-    let blocker = harness.block_writes("wyrd.verifier_runs").await;
+    let blocker = harness.block_writes("wyrd.verifier_executions").await;
     let runtime = harness.spawn(&Harness::limits(), &script);
-    let pid = harness.wait_blocked_writer("wyrd.verifier_runs").await;
+    let pid = harness
+        .wait_blocked_writer("wyrd.verifier_executions")
+        .await;
 
     runtime.stop().await;
     blocker.rollback().await.expect("blocker releases");
     harness.wait_backend_settled(pid).await;
 
-    let row = harness.seed.run(run).await.expect("run reads");
+    let row = harness.seed.execution(run).await.expect("execution reads");
     assert_eq!(
         (row.status.as_str(), row.attempts),
         ("pending", 0),
@@ -1993,7 +2145,7 @@ const CLAIM_COMMIT_LOCK: i64 = 0x5752_4144;
 #[tokio::test]
 async fn claim_committed_after_cancellation_is_released_unexecuted() {
     let harness = Harness::start().await;
-    let run = harness.enqueue().await;
+    let run = harness.submit().await;
     assert_eq!(harness.lease(run).await, (None, None), "never claimed");
     sqlx::query(
         "CREATE FUNCTION wyrd.test_hold_claim_commit() RETURNS trigger \
@@ -2010,9 +2162,9 @@ async fn claim_committed_after_cancellation_is_released_unexecuted() {
     // The run ID is a typed UUID the test minted, not caller input.
     sqlx::query(AssertSqlSafe(format!(
         "CREATE CONSTRAINT TRIGGER test_hold_claim_commit \
-         AFTER UPDATE ON wyrd.verifier_runs \
+         AFTER UPDATE ON wyrd.verifier_executions \
          DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
-         WHEN (NEW.run_id = '{run}'::uuid AND NEW.status = 'running') \
+         WHEN (NEW.execution_id = '{run}'::uuid AND NEW.status = 'running') \
          EXECUTE FUNCTION wyrd.test_hold_claim_commit('{CLAIM_COMMIT_LOCK}')"
     )))
     .execute(&harness.assertion)
@@ -2026,7 +2178,7 @@ async fn claim_committed_after_cancellation_is_released_unexecuted() {
         .expect("commit lock holds");
 
     let script = EngineScript::default();
-    script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    script.push(EngineOutcome::Completed(unscored_report()));
     let runtime = harness.spawn(&Harness::limits(), &script);
     harness.wait_advisory_waiter(CLAIM_COMMIT_LOCK).await;
     runtime.stop.cancel();
@@ -2037,7 +2189,7 @@ async fn claim_committed_after_cancellation_is_released_unexecuted() {
         .expect("commit lock releases");
     runtime.stop().await;
 
-    let row = harness.seed.run(run).await.expect("run reads");
+    let row = harness.seed.execution(run).await.expect("execution reads");
     assert_eq!(
         (row.status.as_str(), row.attempts),
         ("pending", 0),
@@ -2052,7 +2204,7 @@ async fn claim_committed_after_cancellation_is_released_unexecuted() {
     assert_eq!(script.entered(), 0, "the released claim never executed");
     assert!(harness.writes().await.is_empty(), "nothing published");
 
-    sqlx::query("DROP TRIGGER test_hold_claim_commit ON wyrd.verifier_runs")
+    sqlx::query("DROP TRIGGER test_hold_claim_commit ON wyrd.verifier_executions")
         .execute(&harness.assertion)
         .await
         .expect("hold trigger drops");
@@ -2373,130 +2525,6 @@ async fn fit_claim_committed_after_shutdown_is_released_unfitted() {
         .expect("hold function drops");
 }
 
-/// Add or drop a constraint that makes PostgreSQL refuse every new run row,
-/// standing in for a database that cannot accept the outbox's writes.
-///
-/// # Panics
-/// Panics when the DDL fails.
-async fn refuse_run_writes(assertion: &PgPool, refuse: bool) {
-    let ddl = if refuse {
-        "ALTER TABLE wyrd.verifier_runs ADD CONSTRAINT outbox_outage CHECK (false) NOT VALID"
-    } else {
-        "ALTER TABLE wyrd.verifier_runs DROP CONSTRAINT outbox_outage"
-    };
-    sqlx::query(ddl)
-        .execute(assertion)
-        .await
-        .expect("outage constraint changes");
-}
-
-/// The tenant's observation run record IDs, sorted.
-///
-/// # Panics
-/// Panics when the runs cannot be read.
-async fn observation_records(seed: &VerificationFixture) -> Vec<String> {
-    let mut records: Vec<String> = seed
-        .observation_runs()
-        .await
-        .expect("observation runs read")
-        .into_iter()
-        .map(|run| run.record_id)
-        .collect();
-    records.sort();
-    records
-}
-
-/// The Eval run-request outbox keeps every request while PostgreSQL refuses
-/// its writes and retries; once writes succeed, exactly one run exists per
-/// record, a repeated request adds none, graceful shutdown flushes what it
-/// holds, and a request still unwritten at the shutdown deadline is reported.
-///
-/// # Panics
-/// Panics when a request is dropped during the outage, a run is duplicated or
-/// missing, or shutdown misreports what it left unwritten.
-#[tokio::test]
-async fn observation_outbox_retains_through_an_outage_and_flushes_at_shutdown() {
-    let harness = Harness::start().await;
-    let seed = &harness.seed;
-    let (owner, principal) = seed.service("eval-owner").await.expect("owner registers");
-    let verifier = seed
-        .verifier(
-            "eval",
-            &serde_json::json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
-        )
-        .await
-        .expect("Eval Verifier registers");
-    seed.bind_observations(&owner, &verifier)
-        .await
-        .expect("binding projects");
-    seed.activate(principal).await.expect("owner activates");
-    let tenant = harness.server.pg_fixture().data_tenant_id();
-    let record = |record_id: &str| ObservationRecord {
-        subject: owner.clone(),
-        writer: Some(owner.clone()),
-        record_id: record_id.to_owned(),
-        event_time: Utc::now(),
-    };
-    let postgres = harness.server.state().postgres.wyrd().clone();
-    let state = harness.server.state();
-    let authority = BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox));
-    let outbox = ObservationRunSink::outbox(postgres.clone(), authority.clone());
-
-    refuse_run_writes(&harness.assertion, true).await;
-    outbox.stage(tenant, record("r-1"));
-    outbox.stage(tenant, record("r-2"));
-    assert_eq!(
-        outbox
-            .settle(std::time::Instant::now() + Duration::from_millis(400))
-            .await,
-        2,
-        "the outage drops no request"
-    );
-    assert!(observation_records(seed).await.is_empty());
-
-    refuse_run_writes(&harness.assertion, false).await;
-    outbox.stage(tenant, record("r-1"));
-    outbox.stage(tenant, record("r-3"));
-    assert_eq!(
-        outbox.settle(std::time::Instant::now() + WAIT).await,
-        0,
-        "the outbox recovers once writes succeed"
-    );
-    assert_eq!(observation_records(seed).await, ["r-1", "r-2", "r-3"]);
-
-    outbox.stage(tenant, record("r-4"));
-    assert_eq!(
-        outbox.shutdown(std::time::Instant::now() + WAIT).await,
-        0,
-        "graceful shutdown flushes the queue"
-    );
-    assert_eq!(
-        observation_records(seed).await,
-        ["r-1", "r-2", "r-3", "r-4"]
-    );
-
-    let stranded = ObservationRunSink::outbox(postgres, authority);
-    refuse_run_writes(&harness.assertion, true).await;
-    stranded.stage(tenant, record("r-5"));
-    assert_eq!(
-        stranded
-            .shutdown(std::time::Instant::now() + Duration::from_millis(300))
-            .await,
-        1,
-        "a request unwritten at the deadline is reported"
-    );
-    refuse_run_writes(&harness.assertion, false).await;
-}
-
-/// The hour before now, the window every manual run in these tests covers.
-fn last_hour() -> DriftWindow {
-    let now = Utc::now();
-    DriftWindow {
-        start: now - chrono::Duration::hours(1),
-        end: now,
-    }
-}
-
 /// The runner's first logged claim round.
 ///
 /// # Panics
@@ -2521,7 +2549,7 @@ async fn every_tenant_is_claimed_in_the_first_round() {
     let harness = Harness::start().await;
     let script = EngineScript::default();
     script.hold();
-    let mut runs = vec![(harness.seed.clone(), harness.enqueue().await)];
+    let mut runs = vec![(harness.seed.clone(), harness.submit().await)];
     for index in 1..70 {
         let tenant = DataTenantId::new_v7();
         harness
@@ -2532,13 +2560,13 @@ async fn every_tenant_is_claimed_in_the_first_round() {
             .expect("tenant seeds");
         let (seed, subject, verifier) = seed_tenant(&harness.server, tenant).await;
         let run = seed
-            .enqueue_direct(&verifier, &subject, last_hour())
+            .submit(&verifier, &subject, BTreeMap::new())
             .await
             .expect("run enqueues");
         runs.push((seed, run));
     }
     for _ in 0..70 {
-        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+        script.push(EngineOutcome::Completed(unscored_report()));
     }
     let runtime = harness.spawn(&Harness::limits(), &script);
     wait_until("all 70 executions", || script.entered() == 70).await;
@@ -2549,7 +2577,7 @@ async fn every_tenant_is_claimed_in_the_first_round() {
     );
     script.release();
     for (seed, run) in &runs {
-        wait_run_in(seed, *run, status("completed")).await;
+        wait_execution_in(seed, *run, status("completed")).await;
     }
     runtime.stop().await;
 }
@@ -2567,12 +2595,12 @@ async fn verifier_cards_are_cached_and_a_deleted_verifier_errors() {
     let harness = Harness::start().await;
     let script = EngineScript::default();
     for _ in 0..2 {
-        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+        script.push(EngineOutcome::Completed(unscored_report()));
     }
     let runtime = harness.spawn(&Harness::limits(), &script);
     for _ in 0..2 {
-        let run = harness.enqueue().await;
-        harness.wait_run(run, status("completed")).await;
+        let run = harness.submit().await;
+        harness.wait_execution(run, status("completed")).await;
     }
     runtime.stop().await;
     let misses = logs
@@ -2582,14 +2610,14 @@ async fn verifier_cards_are_cached_and_a_deleted_verifier_errors() {
         .count();
     assert_eq!(misses, 1, "only the first run reads the Verifier Card");
 
-    let orphan = harness.enqueue().await;
+    let orphan = harness.submit().await;
     sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
         .bind(harness.verifier.as_uuid())
         .execute(&harness.assertion)
         .await
         .expect("the Verifier is deleted");
     let runtime = harness.spawn(&Harness::limits(), &script);
-    let row = harness.wait_run(orphan, status("errored")).await;
+    let row = harness.wait_execution(orphan, status("errored")).await;
     assert_eq!(row.error_code.as_deref(), Some(VERIFIER_UNAVAILABLE));
     assert_eq!(script.entered(), 2, "a deleted Verifier never executes");
     assert_eq!(
@@ -2622,12 +2650,12 @@ async fn renewal_keeps_a_long_run_and_a_taken_token_cancels_it() {
         },
         &script,
     );
-    let run = harness.enqueue().await;
+    let run = harness.submit().await;
     wait_until("the claim", || script.entered() == 1).await;
     let (token, claimed_expiry) = harness.lease(run).await;
 
     tokio::time::sleep(lease * 2).await;
-    let row = harness.seed.run(run).await.expect("run reads");
+    let row = harness.seed.execution(run).await.expect("execution reads");
     assert_eq!(
         (row.status.as_str(), row.attempts),
         ("running", 1),
@@ -2637,11 +2665,14 @@ async fn renewal_keeps_a_long_run_and_a_taken_token_cancels_it() {
     assert_eq!(renewed_token, token, "renewal keeps the claim's token");
     assert!(renewed_expiry > claimed_expiry, "renewal extends the lease");
 
-    sqlx::query("UPDATE wyrd.verifier_runs SET lease_token = gen_random_uuid() WHERE run_id = $1")
-        .bind(run.as_uuid())
-        .execute(&harness.assertion)
-        .await
-        .expect("the token is taken");
+    sqlx::query(
+        "UPDATE wyrd.verifier_executions SET lease_token = gen_random_uuid() \
+         WHERE execution_id = $1",
+    )
+    .bind(run.as_uuid())
+    .execute(&harness.assertion)
+    .await
+    .expect("the token is taken");
     wait_until("the taken lease cancels the work", || {
         logs.text().contains("a held Verifier run lease was taken")
     })
@@ -2671,14 +2702,14 @@ async fn two_hundred_released_runs_complete_on_their_first_attempt() {
     script.hold();
     let mut runs = Vec::new();
     for _ in 0..200 {
-        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
-        runs.push(harness.enqueue().await);
+        script.push(EngineOutcome::Completed(unscored_report()));
+        runs.push(harness.submit().await);
     }
     let runtime = harness.spawn(&Harness::limits(), &script);
     wait_until("all 200 executions", || script.entered() == 200).await;
     script.release();
     for run in runs {
-        let row = harness.wait_run(run, status("completed")).await;
+        let row = harness.wait_execution(run, status("completed")).await;
         assert_eq!(row.attempts, 1, "{row:?}");
     }
     runtime.stop().await;
@@ -2705,18 +2736,18 @@ async fn a_refused_run_pauses_claiming_until_a_running_run_finishes() {
     let harness = Harness::start().await;
     let script = EngineScript::default();
     script.hold();
-    script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    script.push(EngineOutcome::Completed(unscored_report()));
     script.push_unheld(EngineOutcome::Deferred(VerificationError {
         code: "input_admission_refused".to_owned(),
         message: "the input read was refused at admission".to_owned(),
     }));
-    script.push_unheld(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    script.push_unheld(EngineOutcome::Completed(unscored_report()));
     let runtime = harness.spawn(&Harness::limits(), &script);
-    let running = harness.enqueue().await;
+    let running = harness.submit().await;
     wait_until("the running run executes", || script.entered() == 1).await;
-    let refused = harness.enqueue().await;
+    let refused = harness.submit().await;
     let row = harness
-        .wait_run(refused, |row| row.attempts == 0 && row.status == "pending")
+        .wait_execution(refused, |row| row.attempts == 0 && row.status == "pending")
         .await;
     assert_eq!(row.error_code, None, "a refusal is not a failure");
 
@@ -2727,227 +2758,17 @@ async fn a_refused_run_pauses_claiming_until_a_running_run_finishes() {
         "nothing is claimed while the refusal pauses claiming"
     );
     script.release();
-    harness.wait_run(running, status("completed")).await;
-    let row = harness.wait_run(refused, status("completed")).await;
+    harness.wait_execution(running, status("completed")).await;
+    let row = harness.wait_execution(refused, status("completed")).await;
     assert_eq!(row.attempts, 1, "the refusal consumed no attempt");
     runtime.stop().await;
 }
 
-/// Trace id of the caller whose direct judge executions continue its trace.
-const JUDGE_CALLER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+/// Trace id of the caller whose enqueue request the queued attempt links to.
+const ENQUEUE_CALLER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
 
-/// Spans from a judge's gateway execution up to the request span, innermost
-/// first: one subtree from the verification through the gateway.
-const JUDGE_CHAIN: [&str; 8] = [
-    "gateway.execute",
-    "gateway.call",
-    "agent.gateway.call",
-    "dispatch",
-    "verification.judge",
-    "verification.score",
-    "verification.execute",
-    "request",
-];
-
-/// A direct execution of a Task `llm_judge` and of an Eval `llm_judge`, each
-/// carrying the caller's `traceparent`, produces one subtree under its
-/// request span: the gateway execution of the judge's model call descends,
-/// span by span, through the gateway call, the judge, the score, and the
-/// verification execute span to the request span the caller parents, and its
-/// one captured attempt row sits in the caller's trace under that gateway
-/// call. The Eval case crosses the Eval executor's per-task fan-out.
-///
-/// # Panics
-/// Panics when telemetry, the mock provider, the server, or a fixture fails
-/// to start, an execution is not judged `passed`, or a chain is missing or
-/// broken.
-#[tokio::test]
-async fn eval_judge_gateway_call_descends_from_the_request_span() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let (_telemetry, traces) =
-        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
-            .expect("production-shaped telemetry installs");
-    let provider = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl_traced", "object": "chat.completion", "created": 1_700_000_000,
-            "model": "gpt-test",
-            "choices": [{ "index": 0, "finish_reason": "stop",
-                "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
-            "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
-        })))
-        .mount(&provider)
-        .await;
-    let server = WyrdTestServer::builder()
-        .with_gateway_provider_root_for_test(provider.uri().parse().expect("mock URL parses"))
-        .start_in_process()
-        .await
-        .expect("test server starts");
-    let seed = server
-        .verification_fixture()
-        .await
-        .expect("verification fixture provisions");
-    let (subject, _) = seed
-        .service("traced-judged")
-        .await
-        .expect("subject registers");
-    let check = crate::pg_verification_routes::judge_check();
-    let task = seed
-        .verifier(
-            "traced-task-judge",
-            &serde_json::json!({ "implementation": { "kind": "task", "spec": check } }),
-        )
-        .await
-        .expect("task judge Verifier registers");
-    let eval = seed
-        .verifier(
-            "traced-eval-judge",
-            &serde_json::json!({ "implementation": { "kind": "eval", "spec": {
-                "pass_gate": { "kind": "all_pass" },
-                "tasks": { "judge": check }
-            } } }),
-        )
-        .await
-        .expect("Eval judge Verifier registers");
-    server
-        .deploy_gateway_model_for_test("gpt-test", "traced_judge_invoker")
-        .await
-        .expect("judge model deploys");
-    let wyrd_testing::Bootstrap::User { jwt: admin, .. } = server
-        .bootstrap_user("traced-judge-admin", &["admin"])
-        .await
-        .expect("admin bootstraps")
-    else {
-        panic!("user bootstrap returned a machine principal");
-    };
-    let captured = server
-        .oneshot_authenticated(
-            &admin,
-            axum::http::Request::builder()
-                .method(axum::http::Method::PUT)
-                .uri("/v1/admin/gateway/capture-policy")
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({ "mode": "metadata", "payload_fields": [] }).to_string(),
-                ))
-                .expect("capture policy request builds"),
-        )
-        .await
-        .expect("capture policy request responds");
-    assert!(captured.status().is_success(), "{}", captured.status());
-    let wyrd_testing::Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("traced-judge-writer", &["editor", "traced_judge_invoker"])
-        .await
-        .expect("writer bootstraps")
-    else {
-        panic!("user bootstrap returned a machine principal");
-    };
-    let cases = [
-        (task, "task_context", "b7ad6b7169203331"),
-        (eval, "eval_record", "b7ad6b7169203332"),
-    ];
-    let checkpoint = traces.checkpoint();
-    for (verifier, kind, caller_span) in &cases {
-        let body = serde_json::json!({
-            "verifier_card_uid": verifier,
-            "card_uid": subject,
-            "input": { "kind": kind, "context": { "answer": "yes" } },
-        });
-        let response = server
-            .oneshot_authenticated(
-                &jwt,
-                axum::http::Request::builder()
-                    .method(axum::http::Method::POST)
-                    .uri("/v1/verification/execute")
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .header(
-                        "traceparent",
-                        format!("00-{JUDGE_CALLER_TRACE}-{caller_span}-01"),
-                    )
-                    .body(axum::body::Body::from(body.to_string()))
-                    .expect("execute request builds"),
-            )
-            .await
-            .expect("execute request responds");
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("execute body reads");
-        let judged: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("execute body is JSON");
-        assert_eq!(judged["verdict"], "passed", "{kind}: {judged}");
-    }
-    server.flush_bifrost().await.expect("Scribe flushes");
-    let attempt_parents: Vec<String> = server
-        .retained_span_records(
-            seed.tenant(),
-            "encode(parent_span_id, 'hex')",
-            &format!("trace_id = X'{JUDGE_CALLER_TRACE}' AND scope_name = 'wyrd.gateway'"),
-        )
-        .await
-        .expect("captured attempts read")
-        .into_iter()
-        .map(|row| row.into_iter().flatten().collect())
-        .collect();
-    server.shutdown().await.expect("test server shuts down");
-
-    let spans: Vec<_> = traces
-        .finished_since(checkpoint)
-        .into_iter()
-        .filter(|span| span.trace_id == JUDGE_CALLER_TRACE)
-        .collect();
-    let by_id: BTreeMap<&str, &wyrd_telemetry::CapturedSpan> = spans
-        .iter()
-        .map(|span| (span.span_id.as_str(), span))
-        .collect();
-    for (_, kind, caller_span) in &cases {
-        let chain = spans
-            .iter()
-            .filter(|span| span.name == JUDGE_CHAIN[0])
-            .map(|execute| {
-                let mut chain = vec![execute];
-                while let Some(parent) = chain
-                    .last()
-                    .and_then(|span| by_id.get(span.parent_span_id.as_str()))
-                {
-                    chain.push(parent);
-                }
-                chain
-            })
-            .find(|chain| {
-                chain
-                    .last()
-                    .is_some_and(|root| root.parent_span_id == *caller_span)
-            })
-            .unwrap_or_else(|| panic!("{kind}: no gateway execution under the caller: {spans:#?}"));
-        let names: Vec<&str> = chain.iter().map(|span| span.name.as_str()).collect();
-        let mut expected = JUDGE_CHAIN.iter().peekable();
-        for name in &names {
-            expected.next_if(|step| *step == name);
-        }
-        assert!(
-            expected.peek().is_none(),
-            "{kind}: {names:?} contains {JUDGE_CHAIN:?} in order"
-        );
-        assert_eq!(names.last(), Some(&"request"), "{kind}: {names:?}");
-        let call = chain
-            .iter()
-            .find(|span| span.name == "gateway.call")
-            .expect("the chain holds the gateway call");
-        assert_eq!(
-            attempt_parents
-                .iter()
-                .filter(|parent| **parent == call.span_id)
-                .count(),
-            1,
-            "{kind}: one captured attempt under the gateway call: {attempt_parents:?}"
-        );
-    }
-}
-
-/// A manually enqueued run records the span of the request that enqueued it,
+/// A manually enqueued execution records the span of the request that
+/// enqueued it,
 /// and the runner's later attempt links to that span without adopting it as
 /// a parent: the attempt keeps its own trace, and the enqueuing request's
 /// trace continues the caller's `traceparent`.
@@ -2964,9 +2785,9 @@ async fn manual_run_links_to_its_enqueuing_request() {
     let harness = Harness::start().await;
     let verifier = harness
         .seed
-        .custom_drift_verifier("linked-drift", "score", 1.0, 0.5)
+        .verifier("linked-assertion", &assertion_spec())
         .await
-        .expect("profiled verifier registers");
+        .expect("assertion Verifier registers");
     let wyrd_testing::Bootstrap::User { jwt, .. } = harness
         .server
         .bootstrap_user("linked-run-writer", &["editor"])
@@ -2978,10 +2799,9 @@ async fn manual_run_links_to_its_enqueuing_request() {
     let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
     let checkpoint = traces.checkpoint();
     let body = serde_json::json!({
-        "target": { "kind": "verifier", "verifier_card_uid": verifier,
-                    "card_uid": harness.subject },
-        "input": { "kind": "drift_window", "start": "2026-09-17T00:00:00Z",
-                   "end": "2026-09-17T01:00:00Z" },
+        "verifier_card_uid": verifier,
+        "card_uid": harness.subject,
+        "inputs": { "x": { "kind": "json", "value": 1 } },
     });
     let response = harness
         .server
@@ -2989,29 +2809,30 @@ async fn manual_run_links_to_its_enqueuing_request() {
             &jwt,
             axum::http::Request::builder()
                 .method(axum::http::Method::POST)
-                .uri("/v1/verification/runs")
+                .uri("/v1/verification/enqueue")
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .header(
                     "traceparent",
-                    format!("00-{JUDGE_CALLER_TRACE}-b7ad6b7169203333-01"),
+                    format!("00-{ENQUEUE_CALLER_TRACE}-b7ad6b7169203333-01"),
                 )
                 .body(axum::body::Body::from(body.to_string()))
-                .expect("run request builds"),
+                .expect("enqueue request builds"),
         )
         .await
-        .expect("run request responds");
+        .expect("enqueue request responds");
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .expect("run body reads");
-    let accepted: serde_json::Value = serde_json::from_slice(&bytes).expect("run body is JSON");
-    let run_id = accepted["run_id"]
+        .expect("enqueue body reads");
+    let accepted: serde_json::Value = serde_json::from_slice(&bytes).expect("enqueue body is JSON");
+    let execution_id = accepted["execution_id"]
         .as_str()
-        .unwrap_or_else(|| panic!("the run is accepted: {accepted}"))
+        .unwrap_or_else(|| panic!("the request is accepted: {accepted}"))
         .to_owned();
     harness
-        .wait_run(run_id.parse().expect("the run id parses"), |row| {
-            !matches!(row.status.as_str(), "pending" | "running" | "retrying")
-        })
+        .wait_execution(
+            execution_id.parse().expect("the execution id parses"),
+            |row| !matches!(row.status.as_str(), "pending" | "running" | "retrying"),
+        )
         .await;
     runtime.stop().await;
 
@@ -3019,21 +2840,22 @@ async fn manual_run_links_to_its_enqueuing_request() {
     let attempt = spans
         .iter()
         .find(|span| {
-            span.name == "verification.attempt" && span.attributes.get("run_id") == Some(&run_id)
+            span.name == "verification.attempt"
+                && span.attributes.get("execution_id") == Some(&execution_id)
         })
-        .unwrap_or_else(|| panic!("the run's attempt is recorded: {spans:#?}"));
-    assert_ne!(attempt.trace_id, JUDGE_CALLER_TRACE, "{attempt:#?}");
+        .unwrap_or_else(|| panic!("the execution's attempt is recorded: {spans:#?}"));
+    assert_ne!(attempt.trace_id, ENQUEUE_CALLER_TRACE, "{attempt:#?}");
     let [(trace_id, span_id)] = attempt.links.as_slice() else {
         panic!("the attempt links once to its cause: {attempt:#?}");
     };
-    assert_eq!(trace_id, JUDGE_CALLER_TRACE, "{attempt:#?}");
+    assert_eq!(trace_id, ENQUEUE_CALLER_TRACE, "{attempt:#?}");
     let cause = spans
         .iter()
         .find(|span| span.trace_id == *trace_id && span.span_id == *span_id)
         .unwrap_or_else(|| panic!("the linked span is the enqueuing request's: {spans:#?}"));
     let request = spans
         .iter()
-        .find(|span| span.name == "request" && span.trace_id == JUDGE_CALLER_TRACE)
+        .find(|span| span.name == "request" && span.trace_id == ENQUEUE_CALLER_TRACE)
         .unwrap_or_else(|| panic!("the enqueuing request continues the caller: {spans:#?}"));
     let mut ancestor = Some(cause);
     while let Some(span) = ancestor
@@ -3066,7 +2888,20 @@ struct TenantSpan {
     attributes: Vec<String>,
 }
 
-/// Seeds a deterministic Task Verifier and a subject in `tenant` and returns
+/// A deterministic assertion Verifier spec requiring the `x` JSON input to
+/// equal 1, so an execution needs no provider or evidence.
+fn assertion_spec() -> serde_json::Value {
+    serde_json::json!({
+        "inputs": { "x": { "type": "json" } },
+        "requirements": [{
+            "id": "x_is_one",
+            "statement": "The input x equals one.",
+            "check": { "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": 1 }
+        }]
+    })
+}
+
+/// Seeds a deterministic assertion Verifier and a subject in `tenant` and returns
 /// a token for a caller there, so a traced execution needs no provider.
 ///
 /// # Panics
@@ -3085,15 +2920,9 @@ async fn traced_tenant(
         .expect("tenant provisions");
     let (subject, _) = seed.service("traced").await.expect("subject registers");
     let verifier = seed
-        .verifier(
-            "traced-assertion",
-            &serde_json::json!({ "implementation": { "kind": "task", "spec": {
-                "kind": "assertion", "id": "x_is_one", "context_path": "$.x",
-                "operator": "equals", "expected": 1
-            } } }),
-        )
+        .verifier("traced-assertion", &assertion_spec())
         .await
-        .expect("task Verifier registers");
+        .expect("assertion Verifier registers");
     let wyrd_testing::Bootstrap::Machine { id, api_key, .. } = server
         .bootstrap_service_in_tenant(tenant, name, &["editor"])
         .await
@@ -3123,7 +2952,7 @@ async fn traced_execute(
     let body = serde_json::json!({
         "verifier_card_uid": verifier,
         "card_uid": subject,
-        "input": { "kind": "task_context", "context": { "x": 1 } },
+        "inputs": { "x": { "kind": "json", "value": 1 } },
     });
     let request = axum::http::Request::builder()
         .method(axum::http::Method::POST)

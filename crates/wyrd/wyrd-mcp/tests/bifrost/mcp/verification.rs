@@ -1,17 +1,19 @@
-//! Tier-1 journey: an agent discovers a binding, starts a run, and observes it over `/mcp`.
+//! Tier-1 journey: an agent discovers a binding, executes and enqueues
+//! Verifiers, and observes executions over `/mcp`.
 //!
 //! A registered Service acting as itself reads its own Card, finds the binding
-//! its `verified_by` projected, reads the binding's readiness, starts a keyed
-//! manual Drift run, and reads the run back — every step through a real `rmcp`
-//! client. A reader is not offered the write tool and is refused when it names
-//! it anyway.
+//! its `verified_by` projected, reads the binding's readiness, and enqueues a
+//! keyed execution whose replay keeps its identity — every step through a
+//! real `rmcp` client. A reader is not offered the write tools and is refused
+//! when it names one anyway.
 //!
-//! On a runtime-enabled server the same Service starts a direct Verifier run
-//! over its own emitted Drift observations, polls it to a terminal status, and
-//! reads the persisted result and feature rows through `bifrost.query`.
+//! On a runtime-enabled server the same Service enqueues an assertion
+//! Verifier over inline inputs, polls `verification.get_execution` to a
+//! terminal status, and reads the persisted result through `bifrost.query`.
 //!
-//! Through `verification.execute` the Service also judges supplied samples
-//! inline and receives the verdict in the tool result.
+//! Through `verification.execute` the Service also judges inline inputs and
+//! receives the result in the tool result, plans an evidence upload, and is
+//! refused direct execution of a drift Verifier.
 //!
 //! A tool call carrying the caller's `traceparent` continues the caller's
 //! trace: the request span and the verification, judge, and gateway work it
@@ -32,10 +34,7 @@ mod pg_tests {
     use rmcp::service::{RoleClient, RunningService};
     use secrecy::ExposeSecret as _;
     use serde_json::Value as JsonValue;
-    use wyrd_client::QueueConfig;
-    use wyrd_client::bifrost::client_from_options;
-    use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode};
-    use wyrd_client::state::WyrdState;
+    use wyrd_client::cards::Cards;
     use wyrd_client::transport::credential::ResolvedCredential;
     use wyrd_runtime::Permission;
     use wyrd_spec::auth::TokenAudience;
@@ -50,26 +49,36 @@ mod pg_tests {
     /// The binding status read tool.
     const GET_BINDING: &str = "verification.get_binding";
 
-    /// The manual run write tool, offered only with `verifier:run`.
-    const START_RUN: &str = "verification.start_run";
+    /// The execution status read tool.
+    const GET_EXECUTION: &str = "verification.get_execution";
 
-    /// The run status read tool.
-    const GET_RUN: &str = "verification.get_run";
+    /// The evidence upload planning tool, offered only with `verifier:run`.
+    const EVIDENCE: &str = "verification.evidence";
 
     /// The direct execution write tool, offered only with `verifier:run`.
     const EXECUTE: &str = "verification.execute";
 
+    /// The queued execution write tool, offered only with `verifier:run`.
+    const ENQUEUE: &str = "verification.enqueue";
+
+    /// Every write tool a caller holding `verifier:run` is offered.
+    const WRITE_TOOLS: [&str; 3] = [EVIDENCE, EXECUTE, ENQUEUE];
+
     /// The existing Bifrost read tool verdicts are read through.
     const QUERY: &str = "bifrost.query";
 
-    /// Upper bound on the wait for the server-side runtime to settle a run.
+    /// Upper bound on the wait for the server-side runtime to settle an
+    /// execution.
     const SETTLE: Duration = Duration::from_secs(90);
 
-    /// A ready Custom Drift Verifier the Service binds.
-    const VERIFIER: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: mcp-run-drift\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: drift\n    spec:\n      method: Custom\n      signal:\n        kind: Metric\n        name: score\n      condition:\n        kind: Statistical\n      profile:\n        kind: Custom\n        metric_name: score\n        baseline_value: 1.0\n        alert_threshold: 0.5\n";
+    /// A ready Custom Drift Verifier the Service binds on a schedule.
+    const VERIFIER: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: mcp-run-drift\n  version: 1.0.0\n  space: default\nspec:\n  inputs:\n    scores: {type: samples, features: [score]}\n  requirements:\n    - id: score-steady\n      statement: The score stays at or under its alert threshold\n      check:\n        kind: drift\n        on: inputs.scores\n        method: Custom\n        signal: {kind: Metric, name: score}\n        condition: {kind: Statistical}\n        profile: {kind: Custom, metric_name: score, baseline_value: 1.0, alert_threshold: 0.5}\n";
 
-    /// A Service bound to [`VERIFIER`] on a schedule.
-    const SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: mcp-run-service\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: mcp-run-drift\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: schedule\n        cron: \"0 2 * * *\"\n";
+    /// A Service bound to [`VERIFIER`] on a schedule over its `score` metric.
+    const SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: mcp-run-service\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: mcp-run-drift\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: schedule\n        cron: \"0 2 * * *\"\n      inputs:\n        scores: {metric: score}\n";
+
+    /// SHA-256 of the five bytes `hello`, the evidence file the journey plans.
+    const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
     /// Unwrap a machine bootstrap into an API-key credential.
     ///
@@ -116,17 +125,38 @@ mod pg_tests {
             .ok_or_else(|| format!("{pointer} is a string in {value}").into())
     }
 
-    /// The registered fixture: the Service subject and the Verifier it binds.
+    /// The registered fixture: the Service subject and the Verifiers it is
+    /// judged by.
     struct Fixture {
         /// The Service's server-minted UID.
         service_uid: String,
         /// The Service's exact UID-bearing reference.
         service_ref: CardRef,
-        /// The Custom Drift Verifier's server-minted UID.
+        /// The bound Custom Drift Verifier's server-minted UID.
         verifier_uid: String,
+        /// The `no-refund-promise` assertion Verifier's server-minted UID.
+        assert_uid: String,
     }
 
-    /// Register the fixture Verifier and Service.
+    impl Fixture {
+        /// A request judging `answer` with the assertion Verifier against the
+        /// Service, in the shared `execute`/`enqueue` body shape.
+        fn assert_request(&self, answer: &str) -> JsonValue {
+            serde_json::json!({
+                "verifier_card_uid": self.assert_uid,
+                "card_uid": self.service_uid,
+                "inputs": { "answer": { "kind": "json", "value": answer } },
+            })
+        }
+    }
+
+    /// An answer the `no-refund-promise` assertion passes.
+    const PASSING_ANSWER: &str = "We will review your request.";
+
+    /// An answer the `no-refund-promise` assertion fails.
+    const FAILING_ANSWER: &str = "You get a guaranteed refund.";
+
+    /// Register the fixture Verifiers and Service.
     ///
     /// # Errors
     ///
@@ -140,6 +170,11 @@ mod pg_tests {
         let verifier = Box::pin(cards.register_from_path(&root.join("verifier.yaml"))).await?;
         let receipt = Box::pin(cards.register_from_path(&root.join("service.yaml"))).await?;
         std::fs::remove_dir_all(&root)?;
+        let assertion = Box::pin(cards.register_from_path(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/register_and_hydrate/no-refund-promise.yaml"
+        ))))
+        .await?;
         let uid = |root: &CardRef| -> Result<String, McpJourneyError> {
             Ok(root
                 .uid
@@ -150,6 +185,7 @@ mod pg_tests {
         Ok(Fixture {
             service_uid: uid(&receipt.root)?,
             verifier_uid: uid(&verifier.root)?,
+            assert_uid: uid(&assertion.root)?,
             service_ref: receipt.root,
         })
     }
@@ -426,8 +462,39 @@ mod pg_tests {
         investigation.shutdown().await
     }
 
-    /// A bound Service discovers its binding, starts a keyed run, and reads it
-    /// back over MCP; a reader is not offered the write tool and is refused.
+    /// Connect `principal` to `server` over the production MCP transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns credential or transport failures.
+    async fn connect(
+        server: &WyrdTestServer,
+        principal: &Bootstrap,
+    ) -> Result<RunningService<RoleClient, ()>, McpJourneyError> {
+        Ok(
+            ().serve_with_lifecycle(transport(server, api_key(principal)?, None)?, discover())
+                .await?,
+        )
+    }
+
+    /// Render a refused tool call, whether `rmcp` returned a transport error
+    /// or a tool result carrying a problem.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a tool result carries no problem body.
+    fn rendered(
+        refused: Result<rmcp::model::CallToolResult, rmcp::ServiceError>,
+    ) -> Result<String, McpJourneyError> {
+        Ok(match refused {
+            Err(error) => error.to_string(),
+            Ok(result) => problem(result)?.to_string(),
+        })
+    }
+
+    /// A bound Service discovers its binding and enqueues a keyed execution
+    /// whose replay keeps its identity over MCP; a reader is not offered the
+    /// write tools and is refused.
     ///
     /// # Errors
     ///
@@ -438,12 +505,13 @@ mod pg_tests {
     /// Panics when the administrator's Cards handle cannot connect (API-key
     /// exchange refused or unreachable), or when an assertion fails: the
     /// writer is not offered a required tool, the binding names another
-    /// subject or is not ready, a keyed replay or the read-back returns
-    /// another run id, the reader loses a read tool or is offered the write
-    /// tool, or the reader's write call is not the stable RBAC refusal.
+    /// subject or is not ready, a keyed replay returns another execution id,
+    /// the reader loses a read tool or is offered a write tool, or the
+    /// reader's write call is not the stable RBAC refusal.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
-    async fn an_agent_discovers_starts_and_observes_a_manual_run() -> Result<(), McpJourneyError> {
+    async fn an_agent_discovers_a_binding_and_enqueues_a_keyed_execution()
+    -> Result<(), McpJourneyError> {
         let server = WyrdTestServer::start_bound().await?;
         let admin = server
             .bootstrap_service("mcp-run-admin", &["admin"])
@@ -451,21 +519,18 @@ mod pg_tests {
         let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
             .await
             .expect("handle connects");
-        let Fixture {
-            service_uid,
-            service_ref,
-            ..
-        } = register_fixture(&cards).await?;
+        let fixture = register_fixture(&cards).await?;
 
         let writer = server
-            .credential_registered_service(&service_ref, &["editor"])
+            .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
-        let writer_client =
-            ().serve_with_lifecycle(transport(&server, api_key(&writer)?, None)?, discover())
-                .await?;
+        let writer_client = connect(&server, &writer).await?;
         let tools = writer_client.list_all_tools().await?;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
-        for tool in [CARDS_GET, GET_BINDING, START_RUN, GET_RUN] {
+        for tool in [CARDS_GET, GET_BINDING, GET_EXECUTION]
+            .into_iter()
+            .chain(WRITE_TOOLS)
+        {
             assert!(
                 names.contains(&tool),
                 "a writer is offered {tool}: {names:?}"
@@ -477,7 +542,7 @@ mod pg_tests {
             writer_client
                 .call_tool(call(
                     CARDS_GET,
-                    serde_json::json!({ "kind": "Service", "card_uid": service_uid }),
+                    serde_json::json!({ "kind": "Service", "card_uid": fixture.service_uid }),
                 )?)
                 .await?,
         )?;
@@ -490,153 +555,98 @@ mod pg_tests {
                 )?)
                 .await?,
         )?;
-        assert_eq!(text(&binding, "/card_uid")?, service_uid);
+        assert_eq!(text(&binding, "/card_uid")?, fixture.service_uid);
         assert_eq!(text(&binding, "/readiness")?, "ready");
 
-        // Act: a keyed start, then a replay that returns the same run.
-        let start = serde_json::json!({
-            "target": { "kind": "binding", "binding_id": binding_id },
-            "input": {
-                "kind": "drift_window",
-                "start": "2026-09-17T00:00:00Z",
-                "end": "2026-09-17T01:00:00Z",
-            },
-            "idempotency_key": "mcp-journey-0001",
-        });
-        let started = structured(
+        // Act: a keyed enqueue, then a replay that returns the same execution.
+        let mut enqueue = fixture.assert_request(PASSING_ANSWER);
+        enqueue["idempotency_key"] = "mcp-journey-0001".into();
+        let accepted = structured(
             writer_client
-                .call_tool(call(START_RUN, start.clone())?)
+                .call_tool(call(ENQUEUE, enqueue.clone())?)
                 .await?,
         )?;
-        let run_id = text(&started, "/run_id")?.to_owned();
+        let execution_id = text(&accepted, "/execution_id")?.to_owned();
         let replayed = structured(
             writer_client
-                .call_tool(call(START_RUN, start.clone())?)
+                .call_tool(call(ENQUEUE, enqueue.clone())?)
                 .await?,
         )?;
         assert_eq!(
-            text(&replayed, "/run_id")?,
-            run_id,
-            "a keyed retry returns the same run"
+            text(&replayed, "/execution_id")?,
+            execution_id,
+            "a keyed retry returns the same execution"
         );
-
-        // Observe: the run reads back under the same identity.
-        let run = structured(
-            writer_client
-                .call_tool(call(GET_RUN, serde_json::json!({ "run_id": run_id }))?)
-                .await?,
-        )?;
-        assert_eq!(text(&run, "/run_id")?, run_id);
         writer_client.cancel().await?;
 
-        // A reader keeps the read tools but is neither offered nor allowed the write tool.
+        // A reader keeps the read tools but is neither offered nor allowed the write tools.
         let reader = server
             .bootstrap_service("mcp-run-reader", &["viewer"])
             .await?;
-        let reader_client =
-            ().serve_with_lifecycle(transport(&server, api_key(&reader)?, None)?, discover())
-                .await?;
+        let reader_client = connect(&server, &reader).await?;
         let reader_tools = reader_client.list_all_tools().await?;
         let reader_names: Vec<&str> = reader_tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert!(
-            reader_names.contains(&GET_RUN),
+            reader_names.contains(&GET_EXECUTION),
             "read tools stay available: {reader_names:?}"
         );
+        for tool in WRITE_TOOLS {
+            assert!(
+                !reader_names.contains(&tool),
+                "an agent without verifier:run is not offered {tool}: {reader_names:?}"
+            );
+        }
+        let refused = rendered(reader_client.call_tool(call(ENQUEUE, enqueue)?).await)?;
         assert!(
-            !reader_names.contains(&START_RUN),
-            "an agent without verifier:run is not offered the write tool: {reader_names:?}"
-        );
-        let refused = reader_client.call_tool(call(START_RUN, start)?).await;
-        let rendered = match refused {
-            Err(error) => error.to_string(),
-            Ok(result) => problem(result)?.to_string(),
-        };
-        assert!(
-            rendered.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
-            "naming the write tool anyway is the stable permission refusal: {rendered}"
+            refused.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "naming the write tool anyway is the stable permission refusal: {refused}"
         );
         reader_client.cancel().await?;
+        server.shutdown().await?;
         Ok(())
     }
 
-    /// Submit Drift samples of `service_ref` whose `score` averages 2.0
-    /// against the fixture's 1.0 baseline, through one `WyrdState` lifetime.
+    /// Poll `execution_id` over MCP until it reaches a terminal status.
     ///
-    /// The Service's graph is hydrated into a temporary bundle with `admin`'s
-    /// registry access, observations are written as the Service's own
-    /// `workload`-role credential, and the lifetime is drained and the server
-    /// Scribe flushed before returning, so every row is durable and readable.
+    /// An enqueued execution becomes visible only once the queue accepts its
+    /// submission, so a not-found read is retried until the deadline.
     ///
     /// # Errors
     ///
-    /// Returns hydration, credential, client, startup, emit, drain, or flush
-    /// failures.
-    async fn emit_drifted_scores(
-        server: &WyrdTestServer,
-        admin: &Cards,
-        service_ref: &CardRef,
-    ) -> Result<(), McpJourneyError> {
-        let bundle = std::env::temp_dir().join(format!("wyrd-mcp-direct-{}", uuid::Uuid::now_v7()));
-        Box::pin(CardGraphHydrator::new(admin.registry_context()).hydrate(
-            &CardSelector::exact(service_ref.clone()),
-            &bundle,
-            HydrationMode::Complete,
-        ))
-        .await?;
-        let emitter = server
-            .credential_registered_service(service_ref, &[])
-            .await?;
-        let key = emitter
-            .api_key()
-            .ok_or("a registered Service carries a key")?
-            .expose_secret()
-            .to_owned();
-        let client = client_from_options(
-            server.base_url(),
-            Some(key.as_str()),
-            server.grpc_url().as_deref(),
-        )?;
-        let state = WyrdState::from_path_with(&bundle, client)?;
-        state
-            .start_bifrost_with_config(None, QueueConfig::default())
-            .await?;
-        let run = state.run();
-        for score in [1.5_f64, 2.5, 1.5, 2.5] {
-            run.observe()
-                .submit("mcp-run-drift", serde_json::json!({ "score": score }))
-                .await?;
-        }
-        state.shutdown().await?;
-        server.flush_bifrost().await?;
-        std::fs::remove_dir_all(&bundle)?;
-        Ok(())
-    }
-
-    /// Poll `run_id` over MCP until it leaves pending, running, and retrying.
-    ///
-    /// # Errors
-    ///
-    /// Returns a tool-call failure, or an error when the run never settles
-    /// within [`SETTLE`].
+    /// Returns a tool-call failure other than delayed visibility, or an error
+    /// when the execution never settles within [`SETTLE`].
     async fn settle(
-        client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-        run_id: &str,
+        client: &RunningService<RoleClient, ()>,
+        execution_id: &str,
     ) -> Result<JsonValue, McpJourneyError> {
         let deadline = tokio::time::Instant::now() + SETTLE;
         loop {
-            let run = structured(
-                client
-                    .call_tool(call(GET_RUN, serde_json::json!({ "run_id": run_id }))?)
-                    .await?,
-            )?;
-            if !matches!(
-                run["status"].as_str(),
-                Some("pending" | "running" | "retrying")
-            ) {
-                return Ok(run);
+            let read = client
+                .call_tool(call(
+                    GET_EXECUTION,
+                    serde_json::json!({ "execution_id": execution_id }),
+                )?)
+                .await;
+            let state = match read {
+                Ok(result) if result.is_error != Some(true) => Some(structured(result)?),
+                other => {
+                    let refused = rendered(other)?;
+                    if !refused.contains("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND") {
+                        return Err(refused.into());
+                    }
+                    None
+                }
+            };
+            if let Some(state) = state
+                && !matches!(
+                    state["status"].as_str(),
+                    Some("pending" | "running" | "retrying")
+                )
+            {
+                return Ok(state);
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(format!("run never settled: {run}").into());
+                return Err(format!("execution {execution_id} never settled").into());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -648,7 +658,7 @@ mod pg_tests {
     ///
     /// Returns a tool-call failure or a structured query refusal.
     async fn rows(
-        client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        client: &RunningService<RoleClient, ()>,
         sql: String,
     ) -> Result<JsonValue, McpJourneyError> {
         let answer = structured(
@@ -662,34 +672,33 @@ mod pg_tests {
         Ok(answer["rows"].clone())
     }
 
-    /// A bound Service runs a Verifier directly over MCP and reads the
-    /// persisted judgment back through `bifrost.query`.
+    /// A bound Service enqueues a Verifier over MCP and reads the persisted
+    /// judgment back through `verification.get_execution` and
+    /// `bifrost.query`.
     ///
-    /// On a runtime-enabled server the Service emits drifted observations and
-    /// reads the Verifier through `cards.get` as `kind: Verifier` with a
-    /// `drift` implementation, while `Drift` and `Eval` are refused as Card
-    /// kinds; it then starts a keyed direct Verifier/subject run; a keyed retry returns
-    /// the same `run_id`. Polling `verification.get_run` reaches `completed`
-    /// with a Bifrost `result_id`, the Service's own principal as
-    /// `sub_principal_id` and `act_principal_id`, and no Operator dispatch. `bifrost.query`
-    /// returns exactly one failed summary row and one Custom feature row for
-    /// that `result_id`, both with null `owner_card_uid` and `binding_id` and
-    /// the exact subject UID. A reader is refused the start; another tenant's
-    /// administrator can neither start the run nor read it back, and its
-    /// `bifrost.query` reads its own provisioned, empty result table.
+    /// On a runtime-enabled server the Service reads the Verifier through
+    /// `cards.get` as `kind: Verifier`, while `Drift` and `Eval` are refused
+    /// as Card kinds; it then enqueues a keyed assertion execution over an
+    /// inline answer; a keyed retry returns the same `execution_id`. Polling
+    /// `verification.get_execution` reaches `completed` with a failed result
+    /// naming the exact Verifier and subject, and no Operator dispatch.
+    /// `bifrost.query` returns exactly one failed summary row for that
+    /// execution, with null `owner_card_uid` and `binding_id` and the exact
+    /// subject UID. A reader is refused the enqueue; another tenant's
+    /// administrator cannot read the execution back, and its `bifrost.query`
+    /// reads its own provisioned, empty result table.
     ///
     /// # Errors
     ///
-    /// Returns server startup, bootstrap, registration, emit, MCP transport,
-    /// or tool-call failures, or an error when the run never settles.
+    /// Returns server startup, bootstrap, registration, MCP transport, or
+    /// tool-call failures, or an error when the execution never settles.
     ///
     /// # Panics
     ///
     /// Panics when any status, identity, row, or refusal expectation fails.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
-    async fn an_agent_runs_a_verifier_directly_and_reads_its_result() -> Result<(), McpJourneyError>
-    {
+    async fn an_agent_enqueues_a_verifier_and_reads_its_result() -> Result<(), McpJourneyError> {
         let server = Box::pin(
             WyrdTestServer::builder()
                 .with_verification_runtime_for_test()
@@ -697,98 +706,76 @@ mod pg_tests {
         )
         .await?;
         let admin = server
-            .bootstrap_service("mcp-direct-admin", &["admin"])
+            .bootstrap_service("mcp-queued-admin", &["admin"])
             .await?;
         let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
             .await
             .expect("handle connects");
         let fixture = register_fixture(&cards).await?;
-        emit_drifted_scores(&server, &cards, &fixture.service_ref).await?;
 
-        // A direct run reads the tenant's Bifrost observations, which only the
-        // explicitly granted `workload` role allows.
         let agent = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
-        let agent_client =
-            ().serve_with_lifecycle(transport(&server, api_key(&agent)?, None)?, discover())
-                .await?;
+        let agent_client = connect(&server, &agent).await?;
         let verifier = structured(
             agent_client
                 .call_tool(call(
                     CARDS_GET,
-                    serde_json::json!({ "kind": "Verifier", "card_uid": fixture.verifier_uid }),
+                    serde_json::json!({ "kind": "Verifier", "card_uid": fixture.assert_uid }),
                 )?)
                 .await?,
         )?;
         assert_eq!(text(&verifier, "/card/kind")?, "Verifier");
-        assert_eq!(text(&verifier, "/card/spec/implementation/kind")?, "drift");
         for retired in ["Drift", "Eval"] {
             refusal(
                 agent_client
                     .call_tool(call(
                         CARDS_GET,
-                        serde_json::json!({ "kind": retired, "card_uid": fixture.verifier_uid }),
+                        serde_json::json!({ "kind": retired, "card_uid": fixture.assert_uid }),
                     )?)
                     .await,
             )?;
         }
 
-        let now = chrono::Utc::now();
-        let start = serde_json::json!({
-            "target": {
-                "kind": "verifier",
-                "verifier_card_uid": fixture.verifier_uid,
-                "card_uid": fixture.service_uid,
-            },
-            "input": {
-                "kind": "drift_window",
-                "start": now - chrono::Duration::hours(1),
-                "end": now + chrono::Duration::hours(1),
-            },
-            "idempotency_key": "mcp-direct-0001",
-        });
-        let started = structured(
+        let mut enqueue = fixture.assert_request(FAILING_ANSWER);
+        enqueue["idempotency_key"] = "mcp-queued-0001".into();
+        let accepted = structured(
             agent_client
-                .call_tool(call(START_RUN, start.clone())?)
+                .call_tool(call(ENQUEUE, enqueue.clone())?)
                 .await?,
         )?;
-        let run_id = text(&started, "/run_id")?.to_owned();
+        let execution_id = text(&accepted, "/execution_id")?.to_owned();
         let replayed = structured(
             agent_client
-                .call_tool(call(START_RUN, start.clone())?)
+                .call_tool(call(ENQUEUE, enqueue.clone())?)
                 .await?,
         )?;
         assert_eq!(
-            text(&replayed, "/run_id")?,
-            run_id,
-            "a keyed retry returns the same direct run"
+            text(&replayed, "/execution_id")?,
+            execution_id,
+            "a keyed retry returns the same queued execution"
         );
 
-        let run = settle(&agent_client, &run_id).await?;
-        assert_eq!(run["status"], "completed", "{run}");
-        for pair in ["/sub_principal_id", "/act_principal_id"] {
-            assert_eq!(
-                text(&run, pair)?,
-                agent.id().to_string(),
-                "a direct run records the authenticated requester as {pair}: {run}"
-            );
-        }
+        let state = settle(&agent_client, &execution_id).await?;
+        assert_eq!(state["status"], "completed", "{state}");
+        assert_eq!(text(&state, "/result/execution_id")?, execution_id);
+        assert_eq!(state["result"]["outcome"]["verdict"], "failed", "{state}");
+        assert_eq!(text(&state, "/result/verifier/uid")?, fixture.assert_uid);
+        assert_eq!(text(&state, "/result/subject/uid")?, fixture.service_uid);
         assert_eq!(
-            run["dispatches"],
+            state["dispatches"],
             serde_json::json!([]),
-            "a direct run never dispatches: {run}"
+            "an execution with no binding never dispatches: {state}"
         );
-        let result_id = text(&run, "/result_id")?.to_owned();
-        // The judgment is staged on the Scribe outbox when the run completes;
-        // settle it into Bifrost before reading it back.
+        // The judgment is staged on the Scribe outbox when the execution
+        // completes; settle it into Bifrost before reading it back.
         server.flush_bifrost().await?;
 
         let summary = rows(
             &agent_client,
             format!(
                 "SELECT execution_status, verdict, card_uid, owner_card_uid, binding_id \
-                 FROM vala.verification.results WHERE result_id = '{result_id}'"
+                 FROM vala.verification.results WHERE execution_id = '{execution_id}'"
             ),
         )
         .await?;
@@ -801,39 +788,17 @@ mod pg_tests {
                 JsonValue::Null,
                 JsonValue::Null
             ]]),
-            "one direct summary with null owner and binding"
-        );
-        let features = rows(
-            &agent_client,
-            format!(
-                "SELECT method, feature, verdict, card_uid, owner_card_uid, binding_id \
-                 FROM vala.drift.result_features WHERE result_id = '{result_id}'"
-            ),
-        )
-        .await?;
-        assert_eq!(
-            features,
-            serde_json::json!([[
-                "Custom",
-                "score",
-                "drift",
-                fixture.service_uid,
-                JsonValue::Null,
-                JsonValue::Null
-            ]]),
-            "one direct feature row with null owner and binding"
+            "one summary with null owner and binding"
         );
         agent_client.cancel().await?;
 
         let reader = server
-            .bootstrap_service("mcp-direct-reader", &["viewer"])
+            .bootstrap_service("mcp-queued-reader", &["viewer"])
             .await?;
-        let reader_client =
-            ().serve_with_lifecycle(transport(&server, api_key(&reader)?, None)?, discover())
-                .await?;
+        let reader_client = connect(&server, &reader).await?;
         let denied = refusal(
             reader_client
-                .call_tool(call(START_RUN, start.clone())?)
+                .call_tool(call(ENQUEUE, enqueue.clone())?)
                 .await,
         )?;
         assert!(
@@ -842,26 +807,22 @@ mod pg_tests {
         );
         reader_client.cancel().await?;
 
-        let other_tenant = server.seed_tenant("mcp-direct-other").await?;
+        let other_tenant = server.seed_tenant("mcp-queued-other").await?;
         let foreign = server
-            .bootstrap_service_in_tenant(other_tenant, "mcp-direct-foreign", &["admin"])
+            .bootstrap_service_in_tenant(other_tenant, "mcp-queued-foreign", &["admin"])
             .await?;
-        let foreign_client =
-            ().serve_with_lifecycle(transport(&server, api_key(&foreign)?, None)?, discover())
-                .await?;
-        let foreign_start = refusal(foreign_client.call_tool(call(START_RUN, start)?).await)?;
-        assert!(
-            foreign_start.contains("WYRD_VERIFICATION_400_INVALID_TARGET"),
-            "another tenant cannot run this tenant's Verifier: {foreign_start}"
-        );
+        let foreign_client = connect(&server, &foreign).await?;
         let foreign_read = refusal(
             foreign_client
-                .call_tool(call(GET_RUN, serde_json::json!({ "run_id": run_id }))?)
+                .call_tool(call(
+                    GET_EXECUTION,
+                    serde_json::json!({ "execution_id": execution_id }),
+                )?)
                 .await,
         )?;
         assert!(
-            foreign_read.contains("WYRD_VERIFICATION_404_RUN_NOT_FOUND"),
-            "another tenant cannot read the run: {foreign_read}"
+            foreign_read.contains("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"),
+            "another tenant cannot read the execution: {foreign_read}"
         );
         let foreign_rows = rows(
             &foreign_client,
@@ -878,13 +839,15 @@ mod pg_tests {
         Ok(())
     }
 
-    /// A bound Service judges supplied samples with its Verifier over MCP.
+    /// A bound Service judges inline inputs with a Verifier over MCP.
     ///
-    /// The tool result carries the exact Verifier and subject, the `passed`
-    /// or `failed` verdict, and the Drift detail; nothing is enqueued. A
-    /// reader and a caller holding only `evals:run` are neither offered the
-    /// tool nor allowed it, and another tenant's administrator cannot resolve
-    /// this tenant's Cards.
+    /// The tool result carries the exact Verifier and subject and the
+    /// `passed` or `failed` outcome of the one assertion requirement; nothing
+    /// is enqueued. The Service plans an evidence upload for a new digest,
+    /// and direct execution of its bound drift Verifier is refused as
+    /// unsupported input. A reader and a caller holding only `evals:run` are
+    /// neither offered the write tools nor allowed `verification.execute`,
+    /// and another tenant's administrator cannot resolve this tenant's Cards.
     ///
     /// # Errors
     ///
@@ -893,10 +856,11 @@ mod pg_tests {
     ///
     /// # Panics
     ///
-    /// Panics when any verdict, identity, or refusal expectation fails.
+    /// Panics when any verdict, identity, upload plan, or refusal expectation
+    /// fails.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
-    async fn an_agent_executes_a_verifier_on_supplied_samples() -> Result<(), McpJourneyError> {
+    async fn an_agent_executes_a_verifier_on_inline_inputs() -> Result<(), McpJourneyError> {
         let server = Box::pin(WyrdTestServer::start_bound()).await?;
         let admin = server
             .bootstrap_service("mcp-execute-admin", &["admin"])
@@ -908,28 +872,54 @@ mod pg_tests {
         let agent = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
-        let agent_client =
-            ().serve_with_lifecycle(transport(&server, api_key(&agent)?, None)?, discover())
-                .await?;
-        let request = |score: f64| {
-            serde_json::json!({
-                "verifier_card_uid": fixture.verifier_uid,
-                "card_uid": fixture.service_uid,
-                "input": { "kind": "drift_samples", "columns": { "score": [score] } },
-            })
-        };
-        for (score, verdict) in [(1.2, "passed"), (3.0, "failed")] {
+        let agent_client = connect(&server, &agent).await?;
+        for (answer, verdict) in [(PASSING_ANSWER, "passed"), (FAILING_ANSWER, "failed")] {
             let judged = structured(
                 agent_client
-                    .call_tool(call(EXECUTE, request(score))?)
+                    .call_tool(call(EXECUTE, fixture.assert_request(answer))?)
                     .await?,
             )?;
-            assert_eq!(judged["verdict"], verdict, "{judged}");
-            assert_eq!(judged["kind"], "drift_custom", "{judged}");
-            assert_eq!(text(&judged, "/verifier/uid")?, fixture.verifier_uid);
+            assert_eq!(judged["outcome"]["verdict"], verdict, "{judged}");
+            assert_eq!(
+                text(&judged, "/outcome/requirements/0/id")?,
+                "no-refund-promise"
+            );
+            assert_eq!(text(&judged, "/verifier/uid")?, fixture.assert_uid);
             assert_eq!(text(&judged, "/subject/uid")?, fixture.service_uid);
-            assert!(judged["detail"]["drift"].is_object(), "{judged}");
+            text(&judged, "/execution_id")?;
         }
+
+        let planned = structured(
+            agent_client
+                .call_tool(call(
+                    EVIDENCE,
+                    serde_json::json!({ "files": [{ "sha256": HELLO_SHA256, "size_bytes": 5 }] }),
+                )?)
+                .await?,
+        )?;
+        assert_eq!(
+            text(&planned, "/uploads/0/sha256")?,
+            HELLO_SHA256,
+            "a new digest is planned for upload: {planned}"
+        );
+        assert!(planned["uploads"][0]["plan"].is_object(), "{planned}");
+
+        let drift = refusal(
+            agent_client
+                .call_tool(call(
+                    EXECUTE,
+                    serde_json::json!({
+                        "verifier_card_uid": fixture.verifier_uid,
+                        "card_uid": fixture.service_uid,
+                        "inputs": {},
+                    }),
+                )?)
+                .await,
+        )?;
+        assert!(
+            drift.contains("WYRD_VERIFICATION_422_INPUT_UNSUPPORTED"),
+            "a drift Verifier is never executed directly: {drift}"
+        );
         agent_client.cancel().await?;
 
         server
@@ -943,15 +933,19 @@ mod pg_tests {
             ("mcp-execute-evals-only", "mcp_evals_only"),
         ] {
             let caller = server.bootstrap_service(name, &[role]).await?;
-            let caller_client =
-                ().serve_with_lifecycle(transport(&server, api_key(&caller)?, None)?, discover())
-                    .await?;
+            let caller_client = connect(&server, &caller).await?;
             let tools = caller_client.list_all_tools().await?;
-            assert!(
-                !tools.iter().any(|tool| tool.name == EXECUTE),
-                "{role} is not offered the execute tool"
-            );
-            let denied = refusal(caller_client.call_tool(call(EXECUTE, request(1.0))?).await)?;
+            for tool in WRITE_TOOLS {
+                assert!(
+                    !tools.iter().any(|offered| offered.name == tool),
+                    "{role} is not offered {tool}"
+                );
+            }
+            let denied = refusal(
+                caller_client
+                    .call_tool(call(EXECUTE, fixture.assert_request(PASSING_ANSWER))?)
+                    .await,
+            )?;
             assert!(
                 denied.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
                 "a caller without verifier:run is refused: {role}: {denied}"
@@ -963,11 +957,12 @@ mod pg_tests {
         let foreign = server
             .bootstrap_service_in_tenant(other_tenant, "mcp-execute-foreign", &["admin"])
             .await?;
-        let foreign_client =
-            ().serve_with_lifecycle(transport(&server, api_key(&foreign)?, None)?, discover())
-                .await?;
-        let foreign_execute =
-            refusal(foreign_client.call_tool(call(EXECUTE, request(1.0))?).await)?;
+        let foreign_client = connect(&server, &foreign).await?;
+        let foreign_execute = refusal(
+            foreign_client
+                .call_tool(call(EXECUTE, fixture.assert_request(PASSING_ANSWER))?)
+                .await,
+        )?;
         assert!(
             foreign_execute.contains("WYRD_VERIFICATION_404_TARGET_NOT_FOUND"),
             "another tenant cannot execute this tenant's Verifier: {foreign_execute}"
@@ -988,16 +983,21 @@ mod pg_tests {
 
     /// Spans the judged execution opens beneath its request span.
     const DESCENDANTS: [&str; 4] = [
-        "verification.judge",
+        "verification.execute",
         "agent.gateway.call",
         "gateway.call",
         "gateway.execute",
     ];
 
+    /// The Verdict the local judge returns for every answer: passed, citing
+    /// the whole answer.
+    const AGREES: &str = r#"{"outcome":"passed","reason":"it agrees","citations":[{"slot":"answer","locator":{"json_pointer":""}}]}"#;
+
     /// Start a bound server whose gateway answers `gpt-4o` judge calls from a
-    /// local provider that passes every answer, register the judge Eval
-    /// Verifier and a Service to judge, and return that Service's principal,
-    /// which may run Verifiers and invoke the judge model.
+    /// local provider that passes every answer, register the `answer-judged`
+    /// Agent-check Verifier and a Service to judge, and return that Service's
+    /// principal, which may run Verifiers and invoke the judge model, with
+    /// the execution request it sends.
     ///
     /// # Errors
     ///
@@ -1013,7 +1013,7 @@ mod pg_tests {
                     "id": "chatcmpl-judge", "object": "chat.completion", "created": 1,
                     "model": "gpt-4o",
                     "choices": [{ "index": 0, "finish_reason": "stop",
-                        "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
+                        "message": { "role": "assistant", "content": AGREES } }],
                     "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
                 })),
             )
@@ -1044,7 +1044,7 @@ mod pg_tests {
         let request = serde_json::json!({
             "verifier_card_uid": judged.root.uid.ok_or("a registered Card has a UID")?.to_string(),
             "card_uid": fixture.service_uid,
-            "input": { "kind": "eval_record", "context": { "answer": "yes" } },
+            "inputs": { "answer": { "kind": "json", "value": "yes" } },
         });
         Ok((server, judge, agent, request))
     }
@@ -1076,14 +1076,14 @@ mod pg_tests {
             )
             .await?;
         let judged = structured(agent.call_tool(call(EXECUTE, request.clone())?).await?)?;
-        assert_eq!(judged["verdict"], "passed", "{judged}");
+        assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
         agent.cancel().await?;
         Ok(())
     }
 
     /// A tool call carrying the caller's sampled `traceparent` continues the
     /// caller's trace: its SERVER request span is a child of the caller's
-    /// span, and the judge and gateway spans the execution opens descend from
+    /// span, and the execution, judge, and gateway spans it opens descend from
     /// that request span. A call with a malformed `traceparent` and
     /// `tracestate` still succeeds, on a new trace.
     ///
@@ -1204,7 +1204,7 @@ mod pg_tests {
         assert!(
             spans
                 .iter()
-                .filter(|span| span.name == "verification.judge")
+                .filter(|span| span.name == "verification.execute")
                 .any(|span| span.trace_id != CALLER_TRACE),
             "the malformed call is judged on a new trace: {spans:#?}"
         );

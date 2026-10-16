@@ -24,8 +24,7 @@ use wyrd_testing::release_server::{LocalServer, MemoryPeak};
 
 use crate::Result;
 use crate::evidence::{Backlog, Overhead, Percentiles, Queue, RunTally, Scrapes};
-use crate::fixture::{Kind, Tenant};
-use crate::judge::Judge;
+use crate::fixture::Tenant;
 use crate::load::{Lane, MAX_IN_FLIGHT, Op, Tally, TenantClients, Work, mix};
 use crate::profile::{Capture, Profile};
 
@@ -45,8 +44,6 @@ pub struct Deployment {
     pub clients: Vec<Arc<TenantClients>>,
     /// The durable queues.
     pub queue: Queue,
-    /// The judge provider.
-    pub judge: Arc<Judge>,
     /// Driver permits shared by every lane.
     pub permits: Arc<Semaphore>,
     /// Where profiles land when profiling, `None` otherwise.
@@ -267,8 +264,8 @@ pub struct Record {
     pub window_seconds: f64,
     /// Per operation, in [`Op::ALL`] order.
     pub ops: Vec<(Op, OpRecord)>,
-    /// Direct engine overhead per kind, in [`Kind::ALL`] order.
-    pub overhead: Vec<Overhead>,
+    /// Direct engine overhead.
+    pub overhead: Overhead,
     /// Seconds from load stopping until every backlog was empty; `None`
     /// when [`DRAIN_LIMIT`] passed first.
     pub backlog_drain_seconds: Option<f64>,
@@ -276,11 +273,6 @@ pub struct Record {
     pub backlog: Backlog,
     /// Per-replica resources.
     pub resources: Vec<Resources>,
-    /// Judge completions during the step.
-    pub judge_calls: usize,
-    /// The local judge provider's wait per completion, milliseconds:
-    /// reported apart from judge engine overhead, never judged (AC-040).
-    pub judge_wait_ms: Percentiles,
     /// Profiles, when captured.
     pub profiles: Vec<Profile>,
 }
@@ -318,7 +310,6 @@ impl Deployment {
         for replica in &self.replicas {
             before.push(replica.metrics().await?);
         }
-        let judge_before = self.judge.calls();
         let resources = ResourceWindow::open(&self.replicas)?;
         let captures = self.start_captures(&plan)?;
 
@@ -356,21 +347,16 @@ impl Deployment {
             .await?;
         let scrapes = Scrapes { before, after };
         let runs = self.queue.runs(since).await?;
-        let ops = self.ops(&lanes, &tallies, &runs, window, backlog.runs == 0)?;
+        let ops = self.ops(&lanes, &tallies, &runs, window, backlog.runs == 0);
         Ok(Record {
             replicas: self.replicas.len(),
             plan,
             window_seconds,
             ops,
-            overhead: Kind::ALL
-                .into_iter()
-                .map(|kind| scrapes.overhead(kind))
-                .collect(),
+            overhead: scrapes.overhead(),
             backlog_drain_seconds,
             backlog,
             resources,
-            judge_calls: self.judge.calls().saturating_sub(judge_before),
-            judge_wait_ms: Percentiles::raw(&self.judge.waits_since(judge_before), 1e-3),
             profiles,
         })
     }
@@ -449,10 +435,6 @@ impl Deployment {
     /// Folds every lane's tally, and the queued lanes' durable runs, into
     /// one record per operation. Queued losses count only once the run
     /// queue `drained`, since an undrained run is backlog, not loss.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a lane's tenant does not run its workload.
     fn ops(
         &self,
         lanes: &[Lane],
@@ -460,7 +442,7 @@ impl Deployment {
         runs: &BTreeMap<String, RunTally>,
         window: Duration,
         drained: bool,
-    ) -> Result<Vec<(Op, OpRecord)>> {
+    ) -> Vec<(Op, OpRecord)> {
         let mut records: BTreeMap<Op, (OpRecord, Vec<u64>)> = BTreeMap::new();
         for (lane, tally) in lanes.iter().zip(tallies) {
             let (record, samples) = records.entry(lane.work.op()).or_default();
@@ -481,12 +463,14 @@ impl Deployment {
                 record.drain_seconds =
                     Some(record.drain_seconds.map_or(seconds, |d| d.max(seconds)));
             }
-            let Work::Queued(kind) = lane.work else {
+            if lane.work != Work::Queued {
                 record.completed += within(&tally.completed_at, window);
                 continue;
-            };
-            let (verifier, _) = self.tenants[lane.tenant].target(kind)?;
-            let runs = runs.get(&verifier.to_string()).cloned().unwrap_or_default();
+            }
+            let runs = runs
+                .get(&self.tenants[lane.tenant].verifier.to_string())
+                .cloned()
+                .unwrap_or_default();
             record.completed += within(&runs.settled_at, window);
             if drained && runs.created < tally.accepted {
                 *record.errors.entry("lost".to_owned()).or_default() +=
@@ -501,13 +485,13 @@ impl Deployment {
                 }
             }
         }
-        Ok(records
+        records
             .into_iter()
             .map(|(op, (mut record, samples))| {
                 record.client_ms = Percentiles::raw(&samples, 1e-3);
                 (op, record)
             })
-            .collect())
+            .collect()
     }
 
     /// Starts one capture per replica when profiling.

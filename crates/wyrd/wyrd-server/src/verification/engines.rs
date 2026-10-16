@@ -61,14 +61,12 @@ pub fn summary(outcome: &VerificationOutcome) -> String {
 /// `drift.*` template fields name a single check.
 #[must_use]
 pub fn drift_counts(outcome: &VerificationOutcome) -> Option<DriftCounts> {
-    let mut reports =
-        outcome
-            .requirements
-            .iter()
-            .filter_map(|requirement| match &requirement.detail {
-                Some(RequirementDetail::Drift(report)) => Some(report),
-                None => None,
-            });
+    let mut reports = outcome.requirements.iter().filter_map(|requirement| {
+        requirement
+            .detail
+            .as_ref()
+            .map(|RequirementDetail::Drift(report)| report)
+    });
     let report = reports.next()?;
     if reports.next().is_some() {
         return None;
@@ -120,12 +118,12 @@ mod tests {
     }
 
     /// An empty drift report detail.
-    fn drift() -> Option<RequirementDetail> {
-        Some(RequirementDetail::Drift(DriftReport {
+    fn drift() -> RequirementDetail {
+        RequirementDetail::Drift(DriftReport {
             method: DriftMethod::Custom,
             features: BTreeMap::new(),
             verdict: DriftVerdict::Drift,
-        }))
+        })
     }
 
     /// The summary counts failed requirements, and drift counts exist only
@@ -137,7 +135,7 @@ mod tests {
     fn failure_context_counts_requirements_and_the_one_drift_check() {
         let mut outcome = VerificationOutcome {
             verdict: VerificationVerdict::Failed,
-            requirements: vec![requirement("a", drift()), requirement("b", None)],
+            requirements: vec![requirement("a", Some(drift())), requirement("b", None)],
             steps: Vec::new(),
             evidence: BTreeMap::new(),
         };
@@ -152,7 +150,7 @@ mod tests {
                 total_features: 0
             })
         );
-        outcome.requirements.push(requirement("c", drift()));
+        outcome.requirements.push(requirement("c", Some(drift())));
         assert_eq!(drift_counts(&outcome), None);
     }
 }

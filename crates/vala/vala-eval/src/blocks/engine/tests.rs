@@ -1270,7 +1270,11 @@ async fn drift_requirement_maps_caller_scored_report() {
     let script = Arc::new(Script::default());
     let outcome = engine(&script, InMemoryTraceSource::new(), 1)
         .with_drift(drift)
-        .run(spec, BTreeMap::new(), Instant::now() + Duration::from_secs(60))
+        .run(
+            spec,
+            BTreeMap::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
         .await
         .expect("outcome");
     let shifted = requirement(&outcome, "psi-shift");

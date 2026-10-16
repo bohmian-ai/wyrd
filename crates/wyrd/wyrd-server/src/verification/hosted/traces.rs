@@ -127,7 +127,7 @@ impl TraceSource for CallerTraces {
         let mut spans = Vec::with_capacity(rows);
         for batch in &batches {
             for row in 0..batch.num_rows() {
-                spans.push(span_record(batch, row).map_err(|error| failed(error.to_string()))?);
+                spans.push(span_record(batch, row).map_err(|error| failed(error.clone()))?);
             }
         }
         Ok(Arc::new(spans))

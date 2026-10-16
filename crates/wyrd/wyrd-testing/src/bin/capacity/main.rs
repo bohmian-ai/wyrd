@@ -3,9 +3,8 @@
 //! An operator starts release `wyrd-server` replicas the way the
 //! local-development guide says (`migrate`, serve, `setup`), in peer mode
 //! over Postgres and one shared S3-compatible store, as the kind deployment
-//! runs them, with the LLM provider pointed at a local TLS judge that
-//! answers after a fixed delay. Four identical tenants register the AC-040
-//! reference workloads; the driver then offers one production mix open-loop
+//! runs them. Four identical tenants register the AC-040 reference
+//! workload; the driver then offers one production mix open-loop
 //! through the public Rust client: direct and queued verification, Scribe
 //! ingest through `WyrdState`, and Oracle queries (see [`load::mix`]).
 //!
@@ -41,7 +40,6 @@
 mod client_queue;
 mod evidence;
 mod fixture;
-mod judge;
 mod load;
 mod profile;
 mod query;
@@ -64,7 +62,6 @@ use wyrd_testing::release_server::{
 
 use evidence::Queue;
 use fixture::Tenant;
-use judge::Judge;
 use load::{MAX_IN_FLIGHT, TenantClients};
 use report::{Report, step_row};
 use step::{Deployment, Plan, Record, StepKind, permits};
@@ -299,15 +296,11 @@ struct Benchmark {
     lifetime: Lifetime,
     /// Where the report, logs, and profiles land.
     output: PathBuf,
-    /// Scratch directory of the judge CA, peer certificates, signing key,
+    /// Scratch directory of the peer certificates, signing key,
     /// and tenant bundles; removed when the benchmark drops.
     work: tempfile::TempDir,
     /// The measured `wyrd-server`.
     binary: PathBuf,
-    /// The judge provider every replica calls.
-    judge: Arc<Judge>,
-    /// The judge CA file every replica trusts.
-    ca_file: String,
     /// Each replica's peer TLS directory, by ordinal.
     peer_dirs: Vec<String>,
     /// The workload signing key file every replica shares.
@@ -326,18 +319,12 @@ struct Benchmark {
 
 impl Benchmark {
     /// Prepares the local fixtures under `lifetime`: output directory,
-    /// scratch directory, server binary, judge provider, peer certificates,
-    /// and signing key.
+    /// scratch directory, server binary, peer certificates, and signing key.
     ///
     /// # Errors
     ///
-    /// Returns a file, binary, certificate, key, or judge start failure.
-    ///
-    /// # Cancellation
-    ///
-    /// Only local files and the judge listener exist yet; dropping the
-    /// future removes the scratch directory and stops the judge.
-    async fn prepare(cli: Cli, lifetime: Lifetime) -> Result<Self> {
+    /// Returns a file, binary, certificate, or key failure.
+    fn prepare(cli: Cli, lifetime: Lifetime) -> Result<Self> {
         let output = PathBuf::from("target/capacity");
         std::fs::create_dir_all(&output)?;
         let profiles = output.join("profiles");
@@ -351,7 +338,6 @@ impl Benchmark {
             Some(binary) => std::fs::canonicalize(binary)?,
             None => release_binary()?,
         };
-        let judge = Arc::new(Judge::start(&work.path().join("judge")).await?);
         let peer = BifrostPeerCa::generate(PEER_NAME)?;
         let peer_dirs = (0..REPLICAS)
             .map(|ordinal| {
@@ -373,14 +359,12 @@ impl Benchmark {
         let mut auth_pace = tokio::time::interval(AUTH_SPACING);
         auth_pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         Ok(Self {
-            ca_file: judge.ca_file().display().to_string(),
             signing_key: signing_key.display().to_string(),
             cli,
             lifetime,
             output,
             work,
             binary,
-            judge,
             peer_dirs,
             auth_pace,
             deployment: None,
@@ -500,8 +484,8 @@ impl Benchmark {
     /// # Cancellation
     ///
     /// The first replica is killed with its log kept when the future drops
-    /// before the deployment holds it. Tenants, Cards, fitted baselines, and
-    /// seeded observations already written stay in the database and store;
+    /// before the deployment holds it. Tenants and Cards already written
+    /// stay in the database and store;
     /// a retry starts a fresh database through the Postgres wrapper.
     async fn provision(&mut self) -> Result<()> {
         let first = LocalServer::start(
@@ -522,7 +506,6 @@ impl Benchmark {
             tenants,
             clients: Vec::new(),
             queue: Queue::connect(&self.cli.database_admin_url).await?,
-            judge: Arc::clone(&self.judge),
             permits: permits(),
             profiles: self.cli.profile.then(|| self.output.join("profiles")),
             binary: identity(&self.binary, self.cli.profile)?,
@@ -624,14 +607,10 @@ impl Benchmark {
         (failure, shutdown)
     }
 
-    /// The environment of replica `ordinal`: the judge provider and its CA,
-    /// the shared store, its peer certificates, and the shared signing key.
+    /// The environment of replica `ordinal`: the shared store, its peer certificates, and the shared signing key.
     /// Every replica is `all`, the recommended first way to scale out.
     fn env(&self, ordinal: u16) -> Vec<(&str, &str)> {
         vec![
-            ("OPENAI_API_KEY", "capacity"),
-            ("OPENAI_BASE_URL", self.judge.base_url()),
-            ("SSL_CERT_FILE", self.ca_file.as_str()),
             ("WYRD_STORAGE_URL", self.cli.storage_url.as_str()),
             (
                 "WYRD_STORAGE_ENDPOINT_URL",
@@ -737,16 +716,9 @@ async fn capacity() -> ExitCode {
     install_tracing();
     let cli = Cli::parse();
     let result = match Lifetime::from_command() {
-        Ok(lifetime) => match lifetime
-            .bounded(
-                lifetime.measure_until,
-                Benchmark::prepare(cli, lifetime),
-                "preparation",
-            )
-            .await
-        {
+        Ok(lifetime) => match Benchmark::prepare(cli, lifetime) {
             Ok(benchmark) => Box::pin(benchmark.run()).await,
-            Err(error) => Err(error.into()),
+            Err(error) => Err(format!("preparation failed: {error}").into()),
         },
         Err(error) => Err(error),
     };
@@ -891,7 +863,7 @@ esac
             Duration::from_secs(1),
             Duration::from_secs(1),
         );
-        let mut benchmark = Benchmark::prepare(cli, lifetime).await.expect("prepare");
+        let mut benchmark = Benchmark::prepare(cli, lifetime).expect("prepare");
         benchmark.output = scratch.path().join("capacity");
         std::fs::create_dir_all(&benchmark.output).expect("output directory");
 
@@ -980,7 +952,7 @@ esac
             Duration::from_secs(5),
             Duration::from_secs(10),
         );
-        let mut benchmark = Benchmark::prepare(cli, lifetime).await.expect("prepare");
+        let mut benchmark = Benchmark::prepare(cli, lifetime).expect("prepare");
         benchmark.output = scratch.path().join("capacity");
         std::fs::create_dir_all(&benchmark.output).expect("output directory");
         let replica = LocalServer::start(&server, &[], &[], Placement::Scoped(Envelope::POD))
@@ -991,7 +963,6 @@ esac
             tenants: Vec::new(),
             clients: Vec::new(),
             queue: super::Queue::unconnected().expect("lazy pool"),
-            judge: Arc::clone(&benchmark.judge),
             permits: super::permits(),
             profiles: None,
             binary: serde_json::Value::Null,

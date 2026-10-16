@@ -27,7 +27,7 @@ mod pg_tests {
     /// caller that also holds tenant principal administration, `verifier:run`,
     /// `operators:write`, `gateway:write`, and `gateway:delete`: every read
     /// tool, then that caller's write tools.
-    const ADVERTISED_TOOLS: [&str; 35] = [
+    const ADVERTISED_TOOLS: [&str; 36] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
         "bifrost.query",
@@ -36,7 +36,7 @@ mod pg_tests {
         "cards.list",
         "cards.get_by_ref",
         "verification.get_binding",
-        "verification.get_run",
+        "verification.get_execution",
         "operator_connections.list",
         "operator_connections.get",
         "gateway.list_provider_credentials",
@@ -48,8 +48,9 @@ mod pg_tests {
         "gateway.get_provider_deployment",
         "wyrd.guide",
         "principals.revoke_credential",
-        "verification.start_run",
+        "verification.evidence",
         "verification.execute",
+        "verification.enqueue",
         "operator_connections.create",
         "operator_connections.update",
         "operator_connections.disable",

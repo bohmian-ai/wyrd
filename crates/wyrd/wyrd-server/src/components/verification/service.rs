@@ -364,7 +364,7 @@ impl<'a> VerificationControl<'a> {
                 .await
                 .map_err(storage_error)?;
             uploads.push(EvidenceUpload {
-                sha256: file.sha256.clone(),
+                sha256: file.sha256,
                 plan,
             });
         }

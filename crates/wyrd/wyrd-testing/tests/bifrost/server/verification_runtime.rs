@@ -22,8 +22,8 @@ use std::time::Duration;
 use wyrd_client::bifrost::BifrostOptions;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BinaryArray, FixedSizeBinaryArray, Float64Array, Int32Array,
-    ListArray, StringArray, StructArray, TimestampMicrosecondArray,
+    Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Float64Array, Int32Array, ListArray,
+    StringArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -39,24 +39,24 @@ use vala_bifrost_redux::catalog::{TableRef, TableUid};
 use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use vala_bifrost_redux::oracle::AuthorizedQueryContext;
 use vala_bifrost_redux::scribe::ScribeImpl;
-use vala_bifrost_redux::tables::{DomainTable, EvalObservationsTable};
-use vala_eval::executor::{EvalReport, SkipReason, TaskRunOutcome};
+use vala_bifrost_redux::tables::{DomainTable, ExecutionInputsTable};
 use wyrd_client::Bifrost;
 use wyrd_client::bifrost::TableConfig;
-use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, WyrdJsonEncoderFactory};
+use wyrd_queue::variant::{EncodedVariant, WyrdJsonEncoderFactory};
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::scribe_outbox::{ScribeSink, ScribeWrite};
 use wyrd_server::verification::VerificationRuntime;
-use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
+use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
+use wyrd_spec::card::verifier::Check;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId};
+use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, VerificationResultId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -64,17 +64,17 @@ use wyrd_spec::vala::api::{
     VARIANT_MAX_ENCODED_BYTES,
 };
 use wyrd_spec::vala::eval::TaskId;
-use wyrd_spec::vala::eval::operator::ComparisonOperator;
-use wyrd_spec::vala::eval::result::AssertionResult;
 use wyrd_spec::vala::managed_columns::{
     ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT,
 };
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
-use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
-use wyrd_sql::queries::verifier_runs::RunInput;
+use wyrd_spec::verification::execution::{
+    RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+};
+use wyrd_spec::verification::{DriftReport, DriftVerdict, DriftWindow, VerificationVerdict};
 use wyrd_testing::bifrost::{BifrostClusterSpec, RawIngest, WyrdTestCluster, canonical_signals};
 use wyrd_testing::gateway_capture::GatewayCapture;
-use wyrd_testing::verification::VerificationFixture;
+use wyrd_testing::verification::{ExecutionRow, VerificationFixture};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 use wyrd_types::variant::{variant_field, variant_storage_type};
 
@@ -85,6 +85,86 @@ const WAIT: Duration = Duration::from_mins(1);
 
 /// One day, the receipt-clock shift that moves an ACK onto the next UTC day.
 const DAY: Duration = Duration::from_hours(24);
+
+/// A Custom Drift report that scored `latency` as drifting and `tokens` as
+/// steady, the two-feature detail every published Drift result here carries.
+///
+/// # Errors
+/// Returns a decode error when the fixed report does not deserialize.
+fn two_feature_report() -> Result<DriftReport, ServerJourneyError> {
+    Ok(serde_json::from_value(json!({
+        "method": "Custom",
+        "features": {
+            "latency": { "feature": "latency", "score": 3.0, "threshold": 1.0, "verdict": "Drift" },
+            "tokens": { "feature": "tokens", "score": 0.1, "threshold": 1.0, "verdict": "NoDrift" }
+        },
+        "verdict": "Drift"
+    }))?)
+}
+
+/// A one-requirement outcome whose `drift` requirement carries `report`.
+///
+/// A drifting report fails the requirement and the outcome, a steady one
+/// passes both, and no report leaves both inconclusive with no detail, as an
+/// unscorable window does. The requirement's `check` is a stand-in; result
+/// publication reads only its detail.
+///
+/// # Errors
+/// Returns an error when the requirement id or check does not decode.
+fn drift_outcome(report: Option<DriftReport>) -> Result<VerificationOutcome, ServerJourneyError> {
+    let (outcome, verdict) = match report.as_ref().map(|report| report.verdict) {
+        Some(DriftVerdict::Drift) => (RequirementOutcome::Failed, VerificationVerdict::Failed),
+        Some(DriftVerdict::NoDrift) => (RequirementOutcome::Passed, VerificationVerdict::Passed),
+        _ => (
+            RequirementOutcome::Inconclusive,
+            VerificationVerdict::Inconclusive,
+        ),
+    };
+    Ok(VerificationOutcome {
+        verdict,
+        requirements: vec![RequirementResult {
+            id: TaskId::new("drift")?,
+            step: None,
+            statement: "The window does not drift.".to_owned(),
+            outcome,
+            reason: "scored by the journey".to_owned(),
+            actual: None,
+            citations: Vec::new(),
+            detail: report.map(RequirementDetail::Drift),
+            check: serde_json::from_value::<Check>(json!({
+                "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
+            }))?,
+            provenance: None,
+        }],
+        steps: Vec::new(),
+        evidence: std::collections::BTreeMap::new(),
+    })
+}
+
+/// Poll `seed` until its first execution leaves every status in `waiting`,
+/// returning that execution and its settled row.
+///
+/// # Errors
+/// Returns a fixture error, or a description when no execution settles
+/// within [`WAIT`].
+async fn first_settled(
+    seed: &VerificationFixture,
+    waiting: &[&str],
+) -> Result<(ExecutionId, ExecutionRow), ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        if let Some(execution) = seed.executions().await?.first().copied() {
+            let row = seed.execution(execution).await?;
+            if !waiting.contains(&row.status.as_str()) {
+                return Ok((execution, row));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("no execution settled".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 /// A runner on a node without local Scribe publishes a binding-created Drift
 /// result through the Scribe outbox's peer ingest RPC and completes
@@ -115,23 +195,23 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
     let (owner, owner_principal) = seed.service("remote-owner").await?;
     let verifier = seed.drift_verifier("remote-drift").await?;
     let binding = seed
-        .bind_schedule(&owner, &subject, &verifier, "0 * * * *", Vec::new())
+        .bind_schedule(
+            &owner,
+            &subject,
+            &verifier,
+            "0 * * * *",
+            VerificationFixture::metric_inputs("latency_ms"),
+            Vec::new(),
+        )
         .await?;
     // Activation arms the cursor at the next hour's boundary; the occurrence
     // is brought due in the database, which owns the schedule clock.
     seed.activate(owner_principal).await?;
     seed.make_binding_due(binding).await?;
     let script = EngineScript::default();
-    script.push(EngineOutcome::Completed(VerifierReport::Drift(Some(
-        serde_json::from_value(json!({
-            "method": "Custom",
-            "features": {
-                "latency": { "feature": "latency", "score": 3.0, "threshold": 1.0, "verdict": "Drift" },
-                "tokens": { "feature": "tokens", "score": 0.1, "threshold": 1.0, "verdict": "NoDrift" }
-            },
-            "verdict": "Drift"
-        }))?,
-    ))));
+    script.push(EngineOutcome::Completed(drift_outcome(Some(
+        two_feature_report()?,
+    ))?));
     let runtime = VerificationRuntime::builder(oracle.state())
         .engine_script(script)
         .build()
@@ -142,19 +222,7 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
     let stop = CancellationToken::new();
     let task = tokio::spawn(runtime.run(stop.clone()));
 
-    let deadline = tokio::time::Instant::now() + WAIT;
-    let row = loop {
-        if let Some(run) = seed.runs().await?.first().copied() {
-            let row = seed.run(run).await?;
-            if row.status != "pending" && row.status != "running" {
-                break row;
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("the scheduled run never settled on the remote runner".into());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let (_, row) = first_settled(&seed, &["pending", "running"]).await?;
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
     let ("completed", Some(result)) = (row.status.as_str(), row.result_id) else {
@@ -225,13 +293,16 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
     Ok(())
 }
 
-/// A runner on a pod without a local Oracle completes a real Drift run.
+/// A runner on a pod without a local Oracle completes a real scheduled Drift
+/// execution.
 ///
-/// The Scribe-only node composes the runtime over its own Scribe. Its Custom
-/// Verifier's observation read runs under the tenant SYSTEM read authority
-/// and is forwarded to a peer Oracle, which records one
-/// audited read decision; the run completes with a published result. The
-/// registered table is empty for the subject, so the run is inconclusive.
+/// The Scribe-only node composes the runtime over its own Scribe. A due
+/// monthly binding's Custom Verifier reads its `score` samples under the
+/// binding owner's recovered authority with SYSTEM as actor; the read is
+/// forwarded to a peer Oracle, which records one audited read decision, and
+/// the execution completes with a published result on its first attempt.
+/// The registered table is empty for the subject, so the result is
+/// inconclusive.
 ///
 /// # Errors
 /// Returns cluster, seeding, runtime, or audit errors, or a description of
@@ -255,23 +326,25 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
 
     let seed = VerificationFixture::provision(scribe.state().postgres.wyrd(), tenant).await?;
     let (subject, _) = seed.service("forwarded-subject").await?;
+    let (owner, owner_principal) = seed.service("forwarded-owner").await?;
     let verifier = seed
         .custom_drift_verifier("forwarded-drift", "score", 1.0, 0.5)
         .await?;
     scribe
         .ensure_builtin_table_for_test(tenant, "drift", "observations")
         .await?;
-    let now = chrono::Utc::now();
-    let run = seed
-        .enqueue_direct(
-            &verifier,
+    let binding = seed
+        .bind_schedule(
+            &owner,
             &subject,
-            wyrd_spec::verification::DriftWindow {
-                start: now - chrono::Duration::hours(1),
-                end: now,
-            },
+            &verifier,
+            MONTHLY,
+            VerificationFixture::metric_inputs("score"),
+            Vec::new(),
         )
         .await?;
+    seed.activate(owner_principal).await?;
+    seed.make_binding_due(binding).await?;
     // The runner node hosts no Oracle, so the peer that serves the read
     // stages its decision; the cluster barrier drains every Oracle first.
     cluster.await_audit_retained().await?;
@@ -282,17 +355,7 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
         .ok_or("the runtime did not compose")?;
     let stop = CancellationToken::new();
     let task = tokio::spawn(runtime.run(stop.clone()));
-    let deadline = tokio::time::Instant::now() + WAIT;
-    let row = loop {
-        let row = seed.run(run).await?;
-        if row.status != "pending" && row.status != "running" && row.status != "retrying" {
-            break row;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("the Drift run never settled: {row:?}").into());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let (_, row) = first_settled(&seed, &["pending", "running", "retrying"]).await?;
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
     if row.status != "completed" || row.result_id.is_none() || row.attempts != 1 {
@@ -394,7 +457,14 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     let mut bindings = Vec::new();
     for verifier in [&drifting, &steady] {
         let binding = seed
-            .bind_schedule(&subject, &subject, verifier, MONTHLY, Vec::new())
+            .bind_schedule(
+                &subject,
+                &subject,
+                verifier,
+                MONTHLY,
+                VerificationFixture::metric_inputs("score"),
+                Vec::new(),
+            )
             .await?;
         bindings.push((verifier.clone(), binding));
     }
@@ -429,22 +499,24 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     let task = tokio::spawn(runtime.run(stop.clone()));
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
-        let runs = seed.runs().await?;
+        let executions = seed.executions().await?;
         let mut settled = 0;
-        for run in &runs {
-            let row = seed.run(*run).await?;
+        for execution in &executions {
+            let row = seed.execution(*execution).await?;
             if !matches!(row.status.as_str(), "pending" | "running" | "retrying") {
                 if row.status != "completed" || row.result_id.is_none() {
-                    return Err(format!("a binding run settled {row:?}").into());
+                    return Err(format!("a binding execution settled {row:?}").into());
                 }
                 settled += 1;
             }
         }
-        if runs.len() == 2 && settled == 2 {
+        if executions.len() == 2 && settled == 2 {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("expected two settled binding runs, saw {runs:?}").into());
+            return Err(
+                format!("expected two settled binding executions, saw {executions:?}").into(),
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -570,11 +642,12 @@ fn observation_batch(
 /// Bifrost facade, flushing after each so every result is its own file: a
 /// Drift result whose feature rows are acknowledged on one receipt day and
 /// whose summary is acknowledged on the next, a Drift result whose event time
-/// is the previous UTC day, and an Eval result. Each result's details are
+/// is the previous UTC day, and an unscored result that writes its summary
+/// only. Each result's details are
 /// retrieved by `result_id` alone from both daily partitions; the straddling
 /// result's summary partitions on its `ended_at` while its details partition
 /// on a `wyrd_ingested_at` that falls on a different day. Every published Parquet file of
-/// the three tables carries a physical Bloom filter for its declared and
+/// the two tables carries a physical Bloom filter for its declared and
 /// managed-floor columns, and Oracle's scan metrics show a day-range
 /// predicate dropping the previous day's file and a `result_id` lookup
 /// selecting strictly fewer files or row groups than a full scan.
@@ -591,7 +664,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
     let yesterday = now - chrono::Duration::days(1);
     let straddling = journey.publish(now, Report::Drift, true).await?;
     let previous_day = journey.publish(yesterday, Report::Drift, false).await?;
-    let eval = journey.publish(now, Report::Eval, false).await?;
+    let unscored = journey.publish(now, Report::Unscored, false).await?;
     cluster.refresh_oracle_snapshots().await?;
 
     for (result, expected) in [(&straddling, 2), (&previous_day, 2)] {
@@ -608,13 +681,13 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
             .into());
         }
     }
-    let items = journey
+    let none = journey
         .texts(format!(
-            "SELECT task_id FROM vala.eval.result_items WHERE result_id = '{eval}'"
+            "SELECT feature FROM vala.drift.result_features WHERE result_id = '{unscored}'"
         ))
         .await?;
-    if items != vec![vec![Some("gate".to_owned())]] {
-        return Err(format!("the Eval result retrieves its one item: {items:?}").into());
+    if !none.is_empty() {
+        return Err(format!("the unscored result wrote feature rows: {none:?}").into());
     }
 
     // The summary's time column is `ended_at`; the details declare none, so
@@ -705,13 +778,13 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
     Ok(())
 }
 
-/// Which engine report a published layout result maps.
+/// Which outcome a published layout result maps.
 #[derive(Debug, Clone, Copy)]
 enum Report {
-    /// A two-feature Drift report over a Drift window.
+    /// A two-feature Drift outcome over a Drift window.
     Drift,
-    /// A one-item Eval report over one committed record.
-    Eval,
+    /// An unscored Drift outcome, which publishes its summary only.
+    Unscored,
 }
 
 /// Oracle scan evidence for one query: files and row groups scanned.
@@ -747,7 +820,7 @@ struct ResultLayoutJourney<'a> {
 
 impl<'a> ResultLayoutJourney<'a> {
     /// Provision the tenant's SYSTEM principal, a subject and a Verifier, and
-    /// the three result tables.
+    /// the two result tables.
     ///
     /// # Errors
     /// Returns a seeding or provisioning error.
@@ -758,11 +831,7 @@ impl<'a> ResultLayoutJourney<'a> {
         let (subject, _) = seed.service("layout-subject").await?;
         let uid = seed.drift_verifier("layout-drift").await?;
         let verifier: CardRef = format!("default/Verifier/layout-drift@1.0.0#{uid}").parse()?;
-        for (namespace, name) in [
-            ("verification", "results"),
-            ("drift", "result_features"),
-            ("eval", "result_items"),
-        ] {
+        for (namespace, name) in [("verification", "results"), ("drift", "result_features")] {
             server
                 .ensure_builtin_table_for_test(tenant, namespace, name)
                 .await?;
@@ -796,39 +865,14 @@ impl<'a> ResultLayoutJourney<'a> {
         report: Report,
         straddle: bool,
     ) -> Result<VerificationResultId, ServerJourneyError> {
-        let (input, report) = match report {
-            Report::Drift => (
-                RunInput::DriftWindow(DriftWindow {
-                    start: event_time - chrono::Duration::hours(1),
-                    end: event_time,
-                }),
-                VerifierReport::Drift(Some(serde_json::from_value(json!({
-                    "method": "Custom",
-                    "features": {
-                        "latency": { "feature": "latency", "score": 3.0, "threshold": 1.0, "verdict": "Drift" },
-                        "tokens": { "feature": "tokens", "score": 0.1, "threshold": 1.0, "verdict": "NoDrift" }
-                    },
-                    "verdict": "Drift"
-                }))?)),
-            ),
-            Report::Eval => (
-                RunInput::EvalRecord {
-                    record_id: format!("layout-{}", uuid::Uuid::now_v7()),
-                    event_time,
-                },
-                VerifierReport::Eval {
-                    report: EvalReport {
-                        outcomes: vec![TaskRunOutcome::Skipped {
-                            task_id: TaskId::new("gate")?,
-                            reason: SkipReason::ConditionFalse,
-                        }],
-                    },
-                    verdict: VerificationVerdict::Inconclusive,
-                    run_id: None,
-                },
-            ),
+        let window = DriftWindow {
+            start: event_time - chrono::Duration::hours(1),
+            end: event_time,
         };
-        let result = VerificationResultId::new_v7();
+        let outcome = drift_outcome(match report {
+            Report::Drift => Some(two_feature_report()?),
+            Report::Unscored => None,
+        })?;
         let verifier_uid = self
             .verifier
             .uid
@@ -836,20 +880,21 @@ impl<'a> ResultLayoutJourney<'a> {
             .ok_or("the Verifier has no UID")?;
         let payload = ResultPayloadBuilder::new(
             ResultRun {
+                execution_id: ExecutionId::new_v7(),
                 run_id: None,
                 verifier_version: "1.0.0",
                 card_uid: &self.subject,
                 owner_card_uid: Some(&self.subject),
                 binding_id: Some(BindingId::new_v7()),
                 trigger: None,
-                input: &input,
+                window: Some(&window),
             },
             verifier_uid,
-            result,
             event_time,
             event_time,
         )
-        .build(&report)?;
+        .build(&outcome)?;
+        let result = payload.result_id();
         let scribe = self
             .server
             .bifrost_scribe()
@@ -912,7 +957,7 @@ impl<'a> ResultLayoutJourney<'a> {
     }
 
     /// Require a physical Bloom filter on every declared and managed-floor
-    /// Bloom column in every published file of the three result tables.
+    /// Bloom column in every published file of the two result tables.
     ///
     /// Files are found under the cluster's storage root and classified by a
     /// column only their table carries; each table must have at least one.
@@ -922,16 +967,15 @@ impl<'a> ResultLayoutJourney<'a> {
     /// no file or the first column chunk without a Bloom filter.
     fn assert_blooms(&self) -> Result<(), ServerJourneyError> {
         let floor = [RUN_ID, CARD_UID, SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID];
-        let tables: [(&str, &str, &[&str]); 3] = [
+        let tables: [(&str, &str, &[&str]); 2] = [
             (
                 "vala.verification.results",
                 "execution_status",
                 &["result_id", "verifier_card_uid", "binding_id"],
             ),
             ("vala.drift.result_features", "feature", &["result_id"]),
-            ("vala.eval.result_items", "task_id", &["result_id"]),
         ];
-        let mut found = [0_usize; 3];
+        let mut found = [0_usize; 2];
         let mut pending = vec![self.cluster.storage_root().to_path_buf()];
         while let Some(directory) = pending.pop() {
             for entry in std::fs::read_dir(&directory)? {
@@ -1101,23 +1145,17 @@ async fn query_rows(
 /// Built-in payloads keep their JSON types end to end through the real server.
 ///
 /// One bound server takes every built-in producer whose payload is a typed
-/// column: the production result builder publishes a scored Drift, an
-/// unscored Drift, and an Eval result as the tenant SYSTEM writer; a real
-/// gateway call is captured with its request and response payloads; an
-/// Eval observation is written through the public Bifrost facade; and an
-/// audit decision with a structured detail is staged on the Scribe outbox and
-/// retained. After a flush, whole
-/// columns are read back through the server's query entry and every Variant
-/// cell decodes to the producer's native JSON value. A scored Drift carries
-/// only `drift_report`, an Eval only `eval_summary`, and an unscored Drift
-/// neither. Every child of both summary Structs is projected with
-/// `get_field` from the hot rows before the flush and the published rows
-/// after it: an absent summary's children all read SQL null, including
-/// `to_json` of its Variant, and a present summary's children read its
-/// values. A second gateway call the upstream refuses is captured with no
-/// resolved model: hot and published, both its `resolved_model` children
-/// read SQL null while the resolved call's read its provider and model. The
-/// retained audit row's detail decodes to the decision's canonical JSON.
+/// column: the production result builder publishes a scored and an unscored
+/// Drift outcome as the tenant SYSTEM writer; a real gateway call is captured
+/// with its request and response payloads; and an audit decision with a
+/// structured detail is staged on the Scribe outbox and retained. Each
+/// summary's `outcome` Variant decodes to the producer's native outcome JSON
+/// both before and after the flush, and its `verdict` column names the
+/// outcome's verdict. A second gateway call the upstream refuses is captured
+/// with no resolved model: hot and published, both its `resolved_model`
+/// children read SQL null while the resolved call's read its provider and
+/// model. The retained audit row's detail decodes to the decision's canonical
+/// JSON.
 ///
 /// # Errors
 /// Returns server, seeding, gateway, publication, or query errors, or a
@@ -1129,62 +1167,27 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 
     let results = journey.publish_results().await?;
     let call = journey.gateway.capture_call().await?;
-    let observation = journey.write_eval_observation().await?;
     let decision = journey.stage_audit_decision().await?;
-    let children_sql = format!(
-        "SELECT result_id, drift_report['method'], drift_report['verdict'], \
-         drift_report['features'], to_json(drift_report['features']) IS NULL, \
-         eval_summary['total_tasks'], eval_summary['passed_tasks'], \
-         eval_summary['failed_tasks'], eval_summary['pass_rate'], \
-         eval_summary['duration_ms'] FROM vala.verification.results \
-         WHERE result_id IN ('{}', '{}', '{}') ORDER BY result_id",
-        results.scored_drift, results.unscored_drift, results.eval
+    let outcomes_sql = format!(
+        "SELECT result_id, verdict, outcome FROM vala.verification.results \
+         WHERE result_id IN ('{}', '{}') ORDER BY result_id",
+        results.scored_drift.0, results.unscored_drift.0
     );
-    let drift = |key: &str| results.drift_report[key].clone();
-    let eval = |key: &str| results.eval_summary[key].clone();
-    let mut expected_children = vec![
-        vec![
-            json!(results.scored_drift.to_string()),
-            drift("method"),
-            drift("verdict"),
-            drift("features"),
-            json!(false),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-        ],
-        vec![
-            json!(results.unscored_drift.to_string()),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            json!(true),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-        ],
-        vec![
-            json!(results.eval.to_string()),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            json!(true),
-            eval("total_tasks"),
-            eval("passed_tasks"),
-            eval("failed_tasks"),
-            eval("pass_rate"),
-            eval("duration_ms"),
-        ],
-    ];
-    expected_children.sort_by_key(|row| row[0].to_string());
+    let mut expected_outcomes = [&results.scored_drift, &results.unscored_drift]
+        .map(|(result, outcome)| {
+            Ok::<_, ServerJourneyError>(vec![
+                json!(result.to_string()),
+                json!(<&'static str>::from(outcome.verdict)),
+                serde_json::to_value(outcome)?,
+            ])
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    expected_outcomes.sort_by_key(|row| row[0].to_string());
     expect_eq(
-        "hot summary Struct children",
-        &journey.rows(children_sql.clone()).await?,
-        &expected_children,
+        "hot verification outcomes",
+        &journey.rows(outcomes_sql.clone()).await?,
+        &expected_outcomes,
     )?;
     // Gateway capture: the resolved call carries both model Structs whole,
     // and the refused call's absent resolved model reads both children null.
@@ -1223,69 +1226,15 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     expect_eq("hot gateway model children", &hot_models, &expected_models)?;
     journey.gateway.server.flush_bifrost().await?;
     expect_eq(
-        "published summary Struct children",
-        &journey.rows(children_sql).await?,
-        &expected_children,
+        "published verification outcomes",
+        &journey.rows(outcomes_sql).await?,
+        &expected_outcomes,
     )?;
     expect_eq(
         "published gateway model children",
         &journey.rows(models_sql).await?,
         &expected_models,
     )?;
-
-    // Verification results: the two summary Structs are set exclusively.
-    let summaries = journey
-        .rows(format!(
-            "SELECT result_id, drift_report, eval_summary FROM vala.verification.results \
-             WHERE result_id IN ('{}', '{}', '{}')",
-            results.scored_drift, results.unscored_drift, results.eval
-        ))
-        .await?;
-    let summary = |result: &VerificationResultId| {
-        summaries
-            .iter()
-            .find(|row| row[0] == json!(result.to_string()))
-            .map(|row| (row[1].clone(), row[2].clone()))
-            .ok_or_else(|| format!("no summary for {result}: {summaries:?}"))
-    };
-    expect_eq(
-        "scored Drift summary",
-        &summary(&results.scored_drift)?,
-        &(results.drift_report.clone(), Value::Null),
-    )?;
-    expect_eq(
-        "unscored Drift summary",
-        &summary(&results.unscored_drift)?,
-        &(Value::Null, Value::Null),
-    )?;
-    expect_eq(
-        "Eval summary",
-        &summary(&results.eval)?,
-        &(Value::Null, results.eval_summary.clone()),
-    )?;
-    let children = journey
-        .rows(format!(
-            "SELECT drift_report['method'], drift_report['verdict'], drift_report['features'] \
-             FROM vala.verification.results WHERE result_id = '{}'",
-            results.scored_drift
-        ))
-        .await?;
-    expect_eq(
-        "drift_report children",
-        &children,
-        &vec![vec![
-            results.drift_report["method"].clone(),
-            results.drift_report["verdict"].clone(),
-            results.drift_report["features"].clone(),
-        ]],
-    )?;
-    let items = journey
-        .rows(format!(
-            "SELECT actual, expected FROM vala.eval.result_items WHERE result_id = '{}'",
-            results.eval
-        ))
-        .await?;
-    expect_eq("Eval item payloads", &items, &vec![results.item.clone()])?;
 
     // Gateway capture: both selected payloads decode to the call's JSON.
     let payloads = journey
@@ -1305,19 +1254,6 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     )?;
     expect_eq("captured response", &payload[1], &call.response)?;
 
-    // Eval observation: context and media keep their JSON types.
-    let observations = journey
-        .rows(format!(
-            "SELECT context, media FROM {OBSERVATIONS} WHERE record_id = '{}'",
-            observation.record
-        ))
-        .await?;
-    expect_eq(
-        "Eval observation payloads",
-        &observations,
-        &vec![vec![observation.context, observation.media]],
-    )?;
-
     // Audit: the retained detail decodes to the decision's canonical JSON.
     let audit = journey
         .rows(format!(
@@ -1335,7 +1271,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 /// admission for a non-signal built-in and a nested signal Variant, and each
 /// malformed frame is refused with its exact catalogued error before any ACK.
 ///
-/// `vala.eval.observations` covers a missing and a foreign extension marker,
+/// `vala.verification.execution_inputs` covers a missing and a foreign extension marker,
 /// the Variant marker with foreign extension metadata, invalid bytes, one
 /// container past the depth limit, a compact value nested 20,000 levels deep
 /// that is refused for depth without taking the server down, and one byte
@@ -1393,20 +1329,20 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             ),
         ]))
     };
-    let context = || variant_field("context", false);
-    let media = || variant_field("media", true);
+    let inputs = || variant_field("inputs", false);
+    let activation = || variant_field("activation", true);
     let limit = usize::try_from(VARIANT_MAX_ENCODED_BYTES)?;
     let unsupported = |field: &str| BifrostError::UnsupportedType {
         field: field.to_owned(),
         data_type: variant_storage_type().to_string(),
     };
-    let invalid_context = BifrostError::VariantInvalidJson {
-        field: "context".to_owned(),
+    let invalid_inputs = BifrostError::VariantInvalidJson {
+        field: "inputs".to_owned(),
         row: 0,
         path: String::new(),
     };
     let out_of_range = |path: &str, numeric_kind: &str| BifrostError::VariantNumericOutOfRange {
-        field: "context".to_owned(),
+        field: "inputs".to_owned(),
         row: 0,
         path: path.to_owned(),
         numeric_kind: numeric_kind.to_owned(),
@@ -1429,38 +1365,38 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     EncodedVariant::from_bytes(&EMPTY_METADATA, &deepest)
         .map_err(|violation| format!("the depth-limit fixture is invalid: {violation:?}"))?;
     let too_deep = BifrostError::VariantTooDeep {
-        field: "context".to_owned(),
+        field: "inputs".to_owned(),
         row: 0,
         path: "/0".repeat(usize::try_from(VARIANT_MAX_DEPTH)?),
         depth: VARIANT_MAX_DEPTH + 1,
         limit: VARIANT_MAX_DEPTH,
     };
 
-    let observations = [
+    let frames = [
         (
             "missing extension",
-            (storage_only("context", false), valid()?),
-            unsupported("context"),
+            (storage_only("inputs", false), valid()?),
+            unsupported("inputs"),
         ),
         (
             "foreign extension",
-            (foreign("context"), valid()?),
-            unsupported("context"),
+            (foreign("inputs"), valid()?),
+            unsupported("inputs"),
         ),
         (
             "foreign extension metadata",
-            (foreign_metadata("context"), valid()?),
-            unsupported("context"),
+            (foreign_metadata("inputs"), valid()?),
+            unsupported("inputs"),
         ),
         (
             "invalid bytes",
-            (context(), invalid()?),
-            invalid_context.clone(),
+            (inputs(), invalid()?),
+            invalid_inputs.clone(),
         ),
         (
             "one container past the depth limit",
             (
-                context(),
+                inputs(),
                 raw_variant(&EMPTY_METADATA, &nested_lists(VARIANT_MAX_DEPTH + 1)?)?,
             ),
             too_deep.clone(),
@@ -1468,7 +1404,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "a compact hostile depth",
             (
-                context(),
+                inputs(),
                 raw_variant(&EMPTY_METADATA, &nested_lists(20_000)?)?,
             ),
             too_deep.clone(),
@@ -1476,76 +1412,76 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "malformed bytes below a container past the depth limit",
             (
-                context(),
+                inputs(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &(0..VARIANT_MAX_DEPTH + 5)
                         .try_fold(vec![VARIANT_MALFORMED], |value, _| variant_list(&[value]))?,
                 )?,
             ),
-            invalid_context.clone(),
+            invalid_inputs.clone(),
         ),
         (
             "objects whose fields share one child at every level",
             (
-                context(),
+                inputs(),
                 raw_variant(&AB_METADATA, &shared_objects(VARIANT_MAX_DEPTH)?)?,
             ),
-            invalid_context.clone(),
+            invalid_inputs.clone(),
         ),
         (
             "malformed bytes after an over-deep sibling",
             (
-                context(),
+                inputs(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &variant_list(&[over_deep.clone(), vec![VARIANT_MALFORMED]])?,
                 )?,
             ),
-            invalid_context.clone(),
+            invalid_inputs.clone(),
         ),
         (
             "malformed bytes before an over-deep sibling",
             (
-                context(),
+                inputs(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &variant_list(&[vec![VARIANT_MALFORMED], over_deep.clone()])?,
                 )?,
             ),
-            invalid_context.clone(),
+            invalid_inputs.clone(),
         ),
         (
             "many fields sharing one large child",
-            (context(), raw_variant(&many_names, &one_shared_child)?),
-            invalid_context.clone(),
+            (inputs(), raw_variant(&many_names, &one_shared_child)?),
+            invalid_inputs.clone(),
         ),
         (
             "one field starting inside another",
             (
-                context(),
+                inputs(),
                 raw_variant(
                     &AB_METADATA,
                     &variant_object(&[(0, 0), (1, 1)], &[0x0c, 0x00])?,
                 )?,
             ),
-            invalid_context.clone(),
+            invalid_inputs.clone(),
         ),
         (
             "two fields resolving to one name",
             (
-                context(),
+                inputs(),
                 raw_variant(
                     &variant_metadata(&["a", "a"], false)?,
                     &variant_object(&[(0, 0), (1, 1)], &[VARIANT_NULL, VARIANT_NULL])?,
                 )?,
             ),
-            invalid_context.clone(),
+            invalid_inputs.clone(),
         ),
         (
             "a Decimal4",
             (
-                context(),
+                inputs(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &primitive(VARIANT_DECIMAL4, &[0, 5, 0, 0, 0]),
@@ -1556,7 +1492,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "a Decimal8",
             (
-                context(),
+                inputs(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &primitive(VARIANT_DECIMAL8, &[0, 5, 0, 0, 0, 0, 0, 0, 0]),
@@ -1567,7 +1503,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "a NaN double",
             (
-                context(),
+                inputs(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &primitive(VARIANT_DOUBLE, &f64::NAN.to_le_bytes()),
@@ -1578,7 +1514,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "an infinite float",
             (
-                context(),
+                inputs(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &primitive(VARIANT_FLOAT, &f32::INFINITY.to_le_bytes()),
@@ -1589,7 +1525,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "a fractional decimal",
             (
-                context(),
+                inputs(),
                 raw_variant(&EMPTY_METADATA, &decimal16(12_345, 2))?,
             ),
             out_of_range("", "decimal"),
@@ -1597,20 +1533,20 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "a scale-zero decimal past u64::MAX",
             (
-                context(),
+                inputs(),
                 raw_variant(&EMPTY_METADATA, &decimal16(i128::from(u64::MAX) + 1, 0))?,
             ),
             out_of_range("", "decimal"),
         ),
         (
             "a scale-zero decimal within i64",
-            (context(), raw_variant(&EMPTY_METADATA, &decimal16(5, 0))?),
+            (inputs(), raw_variant(&EMPTY_METADATA, &decimal16(5, 0))?),
             out_of_range("", "decimal"),
         ),
         (
             "a refused decimal after an over-deep sibling",
             (
-                context(),
+                inputs(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &variant_list(&[over_deep.clone(), decimal16(5, 0)])?,
@@ -1620,47 +1556,49 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         ),
         (
             "an oversized malformed value reports its size",
-            (context(), raw_variant(&[0xff], &vec![0xff; limit])?),
+            (inputs(), raw_variant(&[0xff], &vec![0xff; limit])?),
             BifrostError::VariantTooLarge {
-                field: "context".to_owned(),
+                field: "inputs".to_owned(),
                 row: 0,
                 bytes: VARIANT_MAX_ENCODED_BYTES + 1,
                 limit: VARIANT_MAX_ENCODED_BYTES,
             },
         ),
     ];
-    for (what, context, expected) in observations {
-        let frame = admission.observation_frame(&refused, context, (media(), valid()?))?;
+    for (what, inputs, expected) in frames {
+        let frame = admission.inputs_frame(&refused, inputs, (activation(), valid()?))?;
         admission
-            .refuse(what, OBSERVATIONS, &frame, &expected)
+            .refuse(what, EXECUTION_INPUTS, &frame, &expected)
             .await?;
     }
-    let frame = admission.observation_frame(
+    let frame = admission.inputs_frame(
         &refused,
-        (context(), invalid()?),
-        (storage_only("media", true), valid()?),
+        (inputs(), invalid()?),
+        (storage_only("activation", true), valid()?),
     )?;
     admission
         .refuse(
             "a wrong marker outranks invalid bytes",
-            OBSERVATIONS,
+            EXECUTION_INPUTS,
             &frame,
-            &unsupported("media"),
+            &unsupported("activation"),
         )
         .await?;
-    let binary_record_id = |frame: RecordBatch| -> Result<RecordBatch, ServerJourneyError> {
+    let binary_execution_id = |frame: RecordBatch| -> Result<RecordBatch, ServerJourneyError> {
         let fields = frame
             .schema()
             .fields()
             .iter()
             .map(|field| match field.name().as_str() {
-                "record_id" => Arc::new(Field::new("record_id", DataType::Binary, false)),
+                "execution_id" => Arc::new(Field::new("execution_id", DataType::Binary, false)),
                 _ => Arc::clone(field),
             })
             .collect::<Vec<_>>();
         let mut columns = frame.columns().to_vec();
-        columns[frame.schema().index_of("record_id")?] = cast(
-            frame.column_by_name("record_id").ok_or("no record_id")?,
+        columns[frame.schema().index_of("execution_id")?] = cast(
+            frame
+                .column_by_name("execution_id")
+                .ok_or("no execution_id")?,
             &DataType::Binary,
         )?;
         Ok(RecordBatch::try_new(
@@ -1678,10 +1616,9 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             columns,
         )?)
     };
-    let frame =
-        admission.observation_frame(&refused, (context(), valid()?), (media(), valid()?))?;
+    let frame = admission.inputs_frame(&refused, (inputs(), valid()?), (activation(), valid()?))?;
     let error = admission
-        .refusal(OBSERVATIONS, &binary_record_id(frame)?)
+        .refusal(EXECUTION_INPUTS, &binary_execution_id(frame)?)
         .await?;
     expect_eq(
         "a non-Variant type change",
@@ -1698,16 +1635,16 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     ];
     for (defect, bytes) in variant_defects {
         let frame = || {
-            admission.observation_frame(
+            admission.inputs_frame(
                 &refused,
-                (context(), Arc::clone(&bytes)),
-                (media(), valid()?),
+                (inputs(), Arc::clone(&bytes)),
+                (activation(), valid()?),
             )
         };
         admission
             .refuse(
                 &format!("an undeclared column outranks {defect} Variant bytes"),
-                OBSERVATIONS,
+                EXECUTION_INPUTS,
                 &undeclared(frame()?)?,
                 &BifrostError::UndeclaredField {
                     field: "undeclared".to_owned(),
@@ -1716,7 +1653,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             )
             .await?;
         let error = admission
-            .refusal(OBSERVATIONS, &binary_record_id(frame()?)?)
+            .refusal(EXECUTION_INPUTS, &binary_execution_id(frame()?)?)
             .await?;
         expect_eq(
             &format!("a non-Variant type change outranks {defect} Variant bytes"),
@@ -1794,24 +1731,24 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         )
         .await?;
 
-    // The accepted observation carries the one decimal form the exact numeric
+    // The accepted inputs row carries the one decimal form the exact numeric
     // domain admits, which must read back with every digit, and a finite float.
     let accepted = admission.session("accepted");
-    let sentinel = admission.observation_frame(
+    let sentinel = admission.inputs_frame(
         &accepted,
         (
-            context(),
+            inputs(),
             raw_variant(&EMPTY_METADATA, &decimal16(i128::from(u64::MAX), 0))?,
         ),
         (
-            media(),
+            activation(),
             raw_variant(
                 &EMPTY_METADATA,
                 &primitive(VARIANT_FLOAT, &1.5_f32.to_le_bytes()),
             )?,
         ),
     )?;
-    admission.accept(OBSERVATIONS, &sentinel).await?;
+    admission.accept(EXECUTION_INPUTS, &sentinel).await?;
     admission
         .accept(SPANS, &admission.spans_frame(&accepted))
         .await?;
@@ -1822,12 +1759,12 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
 
     let suffix = &admission.run;
     expect_eq(
-        "stored Eval observations",
+        "stored execution inputs",
         &admission
             .journey
             .rows(format!(
-                "SELECT session_id, count(*) FROM {OBSERVATIONS} \
-                 WHERE session_id LIKE '%{suffix}' GROUP BY session_id"
+                "SELECT verifier_card_uid, count(*) FROM {EXECUTION_INPUTS} \
+                 WHERE verifier_card_uid LIKE '%{suffix}' GROUP BY verifier_card_uid"
             ))
             .await?,
         &vec![vec![json!(accepted), json!(1)]],
@@ -1837,8 +1774,8 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         &admission
             .journey
             .rows(format!(
-                "SELECT context, media FROM {OBSERVATIONS} \
-                 WHERE session_id = '{accepted}'"
+                "SELECT inputs, activation FROM {EXECUTION_INPUTS} \
+                 WHERE verifier_card_uid = '{accepted}'"
             ))
             .await?,
         &vec![vec![json!(u64::MAX), json!(1.5)]],
@@ -1871,8 +1808,8 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
 }
 
 /// The non-signal built-in the Variant admission journey writes: a required
-/// `context` and a nullable `media` Variant beside fixed scalar columns.
-const OBSERVATIONS: &str = "vala.eval.observations";
+/// `inputs` and a nullable `activation` Variant beside fixed scalar columns.
+const EXECUTION_INPUTS: &str = "vala.verification.execution_inputs";
 
 /// The signal built-in whose nested `events` Variant the journey writes.
 const SPANS: &str = "vala.traces.spans";
@@ -1945,7 +1882,7 @@ impl VariantAdmissionJourney {
     async fn start() -> Result<Self, ServerJourneyError> {
         let journey = TypedPayloadJourney::start().await?;
         for (namespace, name) in [
-            ("eval", "observations"),
+            ("verification", "execution_inputs"),
             ("traces", "spans"),
             ("metrics", "points"),
         ] {
@@ -1988,12 +1925,12 @@ impl VariantAdmissionJourney {
         })
     }
 
-    /// Require that each JSON Eval observation row is refused before any ACK with
+    /// Require that each JSON execution inputs row is refused before any ACK with
     /// the exact Variant error the revision-13 order selects.
     ///
     /// Numeric range outranks depth in both key orders and inside the
     /// over-depth container; valid JSON nested 129 and 10,000 levels deep
-    /// is too deep rather than invalid; and a `context` value whose built
+    /// is too deep rather than invalid; and an `inputs` value whose built
     /// bytes already exceed the size limit reports size beside a refused
     /// number or an over-depth sibling. Each row goes through the public
     /// facade's JSON-row path with its integer token intact, and the refusal
@@ -2009,13 +1946,13 @@ impl VariantAdmissionJourney {
         };
         let deep = nested("1", 65);
         let numeric = |path: String| BifrostError::VariantNumericOutOfRange {
-            field: "context".to_owned(),
+            field: "inputs".to_owned(),
             row: 0,
             path,
             numeric_kind: "integer".to_owned(),
         };
         let too_deep = BifrostError::VariantTooDeep {
-            field: "context".to_owned(),
+            field: "inputs".to_owned(),
             row: 0,
             path: "/0".repeat(64),
             depth: VARIANT_MAX_DEPTH + 1,
@@ -2027,17 +1964,17 @@ impl VariantAdmissionJourney {
         );
         // The exact byte count is whatever the shared owner built before
         // refusing; the facade must surface that size error unchanged.
-        let too_large = |context: String| -> Result<(String, BifrostError), ServerJourneyError> {
-            let error = EncodedVariant::from_json_text(&context)
+        let too_large = |inputs: String| -> Result<(String, BifrostError), ServerJourneyError> {
+            let error = EncodedVariant::from_json_text(&inputs)
                 .err()
                 .ok_or("the oversized row encodes")?
-                .into_error("context", 0);
+                .into_error("inputs", 0);
             expect_eq(
                 "the oversized row's error",
                 &error.code(),
                 &"WYRD_VALA_413_VARIANT_TOO_LARGE",
             )?;
-            Ok((context, error))
+            Ok((inputs, error))
         };
         let cases = [
             (
@@ -2059,17 +1996,18 @@ impl VariantAdmissionJourney {
             ))?,
             too_large(format!(r#"{{"big": {big}, "other": {deep}}}"#))?,
         ];
-        for (context, expected) in cases {
+        for (inputs, expected) in cases {
             let bifrost = Bifrost::connect_with(&self.client, BifrostOptions::default()).await?;
-            let table = bifrost.writer_table(OBSERVATIONS).await?;
+            let table = bifrost.writer_table(EXECUTION_INPUTS).await?;
             let fields = table
                 .user_schema()
                 .fields()
                 .iter()
                 .map(|field| {
                     let value = match field.data_type() {
-                        _ if field.name() == "context" => context.clone(),
+                        _ if field.name() == "inputs" => inputs.clone(),
                         _ if field.is_nullable() => "null".to_owned(),
+                        DataType::Boolean => "false".to_owned(),
                         DataType::Timestamp(..) => format!("\"{}\"", Utc::now().to_rfc3339()),
                         _ => format!("\"{}\"", self.session("refused")),
                     };
@@ -2098,39 +2036,42 @@ impl VariantAdmissionJourney {
         format!("{outcome}-{}", self.run)
     }
 
-    /// One Eval observation under `session` with the given Variant columns.
+    /// One direct execution's inputs row under `session` with the given
+    /// Variant columns.
     ///
-    /// The row carries a fresh `record_id` and `session` as its `session_id`,
-    /// and no Card correlation, so it activates no binding. Every other column
-    /// takes a fixed valid value, so a refusal can come only from the two
-    /// supplied fields or a deliberate schema change.
+    /// The row carries a fresh `execution_id`, `session` as its
+    /// `verifier_card_uid`, no binding, and `queue_execution` false, so its
+    /// ACK can never queue work. Every other column takes a fixed valid
+    /// value, so a refusal can come only from the two supplied fields or a
+    /// deliberate schema change.
     ///
     /// # Errors
     ///
-    /// Returns the Arrow error when the columns do not form a batch.
-    fn observation_frame(
+    /// Returns the Arrow error when the columns do not form a batch, or an
+    /// error when a supplied field is undeclared.
+    fn inputs_frame(
         &self,
         session: &str,
-        context: (Field, ArrayRef),
-        media: (Field, ArrayRef),
+        inputs: (Field, ArrayRef),
+        activation: (Field, ArrayRef),
     ) -> Result<RecordBatch, ServerJourneyError> {
         let now = Utc::now().timestamp_micros();
         let text = |value: &str| Arc::new(StringArray::from(vec![value])) as ArrayRef;
-        let mut fields = EvalObservationsTable::arrow_fields();
+        let mut fields = ExecutionInputsTable::arrow_fields();
         let columns: Vec<ArrayRef> = vec![
             text(&format!("{session}-{}", uuid::Uuid::now_v7().simple())),
             text(session),
-            context.1,
-            Arc::new(FixedSizeBinaryArray::new_null(16, 1)),
-            Arc::new(FixedSizeBinaryArray::new_null(8, 1)),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+            Arc::new(BooleanArray::from(vec![false])),
+            inputs.1,
+            activation.1,
             Arc::new(TimestampMicrosecondArray::from(vec![now]).with_timezone(UTC_TIME_ZONE)),
-            media.1,
         ];
-        for field in [context.0, media.0] {
+        for field in [inputs.0, activation.0] {
             let index = fields
                 .iter()
                 .position(|declared| declared.name() == field.name())
-                .ok_or("an Eval observation field is undeclared")?;
+                .ok_or("an execution inputs field is undeclared")?;
             fields[index] = field;
         }
         Ok(RecordBatch::try_new(
@@ -2452,30 +2393,13 @@ fn expect_eq<T: PartialEq + Debug>(
     Err(format!("{what} differs:\n  stored   {actual:?}\n  expected {expected:?}").into())
 }
 
-/// Results the journey published and the native values they must read back as.
+/// Results the journey published and the native outcomes they must read
+/// back as.
 struct PublishedResults {
-    /// A Drift result whose report scored two features.
-    scored_drift: VerificationResultId,
+    /// A Drift result whose requirement scored two features.
+    scored_drift: (VerificationResultId, VerificationOutcome),
     /// A Drift result whose window could not be scored.
-    unscored_drift: VerificationResultId,
-    /// An Eval result with one ran assertion.
-    eval: VerificationResultId,
-    /// The scored report's `drift_report` as JSON: method, features, verdict.
-    drift_report: Value,
-    /// The Eval report's workflow summary as JSON.
-    eval_summary: Value,
-    /// The one Eval item's `actual` and `expected` values.
-    item: Vec<Value>,
-}
-
-/// The written Eval observation and its native payloads.
-struct WrittenObservation {
-    /// Record id identifying the one written row.
-    record: String,
-    /// The observation's context payload.
-    context: Value,
-    /// The observation's media payload.
-    media: Value,
+    unscored_drift: (VerificationResultId, VerificationOutcome),
 }
 
 /// The staged audit decision and its native detail.
@@ -2503,10 +2427,10 @@ impl TypedPayloadJourney {
         })
     }
 
-    /// Publish a scored Drift, an unscored Drift, and an Eval result through
-    /// the production payload builder, staged on the process Scribe outbox
-    /// under the tenant SYSTEM principal as the server's internal result
-    /// writer does, then flushed.
+    /// Publish a scored and an unscored Drift outcome through the production
+    /// payload builder, staged on the process Scribe outbox under the tenant
+    /// SYSTEM principal as the server's internal result writer does, then
+    /// flushed.
     ///
     /// # Errors
     /// Returns a seeding, payload, or flush error.
@@ -2518,86 +2442,39 @@ impl TypedPayloadJourney {
         .await?;
         let (subject, _) = seed.service("typed-subject").await?;
         let uid = seed.drift_verifier("typed-drift").await?;
-        for (namespace, name) in [
-            ("verification", "results"),
-            ("drift", "result_features"),
-            ("eval", "result_items"),
-        ] {
+        for (namespace, name) in [("verification", "results"), ("drift", "result_features")] {
             self.gateway
                 .server
                 .ensure_builtin_table_for_test(self.gateway.tenant, namespace, name)
                 .await?;
         }
         let now = Utc::now();
-        let window = RunInput::DriftWindow(DriftWindow {
+        let window = DriftWindow {
             start: now - chrono::Duration::hours(1),
             end: now,
-        });
-        let scored = VerifierReport::Drift(Some(serde_json::from_value(json!({
-            "method": "Custom",
-            "features": {
-                "latency": { "feature": "latency", "score": 3.0, "threshold": 1.0, "verdict": "Drift" },
-                "tokens": { "feature": "tokens", "score": 0.1, "threshold": 1.0, "verdict": "NoDrift" }
-            },
-            "verdict": "Drift"
-        }))?));
-        let VerifierReport::Drift(Some(drift)) = &scored else {
-            return Err("the scored report is not a Drift report".into());
         };
-        let drift_report = json!({
-            "method": "Custom",
-            "features": serde_json::to_value(&drift.features)?,
-            "verdict": "Drift",
-        });
-        let actual = json!({"answer": "yes", "scores": [1, 2.5, null], "nested": {"ok": true}});
-        let expected = json!({"answer": "yes"});
-        let eval_report = EvalReport {
-            outcomes: vec![TaskRunOutcome::Ran(Box::new(AssertionResult {
-                task_id: TaskId::new("answer")?,
-                passed: true,
-                actual: Some(actual.clone()),
-                expected: expected.clone(),
-                operator: ComparisonOperator::Equals,
-                message: None,
-                stage: 0,
-                started_at: now,
-                duration_ms: 7,
-            }))],
-        };
-        let eval_summary = serde_json::to_value(eval_report.workflow_summary())?;
-        let eval_input = RunInput::EvalRecord {
-            record_id: format!("typed-{}", uuid::Uuid::now_v7()),
-            event_time: now,
-        };
-        let eval = VerifierReport::Eval {
-            report: eval_report,
-            verdict: VerificationVerdict::Passed,
-            run_id: None,
-        };
-
         let mut published = Vec::new();
-        for (input, report) in [
-            (&window, &scored),
-            (&window, &VerifierReport::Drift(None)),
-            (&eval_input, &eval),
+        for outcome in [
+            drift_outcome(Some(two_feature_report()?))?,
+            drift_outcome(None)?,
         ] {
-            let result = VerificationResultId::new_v7();
             let payload = ResultPayloadBuilder::new(
                 ResultRun {
+                    execution_id: ExecutionId::new_v7(),
                     run_id: None,
                     verifier_version: "1.0.0",
                     card_uid: &subject,
                     owner_card_uid: Some(&subject),
                     binding_id: Some(BindingId::new_v7()),
                     trigger: None,
-                    input,
+                    window: Some(&window),
                 },
                 &uid,
-                result,
                 now,
                 now,
             )
-            .build(report)?;
+            .build(&outcome)?;
+            let result = payload.result_id();
             self.gateway.server.state().scribe_outbox.stage(
                 self.gateway.tenant,
                 ScribeWrite::Result {
@@ -2605,86 +2482,14 @@ impl TypedPayloadJourney {
                     attribution: Attribution::direct(PrincipalId::new(seed.system_principal())),
                 },
             );
-            published.push(result);
+            published.push((result, outcome));
         }
         self.gateway.server.flush_bifrost().await?;
-        let [scored_drift, unscored_drift, eval] = published[..] else {
-            return Err("three results were not published".into());
-        };
+        let [scored_drift, unscored_drift] =
+            <[_; 2]>::try_from(published).map_err(|_| "two results were not published")?;
         Ok(PublishedResults {
             scored_drift,
             unscored_drift,
-            eval,
-            drift_report,
-            eval_summary,
-            item: vec![actual, expected],
-        })
-    }
-
-    /// Write one Eval observation with nested `context` and `media` payloads
-    /// through the public Bifrost facade as a tenant administrator.
-    ///
-    /// The row names no Card, so it activates no binding.
-    ///
-    /// # Errors
-    /// Returns a bootstrap, provisioning, encoding, or write error.
-    async fn write_eval_observation(&self) -> Result<WrittenObservation, ServerJourneyError> {
-        let Bootstrap::Machine { api_key, .. } = self
-            .gateway
-            .server
-            .bootstrap_service("typed_observation_writer", &["admin"])
-            .await?
-        else {
-            return Err("a service bootstrap returned a user".into());
-        };
-        self.gateway
-            .server
-            .ensure_builtin_table_for_test(self.gateway.tenant, "eval", "observations")
-            .await?;
-        let record = format!("typed-{}", uuid::Uuid::now_v7());
-        let context = json!([
-            {"role": "user", "content": "find wyrd"},
-            {"role": "assistant", "content": null,
-             "tool_calls": [{"name": "search", "arguments": {"q": "wyrd", "limit": 3}}]},
-        ]);
-        let media =
-            json!({"search": {"input": {"q": "wyrd"}, "output": [1, 2.5, true, null, "x"]}});
-        let variant = |value: &Value| -> Result<ArrayRef, ServerJourneyError> {
-            let encoded = EncodedVariant::from_json(value)
-                .map_err(|violation| format!("the payload does not encode: {violation:?}"))?;
-            let mut builder = VariantColumnBuilder::with_capacity(1);
-            builder.append(&encoded);
-            Ok(builder.finish())
-        };
-        let text = |value: &str| Arc::new(StringArray::from(vec![value])) as ArrayRef;
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(EvalObservationsTable::arrow_fields())),
-            vec![
-                text(&record),
-                text("typed-session"),
-                variant(&context)?,
-                Arc::new(FixedSizeBinaryArray::new_null(16, 1)),
-                Arc::new(FixedSizeBinaryArray::new_null(8, 1)),
-                Arc::new(
-                    TimestampMicrosecondArray::from(vec![Utc::now().timestamp_micros()])
-                        .with_timezone(UTC_TIME_ZONE),
-                ),
-                variant(&media)?,
-            ],
-        )?;
-        let writer = wyrd_client::bifrost::client_from_options(
-            self.gateway.server.base_url(),
-            Some(api_key.expose_secret()),
-            self.gateway.server.grpc_url().as_deref(),
-        )?;
-        Bifrost::connect_with(&writer, BifrostOptions::default())
-            .await?
-            .write_batch(OBSERVATIONS, &batch)
-            .await?;
-        Ok(WrittenObservation {
-            record,
-            context,
-            media,
         })
     }
 
@@ -2794,21 +2599,81 @@ impl TypedPayloadJourney {
     }
 }
 
-/// Role a delegated manual run needs from both its subject and actor.
+/// Register a Verifier whose one requirement asserts its `x` JSON input is
+/// `true`, so an enqueued execution reads no external evidence.
+///
+/// # Errors
+/// Returns a fixture error when the Card write fails.
+async fn assert_verifier(
+    seed: &VerificationFixture,
+    name: &str,
+) -> Result<CardUid, ServerJourneyError> {
+    Ok(seed
+        .verifier(
+            name,
+            &json!({
+                "inputs": { "x": { "type": "json" } },
+                "requirements": [{ "id": "valid", "statement": "x holds",
+                    "check": { "kind": "assert", "path": "inputs.x",
+                        "operator": "equals", "expected": true } }]
+            }),
+        )
+        .await?)
+}
+
+/// Body of `POST /v1/verification/enqueue` asking `verifier` to judge
+/// `subject` over the caller-supplied `inputs` declarations.
+fn enqueue_body(verifier: &CardUid, subject: &CardUid, inputs: Value) -> Value {
+    json!({ "verifier_card_uid": verifier, "card_uid": subject, "inputs": inputs })
+}
+
+/// Parse the `execution_id` of an accepted enqueue and wait until the
+/// staged execution reaches the queue, which happens only after Scribe
+/// acknowledges it.
+///
+/// # Errors
+/// Returns a fixture error, or a description when the response carries no
+/// ID or the execution is not queued within [`WAIT`].
+async fn await_queued(
+    seed: &VerificationFixture,
+    accepted: &Value,
+) -> Result<ExecutionId, ServerJourneyError> {
+    let id = accepted["execution_id"]
+        .as_str()
+        .ok_or("the execution has an ID")?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        if let Some(execution) = seed
+            .executions()
+            .await?
+            .into_iter()
+            .find(|execution| execution.to_string() == id)
+        {
+            return Ok(execution);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("the accepted execution {id} was never queued").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Role a delegated enqueue needs from both its subject and actor.
 const QUEUED_RUNNER: &str = "queued_runner";
 
-/// Role only the subject holds, so a delegated run's accepted authority
-/// excludes it.
+/// Role only the subject holds, so a delegated execution's accepted
+/// authority excludes it.
 const QUEUED_SUBJECT_ONLY: &str = "queued_subject_only";
 
-/// A delegated manual run keeps its accepted subject, actor history, and
-/// narrowed authority through a retry and a restarted runtime (AC-013/017).
+/// A delegated enqueued execution keeps its accepted subject, actor
+/// history, and narrowed authority through a retry and a restarted runtime
+/// (AC-013/017).
 ///
 /// User A holds the runner role and gateway invocation; Service B holds
-/// only the runner role. B, acting for A, starts a manual Drift run over the
-/// public route. The run is stored as A/B with an authority snapshot whose
-/// principal is A, whose delegation chain names B, and which carries no
-/// gateway grant; the run view exposes no snapshot. A's runner role is then
+/// only the runner role. B, acting for A, enqueues an assertion Verifier
+/// over the public route. The execution is stored as A/B with an authority
+/// snapshot whose principal is A, whose delegation chain names B, and which
+/// carries no gateway grant; the execution view exposes no snapshot. A's runner role is then
 /// revoked and B is granted gateway invocation. A first runtime fails the
 /// attempt retryably and stops; a newly built runtime, holding no caller
 /// state, completes it. The snapshot is byte-for-byte unchanged and the
@@ -2824,9 +2689,7 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
     let tenant = server.data_tenant_id();
     let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
     let (subject, _) = seed.service("queued-subject").await?;
-    let verifier = seed
-        .custom_drift_verifier("queued-drift", "score", 1.0, 0.5)
-        .await?;
+    let verifier = assert_verifier(&seed, "queued-assert").await?;
     server
         .seed_role(
             QUEUED_RUNNER,
@@ -2852,36 +2715,26 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
             wyrd_spec::auth::TokenAudience::Wyrd,
         )
         .await?;
-    let now = Utc::now();
     let started: Value = delegated
         .request_json(
             reqwest::Method::POST,
-            "/v1/verification/runs",
-            Some(&json!({
-                "target": { "kind": "verifier", "verifier_card_uid": verifier, "card_uid": subject },
-                "input": { "kind": "drift_window",
-                    "start": now - chrono::Duration::hours(1), "end": now }
-            })),
+            "/v1/verification/enqueue",
+            Some(&enqueue_body(
+                &verifier,
+                &subject,
+                json!({ "x": { "kind": "json", "value": true } }),
+            )),
         )
         .await?;
-    let run_id = started["run_id"]
-        .as_str()
-        .ok_or("the run has an ID")?
-        .to_owned();
-    let run = seed
-        .runs()
-        .await?
-        .into_iter()
-        .find(|run| run.to_string() == run_id)
-        .ok_or("the accepted run is queued")?;
+    let execution = await_queued(&seed, &started).await?;
 
     let superuser = server.pg_fixture().superuser_pool()?;
     let stored = async || -> Result<(uuid::Uuid, uuid::Uuid, Value), ServerJourneyError> {
         Ok(sqlx::query_as(
-            "SELECT sub_principal_id, act_principal_id, authority FROM wyrd.verifier_runs \
-             WHERE run_id = $1",
+            "SELECT sub_principal_id, act_principal_id, authority \
+             FROM wyrd.verifier_executions WHERE execution_id = $1",
         )
-        .bind(run.as_uuid())
+        .bind(execution.as_uuid())
         .fetch_one(&superuser)
         .await?)
     };
@@ -2903,15 +2756,12 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
     let view: Value = delegated
         .request_json::<(), _>(
             reqwest::Method::GET,
-            &format!("/v1/verification/runs/{run_id}"),
+            &format!("/v1/verification/executions/{execution}"),
             None,
         )
         .await?;
-    if view.get("authority").is_some()
-        || view["sub_principal_id"] != json!(a_id)
-        || view["act_principal_id"] != json!(b_id)
-    {
-        return Err(format!("the run view differs or exposes authority: {view}").into());
+    if view.get("authority").is_some() || view["execution_id"] != json!(execution.to_string()) {
+        return Err(format!("the execution view differs or exposes authority: {view}").into());
     }
 
     server.revoke_role(&a, QUEUED_RUNNER).await?;
@@ -2920,42 +2770,38 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
         code: "test_transient".to_owned(),
         message: "the first worker fails transiently".to_owned(),
     };
-    let settled = async |outcome: EngineOutcome,
-                         done: &[&str]|
-           -> Result<wyrd_testing::verification::RunRow, ServerJourneyError> {
-        let script = EngineScript::default();
-        script.push_unheld(outcome);
-        let runtime = VerificationRuntime::builder(server.state())
-            .engine_script(script)
-            .build()
-            .ok_or("the runtime did not compose")?;
-        let stop = CancellationToken::new();
-        let task = tokio::spawn(runtime.run(stop.clone()));
-        let deadline = tokio::time::Instant::now() + WAIT;
-        let row = loop {
-            let row = seed.run(run).await?;
-            if done.contains(&row.status.as_str()) {
-                break row;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!("the run never reached {done:?}: {row:?}").into());
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    let settled =
+        async |outcome: EngineOutcome, done: &[&str]| -> Result<ExecutionRow, ServerJourneyError> {
+            let script = EngineScript::default();
+            script.push_unheld(outcome);
+            let runtime = VerificationRuntime::builder(server.state())
+                .engine_script(script)
+                .build()
+                .ok_or("the runtime did not compose")?;
+            let stop = CancellationToken::new();
+            let task = tokio::spawn(runtime.run(stop.clone()));
+            let deadline = tokio::time::Instant::now() + WAIT;
+            let row = loop {
+                let row = seed.execution(execution).await?;
+                if done.contains(&row.status.as_str()) {
+                    break row;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("the execution never reached {done:?}: {row:?}").into());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            stop.cancel();
+            tokio::time::timeout(WAIT, task).await??;
+            Ok(row)
         };
-        stop.cancel();
-        tokio::time::timeout(WAIT, task).await??;
-        Ok(row)
-    };
     let first = settled(EngineOutcome::Retry(retryable), &["retrying"]).await?;
-    seed.make_retry_due(run).await?;
-    let report: wyrd_server::verification::engines::VerifierReport = VerifierReport::Drift(Some(
-        serde_json::from_value(json!({
-            "method": "Custom",
-            "features": { "score": { "feature": "score", "score": 0.1, "threshold": 0.5, "verdict": "NoDrift" } },
-            "verdict": "NoDrift"
-        }))?,
-    ));
-    let second = settled(EngineOutcome::Completed(report), &["completed", "errored"]).await?;
+    seed.make_retry_due(execution).await?;
+    let second = settled(
+        EngineOutcome::Completed(drift_outcome(None)?),
+        &["completed", "errored"],
+    )
+    .await?;
     let (Some(result), 2, "completed") =
         (second.result_id, second.attempts, second.status.as_str())
     else {
@@ -2966,7 +2812,7 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
     };
     let (sub, act, after) = stored().await?;
     if (sub, act) != (a_id, b_id) || after != authority {
-        return Err(format!("the accepted run changed: {sub}/{act} {after}").into());
+        return Err(format!("the accepted execution changed: {sub}/{act} {after}").into());
     }
 
     let unwritten = server
@@ -2995,15 +2841,15 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
     Ok(())
 }
 
-/// A delegated run's SYSTEM input reads keep the accepted delegation history
-/// (REQ-008/010, AC-017, FIND-TASK-001-6).
+/// A delegated execution's trace input reads keep the accepted delegation
+/// history (REQ-008/010, AC-017, FIND-TASK-001-6).
 ///
-/// Service B, acting for User A, starts a manual Drift run over the public
-/// route. The real Drift engine reads the registered observation table under
-/// the tenant SYSTEM read authority. Every retained read decision of that run
-/// is recorded for A with SYSTEM as actor and carries exactly the accepted
-/// chain `[B]`; the history is attribution only, so the run still completes
-/// under SYSTEM's table grant alone.
+/// Service B, acting for User A, enqueues a trace Verifier over the public
+/// route naming a trace that was never recorded. The real runtime reads the
+/// registered span table as the accepted caller. Every retained read
+/// decision of that execution is recorded for A with SYSTEM as actor and
+/// carries exactly the accepted chain `[B]`; the absent trace makes the
+/// requirement inconclusive, so the execution still completes.
 ///
 /// # Errors
 /// Returns server, exchange, route, runtime, or query errors, or a
@@ -3016,15 +2862,29 @@ async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> 
     let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
     let (subject, _) = seed.service("history-subject").await?;
     let verifier = seed
-        .custom_drift_verifier("history-drift", "score", 1.0, 0.5)
+        .verifier(
+            "history-trace",
+            &json!({
+                "inputs": { "trace": { "type": "trace" } },
+                "requirements": [{ "id": "traced", "statement": "the trace retrieves first",
+                    "check": { "kind": "trace", "on": "inputs.trace",
+                        "span_selector": "$.spans[0].name",
+                        "operator": "equals", "expected": "retrieve" } }]
+            }),
+        )
         .await?;
     server
-        .ensure_builtin_table_for_test(tenant, "drift", "observations")
+        .ensure_builtin_table_for_test(tenant, "traces", "spans")
         .await?;
     server
         .seed_role(
             QUEUED_RUNNER,
-            &[Permission::card_read(), Permission::verifier_run_any()],
+            &[
+                Permission::card_read(),
+                Permission::verifier_run_any(),
+                Permission::bifrost_table_read(),
+                Permission::bifrost_query_read(),
+            ],
         )
         .await?;
     let a = server.bootstrap_user("history-a", &[QUEUED_RUNNER]).await?;
@@ -3038,25 +2898,19 @@ async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> 
             wyrd_spec::auth::TokenAudience::Wyrd,
         )
         .await?;
-    let now = Utc::now();
     let started: Value = delegated
         .request_json(
             reqwest::Method::POST,
-            "/v1/verification/runs",
-            Some(&json!({
-                "target": { "kind": "verifier", "verifier_card_uid": verifier, "card_uid": subject },
-                "input": { "kind": "drift_window",
-                    "start": now - chrono::Duration::hours(1), "end": now }
-            })),
+            "/v1/verification/enqueue",
+            Some(&enqueue_body(
+                &verifier,
+                &subject,
+                json!({ "trace": { "kind": "trace",
+                    "trace_id": uuid::Uuid::now_v7().simple().to_string() } }),
+            )),
         )
         .await?;
-    let run_id = started["run_id"].as_str().ok_or("the run has an ID")?;
-    let run = seed
-        .runs()
-        .await?
-        .into_iter()
-        .find(|run| run.to_string() == run_id)
-        .ok_or("the accepted run is queued")?;
+    let execution = await_queued(&seed, &started).await?;
 
     let runtime = VerificationRuntime::builder(server.state())
         .build()
@@ -3065,19 +2919,19 @@ async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> 
     let task = tokio::spawn(runtime.run(stop.clone()));
     let deadline = tokio::time::Instant::now() + WAIT;
     let row = loop {
-        let row = seed.run(run).await?;
+        let row = seed.execution(execution).await?;
         if !["pending", "running", "retrying"].contains(&row.status.as_str()) {
             break row;
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("the Drift run never settled: {row:?}").into());
+            return Err(format!("the trace execution never settled: {row:?}").into());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
     if row.status != "completed" {
-        return Err(format!("the delegated Drift run settled {row:?}").into());
+        return Err(format!("the delegated trace execution settled {row:?}").into());
     }
 
     server.await_audit_retained().await?;
@@ -3090,7 +2944,7 @@ async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> 
         )
         .await?;
     if reads.is_empty() {
-        return Err("the run's input read retained no decision for A".into());
+        return Err("the execution's trace read retained no decision for A".into());
     }
     let system = seed.system_principal().to_string();
     for read in &reads {
@@ -3121,8 +2975,8 @@ async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> 
 ///
 /// A monthly Custom Drift binding of a subject Card is owned by a separate
 /// Service. Once the owner is active and the occurrence is due, the production
-/// runtime accepts it and runs the real Drift engine. The stored run pairs the
-/// owner with SYSTEM and captures the owner's recovered authority with no
+/// runtime accepts it and runs the real Drift engine. The stored execution
+/// pairs the owner with SYSTEM and captures the owner's recovered authority with no
 /// delegation history; its input read decision and its published result carry
 /// the same owner/SYSTEM pair.
 ///
@@ -3144,7 +2998,14 @@ async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyErro
         .ensure_builtin_table_for_test(tenant, "drift", "observations")
         .await?;
     let binding = seed
-        .bind_schedule(&owner, &subject, &verifier, MONTHLY, Vec::new())
+        .bind_schedule(
+            &owner,
+            &subject,
+            &verifier,
+            MONTHLY,
+            VerificationFixture::metric_inputs("score"),
+            Vec::new(),
+        )
         .await?;
     seed.activate(owner_principal).await?;
     seed.make_binding_due(binding).await?;
@@ -3154,19 +3015,7 @@ async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyErro
         .ok_or("the runtime did not compose")?;
     let stop = CancellationToken::new();
     let task = tokio::spawn(runtime.run(stop.clone()));
-    let deadline = tokio::time::Instant::now() + WAIT;
-    let (run, row) = loop {
-        if let Some(run) = seed.runs().await?.first().copied() {
-            let row = seed.run(run).await?;
-            if !["pending", "running", "retrying"].contains(&row.status.as_str()) {
-                break (run, row);
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("the scheduled Drift run never settled".into());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let (execution, row) = first_settled(&seed, &["pending", "running", "retrying"]).await?;
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
     let ("completed", Some(result)) = (row.status.as_str(), row.result_id) else {
@@ -3175,10 +3024,10 @@ async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyErro
 
     let (owner_id, system) = (owner_principal.as_uuid(), seed.system_principal());
     let (sub, act, authority): (uuid::Uuid, uuid::Uuid, Value) = sqlx::query_as(
-        "SELECT sub_principal_id, act_principal_id, authority FROM wyrd.verifier_runs \
-         WHERE run_id = $1",
+        "SELECT sub_principal_id, act_principal_id, authority FROM wyrd.verifier_executions \
+         WHERE execution_id = $1",
     )
-    .bind(run.as_uuid())
+    .bind(execution.as_uuid())
     .fetch_one(&server.pg_fixture().superuser_pool()?)
     .await?;
     if (sub, act) != (owner_id, system)
@@ -3189,7 +3038,7 @@ async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyErro
             .is_some_and(|chain| !chain.is_empty())
     {
         return Err(format!(
-            "expected the owner/SYSTEM run under the owner's own authority, read \
+            "expected the owner/SYSTEM execution under the owner's own authority, read \
              {sub}/{act} {authority}"
         )
         .into());
@@ -3242,11 +3091,11 @@ async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyErro
 /// short enough to observe the initiating credential expire.
 const WIDEN_ACCESS_TTL: chrono::Duration = chrono::Duration::seconds(3);
 
-/// A queued run's reloaded authority cannot reach a model its captured
-/// delegated intersection excluded (AC-013/017, FIND-TASK-001-7).
+/// A queued execution's reloaded authority cannot reach a model its
+/// captured delegated intersection excluded (AC-013/017, FIND-TASK-001-7).
 ///
 /// User A holds the runner and model roles; Service B holds only the
-/// runner role. B, acting for A, queues a manual Drift run, so the stored
+/// runner role. B, acting for A, enqueues an assertion Verifier, so the stored
 /// authority is A's narrowed by B and carries no model grant. B is then
 /// granted the model role and the initiating delegated token is let expire
 /// until the server refuses it. A fresh queue claim reloads the stored
@@ -3269,7 +3118,7 @@ const WIDEN_ACCESS_TTL: chrono::Duration = chrono::Duration::seconds(3);
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJourneyError> {
     /// The role carrying the gateway model's invoke permission: A holds it
-    /// before acceptance, B receives it only after the run is accepted, so
+    /// before acceptance, B receives it only after the execution is accepted, so
     /// the captured A∩B authority lacks it while B's fresh token, the
     /// positive control, has it.
     const MODEL_ROLE: &str = "widen_model";
@@ -3298,9 +3147,7 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
     let tenant = server.data_tenant_id();
     let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
     let (subject, _) = seed.service("widen-subject").await?;
-    let verifier = seed
-        .custom_drift_verifier("widen-drift", "score", 1.0, 0.5)
-        .await?;
+    let verifier = assert_verifier(&seed, "widen-assert").await?;
     server
         .deploy_gateway_model_for_test("gpt-test", MODEL_ROLE)
         .await?;
@@ -3328,24 +3175,30 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
             wyrd_spec::auth::TokenAudience::Wyrd,
         )
         .await?;
-    let now = Utc::now();
     let started = server
         .oneshot_authenticated(
             &initiating,
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/v1/verification/runs")
+                .uri("/v1/verification/enqueue")
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(serde_json::to_vec(&json!({
-                    "target": { "kind": "verifier", "verifier_card_uid": verifier, "card_uid": subject },
-                    "input": { "kind": "drift_window",
-                        "start": now - chrono::Duration::hours(1), "end": now }
-                }))?))?,
+                .body(axum::body::Body::from(serde_json::to_vec(&enqueue_body(
+                    &verifier,
+                    &subject,
+                    json!({ "x": { "kind": "json", "value": true } }),
+                ))?))?,
         )
         .await?;
     if !started.status().is_success() {
-        return Err(format!("the delegated run was not accepted: {}", started.status()).into());
+        return Err(format!(
+            "the delegated execution was not accepted: {}",
+            started.status()
+        )
+        .into());
     }
+    let accepted: Value =
+        serde_json::from_slice(&axum::body::to_bytes(started.into_body(), usize::MAX).await?)?;
+    let execution = await_queued(&seed, &accepted).await?;
 
     server.grant_role(&b, MODEL_ROLE).await?;
     let deadline = tokio::time::Instant::now() + WAIT;
@@ -3354,7 +3207,7 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
             .oneshot_authenticated(
                 &initiating,
                 axum::http::Request::builder()
-                    .uri("/v1/verification/runs")
+                    .uri(format!("/v1/verification/executions/{execution}"))
                     .body(axum::body::Body::empty())?,
             )
             .await?;
@@ -3368,10 +3221,10 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
     }
 
     let mut conn = server.tenant_conn_for(tenant).await?;
-    let claimed = wyrd_sql::queries::verifier_runs::VerifierRunQueue::default()
+    let claimed = wyrd_sql::queries::verifier_executions::VerifierExecutionQueue::default()
         .claim(&mut conn, chrono::Duration::minutes(1))
         .await?
-        .ok_or("the queued run is claimable")?;
+        .ok_or("the queued execution is claimable")?;
     conn.commit().await?;
     let system = claimed.system_principal.ok_or("the tenant has SYSTEM")?;
     let call = |subject: Option<CardUid>| wyrd_server::components::gateway::GatewayCallRequest {

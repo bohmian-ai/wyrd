@@ -1,8 +1,8 @@
 //! The benchmark tenant, provisioned the way a tenant administrator and an
 //! application would through the public client.
 //!
-//! The administrator registers a Service whose one component is a Model,
-//! issues the Service its Card-bound key, and hydrates the bundle the
+//! The administrator registers a Service whose one component is a Model
+//! bound to the Window Verifier that routes its Drift samples, issues the Service its Card-bound key, and hydrates the bundle the
 //! application's `WyrdState` loads offline. Registration gives the Service
 //! principal the `workload` role, so its key emits Drift observations; the
 //! administrator reads them back through Bifrost.
@@ -19,12 +19,15 @@ use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse};
 use wyrd_testing::release_server::{SERVER_URL, SetupTenant};
 
 use crate::client_queue::Result;
+use crate::client_queue::step::FEATURES;
+use crate::fixture::drift_verifier_yaml;
 
 /// The Model Card whose Drift observations the benchmark emits.
 const MODEL: &str = "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: ingest-model\n  version: 1.0.0\n  space: default\nspec:\n  interface:\n    kind: Custom\n    meta:\n      framework_version: 0.1.0\n      loader_module: fixture\n      loader_class: TinyModel\n      extra: {}\n  task_type: Other\n  signature:\n    inputs:\n      - name: f0\n        dtype: float64\n    outputs:\n      - name: score\n        dtype: float64\n  card_refs: []\n";
 
-/// The Service Card composing [`MODEL`] under the alias `model`.
-const SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: ingest-service\n  version: 1.0.0\n  space: default\nspec:\n  components:\n    - alias: model\n      ref: ./model.yaml\n";
+/// The Service Card composing [`MODEL`] under the alias `model`, bound
+/// without a schedule to the Window Verifier of `ingest.yaml`.
+const SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: ingest-service\n  version: 1.0.0\n  space: default\nspec:\n  components:\n    - alias: model\n      ref: ./model.yaml\n      verified_by:\n        - verifier: ./ingest.yaml\n";
 
 /// One provisioned tenant and the identities its traffic uses.
 pub struct Tenant {
@@ -54,6 +57,7 @@ impl Tenant {
     pub async fn provision(setup: &SetupTenant, root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root)?;
         std::fs::write(root.join("model.yaml"), MODEL)?;
+        std::fs::write(root.join("ingest.yaml"), drift_verifier_yaml(FEATURES))?;
         std::fs::write(root.join("service.yaml"), SERVICE)?;
         let admin = connect(&setup.api_key, None)?;
         let cards = Cards::connect_with(&admin).await?;

@@ -28,9 +28,53 @@ use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::registry::{CardLifecycleStatus, RegistrationOutcomeKind};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verification::{InactivityTimeout, binding_activity};
-use wyrd_sql::queries::verifier_runs::{ScheduleOutcome, ScheduleSkip, VerifierRunQueue};
+use wyrd_sql::queries::verifier_executions::{
+    ScheduleOutcome, ScheduleSkip, VerifierExecutionQueue,
+};
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
+
+/// An assertion Verifier spec over one `json` slot.
+///
+/// It has no `samples` slot, so a schedule Trigger cannot activate it, and no
+/// drift check, so a bound Operator cannot template `drift.*` fields.
+fn assertion_verifier_spec() -> Value {
+    json!({
+        "inputs": { "answer": { "type": "json" } },
+        "requirements": [{
+            "id": "answer-is-one",
+            "statement": "The answer is one.",
+            "check": { "kind": "assert", "path": "inputs.answer", "operator": "equals", "expected": 1 }
+        }]
+    })
+}
+
+/// A Custom Drift Verifier spec over the `latency_ms` metric samples.
+///
+/// It needs no fitted baseline, and its one `samples` slot lets a schedule
+/// Trigger activate it through [`latency_inputs`].
+fn latency_drift_spec() -> Value {
+    json!({
+        "inputs": { "samples": { "type": "samples", "features": ["latency_ms"] } },
+        "requirements": [{
+            "id": "drift",
+            "statement": "The window does not drift.",
+            "check": {
+                "kind": "drift", "on": "inputs.samples", "method": "Custom",
+                "signal": { "kind": "Metric", "name": "latency_ms" },
+                "condition": { "kind": "Statistical" },
+                "profile": { "kind": "Custom", "metric_name": "latency_ms",
+                             "baseline_value": 100.0, "alert_threshold": 10.0 }
+            }
+        }]
+    })
+}
+
+/// The schedule binding `inputs` mapping that fills [`latency_drift_spec`]'s
+/// `samples` slot from the recorded `latency_ms` metric.
+fn latency_inputs() -> Value {
+    json!({ "samples": { "metric": "latency_ms" } })
+}
 
 /// Seed a dependency row directly so the journey can exercise non-Active states.
 ///
@@ -861,14 +905,30 @@ async fn non_active_and_cross_tenant_dependencies_leave_no_writes() {
 }
 
 /// Build an Agent submission whose `verified_by` binds already-registered peers.
+///
+/// `trigger_name` names the binding's `runs_on` Trigger; `None` authors an
+/// explicit-only binding with no `runs_on`.
 fn bound_agent_request(
     name: &str,
     prompt_name: &str,
     verifier_name: &str,
-    trigger_name: &str,
+    trigger_name: Option<&str>,
     on_failure: Value,
     idempotency_key: &str,
 ) -> Request<Body> {
+    let mut binding = json!({
+        "verifier": {
+            "kind": "Verifier", "name": verifier_name,
+            "version": "1.0.0", "space": "default"
+        },
+        "on_failure": on_failure,
+    });
+    if let Some(trigger_name) = trigger_name {
+        binding["runs_on"] = json!({
+            "kind": "Trigger", "name": trigger_name,
+            "version": "1.0.0", "space": "default"
+        });
+    }
     request_with_body(
         idempotency_key,
         json!({ "submissions": [{
@@ -880,17 +940,7 @@ fn bound_agent_request(
                     "kind": "Prompt", "name": prompt_name,
                     "version": "1.0.0", "space": "default"
                 }, "execution_route": {"kind": "native"},
-                "verified_by": [{
-                    "verifier": {
-                        "kind": "Verifier", "name": verifier_name,
-                        "version": "1.0.0", "space": "default"
-                    },
-                    "runs_on": {
-                        "kind": "Trigger", "name": trigger_name,
-                        "version": "1.0.0", "space": "default"
-                    },
-                    "on_failure": on_failure,
-                }],
+                "verified_by": [binding],
             },
             "artifacts": []
         }] }),
@@ -899,8 +949,9 @@ fn bound_agent_request(
 
 /// Reject every binding refusal at the authenticated route before any write.
 ///
-/// A `drift.*` template field on an Eval binding's inline or referenced
-/// Operator is refused with the offending binding field path.
+/// A `drift.*` template field on an assertion Verifier binding's inline or
+/// referenced Operator is refused with the offending binding field path, and
+/// a schedule Trigger cannot activate that samples-free Verifier.
 ///
 /// Four branches are only reachable with a real registry behind them: the
 /// effective Operator and Trigger bodies come from previously registered
@@ -944,17 +995,8 @@ async fn referenced_binding_refusals_leave_no_writes() {
         &server,
         tenant,
         "Verifier",
-        "binding-eval-verifier",
-        json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
-        "active",
-    )
-    .await;
-    seed_card(
-        &server,
-        tenant,
-        "Trigger",
-        "binding-observations-trigger",
-        json!({ "kind": "observations_ready" }),
+        "binding-assertion-verifier",
+        assertion_verifier_spec(),
         "active",
     )
     .await;
@@ -1000,8 +1042,8 @@ async fn referenced_binding_refusals_leave_no_writes() {
                 bound_agent_request(
                     &agent,
                     "binding-prompt",
-                    "binding-eval-verifier",
-                    "binding-observations-trigger",
+                    "binding-assertion-verifier",
+                    None,
                     on_failure,
                     &operation,
                 ),
@@ -1030,8 +1072,8 @@ async fn referenced_binding_refusals_leave_no_writes() {
             bound_agent_request(
                 "binding-mismatch-agent",
                 "binding-prompt",
-                "binding-eval-verifier",
-                "binding-schedule-trigger",
+                "binding-assertion-verifier",
+                Some("binding-schedule-trigger"),
                 json!([]),
                 "binding-mismatch-operation",
             ),
@@ -1070,7 +1112,7 @@ async fn referenced_binding_refusals_leave_no_writes() {
         other_tenant,
         "Verifier",
         "binding-foreign-verifier",
-        json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
+        assertion_verifier_spec(),
         "active",
     )
     .await;
@@ -1082,7 +1124,7 @@ async fn referenced_binding_refusals_leave_no_writes() {
                 "binding-cross-tenant-agent",
                 "binding-prompt",
                 "binding-foreign-verifier",
-                "binding-observations-trigger",
+                None,
                 json!([]),
                 "binding-cross-tenant-operation",
             ),
@@ -1107,8 +1149,8 @@ async fn referenced_binding_refusals_leave_no_writes() {
             bound_agent_request(
                 "binding-denied-agent",
                 "binding-prompt",
-                "binding-eval-verifier",
-                "binding-observations-trigger",
+                "binding-assertion-verifier",
+                None,
                 json!([]),
                 "binding-denied-operation",
             ),
@@ -1137,34 +1179,27 @@ async fn referenced_binding_refusals_leave_no_writes() {
                         "space": "default"
                     },
                     "spec": {
-                        "implementation": {
-                            "kind": "eval",
-                            "spec": {
-                                "tasks": {
-                                    "helpful": {
-                                        "kind": "llm_judge",
-                                        "id": "helpful",
-                                        "judge_ref": {
-                                            "prompt": {
-                                                "kind": "Prompt", "name": "binding-prompt",
-                                                "version": "1.0.0", "space": "default"
-                                            }, "execution_route": {"kind": "native"},
-                                            "verified_by": [{
-                                                "verifier": {
-                                                    "kind": "Verifier",
-                                                    "name": "binding-eval-verifier",
-                                                    "version": "1.0.0",
-                                                    "space": "default"
-                                                },
-                                                "runs_on": { "kind": "observations_ready" },
-                                            }],
+                        "requirements": [{
+                            "id": "helpful",
+                            "statement": "The answer is helpful.",
+                            "check": {
+                                "kind": "agent",
+                                "agent": {
+                                    "prompt": {
+                                        "kind": "Prompt", "name": "binding-prompt",
+                                        "version": "1.0.0", "space": "default"
+                                    }, "execution_route": {"kind": "native"},
+                                    "verified_by": [{
+                                        "verifier": {
+                                            "kind": "Verifier",
+                                            "name": "binding-assertion-verifier",
+                                            "version": "1.0.0",
+                                            "space": "default"
                                         },
-                                        "operator": "greater_than_or_equals",
-                                        "expected": 0.5,
-                                    },
+                                    }],
                                 },
                             },
-                        },
+                        }],
                     },
                     "artifacts": []
                 }] }),
@@ -1268,16 +1303,11 @@ async fn verifier_contract_refusals_leave_no_writes() {
             assert_eq!(status, StatusCode::CREATED, "{kind} {name}: {body}");
         }
     };
-    register(
-        "Verifier",
-        "vc-eval-verifier",
-        json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
-    )
-    .await;
+    register("Verifier", "vc-drift-verifier", latency_drift_spec()).await;
     register(
         "Trigger",
-        "vc-observations-trigger",
-        json!({ "kind": "observations_ready" }),
+        "vc-schedule-trigger",
+        json!({ "kind": "schedule", "cron": "0 * * * *" }),
     )
     .await;
     register(
@@ -1339,9 +1369,9 @@ async fn verifier_contract_refusals_leave_no_writes() {
         assert_no_registration_writes(&server, &operation, &name).await;
     }
 
-    let binding = |verifier: Value, runs_on: Value, on_failure: Value| json!({ "verifier": verifier, "runs_on": runs_on, "on_failure": on_failure });
-    let eval = card_ref("Verifier", "vc-eval-verifier");
-    let trigger = card_ref("Trigger", "vc-observations-trigger");
+    let binding = |verifier: Value, runs_on: Value, on_failure: Value| json!({ "verifier": verifier, "runs_on": runs_on, "on_failure": on_failure, "inputs": latency_inputs() });
+    let drift = card_ref("Verifier", "vc-drift-verifier");
+    let trigger = card_ref("Trigger", "vc-schedule-trigger");
     let hook = card_ref("Operator", "vc-hook");
     let cases = [
         (
@@ -1351,13 +1381,13 @@ async fn verifier_contract_refusals_leave_no_writes() {
         ),
         (
             "runs-on-wrong-kind",
-            json!([binding(eval.clone(), eval.clone(), json!([]))]),
+            json!([binding(drift.clone(), drift.clone(), json!([]))]),
             "WYRD_SPEC_400_INVALID_BINDING_REF_KIND",
         ),
         (
             "operator-wrong-kind",
             json!([binding(
-                eval.clone(),
+                drift.clone(),
                 trigger.clone(),
                 json!([trigger.clone()])
             )]),
@@ -1366,10 +1396,10 @@ async fn verifier_contract_refusals_leave_no_writes() {
         (
             "duplicate-binding",
             json!([
-                binding(eval.clone(), trigger.clone(), json!([])),
+                binding(drift.clone(), trigger.clone(), json!([])),
                 binding(
-                    eval.clone(),
-                    json!({ "kind": "observations_ready" }),
+                    drift.clone(),
+                    json!({ "kind": "schedule", "cron": "0 3 * * *" }),
                     json!([])
                 ),
             ]),
@@ -1378,7 +1408,7 @@ async fn verifier_contract_refusals_leave_no_writes() {
         (
             "duplicate-referenced-operator",
             json!([binding(
-                eval.clone(),
+                drift.clone(),
                 trigger.clone(),
                 json!([hook.clone(), hook.clone()])
             )]),
@@ -1387,7 +1417,7 @@ async fn verifier_contract_refusals_leave_no_writes() {
         (
             "duplicate-inline-operator",
             json!([binding(
-                eval.clone(),
+                drift.clone(),
                 trigger.clone(),
                 json!([
                     { "kind": "http", "method": "post", "url": "https://hooks.example.test/a" },
@@ -1399,7 +1429,7 @@ async fn verifier_contract_refusals_leave_no_writes() {
         (
             "secret-authorization-header",
             json!([binding(
-                eval.clone(),
+                drift.clone(),
                 trigger.clone(),
                 json!([{ "kind": "http", "method": "post",
                          "url": "https://hooks.example.test/a",
@@ -1410,7 +1440,7 @@ async fn verifier_contract_refusals_leave_no_writes() {
         (
             "secret-env-template",
             json!([binding(
-                eval.clone(),
+                drift.clone(),
                 trigger.clone(),
                 json!([{ "kind": "notify", "channel": {
                     "kind": "slack", "connection": "ops-slack", "channel_id": "C1",
@@ -1434,7 +1464,7 @@ async fn verifier_contract_refusals_leave_no_writes() {
     }
 
     let token_field = json!([binding(
-        eval.clone(),
+        drift.clone(),
         trigger.clone(),
         json!([{ "kind": "notify", "channel": {
             "kind": "slack", "connection": "ops-slack", "channel_id": "C1",
@@ -2335,7 +2365,7 @@ async fn service_peer_composition_rejects_before_registry_resolution() {
                             "version": "1.0.0",
                             "space": "default"
                         },
-                        "spec": { "implementation": { "kind": "eval", "spec": { "tasks": {} } } },
+                        "spec": assertion_verifier_spec(),
                         "artifacts": []
                     }
                 ] }),
@@ -2609,9 +2639,9 @@ async fn card_reads_list_latest_and_delete_are_tenant_safe() {
 
 /// Seed the active dependencies every bound-Service registration names.
 ///
-/// Inserts the `vb-prompt` Prompt, the `vb-eval` eval Verifier, the
-/// `vb-drift` drift Verifier, and the daily `vb-schedule` Trigger, returning
-/// the Trigger's UID so a test can prove it is frozen by identity.
+/// Inserts the `vb-prompt` Prompt, the `vb-drift` Custom Drift Verifier, and
+/// the daily `vb-schedule` Trigger, returning the Trigger's UID so a test can
+/// prove it is frozen by identity.
 ///
 /// # Panics
 /// Panics when a fixture row cannot be inserted.
@@ -2622,36 +2652,11 @@ async fn seed_binding_dependencies(server: &WyrdTestServer) -> CardUid {
         server,
         tenant,
         "Verifier",
-        "vb-eval",
-        json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
-        "active",
-    )
-    .await;
-    seed_card(
-        server,
-        tenant,
-        "Verifier",
         "vb-drift",
-        json!({ "implementation": { "kind": "drift", "spec": {
-            "method": "Psi",
-            "signal": {
-                "kind": "Distribution",
-                "baseline_ref": {
-                    "kind": "Data", "name": "vb-baseline", "space": "default", "version": "1.0.0"
-                },
-                "features": ["tenure_months"]
-            },
-            "condition": { "kind": "Statistical" },
-            "profile": {
-                "kind": "Psi",
-                "binning_strategy": { "kind": "Quantile", "n_bins": 10 },
-                "threshold": { "kind": "Fixed", "value": 0.25 }
-            }
-        } } }),
+        latency_drift_spec(),
         "active",
     )
     .await;
-
     seed_card(
         server,
         tenant,
@@ -2672,9 +2677,11 @@ fn schedule_trigger_ref() -> Value {
 ///
 /// The Service-level binding runs the drift Verifier on `runs_on` (a
 /// referenced or inline `schedule` Trigger) and dispatches one inline HTTP
-/// Operator on failure; the `assistant` component binding runs the eval
-/// Verifier on an inline `observations_ready` Trigger. `second_alias` adds a second component occurrence
-/// under that alias so the alias-uniqueness refusal can reuse the builder.
+/// Operator on failure; the `assistant` component binding runs the same
+/// Verifier on an inline daily `schedule` Trigger. Both bindings map the
+/// Verifier's samples slot through [`latency_inputs`]. `second_alias` adds a
+/// second component occurrence under that alias so the alias-uniqueness
+/// refusal can reuse the builder.
 fn bound_service_request(
     service_name: &str,
     runs_on: Value,
@@ -2700,9 +2707,10 @@ fn bound_service_body(service_name: &str, runs_on: Value, second_alias: Option<&
         "ref": agent_ref,
         "verified_by": [{
             "verifier": {
-                "kind": "Verifier", "name": "vb-eval", "version": "1.0.0", "space": "default"
+                "kind": "Verifier", "name": "vb-drift", "version": "1.0.0", "space": "default"
             },
-            "runs_on": { "kind": "observations_ready" }
+            "runs_on": { "kind": "schedule", "cron": "0 3 * * *" },
+            "inputs": latency_inputs()
         }]
     })];
     if let Some(alias) = second_alias {
@@ -2720,6 +2728,7 @@ fn bound_service_body(service_name: &str, runs_on: Value, second_alias: Option<&
                             "version": "1.0.0", "space": "default"
                         },
                         "runs_on": runs_on,
+                        "inputs": latency_inputs(),
                         "on_failure": [{
                             "kind": "http", "method": "post",
                             "url": "https://hooks.example.test/verification-failed"
@@ -2757,10 +2766,13 @@ async fn read_card(server: &WyrdTestServer, jwt: &str, kind: &str, uid: &str) ->
         .expect("UID read responds")
 }
 
-/// One projected binding's owner activity, activation, and schedule cursor.
+/// One projected binding's owner activity, subject occurrence key, and
+/// schedule cursor.
 type BindingActivityRow = (Option<DateTime<Utc>>, String, Option<DateTime<Utc>>);
 
-/// Read every binding of `owner` with its principal's activity, ordered by activation.
+/// Read every binding of `owner` with its principal's activity, ordered by
+/// subject occurrence key in byte order, so the owner's own `$owner` binding
+/// precedes every component alias.
 ///
 /// # Panics
 /// Panics when the tenant connection or the read fails.
@@ -2770,11 +2782,11 @@ async fn owner_activity(server: &WyrdTestServer, owner: Uuid) -> Vec<BindingActi
         .await
         .expect("tenant connection opens");
     let rows = sqlx::query_as(
-        "SELECT p.last_authenticated_at, b.activation, b.next_run_at \
+        "SELECT p.last_authenticated_at, b.subject_occurrence_key, b.next_run_at \
            FROM wyrd.verification_bindings b \
            JOIN wyrd.auth_service_accounts p ON p.card_uid = b.owner_card_uid \
           WHERE b.owner_card_uid = $1 \
-          ORDER BY b.activation",
+          ORDER BY b.subject_occurrence_key COLLATE \"C\"",
     )
     .bind(owner)
     .fetch_all(&mut **conn.transaction())
@@ -2788,21 +2800,21 @@ async fn owner_activity(server: &WyrdTestServer, owner: Uuid) -> Vec<BindingActi
 /// only through the owner's real API-key exchange.
 ///
 /// Registers a Service owning a Service-level binding on a referenced
-/// schedule Trigger with an inline Operator, plus a component
-/// observations-ready binding; checks the referenced Trigger is frozen by UID
+/// schedule Trigger with an inline Operator, plus a component binding on an
+/// inline schedule; checks the referenced Trigger is frozen by UID
 /// and the inline Operator by digest; then reads `status.verification.binding_ids`
 /// through the public route, re-applies the identical graph, and checks the
 /// under-privileged and cross-tenant reads. Before any exchange it proves
-/// registration wrote no `wyrd.verifier_runs` row for the owner. Finally it
-/// exchanges an API key for the Service's own projected principal through `/auth/token` and proves
-/// that exchange stamped the owner's activity and armed only the schedule
-/// cursor. An unarmable schedule and a repeated component alias are refused
+/// registration wrote no `wyrd.verifier_executions` row for the owner.
+/// Finally it exchanges an API key for the Service's own projected principal
+/// through `/auth/token` and proves that exchange stamped the owner's activity
+/// and armed both schedule cursors, the component's inherited from its owner. An unarmable schedule and a repeated component alias are refused
 /// before any write.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, a bootstrap or fixture
 /// write fails, a route fails to respond, or any status, error code, binding
-/// identity, run-absence, or activity assertion does not hold.
+/// identity, execution-absence, or activity assertion does not hold.
 #[tokio::test(flavor = "current_thread")]
 async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
     let server = WyrdTestServer::start_in_process()
@@ -2956,7 +2968,7 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
         .expect("tenant connection opens");
     let (frozen_trigger, operators): (Option<Uuid>, Value) = sqlx::query_as(
         "SELECT trigger_uid, operators FROM wyrd.verification_bindings \
-          WHERE owner_card_uid = $1 AND activation = 'schedule'",
+          WHERE owner_card_uid = $1 AND subject_occurrence_key = '$owner'",
     )
     .bind(Uuid::parse_str(&service_uid).expect("service UID parses"))
     .fetch_one(&mut **conn.transaction())
@@ -3039,15 +3051,19 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
         .tenant_conn_for(tenant)
         .await
         .expect("tenant connection opens");
-    let registered_runs: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.verifier_runs WHERE owner_card_uid = $1 OR card_uid = $1",
+    let registered_executions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.verifier_executions \
+          WHERE owner_card_uid = $1 OR card_uid = $1",
     )
     .bind(service_uid)
     .fetch_one(&mut **conn.transaction())
     .await
-    .expect("verifier run count reads");
+    .expect("verifier execution count reads");
     conn.commit().await.expect("assertion transaction commits");
-    assert_eq!(registered_runs, 0, "registration alone never starts a run");
+    assert_eq!(
+        registered_executions, 0,
+        "registration alone never enqueues an execution"
+    );
 
     server
         .exchange_api_key(&api_key)
@@ -3055,15 +3071,15 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
         .expect("owner API key exchanges");
     let rows = owner_activity(&server, service_uid).await;
     assert_eq!(rows.len(), 2);
-    let (seen, _, eval_cursor) = &rows[0];
-    let seen = seen.expect("API-key exchange records owner activity");
-    assert_eq!(rows[0].1, "observations_ready");
-    assert_eq!(*eval_cursor, None, "an eval binding never has a cursor");
-    assert_eq!(rows[1].1, "schedule");
-    assert!(
-        rows[1].2.expect("first exchange arms the schedule") > seen,
-        "the armed cursor is the next future boundary"
-    );
+    let seen = rows[0].0.expect("API-key exchange records owner activity");
+    assert_eq!(rows[0].1, wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY);
+    assert_eq!(rows[1].1, "assistant");
+    for (_, occurrence, cursor) in &rows {
+        assert!(
+            cursor.expect("first exchange arms the schedule") > seen,
+            "{occurrence}: the armed cursor is the next future boundary"
+        );
+    }
 
     server.shutdown().await.expect("test server shuts down");
 }
@@ -3478,13 +3494,13 @@ async fn owner_principal(server: &WyrdTestServer, owner: Uuid) -> (Uuid, Option<
 /// The schedule cursor of `owner`'s Service-level binding.
 ///
 /// # Panics
-/// Panics when the owner has no schedule binding.
+/// Panics when the owner has no Service-level binding.
 async fn schedule_cursor(server: &WyrdTestServer, owner: Uuid) -> Option<DateTime<Utc>> {
     owner_activity(server, owner)
         .await
         .into_iter()
-        .find(|(_, activation, _)| activation == "schedule")
-        .expect("owner has a schedule binding")
+        .find(|(_, occurrence, _)| occurrence == wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY)
+        .expect("owner has a Service-level binding")
         .2
 }
 
@@ -3757,7 +3773,7 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
     sqlx::query(
         "UPDATE wyrd.verification_bindings \
             SET next_run_at = statement_timestamp() - INTERVAL '3 days' \
-          WHERE owner_card_uid = $1 AND activation = 'schedule'",
+          WHERE owner_card_uid = $1",
     )
     .bind(a_owner)
     .execute(&mut **conn.transaction())
@@ -3778,7 +3794,7 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         .tenant_conn_for(server.data_tenant_id())
         .await
         .expect("tenant connection opens");
-    let queue = VerifierRunQueue::default();
+    let queue = VerifierExecutionQueue::default();
     let state = server.state();
     let authority = BackgroundAuthority::new(state.auth.tenant_issuer(&state.scribe_outbox));
     let mut outcomes = Vec::new();
@@ -3796,11 +3812,11 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
             .expect("scheduler ticks");
         outcomes.push(tick.outcome);
     }
-    let (runs, cursor_ahead): (i64, f64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM wyrd.verifier_runs WHERE owner_card_uid = $1), \
+    let (executions, cursor_ahead): (i64, f64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM wyrd.verifier_executions WHERE owner_card_uid = $1), \
                 (SELECT EXTRACT(EPOCH FROM next_run_at - statement_timestamp())::float8 \
                    FROM wyrd.verification_bindings \
-                  WHERE owner_card_uid = $1 AND activation = 'schedule')",
+                  WHERE owner_card_uid = $1 AND subject_occurrence_key = '$owner')",
     )
     .bind(a_owner)
     .fetch_one(&mut **conn.transaction())
@@ -3809,10 +3825,13 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
     conn.commit().await.expect("scheduler commits");
     assert_eq!(
         outcomes,
-        vec![ScheduleOutcome::Skipped(ScheduleSkip::Missed)],
-        "the lapsed occurrences are skipped, not backfilled"
+        vec![ScheduleOutcome::Skipped(ScheduleSkip::Missed); 2],
+        "both bindings' lapsed occurrences are skipped, not backfilled"
     );
-    assert_eq!(runs, 0, "no run is created for a missed occurrence");
+    assert_eq!(
+        executions, 0,
+        "no execution is enqueued for a missed occurrence"
+    );
     assert!(
         cursor_ahead > 0.0 && cursor_ahead <= 86_400.0,
         "the schedule resumes at the next future daily boundary: {cursor_ahead}s"

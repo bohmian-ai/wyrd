@@ -1,190 +1,214 @@
 //! Verification control-plane routes through the authenticated HTTP surface.
 //!
-//! Drives `GET /v1/verification/bindings/{id}`, `POST /v1/verification/runs`,
-//! `GET /v1/verification/runs/{id}`, and `POST /v1/verification/execute` against the in-process server and the
-//! repository-managed Postgres: durable enqueue with requester identity,
-//! Idempotency-Key replay and conflict, every refusal before enqueue, the
-//! audited allow and deny decisions, and tenant isolation. No runtime executes
-//! the runs, so every enqueued run stays `pending`; direct executions judge
-//! inline and never enqueue. It also proves the
-//! tenant's internal SYSTEM result writer is unreachable through the public
-//! principal and credential routes.
+//! Drives `GET /v1/verification/bindings/{id}`, `POST /v1/verification/enqueue`,
+//! `GET /v1/verification/executions/{id}`, and `POST /v1/verification/execute`
+//! against the in-process server and the repository-managed Postgres:
+//! acknowledged enqueue under the caller's authority, Idempotency-Key replay
+//! and conflict, every refusal before staging, the audited allow and deny
+//! decisions, and tenant isolation. No runtime claims the queue, so every
+//! accepted execution stays `pending`; direct executions judge inline and never
+//! enqueue. It also proves the tenant's internal SYSTEM result writer is
+//! unreachable through the public principal and credential routes.
+
+use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Value, json};
 use uuid::Uuid;
 use wyrd_runtime::Permission;
-use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
-use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{BindingId, CardUid, DataTenantId};
-use wyrd_sql::queries::verification::{
-    BindingActivation, FrozenTarget, NewBinding, project_bindings,
-};
+use wyrd_spec::ids::{BindingId, CardUid, DataTenantId, ExecutionId};
+use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
-/// A ready Custom Drift Verifier implementation.
-fn custom_drift() -> Value {
-    json!({ "implementation": { "kind": "drift", "spec": { "method": "Custom" } } })
+/// How long an acknowledged submission may take to become readable.
+const VISIBLE: Duration = Duration::from_secs(10);
+
+/// An assertion Verifier spec whose one requirement holds when the inline
+/// `answer` slot equals `1`.
+fn answer_is_one() -> Value {
+    json!({
+        "inputs": { "answer": { "type": "json" } },
+        "requirements": [{
+            "id": "answer-is-one",
+            "statement": "The answer is one.",
+            "check": { "kind": "assert", "path": "inputs.answer", "operator": "equals", "expected": 1 }
+        }]
+    })
 }
 
-/// A PSI Drift Verifier implementation, never ready until a baseline exists.
+/// A PSI Drift Verifier spec over the `score` samples, never ready until its
+/// baseline is fitted.
 fn psi_drift() -> Value {
-    json!({ "implementation": { "kind": "drift", "spec": { "method": "Psi" } } })
+    json!({
+        "inputs": { "samples": { "type": "samples", "features": ["score"] } },
+        "requirements": [{
+            "id": "drift",
+            "statement": "The window does not drift.",
+            "check": {
+                "kind": "drift", "on": "inputs.samples", "method": "Psi",
+                "signal": { "kind": "Distribution",
+                            "baseline_ref": { "kind": "Data", "name": "vr-psi-baseline", "version": "1.0.0" },
+                            "features": ["score"] },
+                "condition": { "kind": "Statistical" },
+                "profile": { "kind": "Psi",
+                             "binning_strategy": { "kind": "EqualWidth", "n_bins": 10 },
+                             "threshold": { "kind": "Fixed", "value": 0.25 } }
+            }
+        }]
+    })
 }
 
-/// A ready Eval Verifier implementation, which cannot analyze a Drift window.
-fn eval() -> Value {
-    json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } })
-}
-
-/// Insert one active Card row directly and return its UID.
-///
-/// # Panics
-/// Panics when the fixture superuser pool cannot open or the row fails to insert.
-async fn seed_card(
-    server: &WyrdTestServer,
-    tenant: DataTenantId,
-    kind: &str,
-    name: &str,
-    spec: Value,
-) -> CardUid {
-    let uid = CardUid::from_uuid(Uuid::now_v7()).expect("fixture UID is valid");
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool opens");
-    sqlx::query(
-        "INSERT INTO wyrd.cards \
-            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
-         VALUES ($1, $2, $3, 'default', $4, '1.0.0', $5, $4, 'active', '00000000-0000-7000-8000-000000000000', '00000000-0000-7000-8000-000000000000')",
-    )
-    .bind(uid.as_uuid())
-    .bind(tenant.as_uuid())
-    .bind(kind)
-    .bind(name)
-    .bind(spec)
-    .execute(&pool)
-    .await
-    .expect("fixture card inserts");
-    uid
-}
-
-/// Project one owner-level scheduled binding of `verifier` on the Service `owner`.
-///
-/// # Panics
-/// Panics when the tenant connection, projection, or commit fails.
-async fn bind(
-    server: &WyrdTestServer,
-    tenant: DataTenantId,
-    owner: &CardUid,
-    verifier: &CardUid,
-) -> BindingId {
-    let mut conn = server
-        .tenant_conn_for(tenant)
-        .await
-        .expect("tenant connection opens");
-    let binding = project_bindings(
-        &mut conn,
-        owner,
-        &CardKind::Service,
-        &[NewBinding {
-            subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
-            card_uid: owner.clone(),
-            verifier_card_uid: verifier.clone(),
-            trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
-            operators: Vec::new(),
-            activation: BindingActivation::Schedule {
-                cron: "0 2 * * *".to_owned(),
-                tz: None,
-            },
-        }],
-    )
-    .await
-    .expect("binding projects")[0];
-    conn.commit().await.expect("binding commits");
-    binding
-}
-
-/// The tenant fixture: one Service with a ready and an unready binding, plus
-/// the Custom and Eval Verifiers for direct targets.
+/// The tenant fixture: one Service, an assertion Verifier for direct and
+/// queued executions, and a ready and an unready Drift binding.
 struct Fixture {
-    /// The Service owning both bindings and the subject of every run.
+    /// The tenant's verification fixture, which reads its queue.
+    seed: VerificationFixture,
+    /// The Service owning both bindings and the subject of every execution.
     service: CardUid,
+    /// Assertion Verifier judging the `answer` slot.
+    assertion: CardUid,
     /// Ready Custom Drift Verifier.
-    custom: CardUid,
-    /// Ready Eval Verifier.
-    eval: CardUid,
-    /// Binding of the Custom Verifier.
+    drift: CardUid,
+    /// Binding of the Custom Drift Verifier.
     ready_binding: BindingId,
     /// Binding of a PSI Verifier with no fitted baseline.
     unready_binding: BindingId,
 }
 
 impl Fixture {
-    /// Seed the fixture Cards and bindings in `tenant`.
+    /// Seed the fixture Cards and bindings in the server's tenant.
     ///
     /// # Panics
     /// Panics when any fixture write fails.
-    async fn seed(server: &WyrdTestServer, tenant: DataTenantId) -> Self {
-        let service = seed_card(server, tenant, "Service", "vr-service", json!({})).await;
-        let custom = seed_card(server, tenant, "Verifier", "vr-custom", custom_drift()).await;
-        let psi = seed_card(server, tenant, "Verifier", "vr-psi", psi_drift()).await;
-        let eval = seed_card(server, tenant, "Verifier", "vr-eval", eval()).await;
-        let ready_binding = bind(server, tenant, &service, &custom).await;
-        let unready_binding = bind(server, tenant, &service, &psi).await;
+    async fn seed(server: &WyrdTestServer) -> Self {
+        let seed = server
+            .verification_fixture()
+            .await
+            .expect("verification fixture provisions");
+        let (service, _) = seed.service("vr-service").await.expect("Service registers");
+        let assertion = seed
+            .verifier("vr-assertion", &answer_is_one())
+            .await
+            .expect("assertion Verifier registers");
+        let drift = seed
+            .custom_drift_verifier("vr-custom", "latency", 100.0, 10.0)
+            .await
+            .expect("Custom Drift Verifier registers");
+        let psi = seed
+            .verifier("vr-psi", &psi_drift())
+            .await
+            .expect("PSI Verifier registers");
+        let ready_binding = seed
+            .bind_schedule(
+                &service,
+                &service,
+                &drift,
+                "0 2 * * *",
+                VerificationFixture::metric_inputs("latency"),
+                Vec::new(),
+            )
+            .await
+            .expect("ready binding projects");
+        let unready_binding = seed
+            .bind_schedule(
+                &service,
+                &service,
+                &psi,
+                "0 2 * * *",
+                serde_json::from_value(json!({ "samples": { "features": ["score"] } }))
+                    .expect("distribution inputs decode"),
+                Vec::new(),
+            )
+            .await
+            .expect("unready binding projects");
         Self {
+            seed,
             service,
-            custom,
-            eval,
+            assertion,
+            drift,
             ready_binding,
             unready_binding,
         }
     }
+
+    /// A request judging the Service with `verifier` over the inline `answer`.
+    fn request(&self, verifier: &CardUid, answer: Value) -> Value {
+        json!({
+            "verifier_card_uid": verifier,
+            "card_uid": self.service,
+            "inputs": { "answer": { "kind": "json", "value": answer } }
+        })
+    }
+
+    /// Count the tenant's queued executions.
+    ///
+    /// # Panics
+    /// Panics when the queue cannot be read.
+    async fn queued(&self) -> usize {
+        self.seed.executions().await.expect("executions read").len()
+    }
 }
 
-/// A one-hour manual Drift window.
-fn window() -> Value {
-    json!({ "kind": "drift_window", "start": "2026-09-17T00:00:00Z", "end": "2026-09-17T01:00:00Z" })
-}
-
-/// A manual run body for `target` over [`window`].
-fn run_body(target: Value) -> Value {
-    json!({ "target": target, "input": window() })
-}
-
-/// A binding target.
-fn binding_target(binding: BindingId) -> Value {
-    json!({ "kind": "binding", "binding_id": binding })
-}
-
-/// POST one manual run request as `jwt`, optionally keyed.
+/// POST one raw body to `uri` as `jwt`, optionally keyed.
 ///
 /// # Panics
 /// Panics when the request cannot be built or the route fails to respond.
-async fn post_run(
+async fn post(
     server: &WyrdTestServer,
     jwt: &str,
-    body: &Value,
+    uri: &str,
+    body: String,
     key: Option<&str>,
 ) -> (StatusCode, Value) {
     let mut request = Request::builder()
         .method(Method::POST)
-        .uri("/v1/verification/runs")
+        .uri(uri)
         .header(header::CONTENT_TYPE, "application/json");
     if let Some(key) = key {
         request = request.header("Idempotency-Key", key);
     }
     let response = server
-        .oneshot_authenticated(
-            jwt,
-            request
-                .body(Body::from(body.to_string()))
-                .expect("run request builds"),
-        )
+        .oneshot_authenticated(jwt, request.body(Body::from(body)).expect("request builds"))
         .await
-        .expect("run request responds");
+        .expect("request responds");
     decoded(response).await
+}
+
+/// POST one enqueue request as `jwt`, optionally keyed.
+///
+/// # Panics
+/// Panics when the request cannot be built or the route fails to respond.
+async fn enqueue(
+    server: &WyrdTestServer,
+    jwt: &str,
+    body: &Value,
+    key: Option<&str>,
+) -> (StatusCode, Value) {
+    post(
+        server,
+        jwt,
+        "/v1/verification/enqueue",
+        body.to_string(),
+        key,
+    )
+    .await
+}
+
+/// POST one raw direct execution body as `jwt`.
+///
+/// # Panics
+/// Panics when the request cannot be built or the route fails to respond.
+async fn execute(server: &WyrdTestServer, jwt: &str, body: String) -> (StatusCode, Value) {
+    post(server, jwt, "/v1/verification/execute", body, None).await
+}
+
+/// The execution ID of an accepted enqueue response.
+///
+/// # Panics
+/// Panics when the response carries no execution ID.
+fn execution_id(accepted: &Value) -> ExecutionId {
+    serde_json::from_value(accepted["execution_id"].clone()).expect("execution_id is an ID")
 }
 
 /// GET one path as `jwt`.
@@ -204,6 +228,35 @@ async fn get(server: &WyrdTestServer, jwt: &str, uri: &str) -> (StatusCode, Valu
         .await
         .expect("read request responds");
     decoded(response).await
+}
+
+/// Read `execution` as `jwt` once the queue writer has accepted it.
+///
+/// Enqueue answers before Scribe acknowledges the inputs and the batched
+/// writer accepts the submission, so the status read answers not found until
+/// then; this polls through that window.
+///
+/// # Panics
+/// Panics when the execution is not readable within [`VISIBLE`] or a read
+/// answers anything but OK or the execution-not-found refusal.
+async fn visible_execution(server: &WyrdTestServer, jwt: &str, execution: ExecutionId) -> Value {
+    let uri = format!("/v1/verification/executions/{execution}");
+    let deadline = tokio::time::Instant::now() + VISIBLE;
+    loop {
+        let (status, body) = get(server, jwt, &uri).await;
+        if status == StatusCode::OK {
+            return body;
+        }
+        assert_eq!(
+            body["code"], "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND",
+            "{status}: {body}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "execution {execution} never became readable"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Split a response into its status and JSON body.
@@ -247,30 +300,14 @@ async fn machine_jwt(server: &WyrdTestServer, machine: &Bootstrap) -> String {
         .expect("API key exchanges")
 }
 
-/// Count the tenant's runs.
+/// Read one execution's frozen (origin, owner, binding, requester) identity
+/// columns.
 ///
 /// # Panics
-/// Panics when the count cannot be read.
-async fn run_count(server: &WyrdTestServer, tenant: DataTenantId) -> i64 {
-    let mut conn = server
-        .tenant_conn_for(tenant)
-        .await
-        .expect("tenant connection opens");
-    let count = sqlx::query_scalar("SELECT count(*) FROM wyrd.verifier_runs")
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("runs count");
-    conn.commit().await.expect("count commits");
-    count
-}
-
-/// Read one run's frozen (origin, owner, binding, requester) identity columns.
-///
-/// # Panics
-/// Panics when the run cannot be read.
-async fn run_identity(
+/// Panics when the execution cannot be read.
+async fn execution_identity(
     server: &WyrdTestServer,
-    run_id: &str,
+    execution: ExecutionId,
 ) -> (String, Option<Uuid>, Option<Uuid>, Option<Uuid>) {
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
@@ -278,30 +315,14 @@ async fn run_identity(
         .expect("tenant connection opens");
     let row = sqlx::query_as(
         "SELECT origin, owner_card_uid, binding_id, sub_principal_id \
-           FROM wyrd.verifier_runs WHERE run_id = $1::uuid",
+           FROM wyrd.verifier_executions WHERE execution_id = $1",
     )
-    .bind(run_id)
+    .bind(execution.as_uuid())
     .fetch_one(&mut **conn.transaction())
     .await
-    .expect("run identity reads");
+    .expect("execution identity reads");
     conn.commit().await.expect("identity read commits");
     row
-}
-
-/// List `principal`'s `verification.run.start` decisions as (permission, outcome).
-///
-/// # Panics
-/// Panics when the audit rows cannot be read.
-async fn start_decisions(server: &WyrdTestServer, principal: Uuid) -> Vec<(String, String)> {
-    decisions(server, "verification.run.start", principal).await
-}
-
-/// List `principal`'s `verification.execute` decisions as (permission, outcome).
-///
-/// # Panics
-/// Panics when the retained audit history cannot be read.
-async fn execute_decisions(server: &WyrdTestServer, principal: Uuid) -> Vec<(String, String)> {
-    decisions(server, "verification.execute", principal).await
 }
 
 /// List `principal`'s retained `operation` decisions as (permission, outcome),
@@ -340,81 +361,71 @@ async fn decisions(
     rows
 }
 
-/// Binding and direct manual runs enqueue with the caller as requester, never
-/// as owner; a keyed retry replays its run and a key reused for a different
-/// body is refused; binding and run status read back the frozen identities.
+/// One allowed or denied `verifier:run` decision.
+fn run_decision(outcome: &str) -> (String, String) {
+    ("verifier:run".to_owned(), outcome.to_owned())
+}
+
+/// Enqueued executions are accepted under the caller's authority, never the
+/// binding owner's: a keyed retry shares its execution, a key reused for a
+/// different body gets its own execution that settles with the idempotency
+/// conflict, unkeyed requests never deduplicate, and the binding and
+/// execution status reads return the frozen identities.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
 /// to respond, or any status, identity, replay, or audit expectation fails.
 #[tokio::test(flavor = "current_thread")]
-async fn manual_runs_enqueue_replay_and_read_back() {
+async fn enqueued_executions_replay_conflict_and_read_back() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let tenant = server.data_tenant_id();
-    let fixture = Fixture::seed(&server, tenant).await;
+    let fixture = Fixture::seed(&server).await;
     let (requester, jwt) = user(&server, "vr-writer", &["editor"]).await;
 
-    let binding_body = run_body(binding_target(fixture.ready_binding));
-    let (status, bound) = post_run(&server, &jwt, &binding_body, Some("vr-retry-0001")).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{bound}");
-    let bound_run = bound["run_id"]
-        .as_str()
-        .expect("run_id is a string")
-        .to_owned();
-    let (status, replay) = post_run(&server, &jwt, &binding_body, Some("vr-retry-0001")).await;
+    let body = fixture.request(&fixture.assertion, json!(1));
+    let (status, accepted) = enqueue(&server, &jwt, &body, Some("vr-retry-0001")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let keyed = execution_id(&accepted);
+    let (status, replay) = enqueue(&server, &jwt, &body, Some("vr-retry-0001")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
-    assert_eq!(
-        replay["run_id"], bound["run_id"],
-        "same key and body replays"
-    );
-    let other_window = json!({
-        "target": binding_target(fixture.ready_binding),
-        "input": { "kind": "drift_window", "start": "2026-09-16T00:00:00Z", "end": "2026-09-16T01:00:00Z" }
-    });
-    let (status, conflict) = post_run(&server, &jwt, &other_window, Some("vr-retry-0001")).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(conflict["code"], "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT");
-
-    let direct_body = run_body(json!({
-        "kind": "verifier", "verifier_card_uid": fixture.custom, "card_uid": fixture.service
-    }));
-    let (status, direct) = post_run(&server, &jwt, &direct_body, None).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{direct}");
-    let direct_run = direct["run_id"]
-        .as_str()
-        .expect("run_id is a string")
-        .to_owned();
-    let (status, unkeyed) = post_run(&server, &jwt, &direct_body, None).await;
-    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(execution_id(&replay), keyed, "same key and body replays");
+    let other = fixture.request(&fixture.assertion, json!(2));
+    let (status, conflicting) = enqueue(&server, &jwt, &other, Some("vr-retry-0001")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{conflicting}");
+    let conflict = execution_id(&conflicting);
     assert_ne!(
-        unkeyed["run_id"], direct["run_id"],
+        conflict, keyed,
+        "conflicting content gets its own execution"
+    );
+    let (_, first) = enqueue(&server, &jwt, &body, None).await;
+    let (_, second) = enqueue(&server, &jwt, &body, None).await;
+    assert_ne!(
+        execution_id(&first),
+        execution_id(&second),
         "no key, no deduplication"
     );
-    assert_eq!(run_count(&server, tenant).await, 3);
 
+    let execution = visible_execution(&server, &jwt, keyed).await;
+    assert_eq!(execution["execution_id"], keyed.to_string());
+    assert_eq!(execution["status"], "pending", "{execution}");
+    assert_eq!(execution.get("result"), None, "{execution}");
+    assert_eq!(execution["dispatches"], json!([]));
     assert_eq!(
-        run_identity(&server, &bound_run).await,
-        (
-            "manual".to_owned(),
-            Some(fixture.service.as_uuid()),
-            Some(fixture.ready_binding.as_uuid()),
-            Some(requester)
-        )
-    );
-    assert_eq!(
-        run_identity(&server, &direct_run).await,
+        execution_identity(&server, keyed).await,
         ("manual".to_owned(), None, None, Some(requester))
     );
+    let refused = visible_execution(&server, &jwt, conflict).await;
+    assert_eq!(refused["status"], "errored", "{refused}");
+    assert_eq!(
+        refused["error"]["code"], "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT",
+        "{refused}"
+    );
+    for accepted in [&first, &second] {
+        visible_execution(&server, &jwt, execution_id(accepted)).await;
+    }
+    assert_eq!(fixture.queued().await, 4, "the replay added no execution");
 
-    let (status, run) = get(&server, &jwt, &format!("/v1/verification/runs/{bound_run}")).await;
-    assert_eq!(status, StatusCode::OK, "{run}");
-    assert_eq!(run["status"], "pending");
-    assert_eq!(run["sub_principal_id"], requester.to_string());
-    assert_eq!(run["act_principal_id"], requester.to_string());
-    assert_eq!(run["result_id"], Value::Null);
-    assert_eq!(run["dispatches"], json!([]));
     let (status, binding) = get(
         &server,
         &jwt,
@@ -424,125 +435,83 @@ async fn manual_runs_enqueue_replay_and_read_back() {
     assert_eq!(status, StatusCode::OK, "{binding}");
     assert_eq!(binding["owner_card_uid"], fixture.service.to_string());
     assert_eq!(binding["card_uid"], fixture.service.to_string());
-    assert_eq!(binding["verifier_card_uid"], fixture.custom.to_string());
+    assert_eq!(binding["verifier_card_uid"], fixture.drift.to_string());
     assert_eq!(binding["readiness"], "ready");
     assert_eq!(binding["active"], false);
-    assert!(binding["last_run_id"].is_string());
+    let (status, unready) = get(
+        &server,
+        &jwt,
+        &format!("/v1/verification/bindings/{}", fixture.unready_binding),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{unready}");
+    assert_eq!(unready["readiness"], "baseline_not_ready");
 
-    let decisions = start_decisions(&server, requester).await;
-    assert_eq!(decisions.len(), 5, "one decision per request");
-    assert!(
-        decisions
-            .iter()
-            .all(|decision| decision == &("verifier:run".to_owned(), "allowed".to_owned()))
+    let decisions = decisions(&server, "verification.enqueue", requester).await;
+    assert_eq!(
+        decisions,
+        vec![run_decision("allowed"); 5],
+        "one per request"
     );
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Invalid bodies, windows, and targets, unknown and unready bindings, a
-/// caller without `verifier:run`, a caller holding only `evals:run` (the
-/// binding is no grant), and a Card-bound caller without scope over the
-/// subject are all refused with stable codes before any run exists; each
-/// authorization refusal audits exactly one `verifier:run` denial.
+/// Malformed and oversized bodies, an invalid Idempotency-Key, a caller
+/// without `verifier:run`, and a caller holding only `evals:run` are refused
+/// with stable codes before anything is staged, each authorization refusal
+/// auditing exactly one `verifier:run` denial; unknown and malformed
+/// execution reads are refused with their stable codes.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
-/// to respond, or any status, code, run count, or audit expectation fails.
+/// to respond, or any status, code, queue, or audit expectation fails.
 #[tokio::test(flavor = "current_thread")]
-async fn manual_run_refusals_fail_before_enqueue() {
+async fn enqueue_refusals_fail_before_staging() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let tenant = server.data_tenant_id();
-    let fixture = Fixture::seed(&server, tenant).await;
+    let fixture = Fixture::seed(&server).await;
     let (_, jwt) = user(&server, "vr-refused-writer", &["editor"]).await;
+    let body = fixture.request(&fixture.assertion, json!(1));
 
+    let mut unknown = body.clone();
+    unknown["x"] = json!(1);
     let cases = [
         (
-            json!({ "target": binding_target(fixture.ready_binding),
-                    "input": { "kind": "drift_window",
-                               "start": "2026-09-17T01:00:00Z", "end": "2026-09-17T00:00:00Z" } }),
+            "{".to_owned(),
             StatusCode::BAD_REQUEST,
-            "WYRD_VERIFICATION_400_INVALID_WINDOW",
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
         ),
         (
-            json!({ "target": binding_target(fixture.ready_binding),
-                    "input": { "kind": "drift_window",
-                               "start": "2026-01-01T00:00:00Z", "end": "2026-09-17T00:00:00Z" } }),
+            unknown.to_string(),
             StatusCode::BAD_REQUEST,
-            "WYRD_VERIFICATION_400_INVALID_WINDOW",
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
         ),
         (
-            run_body(json!({ "kind": "binding", "binding_id": "not-a-uuid" })),
-            StatusCode::BAD_REQUEST,
-            "WYRD_VERIFICATION_400_INVALID_TARGET",
-        ),
-        (
-            json!({ "target": binding_target(fixture.ready_binding), "input": window(), "x": 1 }),
-            StatusCode::BAD_REQUEST,
-            "WYRD_SPEC_400_VALIDATION",
-        ),
-        (
-            run_body(binding_target(BindingId::new_v7())),
-            StatusCode::NOT_FOUND,
-            "WYRD_VERIFICATION_404_BINDING_NOT_FOUND",
-        ),
-        (
-            run_body(binding_target(fixture.unready_binding)),
-            StatusCode::CONFLICT,
-            "WYRD_VERIFICATION_409_VERIFIER_NOT_READY",
-        ),
-        (
-            run_body(
-                json!({ "kind": "verifier", "verifier_card_uid": fixture.eval,
-                             "card_uid": fixture.service }),
-            ),
-            StatusCode::BAD_REQUEST,
-            "WYRD_VERIFICATION_400_INVALID_TARGET",
-        ),
-        (
-            run_body(
-                json!({ "kind": "verifier", "verifier_card_uid": fixture.service,
-                             "card_uid": fixture.service }),
-            ),
-            StatusCode::BAD_REQUEST,
-            "WYRD_VERIFICATION_400_INVALID_TARGET",
-        ),
-        (
-            run_body(
-                json!({ "kind": "verifier", "verifier_card_uid": fixture.custom,
-                             "card_uid": Uuid::now_v7() }),
-            ),
-            StatusCode::BAD_REQUEST,
-            "WYRD_VERIFICATION_400_INVALID_TARGET",
+            " ".repeat(1024 * 1024 + 1),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
         ),
     ];
-    for (body, status, code) in cases {
-        let (actual, problem) = post_run(&server, &jwt, &body, None).await;
+    for (raw, status, code) in cases {
+        let (actual, problem) = post(&server, &jwt, "/v1/verification/enqueue", raw, None).await;
         assert_eq!(
             (actual, problem["code"].as_str()),
             (status, Some(code)),
-            "{body}"
+            "{problem}"
         );
     }
-    let (status, problem) = post_run(
-        &server,
-        &jwt,
-        &run_body(binding_target(fixture.ready_binding)),
-        Some("bad key"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, problem) = enqueue(&server, &jwt, &body, Some("bad key")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
     assert_eq!(problem["code"], "WYRD_SPEC_400_VALIDATION");
 
     let (reader, reader_jwt) = user(&server, "vr-reader", &["viewer"]).await;
-    let bound = run_body(binding_target(fixture.ready_binding));
-    let (status, problem) = post_run(&server, &reader_jwt, &bound, None).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, problem) = enqueue(&server, &reader_jwt, &body, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
     assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(
-        start_decisions(&server, reader).await,
-        vec![("verifier:run".to_owned(), "denied".to_owned())]
+        decisions(&server, "verification.enqueue", reader).await,
+        vec![run_decision("denied")]
     );
     server
         .seed_role("vr_evals_only", &[Permission::eval_run()])
@@ -550,43 +519,30 @@ async fn manual_run_refusals_fail_before_enqueue() {
         .expect("role seeds");
     let (evals_only, evals_only_jwt) =
         user(&server, "vr-evals-only-user", &["vr_evals_only"]).await;
-    let (status, problem) = post_run(&server, &evals_only_jwt, &bound, None).await;
+    let (status, problem) = enqueue(&server, &evals_only_jwt, &body, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
     assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(
-        start_decisions(&server, evals_only).await,
-        vec![("verifier:run".to_owned(), "denied".to_owned())]
-    );
-
-    let machine = server
-        .bootstrap_service("vr-foreign-service", &["editor"])
-        .await
-        .expect("card-bound service bootstraps");
-    let machine_token = machine_jwt(&server, &machine).await;
-    let (status, problem) = post_run(&server, &machine_token, &bound, None).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
-    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
-    assert_eq!(
-        start_decisions(&server, machine.id().as_uuid()).await,
-        vec![("verifier:run".to_owned(), "denied".to_owned())]
+        decisions(&server, "verification.enqueue", evals_only).await,
+        vec![run_decision("denied")]
     );
 
     let (status, problem) = get(
         &server,
         &jwt,
-        &format!("/v1/verification/runs/{}", Uuid::now_v7()),
+        &format!("/v1/verification/executions/{}", Uuid::now_v7()),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(problem["code"], "WYRD_VERIFICATION_404_RUN_NOT_FOUND");
-    let (status, problem) = get(&server, &jwt, "/v1/verification/runs/not-a-uuid").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{problem}");
+    assert_eq!(problem["code"], "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND");
+    let (status, problem) = get(&server, &jwt, "/v1/verification/executions/not-a-uuid").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
-    assert_eq!(run_count(&server, tenant).await, 0);
+    assert_eq!(fixture.queued().await, 0, "no refusal staged a submission");
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Binding and run status reads each authorize and audit `cards:read`: a
-/// reader is allowed and stages one allowed decision per read, while a
+/// Binding and execution status reads each authorize and audit `cards:read`:
+/// a reader is allowed and stages one allowed decision per read, while a
 /// principal whose only role lacks `cards:read` is refused with the stable
 /// RBAC code and stages one denied decision per read, before any lookup.
 ///
@@ -598,24 +554,23 @@ async fn status_reads_audit_cards_read_decisions() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let fixture = Fixture::seed(&server, server.data_tenant_id()).await;
+    let fixture = Fixture::seed(&server).await;
     let (_, writer) = user(&server, "vr-status-writer", &["editor"]).await;
-    let (status, run) = post_run(
+    let (status, accepted) = enqueue(
         &server,
         &writer,
-        &run_body(binding_target(fixture.ready_binding)),
+        &fixture.request(&fixture.assertion, json!(1)),
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let execution = execution_id(&accepted);
+    visible_execution(&server, &writer, execution).await;
     let binding_uri = format!("/v1/verification/bindings/{}", fixture.ready_binding);
-    let run_uri = format!(
-        "/v1/verification/runs/{}",
-        run["run_id"].as_str().expect("run_id is a string")
-    );
+    let execution_uri = format!("/v1/verification/executions/{execution}");
 
     let (reader, reader_jwt) = user(&server, "vr-status-reader", &["viewer"]).await;
-    for uri in [&binding_uri, &run_uri] {
+    for uri in [&binding_uri, &execution_uri] {
         let (status, body) = get(&server, &reader_jwt, uri).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
     }
@@ -625,12 +580,12 @@ async fn status_reads_audit_cards_read_decisions() {
         allowed
     );
     assert_eq!(
-        decisions(&server, "verification.run.read", reader).await,
+        decisions(&server, "verification.execution.read", reader).await,
         allowed
     );
 
     let (outsider, outsider_jwt) = user(&server, "vr-status-outsider", &[]).await;
-    for uri in [&binding_uri, &run_uri] {
+    for uri in [&binding_uri, &execution_uri] {
         let (status, problem) = get(&server, &outsider_jwt, uri).await;
         assert_eq!(
             (status, problem["code"].as_str()),
@@ -647,84 +602,221 @@ async fn status_reads_audit_cards_read_decisions() {
         denied
     );
     assert_eq!(
-        decisions(&server, "verification.run.read", outsider).await,
+        decisions(&server, "verification.execution.read", outsider).await,
         denied
     );
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Another tenant's administrator cannot read or run this tenant's binding
-/// or read its run: each is indistinguishable from an absent one.
+/// Another tenant's administrator cannot read this tenant's binding or
+/// execution, nor execute its Verifier: each is indistinguishable from an
+/// absent one.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
-/// to respond, or any status, code, or run count expectation fails.
+/// to respond, or any status, code, or queue expectation fails.
 #[tokio::test(flavor = "current_thread")]
 async fn verification_state_is_tenant_isolated() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let tenant = server.data_tenant_id();
-    let fixture = Fixture::seed(&server, tenant).await;
+    let fixture = Fixture::seed(&server).await;
     let (_, jwt) = user(&server, "vr-home-writer", &["editor"]).await;
-    let (status, run) = post_run(
-        &server,
-        &jwt,
-        &run_body(binding_target(fixture.ready_binding)),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
+    let body = fixture.request(&fixture.assertion, json!(1));
+    let (status, accepted) = enqueue(&server, &jwt, &body, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let execution = execution_id(&accepted);
+    visible_execution(&server, &jwt, execution).await;
 
-    let other = server.seed_tenant("vr-other").await.expect("tenant seeds");
+    let other: DataTenantId = server.seed_tenant("vr-other").await.expect("tenant seeds");
     let foreign = server
         .bootstrap_service_in_tenant(other, "vr-other-admin", &["admin"])
         .await
         .expect("foreign admin bootstraps");
     let foreign_jwt = machine_jwt(&server, &foreign).await;
-    let (status, problem) = get(
-        &server,
-        &foreign_jwt,
-        &format!("/v1/verification/bindings/{}", fixture.ready_binding),
-    )
-    .await;
+    let reads = [
+        (
+            format!("/v1/verification/bindings/{}", fixture.ready_binding),
+            "WYRD_VERIFICATION_404_BINDING_NOT_FOUND",
+        ),
+        (
+            format!("/v1/verification/executions/{execution}"),
+            "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND",
+        ),
+    ];
+    for (uri, code) in reads {
+        let (status, problem) = get(&server, &foreign_jwt, &uri).await;
+        assert_eq!(
+            (status, problem["code"].as_str()),
+            (StatusCode::NOT_FOUND, Some(code)),
+            "{uri}"
+        );
+    }
+    let (status, problem) = execute(&server, &foreign_jwt, body.to_string()).await;
     assert_eq!(
         (status, problem["code"].as_str()),
         (
             StatusCode::NOT_FOUND,
-            Some("WYRD_VERIFICATION_404_BINDING_NOT_FOUND")
-        )
+            Some("WYRD_VERIFICATION_404_TARGET_NOT_FOUND")
+        ),
+        "{problem}"
     );
-    let run_id = run["run_id"].as_str().expect("run_id is a string");
-    let (status, problem) = get(
-        &server,
-        &foreign_jwt,
-        &format!("/v1/verification/runs/{run_id}"),
-    )
-    .await;
+    assert_eq!(fixture.queued().await, 1);
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Direct execution judges the assertion Verifier's inline evidence and
+/// returns the exact identities and verdict: a matching answer passes and a
+/// different one fails. Nothing is enqueued and each request audits exactly
+/// one allowed `verifier:run` decision.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any verdict, identity, queue, or audit expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_execution_judges_inline_without_enqueueing() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let (caller, jwt) = user(&server, "vx-writer", &["editor"]).await;
+
+    for (answer, verdict) in [(json!(1), "passed"), (json!(2), "failed")] {
+        let body = fixture.request(&fixture.assertion, answer);
+        let (status, response) = execute(&server, &jwt, body.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{body} -> {response}");
+        assert_eq!(response["outcome"]["verdict"], verdict, "{response}");
+        assert_eq!(
+            response["outcome"]["requirements"][0]["id"], "answer-is-one",
+            "{response}"
+        );
+        assert_eq!(response["verifier"]["uid"], fixture.assertion.to_string());
+        assert_eq!(response["subject"]["uid"], fixture.service.to_string());
+        assert!(response["execution_id"].is_string(), "{response}");
+    }
     assert_eq!(
-        (status, problem["code"].as_str()),
-        (
-            StatusCode::NOT_FOUND,
-            Some("WYRD_VERIFICATION_404_RUN_NOT_FOUND")
-        )
+        decisions(&server, "verification.execute", caller).await,
+        vec![run_decision("allowed"); 2],
+        "one decision per request"
     );
-    let (status, problem) = post_run(
-        &server,
-        &foreign_jwt,
-        &run_body(binding_target(fixture.ready_binding)),
-        None,
-    )
-    .await;
+    assert_eq!(fixture.queued().await, 0);
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Malformed, oversized, unknown, and non-Verifier executions and a Drift
+/// Verifier, which judges only scheduled windows, are refused with stable
+/// codes. A caller without `verifier:run`, holding only `evals:run`, or
+/// granted only an unrelated Verifier UID is refused with one audited denial,
+/// while a Card-bound principal granted exactly that Verifier UID is allowed
+/// whatever its observation scope; nothing is ever enqueued.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any status, code, queue, or audit expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_execution_refusals_are_stable() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let (_, jwt) = user(&server, "vx-refused-writer", &["editor"]).await;
+    let allowed = fixture.request(&fixture.assertion, json!(1));
+    let mut unknown = allowed.clone();
+    unknown["x"] = json!(1);
+    let unregistered = CardUid::from_uuid(Uuid::now_v7()).expect("UID is valid");
+
+    let cases = [
+        (
+            "{".to_owned(),
+            StatusCode::BAD_REQUEST,
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
+        ),
+        (
+            unknown.to_string(),
+            StatusCode::BAD_REQUEST,
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
+        ),
+        (
+            " ".repeat(1024 * 1024 + 1),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
+        ),
+        (
+            fixture.request(&unregistered, json!(1)).to_string(),
+            StatusCode::NOT_FOUND,
+            "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+        ),
+        (
+            fixture.request(&fixture.service, json!(1)).to_string(),
+            StatusCode::NOT_FOUND,
+            "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+        ),
+        (
+            fixture.request(&fixture.drift, json!(1)).to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED",
+        ),
+    ];
+    for (body, status, code) in cases {
+        let (actual, problem) = execute(&server, &jwt, body.clone()).await;
+        assert_eq!(
+            (actual, problem["code"].as_str()),
+            (status, Some(code)),
+            "{} -> {problem}",
+            &body[..body.len().min(200)]
+        );
+    }
+
+    let allowed = allowed.to_string();
+    let (reader, reader_jwt) = user(&server, "vx-reader", &["viewer"]).await;
+    let (status, problem) = execute(&server, &reader_jwt, allowed.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(
-        (status, problem["code"].as_str()),
-        (
-            StatusCode::NOT_FOUND,
-            Some("WYRD_VERIFICATION_404_BINDING_NOT_FOUND")
-        )
+        decisions(&server, "verification.execute", reader).await,
+        vec![run_decision("denied")]
     );
-    assert_eq!(run_count(&server, tenant).await, 1);
-    assert_eq!(run_count(&server, other).await, 0);
+    for (role, permission) in [
+        ("vx_evals_only", Permission::eval_run()),
+        (
+            "vx_other_verifier",
+            Permission::verifier_run(fixture.drift.clone()),
+        ),
+    ] {
+        server
+            .seed_role(role, &[Permission::card_read(), permission])
+            .await
+            .expect("role seeds");
+        let (denied, denied_jwt) = user(&server, &format!("{role}-user"), &[role]).await;
+        let (status, problem) = execute(&server, &denied_jwt, allowed.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{role}: {problem}");
+        assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(
+            decisions(&server, "verification.execute", denied).await,
+            vec![run_decision("denied")],
+            "{role}"
+        );
+    }
+    server
+        .seed_role(
+            "vx_exact_verifier",
+            &[Permission::verifier_run(fixture.assertion.clone())],
+        )
+        .await
+        .expect("role seeds");
+    let machine = server
+        .bootstrap_service("vx-foreign-service", &["vx_exact_verifier"])
+        .await
+        .expect("card-bound service bootstraps");
+    let machine_token = machine_jwt(&server, &machine).await;
+    let (status, judged) = execute(&server, &machine_token, allowed).await;
+    assert_eq!(status, StatusCode::OK, "{judged}");
+    assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+    assert_eq!(
+        decisions(&server, "verification.execute", machine.id().as_uuid()).await,
+        vec![run_decision("allowed")]
+    );
+    assert_eq!(fixture.queued().await, 0);
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -856,672 +948,4 @@ async fn system_writer_is_unreachable_through_public_principal_routes() {
         "no public route changed or credentialed the SYSTEM writer"
     );
     server.shutdown().await.expect("test server shuts down");
-}
-
-/// A PSI Drift Verifier spec over the numeric feature `score`.
-fn psi_spec() -> Value {
-    json!({ "implementation": { "kind": "drift", "spec": {
-        "method": "Psi",
-        "signal": { "kind": "Distribution",
-                    "baseline_ref": { "kind": "Data", "name": "vx-psi-baseline", "version": "1.0.0" },
-                    "features": ["score"] },
-        "condition": { "kind": "Statistical" },
-        "profile": { "kind": "Psi",
-                     "binning_strategy": { "kind": "EqualWidth", "n_bins": 10 },
-                     "threshold": { "kind": "Fixed", "value": 0.25 } }
-    } } })
-}
-
-/// The serialized PSI fit of `score` uniformly spread over `0..1000`.
-///
-/// # Panics
-/// Panics when the spec does not decode or the fit fails.
-fn psi_fitted() -> Value {
-    let spec: wyrd_spec::card::drift::DriftSpec =
-        serde_json::from_value(psi_spec()["implementation"]["spec"].clone())
-            .expect("PSI spec decodes");
-    let values: Vec<f64> = (0..1000).map(f64::from).collect();
-    let batch = arrow::record_batch::RecordBatch::try_from_iter([(
-        "score",
-        std::sync::Arc::new(arrow::array::Float64Array::from(values)) as arrow::array::ArrayRef,
-    )])
-    .expect("fit batch builds");
-    serde_json::to_value(vala_drift::fit_baseline(&batch, &spec).expect("PSI fits"))
-        .expect("fit serializes")
-}
-
-/// An Eval Verifier spec with one gated `is_not_null` assertion on `$.x`.
-fn eval_assertion_spec() -> Value {
-    json!({ "implementation": { "kind": "eval", "spec": {
-        "pass_gate": { "kind": "all_pass" },
-        "tasks": { "a": { "kind": "assertion", "id": "a", "context_path": "$.x",
-                          "operator": "is_not_null", "expected": null } }
-    } } })
-}
-
-/// A task Verifier spec whose one assertion requires `$.x` to equal `1`.
-fn task_assertion_spec() -> Value {
-    json!({ "implementation": { "kind": "task", "spec": {
-        "kind": "assertion", "id": "x_is_one", "context_path": "$.x",
-        "operator": "equals", "expected": 1
-    } } })
-}
-
-/// A direct execution body judging `subject` with `verifier` over `input`.
-fn execute_body(verifier: &CardUid, subject: &CardUid, input: Value) -> Value {
-    json!({ "verifier_card_uid": verifier, "card_uid": subject, "input": input })
-}
-
-/// `drift_samples` input of one numeric column.
-fn samples(column: &str, values: &[f64]) -> Value {
-    json!({ "kind": "drift_samples", "columns": { column: values } })
-}
-
-/// POST one raw direct execution body as `jwt`.
-///
-/// # Panics
-/// Panics when the request cannot be built or the route fails to respond.
-async fn post_execute(server: &WyrdTestServer, jwt: &str, body: String) -> (StatusCode, Value) {
-    let response = server
-        .oneshot_authenticated(
-            jwt,
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/verification/execute")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body))
-                .expect("execute request builds"),
-        )
-        .await
-        .expect("execute request responds");
-    decoded(response).await
-}
-
-/// The direct execution targets of one tenant.
-struct Direct {
-    /// Subject Service every execution judges.
-    service: CardUid,
-    /// Custom Drift Verifier on `latency` with baseline 100 and threshold 10.
-    custom: CardUid,
-    /// PSI Verifier with a ready current-format baseline.
-    psi: CardUid,
-    /// PSI Verifier whose baseline was fitted before the format field.
-    legacy: CardUid,
-    /// PSI Verifier with no fitted baseline.
-    unfitted: CardUid,
-    /// Eval Verifier with one context assertion.
-    eval: CardUid,
-    /// Eval Verifier with a trace assertion direct execution cannot run.
-    traced: CardUid,
-    /// Task Verifier with one `equals` assertion on `$.x`.
-    task: CardUid,
-}
-
-impl Direct {
-    /// Seed every direct target in the server's tenant.
-    ///
-    /// # Panics
-    /// Panics when any fixture write fails.
-    async fn seed(server: &WyrdTestServer) -> Self {
-        let tenant = server.data_tenant_id();
-        let fixture = server
-            .verification_fixture()
-            .await
-            .expect("verification fixture provisions");
-        let mut legacy_fit = psi_fitted();
-        legacy_fit["Psi"]
-            .as_object_mut()
-            .expect("PSI fit is an object")
-            .remove("format");
-        Self {
-            service: seed_card(server, tenant, "Service", "vx-service", json!({})).await,
-            custom: fixture
-                .custom_drift_verifier("vx-custom", "latency", 100.0, 10.0)
-                .await
-                .expect("Custom Verifier registers"),
-            psi: fixture
-                .fitted_verifier("vx-psi", &psi_spec(), &psi_fitted())
-                .await
-                .expect("fitted PSI Verifier registers"),
-            legacy: fixture
-                .fitted_verifier("vx-legacy", &psi_spec(), &legacy_fit)
-                .await
-                .expect("legacy PSI Verifier registers"),
-            unfitted: fixture
-                .verifier("vx-unfitted", &psi_spec())
-                .await
-                .expect("unfitted PSI Verifier registers"),
-            eval: fixture
-                .verifier("vx-eval", &eval_assertion_spec())
-                .await
-                .expect("Eval Verifier registers"),
-            traced: fixture
-                .verifier(
-                    "vx-traced",
-                    &json!({ "implementation": { "kind": "eval", "spec": { "tasks": {
-                        "t": { "kind": "trace_assertion", "id": "t", "span_selector": "$.spans[0].name",
-                               "operator": "equals", "expected": "x" } } } } }),
-                )
-                .await
-                .expect("traced Eval Verifier registers"),
-            task: fixture
-                .verifier("vx-task", &task_assertion_spec())
-                .await
-                .expect("task Verifier registers"),
-        }
-    }
-}
-
-/// Direct execution judges Custom and PSI Drift samples, an Eval record, and
-/// a task Verifier's context inline, returning the exact identities, verdict,
-/// and detail, with counts for Drift and Eval and none for a task;
-/// unscoreable (null) samples are `inconclusive`. Nothing is enqueued and each
-/// request audits exactly one allowed `verifier:run` decision.
-///
-/// # Panics
-/// Panics when the server fails to start, a fixture write fails, a route fails
-/// to respond, or any verdict, identity, run count, or audit expectation fails.
-#[tokio::test(flavor = "current_thread")]
-async fn direct_execution_judges_inline_without_runs() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let direct = Direct::seed(&server).await;
-    let (caller, jwt) = user(&server, "vx-writer", &["editor"]).await;
-
-    let spread: Vec<f64> = (0..1000).map(f64::from).collect();
-    let skewed = vec![990.0; 500];
-    let cases = [
-        (
-            direct.custom.clone(),
-            samples("latency", &[101.0, 99.0]),
-            "passed",
-            "drift",
-        ),
-        (
-            direct.custom.clone(),
-            samples("latency", &[150.0]),
-            "failed",
-            "drift",
-        ),
-        (
-            direct.psi.clone(),
-            samples("score", &spread),
-            "passed",
-            "drift",
-        ),
-        (
-            direct.psi.clone(),
-            samples("score", &skewed),
-            "failed",
-            "drift",
-        ),
-        (
-            direct.psi.clone(),
-            json!({ "kind": "drift_samples", "columns": { "score": [1.0, null] } }),
-            "inconclusive",
-            "drift",
-        ),
-        (
-            direct.eval.clone(),
-            json!({ "kind": "eval_record", "context": { "x": 1 } }),
-            "passed",
-            "eval",
-        ),
-        (
-            direct.eval.clone(),
-            json!({ "kind": "eval_record", "context": { "x": null } }),
-            "failed",
-            "eval",
-        ),
-        (
-            direct.task.clone(),
-            json!({ "kind": "task_context", "context": { "x": 1 } }),
-            "passed",
-            "task",
-        ),
-        (
-            direct.task.clone(),
-            json!({ "kind": "task_context", "context": { "x": 2 } }),
-            "failed",
-            "task",
-        ),
-    ];
-    let requests = cases.len();
-    for (verifier, input, verdict, kind) in cases {
-        let body = execute_body(&verifier, &direct.service, input);
-        let (status, response) = post_execute(&server, &jwt, body.to_string()).await;
-        assert_eq!(status, StatusCode::OK, "{body} -> {response}");
-        assert_eq!(response["verdict"], verdict, "{body} -> {response}");
-        assert_eq!(response["verifier"]["uid"], verifier.to_string());
-        assert_eq!(response["subject"]["uid"], direct.service.to_string());
-        assert_eq!(
-            response["detail"].as_object().map(|d| d.contains_key(kind)),
-            Some(true)
-        );
-        assert!(response["execution_id"].is_string());
-        assert!(response["summary"].is_string());
-        assert_eq!(
-            response.get("counts").is_some(),
-            kind != "task",
-            "{body} -> {response}"
-        );
-    }
-    assert_eq!(run_count(&server, server.data_tenant_id()).await, 0);
-    let decisions = execute_decisions(&server, caller).await;
-    assert_eq!(decisions.len(), requests, "one decision per request");
-    assert!(
-        decisions
-            .iter()
-            .all(|decision| decision == &("verifier:run".to_owned(), "allowed".to_owned()))
-    );
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// Malformed, oversized, unknown, unready, legacy, incompatible, and
-/// unsupported executions are refused with stable codes. A caller without
-/// `verifier:run`, holding only `evals:run`, or granted only an unrelated
-/// Verifier UID is refused with one audited denial, while a Card-bound
-/// principal granted exactly that Verifier UID is allowed whatever its
-/// observation scope; nothing is ever enqueued.
-///
-/// # Panics
-/// Panics when the server fails to start, a fixture write fails, a route fails
-/// to respond, or any status, code, run count, or audit expectation fails.
-#[tokio::test(flavor = "current_thread")]
-async fn direct_execution_refusals_are_stable() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let direct = Direct::seed(&server).await;
-    let (_, jwt) = user(&server, "vx-refused-writer", &["editor"]).await;
-    let service = &direct.service;
-    let record = json!({ "kind": "eval_record", "context": { "x": 1 } });
-    let wide: serde_json::Map<String, Value> =
-        (0..65).map(|i| (format!("c{i}"), json!([1.0]))).collect();
-
-    let cases = [
-        (
-            "{".to_owned(),
-            StatusCode::BAD_REQUEST,
-            "WYRD_VERIFICATION_400_INPUT_INVALID",
-        ),
-        (
-            json!({ "verifier_card_uid": direct.custom, "card_uid": service,
-                    "input": samples("latency", &[1.0]), "x": 1 })
-            .to_string(),
-            StatusCode::BAD_REQUEST,
-            "WYRD_VERIFICATION_400_INPUT_INVALID",
-        ),
-        (
-            execute_body(
-                &direct.custom,
-                service,
-                json!({ "kind": "drift_samples", "columns": { "latency": [1.0, "a"] } }),
-            )
-            .to_string(),
-            StatusCode::BAD_REQUEST,
-            "WYRD_VERIFICATION_400_INPUT_INVALID",
-        ),
-        (
-            " ".repeat(1024 * 1024 + 1),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
-        ),
-        (
-            execute_body(
-                &direct.eval,
-                service,
-                json!({ "kind": "eval_record",
-                "context": { "x": "a".repeat(256 * 1024) } }),
-            )
-            .to_string(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
-        ),
-        (
-            execute_body(
-                &direct.custom,
-                service,
-                json!({ "kind": "drift_samples", "columns": wide }),
-            )
-            .to_string(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
-        ),
-        (
-            execute_body(
-                &CardUid::from_uuid(Uuid::now_v7()).expect("UID is valid"),
-                service,
-                record.clone(),
-            )
-            .to_string(),
-            StatusCode::NOT_FOUND,
-            "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
-        ),
-        (
-            execute_body(service, service, record.clone()).to_string(),
-            StatusCode::NOT_FOUND,
-            "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
-        ),
-        (
-            execute_body(&direct.unfitted, service, samples("score", &[1.0])).to_string(),
-            StatusCode::CONFLICT,
-            "WYRD_VERIFICATION_409_BASELINE_NOT_READY",
-        ),
-        (
-            execute_body(&direct.legacy, service, samples("score", &[1.0])).to_string(),
-            StatusCode::CONFLICT,
-            "WYRD_VERIFICATION_409_BASELINE_LEGACY",
-        ),
-        (
-            execute_body(&direct.custom, service, record.clone()).to_string(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE",
-        ),
-        (
-            execute_body(&direct.psi, service, samples("other", &[1.0])).to_string(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE",
-        ),
-        (
-            execute_body(
-                &direct.eval,
-                service,
-                json!({ "kind": "eval_record", "context": { "y": 1 } }),
-            )
-            .to_string(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE",
-        ),
-        (
-            execute_body(&direct.traced, service, record.clone()).to_string(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED",
-        ),
-        (
-            execute_body(&direct.task, service, record.clone()).to_string(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE",
-        ),
-        (
-            execute_body(
-                &direct.task,
-                service,
-                json!({ "kind": "task_context", "context": { "y": 1 } }),
-            )
-            .to_string(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE",
-        ),
-    ];
-    for (body, status, code) in cases {
-        let (actual, problem) = post_execute(&server, &jwt, body.clone()).await;
-        assert_eq!(
-            (actual, problem["code"].as_str()),
-            (status, Some(code)),
-            "{} -> {problem}",
-            &body[..body.len().min(200)]
-        );
-    }
-
-    let allowed = execute_body(&direct.eval, service, record).to_string();
-    let (reader, reader_jwt) = user(&server, "vx-reader", &["viewer"]).await;
-    let (status, problem) = post_execute(&server, &reader_jwt, allowed.clone()).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
-    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
-    assert_eq!(
-        execute_decisions(&server, reader).await,
-        vec![("verifier:run".to_owned(), "denied".to_owned())]
-    );
-    for (role, permission) in [
-        ("vx_evals_only", Permission::eval_run()),
-        (
-            "vx_other_verifier",
-            Permission::verifier_run(direct.task.clone()),
-        ),
-    ] {
-        server
-            .seed_role(role, &[Permission::card_read(), permission])
-            .await
-            .expect("role seeds");
-        let (denied, denied_jwt) = user(&server, &format!("{role}-user"), &[role]).await;
-        let (status, problem) = post_execute(&server, &denied_jwt, allowed.clone()).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{role}: {problem}");
-        assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
-        assert_eq!(
-            execute_decisions(&server, denied).await,
-            vec![("verifier:run".to_owned(), "denied".to_owned())],
-            "{role}"
-        );
-    }
-    server
-        .seed_role(
-            "vx_exact_verifier",
-            &[Permission::verifier_run(direct.eval.clone())],
-        )
-        .await
-        .expect("role seeds");
-    let machine = server
-        .bootstrap_service("vx-foreign-service", &["vx_exact_verifier"])
-        .await
-        .expect("card-bound service bootstraps");
-    let machine_token = machine_jwt(&server, &machine).await;
-    let (status, judged) = post_execute(&server, &machine_token, allowed).await;
-    assert_eq!(status, StatusCode::OK, "{judged}");
-    assert_eq!(judged["verdict"], "passed", "{judged}");
-    assert_eq!(
-        execute_decisions(&server, machine.id().as_uuid()).await,
-        vec![("verifier:run".to_owned(), "allowed".to_owned())]
-    );
-    assert_eq!(run_count(&server, server.data_tenant_id()).await, 0);
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// An `llm_judge` check asking an inline OpenAI judge, routed to the `openai`
-/// gateway deployment, to grade `$.answer`, with no retries; the Eval and task
-/// judge Verifiers both carry it.
-///
-/// # Panics
-/// Panics when the judge prompt cannot be built.
-pub(crate) fn judge_check() -> Value {
-    let prompt = skald_prompt::openai_chat(
-        "gpt-test",
-        skald_prompt::OpenAiChatOptions {
-            messages: vec!["Grade the answer ${answer}.".to_owned()],
-            output: Some(
-                skald_prompt::ResponseFormat::json_schema(
-                    "judge_result",
-                    json!({
-                        "type": "object",
-                        "properties": { "passed": { "type": "boolean" } },
-                        "required": ["passed"],
-                        "additionalProperties": false
-                    }),
-                )
-                .expect("the judge response format builds"),
-            ),
-            ..skald_prompt::OpenAiChatOptions::default()
-        },
-    )
-    .expect("the judge prompt builds");
-    json!({
-        "kind": "llm_judge", "id": "judge",
-        "judge_ref": { "prompt": prompt.into_native(), "execution_route": { "kind": "wyrd_gateway", "deployment": "openai" }, "tool_names": [],
-                       "run_config": { "max_iterations": 1 } },
-        "context_path": "$.answer", "operator": "equals",
-        "expected": { "passed": true }, "max_retries": 0
-    })
-}
-
-/// Direct Eval and task executions call the configured judge provider and
-/// return its graded verdict; when the provider fails, the execution is
-/// refused with the stable dependency code and no provider detail.
-///
-/// # Panics
-/// Panics when the mock provider or server fails to start, a fixture write
-/// fails, a route fails to respond, or any status, verdict, or code
-/// expectation fails.
-#[tokio::test(flavor = "current_thread")]
-async fn direct_execution_calls_the_judge_provider() {
-    let provider = wiremock::MockServer::start().await;
-    let server = WyrdTestServer::builder()
-        .with_gateway_provider_root_for_test(
-            url::Url::parse(&provider.uri()).expect("mock URL parses"),
-        )
-        .start_in_process()
-        .await
-        .expect("test server starts");
-    let service = seed_card(
-        &server,
-        server.data_tenant_id(),
-        "Service",
-        "vx-judged",
-        json!({}),
-    )
-    .await;
-    let fixture = server
-        .verification_fixture()
-        .await
-        .expect("verification fixture provisions");
-    let eval = fixture
-        .verifier(
-            "vx-judge",
-            &json!({ "implementation": { "kind": "eval", "spec": {
-                "pass_gate": { "kind": "all_pass" },
-                "tasks": { "judge": judge_check() }
-            } } }),
-        )
-        .await
-        .expect("Eval judge Verifier registers");
-    let task = fixture
-        .verifier(
-            "vx-task-judge",
-            &json!({ "implementation": { "kind": "task", "spec": judge_check() } }),
-        )
-        .await
-        .expect("task judge Verifier registers");
-    let bodies = [(eval, "eval_record"), (task, "task_context")].map(|(judge, kind)| {
-        execute_body(
-            &judge,
-            &service,
-            json!({ "kind": kind, "context": { "answer": "yes" } }),
-        )
-        .to_string()
-    });
-    server
-        .seed_role(
-            "vx_judge_runner",
-            &[Permission::card_read(), Permission::verifier_run_any()],
-        )
-        .await
-        .expect("runner role seeds");
-    let (_, unprivileged) = user(&server, "vx-judge-unprivileged", &["vx_judge_runner"]).await;
-    let (_, jwt) = user(&server, "vx-judge-writer", &["editor"]).await;
-    for body in &bodies {
-        refused_before_upstream(&server, &provider, &jwt, body.clone()).await;
-    }
-    server
-        .deploy_gateway_model_for_test("gpt-test", "vx_judge_invoker")
-        .await
-        .expect("judge model deploys");
-    for body in &bodies {
-        refused_before_upstream(&server, &provider, &unprivileged, body.clone()).await;
-        judged_by_provider(&server, &provider, &jwt, body.clone()).await;
-    }
-    for body in bodies {
-        provider_failure_withheld(&server, &provider, &jwt, body).await;
-    }
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// Executes `body` as a caller the gateway refuses (no deployment, or no
-/// invoke grant), asserting the stable dependency refusal and that the
-/// provider was never called.
-///
-/// # Panics
-/// Panics when the route fails to respond or the status, code, or provider
-/// call count differs from the expectation.
-async fn refused_before_upstream(
-    server: &WyrdTestServer,
-    provider: &wiremock::MockServer,
-    jwt: &str,
-    body: String,
-) {
-    provider.reset().await;
-    let (status, problem) = post_execute(server, jwt, body).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{problem}");
-    assert_eq!(problem["code"], "WYRD_VERIFICATION_502_DEPENDENCY_FAILED");
-    assert!(
-        provider
-            .received_requests()
-            .await
-            .is_none_or(|requests| requests.is_empty()),
-        "the gateway refused before upstream IO"
-    );
-}
-
-/// Executes `body` once against a provider grading it passed, asserting the
-/// verdict and exactly one provider call.
-///
-/// # Panics
-/// Panics when the route fails to respond or the status, verdict, or
-/// provider call count differs from the expectation.
-async fn judged_by_provider(
-    server: &WyrdTestServer,
-    provider: &wiremock::MockServer,
-    jwt: &str,
-    body: String,
-) {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, ResponseTemplate};
-
-    provider.reset().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "chatcmpl_direct", "object": "chat.completion", "created": 1_700_000_000,
-            "model": "gpt-test",
-            "choices": [{ "index": 0, "finish_reason": "stop",
-                "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
-            "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
-        })))
-        .expect(1)
-        .mount(provider)
-        .await;
-    let (status, response) = post_execute(server, jwt, body).await;
-    assert_eq!(status, StatusCode::OK, "{response}");
-    assert_eq!(response["verdict"], "passed", "{response}");
-    provider.verify().await;
-}
-
-/// Executes `body` against a failing provider, asserting the stable,
-/// detail-free dependency refusal. The first failure also removes the
-/// deployment from gateway selection, so a later call is refused before
-/// upstream IO with the same refusal.
-///
-/// # Panics
-/// Panics when the route fails to respond or the status or code differs, or
-/// the refusal leaks provider detail.
-async fn provider_failure_withheld(
-    server: &WyrdTestServer,
-    provider: &wiremock::MockServer,
-    jwt: &str,
-    body: String,
-) {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, ResponseTemplate};
-
-    provider.reset().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
-            "error": { "message": "provider-secret-detail", "type": "server_error" }
-        })))
-        .mount(provider)
-        .await;
-    let (status, problem) = post_execute(server, jwt, body).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{problem}");
-    assert_eq!(problem["code"], "WYRD_VERIFICATION_502_DEPENDENCY_FAILED");
-    assert!(!problem.to_string().contains("provider-secret-detail"));
 }

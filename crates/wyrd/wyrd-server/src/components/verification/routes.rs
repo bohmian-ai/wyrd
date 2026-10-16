@@ -256,8 +256,8 @@ async fn get_execution(
           caller's tenant (WYRD_VERIFICATION_404_TARGET_NOT_FOUND)", body = WyrdProblem),
         (status = 413, description = "The body or input exceeds a bound \
           (WYRD_VERIFICATION_413_INPUT_TOO_LARGE)", body = WyrdProblem),
-        (status = 422, description = "The Verifier judges a scheduled window; submit samples \
-          instead (WYRD_VERIFICATION_422_INPUT_UNSUPPORTED)", body = WyrdProblem),
+        (status = 422, description = "The Verifier judges a scheduled window and runs only on \
+          its binding schedule (WYRD_VERIFICATION_422_INPUT_UNSUPPORTED)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, no verifier is configured \
           for the access token, or this process hosts no Verifier execution \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE, \

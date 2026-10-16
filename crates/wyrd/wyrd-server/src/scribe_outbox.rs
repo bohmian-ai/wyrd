@@ -947,22 +947,25 @@ mod tests {
     use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
     use vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES;
     use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
-    use vala_eval::executor::{EvalReport, TaskRunOutcome};
     use wyrd_runtime::audit::AuditStage;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
+    use wyrd_spec::card::drift::DriftMethod;
+    use wyrd_spec::card::verifier::Check;
     use wyrd_spec::gateway::GatewayCaptureMode;
-    use wyrd_spec::ids::{CardUid, VerificationResultId};
+    use wyrd_spec::ids::{CardUid, ExecutionId, FeatureName};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
         AuditEvent, AuditOutcome, ClusterCapabilities, ClusterNodeKey, ClusterRole,
         ClusterRoleLease, NodeId, ScribeCapabilitiesV1,
     };
     use wyrd_spec::vala::eval::ids::TaskId;
-    use wyrd_spec::vala::eval::operator::ComparisonOperator;
-    use wyrd_spec::vala::eval::result::AssertionResult;
-    use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
-    use wyrd_sql::queries::verifier_runs::RunInput;
+    use wyrd_spec::verification::execution::{
+        RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
+    };
+    use wyrd_spec::verification::{
+        DriftReport, DriftVerdict, DriftWindow, FeatureDriftReport, VerificationVerdict,
+    };
     use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
     use wyrd_tonic::tonic::{Code, Request, Response, Status};
     use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_server::{
@@ -981,7 +984,6 @@ mod tests {
     use crate::components::gateway::capture_tests::{facts, policy};
     use crate::components::gateway::recording::{Received, RecordingScribe};
     use crate::grpc::capture_peer::ScribeCapturePeerGrpc;
-    use crate::verification::engines::VerifierReport;
     use crate::verification::results::{ResultPayloadBuilder, ResultRun};
 
     /// One validated `Metadata` capture for `tenant`: a call row and one
@@ -1020,29 +1022,85 @@ mod tests {
     ///
     /// Panics when the payload does not build.
     fn result(subject: &CardUid, attribution: Attribution) -> ScribeWrite {
+        drift_result(subject, attribution, 0, 0)
+    }
+
+    /// One failed Drift judgment of `subject` by a fresh Verifier whose one
+    /// requirement scored `features` features, named `f0000`, `f0001`, ...,
+    /// and gives a reason of `reason_bytes` characters, attributed to
+    /// `attribution`.
+    ///
+    /// With no features the judgment writes its summary row only.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the payload does not build.
+    fn drift_result(
+        subject: &CardUid,
+        attribution: Attribution,
+        features: usize,
+        reason_bytes: usize,
+    ) -> ScribeWrite {
         let verifier = uid();
         let now = Utc::now();
-        let input = RunInput::DriftWindow(DriftWindow {
+        let window = DriftWindow {
             start: now - chrono::Duration::hours(1),
             end: now,
-        });
+        };
+        let features = (0..features)
+            .map(|feature| {
+                let name = FeatureName::new(format!("f{feature:04}")).expect("feature name");
+                let report = FeatureDriftReport {
+                    feature: name.clone(),
+                    score: Some(0.4),
+                    threshold: Some(0.2),
+                    verdict: DriftVerdict::Drift,
+                    evidence: None,
+                };
+                (name, report)
+            })
+            .collect();
+        let outcome = VerificationOutcome {
+            verdict: VerificationVerdict::Failed,
+            requirements: vec![RequirementResult {
+                id: TaskId::new("drift").expect("task id"),
+                step: None,
+                statement: "drift".to_owned(),
+                outcome: RequirementOutcome::Failed,
+                reason: "x".repeat(reason_bytes),
+                actual: None,
+                citations: Vec::new(),
+                detail: Some(RequirementDetail::Drift(DriftReport {
+                    method: DriftMethod::Psi,
+                    features,
+                    verdict: DriftVerdict::Drift,
+                })),
+                check: serde_json::from_value::<Check>(serde_json::json!({
+                    "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
+                }))
+                .expect("assert check decodes"),
+                provenance: None,
+            }],
+            steps: Vec::new(),
+            evidence: std::collections::BTreeMap::new(),
+        };
         let payload = ResultPayloadBuilder::new(
             ResultRun {
+                execution_id: ExecutionId::new_v7(),
                 run_id: None,
                 verifier_version: "1.0.0",
                 card_uid: subject,
                 owner_card_uid: None,
                 binding_id: None,
                 trigger: None,
-                input: &input,
+                window: Some(&window),
             },
             &verifier,
-            VerificationResultId::new_v7(),
             now,
             now,
         )
-        .build(&VerifierReport::Drift(None))
-        .expect("an unscored Drift result builds");
+        .build(&outcome)
+        .expect("a Drift result builds");
         ScribeWrite::Result {
             payload,
             attribution,
@@ -1371,9 +1429,13 @@ mod tests {
         assert_eq!(spans.permits.available_permits(), TENANT_SPAN_PERMITS);
     }
 
-    /// A Scribe request ceiling well below the default, so a modest Eval
+    /// A Scribe request ceiling well below the default, so a modest drift
     /// detail payload needs several frames.
     const SMALL_REQUEST_BYTES: usize = 64 * 1024;
+
+    /// Features scored by the drift judgment whose detail splits into
+    /// several frames under [`SMALL_REQUEST_BYTES`] while its summary fits.
+    const DETAIL_FEATURES: usize = 128;
 
     /// Starts an outbox submitting along `route` under a `request_bytes`
     /// Scribe ceiling.
@@ -1388,61 +1450,6 @@ mod tests {
         )
     }
 
-    /// One Eval judgment with `tasks` passed items, task ids `t0`, `t1`, ...,
-    /// each carrying an expected value of `expected_bytes` characters.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the payload does not build.
-    fn eval_result(attribution: Attribution, tasks: usize, expected_bytes: usize) -> ScribeWrite {
-        let (subject, verifier) = (uid(), uid());
-        let now = Utc::now();
-        let input = RunInput::EvalRecord {
-            record_id: "record-1".to_owned(),
-            event_time: now,
-        };
-        let outcomes = (0..tasks)
-            .map(|task| {
-                TaskRunOutcome::Ran(Box::new(AssertionResult {
-                    task_id: TaskId::new(format!("t{task}")).expect("task id"),
-                    passed: true,
-                    actual: None,
-                    expected: serde_json::Value::String("x".repeat(expected_bytes)),
-                    operator: ComparisonOperator::Equals,
-                    message: None,
-                    stage: 0,
-                    started_at: now,
-                    duration_ms: 1,
-                }))
-            })
-            .collect();
-        let payload = ResultPayloadBuilder::new(
-            ResultRun {
-                run_id: None,
-                verifier_version: "1.0.0",
-                card_uid: &subject,
-                owner_card_uid: None,
-                binding_id: None,
-                trigger: None,
-                input: &input,
-            },
-            &verifier,
-            VerificationResultId::new_v7(),
-            now,
-            now,
-        )
-        .build(&VerifierReport::Eval {
-            report: EvalReport { outcomes },
-            verdict: VerificationVerdict::Passed,
-            run_id: None,
-        })
-        .expect("an Eval result builds");
-        ScribeWrite::Result {
-            payload,
-            attribution,
-        }
-    }
-
     /// Each distinct acknowledged frame once, in first-acknowledged order,
     /// as Scribe's batch-id dedup would retain them.
     fn retained(received: Vec<Received>) -> Vec<Received> {
@@ -1453,23 +1460,23 @@ mod tests {
             .collect()
     }
 
-    /// The task ids of every Eval item row in `frames`, in order.
+    /// The feature of every drift detail row in `frames`, in order.
     ///
     /// # Panics
     ///
     /// Panics when an item frame does not decode.
-    fn item_task_ids(frames: &[Received]) -> Vec<String> {
+    fn detail_features(frames: &[Received]) -> Vec<String> {
         frames
             .iter()
-            .filter(|frame| frame.table == "vala.eval.result_items")
+            .filter(|frame| frame.table == "vala.drift.result_features")
             .flat_map(|frame| {
                 StreamReader::try_new(std::io::Cursor::new(frame.ipc.clone()), None)
                     .expect("an item frame opens")
                     .flat_map(|batch| {
                         let batch = batch.expect("an item batch decodes");
                         let ids = batch
-                            .column_by_name("task_id")
-                            .expect("task_id column")
+                            .column_by_name("feature")
+                            .expect("feature column")
                             .as_string::<i32>()
                             .clone();
                         (0..ids.len())
@@ -1489,7 +1496,7 @@ mod tests {
     ///
     /// Panics when a row is missing, repeated, misordered, or a frame is over
     /// budget or out of order.
-    fn assert_bounded_detail(frames: &[Received], tasks: usize) {
+    fn assert_bounded_detail(frames: &[Received], features: usize) {
         let tables = frames
             .iter()
             .map(|frame| frame.table.as_str())
@@ -1497,18 +1504,29 @@ mod tests {
         let (summary, items) = tables.split_last().expect("frames were written");
         assert_eq!(*summary, "vala.verification.results", "the summary is last");
         assert!(
-            items.len() > 1 && items.iter().all(|table| *table == "vala.eval.result_items"),
+            items.len() > 1
+                && items
+                    .iter()
+                    .all(|table| *table == "vala.drift.result_features"),
             "the detail splits into several item frames before the summary: {tables:?}"
         );
         let budget = frame_budget(SMALL_REQUEST_BYTES);
         assert!(
             frames.iter().all(|frame| frame.ipc.len() <= budget),
-            "every frame fits the budget"
+            "every frame fits the budget: {:?}",
+            frames
+                .iter()
+                .map(|frame| (frame.table.as_str(), frame.ipc.len()))
+                .collect::<Vec<_>>()
         );
-        let expected = (0..tasks)
-            .map(|task| format!("t{task}"))
+        let expected = (0..features)
+            .map(|feature| format!("f{feature:04}"))
             .collect::<Vec<_>>();
-        assert_eq!(item_task_ids(frames), expected, "every row once, in order");
+        assert_eq!(
+            detail_features(frames),
+            expected,
+            "every row once, in order"
+        );
     }
 
     /// A Scribe that acknowledges through `inner` but reports the
@@ -1579,7 +1597,10 @@ mod tests {
             seen: AtomicUsize::new(0),
         };
         let outbox = route_outbox(ScribeRoute::Local(Arc::new(scribe)), SMALL_REQUEST_BYTES);
-        outbox.stage(DataTenantId::new_v7(), eval_result(background(), 64, 1024));
+        outbox.stage(
+            DataTenantId::new_v7(),
+            drift_result(&uid(), background(), DETAIL_FEATURES, 0),
+        );
         settle(&outbox).await;
 
         let submitted = recording.submitted();
@@ -1594,16 +1615,16 @@ mod tests {
             submitted.len() - 2,
             "every frame after the retry is new"
         );
-        assert_bounded_detail(&frames, 64);
+        assert_bounded_detail(&frames, DETAIL_FEATURES);
     }
 
-    /// Proves a single detail row larger than the budget is still submitted
-    /// alone and whole, and a terminal Scribe size refusal consumes it
-    /// without retry while the summary is written.
+    /// Proves a single row larger than the budget is still submitted alone
+    /// and whole, and a terminal Scribe size refusal consumes it without
+    /// retry.
     ///
     /// # Panics
     ///
-    /// Panics when the row is split, retried, or the summary is missing.
+    /// Panics when the row is split, retried, or left staged.
     #[tokio::test]
     async fn an_unsplittable_row_is_submitted_whole_and_terminal_refusal_consumes_it() {
         let scribe = Arc::new(RecordingScribe::default());
@@ -1617,17 +1638,16 @@ mod tests {
         );
         outbox.stage(
             DataTenantId::new_v7(),
-            eval_result(background(), 1, SMALL_REQUEST_BYTES),
+            drift_result(&uid(), background(), 0, SMALL_REQUEST_BYTES),
         );
         settle(&outbox).await;
 
-        assert_eq!(scribe.attempts(), 2, "one item frame and one summary");
-        let tables = scribe
-            .received()
-            .iter()
-            .map(|frame| frame.table.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(tables, ["vala.verification.results"]);
+        assert_eq!(
+            scribe.attempts(),
+            1,
+            "the summary row is submitted once, whole"
+        );
+        assert!(scribe.received().is_empty(), "the refused row is consumed");
     }
 
     /// A peer Scribe that accepts every capture call and never answers,
@@ -1771,7 +1791,10 @@ mod tests {
         let outbox = route_outbox(ScribeRoute::Peer(peers), SMALL_REQUEST_BYTES);
         let tenant = DataTenantId::new_v7();
         let other = DataTenantId::new_v7();
-        outbox.stage(tenant, eval_result(background(), 64, 1024));
+        outbox.stage(
+            tenant,
+            drift_result(&uid(), background(), DETAIL_FEATURES, 0),
+        );
         outbox.stage(other, capture(other));
         settle(&outbox).await;
 
@@ -1789,7 +1812,7 @@ mod tests {
         let (mine, others): (Vec<_>, Vec<_>) = retained(received)
             .into_iter()
             .partition(|frame| frame.tenant == tenant);
-        assert_bounded_detail(&mine, 64);
+        assert_bounded_detail(&mine, DETAIL_FEATURES);
         assert_eq!(
             others
                 .iter()

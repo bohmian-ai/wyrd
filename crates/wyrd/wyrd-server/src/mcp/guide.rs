@@ -64,7 +64,7 @@ fn response(topic: GuideTopic) -> GuideResponse {
         GuideTopic::Overview => (
             vec![
                 "Use tools/list to inspect the current caller-dependent catalog and each tool's input/output schema. Discovery does not grant permission; a named call can still be refused.",
-                "For a Service name, start with cards.list. For a request or trace, discover and describe Bifrost tables. For a run, read verification.get_run. Choose the investigation path from the evidence.",
+                "For a Service name, start with cards.list. For a request or trace, discover and describe Bifrost tables. For a Verifier execution, read verification.get_execution. Choose the investigation path from the evidence.",
                 "Use wyrd.guide topics cards, verification, and bifrost_sql for those workflows. Consult tool descriptors for principal credentials, Operator connections, and gateway administration.",
                 "Cite exact Card UIDs and versions, result IDs, table names, and returned rows. State empty evidence, uncertainty, refusals, and failed queries explicitly.",
             ],
@@ -96,11 +96,11 @@ fn response(topic: GuideTopic) -> GuideResponse {
         ),
         GuideTopic::Verification => (
             vec![
-                "Read the owner Card's status.verification.binding_ids and call verification.get_binding for the exact owner, subject, Verifier, readiness, and last run.",
-                "Call verification.get_run for execution status, result_id, execution errors, and Operator dispatches. A failed judgment differs from an execution failure. Pending, errored, and timed-out runs do not establish a completed judgment.",
-                "Persisted judgment history lives in Bifrost SQL: query vala.verification.results by result_id, or by exact card_uid or owner_card_uid within a suitable time window. Then inspect vala.drift.result_features or vala.eval.result_items by matching result_id.",
-                "card_uid identifies the Card verified and verifier_card_uid the Verifier; sub_principal_id and act_principal_id record who the work was for and who performed it. Verification details and Eval actual/expected/message follow table query permission. Gateway request/response payload columns additionally require gateway_payload:read. Empty evidence is not proof of a passing judgment.",
-                "verification.execute requires verifier:run and returns a one-off judgment directly. It enqueues, persists, and dispatches nothing. verification.start_run durably enqueues a bounded Drift window; poll its run and read published evidence through SQL.",
+                "Read the owner Card's status.verification.binding_ids and call verification.get_binding for the exact owner, subject, Verifier, readiness, and last_execution_id.",
+                "Call verification.get_execution for execution status, its result, execution errors, and Operator dispatches. A failed judgment differs from an execution failure. Pending, errored, and timed-out executions do not establish a completed judgment. A just-enqueued execution may read as not found until the queue accepts it.",
+                "Persisted judgment history lives in Bifrost SQL: query vala.verification.results by result_id, or by exact card_uid or owner_card_uid within a suitable time window. Then inspect vala.drift.result_features by matching result_id.",
+                "card_uid identifies the Card verified and verifier_card_uid the Verifier; sub_principal_id and act_principal_id record who the work was for and who performed it. Verification details follow table query permission. Gateway request/response payload columns additionally require gateway_payload:read. Empty evidence is not proof of a passing judgment.",
+                "verification.execute and verification.enqueue require verifier:run on the Verifier and take the same inline inputs. verification.execute returns the judgment directly and dispatches no Operator. verification.enqueue accepts the work with 202 and an execution_id; poll verification.get_execution. Upload large files first with verification.evidence. Drift Verifiers judge windows and run only on their binding schedule.",
             ],
             vec![
                 example(
@@ -109,13 +109,13 @@ fn response(topic: GuideTopic) -> GuideResponse {
                     json!({ "binding_id": "<binding_id>" }),
                 ),
                 example(
-                    "verification.get_run",
-                    "Find the run's result ID",
-                    json!({ "run_id": "<run_id>" }),
+                    "verification.get_execution",
+                    "Read an execution's status and result",
+                    json!({ "execution_id": "<execution_id>" }),
                 ),
                 sql_example(
                     "Find recent subject judgments",
-                    "SELECT result_id, implementation, verdict, card_uid FROM vala.verification.results WHERE card_uid = '<card_uid>' AND ended_at >= TIMESTAMP '2026-01-01 00:00:00' AND ended_at < TIMESTAMP '2027-01-01 00:00:00' ORDER BY ended_at DESC LIMIT 20",
+                    "SELECT result_id, verifier_card_uid, verdict, card_uid FROM vala.verification.results WHERE card_uid = '<card_uid>' AND ended_at >= TIMESTAMP '2026-01-01 00:00:00' AND ended_at < TIMESTAMP '2027-01-01 00:00:00' ORDER BY ended_at DESC LIMIT 20",
                 ),
             ],
         ),
@@ -124,7 +124,7 @@ fn response(topic: GuideTopic) -> GuideResponse {
                 "Call bifrost.list_tables, then bifrost.describe_table for every table used. Inspect field names and types, including correlation fields. Qualify table names exactly as namespace.name from discovery; do not guess a custom table's fields.",
                 "Use a single DataFusion SELECT with explicit projections, suitable time bounds, and LIMIT. bifrost.query accepts sql and optional deadline_ms, max_rows, max_bytes. Replace placeholders with discovered identifiers and adjust the example time windows.",
                 "Inspect columns once, map positional rows to their column order, and inspect terminal. Treat isError or a failed terminal as failure; do not use incomplete rows as a complete answer. Result ceilings refuse oversized results rather than truncating them.",
-                "Correlate telemetry using described trace_id/span_id and time columns. For verification, use exact subject/owner Card UIDs, then result_id to inspect Drift/Eval details. Use only tables and payload columns the caller is authorized to read.",
+                "Correlate telemetry using described trace_id/span_id and time columns. For verification, use exact subject/owner Card UIDs, then result_id to inspect Drift details. Use only tables and payload columns the caller is authorized to read.",
                 "The custom-table example assumes discovery describes id and value. A Service declares custom tables in vala.datasets; replace the qualified name and projection with the actual declared schema.",
             ],
             vec![

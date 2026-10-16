@@ -115,7 +115,6 @@ and assertion Verifier Cards. Its additional fixtures live in `cards/mcp_investi
 | `service.yaml` | Exact shared component references and the declared `investigation_events` dataset |
 | `drift-verifier.yaml` | Agent-readable Custom Drift Verifier matching the seeded feature report |
 | `drift-report.json` | Native retained Drift report with a failed latency feature |
-| `eval-assertion.json` | Native failed refund-promise assertion item |
 
 The journey registers Cards through the shared client, writes custom rows
 through Bifrost, and publishes fixture reports through the existing native

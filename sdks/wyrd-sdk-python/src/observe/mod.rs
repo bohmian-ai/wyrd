@@ -391,7 +391,9 @@ impl PyObserveHandle {
     ///
     /// Run evidence is staged for one queued execution, returned as a
     /// `wyrd.verify.Execution`; scheduled-window samples are recorded and
-    /// `Recorded` is returned. Arguments are as for `verify`.
+    /// `Recorded` is returned, and each queued sample write records a
+    /// `bifrost.enqueue` PRODUCER span in Python's tracer. Arguments are as
+    /// for `verify`.
     ///
     /// # Errors
     /// As [`PyObserveHandle::verify`] for Run evidence; for window samples,
@@ -407,7 +409,8 @@ impl PyObserveHandle {
     ) -> WyrdPyResult<Py<PyAny>> {
         let inputs = inputs(py, value, named)?;
         let observe = self.observe();
-        match crate::trace::block_on(py, observe.submit(verifier, inputs))? {
+        match crate::trace::traced(|| crate::trace::block_on(py, observe.submit(verifier, inputs)))?
+        {
             Submission::Recorded => Ok(Py::new(py, PyRecorded)?.into_any()),
             Submission::Queued(inner) => Ok(Py::new(py, PyExecution::queued(inner))?.into_any()),
         }

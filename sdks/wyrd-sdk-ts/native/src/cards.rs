@@ -14,6 +14,7 @@ use napi_derive::napi;
 use wyrd_client::cards::{CardKind, CardSelector, Cards, HydrationMode, ListCardsRequest};
 use wyrd_client::observe::Run;
 use wyrd_client::state::{TelemetryFlushFailure, WyrdState};
+use wyrd_client::verify::Submission;
 use wyrd_spec::envelope::Card;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
@@ -772,8 +773,10 @@ impl NativeRun {
         })
     }
 
-    /// Submits slot values: Window samples are recorded, Run evidence
-    /// is queued for one execution.
+    /// Submits slot values: Window samples are recorded now on the
+    /// JavaScript thread, so each queued sample write records its
+    /// `bifrost.enqueue` PRODUCER span in Node's tracer; Run evidence is
+    /// queued for one execution.
     ///
     /// # Errors
     ///
@@ -787,9 +790,15 @@ impl NativeRun {
         inputs: Vec<NativeVerifierInput>,
     ) -> napi::Result<PromiseRaw<'env, NativeSubmission>> {
         let run = self.run.clone();
+        let staged = crate::verification::inputs(inputs).and_then(|inputs| {
+            crate::trace::traced(*env, || run.observe().stage(&verifier, inputs))
+        });
         crate::trace::spawn(env, async move {
-            let result = match crate::verification::inputs(inputs) {
-                Ok(inputs) => Box::pin(run.observe().submit(&verifier, inputs)).await,
+            let result = match staged {
+                Ok(None) => Ok(Submission::Recorded),
+                Ok(Some(staged)) => Box::pin(run.observe().enqueue_staged(staged))
+                    .await
+                    .map(Submission::Queued),
                 Err(error) => Err(error),
             };
             Ok(NativeSubmission::outcome(result))

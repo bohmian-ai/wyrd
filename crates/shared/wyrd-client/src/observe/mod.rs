@@ -33,7 +33,7 @@ use wyrd_spec::verification::execution::VerificationResult;
 
 use crate::bifrost::{Correlation, WriterTable};
 use crate::state::{BoundVerifier, WyrdState};
-use crate::verify::{Inputs, Projected, Submission, Target};
+use crate::verify::{Execution, Inputs, Projected, RunEvidence, Submission, Target};
 
 pub use lifecycle::DRIFT_OBSERVATIONS_TABLE;
 
@@ -362,18 +362,80 @@ impl Observe<'_> {
         verifier: &str,
         inputs: impl Into<Inputs>,
     ) -> Result<Submission, WyrdError> {
-        let state = &self.run.state;
-        let bound = state.bound_verifier(&self.run.subject, verifier)?;
-        let target = self.target(&bound);
-        match target.project(inputs.into())? {
-            Projected::Run(run) => Ok(Submission::Queued(
-                target.enqueue(state.client()?, run).await?,
-            )),
+        match self.record_or_stage(verifier, inputs)? {
+            None => Ok(Submission::Recorded),
+            Some(staged) => Ok(Submission::Queued(self.enqueue_run(staged).await?)),
+        }
+    }
+
+    /// The synchronous half of [`Observe::submit`]: project `inputs` for the
+    /// Verifier named `verifier`, record Window samples now, and return
+    /// `None`, or return the Run evidence still to enqueue.
+    ///
+    /// A foreign runtime calls this on its own thread, inside its producer
+    /// span scope, so each recorded sample's queued write records its
+    /// `bifrost.enqueue` PRODUCER span there.
+    ///
+    /// # Errors
+    /// As [`Observe::submit`], before any execution request.
+    #[cfg(feature = "internal")]
+    pub fn stage(
+        &self,
+        verifier: &str,
+        inputs: impl Into<Inputs>,
+    ) -> Result<Option<StagedRun>, WyrdError> {
+        self.record_or_stage(verifier, inputs)
+    }
+
+    /// Project `inputs` for the Verifier named `verifier`: record Window
+    /// samples and return `None`, or return the Run evidence to enqueue.
+    ///
+    /// # Errors
+    /// As [`Observe::submit`], before any execution request.
+    fn record_or_stage(
+        &self,
+        verifier: &str,
+        inputs: impl Into<Inputs>,
+    ) -> Result<Option<StagedRun>, WyrdError> {
+        let bound = self.run.state.bound_verifier(&self.run.subject, verifier)?;
+        match self.target(&bound).project(inputs.into())? {
+            Projected::Run(evidence) => Ok(Some(StagedRun {
+                verifier: verifier.to_owned(),
+                evidence,
+            })),
             Projected::Window(features) => {
                 self.drift_value(&features, None)?;
-                Ok(Submission::Recorded)
+                Ok(None)
             }
         }
+    }
+
+    /// The asynchronous half of [`Observe::submit`]: pin `staged`'s files
+    /// and stage it for one queued execution.
+    ///
+    /// # Errors
+    /// As [`Observe::submit`] for Run evidence.
+    ///
+    /// # Cancellation
+    /// As [`Observe::submit`].
+    #[cfg(feature = "internal")]
+    pub async fn enqueue_staged(&self, staged: StagedRun) -> Result<Execution, WyrdError> {
+        self.enqueue_run(staged).await
+    }
+
+    /// Pin `staged`'s files and stage it for one queued execution.
+    ///
+    /// # Errors
+    /// As [`Observe::submit`] for Run evidence.
+    ///
+    /// # Cancellation
+    /// As [`Observe::submit`].
+    async fn enqueue_run(&self, staged: StagedRun) -> Result<Execution, WyrdError> {
+        let state = &self.run.state;
+        let bound = state.bound_verifier(&self.run.subject, &staged.verifier)?;
+        self.target(&bound)
+            .enqueue(state.client()?, staged.evidence)
+            .await
     }
 
     /// The execution target of `bound` for this view's Run.
@@ -385,6 +447,15 @@ impl Observe<'_> {
             run_id: self.run.run_id.clone(),
         }
     }
+}
+
+/// Run evidence [`Observe::stage`] projected and still has to enqueue.
+#[derive(Debug)]
+pub struct StagedRun {
+    /// The bound Verifier's `metadata.name`, resolved again on enqueue.
+    verifier: String,
+    /// The projected evidence, before its files are pinned.
+    evidence: RunEvidence,
 }
 
 /// Serialize the bytes of one projected row.

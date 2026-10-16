@@ -203,7 +203,20 @@ PORTABLE_SPEC = {
     "provider": "anthropic",
     "model": "claude-sonnet-4-5",
     "system": "You answer for ${team}.",
-    "messages": [{"role": "user", "content": "${question}"}],
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "${question}"},
+                {"type": "image", "source": "${media:photo}"},
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "mime_type": "image/png", "data": "iVBORw0KGgo="},
+                },
+                {"type": "document", "source": "${media:__wyrd_media_0}"},
+            ],
+        }
+    ],
     "settings": {"temperature": 0.2, "max_output_tokens": 256},
     "response_format": {
         "type": "object",
@@ -254,3 +267,5 @@ def test_prompt_forms_round_trip_as_authored(cards: Cards, tmp_path: Path) -> No
         assert read.metadata["spec_hash"] == envelope.metadata["spec_hash"]
         assert sorted(prompt.parameters) == sorted(prompt.prompt.variables) == variables
         assert prompt.prompt.response_schema == schema
+        media = ["__wyrd_media_0", "photo"] if authored is PORTABLE_SPEC else []
+        assert sorted(prompt.prompt.media_variables) == media

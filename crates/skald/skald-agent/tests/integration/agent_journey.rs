@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use skald_agent::{
     Agent, FinishReason, RunConfig, WyrdGatewayCall, WyrdGatewayCaller, clear_prompt_card_registry,
-    default_prompt_resolver, register_prompt_card,
+    default_prompt_resolver, register_prompt_card, run_config_from_agent_run_config_spec,
 };
 use skald_providers::ProviderError;
 use tokio_util::sync::CancellationToken;
@@ -28,9 +28,17 @@ use skald_spec::wire::openai_chat::{
 };
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 use skald_tool::{AgentTool, ToolDef, ToolRegistry};
-use wyrd_spec::envelope::CardKind;
-use wyrd_spec::reference::{CardRef, InlineableRef};
+use wyrd_spec::card::verifier::VerificationBinding;
+use wyrd_spec::envelope::{CardKind, Spec};
+use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
+use wyrd_spec::{AgentCard, AgentRunConfigSpec, AgentSpec};
 
+/// An Agent authored in code saves, loads, and runs; then every loaded run
+/// configuration shape and a verification binding survive export unchanged.
+///
+/// # Panics
+/// Panics when a save, load, run, or [`assert_loaded_export_is_faithful`]
+/// check fails.
 #[tokio::test]
 async fn journey_author_save_load_run() {
     let path = temp_path("author_save_load_run");
@@ -64,7 +72,147 @@ async fn journey_author_save_load_run() {
 
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     assert_eq!(run.output, "done");
+
+    let card = loaded.to_card().expect("loaded agent exports");
+    for run_config in [
+        AgentRunConfigSpec::default(),
+        AgentRunConfigSpec {
+            timeout_ms: Some(5_000),
+            ..AgentRunConfigSpec::default()
+        },
+        AgentRunConfigSpec {
+            max_iterations: Some(10),
+            tool_concurrency_cap: Some(8),
+            ..AgentRunConfigSpec::default()
+        },
+        AgentRunConfigSpec {
+            max_iterations: Some(3),
+            tool_concurrency_cap: Some(2),
+            session_recent_limit: Some(20),
+            timeout_ms: Some(9_000),
+        },
+    ] {
+        let mut authored = card.clone();
+        authored.spec.run_config = run_config;
+        authored.spec.verified_by = vec![VerificationBinding {
+            verifier: Ref::Ref(CardRef {
+                kind: CardKind::Verifier,
+                ..prompt_card_ref("answers-grounded")
+            }),
+            runs_on: None,
+            on_failure: Vec::new(),
+        }];
+        assert_loaded_export_is_faithful(&authored, &tools, &path);
+    }
     let _ = std::fs::remove_file(path);
+}
+
+/// The canonical hash of an Agent spec, as registration computes it.
+///
+/// # Panics
+/// Panics when the spec does not canonicalize.
+fn spec_hash(spec: &AgentSpec) -> String {
+    Spec::Agent(spec.clone())
+        .canonical_hash()
+        .expect("spec hashes")
+        .to_string()
+}
+
+/// Proves an Agent loaded from `card` exports `card`'s exact spec and hash
+/// through `to_card`, `to_wire`, and a YAML save and reload at `path`, keeps
+/// its identity, Prompt ref and route, and runs with the defaults the authored
+/// configuration resolves to. Edits through `with_run_config` and the public
+/// `run_config` field then export only the edited field, keep every other
+/// authored value and the bindings, and change the hash.
+///
+/// # Panics
+/// Panics when any load, export, save, or equality check fails.
+fn assert_loaded_export_is_faithful(
+    card: &AgentCard,
+    tools: &ToolRegistry,
+    path: &std::path::Path,
+) {
+    let expected = spec_hash(&card.spec);
+    let loaded =
+        Agent::from_card(card.clone(), tools, default_prompt_resolver()).expect("card loads");
+    let config = &card.spec.run_config;
+    assert_eq!(
+        loaded.run_config,
+        run_config_from_agent_run_config_spec(config)
+    );
+    assert_eq!(
+        loaded.to_spec(),
+        card.spec,
+        "{config:?} exports as authored"
+    );
+    let exported = loaded.to_card().expect("exports");
+    assert_eq!(exported.spec, card.spec, "{config:?} to_card");
+    assert_eq!(
+        spec_hash(&exported.spec),
+        expected,
+        "{config:?} to_card hash"
+    );
+    assert_eq!(
+        loaded.to_wire().expect("wire").spec,
+        card.spec,
+        "{config:?} to_wire"
+    );
+    assert_eq!(
+        (exported.name.as_str(), exported.version.as_str()),
+        (card.name.as_str(), card.version.as_str())
+    );
+    assert_eq!(exported.spec.prompt, card.spec.prompt);
+    assert_eq!(exported.spec.execution_route, card.spec.execution_route);
+    loaded.save(path).expect("saves");
+    let reloaded = Agent::from_yaml_path(path, tools, default_prompt_resolver()).expect("reloads");
+    assert_eq!(reloaded.to_spec(), card.spec, "{config:?} YAML round trip");
+    assert_eq!(spec_hash(&reloaded.to_spec()), expected);
+
+    let edited = reloaded.clone().with_run_config(RunConfig {
+        max_iterations: 4,
+        ..reloaded.run_config.clone()
+    });
+    let spec = edited.to_spec();
+    assert_eq!(
+        spec.run_config.max_iterations,
+        Some(4),
+        "{config:?} builder edit"
+    );
+    assert_eq!(
+        (
+            spec.run_config.tool_concurrency_cap,
+            spec.run_config.session_recent_limit,
+            spec.run_config.timeout_ms
+        ),
+        (
+            config.tool_concurrency_cap,
+            config.session_recent_limit,
+            config.timeout_ms
+        ),
+        "{config:?} unedited fields stay authored"
+    );
+    assert_eq!(spec.verified_by, card.spec.verified_by);
+    assert_ne!(
+        spec_hash(&spec),
+        expected,
+        "{config:?} an edit changes the hash"
+    );
+    edited.save(path).expect("edited saves");
+    let edited = Agent::from_yaml_path(path, tools, default_prompt_resolver()).expect("reloads");
+    assert_eq!(edited.to_spec(), spec, "{config:?} the edit persists");
+
+    let mut direct = reloaded;
+    direct.run_config.timeout = Some(Duration::from_millis(7_000));
+    let spec = direct.to_spec();
+    assert_eq!(
+        spec.run_config,
+        AgentRunConfigSpec {
+            timeout_ms: Some(7_000),
+            ..config.clone()
+        },
+        "direct field edit"
+    );
+    assert_eq!(spec.verified_by, card.spec.verified_by);
 }
 
 #[tokio::test]

@@ -7,6 +7,8 @@
 //! and builds the runtime [`Prompt`], whose serialized form is again the
 //! authored form it came from.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -336,7 +338,9 @@ impl AuthoredPrompt {
     ///
     /// Literal media sources are recorded in `literals` under generated
     /// placeholder names for [`compile`](Self::compile) to bind, and each
-    /// binding's block kind in `media_kinds`.
+    /// binding's block kind in `media_kinds`. Every `${media:name}` token the
+    /// author wrote, in any turn, is reserved before lowering so a generated
+    /// literal name can never take an authored input's place.
     ///
     /// # Errors
     ///
@@ -366,11 +370,15 @@ impl AuthoredPrompt {
                 format == PromptFormat::ChatCompletion,
             )?;
         }
+        let mut reserved = HashSet::new();
+        for message in self.messages.iter().flatten() {
+            message.reserve_media_names(&mut reserved);
+        }
         let turns = self
             .messages
             .iter()
             .flatten()
-            .map(|message| message.lower(literals, media_kinds))
+            .map(|message| message.lower(literals, media_kinds, &mut reserved))
             .collect::<SkaldResult<Vec<_>>>()?;
         let has_content = self.system.as_deref().is_some_and(|text| !text.is_empty())
             || turns
@@ -408,8 +416,40 @@ impl AuthoredPrompt {
 }
 
 impl PortableMessage {
+    /// Adds every `${media:name}` token this turn's text and bindings carry
+    /// to `reserved`, so literal media is never named after authored input.
+    fn reserve_media_names(&self, reserved: &mut HashSet<String>) {
+        let texts: Vec<&str> = match &self.content {
+            PortableContent::Text(text) => vec![text],
+            PortableContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text }
+                    | ContentBlock::Image {
+                        source: BlockSource::Binding(text),
+                    }
+                    | ContentBlock::Document {
+                        source: BlockSource::Binding(text),
+                    } => Some(text.as_str()),
+                    ContentBlock::Image { .. } | ContentBlock::Document { .. } => None,
+                })
+                .collect(),
+        };
+        for text in texts {
+            reserved.extend(
+                media_placeholder_regex()
+                    .captures_iter(text)
+                    .map(|found| found[1].to_owned()),
+            );
+        }
+    }
+
     /// Lowers this turn to ordered text parts, recording literal media and
     /// each binding's block kind.
+    ///
+    /// Each literal takes the first `__wyrd_media_<n>` name absent from
+    /// `reserved` and reserves it, so literals never share a name with each
+    /// other or with any authored media token.
     ///
     /// # Errors
     ///
@@ -420,6 +460,7 @@ impl PortableMessage {
         &self,
         literals: &mut Vec<(String, MediaRef)>,
         media_kinds: &mut Vec<(String, MediaKind)>,
+        reserved: &mut HashSet<String>,
     ) -> SkaldResult<Turn> {
         let blocks = match &self.content {
             PortableContent::Text(text) => {
@@ -474,7 +515,12 @@ impl PortableMessage {
                     binding.clone()
                 }
                 BlockSource::Media(source) => {
-                    let name = format!("__wyrd_media_{}", literals.len());
+                    let mut index = literals.len();
+                    while reserved.contains(&format!("__wyrd_media_{index}")) {
+                        index += 1;
+                    }
+                    let name = format!("__wyrd_media_{index}");
+                    reserved.insert(name.clone());
                     let placeholder = format!("${{media:{name}}}");
                     literals.push((
                         name,
@@ -1504,6 +1550,133 @@ mod tests {
         native
             .bind_media_mut("x", &document)
             .expect("untyped binds a document");
+    }
+
+    /// Proves a literal media source never takes an authored media name, even
+    /// one spelled like the compiler's own: authored `__wyrd_media_*` bindings
+    /// before and after a literal, repeated in a later turn, or written as a
+    /// token in message text stay required, keep their declared kind, and
+    /// bind the caller's source in place, while every literal keeps its
+    /// position. A same-named `${name}` text variable stays a text variable,
+    /// and the Prompt still serializes exactly as authored.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any compile, refusal, render, or order assertion fails.
+    #[test]
+    fn portable_literals_never_alias_authored_media() {
+        use crate::MediaRef;
+
+        let fixed = json!({"type": "base64", "mime_type": "image/png", "data": "RklYRUQ="});
+        let later = json!({"type": "base64", "mime_type": "image/png", "data": "TEFURVI="});
+        let caller = MediaRef::image_base64("image/png", "Q0FMTEVS");
+        let report = MediaRef::document_base64("application/pdf", "JVBERi0=");
+        let sorted = |prompt: &crate::Prompt| {
+            let mut names = prompt.media_variables.clone();
+            names.sort();
+            names
+        };
+        for provider in ["openai", "anthropic", "google"] {
+            let authored = json!({"provider": provider, "model": "m",
+            "settings": {"max_output_tokens": 8},
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "image", "source": fixed},
+                    {"type": "image", "source": "${media:__wyrd_media_0}"},
+                    {"type": "text", "text": "and"},
+                ]},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "again ${media:__wyrd_media_1}"},
+                    {"type": "image", "source": "${media:__wyrd_media_0}"},
+                    {"type": "image", "source": later},
+                ]},
+            ]});
+            let mut prompt = compile(authored.clone()).expect("mixed media compiles");
+            assert_eq!(
+                serde_json::to_value(&prompt).expect("authored json"),
+                authored,
+                "{provider}: serializes as authored"
+            );
+            assert_eq!(
+                sorted(&prompt),
+                ["__wyrd_media_0", "__wyrd_media_1"],
+                "{provider}: authored media names stay required"
+            );
+            assert!(
+                matches!(
+                    prompt.render(&[]),
+                    Err(SkaldError::MissingMediaVariable { .. })
+                ),
+                "{provider}: render needs the caller's media"
+            );
+            assert!(
+                matches!(
+                    prompt.bind_media("__wyrd_media_0", &report),
+                    Err(SkaldError::InvalidMediaType(_))
+                ),
+                "{provider}: the authored image binding refuses a document"
+            );
+            prompt
+                .bind_media_mut("__wyrd_media_0", &caller)
+                .expect("caller image binds");
+            prompt
+                .bind_media_mut("__wyrd_media_1", &report)
+                .expect("text token binds");
+            let text =
+                serde_json::to_string(&prompt.render(&[]).expect("renders")).expect("request json");
+            let at = |needle: &str| text.find(needle).expect(needle);
+            assert!(
+                at("RklYRUQ=") < at("Q0FMTEVS")
+                    && at("Q0FMTEVS") < at("JVBERi0=")
+                    && at("JVBERi0=") < text.rfind("Q0FMTEVS").expect("caller twice")
+                    && text.rfind("Q0FMTEVS").expect("caller twice") < at("TEFURVI="),
+                "{provider}: fixed, caller, report, caller, later in order: {text}"
+            );
+
+            let document = compile(json!({"provider": provider, "model": "m",
+            "settings": {"max_output_tokens": 8},
+            "messages": [{"role": "user", "content": [
+                {"type": "document", "source": "${media:__wyrd_media_0}"},
+                {"type": "image", "source": fixed},
+            ]}]}))
+            .expect("document binding beside an image literal compiles");
+            assert_eq!(
+                document.media_variables,
+                ["__wyrd_media_0"],
+                "{provider}: the document binding stays required"
+            );
+            assert!(
+                matches!(
+                    document.bind_media("__wyrd_media_0", &caller),
+                    Err(SkaldError::InvalidMediaType(_))
+                ),
+                "{provider}: the document binding refuses an image"
+            );
+            document
+                .bind_media("__wyrd_media_0", &report)
+                .expect("document binds");
+
+            let variable = compile(json!({"provider": provider, "model": "m",
+            "settings": {"max_output_tokens": 8},
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "say ${__wyrd_media_0}"},
+                {"type": "image", "source": fixed},
+            ]}]}))
+            .expect("text variable beside a literal compiles");
+            assert_eq!(variable.variables, ["__wyrd_media_0"], "{provider}");
+            assert!(variable.media_variables.is_empty(), "{provider}");
+            let text = serde_json::to_string(
+                &variable
+                    .render(&[("__wyrd_media_0", "hello")])
+                    .expect("renders"),
+            )
+            .expect("request json");
+            assert!(
+                text.contains("say hello") && text.contains("RklYRUQ="),
+                "{provider}: text variable and literal both land: {text}"
+            );
+        }
     }
 
     /// Proves literal and bound media sources are validated before the

@@ -425,7 +425,12 @@ fn portable_spec() -> serde_json::Value {
         "provider": "anthropic",
         "model": "claude-sonnet-4-5",
         "system": "You answer for ${team}.",
-        "messages": [{ "role": "user", "content": "${question}" }],
+        "messages": [{ "role": "user", "content": [
+            { "type": "text", "text": "${question}" },
+            { "type": "image", "source": "${media:photo}" },
+            { "type": "image", "source": { "type": "base64", "mime_type": "image/png", "data": "iVBORw0KGgo=" } },
+            { "type": "document", "source": "${media:__wyrd_media_0}" },
+        ] }],
         "settings": { "temperature": 0.2, "max_output_tokens": 256 },
         "response_format": {
             "type": "object",

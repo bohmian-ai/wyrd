@@ -103,7 +103,7 @@ spec:
             current: {features: [tenure_months, monthly_spend]}
 ```
 
-A `Custom` slot reads one metric instead, such as `latency: {metric: latency_p95}`. Every required `samples` slot needs an entry, and the names must match the slot's `features`. To page someone when it fails, add `on_failure` with an Operator; see [Bind a Verifier to a schedule](/build-and-verify/declare/bind-a-verifier/#bind-a-verifier-to-a-schedule).
+A `Custom` slot reads one metric instead, such as `latency: {metric: latency_p95}`. Every required `samples` slot needs an entry, and the names must match the slot's `features`. To page someone when it fails, see [Respond to a failed verification](/build-and-verify/verify/respond-to-a-failed-verification/).
 
 ```bash
 wyrd apply service/churn-service.yaml

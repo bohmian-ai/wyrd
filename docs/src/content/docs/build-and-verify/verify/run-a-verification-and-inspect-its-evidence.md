@@ -198,7 +198,7 @@ If `active` is false, deploy the Service. If `readiness` is `baseline_not_ready`
 
 ## Operators
 
-Only a `failed` verdict from a submitted or scheduled execution runs the binding's `on_failure` Operators, once per execution even if the request was replayed. `passed`, `inconclusive`, execution errors, and `verify` calls never do. Each dispatch is delivered and retried on its own; a delivery failure never changes the verdict.
+Only a `failed` verdict from a submitted or scheduled execution runs the binding's `on_failure` Operators, once per execution even if the request was replayed. `passed`, `inconclusive`, execution errors, and `verify` calls never do. Each dispatch is delivered and retried on its own; a delivery failure never changes the verdict. To set one up, see [Respond to a failed verification](/build-and-verify/verify/respond-to-a-failed-verification/).
 
 ## What can go wrong
 

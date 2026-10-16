@@ -191,7 +191,9 @@ impl<O> RunLedger<O> {
 }
 
 impl<O> IntoIterator for RunLedger<O> {
+    /// One owned settlement: the task id and what it settled as.
     type Item = (TaskId, O);
+    /// Consumes the ledger, yielding settlements in settlement order.
     type IntoIter = std::vec::IntoIter<(TaskId, O)>;
 
     /// Every settlement, in settlement order.
@@ -543,6 +545,17 @@ mod tests {
         Ok(())
     }
 
+    /// Skip propagation names the first skipped dependency in the task's
+    /// declared order, not in ledger settlement order: `b` settles before `a`,
+    /// yet `c` (declaring `a` then `b`) reports `a`.
+    ///
+    /// # Errors
+    /// Returns the task-id, DAG-validation, or registry-construction error of
+    /// the static fixture.
+    ///
+    /// # Panics
+    /// Panics when task `c` is not registered or the reported upstream is not
+    /// `a`.
     #[test]
     fn first_skipped_dependency_returns_declaration_order() -> Result<(), Box<dyn Error>> {
         let tasks = vec![

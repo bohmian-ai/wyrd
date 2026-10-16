@@ -11,6 +11,7 @@ connection. A passing or empty window alerts no one.
 import json
 import time
 from collections.abc import Iterable
+from typing import Any, cast
 
 import pytest
 from wyrd import WyrdError, verify
@@ -59,11 +60,14 @@ def test_failed_schedule_alerts_its_operator_on_the_connection_origin(
     assert result.run_id is None, "a scheduled execution has no Run"
     [requirement] = result.requirements
     assert (requirement["id"], requirement["outcome"]) == ("latency-unshifted", "failed")
-    window = requirement["provenance"]["window"]
-    assert requirement["provenance"]["kind"] == "drift"
-    assert window["start"] < window["end"], window
-    assert requirement["check"]["signal"]["baseline_ref"]["name"] == "latency-baseline"
-    assert requirement["detail"]["drift"]["features"]["latency"]["score"] > 0.25
+    provenance = requirement.get("provenance")
+    assert provenance is not None and provenance["kind"] == "drift", provenance
+    window = provenance.get("window")
+    assert window is not None and window["start"] < window["end"], window
+    check = cast("dict[str, Any]", requirement["check"])
+    assert check["signal"]["baseline_ref"]["name"] == "latency-baseline"
+    score = requirement["detail"]["drift"]["features"]["latency"]["score"]
+    assert score is not None and score > 0.25
 
     alert = latency_watch.hooks.wait_for(HOOK, WAIT_SECONDS)
     assert alert.headers["authorization"] == f"Bearer {ON_CALL_TOKEN}"

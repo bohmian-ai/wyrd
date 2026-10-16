@@ -16,7 +16,7 @@ with a citation unless the answer names a scripted case.
 
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from opentelemetry import trace
@@ -28,6 +28,9 @@ from wyrd.testing import WyrdTestServer
 
 from .support import FIXTURES, Receiver, download, register, service_key, timeline
 from .test_local_development import configure_gateway
+
+if TYPE_CHECKING:
+    from wyrd.verify import RequirementResult, StepResult
 
 pytestmark = pytest.mark.integration
 
@@ -122,13 +125,13 @@ def review(
     return desk.run().observe.verify("policy-review", **inputs)
 
 
-def requirement(result: verify.VerificationResult, id: str) -> dict[str, Any]:
+def requirement(result: verify.VerificationResult, id: str) -> RequirementResult:
     """The requirement ``id`` of ``result``."""
     [found] = [each for each in result.requirements if each["id"] == id]
     return found
 
 
-def step(result: verify.VerificationResult, id: str) -> dict[str, Any]:
+def step(result: verify.VerificationResult, id: str) -> StepResult:
     """The step ``id`` of ``result``."""
     [found] = [each for each in result.steps if each["id"] == id]
     return found
@@ -156,7 +159,8 @@ def test_policy_review_runs_every_action_and_check_kind(
     assert result.verdict == "passed", result.requirements
     assert result.subject == desk.root_ref
     text = step(result, "policy-text")
-    assert (text["status"], text["output"]["format"]) == ("succeeded", "pdf")
+    output = cast("dict[str, Any]", text.get("output"))
+    assert (text["status"], output["format"]) == ("succeeded", "pdf")
     assert text["provenance"]["kind"] == "extract"
     rules = step(result, "refund-rules")
     assert (rules["status"], rules["output"]) == ("succeeded", {"max_refund": 100})

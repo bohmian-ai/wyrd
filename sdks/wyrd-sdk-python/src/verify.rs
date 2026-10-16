@@ -95,11 +95,64 @@ pub struct PyRecorded;
 
 /// One queued Verifier execution, addressed by its server-issued ID.
 #[pyclass(module = "wyrd._wyrd.verify", name = "Execution", frozen)]
-pub struct PyExecution(pub(crate) Execution);
+pub struct PyExecution {
+    /// The execution identity, parsed locally so it reads without IO.
+    id: ExecutionId,
+    /// The shared execution handle every status read and wait delegates to,
+    /// connected on the first server operation, by `connect`, or already
+    /// connected when `submit` queued it.
+    inner: crate::client::LazyConnection<Execution>,
+}
+
+impl PyExecution {
+    /// Wrap the connected execution `submit` queued, keeping its client.
+    pub(crate) fn queued(execution: Execution) -> Self {
+        Self {
+            id: *execution.id(),
+            inner: crate::client::LazyConnection::ready(execution),
+        }
+    }
+
+    /// Return the connected shared execution, connecting it on first use.
+    ///
+    /// # Errors
+    /// Returns the client's configuration, credential, or refused-exchange
+    /// error; nothing is retained, so the next operation connects again.
+    fn handle(&self, py: Python<'_>) -> WyrdPyResult<&Execution> {
+        let id = self.id;
+        Ok(self.inner.get(py, |client| async move {
+            match client {
+                Some(client) => Execution::connect_with(id, &client).await,
+                None => Execution::connect(id).await,
+            }
+        })?)
+    }
+}
 
 #[pymethods]
 impl PyExecution {
-    /// Rebuild the handle of `id` as `client`, or the ambient client.
+    /// The handle of `id`, read as `client` or the ambient client, performing
+    /// no IO until its first status read or wait.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SPEC_400_VALIDATION` for an `id` that is not an
+    /// execution ID.
+    #[new]
+    #[pyo3(signature = (id, client=None))]
+    fn __new__(
+        id: &str,
+        client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
+    ) -> WyrdPyResult<Self> {
+        Ok(Self {
+            id: id
+                .parse::<ExecutionId>()
+                .map_err(|error| invalid_argument("id", error))?,
+            inner: crate::client::LazyConnection::new(client.as_deref()),
+        })
+    }
+
+    /// Rebuild the handle of `id` as `client`, or the ambient client, and
+    /// connect it now.
     ///
     /// # Errors
     /// Raises `WYRD_SPEC_400_VALIDATION` for an `id` that is not an
@@ -111,47 +164,41 @@ impl PyExecution {
         id: &str,
         client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
     ) -> WyrdPyResult<Self> {
-        let id = id
-            .parse::<ExecutionId>()
-            .map_err(|error| invalid_argument("id", error))?;
-        let client = crate::client::PyWyrdClient::native(client.as_deref());
-        let connected = crate::trace::block_on(py, async move {
-            match client {
-                Some(client) => Execution::connect_with(id, &client).await,
-                None => Execution::connect(id).await,
-            }
-        })?;
-        Ok(Self(connected))
+        let execution = Self::__new__(id, client)?;
+        execution.handle(py)?;
+        Ok(execution)
     }
 
     /// The execution ID.
     #[getter]
     fn id(&self) -> String {
-        self.0.id().to_string()
+        self.id.to_string()
     }
 
     /// The execution's current status, terminal error, and visible result as
     /// their wire mapping.
     ///
     /// # Errors
-    /// Raises the server's not-found error before the execution is visible,
-    /// and its authorization or transport error.
+    /// Raises the client's connection error on first use, the server's
+    /// not-found error before the execution is visible, and its
+    /// authorization or transport error.
     fn status(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        let state = crate::trace::block_on(py, self.0.status())?;
+        let state = crate::trace::block_on(py, self.handle(py)?.status())?;
         Ok(json_to_pyobject(py, &serde_json::to_value(state)?)?)
     }
 
     /// Poll until a result, the execution's own error, or `timeout` seconds.
     ///
     /// # Errors
-    /// Raises the execution's terminal error, including a delayed
-    /// idempotency conflict, `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` when
-    /// `timeout` passes first, `WYRD_SPEC_400_VALIDATION` for a negative or
-    /// non-finite `timeout`, and any other status-read error.
+    /// Raises `WYRD_SPEC_400_VALIDATION` for a negative or non-finite
+    /// `timeout`, the client's connection error on first use, the
+    /// execution's terminal error, including a delayed idempotency conflict,
+    /// `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` when `timeout` passes first,
+    /// and any other status-read error.
     fn wait(&self, py: Python<'_>, timeout: f64) -> WyrdPyResult<PyVerificationResult> {
         let timeout = Duration::try_from_secs_f64(timeout)
             .map_err(|error| invalid_argument("timeout", error))?;
-        crate::trace::block_on(py, self.0.wait(timeout))
+        crate::trace::block_on(py, self.handle(py)?.wait(timeout))
             .map(PyVerificationResult)
             .map_err(WyrdPyError::from)
     }
@@ -159,7 +206,10 @@ impl PyExecution {
 
 /// Read-only Python view of one attributable Verifier result.
 #[pyclass(module = "wyrd._wyrd.verify", name = "VerificationResult", frozen)]
-pub struct PyVerificationResult(pub(crate) VerificationResult);
+pub struct PyVerificationResult(
+    /// The shared client's result, read by every getter and never mutated.
+    pub(crate) VerificationResult,
+);
 
 #[pymethods]
 impl PyVerificationResult {

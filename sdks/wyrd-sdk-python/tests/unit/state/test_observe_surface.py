@@ -7,6 +7,7 @@ journey lanes, not here.
 
 import asyncio
 import importlib
+import json
 import sys
 import threading
 import time
@@ -18,6 +19,7 @@ from uuid import UUID
 
 import pytest
 import wyrd
+import wyrd.observe
 import wyrd.otel
 from opentelemetry import context as otel_context
 from opentelemetry import trace
@@ -177,6 +179,79 @@ def test_execution_connect_refuses_a_malformed_id_before_resolving_a_client() ->
     with pytest.raises(wyrd.WyrdError) as raised:
         Execution.connect("not-an-execution-id")
     assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
+
+
+EXECUTION_ID = "0190b2a4-0000-7000-8000-000000000000"
+
+
+class _ExecutionServer(BaseHTTPRequestHandler):
+    """A local Wyrd server for one execution: it refuses the API-key exchange
+    while ``refuse`` is set and answers the status read with ``running``."""
+
+    refuse = True
+    requests: list[str] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server's handler name
+        self.rfile.read(int(self.headers.get("content-length", 0)))
+        type(self).requests.append(self.path)
+        if type(self).refuse:
+            self._send(401, {"code": "WYRD_AUTH_401_UNAUTHENTICATED", "detail": "refused"})
+        else:
+            self._send(200, {"access_token": "t", "token_type": "Bearer", "expires_in": 3600})
+
+    def do_GET(self) -> None:  # noqa: N802 - http.server's handler name
+        type(self).requests.append(self.path)
+        self._send(200, {"execution_id": EXECUTION_ID, "status": "running"})
+
+    def _send(self, status: int, body: dict[str, object]) -> None:
+        payload = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: object) -> None:
+        """Keep the test output quiet."""
+
+
+@pytest.fixture
+def execution_server() -> Iterator[str]:
+    """Serve ``_ExecutionServer`` on a free port, refusing exchanges at first."""
+    _ExecutionServer.refuse, _ExecutionServer.requests = True, []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ExecutionServer)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+
+
+def test_execution_constructs_offline_and_connects_on_first_read(execution_server: str) -> None:
+    """``Execution(id, client)`` sends nothing until its first read, which
+    exchanges the retained client's key; a refused first connection is
+    retried by the next read, and a connected handle is reused."""
+    execution = Execution(EXECUTION_ID, WyrdClient(execution_server, "wyrd_sk_t_v_s"))
+    assert execution.id == EXECUTION_ID
+    assert _ExecutionServer.requests == []
+
+    with pytest.raises(wyrd.WyrdError):
+        execution.status()
+    assert _ExecutionServer.requests == ["/auth/token"]
+
+    _ExecutionServer.refuse = False
+    assert execution.status()["status"] == "running"
+    assert execution.status()["status"] == "running"
+    status = f"/v1/verification/executions/{EXECUTION_ID}"
+    assert _ExecutionServer.requests == ["/auth/token", "/auth/token", status, status]
+
+
+def test_execution_connect_exchanges_now(execution_server: str) -> None:
+    """``Execution.connect`` connects eagerly: a refused exchange raises before
+    any read, and an accepted one completes before it returns."""
+    with pytest.raises(wyrd.WyrdError):
+        Execution.connect(EXECUTION_ID, WyrdClient(execution_server, "wyrd_sk_t_v_s"))
+    _ExecutionServer.refuse = False
+    Execution.connect(EXECUTION_ID, WyrdClient(execution_server, "wyrd_sk_t_v_s"))
+    assert _ExecutionServer.requests == ["/auth/token", "/auth/token"]
 
 
 def test_verification_types_are_exported_and_judge_surfaces_are_gone() -> None:

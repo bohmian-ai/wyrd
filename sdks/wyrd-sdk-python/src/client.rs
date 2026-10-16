@@ -105,6 +105,20 @@ impl<T: Send + Sync> LazyConnection<T> {
         }
     }
 
+    /// Retain `handle`, already connected, so no operation connects again:
+    /// the form a handle the shared client returned connected takes, such
+    /// as `submit`'s queued execution.
+    ///
+    /// # Arguments
+    /// * `handle` - The connected native handle every operation reuses.
+    pub(crate) fn ready(handle: T) -> Self {
+        Self {
+            client: None,
+            handle: OnceLock::from(handle),
+            gate: Mutex::new(()),
+        }
+    }
+
     /// The connected handle when a connection has already succeeded; never
     /// connects, so local state can be read without IO.
     pub(crate) fn connected(&self) -> Option<&T> {

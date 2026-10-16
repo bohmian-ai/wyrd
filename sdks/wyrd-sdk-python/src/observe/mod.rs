@@ -409,7 +409,7 @@ impl PyObserveHandle {
         let observe = self.observe();
         match crate::trace::block_on(py, observe.submit(verifier, inputs))? {
             Submission::Recorded => Ok(Py::new(py, PyRecorded)?.into_any()),
-            Submission::Queued(inner) => Ok(Py::new(py, PyExecution(inner))?.into_any()),
+            Submission::Queued(inner) => Ok(Py::new(py, PyExecution::queued(inner))?.into_any()),
         }
     }
 }

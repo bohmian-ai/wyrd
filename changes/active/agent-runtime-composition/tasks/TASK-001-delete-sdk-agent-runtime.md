@@ -227,3 +227,34 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:mig
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
 - [Canonical commands](../../../../mise.toml)
+
+## Implementation Evidence
+
+Commits `178129c6c`..`c2d0db662` on `change/agent-runtime-composition`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-012/013; AC-007 | Deleted `python/wyrd/agent/`, the `agent`/`tool`/`providers` native submodules in `sdks/wyrd-sdk-python/src/lib.rs`, root `wyrd` exports/stubs, and the `python` features plus `python.rs` of `skald-agent`/`skald-tool`/`skald-runtime`. Rust (`wyrd-ai`) and TS exports never had an Agent constructor; still none. `AgentError`/`SessionError`/`ToolError` codes remain. | Import probe: `wyrd.agent` and `_wyrd.agent`/`tool`/`providers` absent, `AgentCard` imports; `py:test:unit` (597 passed), `py:lints`, `py:typecheck`, `check:py-wheel-no-testing`, `ts:pack:check`, `ts:napi:check` | PASS |
+| REQ-014; AC-008; INV-005..008 | `AgentCard`/`AgentSpec`, hydration, Prompt authoring, and internal Skald/Vala/server execution untouched beyond removing python-only cfg items | P-R 3/3, P-P 3/3, P-T 3/3 (exact commands above; requires `mise run build:monty-worker`); `test:skald`, `test:shared` | PASS |
+| REQ-015/016; AC-009 | Deleted `wyrd-client` `observe/invoke.rs`, `gateway_caller.rs` and their tests; Python `Run.invoke` pymethod/stub; TS native `invoke` and `Run.invoke`; regenerated `index.d.ts`/`index.d.cts`. Consumers render the Agent's Prompt and call the gateway with `wyrd-run-id`/`wyrd-card-uid` themselves: `examples/support-desk/{python,rust,typescript}`, `examples/support-desk-app/rust/lib.rs`, and the gateway-inference, local-development, and support-desk journeys in all three SDKs | J-R 6/6 (task selectors plus `gateway_inference::run_invokes_its_agent_through_the_gateway` and `::agent_routes_reach_named_native_ingress`), J-P 4 passed, J-T 4/4; `test_cli_gateway_agents` via `test_installed_cli_gateway_setup` (`test:local-dev:journey` step) PASS | PASS |
+| REQ-017; AC-010; INV-001..004 | Refusals now asserted as gateway responses: 403 `WYRD_PERMISSION_403_DENIED_RBAC` (viewer, granted deployment), 403 `WYRD_VALA_403_BIFROST_CARD_SCOPE` (foreign Card), 400 `WYRD_GATEWAY_400_INVALID_REQUEST` (incompatible adapter, via the existing `wyrd-prompt-provider` header); correlation headers asserted absent upstream | Same journeys as above; external-framework/stock-client gateway tests unchanged | PASS |
+| REQ-018; AC-011 | Updated `runs-observations-and-evidence.md`, `examples/gateway-setup/README.md`, `examples/README.md`, `examples/rust/README.md`, `wyrd-sdk-rust` lib docs, `wyrd-utils` rustdoc | `docs:check`, `check:examples`, `check:deps`, `fmt`, `lints`, `py:format`, `ts:format:check`, `ts:lints`, `ts:typecheck`, `git diff --check` | PASS |
+
+Retired tests and assertions (sole contract was the deleted API):
+`tests/unit/runtime/agent/`, `test_callbacks.py`, `test_session.py`,
+`test_validate_registrable.py`, the opt-in live smoke
+`tests/smoke/test_prompt_live_providers.py` (its execution vehicle was the
+runtime Agent; no live-provider replacement), the Rust examples
+`agent_smoke`/`agent_openai` and Python `agent_smoke`/`structured_pipeline`,
+`wyrd-client` `gateway_caller` and `local_development::cli_gateway_agents`
+(the Rust child of the Python CLI journey, with its native-route trap), the
+state test `invoke_refuses_an_agent_with_tools_before_io`, the malformed-route
+and non-Agent-Run refusals, the local Vertex-Prompt refusal, and the "override
+never changes the declared route" assertion. Test names were kept, so the task
+selectors are unchanged.
+
+Material limits: the docs-only `examples/support-desk-app/rust/lib.rs` is not
+compiled by any lane; it was formatted and mirrors the compiled support-desk
+`answer`. TypeScript has no Prompt render API, so TS callers bind
+`{{question}}` in the portable messages themselves. The Python `test_cli_gateway_agents`
+runs only under the installed-CLI fixture.

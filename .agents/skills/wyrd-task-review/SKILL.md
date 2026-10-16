@@ -55,7 +55,7 @@ Before spawning discovery reviewers, create a new
 `changes/active/<slug>/review/<review-name>/` directory without overwriting a
 prior attempt. Assign every reviewer its exact report path in that directory.
 
-The review directory holds reports only. Never write a diff or patch into it:
+The review directory holds reports only. Never write a diff, patch, or source archive into it:
 the base and candidate commits recorded in the review identify the subject, and
 every reviewer reads the range itself with `git diff <base>...<candidate>`
 (an external repository at its recorded commits).

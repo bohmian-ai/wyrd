@@ -65,5 +65,7 @@ mise.*.local.toml
 openapi.yaml.tmp
 /release/
 
-# Review subjects are read from git, never stored as diffs.
+# Review subjects are read from git, never stored as diffs or archives.
 changes/**/review/**/*.diff
+changes/**/review/**/*.patch
+changes/**/review/**/*.tar.gz

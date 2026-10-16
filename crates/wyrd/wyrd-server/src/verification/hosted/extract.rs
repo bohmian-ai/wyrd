@@ -29,6 +29,9 @@ use super::HostedLimits;
 /// The extractor identity recorded as `extract` provenance.
 pub const EXTRACT_VERSION: &str = "wyrd-extract/1";
 
+/// Word's table column limit; a DOCX row spanning more is malformed.
+const DOCX_MAX_COLUMNS: usize = 63;
+
 /// One extraction under the Deployment limits.
 ///
 /// Owns the running extracted-text total so every string the parsers emit is
@@ -289,8 +292,12 @@ impl<'a> Extraction<'a> {
     /// Append the paragraphs and tables under `parent`, descending into
     /// content controls.
     ///
+    /// A merged cell's `gridSpan` expands into covered blank cells, so each
+    /// row is checked against Word's column limit before expanding.
+    ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] once the text limit is exceeded.
+    /// Returns [`BlockError::Terminal`] once the text limit is exceeded or a
+    /// row's spans are invalid or exceed [`DOCX_MAX_COLUMNS`].
     fn docx_blocks(
         &mut self,
         parent: &Node,
@@ -320,8 +327,16 @@ impl<'a> Extraction<'a> {
                             let span = properties
                                 .and_then(|properties| properties.child("gridSpan"))
                                 .and_then(|span| span.attr("val"))
-                                .and_then(|val| val.parse::<usize>().ok())
-                                .unwrap_or(1);
+                                .map_or(Some(1), |val| val.parse::<usize>().ok())
+                                .filter(|&span| span >= 1 && cells.len() + span <= DOCX_MAX_COLUMNS)
+                                .ok_or_else(|| {
+                                    refused(
+                                        MediaFormat::Docx,
+                                        &format!(
+                                            "a table row spans more than {DOCX_MAX_COLUMNS} columns"
+                                        ),
+                                    )
+                                })?;
                             cells.push(self.text(if covered {
                                 String::new()
                             } else {
@@ -522,7 +537,8 @@ pub fn units(output: &ExtractOutput, source: &[u8]) -> Vec<(Locator, String)> {
 /// Whether `locator` names a location in `units`.
 ///
 /// Pages and slides must be present; a line range must lie within the line
-/// units; a JSON pointer must name a leaf or a container of leaves; a region
+/// units; a JSON pointer must name a leaf (empty ones included) or a
+/// container of leaves; a region
 /// must sit on a present page.
 #[must_use]
 pub fn locates(units: &[(Locator, String)], locator: &Locator) -> bool {
@@ -543,11 +559,18 @@ pub fn locates(units: &[(Locator, String)], locator: &Locator) -> bool {
     }
 }
 
-/// Collect the text-bearing leaves under `value` as JSON-pointer units;
-/// with `canonical`, skip the `format` and `kind` discriminants and DOCX
+/// Collect the leaves under `value` as JSON-pointer units, including null,
+/// empty strings, and empty containers with empty text so their locations
+/// stay citable; with `canonical`, skip the `format` and `kind` discriminants and DOCX
 /// styles of extracted output.
 fn leaves(value: &Value, pointer: String, canonical: bool, units: &mut Vec<(Locator, String)>) {
     match value {
+        Value::Object(map) if map.is_empty() => {
+            units.push((Locator::JsonPointer(pointer), String::new()));
+        }
+        Value::Array(items) if items.is_empty() => {
+            units.push((Locator::JsonPointer(pointer), String::new()));
+        }
         Value::Object(map) => {
             for (key, child) in map {
                 if !canonical || !matches!(key.as_str(), "format" | "kind" | "style") {
@@ -561,9 +584,8 @@ fn leaves(value: &Value, pointer: String, canonical: bool, units: &mut Vec<(Loca
                 leaves(child, format!("{pointer}/{index}"), canonical, units);
             }
         }
-        Value::Null => {}
-        Value::String(text) if text.is_empty() => {}
         Value::String(text) => units.push((Locator::JsonPointer(pointer), text.clone())),
+        Value::Null => units.push((Locator::JsonPointer(pointer), String::new())),
         other => units.push((Locator::JsonPointer(pointer), other.to_string())),
     }
 }

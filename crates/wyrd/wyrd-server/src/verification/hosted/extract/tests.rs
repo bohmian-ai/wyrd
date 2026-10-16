@@ -313,6 +313,84 @@ fn units_locate_extracted_text() {
     );
 }
 
+/// Null, empty, and empty-container values are citable locations, in plain
+/// JSON and in canonical Office output; absent members and indices are not.
+///
+/// # Panics
+/// Panics when an existing empty location is rejected or a missing one is
+/// accepted.
+#[test]
+fn empty_values_are_locations() {
+    let json = br#"{"answer":null,"comment":"","items":[],"meta":{}}"#;
+    let located = units(&extract(json, MediaFormat::Json).expect("json"), json);
+    for pointer in ["", "/answer", "/comment", "/items", "/meta"] {
+        assert!(
+            locates(&located, &Locator::JsonPointer(pointer.to_owned())),
+            "{pointer:?}"
+        );
+    }
+    for pointer in ["/missing", "/items/0", "/meta/key"] {
+        assert!(
+            !locates(&located, &Locator::JsonPointer(pointer.to_owned())),
+            "{pointer:?}"
+        );
+    }
+    let empty = b"{}";
+    let root = units(&extract(empty, MediaFormat::Json).expect("json"), empty);
+    assert!(locates(&root, &Locator::JsonPointer(String::new())));
+
+    let docx = units(&extract(&docx(), MediaFormat::Docx).expect("docx"), b"");
+    for pointer in ["/blocks/3/text", "/blocks/1/rows/0/1"] {
+        assert!(
+            locates(&docx, &Locator::JsonPointer(pointer.to_owned())),
+            "{pointer:?}"
+        );
+    }
+    assert!(!locates(
+        &docx,
+        &Locator::JsonPointer("/blocks/3/style".to_owned())
+    ));
+    let xlsx = units(&extract(&xlsx(), MediaFormat::Xlsx).expect("xlsx"), b"");
+    for pointer in ["/sheets/0/cells/2/value", "/sheets/1/cells"] {
+        assert!(
+            locates(&xlsx, &Locator::JsonPointer(pointer.to_owned())),
+            "{pointer:?}"
+        );
+    }
+}
+
+/// A tiny DOCX whose merged-cell spans exceed Word's column limit, are zero,
+/// or are not numbers is refused before any covered cell is allocated.
+///
+/// # Panics
+/// Panics when a malformed span is expanded.
+#[test]
+fn docx_refuses_impossible_spans() {
+    for span in ["18446744073709551615", "0", "x", "64"] {
+        let bytes = ooxml(&[(
+            "word/document.xml",
+            &format!(
+                r#"<w:document xmlns:w="w"><w:body><w:tbl><w:tr><w:tc><w:tcPr><w:gridSpan w:val="{span}"/></w:tcPr><w:p/></w:tc></w:tr></w:tbl></w:body></w:document>"#
+            ),
+        )]);
+        let error = extract(&bytes, MediaFormat::Docx).expect_err("refused");
+        assert!(
+            matches!(error, BlockError::Terminal { .. }),
+            "{span}: {error}"
+        );
+    }
+    let row: String = (0..2)
+        .map(|_| r#"<w:tc><w:tcPr><w:gridSpan w:val="32"/></w:tcPr><w:p/></w:tc>"#)
+        .collect();
+    let bytes = ooxml(&[(
+        "word/document.xml",
+        &format!(
+            r#"<w:document xmlns:w="w"><w:body><w:tbl><w:tr>{row}</w:tr></w:tbl></w:body></w:document>"#
+        ),
+    )]);
+    assert!(extract(&bytes, MediaFormat::Docx).is_err());
+}
+
 /// Legacy Office, images, archives, and bytes of the wrong format are
 /// refused as terminal.
 ///

@@ -1,10 +1,20 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
-import { Bifrost, type CardRef, type RegistrationReceipt, type SpanRecord } from "wyrd-ai";
+import {
+  Bifrost,
+  type CardRef,
+  type Cards,
+  type RegistrationReceipt,
+  type SpanRecord,
+  verify,
+  type VerificationResult,
+} from "wyrd-ai";
 import { type NativeWyrdTestServer, startTestServer } from "@wyrd/testing";
 import { test as base, vi } from "vitest";
+import { z } from "zod";
 
 import { type ReceivedRequest, Receiver, type Reply } from "./http-receiver.js";
 
@@ -59,14 +69,54 @@ export function registered(receipt: RegistrationReceipt, name: string = receipt.
   return { ...ref, uid: ref.uid };
 }
 
+/** The one verification binding `owner` declares, read from its served status. */
+export async function binding(cards: Cards, owner: CardRef): Promise<string> {
+  const [id] = (await cards.get(owner)).status?.verification?.binding_ids ?? [];
+  if (id === undefined) {
+    throw new Error(`${owner.name} declares no verification binding`);
+  }
+  return id;
+}
+
+/**
+ * The first retained result of `bindingId`, read back as the administrator:
+ * publish captured rows until `vala.verification.results` names one, then
+ * wait for that execution's typed result by its ID.
+ */
+export async function scheduledResult(
+  server: { flushBifrost(): void },
+  bindingId: string,
+  timeoutMs: number,
+): Promise<VerificationResult> {
+  const bifrost = await Bifrost.connect();
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    server.flushBifrost();
+    const [row] = await bifrost.sql(
+      "SELECT result_id FROM vala.verification.results WHERE binding_id = $1",
+      [bindingId],
+      z.object({ result_id: z.string() }),
+    );
+    if (row !== undefined) {
+      return (await verify.Execution.connect(row.result_id)).wait({ timeoutMs });
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`binding ${bindingId} retained no result within ${timeoutMs} ms`);
+    }
+    await sleep(500);
+  }
+}
+
 /** How a story file starts its server. */
 export interface ServerOptions {
-  /** Answers the Gateway adapters and the Eval judge send to the server's provider upstream. */
+  /** Answers the Gateway adapters and Verifier Agents send to the server's provider upstream. */
   readonly provider?: (request: ReceivedRequest) => Reply;
   /** Run Drift baseline fitting, scheduled Verifier runs, and Operators. */
   readonly verificationRuntime?: boolean;
   /** Access-token lifetime in seconds, verified with no clock-skew allowance. */
   readonly accessTtlSeconds?: number;
+  /** Start a fresh server for every test instead of one per story file. */
+  readonly perTest?: boolean;
 }
 
 /**
@@ -115,7 +165,7 @@ export function serverTest(options: ServerOptions = {}) {
         vi.unstubAllEnvs();
         server.shutdown();
       },
-      { scope: "file" },
+      { scope: options.perTest ? "test" : "file" },
     ],
     deployment: [
       async ({ server }, use) => {

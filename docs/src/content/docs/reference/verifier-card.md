@@ -93,17 +93,97 @@ A step prepares evidence a requirement needs but the caller did not send in usab
 
 The action is what a step does. Each step has exactly one.
 
-| `kind` | Fields | Output |
+| `kind` | Use it to | Output |
 | --- | --- | --- |
-| `extract` | `from`: a reference to a `media` slot | The extracted document |
-| `agent` | `agent`, `inputs`, `workspace` | The Agent's response |
-| `code` | `runtime` (`python`), `source`, `entrypoint`, `inputs` | The function's return value |
+| [`extract`](#extract) | Turn an uploaded file into JSON that checks and Agents can read | The file's text and structure |
+| [`agent`](#agent) | Ask an Agent to read evidence and return structured data | The Agent's response |
+| [`code`](#code) | Compute a value in Python | The function's return value |
 
-`agent` is a path such as `./policy-judge.yaml` or a CardRef. `inputs` maps each prompt placeholder to a reference. A placeholder takes text, so a `media` slot goes through `extract` first. `workspace` maps file paths under `/inputs/`, such as `/inputs/policy.pdf`, to references, for Agents that read files with the `fs` tools.
+#### extract
 
-`source` is `{inline: "<python>"}` or `{artifact: {card, path?}}`, where `card` names an Artifact Card. `entrypoint` names the function to call; it receives `inputs` as keyword arguments.
+`extract` reads one `media` input and returns its text and structure as JSON. Use it whenever a check or an Agent needs what is inside a file. An Agent's text placeholders and an `assert` path cannot read a raw file, so a PDF, DOCX, or spreadsheet always goes through `extract` first.
+
+It takes one field, `from`, which names a `media` slot:
+
+```yaml
+spec:
+  inputs:
+    policy: {type: media, formats: [pdf]}
+  steps:
+    - id: policy-text
+      action: {kind: extract, from: inputs.policy}
+  requirements:
+    - id: has-text
+      statement: Every page of the policy has text
+      check: {kind: assert, each: "steps.policy-text.output.pages[*].text", operator: not_equals, expected: ""}
+    - id: names-window
+      statement: The first page states the refund window
+      check: {kind: assert, path: "steps.policy-text.output.pages[0].text", operator: contains, expected: "30 days"}
+```
+
+The app sends the file, and the server extracts it before any requirement runs:
+
+```python
+from wyrd import verify
+
+run.observe.verify("policy-check", policy=verify.File("policy.pdf"))
+```
+
+For a two-page PDF, `steps.policy-text.output` is:
+
+```json
+{"format": "pdf", "pages": [{"number": 1, "text": "Refund policy\nRefunds are issued within 30 days."}, {"number": 2, "text": "Exceptions"}]}
+```
+
+The shape depends on the format: `pages` for PDF, `slides` for PPTX, `blocks` for DOCX, `sheets` for XLSX, `rows` for CSV, `value` for JSON, and `text` for text, Markdown, and HTML. Every shape is in [Extraction output](/reference/extraction-output/).
+
+To hand the file to a judge, pass the whole output to an Agent placeholder, as in `inputs: {policy: steps.policy-text.output}`. Citations still point at the original file by slot and page or line, not at the step.
+
+Extraction reads text only: there is no OCR, so a scanned PDF extracts as empty pages. The `has-text` requirement above catches that. `png`, `jpeg`, `gif`, `webp`, `doc`, `xls`, `ppt`, `tar_gz`, and `zip` cannot be extracted, and a slot that accepts any of them fails `wyrd plan` with rule `extract_format`.
+
+#### agent
+
+`agent` runs an Agent Card and returns its response, shaped by the Agent's Prompt `response_format`. Use it when a later requirement needs a model to pull something out of the evidence, such as the refund limit a policy states:
+
+```yaml
+steps:
+  - id: refund-rules
+    action:
+      kind: agent
+      agent: ./refund-reader.yaml
+      inputs: {policy: steps.policy-text.output, answer: inputs.answer.text}
+requirements:
+  - id: limit-found
+    statement: The reader found a positive refund limit
+    check: {kind: assert, path: steps.refund-rules.output.max_refund, operator: greater_than, expected: 0}
+```
+
+`agent` is a path such as `./refund-reader.yaml` or a CardRef. `inputs` maps each Prompt placeholder to a reference. A placeholder takes text, so a `media` slot goes through `extract` first. `workspace` maps file paths under `/inputs/`, such as `/inputs/policy.pdf`, to references, for Agents that read files with the `fs` tools.
 
 A step Agent can use these tools: `cards.list`, `cards.get`, `cards.get_by_ref`, `bifrost.list_tables`, `bifrost.describe_table`, `bifrost.query`, `fs.list`, `fs.read`, `fs.search`, and `code.run`.
+
+#### code
+
+`code` calls a Python function and returns what it returns, as JSON. Use it for logic one operator cannot express:
+
+```yaml
+steps:
+  - id: answer-facts
+    action:
+      kind: code
+      entrypoint: facts
+      inputs: {answer: inputs.answer, rules: steps.refund-rules.output}
+      source:
+        inline: |
+          def facts(answer, rules):
+              return {"within_limit": answer["refund"] <= rules["max_refund"]}
+requirements:
+  - id: refund-within-limit
+    statement: The refund offered is within the policy limit
+    check: {kind: assert, path: steps.answer-facts.output.within_limit, operator: equals, expected: true}
+```
+
+`entrypoint` names the function; it receives `inputs` as keyword arguments. `source` is `{inline: "<python>"}` or `{artifact: {card, path?}}`, where `card` names an Artifact Card. A step returns data for later checks. To return a verdict directly, use a [`code` check](#checks) instead.
 
 ## Requirements
 

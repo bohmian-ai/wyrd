@@ -244,6 +244,7 @@ jobs:
   inspect-wheels:
     name: inspect wheels
     needs: [build-sdist, build-linux, build-macos]
+    if: ${{ !cancelled() && !failure() && needs.build-sdist.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -256,6 +257,7 @@ jobs:
   test-wheels:
     name: smoke - ${{ matrix.os }}
     needs: [build-sdist, build-linux, build-macos]
+    if: ${{ !cancelled() && !failure() && needs.build-sdist.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -286,7 +288,8 @@ jobs:
 
   publish-pypi:
     name: publish python
-    if: github.event_name == 'release'
+    # The skipped `changes` job would skip this through the implicit success().
+    if: ${{ !cancelled() && !failure() && github.event_name == 'release' }}
     needs: [release-commit, test-wheels]
     runs-on: ubuntu-latest
     environment: release
@@ -442,7 +445,8 @@ jobs:
   # after the four platform addons it optionally depends on.
   publish-npm:
     name: publish typescript
-    if: github.event_name == 'release'
+    # The skipped `changes` job would skip this through the implicit success().
+    if: ${{ !cancelled() && !failure() && github.event_name == 'release' }}
     needs: [release-commit, build-typescript]
     runs-on: ubuntu-latest
     environment: release
@@ -568,7 +572,8 @@ jobs:
   # on an arm runner, not under emulation.
   publish-docker:
     name: docker - ${{ matrix.distro }}-${{ matrix.arch }}
-    if: github.event_name == 'release'
+    # The skipped `changes` job would skip this through the implicit success().
+    if: ${{ !cancelled() && !failure() && github.event_name == 'release' }}
     needs: [release-commit, build-server]
     runs-on: ${{ matrix.runner }}
     environment: release
@@ -659,7 +664,8 @@ jobs:
   # distro, and the ubuntu image as the bare version and latest.
   publish-docker-manifests:
     name: docker manifests
-    if: github.event_name == 'release'
+    # The skipped `changes` job would skip this through the implicit success().
+    if: ${{ !cancelled() && !failure() && github.event_name == 'release' }}
     needs: publish-docker
     runs-on: ubuntu-24.04
     environment: release
@@ -689,7 +695,8 @@ jobs:
 
   publish-binaries:
     name: publish binaries
-    if: github.event_name == 'release'
+    # The skipped `changes` job would skip this through the implicit success().
+    if: ${{ !cancelled() && !failure() && github.event_name == 'release' }}
     needs: [release-commit, build-server]
     runs-on: ubuntu-latest
     environment: release
@@ -770,7 +777,8 @@ jobs:
 
   publish-crates:
     name: publish rust crates
-    if: github.event_name == 'release'
+    # The skipped `changes` job would skip this through the implicit success().
+    if: ${{ !cancelled() && !failure() && github.event_name == 'release' }}
     needs: [release-commit, package-crates, test-wheels, build-server]
     runs-on: ubuntu-24.04
     environment: release

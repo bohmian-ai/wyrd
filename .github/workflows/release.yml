@@ -473,18 +473,13 @@ jobs:
             bundle: x86_64-unknown-linux-gnu-rocky
           - os: ubuntu-22.04-arm
             bundle: aarch64-unknown-linux-gnu
-          # Fat LTO of the server on the 7 GB macOS runner takes about three
-          # hours; thin LTO keeps this local-development bundle near Linux time.
-          - os: macos-15
-            bundle: aarch64-apple-darwin
-            lto: thin
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
     env:
       BUNDLE: wyrd-server-${{ matrix.bundle }}.tar.gz
       WYRD_PROFILE: dist
       CARGO_PROFILE_DIST_LTO: ${{ matrix.lto || 'fat' }}
-    steps:
+    steps: &build-server-steps
       - name: Install system deps
         if: matrix.container
         run: |
@@ -533,6 +528,24 @@ jobs:
             ${{ env.BUNDLE }}
             SHA256SUMS.wyrd-server-${{ matrix.bundle }}
           retention-days: 1
+
+  # The macOS bundle is its own job so the images, which never use it, do not
+  # wait on the slowest build. Fat LTO on the 7 GB macOS runner takes about
+  # three hours; thin LTO keeps this local-development bundle near an hour.
+  build-server-macos:
+    name: server - ${{ matrix.bundle }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-15
+            bundle: aarch64-apple-darwin
+            lto: thin
+    runs-on: ${{ matrix.os }}
+    env:
+      BUNDLE: wyrd-server-${{ matrix.bundle }}.tar.gz
+      WYRD_PROFILE: dist
+      CARGO_PROFILE_DIST_LTO: ${{ matrix.lto }}
+    steps: *build-server-steps
 
   # Each image copies a tested Linux bundle and compiles nothing; arm64 builds
   # on an arm runner, not under emulation.
@@ -660,7 +673,7 @@ jobs:
   publish-binaries:
     name: publish binaries
     if: github.event_name == 'release'
-    needs: [release-commit, build-server]
+    needs: [release-commit, build-server, build-server-macos]
     runs-on: ubuntu-latest
     environment: release
     permissions:
